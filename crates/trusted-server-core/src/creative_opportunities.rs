@@ -618,7 +618,7 @@ mod tests {
     // input combination, `expected == Yes` must equal the legacy all-AND boolean.
     #[test]
     fn ad_stack_gate_with_known_consent_matches_legacy_boolean() {
-        for bits in 0u8..64 {
+        for bits in 0u8..128 {
             let input = AdStackGateInput {
                 method_get: bits & 1 != 0,
                 navigation: bits & 2 != 0,
@@ -626,7 +626,7 @@ mod tests {
                 bot: bits & 8 != 0,
                 matched_slots: bits & 16 != 0,
                 consent_allows_auction: Some(bits & 32 != 0),
-                auction_enabled: bits & 1 == 0,
+                auction_enabled: bits & 64 != 0,
             };
             // Legacy semantics: all positive gates true, both negative gates false.
             let legacy = input.method_get

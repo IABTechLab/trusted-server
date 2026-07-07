@@ -18,16 +18,24 @@ const __ts_ev = (window.__tsAdTemplateEvidence = window.__tsAdTemplateEvidence |
 
 const __ts_phase = () => (window.__tsScrollPhase ? "scroll" : "initial_load")
 
+// Hard cap per evidence list so a hostile page cannot grow the store without
+// bound; the page controls how many slots/elements/warnings it produces.
+const __ts_max_entries = 1024
+function __ts_push(list, entry) {
+  if (list.length < __ts_max_entries) list.push(entry)
+}
+
 function __ts_normalize_sizes(sizes) {
   const out = []
   if (!Array.isArray(sizes)) return out
   // Accept [w, h] or [[w, h], ...]; treat numeric-leading arrays as a single pair.
   const pairs = typeof sizes[0] === "number" ? [sizes] : sizes
   for (const size of pairs) {
+    if (out.length >= __ts_max_entries) break
     if (Array.isArray(size) && typeof size[0] === "number" && typeof size[1] === "number") {
       out.push([size[0], size[1]])
     } else {
-      __ts_ev.warnings.push({
+      __ts_push(__ts_ev.warnings, {
         code: "fluid_size_ignored",
         message: "non-numeric GPT size ignored",
       })
@@ -37,7 +45,7 @@ function __ts_normalize_sizes(sizes) {
 }
 
 function __ts_record_define_slot(adUnitPath, sizes, divId) {
-  __ts_ev.gpt_slots.push({
+  __ts_push(__ts_ev.gpt_slots, {
     gam_unit_path: String(adUnitPath),
     div_id: String(divId),
     sizes: __ts_normalize_sizes(sizes),
@@ -63,7 +71,7 @@ function __ts_wrap_googletag(googletag) {
       try {
         __ts_record_define_slot(adUnitPath, sizes, divId)
       } catch (error) {
-        __ts_ev.warnings.push({ code: "define_slot_capture_failed", message: String(error) })
+        __ts_push(__ts_ev.warnings, { code: "define_slot_capture_failed", message: String(error) })
       }
       return slot
     }
@@ -80,14 +88,14 @@ function __ts_wrap_apstag(apstag) {
       try {
         const slots = (config && config.slots) || []
         for (const slot of slots) {
-          __ts_ev.aps_calls.push({
+          __ts_push(__ts_ev.aps_calls, {
             slot_id: String(slot.slotID || slot.slotName || ""),
             sizes: __ts_normalize_sizes(slot.sizes),
             phase: __ts_phase(),
           })
         }
       } catch (error) {
-        __ts_ev.warnings.push({ code: "aps_capture_failed", message: String(error) })
+        __ts_push(__ts_ev.warnings, { code: "aps_capture_failed", message: String(error) })
       }
       return originalFetchBids.apply(this, arguments)
     }
@@ -124,7 +132,7 @@ window.__tsCollectAdTemplateEvidence = function () {
       const id = element.id
       if (id.endsWith("-container")) continue
       if (__ts_prefixes.some((prefix) => id.startsWith(prefix)) && !seen.has(id)) {
-        __ts_ev.dom_ids.push({ dom_id: id, phase: __ts_phase() })
+        __ts_push(__ts_ev.dom_ids, { dom_id: id, phase: __ts_phase() })
         seen.add(id)
       }
     }
@@ -139,6 +147,7 @@ window.__tsCollectAdTemplateEvidence = function () {
           const rawSizes = typeof slot.getSizes === "function" ? slot.getSizes() : []
           const sizes = []
           for (const size of rawSizes) {
+            if (sizes.length >= __ts_max_entries) break
             if (size && typeof size.getWidth === "function") {
               sizes.push([size.getWidth(), size.getHeight()])
             } else if (Array.isArray(size) && typeof size[0] === "number") {
@@ -149,7 +158,7 @@ window.__tsCollectAdTemplateEvidence = function () {
             (entry) => entry.gam_unit_path === String(path) && entry.div_id === String(divId)
           )
           if (!exists) {
-            __ts_ev.gpt_slots.push({
+            __ts_push(__ts_ev.gpt_slots, {
               gam_unit_path: String(path),
               div_id: String(divId),
               sizes,
@@ -157,12 +166,12 @@ window.__tsCollectAdTemplateEvidence = function () {
             })
           }
         } catch (error) {
-          __ts_ev.warnings.push({ code: "gpt_scrape_failed", message: String(error) })
+          __ts_push(__ts_ev.warnings, { code: "gpt_scrape_failed", message: String(error) })
         }
       }
     }
   } catch (error) {
-    __ts_ev.warnings.push({ code: "collect_failed", message: String(error) })
+    __ts_push(__ts_ev.warnings, { code: "collect_failed", message: String(error) })
   }
   return __ts_ev
 }

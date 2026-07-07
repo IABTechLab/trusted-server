@@ -210,7 +210,13 @@ fn parse_gampad_request(raw_url: &str) -> Option<(String, DiscoveredSlot)> {
 
     let iu_parts = iu_parts?;
     let mut parts = iu_parts.split(',').filter(|part| !part.is_empty());
-    let network_id = parts.next()?.to_string();
+    // Mirror the registry path's validation: a GAM network id is digits only.
+    // The percent-decoded query value is page-controlled and gets spliced into
+    // generated TOML, so reject anything else.
+    let network_id = parts
+        .next()
+        .filter(|segment| segment.bytes().all(|byte| byte.is_ascii_digit()))?
+        .to_string();
     let gam_unit_path = format!("/{}", iu_parts.replace(',', "/"));
     // A usable unit path needs the network id plus at least one path segment.
     parts.next()?;
@@ -379,6 +385,21 @@ mod tests {
             discovered.slots.is_empty(),
             "a bare network id is not a usable ad-unit path"
         );
+    }
+
+    #[test]
+    fn skips_requests_with_non_numeric_network_id() {
+        // A page-controlled iu_parts value must not smuggle a non-numeric
+        // network id (it gets spliced into generated TOML).
+        let discovered = from_requests(&[request(
+            "https://securepubads.g.doubleclick.net/gampad/ads?iu_parts=123%22evil%2Cslot&dids=div-gpt-ad-x&prev_iu_szs=300x250",
+        )]);
+
+        assert!(
+            discovered.slots.is_empty(),
+            "a non-numeric network id should be rejected"
+        );
+        assert_eq!(discovered.gam_network_id, None);
     }
 
     #[test]

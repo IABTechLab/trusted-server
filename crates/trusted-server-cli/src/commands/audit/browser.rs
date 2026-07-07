@@ -31,6 +31,13 @@ const CHROME_NAMES: &[&str] = &[
 
 /// Poll interval while waiting for the page network to settle, in milliseconds.
 const SETTLE_POLL_MS: u64 = 250;
+/// Hard cap on page navigation so a stalled load cannot hang the audit.
+const NAVIGATION_TIMEOUT: Duration = Duration::from_secs(30);
+/// Hard cap per decoded evidence list, mirroring the collector script's
+/// `__ts_max_entries`, so a hostile page cannot inflate CLI memory.
+const MAX_EVIDENCE_ENTRIES: usize = 1024;
+/// Hard cap on browser teardown so a wedged Chrome cannot hang the audit.
+const BROWSER_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default quiet window (no new resources) marking the page settled.
 const DEFAULT_SETTLE_QUIET_MS: u64 = 750;
 /// Default hard cap on settling so slow/ad-heavy pages still terminate.
@@ -228,9 +235,10 @@ async fn collect(
 
     let result = collect_with_browser(&browser, request, settle_config).await;
 
-    // Best-effort teardown; ignore errors since we already have a result.
-    let _ = browser.close().await;
-    let _ = browser.wait().await;
+    // Best-effort teardown; ignore errors since we already have a result, but
+    // bound it so a Chrome that ignores `close` cannot hang the command.
+    let _ = tokio::time::timeout(BROWSER_CLOSE_TIMEOUT, browser.close()).await;
+    let _ = tokio::time::timeout(BROWSER_CLOSE_TIMEOUT, browser.wait()).await;
     handler_task.abort();
 
     result
@@ -267,16 +275,29 @@ async fn collect_with_browser(
             .map_err(|error| format!("failed to set cookie `{name}`: {error}"))?;
     }
 
-    page.goto(request.url.as_str())
+    tokio::time::timeout(NAVIGATION_TIMEOUT, page.goto(request.url.as_str()))
         .await
+        .map_err(|_| format!("navigation to {} timed out", request.url))?
         .map_err(|error| format!("failed to navigate to {}: {error}", request.url))?;
-    page.wait_for_navigation()
+    tokio::time::timeout(NAVIGATION_TIMEOUT, page.wait_for_navigation())
         .await
+        .map_err(|_| format!("navigation to {} timed out", request.url))?
         .map_err(|error| format!("failed to read main document navigation response: {error}"))?;
 
     settle(&page, settle_config).await;
 
     if request.scroll {
+        if request.collect_ad_evidence {
+            // Snapshot evidence before scrolling so entries already present at
+            // initial load keep phase "load"; the store dedups first-seen, so
+            // the post-scroll scrape only adds genuinely scroll-phase entries.
+            let _ = page
+                .evaluate(
+                    "(typeof window.__tsCollectAdTemplateEvidence === 'function' \
+                     && window.__tsCollectAdTemplateEvidence(), null)",
+                )
+                .await;
+        }
         scroll_page(&page).await;
         settle(&page, settle_config).await;
     }
@@ -386,7 +407,15 @@ async fn extract_ad_evidence(
             None
         }
         Some(value) => match serde_json::from_value::<BrowserAdEvidence>(value) {
-            Ok(evidence) => Some(evidence),
+            Ok(mut evidence) => {
+                // Defense in depth: the injected script caps these lists, but the
+                // page owns that store, so re-cap after decode.
+                evidence.dom_ids.truncate(MAX_EVIDENCE_ENTRIES);
+                evidence.gpt_slots.truncate(MAX_EVIDENCE_ENTRIES);
+                evidence.aps_calls.truncate(MAX_EVIDENCE_ENTRIES);
+                evidence.warnings.truncate(MAX_EVIDENCE_ENTRIES);
+                Some(evidence)
+            }
             Err(error) => {
                 warnings.push(Warning {
                     code: "ad_evidence_decode_failed".to_string(),
@@ -503,6 +532,56 @@ mod tests {
         assert!(
             evidence.dom_ids.iter().any(|dom| dom.dom_id == "ad-atf-0"),
             "should capture the configured-prefix DOM id"
+        );
+    }
+
+    #[test]
+    fn scroll_pass_keeps_initial_load_phase_for_load_time_evidence() {
+        if !chrome_available() {
+            // Browser fixture test requires a local Chrome/Chromium; skipping.
+            return;
+        }
+
+        let mut fixture = tempfile::Builder::new()
+            .suffix(".html")
+            .tempfile()
+            .expect("should create fixture file");
+        fixture
+            .write_all(GPT_FIXTURE.as_bytes())
+            .expect("should write fixture");
+        let url = url::Url::from_file_path(fixture.path()).expect("should build file url");
+
+        let script = build_ad_template_init_script(&AdTemplateCollectorConfig {
+            div_prefixes: vec!["ad-atf-".to_string()],
+            aps_slot_ids: Vec::new(),
+        })
+        .expect("should build init script");
+
+        let collector = BrowserCollector::new();
+        let page = collector
+            .collect_page(BrowserCollectRequest {
+                url,
+                init_scripts: vec![script],
+                scroll: true,
+                collect_ad_evidence: true,
+                cookies: Vec::new(),
+            })
+            .expect("should collect fixture page");
+
+        // The slot and DOM id exist at load time, so the pre-scroll snapshot
+        // must record them as initial-load even though a scroll pass ran.
+        let evidence = page.ad_evidence.expect("fixture should yield ad evidence");
+        assert!(
+            evidence.dom_ids.iter().any(|dom| dom.dom_id == "ad-atf-0"
+                && dom.phase == crate::ad_templates::compare::EvidencePhase::InitialLoad),
+            "load-time DOM id should keep phase initial_load under --scroll"
+        );
+        assert!(
+            evidence.gpt_slots.iter().any(|slot| {
+                slot.gam_unit_path == "/123/news/atf"
+                    && slot.phase == crate::ad_templates::compare::EvidencePhase::InitialLoad
+            }),
+            "load-time GPT slot should keep phase initial_load under --scroll"
         );
     }
 }

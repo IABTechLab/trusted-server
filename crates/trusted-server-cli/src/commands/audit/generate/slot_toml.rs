@@ -1,0 +1,762 @@
+//! TOML-side slot config: the [`RenderSlot`] model, run merging, rendering,
+//! and in-place `[creative_opportunities]` splicing for `ts audit ad-templates
+//! generate`.
+
+use std::collections::BTreeMap;
+
+use trusted_server_core::auction::types::MediaType;
+use trusted_server_core::creative_opportunities::{
+    CreativeOpportunitiesConfig, CreativeOpportunitySlot,
+};
+
+use crate::commands::audit::generate::gpt_slots;
+use crate::error::{CliResult, cli_error, report_error};
+
+/// A slot ready to render — the union of discovered and existing fields, without
+/// the core type's `pub(crate)` compiled-pattern cache.
+#[derive(Debug, Clone)]
+pub(super) struct RenderSlot {
+    id: String,
+    div_id: Option<String>,
+    gam_unit_path: Option<String>,
+    page_patterns: Vec<String>,
+    /// `(width, height, non-banner media type)`.
+    formats: Vec<(u32, u32, Option<&'static str>)>,
+    floor_price: Option<f64>,
+    targeting: BTreeMap<String, String>,
+    aps_slot_id: Option<String>,
+    /// `Some` when the slot runs Prebid; the map is per-bidder params (often empty).
+    prebid_bidders: Option<BTreeMap<String, serde_json::Value>>,
+}
+
+impl RenderSlot {
+    /// The stable identity used to match slots across runs: the div id (or slot
+    /// id), with any trailing `-` trimmed so hand-authored stems still match.
+    fn key(&self) -> String {
+        self.div_id
+            .as_deref()
+            .unwrap_or(&self.id)
+            .trim_end_matches('-')
+            .to_string()
+    }
+
+    fn from_discovered(slot: &gpt_slots::DiscoveredSlot, patterns: &[String]) -> Self {
+        Self {
+            id: slot.id.clone(),
+            div_id: Some(slot.div_id.clone()),
+            gam_unit_path: Some(slot.gam_unit_path.clone()),
+            page_patterns: patterns.to_vec(),
+            formats: slot
+                .formats
+                .iter()
+                .map(|&(width, height)| (width, height, None))
+                .collect(),
+            floor_price: None,
+            targeting: BTreeMap::new(),
+            aps_slot_id: None,
+            prebid_bidders: slot.has_prebid.then(BTreeMap::new),
+        }
+    }
+
+    fn from_existing(slot: &CreativeOpportunitySlot) -> Self {
+        Self {
+            id: slot.id.clone(),
+            div_id: slot.div_id.clone(),
+            gam_unit_path: slot.gam_unit_path.clone(),
+            page_patterns: slot.page_patterns.clone(),
+            formats: slot
+                .formats
+                .iter()
+                .map(|format| {
+                    (
+                        format.width,
+                        format.height,
+                        media_type_label(&format.media_type),
+                    )
+                })
+                .collect(),
+            floor_price: slot.floor_price,
+            targeting: slot
+                .targeting
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            aps_slot_id: slot.providers.aps.as_ref().map(|aps| aps.slot_id.clone()),
+            prebid_bidders: slot.providers.prebid.as_ref().map(|prebid| {
+                prebid
+                    .bidders
+                    .iter()
+                    .map(|(name, params)| (name.clone(), params.clone()))
+                    .collect()
+            }),
+        }
+    }
+}
+
+/// The non-default (non-banner) media-type label to emit, or `None` for banner.
+fn media_type_label(media_type: &MediaType) -> Option<&'static str> {
+    match media_type {
+        MediaType::Banner => None,
+        MediaType::Video => Some("video"),
+        MediaType::Native => Some("native"),
+    }
+}
+
+/// Merges discovered slots into the existing slot set, keyed by [`RenderSlot::key`].
+///
+/// - `--replace` (or no existing slots): the result is exactly the discovered set.
+/// - Otherwise existing slots are preserved (covering other pages / hand-tuned
+///   fields); a slot re-seen this run has `run_patterns` unioned into its
+///   `page_patterns`; slots seen only this run are appended.
+pub(super) fn merge_slots(
+    existing: Option<&CreativeOpportunitiesConfig>,
+    discovered: &gpt_slots::DiscoveredSlots,
+    run_patterns: &[String],
+    replace: bool,
+) -> Vec<RenderSlot> {
+    let discovered_slots: Vec<RenderSlot> = discovered
+        .slots
+        .iter()
+        .map(|slot| RenderSlot::from_discovered(slot, run_patterns))
+        .collect();
+
+    let existing_slots = existing.map(|config| config.slot.as_slice()).unwrap_or(&[]);
+    if replace || existing_slots.is_empty() {
+        return discovered_slots;
+    }
+
+    let mut merged: Vec<RenderSlot> = existing_slots
+        .iter()
+        .map(RenderSlot::from_existing)
+        .collect();
+    for slot in discovered_slots {
+        let key = slot.key();
+        if let Some(present) = merged.iter_mut().find(|existing| existing.key() == key) {
+            for pattern in &slot.page_patterns {
+                if !present.page_patterns.contains(pattern) {
+                    present.page_patterns.push(pattern.clone());
+                }
+            }
+        } else {
+            merged.push(slot);
+        }
+    }
+    merged
+}
+
+/// Renders merged slots as compact `[[creative_opportunities.slot]]` TOML blocks.
+pub(super) fn render_slots(slots: &[RenderSlot]) -> String {
+    let mut out = String::from(
+        "\n# Slots managed by `ts audit ad-templates generate`.\n\
+         # Review page_patterns and formats before validating/pushing.\n",
+    );
+    for slot in slots {
+        out.push_str("\n[[creative_opportunities.slot]]\n");
+        out.push_str(&format!("id = {}\n", toml_string(&slot.id)));
+        if let Some(div_id) = &slot.div_id {
+            out.push_str(&format!("div_id = {}\n", toml_string(div_id)));
+        }
+        if let Some(path) = &slot.gam_unit_path {
+            out.push_str(&format!("gam_unit_path = {}\n", toml_string(path)));
+        }
+        let patterns = slot
+            .page_patterns
+            .iter()
+            .map(|pattern| toml_string(pattern))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("page_patterns = [{patterns}]\n"));
+        let formats = slot
+            .formats
+            .iter()
+            .map(|(width, height, media_type)| match media_type {
+                Some(kind) => {
+                    format!("{{ width = {width}, height = {height}, media_type = \"{kind}\" }}")
+                }
+                None => format!("{{ width = {width}, height = {height} }}"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("formats = [{formats}]\n"));
+        if let Some(floor) = slot.floor_price {
+            // `f64` Display prints `NaN`, which is not valid TOML (`nan` is);
+            // normalize non-finite values so the spliced config stays parseable.
+            if floor.is_finite() {
+                out.push_str(&format!("floor_price = {floor}\n"));
+            } else if floor.is_nan() {
+                out.push_str("floor_price = nan\n");
+            } else if floor.is_sign_positive() {
+                out.push_str("floor_price = inf\n");
+            } else {
+                out.push_str("floor_price = -inf\n");
+            }
+        }
+        if !slot.targeting.is_empty() {
+            let pairs = slot
+                .targeting
+                .iter()
+                .map(|(key, value)| format!("{} = {}", toml_key(key), toml_string(value)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("targeting = {{ {pairs} }}\n"));
+        }
+        if let Some(slot_id) = &slot.aps_slot_id {
+            out.push_str("[creative_opportunities.slot.providers.aps]\n");
+            out.push_str(&format!("slot_id = {}\n", toml_string(slot_id)));
+        }
+        if let Some(bidders) = &slot.prebid_bidders {
+            out.push_str("[creative_opportunities.slot.providers.prebid]\n");
+            let rendered = bidders
+                .iter()
+                .map(|(name, params)| format!("{} = {}", toml_key(name), toml_inline_value(params)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if rendered.is_empty() {
+                out.push_str("bidders = {}\n");
+            } else {
+                out.push_str(&format!("bidders = {{ {rendered} }}\n"));
+            }
+        }
+    }
+    out
+}
+
+/// Quotes and escapes a string as a TOML basic string, including control chars.
+pub(super) fn toml_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            control if (control as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04X}", control as u32));
+            }
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Renders a TOML table key: bare when it is a valid bare key, else a quoted key.
+fn toml_key(key: &str) -> String {
+    let is_bare = !key.is_empty()
+        && key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-');
+    if is_bare {
+        key.to_string()
+    } else {
+        toml_string(key)
+    }
+}
+
+/// Renders a JSON value as a compact inline TOML value (for prebid bidder params).
+fn toml_inline_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "{}".to_string(),
+        serde_json::Value::Bool(bool) => bool.to_string(),
+        serde_json::Value::Number(number) => number.to_string(),
+        serde_json::Value::String(string) => toml_string(string),
+        serde_json::Value::Array(items) => {
+            let rendered = items
+                .iter()
+                .map(toml_inline_value)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("[{rendered}]")
+        }
+        serde_json::Value::Object(map) => {
+            let rendered = map
+                .iter()
+                .map(|(key, value)| format!("{} = {}", toml_key(key), toml_inline_value(value)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{{ {rendered} }}")
+        }
+    }
+}
+
+/// Rewrites the `[creative_opportunities]` slot array of `existing` with the
+/// pre-rendered `rendered_slots` text, updating `gam_network_id` and preserving
+/// all other sections and comments.
+///
+/// If the config has no `[creative_opportunities]` section, a fresh one is
+/// appended so `generate` works against a config that omits it.
+pub(super) fn splice_creative_slots(
+    existing: &str,
+    network_id: Option<&str>,
+    rendered_slots: &str,
+) -> CliResult<String> {
+    let rendered = rendered_slots.trim_matches('\n');
+
+    // No section yet — append a fresh one with the network id and slots.
+    if !existing
+        .lines()
+        .any(|line| line.trim() == "[creative_opportunities]")
+    {
+        let mut result = existing.to_string();
+        if !result.is_empty() && !result.ends_with('\n') {
+            result.push('\n');
+        }
+        result.push_str("\n[creative_opportunities]\n");
+        if let Some(network_id) = network_id {
+            result.push_str(&format!("gam_network_id = {}\n", toml_string(network_id)));
+        }
+        result.push_str(rendered);
+        result.push('\n');
+        return Ok(result);
+    }
+
+    // Section exists — update `gam_network_id` (best-effort) and replace slots.
+    let mut document = existing.to_string();
+    if let Some(network_id) = network_id
+        && let Ok(updated) = replace_key_in_section(
+            &document,
+            "creative_opportunities",
+            "gam_network_id",
+            &format!("gam_network_id = {}", toml_string(network_id)),
+        )
+    {
+        document = updated;
+    }
+
+    let lines: Vec<&str> = document.lines().collect();
+    let header = lines
+        .iter()
+        .position(|line| line.trim() == "[creative_opportunities]")
+        .ok_or_else(|| {
+            report_error("target config has no [creative_opportunities] section to update")
+        })?;
+
+    let is_slot_table = |line: &str| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("[[creative_opportunities.slot]]")
+            || trimmed.starts_with("[creative_opportunities.slot.")
+    };
+    let is_unrelated_table = |line: &str| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with('[') && !is_slot_table(line) && trimmed != "[creative_opportunities]"
+    };
+
+    // Where the existing slot array begins (first slot table after the header),
+    // else the end of the scalar block (first unrelated table, or EOF).
+    let existing_start = lines[header + 1..]
+        .iter()
+        .position(|line| is_slot_table(line))
+        .map(|offset| header + 1 + offset);
+    let start = existing_start.unwrap_or_else(|| {
+        lines[header + 1..]
+            .iter()
+            .position(|line| is_unrelated_table(line))
+            .map_or(lines.len(), |offset| header + 1 + offset)
+    });
+    // Where the slot array ends: first unrelated top-level table, or EOF.
+    let end = lines[start..]
+        .iter()
+        .position(|line| is_unrelated_table(line))
+        .map_or(lines.len(), |offset| start + offset);
+
+    let mut result = lines[..start].join("\n");
+    if !result.is_empty() {
+        result.push('\n');
+    }
+    result.push_str(rendered);
+    result.push('\n');
+    let tail = lines[end..].join("\n");
+    if !tail.is_empty() {
+        result.push('\n');
+        result.push_str(&tail);
+    }
+    if existing.ends_with('\n') && !result.ends_with('\n') {
+        result.push('\n');
+    }
+    if uses_crlf(existing) {
+        result = result.replace('\n', "\r\n");
+    }
+    Ok(result)
+}
+
+/// Whether `document` uses CRLF line endings (so edits preserve them).
+fn uses_crlf(document: &str) -> bool {
+    document.contains("\r\n")
+}
+
+pub(super) fn replace_key_in_section(
+    document: &str,
+    section: &str,
+    key: &str,
+    replacement_line: &str,
+) -> CliResult<String> {
+    let section_header = format!("[{section}]");
+    let mut in_section = false;
+    let mut replaced = false;
+    let mut saw_section = false;
+    let mut lines = Vec::new();
+
+    for line in document.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_section = trimmed == section_header;
+            saw_section |= in_section;
+        }
+
+        if in_section && !replaced && is_key_line(trimmed, key) {
+            lines.push(replacement_line.to_string());
+            replaced = true;
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+
+    if !saw_section {
+        return cli_error(format!(
+            "failed to update starter config because section `{section_header}` was not found"
+        ));
+    }
+    if !replaced {
+        return cli_error(format!(
+            "failed to update starter config because key `{key}` was not found in `{section_header}`"
+        ));
+    }
+
+    let mut output = lines.join("\n");
+    if document.ends_with('\n') {
+        output.push('\n');
+    }
+    if uses_crlf(document) {
+        // `lines()` stripped the `\r`s; restore the document's CRLF endings.
+        output = output.replace("\r\n", "\n").replace('\n', "\r\n");
+    }
+    Ok(output)
+}
+
+fn is_key_line(trimmed_line: &str, key: &str) -> bool {
+    trimmed_line
+        .strip_prefix(key)
+        .and_then(|remaining| remaining.trim_start().strip_prefix('='))
+        .is_some()
+}
+
+/// Chooses the `gam_network_id` to write.
+///
+/// The existing id is kept only when a real merge preserves existing slots.
+/// On `--replace`, or when the config had no slots (e.g. a placeholder
+/// `[creative_opportunities]` section), the discovered id wins — mirroring
+/// [`merge_slots`], which returns discovered-only in those cases.
+pub(super) fn resolve_network_id(
+    existing: Option<&CreativeOpportunitiesConfig>,
+    discovered_network_id: Option<&str>,
+    replace: bool,
+) -> Option<String> {
+    let existing_network_id = existing.map(|config| config.gam_network_id.clone());
+    let preserving_existing = !replace && existing.is_some_and(|config| !config.slot.is_empty());
+    if preserving_existing {
+        existing_network_id.or_else(|| discovered_network_id.map(str::to_string))
+    } else {
+        discovered_network_id
+            .map(str::to_string)
+            .or(existing_network_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::audit::generate::collector;
+
+    fn discovered_header_slot() -> gpt_slots::DiscoveredSlots {
+        let registry = vec![collector::CollectedGptSlot {
+            gam_unit_path: "/222/homepage/header".to_string(),
+            div_id: "div-gpt-ad-header".to_string(),
+            sizes: vec![(728, 90)],
+        }];
+        gpt_slots::discover_gpt_slots(&registry, &[], false)
+    }
+
+    /// Rendered slot text for the discovered header slot, patterns = `/`.
+    fn header_rendered() -> String {
+        let merged = merge_slots(None, &discovered_header_slot(), &["/".to_string()], true);
+        render_slots(&merged)
+    }
+
+    fn existing_config(toml_str: &str) -> CreativeOpportunitiesConfig {
+        toml::from_str::<CreativeOpportunitiesConfig>(toml_str).expect("valid creative config")
+    }
+
+    #[test]
+    fn splice_replaces_slots_and_preserves_other_sections() {
+        let existing = "[publisher]\ndomain = \"x\"\n\n\
+             [creative_opportunities]\ngam_network_id = \"111\"\nprice_granularity = \"dense\"\n\n\
+             [[creative_opportunities.slot]]\nid = \"old\"\ndiv_id = \"old\"\n\
+             gam_unit_path = \"/111/old\"\npage_patterns = [\"/\"]\n\
+             formats = [{ width = 300, height = 250 }]\n\n\
+             [auction]\nenabled = true\n";
+
+        let out = splice_creative_slots(existing, Some("222"), &header_rendered())
+            .expect("should splice");
+
+        assert!(
+            out.contains("gam_network_id = \"222\""),
+            "network id updated"
+        );
+        assert!(!out.contains("id = \"old\""), "old slot removed");
+        assert!(
+            out.contains("gam_unit_path = \"/222/homepage/header\""),
+            "new slot written"
+        );
+        assert!(
+            out.contains("[publisher]") && out.contains("domain = \"x\""),
+            "publisher section preserved"
+        );
+        assert!(
+            out.contains("[auction]") && out.contains("enabled = true"),
+            "trailing auction section preserved"
+        );
+        toml::from_str::<toml::Value>(&out).expect("spliced config is valid TOML");
+    }
+
+    #[test]
+    fn splice_preserves_crlf_line_endings() {
+        let existing = "[creative_opportunities]\r\ngam_network_id = \"111\"\r\n\r\n\
+             [auction]\r\nenabled = true\r\n";
+
+        let out = splice_creative_slots(existing, Some("222"), &header_rendered())
+            .expect("should splice");
+
+        assert!(
+            !out.replace("\r\n", "").contains('\n'),
+            "every line ending should stay CRLF"
+        );
+        let value = toml::from_str::<toml::Value>(&out).expect("spliced CRLF config is valid TOML");
+        assert_eq!(
+            value["creative_opportunities"]["gam_network_id"].as_str(),
+            Some("222"),
+            "network id updated in CRLF config"
+        );
+    }
+
+    #[test]
+    fn render_slots_writes_non_finite_floor_price_as_valid_toml() {
+        let slot = RenderSlot {
+            id: "header".to_string(),
+            div_id: Some("div-gpt-ad-header".to_string()),
+            gam_unit_path: Some("/222/homepage/header".to_string()),
+            page_patterns: vec!["/".to_string()],
+            formats: vec![(728, 90, None)],
+            floor_price: Some(f64::NAN),
+            targeting: BTreeMap::new(),
+            aps_slot_id: None,
+            prebid_bidders: None,
+        };
+
+        let rendered = render_slots(&[slot]);
+
+        assert!(
+            rendered.contains("floor_price = nan"),
+            "NaN should render as TOML `nan`, not Rust `NaN`"
+        );
+        toml::from_str::<toml::Value>(&rendered).expect("rendered slots are valid TOML");
+    }
+
+    #[test]
+    fn splice_creates_section_when_absent() {
+        // Config with no [creative_opportunities] at all — generate should append it.
+        let existing = "[publisher]\ndomain = \"x\"\n\n[auction]\nenabled = true\n";
+
+        let out = splice_creative_slots(existing, Some("222"), &header_rendered())
+            .expect("should splice");
+
+        let value = toml::from_str::<toml::Value>(&out).expect("valid TOML");
+        assert_eq!(
+            value["creative_opportunities"]["gam_network_id"].as_str(),
+            Some("222"),
+            "appended section carries the discovered network id"
+        );
+        assert_eq!(
+            value["creative_opportunities"]["slot"][0]["id"].as_str(),
+            Some("header")
+        );
+        assert!(
+            value["publisher"]["domain"].as_str() == Some("x")
+                && value["auction"]["enabled"].as_bool() == Some(true),
+            "existing sections preserved when appending"
+        );
+    }
+
+    #[test]
+    fn splice_inserts_when_no_existing_slots() {
+        let existing =
+            "[creative_opportunities]\ngam_network_id = \"111\"\n\n[auction]\nenabled = true\n";
+
+        let out = splice_creative_slots(existing, Some("222"), &header_rendered())
+            .expect("should splice");
+
+        let value = toml::from_str::<toml::Value>(&out).expect("valid TOML");
+        assert_eq!(
+            value["creative_opportunities"]["slot"][0]["id"].as_str(),
+            Some("header"),
+            "inserted slot id strips the div-gpt-ad- prefix"
+        );
+        assert_eq!(
+            value["creative_opportunities"]["slot"][0]["div_id"].as_str(),
+            Some("div-gpt-ad-header"),
+            "div_id keeps the stable stem"
+        );
+        assert!(
+            value["auction"]["enabled"].as_bool() == Some(true),
+            "auction section preserved after inserted slots"
+        );
+    }
+
+    #[test]
+    fn merge_second_run_unions_page_patterns() {
+        // Existing slot on "/"; re-discovered this run with "/news/*".
+        let existing = existing_config(
+            "gam_network_id = \"222\"\n\n\
+             [[slot]]\nid = \"header\"\ndiv_id = \"div-gpt-ad-header\"\n\
+             gam_unit_path = \"/222/homepage/header\"\npage_patterns = [\"/\"]\n\
+             formats = [{ width = 728, height = 90 }]\n",
+        );
+
+        let merged = merge_slots(
+            Some(&existing),
+            &discovered_header_slot(),
+            &["/news/*".to_string()],
+            false,
+        );
+
+        assert_eq!(merged.len(), 1, "same slot is not duplicated");
+        assert_eq!(
+            merged[0].page_patterns,
+            vec!["/".to_string(), "/news/*".to_string()],
+            "this run's pattern is unioned into the existing slot"
+        );
+    }
+
+    #[test]
+    fn merge_keeps_existing_only_slots() {
+        // Existing has header + sidebar; this run re-sees only header.
+        let existing = existing_config(
+            "gam_network_id = \"222\"\n\n\
+             [[slot]]\nid = \"header\"\ndiv_id = \"div-gpt-ad-header\"\n\
+             gam_unit_path = \"/222/homepage/header\"\npage_patterns = [\"/\"]\n\
+             formats = [{ width = 728, height = 90 }]\n\n\
+             [[slot]]\nid = \"sidebar\"\ndiv_id = \"ad-sidebar\"\n\
+             gam_unit_path = \"/222/sidebar\"\npage_patterns = [\"/news/*\"]\n\
+             formats = [{ width = 300, height = 250 }]\nfloor_price = 0.5\n",
+        );
+
+        let merged = merge_slots(
+            Some(&existing),
+            &discovered_header_slot(),
+            &["/".to_string()],
+            false,
+        );
+
+        let ids: Vec<&str> = merged.iter().map(|slot| slot.id.as_str()).collect();
+        assert_eq!(ids, vec!["header", "sidebar"], "sidebar preserved");
+        let sidebar = merged
+            .iter()
+            .find(|slot| slot.id == "sidebar")
+            .expect("sidebar");
+        assert_eq!(
+            sidebar.floor_price,
+            Some(0.5),
+            "hand-tuned fields preserved"
+        );
+    }
+
+    #[test]
+    fn merge_replace_wipes_existing() {
+        let existing = existing_config(
+            "gam_network_id = \"222\"\n\n\
+             [[slot]]\nid = \"sidebar\"\ndiv_id = \"ad-sidebar\"\n\
+             gam_unit_path = \"/222/sidebar\"\npage_patterns = [\"/\"]\n\
+             formats = [{ width = 300, height = 250 }]\n",
+        );
+
+        let merged = merge_slots(
+            Some(&existing),
+            &discovered_header_slot(),
+            &["/".to_string()],
+            true,
+        );
+
+        let ids: Vec<&str> = merged.iter().map(|slot| slot.id.as_str()).collect();
+        assert_eq!(ids, vec!["header"], "--replace keeps only discovered slots");
+    }
+
+    #[test]
+    fn resolve_network_id_prefers_discovered_unless_preserving_existing() {
+        let with_slots = existing_config(
+            "gam_network_id = \"111\"\n\n[[slot]]\nid = \"s\"\ndiv_id = \"ad-s\"\n\
+             gam_unit_path = \"/111/s\"\npage_patterns = [\"/\"]\n\
+             formats = [{ width = 300, height = 250 }]\n",
+        );
+        let empty = existing_config("gam_network_id = \"111\"\n");
+
+        // Real merge → keep existing.
+        assert_eq!(
+            resolve_network_id(Some(&with_slots), Some("222"), false).as_deref(),
+            Some("111")
+        );
+        // Placeholder section with no slots → discovered wins.
+        assert_eq!(
+            resolve_network_id(Some(&empty), Some("222"), false).as_deref(),
+            Some("222")
+        );
+        // --replace → discovered wins.
+        assert_eq!(
+            resolve_network_id(Some(&with_slots), Some("222"), true).as_deref(),
+            Some("222")
+        );
+        // No existing config → discovered.
+        assert_eq!(
+            resolve_network_id(None, Some("222"), false).as_deref(),
+            Some("222")
+        );
+    }
+
+    #[test]
+    fn toml_key_quotes_only_non_bare_keys() {
+        assert_eq!(toml_key("zone"), "zone");
+        assert_eq!(toml_key("ad-loc"), "ad-loc");
+        assert_eq!(toml_key("a.b"), "\"a.b\"");
+        assert_eq!(toml_key("with space"), "\"with space\"");
+        assert_eq!(toml_key(""), "\"\"");
+    }
+
+    #[test]
+    fn toml_string_escapes_quotes_backslashes_and_controls() {
+        assert_eq!(toml_string("a\"b\\c"), "\"a\\\"b\\\\c\"");
+        assert_eq!(toml_string("line\nbreak\t!"), "\"line\\nbreak\\t!\"");
+    }
+
+    #[test]
+    fn render_quotes_exotic_targeting_keys_to_valid_toml() {
+        let existing = existing_config(
+            "gam_network_id = \"1\"\n\n\
+             [[slot]]\nid = \"s\"\ndiv_id = \"ad-s\"\ngam_unit_path = \"/1/s\"\n\
+             page_patterns = [\"/\"]\nformats = [{ width = 300, height = 250 }]\n\
+             targeting = { \"a.b\" = \"x\" }\n",
+        );
+
+        let merged = merge_slots(
+            Some(&existing),
+            &discovered_header_slot(),
+            &["/".to_string()],
+            false,
+        );
+        let doc = format!(
+            "[creative_opportunities]\ngam_network_id = \"1\"\n{}",
+            render_slots(&merged)
+        );
+
+        toml::from_str::<toml::Value>(&doc).expect("exotic targeting key renders as valid TOML");
+    }
+}
