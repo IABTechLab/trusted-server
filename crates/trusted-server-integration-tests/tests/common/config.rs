@@ -41,3 +41,32 @@ pub fn cloudflare_config_json(origin_port: u16) -> TestResult<String> {
         ))
     })
 }
+
+#[cfg(test)]
+mod tests {
+    const FASTLY_CONFIG: &str = include_str!("../../../../fastly.toml");
+
+    #[test]
+    fn local_fastly_config_defines_runtime_kv_stores() {
+        let parsed: toml::Value =
+            toml::from_str(FASTLY_CONFIG).expect("should parse root fastly.toml");
+        let stores = &parsed["local_server"]["kv_stores"];
+
+        assert!(
+            stores["counter_store"].is_array(),
+            "fastly.toml should define counter_store for batch-sync rate limiting"
+        );
+        let ec_entries = stores["ec_identity_store"]
+            .as_array()
+            .expect("fastly.toml should define ec_identity_store");
+        assert!(
+            ec_entries.iter().any(|entry| {
+                entry["key"].as_str()
+                    == Some(
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test01",
+                    )
+            }),
+            "fastly.toml should preserve the pre-seeded local EC test row"
+        );
+    }
+}

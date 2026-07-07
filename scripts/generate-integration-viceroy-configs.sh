@@ -39,13 +39,5 @@ fi
 "$GENERATOR_BIN" \
     --template "$TEMPLATE_PATH" \
     --app-config "$APP_CONFIG_PATH" \
-    --output "$CONFIG_DIR/viceroy-legacy.toml" \
-    --edgezero-enabled false \
-    --origin-url "$ORIGIN_URL"
-
-"$GENERATOR_BIN" \
-    --template "$TEMPLATE_PATH" \
-    --app-config "$APP_CONFIG_PATH" \
-    --output "$CONFIG_DIR/viceroy-edgezero.toml" \
-    --edgezero-enabled true \
+    --output "$CONFIG_DIR/viceroy.toml" \
     --origin-url "$ORIGIN_URL"

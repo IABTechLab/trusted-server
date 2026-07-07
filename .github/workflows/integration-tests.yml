@@ -111,11 +111,11 @@ jobs:
           AXUM_BINARY_PATH: ${{ env.AXUM_ARTIFACT_PATH }}
           CLOUDFLARE_WRANGLER_DIR: ${{ github.workspace }}/crates/trusted-server-adapter-cloudflare
           INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
-          VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/configs/viceroy-legacy.toml
+          VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/configs/viceroy.toml
           RUST_LOG: info
 
-  integration-tests-edgezero:
-    name: integration tests (EdgeZero entry point)
+  integration-tests-fastly-ec:
+    name: integration tests (Fastly EC lifecycle)
     needs: prepare-artifacts
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -137,14 +137,9 @@ jobs:
           name: integration-test-artifacts
           path: ${{ env.ARTIFACTS_DIR }}
 
-      # Exercises the EdgeZero entry point against the same WASM binary by
-      # pointing Viceroy at a config store with `edgezero_enabled = "true"`.
-      # Scoped to the container-free EC lifecycle suite (minimal TCP origin), a
-      # focused parity subset covering Fastly request conversion, config-store
-      # dispatch, publisher fallback proxying, and end-to-end EC/API wiring on
-      # the EdgeZero path. The legacy `integration-tests` job above still covers
-      # the full framework matrix.
-      - name: Run EdgeZero EC lifecycle tests
+      # Focused container-free EC lifecycle coverage using the same post-cutover
+      # Viceroy config as the full integration matrix.
+      - name: Run Fastly EC lifecycle tests
         run: >-
           cargo test
           --manifest-path crates/trusted-server-integration-tests/Cargo.toml
@@ -154,11 +149,7 @@ jobs:
         env:
           WASM_BINARY_PATH: ${{ env.WASM_ARTIFACT_PATH }}
           INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
-          VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/configs/viceroy-edgezero.toml
-          # Opt into the EdgeZero entry-point probe in test_ec_lifecycle_fastly.
-          # Only set here, so the legacy integration-tests job runs the same
-          # scenarios through legacy_main without the EdgeZero diagnostic probe.
-          EXPECT_EDGEZERO_ENTRY_POINT: "true"
+          VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/configs/viceroy.toml
           RUST_LOG: info
 
   browser-tests:
@@ -205,7 +196,7 @@ jobs:
         env:
           WASM_BINARY_PATH: ${{ env.WASM_ARTIFACT_PATH }}
           INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
-          VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/configs/viceroy-legacy.toml
+          VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/configs/viceroy.toml
           TEST_FRAMEWORK: nextjs
           PLAYWRIGHT_HTML_REPORT: playwright-report-nextjs
         run: npx playwright test
@@ -224,7 +215,7 @@ jobs:
         env:
           WASM_BINARY_PATH: ${{ env.WASM_ARTIFACT_PATH }}
           INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
-          VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/configs/viceroy-legacy.toml
+          VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/configs/viceroy.toml
           TEST_FRAMEWORK: wordpress
           PLAYWRIGHT_HTML_REPORT: playwright-report-wordpress
         run: npx playwright test

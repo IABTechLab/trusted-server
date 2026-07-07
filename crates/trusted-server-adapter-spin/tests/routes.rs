@@ -88,6 +88,32 @@ fn edgezero_manifest_loads_and_resolves_spin_stores() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_admin_routes_return_501() {
+    for (path, body) in [
+        ("/_ts/admin/keys/rotate", "{}"),
+        (
+            "/_ts/admin/keys/deactivate",
+            r#"{"kid":"test-key","delete":false}"#,
+        ),
+    ] {
+        let req = request_builder()
+            .method("POST")
+            .uri(path)
+            .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+            .header("content-type", "application/json")
+            .body(edgezero_core::body::Body::from(body))
+            .expect("should build request");
+        let resp = route(test_router(), req).await;
+
+        assert_eq!(
+            resp.status().as_u16(),
+            501,
+            "{path} should report that Spin key management is unsupported"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn health_route_returns_ok() {
     // Parity with the Fastly/Axum adapters: GET /health is a cheap liveness probe
     // answering 200 "ok", not routed through publisher handling.

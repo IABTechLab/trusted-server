@@ -33,12 +33,14 @@ test-axum = ["test", "-p", "trusted-server-adapter-axum"]
 
 # --- Cloudflare adapter (native host + wasm32-unknown-unknown) ---
 # Build/check target the WASM runtime (requires the `cloudflare` feature);
-# tests and clippy run on the native host.
+# tests run on the native host; clippy covers both native test code and the
+# production WASM feature.
 build-cloudflare = ["build", "-p", "trusted-server-adapter-cloudflare", "--target", "wasm32-unknown-unknown", "--features", "cloudflare"]
 check-cloudflare = ["check", "-p", "trusted-server-adapter-cloudflare", "--target", "wasm32-unknown-unknown", "--features", "cloudflare"]
 # No --all-features: the `cloudflare` feature has a compile_error! guard on
-# non-wasm32 targets. WASM-feature coverage comes from `cargo check-cloudflare`.
+# non-wasm32 targets.
 clippy-cloudflare = ["clippy", "-p", "trusted-server-adapter-cloudflare", "--all-targets", "--", "-D", "warnings"]
+clippy-cloudflare-wasm = ["clippy", "-p", "trusted-server-adapter-cloudflare", "--target", "wasm32-unknown-unknown", "--features", "cloudflare", "--lib", "--", "-D", "warnings"]
 test-cloudflare = ["test", "-p", "trusted-server-adapter-cloudflare"]
 
 # --- Spin adapter (native host tests + wasm32-wasip1 target) ---
