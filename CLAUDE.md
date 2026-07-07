@@ -101,6 +101,8 @@ cargo test-spin        # Spin adapter route tests (native host)
 # Run host-target CLI tests (workspace default target is wasm32-wasip1)
 # Use your host triple, for example x86_64-unknown-linux-gnu on CI/Linux
 # or aarch64-apple-darwin on Apple Silicon macOS.
+# Use the local helper (recommended):
+# ./scripts/test-cli.sh
 cargo test --package trusted-server-cli --target <host-triple>
 
 # Format

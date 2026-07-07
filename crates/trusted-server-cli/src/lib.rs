@@ -1,6 +1,8 @@
 #[cfg(not(target_arch = "wasm32"))]
 mod error;
 #[cfg(not(target_arch = "wasm32"))]
+mod prebid_bundle;
+#[cfg(not(target_arch = "wasm32"))]
 mod run;
 
 #[cfg(not(target_arch = "wasm32"))]

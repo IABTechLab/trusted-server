@@ -41,7 +41,7 @@ Helpers:
 JS bundles (served by publisher module):
 
 - Dynamic endpoint: `/static/tsjs=tsjs-unified.min.js?v=<hash>`
-    - At build time, each integration is compiled as a separate IIFE (`tsjs-core.js`, `tsjs-prebid.js`, `tsjs-creative.js`, etc.)
+    - At build time, embedded integrations are compiled as separate IIFEs (`tsjs-core.js`, `tsjs-creative.js`, etc.); Prebid is generated externally and served through `/integrations/prebid/bundle.js`.
     - At runtime, the server concatenates `tsjs-core.js` + enabled integration modules based on `IntegrationRegistry` config
     - The URL filename is fixed for backward compatibility; the `?v=` hash changes when modules change
 

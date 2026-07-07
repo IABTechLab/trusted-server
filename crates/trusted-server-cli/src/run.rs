@@ -10,6 +10,7 @@ use trusted_server_core::config::TrustedServerAppConfig;
 use crate::commands::audit::AuditArgs;
 use crate::commands::audit::browser_collector::BrowserAuditCollector;
 use crate::commands::config::init::{ConfigInitArgs, run_config_init};
+use crate::prebid_bundle::{NpmPrebidBundleGenerator, PrebidBundleArgs, run_bundle};
 
 #[derive(Debug, Parser)]
 #[command(name = "ts", about = "Trusted Server CLI")]
@@ -31,6 +32,8 @@ enum Command {
     Config(ConfigCommand),
     /// Deploy the project through a target adapter.
     Deploy(DeployArgs),
+    /// Trusted Server Prebid commands.
+    Prebid(PrebidArgs),
     /// Provision platform resources through a target adapter.
     Provision(ProvisionArgs),
     /// Serve the project locally through a target adapter.
@@ -52,12 +55,24 @@ enum ConfigCommand {
     Validate(ConfigValidateArgs),
 }
 
+#[derive(Debug, clap::Args)]
+struct PrebidArgs {
+    #[command(subcommand)]
+    command: PrebidCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum PrebidCommand {
+    /// Generate a local external Prebid bundle and update config metadata.
+    Bundle(PrebidBundleArgs),
+}
+
 /// Run the CLI using process arguments.
 ///
 /// # Errors
 ///
 /// Returns an error when command parsing, config validation, `EdgeZero`
-/// delegation, audit collection, or config initialization fails.
+/// delegation, audit collection, config initialization, or Prebid bundle generation fails.
 pub fn run_from_env() -> Result<(), String> {
     dispatch(Args::parse())
 }
@@ -87,6 +102,16 @@ fn dispatch(args: Args) -> Result<(), String> {
             edgezero_cli::run_config_validate_typed::<TrustedServerAppConfig>(&args)
         }
         Command::Deploy(args) => edgezero_cli::run_deploy(&args),
+        Command::Prebid(prebid) => {
+            let mut generator = NpmPrebidBundleGenerator;
+            let mut stdout = std::io::stdout();
+            let mut stderr = std::io::stderr();
+            match prebid.command {
+                PrebidCommand::Bundle(args) => {
+                    run_bundle(&args, &mut generator, &mut stdout, &mut stderr)
+                }
+            }
+        }
         Command::Provision(args) => edgezero_cli::run_provision(&args),
         Command::Serve(args) => edgezero_cli::run_serve(&args),
         Command::Dev(command) => crate::commands::dev::run(command),
@@ -265,5 +290,46 @@ mod tests {
 
         let default_validate = ConfigValidateArgs::default();
         assert_eq!(validate.manifest, default_validate.manifest);
+    }
+
+    #[test]
+    fn prebid_bundle_defaults_match_spec() {
+        let args = parse(&["ts", "prebid", "bundle"]);
+        let Command::Prebid(prebid) = args.command else {
+            panic!("expected prebid command");
+        };
+        let PrebidCommand::Bundle(bundle) = prebid.command;
+        assert_eq!(bundle.config, PathBuf::from("trusted-server.toml"));
+        assert_eq!(bundle.out, PathBuf::from("dist/prebid"));
+    }
+
+    #[test]
+    fn prebid_bundle_accepts_custom_paths() {
+        let args = parse(&[
+            "ts",
+            "prebid",
+            "bundle",
+            "--config",
+            "publisher.toml",
+            "--out",
+            "build/prebid",
+        ]);
+        let Command::Prebid(prebid) = args.command else {
+            panic!("expected prebid command");
+        };
+        let PrebidCommand::Bundle(bundle) = prebid.command;
+        assert_eq!(bundle.config, PathBuf::from("publisher.toml"));
+        assert_eq!(bundle.out, PathBuf::from("build/prebid"));
+    }
+
+    #[test]
+    fn prebid_bundle_does_not_accept_adapter_option() {
+        let error = Args::try_parse_from(["ts", "prebid", "bundle", "--adapter", "fastly"])
+            .expect_err("should reject prebid adapter option");
+        assert!(
+            error.to_string().contains("unexpected argument")
+                || error.to_string().contains("Found argument"),
+            "error should explain unsupported option"
+        );
     }
 }
