@@ -39,8 +39,14 @@ Branch: worktree-edgezero-migration-spec
   (coverage).
 
 ## Tasks
-- Task 1: in progress (inventory + D5/D6-a decision record)
-- Task 1: COMPLETE — preflight green, D6-a confirmed, D5 map recorded (commit pending)
+- Task 1: COMPLETE — preflight green, D6-a confirmed, D5 map recorded.
+- Task 2: COMPLETE.
+  - part 1 (0513377e9): H1 store-name/blob-key decouple + request-signing ids.
+  - part 2 (7da58df8c): edgezero.toml full id lists; provision trusted_server_kv/
+    trusted_server_secrets + s3-auth in fastly.toml/viceroy-template.toml/spin.toml;
+    shared STORES_METADATA const in core/src/stores.rs feeding all 4 Hooks::stores();
+    anti-drift test (RED verified). CF: decision C (cloudflare.toml left vestigial;
+    per-id wrangler.toml bindings deferred to Phase 2). All adapters + parity green.
 
 ## 2026-07-07 operator decision (mid-Task-2) — SUPERSEDED 2026-07-08
 - (Was: KEEP app_config store id.) Rested on false premise that manifests/generator

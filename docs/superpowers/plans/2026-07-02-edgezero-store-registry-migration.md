@@ -16,6 +16,65 @@ This plan targets the EdgeZero commit pinned in `Cargo.lock`: **`branch = worktr
 
 > **Lockfile guard (execution):** `Cargo.toml` uses a **mutable branch** dependency (`branch = "worktree-state-nested-secrets-spec-review"`) and the upstream branch has **already advanced past `d8f71a4a`**. Execute every task with the committed `Cargo.lock` — build/test **`--locked`** and **do not `cargo update` the edgezero crates** unless the EdgeZero API is re-reviewed and this pin note re-verified. A silent bump could pull an unreviewed commit mid-migration.
 
+## 2026-07-08 post-merge amendments (SUPERSEDING — read before executing Task 3+)
+
+`iabtechlab/main` was merged into the branch (merge `76662d364`). This changes several
+load-bearing assumptions below. Where this section conflicts with an earlier one, THIS wins.
+Authoritative live state is `.superpowers/sdd/progress.md`.
+
+- **Pin advanced: `d8f71a4a` → `ff530286`.** The PR #306 branch head moved; the merge kept
+  the PR #306 branch pin (rejected main's `tag = "v0.0.4"`, which lacks State<T>/nested
+  secrets). Every `d8f71a4a` reference in this doc now means `ff530286`. APIs re-verified
+  green at `ff530286` on core + all four adapters + CLI (`--locked`). Verify API checks
+  against the local edgezero repo `git show ff530286:…`, not a cargo-cache checkout.
+
+- **D5 REVERSED again → unify on `trusted_server_config`** (2026-07-08 operator decision).
+  The "KEEP `app_config`" note in Task 1 (below) is SUPERSEDED. The config store *id* is
+  `trusted_server_config` (already in every manifest + `edgezero.toml`); the blob *key*
+  stays `app_config` (`CONFIG_BLOB_KEY`). Implemented in Task 2 part 1 as a *decouple*
+  (not a rename): `settings_data.rs` `default_config_store_name()` → `trusted_server_config`,
+  `default_config_key()` → `CONFIG_BLOB_KEY`. Manifests/generator untouched. **DONE.**
+
+- **Task 2 DONE** (commits `0513377e9`, `7da58df8c`). Full id lists in `edgezero.toml`;
+  defaults `trusted_server_kv`/`trusted_server_secrets` + `s3-auth` provisioned in
+  fastly.toml/viceroy-template.toml/spin.toml; shared `STORES_METADATA` const in
+  `core/src/stores.rs` feeds all four `Hooks::stores()`; anti-drift test enforces
+  const↔manifest. CF: `cloudflare.toml` left vestigial (decision C); per-id `wrangler.toml`
+  bindings deferred to Phase 2.
+
+- **H3 — Task 8 re-scope: `legacy_main` is GONE** (main #744 removed the legacy Fastly
+  entry point; Phase 5's legacy-delete is already done upstream). Task 8's justification
+  ("keep Fastly reads read+write because `legacy_main`/`platform.rs:578` use them until
+  Phase 5") is INVALID. Re-ground on the *real* remaining Fastly readers:
+  `load_settings_from_config_store` (boot), the `build_per_request_services` fallback, and
+  the management-API write backing. Fastly reads may go write-only earlier than planned.
+
+- **H2b — Task 6: make `build_kv_registry` per-store open NON-FATAL.** It eager-opens every
+  declared KV id; a single unprovisioned/deprecated id (`creative_store`) would fail ALL
+  traffic and converts Fastly's lazy fail-closed model into eager-fail-all. Skip/log a
+  per-store open failure instead of propagating it into the dispatch `Result`.
+
+- **EC correction — Task 5: the EC identity graph BYPASSES the registry.** The plan's claim
+  that "`ec/*` already use `kv_handle()`" is FALSE. Fastly builds it via a bespoke direct
+  open: `main.rs:1378 maybe_identity_graph` / `:1449 require_identity_graph` →
+  `KvIdentityGraph::new(FastlyEcKvStore::new(store_name))` (`ec_kv.rs`), and no other adapter
+  constructs a `KvIdentityGraph` at all. Either migrate these to
+  `kv_handle_named("ec_identity_store")` (+ other-adapter EC wiring) or explicitly scope
+  EC-KV-via-registry OUT with a stated reason. Do not rely on the false premise.
+
+- **CF config mechanism (Phase 1/2 boundary): DO NOT move CF config to KV namespaces in
+  Phase 1.** CF config is served today via a plaintext side-channel `[vars]` string
+  (`wrangler.toml TRUSTED_SERVER_CONFIG`). Removing/replacing it is Phase 2. Any Step 6
+  instruction to add per-id `[[kv_namespaces]]` for config in Phase 1 is out of scope.
+
+- **Consent fail-closed now fires on ALL FOUR adapters** (Task 6 Step 5b moves the guard
+  into core `handle_auction` via `resolve_consent_kv`; `handle_auction` is called from all
+  four adapter `app.rs`). Add CF/Spin auction-503 coverage (or state the core behavioral
+  test is deemed sufficient), and ensure CF/Spin manifests provision `consent_store`.
+
+- **CI gate: add `cargo clippy-cloudflare-wasm`** (now required by CLAUDE.md) to the gate
+  list below.
+
 ## Global Constraints
 
 - **Mixed Rust edition — follow each crate's `Cargo.toml`** (not global 2024): `trusted-server-core` and `trusted-server-adapter-fastly` are **2021**; `trusted-server-adapter-axum` is **2024**. Toolchain **1.95.0**; WASM target `wasm32-wasip1`.
@@ -25,7 +84,7 @@ This plan targets the EdgeZero commit pinned in `Cargo.lock`: **`branch = worktr
 - No `unwrap()` in production (`expect("should …")`); no `println!`/`eprintln!` (use `log`).
 - No wildcard imports (except `use super::*` in `#[cfg(test)]`); no imports inside functions.
 - Commits: sentence case, imperative, no semantic prefixes, no `Co-Authored-By`/AI footers.
-- CI gate before PR: `cargo fmt --all -- --check`; `cargo clippy-{fastly,axum,cloudflare,spin-native,spin-wasm}`; **`cargo check-cloudflare` + `cargo check-spin`** (wasm-target surfaces — `test-cloudflare`/`test-spin` are native and do **not** compile the wasm runtime paths); `cargo test-{fastly,axum,cloudflare,spin}`; `cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity`.
+- CI gate before PR: `cargo fmt --all -- --check`; `cargo clippy-{fastly,axum,cloudflare,cloudflare-wasm,spin-native,spin-wasm}`; **`cargo check-cloudflare` + `cargo check-spin`** (wasm-target surfaces — `test-cloudflare`/`test-spin` are native and do **not** compile the wasm runtime paths); `cargo test-{fastly,axum,cloudflare,spin}`; `cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity`.
 - **Every task leaves all four adapters building and green.**
 - **EdgeZero `ConfigStore`/`SecretStore` are read-only.** Runtime writes stay on the management path (D6-a).
 - **Registry lookup is strict:** an unknown logical id yields `None`. Every id any config field names — in **any** kind (kv/config/secrets) — must be declared in `edgezero.toml`.
@@ -59,7 +118,7 @@ rg -n '\[stores\.' edgezero.toml
 ```
 Expected (verified): **KV** ids = `ec.ec_store` (`ec_identity_store`, `settings.rs:452`), `consent.consent_store` (`consent_config.rs:80`), and `auction.creative_store` (`auction_config_types.rs:28`, default `"creative_store"`, **deprecated** — creatives are delivered inline); **config** ids = the app-config blob store (**store id `app_config`**, see D5 rule below), `request_signing.config_store_id`, the JWKS store (`JWKS_CONFIG_STORE_NAME`), and **DataDome's IP-CIDR config store** (`ProtectionIpCidrSourceConfig.config_store`, default `datadome-ip-bypass`, `protection_scope.rs:165`); **secret** ids = `secrets` (`request_signing.secret_store_id`), DataDome `ts_secrets`, the S3 secret store, `signing_keys` (`SIGNING_SECRET_STORE_NAME`) — versus `edgezero.toml` declaring only one id per kind. NOTE: `counter_store` (`RATE_COUNTER_NAME` in the Fastly `rate_limiter.rs`) and `opid_store` are **Fastly-only** platform stores, not `Settings` logical ids — out of scope for D5. `creative_store` **is** a `Settings` id: declare it in `[stores.kv]` (deprecated) so strict lookup can't fail, and flag it for removal in a later phase.
 
-  **D5 app-config store-id/key decision (operator-confirmed — KEEP `app_config`):** the app-config blob stays in config **store id `app_config`**, blob **key `app_config`** (`CONFIG_BLOB_KEY` and `DEFAULT_CONFIG_STORE_ID` **unchanged**). We resolve the `settings_data.rs` (`app_config`) vs `edgezero.toml` (was `trusted_server_config`) inconsistency by **declaring `app_config` in `edgezero.toml`** (config `default = "app_config"`), **not** by renaming the code/config/tests. This avoids the entire rename cascade (config_payload, settings_data, example, integration fixtures, Viceroy generator, test envs, Cloudflare side-channel). Key == id == `app_config`, so `ts config push`'s default key and the boot read already agree with no env/`--key`. *(The earlier "rename to `trusted_server_config`" plan was reversed by operator decision on 2026-07-07.)*
+  **D5 app-config store-id/key decision** *(⚠️ SUPERSEDED 2026-07-08 — see the post-merge amendments section above: unify on `trusted_server_config` via the settings_data.rs decouple; DONE in Task 2 part 1. The KEEP-`app_config` text below is retained only for history.)* **(operator-confirmed — KEEP `app_config`):** the app-config blob stays in config **store id `app_config`**, blob **key `app_config`** (`CONFIG_BLOB_KEY` and `DEFAULT_CONFIG_STORE_ID` **unchanged**). We resolve the `settings_data.rs` (`app_config`) vs `edgezero.toml` (was `trusted_server_config`) inconsistency by **declaring `app_config` in `edgezero.toml`** (config `default = "app_config"`), **not** by renaming the code/config/tests. This avoids the entire rename cascade (config_payload, settings_data, example, integration fixtures, Viceroy generator, test envs, Cloudflare side-channel). Key == id == `app_config`, so `ts config push`'s default key and the boot read already agree with no env/`--key`. *(The earlier "rename to `trusted_server_config`" plan was reversed by operator decision on 2026-07-07.)*
 
   **Request-signing store ids (do NOT point at app-config):** request signing reads use hard-coded `JWKS_CONFIG_STORE_NAME = "jwks_store"` (config) + `SIGNING_SECRET_STORE_NAME = "signing_keys"` (secret); writes use `request_signing.config_store_id`/`secret_store_id`. Today the example sets these to `"app_config"`/`"secrets"` — which sends **writes to a different store than reads**. Fix: set `request_signing.config_store_id = "jwks_store"` and `secret_store_id = "signing_keys"` in `trusted-server.example.toml` + fixtures, and declare `jwks_store` (config) + `signing_keys` (secret) as logical ids in `edgezero.toml`. (Under the composite, reads resolve `registry.named("jwks_store")`; writes go to the same store via the writer/management id.)
 
