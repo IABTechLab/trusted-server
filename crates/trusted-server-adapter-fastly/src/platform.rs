@@ -736,6 +736,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn predict_name_matches_ensured_backend_name() {
+        // The auction orchestrator maps responses back to providers by the
+        // predicted backend name, so predict_name and ensure must return the
+        // identical string for the same spec — a divergence would make
+        // responses land in the "unknown backend" branch and drop bids
+        // silently.
+        let backend = FastlyPlatformBackend;
+        let spec = PlatformBackendSpec {
+            scheme: "https".to_string(),
+            host: "consistency.example.com".to_string(),
+            port: None,
+            host_header_override: None,
+            certificate_check: true,
+            first_byte_timeout: Duration::from_millis(750),
+            between_bytes_timeout: Duration::from_millis(750),
+        };
+
+        let predicted = backend
+            .predict_name(&spec)
+            .expect("should predict backend name");
+        let ensured = backend
+            .ensure(&spec)
+            .expect("should register backend for valid spec");
+
+        assert_eq!(
+            predicted, ensured,
+            "predicted backend name should match the registered backend name"
+        );
+    }
+
     // --- FastlyPlatformHttpClient -------------------------------------------
 
     #[test]
