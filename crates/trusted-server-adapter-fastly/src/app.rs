@@ -65,10 +65,10 @@
 //!   run on these responses. Legacy ran EC finalization on its own auth
 //!   challenges. Like the 401 geo-skip, this is privacy-conservative: no EC
 //!   cookies are issued to unauthenticated callers.
-//! - **Publisher HTML responses with full-document post-processors** remain
-//!   buffered (bounded by `publisher.max_buffered_body_bytes`). Other
-//!   processable publisher responses and asset responses stream through to the
-//!   client.
+//! - **Publisher responses** are buffered (bounded by
+//!   `publisher.max_buffered_body_bytes`) instead of streamed to the client.
+//!   Asset responses are streamed straight to the client (see
+//!   [`dispatch_asset_fallback`]), matching legacy.
 //! - **Router-level 405s** (unregistered verbs) skip EC finalization along
 //!   with the middleware chain; the entry point still adds TS headers.
 //!
@@ -94,6 +94,7 @@ use edgezero_core::http::{
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
+use trusted_server_core::auction::AuctionTelemetrySink;
 use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
 use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
@@ -115,8 +116,8 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, AssetProxyCachePolicy,
 };
 use trusted_server_core::publisher::{
-    handle_streaming_publisher_request, handle_tsjs_dynamic, OwnedProcessResponseParams,
-    PublisherResponse,
+    buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
+    handle_tsjs_dynamic, page_bids_preflight_denied, AuctionDispatch,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
@@ -147,14 +148,7 @@ pub(crate) struct AppState {
     pub(crate) orchestrator: Arc<AuctionOrchestrator>,
     pub(crate) registry: Arc<IntegrationRegistry>,
     pub(crate) default_kv_store: Arc<dyn PlatformKvStore>,
-}
-
-/// Processing state consumed by the Fastly entry point when it writes a
-/// publisher response directly into the client stream.
-pub(crate) struct PublisherStreamState {
-    pub(crate) params: OwnedProcessResponseParams,
-    pub(crate) settings: Arc<Settings>,
-    pub(crate) registry: Arc<IntegrationRegistry>,
+    pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -181,6 +175,7 @@ pub(crate) fn build_state_from_settings(
     let orchestrator = build_orchestrator(&settings)?;
     let registry = IntegrationRegistry::new(&settings)?;
 
+    let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
 
     Ok(Arc::new(AppState {
@@ -188,6 +183,7 @@ pub(crate) fn build_state_from_settings(
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
         default_kv_store,
+        auction_telemetry_sink,
     }))
 }
 
@@ -202,9 +198,11 @@ fn warn_if_certificate_check_disabled(settings: &Settings) {
 /// Resolves per-request consent KV store services for routes that read consent data.
 ///
 /// When `settings.consent.consent_store` is configured and the named KV store cannot
-/// be opened, returns `Err` so the caller can respond with 503 (fail-closed). This
-/// ensures a misconfigured consent store makes consent-dependent routes unavailable
-/// rather than proceeding without consent.
+/// be opened, returns `Err` so the caller can respond with 503 (fail-closed). This is
+/// intentional hardening over the legacy `route_request` path, which builds
+/// `runtime_services` with `UnavailableKvStore` and never opens the named consent
+/// store, so it never fails closed — the `EdgeZero` path instead makes consent-dependent
+/// routes unavailable rather than proceeding without consent.
 ///
 /// # Errors
 ///
@@ -260,6 +258,7 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         .backend(Arc::new(FastlyPlatformBackend))
         .http_client(Arc::new(FastlyPlatformHttpClient))
         .geo(Arc::new(FastlyPlatformGeo))
+        .auction_telemetry_sink(Arc::clone(&state.auction_telemetry_sink))
         .client_info(client_info)
         .build()
 }
@@ -610,6 +609,38 @@ async fn run_named_route(
             )
             .await
         }
+        NamedRouteHandler::PageBids => {
+            // SPA re-auction endpoint. `OPTIONS` is a CORS preflight for this
+            // side-effecting GET and is always denied so the GET handler's
+            // `X-TSJS-Page-Bids` gate stays trustworthy.
+            if req.method() == Method::OPTIONS {
+                return Ok(page_bids_preflight_denied());
+            }
+            // Like the auction, page-bids reads consent data, so the consent KV
+            // store must be available — fail closed with 503 when configured but
+            // unopenable, matching legacy.
+            let consent_services = runtime_services_for_consent_route(&state.settings, services)?;
+            let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
+            let registry_ref = if partner_registry.is_empty() {
+                None
+            } else {
+                Some(&partner_registry)
+            };
+            let auction = AuctionDispatch {
+                orchestrator: &state.orchestrator,
+                slots: state.settings.creative_opportunity_slots(),
+                registry: registry_ref,
+            };
+            handle_page_bids(
+                &state.settings,
+                &consent_services,
+                ec.kv_graph.as_ref(),
+                auction,
+                &ec.ec_context,
+                req,
+            )
+            .await
+        }
         NamedRouteHandler::FirstPartyProxy => {
             handle_first_party_proxy(&state.settings, services, req).await
         }
@@ -692,7 +723,7 @@ async fn dispatch_fallback(
     } else if state.registry.has_route(&method, &path) {
         // Integration-proxy responses are not bounded by publisher.max_buffered_body_bytes.
         // Only the handle_publisher_request branch below routes through
-        // buffer_publisher_response. Integration responses are small in practice
+        // buffer_publisher_response_async. Integration responses are small in practice
         // and the EdgeZero flag is off by default; extend the cap here if that changes.
         state
             .registry
@@ -740,59 +771,55 @@ async fn dispatch_fallback(
         // available — fail closed with 503 when it is configured but cannot
         // be opened, matching legacy behavior.
         match runtime_services_for_consent_route(&state.settings, services) {
-            Ok(publisher_services) => handle_streaming_publisher_request(
-                &state.settings,
-                &state.registry,
-                &publisher_services,
-                req,
-            )
-            .await
-            .map(|publisher_response| {
-                resolve_publisher_response(publisher_response, &method, state)
-            }),
+            Ok(publisher_services) => {
+                // Run the server-side auction with the configured creative-
+                // opportunity slots and collect the dispatched bids in the
+                // buffered finalize (`buffer_publisher_response_async`), matching
+                // the legacy streaming path. `handle_publisher_request` matches the
+                // slots against the request path. The partner registry plus the
+                // EC identity-graph KV (`ec.kv_graph`) enrich the bid request with
+                // server-side EIDs, same as the legacy auction.
+                let slots = state.settings.creative_opportunity_slots();
+                match PartnerRegistry::from_config(&state.settings.ec.partners) {
+                    Ok(partner_registry) => {
+                        let auction = AuctionDispatch {
+                            orchestrator: &state.orchestrator,
+                            slots,
+                            registry: Some(&partner_registry),
+                        };
+                        match handle_publisher_request(
+                            &state.settings,
+                            &publisher_services,
+                            ec.kv_graph.as_ref(),
+                            &mut ec.ec_context,
+                            auction,
+                            req,
+                        )
+                        .await
+                        {
+                            Ok(pub_response) => {
+                                buffer_publisher_response_async(
+                                    pub_response,
+                                    &method,
+                                    &state.settings,
+                                    &state.registry,
+                                    &state.orchestrator,
+                                    &publisher_services,
+                                )
+                                .await
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            }
             Err(e) => Err(e),
         }
     };
 
     let response = result.unwrap_or_else(|e| http_error(&e));
     attach_dispatch_extensions(response, ec, effects)
-}
-
-fn resolve_publisher_response(
-    publisher_response: PublisherResponse,
-    method: &Method,
-    state: &AppState,
-) -> Response {
-    match publisher_response {
-        PublisherResponse::Buffered(response) => response,
-        PublisherResponse::Stream {
-            mut response,
-            body,
-            params,
-        } => {
-            if response_carries_body(method, response.status()) {
-                *response.body_mut() = body;
-                response
-                    .extensions_mut()
-                    .insert(Arc::new(PublisherStreamState {
-                        params,
-                        settings: Arc::clone(&state.settings),
-                        registry: Arc::clone(&state.registry),
-                    }));
-            }
-            response
-        }
-        PublisherResponse::PassThrough { mut response, body } => {
-            *response.body_mut() = body;
-            response
-        }
-    }
-}
-
-fn response_carries_body(method: &Method, status: StatusCode) -> bool {
-    *method != Method::HEAD
-        && status != StatusCode::NO_CONTENT
-        && status != StatusCode::NOT_MODIFIED
 }
 
 /// Returns `true` when an asset response should carry a (streamed) body.
@@ -881,7 +908,11 @@ fn attach_request_filter_effects(response: &mut Response, effects: &RequestFilte
 // Error helper
 // ---------------------------------------------------------------------------
 
-/// Converts a [`Report<TrustedServerError>`] into an HTTP [`Response`].
+/// Convert a [`Report<TrustedServerError>`] into an HTTP [`Response`],
+/// mirroring [`crate::http_error_response`] exactly.
+///
+/// The near-identical function in `main.rs` is intentional: the legacy path
+/// uses fastly HTTP types while this path uses `edgezero_core` types.
 pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
     let root_error = report.current_context();
     log::error!("Error occurred: {:?}", report);
@@ -964,6 +995,7 @@ enum NamedRouteHandler {
     SetTester,
     ClearTester,
     Auction,
+    PageBids,
     FirstPartyProxy,
     FirstPartyClick,
     FirstPartySign,
@@ -1047,6 +1079,13 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: "/auction",
         primary_methods: &[Method::POST],
         handler: NamedRouteHandler::Auction,
+    },
+    // GET runs the SPA re-auction; OPTIONS is denied in-handler as a CORS
+    // preflight guard for this side-effecting endpoint.
+    NamedRoute {
+        path: "/__ts/page-bids",
+        primary_methods: &[Method::GET, Method::OPTIONS],
+        handler: NamedRouteHandler::PageBids,
     },
     NamedRoute {
         path: "/first-party/proxy",
@@ -1175,7 +1214,6 @@ mod tests {
         build_state_from_settings, startup_error_router, AppState, NamedRouteHandler,
         TrustedServerApp, NAMED_ROUTES,
     };
-
     use bytes::Bytes;
     use edgezero_core::body::Body;
     use edgezero_core::http::{header, request_builder, Method, Response, StatusCode};
@@ -1215,6 +1253,9 @@ mod tests {
                 origin_url = "https://origin.test-publisher.com"
                 proxy_secret = "unit-test-proxy-secret"
 
+                [proxy]
+                allowed_domains = ["*.example", "*.example.com"]
+
                 [ec]
                 passphrase = "test-passphrase-at-least-32-bytes!!"
 
@@ -1229,6 +1270,7 @@ mod tests {
                 [integrations.prebid]
                 enabled = true
                 server_url = "https://test-prebid.com/openrtb2/auction"
+                external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
 
                 [integrations.datadome]
                 enabled = true
@@ -1261,70 +1303,6 @@ mod tests {
         block_on(router.oneshot(request)).expect("should route request")
     }
 
-    struct FixedBackend;
-
-    impl PlatformBackend for FixedBackend {
-        fn predict_name(
-            &self,
-            spec: &PlatformBackendSpec,
-        ) -> Result<String, Report<PlatformError>> {
-            Ok(format!("{}-{}", spec.scheme, spec.host))
-        }
-
-        fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-            self.predict_name(spec)
-        }
-    }
-
-    struct StreamingHttpClient;
-
-    #[async_trait::async_trait(?Send)]
-    impl PlatformHttpClient for StreamingHttpClient {
-        async fn send(
-            &self,
-            request: PlatformHttpRequest,
-        ) -> Result<PlatformResponse, Report<PlatformError>> {
-            assert!(
-                request.stream_response,
-                "streaming Fastly routes should request an origin response stream"
-            );
-            let response = edgezero_core::http::response_builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "text/html")
-                .body(Body::stream(futures::stream::iter(vec![
-                    Bytes::from_static(b"streamed-asset"),
-                ])))
-                .map_err(|_| Report::new(PlatformError::HttpClient))?;
-            Ok(PlatformResponse::new(response))
-        }
-
-        async fn send_async(
-            &self,
-            _request: PlatformHttpRequest,
-        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-
-        async fn select(
-            &self,
-            _pending_requests: Vec<PlatformPendingRequest>,
-        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-    }
-
-    fn streaming_runtime_services() -> RuntimeServices {
-        RuntimeServices::builder()
-            .config_store(Arc::new(crate::platform::FastlyPlatformConfigStore))
-            .secret_store(Arc::new(crate::platform::FastlyPlatformSecretStore))
-            .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
-            .backend(Arc::new(FixedBackend))
-            .http_client(Arc::new(StreamingHttpClient))
-            .geo(Arc::new(crate::platform::FastlyPlatformGeo))
-            .client_info(ClientInfo::default())
-            .build()
-    }
-
     fn test_settings() -> Settings {
         Settings::from_toml(
             r#"
@@ -1344,6 +1322,9 @@ mod tests {
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
+            [proxy]
+            allowed_domains = ["*.example", "*.example.com"]
+
             [ec]
             passphrase = "test-secret-key-32-bytes-minimum"
 
@@ -1355,6 +1336,7 @@ mod tests {
             [integrations.prebid]
             enabled = true
             server_url = "https://test-prebid.com/openrtb2/auction"
+            external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
 
             [auction]
             enabled = true
@@ -1383,6 +1365,9 @@ mod tests {
         let default_kv_store =
             Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn super::PlatformKvStore>;
         let state = Arc::new(super::AppState {
+            auction_telemetry_sink: Arc::new(
+                trusted_server_core::auction::NoopAuctionTelemetrySink,
+            ),
             settings: Arc::new(settings),
             orchestrator: Arc::new(orchestrator),
             registry: Arc::new(registry),
@@ -1975,9 +1960,9 @@ mod tests {
     #[test]
     fn dispatch_head_on_named_get_route_falls_through_to_publisher_fallback() {
         // Regression guard: HEAD /first-party/proxy must reach the publisher
-        // fallback, not return a router-level 405. The EdgeZero dispatch path
-        // proxies every (method, path) combination not matched by a specific
-        // arm through to the publisher origin.
+        // fallback, not return a router-level 405. Legacy route_request proxies
+        // every (method, path) combination not matched by a specific arm through
+        // to the publisher origin.
         //
         // Without a live backend the publisher proxy errors (502/503), but the
         // important invariant is that the status is NOT 405.
@@ -2151,6 +2136,70 @@ mod tests {
         );
     }
 
+    struct FixedBackend;
+
+    impl PlatformBackend for FixedBackend {
+        fn predict_name(
+            &self,
+            spec: &PlatformBackendSpec,
+        ) -> Result<String, Report<PlatformError>> {
+            Ok(format!("{}-{}", spec.scheme, spec.host))
+        }
+
+        fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+            self.predict_name(spec)
+        }
+    }
+
+    struct StreamingHttpClient;
+
+    #[async_trait::async_trait(?Send)]
+    impl PlatformHttpClient for StreamingHttpClient {
+        async fn send(
+            &self,
+            request: PlatformHttpRequest,
+        ) -> Result<PlatformResponse, Report<PlatformError>> {
+            assert!(
+                request.stream_response,
+                "streaming Fastly routes should request an origin response stream"
+            );
+            let response = edgezero_core::http::response_builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/html")
+                .body(Body::stream(futures::stream::iter(vec![
+                    Bytes::from_static(b"streamed-asset"),
+                ])))
+                .map_err(|_| Report::new(PlatformError::HttpClient))?;
+            Ok(PlatformResponse::new(response))
+        }
+
+        async fn send_async(
+            &self,
+            _request: PlatformHttpRequest,
+        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        async fn select(
+            &self,
+            _pending_requests: Vec<PlatformPendingRequest>,
+        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+    }
+
+    fn streaming_runtime_services() -> RuntimeServices {
+        RuntimeServices::builder()
+            .config_store(Arc::new(crate::platform::FastlyPlatformConfigStore))
+            .secret_store(Arc::new(crate::platform::FastlyPlatformSecretStore))
+            .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
+            .backend(Arc::new(FixedBackend))
+            .http_client(Arc::new(StreamingHttpClient))
+            .geo(Arc::new(crate::platform::FastlyPlatformGeo))
+            .client_info(ClientInfo::default())
+            .build()
+    }
+
     #[test]
     fn dispatch_asset_fallback_streams_origin_body_without_buffering() {
         // Regression guard for the EdgeZero asset streaming cutover: a successful
@@ -2213,47 +2262,6 @@ mod tests {
         assert!(
             matches!(response.body(), Body::Stream(_)),
             "EdgeZero asset dispatch must stream the origin body, not buffer it"
-        );
-    }
-
-    #[test]
-    fn dispatch_publisher_fallback_preserves_origin_stream() {
-        let state =
-            build_state_from_settings(test_settings()).expect("should build publisher test state");
-        let services = streaming_runtime_services();
-        let req = request_builder()
-            .method(Method::GET)
-            .uri("https://test-publisher.com/")
-            .header(header::HOST, "test-publisher.com")
-            .body(Body::empty())
-            .expect("should build publisher request");
-
-        let response = block_on(super::dispatch_fallback(&state, &services, req));
-
-        assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "should preserve the streaming origin status"
-        );
-        assert_eq!(
-            response
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok()),
-            Some("text/html"),
-            "should preserve the processable origin content type"
-        );
-        assert!(
-            matches!(response.body(), Body::Stream(_)),
-            "Fastly publisher dispatch must preserve the origin stream: {:?}",
-            response.body()
-        );
-        assert!(
-            response
-                .extensions()
-                .get::<Arc<super::PublisherStreamState>>()
-                .is_some(),
-            "publisher streams should carry processing state for the entry point"
         );
     }
 

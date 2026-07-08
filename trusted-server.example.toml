@@ -44,6 +44,14 @@ timeout_ms = 1000
 bidders = []
 debug = false
 client_side_bidders = []
+# Runtime bundle metadata. Set these after running `ts prebid bundle` and uploading the bundle.
+# external_bundle_url = "https://assets.example.com/prebid/trusted-prebid-<sha256>.js"
+# external_bundle_sha256 = "<manifest sha256>"
+# external_bundle_sri = "<manifest sri>"
+
+[integrations.prebid.bundle]
+adapters = ["rubicon"]
+# user_id_modules = ["sharedIdSystem"]
 
 [integrations.nextjs]
 enabled = false
@@ -98,7 +106,8 @@ rewrite_script = true
 
 [proxy]
 # certificate_check = true
-# allowed_domains = ["ads.example.com", "*.cdn.example.com"]
+# Required for integrations.prebid.external_bundle_url and first-party proxy redirects.
+# allowed_domains = ["ads.example.com", "assets.example.com", "*.cdn.example.com"]
 
 [auction]
 enabled = false
@@ -127,3 +136,19 @@ example_segments = "segments"
 
 [debug]
 ja4_endpoint_enabled = false
+
+[creative_opportunities]
+gam_network_id = "123456789"
+# FCP is not affected by this value — body content above </body> has already
+# streamed and painted before the hold begins. What this caps is the slip on
+# DOMContentLoaded and window.load. Worst case: a cache-hit page where origin
+# drains in <50 ms but the auction runs to the limit. 500 ms is the recommended
+# default; raise only if your SSPs need more headroom and your analytics confirm
+# the DCL slip is acceptable.
+auction_timeout_ms = 500  # override via TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__AUCTION_TIMEOUT_MS
+price_granularity = "dense"
+
+# No slot templates are enabled in the checked-in default config. Add
+# `[[creative_opportunities.slot]]` entries via private config or override the
+# entire array via:
+# TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__SLOT='[{"id":"...","gam_unit_path":"...",...}]'

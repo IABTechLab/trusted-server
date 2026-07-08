@@ -51,18 +51,19 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 derive_more = { version = "2.0", features = ["display", "error"] }
 directories = "5"
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }
-edgezero-adapter-axum = { git = "https://github.com/stackpop/edgezero", branch = "main", default-features = false }
-edgezero-adapter-cloudflare = { git = "https://github.com/stackpop/edgezero", branch = "main", default-features = false }
-edgezero-adapter-fastly = { git = "https://github.com/stackpop/edgezero", branch = "main", default-features = false }
-edgezero-adapter-spin = { git = "https://github.com/stackpop/edgezero", branch = "main", default-features = false }
-edgezero-cli = { git = "https://github.com/stackpop/edgezero", branch = "main" }
-edgezero-core = { git = "https://github.com/stackpop/edgezero", branch = "main", default-features = false }
+edgezero-adapter-axum = { git = "https://github.com/stackpop/edgezero", tag = "v0.0.4", default-features = false }
+edgezero-adapter-cloudflare = { git = "https://github.com/stackpop/edgezero", tag = "v0.0.4", default-features = false }
+edgezero-adapter-fastly = { git = "https://github.com/stackpop/edgezero", tag = "v0.0.4", default-features = false }
+edgezero-adapter-spin = { git = "https://github.com/stackpop/edgezero", tag = "v0.0.4", default-features = false }
+edgezero-cli = { git = "https://github.com/stackpop/edgezero", tag = "v0.0.4" }
+edgezero-core = { git = "https://github.com/stackpop/edgezero", tag = "v0.0.4", default-features = false }
 env_logger = "0.11"
 error-stack = "0.6"
 fastly = "0.12"
 fern = "0.7.1"
 flate2 = "1.1"
 futures = "0.3"
+glob = "0.3"
 getrandom = "0.2"
 hex = "0.4.3"
 hmac = "0.12.1"
@@ -99,6 +100,7 @@ time = "0.3"
 tokio = { version = "1.49", features = ["sync", "macros", "io-util", "rt", "time"] }
 tokio-rustls = "0.26"
 toml = "1.1"
+toml_edit = "0.23.10"
 tower = "0.4"
 trusted-server-core = { path = "crates/trusted-server-core" }
 trusted-server-js = { path = "crates/trusted-server-js" }

@@ -13,6 +13,7 @@ use validator::{Validate, ValidationError};
 
 use crate::auction_config_types::AuctionConfig;
 use crate::consent_config::ConsentConfig;
+use crate::creative_opportunities::CreativeOpportunitiesConfig;
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::platform::PlatformImageOptimizerRegion;
@@ -1720,6 +1721,174 @@ impl Proxy {
     }
 }
 
+/// Direct Tinybird Events API telemetry configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TinybirdSettings {
+    /// Master enablement for auction telemetry ingestion.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Regional Tinybird API host, without scheme or path.
+    #[serde(default)]
+    pub api_host: String,
+    /// Fastly Secret Store name containing Tinybird append tokens.
+    #[serde(default = "default_tinybird_secret_store")]
+    pub secret_store: String,
+    /// Auction Events API datasource name.
+    #[serde(default = "default_tinybird_auction_dataset")]
+    pub auction_dataset: String,
+    /// Secret key containing the auction datasource APPEND token.
+    #[serde(default = "default_tinybird_auction_token_secret")]
+    pub auction_token_secret: String,
+    /// Reserved for future access-log telemetry.
+    ///
+    /// `true` is rejected until an access-log emitter is wired, so operators
+    /// cannot enable a setting that silently emits nothing.
+    #[serde(default)]
+    pub access_enabled: bool,
+    /// Future access-log Events API datasource name.
+    #[serde(default = "default_tinybird_access_dataset")]
+    pub access_dataset: String,
+    /// Future Secret Store key containing the access-log datasource APPEND token.
+    #[serde(default = "default_tinybird_access_token_secret")]
+    pub access_token_secret: String,
+    /// Future fraction of requests to emit for optional access telemetry.
+    #[serde(default)]
+    pub access_sample_rate: f64,
+    /// Defensive maximum NDJSON body size for one Events API request.
+    #[serde(default = "default_tinybird_max_body_bytes")]
+    pub max_body_bytes: usize,
+}
+
+fn default_tinybird_secret_store() -> String {
+    "ts_secrets".to_owned()
+}
+
+fn default_tinybird_auction_dataset() -> String {
+    "auction_events_raw".to_owned()
+}
+
+fn default_tinybird_auction_token_secret() -> String {
+    "tinybird_auction_append_token".to_owned()
+}
+
+fn default_tinybird_access_dataset() -> String {
+    "access_logs_raw".to_owned()
+}
+
+fn default_tinybird_access_token_secret() -> String {
+    "tinybird_access_append_token".to_owned()
+}
+
+fn default_tinybird_max_body_bytes() -> usize {
+    1024 * 1024
+}
+
+impl Default for TinybirdSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_host: String::new(),
+            secret_store: default_tinybird_secret_store(),
+            auction_dataset: default_tinybird_auction_dataset(),
+            auction_token_secret: default_tinybird_auction_token_secret(),
+            access_enabled: false,
+            access_dataset: default_tinybird_access_dataset(),
+            access_token_secret: default_tinybird_access_token_secret(),
+            access_sample_rate: 0.0,
+            max_body_bytes: default_tinybird_max_body_bytes(),
+        }
+    }
+}
+
+impl TinybirdSettings {
+    fn normalize(&mut self) {
+        self.api_host = self.api_host.trim().to_ascii_lowercase();
+        self.secret_store = self.secret_store.trim().to_owned();
+        self.auction_dataset = self.auction_dataset.trim().to_owned();
+        self.auction_token_secret = self.auction_token_secret.trim().to_owned();
+        self.access_dataset = self.access_dataset.trim().to_owned();
+        self.access_token_secret = self.access_token_secret.trim().to_owned();
+    }
+
+    fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
+        self.normalize();
+        if !(0.0..=1.0).contains(&self.access_sample_rate) {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "tinybird.access_sample_rate must be between 0.0 and 1.0".to_owned(),
+            }));
+        }
+        if self.max_body_bytes < 1024 {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "tinybird.max_body_bytes must be at least 1024".to_owned(),
+            }));
+        }
+        if self.access_enabled {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "tinybird.access_enabled is reserved for future access-log telemetry; no emitter is currently wired".to_owned(),
+            }));
+        }
+        if !self.enabled {
+            return Ok(());
+        }
+        validate_tinybird_api_host(&self.api_host)?;
+        if self.secret_store.is_empty() {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message:
+                    "tinybird.secret_store must not be empty when Tinybird telemetry is enabled"
+                        .to_owned(),
+            }));
+        }
+        if self.enabled {
+            validate_tinybird_dataset(&self.auction_dataset, "tinybird.auction_dataset")?;
+            validate_tinybird_secret(&self.auction_token_secret, "tinybird.auction_token_secret")?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_tinybird_api_host(host: &str) -> Result<(), Report<TrustedServerError>> {
+    if host.is_empty()
+        || host.contains('/')
+        || host.contains(':')
+        || host.chars().any(char::is_control)
+        || host.starts_with("http://")
+        || host.starts_with("https://")
+    {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: "tinybird.api_host must be a regional host without scheme, port, or path"
+                .to_owned(),
+        }));
+    }
+    validate_host_header_override_value(host).map_err(|reason| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!("tinybird.api_host {reason}"),
+        })
+    })
+}
+
+fn validate_tinybird_dataset(value: &str, setting: &str) -> Result<(), Report<TrustedServerError>> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: format!("{setting} must be a non-empty datasource identifier"),
+        }));
+    }
+    Ok(())
+}
+
+fn validate_tinybird_secret(value: &str, setting: &str) -> Result<(), Report<TrustedServerError>> {
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: format!("{setting} must be a non-empty Secret Store key"),
+        }));
+    }
+    Ok(())
+}
+
 /// Debug-only features. All flags default to `false` (off in production).
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1731,6 +1900,21 @@ pub struct DebugConfig {
     /// Fastly-observed TLS details that browser JS cannot normally read.
     #[serde(default)]
     pub ja4_endpoint_enabled: bool,
+
+    /// Inject a `<!-- ts-debug: ... -->` HTML comment before `</body>` showing
+    /// auction pipeline stats (SSP count, mediator status, winning bid count).
+    /// Never enable in production — visible in page source.
+    #[serde(default)]
+    pub auction_html_comment: bool,
+
+    /// Include raw `adm` creative markup in `window.tsjs.bids` for GPT/GAM
+    /// debug rendering through the Prebid Universal Creative bridge.
+    ///
+    /// Use this to validate the server-side auction→GAM targeting→creative
+    /// rendering pipeline while PBS Cache is unavailable. Never enable in
+    /// production — injects raw HTML from SSPs.
+    #[serde(default)]
+    pub inject_adm_for_testing: bool,
 }
 
 /// Tester-cookie endpoint configuration.
@@ -1769,7 +1953,11 @@ pub struct Settings {
     #[serde(default)]
     pub proxy: Proxy,
     #[serde(default)]
+    pub creative_opportunities: Option<CreativeOpportunitiesConfig>,
+    #[serde(default)]
     pub image_optimizer: ImageOptimizerSettings,
+    #[serde(default)]
+    pub tinybird: TinybirdSettings,
     #[serde(default)]
     pub debug: DebugConfig,
 }
@@ -1868,14 +2056,29 @@ impl Settings {
     ///
     /// # Errors
     ///
-    /// Returns a configuration error if any handler path regex does not compile.
-    pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+    /// Returns a configuration error if any cached runtime artifact cannot be
+    /// prepared, if any handler path regex does not compile, or if a creative
+    /// opportunity slot is invalid.
+    pub fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
         self.image_optimizer.prepare_runtime()?;
         self.proxy.prepare_runtime()?;
+        self.tinybird.prepare_runtime()?;
         self.validate_asset_image_optimizer_profile_sets()?;
 
         for handler in &self.handlers {
             handler.prepare_runtime()?;
+        }
+
+        if let Some(co) = &mut self.creative_opportunities {
+            co.compile_slots();
+            // Slots flow into injected HTML/JS, provider payloads, and GPT
+            // calls. Env/private config can bypass static review, so validate
+            // the full runtime shape on every load path.
+            co.validate_runtime().map_err(|err| {
+                Report::new(TrustedServerError::Configuration {
+                    message: format!("Invalid creative opportunity slot config: {err}"),
+                })
+            })?;
         }
 
         for (name, value) in &self.response_headers {
@@ -1892,6 +2095,17 @@ impl Settings {
         }
 
         Ok(())
+    }
+
+    /// Returns compiled creative opportunity slots, or empty slice if feature is disabled.
+    #[must_use]
+    pub fn creative_opportunity_slots(
+        &self,
+    ) -> &[crate::creative_opportunities::CreativeOpportunitySlot] {
+        self.creative_opportunities
+            .as_ref()
+            .map(|co| co.slot.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Rejects known placeholder secret values.
@@ -2386,6 +2600,64 @@ mod tests {
     };
     use crate::redacted::Redacted;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
+
+    #[test]
+    fn tinybird_defaults_to_disabled_placeholders() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse settings without tinybird block");
+
+        assert!(
+            !settings.tinybird.enabled,
+            "Tinybird should default disabled"
+        );
+        assert_eq!(settings.tinybird.secret_store, "ts_secrets");
+        assert_eq!(settings.tinybird.auction_dataset, "auction_events_raw");
+        assert_eq!(
+            settings.tinybird.auction_token_secret,
+            "tinybird_auction_append_token"
+        );
+    }
+
+    #[test]
+    fn tinybird_enabled_requires_host_dataset_and_token() {
+        let toml = format!(
+            "{}\n[tinybird]\nenabled = true\napi_host = \"https://api.example.com/path\"\n",
+            crate_test_settings_str()
+        );
+
+        let err = Settings::from_toml(&toml).expect_err("should reject invalid api host");
+        assert!(
+            format!("{err:?}").contains("tinybird.api_host"),
+            "should report tinybird.api_host validation error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn tinybird_accepts_region_host_without_scheme() {
+        let toml = format!(
+            "{}\n[tinybird]\nenabled = true\napi_host = \"api.us-east.aws.tinybird.co\"\n",
+            crate_test_settings_str()
+        );
+
+        let settings = Settings::from_toml(&toml).expect("should accept Tinybird region host");
+        assert!(settings.tinybird.enabled);
+        assert_eq!(settings.tinybird.api_host, "api.us-east.aws.tinybird.co");
+    }
+
+    #[test]
+    fn tinybird_access_enabled_is_rejected_until_emitter_is_wired() {
+        let toml = format!(
+            "{}\n[tinybird]\naccess_enabled = true\n",
+            crate_test_settings_str()
+        );
+
+        let err = Settings::from_toml(&toml)
+            .expect_err("should reject access telemetry before emitter exists");
+        assert!(
+            format!("{err:?}").contains("tinybird.access_enabled"),
+            "should report unsupported tinybird.access_enabled setting: {err:?}"
+        );
+    }
 
     #[test]
     fn test_settings_from_valid_toml() {
@@ -5044,6 +5316,210 @@ origin_host_header_overide = "www.example.com""#,
     ///
     /// If this test fails, a route was added or removed in the Fastly
     /// router without updating `ADMIN_ENDPOINTS` (or vice versa).
+    #[test]
+    fn settings_parses_creative_opportunities_section() {
+        let toml = r#"
+[[handlers]]
+path = "^/_ts/admin"
+username = "admin"
+password = "unit-test-admin-secret"
+
+[publisher]
+domain = "example.com"
+cookie_domain = ".example.com"
+origin_url = "https://origin.example.com"
+proxy_secret = "secret"
+
+[ec]
+passphrase = "test-secret-key-32-bytes-minimum"
+
+[creative_opportunities]
+gam_network_id = "21765378893"
+auction_timeout_ms = 500
+"#;
+        let settings = Settings::from_toml(toml).expect("should parse");
+        let co = settings
+            .creative_opportunities
+            .expect("should have creative_opportunities");
+        assert_eq!(co.gam_network_id, "21765378893");
+        assert_eq!(co.auction_timeout_ms, Some(500));
+    }
+
+    #[test]
+    fn settings_rejects_invalid_creative_opportunity_slot_id() {
+        let toml = r#"
+[[handlers]]
+path = "^/_ts/admin"
+username = "admin"
+password = "unit-test-admin-secret"
+
+[publisher]
+domain = "example.com"
+cookie_domain = ".example.com"
+origin_url = "https://origin.example.com"
+proxy_secret = "secret"
+
+[ec]
+passphrase = "test-secret-key-32-bytes-minimum"
+
+[creative_opportunities]
+gam_network_id = "21765378893"
+
+[[creative_opportunities.slot]]
+id = "xss<script>"
+page_patterns = ["/"]
+formats = [{ width = 300, height = 250 }]
+"#;
+        let err = Settings::from_toml(toml).expect_err("should reject invalid slot id");
+        assert!(
+            format!("{err:?}").contains("Invalid creative opportunity slot config"),
+            "error should mention the invalid slot id, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn settings_rejects_env_injected_invalid_creative_opportunity_slot_id() {
+        // A TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__SLOT override must go through
+        // the same runtime slot validation as a TOML-defined slot, so an invalid
+        // id injected via env is rejected by from_toml_and_env (the build-time
+        // path uses the same validation against the merged config).
+        let toml = r#"
+[[handlers]]
+path = "^/_ts/admin"
+username = "admin"
+password = "unit-test-admin-secret"
+
+[publisher]
+domain = "example.com"
+cookie_domain = ".example.com"
+origin_url = "https://origin.example.com"
+proxy_secret = "secret"
+
+[ec]
+passphrase = "test-secret-key-32-bytes-minimum"
+
+[creative_opportunities]
+gam_network_id = "21765378893"
+"#;
+        let slot_key = format!(
+            "{}{}CREATIVE_OPPORTUNITIES{}SLOT",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        temp_env::with_var(
+            slot_key,
+            Some(
+                r#"[{"id":"bad id","page_patterns":["/"],"formats":[{"width":300,"height":250}]}]"#,
+            ),
+            || {
+                let err = Settings::from_toml_and_env(toml)
+                    .expect_err("should reject env-injected invalid slot id");
+                assert!(
+                    format!("{err:?}").contains("Invalid creative opportunity slot config"),
+                    "error should mention the invalid slot id, got: {err:?}"
+                );
+            },
+        );
+    }
+
+    fn creative_opportunity_settings_toml(slot_body: &str) -> String {
+        format!(
+            r#"
+[[handlers]]
+path = "^/_ts/admin"
+username = "admin"
+password = "unit-test-admin-secret"
+
+[publisher]
+domain = "example.com"
+cookie_domain = ".example.com"
+origin_url = "https://origin.example.com"
+proxy_secret = "secret"
+
+[ec]
+passphrase = "test-secret-key-32-bytes-minimum"
+
+[creative_opportunities]
+gam_network_id = "21765378893"
+
+[[creative_opportunities.slot]]
+{slot_body}
+"#
+        )
+    }
+
+    fn assert_creative_opportunity_slot_config_rejected(slot_body: &str, expected: &str) {
+        let toml = creative_opportunity_settings_toml(slot_body);
+        let err = Settings::from_toml(&toml)
+            .expect_err("should reject malformed creative opportunity slot");
+        assert!(
+            format!("{err:?}").contains(expected),
+            "error should contain {expected:?}, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn settings_rejects_creative_opportunity_slot_without_page_patterns() {
+        assert_creative_opportunity_slot_config_rejected(
+            r#"
+id = "atf"
+page_patterns = []
+formats = [{ width = 300, height = 250 }]
+"#,
+            "must include at least one page pattern",
+        );
+    }
+
+    #[test]
+    fn settings_rejects_creative_opportunity_slot_without_valid_page_patterns() {
+        assert_creative_opportunity_slot_config_rejected(
+            r#"
+id = "atf"
+page_patterns = ["["]
+formats = [{ width = 300, height = 250 }]
+"#,
+            "must include at least one valid page pattern",
+        );
+    }
+
+    #[test]
+    fn settings_rejects_creative_opportunity_slot_without_formats() {
+        assert_creative_opportunity_slot_config_rejected(
+            r#"
+id = "atf"
+page_patterns = ["/"]
+formats = []
+"#,
+            "must include at least one format",
+        );
+    }
+
+    #[test]
+    fn settings_rejects_creative_opportunity_slot_with_zero_dimensions() {
+        assert_creative_opportunity_slot_config_rejected(
+            r#"
+id = "atf"
+page_patterns = ["/"]
+formats = [{ width = 0, height = 250 }]
+"#,
+            "must have positive width and height",
+        );
+    }
+
+    #[test]
+    fn settings_rejects_creative_opportunity_slot_with_empty_gam_unit_path() {
+        assert_creative_opportunity_slot_config_rejected(
+            r#"
+id = "atf"
+gam_unit_path = ""
+page_patterns = ["/"]
+formats = [{ width = 300, height = 250 }]
+"#,
+            "resolved GAM unit path must not be empty",
+        );
+    }
+
     #[test]
     fn admin_endpoints_match_fastly_router() {
         let router_source = include_str!("../../trusted-server-adapter-fastly/src/app.rs");

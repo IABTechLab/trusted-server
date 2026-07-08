@@ -1,0 +1,28 @@
+DESCRIPTION >
+  Materialized per-minute bid and canonical winner rollup.
+
+NODE auction_bid_stats_mv
+SQL >
+  SELECT
+    toStartOfMinute(event_ts) AS minute,
+    publisher_domain,
+    auction_source,
+    assumeNotNull(provider) AS provider,
+    assumeNotNull(seat) AS seat,
+    countState() AS bids,
+    sumState(toUInt64(coalesce(is_win, 0) = 1)) AS wins,
+    quantilesStateIf(0.5, 0.95, 0.99)(assumeNotNull(price_cpm), coalesce(is_win, 0) = 1) AS winning_cpm_quantiles
+  FROM auction_events_raw
+  WHERE event_kind = 'bid'
+    AND provider IS NOT NULL
+    AND seat IS NOT NULL
+    AND price_cpm IS NOT NULL
+  GROUP BY
+    minute,
+    publisher_domain,
+    auction_source,
+    provider,
+    seat
+
+TYPE materialized
+DATASOURCE auction_bid_stats_rollup

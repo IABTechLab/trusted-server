@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{HeaderName, HeaderValue, Response};
+use edgezero_core::http::{HeaderValue, Response};
 use edgezero_core::middleware::{Middleware, Next};
 use trusted_server_core::auth::enforce_basic_auth;
 use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
@@ -124,8 +124,8 @@ impl Middleware for NormalizeMiddleware {
 ///
 /// `geo_available` controls `X-Geo-Info-Available`. Spin passes `false`
 /// because it has no geo headers. Operator-configured
-/// `settings.response_headers` are applied last and can override any managed
-/// header.
+/// `settings.response_headers` are applied last (with the shared cookie
+/// cache-privacy hardening) and can override any managed header.
 pub(crate) fn apply_finalize_headers(
     settings: &Settings,
     geo_available: bool,
@@ -136,18 +136,11 @@ pub(crate) fn apply_finalize_headers(
         HeaderValue::from_static(if geo_available { "true" } else { "false" }),
     );
 
-    for (key, value) in &settings.response_headers {
-        let header_name = HeaderName::from_bytes(key.as_bytes());
-        let header_value = HeaderValue::from_str(value);
-        if let (Ok(header_name), Ok(header_value)) = (header_name, header_value) {
-            response.headers_mut().insert(header_name, header_value);
-        } else {
-            log::warn!(
-                "Skipping invalid configured response header value for {}",
-                key
-            );
-        }
-    }
+    // Cookie-bearing responses stay private to shared caches and operator
+    // headers cannot re-enable caching for uncacheable per-user payloads.
+    trusted_server_core::response_privacy::apply_response_headers_with_cache_privacy(
+        settings, response,
+    );
 }
 
 // ---------------------------------------------------------------------------

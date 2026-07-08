@@ -265,6 +265,48 @@ async fn spin_authorized_json(method: &str, uri: &str, body: &str) -> (u16, Head
     (resp.status().as_u16(), resp.headers().clone())
 }
 
+/// Send an OPTIONS request to the Axum adapter and return (status, headers).
+async fn axum_options(uri: &str) -> (u16, HeaderMap) {
+    let mut svc = EdgeZeroAxumService::new(axum_router());
+    let req = AxumRequest::builder()
+        .method("OPTIONS")
+        .uri(uri)
+        .body(AxumBody::empty())
+        .expect("should build OPTIONS request");
+    let resp = svc
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
+    (resp.status().as_u16(), resp.headers().clone())
+}
+
+/// Send an OPTIONS request to the Cloudflare adapter and return (status, headers).
+async fn cf_options(uri: &str) -> (u16, HeaderMap) {
+    let router = cf_router();
+    let req = request_builder()
+        .method("OPTIONS")
+        .uri(uri)
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build OPTIONS request");
+    let resp = router.oneshot(req).await.expect("should respond");
+    (resp.status().as_u16(), resp.headers().clone())
+}
+
+/// Send an OPTIONS request to the Spin adapter and return (status, headers).
+async fn spin_options(uri: &str) -> (u16, HeaderMap) {
+    let router = spin_router();
+    let req = request_builder()
+        .method("OPTIONS")
+        .uri(uri)
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build OPTIONS request");
+    let resp = router.oneshot(req).await.expect("should respond");
+    (resp.status().as_u16(), resp.headers().clone())
+}
+
 // ---------------------------------------------------------------------------
 // Route parity: same route → same status on all adapters
 // ---------------------------------------------------------------------------
@@ -649,6 +691,32 @@ async fn auction_not_challenged_by_auth_parity() {
         cf_status, spin_status,
         "/auction must return the same status across adapters: \
          cf={cf_status} spin={spin_status}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn page_bids_options_preflight_denied_parity() {
+    // OPTIONS /__ts/page-bids is a CORS preflight to a side-effecting endpoint.
+    // Every adapter must refuse it with 403 rather than proxy it to the origin:
+    // a permissive origin preflight would let a cross-site page defeat the GET
+    // handler's `X-TSJS-Page-Bids` gate and trigger real auctions in a visitor's
+    // browser. The denial is unconditional (independent of creative-opportunity
+    // configuration), so all adapters must agree on 403.
+    let (axum_status, _) = axum_options("/__ts/page-bids").await;
+    let (cf_status, _) = cf_options("/__ts/page-bids").await;
+    let (spin_status, _) = spin_options("/__ts/page-bids").await;
+
+    assert_eq!(
+        axum_status, 403,
+        "Axum OPTIONS /__ts/page-bids must be denied with 403, got {axum_status}"
+    );
+    assert_eq!(
+        cf_status, 403,
+        "Cloudflare OPTIONS /__ts/page-bids must be denied with 403, got {cf_status}"
+    );
+    assert_eq!(
+        spin_status, 403,
+        "Spin OPTIONS /__ts/page-bids must be denied with 403, got {spin_status}"
     );
 }
 

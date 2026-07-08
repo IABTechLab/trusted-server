@@ -119,3 +119,38 @@ ts audit https://publisher.example --force
 `ts audit` is not an EdgeZero adapter command. It has no `--adapter` option and
 it does not provision resources, push config, build, deploy, or contact platform
 APIs.
+
+## Generate an external Prebid bundle
+
+`ts prebid bundle` builds the local external Prebid browser bundle configured in
+`trusted-server.toml`.
+
+```toml
+[integrations.prebid.bundle]
+adapters = ["rubicon", "kargo"]
+user_id_modules = ["sharedIdSystem"]
+```
+
+Run the command after installing JS dependencies:
+
+```bash
+cd crates/trusted-server-js/lib && npm ci
+cd ../../..
+ts prebid bundle
+```
+
+By default, generated artifacts are written to `dist/prebid/`, and the command
+updates `integrations.prebid.external_bundle_sha256` and
+`integrations.prebid.external_bundle_sri` in `trusted-server.toml`. Upload the
+generated JavaScript file yourself, set `external_bundle_url` to its HTTPS
+asset URL, and include that host (plus any redirect targets) in
+`proxy.allowed_domains` before running `ts config validate` or `ts config push`.
+
+Use custom paths when needed:
+
+```bash
+ts prebid bundle --config publisher-a.toml --out build/prebid
+```
+
+`ts prebid bundle` is local-only. It has no `--adapter` option and does not
+upload, provision, deploy, or push config.

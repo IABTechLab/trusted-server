@@ -81,6 +81,16 @@ pub struct GptConfig {
     /// Whether to rewrite GPT script URLs in publisher HTML.
     #[serde(default = "default_rewrite_script")]
     pub rewrite_script: bool,
+
+    /// URL for the slim-Prebid bundle loaded post-window.load.
+    ///
+    /// When set, `installSlimPrebidLoader()` in the GPT bundle will load this
+    /// script after `window.load`, enabling scroll/refresh client-side auctions
+    /// and userID module warm-up. Set to the publisher's tsjs-prebid bundle URL.
+    ///
+    /// Override via env var: `TRUSTED_SERVER__INTEGRATIONS__GPT__SLIM_PREBID_URL`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slim_prebid_url: Option<String>,
 }
 
 impl IntegrationConfig for GptConfig {
@@ -459,17 +469,56 @@ impl IntegrationHeadInjector for GptIntegration {
         GPT_INTEGRATION_ID
     }
 
+    /// Injects the `tsjs.adInit` bootstrap script into `<head>`.
+    ///
+    /// ## Scroll / refresh handoff contract (Phase 1)
+    ///
+    /// `tsjs.adInit` handles **initial render only**: it wires server-side bid
+    /// targeting into GPT slots and refreshes them. Win/billing beacons fire
+    /// only from the TS render bridge in the JS bundle, where a matching
+    /// Prebid Universal Creative request proves the TS creative rendered.
+    /// It does **not** trigger refresh auctions or handle GPT slot refresh events.
+    ///
+    /// Post-`window.load`, slim-Prebid owns scroll and GPT refresh: it listens
+    /// for GPT refresh events, runs client-side auctions, and sets targeting for
+    /// subsequent impressions. SPA navigation is handled separately by
+    /// `installSpaAuctionHook()` in the GPT bundle, which re-runs the server-side
+    /// auction via `GET /__ts/page-bids` on pushState / replaceState / popstate
+    /// route changes (see `auction/endpoints.rs`).
+    /// The `POST /auction` endpoint is not involved in scroll or refresh flows.
     fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-        // Set the enable flag and best-effort call the activation function
-        // registered by the GPT shim module. The bundle also auto-installs
-        // when it sees the pre-set flag, so this works regardless of whether
-        // the inline bootstrap runs before or after the TSJS bundle.
-        vec![
-            "<script>window.__tsjs_gpt_enabled=true;window.__tsjs_installGptShim&&window.__tsjs_installGptShim();</script>"
+        let mut scripts = vec![
+            "<script>window.__tsjs_gpt_enabled=true;\
+             window.__tsjs_installGptShim&&window.__tsjs_installGptShim();</script>"
                 .to_string(),
-        ]
+            format!("<script>{}</script>", GPT_BOOTSTRAP_JS),
+        ];
+
+        if let Some(ref url) = self.config.slim_prebid_url {
+            // JSON-encode the URL, then escape `</` so a configured value
+            // containing the literal `</script>` cannot close this inline tag and
+            // let trailing markup execute (standard JSON-in-HTML mitigation).
+            let encoded = serde_json::to_string(url)
+                .expect("should serialize string")
+                .replace("</", "<\\/");
+            scripts.push(format!(
+                "<script>window.__tsjs_slim_prebid_url={encoded};</script>"
+            ));
+        }
+
+        scripts
     }
 }
+
+/// Inline `window.tsjs.adInit` bootstrap injected at `<head>` so the bids
+/// script at `</body>` can call it before the TSJS bundle has loaded.
+///
+/// The bundle's idempotent implementation in
+/// `crates/trusted-server-js/lib/src/integrations/gpt/index.ts` later overwrites this stub.
+/// Both implementations guard the one-time-per-page setup with
+/// `window.tsjs.servicesEnabled` so neither double-enables services if the
+/// publisher's own init code also calls `googletag.enableServices()`.
+const GPT_BOOTSTRAP_JS: &str = include_str!("gpt_bootstrap.js");
 
 // Default value functions
 
@@ -503,6 +552,7 @@ mod tests {
             script_url: default_script_url(),
             cache_ttl_seconds: 3600,
             rewrite_script: true,
+            slim_prebid_url: None,
         }
     }
 
@@ -1086,11 +1136,137 @@ mod tests {
 
         let inserts = integration.head_inserts(&ctx);
 
-        assert_eq!(inserts.len(), 1, "should emit exactly one head insert");
+        assert_eq!(inserts.len(), 2, "should emit exactly two head inserts");
         assert_eq!(
             inserts[0],
             "<script>window.__tsjs_gpt_enabled=true;window.__tsjs_installGptShim&&window.__tsjs_installGptShim();</script>",
             "should set the enable flag and call the GPT shim activation function"
+        );
+    }
+
+    #[test]
+    fn head_inserts_includes_ts_ad_init_with_synchronous_bids_read() {
+        let config = test_config();
+        let integration = GptIntegration::new(config);
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+        let inserts = integration.head_inserts(&ctx);
+        let combined = inserts.join("");
+        assert!(combined.contains("ts.adInit"), "should define tsjs.adInit");
+        assert!(
+            combined.contains("ts.bids"),
+            "should read tsjs.bids synchronously"
+        );
+        assert!(
+            combined.contains("ts_initial"),
+            "should set ts_initial sentinel"
+        );
+        assert!(
+            !combined.contains("addEventListener(\"slotRenderEnded\""),
+            "inline bootstrap cannot prove TS creative rendering from GPT slotRenderEnded"
+        );
+        assert!(
+            !combined.contains("sendBeacon"),
+            "inline bootstrap must not fire win/billing beacons from GPT slotRenderEnded"
+        );
+        assert!(
+            !combined.contains("getTargeting(\"hb_adid\")"),
+            "inline bootstrap must not treat GPT targeting as winner proof"
+        );
+        assert!(
+            !combined.contains("/ts-bids"),
+            "must NOT fetch /ts-bids — bids are inline on the page"
+        );
+        assert!(
+            !combined.contains("bidsPromise"),
+            "must NOT use bidsPromise — bids are synchronous"
+        );
+        assert!(
+            !combined.contains("__ts_request_id"),
+            "must NOT reference request_id — no longer used"
+        );
+    }
+
+    #[test]
+    fn head_inserts_bootstrap_uses_css_safe_div_prefix_lookup() {
+        let config = test_config();
+        let integration = GptIntegration::new(config);
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+        let combined = integration.head_inserts(&ctx).join("");
+        assert!(
+            combined.contains("querySelectorAll(\"[id]\")"),
+            "bootstrap should scan ID-bearing elements instead of interpolating div_id into CSS"
+        );
+        assert!(
+            combined.contains(".startsWith(slot.div_id)"),
+            "bootstrap should match metacharacter-containing div_id prefixes with startsWith"
+        );
+        assert!(
+            !combined.contains("[id^='\" + slot.div_id"),
+            "bootstrap must not build a CSS attribute selector from raw div_id"
+        );
+    }
+
+    #[test]
+    fn head_inserts_bootstrap_guards_enable_services_with_idempotency_flag() {
+        let config = test_config();
+        let integration = GptIntegration::new(config);
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+        let combined = integration.head_inserts(&ctx).join("");
+        assert!(
+            combined.contains("ts.servicesEnabled"),
+            "should guard enableServices/enableSingleRequest with the tsjs.servicesEnabled flag"
+        );
+        assert!(combined.contains("ts.adInit"), "should install tsjs.adInit");
+        assert!(
+            !combined.contains("googletag.pubads().refresh()"),
+            "should never call unbounded refresh() — only refresh(newSlots)"
+        );
+    }
+
+    #[test]
+    fn head_inserts_bootstrap_refreshes_ts_slots_when_initial_load_disabled() {
+        // Mirrors the bundle: when the publisher calls disableInitialLoad(),
+        // display() only registers a TS-defined slot, so the bootstrap must also
+        // refresh those slots or they render blank.
+        let config = test_config();
+        let integration = GptIntegration::new(config);
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+        let combined = integration.head_inserts(&ctx).join("");
+        assert!(
+            combined.contains("disableInitialLoad"),
+            "bootstrap should wrap disableInitialLoad() to detect the disabled state"
+        );
+        assert!(
+            combined.contains("gptInitialLoadDisabled"),
+            "bootstrap should record the initial-load-disabled state on window.tsjs"
+        );
+        assert!(
+            combined.contains("slotsNeedingRefresh"),
+            "bootstrap should refresh TS-defined slots when initial load is disabled"
         );
     }
 
@@ -1100,6 +1276,99 @@ mod tests {
         assert_eq!(
             IntegrationHeadInjector::integration_id(integration.as_ref()),
             "gpt"
+        );
+    }
+
+    #[test]
+    fn head_inserts_emits_slim_prebid_url_when_configured() {
+        let config = GptConfig {
+            slim_prebid_url: Some("https://cdn.example.com/tsjs-prebid.min.js".to_string()),
+            ..test_config()
+        };
+        let integration = GptIntegration::new(config);
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+
+        assert_eq!(
+            inserts.len(),
+            3,
+            "should emit three head inserts when slim_prebid_url is set"
+        );
+        assert_eq!(
+            inserts[2],
+            r#"<script>window.__tsjs_slim_prebid_url="https://cdn.example.com/tsjs-prebid.min.js";</script>"#,
+            "should emit the slim-Prebid URL as a JSON-encoded string assignment"
+        );
+    }
+
+    #[test]
+    fn head_inserts_escapes_script_terminator_in_slim_prebid_url() {
+        // A configured URL containing `</script>` must not close the inline tag.
+        let config = GptConfig {
+            slim_prebid_url: Some("https://cdn.example.com/x</script><img src=x>".to_string()),
+            ..test_config()
+        };
+        let integration = GptIntegration::new(config);
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+
+        // The injected `</script><img ...>` must be neutralised: the only
+        // `</script>` left is the tag's own legitimate closer.
+        assert!(
+            !inserts[2].contains("</script><img"),
+            "should escape the injected </script> terminator, got: {}",
+            inserts[2]
+        );
+        assert_eq!(
+            inserts[2].matches("</script>").count(),
+            1,
+            "only the tag's own closing </script> should remain, got: {}",
+            inserts[2]
+        );
+        assert!(
+            inserts[2].contains("<\\/script>"),
+            "should emit the escaped terminator, got: {}",
+            inserts[2]
+        );
+    }
+
+    #[test]
+    fn head_inserts_omits_slim_prebid_url_when_not_configured() {
+        let integration = GptIntegration::new(test_config());
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+
+        assert_eq!(
+            inserts.len(),
+            2,
+            "should emit exactly two head inserts when slim_prebid_url is absent"
+        );
+        assert!(
+            inserts
+                .iter()
+                .all(|s| !s.contains("__tsjs_slim_prebid_url")),
+            "should not emit slim-Prebid URL tag when not configured"
         );
     }
 }

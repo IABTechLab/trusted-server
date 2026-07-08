@@ -642,6 +642,7 @@ mod tests {
             port: None,
             certificate_check: true,
             first_byte_timeout: Duration::from_secs(15),
+            between_bytes_timeout: Duration::from_secs(15),
             host_header_override: None,
         };
         let name1 = backend.predict_name(&spec).expect("should return a name");
@@ -661,6 +662,7 @@ mod tests {
             port: None,
             certificate_check: true,
             first_byte_timeout: Duration::from_secs(15),
+            between_bytes_timeout: Duration::from_secs(15),
             host_header_override: None,
         };
         assert_eq!(
