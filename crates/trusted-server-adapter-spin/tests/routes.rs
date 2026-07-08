@@ -210,6 +210,36 @@ async fn tsjs_route_is_routed_not_5xx() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tsjs_route_matching_hash_uses_s_maxage_fallback() {
+    let router = test_router();
+    let src = trusted_server_core::tsjs::tsjs_script_src(&["creative"]);
+    let req = request_builder()
+        .method("GET")
+        .uri(src)
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build request");
+
+    let resp = route(router, req).await;
+
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "matching TSJS hash should serve OK"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("public, max-age=31536000, s-maxage=31536000, immutable"),
+        "Spin adapter should render the portable s-maxage fallback"
+    );
+    assert!(
+        resp.headers().get("surrogate-control").is_none(),
+        "s-maxage fallback must not emit Fastly Surrogate-Control"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn verify_signature_is_routed() {
     let router = test_router();
     let req = request_builder()
