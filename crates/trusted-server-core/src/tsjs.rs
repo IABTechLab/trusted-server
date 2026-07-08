@@ -113,10 +113,10 @@ mod tests {
     #[test]
     fn tsjs_script_src_hash_changes_with_module_set() {
         let creative_src = tsjs_script_src(&["creative"]);
-        let creative_prebid_src = tsjs_script_src(&["creative", "prebid"]);
+        let creative_datadome_src = tsjs_script_src(&["creative", "datadome"]);
 
         assert_ne!(
-            creative_src, creative_prebid_src,
+            creative_src, creative_datadome_src,
             "should include requested modules in cache-busting hash"
         );
     }
@@ -124,8 +124,8 @@ mod tests {
     #[test]
     fn tsjs_script_src_hash_depends_on_module_order() {
         assert_ne!(
-            tsjs_script_src(&["creative", "prebid"]),
-            tsjs_script_src(&["prebid", "creative"]),
+            tsjs_script_src(&["creative", "datadome"]),
+            tsjs_script_src(&["datadome", "creative"]),
             "should include module order in cache-busting hash"
         );
     }
@@ -133,8 +133,8 @@ mod tests {
     #[test]
     fn tsjs_script_src_deduplicates_core_module() {
         assert_eq!(
-            tsjs_script_src(&["core", "prebid"]),
-            tsjs_script_src(&["prebid"]),
+            tsjs_script_src(&["core", "datadome"]),
+            tsjs_script_src(&["datadome"]),
             "should not hash core twice when requested explicitly"
         );
     }
@@ -182,17 +182,22 @@ mod tests {
 
     #[test]
     fn tsjs_deferred_script_src_formats_known_module_url_with_hash() {
-        let src = tsjs_deferred_script_src("prebid");
+        let src = tsjs_deferred_script_src("creative");
 
         assert!(
-            src.starts_with("/static/tsjs=tsjs-prebid.min.js?v="),
+            src.starts_with("/static/tsjs=tsjs-creative.min.js?v="),
             "should use per-module static bundle path"
         );
         assert_sha256_hex_hash(hash_query_value(&src));
     }
 
     #[test]
-    fn tsjs_deferred_script_src_uses_empty_hash_for_unknown_module() {
+    fn tsjs_deferred_script_src_uses_empty_hash_for_external_or_unknown_module() {
+        assert_eq!(
+            tsjs_deferred_script_src("prebid"),
+            "/static/tsjs=tsjs-prebid.min.js?v=",
+            "prebid now ships as an external bundle and has no local hash"
+        );
         assert_eq!(
             tsjs_deferred_script_src("unknown-module"),
             "/static/tsjs=tsjs-unknown-module.min.js?v=",

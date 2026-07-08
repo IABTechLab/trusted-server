@@ -1,0 +1,13 @@
+- name: auction_api_completed_fill_rate
+  description: Completed auction summary counts one auction and computes fill rate from summary rows.
+  expected_http_status: 200
+  parameters: start=2026-06-23%2012:00:00&end=2026-06-23%2012:01:00&publisher=test-publisher.example&source=auction_api
+  expected_result: |
+    {"minute":"2026-06-23 12:00:00","publisher_domain":"test-publisher.example","auction_source":"auction_api","terminal_status":"completed","terminal_reason":null,"auctions":1,"requested_slots":2,"winning_bids":1,"fill_rate":0.5,"total_time_ms_quantiles":[120,120,120]}
+
+- name: skipped_spa_navigation_visible
+  description: Skipped SPA navigation summaries remain queryable for consent-denied traffic.
+  expected_http_status: 200
+  parameters: start=2026-06-23%2012:02:00&end=2026-06-23%2012:03:00&publisher=test-publisher.example&source=spa_navigation
+  expected_result: |
+    {"minute":"2026-06-23 12:02:00","publisher_domain":"test-publisher.example","auction_source":"spa_navigation","terminal_status":"skipped","terminal_reason":"consent_denied","auctions":1,"requested_slots":1,"winning_bids":0,"fill_rate":0,"total_time_ms_quantiles":[0,0,0]}

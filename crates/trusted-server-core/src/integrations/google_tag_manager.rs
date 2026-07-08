@@ -678,7 +678,7 @@ mod tests {
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
 
     use crate::platform::test_support::noop_services;
-    use crate::test_support::tests::crate_test_settings_str;
+    use crate::test_support::tests::create_test_settings;
     use http::Method;
     use std::io::Cursor;
 
@@ -1499,7 +1499,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
     }
 
     fn make_settings() -> Settings {
-        Settings::from_toml(&crate_test_settings_str()).expect("should parse settings")
+        create_test_settings()
     }
 
     fn config_from_settings(

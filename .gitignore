@@ -18,6 +18,7 @@
 
 # EdgeZero local KV store (created by edgezero-adapter-axum framework)
 .edgezero/
+/dist/prebid/
 
 # env
 .env*
@@ -58,4 +59,3 @@ src/*.html
 # leftover local build artifacts (node_modules, target, dist) that remain on disk.
 /crates/js/
 /crates/integration-tests/
-

@@ -94,6 +94,7 @@ use edgezero_core::http::{
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
+use trusted_server_core::auction::AuctionTelemetrySink;
 use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
 use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
@@ -147,6 +148,7 @@ pub(crate) struct AppState {
     pub(crate) orchestrator: Arc<AuctionOrchestrator>,
     pub(crate) registry: Arc<IntegrationRegistry>,
     pub(crate) default_kv_store: Arc<dyn PlatformKvStore>,
+    pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -173,6 +175,7 @@ pub(crate) fn build_state_from_settings(
     let orchestrator = build_orchestrator(&settings)?;
     let registry = IntegrationRegistry::new(&settings)?;
 
+    let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
 
     Ok(Arc::new(AppState {
@@ -180,6 +183,7 @@ pub(crate) fn build_state_from_settings(
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
         default_kv_store,
+        auction_telemetry_sink,
     }))
 }
 
@@ -254,6 +258,7 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         .backend(Arc::new(FastlyPlatformBackend))
         .http_client(Arc::new(FastlyPlatformHttpClient))
         .geo(Arc::new(FastlyPlatformGeo))
+        .auction_telemetry_sink(Arc::clone(&state.auction_telemetry_sink))
         .client_info(client_info)
         .build()
 }
@@ -1248,6 +1253,9 @@ mod tests {
                 origin_url = "https://origin.test-publisher.com"
                 proxy_secret = "unit-test-proxy-secret"
 
+                [proxy]
+                allowed_domains = ["*.example", "*.example.com"]
+
                 [ec]
                 passphrase = "test-passphrase-at-least-32-bytes!!"
 
@@ -1262,6 +1270,7 @@ mod tests {
                 [integrations.prebid]
                 enabled = true
                 server_url = "https://test-prebid.com/openrtb2/auction"
+                external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
 
                 [integrations.datadome]
                 enabled = true
@@ -1313,6 +1322,9 @@ mod tests {
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
+            [proxy]
+            allowed_domains = ["*.example", "*.example.com"]
+
             [ec]
             passphrase = "test-secret-key-32-bytes-minimum"
 
@@ -1324,6 +1336,7 @@ mod tests {
             [integrations.prebid]
             enabled = true
             server_url = "https://test-prebid.com/openrtb2/auction"
+            external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
 
             [auction]
             enabled = true
@@ -1352,6 +1365,9 @@ mod tests {
         let default_kv_store =
             Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn super::PlatformKvStore>;
         let state = Arc::new(super::AppState {
+            auction_telemetry_sink: Arc::new(
+                trusted_server_core::auction::NoopAuctionTelemetrySink,
+            ),
             settings: Arc::new(settings),
             orchestrator: Arc::new(orchestrator),
             registry: Arc::new(registry),
