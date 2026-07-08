@@ -1,5 +1,8 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use trusted_server_core::html_processor::{create_html_processor, HtmlProcessorConfig};
+use trusted_server_core::html_processor::{
+    create_html_processor, BidInjectionMode, HtmlPostProcessingMode, HtmlProcessorConfig,
+};
+use trusted_server_core::integrations::IntegrationDocumentState;
 use trusted_server_core::integrations::IntegrationRegistry;
 use trusted_server_core::streaming_processor::StreamProcessor as _;
 
@@ -12,6 +15,9 @@ fn make_config() -> HtmlProcessorConfig {
         ad_slots_script: None,
         ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
         max_buffered_body_bytes: 16 * 1024 * 1024,
+        bid_injection_mode: BidInjectionMode::DirectState,
+        post_processing_mode: HtmlPostProcessingMode::Enabled,
+        document_state: IntegrationDocumentState::default(),
     }
 }
 

@@ -59,6 +59,7 @@ pub mod platform;
 pub mod price_bucket;
 pub mod proxy;
 pub mod publisher;
+pub mod publisher_late_binding;
 pub mod redacted;
 pub mod request_signing;
 pub mod response_privacy;
