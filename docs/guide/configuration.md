@@ -998,23 +998,23 @@ Rules are evaluated in file order; the first enabled matching rule wins.
 Disabled rules are ignored, which lets you keep framework presets documented in
 config without enabling them for every publisher.
 
-| Field                              | Type          | Required | Description                                                       |
-| ---------------------------------- | ------------- | -------- | ----------------------------------------------------------------- |
-| `id`                               | String        | Yes      | Unique operator-facing rule identifier                            |
-| `enabled`                          | Boolean       | No       | Whether the rule participates in matching (default `false`)        |
-| `preset`                           | String        | Matcher  | Built-in preset such as `nextjs-static`                           |
-| `path_prefix`                      | String        | Matcher  | Request path prefix                                               |
-| `path_glob`                        | String        | Matcher  | Single glob matched against the request path                      |
-| `path_globs`                       | Array[String] | Matcher  | Multiple globs matched against the request path                   |
-| `path_regex`                       | String        | Matcher  | Regex matched against the request path                            |
-| `extensions`                       | Array[String] | Matcher  | Case-insensitive file extensions                                  |
-| `requires_hash_in_filename`        | Boolean       | No       | Require an 8+ hex token in the final path segment before matching |
-| `visibility`                       | String        | No       | `public` or `private` (default `public`)                          |
-| `browser_ttl_seconds`              | Integer       | No       | Browser `max-age`                                                 |
-| `edge_ttl_seconds`                 | Integer       | No       | Edge/shared-cache TTL                                             |
-| `stale_while_revalidate_seconds`   | Integer       | No       | Optional `stale-while-revalidate`                                 |
-| `stale_if_error_seconds`           | Integer       | No       | Optional `stale-if-error`                                         |
-| `immutable`                        | Boolean       | No       | Add `immutable` when browser TTL is positive                      |
+| Field                            | Type          | Required | Description                                                       |
+| -------------------------------- | ------------- | -------- | ----------------------------------------------------------------- |
+| `id`                             | String        | Yes      | Unique operator-facing rule identifier                            |
+| `enabled`                        | Boolean       | No       | Whether the rule participates in matching (default `false`)       |
+| `preset`                         | String        | Matcher  | Built-in preset such as `nextjs-static`                           |
+| `path_prefix`                    | String        | Matcher  | Request path prefix                                               |
+| `path_glob`                      | String        | Matcher  | Single glob matched against the request path                      |
+| `path_globs`                     | Array[String] | Matcher  | Multiple globs matched against the request path                   |
+| `path_regex`                     | String        | Matcher  | Regex matched against the request path                            |
+| `extensions`                     | Array[String] | Matcher  | Case-insensitive file extensions                                  |
+| `requires_hash_in_filename`      | Boolean       | No       | Require an 8+ hex token in the final path segment before matching |
+| `visibility`                     | String        | No       | `public` or `private` (default `public`)                          |
+| `browser_ttl_seconds`            | Integer       | No       | Browser `max-age`                                                 |
+| `edge_ttl_seconds`               | Integer       | No       | Edge/shared-cache TTL                                             |
+| `stale_while_revalidate_seconds` | Integer       | No       | Optional `stale-while-revalidate`                                 |
+| `stale_if_error_seconds`         | Integer       | No       | Optional `stale-if-error`                                         |
+| `immutable`                      | Boolean       | No       | Add `immutable` when browser TTL is positive                      |
 
 Exactly one matcher must be configured per rule. `path_glob` and `path_globs`
 are mutually exclusive.
