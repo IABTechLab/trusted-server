@@ -9,6 +9,15 @@
     [local_server.kv_stores]
         # These inline placeholders satisfy Viceroy's local KV configuration
         # requirements without exercising KV-backed application behavior.
+        # Default general-purpose KV registry slot (carries no data yet).
+        [[local_server.kv_stores.trusted_server_kv]]
+            key = "placeholder"
+            data = "placeholder"
+
+        [[local_server.kv_stores.consent_store]]
+            key = "placeholder"
+            data = "placeholder"
+
         [[local_server.kv_stores.counter_store]]
             key = "placeholder"
             data = "placeholder"
@@ -58,6 +67,23 @@
     # They were generated specifically for testing and are safe to commit — they
     # have never been used in any production or staging environment.
     [local_server.secret_stores]
+        # Default general-purpose secrets registry slot (carries no data yet).
+        [[local_server.secret_stores.trusted_server_secrets]]
+            key = "placeholder"
+            data = "test-placeholder-secret"
+
+        [[local_server.secret_stores.ts_secrets]]
+            key = "tinybird_auction_append_token"
+            data = "test-tinybird-auction-append-token"
+
+        [[local_server.secret_stores.ts_secrets]]
+            key = "tinybird_access_append_token"
+            data = "test-tinybird-access-append-token"
+
+        [[local_server.secret_stores.s3-auth]]
+            key = "placeholder"
+            data = "test-placeholder-secret"
+
         [[local_server.secret_stores.signing_keys]]
             key = "ts-2025-10-A"
             data = "NVnTYrw5xoyTJDOwoUWoPJO3A6UCCXOJJUzgGTxxx7k="
@@ -78,3 +104,7 @@
             ts-2025-10-B = "{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"kid\":\"ts-2025-10-B\",\"use\":\"sig\",\"x\":\"HVTi04QLrIuB7jXpVfHjUTVN5aIdcbPNr50umTtN8pw\"}"
             current-kid = "ts-2025-10-A"
             active-kids = "ts-2025-10-A,ts-2025-10-B"
+
+        [local_server.config_stores.datadome-ip-bypass]
+            format = "inline-toml"
+        [local_server.config_stores.datadome-ip-bypass.contents]

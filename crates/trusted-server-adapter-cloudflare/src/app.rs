@@ -2,7 +2,7 @@ use core::future::Future;
 use core::pin::Pin;
 use std::sync::Arc;
 
-use edgezero_core::app::Hooks;
+use edgezero_core::app::{Hooks, StoresMetadata};
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, header};
@@ -328,6 +328,10 @@ impl Hooks for TrustedServerApp {
         };
 
         build_router(&state)
+    }
+
+    fn stores() -> StoresMetadata {
+        trusted_server_core::stores::STORES_METADATA
     }
 }
 

@@ -38,7 +38,20 @@ source = "../../target/wasm32-wasip1/release/trusted_server_adapter_spin.wasm"
 # origins are still served over plaintext http. Follow-up: scope this to the
 # configured origins once they can be enumerated from settings.
 allowed_outbound_hosts = ["https://*:*", "http://*:*"]
-key_value_stores = ["default"]
+# Spin is KV-backed for both KV and config stores, so every declared logical
+# store id (from edgezero.toml `[stores.kv]` and `[stores.config]`) must be
+# labeled here for the registry to open it at dispatch. Secrets resolve to flat
+# component variables (see `[component.trusted-server.variables]`), not KV labels.
+key_value_stores = [
+    "default",
+    "trusted_server_kv",
+    "ec_identity_store",
+    "consent_store",
+    "creative_store",
+    "trusted_server_config",
+    "jwks_store",
+    "datadome-ip-bypass",
+]
 
 [component.trusted-server.variables]
 v_current_x2dkid = "{{ v_current_x2dkid }}"

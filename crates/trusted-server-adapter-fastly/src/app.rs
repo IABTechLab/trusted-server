@@ -85,7 +85,7 @@ use std::sync::Arc;
 
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use edgezero_adapter_fastly::context::FastlyRequestContext;
-use edgezero_core::app::{App, Hooks};
+use edgezero_core::app::{App, Hooks, StoresMetadata};
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
@@ -1203,6 +1203,10 @@ impl Hooks for TrustedServerApp {
 
     fn routes() -> RouterService {
         Self::router_with_state().0
+    }
+
+    fn stores() -> StoresMetadata {
+        trusted_server_core::stores::STORES_METADATA
     }
 }
 

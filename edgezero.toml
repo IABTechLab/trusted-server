@@ -21,15 +21,15 @@ version = "0.1.0"
 # any one platform's names. `default` is the primary logical id.
 
 [stores.kv]
-ids = ["trusted_server_kv"]
+ids = ["trusted_server_kv", "ec_identity_store", "consent_store", "creative_store"]
 default = "trusted_server_kv"
 
 [stores.config]
-ids = ["trusted_server_config"]
+ids = ["trusted_server_config", "jwks_store", "datadome-ip-bypass"]
 default = "trusted_server_config"
 
 [stores.secrets]
-ids = ["trusted_server_secrets"]
+ids = ["trusted_server_secrets", "signing_keys", "ts_secrets", "s3-auth"]
 default = "trusted_server_secrets"
 
 # -- Fastly Compute (production) --------------------------------------------
