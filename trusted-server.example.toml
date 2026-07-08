@@ -34,8 +34,8 @@ pull_sync_concurrency = 3
 
 [request_signing]
 enabled = false
-config_store_id = "app_config"
-secret_store_id = "secrets"
+config_store_id = "jwks_store"
+secret_store_id = "signing_keys"
 
 [integrations.prebid]
 enabled = false

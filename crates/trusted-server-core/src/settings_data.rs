@@ -3,12 +3,16 @@ use error_stack::{Report, ResultExt};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
-use crate::config_payload::settings_from_config_blob;
+use crate::config_payload::{settings_from_config_blob, CONFIG_BLOB_KEY};
 use crate::error::TrustedServerError;
 use crate::platform::{PlatformConfigStore, StoreName};
 use crate::settings::Settings;
 
-const DEFAULT_CONFIG_STORE_ID: &str = "app_config";
+// The config store *id* is `trusted_server_config` (declared in edgezero.toml and
+// provisioned in every adapter manifest). The app-config blob lives under the
+// separate *key* `app_config` ([`CONFIG_BLOB_KEY`]) within that store, so the
+// store name and the blob key are intentionally decoupled.
+const DEFAULT_CONFIG_STORE_ID: &str = "trusted_server_config";
 const FASTLY_CHUNK_POINTER_KIND: &str = "fastly_config_chunks";
 const FASTLY_CONFIG_ENTRY_LIMIT: usize = 8_000;
 
@@ -37,7 +41,7 @@ pub fn default_config_store_name() -> StoreName {
 /// Returns the default config-store key containing the app-config blob.
 #[must_use]
 pub fn default_config_key() -> String {
-    EnvConfig::from_env().store_key("config", DEFAULT_CONFIG_STORE_ID)
+    EnvConfig::from_env().store_key("config", CONFIG_BLOB_KEY)
 }
 
 /// Loads [`Settings`] from a platform config store and key.
