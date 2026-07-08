@@ -359,88 +359,177 @@ pub(crate) const STREAM_CHUNK_SIZE: usize = 8192;
 /// Compressed bytes go in via [`Self::decode_chunk`]; decoded bytes drain
 /// out of the internal buffer after every push. Write-based decoders are
 /// used because the async publisher path cannot wrap a blocking `Read`.
-pub(crate) enum BodyStreamDecoder {
+///
+/// Decoded output is capped cumulatively: the chunk source only bounds raw
+/// (still compressed) bytes, and a decompression bomb can expand ~1000x past
+/// that, so the decoder enforces its own ceiling on the total bytes it emits.
+///
+/// Every codec validates end-of-stream at [`Self::finish`] so a truncated
+/// origin body errors instead of silently truncating the page: gzip via its
+/// trailer checksum, brotli via `close()`, and deflate via an explicit
+/// [`flate2::Status::StreamEnd`] check (`write::ZlibDecoder` accepts
+/// truncated input silently, so the deflate arm drives [`flate2::Decompress`]
+/// directly).
+pub(crate) struct BodyStreamDecoder {
+    codec: BodyStreamDecoderCodec,
+    decoded_bytes: usize,
+    max_decoded_bytes: usize,
+}
+
+enum BodyStreamDecoderCodec {
     None,
     Gzip(flate2::write::GzDecoder<Vec<u8>>),
-    Deflate(flate2::write::ZlibDecoder<Vec<u8>>),
+    Deflate(DeflateStreamDecoder),
     Brotli(Box<brotli::DecompressorWriter<Vec<u8>>>),
 }
 
+/// Streaming zlib decoder that tracks whether the stream reached its end
+/// marker, so truncated deflate bodies fail at finalization.
+struct DeflateStreamDecoder {
+    decompress: flate2::Decompress,
+    stream_ended: bool,
+}
+
+impl DeflateStreamDecoder {
+    fn new() -> Self {
+        Self {
+            decompress: flate2::Decompress::new(true),
+            stream_ended: false,
+        }
+    }
+
+    fn decode(&mut self, chunk: &[u8]) -> Result<Vec<u8>, Report<TrustedServerError>> {
+        let mut output = Vec::with_capacity(STREAM_CHUNK_SIZE);
+        let mut offset = 0usize;
+        // Trailing bytes after the zlib end marker are ignored, matching the
+        // read-based decoder used by the buffered pipeline.
+        while offset < chunk.len() && !self.stream_ended {
+            if output.len() == output.capacity() {
+                output.reserve(STREAM_CHUNK_SIZE);
+            }
+            let before_in = self.decompress.total_in();
+            let before_out = self.decompress.total_out();
+            let status = self
+                .decompress
+                .decompress_vec(&chunk[offset..], &mut output, flate2::FlushDecompress::None)
+                .change_context(TrustedServerError::Proxy {
+                    message: "Failed to decode deflate publisher body chunk".to_string(),
+                })?;
+            let consumed = (self.decompress.total_in() - before_in) as usize;
+            let produced = (self.decompress.total_out() - before_out) as usize;
+            offset += consumed;
+            match status {
+                flate2::Status::StreamEnd => self.stream_ended = true,
+                flate2::Status::Ok | flate2::Status::BufError => {
+                    if consumed == 0 && produced == 0 && output.len() < output.capacity() {
+                        return Err(Report::new(TrustedServerError::Proxy {
+                            message: "deflate publisher body decoder made no progress".to_string(),
+                        }));
+                    }
+                }
+            }
+        }
+        Ok(output)
+    }
+}
+
 impl BodyStreamDecoder {
-    pub(crate) fn new(compression: Compression) -> Self {
-        match compression {
-            Compression::None => Self::None,
-            Compression::Gzip => Self::Gzip(flate2::write::GzDecoder::new(Vec::new())),
-            Compression::Deflate => Self::Deflate(flate2::write::ZlibDecoder::new(Vec::new())),
-            Compression::Brotli => Self::Brotli(Box::new(brotli::DecompressorWriter::new(
-                Vec::new(),
-                STREAM_CHUNK_SIZE,
-            ))),
+    pub(crate) fn new(compression: Compression, max_decoded_bytes: usize) -> Self {
+        let codec = match compression {
+            Compression::None => BodyStreamDecoderCodec::None,
+            Compression::Gzip => {
+                BodyStreamDecoderCodec::Gzip(flate2::write::GzDecoder::new(Vec::new()))
+            }
+            Compression::Deflate => BodyStreamDecoderCodec::Deflate(DeflateStreamDecoder::new()),
+            Compression::Brotli => BodyStreamDecoderCodec::Brotli(Box::new(
+                brotli::DecompressorWriter::new(Vec::new(), STREAM_CHUNK_SIZE),
+            )),
+        };
+        Self {
+            codec,
+            decoded_bytes: 0,
+            max_decoded_bytes,
         }
     }
 
     pub(crate) fn decode_chunk(
         &mut self,
-        chunk: &[u8],
-    ) -> Result<Vec<u8>, Report<TrustedServerError>> {
-        match self {
-            Self::None => Ok(chunk.to_vec()),
-            Self::Gzip(decoder) => {
+        chunk: bytes::Bytes,
+    ) -> Result<bytes::Bytes, Report<TrustedServerError>> {
+        let decoded = match &mut self.codec {
+            BodyStreamDecoderCodec::None => chunk,
+            BodyStreamDecoderCodec::Gzip(decoder) => {
                 decoder
-                    .write_all(chunk)
+                    .write_all(&chunk)
                     .change_context(TrustedServerError::Proxy {
                         message: "Failed to decode gzip publisher body chunk".to_string(),
                     })?;
-                Ok(std::mem::take(decoder.get_mut()))
+                bytes::Bytes::from(std::mem::take(decoder.get_mut()))
             }
-            Self::Deflate(decoder) => {
+            BodyStreamDecoderCodec::Deflate(decoder) => bytes::Bytes::from(decoder.decode(&chunk)?),
+            BodyStreamDecoderCodec::Brotli(decoder) => {
                 decoder
-                    .write_all(chunk)
-                    .change_context(TrustedServerError::Proxy {
-                        message: "Failed to decode deflate publisher body chunk".to_string(),
-                    })?;
-                Ok(std::mem::take(decoder.get_mut()))
-            }
-            Self::Brotli(decoder) => {
-                decoder
-                    .write_all(chunk)
+                    .write_all(&chunk)
                     .change_context(TrustedServerError::Proxy {
                         message: "Failed to decode brotli publisher body chunk".to_string(),
                     })?;
-                Ok(std::mem::take(decoder.get_mut()))
+                bytes::Bytes::from(std::mem::take(decoder.get_mut()))
             }
-        }
+        };
+        self.track_decoded(decoded.len())?;
+        Ok(decoded)
     }
 
     pub(crate) fn finish(&mut self) -> Result<Vec<u8>, Report<TrustedServerError>> {
-        match self {
-            Self::None => Ok(Vec::new()),
-            Self::Gzip(decoder) => {
+        let tail = match &mut self.codec {
+            BodyStreamDecoderCodec::None => Vec::new(),
+            BodyStreamDecoderCodec::Gzip(decoder) => {
                 decoder
                     .try_finish()
                     .change_context(TrustedServerError::Proxy {
                         message: "Failed to finalize gzip publisher body decoder".to_string(),
                     })?;
-                Ok(std::mem::take(decoder.get_mut()))
+                std::mem::take(decoder.get_mut())
             }
-            Self::Deflate(decoder) => {
-                decoder
-                    .try_finish()
-                    .change_context(TrustedServerError::Proxy {
-                        message: "Failed to finalize deflate publisher body decoder".to_string(),
-                    })?;
-                Ok(std::mem::take(decoder.get_mut()))
+            BodyStreamDecoderCodec::Deflate(decoder) => {
+                if !decoder.stream_ended {
+                    return Err(Report::new(TrustedServerError::Proxy {
+                        message:
+                            "Failed to finalize deflate publisher body decoder: truncated stream"
+                                .to_string(),
+                    }));
+                }
+                Vec::new()
             }
-            Self::Brotli(decoder) => {
+            BodyStreamDecoderCodec::Brotli(decoder) => {
                 // `close()` (not `flush()`): flush accepts a truncated brotli
                 // stream silently, while close validates end-of-stream and
                 // errors on incomplete input, matching the gzip/deflate arms.
                 decoder.close().change_context(TrustedServerError::Proxy {
                     message: "Failed to finalize brotli publisher body decoder".to_string(),
                 })?;
-                Ok(std::mem::take(decoder.get_mut()))
+                std::mem::take(decoder.get_mut())
             }
+        };
+        self.track_decoded(tail.len())?;
+        Ok(tail)
+    }
+
+    fn track_decoded(&mut self, len: usize) -> Result<(), Report<TrustedServerError>> {
+        self.decoded_bytes = self.decoded_bytes.checked_add(len).ok_or_else(|| {
+            Report::new(TrustedServerError::Proxy {
+                message: "publisher origin body decoded byte count overflowed".to_string(),
+            })
+        })?;
+        if self.decoded_bytes > self.max_decoded_bytes {
+            return Err(Report::new(TrustedServerError::Proxy {
+                message: format!(
+                    "publisher origin body decoded size exceeded {}-byte streaming limit",
+                    self.max_decoded_bytes
+                ),
+            }));
         }
+        Ok(())
     }
 }
 
@@ -482,13 +571,14 @@ impl BodyStreamEncoder {
 
     pub(crate) fn encode_chunk(
         &mut self,
-        chunk: &[u8],
+        chunk: Vec<u8>,
     ) -> Result<Vec<u8>, Report<TrustedServerError>> {
         match self {
-            Self::None => Ok(chunk.to_vec()),
+            // Identity encoding passes the processed chunk through untouched.
+            Self::None => Ok(chunk),
             Self::Gzip(encoder) => {
                 encoder
-                    .write_all(chunk)
+                    .write_all(&chunk)
                     .change_context(TrustedServerError::Proxy {
                         message: "Failed to encode gzip publisher body chunk".to_string(),
                     })?;
@@ -496,7 +586,7 @@ impl BodyStreamEncoder {
             }
             Self::Deflate(encoder) => {
                 encoder
-                    .write_all(chunk)
+                    .write_all(&chunk)
                     .change_context(TrustedServerError::Proxy {
                         message: "Failed to encode deflate publisher body chunk".to_string(),
                     })?;
@@ -504,7 +594,7 @@ impl BodyStreamEncoder {
             }
             Self::Brotli(encoder) => {
                 encoder
-                    .write_all(chunk)
+                    .write_all(&chunk)
                     .change_context(TrustedServerError::Proxy {
                         message: "Failed to encode brotli publisher body chunk".to_string(),
                     })?;
@@ -513,29 +603,18 @@ impl BodyStreamEncoder {
         }
     }
 
+    /// Emits the encoder trailer. Consumes the codec state (the encoder
+    /// becomes identity afterwards); terminal — call once at end of stream.
     pub(crate) fn finish(&mut self) -> Result<Vec<u8>, Report<TrustedServerError>> {
-        match self {
+        match std::mem::replace(self, Self::None) {
             Self::None => Ok(Vec::new()),
-            Self::Gzip(encoder) => {
-                encoder
-                    .try_finish()
-                    .change_context(TrustedServerError::Proxy {
-                        message: "Failed to finalize gzip publisher body encoder".to_string(),
-                    })?;
-                Ok(std::mem::take(encoder.get_mut()))
-            }
-            Self::Deflate(encoder) => {
-                encoder
-                    .try_finish()
-                    .change_context(TrustedServerError::Proxy {
-                        message: "Failed to finalize deflate publisher body encoder".to_string(),
-                    })?;
-                Ok(std::mem::take(encoder.get_mut()))
-            }
-            Self::Brotli(encoder) => {
-                let encoder = std::mem::replace(encoder, Box::new(new_brotli_vec_encoder()));
-                Ok((*encoder).into_inner())
-            }
+            Self::Gzip(encoder) => encoder.finish().change_context(TrustedServerError::Proxy {
+                message: "Failed to finalize gzip publisher body encoder".to_string(),
+            }),
+            Self::Deflate(encoder) => encoder.finish().change_context(TrustedServerError::Proxy {
+                message: "Failed to finalize deflate publisher body encoder".to_string(),
+            }),
+            Self::Brotli(encoder) => Ok((*encoder).into_inner()),
         }
     }
 }
@@ -544,6 +623,86 @@ impl BodyStreamEncoder {
 mod tests {
     use super::*;
     use crate::streaming_replacer::{Replacement, StreamingReplacer};
+
+    #[test]
+    fn body_stream_decoder_enforces_cumulative_decoded_cap() {
+        let compressed = {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder
+                .write_all(&vec![b'a'; 64 * 1024])
+                .expect("should write gzip test input");
+            encoder.finish().expect("should finish gzip encoding")
+        };
+        assert!(
+            compressed.len() < 1024,
+            "test precondition: compressed input must stay small"
+        );
+        let mut decoder = BodyStreamDecoder::new(Compression::Gzip, 1024);
+
+        let err = decoder
+            .decode_chunk(bytes::Bytes::from(compressed))
+            .expect_err("decoded expansion past the cap must fail");
+
+        assert!(
+            format!("{err:?}").contains("decoded size exceeded"),
+            "should report the cumulative decoded cap: {err:?}"
+        );
+    }
+
+    #[test]
+    fn body_stream_decoder_rejects_truncated_deflate_stream() {
+        let compressed = {
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder
+                .write_all(b"deflate payload that spans more than one deflate block boundary")
+                .expect("should write deflate test input");
+            encoder.finish().expect("should finish deflate encoding")
+        };
+        let truncated = &compressed[..compressed.len() / 2];
+        let mut decoder = BodyStreamDecoder::new(Compression::Deflate, usize::MAX);
+        decoder
+            .decode_chunk(bytes::Bytes::copy_from_slice(truncated))
+            .expect("partial deflate input should decode incrementally");
+
+        let err = decoder
+            .finish()
+            .expect_err("truncated deflate stream must fail at finalization");
+
+        assert!(
+            format!("{err:?}").contains("truncated stream"),
+            "should report the missing deflate end marker: {err:?}"
+        );
+    }
+
+    #[test]
+    fn body_stream_decoder_ignores_deflate_trailing_bytes() {
+        let compressed = {
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder
+                .write_all(b"deflate payload")
+                .expect("should write deflate test input");
+            encoder.finish().expect("should finish deflate encoding")
+        };
+        let mut with_trailing = compressed;
+        with_trailing.extend_from_slice(b"junk");
+        let mut decoder = BodyStreamDecoder::new(Compression::Deflate, usize::MAX);
+
+        let decoded = decoder
+            .decode_chunk(bytes::Bytes::from(with_trailing))
+            .expect("complete deflate stream should decode");
+        decoder
+            .finish()
+            .expect("trailing bytes after the end marker should be ignored");
+
+        assert_eq!(
+            decoded.as_ref(),
+            b"deflate payload",
+            "should decode the payload and drop trailing junk"
+        );
+    }
 
     /// Verify that `lol_html` fragments text nodes when input chunks split
     /// mid-text-node. Script rewriters must be fragment-safe — they accumulate

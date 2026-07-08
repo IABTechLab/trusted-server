@@ -51,11 +51,14 @@ pub struct Publisher {
     /// Defaults to 16 MiB — a conservative cap that prevents Wasm-heap OOM.
     ///
     /// Fastly origin bodies are preserved as streams on the publisher path, so
-    /// this setting is also the cumulative raw-byte cap while the streaming
-    /// processor decodes and rewrites chunks. Buffered adapters keep using it
-    /// as the post-rewrite output buffer cap. On the streaming path headers
-    /// are already committed when the cap trips, so the response is truncated
-    /// mid-body (with the error logged) rather than replaced with a 5xx.
+    /// this setting also caps the streaming pipeline twice over: cumulative
+    /// raw (still compressed) bytes pulled from origin, and cumulative decoded
+    /// bytes emitted by the decompressor — the latter so a decompression bomb
+    /// cannot push an unbounded decoded volume through the rewrite pipeline.
+    /// Buffered adapters keep using it as the post-rewrite output buffer cap.
+    /// On the streaming path headers are already committed when either cap
+    /// trips, so the response is truncated mid-body (with the error logged)
+    /// rather than replaced with a 5xx.
     ///
     /// Must be at least 1: a zero-byte cap fails every non-empty buffered
     /// publisher response at request time, so it is rejected at config

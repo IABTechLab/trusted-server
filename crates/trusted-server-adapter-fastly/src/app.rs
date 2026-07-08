@@ -2150,6 +2150,10 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl PlatformHttpClient for StreamingHttpClient {
+        fn supports_streaming_responses(&self) -> bool {
+            true
+        }
+
         async fn send(
             &self,
             request: PlatformHttpRequest,
@@ -2257,6 +2261,36 @@ mod tests {
         assert!(
             matches!(response.body(), Body::Stream(_)),
             "EdgeZero asset dispatch must stream the origin body, not buffer it"
+        );
+    }
+
+    #[test]
+    fn dispatch_fallback_streams_publisher_body_without_buffering() {
+        // Regression guard for the publisher streaming cutover (#849): a
+        // successful publisher origin fetch must hand `edgezero_main` a lazy
+        // streaming body (`Body::Stream`) so headers commit at origin first
+        // byte, rather than draining the processed page into a buffered
+        // `Body::Once`. Core tests cover the rewrite pipeline itself; this
+        // guards the adapter wiring that could silently re-buffer.
+        let settings = test_settings();
+        let state = build_state_from_settings(settings).expect("should build state");
+        let services = streaming_runtime_services();
+        let req = empty_request(Method::GET, "/article");
+
+        let response = block_on(super::dispatch_fallback(&state, &services, req));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "publisher proxy should succeed against the streaming origin stub"
+        );
+        assert!(
+            matches!(response.body(), Body::Stream(_)),
+            "EdgeZero publisher dispatch must attach the lazy streaming body, not buffer it"
+        );
+        assert!(
+            !response.headers().contains_key(header::CONTENT_LENGTH),
+            "processed streaming publisher responses must not carry a stale Content-Length"
         );
     }
 
