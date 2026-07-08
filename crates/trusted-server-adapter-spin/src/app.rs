@@ -10,6 +10,7 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::sanitize_forwarded_headers;
@@ -637,7 +638,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // Dynamic tsjs serving is GET-only; other methods fall through to the
             // integration/publisher fallback.
             let result = if method == Method::GET && path.starts_with("/static/tsjs=") {
-                handle_tsjs_dynamic(&req, &state.registry)
+                handle_tsjs_dynamic(&req, &state.registry, EdgeCacheHeader::SMaxageFallback)
             } else if state.registry.has_route(&method, &path) {
                 let mut ec_context = EcContext::default();
                 state
@@ -671,6 +672,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     &mut ec_context,
                     auction,
                     req,
+                    EdgeCacheHeader::SMaxageFallback,
                 )
                 .await
                 {

@@ -11,6 +11,9 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use web_time::{SystemTime, UNIX_EPOCH};
 
+use crate::cache_policy::{
+    apply_no_store_private_to_headers, CachePolicy, EdgeCacheHeader, NO_STORE_PRIVATE_CACHE_CONTROL,
+};
 use crate::constants::{
     HEADER_ACCEPT, HEADER_ACCEPT_ENCODING, HEADER_ACCEPT_LANGUAGE, HEADER_REFERER,
     HEADER_USER_AGENT, HEADER_X_FORWARDED_FOR,
@@ -94,7 +97,7 @@ const ASSET_PROXY_STRIP_RESPONSE_HEADERS: [&str; 3] =
     ["set-cookie", "strict-transport-security", "clear-site-data"];
 
 /// Cache-control value used when asset proxy responses must not be stored.
-pub const ASSET_NO_STORE_PRIVATE_CACHE_CONTROL: &str = "no-store, private";
+pub const ASSET_NO_STORE_PRIVATE_CACHE_CONTROL: &str = NO_STORE_PRIVATE_CACHE_CONTROL;
 
 /// Cache policy metadata emitted by the asset proxy handler.
 ///
@@ -107,13 +110,23 @@ pub enum AssetProxyCachePolicy {
     OriginControlled,
     /// Reapply `Cache-Control: no-store, private` after standard finalization.
     NoStorePrivate,
+    /// Reapply an operator-selected normalized cache policy after finalization.
+    Normalized(CachePolicy),
 }
 
 impl AssetProxyCachePolicy {
     /// Apply protected cache headers after route-level response finalization.
-    pub fn apply_after_route_finalization(self, response: &mut Response<EdgeBody>) {
-        if self == Self::NoStorePrivate {
-            apply_no_store_cache_control(response);
+    pub fn apply_after_route_finalization(
+        self,
+        response: &mut Response<EdgeBody>,
+        edge_header: EdgeCacheHeader,
+    ) {
+        match self {
+            Self::OriginControlled => {}
+            Self::NoStorePrivate => apply_no_store_cache_control(response),
+            Self::Normalized(policy) => {
+                policy.apply_to_headers(response.headers_mut(), edge_header)
+            }
         }
     }
 }
@@ -165,6 +178,11 @@ impl AssetProxyResponse {
     fn apply_no_store_private_policy(&mut self) {
         self.cache_policy = AssetProxyCachePolicy::NoStorePrivate;
         apply_no_store_cache_control(&mut self.response);
+    }
+
+    fn apply_normalized_cache_policy(&mut self, policy: CachePolicy) {
+        self.cache_policy = AssetProxyCachePolicy::Normalized(policy);
+        policy.apply_to_headers(self.response.headers_mut(), EdgeCacheHeader::None);
     }
 
     /// Return cache policy metadata for router finalization.
@@ -968,10 +986,7 @@ fn strip_asset_proxy_response_headers(response: &mut Response<EdgeBody>) {
 }
 
 fn apply_no_store_cache_control(response: &mut Response<EdgeBody>) {
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static(ASSET_NO_STORE_PRIVATE_CACHE_CONTROL),
-    );
+    apply_no_store_private_to_headers(response.headers_mut());
 }
 
 fn should_preflight_s3(
@@ -1152,6 +1167,13 @@ pub async fn handle_asset_proxy_request(
 
     let mut response = platform_response_to_fastly_asset(platform_resp);
     strip_asset_proxy_response_headers(response.response_mut());
+
+    let status = response.response().status();
+    if status.is_success() || status == StatusCode::NOT_MODIFIED {
+        if let Some(policy) = settings.asset_cache_policy_for_path(incoming_path)? {
+            response.apply_normalized_cache_policy(policy);
+        }
+    }
 
     Ok(response)
 }
@@ -2025,6 +2047,7 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::io;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use super::{
         AssetProxyCachePolicy, IMAGE_FALLBACK_CONTENT_TYPE, ProxyRequestConfig,
@@ -2035,6 +2058,7 @@ mod tests {
         proxy_request, rebuild_response_with_body, reconstruct_and_validate_signed_target,
         redirect_is_permitted, stream_asset_body,
     };
+    use crate::cache_policy::{CachePolicy, EdgeCacheHeader};
     use crate::constants::{HEADER_ACCEPT, HEADER_X_FORWARDED_FOR};
     use crate::creative;
     use crate::error::{IntoHttpResponse, TrustedServerError};
@@ -2049,9 +2073,9 @@ mod tests {
     use crate::settings::{
         AssetImageOptimizerConfig, AssetOriginAuth, ImageOptimizerAspectRatioConfig,
         ImageOptimizerCropOffsetsConfig, ImageOptimizerProfileSet, ImageOptimizerSettings,
-        OriginQueryPolicy, ProxyAssetRoute, S3SigV4AuthConfig, UnknownProfilePolicy,
+        OriginQueryPolicy, ProxyAssetRoute, S3SigV4AuthConfig, Settings, UnknownProfilePolicy,
     };
-    use crate::test_support::tests::create_test_settings;
+    use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
     use bytes::Bytes;
     use edgezero_core::body::Body as EdgeBody;
     use edgezero_core::http::response_builder as edge_response_builder;
@@ -3722,6 +3746,130 @@ mod tests {
                 response_header(&response, header::ETAG),
                 Some("\"asset-etag\""),
                 "should preserve safe cache validator headers on asset responses"
+            );
+        });
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_applies_configured_normalized_cache_policy() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                200,
+                b"asset".to_vec(),
+                vec![(header::CACHE_CONTROL.as_str(), "no-store")],
+            );
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let settings = Settings::from_toml(&format!(
+                r#"{}
+
+                [[cache.asset_rules]]
+                id = "fingerprinted-assets"
+                enabled = true
+                path_globs = ["/assets/**/*.js"]
+                requires_hash_in_filename = true
+                visibility = "public"
+                browser_ttl_seconds = 31536000
+                edge_ttl_seconds = 31536000
+                immutable = true
+            "#,
+                crate_test_settings_str()
+            ))
+            .expect("should parse settings with cache asset rule");
+            let req = build_http_request(
+                Method::GET,
+                "https://www.example.com/assets/app.0123abcd.js",
+            );
+            let route = ProxyAssetRoute::new("/assets/", "https://assets.example.com");
+
+            let asset_response = handle_asset_proxy_request(&settings, &services, req, &route)
+                .await
+                .expect("should proxy asset request");
+            assert_eq!(
+                asset_response.cache_policy(),
+                AssetProxyCachePolicy::Normalized(CachePolicy::public_immutable(
+                    Duration::from_secs(31_536_000)
+                )),
+                "should carry normalized cache policy metadata"
+            );
+
+            let mut response = asset_response
+                .into_response()
+                .expect("should return buffered asset response");
+            assert_eq!(
+                response_header(&response, header::CACHE_CONTROL),
+                Some("public, max-age=31536000, immutable"),
+                "core response should apply browser cache policy immediately"
+            );
+            assert!(
+                response.headers().get("surrogate-control").is_none(),
+                "runtime-specific edge header should wait for adapter finalization"
+            );
+
+            AssetProxyCachePolicy::Normalized(CachePolicy::public_immutable(Duration::from_secs(
+                31_536_000,
+            )))
+            .apply_after_route_finalization(&mut response, EdgeCacheHeader::SurrogateControl);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("surrogate-control")
+                    .and_then(|value| value.to_str().ok()),
+                Some("max-age=31536000"),
+                "Fastly finalization should render Surrogate-Control"
+            );
+        });
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_leaves_non_matching_assets_origin_controlled() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                200,
+                b"asset".to_vec(),
+                vec![(header::CACHE_CONTROL.as_str(), "public, max-age=60")],
+            );
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let settings = Settings::from_toml(&format!(
+                r#"{}
+
+                [[cache.asset_rules]]
+                id = "fingerprinted-assets"
+                enabled = true
+                path_globs = ["/assets/**/*.js"]
+                requires_hash_in_filename = true
+                visibility = "public"
+                browser_ttl_seconds = 31536000
+                edge_ttl_seconds = 31536000
+                immutable = true
+            "#,
+                crate_test_settings_str()
+            ))
+            .expect("should parse settings with cache asset rule");
+            let req = build_http_request(Method::GET, "https://www.example.com/assets/app.js");
+            let route = ProxyAssetRoute::new("/assets/", "https://assets.example.com");
+
+            let asset_response = handle_asset_proxy_request(&settings, &services, req, &route)
+                .await
+                .expect("should proxy asset request");
+
+            assert_eq!(
+                asset_response.cache_policy(),
+                AssetProxyCachePolicy::OriginControlled,
+                "non-fingerprinted file should not receive normalized immutable policy"
+            );
+            let response = asset_response
+                .into_response()
+                .expect("should return buffered asset response");
+            assert_eq!(
+                response_header(&response, header::CACHE_CONTROL),
+                Some("public, max-age=60"),
+                "origin-controlled response should preserve origin cache header"
             );
         });
     }
