@@ -373,8 +373,8 @@ This is why mediation is important when using APS: without a mediator, APS bids 
 ```toml
 [integrations.aps]
 enabled = true
-pub_id = "5128"
-endpoint = "https://aax.amazon-adsystem.com/e/dtb/bid"
+pub_id = "example-publisher"
+endpoint = "https://aps.example.com/e/dtb/bid"
 timeout_ms = 800
 ```
 
@@ -593,8 +593,8 @@ debug = false
 
 [integrations.aps]
 enabled = true
-pub_id = "5128"
-endpoint = "https://aax.amazon-adsystem.com/e/dtb/bid"
+pub_id = "example-publisher"
+endpoint = "https://aps.example.com/e/dtb/bid"
 timeout_ms = 800
 
 [integrations.adserver_mock]
@@ -629,12 +629,12 @@ price_floor = 0.50
 
 #### `[integrations.aps]`
 
-| Field        | Type   | Default                                     | Description                 |
-| ------------ | ------ | ------------------------------------------- | --------------------------- |
-| `enabled`    | bool   | `false`                                     | Enable APS provider         |
-| `pub_id`     | string | —                                           | APS publisher ID (required) |
-| `endpoint`   | string | `https://aax.amazon-adsystem.com/e/dtb/bid` | APS TAM endpoint            |
-| `timeout_ms` | u32    | `800`                                       | Request timeout             |
+| Field        | Type   | Default                             | Description                 |
+| ------------ | ------ | ----------------------------------- | --------------------------- |
+| `enabled`    | bool   | `false`                             | Enable APS provider         |
+| `pub_id`     | string | —                                   | APS publisher ID (required) |
+| `endpoint`   | string | `https://aps.example.com/e/dtb/bid` | APS TAM endpoint            |
+| `timeout_ms` | u32    | `800`                               | Request timeout             |
 
 #### `[integrations.adserver_mock]`
 

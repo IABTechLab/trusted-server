@@ -18,6 +18,7 @@
 
 # EdgeZero local KV store (created by edgezero-adapter-axum framework)
 .edgezero/
+/dist/prebid/
 
 # env
 .env*
@@ -53,3 +54,8 @@ src/*.html
 /crates/trusted-server-integration-tests/browser/test-results/
 /crates/trusted-server-integration-tests/browser/playwright-report/
 /crates/trusted-server-integration-tests/browser/.browser-test-state.json
+
+# Defunct pre-rename crate dirs (renamed to crates/trusted-server-*); ignore the
+# leftover local build artifacts (node_modules, target, dist) that remain on disk.
+/crates/js/
+/crates/integration-tests/

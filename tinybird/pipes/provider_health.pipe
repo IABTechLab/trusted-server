@@ -1,0 +1,46 @@
+DESCRIPTION >
+  Published provider no-bid/error/abandonment endpoint for Grafana.
+
+NODE endpoint
+SQL >
+  SELECT
+    minute,
+    publisher_domain,
+    auction_source,
+    provider,
+    provider_role,
+    requests,
+    successes,
+    nobids,
+    errors,
+    timeouts,
+    abandonments,
+    parsed_bids,
+    if(requests = 0, 0, toFloat64(nobids) / requests) AS nobid_rate,
+    if(requests = 0, 0, toFloat64(errors + timeouts) / requests) AS error_rate,
+    if(requests = 0, 0, toFloat64(abandonments) / requests) AS abandonment_rate
+  FROM (
+    SELECT
+      minute,
+      publisher_domain,
+      auction_source,
+      provider,
+      provider_role,
+      countMerge(requests) AS requests,
+      sumMerge(successes) AS successes,
+      sumMerge(nobids) AS nobids,
+      sumMerge(errors) AS errors,
+      sumMerge(timeouts) AS timeouts,
+      sumMerge(abandonments) AS abandonments,
+      sumMerge(parsed_bids) AS parsed_bids
+    FROM auction_provider_stats_rollup
+    WHERE minute >= parseDateTimeBestEffort({{DateTime(start, '2026-01-01 00:00:00')}})
+      AND minute < parseDateTimeBestEffort({{DateTime(end, '2027-01-01 00:00:00')}})
+      AND ({{String(publisher, '')}} = '' OR publisher_domain = {{String(publisher, '')}})
+      AND ({{String(source, '')}} = '' OR auction_source = {{String(source, '')}})
+      AND ({{String(provider_filter, '')}} = '' OR provider = {{String(provider_filter, '')}})
+    GROUP BY minute, publisher_domain, auction_source, provider, provider_role
+  )
+  ORDER BY minute ASC
+
+TYPE endpoint

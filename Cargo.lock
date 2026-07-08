@@ -268,9 +268,9 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.17.0"
+version = "1.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ec2f1fc3ec205783a5da9a7e6c1509cc69dedf09a1949e412c1e18469326d00"
+checksum = "4342d8937fc7e5dd9b1c60292261c0670c882a2cd1719cfc11b1af41731e32ad"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -278,14 +278,15 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.41.0"
+version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a2f9779ce85b93ab6170dd940ad0169b5766ff848247aff13bb788b832fe3f4"
+checksum = "6d9ceb1da931507a12f4fccea479dccd00da1943e1b4ae72d8e502d707361444"
 dependencies = [
  "cc",
  "cmake",
  "dunce",
  "fs_extra",
+ "pkg-config",
 ]
 
 [[package]]
@@ -1397,7 +1398,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=worktree-state-nested-secrets-spec-review#d8f71a4a8e201abf685f40c7cbd4276614bc11ee"
+source = "git+https://github.com/stackpop/edgezero?branch=worktree-state-nested-secrets-spec-review#ff530286625b14fd61b7df75767d725d5c4d9a27"
 dependencies = [
  "toml",
 ]
@@ -1405,7 +1406,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-axum"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=worktree-state-nested-secrets-spec-review#d8f71a4a8e201abf685f40c7cbd4276614bc11ee"
+source = "git+https://github.com/stackpop/edgezero?branch=worktree-state-nested-secrets-spec-review#ff530286625b14fd61b7df75767d725d5c4d9a27"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1433,7 +1434,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-cloudflare"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=worktree-state-nested-secrets-spec-review#d8f71a4a8e201abf685f40c7cbd4276614bc11ee"
+source = "git+https://github.com/stackpop/edgezero?branch=worktree-state-nested-secrets-spec-review#ff530286625b14fd61b7df75767d725d5c4d9a27"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1456,7 +1457,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-fastly"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=worktree-state-nested-secrets-spec-review#d8f71a4a8e201abf685f40c7cbd4276614bc11ee"
+source = "git+https://github.com/stackpop/edgezero?branch=worktree-state-nested-secrets-spec-review#ff530286625b14fd61b7df75767d725d5c4d9a27"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1485,7 +1486,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-spin"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=worktree-state-nested-secrets-spec-review#d8f71a4a8e201abf685f40c7cbd4276614bc11ee"
+source = "git+https://github.com/stackpop/edgezero?branch=worktree-state-nested-secrets-spec-review#ff530286625b14fd61b7df75767d725d5c4d9a27"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1512,7 +1513,7 @@ dependencies = [
 [[package]]
 name = "edgezero-cli"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=worktree-state-nested-secrets-spec-review#d8f71a4a8e201abf685f40c7cbd4276614bc11ee"
+source = "git+https://github.com/stackpop/edgezero?branch=worktree-state-nested-secrets-spec-review#ff530286625b14fd61b7df75767d725d5c4d9a27"
 dependencies = [
  "chrono",
  "clap",
@@ -1537,7 +1538,7 @@ dependencies = [
 [[package]]
 name = "edgezero-core"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=worktree-state-nested-secrets-spec-review#d8f71a4a8e201abf685f40c7cbd4276614bc11ee"
+source = "git+https://github.com/stackpop/edgezero?branch=worktree-state-nested-secrets-spec-review#ff530286625b14fd61b7df75767d725d5c4d9a27"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -1568,7 +1569,7 @@ dependencies = [
 [[package]]
 name = "edgezero-macros"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=worktree-state-nested-secrets-spec-review#d8f71a4a8e201abf685f40c7cbd4276614bc11ee"
+source = "git+https://github.com/stackpop/edgezero?branch=worktree-state-nested-secrets-spec-review#ff530286625b14fd61b7df75767d725d5c4d9a27"
 dependencies = [
  "log",
  "proc-macro2",
@@ -2028,6 +2029,12 @@ dependencies = [
  "libc",
  "r-efi 6.0.0",
 ]
+
+[[package]]
+name = "glob"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "group"
@@ -4053,9 +4060,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-pki-types"
-version = "1.14.1"
+version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30a7197ae7eb376e574fe940d068c30fe0462554a3ddbe4eca7838e049c937a9"
+checksum = "764899a24af3980067ee14bc143654f297b22eaebfe3c7b6b211920a5a59b046"
 dependencies = [
  "web-time",
  "zeroize",
@@ -4812,9 +4819,9 @@ dependencies = [
 
 [[package]]
 name = "time"
-version = "0.3.51"
+version = "0.3.53"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85c17d80feb7334b40c484e45ed1a5273dfd8bfda537c3be2e74a06a6686f327"
+checksum = "18dfaaeddcb932337b5e7866ee7d0ce9b76d2fd092997146f187ec09b4558a50"
 dependencies = [
  "deranged",
  "libc",
@@ -4834,9 +4841,9 @@ checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
 
 [[package]]
 name = "time-macros"
-version = "0.2.30"
+version = "0.2.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dcef1a61bdb119096e153208ec5cbec23944ce8bca13be5c7f60c634f7403935"
+checksum = "c431b87111666e491a90baa837f914fb45cd5dc3c268591b0220ff5057f2085f"
 dependencies = [
  "num-conv",
  "time-core",
@@ -5252,11 +5259,13 @@ dependencies = [
  "rustls-pemfile",
  "scraper",
  "serde",
+ "serde_json",
  "tempfile",
  "time",
  "tokio",
  "tokio-rustls",
  "toml",
+ "toml_edit",
  "trusted-server-core",
  "url",
  "webpki-roots",
@@ -5284,6 +5293,7 @@ dependencies = [
  "flate2",
  "futures",
  "getrandom 0.2.17",
+ "glob",
  "hex",
  "hmac",
  "http",
@@ -5300,6 +5310,7 @@ dependencies = [
  "sha2 0.10.9",
  "subtle",
  "temp-env",
+ "tokio",
  "toml",
  "trusted-server-js",
  "trusted-server-openrtb",

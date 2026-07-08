@@ -93,7 +93,7 @@ secret_store_id = "01GYYY"
 
 [integrations.prebid]
 enabled = true
-server_url = "https://prebid-server.com/openrtb2/auction"
+server_url = "https://prebid-server.example.com/openrtb2/auction"
 timeout_ms = 1200
 bidders = ["kargo", "appnexus", "openx"]
 client_side_bidders = ["rubicon"]
@@ -1011,6 +1011,8 @@ apply when the integration section exists in `trusted-server.toml`.
 | `bid_param_overrides`      | Table         | `{}`                                                                   | Static per-bidder param overrides; normalized into the canonical override-rule engine and shallow-merged into bidder params                           |
 | `bid_param_zone_overrides` | Table         | `{}`                                                                   | Per-bidder, per-zone param overrides; normalized into the canonical override-rule engine and shallow-merged into bidder params                        |
 | `bid_param_override_rules` | Array[Table]  | `[]`                                                                   | Canonical ordered override rules with `when` matchers and `set` objects; evaluated after compatibility fields so later rules win on conflicts         |
+| `suppress_nurl`            | Boolean       | `false`                                                                | Strip `nurl` and `burl` from every PBS bid when the PBS deployment fires win/billing notifications server-side                                        |
+| `suppress_nurl_bidders`    | Array[String] | `[]`                                                                   | Bidder seats whose `nurl` and `burl` should be stripped while preserving client-side win/billing pixels for other bidders                             |
 | `debug`                    | Boolean       | `false`                                                                | Enable debug mode (sets `ext.prebid.debug` and `returnallbidstatus`; surfaces debug metadata in responses)                                            |
 | `test_mode`                | Boolean       | `false`                                                                | Set OpenRTB `test: 1` flag for non-billable test traffic (independent of `debug`)                                                                     |
 | `debug_query_params`       | String        | `None`                                                                 | Extra query params appended for debugging                                                                                                             |
@@ -1207,8 +1209,8 @@ timeout_ms = 2000
 
 [integrations.aps]
 enabled = true
-pub_id = "5128"
-endpoint = "https://aax.amazon-adsystem.com/e/dtb/bid"
+pub_id = "example-publisher"
+endpoint = "https://aps.example.com/e/dtb/bid"
 
 [integrations.prebid]
 enabled = true
@@ -1227,35 +1229,16 @@ TRUSTED_SERVER__AUCTION__TIMEOUT_MS=2000
 TRUSTED_SERVER__AUCTION__CREATIVE_STORE=creative_store
 ```
 
-## Runtime Feature Flags
+## Fastly Runtime Config Store
 
-Unlike the TOML/environment settings above (which are baked into the Wasm binary
-at build time), the EdgeZero entry point is toggled at **runtime** through a
-Fastly Config Store. This lets operators switch request handling without
-rebuilding or redeploying the binary.
+After the EdgeZero cutover, the Fastly adapter always dispatches through the
+EdgeZero entry point. The former `edgezero_enabled` and `edgezero_rollout_pct`
+canary keys are no longer read.
 
-### EdgeZero Canary Routing
-
-**Purpose**: Routes incoming requests through the EdgeZero entry point instead of
-the legacy entry point, with an optional percentage rollout.
-
-**Source**: Fastly Config Store, not `trusted-server.toml` or an environment
-variable.
-
-| Key                    | Value                                              | Behavior                                                                                 |
-| ---------------------- | -------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| `edgezero_enabled`     | `true` or `1` (whitespace-trimmed, any ASCII case) | Master switch. Any other value, missing key, or read error routes all traffic to legacy. |
-| `edgezero_rollout_pct` | Integer string `0` through `100`                   | Percentage of enabled traffic routed to EdgeZero by deterministic client-IP bucket.      |
-
-**Fallback behavior** (fail-safe to the legacy path):
-
-- If the `trusted_server_config` store cannot be opened, requests use the legacy
-  path.
-- If the `edgezero_enabled` key is missing or cannot be read, requests use the
-  legacy path.
-- Any value other than `true`/`1` keeps the legacy path.
-- If `edgezero_enabled=true` but `edgezero_rollout_pct` is missing, invalid, or
-  cannot be read, rollout defaults to `0` and requests use the legacy path.
+The Fastly service must still provide a `trusted_server_config` config store
+because the entry point opens it before dispatch and passes the handle to
+EdgeZero-backed platform services. The store may be empty unless another feature
+adds keys to it.
 
 **Local development** (`fastly.toml`):
 
@@ -1264,29 +1247,18 @@ variable.
   [local_server.config_stores.trusted_server_config]
     format = "inline-toml"
     [local_server.config_stores.trusted_server_config.contents]
-      edgezero_enabled = "true"
-      edgezero_rollout_pct = "0"
 ```
 
 **Production setup** (Fastly CLI):
 
 ```bash
-# Create the store (once) and attach it to the service, then set the keys.
+# Create the store once and attach it to the service.
 fastly config-store create --name trusted_server_config
-fastly config-store-entry create \
-  --store-id <STORE_ID> --key edgezero_enabled --value true
-fastly config-store-entry create \
-  --store-id <STORE_ID> --key edgezero_rollout_pct --value 0
 ```
 
-**Rollout**: With `edgezero_enabled=true`, increase `edgezero_rollout_pct`
-through staged values such as `1`, `10`, `50`, and `100`. Routing is sticky per
-client IP at a given percentage.
-
-**Rollback**: Set `edgezero_rollout_pct` to `0` to return enabled traffic to the
-legacy path immediately. Set `edgezero_enabled` to `false` (or delete the key) to
-disable the EdgeZero entry point entirely. Neither rollback requires a rebuild or
-redeploy.
+Rollback to the legacy entry point is no longer controlled by runtime config
+keys. Use the normal deployment rollback path to restore a pre-cleanup service
+version if that is required.
 
 ## Validation
 

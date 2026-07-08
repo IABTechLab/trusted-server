@@ -33,6 +33,25 @@ describe('core/index', () => {
     expect(typeof api.requestAds).toBe('function');
   });
 
+  it('defaults adSlots and bids so gated-off pages never see undefined', async () => {
+    await import('../../src/core/index');
+    const api = window.tsjs;
+    expect(api.adSlots).toEqual([]);
+    expect(api.bids).toEqual({});
+  });
+
+  it('preserves edge-injected adSlots and bids set before the bundle loads', async () => {
+    (window as any).tsjs = {
+      adSlots: [{ id: 'pre-injected' }],
+      bids: { 'pre-injected': { hb_pb: '1.00' } },
+    };
+
+    await import('../../src/core/index');
+
+    expect(window.tsjs.adSlots).toEqual([{ id: 'pre-injected' }]);
+    expect(window.tsjs.bids).toEqual({ 'pre-injected': { hb_pb: '1.00' } });
+  });
+
   it('flushes queued callbacks that existed before initialization', async () => {
     const callback = vi.fn(function () {
       expect(this).toBe(window.tsjs);

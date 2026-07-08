@@ -165,6 +165,154 @@ describe('GPT shim – patchCommandQueue', () => {
   });
 });
 
+describe('GPT – installSlimPrebidLoader', () => {
+  type SlimWindow = Window & { __tsjs_slim_prebid_url?: string };
+
+  afterEach(() => {
+    delete (window as SlimWindow).__tsjs_slim_prebid_url;
+  });
+
+  it('is a no-op when __tsjs_slim_prebid_url is not set', async () => {
+    const { installSlimPrebidLoader } = await import('../../../src/integrations/gpt/index');
+    const addEventListenerSpy = vi.spyOn(window, 'addEventListener');
+    installSlimPrebidLoader();
+    expect(addEventListenerSpy).not.toHaveBeenCalledWith('load', expect.any(Function));
+    addEventListenerSpy.mockRestore();
+  });
+
+  it('appends a deferred script tag when __tsjs_slim_prebid_url is set and load fires', async () => {
+    (window as SlimWindow).__tsjs_slim_prebid_url = 'https://cdn.example.com/slim-prebid.js';
+    const { installSlimPrebidLoader } = await import('../../../src/integrations/gpt/index');
+
+    installSlimPrebidLoader();
+
+    // Simulate the window load event.
+    window.dispatchEvent(new Event('load'));
+
+    const scripts = Array.from(document.querySelectorAll('script[defer]'));
+    const injected = scripts.find(
+      (s) => (s as HTMLScriptElement).src === 'https://cdn.example.com/slim-prebid.js'
+    );
+    expect(injected).toBeDefined();
+
+    // Clean up
+    injected?.parentNode?.removeChild(injected);
+  });
+
+  it('module init calls installSlimPrebidLoader — script injected when URL is preset', async () => {
+    vi.resetModules();
+    (window as SlimWindow).__tsjs_slim_prebid_url = 'https://cdn.example.com/slim-prebid-init.js';
+
+    await import('../../../src/integrations/gpt/index');
+    window.dispatchEvent(new Event('load'));
+
+    const scripts = Array.from(document.querySelectorAll('script[defer]'));
+    const injected = scripts.find(
+      (s) => (s as HTMLScriptElement).src === 'https://cdn.example.com/slim-prebid-init.js'
+    );
+    expect(injected).toBeDefined();
+
+    injected?.parentNode?.removeChild(injected);
+  });
+});
+
+describe('GPT – installTsAdInit', () => {
+  beforeEach(() => {
+    document.body.innerHTML = '';
+    delete (window as any).tsjs;
+    delete (window as any).googletag;
+  });
+
+  afterEach(() => {
+    document.body.innerHTML = '';
+    delete (window as any).tsjs;
+    delete (window as any).googletag;
+  });
+
+  it('clears stale TS-managed targeting before applying a new route to a reused GPT slot', async () => {
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    const slotTargeting = new Map<string, string[]>([
+      ['hb_pb', ['1.20']],
+      ['hb_bidder', ['kargo']],
+      ['hb_adid', ['old-ad']],
+      ['hb_cache_host', ['cache.example.com']],
+      ['hb_cache_path', ['/cache']],
+      ['ts_initial', ['1']],
+      ['pos', ['old-pos']],
+    ]);
+    const gptSlot: any = {
+      getSlotElementId: vi.fn(() => 'div-ad-homepage-header'),
+      getTargeting: vi.fn((key: string) => slotTargeting.get(key) ?? []),
+      setTargeting: vi.fn((key: string, value: string | string[]) => {
+        slotTargeting.set(key, Array.isArray(value) ? value : [value]);
+        return gptSlot;
+      }),
+      clearTargeting: vi.fn((key?: string) => {
+        if (key) {
+          slotTargeting.delete(key);
+        } else {
+          slotTargeting.clear();
+        }
+        return gptSlot;
+      }),
+    };
+    const pubads = {
+      getSlots: vi.fn(() => [gptSlot]),
+      enableSingleRequest: vi.fn(),
+      addEventListener: vi.fn(),
+      refresh: vi.fn(),
+    };
+    const cmd: Array<() => void> = [];
+    cmd.push = (...callbacks: Array<() => void>) => {
+      callbacks.forEach((callback) => callback());
+      return cmd.length;
+    };
+
+    document.body.innerHTML = '<div id="div-ad-homepage-header"></div>';
+    (window as any).googletag = {
+      cmd,
+      pubads: () => pubads,
+      defineSlot: vi.fn(),
+      destroySlots: vi.fn(),
+      enableServices: vi.fn(),
+    };
+    (window as any).tsjs = {
+      prevSlotTargetingKeys: {
+        'div-ad-homepage-header': ['pos'],
+      },
+      adSlots: [
+        {
+          id: 'homepage_header_ad',
+          gam_unit_path: '/123/homepage',
+          div_id: 'div-ad-homepage-header',
+          formats: [[728, 90]],
+          targeting: { zone: 'homepage' },
+        },
+      ],
+      bids: {},
+    };
+
+    installTsAdInit();
+    (window as any).tsjs.adInit();
+
+    expect(gptSlot.clearTargeting).toHaveBeenCalledWith('hb_pb');
+    expect(gptSlot.clearTargeting).toHaveBeenCalledWith('hb_bidder');
+    expect(gptSlot.clearTargeting).toHaveBeenCalledWith('hb_adid');
+    expect(gptSlot.clearTargeting).toHaveBeenCalledWith('hb_cache_host');
+    expect(gptSlot.clearTargeting).toHaveBeenCalledWith('hb_cache_path');
+    expect(gptSlot.clearTargeting).toHaveBeenCalledWith('ts_initial');
+    expect(gptSlot.clearTargeting).toHaveBeenCalledWith('pos');
+    expect(slotTargeting.get('hb_pb')).toBeUndefined();
+    expect(slotTargeting.get('hb_bidder')).toBeUndefined();
+    expect(slotTargeting.get('hb_adid')).toBeUndefined();
+    expect(slotTargeting.get('hb_cache_host')).toBeUndefined();
+    expect(slotTargeting.get('hb_cache_path')).toBeUndefined();
+    expect(slotTargeting.get('pos')).toBeUndefined();
+    expect(slotTargeting.get('zone')).toEqual(['homepage']);
+    expect(slotTargeting.get('ts_initial')).toEqual(['1']);
+  });
+});
+
 describe('GPT shim – runtime gating', () => {
   type GatedWindow = Window & {
     __tsjs_gpt_enabled?: boolean;
@@ -233,5 +381,37 @@ describe('GPT shim – runtime gating', () => {
     // module only registers `__tsjs_installGptShim`, it does not auto-init.
     expect(guard.isGuardInstalled()).toBe(false);
     expect(win.googletag).toBeUndefined();
+  });
+});
+
+describe('GPT debug ADM iframe hardening', () => {
+  it('sandbox token list omits allow-same-origin', async () => {
+    const mod = await import('../../../src/integrations/gpt/index');
+
+    expect(mod.ADM_IFRAME_SANDBOX).toContain('allow-scripts');
+    // allow-scripts + allow-same-origin on srcdoc content removes the
+    // sandbox's origin isolation — the pair must never be reintroduced.
+    expect(mod.ADM_IFRAME_SANDBOX).not.toContain('allow-same-origin');
+  });
+
+  it('safeAdmIframeSrc accepts http(s), relative, and protocol-relative URLs', async () => {
+    const { safeAdmIframeSrc } = await import('../../../src/integrations/gpt/index');
+
+    expect(safeAdmIframeSrc('https://ads.example.com/creative')).toBe(
+      'https://ads.example.com/creative'
+    );
+    expect(safeAdmIframeSrc('http://ads.example.com/creative')).toBe(
+      'http://ads.example.com/creative'
+    );
+    expect(safeAdmIframeSrc('//ads.example.com/creative')).toBe('https://ads.example.com/creative');
+    expect(safeAdmIframeSrc('/first-party/creative?sig=abc')).toBe('/first-party/creative?sig=abc');
+  });
+
+  it('safeAdmIframeSrc rejects script-executing and opaque schemes', async () => {
+    const { safeAdmIframeSrc } = await import('../../../src/integrations/gpt/index');
+
+    expect(safeAdmIframeSrc('javascript:alert(1)')).toBeUndefined();
+    expect(safeAdmIframeSrc('data:text/html,<script>alert(1)</script>')).toBeUndefined();
+    expect(safeAdmIframeSrc('blob:https://example.com/uuid')).toBeUndefined();
   });
 });

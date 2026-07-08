@@ -271,6 +271,25 @@ fn mappings_to_json(mappings: &[BatchMapping]) -> Vec<Value> {
 // Assertion helpers
 // ---------------------------------------------------------------------------
 
+/// Asserts the running Viceroy instance is serving the post-cutover `EdgeZero`
+/// entry point.
+///
+/// The `EdgeZero` router returns a router-level `405` for methods outside its
+/// registered set (e.g. `TRACE`). This canary catches stale binaries or broken
+/// fixtures that fail before reaching the router.
+pub fn assert_edgezero_entry_point(base_url: &str) -> TestResult<()> {
+    let client = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("should build EdgeZero canary client");
+    let response = client
+        .request(reqwest::Method::TRACE, format!("{base_url}/"))
+        .send()
+        .change_context(TestError::HttpRequest)
+        .attach("TRACE / (EdgeZero entry-point canary)")?;
+    assert_status(&response, 405).attach("EdgeZero canary: TRACE should return a router-level 405")
+}
+
 pub fn assert_status(resp: &Response, expected: u16) -> TestResult<()> {
     let actual = resp.status().as_u16();
     if actual != expected {

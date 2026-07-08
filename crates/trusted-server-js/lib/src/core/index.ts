@@ -29,6 +29,13 @@ api.setConfig = setConfig;
 api.getConfig = getConfig;
 // Provide core requestAds API
 api.requestAds = requestAds;
+// Defensive defaults: the edge injects adSlots (head-open) and bids (before
+// </body>) only when the server-side ad stack runs for the request. When it
+// is gated off (kill switch, consent fail-closed, bots, prefetch), page code
+// reading window.tsjs.bids / window.tsjs.adSlots must still see defined
+// values instead of throwing. Injected scripts overwrite these wholesale.
+api.adSlots ??= [];
+api.bids ??= {};
 // Point global tsjs
 w.tsjs = api;
 

@@ -62,6 +62,7 @@ import {
   getInjectedConfig,
   auctionBidsToPrebidBids,
   installPrebidNpm,
+  installRefreshHandler,
 } from '../../../src/integrations/prebid/index';
 import type { AuctionBid } from '../../../src/core/auction';
 
@@ -577,6 +578,35 @@ describe('prebid/installPrebidNpm', () => {
       expect(adUnits[0].bids.map((b: any) => b.bidder)).toEqual(['trustedServer']);
     });
 
+    it('preserves captured bidder params when requestBids runs twice on the same ad unit', () => {
+      const pbjs = installPrebidNpm();
+
+      // First auction: inline server-side params supplied by the publisher.
+      const adUnits = [
+        {
+          code: 'div-1',
+          bids: [
+            { bidder: 'appnexus', params: { placementId: 123 } },
+            { bidder: 'rubicon', params: { accountId: 'abc' } },
+          ],
+        },
+      ];
+      pbjs.requestBids({ adUnits } as any);
+
+      // Second auction (refresh/re-auction) with the SAME ad unit object: the
+      // server-side bidder entries were already pruned, so the shim must not
+      // overwrite the captured params with an empty object.
+      pbjs.requestBids({ adUnits } as any);
+
+      const trustedServerBid = adUnits[0].bids.find(
+        (b: any) => b.bidder === 'trustedServer'
+      ) as any;
+      expect(trustedServerBid.params.bidderParams).toEqual({
+        appnexus: { placementId: 123 },
+        rubicon: { accountId: 'abc' },
+      });
+    });
+
     it('adds bids array to ad units that have none', () => {
       const pbjs = installPrebidNpm();
 
@@ -762,6 +792,563 @@ describe('prebid/installPrebidNpm with server-injected config', () => {
 
     expect(mockSetConfig).toHaveBeenCalledWith(expect.objectContaining({ debug: false }));
     expect(mockProcessQueue).toHaveBeenCalled();
+  });
+});
+
+describe('prebid/installRefreshHandler', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockRequestBids.mockReset();
+    mockPbjs.requestBids = mockRequestBids;
+    mockPbjs.adUnits = [];
+    (window as any).tsjs = undefined;
+    delete (window as any).googletag;
+  });
+
+  afterEach(() => {
+    (window as any).tsjs = undefined;
+    delete (window as any).googletag;
+  });
+
+  it('builds refresh ad units from injected slot metadata', () => {
+    const originalRefresh = vi.fn();
+    const gptSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-homepage-header'),
+      getTargeting: vi.fn(() => []),
+    };
+    const pubads = {
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => [gptSlot]),
+    };
+    (window as any).googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    (window as any).tsjs = {
+      adSlots: [
+        {
+          id: 'homepage_header_ad',
+          gam_unit_path: '/123/homepage',
+          div_id: 'div-ad-homepage-header',
+          formats: [
+            [970, 250],
+            [728, 90],
+          ],
+          targeting: { zone: 'homepage', pos: 'atf' },
+        },
+      ],
+    };
+
+    installRefreshHandler(750);
+    pubads.refresh();
+
+    expect(mockRequestBids).toHaveBeenCalledWith(
+      expect.objectContaining({
+        timeout: 750,
+        adUnits: [
+          expect.objectContaining({
+            code: 'div-ad-homepage-header',
+            mediaTypes: {
+              banner: {
+                name: 'homepage',
+                sizes: [
+                  [970, 250],
+                  [728, 90],
+                ],
+              },
+            },
+            bids: [{ bidder: 'trustedServer', params: { zone: 'homepage' } }],
+          }),
+        ],
+      })
+    );
+  });
+
+  it('resolves the exact slot when div_ids share a prefix', () => {
+    // Regression: a single find() with a startsWith() clause returned the
+    // first slot whose div_id is a prefix of the element id. With div_ids
+    // "div-ad" and "div-ad-header", refreshing the "div-ad-header" element
+    // must resolve to the header slot, not the shorter prefix slot.
+    const originalRefresh = vi.fn();
+    const gptSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-header'),
+      getTargeting: vi.fn(() => []),
+    };
+    const pubads = {
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => [gptSlot]),
+    };
+    (window as any).googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    (window as any).tsjs = {
+      adSlots: [
+        {
+          id: 'prefix_ad',
+          gam_unit_path: '/123/prefix',
+          div_id: 'div-ad',
+          formats: [[300, 250]],
+          targeting: { zone: 'prefix' },
+        },
+        {
+          id: 'header_ad',
+          gam_unit_path: '/123/header',
+          div_id: 'div-ad-header',
+          formats: [[970, 250]],
+          targeting: { zone: 'header' },
+        },
+      ],
+    };
+
+    installRefreshHandler(750);
+    pubads.refresh();
+
+    expect(mockRequestBids).toHaveBeenCalledWith(
+      expect.objectContaining({
+        adUnits: [
+          expect.objectContaining({
+            code: 'div-ad-header',
+            mediaTypes: {
+              banner: {
+                name: 'header',
+                sizes: [[970, 250]],
+              },
+            },
+          }),
+        ],
+      })
+    );
+  });
+
+  it('scopes the GPT targeting call to the refreshed slot code', () => {
+    const setTargetingForGPTAsync = vi.fn();
+    (mockPbjs as any).setTargetingForGPTAsync = setTargetingForGPTAsync;
+    // Run the bidsBackHandler synchronously so the targeting call fires.
+    mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+      opts?.bidsBackHandler?.();
+    });
+    const originalRefresh = vi.fn();
+    // Only the header slot is refreshed; the footer slot must be untouched.
+    const headerSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-header'),
+      getTargeting: vi.fn(() => []),
+      clearTargeting: vi.fn().mockReturnThis(),
+    };
+    const pubads = {
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => [headerSlot]),
+    };
+    (window as any).googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    (window as any).tsjs = {
+      adSlots: [
+        {
+          id: 'header_ad',
+          gam_unit_path: '/123/header',
+          div_id: 'div-ad-header',
+          formats: [[728, 90]],
+          targeting: { zone: 'header' },
+        },
+        {
+          id: 'footer_ad',
+          gam_unit_path: '/123/footer',
+          div_id: 'div-ad-footer',
+          formats: [[728, 90]],
+          targeting: { zone: 'footer' },
+        },
+      ],
+    };
+
+    installRefreshHandler(750);
+    pubads.refresh([headerSlot]);
+
+    expect(setTargetingForGPTAsync).toHaveBeenCalledTimes(1);
+    expect(setTargetingForGPTAsync).toHaveBeenCalledWith(['div-ad-header']);
+    expect(originalRefresh).toHaveBeenCalledWith([headerSlot], undefined);
+
+    delete (mockPbjs as any).setTargetingForGPTAsync;
+  });
+
+  it('includes configured client-side bidders in refresh ad units', () => {
+    (window as any).__tsjs_prebid = { clientSideBidders: ['rubicon'] };
+    // Original publisher ad unit carries a client-side rubicon bid.
+    mockPbjs.adUnits = [
+      {
+        code: 'div-ad-homepage-header',
+        bids: [
+          { bidder: 'trustedServer', params: {} },
+          { bidder: 'rubicon', params: { accountId: 1, siteId: 2, zoneId: 3 } },
+        ],
+      },
+    ];
+    const originalRefresh = vi.fn();
+    const gptSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-homepage-header'),
+      getTargeting: vi.fn(() => []),
+    };
+    const pubads = {
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => [gptSlot]),
+    };
+    (window as any).googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    (window as any).tsjs = {
+      adSlots: [
+        {
+          id: 'homepage_header_ad',
+          gam_unit_path: '/123/homepage',
+          div_id: 'div-ad-homepage-header',
+          formats: [[728, 90]],
+          targeting: { zone: 'homepage' },
+        },
+      ],
+    };
+
+    installRefreshHandler(750);
+    pubads.refresh();
+
+    expect(mockRequestBids).toHaveBeenCalledWith(
+      expect.objectContaining({
+        adUnits: [
+          expect.objectContaining({
+            code: 'div-ad-homepage-header',
+            bids: [
+              { bidder: 'trustedServer', params: { zone: 'homepage' } },
+              { bidder: 'rubicon', params: { accountId: 1, siteId: 2, zoneId: 3 } },
+            ],
+          }),
+        ],
+      })
+    );
+
+    delete (window as any).__tsjs_prebid;
+    mockPbjs.adUnits = [];
+  });
+
+  it('preserves raw server-side bidder params in refresh ad units', () => {
+    // Original publisher ad unit carries an inline server-side appnexus bid that
+    // the initial auction has not yet folded into the trustedServer bid.
+    mockPbjs.adUnits = [
+      {
+        code: 'div-ad-homepage-header',
+        bids: [{ bidder: 'appnexus', params: { placementId: 12345 } }],
+      },
+    ];
+    const originalRefresh = vi.fn();
+    const gptSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-homepage-header'),
+      getTargeting: vi.fn(() => []),
+    };
+    const pubads = {
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => [gptSlot]),
+    };
+    (window as any).googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    (window as any).tsjs = {
+      adSlots: [
+        {
+          id: 'homepage_header_ad',
+          gam_unit_path: '/123/homepage',
+          div_id: 'div-ad-homepage-header',
+          formats: [[728, 90]],
+          targeting: { zone: 'homepage' },
+        },
+      ],
+    };
+
+    installRefreshHandler(750);
+    pubads.refresh();
+
+    expect(mockRequestBids).toHaveBeenCalledWith(
+      expect.objectContaining({
+        adUnits: [
+          expect.objectContaining({
+            code: 'div-ad-homepage-header',
+            bids: [
+              {
+                bidder: 'trustedServer',
+                params: {
+                  zone: 'homepage',
+                  bidderParams: { appnexus: { placementId: 12345 } },
+                },
+              },
+            ],
+          }),
+        ],
+      })
+    );
+
+    mockPbjs.adUnits = [];
+  });
+
+  it('recovers params and client-side bids for container-backed slots by injected div_id', () => {
+    // A TS-owned GPT slot may be defined on `${div_id}-container`, but the
+    // publisher's Prebid ad unit is keyed by the inner div_id. The synthetic
+    // refresh code stays the GPT element id (so GPT can match it), while params
+    // and client-side bids are recovered from the injected div_id candidate.
+    (window as any).__tsjs_prebid = { clientSideBidders: ['rubicon'] };
+    mockPbjs.adUnits = [
+      {
+        code: 'div-ad-x',
+        bids: [
+          { bidder: 'appnexus', params: { placementId: 12345 } },
+          { bidder: 'rubicon', params: { accountId: 1 } },
+        ],
+      },
+    ];
+    const originalRefresh = vi.fn();
+    const gptSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-x-container'),
+      getTargeting: vi.fn(() => []),
+    };
+    const pubads = {
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => [gptSlot]),
+    };
+    (window as any).googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    (window as any).tsjs = {
+      adSlots: [
+        {
+          id: 'x_ad',
+          gam_unit_path: '/123/x',
+          div_id: 'div-ad-x',
+          formats: [[728, 90]],
+          targeting: { zone: 'homepage' },
+        },
+      ],
+    };
+
+    installRefreshHandler(750);
+    pubads.refresh();
+
+    expect(mockRequestBids).toHaveBeenCalledWith(
+      expect.objectContaining({
+        adUnits: [
+          expect.objectContaining({
+            // Synthetic refresh code stays the GPT element id, not the div_id.
+            code: 'div-ad-x-container',
+            bids: [
+              {
+                bidder: 'trustedServer',
+                params: {
+                  zone: 'homepage',
+                  bidderParams: { appnexus: { placementId: 12345 } },
+                },
+              },
+              { bidder: 'rubicon', params: { accountId: 1 } },
+            ],
+          }),
+        ],
+      })
+    );
+
+    delete (window as any).__tsjs_prebid;
+    mockPbjs.adUnits = [];
+  });
+
+  it('recovers server-side bidder params already folded onto the original trustedServer bid', () => {
+    // After the initial auction, the requestBids shim has folded the publisher's
+    // server-side params into the original ad unit's trustedServer bid. A later
+    // refresh must still recover them by code.
+    mockPbjs.adUnits = [
+      {
+        code: 'div-ad-homepage-header',
+        bids: [
+          {
+            bidder: 'trustedServer',
+            params: { bidderParams: { appnexus: { placementId: 12345 } } },
+          },
+        ],
+      },
+    ];
+    const originalRefresh = vi.fn();
+    const gptSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-homepage-header'),
+      getTargeting: vi.fn(() => []),
+    };
+    const pubads = {
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => [gptSlot]),
+    };
+    (window as any).googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    (window as any).tsjs = {
+      adSlots: [
+        {
+          id: 'homepage_header_ad',
+          gam_unit_path: '/123/homepage',
+          div_id: 'div-ad-homepage-header',
+          formats: [[728, 90]],
+          targeting: { zone: 'homepage' },
+        },
+      ],
+    };
+
+    installRefreshHandler(750);
+    pubads.refresh();
+
+    expect(mockRequestBids).toHaveBeenCalledWith(
+      expect.objectContaining({
+        adUnits: [
+          expect.objectContaining({
+            code: 'div-ad-homepage-header',
+            bids: [
+              {
+                bidder: 'trustedServer',
+                params: {
+                  zone: 'homepage',
+                  bidderParams: { appnexus: { placementId: 12345 } },
+                },
+              },
+            ],
+          }),
+        ],
+      })
+    );
+
+    mockPbjs.adUnits = [];
+  });
+
+  it('auctions refreshed TS initial slots and clears stale TS targeting before refresh', () => {
+    const originalRefresh = vi.fn();
+    const clearTargeting = vi.fn();
+    const gptSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-homepage-header'),
+      getTargeting: vi.fn((key: string) => {
+        if (key === 'ts_initial') return ['1'];
+        if (key === 'zone') return ['homepage'];
+        return [];
+      }),
+      getSizes: vi.fn(() => [
+        { getWidth: () => 970, getHeight: () => 250 },
+        { getWidth: () => 728, getHeight: () => 90 },
+      ]),
+      clearTargeting,
+    };
+    const pubads = {
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => [gptSlot]),
+    };
+    const setTargetingForGPTAsync = vi.fn();
+    (mockPbjs as any).setTargetingForGPTAsync = setTargetingForGPTAsync;
+    (window as any).googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    (window as any).tsjs = {
+      adSlots: [
+        {
+          id: 'homepage_header_ad',
+          gam_unit_path: '/123/homepage',
+          div_id: 'div-ad-homepage-header',
+          formats: [
+            [970, 250],
+            [728, 90],
+          ],
+          targeting: { zone: 'homepage' },
+        },
+      ],
+    };
+
+    installRefreshHandler(750);
+    pubads.refresh([gptSlot]);
+
+    expect(mockRequestBids).toHaveBeenCalledWith(
+      expect.objectContaining({
+        timeout: 750,
+        adUnits: [
+          expect.objectContaining({
+            code: 'div-ad-homepage-header',
+            mediaTypes: {
+              banner: {
+                name: 'homepage',
+                sizes: [
+                  [970, 250],
+                  [728, 90],
+                ],
+              },
+            },
+            bids: [{ bidder: 'trustedServer', params: { zone: 'homepage' } }],
+          }),
+        ],
+      })
+    );
+    expect(clearTargeting).toHaveBeenCalledWith('ts_initial');
+    expect(clearTargeting).toHaveBeenCalledWith('hb_pb');
+    expect(clearTargeting).toHaveBeenCalledWith('hb_bidder');
+    expect(clearTargeting).toHaveBeenCalledWith('hb_adid');
+    expect(clearTargeting).toHaveBeenCalledWith('hb_cache_host');
+    expect(clearTargeting).toHaveBeenCalledWith('hb_cache_path');
+    expect(originalRefresh).not.toHaveBeenCalled();
+
+    const bidsBackHandler = mockRequestBids.mock.calls[0][0].bidsBackHandler;
+    bidsBackHandler();
+
+    expect(setTargetingForGPTAsync).toHaveBeenCalled();
+    expect(originalRefresh).toHaveBeenCalledWith([gptSlot], undefined);
+  });
+
+  it('passes the adInit internal refresh straight to GPT without a client-side auction', () => {
+    const originalRefresh = vi.fn();
+    const clearTargeting = vi.fn();
+    const gptSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-homepage-header'),
+      getTargeting: vi.fn(() => []),
+      clearTargeting,
+    };
+    const pubads = {
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => [gptSlot]),
+    };
+    (window as any).googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    (window as any).tsjs = { adInitRefreshInProgress: true };
+
+    installRefreshHandler(750);
+    pubads.refresh([gptSlot]);
+
+    expect(mockRequestBids).not.toHaveBeenCalled();
+    expect(clearTargeting).not.toHaveBeenCalled();
+    expect(originalRefresh).toHaveBeenCalledWith([gptSlot], undefined);
+  });
+
+  it('runs a client-side auction for publisher refreshes after adInit completes', () => {
+    const originalRefresh = vi.fn();
+    const gptSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-homepage-header'),
+      getTargeting: vi.fn(() => []),
+      clearTargeting: vi.fn(),
+    };
+    const pubads = {
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => [gptSlot]),
+    };
+    (window as any).googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    (window as any).tsjs = { adInitRefreshInProgress: false };
+
+    installRefreshHandler(750);
+    pubads.refresh([gptSlot]);
+
+    expect(mockRequestBids).toHaveBeenCalled();
+    expect(originalRefresh).not.toHaveBeenCalled();
   });
 });
 
@@ -970,5 +1557,49 @@ describe('prebid/client-side bidders', () => {
     expect(hasAdapterError).toBe(false);
 
     errorSpy.mockRestore();
+  });
+});
+
+describe('prebid self-init user ID module timing', () => {
+  const userSyncCallCount = () =>
+    mockSetConfig.mock.calls.filter(([arg]) => arg && typeof arg === 'object' && 'userSync' in arg)
+      .length;
+
+  const setReadyState = (value: DocumentReadyState) => {
+    Object.defineProperty(document, 'readyState', { value, configurable: true });
+  };
+
+  beforeEach(() => {
+    vi.resetModules();
+    mockSetConfig.mockClear();
+  });
+
+  afterEach(() => {
+    setReadyState('complete');
+  });
+
+  it('installs user ID modules immediately when the bundle loads after window load', async () => {
+    // The GPT slim loader appends this bundle from a window.load handler, so
+    // the document is already complete — a load listener would never fire.
+    setReadyState('complete');
+
+    await import('../../../src/integrations/prebid/index');
+
+    expect(userSyncCallCount()).toBeGreaterThan(0);
+  });
+
+  it('defers user ID modules to window load when the document is still loading', async () => {
+    setReadyState('loading');
+
+    await import('../../../src/integrations/prebid/index');
+
+    expect(userSyncCallCount()).toBe(0);
+
+    window.dispatchEvent(new Event('load'));
+    expect(userSyncCallCount()).toBe(1);
+
+    // { once: true } — a second load event must not reinstall.
+    window.dispatchEvent(new Event('load'));
+    expect(userSyncCallCount()).toBe(1);
   });
 });

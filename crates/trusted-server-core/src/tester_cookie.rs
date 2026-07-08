@@ -2,7 +2,9 @@
 //!
 //! The tester routes are intentionally disabled unless configured. When enabled,
 //! they set or clear a first-party `ts-tester` cookie scoped to the configured
-//! publisher cookie domain.
+//! publisher cookie domain. They are self-service routes rather than admin
+//! routes; the cookie only affects tester routing and must not gate sensitive
+//! behavior.
 
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};

@@ -19,6 +19,7 @@ pub mod endpoints;
 pub mod formats;
 pub mod orchestrator;
 pub mod provider;
+pub mod telemetry;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod types;
@@ -27,6 +28,11 @@ pub use config::AuctionConfig;
 pub use context::{build_url_with_context_params, ContextQueryParams, ContextValue};
 pub use orchestrator::AuctionOrchestrator;
 pub use provider::AuctionProvider;
+pub use telemetry::{
+    build_auction_events, emit_auction_events_best_effort, emit_auction_events_best_effort_lazy,
+    AbandonedProviderCall, AuctionEventBatch, AuctionEventRow, AuctionObservationContext,
+    AuctionSource, AuctionTelemetrySink, AuctionTerminalOutcome, NoopAuctionTelemetrySink,
+};
 pub use types::{
     AdFormat, AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus, MediaType,
 };
@@ -92,8 +98,10 @@ mod tests {
 
     fn settings_with_auction_config(auction_config: &str) -> Settings {
         let settings_str = format!("{}\n{auction_config}", crate_test_settings_str());
-        Settings::from_toml(&settings_str)
-            .expect("should parse auction provider validation test settings")
+        let mut settings = Settings::from_toml(&settings_str)
+            .expect("should parse auction provider validation test settings");
+        settings.proxy.allowed_domains = vec!["*.example".to_string(), "*.example.com".to_string()];
+        settings
     }
 
     fn assert_orchestrator_error_contains(settings: &Settings, expected: &str) {

@@ -152,6 +152,7 @@ fn integration_backend_spec(
         host_header_override: None,
         certificate_check,
         first_byte_timeout,
+        between_bytes_timeout: first_byte_timeout,
     })
 }
 
@@ -273,21 +274,64 @@ pub(crate) async fn collect_response_bounded(
     }
 }
 
-type IntegrationBuilder =
+type IntegrationBuilderFn =
     fn(&Settings) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>>;
+
+pub(crate) struct IntegrationBuilder {
+    id: &'static str,
+    build: IntegrationBuilderFn,
+}
 
 pub(crate) fn builders() -> &'static [IntegrationBuilder] {
     &[
-        prebid::register,
-        testlight::register,
-        nextjs::register,
-        permutive::register,
-        lockr::register,
-        didomi::register,
-        sourcepoint::register,
-        osano::register,
-        google_tag_manager::register,
-        datadome::register,
-        gpt::register,
+        IntegrationBuilder {
+            id: "prebid",
+            build: prebid::register,
+        },
+        IntegrationBuilder {
+            id: "testlight",
+            build: testlight::register,
+        },
+        IntegrationBuilder {
+            id: "nextjs",
+            build: nextjs::register,
+        },
+        IntegrationBuilder {
+            id: "permutive",
+            build: permutive::register,
+        },
+        IntegrationBuilder {
+            id: "lockr",
+            build: lockr::register,
+        },
+        IntegrationBuilder {
+            id: "didomi",
+            build: didomi::register,
+        },
+        IntegrationBuilder {
+            id: "sourcepoint",
+            build: sourcepoint::register,
+        },
+        IntegrationBuilder {
+            id: "osano",
+            build: osano::register,
+        },
+        IntegrationBuilder {
+            id: "google_tag_manager",
+            build: google_tag_manager::register,
+        },
+        IntegrationBuilder {
+            id: "datadome",
+            build: datadome::register,
+        },
+        IntegrationBuilder {
+            id: "gpt",
+            build: gpt::register,
+        },
     ]
+}
+
+#[cfg(test)]
+pub(crate) fn registered_builder_ids() -> impl Iterator<Item = &'static str> {
+    builders().iter().map(|builder| builder.id)
 }

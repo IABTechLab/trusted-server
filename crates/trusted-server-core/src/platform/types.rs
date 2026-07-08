@@ -3,6 +3,8 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::auction::telemetry::{AuctionTelemetrySink, NoopAuctionTelemetrySink};
+
 use super::{
     PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformHttpClient, PlatformKvStore,
     PlatformSecretStore,
@@ -139,6 +141,8 @@ pub struct PlatformBackendSpec {
     pub certificate_check: bool,
     /// Maximum time to wait for the first response byte.
     pub first_byte_timeout: Duration,
+    /// Maximum time to wait between response body bytes.
+    pub between_bytes_timeout: Duration,
 }
 
 /// Cloneable container of platform services for a single request.
@@ -160,6 +164,8 @@ pub struct RuntimeServices {
     pub(crate) http_client: Arc<dyn PlatformHttpClient>,
     /// Geographic information lookup.
     pub(crate) geo: Arc<dyn PlatformGeo>,
+    /// Auction telemetry sink.
+    pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
     /// Per-request client metadata extracted at the entry point.
     pub(crate) client_info: ClientInfo,
 }
@@ -225,6 +231,12 @@ impl RuntimeServices {
         &*self.geo
     }
 
+    /// Returns the auction telemetry sink.
+    #[must_use]
+    pub fn auction_telemetry_sink(&self) -> &dyn AuctionTelemetrySink {
+        &*self.auction_telemetry_sink
+    }
+
     /// Returns per-request client metadata (IP address, TLS details).
     #[must_use]
     pub fn client_info(&self) -> &ClientInfo {
@@ -271,6 +283,7 @@ pub struct RuntimeServicesBuilder {
     backend: Option<Arc<dyn PlatformBackend>>,
     http_client: Option<Arc<dyn PlatformHttpClient>>,
     geo: Option<Arc<dyn PlatformGeo>>,
+    auction_telemetry_sink: Option<Arc<dyn AuctionTelemetrySink>>,
     client_info: Option<ClientInfo>,
 }
 
@@ -283,6 +296,7 @@ impl RuntimeServicesBuilder {
             backend: None,
             http_client: None,
             geo: None,
+            auction_telemetry_sink: None,
             client_info: None,
         }
     }
@@ -329,6 +343,16 @@ impl RuntimeServicesBuilder {
         self
     }
 
+    /// Set the auction telemetry sink.
+    #[must_use]
+    pub fn auction_telemetry_sink(
+        mut self,
+        auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
+    ) -> Self {
+        self.auction_telemetry_sink = Some(auction_telemetry_sink);
+        self
+    }
+
     /// Set the per-request client metadata.
     #[must_use]
     pub fn client_info(mut self, client_info: ClientInfo) -> Self {
@@ -362,6 +386,9 @@ impl RuntimeServicesBuilder {
             geo: self
                 .geo
                 .expect("should set geo before building RuntimeServices"),
+            auction_telemetry_sink: self
+                .auction_telemetry_sink
+                .unwrap_or_else(|| Arc::new(NoopAuctionTelemetrySink)),
             client_info: self
                 .client_info
                 .expect("should set client_info before building RuntimeServices"),
