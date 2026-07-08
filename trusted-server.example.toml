@@ -109,6 +109,27 @@ rewrite_script = true
 # Required for integrations.prebid.external_bundle_url and first-party proxy redirects.
 # allowed_domains = ["ads.example.com", "assets.example.com", "*.cdn.example.com"]
 
+# Static/rehosted asset cache policies are operator-controlled. Keep framework
+# presets disabled unless the matched publisher paths are known content-addressed.
+# [[cache.asset_rules]]
+# id = "nextjs-static"
+# enabled = false
+# preset = "nextjs-static"
+# visibility = "public"
+# browser_ttl_seconds = 31536000
+# edge_ttl_seconds = 31536000
+# immutable = true
+#
+# [[cache.asset_rules]]
+# id = "publisher-fingerprinted-assets"
+# enabled = false
+# path_globs = ["/assets/**/*.js", "/assets/**/*.css", "/assets/**/*.png", "/assets/**/*.webp"]
+# requires_hash_in_filename = true
+# visibility = "public"
+# browser_ttl_seconds = 31536000
+# edge_ttl_seconds = 31536000
+# immutable = true
+
 [auction]
 enabled = false
 providers = []

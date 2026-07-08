@@ -69,6 +69,7 @@ fail and the service will return its startup-error response.
 | `[ec]`              | Edge Cookie (EC) ID generation               |
 | `[tester_cookie]`   | Optional tester-cookie endpoint              |
 | `[proxy]`           | Proxy SSRF allowlist and asset routes        |
+| `[cache]`           | Static/rehosted asset cache policy rules     |
 | `[image_optimizer]` | Reusable Image Optimizer profile sets        |
 | `[request_signing]` | Ed25519 request signing                      |
 | `[auction]`         | Auction orchestration                        |
@@ -983,6 +984,78 @@ when_missing = "smart"
 ```
 
 See [Asset Routes](/guide/asset-routes) for request flow, S3 auth details, and Image Optimizer behavior.
+
+## Cache Configuration
+
+Static and rehosted asset cache upgrades are operator-controlled. By default,
+Trusted Server leaves arbitrary publisher-origin assets under origin cache
+control. Add `[[cache.asset_rules]]` entries only for paths that are known to be
+content-addressed or otherwise safe for the configured TTL.
+
+### `[[cache.asset_rules]]`
+
+Rules are evaluated in file order; the first enabled matching rule wins.
+Disabled rules are ignored, which lets you keep framework presets documented in
+config without enabling them for every publisher.
+
+| Field                              | Type          | Required | Description                                                       |
+| ---------------------------------- | ------------- | -------- | ----------------------------------------------------------------- |
+| `id`                               | String        | Yes      | Unique operator-facing rule identifier                            |
+| `enabled`                          | Boolean       | No       | Whether the rule participates in matching (default `false`)        |
+| `preset`                           | String        | Matcher  | Built-in preset such as `nextjs-static`                           |
+| `path_prefix`                      | String        | Matcher  | Request path prefix                                               |
+| `path_glob`                        | String        | Matcher  | Single glob matched against the request path                      |
+| `path_globs`                       | Array[String] | Matcher  | Multiple globs matched against the request path                   |
+| `path_regex`                       | String        | Matcher  | Regex matched against the request path                            |
+| `extensions`                       | Array[String] | Matcher  | Case-insensitive file extensions                                  |
+| `requires_hash_in_filename`        | Boolean       | No       | Require an 8+ hex token in the final path segment before matching |
+| `visibility`                       | String        | No       | `public` or `private` (default `public`)                          |
+| `browser_ttl_seconds`              | Integer       | No       | Browser `max-age`                                                 |
+| `edge_ttl_seconds`                 | Integer       | No       | Edge/shared-cache TTL                                             |
+| `stale_while_revalidate_seconds`   | Integer       | No       | Optional `stale-while-revalidate`                                 |
+| `stale_if_error_seconds`           | Integer       | No       | Optional `stale-if-error`                                         |
+| `immutable`                        | Boolean       | No       | Add `immutable` when browser TTL is positive                      |
+
+Exactly one matcher must be configured per rule. `path_glob` and `path_globs`
+are mutually exclusive.
+
+**Next.js preset example** (disabled until the publisher confirms
+`/_next/static/` is content-addressed):
+
+```toml
+[[cache.asset_rules]]
+id = "nextjs-static"
+enabled = false
+preset = "nextjs-static"
+visibility = "public"
+browser_ttl_seconds = 31536000
+edge_ttl_seconds = 31536000
+immutable = true
+```
+
+**Publisher allowlist example**:
+
+```toml
+[[cache.asset_rules]]
+id = "publisher-fingerprinted-assets"
+enabled = true
+path_globs = [
+  "/assets/**/*.js",
+  "/assets/**/*.css",
+  "/assets/**/*.png",
+  "/assets/**/*.webp",
+]
+requires_hash_in_filename = true
+visibility = "public"
+browser_ttl_seconds = 31536000
+edge_ttl_seconds = 31536000
+immutable = true
+```
+
+If `[cache]` is omitted or no enabled rule matches, Trusted Server preserves the
+origin cache policy for publisher-origin assets. TS-owned validated hash URLs,
+such as `/static/tsjs=...js?v=<hash>`, use their built-in cache policy and do
+not require an asset rule.
 
 ## Integration Configurations
 

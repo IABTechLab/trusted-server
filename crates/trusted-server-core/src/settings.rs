@@ -1,6 +1,7 @@
 #[cfg(test)]
 use config::{Config, Environment, File, FileFormat};
 use error_stack::{Report, ResultExt};
+use glob::Pattern;
 use regex::Regex;
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
@@ -8,10 +9,12 @@ use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::OnceLock;
+use std::time::Duration;
 use url::Url;
 use validator::{Validate, ValidationError};
 
 use crate::auction_config_types::AuctionConfig;
+use crate::cache_policy::{CachePolicy, CacheVisibility};
 use crate::consent_config::ConsentConfig;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
 use crate::error::TrustedServerError;
@@ -1889,6 +1892,322 @@ fn validate_tinybird_secret(value: &str, setting: &str) -> Result<(), Report<Tru
     Ok(())
 }
 
+/// Cache behavior configuration.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct CacheSettings {
+    /// Ordered static/rehosted asset rules. The first enabled matching rule wins.
+    #[serde(default)]
+    pub asset_rules: Vec<CacheAssetRule>,
+}
+
+impl CacheSettings {
+    fn normalize(&mut self) {
+        for rule in &mut self.asset_rules {
+            rule.normalize();
+        }
+    }
+
+    /// Eagerly validate runtime-only cache settings artifacts.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if any rule ID is duplicate, matcher shape
+    /// is invalid, or a configured regex/glob cannot compile.
+    pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+        let mut seen_ids = HashSet::new();
+        for rule in &self.asset_rules {
+            if rule.id.is_empty() {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: "cache.asset_rules id must not be empty".to_string(),
+                }));
+            }
+            if !seen_ids.insert(rule.id.clone()) {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!("cache.asset_rules contains duplicate id `{}`", rule.id),
+                }));
+            }
+            rule.prepare_runtime()?;
+        }
+        Ok(())
+    }
+
+    /// Resolve the first enabled asset cache rule that matches `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if a lazily prepared matcher unexpectedly
+    /// fails to compile.
+    pub fn asset_policy_for_path(
+        &self,
+        path: &str,
+    ) -> Result<Option<CachePolicy>, Report<TrustedServerError>> {
+        for rule in &self.asset_rules {
+            if rule.matches_path(path)? {
+                return Ok(Some(rule.cache_policy()));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// A configurable cache rule for publisher-origin or rehosted static assets.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheAssetRule {
+    /// Stable operator-facing identifier for logs/tests/config errors.
+    pub id: String,
+    /// Whether this rule participates in matching.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Built-in framework/static preset matcher.
+    #[serde(default)]
+    pub preset: Option<CacheAssetPreset>,
+    /// Raw path prefix matcher.
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+    /// Single glob matcher retained for concise configs.
+    #[serde(default)]
+    pub path_glob: Option<String>,
+    /// Multiple glob matchers.
+    #[serde(default)]
+    pub path_globs: Vec<String>,
+    /// Regex matcher applied to the request path.
+    #[serde(default)]
+    pub path_regex: Option<String>,
+    /// File extensions matched against the request path, case-insensitively.
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    /// Require a hash-like token in the final path segment before the rule matches.
+    #[serde(default)]
+    pub requires_hash_in_filename: bool,
+    /// Browser-facing cache visibility.
+    #[serde(default)]
+    pub visibility: CachePolicyVisibility,
+    /// Browser cache TTL rendered as `max-age`.
+    #[serde(default)]
+    pub browser_ttl_seconds: Option<u64>,
+    /// Shared edge cache TTL rendered as runtime-specific edge control.
+    #[serde(default)]
+    pub edge_ttl_seconds: Option<u64>,
+    /// Optional stale-while-revalidate duration.
+    #[serde(default)]
+    pub stale_while_revalidate_seconds: Option<u64>,
+    /// Optional stale-if-error duration.
+    #[serde(default)]
+    pub stale_if_error_seconds: Option<u64>,
+    /// Whether browser caches may treat the response as immutable.
+    #[serde(default)]
+    pub immutable: bool,
+    #[serde(skip)]
+    compiled_regex: OnceLock<Result<Regex, String>>,
+    #[serde(skip)]
+    compiled_globs: OnceLock<Result<Vec<Pattern>, String>>,
+}
+
+impl CacheAssetRule {
+    fn normalize(&mut self) {
+        self.id = self.id.trim().to_string();
+        self.path_prefix = self
+            .path_prefix
+            .take()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.path_glob = self
+            .path_glob
+            .take()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.path_globs = self
+            .path_globs
+            .iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect();
+        self.path_regex = self
+            .path_regex
+            .take()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.extensions = self
+            .extensions
+            .iter()
+            .map(|value| value.trim().trim_start_matches('.').to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .collect();
+    }
+
+    fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+        self.validate_matcher_shape()?;
+        self.compiled_regex().map(|_| ())?;
+        self.compiled_globs().map(|_| ())?;
+        Ok(())
+    }
+
+    fn validate_matcher_shape(&self) -> Result<(), Report<TrustedServerError>> {
+        if self.path_glob.is_some() && !self.path_globs.is_empty() {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "cache.asset_rules `{}` must use path_glob or path_globs, not both",
+                    self.id
+                ),
+            }));
+        }
+
+        let matcher_count = usize::from(self.preset.is_some())
+            + usize::from(self.path_prefix.is_some())
+            + usize::from(self.path_glob.is_some() || !self.path_globs.is_empty())
+            + usize::from(self.path_regex.is_some())
+            + usize::from(!self.extensions.is_empty());
+
+        if matcher_count != 1 {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "cache.asset_rules `{}` must configure exactly one matcher",
+                    self.id
+                ),
+            }));
+        }
+        Ok(())
+    }
+
+    fn compiled_regex(&self) -> Result<Option<&Regex>, Report<TrustedServerError>> {
+        let Some(pattern) = self.path_regex.as_deref() else {
+            return Ok(None);
+        };
+        match self
+            .compiled_regex
+            .get_or_init(|| Regex::new(pattern).map_err(|err| err.to_string()))
+        {
+            Ok(regex) => Ok(Some(regex)),
+            Err(message) => Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "cache.asset_rules `{}` path_regex `{pattern}` failed to compile: {message}",
+                    self.id
+                ),
+            })),
+        }
+    }
+
+    fn compiled_globs(&self) -> Result<Option<&[Pattern]>, Report<TrustedServerError>> {
+        if self.path_glob.is_none() && self.path_globs.is_empty() {
+            return Ok(None);
+        }
+
+        match self.compiled_globs.get_or_init(|| {
+            if let Some(glob) = self.path_glob.as_deref() {
+                Pattern::new(glob)
+                    .map(|pattern| vec![pattern])
+                    .map_err(|err| err.to_string())
+            } else {
+                self.path_globs
+                    .iter()
+                    .map(|pattern| Pattern::new(pattern).map_err(|err| err.to_string()))
+                    .collect()
+            }
+        }) {
+            Ok(patterns) => Ok(Some(patterns.as_slice())),
+            Err(message) => Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "cache.asset_rules `{}` glob matcher failed to compile: {message}",
+                    self.id
+                ),
+            })),
+        }
+    }
+
+    fn matches_path(&self, path: &str) -> Result<bool, Report<TrustedServerError>> {
+        if !self.enabled {
+            return Ok(false);
+        }
+        if self.requires_hash_in_filename && !filename_contains_hash(path) {
+            return Ok(false);
+        }
+
+        if let Some(preset) = self.preset {
+            return Ok(preset.matches_path(path));
+        }
+        if let Some(prefix) = self.path_prefix.as_deref() {
+            return Ok(path.starts_with(prefix));
+        }
+        if let Some(patterns) = self.compiled_globs()? {
+            return Ok(patterns.iter().any(|pattern| pattern.matches(path)));
+        }
+        if let Some(regex) = self.compiled_regex()? {
+            return Ok(regex.is_match(path));
+        }
+        if !self.extensions.is_empty() {
+            return Ok(path_extension(path).is_some_and(|extension| {
+                self.extensions
+                    .iter()
+                    .any(|candidate| candidate == &extension)
+            }));
+        }
+        Ok(false)
+    }
+
+    fn cache_policy(&self) -> CachePolicy {
+        CachePolicy {
+            visibility: self.visibility.into(),
+            browser_ttl: self.browser_ttl_seconds.map(Duration::from_secs),
+            edge_ttl: self.edge_ttl_seconds.map(Duration::from_secs),
+            stale_while_revalidate: self.stale_while_revalidate_seconds.map(Duration::from_secs),
+            stale_if_error: self.stale_if_error_seconds.map(Duration::from_secs),
+            immutable: self.immutable,
+        }
+    }
+}
+
+/// Built-in cache-rule presets that operators can enable explicitly.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CacheAssetPreset {
+    /// Next.js build output under `/_next/static/`.
+    #[serde(rename = "nextjs-static")]
+    NextJsStatic,
+}
+
+impl CacheAssetPreset {
+    fn matches_path(self, path: &str) -> bool {
+        match self {
+            Self::NextJsStatic => path.starts_with("/_next/static/"),
+        }
+    }
+}
+
+/// Cache visibility parsed from operator configuration.
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CachePolicyVisibility {
+    /// Public browser/cache visibility.
+    #[default]
+    Public,
+    /// Private browser visibility.
+    Private,
+}
+
+impl From<CachePolicyVisibility> for CacheVisibility {
+    fn from(value: CachePolicyVisibility) -> Self {
+        match value {
+            CachePolicyVisibility::Public => Self::Public,
+            CachePolicyVisibility::Private => Self::Private,
+        }
+    }
+}
+
+fn path_extension(path: &str) -> Option<String> {
+    let filename = path.rsplit('/').next()?;
+    let (_, extension) = filename.rsplit_once('.')?;
+    (!extension.is_empty()).then(|| extension.to_ascii_lowercase())
+}
+
+fn filename_contains_hash(path: &str) -> bool {
+    let filename = path.rsplit('/').next().unwrap_or(path);
+    filename
+        .split(['.', '-', '_', '~'])
+        .any(|segment| segment.len() >= 8 && segment.chars().all(|ch| ch.is_ascii_hexdigit()))
+}
+
 /// Debug-only features. All flags default to `false` (off in production).
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1950,6 +2269,9 @@ pub struct Settings {
     pub auction: AuctionConfig,
     #[serde(default)]
     pub consent: ConsentConfig,
+    #[serde(default)]
+    #[validate(nested)]
+    pub cache: CacheSettings,
     #[serde(default)]
     pub proxy: Proxy,
     #[serde(default)]
@@ -2034,6 +2356,7 @@ impl Settings {
         validation_label: &str,
     ) -> Result<Self, Report<TrustedServerError>> {
         settings.integrations.normalize();
+        settings.cache.normalize();
         settings.proxy.normalize();
         settings.image_optimizer.normalize();
         settings.consent.validate();
@@ -2061,6 +2384,7 @@ impl Settings {
     /// opportunity slot is invalid.
     pub fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
         self.image_optimizer.prepare_runtime()?;
+        self.cache.prepare_runtime()?;
         self.proxy.prepare_runtime()?;
         self.tinybird.prepare_runtime()?;
         self.validate_asset_image_optimizer_profile_sets()?;
@@ -2167,6 +2491,18 @@ impl Settings {
             }
         }
         Ok(())
+    }
+
+    /// Resolve the first matching configured asset cache policy for the request path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if matcher preparation unexpectedly fails.
+    pub fn asset_cache_policy_for_path(
+        &self,
+        path: &str,
+    ) -> Result<Option<CachePolicy>, Report<TrustedServerError>> {
+        self.cache.asset_policy_for_path(path)
     }
 
     /// Resolve the longest matching asset route for the request path.
@@ -2732,6 +3068,143 @@ mod tests {
         assert!(
             settings.tester_cookie.enabled,
             "tester-cookie config should enable the route"
+        );
+    }
+
+    #[test]
+    fn cache_asset_rule_nextjs_preset_is_operator_controlled() {
+        let toml_str = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "nextjs-static"
+            enabled = true
+            preset = "nextjs-static"
+            visibility = "public"
+            browser_ttl_seconds = 31536000
+            edge_ttl_seconds = 31536000
+            immutable = true
+        "#,
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml_str).expect("should parse cache asset rule");
+
+        let policy = settings
+            .asset_cache_policy_for_path("/_next/static/chunks/app.js")
+            .expect("should evaluate cache rules")
+            .expect("should match enabled Next.js preset");
+        assert_eq!(
+            policy,
+            CachePolicy::public_immutable(Duration::from_secs(31_536_000)),
+            "enabled preset should produce immutable static policy"
+        );
+
+        let disabled_toml = toml_str.replace("enabled = true", "enabled = false");
+        let disabled_settings =
+            Settings::from_toml(&disabled_toml).expect("should parse disabled cache asset rule");
+        assert!(
+            disabled_settings
+                .asset_cache_policy_for_path("/_next/static/chunks/app.js")
+                .expect("should evaluate disabled cache rules")
+                .is_none(),
+            "disabled preset must not mark framework paths immutable"
+        );
+    }
+
+    #[test]
+    fn cache_asset_rule_requires_hash_in_filename_when_configured() {
+        let toml_str = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "publisher-assets"
+            enabled = true
+            path_globs = ["/assets/**/*.js"]
+            requires_hash_in_filename = true
+            visibility = "public"
+            browser_ttl_seconds = 31536000
+            edge_ttl_seconds = 31536000
+            immutable = true
+        "#,
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml_str).expect("should parse cache asset rule");
+
+        assert!(
+            settings
+                .asset_cache_policy_for_path("/assets/app.js")
+                .expect("should evaluate cache rules")
+                .is_none(),
+            "broad allowlist should not match non-fingerprinted files when hash is required"
+        );
+        assert_eq!(
+            settings
+                .asset_cache_policy_for_path("/assets/app.0123abcd.js")
+                .expect("should evaluate cache rules"),
+            Some(CachePolicy::public_immutable(Duration::from_secs(
+                31_536_000
+            ))),
+            "fingerprinted asset should match the allowlist"
+        );
+    }
+
+    #[test]
+    fn cache_asset_rule_validation_rejects_invalid_config() {
+        let duplicate_ids = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "duplicate"
+            enabled = true
+            path_prefix = "/assets/"
+
+            [[cache.asset_rules]]
+            id = "duplicate"
+            enabled = true
+            path_prefix = "/static/"
+        "#,
+            crate_test_settings_str()
+        );
+        let duplicate_err =
+            Settings::from_toml(&duplicate_ids).expect_err("should reject duplicate rule ids");
+        assert!(
+            format!("{duplicate_err:?}").contains("duplicate id"),
+            "should explain duplicate rule id: {duplicate_err:?}"
+        );
+
+        let invalid_regex = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "bad-regex"
+            enabled = true
+            path_regex = "["
+        "#,
+            crate_test_settings_str()
+        );
+        let regex_err =
+            Settings::from_toml(&invalid_regex).expect_err("should reject invalid regex");
+        assert!(
+            format!("{regex_err:?}").contains("path_regex"),
+            "should explain invalid regex: {regex_err:?}"
+        );
+
+        let invalid_shape = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "too-many-matchers"
+            enabled = true
+            path_prefix = "/assets/"
+            extensions = ["js"]
+        "#,
+            crate_test_settings_str()
+        );
+        let shape_err =
+            Settings::from_toml(&invalid_shape).expect_err("should reject invalid matcher shape");
+        assert!(
+            format!("{shape_err:?}").contains("exactly one matcher"),
+            "should explain invalid matcher shape: {shape_err:?}"
         );
     }
 

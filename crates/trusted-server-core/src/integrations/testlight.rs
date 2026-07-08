@@ -265,8 +265,9 @@ fn default_timeout_ms() -> u32 {
 }
 
 fn default_shim_src() -> String {
-    // Testlight is included in the unified bundle, so we return the unified script source.
-    // Uses conservative all-module hash since the registry is unavailable at config time.
+    // Testlight is included in the unified bundle, so return the registry-free
+    // unified script source. It intentionally omits `?v=` because the exact
+    // enabled module set is unavailable at config-default time.
     tsjs::tsjs_unified_script_src()
 }
 
