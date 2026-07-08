@@ -1,8 +1,9 @@
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use trusted_server_core::html_processor::{
-    BodyCloseInjection, HtmlProcessorConfig, create_html_processor,
+    BidInjectionMode, BodyCloseInjection, HtmlPostProcessingMode, HtmlProcessorConfig,
+    create_html_processor,
 };
-use trusted_server_core::integrations::IntegrationRegistry;
+use trusted_server_core::integrations::{IntegrationDocumentState, IntegrationRegistry};
 use trusted_server_core::streaming_processor::StreamProcessor as _;
 
 fn make_config() -> HtmlProcessorConfig {
@@ -21,6 +22,9 @@ fn make_config() -> HtmlProcessorConfig {
         // which inferred no body-close work from that.
         body_close: BodyCloseInjection::None,
         suppress_datadome_client_side_tag: false,
+        bid_injection_mode: BidInjectionMode::DirectState,
+        post_processing_mode: HtmlPostProcessingMode::Enabled,
+        document_state: IntegrationDocumentState::default(),
     }
 }
 
