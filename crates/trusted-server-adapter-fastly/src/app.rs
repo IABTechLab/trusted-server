@@ -65,10 +65,10 @@
 //!   run on these responses. Legacy ran EC finalization on its own auth
 //!   challenges. Like the 401 geo-skip, this is privacy-conservative: no EC
 //!   cookies are issued to unauthenticated callers.
-//! - **Publisher responses** are buffered (bounded by
-//!   `publisher.max_buffered_body_bytes`) instead of streamed to the client.
-//!   Asset responses are streamed straight to the client (see
-//!   [`dispatch_asset_fallback`]), matching legacy.
+//! - **Publisher responses** keep Fastly origin bodies streaming through the
+//!   `EdgeZero` response body when the body is processable or pass-through.
+//!   Adapters without streaming-body support still use the bounded buffered
+//!   finalizer.
 //! - **Router-level 405s** (unregistered verbs) skip EC finalization along
 //!   with the middleware chain; the entry point still adds TS headers.
 //!
@@ -116,8 +116,8 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, AssetProxyCachePolicy,
 };
 use trusted_server_core::publisher::{
-    buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
-    handle_tsjs_dynamic, page_bids_preflight_denied, AuctionDispatch,
+    handle_page_bids, handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
+    publisher_response_into_streaming_response, AuctionDispatch,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
@@ -721,10 +721,9 @@ async fn dispatch_fallback(
     let result = if uses_dynamic_tsjs_fallback(&method, &path) {
         handle_tsjs_dynamic(&req, &state.registry)
     } else if state.registry.has_route(&method, &path) {
-        // Integration-proxy responses are not bounded by publisher.max_buffered_body_bytes.
-        // Only the handle_publisher_request branch below routes through
-        // buffer_publisher_response_async. Integration responses are small in practice
-        // and the EdgeZero flag is off by default; extend the cap here if that changes.
+        // Integration-proxy responses are not bounded by
+        // publisher.max_buffered_body_bytes. Publisher fallback below uses the
+        // publisher-specific streaming finalizer instead.
         state
             .registry
             .handle_proxy(ProxyDispatchInput {
@@ -773,9 +772,8 @@ async fn dispatch_fallback(
         match runtime_services_for_consent_route(&state.settings, services) {
             Ok(publisher_services) => {
                 // Run the server-side auction with the configured creative-
-                // opportunity slots and collect the dispatched bids in the
-                // buffered finalize (`buffer_publisher_response_async`), matching
-                // the legacy streaming path. `handle_publisher_request` matches the
+                // opportunity slots and collect dispatched bids from the lazy
+                // publisher body stream. `handle_publisher_request` matches the
                 // slots against the request path. The partner registry plus the
                 // EC identity-graph KV (`ec.kv_graph`) enrich the bid request with
                 // server-side EIDs, same as the legacy auction.
@@ -797,17 +795,14 @@ async fn dispatch_fallback(
                         )
                         .await
                         {
-                            Ok(pub_response) => {
-                                buffer_publisher_response_async(
-                                    pub_response,
-                                    &method,
-                                    &state.settings,
-                                    &state.registry,
-                                    &state.orchestrator,
-                                    &publisher_services,
-                                )
-                                .await
-                            }
+                            Ok(pub_response) => publisher_response_into_streaming_response(
+                                pub_response,
+                                &method,
+                                Arc::clone(&state.settings),
+                                state.registry.as_ref(),
+                                Arc::clone(&state.orchestrator),
+                                publisher_services.clone(),
+                            ),
                             Err(e) => Err(e),
                         }
                     }

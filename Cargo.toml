@@ -27,6 +27,7 @@ debug = 1
 
 [workspace.dependencies]
 anyhow = "1"
+async-stream = "0.3"
 async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"

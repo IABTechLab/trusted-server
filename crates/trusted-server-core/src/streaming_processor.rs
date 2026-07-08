@@ -349,6 +349,197 @@ impl StreamProcessor for StreamingReplacer {
     }
 }
 
+/// Read buffer size for streaming body processing and brotli internal buffers.
+/// Both the `Decompressor` and `CompressorWriter` use this value so all
+/// brotli I/O layers operate on consistently-sized chunks.
+pub(crate) const STREAM_CHUNK_SIZE: usize = 8192;
+
+/// Incremental push-style decompressor for the async chunk pipeline.
+///
+/// Compressed bytes go in via [`Self::decode_chunk`]; decoded bytes drain
+/// out of the internal buffer after every push. Write-based decoders are
+/// used because the async publisher path cannot wrap a blocking `Read`.
+pub(crate) enum BodyStreamDecoder {
+    None,
+    Gzip(flate2::write::GzDecoder<Vec<u8>>),
+    Deflate(flate2::write::ZlibDecoder<Vec<u8>>),
+    Brotli(Box<brotli::DecompressorWriter<Vec<u8>>>),
+}
+
+impl BodyStreamDecoder {
+    pub(crate) fn new(compression: Compression) -> Self {
+        match compression {
+            Compression::None => Self::None,
+            Compression::Gzip => Self::Gzip(flate2::write::GzDecoder::new(Vec::new())),
+            Compression::Deflate => Self::Deflate(flate2::write::ZlibDecoder::new(Vec::new())),
+            Compression::Brotli => Self::Brotli(Box::new(brotli::DecompressorWriter::new(
+                Vec::new(),
+                STREAM_CHUNK_SIZE,
+            ))),
+        }
+    }
+
+    pub(crate) fn decode_chunk(
+        &mut self,
+        chunk: &[u8],
+    ) -> Result<Vec<u8>, Report<TrustedServerError>> {
+        match self {
+            Self::None => Ok(chunk.to_vec()),
+            Self::Gzip(decoder) => {
+                decoder
+                    .write_all(chunk)
+                    .change_context(TrustedServerError::Proxy {
+                        message: "Failed to decode gzip publisher body chunk".to_string(),
+                    })?;
+                Ok(std::mem::take(decoder.get_mut()))
+            }
+            Self::Deflate(decoder) => {
+                decoder
+                    .write_all(chunk)
+                    .change_context(TrustedServerError::Proxy {
+                        message: "Failed to decode deflate publisher body chunk".to_string(),
+                    })?;
+                Ok(std::mem::take(decoder.get_mut()))
+            }
+            Self::Brotli(decoder) => {
+                decoder
+                    .write_all(chunk)
+                    .change_context(TrustedServerError::Proxy {
+                        message: "Failed to decode brotli publisher body chunk".to_string(),
+                    })?;
+                Ok(std::mem::take(decoder.get_mut()))
+            }
+        }
+    }
+
+    pub(crate) fn finish(&mut self) -> Result<Vec<u8>, Report<TrustedServerError>> {
+        match self {
+            Self::None => Ok(Vec::new()),
+            Self::Gzip(decoder) => {
+                decoder
+                    .try_finish()
+                    .change_context(TrustedServerError::Proxy {
+                        message: "Failed to finalize gzip publisher body decoder".to_string(),
+                    })?;
+                Ok(std::mem::take(decoder.get_mut()))
+            }
+            Self::Deflate(decoder) => {
+                decoder
+                    .try_finish()
+                    .change_context(TrustedServerError::Proxy {
+                        message: "Failed to finalize deflate publisher body decoder".to_string(),
+                    })?;
+                Ok(std::mem::take(decoder.get_mut()))
+            }
+            Self::Brotli(decoder) => {
+                // `close()` (not `flush()`): flush accepts a truncated brotli
+                // stream silently, while close validates end-of-stream and
+                // errors on incomplete input, matching the gzip/deflate arms.
+                decoder.close().change_context(TrustedServerError::Proxy {
+                    message: "Failed to finalize brotli publisher body decoder".to_string(),
+                })?;
+                Ok(std::mem::take(decoder.get_mut()))
+            }
+        }
+    }
+}
+
+/// Incremental push-style compressor mirroring [`BodyStreamDecoder`].
+///
+/// Processed bytes go in via [`Self::encode_chunk`]; encoded bytes drain out
+/// after every push, and [`Self::finish`] emits the stream trailer.
+pub(crate) enum BodyStreamEncoder {
+    None,
+    Gzip(flate2::write::GzEncoder<Vec<u8>>),
+    Deflate(flate2::write::ZlibEncoder<Vec<u8>>),
+    Brotli(Box<brotli::enc::writer::CompressorWriter<Vec<u8>>>),
+}
+
+fn new_brotli_vec_encoder() -> brotli::enc::writer::CompressorWriter<Vec<u8>> {
+    let params = brotli::enc::BrotliEncoderParams {
+        quality: 4,
+        lgwin: 22,
+        ..Default::default()
+    };
+    brotli::enc::writer::CompressorWriter::with_params(Vec::new(), STREAM_CHUNK_SIZE, &params)
+}
+
+impl BodyStreamEncoder {
+    pub(crate) fn new(compression: Compression) -> Self {
+        match compression {
+            Compression::None => Self::None,
+            Compression::Gzip => Self::Gzip(flate2::write::GzEncoder::new(
+                Vec::new(),
+                flate2::Compression::default(),
+            )),
+            Compression::Deflate => Self::Deflate(flate2::write::ZlibEncoder::new(
+                Vec::new(),
+                flate2::Compression::default(),
+            )),
+            Compression::Brotli => Self::Brotli(Box::new(new_brotli_vec_encoder())),
+        }
+    }
+
+    pub(crate) fn encode_chunk(
+        &mut self,
+        chunk: &[u8],
+    ) -> Result<Vec<u8>, Report<TrustedServerError>> {
+        match self {
+            Self::None => Ok(chunk.to_vec()),
+            Self::Gzip(encoder) => {
+                encoder
+                    .write_all(chunk)
+                    .change_context(TrustedServerError::Proxy {
+                        message: "Failed to encode gzip publisher body chunk".to_string(),
+                    })?;
+                Ok(std::mem::take(encoder.get_mut()))
+            }
+            Self::Deflate(encoder) => {
+                encoder
+                    .write_all(chunk)
+                    .change_context(TrustedServerError::Proxy {
+                        message: "Failed to encode deflate publisher body chunk".to_string(),
+                    })?;
+                Ok(std::mem::take(encoder.get_mut()))
+            }
+            Self::Brotli(encoder) => {
+                encoder
+                    .write_all(chunk)
+                    .change_context(TrustedServerError::Proxy {
+                        message: "Failed to encode brotli publisher body chunk".to_string(),
+                    })?;
+                Ok(std::mem::take(encoder.get_mut()))
+            }
+        }
+    }
+
+    pub(crate) fn finish(&mut self) -> Result<Vec<u8>, Report<TrustedServerError>> {
+        match self {
+            Self::None => Ok(Vec::new()),
+            Self::Gzip(encoder) => {
+                encoder
+                    .try_finish()
+                    .change_context(TrustedServerError::Proxy {
+                        message: "Failed to finalize gzip publisher body encoder".to_string(),
+                    })?;
+                Ok(std::mem::take(encoder.get_mut()))
+            }
+            Self::Deflate(encoder) => {
+                encoder
+                    .try_finish()
+                    .change_context(TrustedServerError::Proxy {
+                        message: "Failed to finalize deflate publisher body encoder".to_string(),
+                    })?;
+                Ok(std::mem::take(encoder.get_mut()))
+            }
+            Self::Brotli(encoder) => {
+                let encoder = std::mem::replace(encoder, Box::new(new_brotli_vec_encoder()));
+                Ok((*encoder).into_inner())
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

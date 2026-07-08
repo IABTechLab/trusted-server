@@ -22,9 +22,15 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use brotli::enc::writer::CompressorWriter;
+use brotli::enc::BrotliEncoderParams;
+use brotli::Decompressor;
 use cookie::CookieJar;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
+use flate2::read::{GzDecoder, ZlibDecoder};
+use flate2::write::{GzEncoder, ZlibEncoder};
+use futures::StreamExt as _;
 use http::{header, HeaderValue, Method, Request, Response, StatusCode, Uri};
 
 use crate::auction::endpoints::{
@@ -53,19 +59,134 @@ use crate::platform::{GeoInfo, PlatformBackendSpec, PlatformHttpRequest, Runtime
 use crate::price_bucket::{price_bucket, PriceGranularity};
 use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::Settings;
-use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
+use crate::streaming_processor::{
+    BodyStreamDecoder, BodyStreamEncoder, Compression, PipelineConfig, StreamProcessor,
+    StreamingPipeline, STREAM_CHUNK_SIZE,
+};
 use crate::streaming_replacer::create_url_replacer;
 
 const SUPPORTED_ENCODING_VALUES: [&str; 3] = ["gzip", "deflate", "br"];
 const DEFAULT_PUBLISHER_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Read buffer size for streaming body processing and brotli internal buffers.
-/// Both the `Decompressor` and `CompressorWriter` use this value so all
-/// brotli I/O layers operate on consistently-sized chunks.
-const STREAM_CHUNK_SIZE: usize = 8192;
+fn body_as_reader(
+    body: EdgeBody,
+) -> Result<std::io::Cursor<bytes::Bytes>, Report<TrustedServerError>> {
+    let bytes = body.into_bytes().ok_or_else(|| {
+        Report::new(TrustedServerError::Proxy {
+            message: "streaming body cannot be processed by sync publisher pipeline".to_string(),
+        })
+    })?;
+    Ok(std::io::Cursor::new(bytes))
+}
 
-fn body_as_reader(body: EdgeBody) -> std::io::Cursor<bytes::Bytes> {
-    std::io::Cursor::new(body.into_bytes().unwrap_or_default())
+struct BodyChunkSource {
+    body: Option<EdgeBody>,
+    chunk_size: usize,
+    max_bytes: usize,
+    bytes_seen: usize,
+    once_offset: usize,
+}
+
+impl BodyChunkSource {
+    fn new(body: EdgeBody, chunk_size: usize) -> Self {
+        Self {
+            body: Some(body),
+            chunk_size,
+            max_bytes: usize::MAX,
+            bytes_seen: 0,
+            once_offset: 0,
+        }
+    }
+
+    fn with_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_bytes = max_bytes;
+        self
+    }
+
+    async fn next_chunk(&mut self) -> Result<Option<bytes::Bytes>, Report<TrustedServerError>> {
+        let Some(body) = self.body.take() else {
+            return Ok(None);
+        };
+
+        let chunk = match body {
+            EdgeBody::Once(bytes) => {
+                if self.once_offset >= bytes.len() {
+                    None
+                } else {
+                    let end = (self.once_offset + self.chunk_size).min(bytes.len());
+                    let chunk = bytes.slice(self.once_offset..end);
+                    self.once_offset = end;
+                    if self.once_offset < bytes.len() {
+                        self.body = Some(EdgeBody::Once(bytes));
+                    }
+                    Some(chunk)
+                }
+            }
+            EdgeBody::Stream(mut stream) => match stream.next().await {
+                Some(Ok(chunk)) => {
+                    self.body = Some(EdgeBody::Stream(stream));
+                    Some(chunk)
+                }
+                Some(Err(err)) => {
+                    return Err(Report::new(TrustedServerError::Proxy {
+                        message: format!("Failed to read publisher origin body stream: {err}"),
+                    }));
+                }
+                None => None,
+            },
+        };
+
+        let Some(chunk) = chunk else {
+            return Ok(None);
+        };
+
+        self.bytes_seen = self.bytes_seen.checked_add(chunk.len()).ok_or_else(|| {
+            Report::new(TrustedServerError::Proxy {
+                message: "publisher origin body byte count overflowed".to_string(),
+            })
+        })?;
+        if self.bytes_seen > self.max_bytes {
+            return Err(Report::new(TrustedServerError::Proxy {
+                message: format!(
+                    "publisher origin body exceeded {}-byte streaming limit",
+                    self.max_bytes
+                ),
+            }));
+        }
+
+        Ok(Some(chunk))
+    }
+}
+
+fn process_and_encode_chunk<P: StreamProcessor>(
+    processor: &mut P,
+    encoder: &mut BodyStreamEncoder,
+    chunk: &[u8],
+    is_last: bool,
+    process_error: &str,
+) -> Result<Option<bytes::Bytes>, Report<TrustedServerError>> {
+    let processed =
+        processor
+            .process_chunk(chunk, is_last)
+            .change_context(TrustedServerError::Proxy {
+                message: process_error.to_string(),
+            })?;
+    if processed.is_empty() {
+        return Ok(None);
+    }
+    let encoded = encoder.encode_chunk(&processed)?;
+    if encoded.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(bytes::Bytes::from(encoded)))
+}
+
+fn publisher_stream_error(err: Report<TrustedServerError>) -> std::io::Error {
+    let message = format!("{err:?}");
+    // Consume the report so clippy's needless_pass_by_value accepts the
+    // by-value signature that `map_err(publisher_stream_error)` requires.
+    drop(err);
+    std::io::Error::other(message)
 }
 
 fn not_found_response() -> Response<EdgeBody> {
@@ -233,6 +354,55 @@ struct ProcessResponseParams<'a> {
     ad_bids_state: &'a Arc<Mutex<Option<String>>>,
 }
 
+struct PublisherBodyProcessor {
+    inner: Box<dyn StreamProcessor>,
+}
+
+impl PublisherBodyProcessor {
+    fn new(
+        params: &OwnedProcessResponseParams,
+        settings: &Settings,
+        integration_registry: &IntegrationRegistry,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        let is_html = is_html_content_type(&params.content_type);
+        let is_rsc_flight =
+            content_type_contains_ascii_case_insensitive(&params.content_type, "text/x-component");
+        let inner: Box<dyn StreamProcessor> = if is_html {
+            Box::new(create_html_stream_processor(
+                &params.origin_host,
+                &params.request_host,
+                &params.request_scheme,
+                settings,
+                integration_registry,
+                params.ad_slots_script.as_deref().map(str::to_string),
+                Arc::clone(&params.ad_bids_state),
+            )?)
+        } else if is_rsc_flight {
+            Box::new(RscFlightUrlRewriter::new(
+                &params.origin_host,
+                &params.origin_url,
+                &params.request_host,
+                &params.request_scheme,
+            ))
+        } else {
+            Box::new(create_url_replacer(
+                &params.origin_host,
+                &params.origin_url,
+                &params.request_host,
+                &params.request_scheme,
+            ))
+        };
+
+        Ok(Self { inner })
+    }
+}
+
+impl StreamProcessor for PublisherBodyProcessor {
+    fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, std::io::Error> {
+        self.inner.process_chunk(chunk, is_last)
+    }
+}
+
 /// Process response body through the streaming pipeline.
 ///
 /// Selects the appropriate processor based on content type (HTML rewriter,
@@ -276,7 +446,7 @@ fn process_response_streaming<W: Write>(
             params.ad_slots_script.map(str::to_string),
             params.ad_bids_state.clone(),
         )?;
-        StreamingPipeline::new(config, processor).process(body_as_reader(body), output)?;
+        StreamingPipeline::new(config, processor).process(body_as_reader(body)?, output)?;
     } else if is_rsc_flight {
         // RSC Flight responses are length-prefixed (T rows). A naive string replacement will
         // corrupt the stream by changing byte lengths without updating the prefixes.
@@ -286,7 +456,7 @@ fn process_response_streaming<W: Write>(
             params.request_host,
             params.request_scheme,
         );
-        StreamingPipeline::new(config, processor).process(body_as_reader(body), output)?;
+        StreamingPipeline::new(config, processor).process(body_as_reader(body)?, output)?;
     } else {
         let replacer = create_url_replacer(
             params.origin_host,
@@ -294,10 +464,350 @@ fn process_response_streaming<W: Write>(
             params.request_host,
             params.request_scheme,
         );
-        StreamingPipeline::new(config, replacer).process(body_as_reader(body), output)?;
+        StreamingPipeline::new(config, replacer).process(body_as_reader(body)?, output)?;
     }
 
     Ok(())
+}
+
+async fn process_response_streaming_async<W: Write>(
+    body: EdgeBody,
+    output: &mut W,
+    params: &ProcessResponseParams<'_>,
+    max_raw_body_bytes: usize,
+) -> Result<(), Report<TrustedServerError>> {
+    let is_html = is_html_content_type(params.content_type);
+    let is_rsc_flight =
+        content_type_contains_ascii_case_insensitive(params.content_type, "text/x-component");
+    log::debug!(
+        "process_response_streaming_async: content_type={}, content_encoding={}, is_html={}, is_rsc_flight={}",
+        params.content_type,
+        params.content_encoding,
+        is_html,
+        is_rsc_flight
+    );
+
+    let compression = Compression::from_content_encoding(params.content_encoding);
+
+    if is_html {
+        let mut processor = create_html_stream_processor(
+            params.origin_host,
+            params.request_host,
+            params.request_scheme,
+            params.settings,
+            params.integration_registry,
+            params.ad_slots_script.map(str::to_string),
+            params.ad_bids_state.clone(),
+        )?;
+        process_body_chunks_async(
+            body,
+            output,
+            &mut processor,
+            compression,
+            max_raw_body_bytes,
+        )
+        .await
+    } else if is_rsc_flight {
+        let mut processor = RscFlightUrlRewriter::new(
+            params.origin_host,
+            params.origin_url,
+            params.request_host,
+            params.request_scheme,
+        );
+        process_body_chunks_async(
+            body,
+            output,
+            &mut processor,
+            compression,
+            max_raw_body_bytes,
+        )
+        .await
+    } else {
+        let mut replacer = create_url_replacer(
+            params.origin_host,
+            params.origin_url,
+            params.request_host,
+            params.request_scheme,
+        );
+        process_body_chunks_async(body, output, &mut replacer, compression, max_raw_body_bytes)
+            .await
+    }
+}
+
+async fn process_body_chunks_async<W: Write, P: StreamProcessor>(
+    body: EdgeBody,
+    writer: &mut W,
+    processor: &mut P,
+    compression: Compression,
+    max_raw_body_bytes: usize,
+) -> Result<(), Report<TrustedServerError>> {
+    let mut decoder = BodyStreamDecoder::new(compression);
+    let mut encoder = BodyStreamEncoder::new(compression);
+    let mut source =
+        BodyChunkSource::new(body, STREAM_CHUNK_SIZE).with_max_bytes(max_raw_body_bytes);
+
+    while let Some(chunk) = source.next_chunk().await? {
+        let decoded = decoder.decode_chunk(&chunk)?;
+        if decoded.is_empty() {
+            continue;
+        }
+        if let Some(encoded) = process_and_encode_chunk(
+            processor,
+            &mut encoder,
+            &decoded,
+            false,
+            "Failed to process chunk",
+        )? {
+            write_encoded_segment(writer, &encoded)?;
+        }
+    }
+
+    for encoded in passthrough_finish_segments(processor, &mut decoder, &mut encoder)? {
+        write_encoded_segment(writer, &encoded)?;
+    }
+    writer.flush().change_context(TrustedServerError::Proxy {
+        message: "Failed to flush output".to_string(),
+    })?;
+
+    Ok(())
+}
+
+/// Write one encoded output segment produced by the chunk pipeline.
+fn write_encoded_segment<W: Write>(
+    writer: &mut W,
+    encoded: &[u8],
+) -> Result<(), Report<TrustedServerError>> {
+    writer
+        .write_all(encoded)
+        .change_context(TrustedServerError::Proxy {
+            message: "Failed to write encoded chunk".to_string(),
+        })
+}
+
+/// Finalize a no-hold chunk pipeline: drain the decoder tail through the
+/// processor, signal end-of-stream to the processor, and emit the encoder
+/// trailer. Returns the encoded segments for the caller to emit.
+fn passthrough_finish_segments<P: StreamProcessor>(
+    processor: &mut P,
+    decoder: &mut BodyStreamDecoder,
+    encoder: &mut BodyStreamEncoder,
+) -> Result<Vec<bytes::Bytes>, Report<TrustedServerError>> {
+    let mut segments = Vec::new();
+    let decoded_tail = decoder.finish()?;
+    if !decoded_tail.is_empty() {
+        if let Some(encoded) = process_and_encode_chunk(
+            processor,
+            encoder,
+            &decoded_tail,
+            false,
+            "Failed to process decoded tail",
+        )? {
+            segments.push(encoded);
+        }
+    }
+    if let Some(encoded) = process_and_encode_chunk(
+        processor,
+        encoder,
+        &[],
+        true,
+        "Failed to finalize processor",
+    )? {
+        segments.push(encoded);
+    }
+    let trailer = encoder.finish()?;
+    if !trailer.is_empty() {
+        segments.push(bytes::Bytes::from(trailer));
+    }
+    Ok(segments)
+}
+
+/// Mutable auction-hold state threaded through the streaming hold pipeline.
+struct AuctionHoldState {
+    hold: Option<BodyCloseHoldBuffer>,
+    dispatched: Option<DispatchedAuction>,
+    telemetry: AuctionTelemetryCarry,
+}
+
+impl AuctionHoldState {
+    fn new(dispatched: DispatchedAuction, telemetry: AuctionTelemetryCarry) -> Self {
+        Self {
+            hold: Some(BodyCloseHoldBuffer::new()),
+            dispatched: Some(dispatched),
+            telemetry,
+        }
+    }
+}
+
+/// Abandon the in-flight auction (if still pending) with the given telemetry
+/// reason. No-op once the auction has been collected or already abandoned.
+async fn abandon_hold_auction(
+    state: &mut AuctionHoldState,
+    services: &RuntimeServices,
+    reason: &'static str,
+) {
+    if let Some(dispatched) = state.dispatched.take() {
+        emit_abandoned_auction(
+            services,
+            state.telemetry.observation.take(),
+            dispatched,
+            reason,
+        )
+        .await;
+    }
+}
+
+/// Feed one decoded chunk through the close-body hold and processor.
+///
+/// Returns the encoded output segments for the caller to emit — written to a
+/// client stream by [`body_close_hold_loop_stream`], yielded from the lazy
+/// body by [`publisher_response_into_streaming_response`]. Both async hold
+/// paths share this function so their behavior cannot drift apart.
+///
+/// When the raw `</body` prefix is found the dispatched auction is collected
+/// before the held tail is processed, so `lol_html` sees live bids. On
+/// processing failure the pending auction is abandoned before the error is
+/// returned.
+async fn hold_step_decoded_chunk<P: StreamProcessor>(
+    processor: &mut P,
+    encoder: &mut BodyStreamEncoder,
+    chunk: &[u8],
+    state: &mut AuctionHoldState,
+    collect_refs: &AuctionHoldCollectRefs<'_>,
+) -> Result<Vec<bytes::Bytes>, Report<TrustedServerError>> {
+    let mut segments = Vec::new();
+    if let Some(hold_buffer) = state.hold.as_mut() {
+        let ready = hold_buffer.push(chunk);
+        match process_and_encode_chunk(processor, encoder, &ready, false, "Failed to process chunk")
+        {
+            Ok(Some(encoded)) => segments.push(encoded),
+            Ok(None) => {}
+            Err(err) => {
+                abandon_hold_auction(state, collect_refs.services, "stream_process_error").await;
+                return Err(err);
+            }
+        }
+
+        if state
+            .hold
+            .as_ref()
+            .is_some_and(BodyCloseHoldBuffer::found_close)
+        {
+            let dispatched = state
+                .dispatched
+                .take()
+                .expect("should have dispatched auction to collect");
+            collect_stream_auction(
+                dispatched,
+                state.telemetry.take(),
+                collect_refs.price_granularity,
+                collect_refs.ad_bids_state,
+                collect_refs.orchestrator,
+                collect_refs.services,
+                collect_refs.settings,
+            )
+            .await;
+
+            let held = state
+                .hold
+                .take()
+                .expect("should have close-body hold buffer")
+                .finish();
+            if let Some(encoded) = process_and_encode_chunk(
+                processor,
+                encoder,
+                &held,
+                false,
+                "Failed to process held body close",
+            )? {
+                segments.push(encoded);
+            }
+        }
+    } else {
+        match process_and_encode_chunk(processor, encoder, chunk, false, "Failed to process chunk")
+        {
+            Ok(Some(encoded)) => segments.push(encoded),
+            Ok(None) => {}
+            Err(err) => {
+                abandon_hold_auction(state, collect_refs.services, "stream_process_error").await;
+                return Err(err);
+            }
+        }
+    }
+    Ok(segments)
+}
+
+/// Finalize the close-body hold pipeline at end of the origin stream.
+///
+/// Drains the decoder tail through the hold (or straight through when the
+/// hold was already released mid-stream), collects the auction if the
+/// close-body tag never streamed, processes the held tail plus the
+/// processor's final chunk, and emits the encoder trailer. Returns the
+/// encoded segments for the caller to emit. On decoder failure the pending
+/// auction is abandoned before the error is returned.
+async fn hold_finish_segments<P: StreamProcessor>(
+    processor: &mut P,
+    decoder: &mut BodyStreamDecoder,
+    encoder: &mut BodyStreamEncoder,
+    state: &mut AuctionHoldState,
+    collect_refs: &AuctionHoldCollectRefs<'_>,
+) -> Result<Vec<bytes::Bytes>, Report<TrustedServerError>> {
+    let mut segments = Vec::new();
+
+    let decoded_tail = match decoder.finish() {
+        Ok(decoded_tail) => decoded_tail,
+        Err(err) => {
+            abandon_hold_auction(state, collect_refs.services, "stream_decode_error").await;
+            return Err(err);
+        }
+    };
+    if !decoded_tail.is_empty() {
+        segments.extend(
+            hold_step_decoded_chunk(processor, encoder, &decoded_tail, state, collect_refs).await?,
+        );
+    }
+
+    if let Some(hold) = state.hold.take() {
+        let dispatched = state
+            .dispatched
+            .take()
+            .expect("should have dispatched auction to collect");
+        collect_stream_auction(
+            dispatched,
+            state.telemetry.take(),
+            collect_refs.price_granularity,
+            collect_refs.ad_bids_state,
+            collect_refs.orchestrator,
+            collect_refs.services,
+            collect_refs.settings,
+        )
+        .await;
+
+        let held = hold.finish();
+        if let Some(encoded) = process_and_encode_chunk(
+            processor,
+            encoder,
+            &held,
+            false,
+            "Failed to process held body close",
+        )? {
+            segments.push(encoded);
+        }
+    }
+
+    if let Some(encoded) = process_and_encode_chunk(
+        processor,
+        encoder,
+        &[],
+        true,
+        "Failed to finalize processor",
+    )? {
+        segments.push(encoded);
+    }
+    let trailer = encoder.finish()?;
+    if !trailer.is_empty() {
+        segments.push(bytes::Bytes::from(trailer));
+    }
+    Ok(segments)
 }
 
 /// Create a unified HTML stream processor.
@@ -339,16 +849,13 @@ pub enum PublisherResponse {
     /// content on any status (2xx or non-2xx — e.g., branded 404/500 HTML and
     /// error JSON still get URL rewriting) where the encoding is supported.
     /// Post-processors run inside the streaming processor, so processable HTML
-    /// is streamed regardless of whether any are registered. The caller must:
-    /// 1. Call `finalize_response()` on the response
-    /// 2. Call `response.stream_to_client()` to get a `StreamingBody`
-    /// 3. Call `stream_publisher_body()` with the body and streaming writer
-    /// 4. Call `StreamingBody::finish()`
+    /// is streamed regardless of whether any are registered.
     ///
-    /// **Interim (PR 15):** `body` has already been fully materialised into
-    /// WASM heap by the platform HTTP client.  `stream_publisher_body` reads
-    /// from an in-memory buffer, not a live origin stream.  The origin-side
-    /// peak is bounded by `MAX_PLATFORM_RESPONSE_BODY_BYTES`.
+    /// Adapters with platform streaming support preserve `body` as
+    /// [`EdgeBody::Stream`] and attach a lazy processed stream via
+    /// [`publisher_response_into_streaming_response`]. Buffered adapters use
+    /// [`buffer_publisher_response_async`] and are bounded by
+    /// `settings.publisher.max_buffered_body_bytes`.
     Stream {
         /// Response with all headers set (EC ID, cookies, etc.)
         /// but body not yet written. `Content-Length` already removed.
@@ -363,12 +870,9 @@ pub enum PublisherResponse {
     /// `finalize_response()` and `send_to_client()` are applied at the outer
     /// response-dispatch level, not in this arm.
     ///
-    /// `Content-Length` is preserved — the body is unmodified.
-    ///
-    /// **Interim (PR 15):** `body` has been fully materialised into WASM heap.
-    /// Previously, binary assets streamed lazily from origin with no WASM
-    /// buffering.  This path is now bounded by `MAX_PLATFORM_RESPONSE_BODY_BYTES`;
-    /// assets exceeding that limit return an error instead of exhausting heap.
+    /// `Content-Length` is preserved — the body is unmodified. Streaming
+    /// adapters reattach the origin body directly so non-processable 2xx bodies
+    /// can pass through without materializing in WASM memory.
     PassThrough {
         /// Response with all headers set but body not yet written.
         response: Response<EdgeBody>,
@@ -465,7 +969,7 @@ pub struct OwnedProcessResponseParams {
 /// statuses (204, 304) carry no body but may advertise the `GET` representation's
 /// length, so they skip the buffer and length rewrite.
 ///
-/// Every adapter (Axum, Cloudflare, Spin, and the Fastly `EdgeZero` path) calls
+/// Buffered adapters (Axum, Cloudflare, Spin, and non-streaming fallbacks) call
 /// this: it drives
 /// [`stream_publisher_body_async`], which awaits
 /// [`AuctionOrchestrator::collect_dispatched_auction`], writes the winning bids
@@ -525,6 +1029,183 @@ pub async fn buffer_publisher_response_async(
         }
         PublisherResponse::PassThrough { mut response, body } => {
             *response.body_mut() = body;
+            Ok(response)
+        }
+    }
+}
+
+/// Convert a [`PublisherResponse`] into a response that preserves streaming
+/// bodies where possible.
+///
+/// Buffered adapters should keep using [`buffer_publisher_response_async`].
+/// Fastly uses this helper before the entry point commits headers, allowing the
+/// response body to be pulled lazily by `stream_to_client()`.
+///
+/// # Errors
+///
+/// Returns an error if processor construction fails before the streaming body is
+/// created.
+pub fn publisher_response_into_streaming_response(
+    publisher_response: PublisherResponse,
+    method: &Method,
+    settings: Arc<Settings>,
+    integration_registry: &IntegrationRegistry,
+    orchestrator: Arc<AuctionOrchestrator>,
+    services: RuntimeServices,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    match publisher_response {
+        PublisherResponse::Buffered(response) => Ok(response),
+        PublisherResponse::PassThrough { mut response, body } => {
+            if response_carries_body(method, response.status()) {
+                *response.body_mut() = body;
+            }
+            Ok(response)
+        }
+        PublisherResponse::Stream {
+            mut response,
+            body,
+            params,
+        } => {
+            if !response_carries_body(method, response.status()) {
+                if params.dispatched_auction.is_some() {
+                    // A bodiless response (HEAD navigation, 204/304) has no
+                    // `</body>` to inject bids into, so the dispatched SSP
+                    // requests are wasted — surface it for quota observability,
+                    // matching the buffered finalizer.
+                    log::warn!(
+                        "Server-side auction dispatched but response is bodiless (method: {}, status: {}); in-flight SSP bid requests will not be collected",
+                        method,
+                        response.status(),
+                    );
+                }
+                return Ok(response);
+            }
+
+            response.headers_mut().remove(header::CONTENT_LENGTH);
+            let mut params = *params;
+            let mut processor =
+                PublisherBodyProcessor::new(&params, &settings, integration_registry)?;
+            let stream = async_stream::try_stream! {
+                let compression = Compression::from_content_encoding(&params.content_encoding);
+                let mut decoder = BodyStreamDecoder::new(compression);
+                let mut encoder = BodyStreamEncoder::new(compression);
+                let mut source = BodyChunkSource::new(body, STREAM_CHUNK_SIZE)
+                    .with_max_bytes(settings.publisher.max_buffered_body_bytes);
+
+                // HTML rides the close-body hold so bids land before `</body>`;
+                // non-HTML has no injection point, so its auction is collected
+                // before any byte streams (matching the buffered finalizer).
+                let mut hold_auction = None;
+                if let Some(dispatched) = params.dispatched_auction.take() {
+                    let telemetry = AuctionTelemetryCarry {
+                        observation: params.auction_observation.take(),
+                        auction_request: params.auction_request.take(),
+                    };
+                    if is_html_content_type(&params.content_type) {
+                        hold_auction = Some((dispatched, telemetry));
+                    } else {
+                        collect_non_html_auction(
+                            dispatched,
+                            telemetry,
+                            &params,
+                            &orchestrator,
+                            &services,
+                            &settings,
+                        )
+                        .await;
+                    }
+                }
+
+                if let Some((dispatched, telemetry)) = hold_auction {
+                    let mut state = AuctionHoldState::new(dispatched, telemetry);
+                    let collect_refs = AuctionHoldCollectRefs {
+                        price_granularity: params.price_granularity,
+                        ad_bids_state: &params.ad_bids_state,
+                        orchestrator: &orchestrator,
+                        services: &services,
+                        settings: &settings,
+                    };
+
+                    loop {
+                        let raw_chunk = match source.next_chunk().await {
+                            Ok(Some(chunk)) => chunk,
+                            Ok(None) => break,
+                            Err(err) => {
+                                abandon_hold_auction(&mut state, &services, "stream_read_error")
+                                    .await;
+                                Err(publisher_stream_error(err))?;
+                                unreachable!("error should have returned");
+                            }
+                        };
+                        let decoded = match decoder.decode_chunk(&raw_chunk) {
+                            Ok(decoded) => decoded,
+                            Err(err) => {
+                                abandon_hold_auction(&mut state, &services, "stream_decode_error")
+                                    .await;
+                                Err(publisher_stream_error(err))?;
+                                unreachable!("error should have returned");
+                            }
+                        };
+                        if decoded.is_empty() {
+                            continue;
+                        }
+                        for encoded in hold_step_decoded_chunk(
+                            &mut processor,
+                            &mut encoder,
+                            &decoded,
+                            &mut state,
+                            &collect_refs,
+                        )
+                        .await
+                        .map_err(publisher_stream_error)?
+                        {
+                            yield encoded;
+                        }
+                    }
+
+                    for encoded in hold_finish_segments(
+                        &mut processor,
+                        &mut decoder,
+                        &mut encoder,
+                        &mut state,
+                        &collect_refs,
+                    )
+                    .await
+                    .map_err(publisher_stream_error)?
+                    {
+                        yield encoded;
+                    }
+                } else {
+                    while let Some(raw_chunk) =
+                        source.next_chunk().await.map_err(publisher_stream_error)?
+                    {
+                        let decoded = decoder
+                            .decode_chunk(&raw_chunk)
+                            .map_err(publisher_stream_error)?;
+                        if decoded.is_empty() {
+                            continue;
+                        }
+                        if let Some(encoded) = process_and_encode_chunk(
+                            &mut processor,
+                            &mut encoder,
+                            &decoded,
+                            false,
+                            "Failed to process chunk",
+                        )
+                        .map_err(publisher_stream_error)?
+                        {
+                            yield encoded;
+                        }
+                    }
+                    for encoded in
+                        passthrough_finish_segments(&mut processor, &mut decoder, &mut encoder)
+                            .map_err(publisher_stream_error)?
+                    {
+                        yield encoded;
+                    }
+                }
+            };
+            *response.body_mut() = EdgeBody::from_stream::<_, std::io::Error>(stream);
             Ok(response)
         }
     }
@@ -652,7 +1333,29 @@ pub async fn stream_publisher_body_async<W: Write>(
     services: &RuntimeServices,
 ) -> Result<(), Report<TrustedServerError>> {
     let Some(dispatched) = params.dispatched_auction.take() else {
-        // No auction — use the existing sync pipeline unchanged.
+        if body.is_stream() {
+            let borrowed = ProcessResponseParams {
+                content_encoding: &params.content_encoding,
+                origin_host: &params.origin_host,
+                origin_url: &params.origin_url,
+                request_host: &params.request_host,
+                request_scheme: &params.request_scheme,
+                settings,
+                content_type: &params.content_type,
+                integration_registry,
+                ad_slots_script: params.ad_slots_script.as_deref(),
+                ad_bids_state: &params.ad_bids_state,
+            };
+            return process_response_streaming_async(
+                body,
+                output,
+                &borrowed,
+                settings.publisher.max_buffered_body_bytes,
+            )
+            .await;
+        }
+
+        // No auction and already-buffered body — keep the existing sync pipeline.
         return stream_publisher_body(body, output, params, settings, integration_registry);
     };
     let telemetry = AuctionTelemetryCarry {
@@ -665,35 +1368,36 @@ pub async fn stream_publisher_body_async<W: Write>(
     if !is_html {
         // Non-HTML: collect auction first, then stream.  There is no </body>
         // to hold, so delaying the entire body until collection is acceptable.
-        let placeholder = mediator_placeholder_request();
-        let result = orchestrator
-            .collect_dispatched_auction(
-                dispatched,
-                services,
-                &make_collect_context(settings, services, &placeholder),
+        collect_non_html_auction(
+            dispatched,
+            telemetry,
+            params,
+            orchestrator,
+            services,
+            settings,
+        )
+        .await;
+        if body.is_stream() {
+            let borrowed = ProcessResponseParams {
+                content_encoding: &params.content_encoding,
+                origin_host: &params.origin_host,
+                origin_url: &params.origin_url,
+                request_host: &params.request_host,
+                request_scheme: &params.request_scheme,
+                settings,
+                content_type: &params.content_type,
+                integration_registry,
+                ad_slots_script: params.ad_slots_script.as_deref(),
+                ad_bids_state: &params.ad_bids_state,
+            };
+            return process_response_streaming_async(
+                body,
+                output,
+                &borrowed,
+                settings.publisher.max_buffered_body_bytes,
             )
             .await;
-        if let (Some(observation), Some(auction_request)) =
-            (telemetry.observation, telemetry.auction_request.as_ref())
-        {
-            emit_auction_events_best_effort_lazy(services, || {
-                build_auction_events(
-                    observation,
-                    AuctionTerminalOutcome::Completed {
-                        request: auction_request,
-                        result: &result,
-                    },
-                )
-            })
-            .await;
         }
-
-        write_bids_to_state(
-            &result.winning_bids,
-            params.price_granularity,
-            &params.ad_bids_state,
-            settings.debug.inject_adm_for_testing,
-        );
         return stream_publisher_body(body, output, params, settings, integration_registry);
     }
 
@@ -917,6 +1621,14 @@ struct AuctionCollectCtx<'a> {
     settings: &'a Settings,
 }
 
+struct AuctionHoldCollectRefs<'a> {
+    price_granularity: PriceGranularity,
+    ad_bids_state: &'a Arc<Mutex<Option<String>>>,
+    orchestrator: &'a AuctionOrchestrator,
+    services: &'a RuntimeServices,
+    settings: &'a Settings,
+}
+
 /// Run the close-body hold loop for HTML bodies, collecting the auction before
 /// the raw `</body` tail is processed so `lol_html` sees live bids.
 async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
@@ -926,13 +1638,20 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
     compression: Compression,
     ctx: AuctionCollectCtx<'_>,
 ) -> Result<(), Report<TrustedServerError>> {
-    use brotli::enc::writer::CompressorWriter;
-    use brotli::enc::BrotliEncoderParams;
-    use brotli::Decompressor;
-    use flate2::read::{GzDecoder, ZlibDecoder};
-    use flate2::write::{GzEncoder, ZlibEncoder};
+    if body.is_stream() {
+        let max_raw_body_bytes = ctx.settings.publisher.max_buffered_body_bytes;
+        return body_close_hold_loop_stream(
+            body,
+            output,
+            processor,
+            compression,
+            ctx,
+            max_raw_body_bytes,
+        )
+        .await;
+    }
 
-    let body = body_as_reader(body);
+    let body = body_as_reader(body)?;
     match compression {
         Compression::None => body_close_hold_loop(body, output, processor, ctx).await,
         Compression::Gzip => {
@@ -967,6 +1686,85 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
             Ok(())
         }
     }
+}
+
+/// Async-pull variant of [`body_close_hold_loop`] for live origin streams.
+///
+/// Shares [`hold_step_decoded_chunk`] and [`hold_finish_segments`] with the
+/// lazy streaming body built by [`publisher_response_into_streaming_response`],
+/// so the two async hold paths cannot drift apart.
+async fn body_close_hold_loop_stream<W: Write, P: StreamProcessor>(
+    body: EdgeBody,
+    writer: &mut W,
+    processor: &mut P,
+    compression: Compression,
+    ctx: AuctionCollectCtx<'_>,
+    max_raw_body_bytes: usize,
+) -> Result<(), Report<TrustedServerError>> {
+    let AuctionCollectCtx {
+        dispatched,
+        telemetry,
+        price_granularity,
+        ad_bids_state,
+        orchestrator,
+        services,
+        settings,
+    } = ctx;
+    let mut decoder = BodyStreamDecoder::new(compression);
+    let mut encoder = BodyStreamEncoder::new(compression);
+    let mut source =
+        BodyChunkSource::new(body, STREAM_CHUNK_SIZE).with_max_bytes(max_raw_body_bytes);
+    let mut state = AuctionHoldState::new(dispatched, telemetry);
+    let collect_refs = AuctionHoldCollectRefs {
+        price_granularity,
+        ad_bids_state,
+        orchestrator,
+        services,
+        settings,
+    };
+
+    loop {
+        let raw_chunk = match source.next_chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(err) => {
+                abandon_hold_auction(&mut state, services, "stream_read_error").await;
+                return Err(err);
+            }
+        };
+        let decoded = match decoder.decode_chunk(&raw_chunk) {
+            Ok(decoded) => decoded,
+            Err(err) => {
+                abandon_hold_auction(&mut state, services, "stream_decode_error").await;
+                return Err(err);
+            }
+        };
+        if decoded.is_empty() {
+            continue;
+        }
+        for encoded in
+            hold_step_decoded_chunk(processor, &mut encoder, &decoded, &mut state, &collect_refs)
+                .await?
+        {
+            write_encoded_segment(writer, &encoded)?;
+        }
+    }
+
+    for encoded in hold_finish_segments(
+        processor,
+        &mut decoder,
+        &mut encoder,
+        &mut state,
+        &collect_refs,
+    )
+    .await?
+    {
+        write_encoded_segment(writer, &encoded)?;
+    }
+    writer.flush().change_context(TrustedServerError::Proxy {
+        message: "Failed to flush output".to_string(),
+    })?;
+    Ok(())
 }
 
 const BODY_CLOSE_PREFIX: &[u8] = b"</body";
@@ -1199,6 +1997,47 @@ async fn emit_abandoned_auction(
         )
     })
     .await;
+}
+
+/// Collect a dispatched auction before a non-HTML body streams: there is no
+/// `</body>` to inject into, so bids are written to state up front and the
+/// auction telemetry completes immediately.
+async fn collect_non_html_auction(
+    dispatched: DispatchedAuction,
+    telemetry: AuctionTelemetryCarry,
+    params: &OwnedProcessResponseParams,
+    orchestrator: &AuctionOrchestrator,
+    services: &RuntimeServices,
+    settings: &Settings,
+) {
+    let placeholder = mediator_placeholder_request();
+    let result = orchestrator
+        .collect_dispatched_auction(
+            dispatched,
+            services,
+            &make_collect_context(settings, services, &placeholder),
+        )
+        .await;
+    if let (Some(observation), Some(auction_request)) =
+        (telemetry.observation, telemetry.auction_request.as_ref())
+    {
+        emit_auction_events_best_effort_lazy(services, || {
+            build_auction_events(
+                observation,
+                AuctionTerminalOutcome::Completed {
+                    request: auction_request,
+                    result: &result,
+                },
+            )
+        })
+        .await;
+    }
+    write_bids_to_state(
+        &result.winning_bids,
+        params.price_granularity,
+        &params.ad_bids_state,
+        settings.debug.inject_adm_for_testing,
+    );
 }
 
 async fn collect_stream_auction(
@@ -1600,11 +2439,12 @@ pub async fn handle_publisher_request(
 
     // SSP requests are already racing through the platform HTTP client, so
     // origin TTFB tracks origin latency rather than the auction timeout.
-    let mut response = match services
-        .http_client()
-        .send(PlatformHttpRequest::new(req, backend_name))
-        .await
-    {
+    let mut platform_request = PlatformHttpRequest::new(req, backend_name);
+    if services.http_client().supports_streaming_responses() {
+        platform_request = platform_request.with_stream_response();
+    }
+
+    let mut response = match services.http_client().send(platform_request).await {
         Ok(platform_response) => platform_response.response,
         Err(err) => {
             if let Some(dispatched) = dispatched_auction.take() {
@@ -2505,6 +3345,24 @@ mod tests {
         output
     }
 
+    fn deflate_encode(input: &[u8]) -> Vec<u8> {
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(input)
+            .expect("should write deflate test input");
+        encoder.finish().expect("should finish deflate encoding")
+    }
+
+    fn deflate_decode(input: &[u8]) -> Vec<u8> {
+        let mut decoder = flate2::read::ZlibDecoder::new(input);
+        let mut output = Vec::new();
+        decoder
+            .read_to_end(&mut output)
+            .expect("should decode deflate test output");
+        output
+    }
+
     fn brotli_encode(input: &[u8]) -> Vec<u8> {
         let mut encoder = CompressorWriter::new(Vec::new(), 4096, 5, 22);
         encoder
@@ -2730,6 +3588,63 @@ mod tests {
             stub.recorded_backend_names(),
             vec!["stub-backend".to_string()],
             "should proxy through the platform http client"
+        );
+    }
+
+    #[tokio::test]
+    async fn publisher_origin_fetch_leaves_stream_response_disabled_when_unsupported() {
+        let settings = create_test_settings();
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            200,
+            b"<html><body>origin</body></html>".to_vec(),
+            vec![("content-type", "text/html; charset=utf-8")],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/page")
+            .header(header::HOST, "publisher.example")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let _ = run_publisher_proxy(&settings, &services, req).await;
+
+        assert_eq!(
+            stub.recorded_stream_response_flags(),
+            vec![false],
+            "publisher origin fetch must not request streams when the platform does not support them"
+        );
+    }
+
+    #[tokio::test]
+    async fn publisher_origin_fetch_sets_stream_response_when_supported() {
+        let settings = create_test_settings();
+        let stub = Arc::new(StubHttpClient::new());
+        stub.set_streaming_responses_supported(true);
+        stub.push_response_with_headers(
+            200,
+            b"<html><body>origin</body></html>".to_vec(),
+            vec![("content-type", "text/html; charset=utf-8")],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/page")
+            .header(header::HOST, "publisher.example")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let _ = run_publisher_proxy(&settings, &services, req).await;
+
+        assert_eq!(
+            stub.recorded_stream_response_flags(),
+            vec![true],
+            "publisher origin fetch should request streams when the platform supports them"
         );
     }
 
@@ -3656,6 +4571,734 @@ mod tests {
         assert!(
             output.is_empty(),
             "empty origin body should produce empty streaming output. Got: {output:?}"
+        );
+    }
+
+    #[test]
+    fn stream_publisher_body_rejects_stream_body_in_sync_path() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let params = OwnedProcessResponseParams {
+            content_encoding: String::new(),
+            origin_host: "origin.example.com".to_string(),
+            origin_url: "https://origin.example.com".to_string(),
+            request_host: "proxy.example.com".to_string(),
+            request_scheme: "https".to_string(),
+            content_type: "text/html; charset=utf-8".to_string(),
+            ad_slots_script: None,
+            ad_bids_state: Arc::new(Mutex::new(None)),
+            auction_observation: None,
+            auction_request: None,
+            dispatched_auction: None,
+            price_granularity: crate::price_bucket::PriceGranularity::default(),
+        };
+        let body = EdgeBody::from_stream(futures::stream::iter(vec![Ok::<_, io::Error>(
+            bytes::Bytes::from_static(b"<html><body>live</body></html>"),
+        )]));
+        let mut output = Vec::new();
+
+        let err = stream_publisher_body(body, &mut output, &params, &settings, &registry)
+            .expect_err("should reject stream body in sync path");
+
+        assert!(
+            format!("{err:?}").contains("streaming body"),
+            "should explain that Body::Stream is not supported by the sync path: {err:?}"
+        );
+    }
+
+    #[test]
+    fn body_chunk_source_yields_once_body_in_chunks() {
+        futures::executor::block_on(async {
+            let body = EdgeBody::from_bytes(bytes::Bytes::from_static(b"abcdef"));
+            let mut source = BodyChunkSource::new(body, 3).with_max_bytes(16);
+
+            assert_eq!(
+                source.next_chunk().await.expect("should read").as_deref(),
+                Some(&b"abc"[..]),
+                "should yield the first chunk"
+            );
+            assert_eq!(
+                source.next_chunk().await.expect("should read").as_deref(),
+                Some(&b"def"[..]),
+                "should yield the second chunk"
+            );
+            assert!(
+                source.next_chunk().await.expect("should read").is_none(),
+                "should end after buffered bytes are exhausted"
+            );
+        });
+    }
+
+    #[test]
+    fn body_chunk_source_preserves_stream_chunks() {
+        futures::executor::block_on(async {
+            let body = EdgeBody::stream(futures::stream::iter(vec![
+                bytes::Bytes::from_static(b"first"),
+                bytes::Bytes::from_static(b"second"),
+            ]));
+            let mut source = BodyChunkSource::new(body, 3).with_max_bytes(16);
+
+            assert_eq!(
+                source.next_chunk().await.expect("should read").as_deref(),
+                Some(&b"first"[..]),
+                "stream chunks should pass through without re-chunking"
+            );
+            assert_eq!(
+                source.next_chunk().await.expect("should read").as_deref(),
+                Some(&b"second"[..]),
+                "stream chunks should preserve upstream boundaries"
+            );
+            assert!(
+                source.next_chunk().await.expect("should read").is_none(),
+                "should end after stream is exhausted"
+            );
+        });
+    }
+
+    #[test]
+    fn body_chunk_source_enforces_cumulative_raw_cap() {
+        futures::executor::block_on(async {
+            let body = EdgeBody::stream(futures::stream::iter(vec![
+                bytes::Bytes::from_static(b"1234"),
+                bytes::Bytes::from_static(b"5678"),
+            ]));
+            let mut source = BodyChunkSource::new(body, STREAM_CHUNK_SIZE).with_max_bytes(6);
+
+            assert!(
+                source
+                    .next_chunk()
+                    .await
+                    .expect("first chunk should pass")
+                    .is_some(),
+                "first chunk should stay under cap"
+            );
+            let err = source
+                .next_chunk()
+                .await
+                .expect_err("second chunk should exceed cap");
+
+            assert!(
+                format!("{err:?}").contains("publisher origin body exceeded"),
+                "should report cumulative cap: {err:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn stream_publisher_body_async_processes_stream_without_auction() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let registry =
+                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let services = noop_services();
+            let mut params = OwnedProcessResponseParams {
+                content_encoding: String::new(),
+                origin_host: "origin.example.com".to_string(),
+                origin_url: "https://origin.example.com".to_string(),
+                request_host: "proxy.example.com".to_string(),
+                request_scheme: "https".to_string(),
+                content_type: "text/css".to_string(),
+                ad_slots_script: None,
+                ad_bids_state: Arc::new(Mutex::new(None)),
+                auction_observation: None,
+                auction_request: None,
+                dispatched_auction: None,
+                price_granularity: crate::price_bucket::PriceGranularity::default(),
+            };
+            let body = EdgeBody::stream(futures::stream::iter(vec![
+                bytes::Bytes::from_static(b"body{background:url('https://origin.example.com/"),
+                bytes::Bytes::from_static(b"asset.png')}"),
+            ]));
+            let mut output = Vec::new();
+
+            stream_publisher_body_async(
+                body,
+                &mut output,
+                &mut params,
+                &settings,
+                &registry,
+                &orchestrator,
+                &services,
+            )
+            .await
+            .expect("stream body should process on async path");
+
+            let css = String::from_utf8(output).expect("should be valid UTF-8");
+            assert!(
+                css.contains("proxy.example.com"),
+                "should rewrite origin host while streaming. Got: {css}"
+            );
+            assert!(
+                !css.contains("origin.example.com"),
+                "should not leave origin host after rewrite. Got: {css}"
+            );
+        });
+    }
+
+    #[test]
+    fn stream_publisher_body_async_processes_gzip_stream_without_auction() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let registry =
+                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let services = noop_services();
+            let mut params = OwnedProcessResponseParams {
+                content_encoding: "gzip".to_string(),
+                origin_host: "origin.example.com".to_string(),
+                origin_url: "https://origin.example.com".to_string(),
+                request_host: "proxy.example.com".to_string(),
+                request_scheme: "https".to_string(),
+                content_type: "text/css".to_string(),
+                ad_slots_script: None,
+                ad_bids_state: Arc::new(Mutex::new(None)),
+                auction_observation: None,
+                auction_request: None,
+                dispatched_auction: None,
+                price_granularity: crate::price_bucket::PriceGranularity::default(),
+            };
+            let compressed =
+                gzip_encode(b"body{background:url('https://origin.example.com/asset.png')}");
+            let split_at = compressed.len() / 2;
+            let body = EdgeBody::stream(futures::stream::iter(vec![
+                bytes::Bytes::copy_from_slice(&compressed[..split_at]),
+                bytes::Bytes::copy_from_slice(&compressed[split_at..]),
+            ]));
+            let mut output = Vec::new();
+
+            stream_publisher_body_async(
+                body,
+                &mut output,
+                &mut params,
+                &settings,
+                &registry,
+                &orchestrator,
+                &services,
+            )
+            .await
+            .expect("gzip stream body should process on async path");
+
+            let css = String::from_utf8(gzip_decode(&output)).expect("should be valid UTF-8");
+            assert!(
+                css.contains("proxy.example.com"),
+                "should rewrite origin host while streaming gzip. Got: {css}"
+            );
+            assert!(
+                !css.contains("origin.example.com"),
+                "should not leave origin host after gzip rewrite. Got: {css}"
+            );
+        });
+    }
+
+    #[test]
+    fn stream_publisher_body_async_processes_deflate_stream_without_auction() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let registry =
+                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let services = noop_services();
+            let mut params = OwnedProcessResponseParams {
+                content_encoding: "deflate".to_string(),
+                origin_host: "origin.example.com".to_string(),
+                origin_url: "https://origin.example.com".to_string(),
+                request_host: "proxy.example.com".to_string(),
+                request_scheme: "https".to_string(),
+                content_type: "text/css".to_string(),
+                ad_slots_script: None,
+                ad_bids_state: Arc::new(Mutex::new(None)),
+                auction_observation: None,
+                auction_request: None,
+                dispatched_auction: None,
+                price_granularity: crate::price_bucket::PriceGranularity::default(),
+            };
+            let compressed =
+                deflate_encode(b"body{background:url('https://origin.example.com/asset.png')}");
+            let split_at = compressed.len() / 2;
+            let body = EdgeBody::stream(futures::stream::iter(vec![
+                bytes::Bytes::copy_from_slice(&compressed[..split_at]),
+                bytes::Bytes::copy_from_slice(&compressed[split_at..]),
+            ]));
+            let mut output = Vec::new();
+
+            stream_publisher_body_async(
+                body,
+                &mut output,
+                &mut params,
+                &settings,
+                &registry,
+                &orchestrator,
+                &services,
+            )
+            .await
+            .expect("deflate stream body should process on async path");
+
+            let css = String::from_utf8(deflate_decode(&output)).expect("should be valid UTF-8");
+            assert!(
+                css.contains("proxy.example.com"),
+                "should rewrite origin host while streaming deflate. Got: {css}"
+            );
+            assert!(
+                !css.contains("origin.example.com"),
+                "should not leave origin host after deflate rewrite. Got: {css}"
+            );
+        });
+    }
+
+    #[test]
+    fn stream_publisher_body_async_processes_brotli_stream_without_auction() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let registry =
+                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let services = noop_services();
+            let mut params = OwnedProcessResponseParams {
+                content_encoding: "br".to_string(),
+                origin_host: "origin.example.com".to_string(),
+                origin_url: "https://origin.example.com".to_string(),
+                request_host: "proxy.example.com".to_string(),
+                request_scheme: "https".to_string(),
+                content_type: "text/css".to_string(),
+                ad_slots_script: None,
+                ad_bids_state: Arc::new(Mutex::new(None)),
+                auction_observation: None,
+                auction_request: None,
+                dispatched_auction: None,
+                price_granularity: crate::price_bucket::PriceGranularity::default(),
+            };
+            let compressed =
+                brotli_encode(b"body{background:url('https://origin.example.com/asset.png')}");
+            let split_at = compressed.len() / 2;
+            let body = EdgeBody::stream(futures::stream::iter(vec![
+                bytes::Bytes::copy_from_slice(&compressed[..split_at]),
+                bytes::Bytes::copy_from_slice(&compressed[split_at..]),
+            ]));
+            let mut output = Vec::new();
+
+            stream_publisher_body_async(
+                body,
+                &mut output,
+                &mut params,
+                &settings,
+                &registry,
+                &orchestrator,
+                &services,
+            )
+            .await
+            .expect("brotli stream body should process on async path");
+
+            let css = String::from_utf8(brotli_decode(&output)).expect("should be valid UTF-8");
+            assert!(
+                css.contains("proxy.example.com"),
+                "should rewrite origin host while streaming brotli. Got: {css}"
+            );
+            assert!(
+                !css.contains("origin.example.com"),
+                "should not leave origin host after brotli rewrite. Got: {css}"
+            );
+        });
+    }
+
+    #[test]
+    fn stream_publisher_body_async_rejects_truncated_brotli_stream() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let registry =
+                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let services = noop_services();
+            let mut params = OwnedProcessResponseParams {
+                content_encoding: "br".to_string(),
+                origin_host: "origin.example.com".to_string(),
+                origin_url: "https://origin.example.com".to_string(),
+                request_host: "proxy.example.com".to_string(),
+                request_scheme: "https".to_string(),
+                content_type: "text/css".to_string(),
+                ad_slots_script: None,
+                ad_bids_state: Arc::new(Mutex::new(None)),
+                auction_observation: None,
+                auction_request: None,
+                dispatched_auction: None,
+                price_granularity: crate::price_bucket::PriceGranularity::default(),
+            };
+            let compressed =
+                brotli_encode(b"body{background:url('https://origin.example.com/asset.png')}");
+            let truncated = &compressed[..compressed.len() - 3];
+            let body =
+                EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::copy_from_slice(
+                    truncated,
+                )]));
+            let mut output = Vec::new();
+
+            let err = stream_publisher_body_async(
+                body,
+                &mut output,
+                &mut params,
+                &settings,
+                &registry,
+                &orchestrator,
+                &services,
+            )
+            .await
+            .expect_err("truncated brotli stream must fail instead of truncating silently");
+
+            assert!(
+                format!("{err:?}").contains("brotli"),
+                "should surface the brotli finalization failure: {err:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn stream_publisher_body_async_processes_stream_with_auction_hold() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let registry =
+                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let services = noop_services();
+            let state = Arc::new(Mutex::new(None));
+            let mut params = OwnedProcessResponseParams {
+                content_encoding: String::new(),
+                origin_host: "origin.example.com".to_string(),
+                origin_url: "https://origin.example.com".to_string(),
+                request_host: "proxy.example.com".to_string(),
+                request_scheme: "https".to_string(),
+                content_type: "text/html; charset=utf-8".to_string(),
+                ad_slots_script: Some(
+                    r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
+                        .to_string(),
+                ),
+                ad_bids_state: state,
+                auction_observation: None,
+                auction_request: Some(test_auction_request()),
+                dispatched_auction: Some(DispatchedAuction::empty_for_test(
+                    test_auction_request(),
+                    10,
+                )),
+                price_granularity: crate::price_bucket::PriceGranularity::default(),
+            };
+            let body = EdgeBody::stream(futures::stream::iter(vec![
+                bytes::Bytes::from_static(b"<html><head></head><body>hello"),
+                bytes::Bytes::from_static(b"</body></html>"),
+            ]));
+            let mut output = Vec::new();
+
+            stream_publisher_body_async(
+                body,
+                &mut output,
+                &mut params,
+                &settings,
+                &registry,
+                &orchestrator,
+                &services,
+            )
+            .await
+            .expect("stream body with auction should process on async path");
+
+            let html = String::from_utf8(output).expect("should be valid UTF-8");
+            assert!(
+                html.contains("hello"),
+                "should preserve streamed HTML content. Got: {html}"
+            );
+            assert!(
+                html.contains(".adSlots=JSON.parse"),
+                "should still inject ad slots. Got: {html}"
+            );
+            assert!(
+                html.contains(".bids=JSON.parse"),
+                "should collect auction and inject bids before body close. Got: {html}"
+            );
+        });
+    }
+
+    #[test]
+    fn stream_publisher_body_async_processes_non_html_stream_after_auction_collect() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let registry =
+                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let services = noop_services();
+            let mut params = OwnedProcessResponseParams {
+                content_encoding: String::new(),
+                origin_host: "origin.example.com".to_string(),
+                origin_url: "https://origin.example.com".to_string(),
+                request_host: "proxy.example.com".to_string(),
+                request_scheme: "https".to_string(),
+                content_type: "text/css".to_string(),
+                ad_slots_script: None,
+                ad_bids_state: Arc::new(Mutex::new(None)),
+                auction_observation: None,
+                auction_request: Some(test_auction_request()),
+                dispatched_auction: Some(DispatchedAuction::empty_for_test(
+                    test_auction_request(),
+                    10,
+                )),
+                price_granularity: crate::price_bucket::PriceGranularity::default(),
+            };
+            let body = EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from_static(
+                b"body{background:url('https://origin.example.com/asset.png')}",
+            )]));
+            let mut output = Vec::new();
+
+            stream_publisher_body_async(
+                body,
+                &mut output,
+                &mut params,
+                &settings,
+                &registry,
+                &orchestrator,
+                &services,
+            )
+            .await
+            .expect("non-html stream body should process after auction collection");
+
+            let css = String::from_utf8(output).expect("should be valid UTF-8");
+            assert!(
+                css.contains("proxy.example.com"),
+                "should rewrite non-html stream after auction collection. Got: {css}"
+            );
+            assert!(
+                !css.contains("origin.example.com"),
+                "should not leave origin host after rewrite. Got: {css}"
+            );
+        });
+    }
+
+    fn drain_streaming_finalize_body(content_encoding: &str, body: EdgeBody) -> Vec<u8> {
+        let settings = Arc::new(create_test_settings());
+        let registry = Arc::new(
+            IntegrationRegistry::new(&settings).expect("should create integration registry"),
+        );
+        let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+        let services = noop_services();
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/css")
+            .body(EdgeBody::empty())
+            .expect("should build response");
+        let params = OwnedProcessResponseParams {
+            content_encoding: content_encoding.to_string(),
+            origin_host: "origin.example.com".to_string(),
+            origin_url: "https://origin.example.com".to_string(),
+            request_host: "proxy.example.com".to_string(),
+            request_scheme: "https".to_string(),
+            content_type: "text/css".to_string(),
+            ad_slots_script: None,
+            ad_bids_state: Arc::new(Mutex::new(None)),
+            auction_observation: None,
+            auction_request: None,
+            dispatched_auction: None,
+            price_granularity: crate::price_bucket::PriceGranularity::default(),
+        };
+        let publisher_response = PublisherResponse::Stream {
+            response,
+            body,
+            params: Box::new(params),
+        };
+
+        let response = publisher_response_into_streaming_response(
+            publisher_response,
+            &Method::GET,
+            Arc::clone(&settings),
+            registry.as_ref(),
+            orchestrator,
+            services,
+        )
+        .expect("should build streaming response");
+
+        assert!(
+            matches!(response.body(), EdgeBody::Stream(_)),
+            "streaming finalize should keep a lazy Body::Stream"
+        );
+
+        futures::executor::block_on(
+            response
+                .into_body()
+                .into_bytes_bounded(settings.publisher.max_buffered_body_bytes),
+        )
+        .expect("streaming body should drain")
+        .to_vec()
+    }
+
+    #[test]
+    fn publisher_response_streaming_finalize_keeps_stream_body_lazy() {
+        let body_bytes = drain_streaming_finalize_body(
+            "",
+            EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from_static(
+                b"body{background:url('https://origin.example.com/asset.png')}",
+            )])),
+        );
+        let css = String::from_utf8(body_bytes).expect("should be valid UTF-8");
+        assert!(
+            css.contains("proxy.example.com"),
+            "streaming response body should still run publisher rewriting. Got: {css}"
+        );
+        assert!(
+            !css.contains("origin.example.com"),
+            "streaming response body should not leave origin URLs unrewritten. Got: {css}"
+        );
+    }
+
+    #[test]
+    fn publisher_response_streaming_finalize_processes_gzip_stream() {
+        let compressed =
+            gzip_encode(b"body{background:url('https://origin.example.com/asset.png')}");
+        let split_at = compressed.len() / 2;
+        let output = drain_streaming_finalize_body(
+            "gzip",
+            EdgeBody::stream(futures::stream::iter(vec![
+                bytes::Bytes::copy_from_slice(&compressed[..split_at]),
+                bytes::Bytes::copy_from_slice(&compressed[split_at..]),
+            ])),
+        );
+
+        let css = String::from_utf8(gzip_decode(&output)).expect("should be valid UTF-8");
+        assert!(
+            css.contains("proxy.example.com"),
+            "streaming response finalize should rewrite gzip body. Got: {css}"
+        );
+        assert!(
+            !css.contains("origin.example.com"),
+            "streaming response finalize should not leave gzip origin URLs. Got: {css}"
+        );
+    }
+
+    #[test]
+    fn publisher_response_streaming_finalize_processes_deflate_stream() {
+        let compressed =
+            deflate_encode(b"body{background:url('https://origin.example.com/asset.png')}");
+        let split_at = compressed.len() / 2;
+        let output = drain_streaming_finalize_body(
+            "deflate",
+            EdgeBody::stream(futures::stream::iter(vec![
+                bytes::Bytes::copy_from_slice(&compressed[..split_at]),
+                bytes::Bytes::copy_from_slice(&compressed[split_at..]),
+            ])),
+        );
+
+        let css = String::from_utf8(deflate_decode(&output)).expect("should be valid UTF-8");
+        assert!(
+            css.contains("proxy.example.com"),
+            "streaming response finalize should rewrite deflate body. Got: {css}"
+        );
+        assert!(
+            !css.contains("origin.example.com"),
+            "streaming response finalize should not leave deflate origin URLs. Got: {css}"
+        );
+    }
+
+    #[test]
+    fn publisher_response_streaming_finalize_processes_brotli_stream() {
+        let compressed =
+            brotli_encode(b"body{background:url('https://origin.example.com/asset.png')}");
+        let split_at = compressed.len() / 2;
+        let output = drain_streaming_finalize_body(
+            "br",
+            EdgeBody::stream(futures::stream::iter(vec![
+                bytes::Bytes::copy_from_slice(&compressed[..split_at]),
+                bytes::Bytes::copy_from_slice(&compressed[split_at..]),
+            ])),
+        );
+
+        let css = String::from_utf8(brotli_decode(&output)).expect("should be valid UTF-8");
+        assert!(
+            css.contains("proxy.example.com"),
+            "streaming response finalize should rewrite brotli body. Got: {css}"
+        );
+        assert!(
+            !css.contains("origin.example.com"),
+            "streaming response finalize should not leave brotli origin URLs. Got: {css}"
+        );
+    }
+
+    #[test]
+    fn publisher_response_streaming_finalize_holds_auction_and_keeps_gzip_tail() {
+        let settings = Arc::new(create_test_settings());
+        let registry = Arc::new(
+            IntegrationRegistry::new(&settings).expect("should create integration registry"),
+        );
+        let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+        let services = noop_services();
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(EdgeBody::empty())
+            .expect("should build response");
+        // The trailing content after `</body>` must exceed the flate2 write
+        // decoder's 32 KiB internal output buffer: the close-body tag then
+        // surfaces (and releases the auction hold) mid-stream, while the
+        // trailing markup only surfaces at decoder finalization. This guards
+        // against the EOF decoded tail being dropped once the hold is gone.
+        let trailing_comment = format!("<!-- {} -->", "trailing-content ".repeat(3 * 1024));
+        let page = format!("<html><head></head><body>hello</body>{trailing_comment}</html>");
+        let compressed = gzip_encode(page.as_bytes());
+        let chunks: Vec<bytes::Bytes> = compressed
+            .chunks(STREAM_CHUNK_SIZE)
+            .map(bytes::Bytes::copy_from_slice)
+            .collect();
+        let params = OwnedProcessResponseParams {
+            content_encoding: "gzip".to_string(),
+            origin_host: "origin.example.com".to_string(),
+            origin_url: "https://origin.example.com".to_string(),
+            request_host: "proxy.example.com".to_string(),
+            request_scheme: "https".to_string(),
+            content_type: "text/html; charset=utf-8".to_string(),
+            ad_slots_script: Some(
+                r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
+                    .to_string(),
+            ),
+            ad_bids_state: Arc::new(Mutex::new(None)),
+            auction_observation: None,
+            auction_request: Some(test_auction_request()),
+            dispatched_auction: Some(DispatchedAuction::empty_for_test(
+                test_auction_request(),
+                10,
+            )),
+            price_granularity: crate::price_bucket::PriceGranularity::default(),
+        };
+        let publisher_response = PublisherResponse::Stream {
+            response,
+            body: EdgeBody::stream(futures::stream::iter(chunks)),
+            params: Box::new(params),
+        };
+
+        let response = publisher_response_into_streaming_response(
+            publisher_response,
+            &Method::GET,
+            Arc::clone(&settings),
+            registry.as_ref(),
+            orchestrator,
+            services,
+        )
+        .expect("should build streaming response");
+
+        let output = futures::executor::block_on(
+            response
+                .into_body()
+                .into_bytes_bounded(settings.publisher.max_buffered_body_bytes),
+        )
+        .expect("streaming body should drain")
+        .to_vec();
+
+        let html = String::from_utf8(gzip_decode(&output)).expect("should be valid UTF-8");
+        assert!(
+            html.contains(".bids=JSON.parse"),
+            "should collect the held auction and inject bids. Got tail: {}",
+            &html[html.len().saturating_sub(200)..]
+        );
+        assert!(
+            html.contains("trailing-content"),
+            "should preserve content after the close-body tag"
+        );
+        assert!(
+            html.trim_end().ends_with("</html>"),
+            "should not drop the decoded tail once the auction hold is released. Got tail: {}",
+            &html[html.len().saturating_sub(200)..]
         );
     }
 
