@@ -29,6 +29,14 @@ jobs:
           components: "clippy, rustfmt"
           cache-shared-key: cargo-${{ runner.os }}
 
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Configure sccache for Rust
+        run: |
+          echo "SCCACHE_GHA_ENABLED=on" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+
       - name: Run cargo fmt
         uses: actions-rust-lang/rustfmt@v1
 
