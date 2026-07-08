@@ -1101,9 +1101,10 @@ pub async fn buffer_publisher_response_async(
 ///
 /// # Errors
 ///
-/// Returns an error if processor construction fails before the streaming body is
-/// created.
-pub fn publisher_response_into_streaming_response(
+/// Returns an error if processor construction fails before the streaming body
+/// is created; a dispatched auction is abandoned with `processor_init_error`
+/// telemetry first, matching the buffered finalizer.
+pub async fn publisher_response_into_streaming_response(
     publisher_response: PublisherResponse,
     method: &Method,
     settings: Arc<Settings>,
@@ -1142,7 +1143,25 @@ pub fn publisher_response_into_streaming_response(
             response.headers_mut().remove(header::CONTENT_LENGTH);
             let mut params = *params;
             let mut processor =
-                PublisherBodyProcessor::new(&params, &settings, integration_registry)?;
+                match PublisherBodyProcessor::new(&params, &settings, integration_registry) {
+                    Ok(processor) => processor,
+                    Err(err) => {
+                        // Parity with the buffered finalizer: a processor
+                        // construction failure abandons the dispatched auction
+                        // with telemetry instead of dropping the in-flight SSP
+                        // responses silently.
+                        if let Some(dispatched) = params.dispatched_auction.take() {
+                            emit_abandoned_auction(
+                                &services,
+                                params.auction_observation.take(),
+                                dispatched,
+                                "processor_init_error",
+                            )
+                            .await;
+                        }
+                        return Err(err);
+                    }
+                };
             // The guard is created before the lazy stream so an auction whose
             // response body is dropped unpolled still logs the loss.
             let dispatched_auction = params.dispatched_auction.take().map(|dispatched| {
@@ -5292,14 +5311,14 @@ mod tests {
             params: Box::new(params),
         };
 
-        let response = publisher_response_into_streaming_response(
+        let response = futures::executor::block_on(publisher_response_into_streaming_response(
             publisher_response,
             &Method::GET,
             Arc::clone(&settings),
             registry.as_ref(),
             orchestrator,
             services,
-        )
+        ))
         .expect("should build streaming response");
 
         assert!(
@@ -5458,14 +5477,14 @@ mod tests {
             params: Box::new(params),
         };
 
-        let response = publisher_response_into_streaming_response(
+        let response = futures::executor::block_on(publisher_response_into_streaming_response(
             publisher_response,
             &Method::GET,
             Arc::clone(&settings),
             registry.as_ref(),
             orchestrator,
             services,
-        )
+        ))
         .expect("should build streaming response");
 
         let output = futures::executor::block_on(

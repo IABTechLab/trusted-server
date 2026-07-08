@@ -795,14 +795,17 @@ async fn dispatch_fallback(
                         )
                         .await
                         {
-                            Ok(pub_response) => publisher_response_into_streaming_response(
-                                pub_response,
-                                &method,
-                                Arc::clone(&state.settings),
-                                state.registry.as_ref(),
-                                Arc::clone(&state.orchestrator),
-                                publisher_services.clone(),
-                            ),
+                            Ok(pub_response) => {
+                                publisher_response_into_streaming_response(
+                                    pub_response,
+                                    &method,
+                                    Arc::clone(&state.settings),
+                                    state.registry.as_ref(),
+                                    Arc::clone(&state.orchestrator),
+                                    publisher_services.clone(),
+                                )
+                                .await
+                            }
                             Err(e) => Err(e),
                         }
                     }
