@@ -232,7 +232,8 @@ pub(super) fn toml_string(value: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            control if (control as u32) < 0x20 => {
+            // TOML basic strings reject U+0000..U+001F and DEL (U+007F).
+            control if (control as u32) < 0x20 || control == '\u{7f}' => {
                 out.push_str(&format!("\\u{:04X}", control as u32));
             }
             other => out.push(other),
@@ -297,7 +298,7 @@ pub(super) fn splice_creative_slots(
     // No section yet — append a fresh one with the network id and slots.
     if !existing
         .lines()
-        .any(|line| line.trim() == "[creative_opportunities]")
+        .any(|line| is_table_header(line, "[creative_opportunities]"))
     {
         let mut result = existing.to_string();
         if !result.is_empty() && !result.ends_with('\n') {
@@ -328,7 +329,7 @@ pub(super) fn splice_creative_slots(
     let lines: Vec<&str> = document.lines().collect();
     let header = lines
         .iter()
-        .position(|line| line.trim() == "[creative_opportunities]")
+        .position(|line| is_table_header(line, "[creative_opportunities]"))
         .ok_or_else(|| {
             report_error("target config has no [creative_opportunities] section to update")
         })?;
@@ -340,7 +341,9 @@ pub(super) fn splice_creative_slots(
     };
     let is_unrelated_table = |line: &str| {
         let trimmed = line.trim_start();
-        trimmed.starts_with('[') && !is_slot_table(line) && trimmed != "[creative_opportunities]"
+        trimmed.starts_with('[')
+            && !is_slot_table(line)
+            && !is_table_header(line, "[creative_opportunities]")
     };
 
     // Where the existing slot array begins (first slot table after the header),
@@ -386,6 +389,25 @@ fn uses_crlf(document: &str) -> bool {
     document.contains("\r\n")
 }
 
+/// Strips a trailing inline `# comment` from a candidate table-header line.
+///
+/// Only valid on header candidates: header lines cannot contain `#` before the
+/// closing bracket unless it is inside a quoted key, which the configs this
+/// updater manages never use.
+fn strip_inline_comment(line: &str) -> &str {
+    match line.find('#') {
+        Some(position) => line[..position].trim_end(),
+        None => line,
+    }
+}
+
+/// Whether `line` is exactly the `section_header` table header (for example
+/// `[creative_opportunities]`), tolerating surrounding whitespace and a
+/// trailing inline `# comment` — both valid TOML.
+fn is_table_header(line: &str, section_header: &str) -> bool {
+    strip_inline_comment(line.trim()) == section_header
+}
+
 pub(super) fn replace_key_in_section(
     document: &str,
     section: &str,
@@ -400,8 +422,9 @@ pub(super) fn replace_key_in_section(
 
     for line in document.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            in_section = trimmed == section_header;
+        let header_candidate = strip_inline_comment(trimmed);
+        if header_candidate.starts_with('[') && header_candidate.ends_with(']') {
+            in_section = header_candidate == section_header;
             saw_section |= in_section;
         }
 
@@ -589,6 +612,40 @@ mod tests {
     }
 
     #[test]
+    fn splice_recognizes_inline_commented_section_header() {
+        // `[creative_opportunities] # comment` is valid TOML; the splice must
+        // update it in place instead of appending a duplicate section.
+        let existing = "[creative_opportunities] # ad templates\ngam_network_id = \"111\"\n\n\
+             [auction] # flags\nenabled = true\n";
+
+        let out = splice_creative_slots(existing, Some("222"), &header_rendered())
+            .expect("should splice");
+
+        assert_eq!(
+            out.lines()
+                .filter(|line| is_table_header(line, "[creative_opportunities]"))
+                .count(),
+            1,
+            "commented header must not be duplicated"
+        );
+        let value = toml::from_str::<toml::Value>(&out).expect("spliced config is valid TOML");
+        assert_eq!(
+            value["creative_opportunities"]["gam_network_id"].as_str(),
+            Some("222"),
+            "network id updated under a commented header"
+        );
+        assert_eq!(
+            value["creative_opportunities"]["slot"][0]["id"].as_str(),
+            Some("header")
+        );
+        assert_eq!(
+            value["auction"]["enabled"].as_bool(),
+            Some(true),
+            "commented trailing section preserved"
+        );
+    }
+
+    #[test]
     fn splice_inserts_when_no_existing_slots() {
         let existing =
             "[creative_opportunities]\ngam_network_id = \"111\"\n\n[auction]\nenabled = true\n";
@@ -735,6 +792,41 @@ mod tests {
     fn toml_string_escapes_quotes_backslashes_and_controls() {
         assert_eq!(toml_string("a\"b\\c"), "\"a\\\"b\\\\c\"");
         assert_eq!(toml_string("line\nbreak\t!"), "\"line\\nbreak\\t!\"");
+    }
+
+    #[test]
+    fn toml_string_escapes_del_control_char() {
+        assert_eq!(toml_string("a\u{7f}b"), "\"a\\u007Fb\"");
+        let doc = format!("value = {}", toml_string("a\u{7f}b"));
+        let value = toml::from_str::<toml::Value>(&doc).expect("DEL escapes to valid TOML");
+        assert_eq!(
+            value["value"].as_str(),
+            Some("a\u{7f}b"),
+            "escaped DEL round-trips as data"
+        );
+    }
+
+    #[test]
+    fn replace_key_handles_inline_commented_headers() {
+        let document = "[creative_opportunities] # managed\ngam_network_id = \"111\"\n\n\
+             [auction] # flags\nenabled = true\n";
+
+        let updated = replace_key_in_section(
+            document,
+            "creative_opportunities",
+            "gam_network_id",
+            "gam_network_id = \"222\"",
+        )
+        .expect("should find the commented section header");
+
+        assert!(
+            updated.contains("gam_network_id = \"222\""),
+            "key replaced under a commented header"
+        );
+        assert!(
+            updated.contains("enabled = true"),
+            "later commented section left untouched"
+        );
     }
 
     #[test]

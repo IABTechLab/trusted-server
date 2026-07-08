@@ -478,9 +478,13 @@ pub(crate) fn run_update_slots(
     }
 
     // Patterns for slots seen on this run: the `--page-pattern` values, or the
-    // audited path when none are given (preserving single-page behavior).
+    // audited path when none are given (preserving single-page behavior). The
+    // default uses the recorded post-redirect URL so it matches the page that
+    // was actually audited, falling back to the requested URL when the
+    // recorded final URL is invalid.
     let run_patterns: Vec<String> = if page_patterns.is_empty() {
-        vec![default_page_pattern(&target_url)]
+        let audited_url = collected.final_url().unwrap_or_else(|_| target_url.clone());
+        vec![default_page_pattern(&audited_url)]
     } else {
         page_patterns.to_vec()
     };
@@ -903,6 +907,49 @@ mod tests {
             slot["div_id"].as_str(),
             Some("div-gpt-ad-head\"er"),
             "should keep the quote as data, not TOML syntax"
+        );
+    }
+
+    #[test]
+    fn update_slots_defaults_pattern_to_final_url_after_redirect() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let config_path = temp.path().join("trusted-server.toml");
+        fs::write(
+            &config_path,
+            "[creative_opportunities]\ngam_network_id = \"111\"\n",
+        )
+        .expect("should write config");
+        // The requested URL redirects; slots are scraped from the final page.
+        let mut collected = collected_page();
+        collected.requested_url = "https://publisher.example/".to_string();
+        collected.final_url = "https://publisher.example/news/story".to_string();
+        collected.gpt_slots = vec![collector::CollectedGptSlot {
+            gam_unit_path: "/222/homepage/header".to_string(),
+            div_id: "div-gpt-ad-header".to_string(),
+            sizes: vec![(728, 90)],
+        }];
+        let collector = FakeCollector::new(collected);
+        let mut out = Vec::new();
+
+        run_update_slots(
+            "https://publisher.example/",
+            &config_path,
+            None,
+            &[],
+            false,
+            &[],
+            false,
+            &collector,
+            &mut out,
+        )
+        .expect("should update slots");
+
+        let written = fs::read_to_string(&config_path).expect("should read config");
+        let value = toml::from_str::<toml::Value>(&written).expect("valid TOML");
+        assert_eq!(
+            value["creative_opportunities"]["slot"][0]["page_patterns"][0].as_str(),
+            Some("/news/story"),
+            "default pattern should use the post-redirect path, not the requested one"
         );
     }
 
