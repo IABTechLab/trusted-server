@@ -92,6 +92,59 @@ pub trait PlatformSecretStore: Send + Sync {
     fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>>;
 }
 
+/// Write-only view of a config store, keyed by management [`StoreId`].
+///
+/// Extracted from [`PlatformConfigStore`] so the registry-backed composite
+/// store can delegate writes to a management-path implementation without also
+/// depending on that implementation's read path. Reads flow through the
+/// EdgeZero registry instead (see `platform::composite`).
+pub trait PlatformConfigWriter: Send + Sync {
+    /// Store a string value in the management store identified by `store_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::ConfigStore`] when the write fails or the
+    /// platform management API is unreachable.
+    fn put(&self, store_id: &StoreId, key: &str, value: &str) -> Result<(), Report<PlatformError>>;
+
+    /// Delete a key from the management store identified by `store_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::ConfigStore`] when the delete fails or the
+    /// platform management API is unreachable.
+    fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>>;
+}
+
+/// Write-only view of a secret store, keyed by management [`StoreId`].
+///
+/// Extracted from [`PlatformSecretStore`] so the registry-backed composite
+/// store can delegate writes to a management-path implementation without also
+/// depending on that implementation's read path. Reads flow through the
+/// EdgeZero registry instead (see `platform::composite`).
+pub trait PlatformSecretWriter: Send + Sync {
+    /// Create or overwrite a secret in the management store identified by `store_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::SecretStore`] when the create fails or the
+    /// platform management API is unreachable.
+    fn create(
+        &self,
+        store_id: &StoreId,
+        name: &str,
+        value: &str,
+    ) -> Result<(), Report<PlatformError>>;
+
+    /// Delete a secret from the management store identified by `store_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::SecretStore`] when the delete fails or the
+    /// platform management API is unreachable.
+    fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>>;
+}
+
 /// Synchronous, object-safe dynamic backend management.
 pub trait PlatformBackend: Send + Sync {
     /// Compute the deterministic backend name for the given spec without

@@ -69,12 +69,18 @@ pub struct ClientInfo {
     pub server_region: Option<String>,
 }
 
-/// Edge-visible name used to open a config or secret store at runtime.
+/// Logical runtime store id used to resolve a config or secret store on read.
 ///
 /// Passed to read methods on [`super::PlatformConfigStore`] and
-/// [`super::PlatformSecretStore`]. Distinct from [`StoreId`] to prevent
-/// accidentally passing a management API identifier where a runtime name is
-/// expected.
+/// [`super::PlatformSecretStore`]. Under the registry-backed composite store
+/// (`platform::composite`) this value is resolved as a **logical store id** via
+/// `ConfigRegistry::named` / `SecretRegistry::named` — i.e. the `[stores.*]` id
+/// declared in `edgezero.toml` (`trusted_server_config`, `jwks_store`,
+/// `ts_secrets`, `datadome-ip-bypass`, …), not a physical platform store name.
+/// Under the D7 convention the logical id equals the platform store name, so
+/// existing call sites need no change. Distinct from [`StoreId`] (the
+/// management-API write identifier) to prevent passing a write identifier where
+/// a read id is expected.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, derive_more::Display)]
 pub struct StoreName(String);
 

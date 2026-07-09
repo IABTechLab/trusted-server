@@ -32,6 +32,7 @@
 
 use std::time::Duration;
 
+mod composite;
 mod error;
 mod http;
 mod image_optimizer;
@@ -41,6 +42,7 @@ pub(crate) mod test_support;
 mod traits;
 mod types;
 
+pub use composite::{CompositeConfigStore, CompositeSecretStore};
 pub use edgezero_core::key_value_store::{KvError, KvHandle, KvStore as PlatformKvStore};
 pub use error::PlatformError;
 pub use http::{
@@ -52,7 +54,10 @@ pub use image_optimizer::{
     PlatformImageOptimizerParams, PlatformImageOptimizerRegion,
 };
 pub use kv::UnavailableKvStore;
-pub use traits::{PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore};
+pub use traits::{
+    PlatformBackend, PlatformConfigStore, PlatformConfigWriter, PlatformGeo, PlatformSecretStore,
+    PlatformSecretWriter,
+};
 pub use types::{
     ClientInfo, GeoInfo, PlatformBackendSpec, RuntimeServices, RuntimeServicesBuilder, StoreId,
     StoreName,
