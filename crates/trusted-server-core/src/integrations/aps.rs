@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
 use std::collections::HashMap;
 use std::time::Duration;
-use validator::Validate;
+use validator::{Validate, ValidationError};
 
 use crate::auction::provider::AuctionProvider;
 use crate::auction::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid, MediaType};
@@ -201,6 +201,7 @@ pub struct ApsConfig {
 
     /// APS publisher ID (accepts both string and integer from config)
     #[serde(deserialize_with = "deserialize_pub_id")]
+    #[validate(length(min = 1), custom(function = validate_aps_pub_id))]
     pub pub_id: String,
 
     /// APS API endpoint
@@ -283,6 +284,26 @@ impl Default for ApsConfig {
             timeout_ms: default_timeout_ms(),
         }
     }
+}
+
+/// Validator for [`ApsConfig::pub_id`]: rejects the known template placeholder
+/// publisher ID. Non-emptiness is enforced by the built-in `length` validator;
+/// this runs only when APS is enabled, because integration configs validate
+/// lazily via `get_typed`.
+fn validate_aps_pub_id(pub_id: &str) -> Result<(), ValidationError> {
+    if ApsConfig::PUB_ID_PLACEHOLDERS
+        .iter()
+        .any(|placeholder| placeholder.eq_ignore_ascii_case(pub_id.trim()))
+    {
+        return Err(ValidationError::new("aps_pub_id_placeholder"));
+    }
+    Ok(())
+}
+
+impl ApsConfig {
+    /// Reserved example `pub_id` values from the config template that must not
+    /// be deployed while APS is enabled.
+    pub const PUB_ID_PLACEHOLDERS: &[&str] = &["your-aps-publisher-id"];
 }
 
 impl IntegrationConfig for ApsConfig {

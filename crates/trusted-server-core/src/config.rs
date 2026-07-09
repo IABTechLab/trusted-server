@@ -282,6 +282,82 @@ password = "production-admin-password-32-bytes"
     }
 
     #[test]
+    fn deploy_validation_rejects_example_publisher_hosts() {
+        let mut settings = valid_settings();
+        settings.publisher.domain = "example.com".to_string();
+        settings.publisher.cookie_domain = ".example.com".to_string();
+        settings.publisher.origin_url = "https://origin.example.com".to_string();
+
+        let err = validate_settings_for_deploy(&settings)
+            .expect_err("should reject unedited example publisher hosts");
+        let text = format!("{err:?}");
+
+        assert!(
+            text.contains("publisher.domain")
+                && text.contains("publisher.cookie_domain")
+                && text.contains("publisher.origin_url"),
+            "should flag all three example publisher placeholders: {err:?}"
+        );
+    }
+
+    #[test]
+    fn deploy_validation_rejects_placeholder_request_signing_store_ids() {
+        let mut settings = valid_settings();
+        settings.request_signing = Some(crate::settings::RequestSigning {
+            enabled: true,
+            config_store_id: "<management-config-store-id>".to_string(),
+            secret_store_id: "<management-secret-store-id>".to_string(),
+        });
+
+        let err = validate_settings_for_deploy(&settings)
+            .expect_err("should reject placeholder request-signing store ids when enabled");
+        let text = format!("{err:?}");
+
+        assert!(
+            text.contains("request_signing.config_store_id")
+                && text.contains("request_signing.secret_store_id"),
+            "should flag both request-signing store ids: {err:?}"
+        );
+    }
+
+    #[test]
+    fn deploy_validation_allows_disabled_request_signing_with_placeholder_store_ids() {
+        let mut settings = valid_settings();
+        settings.request_signing = Some(crate::settings::RequestSigning {
+            enabled: false,
+            config_store_id: "<management-config-store-id>".to_string(),
+            secret_store_id: "<management-secret-store-id>".to_string(),
+        });
+
+        validate_settings_for_deploy(&settings)
+            .expect("should allow placeholder store ids while request signing is disabled");
+    }
+
+    #[test]
+    fn deploy_validation_rejects_placeholder_aps_pub_id() {
+        let mut settings = valid_settings();
+        settings
+            .integrations
+            .insert_config(
+                "aps",
+                &serde_json::json!({
+                    "enabled": true,
+                    "pub_id": "your-aps-publisher-id",
+                    "endpoint": "https://aps.example.com/e/dtb/bid"
+                }),
+            )
+            .expect("should insert APS config");
+
+        let err = validate_settings_for_deploy(&settings)
+            .expect_err("should reject placeholder APS pub_id when enabled");
+
+        assert!(
+            format!("{err:?}").contains("aps"),
+            "should mention the APS integration: {err:?}"
+        );
+    }
+
+    #[test]
     fn deploy_validation_rejects_external_prebid_bundle_without_proxy_allowed_domains() {
         let mut settings = valid_settings();
         settings.proxy.allowed_domains.clear();
