@@ -3,9 +3,9 @@ use error_stack::{Report, ResultExt};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
-use crate::config_payload::settings_from_config_blob;
+use crate::config_payload::settings_from_config_blob_with_secrets;
 use crate::error::TrustedServerError;
-use crate::platform::{PlatformConfigStore, StoreName};
+use crate::platform::{PlatformConfigStore, PlatformSecretStore, StoreName};
 use crate::settings::Settings;
 
 const DEFAULT_CONFIG_STORE_ID: &str = "app_config";
@@ -42,19 +42,24 @@ pub fn default_config_key() -> String {
 
 /// Loads [`Settings`] from a platform config store and key.
 ///
+/// `secret_store` resolves `[secrets]`-mode key names into secret values at
+/// load; adapters without secret-store support pass `None`, which fails
+/// closed on store-mode blobs.
+///
 /// # Errors
 ///
 /// Returns [`TrustedServerError::Configuration`] when the config blob is
-/// missing, cannot be read, fails envelope verification, or fails Trusted
-/// Server settings validation.
+/// missing, cannot be read, fails envelope verification, references secrets
+/// that cannot be resolved, or fails Trusted Server settings validation.
 pub fn get_settings_from_config_store(
     config_store: &dyn PlatformConfigStore,
+    secret_store: Option<&dyn PlatformSecretStore>,
     store_name: &StoreName,
     key: &str,
 ) -> Result<Settings, Report<TrustedServerError>> {
     let raw_value = read_config_entry(config_store, store_name, key)?;
     let envelope_json = resolve_fastly_chunk_pointer(config_store, store_name, &raw_value)?;
-    settings_from_config_blob(&envelope_json)
+    settings_from_config_blob_with_secrets(&envelope_json, secret_store)
 }
 
 fn read_config_entry(
@@ -228,13 +233,59 @@ mod tests {
             entries: BTreeMap::from([(CONFIG_BLOB_KEY.to_string(), envelope_json)]),
         };
 
-        let loaded =
-            get_settings_from_config_store(&store, &StoreName::from("app_config"), CONFIG_BLOB_KEY)
-                .expect("should load settings");
+        let loaded = get_settings_from_config_store(
+            &store,
+            None,
+            &StoreName::from("app_config"),
+            CONFIG_BLOB_KEY,
+        )
+        .expect("should load settings");
 
         assert_eq!(
             loaded.publisher.domain, settings.publisher.domain,
             "should load publisher domain"
+        );
+    }
+
+    #[test]
+    fn loads_store_mode_settings_resolving_secrets() {
+        let mut settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        settings.secrets.enabled = true;
+        settings.ec.passphrase = crate::redacted::Redacted::new("ec_passphrase".to_owned());
+        settings.publisher.proxy_secret = crate::redacted::Redacted::new("proxy_secret".to_owned());
+        for handler in &mut settings.handlers {
+            handler.password = crate::redacted::Redacted::new("handler_password".to_owned());
+        }
+        let store = MemoryConfigStore {
+            entries: BTreeMap::from([(CONFIG_BLOB_KEY.to_string(), envelope_json(&settings))]),
+        };
+        let secret_store = crate::platform::test_support::HashMapSecretStore::new(
+            std::collections::HashMap::from([
+                (
+                    "ec_passphrase".to_owned(),
+                    b"resolved-passphrase-32-bytes-min!".to_vec(),
+                ),
+                ("proxy_secret".to_owned(), b"resolved-proxy-secret".to_vec()),
+                (
+                    "handler_password".to_owned(),
+                    b"resolved-handler-password".to_vec(),
+                ),
+            ]),
+        );
+
+        let loaded = get_settings_from_config_store(
+            &store,
+            Some(&secret_store),
+            &StoreName::from("app_config"),
+            CONFIG_BLOB_KEY,
+        )
+        .expect("should load store-mode settings");
+
+        assert_eq!(
+            loaded.ec.passphrase.expose(),
+            "resolved-passphrase-32-bytes-min!",
+            "should resolve passphrase from secret store"
         );
     }
 
@@ -275,9 +326,13 @@ mod tests {
             ]),
         };
 
-        let loaded =
-            get_settings_from_config_store(&store, &StoreName::from("app_config"), CONFIG_BLOB_KEY)
-                .expect("should load settings");
+        let loaded = get_settings_from_config_store(
+            &store,
+            None,
+            &StoreName::from("app_config"),
+            CONFIG_BLOB_KEY,
+        )
+        .expect("should load settings");
 
         assert_eq!(
             loaded.publisher.domain, settings.publisher.domain,
@@ -306,9 +361,13 @@ mod tests {
             entries: BTreeMap::from([(CONFIG_BLOB_KEY.to_string(), pointer)]),
         };
 
-        let err =
-            get_settings_from_config_store(&store, &StoreName::from("app_config"), CONFIG_BLOB_KEY)
-                .expect_err("should reject malformed chunk length metadata");
+        let err = get_settings_from_config_store(
+            &store,
+            None,
+            &StoreName::from("app_config"),
+            CONFIG_BLOB_KEY,
+        )
+        .expect_err("should reject malformed chunk length metadata");
 
         assert!(
             err.to_string().contains("chunk lengths total mismatch"),
@@ -322,9 +381,13 @@ mod tests {
             entries: BTreeMap::new(),
         };
 
-        let err =
-            get_settings_from_config_store(&store, &StoreName::from("app_config"), CONFIG_BLOB_KEY)
-                .expect_err("should fail when blob is missing");
+        let err = get_settings_from_config_store(
+            &store,
+            None,
+            &StoreName::from("app_config"),
+            CONFIG_BLOB_KEY,
+        )
+        .expect_err("should fail when blob is missing");
 
         assert!(
             err.to_string().contains(CONFIG_BLOB_KEY),

@@ -1,3 +1,14 @@
+# Store mode (recommended for production): enable the [secrets] section at
+# the bottom of this file and replace each secret VALUE below with the NAME
+# of a secret in the platform secret store. Covered fields:
+# publisher.proxy_secret, ec.passphrase, ec.partners[].api_token,
+# ec.partners[].ts_pull_token, handlers[].password. Seed the store with your
+# EXISTING values first — changing ec.passphrase rotates every visitor ID,
+# and changing publisher.proxy_secret invalidates outstanding proxy URL
+# tokens:
+#   fastly secret-store-entry create --store-id <ID> --name ec_passphrase --secret <value>
+# Rollout order: deploy new WASM -> seed secrets -> push store-mode config.
+
 [[handlers]]
 path = "^/_ts/admin"
 username = "admin"
@@ -136,6 +147,12 @@ example_segments = "segments"
 
 [debug]
 ja4_endpoint_enabled = false
+
+# Secret-store reference mode. When enabled, the secret fields listed at the
+# top of this file hold secret key NAMES resolved from `store` at startup.
+# [secrets]
+# enabled = true
+# store = "ts_secrets"
 
 [creative_opportunities]
 gam_network_id = "123456789"

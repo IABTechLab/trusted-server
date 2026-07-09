@@ -61,6 +61,19 @@ build = """
             key = "tinybird_access_append_token"
             data = "test-tinybird-access-append-token"
 
+        # Local values for [secrets] store-mode app configs (issue #846).
+        [[local_server.secret_stores.ts_secrets]]
+            key = "ec_passphrase"
+            data = "local-dev-ec-passphrase-32-bytes!!"
+
+        [[local_server.secret_stores.ts_secrets]]
+            key = "proxy_secret"
+            data = "local-dev-proxy-secret"
+
+        [[local_server.secret_stores.ts_secrets]]
+            key = "admin_password"
+            data = "local-dev-admin-password-32-bytes!"
+
     [local_server.config_stores]
         [local_server.config_stores.trusted_server_config]
             format = "inline-toml"

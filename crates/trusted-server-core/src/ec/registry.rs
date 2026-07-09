@@ -10,7 +10,7 @@ use error_stack::{Report, ResultExt as _};
 
 use crate::error::TrustedServerError;
 use crate::redacted::Redacted;
-use crate::settings::EcPartner;
+use crate::settings::{EcPartner, SecretFieldMode};
 
 use super::partner::{hash_api_key, normalize_partner_source_domain};
 
@@ -69,6 +69,23 @@ impl PartnerRegistry {
     /// invalid source domain, duplicate source domain, duplicate API token hash,
     /// or invalid pull sync configuration.
     pub fn from_config(partners: &[EcPartner]) -> Result<Self, Report<TrustedServerError>> {
+        Self::from_config_with_secret_mode(partners, SecretFieldMode::ResolvedValues)
+    }
+
+    /// Builds a registry like [`Self::from_config`], with API token checks
+    /// matched to `mode`.
+    ///
+    /// In [`SecretFieldMode::KeyNames`] the tokens are secret-store key
+    /// names, so the minimum token length check is deferred to runtime where
+    /// the resolved values are available.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::from_config`].
+    pub fn from_config_with_secret_mode(
+        partners: &[EcPartner],
+        mode: SecretFieldMode,
+    ) -> Result<Self, Report<TrustedServerError>> {
         let mut by_source_domain = HashMap::with_capacity(partners.len());
         let mut by_api_key_hash = HashMap::with_capacity(partners.len());
 
@@ -86,7 +103,9 @@ impl PartnerRegistry {
                 }));
             }
 
-            validate_api_token(&normalized_source, partner.api_token.expose())?;
+            if mode == SecretFieldMode::ResolvedValues {
+                validate_api_token(&normalized_source, partner.api_token.expose())?;
+            }
 
             let api_key_hash = hash_api_key(partner.api_token.expose());
 

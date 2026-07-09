@@ -21,7 +21,7 @@ use crate::integrations::{
     lockr::LockrConfig, nextjs::NextJsIntegrationConfig, osano::OsanoConfig,
     permutive::PermutiveConfig, prebid, sourcepoint::SourcepointConfig, testlight::TestlightConfig,
 };
-use crate::settings::{IntegrationConfig, Settings};
+use crate::settings::{IntegrationConfig, SecretFieldMode, Settings};
 
 const DEPLOY_VALIDATION_FIELD: &str = "trusted_server";
 #[cfg(test)]
@@ -91,7 +91,8 @@ impl<'de> Deserialize<'de> for TrustedServerAppConfig {
         D: Deserializer<'de>,
     {
         let settings = Settings::deserialize(deserializer)?;
-        let settings = Settings::finalize_deserialized(settings, "Configuration")
+        let mode = settings.secret_field_mode();
+        let settings = Settings::finalize_deserialized(settings, "Configuration", mode)
             .map_err(serde::de::Error::custom)?;
         Ok(Self { settings })
     }
@@ -105,11 +106,12 @@ impl Validate for TrustedServerAppConfig {
 }
 
 impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
-    // Phase 1 intentionally preserves the existing inline-settings model:
-    // `ts config push` publishes the validated Trusted Server config as one
-    // app-config blob. Migrating app-level secrets to `EdgeZero` secret-store
-    // references needs nested/array extraction support and operator migration
-    // work tracked separately.
+    // Empty on purpose: EdgeZero's `#[secret]` reflection only handles
+    // top-level fields, while Trusted Server secrets are nested/array
+    // fields. Secret-store references are instead handled in-repo by
+    // `crate::secret_refs` (gated by `[secrets]`), which mirrors EdgeZero's
+    // key-names-at-rest semantics so the nested `#[secret]` derive can
+    // replace it once available upstream.
     const SECRET_FIELDS: &'static [edgezero_core::app_config::SecretField] = &[];
 }
 
@@ -124,10 +126,17 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
 ///
 /// Returns [`TrustedServerError`] when the config should not be deployed.
 pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
-    settings.reject_placeholder_secrets()?;
+    let mode = settings.secret_field_mode();
+    match mode {
+        // Store mode: secret fields hold key names; value checks
+        // (placeholders, token length) run at runtime against the resolved
+        // values instead.
+        SecretFieldMode::KeyNames => settings.validate_secret_key_names()?,
+        SecretFieldMode::ResolvedValues => settings.reject_placeholder_secrets()?,
+    }
     let enabled_auction_providers = validate_enabled_integrations(settings)?;
     validate_auction_provider_names(settings, &enabled_auction_providers)?;
-    PartnerRegistry::from_config(&settings.ec.partners).map(|_| ())?;
+    PartnerRegistry::from_config_with_secret_mode(&settings.ec.partners, mode).map(|_| ())?;
     Ok(())
 }
 
@@ -213,6 +222,8 @@ fn report_to_validation_errors(report: &Report<TrustedServerError>) -> Validatio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::redacted::Redacted;
+    use crate::settings::EcPartner;
     use crate::test_support::tests::crate_test_settings_str;
 
     fn valid_settings() -> Settings {
@@ -248,6 +259,68 @@ mod tests {
             app_config.settings().publisher.domain,
             "test-publisher.com",
             "should load publisher settings"
+        );
+    }
+
+    fn store_mode_settings_with_key_names() -> Settings {
+        let mut settings = valid_settings();
+        settings.secrets.enabled = true;
+        settings.publisher.proxy_secret = Redacted::new("proxy_secret".to_owned());
+        settings.ec.passphrase = Redacted::new("ec_passphrase".to_owned());
+        for handler in &mut settings.handlers {
+            handler.password = Redacted::new("admin_password".to_owned());
+        }
+        settings
+    }
+
+    #[test]
+    fn deploy_validation_accepts_key_name_secrets_in_store_mode() {
+        let settings = store_mode_settings_with_key_names();
+
+        validate_settings_for_deploy(&settings)
+            .expect("should accept key-name secrets in store mode");
+    }
+
+    #[test]
+    fn deploy_validation_accepts_key_name_partner_tokens_in_store_mode() {
+        let mut settings = store_mode_settings_with_key_names();
+        let partner_toml = r#"
+            name = "Example Partner"
+            source_domain = "partner.example"
+            api_token = "partner_api_token"
+        "#;
+        settings.ec.partners =
+            vec![toml::from_str::<EcPartner>(partner_toml).expect("should parse partner fixture")];
+
+        validate_settings_for_deploy(&settings)
+            .expect("should accept short key-name partner tokens in store mode");
+    }
+
+    #[test]
+    fn deploy_validation_rejects_whitespace_key_names_in_store_mode() {
+        let mut settings = store_mode_settings_with_key_names();
+        settings.ec.passphrase = Redacted::new("has space".to_owned());
+
+        let err = validate_settings_for_deploy(&settings)
+            .expect_err("should reject whitespace in secret key names");
+
+        assert!(
+            err.to_string().contains("ec.passphrase"),
+            "error should mention the offending field: {err}"
+        );
+    }
+
+    #[test]
+    fn deploy_validation_rejects_empty_key_names_in_store_mode() {
+        let mut settings = store_mode_settings_with_key_names();
+        settings.publisher.proxy_secret = Redacted::new(String::new());
+
+        let err = validate_settings_for_deploy(&settings)
+            .expect_err("should reject empty secret key names");
+
+        assert!(
+            err.to_string().contains("publisher.proxy_secret"),
+            "error should mention the offending field: {err}"
         );
     }
 

@@ -55,8 +55,10 @@ pub struct AppState {
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let store_name = default_config_store_name();
     let config_key = default_config_key();
+    // Axum secret-store wiring is a follow-up; `None` fails closed on
+    // store-mode blobs.
     let settings =
-        get_settings_from_config_store(&AxumPlatformConfigStore, &store_name, &config_key)?;
+        get_settings_from_config_store(&AxumPlatformConfigStore, None, &store_name, &config_key)?;
     build_state_with_settings(settings)
 }
 
