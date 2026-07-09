@@ -2,9 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use validator::Validate;
 
 /// Auction orchestration configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct AuctionConfig {
     /// Enable the auction orchestrator
@@ -23,6 +24,7 @@ pub struct AuctionConfig {
 
     /// Timeout in milliseconds
     #[serde(default = "default_timeout")]
+    #[validate(range(min = 1, max = 60000))]
     pub timeout_ms: u32,
 
     /// KV store name for creative storage (deprecated: creatives are now delivered inline)
@@ -77,5 +79,32 @@ impl AuctionConfig {
     #[must_use]
     pub fn has_mediator(&self) -> bool {
         self.mediator.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use validator::Validate as _;
+
+    fn config_with_timeout(timeout_ms: u32) -> AuctionConfig {
+        AuctionConfig {
+            timeout_ms,
+            ..AuctionConfig::default()
+        }
+    }
+
+    #[test]
+    fn timeout_ms_range_is_enforced() {
+        for good in [1, 2000, 60000] {
+            config_with_timeout(good)
+                .validate()
+                .unwrap_or_else(|err| panic!("timeout {good} should be accepted: {err:?}"));
+        }
+        for bad in [0, 60001] {
+            config_with_timeout(bad)
+                .validate()
+                .expect_err(&format!("timeout {bad} should be rejected"));
+        }
     }
 }

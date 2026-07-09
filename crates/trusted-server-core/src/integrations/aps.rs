@@ -211,6 +211,7 @@ pub struct ApsConfig {
 
     /// Timeout in milliseconds
     #[serde(default = "default_timeout_ms")]
+    #[validate(range(min = 1, max = 60000))]
     pub timeout_ms: u32,
 }
 

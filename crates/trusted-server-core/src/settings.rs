@@ -1998,6 +1998,7 @@ pub struct Settings {
     #[validate(nested)]
     pub rewrite: Rewrite,
     #[serde(default)]
+    #[validate(nested)]
     pub auction: AuctionConfig,
     #[serde(default)]
     pub consent: ConsentConfig,

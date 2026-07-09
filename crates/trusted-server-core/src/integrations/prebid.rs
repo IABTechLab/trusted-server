@@ -100,6 +100,7 @@ pub struct PrebidIntegrationConfig {
     #[serde(default)]
     pub account_id: Option<String>,
     #[serde(default = "default_timeout_ms")]
+    #[validate(range(min = 1, max = 60000))]
     pub timeout_ms: u32,
     #[serde(
         default = "default_bidders",
