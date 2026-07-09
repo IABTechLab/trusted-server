@@ -489,12 +489,12 @@ mod tests {
 </html>"#;
 
     #[test]
+    #[ignore = "requires local Chrome/Chromium; run through scripts/test-cli.sh"]
     fn collects_gpt_slot_from_local_fixture() {
         if !chrome_available() {
             // Browser fixture test requires a local Chrome/Chromium; skipping.
             return;
         }
-
         let mut fixture = tempfile::Builder::new()
             .suffix(".html")
             .tempfile()
@@ -536,12 +536,12 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local Chrome/Chromium; run through scripts/test-cli.sh"]
     fn scroll_pass_keeps_initial_load_phase_for_load_time_evidence() {
         if !chrome_available() {
             // Browser fixture test requires a local Chrome/Chromium; skipping.
             return;
         }
-
         let mut fixture = tempfile::Builder::new()
             .suffix(".html")
             .tempfile()
