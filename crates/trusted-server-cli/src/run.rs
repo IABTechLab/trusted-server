@@ -24,7 +24,7 @@ enum Command {
     /// Sign in / out / status against an `EdgeZero` adapter.
     Auth(AuthArgs),
     /// Browser-backed page and ad-template audits.
-    Audit(AuditArgs),
+    Audit(Box<AuditArgs>),
     /// Build the project for a target adapter.
     Build(BuildArgs),
     /// Trusted Server app-config commands.
