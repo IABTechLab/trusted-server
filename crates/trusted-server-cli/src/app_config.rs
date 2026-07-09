@@ -49,6 +49,27 @@ pub struct LoadedSettings {
 /// explicit `--app-config` path is given and is missing, the error names that
 /// exact path rather than silently falling back.
 pub fn load_settings(args: &AppConfigArgs) -> Result<LoadedSettings, String> {
+    load_settings_with_env_overlay(args, !args.no_env)
+}
+
+/// Loads Trusted Server settings from the resolved app-config file without
+/// applying environment overlays.
+///
+/// Mutating commands use this path so environment-only values are never
+/// persisted into the operator-owned TOML file.
+///
+/// # Errors
+///
+/// Returns the same path-resolution, read, and parse errors as
+/// [`load_settings`].
+pub fn load_file_settings(args: &AppConfigArgs) -> Result<LoadedSettings, String> {
+    load_settings_with_env_overlay(args, false)
+}
+
+fn load_settings_with_env_overlay(
+    args: &AppConfigArgs,
+    env_overlay: bool,
+) -> Result<LoadedSettings, String> {
     let manifest_loader = ManifestLoader::from_path(&args.manifest)
         .map_err(|err| format!("failed to load {}: {err}", args.manifest.display()))?;
     let app_name = manifest_loader.manifest().app.name.clone().ok_or_else(|| {
@@ -61,7 +82,7 @@ pub fn load_settings(args: &AppConfigArgs) -> Result<LoadedSettings, String> {
         resolve_app_config_path(args.app_config.as_deref(), &args.manifest, &app_name);
 
     let mut opts = AppConfigLoadOptions::default();
-    opts.env_overlay = !args.no_env;
+    opts.env_overlay = env_overlay;
     let app_config = app_config::deserialize_app_config_with_options::<TrustedServerAppConfig>(
         &app_config_path,
         &app_name,

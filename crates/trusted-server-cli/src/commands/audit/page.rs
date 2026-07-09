@@ -35,16 +35,6 @@ pub(crate) fn run_page(args: &PageAuditArgs) -> Result<(), String> {
     )
 }
 
-/// Runs the generic page audit for a single URL with default browser options
-/// (the legacy `ts audit <url>` alias entry point).
-///
-/// # Errors
-///
-/// Returns a user-facing string when the browser cannot collect the page.
-pub(crate) fn run_page_url(url: &url::Url, scroll: bool) -> Result<(), String> {
-    run_with_collector(&BrowserCollector::new(), url, scroll)
-}
-
 fn run_with_collector(
     collector: &BrowserCollector,
     url: &url::Url,

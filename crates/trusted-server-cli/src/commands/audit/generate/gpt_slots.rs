@@ -20,6 +20,7 @@ use std::collections::BTreeSet;
 use std::sync::LazyLock;
 
 use regex::Regex;
+use trusted_server_core::creative_opportunities::validate_slot_id;
 use url::Url;
 
 use crate::commands::audit::generate::collector::{CollectedGptSlot, CollectedRequest};
@@ -113,6 +114,7 @@ pub(crate) fn discover_gpt_slots(
         }
         slots.push(slot);
     }
+    make_slot_ids_unique(&mut slots);
 
     DiscoveredSlots {
         gam_network_id,
@@ -274,12 +276,56 @@ fn parse_sizes(raw: &str) -> Vec<(u32, u32)> {
     sizes
 }
 
-/// Derives a slot id from a div id by stripping the common GPT prefix.
+/// Derives a runtime-safe slot id from a div id.
+///
+/// The common GPT prefix is stripped, invalid character runs become one
+/// hyphen, and an all-invalid value falls back to `slot`.
 fn slot_id_from_div(div_id: &str) -> String {
-    div_id
-        .strip_prefix(GPT_DIV_PREFIX)
-        .unwrap_or(div_id)
-        .to_string()
+    let candidate = div_id.strip_prefix(GPT_DIV_PREFIX).unwrap_or(div_id);
+    let mut id = String::with_capacity(candidate.len());
+    let mut previous_was_hyphen = false;
+    for character in candidate.chars() {
+        if character.is_ascii_alphanumeric() || character == '_' {
+            id.push(character);
+            previous_was_hyphen = false;
+        } else if !id.is_empty() && !previous_was_hyphen {
+            id.push('-');
+            previous_was_hyphen = true;
+        }
+    }
+    while id.ends_with('-') {
+        id.pop();
+    }
+    if id.is_empty() {
+        id.push_str("slot");
+    }
+
+    if validate_slot_id(&id).is_ok() {
+        id
+    } else {
+        "slot".to_string()
+    }
+}
+
+/// Adds deterministic numeric suffixes when sanitization produces duplicate ids.
+fn make_slot_ids_unique(slots: &mut [DiscoveredSlot]) {
+    let mut used = BTreeSet::new();
+    for slot in slots {
+        if used.insert(slot.id.clone()) {
+            continue;
+        }
+
+        let base = slot.id.clone();
+        let mut suffix = 2_usize;
+        loop {
+            let candidate = format!("{base}-{suffix}");
+            if used.insert(candidate.clone()) {
+                slot.id = candidate;
+                break;
+            }
+            suffix += 1;
+        }
+    }
 }
 
 /// Detects Prebid/header-bidding signals in a slot's `prev_scp` targeting.
@@ -547,6 +593,63 @@ mod tests {
             normalize_div_stem("div-gpt-ad-leaderboard-1"),
             "div-gpt-ad-leaderboard-1"
         );
+    }
+
+    #[test]
+    fn sanitizes_page_controlled_div_ids_for_runtime_slot_ids() {
+        let registry = vec![registry_slot(
+            "/123456789/homepage/header",
+            "div-gpt-ad-header.main: 1",
+            &[(728, 90)],
+        )];
+
+        let discovered = discover_gpt_slots(&registry, &[], false);
+
+        assert_eq!(discovered.slots[0].id, "header-main-1");
+        assert_eq!(
+            discovered.slots[0].div_id, "div-gpt-ad-header.main: 1",
+            "matching should retain the original normalized div stem"
+        );
+        trusted_server_core::creative_opportunities::validate_slot_id(&discovered.slots[0].id)
+            .expect("generated id should pass runtime validation");
+    }
+
+    #[test]
+    fn uses_fallback_for_div_id_without_safe_slot_id_characters() {
+        let registry = vec![registry_slot(
+            "/123456789/homepage/fallback",
+            "div-gpt-ad-...",
+            &[(300, 250)],
+        )];
+
+        let discovered = discover_gpt_slots(&registry, &[], false);
+
+        assert_eq!(discovered.slots[0].id, "slot");
+    }
+
+    #[test]
+    fn makes_colliding_sanitized_slot_ids_unique() {
+        let registry = vec![
+            registry_slot(
+                "/123456789/homepage/dotted",
+                "div-gpt-ad-header.main",
+                &[(728, 90)],
+            ),
+            registry_slot(
+                "/123456789/homepage/colon",
+                "div-gpt-ad-header:main",
+                &[(300, 250)],
+            ),
+        ];
+
+        let discovered = discover_gpt_slots(&registry, &[], false);
+        let ids = discovered
+            .slots
+            .iter()
+            .map(|slot| slot.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, ["header-main", "header-main-2"]);
     }
 
     #[test]

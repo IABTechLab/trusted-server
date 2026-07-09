@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 
+use toml_edit::{DocumentMut, Item};
 use trusted_server_core::auction::types::MediaType;
 use trusted_server_core::creative_opportunities::{
     CreativeOpportunitiesConfig, CreativeOpportunitySlot,
@@ -30,8 +31,8 @@ pub(super) struct RenderSlot {
 }
 
 impl RenderSlot {
-    /// The stable identity used to match slots across runs: the div id (or slot
-    /// id), with any trailing `-` trimmed so hand-authored stems still match.
+    /// The stable exact identity fallback used when no configured div prefix
+    /// matches a discovered slot.
     fn key(&self) -> String {
         self.div_id
             .as_deref()
@@ -129,19 +130,62 @@ pub(super) fn merge_slots(
         .iter()
         .map(RenderSlot::from_existing)
         .collect();
-    for slot in discovered_slots {
-        let key = slot.key();
-        if let Some(present) = merged.iter_mut().find(|existing| existing.key() == key) {
+    for mut slot in discovered_slots {
+        if let Some(index) = matching_slot_index(&merged, &slot) {
+            let present = &mut merged[index];
             for pattern in &slot.page_patterns {
                 if !present.page_patterns.contains(pattern) {
                     present.page_patterns.push(pattern.clone());
                 }
             }
         } else {
+            slot.id = unique_slot_id(&slot.id, &merged);
             merged.push(slot);
         }
     }
     merged
+}
+
+fn unique_slot_id(candidate: &str, existing: &[RenderSlot]) -> String {
+    if existing.iter().all(|slot| slot.id != candidate) {
+        return candidate.to_string();
+    }
+
+    let mut suffix = 2_usize;
+    loop {
+        let unique = format!("{candidate}-{suffix}");
+        if existing.iter().all(|slot| slot.id != unique) {
+            return unique;
+        }
+        suffix += 1;
+    }
+}
+
+/// Finds the most specific configured slot matching a discovered live div.
+///
+/// Configured `div_id` values are runtime prefixes. Exact matches naturally
+/// win because they are the longest possible prefix; equal-length ties retain
+/// config order. The prior exact key behavior remains as a fallback.
+fn matching_slot_index(existing: &[RenderSlot], discovered: &RenderSlot) -> Option<usize> {
+    if let Some(discovered_div) = discovered.div_id.as_deref() {
+        let mut best = None;
+        let mut best_length = 0;
+        for (index, slot) in existing.iter().enumerate() {
+            let Some(prefix) = slot.div_id.as_deref().filter(|prefix| !prefix.is_empty()) else {
+                continue;
+            };
+            if discovered_div.starts_with(prefix) && prefix.len() > best_length {
+                best = Some(index);
+                best_length = prefix.len();
+            }
+        }
+        if best.is_some() {
+            return best;
+        }
+    }
+
+    let key = discovered.key();
+    existing.iter().position(|slot| slot.key() == key)
 }
 
 /// Renders merged slots as compact `[[creative_opportunities.slot]]` TOML blocks.
@@ -294,13 +338,14 @@ pub(super) fn splice_creative_slots(
     rendered_slots: &str,
 ) -> CliResult<String> {
     let rendered = rendered_slots.trim_matches('\n');
+    let existing = remove_inline_slot_value(existing)?;
 
     // No section yet — append a fresh one with the network id and slots.
     if !existing
         .lines()
         .any(|line| is_table_header(line, "[creative_opportunities]"))
     {
-        let mut result = existing.to_string();
+        let mut result = existing;
         if !result.is_empty() && !result.ends_with('\n') {
             result.push('\n');
         }
@@ -314,7 +359,7 @@ pub(super) fn splice_creative_slots(
     }
 
     // Section exists — update `gam_network_id` (best-effort) and replace slots.
-    let mut document = existing.to_string();
+    let mut document = existing.clone();
     if let Some(network_id) = network_id
         && let Ok(updated) = replace_key_in_section(
             &document,
@@ -378,10 +423,35 @@ pub(super) fn splice_creative_slots(
     if existing.ends_with('\n') && !result.ends_with('\n') {
         result.push('\n');
     }
-    if uses_crlf(existing) {
+    if uses_crlf(&existing) {
         result = result.replace('\n', "\r\n");
     }
     Ok(result)
+}
+
+/// Removes a scalar `creative_opportunities.slot` value so it can be replaced
+/// with the generated array-of-tables representation.
+fn remove_inline_slot_value(document: &str) -> CliResult<String> {
+    let mut parsed = document.parse::<DocumentMut>().map_err(|error| {
+        report_error(format!(
+            "failed to parse target config before updating slots: {error}"
+        ))
+    })?;
+    let Some(creative) = parsed.get_mut("creative_opportunities") else {
+        return Ok(document.to_string());
+    };
+    let Some(table) = creative.as_table_like_mut() else {
+        return Ok(document.to_string());
+    };
+    let has_inline_slot = table
+        .get("slot")
+        .is_some_and(|slot| matches!(slot, Item::Value(_)));
+    if !has_inline_slot {
+        return Ok(document.to_string());
+    }
+
+    table.remove("slot");
+    Ok(parsed.to_string())
 }
 
 /// Whether `document` uses CRLF line endings (so edits preserve them).
@@ -671,6 +741,46 @@ mod tests {
     }
 
     #[test]
+    fn splice_replaces_inline_slot_array() {
+        let existing = "[creative_opportunities]\n\
+             gam_network_id = \"111\"\n\
+             slot = [{ id = \"old\", div_id = \"old\", gam_unit_path = \"/111/old\", page_patterns = [\"/\"], formats = [{ width = 300, height = 250 }] }]\n\n\
+             [auction]\nenabled = true\n";
+
+        let out = splice_creative_slots(existing, Some("222"), &header_rendered())
+            .expect("should replace inline slot array");
+
+        let value = toml::from_str::<toml::Value>(&out).expect("spliced config should be valid");
+        let slots = value["creative_opportunities"]["slot"]
+            .as_array()
+            .expect("slots should be an array");
+        assert_eq!(slots.len(), 1, "old inline slot should be removed");
+        assert_eq!(slots[0]["id"].as_str(), Some("header"));
+        assert_eq!(
+            value["auction"]["enabled"].as_bool(),
+            Some(true),
+            "unrelated tables should be preserved"
+        );
+    }
+
+    #[test]
+    fn splice_replaces_inline_slot_map() {
+        let existing = "[creative_opportunities]\n\
+             gam_network_id = \"111\"\n\
+             slot = { \"0\" = { id = \"old\", div_id = \"old\", gam_unit_path = \"/111/old\", page_patterns = [\"/\"], formats = [{ width = 300, height = 250 }] } }\n";
+
+        let out = splice_creative_slots(existing, Some("222"), &header_rendered())
+            .expect("should replace inline slot map");
+
+        let value = toml::from_str::<toml::Value>(&out).expect("spliced config should be valid");
+        let slots = value["creative_opportunities"]["slot"]
+            .as_array()
+            .expect("slots should be an array");
+        assert_eq!(slots.len(), 1, "old inline slot should be removed");
+        assert_eq!(slots[0]["id"].as_str(), Some("header"));
+    }
+
+    #[test]
     fn merge_second_run_unions_page_patterns() {
         // Existing slot on "/"; re-discovered this run with "/news/*".
         let existing = existing_config(
@@ -693,6 +803,85 @@ mod tests {
             vec!["/".to_string(), "/news/*".to_string()],
             "this run's pattern is unioned into the existing slot"
         );
+    }
+
+    #[test]
+    fn merge_uses_longest_existing_div_prefix() {
+        let existing = existing_config(
+            "gam_network_id = \"222\"\n\n\
+             [[slot]]\nid = \"broad\"\ndiv_id = \"ad-\"\n\
+             gam_unit_path = \"/222/broad\"\npage_patterns = [\"/broad/*\"]\n\
+             formats = [{ width = 300, height = 250 }]\n\n\
+             [[slot]]\nid = \"atf\"\ndiv_id = \"ad-atf-\"\n\
+             gam_unit_path = \"/222/atf\"\npage_patterns = [\"/\"]\n\
+             formats = [{ width = 728, height = 90 }]\n",
+        );
+        let registry = vec![collector::CollectedGptSlot {
+            gam_unit_path: "/222/atf".to_string(),
+            div_id: "ad-atf-0".to_string(),
+            sizes: vec![(728, 90)],
+        }];
+        let discovered = gpt_slots::discover_gpt_slots(&registry, &[], false);
+
+        let merged = merge_slots(
+            Some(&existing),
+            &discovered,
+            &["/news/*".to_string()],
+            false,
+        );
+
+        assert_eq!(
+            merged.len(),
+            2,
+            "prefix match should not append a duplicate"
+        );
+        let broad = merged
+            .iter()
+            .find(|slot| slot.id == "broad")
+            .expect("should keep broad slot");
+        assert_eq!(
+            broad.page_patterns,
+            ["/broad/*"],
+            "shorter prefix should not claim the discovered div"
+        );
+        let atf = merged
+            .iter()
+            .find(|slot| slot.id == "atf")
+            .expect("should keep specific slot");
+        assert_eq!(
+            atf.page_patterns,
+            ["/", "/news/*"],
+            "longest matching prefix should receive this run's pattern"
+        );
+    }
+
+    #[test]
+    fn merge_renames_new_slot_id_that_collides_with_existing_config() {
+        let existing = existing_config(
+            "gam_network_id = \"222\"\n\n\
+             [[slot]]\nid = \"header-main\"\ndiv_id = \"legacy-header\"\n\
+             gam_unit_path = \"/222/legacy\"\npage_patterns = [\"/\"]\n\
+             formats = [{ width = 300, height = 250 }]\n",
+        );
+        let registry = vec![collector::CollectedGptSlot {
+            gam_unit_path: "/222/header".to_string(),
+            div_id: "div-gpt-ad-header.main".to_string(),
+            sizes: vec![(728, 90)],
+        }];
+        let discovered = gpt_slots::discover_gpt_slots(&registry, &[], false);
+
+        let merged = merge_slots(
+            Some(&existing),
+            &discovered,
+            &["/news/*".to_string()],
+            false,
+        );
+        let ids = merged
+            .iter()
+            .map(|slot| slot.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, ["header-main", "header-main-2"]);
     }
 
     #[test]

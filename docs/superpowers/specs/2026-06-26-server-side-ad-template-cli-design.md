@@ -792,21 +792,23 @@ should become a subcommand namespace:
 
 ```bash
 ts audit page <url>
+ts audit generate <url>
 ts audit ad-templates verify <url>...
 ```
 
 The existing #800 `ts audit <url>` behavior should be preserved as a
-compatibility alias for `ts audit page <url>` during the transition. New
-ad-template work should use the nested namespace only. This avoids routing
-ambiguity in Clap and keeps generic page audit behavior separate from
-ad-template verification.
+compatibility alias for `ts audit generate <url>` during the transition,
+including its artifact output flags. This avoids a successful but silent
+behavior change for existing onboarding scripts.
 
 Parsing contract:
 
 - `ts audit page <url>` is the canonical generic page-audit command.
+- `ts audit generate <url>` is the canonical artifact-generation command.
 - `ts audit ad-templates verify <url>...` is the canonical ad-template verifier.
-- `ts audit <url>` is a hidden compatibility alias for `ts audit page <url>` and
-  is accepted only when `<url>` parses as `http` or `https`.
+- `ts audit <url>` is a hidden compatibility alias for
+  `ts audit generate <url>` and is accepted only when `<url>` parses as `http`
+  or `https`.
 - `ts audit ad-templates` must never be treated as a legacy URL positional.
 - `ts audit page` without a URL must fail with the normal Clap missing-argument
   error.
@@ -834,7 +836,7 @@ If Clap cannot enforce the optional-subcommand plus hidden positional contract
 cleanly, implement a small custom dispatcher for the `audit` argv tail and test
 it directly. Required parser tests:
 
-- `ts audit https://www.example.com/` dispatches to page audit;
+- `ts audit https://www.example.com/` dispatches to artifact generation;
 - `ts audit page https://www.example.com/` dispatches to page audit;
 - `ts audit ad-templates verify https://www.example.com/` dispatches to
   ad-template verification;

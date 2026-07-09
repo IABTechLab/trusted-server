@@ -286,9 +286,35 @@ mod tests {
     }
 
     #[test]
-    fn audit_legacy_url_parses_as_page_alias() {
-        let args = parse(&["ts", "audit", "https://www.example.com/"]);
-        assert!(matches!(args.command, Command::Audit(_)));
+    fn audit_legacy_url_parses_with_artifact_generation_flags() {
+        let args = parse(&[
+            "ts",
+            "audit",
+            "https://www.example.com/",
+            "--js-assets",
+            "audit/assets.toml",
+            "--config",
+            "audit/config.toml",
+            "--force",
+            "--cookie",
+            "session=example",
+        ]);
+        let Command::Audit(audit) = args.command else {
+            panic!("expected audit command");
+        };
+        assert_eq!(
+            audit.legacy_generate.js_assets,
+            Some(PathBuf::from("audit/assets.toml"))
+        );
+        assert_eq!(
+            audit.legacy_generate.config,
+            Some(PathBuf::from("audit/config.toml"))
+        );
+        assert!(audit.legacy_generate.force);
+        assert_eq!(
+            audit.legacy_generate.cookies,
+            [("session".to_string(), "example".to_string())]
+        );
     }
 
     #[test]

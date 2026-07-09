@@ -535,9 +535,11 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::app_config::AppConfigArgs;
     use crate::commands::audit::generate::collector::{
         CollectedPage, CollectedRequest, CollectedScriptTag,
     };
+    use crate::commands::config::init::EXAMPLE_CONFIG;
 
     struct FakeCollector {
         collected: CollectedPage,
@@ -950,6 +952,99 @@ mod tests {
             value["creative_opportunities"]["slot"][0]["page_patterns"][0].as_str(),
             Some("/news/story"),
             "default pattern should use the post-redirect path, not the requested one"
+        );
+    }
+
+    #[test]
+    fn update_slots_dry_run_does_not_persist_environment_overlay_config() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        let config_path = temp.path().join("trusted-server.toml");
+        fs::write(&manifest_path, "[app]\nname = \"trusted-server\"\n")
+            .expect("should write manifest");
+        let config = EXAMPLE_CONFIG
+            .replace(
+                "replace-with-admin-password-32-bytes",
+                "test-admin-password-32-bytes-minimum",
+            )
+            .replace(
+                "trusted-server-placeholder-secret",
+                "test-ec-passphrase-32-bytes-minimum",
+            )
+            .replace(
+                "change-me-proxy-secret",
+                "test-proxy-secret-32-bytes-minimum",
+            );
+        let config = format!(
+            "{config}\n\
+             [[creative_opportunities.slot]]\n\
+             id = \"file-only\"\n\
+             div_id = \"div-gpt-ad-file\"\n\
+             gam_unit_path = \"/123456789/homepage/file\"\n\
+             page_patterns = [\"/\"]\n\
+             formats = [{{ width = 728, height = 90 }}]\n"
+        );
+        fs::write(&config_path, config).expect("should write config");
+        let args = AppConfigArgs {
+            app_config: Some(config_path.clone()),
+            manifest: manifest_path,
+            no_env: false,
+        };
+
+        temp_env::with_var(
+            "TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__GAM_NETWORK_ID",
+            Some("987654321"),
+            || {
+                let effective = crate::app_config::load_settings(&args)
+                    .expect("should load effective settings");
+                assert_eq!(
+                    effective
+                        .settings
+                        .creative_opportunities
+                        .as_ref()
+                        .expect("should have creative config")
+                        .gam_network_id,
+                    "987654321",
+                    "test environment should override the network id"
+                );
+                let loaded = crate::app_config::load_file_settings(&args)
+                    .expect("should load file-only settings");
+                let mut collected = collected_page();
+                collected.gpt_slots = vec![collector::CollectedGptSlot {
+                    gam_unit_path: "/123456789/homepage/file".to_string(),
+                    div_id: "div-gpt-ad-file".to_string(),
+                    sizes: vec![(728, 90)],
+                }];
+                let collector = FakeCollector::new(collected);
+                let mut out = Vec::new();
+
+                run_update_slots(
+                    "https://publisher.example/",
+                    &loaded.app_config_path,
+                    loaded.settings.creative_opportunities.as_ref(),
+                    &[],
+                    false,
+                    &[],
+                    true,
+                    &collector,
+                    &mut out,
+                )
+                .expect("should render dry-run update");
+
+                let output = String::from_utf8(out).expect("output should be UTF-8");
+                assert!(
+                    output.contains("id = \"file-only\""),
+                    "dry run should preserve the file-backed slot"
+                );
+                assert!(
+                    output.contains("gam_network_id = \"123456789\""),
+                    "dry run should preserve the file-backed network id"
+                );
+                assert!(
+                    !output.contains("987654321"),
+                    "dry run must not persist environment-only config"
+                );
+            },
         );
     }
 

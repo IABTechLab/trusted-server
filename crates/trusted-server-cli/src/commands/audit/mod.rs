@@ -3,7 +3,7 @@
 //! `ts audit page <url>` is the generic page audit; `ts audit ad-templates verify
 //! <url>...` is the ad-template verifier; `ts audit generate <url>` bootstraps a
 //! draft config from a live page (issue #800). `ts audit <url>` is a hidden
-//! compatibility alias for `ts audit page <url>`.
+//! compatibility alias for `ts audit generate <url>`.
 
 pub mod ad_templates;
 pub mod browser;
@@ -55,9 +55,40 @@ pub(crate) fn parse_cookie(raw: &str) -> Result<(String, String), String> {
 pub(crate) struct AuditArgs {
     #[command(subcommand)]
     pub(crate) command: Option<AuditSubcommand>,
-    /// Hidden compatibility alias: `ts audit <url>` behaves like `ts audit page <url>`.
+    /// Hidden compatibility alias: `ts audit <url>` behaves like `ts audit generate <url>`.
     #[arg(value_parser = parse_http_url, hide = true)]
     pub(crate) legacy_url: Option<url::Url>,
+    #[command(flatten)]
+    pub(crate) legacy_generate: LegacyGenerateArgs,
+}
+
+/// Hidden generation flags retained for the legacy `ts audit <url>` form.
+#[derive(Debug, Default, Args)]
+pub(crate) struct LegacyGenerateArgs {
+    /// JavaScript asset audit output path.
+    #[arg(long, hide = true, requires = "legacy_url")]
+    pub(crate) js_assets: Option<std::path::PathBuf>,
+    /// Draft Trusted Server config output path.
+    #[arg(long, hide = true, requires = "legacy_url")]
+    pub(crate) config: Option<std::path::PathBuf>,
+    /// Do not write the JavaScript asset audit file.
+    #[arg(long, hide = true, requires = "legacy_url")]
+    pub(crate) no_js_assets: bool,
+    /// Do not write the draft Trusted Server config file.
+    #[arg(long, hide = true, requires = "legacy_url")]
+    pub(crate) no_config: bool,
+    /// Overwrite existing output files.
+    #[arg(long, hide = true, requires = "legacy_url")]
+    pub(crate) force: bool,
+    /// Cookie to send with the page request, as `name=value`. Repeatable.
+    #[arg(
+        long = "cookie",
+        value_name = "NAME=VALUE",
+        value_parser = parse_cookie,
+        hide = true,
+        requires = "legacy_url"
+    )]
+    pub(crate) cookies: Vec<(String, String)>,
 }
 
 /// `ts audit` subcommands.
@@ -136,8 +167,8 @@ pub(crate) struct AuditAdTemplatesVerifyArgs {
 
 /// Dispatches a `ts audit` invocation.
 ///
-/// `legacy_url` (if present) and the `page` subcommand both route to the generic
-/// page audit; `ad-templates verify` routes to the verifier.
+/// `legacy_url` (if present) routes to artifact generation, while the `page`
+/// subcommand routes to the generic read-only page audit.
 ///
 /// # Errors
 ///
@@ -147,7 +178,7 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<(), String> {
     match &args.command {
         Some(AuditSubcommand::Page(page_args)) => page::run_page(page_args),
         Some(AuditSubcommand::AdTemplates(AuditAdTemplatesCommand::Generate(gen_args))) => {
-            let loaded = crate::app_config::load_settings(&gen_args.config)?;
+            let loaded = crate::app_config::load_file_settings(&gen_args.config)?;
             let collector = generate::browser_collector::BrowserAuditCollector;
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
@@ -173,10 +204,30 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<(), String> {
             generate::run_generate(generate_args, &collector, &mut out)
         }
         None => match &args.legacy_url {
-            Some(url) => page::run_page_url(url, false),
+            Some(_) => {
+                let generate_args = legacy_generate_args(args)
+                    .expect("should build generation args when legacy URL is present");
+                let stdout = std::io::stdout();
+                let mut out = stdout.lock();
+                let collector = generate::browser_collector::BrowserAuditCollector;
+                generate::run_generate(&generate_args, &collector, &mut out)
+            }
             None => Err("provide a URL or a subcommand (`page`, `ad-templates`)".to_string()),
         },
     }
+}
+
+fn legacy_generate_args(args: &AuditArgs) -> Option<generate::GenerateArgs> {
+    let url = args.legacy_url.as_ref()?;
+    Some(generate::GenerateArgs {
+        url: url.to_string(),
+        js_assets: args.legacy_generate.js_assets.clone(),
+        config: args.legacy_generate.config.clone(),
+        no_js_assets: args.legacy_generate.no_js_assets,
+        no_config: args.legacy_generate.no_config,
+        force: args.legacy_generate.force,
+        cookies: args.legacy_generate.cookies.clone(),
+    })
 }
 
 #[cfg(test)]
@@ -213,5 +264,40 @@ mod tests {
     fn parse_cookie_rejects_empty_name() {
         let err = parse_cookie("=value").expect_err("should reject empty name");
         assert!(err.contains("empty name"), "error should name the problem");
+    }
+
+    #[test]
+    fn legacy_url_builds_artifact_generation_args() {
+        let args = AuditArgs {
+            command: None,
+            legacy_url: Some(
+                url::Url::parse("https://www.example.com/").expect("should parse URL"),
+            ),
+            legacy_generate: LegacyGenerateArgs {
+                js_assets: Some("audit/assets.toml".into()),
+                config: Some("audit/config.toml".into()),
+                no_js_assets: false,
+                no_config: false,
+                force: true,
+                cookies: vec![("session".to_string(), "example".to_string())],
+            },
+        };
+
+        let generate = legacy_generate_args(&args).expect("should build generation args");
+
+        assert_eq!(generate.url, "https://www.example.com/");
+        assert_eq!(
+            generate.js_assets.as_deref(),
+            Some(std::path::Path::new("audit/assets.toml"))
+        );
+        assert_eq!(
+            generate.config.as_deref(),
+            Some(std::path::Path::new("audit/config.toml"))
+        );
+        assert!(generate.force);
+        assert_eq!(
+            generate.cookies,
+            [("session".to_string(), "example".to_string())]
+        );
     }
 }

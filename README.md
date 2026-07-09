@@ -37,7 +37,7 @@ ts config init
 ts config validate
 
 # Audit a public page with Chrome/Chromium to bootstrap a draft config
-ts audit https://publisher.example
+ts audit generate https://publisher.example
 
 # Run tests (Fastly/WASM crates — requires Viceroy)
 cargo test-fastly
