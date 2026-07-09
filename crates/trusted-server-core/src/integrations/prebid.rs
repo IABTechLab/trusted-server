@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -13,6 +13,7 @@ use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::header::HeaderValue;
 use http::{header, Method, StatusCode};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use url::{Url, Url as ParsedUrl};
@@ -129,7 +130,10 @@ pub struct PrebidIntegrationConfig {
     pub external_bundle_url: Option<String>,
     /// Optional hex SHA-256 of the exact external bundle bytes.
     #[serde(default)]
-    #[validate(custom(function = "validate_external_bundle_sha256"))]
+    #[validate(regex(
+        path = *EXTERNAL_BUNDLE_SHA256_PATTERN,
+        message = "external_bundle_sha256 must be a 64-character hex SHA-256"
+    ))]
     pub external_bundle_sha256: Option<String>,
     /// Optional browser Subresource Integrity value for the first-party script.
     #[serde(default)]
@@ -332,15 +336,11 @@ fn validate_external_bundle_url(value: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
-fn validate_external_bundle_sha256(value: &str) -> Result<(), ValidationError> {
-    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Ok(());
-    }
-
-    let mut err = ValidationError::new("invalid_external_bundle_sha256");
-    err.message = Some("external_bundle_sha256 must be a 64-character hex SHA-256".into());
-    Err(err)
-}
+/// Exact hex SHA-256: 64 hex digits. Used by the built-in `regex` validator on
+/// [`PrebidIntegrationConfig::external_bundle_sha256`].
+static EXTERNAL_BUNDLE_SHA256_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[0-9a-fA-F]{64}$").expect("SHA-256 hex regex should compile")
+});
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum ExternalBundleSriAlgorithm {
@@ -2238,6 +2238,34 @@ mod tests {
 
     use crate::consent::{ConsentContext, ConsentSource};
     use crate::geo::GeoInfo;
+
+    #[test]
+    fn external_bundle_sha256_validation_matches_hex_pattern() {
+        use validator::Validate as _;
+
+        let config = |sha: &str| -> PrebidIntegrationConfig {
+            serde_json::from_value(serde_json::json!({
+                "server_url": "https://prebid.example.com/openrtb2/auction",
+                "external_bundle_sha256": sha,
+            }))
+            .expect("should deserialize prebid config")
+        };
+
+        // Exactly 64 hex digits (either case) passes.
+        config(&"a".repeat(64))
+            .validate()
+            .expect("64-char lowercase hex sha256 should pass");
+        config("ABCDEF0123456789abcdef0123456789ABCDEF0123456789abcdef0123456789")
+            .validate()
+            .expect("mixed-case 64-char hex sha256 should pass");
+
+        // Wrong length or non-hex characters are rejected.
+        for bad in ["a".repeat(63), "a".repeat(65), "g".repeat(64), String::new()] {
+            config(&bad)
+                .validate()
+                .expect_err(&format!("invalid sha256 {bad:?} should be rejected"));
+        }
+    }
     use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
     use crate::integrations::{
         AttributeRewriteAction, IntegrationDocumentState, IntegrationRegistry,
