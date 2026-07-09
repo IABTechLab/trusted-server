@@ -3,8 +3,7 @@ use error_stack::{Report, ResultExt};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
-use crate::config_payload::DEFAULT_SECRET_STORE_ID;
-use crate::config_payload::settings_from_config_blob;
+use crate::config_payload::{settings_from_config_blob, CONFIG_BLOB_KEY, DEFAULT_SECRET_STORE_ID};
 use crate::error::TrustedServerError;
 use crate::platform::{PlatformConfigStore, PlatformSecretStore, StoreName};
 use crate::settings::Settings;
@@ -33,13 +32,13 @@ struct FastlyChunkRef {
 /// Resolves the `EdgeZero` app-config store name from runtime configuration.
 #[must_use]
 pub fn config_store_name(env: &EnvConfig) -> StoreName {
-    StoreName::from(env.store_name("config", DEFAULT_CONFIG_STORE_ID))
+    StoreName::from(env.store_name("config", CONFIG_BLOB_KEY))
 }
 
 /// Resolves the config-store key containing the app-config blob.
 #[must_use]
 pub fn config_key(env: &EnvConfig) -> String {
-    env.store_key("config", DEFAULT_CONFIG_STORE_ID)
+    env.store_key("config", CONFIG_BLOB_KEY)
 }
 
 /// Returns the default `EdgeZero` app-config store name.
@@ -278,6 +277,30 @@ mod tests {
             key,
             &StoreName::from("trusted_server_secrets"),
         )
+    }
+
+    #[test]
+    fn config_defaults_match_edgezero_manifest() {
+        let manifest = edgezero_core::manifest::ManifestLoader::try_load_from_str(include_str!(
+            "../../../edgezero.toml"
+        ))
+        .expect("should load the repository EdgeZero manifest");
+        let manifest_default = manifest
+            .manifest()
+            .stores
+            .config
+            .as_ref()
+            .expect("should declare [stores.config]")
+            .default_id();
+
+        assert_eq!(
+            CONFIG_BLOB_KEY, manifest_default,
+            "compiled default should match edgezero.toml"
+        );
+        assert_eq!(
+            manifest_default, "trusted_server_config",
+            "Trusted Server should retain its expected default config store"
+        );
     }
 
     #[test]
