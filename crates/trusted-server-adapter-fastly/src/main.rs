@@ -24,6 +24,7 @@ use trusted_server_core::platform::PlatformGeo as _;
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{stream_asset_body, AssetProxyCachePolicy};
 use trusted_server_core::settings::Settings;
+use trusted_server_core::settings_data::default_config_store_name;
 
 mod app;
 mod backend;
@@ -42,18 +43,15 @@ use crate::middleware::{apply_finalize_headers, resolve_geo_for_response, HEADER
 use crate::platform::{client_info_from_request, FastlyPlatformGeo};
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 
-const TRUSTED_SERVER_CONFIG_STORE: &str = "trusted_server_config";
-
-/// Opens the Fastly Config Store used by the `EdgeZero` dispatcher.
+/// Opens the manifest-default Fastly Config Store used by the `EdgeZero` dispatcher.
 ///
 /// # Errors
 ///
 /// Returns [`fastly::Error`] if the config store cannot be opened.
 fn open_trusted_server_config_store() -> Result<ConfigStoreHandle, fastly::Error> {
-    let store = EdgeZeroFastlyConfigStore::try_open(TRUSTED_SERVER_CONFIG_STORE).map_err(|e| {
-        fastly::Error::msg(format!(
-            "failed to open config store `{TRUSTED_SERVER_CONFIG_STORE}`: {e}"
-        ))
+    let store_name = default_config_store_name();
+    let store = EdgeZeroFastlyConfigStore::try_open(store_name.as_ref()).map_err(|e| {
+        fastly::Error::msg(format!("failed to open config store `{store_name}`: {e}"))
     })?;
     Ok(ConfigStoreHandle::new(Arc::new(store)))
 }

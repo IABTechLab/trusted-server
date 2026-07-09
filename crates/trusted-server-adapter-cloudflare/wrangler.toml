@@ -18,6 +18,6 @@ id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
 
 [vars]
 # TRUSTED_SERVER_CONFIG is required at startup. Replace this intentionally
-# invalid placeholder with JSON containing an `app_config` blob envelope before
-# deploying or running `wrangler dev` against real traffic.
-TRUSTED_SERVER_CONFIG = '{"app_config":""}'
+# invalid placeholder with JSON containing the manifest-default app-config blob
+# envelope before deploying or running `wrangler dev` against real traffic.
+TRUSTED_SERVER_CONFIG = '{"trusted_server_config":""}'

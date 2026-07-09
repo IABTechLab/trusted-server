@@ -10,6 +10,8 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+#[cfg(any(test, target_arch = "wasm32"))]
+use trusted_server_core::config_payload::CONFIG_BLOB_KEY;
 #[cfg(target_arch = "wasm32")]
 use trusted_server_core::config_payload::settings_from_config_blob;
 use trusted_server_core::ec::EcContext;
@@ -78,7 +80,9 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
         Report::new(TrustedServerError::Configuration {
             message: "Cloudflare TRUSTED_SERVER_CONFIG is required".to_string(),
         })
-        .attach("set TRUSTED_SERVER_CONFIG to JSON containing the app_config blob envelope")
+        .attach(format!(
+            "set TRUSTED_SERVER_CONFIG to JSON containing the `{CONFIG_BLOB_KEY}` blob envelope"
+        ))
     })?;
     let value: serde_json::Value = serde_json::from_str(raw_config).map_err(|error| {
         Report::new(TrustedServerError::Configuration {
@@ -86,15 +90,27 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
         })
         .attach(format!("failed to parse TRUSTED_SERVER_CONFIG: {error}"))
     })?;
-    let envelope = value
-        .get("app_config")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            Report::new(TrustedServerError::Configuration {
-                message: "Cloudflare TRUSTED_SERVER_CONFIG missing app_config".to_string(),
-            })
-        })?;
+    let envelope = cloudflare_config_envelope(&value).ok_or_else(|| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "Cloudflare TRUSTED_SERVER_CONFIG missing string value at `{CONFIG_BLOB_KEY}`"
+            ),
+        })
+    })?;
     settings_from_config_blob(envelope)
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+fn cloudflare_config_envelope(value: &serde_json::Value) -> Option<&str> {
+    const LEGACY_CONFIG_BLOB_KEY: &str = "app_config";
+
+    match value.get(CONFIG_BLOB_KEY) {
+        Some(envelope) => envelope.as_str(),
+        None if CONFIG_BLOB_KEY != LEGACY_CONFIG_BLOB_KEY => value
+            .get(LEGACY_CONFIG_BLOB_KEY)
+            .and_then(serde_json::Value::as_str),
+        None => None,
+    }
 }
 
 /// Build the application state from explicit settings.
@@ -552,5 +568,61 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         }
 
         router.build()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_value(entries: &[(&str, &str)]) -> serde_json::Value {
+        serde_json::Value::Object(
+            entries
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        (*key).to_string(),
+                        serde_json::Value::String((*value).to_string()),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn cloudflare_config_prefers_manifest_default_key() {
+        let value = config_value(&[
+            ("app_config", "legacy-envelope"),
+            (CONFIG_BLOB_KEY, "manifest-envelope"),
+        ]);
+
+        assert_eq!(
+            cloudflare_config_envelope(&value),
+            Some("manifest-envelope"),
+            "manifest-derived key should take precedence"
+        );
+    }
+
+    #[test]
+    fn cloudflare_config_accepts_legacy_app_config_key() {
+        let value = config_value(&[("app_config", "legacy-envelope")]);
+
+        assert_eq!(
+            cloudflare_config_envelope(&value),
+            Some("legacy-envelope"),
+            "legacy app_config key should remain compatible"
+        );
+    }
+
+    #[test]
+    fn cloudflare_config_does_not_mask_malformed_manifest_value() {
+        let mut value = config_value(&[("app_config", "legacy-envelope")]);
+        value[CONFIG_BLOB_KEY] = serde_json::Value::Bool(true);
+
+        assert_eq!(
+            cloudflare_config_envelope(&value),
+            None,
+            "malformed manifest-derived value should not fall back"
+        );
     }
 }
