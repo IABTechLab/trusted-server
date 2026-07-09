@@ -239,6 +239,38 @@ mod tests {
     }
 
     #[test]
+    fn wrapper_omits_disabled_ssat_compression_offload_for_legacy_compatibility() {
+        let mut settings = valid_settings();
+        settings.publisher.ssat_compression_offload_enabled = false;
+        let app_config =
+            TrustedServerAppConfig::new(settings).expect("should build disabled app config");
+        let value =
+            serde_json::to_value(&app_config).expect("should serialize disabled app config");
+        let publisher = value
+            .get("publisher")
+            .and_then(serde_json::Value::as_object)
+            .expect("should serialize publisher settings");
+
+        assert!(
+            !publisher.contains_key("ssat_compression_offload_enabled"),
+            "disabled setting must be omitted so older runtimes can load the config"
+        );
+
+        let mut settings = valid_settings();
+        settings.publisher.ssat_compression_offload_enabled = true;
+        let app_config =
+            TrustedServerAppConfig::new(settings).expect("should build enabled app config");
+        let value = serde_json::to_value(&app_config).expect("should serialize enabled app config");
+        assert_eq!(
+            value
+                .get("publisher")
+                .and_then(|publisher| publisher.get("ssat_compression_offload_enabled")),
+            Some(&serde_json::Value::Bool(true)),
+            "enabled setting must remain present in the published config"
+        );
+    }
+
+    #[test]
     fn wrapper_deserializes_from_settings_shape() {
         let toml = crate_test_settings_str();
         let app_config: TrustedServerAppConfig =

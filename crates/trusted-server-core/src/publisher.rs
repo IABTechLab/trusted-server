@@ -2224,18 +2224,11 @@ pub async fn handle_publisher_request(
         }
     );
 
-    if compression_offload_active {
-        // Ask the origin for identity so Trusted Server can emit uncompressed
-        // HTML for Fastly's dynamic delivery compression. The response path
-        // still decodes supported compression if the origin ignores this.
-        req.headers_mut().insert(
-            header::ACCEPT_ENCODING,
-            HeaderValue::from_static("identity"),
-        );
-    } else {
-        // Only advertise encodings the rewrite pipeline can decode and re-encode.
-        restrict_accept_encoding(&mut req);
-    }
+    // Only advertise encodings the rewrite pipeline can decode. Compression
+    // offload changes the processed HTML representation sent to Fastly, not
+    // origin negotiation, so non-HTML responses retain their negotiated
+    // encoding.
+    restrict_accept_encoding(&mut req);
     // Strip the internal `fastly-ssl` scheme signal before forwarding to the
     // origin. On the EdgeZero path the entry point re-injects this header from
     // trusted Fastly TLS metadata so in-process scheme detection works; the
@@ -3328,6 +3321,8 @@ mod tests {
         settings: &Settings,
         adapter_options: PublisherAdapterOptions,
         origin_body: Vec<u8>,
+        origin_status: u16,
+        origin_content_type: &str,
         origin_content_encoding: Option<&str>,
     ) -> (
         PublisherResponse,
@@ -3339,7 +3334,7 @@ mod tests {
         let mut origin_headers = vec![
             (
                 header::CONTENT_TYPE.as_str().to_string(),
-                "text/html; charset=utf-8".to_string(),
+                origin_content_type.to_string(),
             ),
             (
                 header::CONTENT_LENGTH.as_str().to_string(),
@@ -3357,7 +3352,7 @@ mod tests {
                 origin_content_encoding.to_string(),
             ));
         }
-        stub.push_response_with_headers(200, origin_body, origin_headers);
+        stub.push_response_with_headers(origin_status, origin_body, origin_headers);
         let services = build_services_with_http_client(
             Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
         );
@@ -3371,7 +3366,7 @@ mod tests {
             .method(Method::GET)
             .uri("https://publisher.example/article?edition=morning&view=full")
             .header(header::HOST, "publisher.example")
-            .header(header::ACCEPT_ENCODING, "gzip, br")
+            .header(header::ACCEPT_ENCODING, "gzip, br, identity;q=0")
             .header("sec-fetch-dest", "document")
             .body(EdgeBody::empty())
             .expect("should build SSAT compression request");
@@ -3445,7 +3440,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fastly_ssat_compression_offload_requests_and_emits_identity() {
+    async fn fastly_ssat_compression_offload_preserves_origin_negotiation_and_emits_identity() {
         let settings = ssat_compression_test_settings(true);
         let html = b"<html><body><p>Origin HTML</p></body></html>";
         let (publisher_response, stub, services, orchestrator) = run_ssat_compression_request(
@@ -3455,6 +3450,8 @@ mod tests {
                 delivery_compression: DeliveryCompressionCapability::FastlyDynamic,
             },
             html.to_vec(),
+            200,
+            "text/html; charset=utf-8",
             None,
         )
         .await;
@@ -3467,9 +3464,9 @@ mod tests {
         let request_headers = stub.recorded_request_headers();
         assert!(
             request_headers[0].iter().any(|(name, value)| {
-                name.eq_ignore_ascii_case(header::ACCEPT_ENCODING.as_str()) && value == "identity"
+                name.eq_ignore_ascii_case(header::ACCEPT_ENCODING.as_str()) && value == "gzip, br"
             }),
-            "Fastly SSAT offload must request identity from the origin"
+            "Fastly SSAT offload must retain supported origin negotiation"
         );
 
         let PublisherResponse::Stream {
@@ -3535,6 +3532,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fastly_ssat_compression_offload_preserves_non_html_error_compression() {
+        let settings = ssat_compression_test_settings(true);
+        let json = br#"{"message":"Negotiated JSON"}"#;
+        let (publisher_response, stub, services, orchestrator) = run_ssat_compression_request(
+            &settings,
+            PublisherAdapterOptions {
+                edge_cache_header: EdgeCacheHeader::SurrogateControl,
+                delivery_compression: DeliveryCompressionCapability::FastlyDynamic,
+            },
+            gzip_encode(json),
+            502,
+            "application/json",
+            Some("gzip"),
+        )
+        .await;
+
+        let request_headers = stub.recorded_request_headers();
+        assert!(
+            request_headers[0].iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case(header::ACCEPT_ENCODING.as_str()) && value == "gzip, br"
+            }),
+            "offload must preserve supported origin negotiation for non-HTML responses"
+        );
+
+        let PublisherResponse::Stream {
+            response, params, ..
+        } = &publisher_response
+        else {
+            panic!("processable JSON should use the stream route");
+        };
+        assert_eq!(response.status(), http::StatusCode::BAD_GATEWAY);
+        assert_eq!(params.input_compression, Compression::Gzip);
+        assert_eq!(params.output_compression, Compression::Gzip);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            Some("gzip")
+        );
+        assert!(response.headers().get(HEADER_X_COMPRESS_HINT).is_none());
+
+        let registry = IntegrationRegistry::new(&settings).expect("should build registry");
+        let response = buffer_publisher_response_async(
+            publisher_response,
+            &Method::GET,
+            &settings,
+            &registry,
+            &orchestrator,
+            &services,
+        )
+        .await
+        .expect("should buffer mirrored non-HTML output");
+        let body = response
+            .into_body()
+            .into_bytes()
+            .expect("should read mirrored non-HTML output");
+        let decoded = gzip_decode(&body);
+        assert!(
+            String::from_utf8(decoded)
+                .expect("should decode mirrored non-HTML gzip")
+                .contains("Negotiated JSON"),
+            "non-HTML output must remain valid gzip"
+        );
+    }
+
+    #[tokio::test]
     async fn fastly_ssat_compression_offload_decodes_supported_origin_encodings() {
         let settings = ssat_compression_test_settings(true);
         let registry = IntegrationRegistry::new(&settings).expect("should build registry");
@@ -3553,6 +3617,8 @@ mod tests {
                     delivery_compression: DeliveryCompressionCapability::FastlyDynamic,
                 },
                 origin_body,
+                200,
+                "text/html; charset=utf-8",
                 Some(origin_content_encoding),
             )
             .await;
@@ -3612,6 +3678,8 @@ mod tests {
                 delivery_compression: DeliveryCompressionCapability::Unavailable,
             },
             gzip_encode(html),
+            200,
+            "text/html; charset=utf-8",
             Some("gzip"),
         )
         .await;
@@ -3685,6 +3753,8 @@ mod tests {
                 delivery_compression: DeliveryCompressionCapability::FastlyDynamic,
             },
             gzip_encode(html),
+            200,
+            "text/html; charset=utf-8",
             Some("gzip"),
         )
         .await;

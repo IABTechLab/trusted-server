@@ -10,9 +10,9 @@ origin_url = "https://origin.example.com"
 # Optional: override outbound Host header while connecting to origin_url.
 # origin_host_header_override = "www.example.com"
 proxy_secret = "change-me-proxy-secret"
-# Fastly only: request identity HTML from the origin and let Fastly dynamically
-# compress eligible server-side ad stack responses at delivery.
-ssat_compression_offload_enabled = false
+# Fastly only: emit processed server-side ad stack HTML as identity and let
+# Fastly dynamically compress it at delivery. Defaults to false.
+# ssat_compression_offload_enabled = true
 
 [ec]
 passphrase = "trusted-server-placeholder-secret"

@@ -185,8 +185,8 @@ origin_url = "https://origin.publisher.com"
 # Optional: connect to origin_url but send this outbound Host header.
 # origin_host_header_override = "www.publisher.com"
 proxy_secret = "change-me-to-secure-random-value"
-# Fastly only; disabled by default.
-ssat_compression_offload_enabled = false
+# Fastly only; disabled by default. Uncomment after deploying a compatible binary.
+# ssat_compression_offload_enabled = true
 ```
 
 **Environment Override**:
@@ -308,22 +308,32 @@ Changing `proxy_secret` invalidates all existing signed URLs. Plan rotations car
 **Purpose**: Offload delivery compression for eligible server-side ad stack
 (SSAT) HTML responses to Fastly dynamic compression.
 
-When enabled on the Fastly adapter, Trusted Server requests identity encoding
-from the publisher origin, decodes a supported compressed response if the origin
-ignores that request, emits identity HTML, and sends `X-Compress-Hint: on` for
+When enabled on the Fastly adapter, Trusted Server continues to negotiate only
+supported encodings with the publisher origin. For processable HTML, it decodes
+the origin response, emits identity HTML, and sends `X-Compress-Hint: on` for
 Fastly delivery compression. `Vary: Accept-Encoding` is retained or added as
 needed. The setting applies only when the existing SSAT request gates pass and
-the response is processable HTML.
+the response is processable HTML; non-HTML responses retain their negotiated
+origin encoding.
 
 The setting defaults to `false`. Axum, Cloudflare, and Spin explicitly declare
 the capability unavailable, so enabling it there does not change request or
 response compression behavior.
 
-::: warning Origin response size
-Identity responses use more origin-to-edge bandwidth and count against Fastly's
-current 10 MiB raw origin-response limit before Trusted Server processing. Keep
-this option disabled for publishers whose representative identity HTML can
-approach that limit.
+::: warning Fastly delivery billing
+Fastly bills dynamically compressed responses based on their uncompressed size
+before compression when the service is subject to metered delivery charges.
+This option can therefore increase billable delivery bytes even though browsers
+receive compressed content. Include uncompressed response size and projected
+delivery cost in rollout measurements. See Fastly's
+[compression guide](https://www.fastly.com/documentation/guides/concepts/compression/).
+:::
+
+::: warning Deployment ordering
+Deploy a Trusted Server binary that supports this setting before enabling it.
+Before rolling back to an older binary, set the option to `false` and publish
+the configuration with the current CLI so the disabled field is omitted, then
+roll back the binary.
 :::
 
 **Environment Override**:

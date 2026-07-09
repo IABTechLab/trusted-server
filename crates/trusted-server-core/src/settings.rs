@@ -27,6 +27,10 @@ pub const ENVIRONMENT_VARIABLE_PREFIX: &str = "TRUSTED_SERVER";
 #[cfg(test)]
 pub const ENVIRONMENT_VARIABLE_SEPARATOR: &str = "__";
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct Publisher {
@@ -49,7 +53,7 @@ pub struct Publisher {
     /// Enables Fastly dynamic delivery compression for eligible server-side ad
     /// stack HTML responses. Defaults to `false` and has no effect on runtimes
     /// that do not explicitly declare support for Fastly dynamic delivery.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub ssat_compression_offload_enabled: bool,
     /// Maximum number of bytes buffered when a publisher origin response is
     /// post-processed in full (HTML rewriting/injection) instead of streamed.
