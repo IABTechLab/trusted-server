@@ -691,7 +691,15 @@ mod tests {
 
         // Malformed ids are rejected: wrong prefix, too short, lowercase, bad
         // chars, empty.
-        for bad in ["ABCD1234", "GTM-abc", "gtm-ABCD", "GTM-AB", "GTM_ABCD", "GTM-ABCD!", ""] {
+        for bad in [
+            "ABCD1234",
+            "GTM-abc",
+            "gtm-ABCD",
+            "GTM-AB",
+            "GTM_ABCD",
+            "GTM-ABCD!",
+            "",
+        ] {
             config(bad)
                 .validate()
                 .expect_err(&format!("invalid container id {bad:?} should be rejected"));

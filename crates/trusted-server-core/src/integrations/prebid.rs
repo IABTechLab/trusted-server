@@ -339,9 +339,8 @@ fn validate_external_bundle_url(value: &str) -> Result<(), ValidationError> {
 
 /// Exact hex SHA-256: 64 hex digits. Used by the built-in `regex` validator on
 /// [`PrebidIntegrationConfig::external_bundle_sha256`].
-static EXTERNAL_BUNDLE_SHA256_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^[0-9a-fA-F]{64}$").expect("SHA-256 hex regex should compile")
-});
+static EXTERNAL_BUNDLE_SHA256_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[0-9a-fA-F]{64}$").expect("SHA-256 hex regex should compile"));
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum ExternalBundleSriAlgorithm {
@@ -2261,7 +2260,12 @@ mod tests {
             .expect("mixed-case 64-char hex sha256 should pass");
 
         // Wrong length or non-hex characters are rejected.
-        for bad in ["a".repeat(63), "a".repeat(65), "g".repeat(64), String::new()] {
+        for bad in [
+            "a".repeat(63),
+            "a".repeat(65),
+            "g".repeat(64),
+            String::new(),
+        ] {
             config(&bad)
                 .validate()
                 .expect_err(&format!("invalid sha256 {bad:?} should be rejected"));

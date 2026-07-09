@@ -684,8 +684,10 @@ pub struct RequestSigning {
 impl RequestSigning {
     /// Reserved example store-id values from the config template, plus the
     /// empty string, that must not be deployed while request signing is enabled.
-    pub const STORE_ID_PLACEHOLDERS: &[&str] =
-        &["<management-config-store-id>", "<management-secret-store-id>"];
+    pub const STORE_ID_PLACEHOLDERS: &[&str] = &[
+        "<management-config-store-id>",
+        "<management-secret-store-id>",
+    ];
 
     /// Returns `true` if `store_id` is empty or a known template placeholder
     /// (case-insensitive).
