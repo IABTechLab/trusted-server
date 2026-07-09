@@ -1951,6 +1951,22 @@ impl Default for SecretsSettings {
     }
 }
 
+impl SecretsSettings {
+    /// Returns `true` when store mode is disabled.
+    ///
+    /// Used to omit the `[secrets]` section from the serialized app-config
+    /// blob whenever store mode is off, so that a binary predating this field
+    /// (which uses `#[serde(deny_unknown_fields)]`) still accepts a blob
+    /// pushed by a newer CLI. `store` is only meaningful when `enabled`, so a
+    /// disabled section carries nothing worth serializing (a custom `store`
+    /// with `enabled = false` is inert). Store mode (`enabled = true`) always
+    /// serializes and therefore requires the newer binary — as intended.
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        !self.enabled
+    }
+}
+
 fn default_secrets_store() -> String {
     "ts_secrets".to_owned()
 }
@@ -2025,7 +2041,7 @@ pub struct Settings {
     pub tinybird: TinybirdSettings,
     #[serde(default)]
     pub debug: DebugConfig,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "SecretsSettings::is_disabled")]
     #[validate(nested)]
     pub secrets: SecretsSettings,
 }
@@ -2870,6 +2886,54 @@ mod tests {
         assert!(
             err.to_string().contains("placeholder password"),
             "should mention placeholder password: {err}"
+        );
+    }
+
+    #[test]
+    fn default_secrets_omitted_from_serialization() {
+        // Wire compatibility: a blob pushed by a newer CLI for an ordinary
+        // inline config must not carry a `secrets` field, or a binary
+        // predating this field (with `deny_unknown_fields`) rejects it.
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse inline settings");
+
+        let json = serde_json::to_value(&settings).expect("should serialize");
+
+        assert!(
+            json.get("secrets").is_none(),
+            "default (inline) secrets section must be omitted from the blob"
+        );
+    }
+
+    #[test]
+    fn store_mode_secrets_are_serialized() {
+        let toml = format!("{}\n[secrets]\nenabled = true\n", crate_test_settings_str());
+        let settings = Settings::from_toml(&toml).expect("should parse store-mode settings");
+
+        let json = serde_json::to_value(&settings).expect("should serialize");
+
+        assert_eq!(
+            json.pointer("/secrets/enabled"),
+            Some(&serde_json::Value::Bool(true)),
+            "store-mode secrets section must be serialized"
+        );
+    }
+
+    #[test]
+    fn disabled_secrets_with_custom_store_are_omitted() {
+        // Wire compatibility: a disabled section is inert, so even a
+        // non-default `store` must be omitted or old binaries reject the blob.
+        let toml = format!(
+            "{}\n[secrets]\nenabled = false\nstore = \"custom_secrets\"\n",
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml).expect("should parse disabled custom-store");
+
+        let json = serde_json::to_value(&settings).expect("should serialize");
+
+        assert!(
+            json.get("secrets").is_none(),
+            "disabled secrets section must be omitted even with a custom store"
         );
     }
 

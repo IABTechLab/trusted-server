@@ -76,8 +76,9 @@ impl PartnerRegistry {
     /// matched to `mode`.
     ///
     /// In [`SecretFieldMode::KeyNames`] the tokens are secret-store key
-    /// names, so the minimum token length check is deferred to runtime where
-    /// the resolved values are available.
+    /// names: the non-empty check still runs (an empty key name can never
+    /// resolve), but the minimum token length check is deferred to runtime
+    /// where the resolved value is available.
     ///
     /// # Errors
     ///
@@ -103,8 +104,15 @@ impl PartnerRegistry {
                 }));
             }
 
-            if mode == SecretFieldMode::ResolvedValues {
-                validate_api_token(&normalized_source, partner.api_token.expose())?;
+            match mode {
+                SecretFieldMode::ResolvedValues => {
+                    validate_api_token(&normalized_source, partner.api_token.expose())?;
+                }
+                // Key names must still be non-empty; the length rule is a
+                // property of the resolved secret value, checked at runtime.
+                SecretFieldMode::KeyNames => {
+                    validate_api_token_non_empty(&normalized_source, partner.api_token.expose())?;
+                }
             }
 
             let api_key_hash = hash_api_key(partner.api_token.expose());
@@ -205,7 +213,7 @@ impl PartnerRegistry {
     }
 }
 
-fn validate_api_token(
+fn validate_api_token_non_empty(
     source_domain: &str,
     api_token: &str,
 ) -> Result<(), Report<TrustedServerError>> {
@@ -216,6 +224,14 @@ fn validate_api_token(
             ),
         }));
     }
+    Ok(())
+}
+
+fn validate_api_token(
+    source_domain: &str,
+    api_token: &str,
+) -> Result<(), Report<TrustedServerError>> {
+    validate_api_token_non_empty(source_domain, api_token)?;
 
     if api_token.len() < MIN_API_TOKEN_LENGTH {
         return Err(Report::new(TrustedServerError::Configuration {
@@ -352,6 +368,43 @@ mod tests {
     fn empty_config_builds_empty_registry() {
         let registry = PartnerRegistry::from_config(&[]).expect("should build empty registry");
         assert!(registry.is_empty(), "should have no partners");
+    }
+
+    #[test]
+    fn key_name_mode_accepts_short_non_empty_token() {
+        // A secret-store key name is typically shorter than MIN_API_TOKEN_LENGTH;
+        // key-name mode must not apply the length rule.
+        let partners = vec![make_partner("ssp.example.com", "partner_a_token")];
+        PartnerRegistry::from_config_with_secret_mode(&partners, SecretFieldMode::KeyNames)
+            .expect("short non-empty key name should be accepted in key-name mode");
+    }
+
+    #[test]
+    fn key_name_mode_rejects_empty_token() {
+        // Non-empty is still enforced in key-name mode — an empty key name can
+        // never resolve to a secret.
+        let partners = vec![make_partner("ssp.example.com", "")];
+        let err =
+            PartnerRegistry::from_config_with_secret_mode(&partners, SecretFieldMode::KeyNames)
+                .expect_err("empty key name should be rejected in key-name mode");
+        assert!(
+            err.to_string().contains("must not be empty"),
+            "error should name the empty-token rule: {err}"
+        );
+    }
+
+    #[test]
+    fn resolved_values_mode_still_rejects_short_token() {
+        let partners = vec![make_partner("ssp.example.com", "too-short")];
+        let err = PartnerRegistry::from_config_with_secret_mode(
+            &partners,
+            SecretFieldMode::ResolvedValues,
+        )
+        .expect_err("short resolved token should be rejected");
+        assert!(
+            err.to_string().contains("at least"),
+            "error should name the length rule: {err}"
+        );
     }
 
     #[test]

@@ -685,7 +685,7 @@ Under the existing secret fields add commented guidance:
 # below with the NAME of a secret in the platform secret store. Seed the
 # store with your EXISTING values first (changing ec.passphrase rotates all
 # visitor IDs; changing publisher.proxy_secret invalidates proxy URL tokens):
-#   fastly secret-store-entry create --store-id <ID> --name ec_passphrase --secret <value>
+#   printf %s "$EC_PASSPHRASE" | fastly secret-store-entry create --store-id <ID> --name ec_passphrase --stdin
 # Rollout order: deploy new WASM -> seed secrets -> push store-mode config.
 #
 # [secrets]
@@ -732,4 +732,5 @@ Expected: no manifest parse errors.
 - 2026-07-09: Task 5 done — `settings_from_config_blob_with_secrets`, fail-closed without store; 7 config_payload tests green. Commit pending approval.
 - 2026-07-09: Task 6 done — loader takes Option<&dyn PlatformSecretStore>; Fastly passes FastlyPlatformSecretStore, Axum None; settings_data 5 tests + axum suite green, check-fastly clean. Commit pending approval.
 - 2026-07-09: Task 7 done — fastly.toml local ts_secrets entries (ec_passphrase/proxy_secret/admin_password), example.toml store-mode guidance; Viceroy manifest parses. Commit pending approval.
-- 2026-07-09: Task 8 done — fmt clean; all 6 clippy targets clean on 1.95.0; test-fastly 1648+99+21+2, test-axum 32, test-cloudflare 32, test-spin 72, parity 13, CLI 108 all green. Awaiting commit approvals + PR handoff.
+- 2026-07-09: Task 8 done — fmt clean; all 6 clippy targets clean on 1.95.0; full Rust + parity + CLI suites green. Committed and pushed; draft PR #873 opened.
+- 2026-07-09: Applied two rounds of external review. Round 1: `[secrets]` omitted from serialization when disabled (old-binary wire compat); resolver fails closed on non-array covered sections; registry key-name mode keeps the non-empty check; docs corrected (`fastly … --stdin`, no `--secret` flag). Round 2: added a hard push/deploy guard rejecting `TRUSTED_SERVER__` secret env overrides in store mode; serialization now omits `[secrets]` whenever disabled (not just the exact default); resolver `# Errors` and this plan's `--stdin` command corrected. Regression tests added for each.

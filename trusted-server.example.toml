@@ -5,8 +5,15 @@
 # ec.partners[].ts_pull_token, handlers[].password. Seed the store with your
 # EXISTING values first — changing ec.passphrase rotates every visitor ID,
 # and changing publisher.proxy_secret invalidates outstanding proxy URL
-# tokens:
-#   fastly secret-store-entry create --store-id <ID> --name ec_passphrase --secret <value>
+# tokens. The Fastly CLI reads the value from stdin or a file (there is no
+# --secret flag):
+#   printf %s "$EC_PASSPHRASE" | fastly secret-store-entry create --store-id <ID> --name ec_passphrase --stdin
+# IMPORTANT: in store mode, do NOT set TRUSTED_SERVER__ secret overrides
+# (EC__PASSPHRASE, PUBLISHER__PROXY_SECRET, EC__PARTNERS__<n>__API_TOKEN,
+# EC__PARTNERS__<n>__TS_PULL_TOKEN, HANDLERS__<n>__PASSWORD). The push env
+# overlay would overwrite the key NAME with the real value and persist it as
+# plaintext. `ts config push` rejects this combination — unset those vars and
+# seed the secret store with the real values instead.
 # Rollout order: deploy new WASM -> seed secrets -> push store-mode config.
 
 [[handlers]]

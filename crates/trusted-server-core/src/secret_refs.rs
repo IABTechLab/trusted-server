@@ -41,8 +41,10 @@ const SECRET_REF_PATHS: &[&str] = &[
 /// # Errors
 ///
 /// Returns [`TrustedServerError::Configuration`] when a present leaf is not a
-/// string, or when the secret store cannot supply a referenced key. Error
-/// messages carry the dotted path and key name, never a secret value.
+/// string, when a covered array section (e.g. `ec.partners`, `handlers`) is
+/// present in a non-array encoding that cannot be resolved, or when the secret
+/// store cannot supply a referenced key. Error messages carry the dotted path
+/// and key name, never a secret value.
 pub fn resolve_secret_refs(
     data: &mut Value,
     secret_store: &dyn PlatformSecretStore,
@@ -69,13 +71,26 @@ fn resolve_path(
         None => resolve_leaf(node, remaining, full_path, secret_store, store_name),
         Some((head, rest)) => {
             if let Some(field) = head.strip_suffix("[]") {
-                let Some(items) = node.get_mut(field).and_then(Value::as_array_mut) else {
-                    return Ok(());
-                };
-                for item in items {
-                    resolve_path(item, rest, full_path, secret_store, store_name)?;
+                match node.get_mut(field) {
+                    // Absent section (or explicit null) — nothing to resolve.
+                    None | Some(Value::Null) => Ok(()),
+                    Some(Value::Array(items)) => {
+                        for item in items {
+                            resolve_path(item, rest, full_path, secret_store, store_name)?;
+                        }
+                        Ok(())
+                    }
+                    // Present but not an array. `Settings` also accepts
+                    // map/string encodings of these fields, which would
+                    // deserialize the unresolved key names as real secret
+                    // values — fail closed instead of silently skipping.
+                    Some(_) => Err(Report::new(TrustedServerError::Configuration {
+                        message: format!(
+                            "secret ref `{full_path}` requires `{field}` to be an array; \
+                             found a non-array encoding that cannot be resolved"
+                        ),
+                    })),
                 }
-                Ok(())
             } else {
                 match node.get_mut(head) {
                     Some(child) => resolve_path(child, rest, full_path, secret_store, store_name),
@@ -213,6 +228,55 @@ mod tests {
         assert!(
             data["ec"]["partners"][0].get("ts_pull_token").is_none(),
             "should not insert absent optional leaves"
+        );
+    }
+
+    #[test]
+    fn present_non_array_section_fails_closed() {
+        // `Settings` also accepts a numeric-map encoding of `handlers`; if a
+        // blob carried that shape, the array walk must NOT silently skip it
+        // (that would leave key names as real passwords). Fail closed.
+        let mut data = json!({
+            "handlers": { "0": { "password": "admin_password" } }
+        });
+
+        let err = resolve_secret_refs(&mut data, &test_store())
+            .expect_err("non-array handlers must fail closed");
+
+        assert!(
+            err.to_string().contains("handlers"),
+            "error should name the offending section: {err}"
+        );
+    }
+
+    #[test]
+    fn present_string_encoded_array_fails_closed() {
+        let mut data = json!({
+            "ec": { "partners": "[{\"api_token\":\"partner_a_token\"}]" }
+        });
+
+        let err = resolve_secret_refs(&mut data, &test_store())
+            .expect_err("string-encoded partners array must fail closed");
+
+        assert!(
+            err.to_string().contains("partners"),
+            "error should name the offending section: {err}"
+        );
+    }
+
+    #[test]
+    fn null_section_is_skipped() {
+        let mut data = json!({
+            "publisher": { "proxy_secret": "proxy_secret" },
+            "ec": { "passphrase": "ec_passphrase", "partners": null }
+        });
+
+        resolve_secret_refs(&mut data, &test_store())
+            .expect("null array section should be skipped, not rejected");
+
+        assert_eq!(
+            data["ec"]["passphrase"],
+            "resolved-passphrase-32-bytes-min!"
         );
     }
 
