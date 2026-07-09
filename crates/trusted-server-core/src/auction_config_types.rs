@@ -85,7 +85,6 @@ impl AuctionConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use validator::Validate as _;
 
     fn config_with_timeout(timeout_ms: u32) -> AuctionConfig {
         AuctionConfig {
