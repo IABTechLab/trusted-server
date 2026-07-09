@@ -10,7 +10,7 @@
 
 **Branch:** `846-secrets-to-secret-store`
 
-**Commit policy:** every commit requires explicit user approval before running `git commit` (standing user rule). Commit steps below are checkpoints to *request* approval, not to commit unprompted.
+**Commit policy:** every commit requires explicit user approval before running `git commit` (standing user rule). Commit steps below are checkpoints to _request_ approval, not to commit unprompted.
 
 ---
 
@@ -41,6 +41,7 @@ Out of scope (follow-ups, do NOT implement here): Cloudflare/Spin/Axum wiring be
 ### Task 1: `[secrets]` settings section
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/settings.rs` (new struct + `Settings` field)
 - Test: same file, `#[cfg(test)] mod tests`
 
@@ -138,12 +139,14 @@ Expected: PASS (the `enabled = true` test may need Task 3 — if it fails only o
 ### Task 2: Secret-ref resolver module
 
 **Files:**
+
 - Create: `crates/trusted-server-core/src/secret_refs.rs`
 - Modify: `crates/trusted-server-core/src/lib.rs` (add `pub mod secret_refs;`)
 
 - [x] **Step 1: Write failing tests** (in `secret_refs.rs` `#[cfg(test)]`)
 
 Cover, using `crate::platform::test_support::HashMapSecretStore` and `serde_json::json!`:
+
 1. resolves nested scalar (`publisher.proxy_secret`),
 2. resolves array element (`ec.partners[].api_token` for two partners),
 3. skips absent optional leaf (`ts_pull_token` missing) and absent sections (no `handlers`),
@@ -327,6 +330,7 @@ Expected: PASS (all resolver tests).
 ### Task 3: Validation-mode split (push = key names, runtime = resolved values)
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/settings.rs` (`finalize_deserialized`, `from_toml`, `from_json_value`, new mode enum + error-strip helper)
 - Modify: `crates/trusted-server-core/src/config.rs` (`Deserialize` impl passes mode)
 - Test: `settings.rs` tests
@@ -394,6 +398,7 @@ pub enum SecretFieldMode {
 ```
 
 Change `finalize_deserialized` signature to `pub(crate) fn finalize_deserialized(settings: Self, validation_label: &str, mode: SecretFieldMode)`. Inside:
+
 - after `settings.validate()` fails, when `mode == SecretFieldMode::KeyNames`, strip only the `ec.passphrase` errors (the sole value-shape serde validator that a key name can trip) via a helper, and succeed if nothing else remains:
 
 ```rust
@@ -437,6 +442,7 @@ Expected: PASS, including un-ignored Task 1 test and all pre-existing settings t
 ### Task 4: Deploy-validation gating + key-name shape checks
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/config.rs` (`validate_settings_for_deploy`)
 - Modify: `crates/trusted-server-core/src/settings.rs` (new `validate_secret_key_names`)
 - Modify: `crates/trusted-server-core/src/ec/registry.rs` (token-mode-aware validation)
@@ -474,6 +480,7 @@ Run: `cargo test-fastly -p trusted-server-core deploy_validation 2>&1 | tail -10
 - [x] **Step 3: Implement**
 
 In `validate_settings_for_deploy` (`config.rs:126`), branch on `settings.secrets.enabled`:
+
 - store mode: replace `reject_placeholder_secrets()` with `settings.validate_secret_key_names()`; build the partner registry with token value checks relaxed (see below); keep integration + auction-provider validation unchanged.
 - inline mode: unchanged behavior.
 
@@ -494,6 +501,7 @@ Run: `cargo test-fastly -p trusted-server-core 2>&1 | tail -5`
 ### Task 5: Runtime blob resolution in `config_payload`
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/config_payload.rs`
 - Test: same file
 
@@ -591,6 +599,7 @@ Run: `cargo test-fastly -p trusted-server-core config_payload 2>&1 | tail -5`
 ### Task 6: Loader plumbing (`settings_data`) + adapter call sites
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/settings_data.rs` (`get_settings_from_config_store` signature)
 - Modify: `crates/trusted-server-adapter-fastly/src/app.rs:164-168` (pass Fastly secret store)
 - Modify: `crates/trusted-server-adapter-axum/src/app.rs:59` (pass `None`)
@@ -626,6 +635,7 @@ pub fn get_settings_from_config_store(
 ```
 
 body delegates to `settings_from_config_blob_with_secrets(&envelope_json, secret_store)`. Update ALL call sites:
+
 - `adapter-fastly/src/app.rs:167`: `get_settings_from_config_store(&FastlyPlatformConfigStore, Some(&FastlyPlatformSecretStore), &store_name, &config_key)`
 - `adapter-axum/src/app.rs:59`: pass `None` (Axum wiring is a follow-up).
 - every `settings_data.rs` test call: add `None` (or the new store for the new test).
@@ -644,6 +654,7 @@ Expected: PASS both.
 ### Task 7: Local dev (Viceroy) + operator template
 
 **Files:**
+
 - Modify: `fastly.toml` (`[local_server.secret_stores.ts_secrets]` entries)
 - Modify: `trusted-server.example.toml` (commented store-mode example)
 
