@@ -46,6 +46,11 @@ pub struct Publisher {
     /// Keep this secret stable to allow existing links to decode.
     #[validate(custom(function = validate_redacted_not_empty))]
     pub proxy_secret: Redacted<String>,
+    /// Enables Fastly dynamic delivery compression for eligible server-side ad
+    /// stack HTML responses. Defaults to `false` and has no effect on runtimes
+    /// that do not explicitly declare support for Fastly dynamic delivery.
+    #[serde(default)]
+    pub ssat_compression_offload_enabled: bool,
     /// Maximum number of bytes buffered when a publisher origin response is
     /// post-processed in full (HTML rewriting/injection) instead of streamed.
     /// This caps the *decoded, post-rewrite* output buffer and applies to any
@@ -88,6 +93,7 @@ impl Default for Publisher {
             origin_url: String::default(),
             origin_host_header_override: None,
             proxy_secret: Redacted::default(),
+            ssat_compression_offload_enabled: false,
             max_buffered_body_bytes: default_max_buffered_body_bytes(),
         }
     }
@@ -130,6 +136,7 @@ impl Publisher {
     ///     origin_url: "https://origin.example.com:8080".to_string(),
     ///     origin_host_header_override: None,
     ///     proxy_secret: Redacted::new("proxy-secret".to_string()),
+    ///     ssat_compression_offload_enabled: false,
     ///     max_buffered_body_bytes: 16 * 1024 * 1024,
     /// };
     /// assert_eq!(publisher.origin_host(), "origin.example.com:8080");
@@ -4317,6 +4324,7 @@ origin_host_header_overide = "www.example.com""#,
             origin_url: "https://origin.example.com:8080".to_string(),
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
+            ssat_compression_offload_enabled: false,
             max_buffered_body_bytes: 16 * 1024 * 1024,
         };
         assert_eq!(publisher.origin_host(), "origin.example.com:8080");
@@ -4328,6 +4336,7 @@ origin_host_header_overide = "www.example.com""#,
             origin_url: "https://origin.example.com".to_string(),
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
+            ssat_compression_offload_enabled: false,
             max_buffered_body_bytes: 16 * 1024 * 1024,
         };
         assert_eq!(publisher.origin_host(), "origin.example.com");
@@ -4339,6 +4348,7 @@ origin_host_header_overide = "www.example.com""#,
             origin_url: "http://localhost:9090".to_string(),
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
+            ssat_compression_offload_enabled: false,
             max_buffered_body_bytes: 16 * 1024 * 1024,
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
@@ -4350,6 +4360,7 @@ origin_host_header_overide = "www.example.com""#,
             origin_url: "localhost:9090".to_string(),
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
+            ssat_compression_offload_enabled: false,
             max_buffered_body_bytes: 16 * 1024 * 1024,
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
@@ -4361,6 +4372,7 @@ origin_host_header_overide = "www.example.com""#,
             origin_url: "http://192.168.1.1:8080".to_string(),
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
+            ssat_compression_offload_enabled: false,
             max_buffered_body_bytes: 16 * 1024 * 1024,
         };
         assert_eq!(publisher.origin_host(), "192.168.1.1:8080");
@@ -4372,6 +4384,7 @@ origin_host_header_overide = "www.example.com""#,
             origin_url: "http://[::1]:8080".to_string(),
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
+            ssat_compression_offload_enabled: false,
             max_buffered_body_bytes: 16 * 1024 * 1024,
         };
         assert_eq!(publisher.origin_host(), "[::1]:8080");
@@ -4385,6 +4398,7 @@ origin_host_header_overide = "www.example.com""#,
             origin_url: "https://origin.example.com:8443".to_string(),
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
+            ssat_compression_offload_enabled: false,
             max_buffered_body_bytes: 16 * 1024 * 1024,
         };
 
@@ -4399,6 +4413,7 @@ origin_host_header_overide = "www.example.com""#,
             origin_url: "https://origin.example.com".to_string(),
             origin_host_header_override: Some("www.example.com".to_string()),
             proxy_secret: Redacted::new("test-secret".to_string()),
+            ssat_compression_offload_enabled: false,
             max_buffered_body_bytes: 16 * 1024 * 1024,
         };
 
@@ -4406,7 +4421,7 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     #[test]
-    fn publisher_default_max_buffered_body_bytes_matches_config_default() {
+    fn publisher_defaults_match_config_defaults() {
         // The manual `Default` impl must agree with the serde default applied
         // when the key is omitted from TOML, so programmatic `Publisher::default()`
         // does not silently produce a zero-byte buffer cap.
@@ -4414,6 +4429,10 @@ origin_host_header_overide = "www.example.com""#,
             Publisher::default().max_buffered_body_bytes,
             super::default_max_buffered_body_bytes(),
             "Publisher::default() must use the same buffer cap as the TOML default"
+        );
+        assert!(
+            !Publisher::default().ssat_compression_offload_enabled,
+            "Publisher::default() must keep SSAT compression offload disabled"
         );
 
         let from_toml = Settings::from_toml(
@@ -4438,6 +4457,26 @@ origin_host_header_overide = "www.example.com""#,
             from_toml.publisher.max_buffered_body_bytes,
             Publisher::default().max_buffered_body_bytes,
             "TOML default and Publisher::default() must stay aligned"
+        );
+        assert!(
+            !from_toml.publisher.ssat_compression_offload_enabled,
+            "omitted TOML key must keep SSAT compression offload disabled"
+        );
+    }
+
+    #[test]
+    fn publisher_ssat_compression_offload_parses_from_toml() {
+        let toml = crate_test_settings_str().replace(
+            "proxy_secret = \"unit-test-proxy-secret\"",
+            "proxy_secret = \"unit-test-proxy-secret\"\n            ssat_compression_offload_enabled = true",
+        );
+
+        let settings = Settings::from_toml(&toml)
+            .expect("should parse publisher SSAT compression offload setting");
+
+        assert!(
+            settings.publisher.ssat_compression_offload_enabled,
+            "explicit TOML setting should enable SSAT compression offload"
         );
     }
 

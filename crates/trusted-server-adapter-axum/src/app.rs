@@ -20,7 +20,8 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
+    AuctionDispatch, DeliveryCompressionCapability, PublisherAdapterOptions,
+    buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
     handle_tsjs_dynamic, page_bids_preflight_denied,
 };
 use trusted_server_core::request_signing::{
@@ -216,7 +217,10 @@ async fn dispatch_fallback(
         &mut ec_context,
         auction,
         req,
-        EdgeCacheHeader::SMaxageFallback,
+        PublisherAdapterOptions {
+            edge_cache_header: EdgeCacheHeader::SMaxageFallback,
+            delivery_compression: DeliveryCompressionCapability::Unavailable,
+        },
     )
     .await?;
     // Async finalize so the dispatched auction is collected and its bids are

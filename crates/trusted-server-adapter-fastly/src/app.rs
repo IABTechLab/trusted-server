@@ -119,6 +119,7 @@ use trusted_server_core::proxy::{
 use trusted_server_core::publisher::{
     buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
     handle_tsjs_dynamic, page_bids_preflight_denied, AuctionDispatch,
+    DeliveryCompressionCapability, PublisherAdapterOptions,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
@@ -795,7 +796,10 @@ async fn dispatch_fallback(
                             &mut ec.ec_context,
                             auction,
                             req,
-                            EdgeCacheHeader::SurrogateControl,
+                            PublisherAdapterOptions {
+                                edge_cache_header: EdgeCacheHeader::SurrogateControl,
+                                delivery_compression: DeliveryCompressionCapability::FastlyDynamic,
+                            },
                         )
                         .await
                         {

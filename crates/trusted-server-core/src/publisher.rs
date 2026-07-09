@@ -101,6 +101,20 @@ fn restrict_accept_encoding(req: &mut Request<EdgeBody>) {
     );
 }
 
+fn ensure_vary_accept_encoding(headers: &mut http::HeaderMap) {
+    let already_varies = headers.get_all(header::VARY).iter().any(|value| {
+        value.to_str().ok().is_some_and(|value| {
+            value.split(',').any(|token| {
+                let token = token.trim();
+                token == "*" || token.eq_ignore_ascii_case("accept-encoding")
+            })
+        })
+    });
+    if !already_varies {
+        headers.append(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+    }
+}
+
 fn select_supported_accept_encoding(client_accept_encoding: &str) -> String {
     let supported_subset = SUPPORTED_ENCODING_VALUES
         .into_iter()
@@ -254,7 +268,8 @@ fn parse_deferred_module_filename(filename: &str) -> Option<&'static str> {
 
 /// Parameters for processing response streaming.
 struct ProcessResponseParams<'a> {
-    content_encoding: &'a str,
+    input_compression: Compression,
+    output_compression: Compression,
     origin_host: &'a str,
     origin_url: &'a str,
     request_host: &'a str,
@@ -285,17 +300,17 @@ fn process_response_streaming<W: Write>(
     let is_rsc_flight =
         content_type_contains_ascii_case_insensitive(params.content_type, "text/x-component");
     log::debug!(
-        "process_response_streaming: content_type={}, content_encoding={}, is_html={}, is_rsc_flight={}",
+        "process_response_streaming: content_type={}, input_compression={:?}, output_compression={:?}, is_html={}, is_rsc_flight={}",
         params.content_type,
-        params.content_encoding,
+        params.input_compression,
+        params.output_compression,
         is_html,
         is_rsc_flight
     );
 
-    let compression = Compression::from_content_encoding(params.content_encoding);
     let config = PipelineConfig {
-        input_compression: compression,
-        output_compression: compression,
+        input_compression: params.input_compression,
+        output_compression: params.output_compression,
         chunk_size: 8192,
     };
 
@@ -530,7 +545,8 @@ fn apply_publisher_asset_cache_policy(
 /// Owned version of [`ProcessResponseParams`] for returning from
 /// [`handle_publisher_request`] without lifetime issues.
 pub struct OwnedProcessResponseParams {
-    pub(crate) content_encoding: String,
+    pub(crate) input_compression: Compression,
+    pub(crate) output_compression: Compression,
     pub(crate) origin_host: String,
     pub(crate) origin_url: String,
     pub(crate) request_host: String,
@@ -707,7 +723,8 @@ pub fn stream_publisher_body<W: Write>(
     integration_registry: &IntegrationRegistry,
 ) -> Result<(), Report<TrustedServerError>> {
     let borrowed = ProcessResponseParams {
-        content_encoding: &params.content_encoding,
+        input_compression: params.input_compression,
+        output_compression: params.output_compression,
         origin_host: &params.origin_host,
         origin_url: &params.origin_url,
         request_host: &params.request_host,
@@ -843,12 +860,12 @@ pub async fn stream_publisher_body_async<W: Write>(
             }
         };
 
-    let compression = Compression::from_content_encoding(&params.content_encoding);
     stream_html_with_auction_hold(
         body,
         output,
         &mut processor,
-        compression,
+        params.input_compression,
+        params.output_compression,
         AuctionCollectCtx {
             dispatched,
             telemetry,
@@ -893,10 +910,9 @@ async fn buffer_html_late_binding_with_postprocessors<W: Write>(
     };
     use crate::integrations::IntegrationDocumentState;
 
-    let compression = Compression::from_content_encoding(&ctx.params.content_encoding);
     let decoded = match decode_body_to_vec(
         body,
-        compression,
+        ctx.params.input_compression,
         ctx.settings.publisher.max_buffered_body_bytes,
     ) {
         Ok(decoded) => decoded,
@@ -1032,7 +1048,7 @@ async fn buffer_html_late_binding_with_postprocessors<W: Write>(
         message: "Failed to post-process buffered publisher HTML".to_string(),
     })?;
 
-    encode_processed_html_to_writer(&post_processed, compression, output)
+    encode_processed_html_to_writer(&post_processed, ctx.params.output_compression, output)
 }
 
 fn decode_body_to_vec(
@@ -1337,7 +1353,8 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
     body: EdgeBody,
     output: &mut W,
     processor: &mut P,
-    compression: Compression,
+    input_compression: Compression,
+    output_compression: Compression,
     ctx: AuctionCollectCtx<'_>,
     late_binding: LateBindingStreamConfig<'_>,
 ) -> Result<(), Report<TrustedServerError>> {
@@ -1351,8 +1368,8 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
     let tracker = late_binding.tracker;
     let fallback_ctx = late_binding.fallback;
     let body = body_as_reader(body);
-    match compression {
-        Compression::None => {
+    match (input_compression, output_compression) {
+        (Compression::None, Compression::None) => {
             body_close_hold_loop(
                 body,
                 output,
@@ -1364,7 +1381,7 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
             )
             .await
         }
-        Compression::Gzip => {
+        (Compression::Gzip, Compression::Gzip) => {
             let decoder = GzDecoder::new(body);
             let mut encoder = GzEncoder::new(&mut *output, flate2::Compression::default());
             body_close_hold_loop(
@@ -1382,7 +1399,7 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
             })?;
             Ok(())
         }
-        Compression::Deflate => {
+        (Compression::Deflate, Compression::Deflate) => {
             let decoder = ZlibDecoder::new(body);
             let mut encoder = ZlibEncoder::new(&mut *output, flate2::Compression::default());
             body_close_hold_loop(
@@ -1400,7 +1417,7 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
             })?;
             Ok(())
         }
-        Compression::Brotli => {
+        (Compression::Brotli, Compression::Brotli) => {
             let decoder = Decompressor::new(body, STREAM_CHUNK_SIZE);
             let params = BrotliEncoderParams {
                 quality: 4,
@@ -1422,6 +1439,45 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
             let _ = encoder.into_inner();
             Ok(())
         }
+        (Compression::Gzip, Compression::None) => {
+            body_close_hold_loop(
+                GzDecoder::new(body),
+                output,
+                processor,
+                placeholder,
+                Arc::clone(&tracker),
+                ctx,
+                fallback_ctx,
+            )
+            .await
+        }
+        (Compression::Deflate, Compression::None) => {
+            body_close_hold_loop(
+                ZlibDecoder::new(body),
+                output,
+                processor,
+                placeholder,
+                Arc::clone(&tracker),
+                ctx,
+                fallback_ctx,
+            )
+            .await
+        }
+        (Compression::Brotli, Compression::None) => {
+            body_close_hold_loop(
+                Decompressor::new(body, STREAM_CHUNK_SIZE),
+                output,
+                processor,
+                placeholder,
+                Arc::clone(&tracker),
+                ctx,
+                fallback_ctx,
+            )
+            .await
+        }
+        _ => Err(Report::new(TrustedServerError::Proxy {
+            message: "Unsupported compression transformation".to_string(),
+        })),
     }
 }
 
@@ -1821,6 +1877,41 @@ async fn collect_stream_auction(
     }
 }
 
+/// Delivery-compression behavior explicitly supported by an adapter.
+///
+/// This capability is independent of [`EdgeCacheHeader`]. Adapters must declare
+/// it directly so cache-header selection cannot accidentally enable Fastly-only
+/// response delivery behavior.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum DeliveryCompressionCapability {
+    /// Fastly dynamic compression honors `X-Compress-Hint: on` at delivery.
+    FastlyDynamic,
+    /// The adapter has no compatible delivery-compression facility.
+    Unavailable,
+}
+
+/// Adapter-specific publisher response behavior.
+///
+/// Bundles cache-header selection with an explicit delivery-compression
+/// capability while keeping those independent platform concerns visible.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct PublisherAdapterOptions {
+    /// Shared-cache header family emitted by publisher cache policies.
+    pub edge_cache_header: EdgeCacheHeader,
+    /// Delivery-compression facility available on the current adapter.
+    pub delivery_compression: DeliveryCompressionCapability,
+}
+
+fn should_offload_ssat_compression(
+    settings: &Settings,
+    adapter_options: PublisherAdapterOptions,
+    should_run_ad_stack: bool,
+) -> bool {
+    settings.publisher.ssat_compression_offload_enabled
+        && adapter_options.delivery_compression == DeliveryCompressionCapability::FastlyDynamic
+        && should_run_ad_stack
+}
+
 /// Auction dispatch context passed to [`handle_publisher_request`].
 pub struct AuctionDispatch<'a> {
     /// Orchestrator that dispatches and collects SSP bid requests.
@@ -1852,9 +1943,10 @@ pub async fn handle_publisher_request(
     ec_context: &mut EcContext,
     auction: AuctionDispatch<'_>,
     mut req: Request<EdgeBody>,
-    edge_header: EdgeCacheHeader,
+    adapter_options: PublisherAdapterOptions,
 ) -> Result<PublisherResponse, Report<TrustedServerError>> {
     log::debug!("Proxying request to publisher_origin");
+    let edge_header = adapter_options.edge_cache_header;
 
     // Prebid.js requests are not intercepted here anymore. The HTML processor removes
     // publisher-supplied Prebid scripts; the unified TSJS bundle includes Prebid.js when enabled.
@@ -1965,6 +2057,8 @@ pub async fn handle_publisher_request(
         auction.orchestrator.is_enabled(),
     );
     let should_run_auction = should_run_ad_stack;
+    let compression_offload_active =
+        should_offload_ssat_compression(settings, adapter_options, should_run_ad_stack);
     // Diagnostic: shows which gate suppresses the server-side auction. Pair with
     // the `EC context: ... jurisdiction=...` line from EC-context construction
     // when `consent_allows_auction=false`.
@@ -2130,8 +2224,18 @@ pub async fn handle_publisher_request(
         }
     );
 
-    // Only advertise encodings the rewrite pipeline can decode and re-encode.
-    restrict_accept_encoding(&mut req);
+    if compression_offload_active {
+        // Ask the origin for identity so Trusted Server can emit uncompressed
+        // HTML for Fastly's dynamic delivery compression. The response path
+        // still decodes supported compression if the origin ignores this.
+        req.headers_mut().insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
+    } else {
+        // Only advertise encodings the rewrite pipeline can decode and re-encode.
+        restrict_accept_encoding(&mut req);
+    }
     // Strip the internal `fastly-ssl` scheme signal before forwarding to the
     // origin. On the EdgeZero path the entry point re-injects this header from
     // trusted Fastly TLS metadata so in-process scheme detection works; the
@@ -2303,14 +2407,29 @@ pub async fn handle_publisher_request(
                 content_encoding
             );
 
+            let offload_stream = compression_offload_active && is_html_content_type(&content_type);
+            let input_compression = Compression::from_content_encoding(&content_encoding);
+            let output_compression = if offload_stream {
+                Compression::None
+            } else {
+                input_compression
+            };
             let body = std::mem::replace(response.body_mut(), EdgeBody::empty());
             response.headers_mut().remove(header::CONTENT_LENGTH);
+            if offload_stream {
+                response.headers_mut().remove(header::CONTENT_ENCODING);
+                response
+                    .headers_mut()
+                    .insert(HEADER_X_COMPRESS_HINT, HeaderValue::from_static("on"));
+                ensure_vary_accept_encoding(response.headers_mut());
+            }
 
             Ok(PublisherResponse::Stream {
                 response,
                 body,
                 params: Box::new(OwnedProcessResponseParams {
-                    content_encoding,
+                    input_compression,
+                    output_compression,
                     origin_host,
                     origin_url: settings.publisher.origin_url.clone(),
                     request_host: request_host.to_string(),
@@ -2984,7 +3103,7 @@ mod tests {
     use brotli::enc::writer::CompressorWriter;
     use brotli::Decompressor;
     use flate2::read::GzDecoder;
-    use flate2::write::GzEncoder;
+    use flate2::write::{GzEncoder, ZlibEncoder};
 
     use super::*;
     use crate::auction::types::{AdFormat, AdSlot, MediaType};
@@ -3014,6 +3133,14 @@ mod tests {
         output
     }
 
+    fn deflate_encode(input: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(input)
+            .expect("should write deflate test input");
+        encoder.finish().expect("should finish deflate encoding")
+    }
+
     fn brotli_encode(input: &[u8]) -> Vec<u8> {
         let mut encoder = CompressorWriter::new(Vec::new(), 4096, 5, 22);
         encoder
@@ -3036,7 +3163,8 @@ mod tests {
         content_encoding: &str,
     ) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
-            content_encoding: content_encoding.to_owned(),
+            input_compression: Compression::from_content_encoding(content_encoding),
+            output_compression: Compression::from_content_encoding(content_encoding),
             origin_host: settings.publisher.origin_host(),
             origin_url: settings.publisher.origin_url.clone(),
             request_host: settings.publisher.domain.clone(),
@@ -3056,7 +3184,8 @@ mod tests {
         dispatched_auction: Option<DispatchedAuction>,
     ) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
-            content_encoding: String::new(),
+            input_compression: Compression::None,
+            output_compression: Compression::None,
             origin_host: settings.publisher.origin_host(),
             origin_url: settings.publisher.origin_url.clone(),
             request_host: settings.publisher.domain.clone(),
@@ -3172,6 +3301,416 @@ mod tests {
         );
     }
 
+    fn ssat_compression_test_settings(enabled: bool) -> Settings {
+        let mut settings = Settings::from_toml(&format!(
+            r#"{}
+
+            [auction]
+            enabled = true
+
+            [creative_opportunities]
+            gam_network_id = "12345"
+
+            [[creative_opportunities.slot]]
+            id = "article-slot"
+            page_patterns = ["/article"]
+            formats = [{{ width = 300, height = 250 }}]
+            "#,
+            crate_test_settings_str()
+        ))
+        .expect("should parse SSAT compression test settings");
+        settings.publisher.ssat_compression_offload_enabled = enabled;
+        settings.proxy.allowed_domains = vec!["*.example".to_string(), "*.example.com".to_string()];
+        settings
+    }
+
+    async fn run_ssat_compression_request(
+        settings: &Settings,
+        adapter_options: PublisherAdapterOptions,
+        origin_body: Vec<u8>,
+        origin_content_encoding: Option<&str>,
+    ) -> (
+        PublisherResponse,
+        Arc<StubHttpClient>,
+        RuntimeServices,
+        AuctionOrchestrator,
+    ) {
+        let stub = Arc::new(StubHttpClient::new());
+        let mut origin_headers = vec![
+            (
+                header::CONTENT_TYPE.as_str().to_string(),
+                "text/html; charset=utf-8".to_string(),
+            ),
+            (
+                header::CONTENT_LENGTH.as_str().to_string(),
+                "9999".to_string(),
+            ),
+            (header::VARY.as_str().to_string(), "Origin".to_string()),
+            (
+                header::VARY.as_str().to_string(),
+                "Accept-Language".to_string(),
+            ),
+        ];
+        if let Some(origin_content_encoding) = origin_content_encoding {
+            origin_headers.push((
+                header::CONTENT_ENCODING.as_str().to_string(),
+                origin_content_encoding.to_string(),
+            ));
+        }
+        stub.push_response_with_headers(200, origin_body, origin_headers);
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let consent = crate::consent::ConsentContext {
+            jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+            ..Default::default()
+        };
+        let mut ec_context = EcContext::new_for_test_with_ip(None, consent, None);
+        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/article?edition=morning&view=full")
+            .header(header::HOST, "publisher.example")
+            .header(header::ACCEPT_ENCODING, "gzip, br")
+            .header("sec-fetch-dest", "document")
+            .body(EdgeBody::empty())
+            .expect("should build SSAT compression request");
+
+        let publisher_response = handle_publisher_request(
+            settings,
+            &services,
+            None,
+            &mut ec_context,
+            AuctionDispatch {
+                orchestrator: &orchestrator,
+                slots: settings.creative_opportunity_slots(),
+                registry: None,
+            },
+            req,
+            adapter_options,
+        )
+        .await
+        .expect("should proxy SSAT compression request");
+
+        (publisher_response, stub, services, orchestrator)
+    }
+
+    #[test]
+    fn ssat_compression_offload_requires_setting_capability_and_ad_stack() {
+        let mut settings = create_test_settings();
+        let fastly_options = PublisherAdapterOptions {
+            edge_cache_header: EdgeCacheHeader::SurrogateControl,
+            delivery_compression: DeliveryCompressionCapability::FastlyDynamic,
+        };
+        let unavailable_options = PublisherAdapterOptions {
+            edge_cache_header: EdgeCacheHeader::SMaxageFallback,
+            delivery_compression: DeliveryCompressionCapability::Unavailable,
+        };
+
+        assert!(
+            !should_offload_ssat_compression(&settings, fastly_options, true),
+            "disabled setting should retain in-guest compression"
+        );
+        settings.publisher.ssat_compression_offload_enabled = true;
+        assert!(
+            !should_offload_ssat_compression(&settings, unavailable_options, true),
+            "adapters without Fastly dynamic compression should retain in-guest compression"
+        );
+        assert!(
+            !should_offload_ssat_compression(&settings, fastly_options, false),
+            "requests outside the server-side ad stack should retain in-guest compression"
+        );
+        assert!(
+            should_offload_ssat_compression(&settings, fastly_options, true),
+            "enabled Fastly server-side ad stack should offload compression"
+        );
+    }
+
+    #[test]
+    fn ensure_vary_accept_encoding_preserves_wildcard() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(header::VARY, HeaderValue::from_static("*"));
+
+        ensure_vary_accept_encoding(&mut headers);
+
+        assert_eq!(
+            headers
+                .get_all(header::VARY)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .collect::<Vec<_>>(),
+            vec!["*"],
+            "wildcard Vary should not receive a redundant Accept-Encoding field"
+        );
+    }
+
+    #[tokio::test]
+    async fn fastly_ssat_compression_offload_requests_and_emits_identity() {
+        let settings = ssat_compression_test_settings(true);
+        let html = b"<html><body><p>Origin HTML</p></body></html>";
+        let (publisher_response, stub, services, orchestrator) = run_ssat_compression_request(
+            &settings,
+            PublisherAdapterOptions {
+                edge_cache_header: EdgeCacheHeader::SurrogateControl,
+                delivery_compression: DeliveryCompressionCapability::FastlyDynamic,
+            },
+            html.to_vec(),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            stub.recorded_request_uris(),
+            vec!["https://origin.test-publisher.com/article?edition=morning&view=full"],
+            "offload must preserve the publisher request path and query"
+        );
+        let request_headers = stub.recorded_request_headers();
+        assert!(
+            request_headers[0].iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case(header::ACCEPT_ENCODING.as_str()) && value == "identity"
+            }),
+            "Fastly SSAT offload must request identity from the origin"
+        );
+
+        let PublisherResponse::Stream {
+            response, params, ..
+        } = &publisher_response
+        else {
+            panic!("processable SSAT HTML should use the stream route");
+        };
+        assert_eq!(params.input_compression, Compression::None);
+        assert_eq!(params.output_compression, Compression::None);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("private, max-age=0"),
+            "compression offload must preserve SSAT browser privacy"
+        );
+        assert!(
+            response.headers().get("surrogate-control").is_none(),
+            "compression offload must not restore shared cacheability"
+        );
+        assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+        assert!(response.headers().get(header::CONTENT_LENGTH).is_none());
+        assert_eq!(
+            response
+                .headers()
+                .get(HEADER_X_COMPRESS_HINT)
+                .and_then(|value| value.to_str().ok()),
+            Some("on")
+        );
+        let vary = response
+            .headers()
+            .get_all(header::VARY)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            vary,
+            vec!["Origin", "Accept-Language", "Accept-Encoding"],
+            "offload must preserve existing Vary fields and add Accept-Encoding once"
+        );
+
+        let registry = IntegrationRegistry::new(&settings).expect("should build registry");
+        let response = buffer_publisher_response_async(
+            publisher_response,
+            &Method::GET,
+            &settings,
+            &registry,
+            &orchestrator,
+            &services,
+        )
+        .await
+        .expect("should buffer identity SSAT output");
+        assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+        let body = response
+            .into_body()
+            .into_bytes()
+            .expect("should read identity SSAT output");
+        let body = String::from_utf8(body.to_vec()).expect("should decode identity SSAT output");
+        assert!(body.contains("Origin HTML"), "should preserve origin HTML");
+        assert!(body.contains("tsjs"), "should still process SSAT HTML");
+    }
+
+    #[tokio::test]
+    async fn fastly_ssat_compression_offload_decodes_supported_origin_encodings() {
+        let settings = ssat_compression_test_settings(true);
+        let registry = IntegrationRegistry::new(&settings).expect("should build registry");
+        let html = b"<html><body><p>Compressed origin HTML</p></body></html>";
+        let cases = [
+            ("gzip", gzip_encode(html)),
+            ("deflate", deflate_encode(html)),
+            ("br", brotli_encode(html)),
+        ];
+
+        for (origin_content_encoding, origin_body) in cases {
+            let (publisher_response, _stub, services, orchestrator) = run_ssat_compression_request(
+                &settings,
+                PublisherAdapterOptions {
+                    edge_cache_header: EdgeCacheHeader::SurrogateControl,
+                    delivery_compression: DeliveryCompressionCapability::FastlyDynamic,
+                },
+                origin_body,
+                Some(origin_content_encoding),
+            )
+            .await;
+
+            let PublisherResponse::Stream {
+                response, params, ..
+            } = &publisher_response
+            else {
+                panic!("supported compressed SSAT HTML should use the stream route");
+            };
+            assert_eq!(
+                params.input_compression,
+                Compression::from_content_encoding(origin_content_encoding),
+                "should decode the origin's actual content encoding"
+            );
+            assert_eq!(params.output_compression, Compression::None);
+            assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+            assert_eq!(
+                response
+                    .headers()
+                    .get(HEADER_X_COMPRESS_HINT)
+                    .and_then(|value| value.to_str().ok()),
+                Some("on")
+            );
+
+            let response = buffer_publisher_response_async(
+                publisher_response,
+                &Method::GET,
+                &settings,
+                &registry,
+                &orchestrator,
+                &services,
+            )
+            .await
+            .expect("should buffer decoded SSAT output");
+            let body = response
+                .into_body()
+                .into_bytes()
+                .expect("should read decoded SSAT output");
+            let body =
+                String::from_utf8(body.to_vec()).expect("should decode identity SSAT output");
+            assert!(
+                body.contains("Compressed origin HTML"),
+                "should decode {origin_content_encoding} origin HTML"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_delivery_compression_keeps_mirrored_gzip_behavior() {
+        let settings = ssat_compression_test_settings(true);
+        let html = b"<html><body><p>Portable adapter</p></body></html>";
+        let (publisher_response, stub, services, orchestrator) = run_ssat_compression_request(
+            &settings,
+            PublisherAdapterOptions {
+                edge_cache_header: EdgeCacheHeader::SMaxageFallback,
+                delivery_compression: DeliveryCompressionCapability::Unavailable,
+            },
+            gzip_encode(html),
+            Some("gzip"),
+        )
+        .await;
+
+        let request_headers = stub.recorded_request_headers();
+        assert!(
+            request_headers[0].iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case(header::ACCEPT_ENCODING.as_str()) && value == "gzip, br"
+            }),
+            "non-Fastly adapters must retain supported client encodings"
+        );
+        let PublisherResponse::Stream {
+            response, params, ..
+        } = &publisher_response
+        else {
+            panic!("processable SSAT HTML should use the stream route");
+        };
+        assert_eq!(params.input_compression, Compression::Gzip);
+        assert_eq!(params.output_compression, Compression::Gzip);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            Some("gzip")
+        );
+        assert!(response.headers().get(HEADER_X_COMPRESS_HINT).is_none());
+        assert_eq!(
+            response
+                .headers()
+                .get_all(header::VARY)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .collect::<Vec<_>>(),
+            vec!["Origin", "Accept-Language"],
+            "non-Fastly adapters must not mutate Vary"
+        );
+
+        let registry = IntegrationRegistry::new(&settings).expect("should build registry");
+        let response = buffer_publisher_response_async(
+            publisher_response,
+            &Method::GET,
+            &settings,
+            &registry,
+            &orchestrator,
+            &services,
+        )
+        .await
+        .expect("should buffer mirrored gzip output");
+        let body = response
+            .into_body()
+            .into_bytes()
+            .expect("should read mirrored gzip output");
+        let decoded = gzip_decode(&body);
+        assert!(
+            String::from_utf8(decoded)
+                .expect("should decode mirrored gzip")
+                .contains("Portable adapter"),
+            "non-Fastly output must remain valid gzip"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_offload_keeps_default_mirrored_compression() {
+        let settings = ssat_compression_test_settings(false);
+        let html = b"<html><body><p>Default behavior</p></body></html>";
+        let (publisher_response, stub, _services, _orchestrator) = run_ssat_compression_request(
+            &settings,
+            PublisherAdapterOptions {
+                edge_cache_header: EdgeCacheHeader::SurrogateControl,
+                delivery_compression: DeliveryCompressionCapability::FastlyDynamic,
+            },
+            gzip_encode(html),
+            Some("gzip"),
+        )
+        .await;
+
+        let request_headers = stub.recorded_request_headers();
+        assert!(request_headers[0].iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case(header::ACCEPT_ENCODING.as_str()) && value == "gzip, br"
+        }));
+        let PublisherResponse::Stream {
+            response, params, ..
+        } = publisher_response
+        else {
+            panic!("processable SSAT HTML should use the stream route");
+        };
+        assert_eq!(params.input_compression, Compression::Gzip);
+        assert_eq!(params.output_compression, Compression::Gzip);
+        assert!(response.headers().get(HEADER_X_COMPRESS_HINT).is_none());
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            Some("gzip")
+        );
+    }
+
     #[test]
     fn request_ec_uses_cookie_not_header() {
         let settings = create_test_settings();
@@ -3226,7 +3765,10 @@ mod tests {
                 registry: None,
             },
             req,
-            EdgeCacheHeader::SurrogateControl,
+            PublisherAdapterOptions {
+                edge_cache_header: EdgeCacheHeader::SurrogateControl,
+                delivery_compression: DeliveryCompressionCapability::Unavailable,
+            },
         )
         .await
         .expect("should proxy publisher request")
@@ -3436,7 +3978,10 @@ mod tests {
                 registry: None,
             },
             req,
-            EdgeCacheHeader::SurrogateControl,
+            PublisherAdapterOptions {
+                edge_cache_header: EdgeCacheHeader::SurrogateControl,
+                delivery_compression: DeliveryCompressionCapability::Unavailable,
+            },
         )
         .await
         .expect("should proxy publisher request");
@@ -4485,7 +5030,8 @@ mod tests {
 
         let body = EdgeBody::from(compressed);
         let params = OwnedProcessResponseParams {
-            content_encoding: "gzip".to_string(),
+            input_compression: Compression::Gzip,
+            output_compression: Compression::Gzip,
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
@@ -4532,7 +5078,8 @@ mod tests {
             IntegrationRegistry::new(&settings).expect("should create integration registry");
 
         let params = OwnedProcessResponseParams {
-            content_encoding: String::new(),
+            input_compression: Compression::None,
+            output_compression: Compression::None,
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
@@ -4571,7 +5118,8 @@ mod tests {
             r#"<script>(window.tsjs=window.tsjs||{}).bids=JSON.parse("{}");</script>"#;
         let state = Arc::new(Mutex::new(Some(bids_script.to_string())));
         let params = OwnedProcessResponseParams {
-            content_encoding: String::new(),
+            input_compression: Compression::None,
+            output_compression: Compression::None,
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
@@ -4623,7 +5171,8 @@ mod tests {
         // Claim gzip encoding but feed non-gzip bytes. The GzDecoder will
         // error as soon as it tries to read the gzip header.
         let params = OwnedProcessResponseParams {
-            content_encoding: "gzip".to_string(),
+            input_compression: Compression::Gzip,
+            output_compression: Compression::Gzip,
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
@@ -4730,7 +5279,8 @@ mod tests {
         let body = EdgeBody::from(html.to_vec());
 
         let params = OwnedProcessResponseParams {
-            content_encoding: String::new(),
+            input_compression: Compression::None,
+            output_compression: Compression::None,
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
@@ -4786,7 +5336,8 @@ mod tests {
         // Small, single-fragment RSC script — placeholder path (not fallback).
         let html = br#"<html><body><script>self.__next_f.push([1,"1:{\"link\":\"https://origin.example.com/page\"}"])</script></body></html>"#;
         let params = OwnedProcessResponseParams {
-            content_encoding: String::new(),
+            input_compression: Compression::None,
+            output_compression: Compression::None,
             origin_host: "origin.example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
             request_host: "proxy.example.com".to_string(),
