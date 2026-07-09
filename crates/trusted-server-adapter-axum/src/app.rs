@@ -11,6 +11,7 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+use trusted_server_core::config_payload::CONFIG_BLOB_KEY;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
@@ -26,14 +27,23 @@ use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
-use trusted_server_core::settings_data::{
-    default_config_key, default_config_store_name, get_settings_from_config_store,
-};
+use trusted_server_core::settings_data::get_settings_from_config_store;
 
+use edgezero_adapter_axum::config_store::AxumConfigStore;
+use edgezero_core::config_store::ConfigStoreHandle;
 use trusted_server_core::platform::RuntimeServices;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
-use crate::platform::{AxumPlatformConfigStore, build_runtime_services};
+use crate::platform::build_runtime_services;
+
+/// Logical id of the `EdgeZero` config store holding the Trusted Server
+/// app-config blob. Resolves to `.edgezero/local-config-trusted_server_config.json`.
+const AXUM_CONFIG_STORE_ID: &str = "trusted_server_config";
+
+/// Environment variable naming an explicit JSON config-store file to load
+/// instead of the default `.edgezero/local-config-<id>.json`. This is a
+/// file-location pointer only — it does not carry any config value.
+const AXUM_CONFIG_PATH_ENV: &str = "TRUSTED_SERVER_AXUM_CONFIG_PATH";
 
 // ---------------------------------------------------------------------------
 // AppState
@@ -53,11 +63,33 @@ pub struct AppState {
 /// Returns an error when settings, the auction orchestrator, or the integration
 /// registry fail to initialise.
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let store_name = default_config_store_name();
-    let config_key = default_config_key();
-    let settings =
-        get_settings_from_config_store(&AxumPlatformConfigStore, &store_name, &config_key)?;
+    let config_store = open_config_store()?;
+    let settings = get_settings_from_config_store(&config_store, CONFIG_BLOB_KEY)?;
     build_state_with_settings(settings)
+}
+
+/// Opens the `EdgeZero` Axum config store for the app-config blob.
+///
+/// When [`AXUM_CONFIG_PATH_ENV`] is set, the store is read from that explicit
+/// JSON file; otherwise it reads the default
+/// `.edgezero/local-config-trusted_server_config.json`. The env var is a
+/// file-location pointer only and never carries a config value.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] when the backing file exists
+/// but cannot be read or parsed.
+fn open_config_store() -> Result<ConfigStoreHandle, Report<TrustedServerError>> {
+    let store = match std::env::var(AXUM_CONFIG_PATH_ENV) {
+        Ok(path) => AxumConfigStore::from_path(std::path::Path::new(&path)),
+        Err(_) => AxumConfigStore::from_local_file(AXUM_CONFIG_STORE_ID),
+    }
+    .map_err(|error| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!("failed to open Trusted Server config store: {error}"),
+        })
+    })?;
+    Ok(ConfigStoreHandle::new(Arc::new(store)))
 }
 
 /// Build the application state from explicit settings.

@@ -1,18 +1,14 @@
+use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::env_config::EnvConfig;
-use error_stack::{Report, ResultExt};
+use error_stack::Report;
+use futures::executor::block_on;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
 use crate::config_payload::{settings_from_config_blob, CONFIG_BLOB_KEY};
 use crate::error::TrustedServerError;
-use crate::platform::{PlatformConfigStore, StoreName};
 use crate::settings::Settings;
 
-// The config store *id* is `trusted_server_config` (declared in edgezero.toml and
-// provisioned in every adapter manifest). The app-config blob lives under the
-// separate *key* `app_config` ([`CONFIG_BLOB_KEY`]) within that store, so the
-// store name and the blob key are intentionally decoupled.
-const DEFAULT_CONFIG_STORE_ID: &str = "trusted_server_config";
 const FASTLY_CHUNK_POINTER_KIND: &str = "fastly_config_chunks";
 const FASTLY_CONFIG_ENTRY_LIMIT: usize = 8_000;
 
@@ -32,19 +28,19 @@ struct FastlyChunkRef {
     sha256: String,
 }
 
-/// Returns the default `EdgeZero` app-config store name.
-#[must_use]
-pub fn default_config_store_name() -> StoreName {
-    StoreName::from(EnvConfig::from_env().store_name("config", DEFAULT_CONFIG_STORE_ID))
-}
-
 /// Returns the default config-store key containing the app-config blob.
 #[must_use]
 pub fn default_config_key() -> String {
     EnvConfig::from_env().store_key("config", CONFIG_BLOB_KEY)
 }
 
-/// Loads [`Settings`] from a platform config store and key.
+/// Loads [`Settings`] from an `EdgeZero` [`ConfigStoreHandle`] and key.
+///
+/// The handle is already bound to a specific config store, so only the blob
+/// `key` is supplied. Reads resolve through the handle's async
+/// [`ConfigStoreHandle::get`], driven to completion with [`block_on`]; the
+/// Fastly chunk-pointer path reads its additional chunk keys from the same
+/// handle.
 ///
 /// # Errors
 ///
@@ -52,31 +48,31 @@ pub fn default_config_key() -> String {
 /// missing, cannot be read, fails envelope verification, or fails Trusted
 /// Server settings validation.
 pub fn get_settings_from_config_store(
-    config_store: &dyn PlatformConfigStore,
-    store_name: &StoreName,
+    config_store: &ConfigStoreHandle,
     key: &str,
 ) -> Result<Settings, Report<TrustedServerError>> {
-    let raw_value = read_config_entry(config_store, store_name, key)?;
-    let envelope_json = resolve_fastly_chunk_pointer(config_store, store_name, &raw_value)?;
+    let raw_value = read_config_entry(config_store, key)?;
+    let envelope_json = resolve_fastly_chunk_pointer(config_store, &raw_value)?;
     settings_from_config_blob(&envelope_json)
 }
 
 fn read_config_entry(
-    config_store: &dyn PlatformConfigStore,
-    store_name: &StoreName,
+    config_store: &ConfigStoreHandle,
     key: &str,
 ) -> Result<String, Report<TrustedServerError>> {
-    let message = format!(
-        "failed to read Trusted Server app config key `{key}` from config store `{store_name}`"
-    );
-    config_store
-        .get(store_name, key)
-        .change_context(TrustedServerError::Configuration { message })
+    match block_on(config_store.get(key)) {
+        Ok(Some(value)) => Ok(value),
+        Ok(None) => configuration_error(format!(
+            "Trusted Server app config key `{key}` was not found in the config store"
+        )),
+        Err(error) => configuration_error(format!(
+            "failed to read Trusted Server app config key `{key}` from the config store: {error}"
+        )),
+    }
 }
 
 fn resolve_fastly_chunk_pointer(
-    config_store: &dyn PlatformConfigStore,
-    store_name: &StoreName,
+    config_store: &ConfigStoreHandle,
     value: &str,
 ) -> Result<String, Report<TrustedServerError>> {
     let Ok(pointer) = serde_json::from_str::<FastlyChunkPointer>(value) else {
@@ -126,7 +122,7 @@ fn resolve_fastly_chunk_pointer(
     let mut envelope_json = String::with_capacity(pointer.envelope_len);
     let mut actual_envelope_len = 0usize;
     for chunk in pointer.chunks {
-        let chunk_value = read_config_entry(config_store, store_name, &chunk.key)?;
+        let chunk_value = read_config_entry(config_store, &chunk.key)?;
         let chunk_len = chunk_value.len();
         if chunk_len != chunk.len {
             return configuration_error(format!(
@@ -181,40 +177,39 @@ fn configuration_error<T>(message: String) -> Result<T, Report<TrustedServerErro
 mod tests {
     use super::*;
     use crate::config_payload::CONFIG_BLOB_KEY;
-    use crate::platform::PlatformError;
     use crate::settings::Settings;
     use crate::test_support::tests::crate_test_settings_str;
+    use async_trait::async_trait;
     use edgezero_core::blob_envelope::BlobEnvelope;
+    use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
     use serde_json::json;
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
-    struct MemoryConfigStore {
+    struct InMemoryConfigStore {
         entries: BTreeMap<String, String>,
     }
 
-    impl PlatformConfigStore for MemoryConfigStore {
-        fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
-            self.entries.get(key).cloned().ok_or_else(|| {
-                Report::new(PlatformError::ConfigStore).attach(format!("missing key `{key}`"))
-            })
+    impl InMemoryConfigStore {
+        fn with(entries: &[(&str, &str)]) -> Self {
+            Self {
+                entries: entries
+                    .iter()
+                    .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                    .collect(),
+            }
         }
+    }
 
-        fn put(
-            &self,
-            _store_id: &crate::platform::StoreId,
-            _key: &str,
-            _value: &str,
-        ) -> Result<(), Report<PlatformError>> {
-            Ok(())
+    #[async_trait(?Send)]
+    impl ConfigStore for InMemoryConfigStore {
+        async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+            Ok(self.entries.get(key).cloned())
         }
+    }
 
-        fn delete(
-            &self,
-            _store_id: &crate::platform::StoreId,
-            _key: &str,
-        ) -> Result<(), Report<PlatformError>> {
-            Ok(())
-        }
+    fn handle_with(entries: &[(&str, &str)]) -> ConfigStoreHandle {
+        ConfigStoreHandle::new(Arc::new(InMemoryConfigStore::with(entries)))
     }
 
     fn envelope_json(settings: &Settings) -> String {
@@ -223,18 +218,34 @@ mod tests {
         serde_json::to_string(&envelope).expect("should serialize envelope")
     }
 
+    fn blob_envelope_json(toml: &str) -> String {
+        let settings = Settings::from_toml(toml).expect("should parse settings TOML");
+        envelope_json(&settings)
+    }
+
+    #[test]
+    fn get_settings_reads_blob_via_edgezero_handle() {
+        let blob = blob_envelope_json(&crate_test_settings_str());
+        let handle = handle_with(&[(CONFIG_BLOB_KEY, &blob)]);
+
+        let settings = get_settings_from_config_store(&handle, CONFIG_BLOB_KEY)
+            .expect("should parse settings from the EdgeZero-read blob");
+
+        assert!(
+            !settings.publisher.domain.is_empty(),
+            "should deserialize the config blob read through the EdgeZero handle"
+        );
+    }
+
     #[test]
     fn loads_settings_from_config_blob_entry() {
         let settings =
             Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
         let envelope_json = envelope_json(&settings);
-        let store = MemoryConfigStore {
-            entries: BTreeMap::from([(CONFIG_BLOB_KEY.to_string(), envelope_json)]),
-        };
+        let handle = handle_with(&[(CONFIG_BLOB_KEY, &envelope_json)]);
 
         let loaded =
-            get_settings_from_config_store(&store, &StoreName::from("app_config"), CONFIG_BLOB_KEY)
-                .expect("should load settings");
+            get_settings_from_config_store(&handle, CONFIG_BLOB_KEY).expect("should load settings");
 
         assert_eq!(
             loaded.publisher.domain, settings.publisher.domain,
@@ -271,17 +282,14 @@ mod tests {
             ]
         })
         .to_string();
-        let store = MemoryConfigStore {
-            entries: BTreeMap::from([
-                (CONFIG_BLOB_KEY.to_string(), pointer),
-                (first_key, first_chunk),
-                (second_key, second_chunk),
-            ]),
-        };
+        let handle = handle_with(&[
+            (CONFIG_BLOB_KEY, &pointer),
+            (&first_key, &first_chunk),
+            (&second_key, &second_chunk),
+        ]);
 
         let loaded =
-            get_settings_from_config_store(&store, &StoreName::from("app_config"), CONFIG_BLOB_KEY)
-                .expect("should load settings");
+            get_settings_from_config_store(&handle, CONFIG_BLOB_KEY).expect("should load settings");
 
         assert_eq!(
             loaded.publisher.domain, settings.publisher.domain,
@@ -306,13 +314,10 @@ mod tests {
             ]
         })
         .to_string();
-        let store = MemoryConfigStore {
-            entries: BTreeMap::from([(CONFIG_BLOB_KEY.to_string(), pointer)]),
-        };
+        let handle = handle_with(&[(CONFIG_BLOB_KEY, &pointer)]);
 
-        let err =
-            get_settings_from_config_store(&store, &StoreName::from("app_config"), CONFIG_BLOB_KEY)
-                .expect_err("should reject malformed chunk length metadata");
+        let err = get_settings_from_config_store(&handle, CONFIG_BLOB_KEY)
+            .expect_err("should reject malformed chunk length metadata");
 
         assert!(
             err.to_string().contains("chunk lengths total mismatch"),
@@ -322,13 +327,10 @@ mod tests {
 
     #[test]
     fn fails_when_blob_key_is_missing() {
-        let store = MemoryConfigStore {
-            entries: BTreeMap::new(),
-        };
+        let handle = handle_with(&[]);
 
-        let err =
-            get_settings_from_config_store(&store, &StoreName::from("app_config"), CONFIG_BLOB_KEY)
-                .expect_err("should fail when blob is missing");
+        let err = get_settings_from_config_store(&handle, CONFIG_BLOB_KEY)
+            .expect_err("should fail when blob is missing");
 
         assert!(
             err.to_string().contains(CONFIG_BLOB_KEY),

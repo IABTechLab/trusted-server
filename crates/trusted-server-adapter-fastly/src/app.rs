@@ -96,6 +96,7 @@ use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::AuctionTelemetrySink;
 use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
+use trusted_server_core::config_payload::CONFIG_BLOB_KEY;
 use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
 use trusted_server_core::ec::consent::ec_consent_withdrawn;
@@ -124,9 +125,7 @@ use trusted_server_core::request_signing::{
     handle_verify_signature,
 };
 use trusted_server_core::settings::{ProxyAssetRoute, Settings};
-use trusted_server_core::settings_data::{
-    default_config_key, default_config_store_name, get_settings_from_config_store,
-};
+use trusted_server_core::settings_data::get_settings_from_config_store;
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
@@ -162,9 +161,12 @@ pub(crate) fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>>
 }
 
 pub(crate) fn load_settings_from_config_store() -> Result<Settings, Report<TrustedServerError>> {
-    let store_name = default_config_store_name();
-    let config_key = default_config_key();
-    get_settings_from_config_store(&FastlyPlatformConfigStore, &store_name, &config_key)
+    let config_store = crate::open_trusted_server_config_store().map_err(|error| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!("failed to open Trusted Server config store: {error}"),
+        })
+    })?;
+    get_settings_from_config_store(&config_store, CONFIG_BLOB_KEY)
 }
 
 pub(crate) fn build_state_from_settings(
