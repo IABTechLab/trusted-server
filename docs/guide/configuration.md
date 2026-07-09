@@ -162,14 +162,15 @@ Core publisher settings for domain, origin, and proxy configuration.
 
 ### `[publisher]`
 
-| Field                         | Type    | Required | Description                                                                             |
-| ----------------------------- | ------- | -------- | --------------------------------------------------------------------------------------- |
-| `domain`                      | String  | Yes      | Publisher's apex domain name                                                            |
-| `cookie_domain`               | String  | Yes      | Domain for non-EC cookies (typically with leading dot)                                  |
-| `origin_url`                  | String  | Yes      | Full URL of publisher origin server                                                     |
-| `origin_host_header_override` | String  | No       | Outbound Host header to send while connecting to `origin_url`                           |
-| `proxy_secret`                | String  | Yes      | Secret key for encrypting/signing proxy URLs                                            |
-| `max_buffered_body_bytes`     | Integer | No       | Max bytes buffered when a publisher response is post-processed in full (default 16 MiB) |
+| Field                              | Type    | Required | Description                                                                             |
+| ---------------------------------- | ------- | -------- | --------------------------------------------------------------------------------------- |
+| `domain`                           | String  | Yes      | Publisher's apex domain name                                                            |
+| `cookie_domain`                    | String  | Yes      | Domain for non-EC cookies (typically with leading dot)                                  |
+| `origin_url`                       | String  | Yes      | Full URL of publisher origin server                                                     |
+| `origin_host_header_override`      | String  | No       | Outbound Host header to send while connecting to `origin_url`                           |
+| `proxy_secret`                     | String  | Yes      | Secret key for encrypting/signing proxy URLs                                            |
+| `ssat_compression_offload_enabled` | Boolean | No       | Fastly-only dynamic delivery compression for eligible SSAT HTML (default `false`)       |
+| `max_buffered_body_bytes`          | Integer | No       | Max bytes buffered when a publisher response is post-processed in full (default 16 MiB) |
 
 > **Note:** EC cookies (`ts-ec`) derive their domain automatically as `.{domain}` and
 > do not use `cookie_domain`. The `cookie_domain` field is used by other cookie helpers.
@@ -184,6 +185,8 @@ origin_url = "https://origin.publisher.com"
 # Optional: connect to origin_url but send this outbound Host header.
 # origin_host_header_override = "www.publisher.com"
 proxy_secret = "change-me-to-secure-random-value"
+# Fastly only; disabled by default. Uncomment after deploying a compatible binary.
+# ssat_compression_offload_enabled = true
 ```
 
 **Environment Override**:
@@ -194,6 +197,7 @@ TRUSTED_SERVER__PUBLISHER__COOKIE_DOMAIN=.publisher.com
 TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
 TRUSTED_SERVER__PUBLISHER__ORIGIN_HOST_HEADER_OVERRIDE=www.publisher.com
 TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=your-secret-here
+TRUSTED_SERVER__PUBLISHER__SSAT_COMPRESSION_OFFLOAD_ENABLED=true
 TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
 ```
 
@@ -298,6 +302,45 @@ openssl rand -base64 32
 ::: danger Security Warning
 Changing `proxy_secret` invalidates all existing signed URLs. Plan rotations carefully and use graceful transition periods.
 :::
+
+#### `ssat_compression_offload_enabled`
+
+**Purpose**: Offload delivery compression for eligible server-side ad stack
+(SSAT) HTML responses to Fastly dynamic compression.
+
+When enabled on the Fastly adapter, Trusted Server continues to negotiate only
+supported encodings with the publisher origin. For processable HTML, it decodes
+the origin response, emits identity HTML, and sends `X-Compress-Hint: on` for
+Fastly delivery compression. `Vary: Accept-Encoding` is retained or added as
+needed. The setting applies only when the existing SSAT request gates pass and
+the response is processable HTML; non-HTML responses retain their negotiated
+origin encoding.
+
+The setting defaults to `false`. Axum, Cloudflare, and Spin explicitly declare
+the capability unavailable, so enabling it there does not change request or
+response compression behavior.
+
+::: warning Fastly delivery billing
+Fastly bills dynamically compressed responses based on their uncompressed size
+before compression when the service is subject to metered delivery charges.
+This option can therefore increase billable delivery bytes even though browsers
+receive compressed content. Include uncompressed response size and projected
+delivery cost in rollout measurements. See Fastly's
+[compression guide](https://www.fastly.com/documentation/guides/concepts/compression/).
+:::
+
+::: warning Deployment ordering
+Deploy a Trusted Server binary that supports this setting before enabling it.
+Before rolling back to an older binary, set the option to `false` and publish
+the configuration with the current CLI so the disabled field is omitted, then
+roll back the binary.
+:::
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__PUBLISHER__SSAT_COMPRESSION_OFFLOAD_ENABLED=true
+```
 
 #### `max_buffered_body_bytes`
 
@@ -998,23 +1041,23 @@ Rules are evaluated in file order; the first enabled matching rule wins.
 Disabled rules are ignored, which lets you keep framework presets documented in
 config without enabling them for every publisher.
 
-| Field                              | Type          | Required | Description                                                       |
-| ---------------------------------- | ------------- | -------- | ----------------------------------------------------------------- |
-| `id`                               | String        | Yes      | Unique operator-facing rule identifier                            |
-| `enabled`                          | Boolean       | No       | Whether the rule participates in matching (default `false`)        |
-| `preset`                           | String        | Matcher  | Built-in preset such as `nextjs-static`                           |
-| `path_prefix`                      | String        | Matcher  | Request path prefix                                               |
-| `path_glob`                        | String        | Matcher  | Single glob matched against the request path                      |
-| `path_globs`                       | Array[String] | Matcher  | Multiple globs matched against the request path                   |
-| `path_regex`                       | String        | Matcher  | Regex matched against the request path                            |
-| `extensions`                       | Array[String] | Matcher  | Case-insensitive file extensions                                  |
-| `requires_hash_in_filename`        | Boolean       | No       | Require an 8+ hex token in the final path segment before matching |
-| `visibility`                       | String        | No       | `public` or `private` (default `public`)                          |
-| `browser_ttl_seconds`              | Integer       | No       | Browser `max-age`                                                 |
-| `edge_ttl_seconds`                 | Integer       | No       | Edge/shared-cache TTL                                             |
-| `stale_while_revalidate_seconds`   | Integer       | No       | Optional `stale-while-revalidate`                                 |
-| `stale_if_error_seconds`           | Integer       | No       | Optional `stale-if-error`                                         |
-| `immutable`                        | Boolean       | No       | Add `immutable` when browser TTL is positive                      |
+| Field                            | Type          | Required | Description                                                       |
+| -------------------------------- | ------------- | -------- | ----------------------------------------------------------------- |
+| `id`                             | String        | Yes      | Unique operator-facing rule identifier                            |
+| `enabled`                        | Boolean       | No       | Whether the rule participates in matching (default `false`)       |
+| `preset`                         | String        | Matcher  | Built-in preset such as `nextjs-static`                           |
+| `path_prefix`                    | String        | Matcher  | Request path prefix                                               |
+| `path_glob`                      | String        | Matcher  | Single glob matched against the request path                      |
+| `path_globs`                     | Array[String] | Matcher  | Multiple globs matched against the request path                   |
+| `path_regex`                     | String        | Matcher  | Regex matched against the request path                            |
+| `extensions`                     | Array[String] | Matcher  | Case-insensitive file extensions                                  |
+| `requires_hash_in_filename`      | Boolean       | No       | Require an 8+ hex token in the final path segment before matching |
+| `visibility`                     | String        | No       | `public` or `private` (default `public`)                          |
+| `browser_ttl_seconds`            | Integer       | No       | Browser `max-age`                                                 |
+| `edge_ttl_seconds`               | Integer       | No       | Edge/shared-cache TTL                                             |
+| `stale_while_revalidate_seconds` | Integer       | No       | Optional `stale-while-revalidate`                                 |
+| `stale_if_error_seconds`         | Integer       | No       | Optional `stale-if-error`                                         |
+| `immutable`                      | Boolean       | No       | Add `immutable` when browser TTL is positive                      |
 
 Exactly one matcher must be configured per rule. `path_glob` and `path_globs`
 are mutually exclusive.
