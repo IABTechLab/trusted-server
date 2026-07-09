@@ -36,7 +36,10 @@ impl RuntimeEnvironment for AxumDevServer {
 
         let mut child = Command::new(&binary)
             .env("PORT", port.to_string())
-            .env("TRUSTED_SERVER_CONFIG_APP_CONFIG_APP_CONFIG", app_config)
+            .env(
+                "TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG",
+                app_config,
+            )
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
