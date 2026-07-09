@@ -16,7 +16,7 @@ version = "0.1.0"
 # -- Stores ------------------------------------------------------------------
 # Logical store ids only. These are the portable Trusted Server names; the
 # physical store each adapter binds is overridable out of band (Fastly binds
-# `ec_identity_store`/`app_config`/secret stores in `fastly.toml`, Spin via its
+# `ec_identity_store`/`trusted_server_config`/secret stores in `fastly.toml`, Spin via its
 # runtime config, Cloudflare via bindings), so the ids here do not have to match
 # any one platform's names. `default` is the primary logical id.
 
