@@ -14,7 +14,7 @@ use crate::secret_refs::resolve_secret_refs;
 use crate::settings::Settings;
 
 /// Default config-store key containing the Trusted Server app-config blob.
-pub const CONFIG_BLOB_KEY: &str = "app_config";
+pub const CONFIG_BLOB_KEY: &str = "trusted_server_config";
 
 /// Reconstruct validated [`Settings`] from a serialized config blob envelope.
 ///
