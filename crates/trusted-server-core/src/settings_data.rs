@@ -3,12 +3,11 @@ use error_stack::{Report, ResultExt};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
-use crate::config_payload::settings_from_config_blob;
+use crate::config_payload::{settings_from_config_blob, CONFIG_BLOB_KEY};
 use crate::error::TrustedServerError;
 use crate::platform::{PlatformConfigStore, StoreName};
 use crate::settings::Settings;
 
-const DEFAULT_CONFIG_STORE_ID: &str = "trusted_server_config";
 const FASTLY_CHUNK_POINTER_KIND: &str = "fastly_config_chunks";
 const FASTLY_CONFIG_ENTRY_LIMIT: usize = 8_000;
 
@@ -31,13 +30,13 @@ struct FastlyChunkRef {
 /// Resolves the `EdgeZero` app-config store name from runtime configuration.
 #[must_use]
 pub fn config_store_name(env: &EnvConfig) -> StoreName {
-    StoreName::from(env.store_name("config", DEFAULT_CONFIG_STORE_ID))
+    StoreName::from(env.store_name("config", CONFIG_BLOB_KEY))
 }
 
 /// Resolves the config-store key containing the app-config blob.
 #[must_use]
 pub fn config_key(env: &EnvConfig) -> String {
-    env.store_key("config", DEFAULT_CONFIG_STORE_ID)
+    env.store_key("config", CONFIG_BLOB_KEY)
 }
 
 /// Returns the default `EdgeZero` app-config store name.
@@ -229,6 +228,30 @@ mod tests {
         let data = serde_json::to_value(settings).expect("should serialize settings to JSON");
         let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_string());
         serde_json::to_string(&envelope).expect("should serialize envelope")
+    }
+
+    #[test]
+    fn config_defaults_match_edgezero_manifest() {
+        let manifest = edgezero_core::manifest::ManifestLoader::try_load_from_str(include_str!(
+            "../../../edgezero.toml"
+        ))
+        .expect("should load the repository EdgeZero manifest");
+        let manifest_default = manifest
+            .manifest()
+            .stores
+            .config
+            .as_ref()
+            .expect("should declare [stores.config]")
+            .default_id();
+
+        assert_eq!(
+            CONFIG_BLOB_KEY, manifest_default,
+            "compiled default should match edgezero.toml"
+        );
+        assert_eq!(
+            manifest_default, "trusted_server_config",
+            "Trusted Server should retain its expected default config store"
+        );
     }
 
     #[test]
