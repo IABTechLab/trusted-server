@@ -3,9 +3,17 @@
 //! [`STORES_METADATA`] is the single source of truth for the logical store ids
 //! the app declares, mirroring the `[stores.*]` tables in the workspace-root
 //! `edgezero.toml`. Every adapter's `Hooks::stores()` returns this same const,
-//! so the EdgeZero store registry is wired identically across the Fastly, Axum,
+//! so the `EdgeZero` store registry is wired identically across the Fastly, Axum,
 //! Cloudflare, and Spin runtimes. The anti-drift test in this module asserts the
 //! const and the manifest never diverge.
+//!
+//! Deferred ids: the `DataDome` IP-CIDR (`datadome-ip-bypass`) and S3 (`s3-auth`)
+//! stores are NOT declared here yet. `EdgeZero`'s manifest validator requires
+//! store ids to match `[A-Za-z0-9_]` (they become `EDGEZERO__STORES__…` env
+//! segments), so those hyphenated names cannot be registry ids as-is. They are
+//! also not routed through the registry in this phase (still bespoke paths), so
+//! declaring them would be premature. They join here — with underscore logical
+//! ids mapped to their physical names — when their reads move onto the composite.
 
 use edgezero_core::app::{StoreMetadata, StoresMetadata};
 
@@ -13,13 +21,13 @@ use edgezero_core::app::{StoreMetadata, StoresMetadata};
 /// [`edgezero_core::app::Hooks::stores`] implementation.
 ///
 /// The `default` of each kind is the general-purpose registry slot; the named
-/// ids carry the real reads (request signing, EC identity, consent, DataDome,
-/// Tinybird, S3). Keep this in lockstep with `edgezero.toml` — the
+/// ids carry the real reads (request signing, EC identity, consent, Tinybird).
+/// Keep this in lockstep with `edgezero.toml` — the
 /// `stores_metadata_matches_edgezero_manifest` test enforces it.
 pub const STORES_METADATA: StoresMetadata = StoresMetadata {
     config: Some(StoreMetadata {
         default: "trusted_server_config",
-        ids: &["trusted_server_config", "jwks_store", "datadome-ip-bypass"],
+        ids: &["trusted_server_config", "jwks_store"],
     }),
     kv: Some(StoreMetadata {
         default: "trusted_server_kv",
@@ -32,12 +40,7 @@ pub const STORES_METADATA: StoresMetadata = StoresMetadata {
     }),
     secrets: Some(StoreMetadata {
         default: "trusted_server_secrets",
-        ids: &[
-            "trusted_server_secrets",
-            "signing_keys",
-            "ts_secrets",
-            "s3-auth",
-        ],
+        ids: &["trusted_server_secrets", "signing_keys", "ts_secrets"],
     }),
 };
 

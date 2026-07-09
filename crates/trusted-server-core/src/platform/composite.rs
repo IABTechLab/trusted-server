@@ -1,6 +1,6 @@
 //! Registry-backed composite config/secret stores (decision D6-a).
 //!
-//! Reads resolve through the per-request EdgeZero
+//! Reads resolve through the per-request `EdgeZero`
 //! [`ConfigRegistry`](edgezero_core::store_registry::ConfigRegistry) /
 //! [`SecretRegistry`](edgezero_core::store_registry::SecretRegistry) by logical
 //! store id; writes delegate to a management-path
@@ -18,7 +18,7 @@ use super::{
     PlatformSecretWriter, StoreId, StoreName,
 };
 
-/// Config store whose reads resolve through an EdgeZero [`ConfigRegistry`] and
+/// Config store whose reads resolve through an `EdgeZero` [`ConfigRegistry`] and
 /// whose writes delegate to a management-path [`PlatformConfigWriter`].
 ///
 /// Reads resolve `store_name` as a **logical store id** via
@@ -69,7 +69,7 @@ impl PlatformConfigStore for CompositeConfigStore {
     }
 }
 
-/// Secret store whose reads resolve through an EdgeZero [`SecretRegistry`] and
+/// Secret store whose reads resolve through an `EdgeZero` [`SecretRegistry`] and
 /// whose writes delegate to a management-path [`PlatformSecretWriter`].
 ///
 /// Reads resolve `store_name` as a **logical store id** via

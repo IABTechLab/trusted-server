@@ -97,7 +97,7 @@ pub trait PlatformSecretStore: Send + Sync {
 /// Extracted from [`PlatformConfigStore`] so the registry-backed composite
 /// store can delegate writes to a management-path implementation without also
 /// depending on that implementation's read path. Reads flow through the
-/// EdgeZero registry instead (see `platform::composite`).
+/// `EdgeZero` registry instead (see `platform::composite`).
 pub trait PlatformConfigWriter: Send + Sync {
     /// Store a string value in the management store identified by `store_id`.
     ///
@@ -121,7 +121,7 @@ pub trait PlatformConfigWriter: Send + Sync {
 /// Extracted from [`PlatformSecretStore`] so the registry-backed composite
 /// store can delegate writes to a management-path implementation without also
 /// depending on that implementation's read path. Reads flow through the
-/// EdgeZero registry instead (see `platform::composite`).
+/// `EdgeZero` registry instead (see `platform::composite`).
 pub trait PlatformSecretWriter: Send + Sync {
     /// Create or overwrite a secret in the management store identified by `store_id`.
     ///
