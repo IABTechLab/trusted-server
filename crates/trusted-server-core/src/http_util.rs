@@ -256,6 +256,14 @@ fn detect_request_scheme(
     // 4. Check Fastly-SSL header. On the `EdgeZero` path this is injected from
     //    authoritative Fastly TLS metadata after spoofable headers are stripped,
     //    so it is reliable. On direct or legacy paths it can be spoofed by clients.
+    //
+    //    Layering wart: this is a vendor-specific header name living in
+    //    platform-neutral core. It is only a fallback — signal #1 above
+    //    (`ClientInfo::tls_protocol`) is the neutral path adapters populate. The
+    //    `fastly-ssl` fallback (plus its entry in `SPOOFABLE_FORWARDED_HEADERS`
+    //    and the origin-forwarding strip in `publisher::rewrite_origin_request`)
+    //    should be replaced by a platform-neutral scheme signal in a separate
+    //    change, after confirming the legacy path is covered by `ClientInfo`.
     if let Some(ssl) = req.headers().get("fastly-ssl") {
         if let Ok(ssl_str) = ssl.to_str() {
             if ssl_str == "1" || ssl_str.to_lowercase() == "true" {

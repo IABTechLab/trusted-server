@@ -138,10 +138,13 @@ fn recover_orphaned_ec(
     updates: &[super::kv::PartnerIdUpdate],
     response: &mut Response<EdgeBody>,
 ) {
+    // Snapshot the orphaned ID once so every fail-closed exit binds the failed
+    // snapshot to the same key.
+    let orphan_id = ec_context.ec_value().unwrap_or_default().to_owned();
     let Some(client_ip) = ec_context.client_ip().map(str::to_owned) else {
         log::warn!("Orphan EC recovery skipped because client IP is unavailable");
         ec_context.set_kv_snapshot(EcKvSnapshot::Failed {
-            ec_id: ec_context.ec_value().unwrap_or_default().to_owned(),
+            ec_id: orphan_id.clone(),
         });
         return;
     };
@@ -153,7 +156,7 @@ fn recover_orphaned_ec(
             Err(err) => {
                 log::warn!("Orphan EC recovery ID generation failed: {err:?}");
                 ec_context.set_kv_snapshot(EcKvSnapshot::Failed {
-                    ec_id: ec_context.ec_value().unwrap_or_default().to_owned(),
+                    ec_id: orphan_id.clone(),
                 });
                 return;
             }
@@ -184,7 +187,7 @@ fn recover_orphaned_ec(
             Err(err) => {
                 log::warn!("Orphan EC recovery failed: {err:?}");
                 ec_context.set_kv_snapshot(EcKvSnapshot::Failed {
-                    ec_id: ec_context.ec_value().unwrap_or_default().to_owned(),
+                    ec_id: orphan_id.clone(),
                 });
                 return;
             }
@@ -193,7 +196,7 @@ fn recover_orphaned_ec(
 
     log::warn!("Orphan EC recovery exhausted collision retries");
     ec_context.set_kv_snapshot(EcKvSnapshot::Failed {
-        ec_id: ec_context.ec_value().unwrap_or_default().to_owned(),
+        ec_id: orphan_id.clone(),
     });
 }
 
@@ -785,5 +788,203 @@ mod tests {
             get_header(&response, "set-cookie").is_none(),
             "should not expire the cookie without an explicit withdrawal signal"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Orphan-recovery gating and two-ID withdrawal
+    // -----------------------------------------------------------------------
+
+    fn granting_consent() -> ConsentContext {
+        ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        }
+    }
+
+    fn returning_user_context(
+        orphan: &str,
+        snapshot: EcKvSnapshot,
+        recovery_eligible: bool,
+    ) -> EcContext {
+        let mut ec = EcContext::new_for_test_with_ip(
+            Some(orphan.to_owned()),
+            granting_consent(),
+            Some("192.0.2.10".to_owned()),
+        );
+        ec.set_recovery_eligible(recovery_eligible);
+        ec.set_kv_snapshot(snapshot);
+        ec
+    }
+
+    fn assert_did_not_rotate(ec_context: &EcContext, orphan: &str, response: &Response<EdgeBody>) {
+        assert_eq!(
+            ec_context.ec_value(),
+            Some(orphan),
+            "must not rotate the active EC ID"
+        );
+        assert!(!ec_context.ec_generated(), "must not mark a rotated EC");
+        assert!(
+            get_header(response, "set-cookie").is_none(),
+            "must not emit a replacement cookie"
+        );
+    }
+
+    #[test]
+    fn finalize_not_read_snapshot_does_not_rotate() {
+        let settings = create_test_settings();
+        let orphan = sample_ec_id("notrd1");
+        let mut ec_context = returning_user_context(&orphan, EcKvSnapshot::NotRead, true);
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        assert_did_not_rotate(&ec_context, &orphan, &response);
+    }
+
+    #[test]
+    fn finalize_failed_snapshot_does_not_rotate() {
+        let settings = create_test_settings();
+        let orphan = sample_ec_id("faild1");
+        let mut ec_context = returning_user_context(
+            &orphan,
+            EcKvSnapshot::Failed {
+                ec_id: orphan.clone(),
+            },
+            true,
+        );
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        assert_did_not_rotate(&ec_context, &orphan, &response);
+    }
+
+    #[test]
+    fn finalize_tombstone_snapshot_does_not_rotate() {
+        let settings = create_test_settings();
+        let orphan = sample_ec_id("tomb01");
+        let tombstone = EcKvSnapshot::Present {
+            ec_id: orphan.clone(),
+            entry: Box::new(KvEntry::tombstone(current_timestamp())),
+            generation: Some(1),
+        };
+        let mut ec_context = returning_user_context(&orphan, tombstone, true);
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        assert_did_not_rotate(&ec_context, &orphan, &response);
+    }
+
+    #[test]
+    fn finalize_subresource_missing_row_does_not_rotate() {
+        let settings = create_test_settings();
+        let orphan = sample_ec_id("subrs1");
+        // Missing row, but the request is not a recovery-eligible browser navigation.
+        let mut ec_context = returning_user_context(
+            &orphan,
+            EcKvSnapshot::Missing {
+                ec_id: orphan.clone(),
+            },
+            false,
+        );
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        assert_did_not_rotate(&ec_context, &orphan, &response);
+        assert!(
+            graph.get(&orphan).expect("should read store").is_none(),
+            "a non-eligible request must not create the missing root"
+        );
+    }
+
+    #[test]
+    fn finalize_withdrawal_tombstones_present_id_and_skips_missing_other() {
+        let settings = create_test_settings();
+        let active_ec = sample_ec_id("activ2");
+        let cookie_ec = sample_ec_id("cook2e");
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            gpc: true,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let mut ec_context =
+            make_context_with_consent(Some(&active_ec), Some(&cookie_ec), true, false, consent);
+        // Carry a snapshot only for the active ID; the other ID must be looked up
+        // independently and never created if absent.
+        let graph = KvIdentityGraph::in_memory("test_store");
+        graph
+            .create(&active_ec, &live_entry())
+            .expect("should seed active row");
+        ec_context.set_kv_snapshot(graph.load_snapshot(&active_ec));
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        let (active_stored, _) = graph
+            .get(&active_ec)
+            .expect("should read active row")
+            .expect("active row should remain as a tombstone");
+        assert!(
+            !active_stored.consent.ok,
+            "the present active ID should be tombstoned via its carried snapshot"
+        );
+        assert!(
+            graph.get(&cookie_ec).expect("should read store").is_none(),
+            "a missing second ID must never be created by withdrawal"
+        );
+    }
+
+    fn live_entry() -> KvEntry {
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        entry
     }
 }

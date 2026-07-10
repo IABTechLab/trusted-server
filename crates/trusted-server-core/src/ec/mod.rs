@@ -619,8 +619,145 @@ pub(crate) fn current_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consent::jurisdiction::Jurisdiction;
+    use crate::consent::types::{ConsentContext, ConsentSource};
+    use crate::ec::kv_backend::test_support::InMemoryEcKv;
+    use crate::ec::kv_backend::{
+        EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome,
+    };
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
+
+    /// [`EcKvStore`] wrapper whose first `collisions` `Add` writes report a
+    /// precondition failure, forcing generation to retry with a fresh suffix.
+    struct AddCollidingEcKv {
+        inner: InMemoryEcKv,
+        collisions_remaining: std::sync::Mutex<u32>,
+    }
+
+    impl AddCollidingEcKv {
+        fn new(collisions: u32) -> Self {
+            Self {
+                inner: InMemoryEcKv::new("add-colliding-store"),
+                collisions_remaining: std::sync::Mutex::new(collisions),
+            }
+        }
+    }
+
+    impl EcKvStore for AddCollidingEcKv {
+        fn store_name(&self) -> &str {
+            self.inner.store_name()
+        }
+        fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            self.inner.lookup(key)
+        }
+        fn insert(
+            &self,
+            key: &str,
+            write: EcKvWrite<'_>,
+        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+            if matches!(write.mode, EcKvWriteMode::Add) {
+                let mut remaining = self
+                    .collisions_remaining
+                    .lock()
+                    .expect("should lock collision counter");
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return Ok(EcKvWriteOutcome::PreconditionFailed);
+                }
+            }
+            self.inner.insert(key, write)
+        }
+        fn count_keys_with_prefix(
+            &self,
+            prefix: &str,
+            limit: u32,
+        ) -> Result<u32, Report<TrustedServerError>> {
+            self.inner.count_keys_with_prefix(prefix, limit)
+        }
+        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            self.inner.delete(key)
+        }
+    }
+
+    fn granting_consent() -> ConsentContext {
+        ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn generate_if_needed_retries_id_collision_then_persists() {
+        let settings = create_test_settings();
+        let mut ec =
+            EcContext::new_for_test_with_ip(None, granting_consent(), Some("192.0.2.5".to_owned()));
+        let graph = KvIdentityGraph::new(AddCollidingEcKv::new(2));
+
+        ec.generate_if_needed(&settings, Some(&graph))
+            .expect("should generate after bounded collisions");
+
+        assert!(ec.ec_value().is_some(), "should allocate a fresh EC ID");
+        assert!(ec.ec_generated(), "should mark the EC as generated");
+        assert!(
+            matches!(ec.kv_snapshot(), EcKvSnapshot::Present { .. }),
+            "generation should seed a present snapshot"
+        );
+    }
+
+    #[test]
+    fn generate_if_needed_errors_after_collision_exhaustion() {
+        let settings = create_test_settings();
+        let mut ec =
+            EcContext::new_for_test_with_ip(None, granting_consent(), Some("192.0.2.6".to_owned()));
+        // Collide on every attempt so the bounded retry is exhausted.
+        let graph = KvIdentityGraph::new(AddCollidingEcKv::new(u32::MAX));
+
+        let result = ec.generate_if_needed(&settings, Some(&graph));
+
+        assert!(result.is_err(), "should fail after exhausting attempts");
+        assert!(
+            ec.ec_value().is_none() && !ec.ec_generated(),
+            "must not activate an EC ID it could not persist"
+        );
+    }
+
+    #[test]
+    fn default_ec_context_is_recovery_ineligible_and_unread() {
+        let ec = EcContext::default();
+        assert!(
+            !ec.recovery_eligible(),
+            "a default context must not authorize orphan recovery"
+        );
+        assert!(
+            matches!(ec.kv_snapshot(), EcKvSnapshot::NotRead),
+            "a default context must carry no identity-graph state"
+        );
+    }
+
+    #[test]
+    fn read_from_request_does_not_authorize_recovery_from_navigation_headers() {
+        // Non-Fastly adapters build EC context through the shared read path and
+        // never call `set_recovery_eligible`. Navigation headers alone must not
+        // authorize orphan recovery or seed KV state.
+        let settings = create_test_settings();
+        let ec_id = valid_ec_id("b", "CkEc01");
+        let cookie = format!("ts-ec={ec_id}");
+        let req = create_test_request(&[("cookie", &cookie), ("sec-fetch-dest", "document")]);
+
+        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context");
+
+        assert!(
+            !ec.recovery_eligible(),
+            "the shared read path must never authorize recovery from headers"
+        );
+        assert!(
+            matches!(ec.kv_snapshot(), EcKvSnapshot::NotRead),
+            "the shared read path must leave the snapshot unread"
+        );
+    }
 
     fn create_test_request(headers: &[(&str, &str)]) -> Request<EdgeBody> {
         let mut builder = Request::builder().method("GET").uri("http://example.com");

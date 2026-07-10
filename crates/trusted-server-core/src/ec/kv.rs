@@ -1557,4 +1557,364 @@ mod tests {
             .expect("should preserve existing key");
         assert!(!stored.consent.ok, "should persist withdrawal state");
     }
+
+    // -----------------------------------------------------------------------
+    // Snapshot-aware mutation stores and tests
+    // -----------------------------------------------------------------------
+
+    /// [`EcKvStore`] wrapper that counts `lookup` calls through a shared counter
+    /// so tests can prove exactly how many reads a mutation performs.
+    struct CountingEcKv {
+        inner: InMemoryEcKv,
+        lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CountingEcKv {
+        fn new(lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            Self {
+                inner: InMemoryEcKv::new("counting-store"),
+                lookups,
+            }
+        }
+    }
+
+    impl EcKvStore for CountingEcKv {
+        fn store_name(&self) -> &str {
+            self.inner.store_name()
+        }
+        fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            self.lookups
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.lookup(key)
+        }
+        fn insert(
+            &self,
+            key: &str,
+            write: EcKvWrite<'_>,
+        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+            self.inner.insert(key, write)
+        }
+        fn count_keys_with_prefix(
+            &self,
+            prefix: &str,
+            limit: u32,
+        ) -> Result<u32, Report<TrustedServerError>> {
+            self.inner.count_keys_with_prefix(prefix, limit)
+        }
+        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            self.inner.delete(key)
+        }
+    }
+
+    /// [`EcKvStore`] whose reads succeed but every write fails, simulating a
+    /// store that becomes unwritable mid-request.
+    struct WriteFailingEcKv {
+        inner: InMemoryEcKv,
+    }
+
+    impl WriteFailingEcKv {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryEcKv::new("write-failing-store"),
+            }
+        }
+    }
+
+    impl EcKvStore for WriteFailingEcKv {
+        fn store_name(&self) -> &str {
+            self.inner.store_name()
+        }
+        fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            self.inner.lookup(key)
+        }
+        fn insert(
+            &self,
+            _key: &str,
+            _write: EcKvWrite<'_>,
+        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+            Err(Report::new(TrustedServerError::KvStore {
+                store_name: self.inner.store_name().to_owned(),
+                message: "write failing test store".to_owned(),
+            }))
+        }
+        fn count_keys_with_prefix(
+            &self,
+            prefix: &str,
+            limit: u32,
+        ) -> Result<u32, Report<TrustedServerError>> {
+            self.inner.count_keys_with_prefix(prefix, limit)
+        }
+        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            self.inner.delete(key)
+        }
+    }
+
+    /// [`EcKvStore`] wrapper whose first CAS write both fails the precondition
+    /// and deletes the key, simulating a concurrent withdrawal that removes the
+    /// row between this writer's read and its write.
+    struct DisappearOnConflictEcKv {
+        inner: InMemoryEcKv,
+        conflicts_remaining: std::sync::Mutex<u32>,
+    }
+
+    impl DisappearOnConflictEcKv {
+        fn new(conflicts: u32) -> Self {
+            Self {
+                inner: InMemoryEcKv::new("disappear-store"),
+                conflicts_remaining: std::sync::Mutex::new(conflicts),
+            }
+        }
+        fn seed_live(&self, ec_id: &str) {
+            let (body, meta) =
+                KvIdentityGraph::serialize_entry(&live_entry(), self.inner.store_name())
+                    .expect("should serialize seeded entry");
+            self.inner
+                .insert(
+                    ec_id,
+                    EcKvWrite {
+                        body: &body,
+                        metadata: &meta,
+                        ttl: ENTRY_TTL,
+                        mode: EcKvWriteMode::Add,
+                    },
+                )
+                .expect("should seed live entry");
+        }
+    }
+
+    impl EcKvStore for DisappearOnConflictEcKv {
+        fn store_name(&self) -> &str {
+            self.inner.store_name()
+        }
+        fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            self.inner.lookup(key)
+        }
+        fn insert(
+            &self,
+            key: &str,
+            write: EcKvWrite<'_>,
+        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+            if matches!(write.mode, EcKvWriteMode::IfGenerationMatch(_)) {
+                let mut remaining = self
+                    .conflicts_remaining
+                    .lock()
+                    .expect("should lock conflict counter");
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    self.inner.delete(key).expect("should delete on conflict");
+                    return Ok(EcKvWriteOutcome::PreconditionFailed);
+                }
+            }
+            self.inner.insert(key, write)
+        }
+        fn count_keys_with_prefix(
+            &self,
+            prefix: &str,
+            limit: u32,
+        ) -> Result<u32, Report<TrustedServerError>> {
+            self.inner.count_keys_with_prefix(prefix, limit)
+        }
+        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            self.inner.delete(key)
+        }
+    }
+
+    fn snapshot_ec_id() -> String {
+        format!("{}.ABC123", "a".repeat(64))
+    }
+
+    #[test]
+    fn snapshot_upsert_with_generation_writes_without_reading() {
+        let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let graph = KvIdentityGraph::new(CountingEcKv::new(lookups.clone()));
+        let ec_id = snapshot_ec_id();
+        graph.create(&ec_id, &live_entry()).expect("should seed");
+        let snapshot = EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(live_entry()),
+            generation: Some(1),
+        };
+        let updates = [PartnerIdUpdate::new("ssp_x", "uid-1")];
+
+        let outcome = graph.upsert_partner_ids_from_snapshot(&ec_id, &updates, snapshot);
+
+        assert_eq!(
+            lookups.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a usable generation must avoid the initial read"
+        );
+        assert_eq!(
+            outcome
+                .entry_for(&ec_id)
+                .and_then(|entry| entry.ids.get("ssp_x"))
+                .map(|id| id.uid.as_str()),
+            Some("uid-1")
+        );
+        assert_eq!(outcome.generation_for(&ec_id), None);
+    }
+
+    #[test]
+    fn snapshot_upsert_unchanged_updates_preserve_generation() {
+        let kv = KvIdentityGraph::in_memory("test_store");
+        let ec_id = snapshot_ec_id();
+        let mut seeded = live_entry();
+        apply_partner_id_updates(&mut seeded, &[PartnerIdUpdate::new("ssp_x", "uid-1")]);
+        kv.create(&ec_id, &seeded).expect("should seed");
+        let snapshot = kv.load_snapshot(&ec_id);
+        assert_eq!(snapshot.generation_for(&ec_id), Some(1));
+
+        let outcome = kv.upsert_partner_ids_from_snapshot(
+            &ec_id,
+            &[PartnerIdUpdate::new("ssp_x", "uid-1")],
+            snapshot,
+        );
+
+        assert_eq!(
+            outcome.generation_for(&ec_id),
+            Some(1),
+            "an unchanged merge preserves the usable generation and performs no write"
+        );
+    }
+
+    #[test]
+    fn snapshot_upsert_refreshes_unavailable_generation_exactly_once() {
+        let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let graph = KvIdentityGraph::new(CountingEcKv::new(lookups.clone()));
+        let ec_id = snapshot_ec_id();
+        graph.create(&ec_id, &live_entry()).expect("should seed");
+        // Finalize-written style snapshot: entry known, generation unavailable.
+        let snapshot = EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(live_entry()),
+            generation: None,
+        };
+        let updates = [PartnerIdUpdate::new("ssp_x", "uid-1")];
+
+        let outcome = graph.upsert_partner_ids_from_snapshot(&ec_id, &updates, snapshot);
+
+        assert_eq!(
+            lookups.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "an unavailable generation refreshes exactly once before CAS"
+        );
+        assert!(outcome
+            .entry_for(&ec_id)
+            .is_some_and(|e| e.ids.contains_key("ssp_x")));
+    }
+
+    #[test]
+    fn snapshot_upsert_cas_conflict_remerges_concurrent_data() {
+        let graph = KvIdentityGraph::new(ConflictInjectingEcKv::new(1, true));
+        let ec_id = snapshot_ec_id();
+        graph.create(&ec_id, &live_entry()).expect("should seed");
+        let snapshot = graph.load_snapshot(&ec_id);
+        let updates = [PartnerIdUpdate::new("ssp_x", "uid-1")];
+
+        let outcome = graph.upsert_partner_ids_from_snapshot(&ec_id, &updates, snapshot);
+
+        let entry = outcome
+            .entry_for(&ec_id)
+            .expect("should persist re-merged entry");
+        assert_eq!(
+            entry.ids.get("ssp_x").map(|id| id.uid.as_str()),
+            Some("uid-1"),
+            "conflict must re-merge our update onto the concurrently revived row"
+        );
+        assert!(entry.consent.ok, "concurrent revive keeps the row live");
+    }
+
+    #[test]
+    fn snapshot_upsert_rejects_tombstone() {
+        let kv = KvIdentityGraph::in_memory("test_store");
+        let ec_id = snapshot_ec_id();
+        kv.create(&ec_id, &KvEntry::tombstone(1000))
+            .expect("should seed tombstone");
+        let snapshot = kv.load_snapshot(&ec_id);
+        let updates = [PartnerIdUpdate::new("ssp_x", "uid-1")];
+
+        let outcome = kv.upsert_partner_ids_from_snapshot(&ec_id, &updates, snapshot);
+
+        assert!(
+            outcome
+                .entry_for(&ec_id)
+                .is_some_and(|entry| entry.ids.is_empty()),
+            "a tombstone must reject partner enrichment"
+        );
+        let (stored, _) = kv
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("tombstone should remain");
+        assert!(stored.ids.is_empty(), "no update should reach the store");
+    }
+
+    #[test]
+    fn snapshot_upsert_store_failure_returns_failed_not_request_local() {
+        let graph = KvIdentityGraph::new(WriteFailingEcKv::new());
+        let ec_id = snapshot_ec_id();
+        let snapshot = EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(live_entry()),
+            generation: Some(1),
+        };
+        let updates = [PartnerIdUpdate::new("ssp_x", "uid-1")];
+
+        let outcome = graph.upsert_partner_ids_from_snapshot(&ec_id, &updates, snapshot);
+
+        assert!(
+            matches!(outcome, EcKvSnapshot::Failed { .. }),
+            "a store write failure must not claim request-local IDs were persisted"
+        );
+    }
+
+    #[test]
+    fn tombstone_existing_from_snapshot_retries_cas_conflict() {
+        let graph = KvIdentityGraph::new(ConflictInjectingEcKv::new(1, false));
+        let ec_id = snapshot_ec_id();
+        graph.create(&ec_id, &live_entry()).expect("should seed");
+        let snapshot = graph.load_snapshot(&ec_id);
+
+        let outcome = graph.tombstone_existing_from_snapshot(&ec_id, snapshot);
+
+        assert!(
+            outcome
+                .entry_for(&ec_id)
+                .is_some_and(|entry| !entry.consent.ok),
+            "should retry the conflict and persist the tombstone"
+        );
+    }
+
+    #[test]
+    fn tombstone_existing_from_snapshot_store_failure_returns_failed() {
+        let graph = KvIdentityGraph::new(WriteFailingEcKv::new());
+        let ec_id = snapshot_ec_id();
+        let snapshot = EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(live_entry()),
+            generation: Some(1),
+        };
+
+        let outcome = graph.tombstone_existing_from_snapshot(&ec_id, snapshot);
+
+        assert!(matches!(outcome, EcKvSnapshot::Failed { .. }));
+    }
+
+    #[test]
+    fn tombstone_existing_from_snapshot_noop_when_row_disappears_on_retry() {
+        let store = DisappearOnConflictEcKv::new(1);
+        store.seed_live(&snapshot_ec_id());
+        let graph = KvIdentityGraph::new(store);
+        let ec_id = snapshot_ec_id();
+        let snapshot = graph.load_snapshot(&ec_id);
+
+        let outcome = graph.tombstone_existing_from_snapshot(&ec_id, snapshot);
+
+        assert!(
+            matches!(outcome, EcKvSnapshot::Missing { .. }),
+            "a row that disappears during retry becomes a no-op"
+        );
+        assert!(
+            graph.get(&ec_id).expect("should read store").is_none(),
+            "must not recreate the disappeared key"
+        );
+    }
 }

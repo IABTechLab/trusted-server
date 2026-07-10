@@ -608,6 +608,39 @@ mod tests {
     }
 
     #[test]
+    fn collect_eid_cookie_updates_merges_prebid_and_sharedid_without_kv() {
+        let registry = make_registry(vec![("id5", "id5-sync.com"), ("sharedid", "sharedid.org")]);
+        let eids_cookie = encode_json(&json!([
+            {"source": "id5-sync.com", "uids": [{"id": "ID5_abc", "atype": 1}]}
+        ]));
+
+        let updates = collect_eid_cookie_updates(Some(&eids_cookie), Some(" shared-1 "), &registry);
+
+        assert_eq!(
+            updates.len(),
+            2,
+            "should collect prebid and sharedId matches"
+        );
+        assert!(updates.contains(&PartnerIdUpdate::new("id5-sync.com", "ID5_abc")));
+        assert!(updates.contains(&PartnerIdUpdate::new("sharedid.org", "shared-1")));
+    }
+
+    #[test]
+    fn collect_eid_cookie_updates_empty_registry_returns_no_updates() {
+        let registry = PartnerRegistry::empty();
+        let eids_cookie = encode_json(&json!([
+            {"source": "id5-sync.com", "uids": [{"id": "ID5_abc", "atype": 1}]}
+        ]));
+
+        let updates = collect_eid_cookie_updates(Some(&eids_cookie), Some("shared-1"), &registry);
+
+        assert!(
+            updates.is_empty(),
+            "an empty registry matches no partners and touches no KV"
+        );
+    }
+
+    #[test]
     fn dedupe_partner_updates_uses_last_partner_value() {
         let updates = vec![
             PartnerIdUpdate::new("sharedid.org", "prebid-shared"),

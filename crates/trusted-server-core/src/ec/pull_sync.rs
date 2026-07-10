@@ -716,4 +716,190 @@ mod tests {
             "hour 1 rotation should move beta to front"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Snapshot-driven eligibility and request-wide aggregation
+    // -----------------------------------------------------------------------
+
+    use crate::error::TrustedServerError;
+    use crate::platform::test_support::{build_services_with_http_client, StubHttpClient};
+    use crate::settings::EcPartner;
+    use crate::test_support::tests::create_test_settings;
+    use error_stack::Report;
+    use std::sync::Arc;
+
+    struct AllowAllRateLimiter;
+
+    impl RateLimiter for AllowAllRateLimiter {
+        fn exceeded(
+            &self,
+            _key: &str,
+            _hourly_limit: u32,
+        ) -> Result<bool, Report<TrustedServerError>> {
+            Ok(false)
+        }
+    }
+
+    fn pull_enabled_ec_partner(source_domain: &str) -> EcPartner {
+        EcPartner {
+            name: format!("Partner {source_domain}"),
+            source_domain: source_domain.to_owned(),
+            openrtb_atype: EcPartner::default_openrtb_atype(),
+            bidstream_enabled: true,
+            api_token: Redacted::new(format!("{source_domain}-api-token-32-bytes-minimum")),
+            batch_rate_limit: EcPartner::default_batch_rate_limit(),
+            pull_sync_enabled: true,
+            pull_sync_url: Some(format!("https://{source_domain}/sync")),
+            pull_sync_allowed_domains: vec![source_domain.to_owned()],
+            pull_sync_ttl_sec: 3600,
+            pull_sync_rate_limit: 100,
+            ts_pull_token: Some(Redacted::new("outbound-token".to_owned())),
+        }
+    }
+
+    fn snapshot_ec_id() -> String {
+        format!("{}.ABC123", "a".repeat(64))
+    }
+
+    fn seed_present_snapshot(graph: &KvIdentityGraph, ec_id: &str) -> EcKvSnapshot {
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        graph.create(ec_id, &entry).expect("should seed live entry");
+        graph.load_snapshot(ec_id)
+    }
+
+    #[test]
+    fn dispatch_pull_sync_aggregates_batches_into_one_bulk_write() {
+        let mut settings = create_test_settings();
+        // Force one partner per concurrency batch so responses span batches.
+        settings.ec.pull_sync_concurrency = 1;
+        let registry = PartnerRegistry::from_config(&[
+            pull_enabled_ec_partner("alpha.example.com"),
+            pull_enabled_ec_partner("beta.example.com"),
+        ])
+        .expect("should build pull registry");
+
+        let graph = KvIdentityGraph::in_memory("pull_store");
+        let ec_id = snapshot_ec_id();
+        let snapshot = seed_present_snapshot(&graph, &ec_id);
+
+        let stub = Arc::new(StubHttpClient::new());
+        // One JSON response per partner, drained across two concurrency batches.
+        stub.push_response(200, br#"{"uid":"synced-uid"}"#.to_vec());
+        stub.push_response(200, br#"{"uid":"synced-uid"}"#.to_vec());
+        let services = build_services_with_http_client(stub.clone());
+
+        let context = PullSyncContext {
+            ec_id: ec_id.clone(),
+            snapshot,
+        };
+        dispatch_pull_sync(
+            &settings,
+            &graph,
+            &registry,
+            &AllowAllRateLimiter,
+            &context,
+            &services,
+        );
+
+        let (entry, generation) = graph
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("entry should exist");
+        assert_eq!(
+            entry.ids.get("alpha.example.com").map(|id| id.uid.as_str()),
+            Some("synced-uid"),
+            "first partner UID should persist"
+        );
+        assert_eq!(
+            entry.ids.get("beta.example.com").map(|id| id.uid.as_str()),
+            Some("synced-uid"),
+            "second partner UID should persist"
+        );
+        assert_eq!(
+            generation, 2,
+            "two partner responses across batches must persist in exactly one bulk write"
+        );
+    }
+
+    #[test]
+    fn dispatch_pull_sync_skips_non_present_snapshots() {
+        let mut settings = create_test_settings();
+        settings.ec.pull_sync_concurrency = 4;
+        let registry =
+            PartnerRegistry::from_config(&[pull_enabled_ec_partner("alpha.example.com")])
+                .expect("should build registry");
+        let graph = KvIdentityGraph::in_memory("pull_store");
+        let ec_id = snapshot_ec_id();
+        let stub = Arc::new(StubHttpClient::new());
+        let services = build_services_with_http_client(stub.clone());
+
+        for snapshot in [
+            EcKvSnapshot::NotRead,
+            EcKvSnapshot::Missing {
+                ec_id: ec_id.clone(),
+            },
+            EcKvSnapshot::Failed {
+                ec_id: ec_id.clone(),
+            },
+        ] {
+            let context = PullSyncContext {
+                ec_id: ec_id.clone(),
+                snapshot,
+            };
+            dispatch_pull_sync(
+                &settings,
+                &graph,
+                &registry,
+                &AllowAllRateLimiter,
+                &context,
+                &services,
+            );
+        }
+
+        assert!(
+            stub.recorded_backend_names().is_empty(),
+            "not-read, missing, and failed snapshots must not dispatch pull sync"
+        );
+        assert!(
+            graph.get(&ec_id).expect("should read store").is_none(),
+            "no snapshot state should create a missing root"
+        );
+    }
+
+    #[test]
+    fn dispatch_pull_sync_skips_tombstone_snapshot() {
+        let mut settings = create_test_settings();
+        settings.ec.pull_sync_concurrency = 4;
+        let registry =
+            PartnerRegistry::from_config(&[pull_enabled_ec_partner("alpha.example.com")])
+                .expect("should build registry");
+        let graph = KvIdentityGraph::in_memory("pull_store");
+        let ec_id = snapshot_ec_id();
+        let snapshot = EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(KvEntry::tombstone(1000)),
+            generation: Some(1),
+        };
+        let stub = Arc::new(StubHttpClient::new());
+        let services = build_services_with_http_client(stub.clone());
+
+        let context = PullSyncContext {
+            ec_id: ec_id.clone(),
+            snapshot,
+        };
+        dispatch_pull_sync(
+            &settings,
+            &graph,
+            &registry,
+            &AllowAllRateLimiter,
+            &context,
+            &services,
+        );
+
+        assert!(
+            stub.recorded_backend_names().is_empty(),
+            "a tombstone snapshot must not dispatch pull sync"
+        );
+    }
 }
