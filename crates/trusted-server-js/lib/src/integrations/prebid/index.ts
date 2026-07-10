@@ -25,13 +25,13 @@ import 'prebid.js/modules/userId.js';
 // shim leaves its bids untouched and the corresponding adapter handles them
 // natively in the browser.
 import './_adapters.generated';
-import { INCLUDED_PREBID_USER_ID_MODULES } from './_user_ids.generated';
 
 import { log } from '../../core/log';
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
 import type { AuctionBid, AuctionEid } from '../../core/auction';
 import type { AuctionSlot } from '../../core/types';
 
+import { INCLUDED_PREBID_USER_ID_MODULES } from './_user_ids.generated';
 import { PREBID_USER_ID_MODULE_REGISTRY } from './user_id_modules';
 
 const ADAPTER_CODE = 'trustedServer';
