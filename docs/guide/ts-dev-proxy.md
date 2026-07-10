@@ -57,11 +57,13 @@ ts dev proxy \
   --launch chrome
 ```
 
-`--rewrite-host` sends the upstream `Host: <TO>`, which most dev and staging
-upstreams require — they don't have the production hostname configured and would
-reject the default `Host: <FROM>`. See
-[Host header behavior](#host-header-behavior) for the one case where you can drop
-it.
+`--rewrite-host` sends the upstream `Host: <TO>` so upstreams that reject the
+default `Host: <FROM>` — most dev and staging services, which aren't configured
+for the production hostname — still serve a page. Trade-off: against a real
+Trusted Server adapter, first-party URLs then render on the upstream host, not the
+production domain. To keep them on the production domain, point at an upstream that
+accepts `Host: <FROM>` and omit `--rewrite-host` — see
+[Host header behavior](#host-header-behavior).
 
 Run `ts dev proxy --help` to list every flag.
 
@@ -78,6 +80,9 @@ ts dev proxy -f www.example-publisher.com -t trusted-server-example.edgecompute.
 With no `--map`/`-f`/`-t`, the proxy exits with
 `no rewrite rule: pass --map FROM=TO (or -f/--from with -t/--to)`.
 
+Connection options — `--rewrite-host`, `--basic-auth`/`--basic-auth-file`,
+`--insecure`, and `--upstream-plaintext` — apply to every mapping, not per-rule.
+
 ### Explicit rule and browser launch
 
 ```bash
@@ -87,7 +92,9 @@ ts dev proxy \
 ```
 
 `--launch` takes a comma list (`chrome`, `firefox`, `safari`) or `all`. When
-omitted the proxy runs without opening any browser.
+omitted the proxy runs without opening any browser. With multiple `--map` rules,
+every mapping is proxied, but `--launch` opens only the first rule's `FROM`
+hostname — navigate to the others manually.
 
 ### Other examples
 
@@ -135,9 +142,11 @@ will trust the proxy's certificates immediately.
 ### Trust the CA in Firefox
 
 Firefox does not reliably consult the macOS login keychain. When you use
-`--launch firefox`, the proxy automatically imports the CA into the temporary
-Firefox profile's NSS database using `certutil`. If you are pointing an existing
-Firefox profile at the proxy manually, run:
+`--launch firefox`, the proxy imports the CA into the temporary Firefox profile's
+NSS database using `certutil`. `certutil` is not built into macOS — install it
+with `brew install nss`; without it the proxy prints a warning and Firefox opens
+with certificate errors. If you are pointing an existing Firefox profile at the
+proxy manually, run:
 
 ```bash
 certutil -A -n "Trusted Server DEV-ONLY Proxy CA — DO NOT TRUST IN PRODUCTION" \
@@ -190,8 +199,10 @@ trust the new CA.
 The proxy always sends `X-Forwarded-Host: <FROM>` (the production hostname) — the
 standard "original host" header for a forward proxy. Trusted Server core anchors
 all HTML/URL rewriting to it (it prefers `X-Forwarded-Host`, then `Host`), so
-**first-party URLs always stay on the production domain regardless of the `Host`
-header**. That decouples routing (`Host`) from the first-party host.
+**first-party URLs stay on the production domain regardless of the `Host` header —
+as long as the upstream preserves `X-Forwarded-Host`**. That decouples routing
+(`Host`) from the first-party host. (Real Trusted Server adapters strip inbound
+`X-Forwarded-Host`; the caveat below covers what that means with `--rewrite-host`.)
 
 By default `Host: <FROM>` too. Fastly routes by SNI (`= TO`) and passes `Host`
 through unchanged, so `Host: <FROM>` reaches the upstream — but the upstream still
@@ -306,7 +317,7 @@ the terminal (only that command is elevated; the proxy keeps running as you). If
 `sudo` is declined or there is no terminal (e.g. the proxy is backgrounded), it
 prints the exact `networksetup` command and the System Settings path so you can
 set the PAC manually. The change is system-wide (all apps) but PAC-scoped to the
-`FROM` hosts, and only while the proxy runs. The prior setting — including
+`FROM` hosts, and — on a clean exit — only while the proxy runs. The prior setting — including
 whether auto-proxy was enabled or disabled — is saved and restored. On a clean
 exit (Ctrl-C) the restore uses `sudo` and may prompt once more if a long run
 outlived the cached credential. After a hard kill (`SIGKILL`) the next
@@ -316,11 +327,11 @@ command.
 
 ## Troubleshooting
 
-| Symptom                                        | Cause                                                                                                                                                                                       | Fix                                                                                                                                                                                                |
-| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| "unknown domain" or `404` from upstream        | The upstream service does not accept `Host: <FROM>` (the default). A domain can be active on only one Fastly service at a time, so you cannot add the production hostname to a dev service. | Use a Trusted Server Compute upstream (routes by SNI, not `Host`), or pass `--rewrite-host` to send `Host: <TO>`.                                                                                  |
-| Upstream returns `401`                         | Upstream is behind Basic auth.                                                                                                                                                              | Pass `--basic-auth user:pass` or `--basic-auth-file ./creds.txt`.                                                                                                                                  |
-| Upstream unreachable (`502` / `503`)           | Upstream service is down or the domain is not provisioned.                                                                                                                                  | Verify the upstream URL and its Fastly service health.                                                                                                                                             |
-| Browser shows an untrusted-certificate warning | The dev CA is not trusted in the browser.                                                                                                                                                   | Run `ts dev proxy ca install` for Chrome and Safari. For Firefox, use `--launch firefox` (auto-imports) or run `certutil` manually (see above). After `ca regenerate`, re-trust with `ca install`. |
-| Listen address already in use                  | Another process holds port 18080.                                                                                                                                                           | Pass `--listen 127.0.0.1:18081` (or another free port).                                                                                                                                            |
-| `--listen` rejected as non-loopback            | A non-loopback address was given without the required flag.                                                                                                                                 | Add `--allow-non-loopback`.                                                                                                                                                                        |
+| Symptom                                        | Cause                                                                                                                                                                                       | Fix                                                                                                                                                                                                                                                  |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| "unknown domain" or `404` from upstream        | The upstream service does not accept `Host: <FROM>` (the default). A domain can be active on only one Fastly service at a time, so you cannot add the production hostname to a dev service. | Use a Trusted Server Compute upstream (routes by SNI, not `Host`), or pass `--rewrite-host` to send `Host: <TO>`.                                                                                                                                    |
+| Upstream returns `401`                         | Upstream is behind Basic auth.                                                                                                                                                              | Pass `--basic-auth user:pass` or `--basic-auth-file ./creds.txt`.                                                                                                                                                                                    |
+| Upstream unreachable (`502` / `503`)           | Upstream service is down or the domain is not provisioned.                                                                                                                                  | Verify the upstream URL and its Fastly service health.                                                                                                                                                                                               |
+| Browser shows an untrusted-certificate warning | The dev CA is not trusted in the browser.                                                                                                                                                   | Run `ts dev proxy ca install` for Chrome and Safari. For Firefox, use `--launch firefox` (auto-imports when `certutil` is installed — `brew install nss`) or run `certutil` manually (see above). After `ca regenerate`, re-trust with `ca install`. |
+| Listen address already in use                  | Another process holds port 18080.                                                                                                                                                           | Pass `--listen 127.0.0.1:18081` (or another free port).                                                                                                                                                                                              |
+| `--listen` rejected as non-loopback            | A non-loopback address was given without the required flag.                                                                                                                                 | Add `--allow-non-loopback`.                                                                                                                                                                                                                          |
