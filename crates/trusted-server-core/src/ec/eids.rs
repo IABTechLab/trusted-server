@@ -25,7 +25,7 @@ pub struct ResolvedPartnerId {
     /// The synced user ID value.
     pub uid: String,
     /// `OpenRTB` agent type for this partner's identifiers.
-    pub openrtb_atype: u8,
+    pub openrtb_atype: i32,
 }
 
 /// Resolves source-domain keyed IDs from a KV entry against the partner registry.
@@ -214,17 +214,29 @@ mod tests {
                 source_domain: "id5-sync.com".to_owned(),
                 openrtb_atype: 1,
             },
+            ResolvedPartnerId {
+                uid: "pair-id".to_owned(),
+                source_domain: "google.com".to_owned(),
+                openrtb_atype: 571187,
+            },
         ];
 
         let eids = to_eids(&resolved);
 
-        assert_eq!(eids.len(), 2, "should produce one EID per resolved partner");
+        assert_eq!(eids.len(), 3, "should produce one EID per resolved partner");
         assert_eq!(eids[0].source, "liveramp.com");
         assert_eq!(eids[0].uids[0].id, "LR_xyz");
         assert_eq!(eids[0].uids[0].atype, Some(3));
         assert_eq!(eids[1].source, "id5-sync.com");
         assert_eq!(eids[1].uids[0].id, "ID5_abc");
         assert_eq!(eids[1].uids[0].atype, Some(1));
+        assert_eq!(eids[2].source, "google.com", "should preserve PAIR source");
+        assert_eq!(eids[2].uids[0].id, "pair-id", "should preserve PAIR ID");
+        assert_eq!(
+            eids[2].uids[0].atype,
+            Some(571187),
+            "should preserve PAIR vendor-specific atype"
+        );
     }
 
     #[test]

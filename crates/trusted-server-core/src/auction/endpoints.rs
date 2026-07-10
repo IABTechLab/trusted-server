@@ -476,7 +476,7 @@ fn parse_client_auction_uid(raw: &JsonValue) -> Option<Uid> {
     let atype = uid
         .get("atype")
         .and_then(JsonValue::as_u64)
-        .and_then(|atype| u8::try_from(atype).ok());
+        .and_then(|atype| i32::try_from(atype).ok());
 
     let ext = match uid.get("ext") {
         Some(JsonValue::Object(_)) => uid.get("ext").cloned(),
@@ -1058,6 +1058,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_client_auction_eids_preserves_pair_atype() {
+        let raw = json!([
+            {
+                "source": "google.com",
+                "uids": [{ "id": "pair-id", "atype": 571187 }]
+            }
+        ]);
+
+        let parsed = parse_client_auction_eids(Some(&raw)).expect("should parse PAIR EID");
+
+        assert_eq!(
+            parsed[0].uids[0].atype,
+            Some(571187),
+            "should preserve PAIR's vendor-specific atype"
+        );
+    }
+
+    #[test]
     fn parse_client_auction_eids_preserves_uid_ext_and_sanitizes_invalid_atype() {
         let raw = json!([
             {
@@ -1070,7 +1088,7 @@ mod tests {
                     },
                     {
                         "id": "uid-bad-atype",
-                        "atype": 999,
+                        "atype": 2_147_483_648_u64,
                         "ext": { "keep": true }
                     },
                     {

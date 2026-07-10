@@ -344,6 +344,10 @@ describe('prebid/installPrebidNpm', () => {
           source: 'sharedid.org',
           uids: [{ id: 'shared_123' }, { id: 'shared_456', atype: 3 }],
         },
+        {
+          source: 'google.com',
+          uids: [{ id: 'pair_123', atype: 571187 }],
+        },
       ]);
 
       const result = spec.buildRequests([
@@ -364,6 +368,10 @@ describe('prebid/installPrebidNpm', () => {
         {
           source: 'sharedid.org',
           uids: [{ id: 'shared_123' }, { id: 'shared_456', atype: 3 }],
+        },
+        {
+          source: 'google.com',
+          uids: [{ id: 'pair_123', atype: 571187 }],
         },
       ]);
     });
@@ -398,7 +406,7 @@ describe('prebid/installPrebidNpm', () => {
             },
             {
               id: 'uid-bad-atype',
-              atype: 999,
+              atype: 2_147_483_648,
               ext: { keep: true },
             },
             {

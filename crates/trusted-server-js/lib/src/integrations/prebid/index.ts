@@ -35,6 +35,9 @@ import { INCLUDED_PREBID_USER_ID_MODULES } from './_user_ids.generated';
 import { PREBID_USER_ID_MODULE_REGISTRY } from './user_id_modules';
 
 const ADAPTER_CODE = 'trustedServer';
+// OpenRTB permits vendor-specific agent types; PAIR uses 571187.
+// Keep this range aligned with the signed 32-bit Rust/OpenRTB representation.
+const MAX_OPENRTB_ATYPE = 2_147_483_647;
 const BIDDER_PARAMS_KEY = 'bidderParams';
 const ZONE_KEY = 'zone';
 const TS_REFRESH_TARGETING_KEYS = [
@@ -281,7 +284,7 @@ function sanitizeAuctionUid(uid: {
     typeof uid.atype === 'number' &&
     Number.isInteger(uid.atype) &&
     uid.atype >= 0 &&
-    uid.atype <= 255
+    uid.atype <= MAX_OPENRTB_ATYPE
   ) {
     sanitizedUid.atype = uid.atype;
   }
