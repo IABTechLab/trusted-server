@@ -203,14 +203,18 @@ The response-body adapter follows this state machine:
 
 1. `Streaming`: forward DATA and trailer frames unchanged. A trailer frame is
    not terminal by itself; wait for the following successful end-of-stream.
-2. `Reusable`: enter only after response end-of-stream, request upload
-   `Complete`, a healthy connection driver, and no upstream close intent. Send
-   the lease back through the manager's non-blocking return channel. The channel
-   is bounded to the 64-live-connection global limit; if it is unexpectedly
-   full or closed, close the connection instead of blocking a body poll.
+2. `Reusable`: when response end-of-stream is polled, enter only if request
+   upload is **already** `Complete`, the connection driver is healthy, and there
+   is no upstream close intent. Send the lease back through the manager's
+   non-blocking return channel. The channel is bounded to the
+   64-live-connection global limit; if it is unexpectedly full or closed, close
+   the connection instead of blocking a body poll.
 3. `Closed`: enter on body error, driver failure, request-upload failure,
    downstream cancellation/drop before terminal end-of-stream, or upstream close
-   intent. Drop the sender and capacity lease; never drain in the background.
+   intent. Also enter `Closed` when response end-of-stream arrives while request
+   upload is still `Streaming`; forward response EOF immediately, without waiting
+   for or draining the upload. Drop the sender and capacity lease; never drain in
+   the background.
 
 Upstream `Connection: close` and equivalent HTTP/1 connection intent are
 captured before hop-by-hop response sanitation. The sanitized header is still
@@ -611,6 +615,9 @@ gate and its code is retained.
 - Browser cancellation, slow or infinite response bodies, body errors, and
   trailers prove that an HTTP/1.1 lease is returned only after successful
   end-of-stream and otherwise closes without unbounded draining.
+- An upstream that returns an early response without consuming the full
+  streaming upload reaches the browser without delay and closes, rather than
+  pooling, that upstream connection.
 - A server-closed idle connection is retried once on a fresh connection.
 - Sender-readiness failure preserves an unconsumed request; post-send failure
   retries only an eligible idempotent empty request. Streaming and truncated
