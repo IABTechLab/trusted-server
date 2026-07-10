@@ -2124,14 +2124,23 @@ impl AuctionProvider for PrebidAuctionProvider {
 
         if !status.is_success() {
             log::warn!("Prebid returned non-success status: {}", status,);
+            let body_preview = String::from_utf8_lossy(&body_bytes);
             if log::log_enabled!(log::Level::Trace) {
-                let body_preview = String::from_utf8_lossy(&body_bytes);
                 log::trace!(
                     "Prebid error response body: {}",
                     &body_preview[..body_preview.floor_char_boundary(1000)]
                 );
             }
-            return Ok(AuctionResponse::error("prebid", response_time_ms));
+            // Surface the HTTP status and a body snippet on the response metadata
+            // so the ts-debug auction dump shows *why* prebid errored (e.g. a 4xx
+            // from a PBS that rejects the unsigned server-side request) without
+            // needing log access. A bare `AuctionResponse::error` yields empty
+            // metadata, which is indistinguishable from other failures in the dump.
+            let body_snippet = body_preview[..body_preview.floor_char_boundary(512)].to_string();
+            return Ok(AuctionResponse::error("prebid", response_time_ms)
+                .with_metadata("error_type", serde_json::json!("http_status"))
+                .with_metadata("status", serde_json::json!(status.as_u16()))
+                .with_metadata("body", serde_json::json!(body_snippet)));
         }
 
         let response_json: Json =
@@ -2338,6 +2347,44 @@ mod tests {
         assert_eq!(
             backend_name, "predicted_https_prebid.example_123_123",
             "should cap both first-byte and between-bytes timeouts to the auction budget"
+        );
+    }
+
+    #[test]
+    fn parse_response_attaches_status_and_body_metadata_on_http_error() {
+        use crate::auction::types::BidStatus;
+
+        let provider = PrebidAuctionProvider::new(base_config());
+        let response = PlatformResponse::new(
+            edgezero_core::http::response_builder()
+                .status(403)
+                .body(EdgeBody::from(br#"{"error":"missing signature"}"#.to_vec()))
+                .expect("should build test response"),
+        );
+
+        let result = futures::executor::block_on(provider.parse_response(response, 643))
+            .expect("should return Ok(error response) for non-success status");
+
+        assert_eq!(
+            result.status,
+            BidStatus::Error,
+            "non-success HTTP status should map to an error response"
+        );
+        assert_eq!(
+            result.metadata["error_type"],
+            json!("http_status"),
+            "should tag the error path so the auction dump is distinguishable"
+        );
+        assert_eq!(
+            result.metadata["status"],
+            json!(403),
+            "should surface the upstream HTTP status code"
+        );
+        assert!(
+            result.metadata["body"]
+                .as_str()
+                .is_some_and(|body| body.contains("missing signature")),
+            "should include the response body snippet"
         );
     }
 
