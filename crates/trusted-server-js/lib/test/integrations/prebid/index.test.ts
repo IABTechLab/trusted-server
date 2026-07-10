@@ -7,6 +7,7 @@ const {
   mockRequestBids,
   mockRegisterBidAdapter,
   mockGetUserIdsAsEids,
+  mockGetConfig,
   mockPbjs,
   mockGetBidAdapter,
   mockAdapterManager,
@@ -19,12 +20,14 @@ const {
   const mockGetUserIdsAsEids = vi.fn(
     () => [] as Array<{ source: string; uids?: Array<{ id: string; atype?: number }> }>
   );
+  const mockGetConfig = vi.fn();
   const mockPbjs = {
     setConfig: mockSetConfig,
     processQueue: mockProcessQueue,
     requestBids: mockRequestBids,
     registerBidAdapter: mockRegisterBidAdapter,
     getUserIdsAsEids: mockGetUserIdsAsEids,
+    getConfig: mockGetConfig,
     adUnits: [] as any[],
   };
   const mockAdapterManager = {
@@ -36,6 +39,7 @@ const {
     mockRequestBids,
     mockRegisterBidAdapter,
     mockGetUserIdsAsEids,
+    mockGetConfig,
     mockPbjs,
     mockGetBidAdapter,
     mockAdapterManager,
@@ -53,9 +57,11 @@ vi.mock('prebid.js/modules/consentManagementGpp.js', () => ({}));
 vi.mock('prebid.js/modules/consentManagementUsp.js', () => ({}));
 vi.mock('prebid.js/modules/userId.js', () => ({}));
 
-// Mock the build-generated side-effect imports (no-op in tests)
+// Mock the build-generated imports in tests.
 vi.mock('../../../src/integrations/prebid/_adapters.generated', () => ({}));
-vi.mock('../../../src/integrations/prebid/_user_ids.generated', () => ({}));
+vi.mock('../../../src/integrations/prebid/_user_ids.generated', () => ({
+  INCLUDED_PREBID_USER_ID_MODULES: ['sharedIdSystem'],
+}));
 
 import {
   collectBidders,
@@ -65,6 +71,7 @@ import {
   installRefreshHandler,
 } from '../../../src/integrations/prebid/index';
 import type { AuctionBid } from '../../../src/core/auction';
+import { log } from '../../../src/core/log';
 
 describe('prebid/collectBidders', () => {
   it('returns empty array for empty ad units', () => {
@@ -207,8 +214,14 @@ describe('prebid/installPrebidNpm', () => {
     mockPbjs.adUnits = [];
     mockGetUserIdsAsEids.mockReset();
     mockGetUserIdsAsEids.mockReturnValue([]);
+    mockGetConfig.mockReset();
     document.cookie = 'ts-eids=; Path=/; Max-Age=0';
     delete (window as any).__tsjs_prebid;
+    delete (window as any).__tsjs_prebid_diagnostics;
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   it('registers the trustedServer bid adapter', () => {
@@ -249,6 +262,36 @@ describe('prebid/installPrebidNpm', () => {
   it('calls processQueue after configuration', () => {
     installPrebidNpm();
     expect(mockProcessQueue).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports the User ID modules selected by the generated bundle', () => {
+    installPrebidNpm();
+
+    expect((window as any).__tsjs_prebid_diagnostics.userIdModules).toEqual({
+      includedModules: ['sharedIdSystem'],
+      configuredUserIdNames: [],
+      missingConfiguredUserIdNames: [],
+    });
+  });
+
+  it('refreshes late User ID config without repeating missing-module warnings', () => {
+    installPrebidNpm();
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [{ name: 'sharedId' }, { name: 'pairId' }] : {}
+    );
+    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
+
+    mockPbjs.requestBids({ adUnits: [] });
+    mockPbjs.requestBids({ adUnits: [] });
+
+    expect((window as any).__tsjs_prebid_diagnostics.userIdModules).toEqual({
+      includedModules: ['sharedIdSystem'],
+      configuredUserIdNames: ['pairId', 'sharedId'],
+      missingConfiguredUserIdNames: ['pairId'],
+    });
+    expect(
+      warnSpy.mock.calls.filter(([message]) => String(message).includes('"pairId"'))
+    ).toHaveLength(1);
   });
 
   it('returns the pbjs instance', () => {
