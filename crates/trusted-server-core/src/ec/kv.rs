@@ -23,7 +23,7 @@ use super::current_timestamp;
 use super::generation::ec_hash;
 use super::kv_backend::{EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome};
 use super::kv_types::{KvEntry, KvMetadata, KvNetwork};
-use super::log_id;
+use super::{log_id, EcKvSnapshot};
 
 /// Maximum number of CAS retry attempts before giving up.
 const MAX_CAS_RETRIES: u32 = 5;
@@ -56,6 +56,15 @@ pub enum UpsertResult {
     Unchanged,
 }
 
+/// Outcome of atomically creating an identity-graph root when absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateIfAbsentOutcome {
+    /// The candidate entry was persisted.
+    Written,
+    /// A row already exists for the candidate key.
+    AlreadyExists,
+}
+
 /// Partner UID update to apply to a KV identity graph entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PartnerIdUpdate {
@@ -75,7 +84,7 @@ impl PartnerIdUpdate {
     }
 }
 
-fn apply_partner_id_updates(entry: &mut KvEntry, updates: &[PartnerIdUpdate]) -> bool {
+pub(crate) fn apply_partner_id_updates(entry: &mut KvEntry, updates: &[PartnerIdUpdate]) -> bool {
     let mut latest_updates = BTreeMap::new();
     for update in updates {
         latest_updates.insert(update.partner_id.as_str(), update.uid.as_str());
@@ -186,6 +195,30 @@ impl KvIdentityGraph {
         Ok(Some((entry, lookup.generation)))
     }
 
+    /// Loads one request-scoped snapshot, preserving miss versus failure at the caller boundary.
+    #[must_use]
+    pub fn load_snapshot(&self, ec_id: &str) -> EcKvSnapshot {
+        match self.get(ec_id) {
+            Ok(Some((entry, generation))) => EcKvSnapshot::Present {
+                ec_id: ec_id.to_owned(),
+                entry: Box::new(entry),
+                generation: Some(generation),
+            },
+            Ok(None) => EcKvSnapshot::Missing {
+                ec_id: ec_id.to_owned(),
+            },
+            Err(err) => {
+                log::warn!(
+                    "EC KV snapshot read failed for '{}': {err:?}",
+                    log_id(ec_id)
+                );
+                EcKvSnapshot::Failed {
+                    ec_id: ec_id.to_owned(),
+                }
+            }
+        }
+    }
+
     fn deserialize_entry(
         store_name: &str,
         ec_id: &str,
@@ -251,6 +284,23 @@ impl KvIdentityGraph {
             EcKvWriteOutcome::PreconditionFailed => {
                 Err(self.kv_error(format!("Key '{ec_id}' already exists")))
             }
+        }
+    }
+
+    /// Atomically creates an entry while preserving collision as normal control flow.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::KvStore`] when serialization or store I/O fails.
+    pub fn create_if_absent(
+        &self,
+        ec_id: &str,
+        entry: &KvEntry,
+    ) -> Result<CreateIfAbsentOutcome, Report<TrustedServerError>> {
+        let (body, meta_str) = Self::serialize_entry(entry, self.store_name())?;
+        match self.write_entry(ec_id, &body, &meta_str, ENTRY_TTL, EcKvWriteMode::Add)? {
+            EcKvWriteOutcome::Written => Ok(CreateIfAbsentOutcome::Written),
+            EcKvWriteOutcome::PreconditionFailed => Ok(CreateIfAbsentOutcome::AlreadyExists),
         }
     }
 
@@ -445,6 +495,86 @@ impl KvIdentityGraph {
         )))
     }
 
+    /// Merges partner IDs using request-scoped persisted state as the first CAS input.
+    pub(crate) fn upsert_partner_ids_from_snapshot(
+        &self,
+        ec_id: &str,
+        updates: &[PartnerIdUpdate],
+        snapshot: EcKvSnapshot,
+    ) -> EcKvSnapshot {
+        if updates.is_empty() {
+            return snapshot;
+        }
+
+        let mut current = snapshot;
+        for _attempt in 0..MAX_CAS_RETRIES {
+            let (mut entry, generation) = match current {
+                EcKvSnapshot::Present {
+                    ec_id: ref snapshot_id,
+                    ref entry,
+                    generation: Some(generation),
+                } if snapshot_id == ec_id => (entry.as_ref().clone(), generation),
+                EcKvSnapshot::Present { .. } | EcKvSnapshot::NotRead => {
+                    current = self.load_snapshot(ec_id);
+                    continue;
+                }
+                EcKvSnapshot::Missing {
+                    ec_id: ref snapshot_id,
+                }
+                | EcKvSnapshot::Failed {
+                    ec_id: ref snapshot_id,
+                } if snapshot_id == ec_id => return current,
+                EcKvSnapshot::Missing { .. } | EcKvSnapshot::Failed { .. } => {
+                    current = self.load_snapshot(ec_id);
+                    continue;
+                }
+            };
+
+            if !entry.consent.ok {
+                return current;
+            }
+            if !apply_partner_id_updates(&mut entry, updates) {
+                return current;
+            }
+            let Ok((body, meta_str)) = Self::serialize_entry(&entry, self.store_name()) else {
+                return EcKvSnapshot::Failed {
+                    ec_id: ec_id.to_owned(),
+                };
+            };
+            match self.write_entry(
+                ec_id,
+                &body,
+                &meta_str,
+                ENTRY_TTL,
+                EcKvWriteMode::IfGenerationMatch(generation),
+            ) {
+                Ok(EcKvWriteOutcome::Written) => {
+                    return EcKvSnapshot::Present {
+                        ec_id: ec_id.to_owned(),
+                        entry: Box::new(entry),
+                        generation: None,
+                    };
+                }
+                Ok(EcKvWriteOutcome::PreconditionFailed) => {
+                    current = self.load_snapshot(ec_id);
+                }
+                Err(err) => {
+                    log::warn!(
+                        "snapshot partner upsert failed for '{}': {err:?}",
+                        log_id(ec_id)
+                    );
+                    return EcKvSnapshot::Failed {
+                        ec_id: ec_id.to_owned(),
+                    };
+                }
+            }
+        }
+
+        EcKvSnapshot::Failed {
+            ec_id: ec_id.to_owned(),
+        }
+    }
+
     /// Atomically merges a partner ID into the existing entry.
     ///
     /// Uses CAS (generation markers) to avoid clobbering concurrent writes
@@ -635,6 +765,70 @@ impl KvIdentityGraph {
                 store_name: self.store_name().to_owned(),
                 message: format!("Failed to write tombstone for key '{ec_id}'"),
             })),
+        }
+    }
+
+    /// Writes a tombstone only when an authoritative row already exists.
+    pub(crate) fn tombstone_existing_from_snapshot(
+        &self,
+        ec_id: &str,
+        snapshot: EcKvSnapshot,
+    ) -> EcKvSnapshot {
+        let mut current = snapshot;
+        for _attempt in 0..MAX_CAS_RETRIES {
+            let generation = match current {
+                EcKvSnapshot::Present {
+                    ec_id: ref snapshot_id,
+                    generation: Some(generation),
+                    ..
+                } if snapshot_id == ec_id => generation,
+                EcKvSnapshot::Missing {
+                    ec_id: ref snapshot_id,
+                } if snapshot_id == ec_id => return current,
+                EcKvSnapshot::Failed {
+                    ec_id: ref snapshot_id,
+                } if snapshot_id == ec_id => return current,
+                _ => {
+                    current = self.load_snapshot(ec_id);
+                    continue;
+                }
+            };
+            let tombstone = KvEntry::tombstone(current_timestamp());
+            let Ok((body, meta_str)) = Self::serialize_entry(&tombstone, self.store_name()) else {
+                return EcKvSnapshot::Failed {
+                    ec_id: ec_id.to_owned(),
+                };
+            };
+            match self.write_entry(
+                ec_id,
+                &body,
+                &meta_str,
+                TOMBSTONE_TTL,
+                EcKvWriteMode::IfGenerationMatch(generation),
+            ) {
+                Ok(EcKvWriteOutcome::Written) => {
+                    return EcKvSnapshot::Present {
+                        ec_id: ec_id.to_owned(),
+                        entry: Box::new(tombstone),
+                        generation: None,
+                    };
+                }
+                Ok(EcKvWriteOutcome::PreconditionFailed) => {
+                    current = self.load_snapshot(ec_id);
+                }
+                Err(err) => {
+                    log::warn!(
+                        "conditional withdrawal tombstone failed for '{}': {err:?}",
+                        log_id(ec_id)
+                    );
+                    return EcKvSnapshot::Failed {
+                        ec_id: ec_id.to_owned(),
+                    };
+                }
+            }
+        }
+        EcKvSnapshot::Failed {
+            ec_id: ec_id.to_owned(),
         }
     }
 
@@ -1182,6 +1376,34 @@ mod tests {
     }
 
     #[test]
+    fn create_if_absent_reports_written_and_collision() {
+        let kv = KvIdentityGraph::in_memory("test_store");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+
+        assert_eq!(
+            kv.create_if_absent(&ec_id, &live_entry())
+                .expect("should create absent entry"),
+            CreateIfAbsentOutcome::Written
+        );
+        assert_eq!(
+            kv.create_if_absent(&ec_id, &live_entry())
+                .expect("should report collision"),
+            CreateIfAbsentOutcome::AlreadyExists
+        );
+    }
+
+    #[test]
+    fn create_if_absent_propagates_store_error() {
+        let kv = KvIdentityGraph::failing("test_store");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+
+        assert!(
+            kv.create_if_absent(&ec_id, &live_entry()).is_err(),
+            "should preserve store failures instead of reporting a collision"
+        );
+    }
+
+    #[test]
     fn create_or_revive_revives_tombstone() {
         let kv = KvIdentityGraph::in_memory("test_store");
         let ec_id = format!("{}.ABC123", "a".repeat(64));
@@ -1240,6 +1462,48 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_bulk_upsert_returns_persisted_entry_without_stale_generation() {
+        let kv = KvIdentityGraph::in_memory("test_store");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        kv.create(&ec_id, &live_entry()).expect("should create");
+        let snapshot = kv.load_snapshot(&ec_id);
+        let updates = [PartnerIdUpdate::new("ssp_x", "uid-1")];
+
+        let outcome = kv.upsert_partner_ids_from_snapshot(&ec_id, &updates, snapshot);
+
+        let entry = outcome
+            .entry_for(&ec_id)
+            .expect("should retain persisted entry");
+        assert_eq!(
+            entry.ids.get("ssp_x").map(|id| id.uid.as_str()),
+            Some("uid-1")
+        );
+        assert_eq!(
+            outcome.generation_for(&ec_id),
+            None,
+            "backend does not return the post-write generation"
+        );
+    }
+
+    #[test]
+    fn snapshot_bulk_upsert_does_not_create_missing_root() {
+        let kv = KvIdentityGraph::in_memory("test_store");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let updates = [PartnerIdUpdate::new("ssp_x", "uid-1")];
+
+        let outcome = kv.upsert_partner_ids_from_snapshot(
+            &ec_id,
+            &updates,
+            EcKvSnapshot::Missing {
+                ec_id: ec_id.clone(),
+            },
+        );
+
+        assert!(matches!(outcome, EcKvSnapshot::Missing { .. }));
+        assert!(kv.get(&ec_id).expect("should read store").is_none());
+    }
+
+    #[test]
     fn write_withdrawal_tombstone_overwrites_live_entry() {
         let kv = KvIdentityGraph::in_memory("test_store");
         let ec_id = format!("{}.ABC123", "a".repeat(64));
@@ -1253,5 +1517,44 @@ mod tests {
             .expect("should read entry back")
             .expect("should find tombstone entry");
         assert!(!loaded.consent.ok, "should be withdrawn after tombstone");
+    }
+
+    #[test]
+    fn tombstone_existing_from_snapshot_never_creates_missing_key() {
+        let kv = KvIdentityGraph::in_memory("test_store");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let snapshot = EcKvSnapshot::Missing {
+            ec_id: ec_id.clone(),
+        };
+
+        let outcome = kv.tombstone_existing_from_snapshot(&ec_id, snapshot);
+
+        assert!(matches!(outcome, EcKvSnapshot::Missing { .. }));
+        assert!(
+            kv.get(&ec_id).expect("should read store").is_none(),
+            "withdrawal must not create a tombstone for an absent key"
+        );
+    }
+
+    #[test]
+    fn tombstone_existing_from_snapshot_uses_existing_generation() {
+        let kv = KvIdentityGraph::in_memory("test_store");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        kv.create(&ec_id, &live_entry()).expect("should create");
+        let snapshot = kv.load_snapshot(&ec_id);
+
+        let outcome = kv.tombstone_existing_from_snapshot(&ec_id, snapshot);
+
+        assert!(
+            outcome
+                .entry_for(&ec_id)
+                .is_some_and(|entry| !entry.consent.ok),
+            "should return the persisted tombstone"
+        );
+        let (stored, _) = kv
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("should preserve existing key");
+        assert!(!stored.consent.ok, "should persist withdrawal state");
     }
 }

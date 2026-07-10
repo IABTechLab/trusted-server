@@ -20,7 +20,7 @@ use crate::platform::{
 use crate::settings::Settings;
 
 use super::generation::{ec_hash, is_valid_ec_id};
-use super::kv::KvIdentityGraph;
+use super::kv::{KvIdentityGraph, PartnerIdUpdate};
 use super::kv_types::KvEntry;
 use super::rate_limiter::RateLimiter;
 use super::registry::{PartnerConfig, PartnerRegistry};
@@ -28,11 +28,13 @@ use super::registry::{PartnerConfig, PartnerRegistry};
 // `current_timestamp` is defined in the parent `ec` module.
 use super::current_timestamp;
 use super::EcContext;
+use super::EcKvSnapshot;
 
 /// Inputs needed to dispatch pull sync after response flush.
 #[derive(Debug, Clone)]
 pub struct PullSyncContext {
     ec_id: String,
+    snapshot: EcKvSnapshot,
 }
 
 impl PullSyncContext {
@@ -69,7 +71,8 @@ pub fn build_pull_sync_context(ec_context: &EcContext) -> Option<PullSyncContext
     }
 
     let ec_id = ec_id_ref.to_owned();
-    Some(PullSyncContext { ec_id })
+    let snapshot = ec_context.kv_snapshot().clone();
+    Some(PullSyncContext { ec_id, snapshot })
 }
 
 /// Dispatches partner pull-sync requests in the background.
@@ -89,16 +92,12 @@ pub fn dispatch_pull_sync(
     services: &RuntimeServices,
 ) {
     let now = current_timestamp();
-    let kv_entry = match kv.get(context.ec_id()) {
-        Ok(entry) => entry.map(|(entry, _)| entry),
-        Err(err) => {
-            log::warn!(
-                "Pull sync: failed to read identity graph for '{}': {err:?}",
-                super::log_id(context.ec_id())
-            );
-            return;
-        }
+    let Some(kv_entry) = context.snapshot.entry_for(context.ec_id()) else {
+        return;
     };
+    if !kv_entry.consent.ok {
+        return;
+    }
 
     let mut pull_partners = registry.pull_enabled_partners();
 
@@ -123,9 +122,10 @@ pub fn dispatch_pull_sync(
 
     let max_concurrency = settings.ec.pull_sync_concurrency.max(1);
     let mut in_flight: Vec<InFlightPull> = Vec::new();
+    let mut updates = Vec::new();
 
     for partner in pull_partners {
-        if !is_partner_pull_eligible(partner, kv_entry.as_ref()) {
+        if !is_partner_pull_eligible(partner, Some(kv_entry)) {
             continue;
         }
 
@@ -213,11 +213,24 @@ pub fn dispatch_pull_sync(
         });
 
         if in_flight.len() >= max_concurrency {
-            drain_pull_batch(kv, context.ec_id(), &mut in_flight, services);
+            drain_pull_batch(&mut in_flight, services, &mut updates);
         }
     }
 
-    drain_pull_batch(kv, context.ec_id(), &mut in_flight, services);
+    drain_pull_batch(&mut in_flight, services, &mut updates);
+    if !updates.is_empty() {
+        let outcome = kv.upsert_partner_ids_from_snapshot(
+            context.ec_id(),
+            &updates,
+            context.snapshot.clone(),
+        );
+        if matches!(outcome, EcKvSnapshot::Failed { .. }) {
+            log::warn!(
+                "Pull sync: failed to persist partner updates for '{}'",
+                super::log_id(context.ec_id())
+            );
+        }
+    }
 }
 
 fn is_partner_pull_eligible(partner: &PartnerConfig, kv_entry: Option<&KvEntry>) -> bool {
@@ -286,10 +299,9 @@ fn pull_rate_limit_key(source_domain: &str, ec_id: &str) -> String {
 }
 
 fn drain_pull_batch(
-    kv: &KvIdentityGraph,
-    ec_id: &str,
     in_flight: &mut Vec<InFlightPull>,
     services: &RuntimeServices,
+    updates: &mut Vec<PartnerIdUpdate>,
 ) {
     for pending in in_flight.drain(..) {
         let source_domain = pending.source_domain;
@@ -311,13 +323,7 @@ fn drain_pull_batch(
             continue;
         };
 
-        if let Err(err) = kv.upsert_partner_id(ec_id, &source_domain, &uid) {
-            log::warn!(
-                "Pull sync: failed to upsert partner '{}' for ec_id '{}': {err:?}",
-                source_domain,
-                super::log_id(ec_id)
-            );
-        }
+        updates.push(PartnerIdUpdate::new(source_domain, uid));
     }
 }
 

@@ -755,6 +755,25 @@ fn mediator_placeholder_request() -> Request<EdgeBody> {
         .expect("MEDIATOR_PLACEHOLDER_URL should be a valid URI")
 }
 
+/// Copies the downstream request head while leaving its body available to the caller.
+fn request_head_snapshot(req: &Request<EdgeBody>) -> Request<EdgeBody> {
+    let mut snapshot = Request::new(EdgeBody::empty());
+    *snapshot.method_mut() = req.method().clone();
+    *snapshot.uri_mut() = req.uri().clone();
+    *snapshot.version_mut() = req.version();
+    *snapshot.headers_mut() = req.headers().clone();
+    snapshot
+}
+
+fn should_preload_ec_snapshot(
+    is_navigation: bool,
+    is_get: bool,
+    has_ec_id: bool,
+    has_kv: bool,
+) -> bool {
+    is_navigation && is_get && has_ec_id && has_kv
+}
+
 /// Build a minimal [`AuctionContext`] for the collect phase.
 ///
 /// See [`AuctionContext::request`]: the orchestrator's collect path runs
@@ -1305,7 +1324,7 @@ pub async fn handle_publisher_request(
     kv: Option<&KvIdentityGraph>,
     ec_context: &mut EcContext,
     auction: AuctionDispatch<'_>,
-    mut req: Request<EdgeBody>,
+    req: Request<EdgeBody>,
 ) -> Result<PublisherResponse, Report<TrustedServerError>> {
     log::debug!("Proxying request to publisher_origin");
 
@@ -1343,7 +1362,11 @@ pub async fn handle_publisher_request(
     );
 
     let consent_context = ec_context.consent().clone();
-    let ec_id = ec_context.ec_value().filter(|_| ec_allowed);
+    let ec_id_owned = ec_context
+        .ec_value()
+        .filter(|_| ec_allowed)
+        .map(str::to_owned);
+    let ec_id = ec_id_owned.as_deref();
     let cookie_jar = handle_request_cookies(&req)?;
     let geo = ec_context.geo_info().cloned();
 
@@ -1450,6 +1473,44 @@ pub async fn handle_publisher_request(
         .map(|co| co.price_granularity)
         .unwrap_or_default();
 
+    let auction_client_request = request_head_snapshot(&req);
+    let mut origin_request = Some(req);
+    let should_preload_ec =
+        should_preload_ec_snapshot(is_navigation, is_get, ec_id.is_some(), kv.is_some());
+    let mut pending_origin = None;
+    if should_preload_ec && services.http_client().supports_concurrent_fanout() {
+        let mut origin_req = origin_request.take().ok_or_else(|| {
+            Report::new(TrustedServerError::Proxy {
+                message: "publisher origin request was already consumed".to_owned(),
+            })
+        })?;
+        restrict_accept_encoding(&mut origin_req);
+        origin_req.headers_mut().remove("fastly-ssl");
+        *origin_req.uri_mut() = target_uri.clone();
+        origin_req.headers_mut().insert(
+            header::HOST,
+            HeaderValue::from_str(&origin_host_header).change_context(
+                TrustedServerError::Proxy {
+                    message: "invalid publisher origin host header".to_string(),
+                },
+            )?,
+        );
+        pending_origin = Some(
+            services
+                .http_client()
+                .send_async(PlatformHttpRequest::new(origin_req, backend_name.clone()))
+                .await
+                .change_context(TrustedServerError::Proxy {
+                    message: "Failed to start publisher origin request".to_string(),
+                })?,
+        );
+    }
+    if should_preload_ec {
+        if let (Some(graph), Some(ec_id)) = (kv, ec_id) {
+            ec_context.set_kv_snapshot(graph.load_snapshot(ec_id));
+        }
+    }
+
     // Dispatch SSP bid requests while req still has the original client headers
     // (User-Agent, x-forwarded-for, cookies, etc.).  The borrow ends when
     // dispatch_auction returns — DispatchedAuction holds no lifetime — so req
@@ -1477,7 +1538,8 @@ pub async fn handle_publisher_request(
                 ec_id,
                 &consent_context,
                 &request_info,
-                req.headers()
+                auction_client_request
+                    .headers()
                     .get("user-agent")
                     .and_then(|v| v.to_str().ok()),
             );
@@ -1486,7 +1548,7 @@ pub async fn handle_publisher_request(
                 &AuctionEidTargeting {
                     cookie_jar: cookie_jar.as_ref(),
                     ec_id,
-                    kv,
+                    kv_snapshot: ec_context.kv_snapshot(),
                     partner_registry: auction.registry,
                     ec_context,
                     services,
@@ -1496,7 +1558,7 @@ pub async fn handle_publisher_request(
             );
             let auction_context = AuctionContext {
                 settings,
-                request: &req,
+                request: &auction_client_request,
                 timeout_ms: auction_timeout_ms,
                 provider_responses: None,
                 services,
@@ -1583,28 +1645,43 @@ pub async fn handle_publisher_request(
     );
 
     // Only advertise encodings the rewrite pipeline can decode and re-encode.
-    restrict_accept_encoding(&mut req);
-    // Strip the internal `fastly-ssl` scheme signal before forwarding to the
-    // origin. On the EdgeZero path the entry point re-injects this header from
-    // trusted Fastly TLS metadata so in-process scheme detection works; the
-    // legacy path never sets it. Either way it is an internal edge signal that
-    // must not leak to publisher backends.
-    req.headers_mut().remove("fastly-ssl");
-    *req.uri_mut() = target_uri;
-    req.headers_mut().insert(
-        header::HOST,
-        HeaderValue::from_str(&origin_host_header).change_context(TrustedServerError::Proxy {
-            message: "invalid publisher origin host header".to_string(),
-        })?,
-    );
+    if let Some(req) = origin_request.as_mut() {
+        restrict_accept_encoding(req);
+        // Strip the internal `fastly-ssl` scheme signal before forwarding to the
+        // origin. On the EdgeZero path the entry point re-injects this header from
+        // trusted Fastly TLS metadata so in-process scheme detection works; the
+        // legacy path never sets it. Either way it is an internal edge signal that
+        // must not leak to publisher backends.
+        req.headers_mut().remove("fastly-ssl");
+        *req.uri_mut() = target_uri;
+        req.headers_mut().insert(
+            header::HOST,
+            HeaderValue::from_str(&origin_host_header).change_context(
+                TrustedServerError::Proxy {
+                    message: "invalid publisher origin host header".to_string(),
+                },
+            )?,
+        );
+    }
 
     // SSP requests are already racing through the platform HTTP client, so
     // origin TTFB tracks origin latency rather than the auction timeout.
-    let mut response = match services
-        .http_client()
-        .send(PlatformHttpRequest::new(req, backend_name))
-        .await
-    {
+    let origin_result = if let Some(pending) = pending_origin {
+        services.http_client().wait(pending).await
+    } else {
+        services
+            .http_client()
+            .send(PlatformHttpRequest::new(
+                origin_request.take().ok_or_else(|| {
+                    Report::new(TrustedServerError::Proxy {
+                        message: "publisher origin request was already consumed".to_owned(),
+                    })
+                })?,
+                backend_name,
+            ))
+            .await
+    };
+    let mut response = match origin_result {
         Ok(platform_response) => platform_response.response,
         Err(err) => {
             if let Some(dispatched) = dispatched_auction.take() {
@@ -1792,7 +1869,7 @@ pub(crate) struct MatchedSlotsContext<'a> {
 struct AuctionEidTargeting<'a> {
     cookie_jar: Option<&'a CookieJar>,
     ec_id: Option<&'a str>,
-    kv: Option<&'a KvIdentityGraph>,
+    kv_snapshot: &'a crate::ec::EcKvSnapshot,
     partner_registry: Option<&'a PartnerRegistry>,
     ec_context: &'a EcContext,
     services: &'a RuntimeServices,
@@ -1821,7 +1898,7 @@ fn apply_auction_eids_and_device(
         None
     };
     let kv_eids = resolve_auction_eids(
-        targeting.kv,
+        targeting.kv_snapshot,
         targeting.partner_registry,
         targeting.ec_context,
     );
@@ -2236,6 +2313,10 @@ pub async fn handle_page_bids(
 
     let request_info = crate::http_util::RequestInfo::from_request(&req, services.client_info());
     let ec_id = ec_context.ec_value().filter(|_| ec_context.ec_allowed());
+    let page_bids_kv_snapshot = match (kv, ec_id) {
+        (Some(graph), Some(ec_id)) => graph.load_snapshot(ec_id),
+        _ => crate::ec::EcKvSnapshot::NotRead,
+    };
     let consent_context = ec_context.consent();
     let geo = ec_context.geo_info().cloned();
     let cookie_jar = handle_request_cookies(&req)?;
@@ -2305,7 +2386,7 @@ pub async fn handle_page_bids(
                 &AuctionEidTargeting {
                     cookie_jar: cookie_jar.as_ref(),
                     ec_id,
-                    kv,
+                    kv_snapshot: &page_bids_kv_snapshot,
                     partner_registry: auction.registry,
                     ec_context,
                     services,
@@ -2437,6 +2518,37 @@ mod tests {
     use flate2::write::GzEncoder;
 
     use super::*;
+
+    #[test]
+    fn request_head_snapshot_preserves_downstream_shape_without_body() {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/article?x=1")
+            .header(header::HOST, "publisher.example")
+            .header("fastly-ssl", "1")
+            .header(header::USER_AGENT, "test-browser")
+            .body(EdgeBody::from("ignored-body"))
+            .expect("should build request");
+
+        let snapshot = request_head_snapshot(&request);
+
+        assert_eq!(snapshot.method(), Method::GET);
+        assert_eq!(snapshot.uri(), request.uri());
+        assert_eq!(snapshot.headers(), request.headers());
+        assert!(
+            matches!(snapshot.body(), EdgeBody::Once(bytes) if bytes.is_empty()),
+            "snapshot should never duplicate the request body"
+        );
+    }
+
+    #[test]
+    fn ec_snapshot_preload_requires_navigation_get_ec_and_kv() {
+        assert!(should_preload_ec_snapshot(true, true, true, true));
+        assert!(!should_preload_ec_snapshot(false, true, true, true));
+        assert!(!should_preload_ec_snapshot(true, false, true, true));
+        assert!(!should_preload_ec_snapshot(true, true, false, true));
+        assert!(!should_preload_ec_snapshot(true, true, true, false));
+    }
     use crate::auction::types::{AdFormat, AdSlot, MediaType};
     use crate::integrations::IntegrationRegistry;
     use crate::platform::test_support::{

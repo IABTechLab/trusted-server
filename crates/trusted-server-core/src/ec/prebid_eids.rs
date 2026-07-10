@@ -119,6 +119,28 @@ pub fn ingest_eid_cookies(
     ingest_eid_cookies_with_writer(eids_cookie, sharedid_cookie, ec_id, kv, registry);
 }
 
+/// Collects validated request-local partner updates without performing KV I/O.
+pub(crate) fn collect_eid_cookie_updates(
+    eids_cookie: Option<&str>,
+    sharedid_cookie: Option<&str>,
+    registry: &PartnerRegistry,
+) -> Vec<PartnerIdUpdate> {
+    if registry.is_empty() {
+        return Vec::new();
+    }
+
+    let mut updates = Vec::new();
+    if let Some(cookie) = eids_cookie {
+        updates.extend(collect_prebid_eid_updates(cookie, registry));
+    }
+    if let Some(cookie) = sharedid_cookie {
+        if let Some(update) = collect_sharedid_update(cookie, registry) {
+            updates.push(update);
+        }
+    }
+    dedupe_partner_updates(updates)
+}
+
 /// Parses a `ts-eids` cookie value and writes matched partner UIDs to KV.
 ///
 /// `cookie_value` is the raw base64-encoded cookie value, already extracted
@@ -142,21 +164,7 @@ fn ingest_eid_cookies_with_writer(
     writer: &dyn PartnerIdBulkWriter,
     registry: &PartnerRegistry,
 ) {
-    if registry.is_empty() {
-        return;
-    }
-
-    let mut updates = Vec::new();
-    if let Some(cookie) = eids_cookie {
-        updates.extend(collect_prebid_eid_updates(cookie, registry));
-    }
-    if let Some(cookie) = sharedid_cookie {
-        if let Some(update) = collect_sharedid_update(cookie, registry) {
-            updates.push(update);
-        }
-    }
-
-    let updates = dedupe_partner_updates(updates);
+    let updates = collect_eid_cookie_updates(eids_cookie, sharedid_cookie, registry);
     if updates.is_empty() {
         return;
     }

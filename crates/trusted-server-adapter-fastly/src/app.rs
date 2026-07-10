@@ -407,6 +407,7 @@ fn build_ec_request_state(
         match EcContext::read_from_request_with_geo(settings, req, services, geo_info.as_ref()) {
             Ok(mut context) => {
                 context.set_device_signals(device_signals);
+                context.set_recovery_eligible(is_real_browser && is_navigation_request(req));
                 (context, None)
             }
             Err(report) => (EcContext::default(), Some(report)),
