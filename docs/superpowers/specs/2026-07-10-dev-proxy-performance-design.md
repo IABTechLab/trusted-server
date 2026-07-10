@@ -186,15 +186,18 @@ the next write. The upstream client retries once when all of these are true:
 
 Initially, replayable means `GET`, `HEAD`, or `OPTIONS` with no
 `Content-Length`, no `Transfer-Encoding`, and an `Incoming` body whose size hint
-is exactly zero before the first attempt. For these requests, the proxy converts
-the body to Hyper's reusable empty body and retains cloned method, URI, version,
-and headers for one reconstruction. Proxy request extensions are not part of
-wire behavior and are not forwarded today; no extension-dependent request is
-eligible for retry. Unknown or misleading size hints, trailers, a body error,
-or any observed body frame make a request non-replayable. All other methods and
-all streaming uploads are attempted once. The retry opens a fresh connection
-and preserves the original wire-visible request head and security settings.
-There is never more than one automatic retry.
+is exactly zero **and** `Body::is_end_stream()` is true before the first attempt.
+Both conditions are required: a zero-byte size hint alone can still precede
+trailers and must not cause the original body to be discarded. For eligible
+requests, the proxy converts the body to Hyper's reusable empty body and retains
+cloned method, URI, version, and headers for one reconstruction. Proxy request
+extensions are not part of wire behavior and are not forwarded today; no
+extension-dependent request is eligible for retry. Unknown or misleading size
+hints, `is_end_stream() == false`, trailers, a body error, or any observed body
+frame make a request non-replayable. All other methods and all streaming uploads
+are attempted once. The retry opens a fresh connection and preserves the
+original wire-visible request head and security settings. There is never more
+than one automatic retry.
 
 ### Upstream HTTP/2
 
@@ -463,7 +466,8 @@ All behavior changes follow test-driven development.
 - Certificate prewarm success, startup failure, deduplication of configured
   FROM hosts, and the unexpected runtime-miss metric.
 - Retry eligibility for reused connections and replayable bodies, including
-  absent framing, misleading/unknown size hints, unexpected frames, trailers,
+  absent framing, misleading/unknown size hints, `exact == 0` with
+  `is_end_stream() == false`, zero-data bodies with trailers, unexpected frames,
   and mid-body errors.
 - Metrics counters and bounded timing buckets.
 
