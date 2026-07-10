@@ -33,17 +33,37 @@ logic, CMP/consent flows, first-party context — before any DNS cutover.
 **Non-goals.** Not a production proxy or load-testing tool. Does not modify any
 Fastly service. Local only, developer-facing.
 
-## Build and run
+## Install and run
 
-`ts dev proxy` is part of `crates/trusted-server-cli`, a workspace member that
-builds for the host. Because the workspace default target is `wasm32-wasip1`
-(where the CLI is an empty shell), build and run it with an explicit native
-target:
+`ts dev proxy` is a subcommand of the `ts` CLI, and is **macOS-only** — its
+dependencies are scoped to macOS, so the command is not present in the CLI on
+other platforms. On macOS, install (or update) the `ts` binary from the
+repository root (see [the CLI guide](./cli.md#install-from-source) for details):
 
 ```bash
-cargo run --manifest-path crates/trusted-server-cli/Cargo.toml \
-  --target "$(rustc -vV | sed -n 's/host: //p')" -- dev proxy --help
+cargo install-cli
 ```
+
+Rerun `cargo install-cli` after pulling CLI changes to refresh the installed
+binary. Then trust the dev CA once (see
+[the development CA](#the-development-ca)), map the production hostname to your
+upstream, and launch a browser:
+
+```bash
+ts dev proxy ca install
+ts dev proxy \
+  --map www.example-publisher.com=trusted-server-example.edgecompute.app \
+  --rewrite-host \
+  --launch chrome
+```
+
+`--rewrite-host` sends the upstream `Host: <TO>`, which most dev and staging
+upstreams require — they don't have the production hostname configured and would
+reject the default `Host: <FROM>`. See
+[Host header behavior](#host-header-behavior) for the one case where you can drop
+it.
+
+Run `ts dev proxy --help` to list every flag.
 
 ### Passing the rewrite rule
 
@@ -52,9 +72,7 @@ The upstream is always passed explicitly — there is no inference from
 shorthand, or one or more `--map FROM=TO` rules:
 
 ```bash
-cargo run --manifest-path crates/trusted-server-cli/Cargo.toml \
-  --target "$(rustc -vV | sed -n 's/host: //p')" -- dev proxy \
-  -f www.example-publisher.com -t trusted-server-example.edgecompute.app
+ts dev proxy -f www.example-publisher.com -t trusted-server-example.edgecompute.app
 ```
 
 With no `--map`/`-f`/`-t`, the proxy exits with
@@ -63,8 +81,7 @@ With no `--map`/`-f`/`-t`, the proxy exits with
 ### Explicit rule and browser launch
 
 ```bash
-cargo run --manifest-path crates/trusted-server-cli/Cargo.toml \
-  --target "$(rustc -vV | sed -n 's/host: //p')" -- dev proxy \
+ts dev proxy \
   --map www.example-publisher.com=trusted-server-example.edgecompute.app \
   --launch chrome,firefox,safari
 ```
@@ -79,7 +96,8 @@ omitted the proxy runs without opening any browser.
 ts dev proxy \
   -f www.example-publisher.com \
   -t staging.example.net \
-  --basic-auth dev:secret \
+  --rewrite-host \
+  --basic-auth-file ./staging-creds.txt \
   --launch firefox
 
 # Local instance over plain HTTP, no browser:
@@ -89,23 +107,25 @@ ts dev proxy \
   --upstream-plaintext
 ```
 
-## First run: CA setup
+## The development CA
 
-On first run the proxy generates a per-machine Certificate Authority and prints:
+The proxy relies on a per-machine Certificate Authority that your browser must
+trust. `ts dev proxy ca install` (in the quick start above) generates it if
+needed and trusts it in one step, so you don't have to run the proxy first.
+Running the proxy also generates the CA on first use, printing:
 
 ```
 generated dev CA at ~/Library/Application Support/trusted-server/dev-proxy/ca-cert.pem
 — run `ts dev proxy ca install` to trust it
 ```
 
-The CA key is stored with mode `0600` outside the repository and is never
-committed.
+The CA key is written with mode `0600` and, by default, is stored outside the
+repository; it is never committed.
 
 ### Trust the CA on macOS (Chrome and Safari)
 
 ```bash
-cargo run --manifest-path crates/trusted-server-cli/Cargo.toml \
-  --target "$(rustc -vV | sed -n 's/host: //p')" -- dev proxy ca install
+ts dev proxy ca install
 ```
 
 This adds the CA to the macOS login keychain (no `sudo` required; prompts for
@@ -120,18 +140,16 @@ Firefox profile's NSS database using `certutil`. If you are pointing an existing
 Firefox profile at the proxy manually, run:
 
 ```bash
-certutil -A -n "Trusted Server DEV-ONLY Proxy CA" \
+certutil -A -n "Trusted Server DEV-ONLY Proxy CA — DO NOT TRUST IN PRODUCTION" \
   -t "CT,," \
-  -i "$(cargo run --manifest-path crates/trusted-server-cli/Cargo.toml \
-    --target "$(rustc -vV | sed -n 's/host: //p')" -- dev proxy ca path)" \
-  -d "$HOME/Library/Application Support/Firefox/Profiles/<profile>"
+  -i "$(ts dev proxy ca path)" \
+  -d "sql:$HOME/Library/Application Support/Firefox/Profiles/<profile>"
 ```
 
 ### Revoking trust when done
 
 ```bash
-cargo run --manifest-path crates/trusted-server-cli/Cargo.toml \
-  --target "$(rustc -vV | sed -n 's/host: //p')" -- dev proxy ca uninstall
+ts dev proxy ca uninstall
 ```
 
 This removes the CA from the macOS keychain. Run it when you are finished —
@@ -175,8 +193,9 @@ all HTML/URL rewriting to it (it prefers `X-Forwarded-Host`, then `Host`), so
 **first-party URLs always stay on the production domain regardless of the `Host`
 header**. That decouples routing (`Host`) from the first-party host.
 
-By default `Host: <FROM>` too, which works against a Trusted Server Compute
-upstream because Fastly routes by SNI (`= TO`) and passes `Host` through unchanged.
+By default `Host: <FROM>` too. Fastly routes by SNI (`= TO`) and passes `Host`
+through unchanged, so `Host: <FROM>` reaches the upstream — but the upstream still
+has to be configured to accept it, which a dev or staging service usually isn't.
 
 **Targeting a specific server by IP.** To point at a particular server or load
 balancer — for example when the `TO` hostname isn't in DNS yet — keep `--to` a
@@ -208,9 +227,12 @@ hostname (e.g. a Fastly Deliver service that rejects an unconfigured `Host`), pa
 > **Caveat with real Trusted Server adapters.** The Fastly and Spin adapter
 > request paths strip inbound `X-Forwarded-Host` before routing, so with
 > `--rewrite-host` a real Trusted Server upstream falls back to `Host` (`TO`) and
-> emits first-party URLs on `TO`, not `FROM`. Prefer the default (no
-> `--rewrite-host`) with Trusted Server upstreams; reach for `--rewrite-host`
-> only when the upstream rejects an unconfigured `Host`.
+> emits first-party URLs on `TO`, not `FROM`. Even so, `--rewrite-host` is the
+> right choice for most upstreams — dev and staging services rarely have the
+> production hostname configured and would reject the plain `Host: <FROM>`. Drop
+> it only when the upstream is configured to accept `Host: <FROM>` and you
+> specifically need first-party URLs anchored to `FROM` — the `--resolve` example
+> above is exactly that case.
 
 The TLS SNI is always the `TO` host either way:
 
@@ -257,11 +279,14 @@ Options:
       --basic-auth-file <PATH>  Read USER:PASS from a file
       --insecure                Skip upstream TLS certificate verification
       --upstream-plaintext      Connect to upstream over plain HTTP
+      --connect-timeout <SECONDS>  Upstream connect timeout in seconds [default: 10]
       --ca-dir <PATH>           CA cert/key directory [default: ~/Library/Application Support/
                                 trusted-server/dev-proxy on macOS]
 ```
 
-The tool is flags-only; there are no environment variable overrides.
+The tool is flags-only; there are no environment variable overrides. The
+`[COMMAND]` slot is the `ca` subcommand — see
+[CA companion commands](#ca-companion-commands).
 
 ## Browser details
 
