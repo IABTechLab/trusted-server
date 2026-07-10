@@ -3775,7 +3775,7 @@ mod tests {
         );
         route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
             region: "us-east-1".to_string(),
-            secret_store: "s3-auth".to_string(),
+            secret_store: "s3_auth".to_string(),
             access_key_id: "access_key_id".to_string(),
             secret_access_key: "secret_access_key".to_string(),
             session_token: None,
@@ -3819,7 +3819,7 @@ mod tests {
             );
             route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
                 region: "us-east-1".to_string(),
-                secret_store: "s3-auth".to_string(),
+                secret_store: "s3_auth".to_string(),
                 access_key_id: "access_key_id".to_string(),
                 secret_access_key: "secret_access_key".to_string(),
                 session_token: None,
@@ -3894,7 +3894,7 @@ mod tests {
             let mut route = test_s3_image_optimizer_route();
             route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
                 region: "us-east-1".to_string(),
-                secret_store: "s3-auth-cache".to_string(),
+                secret_store: "s3_auth_cache".to_string(),
                 access_key_id: "cache_access_key_id".to_string(),
                 secret_access_key: "cache_secret_access_key".to_string(),
                 session_token: Some("cache_session_token".to_string()),

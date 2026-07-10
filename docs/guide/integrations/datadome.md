@@ -209,9 +209,11 @@ Config Store-backed CIDR sources accept newline-, comma-, whitespace-, or JSON-a
 
 ```toml
 [[integrations.datadome.protection_excluded_ip_cidr_sources]]
-config_store = "datadome-ip-bypass"
+config_store = "datadome_ip_bypass"
 key = "googlebot_ips"
 ```
+
+> `config_store` is an EdgeZero logical store id and must match `[A-Za-z0-9_]`; map it to a differently named physical store with `EDGEZERO__STORES__<KIND>__<ID>__NAME`.
 
 ### Header handling
 

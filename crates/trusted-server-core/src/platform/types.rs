@@ -76,7 +76,7 @@ pub struct ClientInfo {
 /// (`platform::composite`) this value is resolved as a **logical store id** via
 /// `ConfigRegistry::named` / `SecretRegistry::named` — i.e. the `[stores.*]` id
 /// declared in `edgezero.toml` (`trusted_server_config`, `jwks_store`,
-/// `ts_secrets`, `datadome-ip-bypass`, …), not a physical platform store name.
+/// `ts_secrets`, `datadome_ip_bypass`, …), not a physical platform store name.
 /// Under the D7 convention the logical id equals the platform store name, so
 /// existing call sites need no change. Distinct from [`StoreId`] (the
 /// management-API write identifier) to prevent passing a write identifier where

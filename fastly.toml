@@ -55,7 +55,7 @@ build = """
             key = "placeholder"
             data = "placeholder"
 
-        [[local_server.secret_stores.s3-auth]]
+        [[local_server.secret_stores.s3_auth]]
             key = "placeholder"
             data = "placeholder"
 
@@ -88,6 +88,6 @@ build = """
             current-kid = "ts-2025-10-A"
             active-kids = "ts-2025-10-A,ts-2025-10-B"
 
-        [local_server.config_stores.datadome-ip-bypass]
+        [local_server.config_stores.datadome_ip_bypass]
             format = "inline-toml"
-        [local_server.config_stores.datadome-ip-bypass.contents]
+        [local_server.config_stores.datadome_ip_bypass.contents]

@@ -25,11 +25,11 @@ ids = ["trusted_server_kv", "ec_identity_store", "consent_store", "creative_stor
 default = "trusted_server_kv"
 
 [stores.config]
-ids = ["trusted_server_config", "jwks_store"]
+ids = ["trusted_server_config", "jwks_store", "datadome_ip_bypass"]
 default = "trusted_server_config"
 
 [stores.secrets]
-ids = ["trusted_server_secrets", "signing_keys", "ts_secrets"]
+ids = ["trusted_server_secrets", "signing_keys", "ts_secrets", "s3_auth"]
 default = "trusted_server_secrets"
 
 # -- Fastly Compute (production) --------------------------------------------

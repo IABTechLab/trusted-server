@@ -7,13 +7,14 @@
 //! Cloudflare, and Spin runtimes. The anti-drift test in this module asserts the
 //! const and the manifest never diverge.
 //!
-//! Deferred ids: the `DataDome` IP-CIDR (`datadome-ip-bypass`) and S3 (`s3-auth`)
-//! stores are NOT declared here yet. `EdgeZero`'s manifest validator requires
-//! store ids to match `[A-Za-z0-9_]` (they become `EDGEZERO__STORES__…` env
-//! segments), so those hyphenated names cannot be registry ids as-is. They are
-//! also not routed through the registry in this phase (still bespoke paths), so
-//! declaring them would be premature. They join here — with underscore logical
-//! ids mapped to their physical names — when their reads move onto the composite.
+//! The `DataDome` IP-CIDR config store (`datadome_ip_bypass`) and the S3 secret
+//! store (`s3_auth`) are declared here as underscore logical ids. `EdgeZero`'s
+//! manifest validator requires store ids to match `[A-Za-z0-9_]` (they become
+//! `EDGEZERO__STORES__…` env segments), so the previously hyphenated names were
+//! converged onto underscores. Under the D7 convention the logical id equals the
+//! physical platform store name, so each maps to a same-named physical store; an
+//! operator whose physical store keeps a different name overrides it out of band
+//! with `EDGEZERO__STORES__<KIND>__<ID>__NAME`.
 
 use edgezero_core::app::{StoreMetadata, StoresMetadata};
 
@@ -27,7 +28,7 @@ use edgezero_core::app::{StoreMetadata, StoresMetadata};
 pub const STORES_METADATA: StoresMetadata = StoresMetadata {
     config: Some(StoreMetadata {
         default: "trusted_server_config",
-        ids: &["trusted_server_config", "jwks_store"],
+        ids: &["trusted_server_config", "jwks_store", "datadome_ip_bypass"],
     }),
     kv: Some(StoreMetadata {
         default: "trusted_server_kv",
@@ -40,7 +41,12 @@ pub const STORES_METADATA: StoresMetadata = StoresMetadata {
     }),
     secrets: Some(StoreMetadata {
         default: "trusted_server_secrets",
-        ids: &["trusted_server_secrets", "signing_keys", "ts_secrets"],
+        ids: &[
+            "trusted_server_secrets",
+            "signing_keys",
+            "ts_secrets",
+            "s3_auth",
+        ],
     }),
 };
 

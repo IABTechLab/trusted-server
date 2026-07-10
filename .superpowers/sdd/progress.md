@@ -47,6 +47,43 @@ Branch: worktree-edgezero-migration-spec
     shared STORES_METADATA const in core/src/stores.rs feeding all 4 Hooks::stores();
     anti-drift test (RED verified). CF: decision C (cloudflare.toml left vestigial;
     per-id wrangler.toml bindings deferred to Phase 2). All adapters + parity green.
+- Plan amended for post-merge state + 2-agent review (c22fcd045).
+- Task 3: COMPLETE (bfde7780a) — write-only PlatformConfigWriter/PlatformSecretWriter
+  split; CompositeConfigStore/CompositeSecretStore (Option<Registry> reader, strict:
+  absent registry AND unknown id both hard-error; writes delegate preserving StoreId);
+  StoreName doc → logical read id + read-site audit. Additive to core/platform only.
+  4 composite tests RED→GREEN; all 4 adapters check + fmt green.
+- Task 4: COMPLETE (11373ea89) — get_settings_from_config_store re-typed to
+  (&ConfigStoreHandle, key); Fastly reuses open_trusted_server_config_store();
+  Axum uses path-env-pointer (TRUSTED_SERVER_AXUM_CONFIG_PATH → tempdir file, else
+  from_local_file("trusted_server_config")); axum.rs harness updated; parity 13/0.
+  CF/Spin untouched (don't call the loader).
+- Defect fixes (45d590c7b), both pre-existing (Task 2/3), caught by Task 4:
+  * EdgeZero manifest validator REJECTS hyphenated store ids ([A-Za-z0-9_] only,
+    for EDGEZERO__STORES__ env exportability). s3-auth + datadome-ip-bypass removed
+    from edgezero.toml + STORES_METADATA (Spin manifest test was failing). They are
+    NOT yet routed through the registry, so removal is safe now.
+  * doc_markdown clippy -D warnings (EdgeZero/DataDome un-backticked) in
+    composite/traits/stores — fixed.
+
+## 2026-07-09 operator decision — s3-auth/datadome-ip-bypass (RESOLVED, was deferred below)
+- CONVERGE on underscore logical ids (Option A). Both reads route through RuntimeServices
+  (proxy.rs:829 secret_store; datadome protection_scope.rs:347 config_store) → the composite
+  in Task 5b, and EdgeZero forbids hyphenated registry ids. So: s3-auth → s3_auth,
+  datadome-ip-bypass → datadome_ip_bypass EVERYWHERE (code defaults, manifests' physical
+  store names, example/fixtures, user docs, tests) + re-declare as registry ids. Under D7
+  logical id == physical store name; operators with hyphenated physical stores use
+  EDGEZERO__STORES__<KIND>__<ID>__NAME (documented, not implemented here).
+- Task 5 SPLIT: 5a = the convergence rename (dispatched); 5b = composite wiring + named-KV.
+
+## (superseded) DEFERRED decision — config-contract
+- s3-auth (secret; settings.rs:655 default_s3_secret_store) and datadome-ip-bypass
+  (config; datadome/protection_scope.rs:165) are REAL store-name defaults with hyphens.
+  When their reads move onto the composite (registry.named(config_value)), the value
+  must be a valid underscore logical id. Options: (a) change operator-facing defaults
+  to s3_auth / datadome_ip_bypass (+ physical-name mapping via EDGEZERO__STORES__…__NAME),
+  or (b) keep these reads off the strict registry. Decide when Task 5/6 wires them.
+  Default-path tests won't trip it (DataDome IP-CIDR sources + S3 default-empty/disabled).
 
 ## 2026-07-07 operator decision (mid-Task-2) — SUPERSEDED 2026-07-08
 - (Was: KEEP app_config store id.) Rested on false premise that manifests/generator

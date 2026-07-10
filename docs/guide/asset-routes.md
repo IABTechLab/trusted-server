@@ -64,7 +64,7 @@ origin_url = "https://bucket.s3.us-east-1.amazonaws.com"
 type = "s3_sigv4"
 region = "us-east-1"
 origin_query = "strip"
-secret_store = "s3-auth"
+secret_store = "s3_auth"
 access_key_id = "access_key_id"
 secret_access_key = "secret_access_key"
 # session_token = "session_token"
@@ -87,10 +87,12 @@ The default secret store and key names are:
 
 | Config field        | Default value       | Secret value                         |
 | ------------------- | ------------------- | ------------------------------------ |
-| `secret_store`      | `s3-auth`           | Secret store name                    |
+| `secret_store`      | `s3_auth`           | Secret store name                    |
 | `access_key_id`     | `access_key_id`     | AWS access key ID                    |
 | `secret_access_key` | `secret_access_key` | AWS secret access key                |
 | `session_token`     | unset               | Optional AWS temporary session token |
+
+`secret_store` is an EdgeZero logical store id and must match `[A-Za-z0-9_]`; map it to a differently named physical store with `EDGEZERO__STORES__<KIND>__<ID>__NAME`.
 
 Use private deployment configuration for environment-specific store names or profile tables.
 

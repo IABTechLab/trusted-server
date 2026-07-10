@@ -869,11 +869,13 @@ The first supported origin auth type is `s3_sigv4`.
 | ------------------- | ------ | -------- | ------------------- | ----------------------------------------------- |
 | `type`              | String | Yes      | none                | Must be `s3_sigv4`                              |
 | `region`            | String | Yes      | none                | AWS region used in the SigV4 credential scope   |
-| `secret_store`      | String | No       | `s3-auth`           | Runtime secret store containing AWS credentials |
+| `secret_store`      | String | No       | `s3_auth`           | Runtime secret store containing AWS credentials |
 | `access_key_id`     | String | No       | `access_key_id`     | Secret key containing the AWS access key ID     |
 | `secret_access_key` | String | No       | `secret_access_key` | Secret key containing the AWS secret access key |
 | `session_token`     | String | No       | unset               | Optional secret key containing a session token  |
 | `origin_query`      | String | No       | route default       | `preserve` or `strip`                           |
+
+> `secret_store` is an EdgeZero logical store id and must match `[A-Za-z0-9_]`; map it to a differently named physical store with `EDGEZERO__STORES__<KIND>__<ID>__NAME`.
 
 **Example**:
 
@@ -886,7 +888,7 @@ origin_url = "https://bucket.s3.us-east-1.amazonaws.com"
 type = "s3_sigv4"
 region = "us-east-1"
 origin_query = "strip"
-secret_store = "s3-auth"
+secret_store = "s3_auth"
 access_key_id = "access_key_id"
 secret_access_key = "secret_access_key"
 # session_token = "session_token"

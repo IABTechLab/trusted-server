@@ -653,7 +653,7 @@ fn default_request_signing_enabled() -> bool {
 }
 
 fn default_s3_secret_store() -> String {
-    "s3-auth".to_string()
+    "s3_auth".to_string()
 }
 
 fn default_s3_access_key_id() -> String {
@@ -3296,7 +3296,7 @@ origin_host_header_overide = "www.example.com""#,
                 (excluded_methods_key, Some(r#"["OPTIONS","TRACE"]"#)),
                 (
                     cidr_sources_key,
-                    Some(r#"[{"config_store":"datadome-ip-bypass","key":"googlebot_ips"}]"#),
+                    Some(r#"[{"config_store":"datadome_ip_bypass","key":"googlebot_ips"}]"#),
                 ),
                 (
                     rules_key,
@@ -3324,7 +3324,7 @@ origin_host_header_overide = "www.example.com""#,
                     "should parse method list from JSON env override"
                 );
                 assert_eq!(
-                    cfg.protection_excluded_ip_cidr_sources[0].config_store, "datadome-ip-bypass",
+                    cfg.protection_excluded_ip_cidr_sources[0].config_store, "datadome_ip_bypass",
                     "should parse CIDR source config_store from JSON env override"
                 );
                 assert_eq!(
@@ -3391,7 +3391,7 @@ origin_host_header_overide = "www.example.com""#,
                     format!(
                         "{datadome_prefix}PROTECTION_EXCLUDED_IP_CIDR_SOURCES{separator}0{separator}CONFIG_STORE"
                     ),
-                    Some("datadome-ip-bypass"),
+                    Some("datadome_ip_bypass"),
                 ),
                 (
                     format!(
@@ -4576,7 +4576,7 @@ origin_host_header_overide = "www.example.com""#,
         match route.auth.as_ref().expect("should configure route auth") {
             AssetOriginAuth::S3SigV4(config) => {
                 assert_eq!(config.region, "us-east-1");
-                assert_eq!(config.secret_store, "s3-auth");
+                assert_eq!(config.secret_store, "s3_auth");
                 assert_eq!(config.access_key_id, "access_key_id");
                 assert_eq!(config.secret_access_key, "secret_access_key");
             }

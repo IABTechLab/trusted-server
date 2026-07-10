@@ -162,7 +162,7 @@ static IP_CIDR_SOURCE_CACHE: LazyLock<
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn default_ip_cidr_source_store() -> String {
-    "datadome-ip-bypass".to_string()
+    "datadome_ip_bypass".to_string()
 }
 
 fn default_enabled_rule() -> bool {
@@ -790,7 +790,7 @@ mod tests {
         clear_ip_cidr_source_cache_for_tests();
         let mut config = config_with_protection();
         config.protection_excluded_ip_cidr_sources = vec![ProtectionIpCidrSourceConfig {
-            config_store: "datadome-ip-bypass".to_string(),
+            config_store: "datadome_ip_bypass".to_string(),
             key: "googlebot_ips".to_string(),
         }];
         let scope = ProtectionScope::compile(&config).expect("should compile scope");

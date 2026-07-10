@@ -50,7 +50,7 @@ key_value_stores = [
     "creative_store",
     "trusted_server_config",
     "jwks_store",
-    "datadome-ip-bypass",
+    "datadome_ip_bypass",
 ]
 
 [component.trusted-server.variables]
