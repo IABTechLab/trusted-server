@@ -871,8 +871,28 @@ pub(crate) fn prepend_auction_debug_comment(
         Some(r) => format!("ok({}_bids)", r.bids.len()),
         None => "none".to_string(),
     };
+    // Full per-provider (and mediator) dump so the operator can see exactly what
+    // each SSP returned — `status` (nobid vs error vs success), every `bids`
+    // entry, and `metadata` (which carries PBS `ext.errors` / `ext.debug.httpcalls`
+    // when prebid `debug=true`) — without needing log access.
+    //
+    // `Bid.creative` and provider metadata are attacker/partner-influenced and
+    // may contain `-->` (or the `--!>` variant), which would terminate the HTML
+    // comment early and leak the remaining markup into the live DOM. Neutralise
+    // both terminators before embedding so the dump stays inside the comment.
+    let neutralise_comment_terminators =
+        |json: String| -> String { json.replace("-->", "-- >").replace("--!>", "-- !>") };
+    let providers_dump = serde_json::to_string_pretty(&result.provider_responses)
+        .map(neutralise_comment_terminators)
+        .unwrap_or_else(|e| format!("<provider_responses serialize error: {e}>"));
+    let mediator_dump = serde_json::to_string_pretty(&result.mediator_response)
+        .map(neutralise_comment_terminators)
+        .unwrap_or_else(|e| format!("<mediator_response serialize error: {e}>"));
     let debug_comment = format!(
-        "<!-- ts-debug: path={path_label} ssp={ssp_count} mediator={mediator_info} winning={} time={}ms -->",
+        "<!-- ts-debug: path={path_label} ssp={ssp_count} mediator={mediator_info} winning={} time={}ms\n\
+         provider_responses={providers_dump}\n\
+         mediator_response={mediator_dump}\n\
+         -->",
         result.winning_bids.len(),
         result.total_time_ms,
     );
@@ -2439,6 +2459,76 @@ mod tests {
     use super::*;
     use crate::auction::types::{AdFormat, AdSlot, MediaType};
     use crate::integrations::IntegrationRegistry;
+
+    #[test]
+    fn auction_debug_comment_dumps_provider_status_and_neutralises_terminators() {
+        use crate::auction::orchestrator::OrchestrationResult;
+        use crate::auction::types::AuctionResponse;
+
+        // One provider that returned nothing (the `winning=0` case) and one that
+        // returned a bid whose creative embeds an HTML-comment terminator.
+        let no_bid = AuctionResponse::no_bid("prebid", 665);
+        let mut bid = make_test_bid_with_creative("<div>evil-->break</div>");
+        bid.slot_id = "ad-header-0".to_string();
+        let with_bid = AuctionResponse::success("aps", vec![bid], 42);
+
+        let result = OrchestrationResult {
+            provider_responses: vec![no_bid, with_bid],
+            mediator_response: None,
+            winning_bids: std::collections::HashMap::new(),
+            total_time_ms: 665,
+            metadata: std::collections::HashMap::new(),
+        };
+
+        let state = Arc::new(Mutex::new(Some("BIDS_SCRIPT".to_string())));
+        prepend_auction_debug_comment("stream", &result, &state);
+        let comment = state
+            .lock()
+            .expect("should lock state")
+            .clone()
+            .expect("should have comment");
+
+        assert!(
+            comment.contains("\"status\": \"nobid\""),
+            "should surface the no-bid provider status: {comment}"
+        );
+        assert!(
+            comment.contains("provider_responses="),
+            "should dump the provider_responses payload"
+        );
+        // The creative's `-->` must be neutralised so the only comment terminator
+        // is the trailing one — otherwise embedded markup would leak into the DOM.
+        assert_eq!(
+            comment.matches("-->").count(),
+            1,
+            "creative `-->` must be neutralised, leaving only the closing terminator: {comment}"
+        );
+        assert!(
+            comment.contains("evil-- >break"),
+            "should retain the creative content with the terminator neutralised"
+        );
+    }
+
+    fn make_test_bid_with_creative(creative: &str) -> Bid {
+        Bid {
+            slot_id: "slot".to_string(),
+            price: Some(1.0),
+            currency: "USD".to_string(),
+            creative: Some(creative.to_string()),
+            adomain: None,
+            bidder: "seat".to_string(),
+            width: 300,
+            height: 250,
+            nurl: None,
+            burl: None,
+            ad_id: None,
+            cache_id: None,
+            cache_host: None,
+            cache_path: None,
+            metadata: Default::default(),
+        }
+    }
+
     use crate::platform::test_support::{
         build_services_with_http_client, noop_services, StubHttpClient,
     };
