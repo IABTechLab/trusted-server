@@ -5,12 +5,27 @@ configuration, page audits, and EdgeZero-backed lifecycle commands.
 
 ## Install from source
 
-The workspace default target is `wasm32-wasip1`, so build or test the CLI with
-your host target:
+From the repository root, install the `ts` binary with the workspace Cargo alias:
 
 ```bash
-HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
-cargo build --package trusted-server-cli --target "$HOST_TARGET"
+cargo install-cli
+```
+
+The alias runs `cargo install --path crates/trusted-server-cli --bin ts --locked --force`.
+Because it does not pass an explicit `--target`, Cargo builds the CLI for your
+current host platform. The binary is installed into Cargo's bin directory,
+usually `~/.cargo/bin`; make sure that directory is on your `PATH`.
+
+For example, add Cargo's bin directory to your current shell session:
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+```
+
+Verify the install:
+
+```bash
+ts --help
 ```
 
 ## Common workflow
