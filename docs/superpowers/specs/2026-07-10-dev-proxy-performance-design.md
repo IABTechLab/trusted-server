@@ -189,7 +189,10 @@ The HTTP/1.1 pool obeys these rules:
 
 Connection return is part of the core design, not an implementation detail. A
 leased HTTP/1.1 sender and its driver-health signal remain owned by a
-`PooledResponseBody` until both request upload and response download finish.
+`PooledResponseBody` until the response terminates or an earlier close condition
+occurs. Reuse requires both request upload and response download to have
+completed successfully; an early response closes instead of waiting for the
+upload.
 
 The request-body adapter records one of `Streaming`, `Complete`, or `Failed`:
 
