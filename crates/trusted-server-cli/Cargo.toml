@@ -17,7 +17,9 @@ workspace = true
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 chromiumoxide = { workspace = true }
 clap = { workspace = true }
+derive_more = { workspace = true, features = ["display"] }
 edgezero-cli = { workspace = true }
+error-stack = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
 regex = { workspace = true }
@@ -32,6 +34,20 @@ trusted-server-core = { workspace = true }
 url = { workspace = true }
 which = { workspace = true }
 
+# `ts dev lint domains` and `ts dev install-hooks` drive all git access through
+# gitoxide (no `git` subprocess). Cross-host: the linter runs in CI on every
+# target. Versions verified via `cargo tree -p gix -p gix-config` to avoid
+# duplicate versions in the lock file.
+gix = { version = "0.83", default-features = false, features = [
+    "blob-diff",
+    "index",
+    "revision",
+    "sha1",
+    # Fixture repos in the unit tests construct trees via gix-only APIs.
+    "tree-editor",
+] }
+gix-config = "0.56"
+
 # `ts dev proxy` is macOS-only — CA trust via the login keychain, Safari
 # automation via `networksetup`, and a native TLS / networking stack. Scoping
 # these dependencies to macOS keeps unsupported targets (notably the
@@ -41,9 +57,7 @@ which = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 base64 = { workspace = true }
 bytes = { workspace = true }
-derive_more = { workspace = true }
 directories = { workspace = true }
-error-stack = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true, features = ["http1", "server", "client"] }
 hyper-util = { workspace = true, features = ["tokio"] }
@@ -62,4 +76,7 @@ tokio = { workspace = true, features = ["test-util"] }
 x509-parser = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+temp-env = { workspace = true }
 tempfile = { workspace = true }
