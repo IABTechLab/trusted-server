@@ -22,8 +22,8 @@ should be amortized across requests.
 ## Goals
 
 1. Reuse upstream connections safely across forwarded requests.
-2. Support upstream HTTP/2 multiplexing when the origin negotiates it, with
-   transparent HTTP/1.1 fallback.
+2. Evaluate upstream HTTP/2 multiplexing after HTTP/1 pooling and retain it only
+   when its entry, compatibility, and performance gates pass.
 3. Establish objective before-and-after measurements for latency, connection
    count, handshake count, throughput, and CPU-sensitive proxy overhead.
 4. Remove avoidable per-request cloning, parsing, encoding, and allocation.
@@ -109,7 +109,7 @@ affect transport identity or security:
 
 ```text
 protocol: plaintext | TLS
-logical host: normalized TO hostname
+reference identity: normalized DNS TO | IP TO
 port
 address policy: logical DNS policy or concrete --resolve pin
 TLS verification: secure | insecure
@@ -124,7 +124,13 @@ by TLS. A default rule that sends `Host: FROM` forces HTTP/1.1, preserving the
 existing deliberate separation between SNI (`TO`) and Host (`FROM`) without
 relying on cross-origin HTTP/2 behavior.
 
-The stable pool key is `(transport, normalized SNI/TO host, port, verification
+The TO reference identity is either a normalized DNS hostname or an IP literal,
+matching Rustls `ServerName`. For DNS identities, TLS sends SNI equal to TO. For
+IP identities, TLS sends no DNS SNI and secure mode validates an IP SAN, matching
+current behavior. IP-literal rules are HTTP/1-required; HTTP/2 eligibility is
+limited to DNS TO identities whose rewritten authority equals TO.
+
+The stable pool key is `(transport, normalized TO reference identity, port, verification
 mode, application mode, address policy)`. For `--resolve`, address policy
 contains the pinned IP. For DNS, address policy is the logical DNS policy, not a
 fallback-varying peer IP. Each connection record stores its actual peer address
@@ -136,7 +142,8 @@ The custom manager performs exact-key lookup only. It never coalesces across TO
 hostnames, even if two names resolve to one IP or a certificate contains both
 names. Hyper and Rustls drive a connection but do not select a pool entry; only
 the manager does. Thus every secure connection was authenticated for the exact
-TO/SNI hostname in its key before carrying a request.
+TO reference identity in its key before carrying a request; SNI is present only
+for DNS identities.
 
 ### Upstream Client and HTTP/1.1 Pool
 
@@ -170,10 +177,13 @@ The HTTP/1.1 pool obeys these rules:
   termination is never returned to the pool. The response wrapper records
   connection-close intent before the existing hop-by-hop sanitation removes the
   header from the browser-facing response.
-- At most six live HTTP/1.1 connections exist per origin and 64 live upstream
-  connections exist globally. “Live” includes connecting, leased, idle, and
-  draining connections. Admission of both limits is atomic under the transport
-  manager; it must not hold one capacity permit while waiting for the other.
+- At most six live HTTP/1.1 connections exist per origin and 64 live
+  **manager-owned mapped** upstream connections exist globally. Blind tunnels
+  and stray plain-HTTP forwarding keep their existing bypass behavior and do not
+  count toward this pool bound. “Live” includes connecting, leased, idle, and
+  driver-closing connections. Admission of both limits is atomic under the
+  transport manager; it must not hold one capacity permit while waiting for the
+  other.
   Requests at the limit wait in FIFO order. The wait queue is bounded to 32 per
   origin and 128 globally; excess requests receive `502`. Dropping the browser
   request cancels and removes its waiter. An internal 30-second acquisition
@@ -188,7 +198,8 @@ The HTTP/1.1 pool obeys these rules:
 ### HTTP/1.1 Lease State Machine
 
 Connection return is part of the core design, not an implementation detail. A
-leased HTTP/1.1 sender and its driver-health signal remain owned by a
+leased HTTP/1.1 sender, its driver-health signal, and an explicit driver abort
+handle remain owned by a
 `PooledResponseBody` until the response terminates or an earlier close condition
 occurs. Reuse requires both request upload and response download to have
 completed successfully; an early response closes instead of waiting for the
@@ -216,8 +227,14 @@ The response-body adapter follows this state machine:
    downstream cancellation/drop before terminal end-of-stream, or upstream close
    intent. Also enter `Closed` when response end-of-stream arrives while request
    upload is still `Streaming`; forward response EOF immediately, without waiting
-   for or draining the upload. Drop the sender and capacity lease; never drain in
-   the background.
+   for or draining the upload. Drop the sender and invoke the driver abort handle;
+   never drain in the background.
+
+Manager live capacity is driver-owned, not body-owned. Closing a lease requests
+driver abort but does not decrement live counts. The spawned driver owns a drop
+guard that reports `DriverClosed(ConnectionId)` even when its task is aborted;
+only that event releases origin/global capacity and admits waiters. Therefore an
+upload or socket cannot remain active after accounting says capacity is free.
 
 Upstream `Connection: close` and equivalent HTTP/1 connection intent are
 captured before hop-by-hop response sanitation. The sanitized header is still
@@ -241,17 +258,24 @@ the next write. Two HTTP/1 failure classes are distinct:
 Initially, replayable means `GET`, `HEAD`, or `OPTIONS` with no
 `Content-Length`, no `Transfer-Encoding`, and an `Incoming` body whose size hint
 is exactly zero **and** `Body::is_end_stream()` is true before the first attempt.
+Capture method, framing headers, body state, and `Request::extensions().is_empty()`
+from the original inbound request before hop-by-hop sanitation. Any extension
+makes the request ineligible; there is no inferred notion of an
+“extension-dependent” request.
 Both conditions are required: a zero-byte size hint alone can still precede
 trailers and must not cause the original body to be discarded. For eligible
 requests, the proxy converts the body to Hyper's reusable empty body and retains
-cloned method, URI, version, and headers for one reconstruction. Proxy request
-extensions are not part of wire behavior and are not forwarded today; no
-extension-dependent request is eligible for retry. Unknown or misleading size
+cloned method, URI, version, and headers for one reconstruction. Request
+extensions are not forwarded or reconstructed. Unknown or misleading size
 hints, `is_end_stream() == false`, trailers, a body error, or any observed body
 frame make a request non-replayable. All other methods and all streaming uploads
 are attempted once. The retry opens a fresh connection and preserves the
 original wire-visible request head and security settings. There is never more
 than one automatic retry.
+
+HTTP/2 retry, if that experiment is retained, uses this same retained empty-body
+representation unless a later explicitly tested replay representation is added;
+it never assumes a consumed streaming body is reconstructable.
 
 ### Upstream HTTP/2
 
@@ -269,8 +293,16 @@ normal HTTP/1.1 pool under the eligible-mode origin key. For eligible rules:
   streams. A draining GOAWAY connection and its replacement may temporarily
   coexist, but only the replacement accepts new streams. No more than 32
   non-draining HTTP/2 connections exist globally. Draining connections still
-  count toward the 64-live-connection global transport limit. Stream waiters use
+  count toward the 64-live-connection global manager-owned limit. Stream waiters use
   the same bounded per-origin/global queue and cancellation rules as HTTP/1.1;
+- acquire one stream permit before dispatch. Reuse requires both request-upload
+  completion and response EOS. If response EOS, downstream drop, or body error
+  occurs while upload remains streaming, invoke an explicit stream-reset handle
+  and retain the permit until a stream-termination guard confirms local reset or
+  closure. Response headers and a reset request alone do not release it. Request-
+  upload failure follows the same reset-then-confirm rule. A GOAWAY/draining connection retains its global
+  live-connection capacity until the driver exits, using the same driver-owned
+  accounting rule as HTTP/1.1;
 - the connection remains keyed by the complete upstream origin key;
 - before dispatch, the client constructs an HTTP/2 request URI whose authority
   is the TO hostname plus any non-default port. Hyper therefore emits
@@ -317,10 +349,20 @@ configurations advertise only `http/1.1`; eligible configurations advertise
 `h2, http/1.1`. A cache keyed only by `--insecure` is prohibited because it could
 advertise HTTP/2 on a `Host: FROM` rule.
 
-HTTP/2 is not part of the initial HTTP/1 pooling delivery. Build the focused
-protocol-discovery/translation proof only if post-pooling metrics show connection
-setup or the six-connection HTTP/1 concurrency ceiling consumes at least 10% of
-the named concurrent remote-latency workload. HTTP/2 is then retained only if
+HTTP/2 is not part of the initial HTTP/1 pooling delivery. Its entry gate uses
+the named remote-latency workload and two controlled variants after two warmups:
+
+- setup contribution is `(cold_duration - preconnected_duration) /
+  cold_duration`, comparing the normal cold pool with an otherwise identical run
+  whose HTTP/1 connections are established before timing;
+- concurrency-ceiling contribution is `(cap6_duration - cap20_duration) /
+  cap6_duration`, comparing the production cap with an internal harness-only cap
+  of 20.
+
+Use the median of ten alternating runs for each comparison. Enter the HTTP/2
+proof if either contribution is at least 10%. Runtime metrics also record pool
+acquisition and queue-wait duration for diagnosis, but overlapping aggregate
+timers are not used as the gate denominator. HTTP/2 is then retained only if
 the benchmark suite shows a meaningful improvement
 over pooled HTTP/1.1 for the representative concurrent workload and the added
 complexity does not weaken correctness. After two unrecorded warmups, run each
@@ -393,7 +435,7 @@ The prefixed-I/O adapter is the single owner of over-read bytes and yields each
 byte exactly once before delegating to the socket. The TLS acceptor, blind tunnel,
 and plain-HTTP forwarder all consume that same adapter; no path separately
 replays the bytes. Buffered parsing is deferred unless initial metrics attribute
-at least 5% of the local proxy-overhead workload to CONNECT/PAC head parsing. If
+at least 5% of the named local-overhead workload to CONNECT/PAC head parsing. If
 it misses that gate, retain the exact byte reader and record the rejected
 optimization rather than accepting new protocol risk for a marginal gain.
 
@@ -402,7 +444,7 @@ optimization rather than accepting new protocol risk for a marginal gain.
 During configuration resolution, each rule precomputes validated immutable data:
 
 - normalized FROM hostname;
-- parsed logical TO hostname and port;
+- parsed TO reference identity and port;
 - TLS `ServerName` for TLS upstreams;
 - upstream `Host` header value;
 - `X-Forwarded-Host` and `X-Orig-Host` values;
@@ -461,7 +503,7 @@ in implementation notes.
 Use low-overhead atomics and scoped timers. Collect at least:
 
 - accepted browser connections;
-- CONNECT heads parsed and rejected;
+- initial request heads parsed/rejected and parse duration;
 - leaf cache hits, misses, unexpected post-prewarm mints, and mint duration;
 - DNS cache hits, misses, and lookup duration;
 - upstream TCP connection attempts, established connections, and connect
@@ -469,6 +511,7 @@ Use low-overhead atomics and scoped timers. Collect at least:
 - upstream TLS handshakes and handshake duration;
 - negotiated HTTP/1.1 and HTTP/2 connection counts;
 - HTTP/1 pool hits, misses, stale failures, and retries;
+- pool acquisition and queue-wait duration;
 - HTTP/2 stream count and connection replacements;
 - request time to upstream response headers;
 - completed and failed requests.
@@ -490,13 +533,19 @@ selected. Keep its mandatory scope to the workloads that gate decisions:
    reuse and handshake count.
 2. One hundred requests at concurrency 20 to a delayed HTTP/1.1 upstream,
    measuring pool bounds and total duration.
-3. A remote-latency model with injectable DNS/connect/TLS/response delays,
-   measuring where remaining time is spent without public network access.
+3. A remote-latency model of 100 zero-body GETs at concurrency 20 with injectable
+   30 ms connection setup, 30 ms TLS setup, and 25 ms response delay, measuring
+   where remaining time is spent without public network access.
 
-Cold/warm certificate, DNS/`--resolve`, HTTP/2, parser, and socket-option variants
+DNS/`--resolve`, HTTP/2, parser, and socket-option variants
 are added only for the corresponding stage after it clears its entry gate. The
 benchmark harness must remain smaller than the transport implementation it
 evaluates.
+
+The parser entry measurement, when reached, is a named local-overhead workload:
+1,000 new loopback connections each send one valid local PAC request and read its
+response, single-threaded. The gate denominator is total client-observed workload
+duration; aggregated initial-head parse duration must be at least 5%.
 
 The harness records median, p95, total duration, upstream TCP connection count,
 TLS handshake count, and request failures. Timing assertions are not placed in
@@ -531,7 +580,7 @@ against an HTTP/1.1 upstream that holds each response for 25 milliseconds:
 
 For allocation changes:
 
-- CPU or duration improves measurably in the local overhead workload, or the
+- CPU or duration improves measurably in the named sequential TLS workload, or the
   change is retained only when it materially simplifies the code without
   weakening correctness.
 
@@ -561,12 +610,14 @@ All new fallible paths continue using `error-stack` with concrete contexts.
 
 The optimized implementation must preserve these invariants:
 
-1. TLS SNI is always the TO hostname and never includes a port.
-2. Secure mode validates the upstream certificate against the TO hostname.
+1. TLS reference identity is always TO and never includes a port. DNS TO values
+   send SNI equal to the normalized hostname; IP TO values send no DNS SNI.
+2. Secure mode validates the upstream certificate against the TO reference
+   identity (DNS SAN or IP SAN).
 3. `--insecure` remains explicit, global, and loudly warned.
 4. `--resolve` changes only the connection address, never SNI or Host semantics.
 5. Plaintext and TLS connections are never pooled together.
-6. Connections authenticated for different TO hostnames are never shared.
+6. Connections authenticated for different TO reference identities are never shared.
    Cross-name HTTP/2 coalescing is disabled even when IP addresses and
    certificate SANs overlap.
 7. Forwarding-header sanitation is unchanged: inbound `Forwarded` and
@@ -588,7 +639,13 @@ All behavior changes follow test-driven development.
 
 ### Unit Tests
 
+Core HTTP/1 and certificate-prewarm unit tests always run. DNS,
+buffered-parser, HTTP/2, and socket-option unit tests are required only when the
+corresponding experiment clears its entry gate and its code is retained.
+
 - Origin-key equality and separation across every security-relevant field.
+- DNS and IP TO reference identities, including DNS SNI, no DNS SNI for IP,
+  DNS-SAN/IP-SAN verification, and IP rules remaining HTTP/1-required.
 - TLS client configuration separation across secure/insecure and HTTP/1
   required/HTTP/2 eligible modes.
 - DNS cache hit, expiry, eviction, multi-address fallback, and `--resolve`
@@ -601,8 +658,8 @@ All behavior changes follow test-driven development.
   FROM hosts, mixed-case CONNECT reuse, and the unexpected runtime-miss metric.
 - Retry eligibility for reused connections and replayable bodies, including
   absent framing, misleading/unknown size hints, `exact == 0` with
-  `is_end_stream() == false`, zero-data bodies with trailers, unexpected frames,
-  and mid-body errors.
+  `is_end_stream() == false`, non-empty extensions, zero-data bodies with
+  trailers, unexpected frames, and mid-body errors.
 - Metrics counters and bounded timing buckets.
 
 ### Integration Tests
@@ -620,7 +677,9 @@ gate and its code is retained.
   end-of-stream and otherwise closes without unbounded draining.
 - An upstream that returns an early response without consuming the full
   streaming upload reaches the browser without delay and closes, rather than
-  pooling, that upstream connection.
+  pooling, that upstream connection. The test asserts upload polling stops, the
+  socket closes, and manager live capacity is released only after the driver
+  drop guard reports termination.
 - A server-closed idle connection is retried once on a fresh connection.
 - Sender-readiness failure preserves an unconsumed request; post-send failure
   retries only an eligible idempotent empty request. Streaming and truncated
@@ -628,7 +687,7 @@ gate and its code is retained.
 - Multi-address connection attempts share one total deadline and record the
   actual selected peer without fragmenting logical pool identity.
 - TLS, plaintext, secure, insecure, and `--resolve` pools remain isolated.
-- Origin-key tests vary protocol, TO hostname, port, address policy,
+- Origin-key tests vary protocol, TO reference identity, port, address policy,
   verification mode, and application mode independently, including combinations
   that cannot arise in one CLI invocation because `--insecure` and `--resolve`
   are global. Cross-rule integration tests use feasible same-process cases:
@@ -639,6 +698,10 @@ gate and its code is retained.
   Authorization values do not persist onto later requests on a reused
   connection.
 - HTTP/2 multiplexes concurrent requests and falls back to HTTP/1.1.
+- With upload still streaming, response EOS, downstream cancellation, response
+  body error, and upload failure each request stream reset and retain the stream
+  permit until the termination guard fires. A 101st request remains queued until
+  confirmed termination, proving the 100-stream cap cannot be released early.
 - Concurrent cold HTTP/2-eligible requests perform exactly one ALPN discovery
   connection; HTTP/1 fallback then expands only within the six-connection bound.
 - `Host: FROM` rules advertise only HTTP/1.1; HTTP/2-eligible rules expose
