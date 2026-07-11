@@ -20,7 +20,6 @@ use hyper::header::{HeaderName, HeaderValue};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
-use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -446,15 +445,15 @@ async fn forward_request(
         },
     };
     let outcome = rewrite_for(rule);
-    let upstream_host = rule.to.host().to_string();
+    let upstream_host = rule.to.host();
     let upstream_port = rule.to.port;
 
     match proxy_to_upstream(
         req,
-        &outcome,
+        outcome,
         basic_auth,
         insecure,
-        (&upstream_host, upstream_port),
+        (upstream_host, upstream_port),
         resolve,
         connect_timeout,
     )
@@ -501,8 +500,14 @@ async fn proxy_to_upstream(
         redact_target(req.uri()),
         upstream_host,
         upstream_port,
-        outcome.host_header,
-        outcome.orig_host,
+        outcome
+            .host_header
+            .to_str()
+            .expect("should prevalidate Host header"),
+        outcome
+            .orig_host
+            .to_str()
+            .expect("should prevalidate original host header"),
     );
 
     rewrite_headers(req.headers_mut(), outcome, basic_auth);
@@ -515,8 +520,10 @@ async fn proxy_to_upstream(
 
     let mut response = if outcome.scheme_is_tls {
         let connector = TlsConnector::from(client_config(insecure));
-        let server_name =
-            ServerName::try_from(outcome.sni.clone()).change_context(ProxyError::Server)?;
+        let server_name = outcome
+            .sni
+            .clone()
+            .expect("should precompute TLS server name");
         let tls = connector
             .connect(server_name, tcp)
             .await
@@ -603,9 +610,7 @@ fn rewrite_headers(
     // Strip hop-by-hop headers first, so a client cannot flag the authoritative
     // headers we stamp below as connection-specific and have them dropped.
     strip_hop_by_hop(headers);
-    if let Ok(value) = HeaderValue::from_str(&outcome.host_header) {
-        headers.insert(hyper::header::HOST, value);
-    }
+    headers.insert(hyper::header::HOST, outcome.host_header.clone());
     // Tell the upstream the original first-party host (always `FROM`). Trusted
     // Server resolves the request host from `Forwarded` → `X-Forwarded-Host` →
     // `Host`, so a client-supplied `Forwarded` would outrank the value we inject.
@@ -617,10 +622,14 @@ fn rewrite_headers(
     // back to `Host` (`TO`). See the `--rewrite-host` caveat in the user guide.
     // The `insert`s below already overwrite any inbound `X-Forwarded-Host`/`X-Orig-Host`.
     headers.remove("forwarded");
-    if let Ok(value) = HeaderValue::from_str(&outcome.orig_host) {
-        headers.insert(HeaderName::from_static(X_FORWARDED_HOST), value.clone());
-        headers.insert(HeaderName::from_static(X_ORIG_HOST), value);
-    }
+    headers.insert(
+        HeaderName::from_static(X_FORWARDED_HOST),
+        outcome.orig_host.clone(),
+    );
+    headers.insert(
+        HeaderName::from_static(X_ORIG_HOST),
+        outcome.orig_host.clone(),
+    );
     // The browser→proxy leg is always TLS, so the original scheme is `https`.
     // Stamp it authoritatively (overwriting any inbound value) and drop the
     // spoofable `Fastly-SSL` signal, so a plaintext upstream (`--upstream-plaintext`)
@@ -633,9 +642,8 @@ fn rewrite_headers(
     headers.remove("fastly-ssl");
     if let Some(auth) = basic_auth
         && !headers.contains_key(hyper::header::AUTHORIZATION)
-        && let Ok(value) = HeaderValue::from_str(&auth.header_value())
     {
-        headers.insert(hyper::header::AUTHORIZATION, value);
+        headers.insert(hyper::header::AUTHORIZATION, auth.header_value().clone());
     }
 }
 
@@ -733,6 +741,18 @@ mod tests {
     use super::*;
     use crate::commands::dev::proxy::rewrite::RewriteOutcome;
 
+    fn rewrite_outcome(host: &'static str) -> RewriteOutcome {
+        RewriteOutcome {
+            sni: Some(
+                rustls::pki_types::ServerName::try_from("to.edgecompute.app")
+                    .expect("should parse server name"),
+            ),
+            host_header: HeaderValue::from_static(host),
+            orig_host: HeaderValue::from_static("www.example-publisher.com"),
+            scheme_is_tls: true,
+        }
+    }
+
     fn head(method: &str, target: &str) -> RequestHead {
         RequestHead {
             method: method.to_string(),
@@ -764,12 +784,7 @@ mod tests {
 
     #[test]
     fn rewrite_headers_strips_proxy_connection() {
-        let outcome = RewriteOutcome {
-            sni: "to.edgecompute.app".to_string(),
-            host_header: "www.example-publisher.com".to_string(),
-            orig_host: "www.example-publisher.com".to_string(),
-            scheme_is_tls: true,
-        };
+        let outcome = rewrite_outcome("www.example-publisher.com");
         let mut headers = hyper::HeaderMap::new();
         headers.insert(
             HeaderName::from_static("proxy-connection"),
@@ -794,12 +809,7 @@ mod tests {
         // Trusted Server resolves the request host from `Forwarded` BEFORE
         // `X-Forwarded-Host`. A client-supplied `Forwarded` must therefore be
         // dropped, or it would outrank the FROM host the proxy injects.
-        let outcome = RewriteOutcome {
-            sni: "to.edgecompute.app".to_string(),
-            host_header: "to.edgecompute.app".to_string(),
-            orig_host: "www.example-publisher.com".to_string(),
-            scheme_is_tls: true,
-        };
+        let outcome = rewrite_outcome("to.edgecompute.app");
         let mut headers = hyper::HeaderMap::new();
         headers.insert(
             HeaderName::from_static("forwarded"),
@@ -821,12 +831,7 @@ mod tests {
     fn rewrite_headers_stamps_https_scheme_and_drops_spoofed_signals() {
         // The browser leg is always TLS, so the scheme is authoritatively https;
         // a client-supplied X-Forwarded-Proto / Fastly-SSL must not downgrade it.
-        let outcome = RewriteOutcome {
-            sni: "to.edgecompute.app".to_string(),
-            host_header: "www.example-publisher.com".to_string(),
-            orig_host: "www.example-publisher.com".to_string(),
-            scheme_is_tls: true,
-        };
+        let outcome = rewrite_outcome("www.example-publisher.com");
         let mut headers = hyper::HeaderMap::new();
         headers.insert(
             HeaderName::from_static(X_FORWARDED_PROTO),
@@ -853,12 +858,7 @@ mod tests {
         // A client naming the proxy's own headers in `Connection` must not cause
         // them to be dropped downstream: we strip the client's copies + the
         // `Connection` header, then stamp our authoritative values.
-        let outcome = RewriteOutcome {
-            sni: "to.edgecompute.app".to_string(),
-            host_header: "to.edgecompute.app".to_string(),
-            orig_host: "www.example-publisher.com".to_string(),
-            scheme_is_tls: true,
-        };
+        let outcome = rewrite_outcome("to.edgecompute.app");
         let mut headers = hyper::HeaderMap::new();
         headers.insert(
             hyper::header::CONNECTION,

@@ -114,10 +114,7 @@ async fn unmatched_host_is_blind_tunneled_on_loopback() {
 async fn basic_auth_injected_when_absent_clears_401() {
     let upstream = support::start_gated_upstream().await;
     let mut cfg = support::test_config(&upstream.addr);
-    cfg.basic_auth = Some(config::BasicAuth {
-        user: "dev".into(),
-        pass: "secret".into(),
-    });
+    cfg.basic_auth = Some(config::BasicAuth::new("dev", "secret").expect("should build auth"));
     let ca = Arc::new(support::dev_ca());
 
     let response = support::drive_request_through_proxy(cfg, ca).await;

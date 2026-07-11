@@ -4,6 +4,7 @@ pub mod config;
 pub mod metrics;
 pub mod rewrite;
 pub mod server;
+pub mod upstream;
 
 use std::sync::Arc;
 

@@ -89,10 +89,10 @@ fn snapshot_separates_attempts_from_established() {
 
 **Files:** Create `upstream/{mod.rs,key.rs}`; modify `config.rs`, `rewrite.rs`, and proxy `mod.rs`.
 
-- [ ] Write failing key tests varying transport, normalized TO/SNI host, port, verify mode, application mode, DNS policy, and `--resolve` pin independently.
-- [ ] Add a test proving two peer IPs selected for one DNS origin do not fragment the logical key, and two TO names sharing one IP never compare equal.
-- [ ] Run focused tests. Expected: RED because `OriginKey` does not exist.
-- [ ] Implement closed key types:
+- [x] Write failing key tests varying transport, normalized TO/SNI host, port, verify mode, application mode, DNS policy, and `--resolve` pin independently.
+- [x] Add a test proving two peer IPs selected for one DNS origin do not fragment the logical key, and two TO names sharing one IP never compare equal.
+- [x] Run focused tests. Expected: RED because `OriginKey` does not exist.
+- [x] Implement closed key types:
 
 ```rust
 pub enum Transport { Plaintext, Tls }
@@ -111,11 +111,11 @@ pub struct OriginKey {
 pub enum ReferenceIdentity { Dns(Arc<str>), Ip(IpAddr) }
 ```
 
-- [ ] Write failing tests requiring prevalidated `HeaderValue`s, `ServerName<'static>`, and a Basic-auth Debug output containing neither username, password, nor encoded token.
-- [ ] Replace `BasicAuth { user, pass }` with a private reusable header and custom `Debug` rendering `BasicAuth([REDACTED])`. Update fixtures to construct it through a checked constructor.
-- [ ] Precompute rule host/forwarding headers, SNI, transport, and stable origin-key fields during `config::resolve`; eliminate per-request Base64 and host-header formatting.
-- [ ] Run config/rewrite/key tests and existing E2E tests. Expected: GREEN with unchanged behavior.
-- [ ] Commit as `Precompute dev proxy upstream identity`.
+- [x] Write failing tests requiring prevalidated `HeaderValue`s, `ServerName<'static>`, and a Basic-auth Debug output containing neither username, password, nor encoded token.
+- [x] Replace `BasicAuth { user, pass }` with a private reusable header and custom `Debug` rendering `BasicAuth([REDACTED])`. Update fixtures to construct it through a checked constructor.
+- [x] Precompute rule host/forwarding headers, SNI, transport, and stable origin-key fields during `config::resolve`; eliminate per-request Base64 and host-header formatting.
+- [x] Run config/rewrite/key tests and existing E2E tests. Expected: GREEN with unchanged behavior.
+- [x] Commit as `Precompute dev proxy upstream identity`.
 
 ---
 

@@ -6,9 +6,11 @@ use std::path::PathBuf;
 
 use base64::Engine as _;
 use error_stack::{Report, ResultExt as _};
+use hyper::header::HeaderValue;
 
 use super::ProxyArgs;
 use super::rewrite::{Authority, Rule, RuleTable};
+use super::upstream::key::AddressPolicy;
 
 /// Errors from configuration resolution.
 #[derive(Debug, derive_more::Display)]
@@ -52,27 +54,40 @@ pub enum ConfigError {
 impl core::error::Error for ConfigError {}
 
 /// Basic-auth credentials to inject upstream.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BasicAuth {
-    pub user: String,
-    pub pass: String,
+    header: HeaderValue,
 }
 
 impl BasicAuth {
-    /// The `Authorization` header value (`Basic base64(user:pass)`).
+    /// Precomputes a validated `Authorization` header.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::BasicAuth`] if the generated value is not a valid
+    /// HTTP header value.
+    pub fn new(user: &str, pass: &str) -> Result<Self, ConfigError> {
+        let token = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+        let header =
+            HeaderValue::from_str(&format!("Basic {token}")).map_err(|_| ConfigError::BasicAuth)?;
+        Ok(Self { header })
+    }
+
+    /// The prevalidated `Authorization` header value.
     #[must_use]
-    pub fn header_value(&self) -> String {
-        let token = base64::engine::general_purpose::STANDARD
-            .encode(format!("{}:{}", self.user, self.pass));
-        format!("Basic {token}")
+    pub fn header_value(&self) -> &HeaderValue {
+        &self.header
     }
 
     fn parse(raw: &str) -> Result<Self, ConfigError> {
         let (user, pass) = raw.split_once(':').ok_or(ConfigError::BasicAuth)?;
-        Ok(Self {
-            user: user.to_string(),
-            pass: pass.to_string(),
-        })
+        Self::new(user, pass)
+    }
+}
+
+impl core::fmt::Debug for BasicAuth {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("BasicAuth([REDACTED])")
     }
 }
 
@@ -163,6 +178,7 @@ fn build_rules(args: &ProxyArgs) -> Result<RuleTable, ConfigError> {
             to,
             args.rewrite_host,
             args.upstream_plaintext,
+            args.insecure,
         )?);
     }
     if let (Some(from), Some(to)) = (&args.from, &args.to) {
@@ -171,6 +187,7 @@ fn build_rules(args: &ProxyArgs) -> Result<RuleTable, ConfigError> {
             to,
             args.rewrite_host,
             args.upstream_plaintext,
+            args.insecure,
         )?);
     }
     Ok(RuleTable(rules))
@@ -221,18 +238,22 @@ fn make_rule(
     to: &str,
     rewrite_host: bool,
     plaintext: bool,
+    insecure: bool,
 ) -> Result<Rule, ConfigError> {
     let from = from.to_ascii_lowercase();
     if !is_valid_host(&from) {
         return Err(ConfigError::InvalidFrom { value: from });
     }
     let to = Authority::parse(to, plaintext).map_err(|_| ConfigError::Rule)?;
-    Ok(Rule {
+    Rule::new(
         from,
         to,
         rewrite_host,
         plaintext,
-    })
+        insecure,
+        AddressPolicy::Dns,
+    )
+    .map_err(|_| ConfigError::Rule)
 }
 
 /// Resolves arguments into a [`ResolvedConfig`].
@@ -243,7 +264,7 @@ fn make_rule(
 /// invalid/forbidden listen address, malformed credentials, or an unknown
 /// browser.
 pub fn resolve(args: &ProxyArgs) -> Result<ResolvedConfig, Report<ConfigError>> {
-    let rules = build_rules(args).map_err(Report::from)?;
+    let mut rules = build_rules(args).map_err(Report::from)?;
     if rules.0.is_empty() {
         return Err(Report::new(ConfigError::NoRule));
     }
@@ -280,6 +301,12 @@ pub fn resolve(args: &ProxyArgs) -> Result<ResolvedConfig, Report<ConfigError>> 
     }
     let ca_dir = ca_dir(args);
     let resolve = build_resolve(args).map_err(Report::from)?;
+
+    for rule in &mut rules.0 {
+        if let Some(address) = resolve.get(rule.to.host()) {
+            rule.set_address_policy(AddressPolicy::Resolve(*address));
+        }
+    }
 
     // A `--resolve HOST:IP` whose HOST matches no rule's TO host is almost
     // certainly a typo: the pin would silently never apply. Warn rather than
@@ -322,7 +349,14 @@ fn resolve_basic_auth(args: &ProxyArgs) -> Result<Option<BasicAuth>, ConfigError
 
 #[cfg(test)]
 mod tests {
+    use hyper::header::HeaderValue;
+    use rustls::pki_types::ServerName;
+
     use super::*;
+    use crate::commands::dev::proxy::rewrite::rewrite_for;
+    use crate::commands::dev::proxy::upstream::key::{
+        AddressPolicy, ApplicationMode, OriginKey, ReferenceIdentity, Transport, VerifyMode,
+    };
 
     fn base_args() -> crate::commands::dev::proxy::ProxyArgs {
         // Construct via clap so defaults match the real surface.
@@ -367,7 +401,11 @@ mod tests {
             .rules
             .first_match("www.example-publisher.com")
             .expect("rule present");
-        assert!(!rule.rewrite_host, "default preserves FROM host");
+        assert_eq!(
+            rewrite_for(rule).host_header,
+            HeaderValue::from_static("www.example-publisher.com"),
+            "default preserves FROM host"
+        );
         assert_eq!(rule.to.host(), "to.edgecompute.app");
     }
 
@@ -377,11 +415,14 @@ mod tests {
         args.map = vec!["www.example-publisher.com=to.edgecompute.app".into()];
         args.rewrite_host = true;
         let cfg = resolve(&args).expect("should resolve");
-        assert!(
-            cfg.rules
-                .first_match("www.example-publisher.com")
-                .expect("rule")
-                .rewrite_host,
+        assert_eq!(
+            rewrite_for(
+                cfg.rules
+                    .first_match("www.example-publisher.com")
+                    .expect("rule")
+            )
+            .host_header,
+            HeaderValue::from_static("to.edgecompute.app"),
             "--rewrite-host sends Host: TO"
         );
     }
@@ -501,14 +542,97 @@ mod tests {
 
     #[test]
     fn basic_auth_header_is_base64() {
-        let auth = BasicAuth {
-            user: "dev".into(),
-            pass: "secret".into(),
-        };
+        let auth = BasicAuth::new("dev", "secret").expect("should build auth");
         assert_eq!(
             auth.header_value(),
-            "Basic ZGV2OnNlY3JldA==",
+            &HeaderValue::from_static("Basic ZGV2OnNlY3JldA=="),
             "Basic base64(user:pass)"
+        );
+        let debug = format!("{auth:?}");
+        assert_eq!(debug, "BasicAuth([REDACTED])", "Debug should be redacted");
+        assert!(!debug.contains("dev"), "Debug should not contain the user");
+        assert!(
+            !debug.contains("secret") && !debug.contains("ZGV2OnNlY3JldA=="),
+            "Debug should not contain raw or encoded credentials"
+        );
+    }
+
+    #[test]
+    fn resolve_precomputes_typed_rule_identity_and_headers() {
+        let mut args = base_args();
+        args.map = vec!["www.example.com=TO.Example.com:8443".into()];
+        args.rewrite_host = true;
+        args.insecure = true;
+        args.resolve = vec!["to.example.com:192.0.2.10".into()];
+
+        let cfg = resolve(&args).expect("should resolve");
+        let rule = cfg
+            .rules
+            .first_match("www.example.com")
+            .expect("should find rule");
+        let outcome = rewrite_for(rule);
+
+        assert_eq!(
+            outcome.host_header,
+            HeaderValue::from_static("to.example.com:8443"),
+            "should prevalidate upstream Host"
+        );
+        assert_eq!(
+            outcome.orig_host,
+            HeaderValue::from_static("www.example.com"),
+            "should prevalidate forwarding host"
+        );
+        assert_eq!(
+            outcome.sni,
+            Some(ServerName::try_from("to.example.com").expect("should parse server name")),
+            "should prevalidate normalized SNI"
+        );
+        assert_eq!(
+            rule.origin_key(),
+            &OriginKey::new(
+                Transport::Tls,
+                ReferenceIdentity::dns("to.example.com"),
+                8443,
+                VerifyMode::Insecure,
+                ApplicationMode::Http2Eligible,
+                AddressPolicy::Resolve("192.0.2.10".parse().expect("should parse pin")),
+            ),
+            "should precompute the complete transport identity"
+        );
+    }
+
+    #[test]
+    fn resolve_keeps_ip_reference_identities_http1_only() {
+        let mut args = base_args();
+        args.map = vec!["www.example.com=127.0.0.1".into()];
+        args.rewrite_host = true;
+
+        let cfg = resolve(&args).expect("should resolve");
+        let rule = cfg
+            .rules
+            .first_match("www.example.com")
+            .expect("should find rule");
+
+        assert_eq!(
+            rule.origin_key(),
+            &OriginKey::new(
+                Transport::Tls,
+                ReferenceIdentity::ip("127.0.0.1".parse().expect("should parse IP")),
+                443,
+                VerifyMode::Secure,
+                ApplicationMode::Http1Required,
+                AddressPolicy::Dns,
+            ),
+            "IP identities should validate as IP and remain HTTP/1-only"
+        );
+        assert_eq!(
+            rewrite_for(rule).sni,
+            Some(ServerName::from(
+                "127.0.0.1"
+                    .parse::<IpAddr>()
+                    .expect("should parse IP server name"),
+            )),
+            "TLS should use an IP server name rather than DNS SNI"
         );
     }
 

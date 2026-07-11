@@ -1,5 +1,14 @@
 //! Pure request-rewriting logic: rule matching and header outcomes (spec §8).
 
+use std::net::IpAddr;
+
+use hyper::header::HeaderValue;
+use rustls::pki_types::ServerName;
+
+use super::upstream::key::{
+    AddressPolicy, ApplicationMode, OriginKey, ReferenceIdentity, Transport, VerifyMode,
+};
+
 /// A rewrite-target authority: host plus a resolved port and its scheme default.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Authority {
@@ -23,6 +32,12 @@ pub enum RuleError {
     /// The authority host was empty.
     #[display("empty host in `{value}`")]
     EmptyHost { value: String },
+    /// A derived HTTP header was invalid.
+    #[display("invalid HTTP header derived from `{value}`")]
+    Header { value: String },
+    /// A TLS upstream identity was not a valid DNS name or IP address.
+    #[display("invalid TLS server identity `{value}`")]
+    ServerName { value: String },
 }
 
 impl core::error::Error for RuleError {}
@@ -35,19 +50,44 @@ impl Authority {
     /// Returns [`RuleError`] on an empty host or an unparseable port.
     pub fn parse(raw: &str, plaintext: bool) -> Result<Self, RuleError> {
         let default_port = if plaintext { 80 } else { 443 };
-        let (host, port) = match raw.rsplit_once(':') {
-            Some((h, p)) => {
-                if p.is_empty() {
-                    return Err(RuleError::Port {
+        let (host, port) = if let Ok(address) = raw.parse::<IpAddr>() {
+            (address.to_string(), default_port)
+        } else if let Some(bracketed) = raw.strip_prefix('[') {
+            let (host, remainder) =
+                bracketed
+                    .split_once(']')
+                    .ok_or_else(|| RuleError::EmptyHost {
                         value: raw.to_string(),
-                    });
-                }
-                let port = p.parse::<u16>().map_err(|_| RuleError::Port {
+                    })?;
+            let address = host.parse::<IpAddr>().map_err(|_| RuleError::EmptyHost {
+                value: raw.to_string(),
+            })?;
+            let port = if remainder.is_empty() {
+                default_port
+            } else {
+                let value = remainder.strip_prefix(':').ok_or_else(|| RuleError::Port {
                     value: raw.to_string(),
                 })?;
-                (h, port)
+                value.parse::<u16>().map_err(|_| RuleError::Port {
+                    value: raw.to_string(),
+                })?
+            };
+            (address.to_string(), port)
+        } else {
+            match raw.rsplit_once(':') {
+                Some((host, value)) => {
+                    if value.is_empty() {
+                        return Err(RuleError::Port {
+                            value: raw.to_string(),
+                        });
+                    }
+                    let port = value.parse::<u16>().map_err(|_| RuleError::Port {
+                        value: raw.to_string(),
+                    })?;
+                    (host.to_string(), port)
+                }
+                None => (raw.to_string(), default_port),
             }
-            None => (raw, default_port),
         };
         if host.is_empty() {
             return Err(RuleError::EmptyHost {
@@ -77,10 +117,15 @@ impl Authority {
     /// `host`, plus `:port` only when the port is non-default — for the `Host` header.
     #[must_use]
     pub fn host_with_port(&self) -> String {
-        if self.is_default_port() {
-            self.host.clone()
+        let host = if matches!(self.host.parse::<IpAddr>(), Ok(IpAddr::V6(_))) {
+            format!("[{}]", self.host)
         } else {
-            format!("{}:{}", self.host, self.port)
+            self.host.clone()
+        };
+        if self.is_default_port() {
+            host
+        } else {
+            format!("{host}:{}", self.port)
         }
     }
 }
@@ -93,11 +138,95 @@ pub struct Rule {
     /// Upstream target — kept a hostname so the SNI/certificate stay valid; the
     /// actual connection address may be pinned via `--resolve`.
     pub to: Authority,
-    /// `--rewrite-host`: when true, send `Host: TO`; otherwise (default) send
-    /// `Host: FROM`. The TLS SNI is always the `TO` host either way.
-    pub rewrite_host: bool,
-    /// Connect to the upstream over plaintext HTTP.
-    pub plaintext: bool,
+    outcome: RewriteOutcome,
+    origin_key: OriginKey,
+}
+
+impl Rule {
+    /// Builds a rule and validates all values used on the request path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuleError`] if a derived header or TLS server name is invalid.
+    pub fn new(
+        from: String,
+        to: Authority,
+        rewrite_host: bool,
+        plaintext: bool,
+        insecure: bool,
+        address_policy: AddressPolicy,
+    ) -> Result<Self, RuleError> {
+        let host_header_text = if rewrite_host {
+            to.host_with_port()
+        } else {
+            from.clone()
+        };
+        let host_header =
+            HeaderValue::from_str(&host_header_text).map_err(|_| RuleError::Header {
+                value: host_header_text.clone(),
+            })?;
+        let orig_host = HeaderValue::from_str(&from).map_err(|_| RuleError::Header {
+            value: from.clone(),
+        })?;
+        let reference = match to.host().parse::<IpAddr>() {
+            Ok(address) => ReferenceIdentity::ip(address),
+            Err(_) => ReferenceIdentity::dns(to.host()),
+        };
+        let sni = if plaintext {
+            None
+        } else {
+            Some(ServerName::try_from(to.host().to_string()).map_err(|_| {
+                RuleError::ServerName {
+                    value: to.host().to_string(),
+                }
+            })?)
+        };
+        let transport = if plaintext {
+            Transport::Plaintext
+        } else {
+            Transport::Tls
+        };
+        let application =
+            if !plaintext && rewrite_host && matches!(&reference, ReferenceIdentity::Dns(_)) {
+                ApplicationMode::Http2Eligible
+            } else {
+                ApplicationMode::Http1Required
+            };
+        let verify = if insecure {
+            VerifyMode::Insecure
+        } else {
+            VerifyMode::Secure
+        };
+        let origin_key = OriginKey::new(
+            transport,
+            reference,
+            to.port,
+            verify,
+            application,
+            address_policy,
+        );
+        let outcome = RewriteOutcome {
+            sni,
+            host_header,
+            orig_host,
+            scheme_is_tls: !plaintext,
+        };
+        Ok(Self {
+            from,
+            to,
+            outcome,
+            origin_key,
+        })
+    }
+
+    #[must_use]
+    pub fn origin_key(&self) -> &OriginKey {
+        &self.origin_key
+    }
+
+    pub(crate) fn set_address_policy(&mut self, address_policy: AddressPolicy) {
+        self.origin_key.set_address_policy(address_policy);
+    }
 }
 
 /// An ordered set of rules; first match wins.
@@ -120,32 +249,20 @@ impl RuleTable {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RewriteOutcome {
     /// SNI to present upstream — always the `TO` host; never carries a port.
-    pub sni: String,
+    pub sni: Option<ServerName<'static>>,
     /// Value for the upstream `Host` header.
-    pub host_header: String,
+    pub host_header: HeaderValue,
     /// The original first-party host (always FROM); sent upstream as
     /// `X-Forwarded-Host` (functional) and `X-Orig-Host` (informational).
-    pub orig_host: String,
+    pub orig_host: HeaderValue,
     /// Whether the upstream leg is TLS (`!plaintext`).
     pub scheme_is_tls: bool,
 }
 
 /// Computes the rewrite outcome for a matched rule (spec §8.3).
 #[must_use]
-pub fn rewrite_for(rule: &Rule) -> RewriteOutcome {
-    // SNI is always the TO host (the connection address may be pinned separately
-    // via `--resolve`); only the `Host` header depends on `rewrite_host`.
-    let host_header = if rule.rewrite_host {
-        rule.to.host_with_port()
-    } else {
-        rule.from.clone()
-    };
-    RewriteOutcome {
-        sni: rule.to.host().to_string(),
-        host_header,
-        orig_host: rule.from.clone(),
-        scheme_is_tls: !rule.plaintext,
-    }
+pub fn rewrite_for(rule: &Rule) -> &RewriteOutcome {
+    &rule.outcome
 }
 
 #[cfg(test)]
@@ -153,12 +270,15 @@ mod tests {
     use super::*;
 
     fn rule(from: &str, to: &str, rewrite_host: bool, plaintext: bool) -> Rule {
-        Rule {
-            from: from.to_string(),
-            to: Authority::parse(to, plaintext).expect("should parse authority"),
+        Rule::new(
+            from.to_string(),
+            Authority::parse(to, plaintext).expect("should parse authority"),
             rewrite_host,
             plaintext,
-        }
+            false,
+            AddressPolicy::Dns,
+        )
+        .expect("should build rule")
     }
 
     #[test]
@@ -191,6 +311,27 @@ mod tests {
             a.host_with_port(),
             "localhost:3000",
             "Host header includes non-default port"
+        );
+    }
+
+    #[test]
+    fn authority_normalizes_ipv6_identity_and_brackets_host_header() {
+        let explicit = Authority::parse("[::1]:8443", false).expect("should parse IPv6");
+        assert_eq!(explicit.host(), "::1", "identity should omit brackets");
+        assert_eq!(explicit.port, 8443, "should parse explicit port");
+        assert_eq!(
+            explicit.host_with_port(),
+            "[::1]:8443",
+            "Host should retain IPv6 brackets"
+        );
+
+        let default = Authority::parse("::1", false).expect("should parse bare IPv6");
+        assert_eq!(default.host(), "::1", "should preserve bare IP identity");
+        assert_eq!(default.port, 443, "should use the TLS default port");
+        assert_eq!(
+            default.host_with_port(),
+            "[::1]",
+            "Host should bracket IPv6 even when the port is omitted"
         );
     }
 
@@ -264,7 +405,8 @@ mod tests {
         );
         let out = rewrite_for(&r);
         assert_eq!(
-            out.sni, "to.edgecompute.app",
+            out.sni,
+            Some(ServerName::try_from("to.edgecompute.app").expect("should parse server name")),
             "SNI is TO host only, no port"
         );
         assert_eq!(
@@ -282,7 +424,7 @@ mod tests {
     fn rewrite_host_uses_to_authority_with_port() {
         let r = rule("www.example-publisher.com", "localhost:3000", true, true);
         let out = rewrite_for(&r);
-        assert_eq!(out.sni, "localhost", "SNI never carries a port");
+        assert_eq!(out.sni, None, "plaintext rules do not need TLS SNI");
         assert_eq!(
             out.host_header, "localhost:3000",
             "rewrite-host sends TO host:port"
