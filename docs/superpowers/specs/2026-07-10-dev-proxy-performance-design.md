@@ -195,11 +195,24 @@ The HTTP/1.1 pool obeys these rules:
   driver-closing connections. Admission of both limits is atomic under the
   transport manager; it must not hold one capacity permit while waiting for the
   other.
-  Requests at the limit wait in FIFO order. The wait queue is bounded to 32 per
-  origin and 128 globally; excess requests receive `502`. Dropping the browser
-  request cancels and removes its waiter. An internal 30-second acquisition
-  timeout returns `502` so a saturated or wedged origin cannot wait forever.
+  Requests at the limit preserve FIFO order within each origin. When global
+  capacity becomes available, the manager admits the oldest admissible
+  per-origin head, so an origin that is still at its own limit cannot
+  head-of-line-block unrelated origins. The wait queue is bounded to 32 per
+  origin and 128 globally; excess requests receive `502`. Each acquire carries a
+  unique waiter ID and a shared atomic ticket in `Pending`. After the ordinary
+  acquire command is enqueued, dropping its future races `Pending -> Cancelled`
+  against the manager's terminal `Pending -> Resolved` transition for a lease or
+  acquisition error. A winning cancellation enqueues one priority `Cancel`; a
+  winning resolution suppresses cancellation. The manager checks the ticket
+  before queueing and again before admission or timeout, so a priority cancel
+  may safely overtake its ordinary acquire without creating a stranded waiter.
+  An internal 30-second acquisition timeout returns `502` so a saturated or
+  wedged origin cannot wait forever.
 - Idle connections expire after a fixed short duration, initially 60 seconds.
+- One actor-owned next-deadline timer covers both waiter acquisition deadlines
+  and idle expiry. Timeouts are handled as an internal select branch, not as
+  ordinary channel messages or one spawned task per entry.
 - Per-origin and global idle limits prevent inactive connections from consuming
   all permits. Initial values are two idle HTTP/1.1 connections per origin and
   32 globally, subject to benchmark adjustment.
@@ -247,20 +260,44 @@ guard that reports `DriverClosed(ConnectionId)` even when its task is aborted;
 only that event releases origin/global capacity and admits waiters. Therefore an
 upload or socket cannot remain active after accounting says capacity is free.
 
-Network lifecycle events use a dedicated unbounded Tokio channel separate from
-the bounded acquire/return command channel. Connection-attempt completion and a
-synchronous driver drop guard can therefore report `ConnectFinished` and
-`DriverClosed` during mass abort without blocking or losing accounting behind
-ordinary queued commands. Failure to send means the manager has already exited
-and no acknowledgment is still waiting.
+The actor has two input lanes. A bounded ordinary Tokio channel carries
+`Acquire` and `Return`. A non-blocking unbounded control/lifecycle channel
+carries exactly-once waiter `Cancel`, the single owner-issued `Shutdown`,
+connection-attempt `ConnectFinished`, and synchronous driver-drop
+`DriverClosed` events. The actor uses a biased select that drains the
+control/lifecycle lane first, so cancellation, shutdown delivery, and capacity
+reconciliation cannot be stranded behind ordinary work. Failure to send means
+the manager has already exited and no acknowledgment is still waiting.
 
-The actor allocates each `ConnectionId` and records a Connecting reservation
-before opening begins. On successful handshake, the connector creates a driver
-task behind a one-shot start latch and sends `ConnectFinished` containing its
-ID and control handles. The actor first transitions that exact reservation to Live (or
-marks it for immediate shutdown), then releases the latch. Consequently
-`DriverClosed` cannot precede registration, and unknown IDs are treated as an
-invariant violation rather than later publishing a dead connection.
+The control/lifecycle channel is unbounded at the Tokio API level only to make
+synchronous drop reporting infallible. Its producers are logically bounded by
+successfully enqueued ordinary acquires plus the 128 admitted waiter IDs, 64
+manager-owned live connection IDs, and one manager owner. An acquire guard is
+armed only after its bounded ordinary send succeeds and its ticket emits at most
+one `Cancel`; after resolution it cannot emit. A successful connection ID
+cannot emit `DriverClosed` until the actor consumes its `ConnectFinished` and
+releases the driver start latch, so each connection ID has at most one lifecycle
+event outstanding. The manager owner emits at most one `Shutdown`. Thus queued
+control state cannot grow with request volume and does not weaken the
+bounded-state invariant.
+
+The actor allocates each `ConnectionId`, records a Connecting reservation, and
+retains a connector abort handle before opening begins. Every connector owns an
+exactly-once completion guard: normal completion sends its result and disarms
+the guard; cancellation, abort, or unwind sends a cancelled `ConnectFinished`
+from the guard's synchronous drop path. On successful handshake, the connector
+creates a driver task behind a one-shot start latch and sends `ConnectFinished`
+containing its ID and control handles. The actor first transitions that exact
+reservation to Live (or marks it for immediate shutdown), then releases the
+latch. Consequently `DriverClosed` cannot precede registration, and an unknown
+or duplicate lifecycle ID is an invariant violation rather than later
+publishing a dead connection.
+
+The priority control/lifecycle lane may deliver `DriverClosed` before an earlier
+ordinary `Return` is processed. `DriverClosed` releases capacity exactly once;
+a later `Return` for that no-longer-live ID discards its sender as stale and
+does not change accounting. The reverse order returns the connection to idle
+first and lets the subsequent `DriverClosed` remove it normally.
 
 ### Shutdown Choreography
 
@@ -269,10 +306,11 @@ still alive, synchronously restore the prior Safari/system PAC setting using the
 existing interactive behavior. Only after restoration returns does shutdown:
 
 1. stop the accept-loop task so no new browser connections enter;
-2. send `Shutdown` to the upstream manager, which rejects acquisition, fails
-   waiters, aborts every driver, and continues consuming lifecycle events;
-3. wait at most two seconds for the manager to observe all `DriverClosed` events
-   and acknowledge zero live manager-owned connections;
+2. enqueue `Shutdown` without waiting on the priority control/lifecycle lane;
+   the manager rejects acquisition, fails waiters, aborts every pending
+   connector and live driver, and continues consuming lifecycle events;
+3. wait at most two seconds for the manager to reconcile all connector/driver
+   lifecycle events and acknowledge zero live manager-owned connections;
 4. on success or timeout, emit the redacted metrics summary from current state
    and return, allowing Tokio runtime teardown to reap anything remaining.
 
@@ -280,11 +318,11 @@ The manager drain is diagnostic/graceful behavior, not a precondition for Safari
 restoration or process exit. A wedged driver or saturated ordinary command queue
 cannot strand the system proxy or hang Ctrl-C indefinitely.
 
-If a pending connection attempt reports `ConnectFinished` while Closing, a
-failure releases its connecting count immediately; a success is never published
-to a waiter and its new driver is aborted, with live capacity retained until the
-subsequent `DriverClosed`. Closing acknowledges only after both connecting and
-driver counts reach zero.
+Aborting a pending connection attempt during Closing triggers its completion
+guard. A failed or cancelled `ConnectFinished` releases its connecting count
+immediately; a raced success is never published to a waiter and its new driver
+is aborted, with live capacity retained until the subsequent `DriverClosed`.
+Closing acknowledges only after both connecting and driver counts reach zero.
 
 Upstream `Connection: close` and equivalent HTTP/1 connection intent are
 captured before hop-by-hop response sanitation. The sanitized header is still
@@ -411,12 +449,13 @@ advertise HTTP/2 on a `Host: FROM` rule.
 HTTP/2 is not part of the initial HTTP/1 pooling delivery. Its entry gate uses
 the named remote-latency workload and two controlled variants after two warmups:
 
-- setup contribution is `(cold_duration - preconnected_duration) /
-  cold_duration`, comparing the normal cold pool with an otherwise identical run
-  whose HTTP/1 connections are established before timing;
-- concurrency-ceiling contribution is `(cap6_duration - cap20_duration) /
-  cap6_duration`, comparing the production cap with an internal harness-only cap
-  of 20.
+- setup contribution is
+  `(cold_duration - preconnected_duration) / cold_duration`, comparing the
+  normal cold pool with an otherwise identical run whose HTTP/1 connections are
+  established before timing;
+- concurrency-ceiling contribution is
+  `(cap6_duration - cap20_duration) / cap6_duration`, comparing the production
+  cap with an internal harness-only cap of 20.
 
 Use the median of ten alternating runs for each comparison. Enter the HTTP/2
 proof if either contribution is at least 10%. Runtime metrics also record pool
@@ -545,12 +584,17 @@ HTTP handshakes. Record successful and failed applications separately. An
 unexpected failure is warned once per socket class and counted, but does not
 abort an otherwise usable local proxy.
 
-After two warmups, run each setting ten times in alternating order. Retain a
-setting only if it improves median total duration by at least 3%, does not
-regress p95 by more than 5%, and does not regress process CPU time reported by
-`/usr/bin/time -p` by more than 5%. Median absolute deviation is recorded. Packet
-count is not used as a gate because the repository has no portable deterministic
-packet-count harness.
+Use the named sequential TLS workload with four harness-only variants:
+`off_off`, `browser_on`, `upstream_on`, and `both_on`. After two complete warmup
+rounds, run every variant ten times in round-robin order. Compare each one-sided
+variant with `off_off`; retain that socket-class setting only if it improves
+median total duration by at least 3%, does not regress p95 by more than 5%, and
+does not regress process CPU time reported by `/usr/bin/time -p` by more than
+5%. If both one-sided settings pass, `both_on` must also pass those regression
+limits and preserve at least a 3% median improvement over `off_off`; otherwise
+retain only the passing one-sided variant with the larger median benefit. Median
+absolute deviation is recorded. Packet count is not used as a gate because the
+repository has no portable deterministic packet-count harness.
 
 No user-facing flag is planned. The accepted setting and evidence are recorded
 in implementation notes.
@@ -590,9 +634,13 @@ selected. Keep its mandatory scope to the workloads that gate decisions:
 
 1. One hundred sequential requests to a local TLS keep-alive upstream, measuring
    reuse and handshake count.
-2. One hundred requests at concurrency 20 to a delayed HTTP/1.1 upstream,
-   measuring pool bounds and total duration.
-3. A remote-latency model of 100 zero-body GETs at concurrency 20 with injectable
+2. One hundred requests at concurrency six to a delayed HTTP/1.1 upstream,
+   comparing baseline and pooled total duration at the production per-origin
+   concurrency ceiling.
+3. A separate 100-request concurrency-20 saturation variant against that
+   upstream, measuring pool bounds and queueing without using the unbounded
+   baseline as a latency-retention gate.
+4. A remote-latency model of 100 zero-body GETs at concurrency 20 with injectable
    30 ms connection setup, 30 ms TLS setup, and 25 ms response delay, measuring
    where remaining time is spent without public network access.
 
@@ -623,12 +671,13 @@ browser-side keep-alive tunnel to a local TLS upstream that keeps connections
 open. After HTTP/1 pooling:
 
 - exactly one established upstream TCP connection and one upstream TLS handshake
-  after warm-up, compared with 100 of each at baseline. Failed multi-address
+  in each measured 100-request run, compared with 100 of each at baseline. The
+  two unrecorded warmups are complete separate runs. Failed multi-address
   attempts are counted separately and do not change logical reuse;
 - no increase in request failures;
 - streamed bodies remain unbuffered and byte-identical.
 
-The named concurrent workload is 100 zero-body GET requests with concurrency 20
+The named saturation workload is 100 zero-body GET requests with concurrency 20
 against an HTTP/1.1 upstream that holds each response for 25 milliseconds:
 
 - deterministic tests observe at least two and no more than six simultaneous
@@ -636,10 +685,19 @@ against an HTTP/1.1 upstream that holds each response for 25 milliseconds:
 - no more than six live connections exist for the origin and no more than two
   remain idle afterward;
 - a separate saturation test proves the 32-per-origin and 128-global waiter
-  bounds, FIFO admission, cancellation removal, and 30-second timeout using
-  paused Tokio time rather than wall-clock sleeps;
-- after two warmups, ten alternating before/after benchmark runs must show no
-  more than 5% regression in median total duration or p95 and no additional
+  bounds, FIFO admission within each origin, oldest-admissible cross-origin
+  admission without head-of-line blocking, cancellation removal, and 30-second
+  timeout using paused Tokio time rather than wall-clock sleeps;
+- no requests fail. Its wall-clock duration is diagnostic only: comparing a
+  six-connection production cap with the current unbounded connection-per-request
+  baseline at concurrency 20 would measure the intentional cap, not manager
+  overhead.
+
+The matched-concurrency performance workload uses the same delayed upstream and
+100 requests but client concurrency six. After two warmups, ten alternating
+before/after benchmark runs must show:
+
+- no more than 5% regression in median total duration or p95 and no additional
   failures. Median absolute deviation is recorded.
 
 For allocation changes:
@@ -760,7 +818,16 @@ gate and its code is retained.
   closes sockets, fails waiters, and discards all bounded state.
 - Ctrl-C shutdown restores Safari before manager drain, completes within the
   two-second drain deadline when a driver delays termination, and still receives
-  all driver lifecycle events when the ordinary command channel is saturated.
+  the priority `Shutdown` plus all connector/driver lifecycle events when the
+  ordinary command channel is saturated.
+- Connector abort, cancellation, and unwind each reconcile a Connecting
+  reservation exactly once. Lifecycle-priority reordering of `DriverClosed`
+  before `Return` discards the stale return without double-decrementing capacity;
+  the reverse order also reconciles exactly once.
+- Dropped acquisition futures enqueue exactly one priority cancellation even
+  when the ordinary lane is saturated. Tests cover cancellation overtaking its
+  acquire, cancellation while queued, and atomic races against admission and
+  timeout; each resolves the ticket and accounting exactly once.
 - Origin-key tests vary protocol, TO reference identity, port, address policy,
   verification mode, and application mode independently, including combinations
   that cannot arise in one CLI invocation because `--insecure` and `--resolve`
@@ -793,8 +860,12 @@ gate and its code is retained.
 Run the repository-prescribed CLI tests using `./scripts/test-cli.sh`, plus:
 
 - `cargo fmt --all -- --check`
-- `cargo clippy --package trusted-server-cli --target "$(rustc -vV | awk
-  '/host:/ { print $2 }')" --all-targets -- -D warnings`;
+- host-target CLI clippy:
+
+  ```bash
+  cargo clippy --package trusted-server-cli --target "$(rustc -vV | awk '/host:/ { print $2 }')" --all-targets -- -D warnings
+  ```
+
 - the explicit performance harness for before-and-after results.
 
 The full repository adapter test matrix is required only if shared core or
