@@ -2,9 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make `ts dev proxy` materially faster by reusing upstream HTTP/1.1 connections, then retain optional parser, DNS, HTTP/2, and socket optimizations only when measurements clear the approved gates.
+**Goal:** Make `ts dev proxy` materially faster against remote/staging upstreams by reusing HTTP/1.1 connections, while treating localhost connection-count reduction as success even when wall-clock change is small; retain optional parser, DNS, HTTP/2, and socket optimizations only when measurements clear the approved gates.
 
 **Architecture:** Create a shared `ProxyState` and bounded upstream-manager actor. The actor owns exact origin-key isolation, FIFO admission, connection opening, sender leases, and idle return; body adapters preserve streaming and return a lease only when request upload and response download both completed successfully. Deterministic counters prove correctness before manual timing comparisons.
+
+The single manager actor is a deliberate serialization point: at developer-proxy request rates its channel hop is negligible, and it makes driver-owned capacity, cancellation, and bounded teardown auditable. Pool-acquisition metrics verify that assumption.
 
 **Tech Stack:** Rust 2024, Tokio, Hyper 1, hyper-util, Rustls 0.23, tokio-rustls, error-stack, macOS CLI integration tests.
 
@@ -79,7 +81,7 @@ fn snapshot_separates_attempts_from_established() {
 - [ ] Add two baseline `#[ignore = "manual performance workload"]` tests: 100 sequential TLS GETs and 100 delayed GETs at concurrency 20. Add the injectable remote-latency model in Task 10 after the connection factory exists.
 - [ ] Run the ignored harness with `--ignored --nocapture --test-threads=1`. Expected baseline: approximately 100 established upstream connections and handshakes for 100 sequential requests.
 - [ ] Record raw output, machine, OS, Rust version, and command in implementation notes.
-- [ ] Run `./scripts/test-cli.sh` and commit as `test(cli): establish dev proxy performance baseline`.
+- [ ] Run `./scripts/test-cli.sh` and commit as `Establish dev proxy performance baseline`.
 
 ---
 
@@ -113,7 +115,7 @@ pub enum ReferenceIdentity { Dns(Arc<str>), Ip(IpAddr) }
 - [ ] Replace `BasicAuth { user, pass }` with a private reusable header and custom `Debug` rendering `BasicAuth([REDACTED])`. Update fixtures to construct it through a checked constructor.
 - [ ] Precompute rule host/forwarding headers, SNI, transport, and stable origin-key fields during `config::resolve`; eliminate per-request Base64 and host-header formatting.
 - [ ] Run config/rewrite/key tests and existing E2E tests. Expected: GREEN with unchanged behavior.
-- [ ] Commit as `refactor(cli): precompute dev proxy upstream identity`.
+- [ ] Commit as `Precompute dev proxy upstream identity`.
 
 ---
 
@@ -122,6 +124,7 @@ pub enum ReferenceIdentity { Dns(Arc<str>), Ip(IpAddr) }
 **Files:** Create `upstream/manager.rs`; modify `upstream/mod.rs` and CLI Cargo.toml.
 
 - [ ] Add Tokio `test-util` only to the macOS dev-dependency feature set.
+- [ ] Note in the code/implementation notes that Cargo feature unification makes `test-util` available in the macOS test build, while pause/advance behavior remains inert unless tests explicitly use it.
 - [ ] With paused time and a test harness that observes `ConnectRequested` commands and manually replies `Connected`, write failing tests for: six live HTTP/1 connections per origin, 64 globally, two idle per origin, 32 idle globally, 32 queued per origin, 128 queued globally, FIFO wakeup, dropped-waiter removal, and 30-second timeout.
 - [ ] Add a test proving origin/global admission is atomic and never reserves one capacity while waiting for the other.
 - [ ] Run manager tests. Expected: RED because the actor is absent.
@@ -135,15 +138,18 @@ enum Command {
     DriverClosed(ConnectionId),
     Cancel(WaiterId),
     Expire(Instant),
+    Shutdown { reply: oneshot::Sender<()> },
 }
 ```
 
 - [ ] Keep all counts and FIFO queues actor-owned. Spawn connection work and report completion; never await network work inside the actor.
 - [ ] Store production defaults in injectable `PoolLimits`; permit harness-only cap variants and pool-disabled baseline mode without adding CLI flags.
 - [ ] Make capacity driver-owned: in actor tests, closing a lease emits an abort request but only a synthetic `DriverClosed(ConnectionId)` decrements live counts. Defer the real socket/upload assertion to Task 7 after the connector and body wrapper exist.
-- [ ] Use one next-deadline timer rather than a task per idle connection. Expiry removes the idle entry and requests driver abort, but does not decrement or admit waiters until `DriverClosed`. Add a paused-time test proving no admission in that interval.
+- [ ] Use one next-deadline timer rather than a task per idle connection. Add paused-time assertions at 59 seconds (still idle) and 60 seconds (expiry requests abort). Expiry removes the entry but does not decrement/admit until `DriverClosed`.
+- [ ] Add actor-shutdown tests proving all waiters are failed, every live driver is aborted, queues/idle maps are cleared, and counts reach zero only through synthetic `DriverClosed` events.
+- [ ] Implement a Closing state: `Shutdown` rejects new Acquire commands, fails queued waiters, aborts every driver, continues processing `DriverClosed`, acknowledges the shutdown reply only at zero live drivers, then exits. Do not rely on command-channel closure because drivers retain senders.
 - [ ] Run manager tests. Expected: GREEN without wall-clock sleeps.
-- [ ] Commit as `feat(cli): add bounded dev proxy upstream manager`.
+- [ ] Commit as `Add bounded dev proxy upstream manager`.
 
 ---
 
@@ -156,10 +162,10 @@ enum Command {
 - [ ] Run focused tests. Expected: RED because `ConnectionFactory` is absent.
 - [ ] Define `ProxyRequestBody = BoxBody<Bytes, ProxyBodyError>` in `upstream/mod.rs`, where `ProxyBodyError` wraps `hyper::Error` and represents local cancellation. Then implement a narrow injectable factory returning an opened HTTP/1 sender, driver health, explicit abort handle, driver drop guard, connection ID, and actual peer.
 - [ ] Preserve IP-literal compatibility: DNS identities send SNI and validate DNS SAN; IP identities send no DNS SNI and validate IP SAN. Mark IP rules HTTP/1-required.
-- [ ] Compute one deadline before resolution. Count TCP attempt before `connect`, established after success, TLS handshake after TLS success, and HTTP handshake after Hyper success.
+- [ ] Compute one deadline before resolution. Record DNS lookup duration, TCP attempt before `connect`, established/connect duration after success, TLS handshake duration after TLS success, and HTTP handshake duration after Hyper success.
 - [ ] Spawn one Hyper driver per opened connection and report termination to the actor.
 - [ ] Run connector tests and existing `--resolve` E2E coverage. Expected: GREEN.
-- [ ] Commit as `feat(cli): open reusable dev proxy upstream connections`.
+- [ ] Commit as `Open reusable dev proxy upstream connections`.
 
 ---
 
@@ -168,6 +174,7 @@ enum Command {
 **Files:** Create `upstream/body.rs`; modify `upstream/{mod.rs,manager.rs}`.
 
 - [ ] Write scripted-body tests proving request state becomes Complete only after terminal EOS including trailers, and Failed on body error or drop before EOS.
+- [ ] Add a backpressure test whose scripted request body counts polls and exposes one frame only when downstream demand arrives; assert the adapter neither pre-polls nor buffers later frames.
 - [ ] Write failing response tests for DATA/trailer passthrough; release after terminal `None`; close intent; driver/body/upload failure; downstream drop; response EOS before upload completion; full/closed return channel; and idempotent finalization.
 - [ ] Run body tests. Expected: RED because adapters are absent.
 - [ ] Implement a streaming request body wrapper and one erased request type:
@@ -182,7 +189,7 @@ enum UploadState { Streaming, Complete, Failed }
 - [ ] Closing invokes driver abort and drops the sender, but does not decrement manager capacity; the driver drop guard reports termination and releases capacity.
 - [ ] Bound the nonblocking return channel to 64; on full/closed, close rather than blocking `poll_frame`.
 - [ ] Run body tests. Expected: GREEN.
-- [ ] Commit as `feat(cli): make pooled response leases streaming-safe`.
+- [ ] Commit as `Make pooled response leases streaming-safe`.
 
 ---
 
@@ -190,8 +197,7 @@ enum UploadState { Streaming, Complete, Failed }
 
 **Files:** Modify proxy `mod.rs`, `server.rs`, `upstream/mod.rs`, test support and existing E2E tests; create `proxy_pool_e2e.rs`.
 
-- [ ] Write a failing test that sends 100 sequential GETs over one MITM tunnel and expects 100 responses, one established upstream TCP connection, and one TLS handshake.
-- [ ] Run `proxy_pool_e2e`. Expected: RED with about 100 upstream connections on the current path.
+- [ ] First write a failing smoke test sending two sequential GETs over one MITM tunnel and expecting one established upstream connection/handshake. Run it and observe RED with two connections.
 - [ ] Introduce shared state:
 
 ```rust
@@ -204,12 +210,13 @@ pub struct ProxyState {
 
 - [ ] Build `ProxyState` once in `proxy::run`; pass `Arc<ProxyState>` into `serve_on`. Update test spawning helpers. Hyper service closures clone this Arc, not rules/auth/resolve maps.
 - [ ] Wire initial-head parse duration and manager acquisition/queue timing into the shared metrics at their actual boundaries.
-- [ ] Wire every mandatory metric at its boundary: CA hit/miss/mint; DNS lookup; TCP attempt/established/connect duration; TLS and Hyper handshake; pool hit/miss/stale/retry; request-to-header; request completion/failure. Add a snapshot integration test that drives one success and one failure and checks the expected deltas.
+- [ ] Wire every core metric at its boundary: accepted browser connections; parsed and rejected initial heads plus parse duration; CA hit/miss; DNS lookup duration; TCP attempt/established/connect duration; TLS and Hyper handshake durations; negotiated HTTP/1 count; pool hit/miss/stale/retry; pool acquisition/queue wait; request-to-header; request completion/failure. Add a snapshot integration test that drives one success, one rejected head, and one failure and checks every core category's expected delta. Task 9 adds mint metrics; Tasks 12/13 add retained-experiment metrics.
 - [ ] On every clean shutdown path, emit the redacted debug summary after Safari restoration. Add a formatting test proving it contains counts/timings but no URL query, auth value, certificate data, or sensitive headers.
 - [ ] Delegate mapped traffic to `UpstreamClient`. Keep blind tunnels, stray plain-HTTP forwarding, local PAC, Host-based per-request routing, and `421` behavior unchanged.
 - [ ] Capture upstream close intent before response hop-by-hop sanitation, then wrap the response body with its lease.
-- [ ] Run sequential reuse and all existing proxy E2E tests. Expected: one established connection/handshake and unchanged routing/security behavior.
-- [ ] Commit as `feat(cli): reuse upstream HTTP/1 connections`.
+- [ ] Make the two-request smoke GREEN, then add the 100-request acceptance case and run all existing proxy E2E tests. Expected: one established connection/handshake and unchanged routing/security behavior.
+- [ ] Add a test around proxy startup/output capture proving `--insecure` still emits its warning before serving. Do not weaken or relocate the warning behind debug logging.
+- [ ] Commit as `Reuse upstream HTTP/1 connections`.
 
 ---
 
@@ -220,12 +227,14 @@ pub struct ProxyState {
 - [ ] Write a failing test for 100 GETs at concurrency 20 against a 25 ms upstream. Require observed concurrency between two and six, at most six manager-owned live connections, and at most two idle afterward.
 - [ ] Write separate failing tests for upstream `Connection: close`, response body error, response trailers, slow/infinite response cancellation, truncated upload, and an origin responding before consuming the upload.
 - [ ] Add manager-selection/header integration cases: TLS versus plaintext, secure versus insecure, pinned versus DNS, different TO identities, and different ports never share; two FROM rules sharing one TO do share when allowed; Host-preserved and Host-rewritten configurations send exact SNI/Host/forwarding headers; one request's Authorization never persists onto the next reused request.
+- [ ] Prove unmatched blind tunnels and stray plain-HTTP forwarding bypass the manager and do not consume/decrement its 64 mapped-connection count.
 - [ ] For every non-reusable case, require the next request to open a fresh connection.
 - [ ] In the early-response case, require immediate browser response, driver abort, upload polling to stop, socket closure, and no live-capacity release until the driver drop guard reports termination.
+- [ ] Add a real proxy-shutdown test proving active/idle mapped drivers are aborted, sockets close, bounded queues are discarded, and the manager task exits without retained state.
 - [ ] Run `proxy_pool_e2e`. Task 5 unit tests may make lifecycle cases GREEN immediately; treat that as acceptance evidence. If an integration case fails, verify the failure is the intended missing behavior before changing production code.
 - [ ] Implement only the failing lifecycle transitions. Never background-drain; admit waiters only after driver termination decrements capacity.
 - [ ] Rerun `proxy_pool_e2e`. Expected: GREEN without timing sleeps except controlled upstream delays.
-- [ ] Commit as `test(cli): harden dev proxy pool lifecycle`.
+- [ ] Commit as `Harden dev proxy pool lifecycle`.
 
 ---
 
@@ -240,7 +249,7 @@ pub struct ProxyState {
 - [ ] For eligible requests only, retain method, URI, version and headers and substitute a reusable empty body. Do not clone or buffer `Incoming`.
 - [ ] Retry readiness failure with the unconsumed original request. Retry post-dispatch failure only from the retained template and only on a reused connection.
 - [ ] Add stale/retry metrics, rerun focused tests and the full E2E binary. Expected: GREEN.
-- [ ] Commit as `feat(cli): retry stale pooled proxy connections safely`.
+- [ ] Commit as `Retry stale pooled proxy connections safely`.
 
 ---
 
@@ -251,10 +260,10 @@ pub struct ProxyState {
 - [ ] Write a failing test that prewarms lowercase `www.example.com`, CONNECTs as mixed-case `WWW.Example.COM`, and expects one mint total plus a runtime hit.
 - [ ] Add failing tests for duplicate-rule deduplication and prewarm failure before browser launch.
 - [ ] Run focused tests. Expected: RED because raw CONNECT case forms a distinct cache key.
-- [ ] Normalize DNS CONNECT identities to lowercase before rule and CA lookup; preserve parsed IP identity without string-case logic.
-- [ ] Prewarm every unique normalized FROM before listener/browser startup. Instrument hits, misses, and unexpected post-prewarm mints without logging key material.
+- [ ] Normalize DNS CONNECT identities to lowercase before CA leaf lookup/cache insertion; `RuleTable::first_match` is already case-insensitive and needs no behavior change. Preserve parsed IP identity without string-case logic.
+- [ ] Prewarm every unique normalized FROM before listener/browser startup. Instrument hits, misses, leaf mint duration, and unexpected post-prewarm mints without logging key material; assert snapshot deltas.
 - [ ] Run `./scripts/test-cli.sh`. Expected: GREEN.
-- [ ] Commit as `perf(cli): prewarm normalized dev proxy certificates`.
+- [ ] Commit as `Prewarm normalized dev proxy certificates`.
 
 ---
 
@@ -264,12 +273,13 @@ pub struct ProxyState {
 
 - [ ] Run deterministic pool tests. Expected: exactly one established connection/handshake for sequential work and all bounds/lifecycle tests pass.
 - [ ] Run two warmups and ten alternating baseline/pooled measurements; record raw runs, median, p95, and median absolute deviation.
-- [ ] Add and run the injectable exact remote model: 100 GETs, concurrency 20, 30 ms connect delay, 30 ms TLS delay, 25 ms response delay. Use harness-only `PoolMode` and `PoolLimits`; expose no CLI flags.
+- [ ] Add and run the injectable exact remote model: 100 zero-body GETs with no `Content-Length` or `Transfer-Encoding`, immediate request EOS, concurrency 20, 30 ms connect delay, 30 ms TLS delay, and 25 ms response delay. Upstream responses use keep-alive plus explicit `Content-Length`; never use close-delimited framing. Use harness-only `PoolMode` and `PoolLimits`; expose no CLI flags.
 - [ ] Run `cargo test --package trusted-server-cli --target "$(rustc -vV | awk '/host:/ { print $2 }')" --test proxy_perf perf_http1_comparison -- --ignored --nocapture --test-threads=1`.
 - [ ] Record entry evidence for parser, DNS, and HTTP/2; label those stages `ENTER` or `SKIP`. `TCP_NODELAY` is always measured in Task 14 and is labeled only `RETAIN` or `REJECT`. For HTTP/2, calculate the spec's cold/preconnected and cap-6/cap-20 ratios from median durations.
 - [ ] Run `perf_allocation_comparison` with harness-only `PoolMode::Disabled` for both baseline-compatible and precomputed variants so pooling gains cannot mask allocation effects. Record process CPU and total duration, or a written simplification justification if timing is neutral.
 - [ ] Confirm HTTP/1 pooling does not regress median or p95 more than 5% and adds no failures.
-- [ ] Commit notes as `docs: record dev proxy HTTP/1 performance results`.
+- [ ] State explicitly in the notes: localhost success is primarily 100-to-1 connection/handshake reduction; material wall-clock gains are expected and judged on the remote/staging latency model.
+- [ ] Commit notes as `Record dev proxy HTTP/1 performance results`.
 
 ---
 
@@ -285,7 +295,7 @@ pub struct ProxyState {
 - [ ] Write failing path tests proving over-read reaches browser TLS accept, blind tunnel, and plain-HTTP forwarding exactly once.
 - [ ] Implement chunk reads and one `PrefixedIo<T>` owner. Apply the 8 KiB cap only through `\r\n\r\n`; every downstream path consumes the same adapter and no path separately replays bytes.
 - [ ] Run correctness tests and ten alternating performance runs. Retain only if the 5% gate remains satisfied with no regression.
-- [ ] If retained, commit `perf(cli): buffer dev proxy initial request parsing`; otherwise remove experiment code and commit notes as `docs: reject buffered proxy parsing experiment`.
+- [ ] If retained, commit `Buffer dev proxy initial request parsing`; otherwise remove experiment code and commit notes as `Reject buffered proxy parsing experiment`.
 
 ---
 
@@ -300,9 +310,10 @@ pub struct ProxyState {
 - [ ] With paused time and a fake resolver, write failing tests for 30-second TTL, 64-entry bound, expired-first eviction, non-in-flight LRU eviction, all-in-flight bypass, concurrent miss coalescing, owned error fan-out, no failure caching, and `--resolve` bypass.
 - [ ] Add failing identity tests proving multiple peer IPs share one DNS origin key, different TO identities never share, and healthy idle connections may outlive DNS TTL only until their 60-second idle deadline.
 - [ ] Implement cache state without awaiting resolution under its lock. Store owned address lists; reconstruct equivalent I/O errors for waiters.
+- [ ] Record DNS cache hits, misses, and lookup duration; add snapshot assertions for retained cache variants.
 - [ ] Prove one total DNS/connect deadline and fair per-address remaining slices with fake time.
 - [ ] After implementation, run `perf_dns_cache_retention` with cache-disabled/cache-enabled variants for ten alternating measurements. Retain only if the original 5% evidence remains and failures do not increase.
-- [ ] Commit retained code, or remove it and commit notes-only rejection.
+- [ ] Commit retained code as `Cache dev proxy DNS results`, or remove it and commit notes as `Reject dev proxy DNS cache experiment`.
 
 ---
 
@@ -318,11 +329,16 @@ pub struct ProxyState {
 - [ ] Prove maintained public APIs can: abort an upload after response headers through `ProxyBodyError`, observe confirmed local stream termination, preserve required informational/trailer frames, and classify GOAWAY/`REFUSED_STREAM` sufficiently for the spec's retries. If any proof is impossible, record `REJECT` immediately.
 - [ ] On feasibility rejection, remove the Cargo feature, proof tests, fixtures, harness variants, and all HTTP/2 scaffolding before committing notes; skip the remaining steps.
 - [ ] If feasible, write failing behavior tests for four TLS configurations, serialized cold discovery, exact authority/SNI/path/query, no cross-name reuse, stream-permit lifecycle, and protocol semantics.
+- [ ] Write explicit failing global-bound tests: a 33rd non-draining h2 connection is not opened; draining connections continue consuming the 64 manager-owned live slots; replacement remains blocked at 64 until a driver-exit event releases capacity.
+- [ ] Test effective stream capacity as `min(100, peer SETTINGS_MAX_CONCURRENT_STREAMS)`: one case with peer max above 100 keeps request 101 queued, and one with peer max 3 keeps request 4 queued.
+- [ ] Test `REFUSED_STREAM` retries for a non-idempotent request only when its complete body is reconstructable; prove a consumed streaming body is never retried.
 - [ ] With upload still streaming, test response EOS, downstream cancellation, response body error, and upload failure. Each must request reset, retain its permit until the termination guard fires, and keep a 101st request queued until confirmed termination.
 - [ ] Implement `Vacant`, `Discovering`, `Http1`, `Http2`, and `Draining` manager states with one creator and exact bounds; implement only enough to turn each behavior test green.
+- [ ] Record negotiated HTTP/2 connections, active/completed streams, and connection replacements; add snapshot assertions before retention measurement.
 - [ ] After two warmups, run ten alternating HTTP/1/HTTP/2 variants. Retain only with at least 10% median duration/throughput improvement, p95 regression no worse than 5%, and no additional failures.
 - [ ] Run the retained-protocol comparison with `cargo test --package trusted-server-cli --target "$(rustc -vV | awk '/host:/ { print $2 }')" --test proxy_perf perf_h2_retention -- --ignored --nocapture --test-threads=1`.
 - [ ] On any retention rejection, remove HTTP/2 production code, Cargo features, proof/behavior tests, fixtures, harness variants, and scaffolding before committing notes. Do not leave dormant complexity.
+- [ ] If retained, commit as `Add upstream HTTP/2 to dev proxy`; if rejected, commit notes as `Reject dev proxy HTTP/2 experiment`.
 
 ---
 
@@ -336,6 +352,7 @@ pub struct ProxyState {
 - [ ] After two warmups, run each setting as a separate process ten times in round-robin order. Example command: `/usr/bin/time -p env TS_PERF_VARIANT=browser_on cargo test --package trusted-server-cli --target "$(rustc -vV | awk '/host:/ { print $2 }')" --test proxy_perf perf_tcp_nodelay -- --ignored --nocapture --test-threads=1`. Repeat with each variant value so CPU evidence is per variant.
 - [ ] Retain browser/upstream settings independently only with at least 3% median improvement, p95 regression no worse than 5%, and per-process CPU regression no worse than 5%.
 - [ ] Remove option abstractions for rejected variants. Commit retained code or notes-only rejection.
+- [ ] Use `Tune dev proxy TCP latency` for retained settings or `Reject dev proxy TCP_NODELAY experiment` for notes-only rejection.
 
 ---
 
@@ -356,5 +373,5 @@ cargo clippy --package trusted-server-cli --target "$(rustc -vV | awk '/host:/ {
 
 - [ ] Run the retained ignored performance workloads single-threaded and compare to recorded variability.
 - [ ] Audit all 14 security invariants against code and tests, including DNS/IP reference identity, no cross-SNI reuse, driver-owned capacity, no streaming-body replay, redacted auth, and bounded state.
-- [ ] Commit final docs as `docs: document dev proxy performance results`.
+- [ ] Commit final docs as `Document dev proxy performance results`.
 - [ ] Use `superpowers:requesting-code-review` on the complete branch. Resolve every critical/important issue and rerun affected verification until approved.

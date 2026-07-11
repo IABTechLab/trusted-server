@@ -19,6 +19,11 @@ TCP connection, performs a new TLS and Hyper handshake, sends one request, and
 drops the sender. A page with many assets therefore repeats network setup that
 should be amortized across requests.
 
+The material wall-clock win is expected against remote and staging upstreams,
+where TCP and TLS setup carry real latency. For localhost, success is primarily
+the deterministic reduction from one setup per request to one reusable
+connection; a flat local duration is not by itself a failure.
+
 ## Goals
 
 1. Reuse upstream connections safely across forwarded requests.
@@ -165,6 +170,12 @@ Hyper-util's general client pool does not expose all of those policies as one
 auditable state machine. The custom manager still uses Hyper's maintained
 HTTP/1.1 and HTTP/2 connection drivers, but owns leasing, limits, and the
 complete origin key itself.
+
+The manager actor is intentionally a single serialization point for
+acquire/return/accounting commands. This channel hop is proportionate at local
+developer-proxy request rates and buys auditable driver-owned capacity and
+teardown. Pool-acquisition and queue-wait metrics verify that it does not become
+a meaningful bottleneck.
 
 The HTTP/1.1 pool obeys these rules:
 
@@ -666,6 +677,7 @@ corresponding experiment clears its entry gate and its code is retained.
   `is_end_stream() == false`, non-empty extensions, zero-data bodies with
   trailers, unexpected frames, and mid-body errors.
 - Metrics counters and bounded timing buckets.
+- Backpressure without adapter pre-buffering.
 
 ### Integration Tests
 
@@ -692,6 +704,9 @@ gate and its code is retained.
 - Multi-address connection attempts share one total deadline and record the
   actual selected peer without fragmenting logical pool identity.
 - TLS, plaintext, secure, insecure, and `--resolve` pools remain isolated.
+- `--insecure` still emits its warning; blind tunnels and stray plain-HTTP
+  forwarding bypass mapped pool accounting; manager shutdown aborts drivers,
+  closes sockets, fails waiters, and discards all bounded state.
 - Origin-key tests vary protocol, TO reference identity, port, address policy,
   verification mode, and application mode independently, including combinations
   that cannot arise in one CLI invocation because `--insecure` and `--resolve`
