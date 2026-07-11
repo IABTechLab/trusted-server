@@ -552,6 +552,11 @@ TLS handshake count, and request failures. Timing assertions are not placed in
 ordinary CI tests. Correctness tests assert deterministic connection/handshake
 counts; performance comparisons are run deliberately and documented.
 
+Harness-only construction may inject pool-disabled mode, alternate pool limits,
+and phase delays so variants can run against one binary in alternating order.
+These controls are not CLI flags and production construction always uses the
+approved defaults.
+
 ### Acceptance Criteria
 
 The named sequential workload is 100 zero-body GET requests over one
