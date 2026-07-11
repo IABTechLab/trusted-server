@@ -133,21 +133,27 @@ pub enum ReferenceIdentity { Dns(Arc<str>), Ip(IpAddr) }
 ```rust
 enum Command {
     Acquire { key: OriginKey, reply: oneshot::Sender<Result<Lease, AcquireError>> },
-    Connected { key: OriginKey, result: Result<IdleConnection, ConnectError> },
     Return(IdleConnection),
-    DriverClosed(ConnectionId),
     Cancel(WaiterId),
     Expire(Instant),
     Shutdown { reply: oneshot::Sender<()> },
 }
+
+enum LifecycleEvent {
+    ConnectFinished { id: ConnectionId, key: OriginKey, result: Result<IdleConnection, ConnectError> },
+    DriverClosed(ConnectionId),
+}
 ```
 
 - [ ] Keep all counts and FIFO queues actor-owned. Spawn connection work and report completion; never await network work inside the actor.
+- [ ] Use two lanes: a bounded ordinary `mpsc::channel` for Acquire/Return/Cancel/Shutdown and an unbounded lifecycle channel for `ConnectFinished` and `DriverClosed`. The actor selects both lanes; spawned network completion and synchronous drop never use `try_send` on the bounded lane.
 - [ ] Store production defaults in injectable `PoolLimits`; permit harness-only cap variants and pool-disabled baseline mode without adding CLI flags.
 - [ ] Make capacity driver-owned: in actor tests, closing a lease emits an abort request but only a synthetic `DriverClosed(ConnectionId)` decrements live counts. Defer the real socket/upload assertion to Task 7 after the connector and body wrapper exist.
 - [ ] Use one next-deadline timer rather than a task per idle connection. Add paused-time assertions at 59 seconds (still idle) and 60 seconds (expiry requests abort). Expiry removes the entry but does not decrement/admit until `DriverClosed`.
 - [ ] Add actor-shutdown tests proving all waiters are failed, every live driver is aborted, queues/idle maps are cleared, and counts reach zero only through synthetic `DriverClosed` events.
-- [ ] Implement a Closing state: `Shutdown` rejects new Acquire commands, fails queued waiters, aborts every driver, continues processing `DriverClosed`, acknowledges the shutdown reply only at zero live drivers, then exits. Do not rely on command-channel closure because drivers retain senders.
+- [ ] Implement a Closing state: `Shutdown` rejects new Acquire commands, fails queued waiters, aborts every driver, and continues processing both unbounded lifecycle events. Reconcile every `ConnectFinished` by its reserved `ConnectionId`, never by key; failure releases that exact connecting count, while success publishes nothing, aborts the new driver, and waits for matching `DriverClosed`. Acknowledge only when connecting and driver counts are both zero.
+- [ ] Add shutdown-race tests for both successful and failed `ConnectFinished` after Closing begins; prove no connection reaches a waiter and capacity is reconciled exactly once.
+- [ ] Saturate the bounded ordinary channel in a paused-time actor test, mass-abort drivers, and prove every unbounded lifecycle event is received and zero-live acknowledgment succeeds.
 - [ ] Run manager tests. Expected: GREEN without wall-clock sleeps.
 - [ ] Commit as `Add bounded dev proxy upstream manager`.
 
@@ -161,6 +167,7 @@ enum Command {
 - [ ] Fake DNS must consume part of the deadline; prove each remaining address receives at most `remaining / addresses_left` and no attempt extends the original deadline.
 - [ ] Run focused tests. Expected: RED because `ConnectionFactory` is absent.
 - [ ] Define `ProxyRequestBody = BoxBody<Bytes, ProxyBodyError>` in `upstream/mod.rs`, where `ProxyBodyError` wraps `hyper::Error` and represents local cancellation. Then implement a narrow injectable factory returning an opened HTTP/1 sender, driver health, explicit abort handle, driver drop guard, connection ID, and actual peer.
+- [ ] Allocate `ConnectionId` and register a Connecting reservation in the actor before spawning network work. Include that ID in `ConnectFinished`. Start every successful Hyper driver behind a one-shot latch: enqueue completion, let the actor transition the exact reservation to Live/Closing, then release the latch. With simultaneous connects for one key, prove success/failure affects only its ID; also prove `DriverClosed` cannot arrive first and unknown IDs are never published/reconciled twice.
 - [ ] Preserve IP-literal compatibility: DNS identities send SNI and validate DNS SAN; IP identities send no DNS SNI and validate IP SAN. Mark IP rules HTTP/1-required.
 - [ ] Compute one deadline before resolution. Record DNS lookup duration, TCP attempt before `connect`, established/connect duration after success, TLS handshake duration after TLS success, and HTTP handshake duration after Hyper success.
 - [ ] Spawn one Hyper driver per opened connection and report termination to the actor.
@@ -212,6 +219,7 @@ pub struct ProxyState {
 - [ ] Wire initial-head parse duration and manager acquisition/queue timing into the shared metrics at their actual boundaries.
 - [ ] Wire every core metric at its boundary: accepted browser connections; parsed and rejected initial heads plus parse duration; CA hit/miss; DNS lookup duration; TCP attempt/established/connect duration; TLS and Hyper handshake durations; negotiated HTTP/1 count; pool hit/miss/stale/retry; pool acquisition/queue wait; request-to-header; request completion/failure. Add a snapshot integration test that drives one success, one rejected head, and one failure and checks every core category's expected delta. Task 9 adds mint metrics; Tasks 12/13 add retained-experiment metrics.
 - [ ] On every clean shutdown path, emit the redacted debug summary after Safari restoration. Add a formatting test proving it contains counts/timings but no URL query, auth value, certificate data, or sensitive headers.
+- [ ] Implement Ctrl-C ordering explicitly: restore Safari/system PAC first while the proxy is alive; abort/stop the accept-loop task; send manager `Shutdown`; wait with a fixed two-second Tokio timeout; emit current metrics on success or timeout; then return so runtime teardown reaps leftovers. Never await manager drain before Safari restoration.
 - [ ] Delegate mapped traffic to `UpstreamClient`. Keep blind tunnels, stray plain-HTTP forwarding, local PAC, Host-based per-request routing, and `421` behavior unchanged.
 - [ ] Capture upstream close intent before response hop-by-hop sanitation, then wrap the response body with its lease.
 - [ ] Make the two-request smoke GREEN, then add the 100-request acceptance case and run all existing proxy E2E tests. Expected: one established connection/handshake and unchanged routing/security behavior.
@@ -230,6 +238,8 @@ pub struct ProxyState {
 - [ ] Prove unmatched blind tunnels and stray plain-HTTP forwarding bypass the manager and do not consume/decrement its 64 mapped-connection count.
 - [ ] For every non-reusable case, require the next request to open a fresh connection.
 - [ ] In the early-response case, require immediate browser response, driver abort, upload polling to stop, socket closure, and no live-capacity release until the driver drop guard reports termination.
+- [ ] Add an adversarial shutdown orchestration test with injected hooks: saturate ordinary manager commands and delay one lifecycle close beyond two seconds. Assert Safari restoration is invoked first, new accepts stop next, shutdown returns at the deadline, and current metrics are emitted.
+- [ ] Add bidirectional large streaming E2E cases (for example 2 MiB in small deterministic chunks): a successful chunked upload captured byte-for-byte at the upstream, and a chunked response read byte-for-byte at the browser. Assert incremental polling/backpressure on both paths rather than whole-body buffering.
 - [ ] Add a real proxy-shutdown test proving active/idle mapped drivers are aborted, sockets close, bounded queues are discarded, and the manager task exits without retained state.
 - [ ] Run `proxy_pool_e2e`. Task 5 unit tests may make lifecycle cases GREEN immediately; treat that as acceptance evidence. If an integration case fails, verify the failure is the intended missing behavior before changing production code.
 - [ ] Implement only the failing lifecycle transitions. Never background-drain; admit waiters only after driver termination decrements capacity.
@@ -326,11 +336,12 @@ pub struct ProxyState {
 - [ ] Measure and record the entry gate.
 - [ ] Run `cargo test --package trusted-server-cli --target "$(rustc -vV | awk '/host:/ { print $2 }')" --test proxy_perf perf_h2_entry -- --ignored --nocapture --test-threads=1`; this internally alternates cold/preconnected and cap-6/cap-20 variants.
 - [ ] Temporarily enable Hyper `http2` and add a narrowly scoped `http2_feasibility` test target. This is prerequisite scaffolding, not a production behavior claim.
-- [ ] Prove maintained public APIs can: abort an upload after response headers through `ProxyBodyError`, observe confirmed local stream termination, preserve required informational/trailer frames, and classify GOAWAY/`REFUSED_STREAM` sufficiently for the spec's retries. If any proof is impossible, record `REJECT` immediately.
+- [ ] Prove maintained public APIs can: abort an upload after response headers through `ProxyBodyError`; observe confirmed local stream termination; preserve required informational/trailer frames; classify GOAWAY/`REFUSED_STREAM`; and expose current/dynamically lowered peer stream capacity (or an equivalent protocol signal) so combined manager plus Hyper-internal waiters can be kept within 32 per origin and 128 globally. `SendRequest::ready()` is insufficient. If any proof is impossible, record `REJECT` immediately.
 - [ ] On feasibility rejection, remove the Cargo feature, proof tests, fixtures, harness variants, and all HTTP/2 scaffolding before committing notes; skip the remaining steps.
 - [ ] If feasible, write failing behavior tests for four TLS configurations, serialized cold discovery, exact authority/SNI/path/query, no cross-name reuse, stream-permit lifecycle, and protocol semantics.
 - [ ] Write explicit failing global-bound tests: a 33rd non-draining h2 connection is not opened; draining connections continue consuming the 64 manager-owned live slots; replacement remains blocked at 64 until a driver-exit event releases capacity.
-- [ ] Test effective stream capacity as `min(100, peer SETTINGS_MAX_CONCURRENT_STREAMS)`: one case with peer max above 100 keeps request 101 queued, and one with peer max 3 keeps request 4 queued.
+- [ ] Only if feasibility exposes adequate peer-capacity accounting, implement candidate active capacity `min(100, peer limit)` and keep all remaining requests in the bounded manager queues rather than a hidden Hyper queue. Hold active permits through response/reset termination and react to dynamic SETTINGS reductions.
+- [ ] Test both layers: with peer max above 100, request 101 stays in the manager queue; with peer max 3, request 4 stays in the manager queue; dynamic lowering moves no extra work into an unbounded internal queue. Assert combined per-origin/global waiter bounds and cancellation.
 - [ ] Test `REFUSED_STREAM` retries for a non-idempotent request only when its complete body is reconstructable; prove a consumed streaming body is never retried.
 - [ ] With upload still streaming, test response EOS, downstream cancellation, response body error, and upload failure. Each must request reset, retain its permit until the termination guard fires, and keep a 101st request queued until confirmed termination.
 - [ ] Implement `Vacant`, `Discovering`, `Http1`, `Http2`, and `Draining` manager states with one creator and exact bounds; implement only enough to turn each behavior test green.

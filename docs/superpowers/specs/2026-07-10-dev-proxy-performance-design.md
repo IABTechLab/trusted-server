@@ -247,6 +247,45 @@ guard that reports `DriverClosed(ConnectionId)` even when its task is aborted;
 only that event releases origin/global capacity and admits waiters. Therefore an
 upload or socket cannot remain active after accounting says capacity is free.
 
+Network lifecycle events use a dedicated unbounded Tokio channel separate from
+the bounded acquire/return command channel. Connection-attempt completion and a
+synchronous driver drop guard can therefore report `ConnectFinished` and
+`DriverClosed` during mass abort without blocking or losing accounting behind
+ordinary queued commands. Failure to send means the manager has already exited
+and no acknowledgment is still waiting.
+
+The actor allocates each `ConnectionId` and records a Connecting reservation
+before opening begins. On successful handshake, the connector creates a driver
+task behind a one-shot start latch and sends `ConnectFinished` containing its
+ID and control handles. The actor first transitions that exact reservation to Live (or
+marks it for immediate shutdown), then releases the latch. Consequently
+`DriverClosed` cannot precede registration, and unknown IDs are treated as an
+invariant violation rather than later publishing a dead connection.
+
+### Shutdown Choreography
+
+Ctrl-C preserves Safari recovery as the first operation. While the proxy is
+still alive, synchronously restore the prior Safari/system PAC setting using the
+existing interactive behavior. Only after restoration returns does shutdown:
+
+1. stop the accept-loop task so no new browser connections enter;
+2. send `Shutdown` to the upstream manager, which rejects acquisition, fails
+   waiters, aborts every driver, and continues consuming lifecycle events;
+3. wait at most two seconds for the manager to observe all `DriverClosed` events
+   and acknowledge zero live manager-owned connections;
+4. on success or timeout, emit the redacted metrics summary from current state
+   and return, allowing Tokio runtime teardown to reap anything remaining.
+
+The manager drain is diagnostic/graceful behavior, not a precondition for Safari
+restoration or process exit. A wedged driver or saturated ordinary command queue
+cannot strand the system proxy or hang Ctrl-C indefinitely.
+
+If a pending connection attempt reports `ConnectFinished` while Closing, a
+failure releases its connecting count immediately; a success is never published
+to a waiter and its new driver is aborted, with live capacity retained until the
+subsequent `DriverClosed`. Closing acknowledges only after both connecting and
+driver counts reach zero.
+
 Upstream `Connection: close` and equivalent HTTP/1 connection intent are
 captured before hop-by-hop response sanitation. The sanitized header is still
 not forwarded to the reusable browser tunnel. Returning a lease is idempotent:
@@ -314,6 +353,15 @@ normal HTTP/1.1 pool under the eligible-mode origin key. For eligible rules:
   upload failure follows the same reset-then-confirm rule. A GOAWAY/draining connection retains its global
   live-connection capacity until the driver exits, using the same driver-owned
   accounting rule as HTTP/1.1;
+- before candidate production work, the feasibility proof must find a maintained
+  public API or equivalent protocol signal that lets the manager account for the
+  peer's current and dynamically lowered `SETTINGS_MAX_CONCURRENT_STREAMS`.
+  `SendRequest::ready()` is explicitly insufficient. The combined manager queue
+  and any requests queued inside Hyper must respect the 32-per-origin and
+  128-global waiter bounds with testable cancellation. If hidden Hyper queuing
+  cannot be observed and bounded, reject HTTP/2 at feasibility and remove all
+  experiment code. Only after this proof may the manager implement the candidate
+  `min(100, peer limit)` active-stream policy and queue the remainder itself;
 - the connection remains keyed by the complete upstream origin key;
 - before dispatch, the client constructs an HTTP/2 request URI whose authority
   is the TO hostname plus any non-default port. Hyper therefore emits
@@ -697,6 +745,9 @@ gate and its code is retained.
   pooling, that upstream connection. The test asserts upload polling stops, the
   socket closes, and manager live capacity is released only after the driver
   drop guard reports termination.
+- Large chunked request and response bodies traverse the pooled wrappers end to
+  end with exactly identical bytes and incremental polling, without whole-body
+  buffering.
 - A server-closed idle connection is retried once on a fresh connection.
 - Sender-readiness failure preserves an unconsumed request; post-send failure
   retries only an eligible idempotent empty request. Streaming and truncated
@@ -707,6 +758,9 @@ gate and its code is retained.
 - `--insecure` still emits its warning; blind tunnels and stray plain-HTTP
   forwarding bypass mapped pool accounting; manager shutdown aborts drivers,
   closes sockets, fails waiters, and discards all bounded state.
+- Ctrl-C shutdown restores Safari before manager drain, completes within the
+  two-second drain deadline when a driver delays termination, and still receives
+  all driver lifecycle events when the ordinary command channel is saturated.
 - Origin-key tests vary protocol, TO reference identity, port, address policy,
   verification mode, and application mode independently, including combinations
   that cannot arise in one CLI invocation because `--insecure` and `--resolve`
