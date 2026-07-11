@@ -5,6 +5,8 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use rustls::DigitallySignedStruct;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -29,6 +31,35 @@ pub struct ProxiedResponse {
 /// A running upstream and the loopback address it bound.
 pub struct Upstream {
     pub addr: SocketAddr,
+    counters: Arc<UpstreamCounters>,
+}
+
+impl Upstream {
+    #[must_use]
+    pub fn snapshot(&self) -> UpstreamSnapshot {
+        UpstreamSnapshot {
+            accepted_connections: self.counters.accepted_connections.load(Ordering::Relaxed),
+            tls_handshakes: self.counters.tls_handshakes.load(Ordering::Relaxed),
+            requests: self.counters.requests.load(Ordering::Relaxed),
+            failures: self.counters.failures.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct UpstreamSnapshot {
+    pub accepted_connections: u64,
+    pub tls_handshakes: u64,
+    pub requests: u64,
+    pub failures: u64,
+}
+
+#[derive(Default)]
+struct UpstreamCounters {
+    accepted_connections: AtomicU64,
+    tls_handshakes: AtomicU64,
+    requests: AtomicU64,
+    failures: AtomicU64,
 }
 
 /// The leaf certificate the client observed at the end of a tunnel.
@@ -152,42 +183,64 @@ fn upstream_tls_acceptor() -> TlsAcceptor {
 /// Starts an HTTPS upstream that echoes the `Host`/`X-Orig-Host`/path it saw and
 /// always returns `200`. Serves keep-alive (many requests per connection).
 pub async fn start_echo_upstream() -> Upstream {
-    start_upstream(false).await
+    start_upstream(false, Duration::ZERO).await
+}
+
+/// Starts the echo upstream with a fixed delay before every response.
+pub async fn start_delayed_echo_upstream(response_delay: Duration) -> Upstream {
+    start_upstream(false, response_delay).await
 }
 
 /// Starts an HTTPS upstream that returns `401` unless an `Authorization` header
 /// is present, otherwise `200`.
 pub async fn start_gated_upstream() -> Upstream {
-    start_upstream(true).await
+    start_upstream(true, Duration::ZERO).await
 }
 
-async fn start_upstream(gated: bool) -> Upstream {
+async fn start_upstream(gated: bool, response_delay: Duration) -> Upstream {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("should bind upstream");
     let addr = listener.local_addr().expect("should read upstream addr");
     let acceptor = upstream_tls_acceptor();
+    let counters = Arc::new(UpstreamCounters::default());
+    let task_counters = Arc::clone(&counters);
     tokio::spawn(async move {
         loop {
             let Ok((tcp, _)) = listener.accept().await else {
                 break;
             };
+            task_counters
+                .accepted_connections
+                .fetch_add(1, Ordering::Relaxed);
             let acceptor = acceptor.clone();
+            let counters = Arc::clone(&task_counters);
             tokio::spawn(async move {
-                let Ok(mut tls) = acceptor.accept(tcp).await else {
-                    return;
+                let mut tls = match acceptor.accept(tcp).await {
+                    Ok(tls) => {
+                        counters.tls_handshakes.fetch_add(1, Ordering::Relaxed);
+                        tls
+                    }
+                    Err(_) => {
+                        counters.failures.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
                 };
-                serve_upstream_connection(&mut tls, gated).await;
+                serve_upstream_connection(&mut tls, gated, response_delay, &counters).await;
             });
         }
     });
-    Upstream { addr }
+    Upstream { addr, counters }
 }
 
 /// Minimal HTTP/1.1 keep-alive loop: parse each request head, echo the headers
 /// the test cares about, respond, repeat until the peer closes.
-async fn serve_upstream_connection<S>(stream: &mut S, gated: bool)
-where
+async fn serve_upstream_connection<S>(
+    stream: &mut S,
+    gated: bool,
+    response_delay: Duration,
+    counters: &UpstreamCounters,
+) where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
     let mut buf = Vec::new();
@@ -199,11 +252,16 @@ where
                 break pos + 4;
             }
             let n = match stream.read(&mut chunk).await {
-                Ok(0) | Err(_) => return,
+                Ok(0) => return,
                 Ok(n) => n,
+                Err(_) => {
+                    counters.failures.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
             };
             buf.extend_from_slice(&chunk[..n]);
         };
+        counters.requests.fetch_add(1, Ordering::Relaxed);
         let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
         buf.drain(..head_end);
 
@@ -224,14 +282,21 @@ where
             let body = format!("host={host};orig={orig_host};fwd={fwd_host};path={path}");
             ("HTTP/1.1 200 OK", body)
         };
+        if !response_delay.is_zero() {
+            tokio::time::sleep(response_delay).await;
+        }
         let response = format!(
             "{status_line}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
             body.len()
         );
         if stream.write_all(response.as_bytes()).await.is_err() {
+            counters.failures.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        let _ = stream.flush().await;
+        if stream.flush().await.is_err() {
+            counters.failures.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
     }
 }
 
@@ -251,7 +316,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 // ---- proxy lifecycle ----
 
 /// Spawns the proxy in the background and returns the loopback address it bound.
-async fn spawn_proxy(cfg: config::ResolvedConfig, ca: Arc<ca::CertAuthority>) -> SocketAddr {
+pub async fn spawn_proxy(cfg: config::ResolvedConfig, ca: Arc<ca::CertAuthority>) -> SocketAddr {
     let listener = server::bind(cfg.listen)
         .await
         .expect("should bind proxy listener");
@@ -425,6 +490,14 @@ pub async fn drive_sequential_requests(
     paths: &[&str],
 ) -> Vec<ProxiedResponse> {
     let proxy = spawn_proxy(cfg, ca).await;
+    drive_sequential_requests_through_proxy(proxy, paths).await
+}
+
+/// Issues several GETs over one keep-alive MITM tunnel to an existing proxy.
+pub async fn drive_sequential_requests_through_proxy(
+    proxy: SocketAddr,
+    paths: &[&str],
+) -> Vec<ProxiedResponse> {
     let authority = format!("{FROM_HOST}:443");
     let tcp = proxy_connect(proxy, &authority).await;
 

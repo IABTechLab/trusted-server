@@ -58,8 +58,8 @@ Each comparison test alternates variants internally after two warmups and prints
 
 **Files:** Create `metrics.rs`, `proxy_perf.rs`, and implementation notes; modify `mod.rs` and `tests/support/mod.rs`.
 
-- [ ] Run `./scripts/test-cli.sh`. Expected: baseline PASS; stop if it does not.
-- [ ] Write failing `metrics.rs` tests requiring separate TCP-attempt/established counters and a fixed-size timing histogram.
+- [x] Run `./scripts/test-cli.sh`. Expected: baseline PASS; stop if it does not.
+- [x] Write failing `metrics.rs` tests requiring separate TCP-attempt/established counters and a fixed-size timing histogram.
 
 ```rust
 #[test]
@@ -75,13 +75,13 @@ fn snapshot_separates_attempts_from_established() {
 }
 ```
 
-- [ ] Run `cargo test --package trusted-server-cli --target "$(rustc -vV | awk '/host:/ { print $2 }')" metrics::tests`. Expected: RED because metrics do not exist.
-- [ ] Implement `ProxyMetrics` with `AtomicU64` fields and fixed atomic duration buckets, including methods for initial-head parse, pool acquisition, and queue wait. Expose `snapshot`, phase-recording methods, and a redacted debug summary; retain no per-request labels or samples. Task 1 uses fixture counters for the baseline; runtime phase wiring occurs when `ProxyState` reaches `server.rs` in Task 6.
-- [ ] Extend the TLS upstream fixture with shared accepted-connection, request, handshake, and failure counters.
-- [ ] Add baseline `#[ignore = "manual performance workload"]` tests for 100 sequential TLS GETs, 100 delayed GETs at matched concurrency six, and a separate concurrency-20 saturation workload. Add the injectable remote-latency model in Task 10 after the connection factory exists.
-- [ ] Run the ignored harness with `--ignored --nocapture --test-threads=1`. Expected baseline: approximately 100 established upstream connections and handshakes for 100 sequential requests.
-- [ ] Record raw output, machine, OS, Rust version, and command in implementation notes.
-- [ ] Run `./scripts/test-cli.sh` and commit as `Establish dev proxy performance baseline`.
+- [x] Run `cargo test --package trusted-server-cli --target "$(rustc -vV | awk '/host:/ { print $2 }')" metrics::tests`. Expected: RED because metrics do not exist.
+- [x] Implement `ProxyMetrics` with `AtomicU64` fields and fixed atomic duration buckets, including methods for initial-head parse, pool acquisition, and queue wait. Expose `snapshot`, phase-recording methods, and a redacted debug summary; retain no per-request labels or samples. Task 1 uses fixture counters for the baseline; runtime phase wiring occurs when `ProxyState` reaches `server.rs` in Task 6.
+- [x] Extend the TLS upstream fixture with shared accepted-connection, request, handshake, and failure counters.
+- [x] Add baseline `#[ignore = "manual performance workload"]` tests for 100 sequential TLS GETs, 100 delayed GETs at matched concurrency six, and a separate concurrency-20 saturation workload. Add the injectable remote-latency model in Task 10 after the connection factory exists.
+- [x] Run the ignored harness with `--ignored --nocapture --test-threads=1`. Expected baseline: approximately 100 established upstream connections and handshakes for 100 sequential requests.
+- [x] Record raw output, machine, OS, Rust version, and command in implementation notes.
+- [x] Run `./scripts/test-cli.sh` and commit as `Establish dev proxy performance baseline`.
 
 ---
 

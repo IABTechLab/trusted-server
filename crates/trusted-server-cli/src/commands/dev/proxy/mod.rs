@@ -1,6 +1,7 @@
 pub mod browser;
 pub mod ca;
 pub mod config;
+pub mod metrics;
 pub mod rewrite;
 pub mod server;
 
