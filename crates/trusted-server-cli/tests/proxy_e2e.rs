@@ -17,6 +17,28 @@ use trusted_server_cli::commands::dev::proxy::{ca, config};
 
 mod support;
 
+async fn wait_for_request_metrics(
+    state: &trusted_server_cli::commands::dev::proxy::ProxyState,
+    completed: u64,
+    failed: u64,
+) {
+    let settled = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let snapshot = state.metrics.snapshot();
+            if snapshot.requests_completed >= completed && snapshot.requests_failed >= failed {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        settled.is_ok(),
+        "request metrics should settle: {:?}",
+        state.metrics.snapshot()
+    );
+}
+
 #[tokio::test]
 async fn matched_host_is_rewritten_and_forwarded() {
     let upstream = support::start_echo_upstream().await;
@@ -297,6 +319,85 @@ async fn large_chunked_upload_and_response_are_byte_identical() {
         },
         "one streamed exchange should use one healthy upstream connection"
     );
+}
+
+#[tokio::test]
+async fn early_response_completes_without_pooling_streaming_upload() {
+    let upstream = support::start_early_response_upstream().await;
+    let cfg = support::test_config(&upstream.addr);
+    let ca = Arc::new(support::dev_ca());
+    let (proxy, state) = support::spawn_proxy_with_state(cfg, ca).await;
+
+    let status = support::drive_early_response(proxy).await;
+    assert_eq!(status, 200, "browser should receive early response");
+    wait_for_request_metrics(&state, 1, 0).await;
+    let next = support::drive_sequential_requests_through_proxy(proxy, &["/next"]).await;
+
+    assert_eq!(next[0].status, 200);
+    assert_eq!(
+        upstream.snapshot().accepted_connections,
+        2,
+        "streaming upload connection must close instead of pooling"
+    );
+    let metrics = state.metrics.snapshot();
+    assert_eq!(metrics.requests_completed, 2);
+    assert_eq!(metrics.requests_failed, 0);
+}
+
+#[tokio::test]
+async fn browser_cancellation_closes_slow_response_and_counts_failure() {
+    let upstream = support::start_slow_response_upstream().await;
+    let cfg = support::test_config(&upstream.addr);
+    let ca = Arc::new(support::dev_ca());
+    let (proxy, state) = support::spawn_proxy_with_state(cfg, ca).await;
+
+    support::cancel_slow_response(proxy).await;
+    wait_for_request_metrics(&state, 0, 1).await;
+
+    tokio::time::timeout(Duration::from_secs(1), state.upstream.shutdown())
+        .await
+        .expect("cancelled response driver should reconcile");
+    assert_eq!(state.metrics.snapshot().requests_completed, 0);
+}
+
+#[tokio::test]
+async fn truncated_upstream_response_counts_failure() {
+    let upstream = support::start_truncated_response_upstream().await;
+    let cfg = support::test_config(&upstream.addr);
+    let ca = Arc::new(support::dev_ca());
+    let (proxy, state) = support::spawn_proxy_with_state(cfg, ca).await;
+
+    let (declared, received) = support::drive_truncated_response(proxy).await;
+    wait_for_request_metrics(&state, 0, 1).await;
+
+    assert_eq!(declared, 10);
+    assert_eq!(received, 3);
+    assert_eq!(state.metrics.snapshot().requests_completed, 0);
+}
+
+#[tokio::test]
+async fn response_trailers_finish_before_connection_reuse() {
+    let upstream = support::start_trailer_upstream().await;
+    let cfg = support::test_config(&upstream.addr);
+    let ca = Arc::new(support::dev_ca());
+    let (proxy, state) = support::spawn_proxy_with_state(cfg, ca).await;
+
+    let responses = support::drive_trailer_requests(proxy).await;
+    wait_for_request_metrics(&state, 2, 0).await;
+
+    assert_eq!(responses.len(), 2);
+    for (body, trailers) in responses {
+        assert_eq!(body, b"data");
+        assert!(
+            trailers
+                .to_ascii_lowercase()
+                .contains("x-test-trailer: done"),
+            "response trailer should be forwarded: {trailers:?}"
+        );
+    }
+    let snapshot = upstream.snapshot();
+    assert_eq!(snapshot.accepted_connections, 1);
+    assert_eq!(snapshot.requests, 2);
 }
 
 #[tokio::test]

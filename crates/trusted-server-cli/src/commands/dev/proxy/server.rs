@@ -574,7 +574,16 @@ async fn proxy_to_upstream(
     // Strip hop-by-hop headers from the upstream response too. A `Connection: close`
     // (or a named connection token) is specific to the upstream leg and must not
     // leak onto the reusable browser↔proxy MITM tunnel and tear it down.
+    let downstream_trailer = response.headers().get(hyper::header::TRAILER).cloned();
     strip_hop_by_hop(response.headers_mut());
+    if let Some(trailer) = downstream_trailer {
+        // Regenerate the trailer declaration for the downstream HTTP/1 leg so
+        // Hyper serializes forwarded trailer frames. This is new downstream
+        // framing metadata, not leaked upstream connection state.
+        response
+            .headers_mut()
+            .insert(hyper::header::TRAILER, trailer);
+    }
     Ok(response)
 }
 

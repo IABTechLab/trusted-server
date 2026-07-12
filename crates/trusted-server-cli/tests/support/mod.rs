@@ -267,6 +267,124 @@ pub async fn start_gated_upstream() -> Upstream {
     start_upstream(true, Duration::ZERO, false, false).await
 }
 
+/// Starts an upstream that responds before consuming a streaming upload.
+pub async fn start_early_response_upstream() -> Upstream {
+    start_scripted_upstream(ScriptedResponse::Early).await
+}
+
+/// Starts an upstream that sends one response chunk and then stalls.
+pub async fn start_slow_response_upstream() -> Upstream {
+    start_scripted_upstream(ScriptedResponse::Slow).await
+}
+
+/// Starts an upstream that truncates a declared fixed-length response.
+pub async fn start_truncated_response_upstream() -> Upstream {
+    start_scripted_upstream(ScriptedResponse::Truncated).await
+}
+
+/// Starts an upstream that sends response trailers on every request.
+pub async fn start_trailer_upstream() -> Upstream {
+    start_scripted_upstream(ScriptedResponse::Trailers).await
+}
+
+#[derive(Clone, Copy)]
+enum ScriptedResponse {
+    Early,
+    Slow,
+    Truncated,
+    Trailers,
+}
+
+async fn start_scripted_upstream(script: ScriptedResponse) -> Upstream {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("should bind scripted upstream");
+    let addr = listener.local_addr().expect("should read scripted address");
+    let acceptor = upstream_tls_acceptor();
+    let counters = Arc::new(UpstreamCounters::default());
+    let task_counters = Arc::clone(&counters);
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                break;
+            };
+            task_counters
+                .accepted_connections
+                .fetch_add(1, Ordering::Relaxed);
+            let acceptor = acceptor.clone();
+            let counters = Arc::clone(&task_counters);
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(tcp).await else {
+                    counters.failures.fetch_add(1, Ordering::Relaxed);
+                    return;
+                };
+                counters.tls_handshakes.fetch_add(1, Ordering::Relaxed);
+                let mut buffered = Vec::new();
+                loop {
+                    if !read_one_head(&mut tls, &mut buffered).await {
+                        return;
+                    }
+                    counters.requests.fetch_add(1, Ordering::Relaxed);
+                    let response = match script {
+                        ScriptedResponse::Early => {
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\nearly"
+                                .as_slice()
+                        }
+                        ScriptedResponse::Slow => {
+                            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n5\r\nfirst\r\n"
+                                .as_slice()
+                        }
+                        ScriptedResponse::Truncated => {
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: keep-alive\r\n\r\nabc"
+                                .as_slice()
+                        }
+                        ScriptedResponse::Trailers => {
+                            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: x-test-trailer\r\nConnection: keep-alive\r\n\r\n4\r\ndata\r\n0\r\nx-test-trailer: done\r\n\r\n"
+                                .as_slice()
+                        }
+                    };
+                    if tls.write_all(response).await.is_err() || tls.flush().await.is_err() {
+                        return;
+                    }
+                    match script {
+                        ScriptedResponse::Early => {
+                            let mut byte = [0_u8; 1];
+                            while tls.read(&mut byte).await.is_ok_and(|count| count > 0) {}
+                            return;
+                        }
+                        ScriptedResponse::Slow => {
+                            std::future::pending::<()>().await;
+                        }
+                        ScriptedResponse::Truncated => return,
+                        ScriptedResponse::Trailers => {}
+                    }
+                }
+            });
+        }
+    });
+    Upstream { addr, counters }
+}
+
+async fn read_one_head<S>(stream: &mut S, buffered: &mut Vec<u8>) -> bool
+where
+    S: AsyncReadExt + Unpin,
+{
+    let mut chunk = [0_u8; 1024];
+    loop {
+        if let Some(position) = find_subslice(buffered, b"\r\n\r\n") {
+            buffered.drain(..position + 4);
+            return true;
+        }
+        let Ok(count) = stream.read(&mut chunk).await else {
+            return false;
+        };
+        if count == 0 {
+            return false;
+        }
+        buffered.extend_from_slice(&chunk[..count]);
+    }
+}
+
 async fn start_upstream(
     gated: bool,
     response_delay: Duration,
@@ -413,6 +531,13 @@ async fn read_chunked_message<S>(stream: &mut S) -> Option<Vec<u8>>
 where
     S: AsyncReadExt + Unpin,
 {
+    read_chunked_response(stream).await.map(|(body, _)| body)
+}
+
+async fn read_chunked_response<S>(stream: &mut S) -> Option<(Vec<u8>, String)>
+where
+    S: AsyncReadExt + Unpin,
+{
     let mut encoded = Vec::new();
     let mut scratch = [0_u8; 1024];
     let head_end = loop {
@@ -429,7 +554,7 @@ where
     decode_chunked_body(stream, encoded).await
 }
 
-async fn decode_chunked_body<S>(stream: &mut S, mut encoded: Vec<u8>) -> Option<Vec<u8>>
+async fn decode_chunked_body<S>(stream: &mut S, mut encoded: Vec<u8>) -> Option<(Vec<u8>, String)>
 where
     S: AsyncReadExt + Unpin,
 {
@@ -450,14 +575,20 @@ where
             usize::from_str_radix(std::str::from_utf8(&encoded[..line_end]).ok()?, 16).ok()?;
         encoded.drain(..line_end + 2);
         if size == 0 {
-            while encoded.len() < 2 {
+            loop {
+                if encoded.starts_with(b"\r\n") {
+                    return Some((body, String::new()));
+                }
+                if let Some(end) = find_subslice(&encoded, b"\r\n\r\n") {
+                    let trailers = String::from_utf8_lossy(&encoded[..end + 4]).to_string();
+                    return Some((body, trailers));
+                }
                 let count = stream.read(&mut scratch).await.ok()?;
                 if count == 0 {
                     return None;
                 }
                 encoded.extend_from_slice(&scratch[..count]);
             }
-            return encoded.starts_with(b"\r\n").then_some(body);
         }
         while encoded.len() < size + 2 {
             let count = stream.read(&mut scratch).await.ok()?;
@@ -651,6 +782,18 @@ async fn proxy_connect(proxy: SocketAddr, authority: &str) -> TcpStream {
     stream
 }
 
+/// Opens one browser-side TLS session through a mapped CONNECT tunnel.
+pub async fn open_mitm_client(proxy: SocketAddr) -> tokio_rustls::client::TlsStream<TcpStream> {
+    let authority = format!("{FROM_HOST}:443");
+    let tcp = proxy_connect(proxy, &authority).await;
+    let connector = accept_any_connector();
+    let server_name = ServerName::try_from(FROM_HOST.to_string()).expect("valid server name");
+    connector
+        .connect(server_name, tcp)
+        .await
+        .expect("client TLS handshake with proxy leaf")
+}
+
 /// Reads bytes until the end of the response head and returns its first line.
 async fn read_status_line(stream: &mut TcpStream) -> String {
     let mut buf = Vec::new();
@@ -775,6 +918,92 @@ pub async fn drive_authorized_then_absent(
         .expect("should write GET without authorization");
     let second = read_http_response(&mut tls).await;
     vec![first, second]
+}
+
+/// Starts a chunked upload, reads the upstream early response, then cancels it.
+pub async fn drive_early_response(proxy: SocketAddr) -> u16 {
+    let tls = open_mitm_client(proxy).await;
+    let (mut reader, mut writer) = tokio::io::split(tls);
+    let request = format!(
+        "POST /early HTTP/1.1\r\nHost: {FROM_HOST}\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nfirst\r\n"
+    );
+    writer
+        .write_all(request.as_bytes())
+        .await
+        .expect("should start streaming upload");
+    writer.flush().await.expect("should flush upload prefix");
+    let response = read_http_response(&mut reader).await;
+    drop(writer);
+    drop(reader);
+    response.status
+}
+
+/// Reads one chunk from a slow response and drops the browser tunnel.
+pub async fn cancel_slow_response(proxy: SocketAddr) {
+    let mut tls = open_mitm_client(proxy).await;
+    let request = format!("GET /slow HTTP/1.1\r\nHost: {FROM_HOST}\r\n\r\n");
+    tls.write_all(request.as_bytes())
+        .await
+        .expect("should request slow response");
+    let mut received = Vec::new();
+    let mut chunk = [0_u8; 256];
+    while !received
+        .windows(b"first".len())
+        .any(|item| item == b"first")
+    {
+        let count = tls
+            .read(&mut chunk)
+            .await
+            .expect("should read slow response");
+        assert!(count > 0, "slow response should send first chunk");
+        received.extend_from_slice(&chunk[..count]);
+    }
+}
+
+/// Returns declared and received body lengths for a truncated response.
+pub async fn drive_truncated_response(proxy: SocketAddr) -> (usize, usize) {
+    let mut tls = open_mitm_client(proxy).await;
+    let request = format!("GET /truncated HTTP/1.1\r\nHost: {FROM_HOST}\r\n\r\n");
+    tls.write_all(request.as_bytes())
+        .await
+        .expect("should request truncated response");
+    let mut received = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(1), tls.read_to_end(&mut received))
+        .await
+        .expect("truncated browser response should terminate");
+    if let Err(error) = read {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::UnexpectedEof,
+            "only truncated TLS EOF is expected"
+        );
+    }
+    let head_end = find_subslice(&received, b"\r\n\r\n")
+        .map(|position| position + 4)
+        .expect("should receive response head");
+    let head = String::from_utf8_lossy(&received[..head_end]);
+    let declared = header_value(&head, "content-length")
+        .and_then(|value| value.parse().ok())
+        .expect("should declare content length");
+    (declared, received.len() - head_end)
+}
+
+/// Sends two GETs and returns decoded bodies plus forwarded trailer blocks.
+pub async fn drive_trailer_requests(proxy: SocketAddr) -> Vec<(Vec<u8>, String)> {
+    let mut tls = open_mitm_client(proxy).await;
+    let mut responses = Vec::new();
+    for path in ["/trailers-one", "/trailers-two"] {
+        let request = format!("GET {path} HTTP/1.1\r\nHost: {FROM_HOST}\r\nTE: trailers\r\n\r\n");
+        tls.write_all(request.as_bytes())
+            .await
+            .expect("should request trailer response");
+        responses.push(
+            read_chunked_response(&mut tls)
+                .await
+                .expect("should decode trailer response"),
+        );
+    }
+    responses
 }
 
 /// Streams `body` through the proxy with chunked request framing and returns

@@ -113,6 +113,7 @@ pub struct PooledResponseBody {
     close_intent: bool,
     metrics: Arc<ProxyMetrics>,
     finalized: bool,
+    response_complete: bool,
 }
 
 impl PooledResponseBody {
@@ -132,6 +133,7 @@ impl PooledResponseBody {
             close_intent,
             metrics,
             finalized: false,
+            response_complete: false,
         }
     }
 
@@ -181,6 +183,7 @@ impl Body for PooledResponseBody {
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         match Pin::new(&mut self.inner).poll_frame(cx) {
             Poll::Ready(None) => {
+                self.response_complete = true;
                 self.finalize(true);
                 Poll::Ready(None)
             }
@@ -189,7 +192,13 @@ impl Body for PooledResponseBody {
                 Poll::Ready(Some(Err(error)))
             }
             Poll::Ready(Some(Ok(frame))) => {
-                if self.inner.is_end_stream() {
+                if frame.is_trailers() {
+                    // A trailer frame from Hyper `Incoming` follows the terminal
+                    // chunk. Defer lease reconciliation until the downstream
+                    // driver releases this wrapper so it can serialize the frame.
+                    self.response_complete = true;
+                } else if self.inner.is_end_stream() {
+                    self.response_complete = true;
                     self.finalize(true);
                 }
                 Poll::Ready(Some(Ok(frame)))
@@ -209,7 +218,7 @@ impl Body for PooledResponseBody {
 
 impl Drop for PooledResponseBody {
     fn drop(&mut self) {
-        self.finalize(false);
+        self.finalize(self.response_complete);
     }
 }
 
