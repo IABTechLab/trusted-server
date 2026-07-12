@@ -20,6 +20,7 @@ use trusted_server_cli::commands::dev::proxy::{ca, config, server};
 
 /// The production hostname the matched rule rewrites from (and preserves).
 pub const FROM_HOST: &str = "www.example-publisher.com";
+pub const ALT_FROM_HOST: &str = "shop.example-publisher.com";
 
 /// What the echo upstream reports back to the test.
 pub struct ProxiedResponse {
@@ -125,6 +126,41 @@ pub fn test_config_rewrite_host(addr: &SocketAddr) -> config::ResolvedConfig {
         "--map",
         &map,
         "--rewrite-host",
+        "--listen",
+        "127.0.0.1:0",
+        "--insecure",
+    ])
+}
+
+/// Maps two browser hosts to the same logical upstream origin.
+pub fn test_config_shared_to(addr: &SocketAddr) -> config::ResolvedConfig {
+    let first = format!("{FROM_HOST}={addr}");
+    let second = format!("{ALT_FROM_HOST}={addr}");
+    resolve(&[
+        "ts",
+        "--map",
+        &first,
+        "--map",
+        &second,
+        "--listen",
+        "127.0.0.1:0",
+        "--insecure",
+    ])
+}
+
+/// Maps two browser hosts to distinct upstream ports.
+pub fn test_config_distinct_to(
+    first_addr: &SocketAddr,
+    second_addr: &SocketAddr,
+) -> config::ResolvedConfig {
+    let first = format!("{FROM_HOST}={first_addr}");
+    let second = format!("{ALT_FROM_HOST}={second_addr}");
+    resolve(&[
+        "ts",
+        "--map",
+        &first,
+        "--map",
+        &second,
         "--listen",
         "127.0.0.1:0",
         "--insecure",
@@ -1086,6 +1122,27 @@ pub async fn drive_request_through_proxy(
         .into_iter()
         .next()
         .expect("should get one response")
+}
+
+/// Sends one mapped request for an arbitrary configured browser host.
+pub async fn drive_host_through_proxy(
+    proxy: SocketAddr,
+    host: &str,
+    path: &str,
+) -> ProxiedResponse {
+    let authority = format!("{host}:443");
+    let tcp = proxy_connect(proxy, &authority).await;
+    let connector = accept_any_connector();
+    let server_name = ServerName::try_from(host.to_string()).expect("valid server name");
+    let mut tls = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("client TLS handshake with proxy leaf");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n");
+    tls.write_all(request.as_bytes())
+        .await
+        .expect("should send host-specific request");
+    read_http_response(&mut tls).await
 }
 
 /// Issues several GETs over ONE keep-alive MITM tunnel and returns them in order.

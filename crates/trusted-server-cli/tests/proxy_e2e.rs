@@ -243,6 +243,42 @@ async fn keep_alive_serves_multiple_sequential_requests() {
 }
 
 #[tokio::test]
+async fn distinct_from_hosts_reuse_the_same_logical_to_pool() {
+    let upstream = support::start_echo_upstream().await;
+    let cfg = support::test_config_shared_to(&upstream.addr);
+    let ca = Arc::new(support::dev_ca());
+    let proxy = support::spawn_proxy(cfg, ca).await;
+
+    let first = support::drive_host_through_proxy(proxy, support::FROM_HOST, "/first").await;
+    let second = support::drive_host_through_proxy(proxy, support::ALT_FROM_HOST, "/second").await;
+
+    assert_eq!(first.seen_host, support::FROM_HOST);
+    assert_eq!(first.seen_forwarded_host, support::FROM_HOST);
+    assert_eq!(second.seen_host, support::ALT_FROM_HOST);
+    assert_eq!(second.seen_forwarded_host, support::ALT_FROM_HOST);
+    let snapshot = upstream.snapshot();
+    assert_eq!(snapshot.accepted_connections, 1);
+    assert_eq!(snapshot.requests, 2);
+}
+
+#[tokio::test]
+async fn distinct_to_ports_never_share_upstream_connections() {
+    let first_upstream = support::start_echo_upstream().await;
+    let second_upstream = support::start_echo_upstream().await;
+    let cfg = support::test_config_distinct_to(&first_upstream.addr, &second_upstream.addr);
+    let ca = Arc::new(support::dev_ca());
+    let proxy = support::spawn_proxy(cfg, ca).await;
+
+    let first = support::drive_host_through_proxy(proxy, support::FROM_HOST, "/first").await;
+    let second = support::drive_host_through_proxy(proxy, support::ALT_FROM_HOST, "/second").await;
+
+    assert_eq!(first.path, "/first");
+    assert_eq!(second.path, "/second");
+    assert_eq!(first_upstream.snapshot().accepted_connections, 1);
+    assert_eq!(second_upstream.snapshot().accepted_connections, 1);
+}
+
+#[tokio::test]
 async fn upstream_connection_close_is_not_reused() {
     let upstream = support::start_closing_upstream().await;
     let cfg = support::test_config(&upstream.addr);
