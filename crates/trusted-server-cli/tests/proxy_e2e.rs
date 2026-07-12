@@ -13,6 +13,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::io::AsyncReadExt as _;
 use trusted_server_cli::commands::dev::proxy::{ca, config};
 
 mod support;
@@ -37,6 +38,16 @@ async fn wait_for_request_metrics(
         "request metrics should settle: {:?}",
         state.metrics.snapshot()
     );
+}
+
+async fn wait_for_raw_connections(upstream: &support::RawUpstream, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while upstream.accepted_connections() < expected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("raw upstream connections should settle");
 }
 
 #[tokio::test]
@@ -434,4 +445,92 @@ async fn unmatched_connect_off_loopback_is_refused_with_403() {
         status.contains(" 403 "),
         "off-loopback unmatched CONNECT must be refused with 403, got: {status}"
     );
+}
+
+#[tokio::test]
+async fn blind_and_plain_forwarding_bypass_mapped_pool_capacity() {
+    let mapped = support::start_echo_upstream().await;
+    let raw = support::start_raw_echo_upstream().await;
+    let cfg = support::test_config(&mapped.addr);
+    let ca = Arc::new(support::dev_ca());
+    let (proxy, state) = support::spawn_proxy_with_state(cfg, ca).await;
+    let authority = raw.addr.to_string();
+
+    let mut blind = Vec::new();
+    for _ in 0..65 {
+        blind.push(support::open_blind_tunnel(proxy, &authority, &[]).await);
+    }
+    wait_for_raw_connections(&raw, 65).await;
+    let first = support::drive_sequential_requests_through_proxy(proxy, &["/after-blind"]).await;
+    assert_eq!(first[0].status, 200);
+    drop(blind);
+
+    let mut plain = Vec::new();
+    for _ in 0..65 {
+        plain.push(support::open_plain_forward(proxy, raw.addr, b"").await.0);
+    }
+    wait_for_raw_connections(&raw, 130).await;
+    let second = support::drive_sequential_requests_through_proxy(proxy, &["/after-plain"]).await;
+    assert_eq!(second[0].status, 200);
+    drop(plain);
+
+    tokio::time::timeout(Duration::from_secs(1), state.upstream.shutdown())
+        .await
+        .expect("forwarding sockets should not block mapped manager shutdown");
+}
+
+#[tokio::test]
+async fn blind_tunnel_overread_reaches_upstream_exactly_once() {
+    let mapped = support::start_echo_upstream().await;
+    let raw = support::start_raw_echo_upstream().await;
+    let cfg = support::test_config(&mapped.addr);
+    let ca = Arc::new(support::dev_ca());
+    let proxy = support::spawn_proxy(cfg, ca).await;
+    let payload = b"blind-overread-prefix";
+
+    let mut tunnel = support::open_blind_tunnel(proxy, &raw.addr.to_string(), payload).await;
+    let mut echoed = vec![0_u8; payload.len()];
+    tokio::time::timeout(Duration::from_secs(1), tunnel.read_exact(&mut echoed))
+        .await
+        .expect("blind overread should be echoed")
+        .expect("should read blind overread");
+
+    assert_eq!(echoed, payload);
+    wait_for_raw_connections(&raw, 1).await;
+    assert_eq!(raw.captured()[0], payload);
+}
+
+#[tokio::test]
+async fn plain_forward_overread_reaches_upstream_exactly_once() {
+    let mapped = support::start_echo_upstream().await;
+    let raw = support::start_raw_echo_upstream().await;
+    let cfg = support::test_config(&mapped.addr);
+    let ca = Arc::new(support::dev_ca());
+    let proxy = support::spawn_proxy(cfg, ca).await;
+
+    let (_client, expected) =
+        support::open_plain_forward(proxy, raw.addr, b"plain-overread-body").await;
+    wait_for_raw_connections(&raw, 1).await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while raw.captured()[0].len() < expected.len() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("plain overread should reach raw upstream");
+
+    assert_eq!(raw.captured()[0], expected);
+}
+
+#[tokio::test]
+async fn mitm_connect_overread_preserves_tls_client_hello() {
+    let upstream = support::start_echo_upstream().await;
+    let cfg = support::test_config(&upstream.addr);
+    let ca = Arc::new(support::dev_ca());
+    let proxy = support::spawn_proxy(cfg, ca).await;
+
+    let response = support::drive_mitm_connect_overread(proxy).await;
+
+    assert_eq!(response.status, 200);
+    assert_eq!(response.path, "/mitm-overread");
 }

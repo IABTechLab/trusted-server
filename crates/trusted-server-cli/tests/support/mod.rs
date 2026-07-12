@@ -4,14 +4,16 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use rustls::DigitallySignedStruct;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use trusted_server_cli::commands::dev::proxy::{ca, config, server};
@@ -32,6 +34,28 @@ pub struct ProxiedResponse {
 pub struct Upstream {
     pub addr: SocketAddr,
     counters: Arc<UpstreamCounters>,
+}
+
+/// A raw loopback echo upstream used for tunnel/accounting tests.
+pub struct RawUpstream {
+    pub addr: SocketAddr,
+    received: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+}
+
+impl RawUpstream {
+    pub fn accepted_connections(&self) -> usize {
+        self.received
+            .lock()
+            .expect("should lock raw captures")
+            .len()
+    }
+
+    pub fn captured(&self) -> Vec<Vec<u8>> {
+        self.received
+            .lock()
+            .expect("should lock raw captures")
+            .clone()
+    }
 }
 
 impl Upstream {
@@ -184,6 +208,46 @@ fn upstream_tls_acceptor() -> TlsAcceptor {
         .expect("should build upstream server config");
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     TlsAcceptor::from(Arc::new(config))
+}
+
+/// Starts a raw TCP upstream that captures and echoes every byte per connection.
+pub async fn start_raw_echo_upstream() -> RawUpstream {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("should bind raw echo upstream");
+    let addr = listener.local_addr().expect("should read raw echo address");
+    let received = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let task_received = Arc::clone(&received);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let index = {
+                let mut captures = task_received.lock().expect("should lock raw captures");
+                captures.push(Vec::new());
+                captures.len() - 1
+            };
+            let received = Arc::clone(&task_received);
+            tokio::spawn(async move {
+                let mut chunk = [0_u8; 2048];
+                loop {
+                    let Ok(count) = stream.read(&mut chunk).await else {
+                        return;
+                    };
+                    if count == 0 {
+                        return;
+                    }
+                    received.lock().expect("should lock raw capture")[index]
+                        .extend_from_slice(&chunk[..count]);
+                    if stream.write_all(&chunk[..count]).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    RawUpstream { addr, received }
 }
 
 /// Starts an HTTPS upstream that echoes the `Host`/`X-Orig-Host`/path it saw and
@@ -712,6 +776,51 @@ pub async fn connect_and_read_status(proxy: SocketAddr, authority: &str) -> Stri
     read_status_line(&mut stream).await
 }
 
+/// Opens an unmatched CONNECT tunnel and optionally pipelines payload bytes
+/// with the CONNECT head in one write.
+pub async fn open_blind_tunnel(proxy: SocketAddr, authority: &str, pipelined: &[u8]) -> TcpStream {
+    let mut stream = TcpStream::connect(proxy)
+        .await
+        .expect("should connect to proxy");
+    let mut request =
+        format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").into_bytes();
+    request.extend_from_slice(pipelined);
+    stream
+        .write_all(&request)
+        .await
+        .expect("should write CONNECT and prefix");
+    stream.flush().await.expect("should flush CONNECT prefix");
+    let status = read_status_line(&mut stream).await;
+    assert!(
+        status.contains(" 200 "),
+        "blind CONNECT should succeed: {status}"
+    );
+    stream
+}
+
+/// Opens a stray absolute-form HTTP forward and keeps the client socket alive.
+pub async fn open_plain_forward(
+    proxy: SocketAddr,
+    upstream: SocketAddr,
+    pipelined: &[u8],
+) -> (TcpStream, Vec<u8>) {
+    let mut stream = TcpStream::connect(proxy)
+        .await
+        .expect("should connect plain client to proxy");
+    let mut request = format!(
+        "POST http://{upstream}/overread HTTP/1.1\r\nHost: {upstream}\r\nContent-Length: {}\r\n\r\n",
+        pipelined.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(pipelined);
+    stream
+        .write_all(&request)
+        .await
+        .expect("should write absolute request and prefix");
+    stream.flush().await.expect("should flush plain request");
+    (stream, request)
+}
+
 // ---- client legs: a no-verify verifier so the test can trust either CA ----
 
 #[derive(Debug)]
@@ -761,6 +870,157 @@ fn accept_any_connector() -> TlsConnector {
         .with_no_client_auth();
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     TlsConnector::from(Arc::new(config))
+}
+
+struct ConnectPrefixedIo {
+    inner: TcpStream,
+    connect_head: Option<Vec<u8>>,
+    pending_write: Vec<u8>,
+    write_offset: usize,
+    response_buffer: Vec<u8>,
+    response_done: bool,
+}
+
+impl ConnectPrefixedIo {
+    fn new(inner: TcpStream, connect_head: Vec<u8>) -> Self {
+        Self {
+            inner,
+            connect_head: Some(connect_head),
+            pending_write: Vec::new(),
+            write_offset: 0,
+            response_buffer: Vec::new(),
+            response_done: false,
+        }
+    }
+
+    fn poll_flush_pending(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        while self.write_offset < self.pending_write.len() {
+            let count = match Pin::new(&mut self.inner)
+                .poll_write(cx, &self.pending_write[self.write_offset..])
+            {
+                Poll::Ready(Ok(count)) => count,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            };
+            if count == 0 {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "proxy tunnel write returned zero",
+                )));
+            }
+            self.write_offset += count;
+        }
+        self.pending_write.clear();
+        self.write_offset = 0;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for ConnectPrefixedIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if let Some(head) = self.connect_head.take() {
+            self.pending_write.extend_from_slice(&head);
+        }
+        self.pending_write.extend_from_slice(buffer);
+        Poll::Ready(Ok(buffer.len()))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.poll_flush_pending(cx) {
+            Poll::Ready(Ok(())) => Pin::new(&mut self.inner).poll_flush(cx),
+            result => result,
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.poll_flush_pending(cx) {
+            Poll::Ready(Ok(())) => Pin::new(&mut self.inner).poll_shutdown(cx),
+            result => result,
+        }
+    }
+}
+
+impl AsyncRead for ConnectPrefixedIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.response_done {
+            if !self.response_buffer.is_empty() {
+                let count = output.remaining().min(self.response_buffer.len());
+                output.put_slice(&self.response_buffer[..count]);
+                self.response_buffer.drain(..count);
+                return Poll::Ready(Ok(()));
+            }
+            return Pin::new(&mut self.inner).poll_read(cx, output);
+        }
+
+        let mut scratch = [0_u8; 4096];
+        let mut buffered = ReadBuf::new(&mut scratch);
+        match Pin::new(&mut self.inner).poll_read(cx, &mut buffered) {
+            Poll::Ready(Ok(())) if buffered.filled().is_empty() => Poll::Ready(Ok(())),
+            Poll::Ready(Ok(())) => {
+                self.response_buffer.extend_from_slice(buffered.filled());
+                if let Some(end) = find_subslice(&self.response_buffer, b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&self.response_buffer[..end + 4]);
+                    if !head
+                        .lines()
+                        .next()
+                        .is_some_and(|line| line.contains(" 200 "))
+                    {
+                        return Poll::Ready(Err(std::io::Error::other(format!(
+                            "proxy CONNECT failed: {head}"
+                        ))));
+                    }
+                    self.response_buffer.drain(..end + 4);
+                    self.response_done = true;
+                    let count = output.remaining().min(self.response_buffer.len());
+                    if count == 0 {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    } else {
+                        output.put_slice(&self.response_buffer[..count]);
+                        self.response_buffer.drain(..count);
+                        Poll::Ready(Ok(()))
+                    }
+                } else {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Forces CONNECT head plus rustls ClientHello into one buffered first flight.
+pub async fn drive_mitm_connect_overread(proxy: SocketAddr) -> ProxiedResponse {
+    let tcp = TcpStream::connect(proxy)
+        .await
+        .expect("should connect overread client");
+    let authority = format!("{FROM_HOST}:443");
+    let connect = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").into_bytes();
+    let io = ConnectPrefixedIo::new(tcp, connect);
+    let connector = accept_any_connector();
+    let server_name = ServerName::try_from(FROM_HOST.to_string()).expect("valid server name");
+    let mut tls = tokio::time::timeout(Duration::from_secs(2), connector.connect(server_name, io))
+        .await
+        .expect("prefixed TLS handshake should not stall")
+        .expect("prefixed TLS handshake should succeed");
+    let request = format!("GET /mitm-overread HTTP/1.1\r\nHost: {FROM_HOST}\r\n\r\n");
+    tls.write_all(request.as_bytes())
+        .await
+        .expect("should write mapped request");
+    tls.flush().await.expect("should flush mapped request");
+    tokio::time::timeout(Duration::from_secs(2), read_http_response(&mut tls))
+        .await
+        .expect("mapped response should not stall")
 }
 
 /// Sends `CONNECT host:port` to the proxy and reads its status line.
