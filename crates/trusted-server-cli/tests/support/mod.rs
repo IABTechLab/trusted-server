@@ -747,6 +747,36 @@ pub async fn drive_get_then_post(
     vec![first, second]
 }
 
+/// Sends browser Authorization only on the first of two pooled requests.
+pub async fn drive_authorized_then_absent(
+    cfg: config::ResolvedConfig,
+    ca: Arc<ca::CertAuthority>,
+) -> Vec<ProxiedResponse> {
+    let proxy = spawn_proxy(cfg, ca).await;
+    let authority = format!("{FROM_HOST}:443");
+    let tcp = proxy_connect(proxy, &authority).await;
+    let connector = accept_any_connector();
+    let server_name = ServerName::try_from(FROM_HOST.to_string()).expect("valid server name");
+    let mut tls = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("client TLS handshake with proxy leaf");
+
+    let authorized = format!(
+        "GET /authorized HTTP/1.1\r\nHost: {FROM_HOST}\r\nAuthorization: Basic ZGV2OnNlY3JldA==\r\n\r\n"
+    );
+    tls.write_all(authorized.as_bytes())
+        .await
+        .expect("should write authorized GET");
+    let first = read_http_response(&mut tls).await;
+    let absent = format!("GET /absent HTTP/1.1\r\nHost: {FROM_HOST}\r\n\r\n");
+    tls.write_all(absent.as_bytes())
+        .await
+        .expect("should write GET without authorization");
+    let second = read_http_response(&mut tls).await;
+    vec![first, second]
+}
+
 /// Streams `body` through the proxy with chunked request framing and returns
 /// the decoded chunked response body.
 pub async fn drive_chunked_body(

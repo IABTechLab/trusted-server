@@ -9,6 +9,7 @@
 // on other targets so it does not reference the macOS-scoped dev-dependencies.
 #![cfg(target_os = "macos")]
 
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -121,6 +122,62 @@ async fn basic_auth_injected_when_absent_clears_401() {
     let response = support::drive_request_through_proxy(cfg, ca).await;
 
     assert_eq!(response.status, 200, "injected Basic auth clears the 401");
+}
+
+#[tokio::test]
+async fn authorization_does_not_persist_on_reused_connection() {
+    let upstream = support::start_gated_upstream().await;
+    let cfg = support::test_config(&upstream.addr);
+    let ca = Arc::new(support::dev_ca());
+
+    let responses = support::drive_authorized_then_absent(cfg, ca).await;
+
+    assert_eq!(
+        responses[0].status, 200,
+        "first request carries authorization"
+    );
+    assert_eq!(
+        responses[1].status, 401,
+        "second request must not inherit it"
+    );
+    let snapshot = upstream.snapshot();
+    assert_eq!(snapshot.accepted_connections, 1);
+    assert_eq!(snapshot.requests, 2);
+}
+
+#[test]
+fn insecure_mode_warns_before_startup_failure() {
+    let occupied =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("should reserve loopback port");
+    let listen = occupied
+        .local_addr()
+        .expect("should read occupied address")
+        .to_string();
+    let ca_dir = tempfile::tempdir().expect("should create temporary CA directory");
+    let output = Command::new(env!("CARGO_BIN_EXE_ts"))
+        .args([
+            "dev",
+            "proxy",
+            "--map",
+            "www.example.com=127.0.0.1:443",
+            "--listen",
+            &listen,
+            "--ca-dir",
+            ca_dir.path().to_str().expect("should encode CA path"),
+            "--insecure",
+        ])
+        .output()
+        .expect("should run ts process");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "occupied port should fail startup"
+    );
+    assert!(
+        stderr.contains("--insecure: upstream TLS verification is DISABLED"),
+        "stderr should warn loudly before bind failure: {stderr}"
+    );
 }
 
 #[tokio::test]
