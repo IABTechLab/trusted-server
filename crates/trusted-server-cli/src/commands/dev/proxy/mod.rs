@@ -62,6 +62,20 @@ pub enum ProxyError {
 
 impl core::error::Error for ProxyError {}
 
+async fn finish_interrupted_run<Restore, Stop, Drain>(
+    restore_system_proxy: Restore,
+    stop_accept_loop: Stop,
+    drain_manager: Drain,
+) where
+    Restore: FnOnce(),
+    Stop: FnOnce(),
+    Drain: std::future::Future<Output = ()>,
+{
+    restore_system_proxy();
+    stop_accept_loop();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), drain_manager).await;
+}
+
 /// `ts dev proxy [OPTIONS]` — see the design spec §4.
 #[derive(Debug, clap::Args)]
 pub struct ProxyArgs {
@@ -296,16 +310,80 @@ pub fn run(args: &ProxyArgs) -> core::result::Result<(), error_stack::Report<Pro
             _ = tokio::signal::ctrl_c() => {
                 // Interactive: the cached sudo credential may have expired during
                 // a long run, so allow `sudo networksetup` to prompt for it.
-                browser::restore_system_proxy_if_pending(&cfg.ca_dir, true);
-                server.abort();
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
+                finish_interrupted_run(
+                    || browser::restore_system_proxy_if_pending(&cfg.ca_dir, true),
+                    || server.abort(),
                     state.upstream.shutdown(),
-                )
-                .await;
+                ).await;
                 log::debug!("{}", state.metrics.debug_summary());
                 Ok(())
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+
+    use super::*;
+
+    struct DrainProbe {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        recorded: bool,
+    }
+
+    impl std::future::Future for DrainProbe {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if !self.recorded {
+                self.events
+                    .lock()
+                    .expect("should lock shutdown events")
+                    .push("drain");
+                self.recorded = true;
+            }
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interrupt_cleanup_restores_then_stops_then_bounds_drain() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let started = tokio::time::Instant::now();
+        finish_interrupted_run(
+            {
+                let events = Arc::clone(&events);
+                move || {
+                    events
+                        .lock()
+                        .expect("should lock shutdown events")
+                        .push("restore");
+                }
+            },
+            {
+                let events = Arc::clone(&events);
+                move || {
+                    events
+                        .lock()
+                        .expect("should lock shutdown events")
+                        .push("stop");
+                }
+            },
+            DrainProbe {
+                events: Arc::clone(&events),
+                recorded: false,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            *events.lock().expect("should lock shutdown events"),
+            ["restore", "stop", "drain"]
+        );
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(2));
+    }
 }

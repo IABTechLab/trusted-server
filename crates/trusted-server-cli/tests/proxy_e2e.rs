@@ -291,6 +291,51 @@ async fn manager_shutdown_aborts_idle_driver_and_acknowledges() {
 }
 
 #[tokio::test]
+async fn shutdown_waits_for_delayed_driver_reconciliation() {
+    let manager = trusted_server_cli::commands::dev::proxy::upstream::manager::Manager::start(
+        trusted_server_cli::commands::dev::proxy::upstream::manager::PoolLimits::default(),
+    );
+    let key = trusted_server_cli::commands::dev::proxy::upstream::key::OriginKey::new(
+        trusted_server_cli::commands::dev::proxy::upstream::key::Transport::Tls,
+        trusted_server_cli::commands::dev::proxy::upstream::key::ReferenceIdentity::dns(
+            "shutdown.example",
+        ),
+        443,
+        trusted_server_cli::commands::dev::proxy::upstream::key::VerifyMode::Secure,
+        trusted_server_cli::commands::dev::proxy::upstream::key::AddressPolicy::Dns,
+    );
+    let trusted_server_cli::commands::dev::proxy::upstream::manager::Acquired::Open(reservation) =
+        manager.acquire(key).await.expect("should reserve driver")
+    else {
+        panic!("should open driver reservation");
+    };
+    let id = reservation.id();
+    let driver = tokio::spawn(std::future::pending::<()>());
+    let lease = reservation.register(&manager, (), driver.abort_handle());
+    manager.return_idle(lease.connection);
+    tokio::task::yield_now().await;
+    let shutdown = tokio::spawn({
+        let manager = Arc::clone(&manager);
+        async move { manager.shutdown().await }
+    });
+    tokio::task::yield_now().await;
+
+    assert!(
+        driver.is_finished(),
+        "shutdown should abort registered driver"
+    );
+    assert!(
+        !shutdown.is_finished(),
+        "shutdown must await delayed lifecycle reconciliation"
+    );
+    manager.driver_closed(id);
+    tokio::time::timeout(Duration::from_secs(1), shutdown)
+        .await
+        .expect("reconciled shutdown should remain externally bounded")
+        .expect("shutdown task should join");
+}
+
+#[tokio::test]
 async fn post_dispatch_failure_does_not_retry_post() {
     let upstream = support::start_post_dispatch_stale_upstream().await;
     let cfg = support::test_config(&upstream.addr);
