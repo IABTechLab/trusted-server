@@ -15,7 +15,7 @@ use hyper::{Request, Response};
 
 use self::body::{PooledResponseBody, RequestUploadBody};
 use self::connect::UpstreamSender;
-use self::manager::{Acquired, Manager};
+use self::manager::{AcquireError, Acquired, Manager};
 use super::ProxyError;
 use super::metrics::ProxyMetrics;
 use super::rewrite::{RewriteOutcome, Rule};
@@ -98,6 +98,23 @@ pub struct UpstreamClient {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum AcquisitionMode {
+    Normal,
+    FreshAfterReadinessFailure,
+}
+
+async fn acquire_for_mode<T: Send + 'static>(
+    manager: &Manager<T>,
+    key: key::OriginKey,
+    mode: AcquisitionMode,
+) -> Result<Acquired<T>, AcquireError> {
+    match mode {
+        AcquisitionMode::Normal => manager.acquire(key).await,
+        AcquisitionMode::FreshAfterReadinessFailure => manager.acquire_fresh(key).await,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct UpstreamOptions {
     pub limits: manager::PoolLimits,
     pub dns_cache: bool,
@@ -155,16 +172,16 @@ impl UpstreamClient {
         let request_started = tokio::time::Instant::now();
         let replay_template = ReplayTemplate::capture(&request, metadata);
         let mut stale_retry = false;
+        let mut acquisition_mode = AcquisitionMode::Normal;
         let mut lease = loop {
             let acquisition_started = tokio::time::Instant::now();
-            let acquired = self
-                .manager
-                .acquire(rule.origin_key().clone())
-                .await
-                .map_err(|error| {
-                    Report::new(ProxyError::Server)
-                        .attach(format!("pool acquire failed: {error:?}"))
-                })?;
+            let acquired =
+                acquire_for_mode(&self.manager, rule.origin_key().clone(), acquisition_mode)
+                    .await
+                    .map_err(|error| {
+                        Report::new(ProxyError::Server)
+                            .attach(format!("pool acquire failed: {error:?}"))
+                    })?;
             self.metrics
                 .record_pool_acquisition(acquisition_started.elapsed());
             if let Some(queue_wait) = acquired.queue_wait() {
@@ -205,6 +222,7 @@ impl UpstreamClient {
                 Ok(_) => break candidate,
                 Err(_error) if candidate.reused && !stale_retry => {
                     stale_retry = true;
+                    acquisition_mode = AcquisitionMode::FreshAfterReadinessFailure;
                     self.metrics.record_pool_stale();
                     self.metrics.record_pool_retry();
                     candidate.connection.abort.abort();
@@ -331,7 +349,26 @@ impl UpstreamClient {
 mod tests {
     use http_body_util::Empty;
 
+    use super::key::{
+        AddressPolicy, ApplicationMode, OriginKey, ReferenceIdentity, Transport, VerifyMode,
+    };
+    use super::manager::PoolLimits;
     use super::*;
+
+    fn key() -> OriginKey {
+        OriginKey::new(
+            Transport::Tls,
+            ReferenceIdentity::dns("readiness.example"),
+            443,
+            VerifyMode::Secure,
+            ApplicationMode::Http1Required,
+            AddressPolicy::Dns,
+        )
+    }
+
+    fn abort_handle() -> tokio::task::AbortHandle {
+        tokio::spawn(std::future::pending::<()>()).abort_handle()
+    }
 
     #[test]
     fn replay_template_reconstructs_only_provably_empty_idempotent_request() {
@@ -365,5 +402,48 @@ mod tests {
         request.extensions_mut().clear();
         *request.method_mut() = hyper::Method::POST;
         assert!(ReplayTemplate::capture(&request, RequestMetadata::capture(&request)).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn readiness_retry_waits_for_a_fresh_reservation() {
+        let manager = Manager::start(PoolLimits {
+            per_origin_live: 2,
+            global_live: 2,
+            ..PoolLimits::default()
+        });
+        let mut reservations = Vec::new();
+        for _ in 0..2 {
+            let Acquired::Open(reservation) = manager.acquire(key()).await.expect("should reserve")
+            else {
+                panic!("should open connection");
+            };
+            reservations.push(reservation);
+        }
+        let mut ids = Vec::new();
+        for (reservation, value) in reservations.into_iter().zip([1_u8, 2_u8]) {
+            ids.push(reservation.id());
+            let lease = reservation.register(&manager, value, abort_handle());
+            manager.return_idle(lease.connection);
+        }
+        tokio::task::yield_now().await;
+
+        let retry = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move {
+                acquire_for_mode(&manager, key(), AcquisitionMode::FreshAfterReadinessFailure).await
+            }
+        });
+        tokio::task::yield_now().await;
+
+        assert!(
+            !retry.is_finished(),
+            "readiness retry must discard idle senders and wait for fresh capacity"
+        );
+        manager.driver_closed(ids[0]);
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            retry.await.expect("should join retry"),
+            Ok(Acquired::Open(_))
+        ));
     }
 }
