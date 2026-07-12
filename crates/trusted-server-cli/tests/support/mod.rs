@@ -86,6 +86,12 @@ pub fn test_config(addr: &SocketAddr) -> config::ResolvedConfig {
     resolve(&["ts", "--map", &map, "--listen", "127.0.0.1:0", "--insecure"])
 }
 
+/// Uses a real DNS identity (`localhost`) rather than an IP-literal TO.
+pub fn test_config_dns(addr: &SocketAddr) -> config::ResolvedConfig {
+    let map = format!("{FROM_HOST}=localhost:{}", addr.port());
+    resolve(&["ts", "--map", &map, "--listen", "127.0.0.1:0", "--insecure"])
+}
+
 /// Like [`test_config`] but with `--rewrite-host`, so the upstream sees
 /// `Host: <TO>` while `X-Forwarded-Host` stays `FROM`.
 pub fn test_config_rewrite_host(addr: &SocketAddr) -> config::ResolvedConfig {
@@ -183,21 +189,26 @@ fn upstream_tls_acceptor() -> TlsAcceptor {
 /// Starts an HTTPS upstream that echoes the `Host`/`X-Orig-Host`/path it saw and
 /// always returns `200`. Serves keep-alive (many requests per connection).
 pub async fn start_echo_upstream() -> Upstream {
-    start_upstream(false, Duration::ZERO).await
+    start_upstream(false, Duration::ZERO, false).await
 }
 
 /// Starts the echo upstream with a fixed delay before every response.
 pub async fn start_delayed_echo_upstream(response_delay: Duration) -> Upstream {
-    start_upstream(false, response_delay).await
+    start_upstream(false, response_delay, false).await
+}
+
+/// Starts an upstream that requests connection closure after every response.
+pub async fn start_closing_upstream() -> Upstream {
+    start_upstream(false, Duration::ZERO, true).await
 }
 
 /// Starts an HTTPS upstream that returns `401` unless an `Authorization` header
 /// is present, otherwise `200`.
 pub async fn start_gated_upstream() -> Upstream {
-    start_upstream(true, Duration::ZERO).await
+    start_upstream(true, Duration::ZERO, false).await
 }
 
-async fn start_upstream(gated: bool, response_delay: Duration) -> Upstream {
+async fn start_upstream(gated: bool, response_delay: Duration, close: bool) -> Upstream {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("should bind upstream");
@@ -226,7 +237,7 @@ async fn start_upstream(gated: bool, response_delay: Duration) -> Upstream {
                         return;
                     }
                 };
-                serve_upstream_connection(&mut tls, gated, response_delay, &counters).await;
+                serve_upstream_connection(&mut tls, gated, response_delay, close, &counters).await;
             });
         }
     });
@@ -239,6 +250,7 @@ async fn serve_upstream_connection<S>(
     stream: &mut S,
     gated: bool,
     response_delay: Duration,
+    close: bool,
     counters: &UpstreamCounters,
 ) where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
@@ -285,8 +297,9 @@ async fn serve_upstream_connection<S>(
         if !response_delay.is_zero() {
             tokio::time::sleep(response_delay).await;
         }
+        let connection = if close { "close" } else { "keep-alive" };
         let response = format!(
-            "{status_line}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+            "{status_line}\r\nContent-Length: {}\r\nConnection: {connection}\r\n\r\n{body}",
             body.len()
         );
         if stream.write_all(response.as_bytes()).await.is_err() {
@@ -295,6 +308,9 @@ async fn serve_upstream_connection<S>(
         }
         if stream.flush().await.is_err() {
             counters.failures.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if close {
             return;
         }
     }
@@ -317,16 +333,29 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// Spawns the proxy in the background and returns the loopback address it bound.
 pub async fn spawn_proxy(cfg: config::ResolvedConfig, ca: Arc<ca::CertAuthority>) -> SocketAddr {
+    spawn_proxy_with_state(cfg, ca).await.0
+}
+
+/// Spawns the proxy and returns its shared state for deterministic metric gates.
+pub async fn spawn_proxy_with_state(
+    cfg: config::ResolvedConfig,
+    ca: Arc<ca::CertAuthority>,
+) -> (
+    SocketAddr,
+    Arc<trusted_server_cli::commands::dev::proxy::ProxyState>,
+) {
     let listener = server::bind(cfg.listen)
         .await
         .expect("should bind proxy listener");
     let addr = listener.local_addr().expect("should read proxy addr");
     let cfg = Arc::new(cfg);
+    let state = trusted_server_cli::commands::dev::proxy::ProxyState::new(cfg);
     let pac: Arc<str> = Arc::from("function FindProxyForURL(u, h) { return \"DIRECT\"; }");
+    let task_state = Arc::clone(&state);
     tokio::spawn(async move {
-        let _ = server::serve_on(listener, cfg, ca, pac).await;
+        let _ = server::serve_on_with_state(listener, task_state, ca, pac).await;
     });
-    addr
+    (addr, state)
 }
 
 /// Spawns a proxy that behaves as if it were bound on a non-loopback address,

@@ -2,6 +2,7 @@ pub mod browser;
 pub mod ca;
 pub mod config;
 pub mod metrics;
+pub mod prefixed_io;
 pub mod rewrite;
 pub mod server;
 pub mod upstream;
@@ -11,6 +12,24 @@ use std::sync::Arc;
 use error_stack::ResultExt as _;
 
 use crate::output;
+
+pub struct ProxyState {
+    pub config: Arc<config::ResolvedConfig>,
+    pub upstream: upstream::UpstreamClient,
+    pub metrics: Arc<metrics::ProxyMetrics>,
+}
+
+impl ProxyState {
+    #[must_use]
+    pub fn new(config: Arc<config::ResolvedConfig>) -> Arc<Self> {
+        let metrics = Arc::new(metrics::ProxyMetrics::default());
+        Arc::new(Self {
+            upstream: upstream::UpstreamClient::new(Arc::clone(&metrics), config.connect_timeout),
+            config,
+            metrics,
+        })
+    }
+}
 
 /// Errors surfaced by `ts dev proxy`.
 #[derive(Debug, derive_more::Display)]
@@ -231,11 +250,21 @@ pub fn run(args: &ProxyArgs) -> core::result::Result<(), error_stack::Report<Pro
             .change_context(ProxyError::Server)?;
         cfg.listen = listener.local_addr().change_context(ProxyError::Server)?;
         let cfg = Arc::new(cfg);
+        let state = ProxyState::new(Arc::clone(&cfg));
+        for rule in &cfg.rules.0 {
+            if ca.is_cached(&rule.from) {
+                continue;
+            }
+            let started = tokio::time::Instant::now();
+            ca.server_config(&rule.from)
+                .change_context(ProxyError::CertAuthority)?;
+            state.metrics.record_ca_miss(started.elapsed(), false);
+        }
         let pac: Arc<str> = Arc::from(browser::generate_pac(&cfg.rules, cfg.listen).as_str());
         output::info(&format!("ts dev proxy listening on {}", cfg.listen));
-        let server = tokio::spawn(server::serve_on(
+        let mut server = tokio::spawn(server::serve_on_with_state(
             listener,
-            Arc::clone(&cfg),
+            Arc::clone(&state),
             Arc::clone(&ca),
             Arc::clone(&pac),
         ));
@@ -251,11 +280,18 @@ pub fn run(args: &ProxyArgs) -> core::result::Result<(), error_stack::Report<Pro
         // Race the server against Ctrl-C.  On clean interrupt, restore any
         // system proxy state that was changed for Safari before exiting.
         tokio::select! {
-            result = server => result.change_context(ProxyError::Server)?,
+            result = &mut server => result.change_context(ProxyError::Server)?,
             _ = tokio::signal::ctrl_c() => {
                 // Interactive: the cached sudo credential may have expired during
                 // a long run, so allow `sudo networksetup` to prompt for it.
                 browser::restore_system_proxy_if_pending(&cfg.ca_dir, true);
+                server.abort();
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    state.upstream.shutdown(),
+                )
+                .await;
+                log::debug!("{}", state.metrics.debug_summary());
                 Ok(())
             }
         }

@@ -22,12 +22,13 @@ use hyper::{Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio_rustls::TlsAcceptor;
 
-use super::ProxyError;
 use super::ca::CertAuthority;
 use super::config::ResolvedConfig;
+use super::prefixed_io::PrefixedIo;
 use super::rewrite::rewrite_for;
+use super::{ProxyError, ProxyState};
 
 const X_ORIG_HOST: &str = "x-orig-host";
 const X_FORWARDED_HOST: &str = "x-forwarded-host";
@@ -57,9 +58,23 @@ pub async fn serve_on(
     ca: Arc<CertAuthority>,
     pac: Arc<str>,
 ) -> Result<(), Report<ProxyError>> {
-    let is_loopback = is_loopback(cfg.listen.ip());
-    log::info!("listening on {}", cfg.listen);
-    for (host, ip) in &cfg.resolve {
+    serve_on_with_state(listener, ProxyState::new(cfg), ca, pac).await
+}
+
+/// Serves with process-shared upstream pooling and metrics state.
+///
+/// # Errors
+///
+/// Returns a server error if the accept loop cannot continue.
+pub async fn serve_on_with_state(
+    listener: TcpListener,
+    state: Arc<ProxyState>,
+    ca: Arc<CertAuthority>,
+    pac: Arc<str>,
+) -> Result<(), Report<ProxyError>> {
+    let is_loopback = is_loopback(state.config.listen.ip());
+    log::info!("listening on {}", state.config.listen);
+    for (host, ip) in &state.config.resolve {
         log::info!("--resolve pin: {host} -> {ip}");
     }
     loop {
@@ -70,11 +85,12 @@ pub async fn serve_on(
                 continue;
             }
         };
-        let cfg = Arc::clone(&cfg);
+        state.metrics.record_browser_connection();
+        let state = Arc::clone(&state);
         let ca = Arc::clone(&ca);
         let pac = Arc::clone(&pac);
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(client, is_loopback, &cfg, &ca, &pac).await {
+            if let Err(err) = handle_connection(client, is_loopback, &state, &ca, &pac).await {
                 log::debug!("connection from {peer} ended: {err:?}");
             }
         });
@@ -100,6 +116,8 @@ struct RequestHead {
     /// cap. `false` means a truncated or oversized head that must be rejected
     /// with `400` rather than routed from a partially-read request.
     complete: bool,
+    /// Bytes read beyond the header terminator, replayed to the selected path.
+    prefix: Vec<u8>,
 }
 
 impl RequestHead {
@@ -125,21 +143,22 @@ impl RequestHead {
 /// absolute-form plain-HTTP request can be forwarded unchanged (spec §8.4) —
 /// `blind_forward_http` writes them to the upstream before piping the remainder.
 async fn read_request_head(client: &mut TcpStream) -> Result<RequestHead, Report<ProxyError>> {
-    let mut buf = Vec::with_capacity(256);
-    let mut byte = [0u8; 1];
-    // Read up to the end of the headers (\r\n\r\n) or a sane cap.
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
     let mut complete = false;
+    let mut head_end = 0;
     loop {
         let n = client
-            .read(&mut byte)
+            .read(&mut chunk)
             .await
             .change_context(ProxyError::Server)?;
         if n == 0 {
             break;
         }
-        buf.push(byte[0]);
-        if buf.ends_with(b"\r\n\r\n") {
-            complete = true;
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(position) = find_bytes(&buf, b"\r\n\r\n") {
+            head_end = position + 4;
+            complete = head_end <= 8192;
             break;
         }
         // Oversized head: stop reading, but mark it incomplete so the caller
@@ -148,6 +167,10 @@ async fn read_request_head(client: &mut TcpStream) -> Result<RequestHead, Report
             break;
         }
     }
+    if !complete {
+        head_end = buf.len();
+    }
+    let prefix = buf.split_off(head_end);
     let text = String::from_utf8_lossy(&buf);
     let first_line = text.lines().next().unwrap_or_default();
     let mut parts = first_line.split_whitespace();
@@ -158,32 +181,53 @@ async fn read_request_head(client: &mut TcpStream) -> Result<RequestHead, Report
         target,
         raw: buf,
         complete,
+        prefix,
     })
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 async fn handle_connection(
     mut client: TcpStream,
     is_loopback: bool,
-    cfg: &ResolvedConfig,
+    state: &ProxyState,
     ca: &CertAuthority,
     pac: &str,
 ) -> Result<(), Report<ProxyError>> {
+    let parse_started = tokio::time::Instant::now();
     let head = read_request_head(&mut client).await?;
+    let mut client = PrefixedIo::new(client, head.prefix.clone());
     // A truncated or oversized head (no `\r\n\r\n` within the cap) is malformed —
     // reject it cleanly instead of routing a partially-parsed request.
     if !head.complete {
+        state
+            .metrics
+            .record_initial_head_rejected(parse_started.elapsed());
         return respond_status_line(&mut client, StatusCode::BAD_REQUEST).await;
     }
+    state
+        .metrics
+        .record_initial_head_parsed(parse_started.elapsed());
     if let Some(authority) = head.connect_authority() {
         let authority = authority.to_string();
-        return handle_connect(client, &authority, is_loopback, cfg, ca).await;
+        return handle_connect(client, &authority, is_loopback, state, ca).await;
     }
     if head.is_local_pac_route() {
         return serve_pac(&mut client, pac).await;
     }
     // Stray absolute-form plain HTTP.
     if is_loopback {
-        blind_forward_http(client, &head, &cfg.resolve, cfg.connect_timeout).await
+        blind_forward_http(
+            client,
+            &head,
+            &state.config.resolve,
+            state.config.connect_timeout,
+        )
+        .await
     } else {
         respond_status_line(&mut client, StatusCode::FORBIDDEN).await
     }
@@ -201,10 +245,10 @@ fn split_authority(authority: &str) -> Option<(String, u16)> {
 }
 
 async fn handle_connect(
-    mut client: TcpStream,
+    mut client: PrefixedIo<TcpStream>,
     authority: &str,
     is_loopback: bool,
-    cfg: &ResolvedConfig,
+    state: &ProxyState,
     ca: &CertAuthority,
 ) -> Result<(), Report<ProxyError>> {
     let Some((host, port)) = split_authority(authority) else {
@@ -212,9 +256,9 @@ async fn handle_connect(
     };
 
     // Match BEFORE replying, so an unmatched non-loopback request is refused.
-    if cfg.rules.first_match(&host).is_some() {
+    if state.config.rules.first_match(&host).is_some() {
         write_connect_ok(&mut client).await?;
-        return mitm(client, &host, cfg, ca).await;
+        return mitm(client, &host, state, ca).await;
     }
 
     if !is_loopback {
@@ -223,7 +267,14 @@ async fn handle_connect(
     }
 
     // No match on loopback: connect upstream FIRST, then reply 200 (else 502).
-    blind_tunnel(client, &host, port, &cfg.resolve, cfg.connect_timeout).await
+    blind_tunnel(
+        client,
+        &host,
+        port,
+        &state.config.resolve,
+        state.config.connect_timeout,
+    )
+    .await
 }
 
 /// Opens an upstream TCP connection, honoring a `--resolve` pin for `host`.
@@ -260,7 +311,7 @@ async fn connect_upstream(
 /// Connects to the upstream first; on success replies `200` then pipes bytes
 /// in both directions without decrypting anything.
 async fn blind_tunnel(
-    mut client: TcpStream,
+    mut client: PrefixedIo<TcpStream>,
     host: &str,
     port: u16,
     resolve: &HashMap<String, IpAddr>,
@@ -283,7 +334,7 @@ async fn blind_tunnel(
     }
 }
 
-async fn write_connect_ok(client: &mut TcpStream) -> Result<(), Report<ProxyError>> {
+async fn write_connect_ok(client: &mut PrefixedIo<TcpStream>) -> Result<(), Report<ProxyError>> {
     client
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await
@@ -292,7 +343,7 @@ async fn write_connect_ok(client: &mut TcpStream) -> Result<(), Report<ProxyErro
 }
 
 async fn respond_status_line(
-    client: &mut TcpStream,
+    client: &mut PrefixedIo<TcpStream>,
     status: StatusCode,
 ) -> Result<(), Report<ProxyError>> {
     let reason = status.canonical_reason().unwrap_or("");
@@ -307,7 +358,10 @@ async fn respond_status_line(
     client.flush().await.change_context(ProxyError::Server)
 }
 
-async fn serve_pac(client: &mut TcpStream, pac: &str) -> Result<(), Report<ProxyError>> {
+async fn serve_pac(
+    client: &mut PrefixedIo<TcpStream>,
+    pac: &str,
+) -> Result<(), Report<ProxyError>> {
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{pac}",
         pac.len(),
@@ -325,7 +379,7 @@ async fn serve_pac(client: &mut TcpStream, pac: &str) -> Result<(), Report<Proxy
 /// verbatim, then pipes the remaining bytes bidirectionally (spec §8.4).
 /// Best-effort: failures are logged, never fatal.
 async fn blind_forward_http(
-    mut client: TcpStream,
+    mut client: PrefixedIo<TcpStream>,
     head: &RequestHead,
     resolve: &HashMap<String, IpAddr>,
     connect_timeout: Duration,
@@ -358,12 +412,22 @@ async fn blind_forward_http(
 /// run a hyper server connection whose service rewrites and forwards each
 /// request to the upstream over a fresh client connection (spec §5/§8).
 async fn mitm(
-    client: TcpStream,
+    client: PrefixedIo<TcpStream>,
     host: &str,
-    cfg: &ResolvedConfig,
+    state: &ProxyState,
     ca: &CertAuthority,
 ) -> Result<(), Report<ProxyError>> {
-    let server_config = ca.server_config(host).change_context(ProxyError::Server)?;
+    let normalized_host = host.to_ascii_lowercase();
+    let cached = ca.is_cached(&normalized_host);
+    let mint_started = tokio::time::Instant::now();
+    let server_config = ca
+        .server_config(&normalized_host)
+        .change_context(ProxyError::Server)?;
+    if cached {
+        state.metrics.record_ca_hit();
+    } else {
+        state.metrics.record_ca_miss(mint_started.elapsed(), true);
+    }
     let acceptor = TlsAcceptor::from(server_config);
     let tls = acceptor
         .accept(client)
@@ -375,23 +439,8 @@ async fn mitm(
     let service = service_fn(move |req: Request<Incoming>| {
         // Clone the per-request inputs into the future.
         let host = host.clone();
-        let rules = cfg.rules.clone();
-        let basic_auth = cfg.basic_auth.clone();
-        let insecure = cfg.insecure;
-        let resolve = cfg.resolve.clone();
-        let connect_timeout = cfg.connect_timeout;
-        async move {
-            forward_request(
-                req,
-                &host,
-                &rules,
-                basic_auth.as_ref(),
-                insecure,
-                &resolve,
-                connect_timeout,
-            )
-            .await
-        }
+        let state = state;
+        async move { forward_request(req, &host, state).await }
     });
 
     // serve_connection drives keep-alive: many sequential requests per tunnel.
@@ -419,11 +468,7 @@ async fn mitm(
 async fn forward_request(
     req: Request<Incoming>,
     connect_host: &str,
-    rules: &super::rewrite::RuleTable,
-    basic_auth: Option<&super::config::BasicAuth>,
-    insecure: bool,
-    resolve: &HashMap<String, IpAddr>,
-    connect_timeout: Duration,
+    state: &ProxyState,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, Report<ProxyError>> {
     if req.headers().contains_key(hyper::header::UPGRADE) {
         log::info!("closing tunnel for {connect_host}: Upgrade (WebSocket) is out of scope");
@@ -434,11 +479,11 @@ async fn forward_request(
     // matches no rule is refused (421) rather than rerouted through the CONNECT
     // authority. Only a request with no Host falls back to the CONNECT authority.
     let rule = match request_host(&req) {
-        Some(host) => match rules.first_match(&host) {
+        Some(host) => match state.config.rules.first_match(&host) {
             Some(rule) => rule,
             None => return Ok(status_response(StatusCode::MISDIRECTED_REQUEST)),
         },
-        None => match rules.first_match(connect_host) {
+        None => match state.config.rules.first_match(connect_host) {
             Some(rule) => rule,
             // Should not happen: MITM is only entered on a CONNECT-authority match.
             None => return Ok(status_response(StatusCode::BAD_GATEWAY)),
@@ -451,11 +496,9 @@ async fn forward_request(
     match proxy_to_upstream(
         req,
         outcome,
-        basic_auth,
-        insecure,
-        (upstream_host, upstream_port),
-        resolve,
-        connect_timeout,
+        state.config.basic_auth.as_ref(),
+        rule,
+        &state.upstream,
     )
     .await
     {
@@ -488,12 +531,11 @@ async fn proxy_to_upstream(
     mut req: Request<Incoming>,
     outcome: &super::rewrite::RewriteOutcome,
     basic_auth: Option<&super::config::BasicAuth>,
-    insecure: bool,
-    upstream: (&str, u16),
-    resolve: &HashMap<String, IpAddr>,
-    connect_timeout: Duration,
+    rule: &super::rewrite::Rule,
+    upstream: &super::upstream::UpstreamClient,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, Report<ProxyError>> {
-    let (upstream_host, upstream_port) = upstream;
+    let upstream_host = rule.to.host();
+    let upstream_port = rule.to.port;
     log::debug!(
         "{} {} -> {}:{} (Host={}, X-Orig-Host={})",
         req.method(),
@@ -512,54 +554,13 @@ async fn proxy_to_upstream(
 
     rewrite_headers(req.headers_mut(), outcome, basic_auth);
 
-    // Dial the `--resolve` pin when the upstream host has one; the SNI/`Host`
-    // (set above) stay the hostname, so the certificate still validates.
-    let tcp = connect_upstream(upstream_host, upstream_port, resolve, connect_timeout)
-        .await
-        .change_context(ProxyError::Server)?;
-
-    let mut response = if outcome.scheme_is_tls {
-        let connector = TlsConnector::from(client_config(insecure));
-        let server_name = outcome
-            .sni
-            .clone()
-            .expect("should precompute TLS server name");
-        let tls = connector
-            .connect(server_name, tcp)
-            .await
-            .change_context(ProxyError::Server)?;
-        send_over(TokioIo::new(tls), req).await?
-    } else {
-        send_over(TokioIo::new(tcp), req).await?
-    };
+    let mut response = upstream.send(req, rule, outcome).await?;
 
     // Strip hop-by-hop headers from the upstream response too. A `Connection: close`
     // (or a named connection token) is specific to the upstream leg and must not
     // leak onto the reusable browser↔proxy MITM tunnel and tear it down.
     strip_hop_by_hop(response.headers_mut());
-    Ok(response.map(http_body_util::BodyExt::boxed))
-}
-
-/// Drives one HTTP/1.1 request/response over an established (TLS or plain) IO.
-async fn send_over<I>(
-    io: I,
-    req: Request<Incoming>,
-) -> Result<Response<Incoming>, Report<ProxyError>>
-where
-    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
-{
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
-        .await
-        .change_context(ProxyError::Server)?;
-    tokio::spawn(async move {
-        if let Err(err) = conn.await {
-            log::debug!("upstream connection closed: {err}");
-        }
-    });
-    sender
-        .send_request(req)
-        .await
-        .change_context(ProxyError::Server)
+    Ok(response)
 }
 
 /// Removes RFC 7230 hop-by-hop request headers, plus every header named in an
@@ -647,33 +648,6 @@ fn rewrite_headers(
     }
 }
 
-/// Builds a rustls client config: a no-verification verifier when `insecure`,
-/// otherwise the bundled webpki roots.
-fn client_config(insecure: bool) -> Arc<rustls::ClientConfig> {
-    // The config is immutable across requests, so build it once per verification
-    // mode and share the `Arc` — rather than rebuilding (and re-parsing the whole
-    // webpki root store) on every upstream request.
-    static SECURE: std::sync::OnceLock<Arc<rustls::ClientConfig>> = std::sync::OnceLock::new();
-    static INSECURE: std::sync::OnceLock<Arc<rustls::ClientConfig>> = std::sync::OnceLock::new();
-    let cell = if insecure { &INSECURE } else { &SECURE };
-    Arc::clone(cell.get_or_init(|| {
-        let mut config = if insecure {
-            rustls::ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(insecure::NoVerifier))
-                .with_no_client_auth()
-        } else {
-            let mut roots = rustls::RootCertStore::empty();
-            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            rustls::ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth()
-        };
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        Arc::new(config)
-    }))
-}
-
 fn status_response(status: StatusCode) -> Response<BoxBody<Bytes, hyper::Error>> {
     let body = Full::new(Bytes::new())
         .map_err(|never| match never {})
@@ -686,54 +660,6 @@ fn status_response(status: StatusCode) -> Response<BoxBody<Bytes, hyper::Error>>
 /// Renders the request target without exposing credentials in query strings.
 fn redact_target(uri: &Uri) -> String {
     uri.path().to_string()
-}
-
-mod insecure {
-    use rustls::DigitallySignedStruct;
-    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-
-    /// A verifier that accepts any upstream certificate — only used under
-    /// `--insecure` for local development against self-signed origins.
-    #[derive(Debug)]
-    pub struct NoVerifier;
-
-    impl ServerCertVerifier for NoVerifier {
-        fn verify_server_cert(
-            &self,
-            _end_entity: &CertificateDer<'_>,
-            _intermediates: &[CertificateDer<'_>],
-            _server_name: &ServerName<'_>,
-            _ocsp_response: &[u8],
-            _now: UnixTime,
-        ) -> Result<ServerCertVerified, rustls::Error> {
-            Ok(ServerCertVerified::assertion())
-        }
-
-        fn verify_tls12_signature(
-            &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            Ok(HandshakeSignatureValid::assertion())
-        }
-
-        fn verify_tls13_signature(
-            &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            Ok(HandshakeSignatureValid::assertion())
-        }
-
-        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            rustls::crypto::aws_lc_rs::default_provider()
-                .signature_verification_algorithms
-                .supported_schemes()
-        }
-    }
 }
 
 #[cfg(test)]
@@ -759,6 +685,7 @@ mod tests {
             target: target.to_string(),
             raw: Vec::new(),
             complete: true,
+            prefix: Vec::new(),
         }
     }
 

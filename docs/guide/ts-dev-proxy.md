@@ -327,6 +327,11 @@ command.
 
 ## Troubleshooting
 
+Mapped HTTP/1.1 upstream connections are reused automatically. With debug
+logging enabled, a clean shutdown prints an aggregate, redacted proxy metrics
+summary that can help distinguish DNS, connection, TLS, and pool wait latency;
+it never includes request URLs, headers, credentials, or certificate contents.
+
 | Symptom                                        | Cause                                                                                                                                                                                       | Fix                                                                                                                                                                                                                                                  |
 | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | "unknown domain" or `404` from upstream        | The upstream service does not accept `Host: <FROM>` (the default). A domain can be active on only one Fastly service at a time, so you cannot add the production hostname to a dev service. | Use a Trusted Server Compute upstream (routes by SNI, not `Host`), or pass `--rewrite-host` to send `Host: <TO>`.                                                                                                                                    |

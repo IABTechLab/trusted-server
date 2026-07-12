@@ -140,6 +140,29 @@ async fn keep_alive_serves_multiple_sequential_requests() {
         responses[1].path, "/two",
         "second request reused the tunnel"
     );
+    let snapshot = upstream.snapshot();
+    assert_eq!(
+        snapshot.accepted_connections, 1,
+        "sequential mapped requests should reuse one upstream TCP connection"
+    );
+    assert_eq!(
+        snapshot.tls_handshakes, 1,
+        "sequential mapped requests should reuse one upstream TLS session"
+    );
+}
+
+#[tokio::test]
+async fn upstream_connection_close_is_not_reused() {
+    let upstream = support::start_closing_upstream().await;
+    let cfg = support::test_config(&upstream.addr);
+    let ca = Arc::new(support::dev_ca());
+
+    let responses = support::drive_sequential_requests(cfg, ca, &["/one", "/two"]).await;
+
+    assert!(responses.iter().all(|response| response.status == 200));
+    let snapshot = upstream.snapshot();
+    assert_eq!(snapshot.accepted_connections, 2);
+    assert_eq!(snapshot.tls_handshakes, 2);
 }
 
 #[tokio::test]
