@@ -574,17 +574,23 @@ async fn proxy_to_upstream(
     // Strip hop-by-hop headers from the upstream response too. A `Connection: close`
     // (or a named connection token) is specific to the upstream leg and must not
     // leak onto the reusable browser↔proxy MITM tunnel and tear it down.
-    let downstream_trailer = response.headers().get(hyper::header::TRAILER).cloned();
-    strip_hop_by_hop(response.headers_mut());
-    if let Some(trailer) = downstream_trailer {
+    sanitize_response_headers(response.headers_mut());
+    Ok(response)
+}
+
+fn sanitize_response_headers(headers: &mut hyper::HeaderMap) {
+    let downstream_trailers: Vec<_> = headers
+        .get_all(hyper::header::TRAILER)
+        .iter()
+        .cloned()
+        .collect();
+    strip_hop_by_hop(headers);
+    for trailer in downstream_trailers {
         // Regenerate the trailer declaration for the downstream HTTP/1 leg so
         // Hyper serializes forwarded trailer frames. This is new downstream
         // framing metadata, not leaked upstream connection state.
-        response
-            .headers_mut()
-            .insert(hyper::header::TRAILER, trailer);
+        headers.append(hyper::header::TRAILER, trailer);
     }
-    Ok(response)
 }
 
 /// Removes RFC 7230 hop-by-hop request headers, plus every header named in an
@@ -801,6 +807,28 @@ mod tests {
             Some("www.example-publisher.com"),
             "Host is still rewritten alongside the strip"
         );
+    }
+
+    #[test]
+    fn response_sanitation_preserves_every_trailer_declaration() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.append(
+            hyper::header::TRAILER,
+            HeaderValue::from_static("x-first-trailer"),
+        );
+        headers.append(
+            hyper::header::TRAILER,
+            HeaderValue::from_static("x-second-trailer"),
+        );
+
+        sanitize_response_headers(&mut headers);
+
+        let declarations: Vec<_> = headers
+            .get_all(hyper::header::TRAILER)
+            .iter()
+            .map(|value| value.to_str().expect("should encode trailer name"))
+            .collect();
+        assert_eq!(declarations, ["x-first-trailer", "x-second-trailer"]);
     }
 
     #[test]

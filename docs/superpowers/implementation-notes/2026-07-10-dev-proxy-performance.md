@@ -153,3 +153,34 @@ the production six-connection bound trades 9.0% duration for bounded upstream
 load while reducing connections and handshakes by 94%. Retention regression
 gates remain the sequential and matched-concurrency-six comparisons documented
 above; this diagnostic is not presented as an HTTP/1 latency win.
+
+## Final review backfill
+
+The final PR review produced three code corrections and a broader lifecycle test
+matrix:
+
+- terminal response EOS now determines completed versus failed request metrics
+  independently from whether the upstream connection is reusable, including
+  already-empty responses that Hyper does not need to poll;
+- a reused sender that fails readiness retries through `acquire_fresh`, so it
+  cannot consume a second idle sender;
+- the rejected HTTP/2 `ApplicationMode` key discriminant was removed. Retained
+  origin identity is transport, normalized TO reference identity, port,
+  verification mode, and address policy; both TLS configurations advertise only
+  HTTP/1.1;
+- response trailer frames are serialized before lease reconciliation, with every
+  downstream trailer declaration regenerated after hop-by-hop sanitation. DATA,
+  trailers, and terminal completion now precede reuse;
+- connector cancellation and owner unwind abort before DNS/TCP and reconcile
+  capacity exactly once;
+- integration coverage now includes early responses, browser cancellation,
+  truncated bodies, response trailers, per-request Authorization isolation,
+  the `--insecure` warning, 65 blind plus 65 plain-forward connections bypassing
+  mapped pool limits, and exact-once over-read delivery to blind, plain, and MITM
+  consumers;
+- Ctrl-C cleanup is tested in the exact restore-system-proxy → stop accept loop →
+  bounded manager-drain order, with delayed driver reconciliation covered
+  separately;
+- feasible cross-rule cases prove shared logical TO reuse and distinct TO-port
+  isolation. Process-global TLS/plaintext and secure/insecure combinations remain
+  independently covered at the origin-key and TLS-config boundary.

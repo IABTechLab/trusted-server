@@ -125,6 +125,7 @@ impl PooledResponseBody {
         close_intent: bool,
         metrics: Arc<ProxyMetrics>,
     ) -> Self {
+        let response_complete = inner.is_end_stream();
         Self {
             inner,
             lease: Some(lease),
@@ -133,7 +134,7 @@ impl PooledResponseBody {
             close_intent,
             metrics,
             finalized: false,
-            response_complete: false,
+            response_complete,
         }
     }
 
@@ -228,7 +229,7 @@ mod tests {
     use std::convert::Infallible;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-    use http_body_util::Full;
+    use http_body_util::{Empty, Full};
     use hyper::service::service_fn;
     use hyper::{HeaderMap, Request, Response};
     use hyper_util::rt::TokioIo;
@@ -377,6 +378,62 @@ mod tests {
         body.collect()
             .await
             .expect("should consume complete response");
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.requests_completed, 1);
+        assert_eq!(snapshot.requests_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn empty_response_dropped_without_poll_is_completed() {
+        let (client_io, server_io) = tokio::io::duplex(1024);
+        tokio::spawn(async move {
+            let service =
+                service_fn(|_| async { Ok::<_, Infallible>(Response::new(Empty::<Bytes>::new())) });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(server_io), service)
+                .await;
+        });
+        let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(client_io))
+            .await
+            .expect("should complete client handshake");
+        let manager = Manager::start(super::super::manager::PoolLimits::default());
+        let key = OriginKey::new(
+            Transport::Tls,
+            ReferenceIdentity::dns("empty.example"),
+            443,
+            VerifyMode::Secure,
+            AddressPolicy::Dns,
+        );
+        let Acquired::Open(reservation) = manager.acquire(key).await.expect("should reserve")
+        else {
+            panic!("should open connection");
+        };
+        let id = reservation.id();
+        let driver_manager = Arc::clone(&manager);
+        let driver = tokio::spawn(async move {
+            let _ = connection.await;
+            driver_manager.driver_closed(id);
+        });
+        let mut lease = reservation.register(&manager, sender, driver.abort_handle());
+        let response = lease
+            .connection
+            .value
+            .send_request(Request::new(RequestUploadBody::empty()))
+            .await
+            .expect("should receive response");
+        assert!(response.body().is_end_stream());
+        let metrics = Arc::new(ProxyMetrics::default());
+        let body = PooledResponseBody::new(
+            response.into_body(),
+            lease,
+            Arc::clone(&manager),
+            Arc::new(AtomicU8::new(COMPLETE)),
+            false,
+            Arc::clone(&metrics),
+        );
+
+        drop(body);
 
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.requests_completed, 1);

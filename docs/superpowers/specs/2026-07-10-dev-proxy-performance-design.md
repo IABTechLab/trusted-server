@@ -763,7 +763,7 @@ corresponding experiment clears its entry gate and its code is retained.
 
 - Origin-key equality and separation across every security-relevant field.
 - DNS and IP TO reference identities, including DNS SNI, no DNS SNI for IP,
-  DNS-SAN/IP-SAN verification, and IP rules remaining HTTP/1-required.
+  DNS-SAN/IP-SAN verification, with all retained rules remaining HTTP/1-only.
 - TLS client configuration separation across secure/insecure modes, with both
   configurations advertising only HTTP/1.1.
 - DNS cache hit, expiry, eviction, multi-address fallback, and `--resolve`
@@ -812,10 +812,11 @@ gate and its code is retained.
 - `--insecure` still emits its warning; blind tunnels and stray plain-HTTP
   forwarding bypass mapped pool accounting; manager shutdown aborts drivers,
   closes sockets, fails waiters, and discards all bounded state.
-- Ctrl-C shutdown restores Safari before manager drain, completes within the
-  two-second drain deadline when a driver delays termination, and still receives
-  the priority `Shutdown` plus all connector/driver lifecycle events when the
-  ordinary command channel is saturated.
+- Ctrl-C shutdown restores Safari, stops the accept loop, and then drains the
+  manager. It completes within the two-second drain deadline when a driver delays
+  termination, and still receives the priority `Shutdown` plus all
+  connector/driver lifecycle events when the ordinary command channel is
+  saturated.
 - Connector abort, cancellation, and unwind each reconcile a Connecting
   reservation exactly once. Lifecycle-priority reordering of `DriverClosed`
   before `Return` discards the stale return without double-decrementing capacity;
@@ -824,7 +825,7 @@ gate and its code is retained.
   when the ordinary lane is saturated. Tests cover cancellation overtaking its
   acquire, cancellation while queued, and atomic races against admission and
   timeout; each resolves the ticket and accounting exactly once.
-- Origin-key tests vary protocol, TO reference identity, port, address policy,
+- Origin-key tests vary transport, TO reference identity, port, address policy,
   and verification mode independently, including combinations that cannot arise
   in one CLI invocation because `--insecure` and `--resolve` are global.
   Cross-rule integration tests use feasible same-process cases:
@@ -834,16 +835,10 @@ gate and its code is retained.
   authoritative forwarding headers, and that per-request
   Authorization values do not persist onto later requests on a reused
   connection.
-- HTTP/2 multiplexes concurrent requests and falls back to HTTP/1.1.
-- With upload still streaming, response EOS, downstream cancellation, response
-  body error, and upload failure each request stream reset and retain the stream
-  permit until the termination guard fires. A 101st request remains queued until
-  confirmed termination, proving the 100-stream cap cannot be released early.
-- Concurrent cold HTTP/2-eligible requests perform exactly one ALPN discovery
-  connection; HTTP/1 fallback then expands only within the six-connection bound.
-- `Host: FROM` rules advertise only HTTP/1.1; HTTP/2-eligible rules expose
-  `:authority = TO[:non-default-port]` at the test upstream.
-- GOAWAY and connection failure trigger safe replacement.
+- The rejected HTTP/2 experiment would additionally have required multiplexing,
+  stream-permit lifecycle, serialized ALPN discovery, authority, fallback,
+  GOAWAY, and replacement tests. These are historical acceptance criteria only;
+  no HTTP/2 production code or active test obligation remains.
 - CONNECT over-read bytes reach the TLS or blind-tunnel consumer intact.
 - Browser-facing and upstream `TCP_NODELAY` application is observable through
   counters, while injected option failures remain non-fatal and warn once per

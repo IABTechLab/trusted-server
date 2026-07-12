@@ -1035,7 +1035,7 @@ impl AsyncRead for ConnectPrefixedIo {
     }
 }
 
-/// Forces CONNECT head plus rustls ClientHello into one buffered first flight.
+/// Forces CONNECT head plus rustls `ClientHello` into one buffered first flight.
 pub async fn drive_mitm_connect_overread(proxy: SocketAddr) -> ProxiedResponse {
     let tcp = TcpStream::connect(proxy)
         .await
