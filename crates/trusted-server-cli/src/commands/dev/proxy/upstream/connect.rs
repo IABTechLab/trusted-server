@@ -284,3 +284,138 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
             .supported_schemes()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::*;
+    use crate::commands::dev::proxy::upstream::key::ReferenceIdentity;
+    use crate::commands::dev::proxy::upstream::manager::{Acquired, PoolLimits};
+
+    fn key() -> OriginKey {
+        let address = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        OriginKey::new(
+            Transport::Tls,
+            ReferenceIdentity::ip(address),
+            443,
+            VerifyMode::Insecure,
+            AddressPolicy::Dns,
+        )
+    }
+
+    fn delayed_policy() -> ConnectPolicy {
+        ConnectPolicy {
+            timeout: Duration::from_secs(30),
+            connect_delay: Duration::from_secs(10),
+            tls_delay: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn client_configs_are_cached_by_verification_and_http1_only() {
+        let secure = client_config(VerifyMode::Secure);
+        let secure_again = client_config(VerifyMode::Secure);
+        let insecure = client_config(VerifyMode::Insecure);
+        let insecure_again = client_config(VerifyMode::Insecure);
+
+        assert!(Arc::ptr_eq(&secure, &secure_again));
+        assert!(Arc::ptr_eq(&insecure, &insecure_again));
+        assert!(!Arc::ptr_eq(&secure, &insecure));
+        assert_eq!(secure.alpn_protocols, [b"http/1.1".to_vec()]);
+        assert_eq!(insecure.alpn_protocols, [b"http/1.1".to_vec()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_pending_connector_reconciles_reservation_once() {
+        let manager = Manager::start(PoolLimits {
+            per_origin_live: 1,
+            global_live: 1,
+            ..PoolLimits::default()
+        });
+        let Acquired::Open(reservation) = manager.acquire(key()).await.expect("should reserve")
+        else {
+            panic!("should open connector reservation");
+        };
+        let id = reservation.id();
+        let pending = PendingConnection::spawn(
+            key(),
+            Some(ServerName::from(IpAddr::V4(Ipv4Addr::LOCALHOST))),
+            delayed_policy(),
+            Arc::new(ProxyMetrics::default()),
+            Arc::clone(&manager),
+            Arc::new(DnsCache::default()),
+            id,
+        );
+        let abort = pending.abort_handle();
+        manager.register_connector(id, abort.clone());
+
+        drop(pending);
+        drop(reservation);
+        tokio::task::yield_now().await;
+
+        assert!(
+            abort.is_finished(),
+            "connector task should be aborted on drop"
+        );
+        let Acquired::Open(replacement) = manager.acquire(key()).await.expect("should reconcile")
+        else {
+            panic!("should admit one replacement");
+        };
+        manager.driver_closed(id);
+        let overflow = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.acquire(key()).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !overflow.is_finished(),
+            "duplicate completion must not free replacement capacity"
+        );
+        drop(replacement);
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            overflow.await.expect("should join overflow"),
+            Ok(Acquired::Open(_))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connector_owner_unwind_reconciles_reservation() {
+        let manager = Manager::start(PoolLimits {
+            per_origin_live: 1,
+            global_live: 1,
+            ..PoolLimits::default()
+        });
+        let Acquired::Open(reservation) = manager.acquire(key()).await.expect("should reserve")
+        else {
+            panic!("should open connector reservation");
+        };
+        let id = reservation.id();
+        let pending = PendingConnection::spawn(
+            key(),
+            Some(ServerName::from(IpAddr::V4(Ipv4Addr::LOCALHOST))),
+            delayed_policy(),
+            Arc::new(ProxyMetrics::default()),
+            Arc::clone(&manager),
+            Arc::new(DnsCache::default()),
+            id,
+        );
+        let abort = pending.abort_handle();
+        manager.register_connector(id, abort.clone());
+
+        let owner = tokio::spawn(async move {
+            let _reservation = reservation;
+            let _pending = pending;
+            panic!("exercise connector owner unwind");
+        });
+        assert!(owner.await.expect_err("owner should panic").is_panic());
+        tokio::task::yield_now().await;
+
+        assert!(abort.is_finished(), "unwind should abort connector task");
+        assert!(matches!(
+            manager.acquire(key()).await,
+            Ok(Acquired::Open(_))
+        ));
+    }
+}
