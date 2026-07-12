@@ -189,26 +189,90 @@ fn upstream_tls_acceptor() -> TlsAcceptor {
 /// Starts an HTTPS upstream that echoes the `Host`/`X-Orig-Host`/path it saw and
 /// always returns `200`. Serves keep-alive (many requests per connection).
 pub async fn start_echo_upstream() -> Upstream {
-    start_upstream(false, Duration::ZERO, false).await
+    start_upstream(false, Duration::ZERO, false, false).await
 }
 
 /// Starts the echo upstream with a fixed delay before every response.
 pub async fn start_delayed_echo_upstream(response_delay: Duration) -> Upstream {
-    start_upstream(false, response_delay, false).await
+    start_upstream(false, response_delay, false, false).await
 }
 
 /// Starts an upstream that requests connection closure after every response.
 pub async fn start_closing_upstream() -> Upstream {
-    start_upstream(false, Duration::ZERO, true).await
+    start_upstream(false, Duration::ZERO, true, false).await
+}
+
+/// First connection closes after consuming its second request but before headers.
+pub async fn start_post_dispatch_stale_upstream() -> Upstream {
+    start_upstream(false, Duration::ZERO, false, true).await
+}
+
+/// Starts an HTTPS upstream that echoes one chunked request body as a chunked
+/// response body.
+pub async fn start_chunked_body_upstream() -> Upstream {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("should bind chunked upstream");
+    let addr = listener
+        .local_addr()
+        .expect("should read chunked upstream addr");
+    let acceptor = upstream_tls_acceptor();
+    let counters = Arc::new(UpstreamCounters::default());
+    let task_counters = Arc::clone(&counters);
+    tokio::spawn(async move {
+        let Ok((tcp, _)) = listener.accept().await else {
+            return;
+        };
+        task_counters
+            .accepted_connections
+            .fetch_add(1, Ordering::Relaxed);
+        let Ok(mut tls) = acceptor.accept(tcp).await else {
+            task_counters.failures.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        task_counters.tls_handshakes.fetch_add(1, Ordering::Relaxed);
+        let Some(body) = read_chunked_message(&mut tls).await else {
+            task_counters.failures.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        task_counters.requests.fetch_add(1, Ordering::Relaxed);
+        if tls
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .await
+            .is_err()
+        {
+            task_counters.failures.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        for chunk in body.chunks(8 * 1024) {
+            let head = format!("{:x}\r\n", chunk.len());
+            if tls.write_all(head.as_bytes()).await.is_err()
+                || tls.write_all(chunk).await.is_err()
+                || tls.write_all(b"\r\n").await.is_err()
+            {
+                task_counters.failures.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        if tls.write_all(b"0\r\n\r\n").await.is_err() || tls.flush().await.is_err() {
+            task_counters.failures.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    Upstream { addr, counters }
 }
 
 /// Starts an HTTPS upstream that returns `401` unless an `Authorization` header
 /// is present, otherwise `200`.
 pub async fn start_gated_upstream() -> Upstream {
-    start_upstream(true, Duration::ZERO, false).await
+    start_upstream(true, Duration::ZERO, false, false).await
 }
 
-async fn start_upstream(gated: bool, response_delay: Duration, close: bool) -> Upstream {
+async fn start_upstream(
+    gated: bool,
+    response_delay: Duration,
+    close: bool,
+    fail_second_on_first: bool,
+) -> Upstream {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("should bind upstream");
@@ -221,9 +285,10 @@ async fn start_upstream(gated: bool, response_delay: Duration, close: bool) -> U
             let Ok((tcp, _)) = listener.accept().await else {
                 break;
             };
-            task_counters
+            let connection_index = task_counters
                 .accepted_connections
-                .fetch_add(1, Ordering::Relaxed);
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
             let acceptor = acceptor.clone();
             let counters = Arc::clone(&task_counters);
             tokio::spawn(async move {
@@ -237,7 +302,15 @@ async fn start_upstream(gated: bool, response_delay: Duration, close: bool) -> U
                         return;
                     }
                 };
-                serve_upstream_connection(&mut tls, gated, response_delay, close, &counters).await;
+                serve_upstream_connection(
+                    &mut tls,
+                    gated,
+                    response_delay,
+                    close,
+                    fail_second_on_first && connection_index == 1,
+                    &counters,
+                )
+                .await;
             });
         }
     });
@@ -251,12 +324,14 @@ async fn serve_upstream_connection<S>(
     gated: bool,
     response_delay: Duration,
     close: bool,
+    fail_second_request: bool,
     counters: &UpstreamCounters,
 ) where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
+    let mut request_index = 0;
     loop {
         // Read until we have a full header block.
         let head_end = loop {
@@ -274,6 +349,7 @@ async fn serve_upstream_connection<S>(
             buf.extend_from_slice(&chunk[..n]);
         };
         counters.requests.fetch_add(1, Ordering::Relaxed);
+        request_index += 1;
         let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
         buf.drain(..head_end);
 
@@ -287,6 +363,10 @@ async fn serve_upstream_connection<S>(
         let orig_host = header_value(&head, "x-orig-host").unwrap_or_default();
         let fwd_host = header_value(&head, "x-forwarded-host").unwrap_or_default();
         let has_auth = header_value(&head, "authorization").is_some();
+
+        if fail_second_request && request_index == 2 {
+            return;
+        }
 
         let (status_line, body) = if gated && !has_auth {
             ("HTTP/1.1 401 Unauthorized", String::new())
@@ -329,6 +409,71 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+async fn read_chunked_message<S>(stream: &mut S) -> Option<Vec<u8>>
+where
+    S: AsyncReadExt + Unpin,
+{
+    let mut encoded = Vec::new();
+    let mut scratch = [0_u8; 1024];
+    let head_end = loop {
+        if let Some(position) = find_subslice(&encoded, b"\r\n\r\n") {
+            break position + 4;
+        }
+        let count = stream.read(&mut scratch).await.ok()?;
+        if count == 0 {
+            return None;
+        }
+        encoded.extend_from_slice(&scratch[..count]);
+    };
+    encoded.drain(..head_end);
+    decode_chunked_body(stream, encoded).await
+}
+
+async fn decode_chunked_body<S>(stream: &mut S, mut encoded: Vec<u8>) -> Option<Vec<u8>>
+where
+    S: AsyncReadExt + Unpin,
+{
+    let mut body = Vec::new();
+    let mut scratch = [0_u8; 1024];
+    loop {
+        let line_end = loop {
+            if let Some(position) = find_subslice(&encoded, b"\r\n") {
+                break position;
+            }
+            let count = stream.read(&mut scratch).await.ok()?;
+            if count == 0 {
+                return None;
+            }
+            encoded.extend_from_slice(&scratch[..count]);
+        };
+        let size =
+            usize::from_str_radix(std::str::from_utf8(&encoded[..line_end]).ok()?, 16).ok()?;
+        encoded.drain(..line_end + 2);
+        if size == 0 {
+            while encoded.len() < 2 {
+                let count = stream.read(&mut scratch).await.ok()?;
+                if count == 0 {
+                    return None;
+                }
+                encoded.extend_from_slice(&scratch[..count]);
+            }
+            return encoded.starts_with(b"\r\n").then_some(body);
+        }
+        while encoded.len() < size + 2 {
+            let count = stream.read(&mut scratch).await.ok()?;
+            if count == 0 {
+                return None;
+            }
+            encoded.extend_from_slice(&scratch[..count]);
+        }
+        body.extend_from_slice(&encoded[..size]);
+        if &encoded[size..size + 2] != b"\r\n" {
+            return None;
+        }
+        encoded.drain(..size + 2);
+    }
+}
+
 // ---- proxy lifecycle ----
 
 /// Spawns the proxy in the background and returns the loopback address it bound.
@@ -349,7 +494,35 @@ pub async fn spawn_proxy_with_state(
         .expect("should bind proxy listener");
     let addr = listener.local_addr().expect("should read proxy addr");
     let cfg = Arc::new(cfg);
-    let state = trusted_server_cli::commands::dev::proxy::ProxyState::new(cfg);
+    let variant = std::env::var("TS_PERF_VARIANT").unwrap_or_default();
+    let pool_disabled = matches!(
+        variant.as_str(),
+        "baseline" | "dns_no_cache" | "dns_cache" | "remote_baseline"
+    );
+    let mut limits =
+        trusted_server_cli::commands::dev::proxy::upstream::manager::PoolLimits::default();
+    if pool_disabled {
+        limits.per_origin_live = 64;
+        limits.per_origin_idle = 0;
+    } else if variant == "cap20" {
+        limits.per_origin_live = 20;
+    }
+    let options = trusted_server_cli::commands::dev::proxy::upstream::UpstreamOptions {
+        limits,
+        dns_cache: variant != "dns_no_cache",
+        connect_delay: if variant.starts_with("remote_") {
+            Duration::from_millis(30)
+        } else {
+            Duration::ZERO
+        },
+        tls_delay: if variant.starts_with("remote_") {
+            Duration::from_millis(30)
+        } else {
+            Duration::ZERO
+        },
+    };
+    let state =
+        trusted_server_cli::commands::dev::proxy::ProxyState::with_upstream_options(cfg, options);
     let pac: Arc<str> = Arc::from("function FindProxyForURL(u, h) { return \"DIRECT\"; }");
     let task_state = Arc::clone(&state);
     tokio::spawn(async move {
@@ -548,6 +721,75 @@ pub async fn drive_sequential_requests_through_proxy(
         results.push(read_http_response(&mut tls).await);
     }
     results
+}
+
+/// Sends a GET followed by a non-replayable POST on one browser tunnel.
+pub async fn drive_get_then_post(
+    cfg: config::ResolvedConfig,
+    ca: Arc<ca::CertAuthority>,
+) -> Vec<ProxiedResponse> {
+    let proxy = spawn_proxy(cfg, ca).await;
+    let authority = format!("{FROM_HOST}:443");
+    let tcp = proxy_connect(proxy, &authority).await;
+    let connector = accept_any_connector();
+    let server_name = ServerName::try_from(FROM_HOST.to_string()).expect("valid server name");
+    let mut tls = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("client TLS handshake with proxy leaf");
+
+    let get = format!("GET /one HTTP/1.1\r\nHost: {FROM_HOST}\r\n\r\n");
+    tls.write_all(get.as_bytes()).await.expect("write GET");
+    let first = read_http_response(&mut tls).await;
+    let post = format!("POST /two HTTP/1.1\r\nHost: {FROM_HOST}\r\nContent-Length: 0\r\n\r\n");
+    tls.write_all(post.as_bytes()).await.expect("write POST");
+    let second = read_http_response(&mut tls).await;
+    vec![first, second]
+}
+
+/// Streams `body` through the proxy with chunked request framing and returns
+/// the decoded chunked response body.
+pub async fn drive_chunked_body(
+    cfg: config::ResolvedConfig,
+    ca: Arc<ca::CertAuthority>,
+    body: &[u8],
+) -> Vec<u8> {
+    let proxy = spawn_proxy(cfg, ca).await;
+    let authority = format!("{FROM_HOST}:443");
+    let tcp = proxy_connect(proxy, &authority).await;
+    let connector = accept_any_connector();
+    let server_name = ServerName::try_from(FROM_HOST.to_string()).expect("valid server name");
+    let mut tls = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("client TLS handshake with proxy leaf");
+
+    let request = format!(
+        "POST /chunked HTTP/1.1\r\nHost: {FROM_HOST}\r\nTransfer-Encoding: chunked\r\n\r\n"
+    );
+    tls.write_all(request.as_bytes())
+        .await
+        .expect("should write chunked request head");
+    for chunk in body.chunks(16 * 1024) {
+        let head = format!("{:x}\r\n", chunk.len());
+        tls.write_all(head.as_bytes())
+            .await
+            .expect("should write request chunk head");
+        tls.write_all(chunk)
+            .await
+            .expect("should write request chunk");
+        tls.write_all(b"\r\n")
+            .await
+            .expect("should finish request chunk");
+    }
+    tls.write_all(b"0\r\n\r\n")
+        .await
+        .expect("should finish chunked request");
+    tls.flush().await.expect("should flush chunked request");
+
+    read_chunked_message(&mut tls)
+        .await
+        .expect("should decode chunked response")
 }
 
 /// CONNECTs to the mapped [`FROM_HOST`] (so the tunnel is MITM'd), then sends a

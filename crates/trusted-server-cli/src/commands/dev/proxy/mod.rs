@@ -22,9 +22,21 @@ pub struct ProxyState {
 impl ProxyState {
     #[must_use]
     pub fn new(config: Arc<config::ResolvedConfig>) -> Arc<Self> {
+        Self::with_upstream_options(config, upstream::UpstreamOptions::default())
+    }
+
+    #[must_use]
+    pub fn with_upstream_options(
+        config: Arc<config::ResolvedConfig>,
+        options: upstream::UpstreamOptions,
+    ) -> Arc<Self> {
         let metrics = Arc::new(metrics::ProxyMetrics::default());
         Arc::new(Self {
-            upstream: upstream::UpstreamClient::new(Arc::clone(&metrics), config.connect_timeout),
+            upstream: upstream::UpstreamClient::with_options(
+                Arc::clone(&metrics),
+                config.connect_timeout,
+                options,
+            ),
             config,
             metrics,
         })

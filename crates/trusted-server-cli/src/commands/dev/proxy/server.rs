@@ -20,7 +20,7 @@ use hyper::header::{HeaderName, HeaderValue};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
@@ -142,7 +142,9 @@ impl RequestHead {
 /// The raw bytes are retained on the returned [`RequestHead`] so that a stray
 /// absolute-form plain-HTTP request can be forwarded unchanged (spec §8.4) —
 /// `blind_forward_http` writes them to the upstream before piping the remainder.
-async fn read_request_head(client: &mut TcpStream) -> Result<RequestHead, Report<ProxyError>> {
+async fn read_request_head<R: AsyncRead + Unpin>(
+    client: &mut R,
+) -> Result<RequestHead, Report<ProxyError>> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     let mut complete = false;
@@ -238,6 +240,18 @@ async fn handle_connection(
 /// Returns `None` when a port is present but not a valid `u16`, so the caller
 /// can reject the CONNECT with `400` instead of silently dialing `443`.
 fn split_authority(authority: &str) -> Option<(String, u16)> {
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        let (host, suffix) = bracketed.split_once(']')?;
+        let port = if suffix.is_empty() {
+            443
+        } else {
+            suffix.strip_prefix(':')?.parse().ok()?
+        };
+        return Some((host.to_string(), port));
+    }
+    if authority.parse::<IpAddr>().is_ok() {
+        return Some((authority.to_string(), 443));
+    }
     match authority.rsplit_once(':') {
         Some((host, port)) => Some((host.to_string(), port.parse().ok()?)),
         None => Some((authority.to_string(), 443)),
@@ -552,9 +566,10 @@ async fn proxy_to_upstream(
             .expect("should prevalidate original host header"),
     );
 
+    let metadata = super::upstream::RequestMetadata::capture(&req);
     rewrite_headers(req.headers_mut(), outcome, basic_auth);
 
-    let mut response = upstream.send(req, rule, outcome).await?;
+    let mut response = upstream.send(req, metadata, rule, outcome).await?;
 
     // Strip hop-by-hop headers from the upstream response too. A `Connection: close`
     // (or a named connection token) is specific to the upstream leg and must not
@@ -667,6 +682,20 @@ mod tests {
     use super::*;
     use crate::commands::dev::proxy::rewrite::RewriteOutcome;
 
+    async fn parse_bytes(chunks: Vec<Vec<u8>>) -> RequestHead {
+        let capacity = chunks.iter().map(Vec::len).sum::<usize>().max(1);
+        let (mut writer, mut reader) = tokio::io::duplex(capacity);
+        tokio::spawn(async move {
+            for chunk in chunks {
+                writer.write_all(&chunk).await.expect("should write chunk");
+                tokio::task::yield_now().await;
+            }
+        });
+        read_request_head(&mut reader)
+            .await
+            .expect("should parse head")
+    }
+
     fn rewrite_outcome(host: &'static str) -> RewriteOutcome {
         RewriteOutcome {
             sni: Some(
@@ -710,6 +739,40 @@ mod tests {
     }
 
     #[test]
+    fn split_authority_normalizes_bracketed_ipv6() {
+        assert_eq!(
+            split_authority("[::1]:8443"),
+            Some(("::1".to_string(), 8443))
+        );
+        assert_eq!(split_authority("[::1]"), Some(("::1".to_string(), 443)));
+    }
+
+    #[tokio::test]
+    async fn buffered_head_parser_handles_delimiter_splits_and_exact_overread() {
+        let head = parse_bytes(vec![
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r".to_vec(),
+            b"\nclient-hello".to_vec(),
+        ])
+        .await;
+        assert!(head.complete);
+        assert_eq!(head.prefix, b"client-hello");
+        assert_eq!(head.connect_authority(), Some("example.com:443"));
+    }
+
+    #[tokio::test]
+    async fn buffered_head_parser_accepts_exactly_eight_kib_and_rejects_larger() {
+        let mut exact = b"GET / HTTP/1.1\r\nX-Fill: ".to_vec();
+        exact.resize(8192 - 4, b'a');
+        exact.extend_from_slice(b"\r\n\r\n");
+        assert!(parse_bytes(vec![exact]).await.complete);
+
+        let mut oversized = b"GET / HTTP/1.1\r\nX-Fill: ".to_vec();
+        oversized.resize(8192, b'a');
+        oversized.extend_from_slice(b"\r\n\r\n");
+        assert!(!parse_bytes(vec![oversized]).await.complete);
+    }
+
+    #[test]
     fn rewrite_headers_strips_proxy_connection() {
         let outcome = rewrite_outcome("www.example-publisher.com");
         let mut headers = hyper::HeaderMap::new();
@@ -728,6 +791,38 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("www.example-publisher.com"),
             "Host is still rewritten alongside the strip"
+        );
+    }
+
+    #[test]
+    fn request_metadata_captures_chunked_upload_before_sanitation() {
+        let mut request = Request::new(Full::new(Bytes::from_static(b"upload")));
+        *request.method_mut() = hyper::Method::POST;
+        request.headers_mut().insert(
+            hyper::header::TRANSFER_ENCODING,
+            HeaderValue::from_static("chunked"),
+        );
+
+        let metadata = super::super::upstream::RequestMetadata::capture(&request);
+        rewrite_headers(
+            request.headers_mut(),
+            &rewrite_outcome("to.edgecompute.app"),
+            None,
+        );
+
+        assert!(
+            !request
+                .headers()
+                .contains_key(hyper::header::TRANSFER_ENCODING),
+            "sanitation should still remove hop-by-hop framing"
+        );
+        assert!(
+            !metadata.upload_initially_complete(),
+            "chunked upload must remain streaming after sanitation"
+        );
+        assert!(
+            !metadata.replayable(),
+            "chunked upload must never enter stale replay"
         );
     }
 

@@ -73,6 +73,12 @@ async fn perf_pooled_saturation_concurrency_twenty() {
     run_concurrent_pooled("saturation_concurrency_20", 20).await;
 }
 
+#[tokio::test]
+#[ignore = "manual performance workload"]
+async fn perf_http1_remote_model() {
+    run_concurrent_pooled("http1_remote_model_30_30_25", 20).await;
+}
+
 async fn run_concurrent_pooled(workload: &str, concurrency: usize) {
     let variant = perf_variant();
     let upstream = support::start_delayed_echo_upstream(Duration::from_millis(25)).await;
@@ -114,7 +120,7 @@ async fn run_concurrent_pooled(workload: &str, concurrency: usize) {
         responses.iter().all(|response| response.status == 200),
         "should return success for every request"
     );
-    if variant == "baseline" {
+    if matches!(variant.as_str(), "baseline" | "remote_baseline") {
         assert_eq!(snapshot.accepted_connections, REQUEST_COUNT as u64);
     } else if variant == "cap20" {
         assert!(snapshot.accepted_connections < REQUEST_COUNT as u64);

@@ -113,3 +113,43 @@ socket-option code was removed.
 - Waiters: 32 per origin, 128 global, 30-second acquisition timeout
 - DNS: 30-second TTL, 64 entries
 - Shutdown manager drain: 2 seconds after Safari/system proxy restoration
+
+## Post-implementation self-review corrections
+
+A fresh adversarial review found and corrected seven lifecycle gaps before merge:
+
+- request framing and replay eligibility are now captured before hop-by-hop
+  sanitation, so removing `Transfer-Encoding` cannot misclassify a chunked
+  upload as empty;
+- upload completion requires terminal EOS after trailers, and response reuse
+  rejects streaming/failed uploads, close intent, and terminated drivers;
+- DNS lookup work is independent of any individual waiter, so caller
+  cancellation cannot poison an in-flight key. One owned success or failure is
+  fanned out, failures are not cached, and TTL behavior is tested under paused
+  time;
+- connector abort handles are registered with the manager before DNS/TCP/TLS
+  awaits. Shutdown and caller cancellation therefore abort pending connector
+  tasks and reconcile the exact reservation;
+- stale post-dispatch retry now reconstructs only a pre-sanitization-proven empty
+  GET/HEAD/OPTIONS request, uses a fresh connection, and runs at most once;
+- performance variants are injected by integration-test support. Production
+  startup no longer reads `TS_PERF_VARIANT`, and queue-wait metrics are now wired
+  from actor admission;
+- a 2 MiB chunked upload/response round trip proves byte identity through both
+  streaming adapters, while priority shutdown is tested with all 64 ordinary
+  command slots occupied.
+
+The exact remote model requested by the plan uses 100 empty GETs at concurrency
+20, 30 ms injected connection delay, 30 ms injected TLS delay, and a 25 ms
+upstream response delay. After two warmups and ten alternating runs:
+
+| Variant       | Median (µs) | p95 (µs) | MAD (µs) | Connections / handshakes | Failures |
+| ------------- | ----------: | -------: | -------: | -----------------------: | -------: |
+| pool disabled |     534,816 |  557,768 |    7,220 |                100 / 100 |        0 |
+| pooled, cap 6 |   583,207.5 |  585,816 |  1,925.5 |                    6 / 6 |        0 |
+
+The concurrency-20 result is intentionally a saturation/HTTP/2-entry diagnostic:
+the production six-connection bound trades 9.0% duration for bounded upstream
+load while reducing connections and handshakes by 94%. Retention regression
+gates remain the sequential and matched-concurrency-six comparisons documented
+above; this diagnostic is not presented as an HTTP/1 latency win.

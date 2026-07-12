@@ -25,6 +25,76 @@ pub struct OpenedConnection {
     pub start: oneshot::Sender<()>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ConnectPolicy {
+    pub timeout: Duration,
+    pub connect_delay: Duration,
+    pub tls_delay: Duration,
+}
+
+/// Abort-on-drop network connector owned by one manager reservation.
+pub struct PendingConnection {
+    task: Option<tokio::task::JoinHandle<Result<OpenedConnection, Report<io::Error>>>>,
+}
+
+impl PendingConnection {
+    pub fn spawn(
+        key: OriginKey,
+        sni: Option<ServerName<'static>>,
+        policy: ConnectPolicy,
+        metrics: Arc<ProxyMetrics>,
+        manager: Arc<Manager<UpstreamSender>>,
+        dns: Arc<DnsCache>,
+        id: ConnectionId,
+    ) -> Self {
+        Self {
+            task: Some(tokio::spawn(async move {
+                open(&key, sni, policy, metrics, manager, dns, id).await
+            })),
+        }
+    }
+
+    #[must_use]
+    /// Returns the task abort handle while the connector is pending.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if called after this value has already completed.
+    pub fn abort_handle(&self) -> AbortHandle {
+        self.task
+            .as_ref()
+            .expect("should retain connector task")
+            .abort_handle()
+    }
+
+    /// Waits for connector completion while retaining abort-on-caller-drop behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns the connection error or a task cancellation/panic as an I/O report.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if internal code removes the task before awaiting it.
+    pub async fn finish(mut self) -> Result<OpenedConnection, Report<io::Error>> {
+        let result = self
+            .task
+            .as_mut()
+            .expect("should retain connector task")
+            .await;
+        self.task.take();
+        result.map_err(|error| Report::new(io::Error::other(error.to_string())))?
+    }
+}
+
+impl Drop for PendingConnection {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
 /// Opens TCP/TLS and completes an HTTP/1 client handshake for one reservation.
 ///
 /// # Errors
@@ -33,19 +103,19 @@ pub struct OpenedConnection {
 pub async fn open(
     key: &OriginKey,
     sni: Option<ServerName<'static>>,
-    timeout: Duration,
+    policy: ConnectPolicy,
     metrics: Arc<ProxyMetrics>,
     manager: Arc<Manager<UpstreamSender>>,
     dns: Arc<DnsCache>,
     id: ConnectionId,
 ) -> Result<OpenedConnection, Report<io::Error>> {
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = tokio::time::Instant::now() + policy.timeout;
     let addresses: Vec<std::net::SocketAddr> = match key.address_policy() {
         AddressPolicy::Resolve(address) => vec![(address, key.port()).into()],
         AddressPolicy::Dns => match key.reference() {
             ReferenceIdentity::Ip(address) => vec![(*address, key.port()).into()],
             ReferenceIdentity::Dns(host) => dns
-                .lookup(host, key.port(), deadline, &metrics)
+                .lookup(host, key.port(), deadline, Arc::clone(&metrics))
                 .await?
                 .to_vec(),
         },
@@ -58,6 +128,9 @@ pub async fn open(
     }
     let mut last_error = None;
     let mut connected = None;
+    if !policy.connect_delay.is_zero() {
+        tokio::time::sleep(policy.connect_delay).await;
+    }
     for (index, address) in addresses.iter().enumerate() {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -93,6 +166,9 @@ pub async fn open(
             io::Error::new(io::ErrorKind::InvalidInput, "TLS origin has no server name")
         })?;
         let tls_started = tokio::time::Instant::now();
+        if !policy.tls_delay.is_zero() {
+            tokio::time::sleep(policy.tls_delay).await;
+        }
         let tls = connector
             .connect(server_name, tcp)
             .await

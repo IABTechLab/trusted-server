@@ -10,6 +10,7 @@
 #![cfg(target_os = "macos")]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use trusted_server_cli::commands::dev::proxy::{ca, config};
 
@@ -163,6 +164,82 @@ async fn upstream_connection_close_is_not_reused() {
     let snapshot = upstream.snapshot();
     assert_eq!(snapshot.accepted_connections, 2);
     assert_eq!(snapshot.tls_handshakes, 2);
+}
+
+#[tokio::test]
+async fn reused_empty_get_retries_once_after_post_dispatch_close() {
+    let upstream = support::start_post_dispatch_stale_upstream().await;
+    let cfg = support::test_config(&upstream.addr);
+    let ca = Arc::new(support::dev_ca());
+
+    let responses = support::drive_sequential_requests(cfg, ca, &["/one", "/two"]).await;
+
+    assert!(responses.iter().all(|response| response.status == 200));
+    let snapshot = upstream.snapshot();
+    assert_eq!(
+        snapshot.accepted_connections, 2,
+        "retry should open one replacement"
+    );
+    assert_eq!(
+        snapshot.requests, 3,
+        "second GET should be attempted exactly twice"
+    );
+}
+
+#[tokio::test]
+async fn manager_shutdown_aborts_idle_driver_and_acknowledges() {
+    let upstream = support::start_echo_upstream().await;
+    let cfg = support::test_config(&upstream.addr);
+    let ca = Arc::new(support::dev_ca());
+    let (proxy, state) = support::spawn_proxy_with_state(cfg, ca).await;
+    let responses = support::drive_sequential_requests_through_proxy(proxy, &["/idle"]).await;
+    assert_eq!(responses[0].status, 200);
+
+    tokio::time::timeout(Duration::from_secs(1), state.upstream.shutdown())
+        .await
+        .expect("manager should acknowledge after driver guard closes");
+}
+
+#[tokio::test]
+async fn post_dispatch_failure_does_not_retry_post() {
+    let upstream = support::start_post_dispatch_stale_upstream().await;
+    let cfg = support::test_config(&upstream.addr);
+    let ca = Arc::new(support::dev_ca());
+
+    let responses = support::drive_get_then_post(cfg, ca).await;
+
+    assert_eq!(responses[0].status, 200);
+    assert_eq!(responses[1].status, 502);
+    let snapshot = upstream.snapshot();
+    assert_eq!(
+        snapshot.accepted_connections, 1,
+        "POST must not open retry connection"
+    );
+    assert_eq!(snapshot.requests, 2, "POST must be attempted exactly once");
+}
+
+#[tokio::test]
+async fn large_chunked_upload_and_response_are_byte_identical() {
+    let upstream = support::start_chunked_body_upstream().await;
+    let cfg = support::test_config(&upstream.addr);
+    let ca = Arc::new(support::dev_ca());
+    let body: Vec<u8> = (0..2 * 1024 * 1024)
+        .map(|index| ((index * 31 + 17) % 251) as u8)
+        .collect();
+
+    let response = support::drive_chunked_body(cfg, ca, &body).await;
+
+    assert_eq!(response, body, "chunked body should remain byte-identical");
+    assert_eq!(
+        upstream.snapshot(),
+        support::UpstreamSnapshot {
+            accepted_connections: 1,
+            tls_handshakes: 1,
+            requests: 1,
+            failures: 0,
+        },
+        "one streamed exchange should use one healthy upstream connection"
+    );
 }
 
 #[tokio::test]
