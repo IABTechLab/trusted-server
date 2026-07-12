@@ -349,9 +349,7 @@ impl UpstreamClient {
 mod tests {
     use http_body_util::Empty;
 
-    use super::key::{
-        AddressPolicy, ApplicationMode, OriginKey, ReferenceIdentity, Transport, VerifyMode,
-    };
+    use super::key::{AddressPolicy, OriginKey, ReferenceIdentity, Transport, VerifyMode};
     use super::manager::PoolLimits;
     use super::*;
 
@@ -361,7 +359,6 @@ mod tests {
             ReferenceIdentity::dns("readiness.example"),
             443,
             VerifyMode::Secure,
-            ApplicationMode::Http1Required,
             AddressPolicy::Dns,
         )
     }

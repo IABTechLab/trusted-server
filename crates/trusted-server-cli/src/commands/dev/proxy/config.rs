@@ -355,7 +355,7 @@ mod tests {
     use super::*;
     use crate::commands::dev::proxy::rewrite::rewrite_for;
     use crate::commands::dev::proxy::upstream::key::{
-        AddressPolicy, ApplicationMode, OriginKey, ReferenceIdentity, Transport, VerifyMode,
+        AddressPolicy, OriginKey, ReferenceIdentity, Transport, VerifyMode,
     };
 
     fn base_args() -> crate::commands::dev::proxy::ProxyArgs {
@@ -594,7 +594,6 @@ mod tests {
                 ReferenceIdentity::dns("to.example.com"),
                 8443,
                 VerifyMode::Insecure,
-                ApplicationMode::Http2Eligible,
                 AddressPolicy::Resolve("192.0.2.10".parse().expect("should parse pin")),
             ),
             "should precompute the complete transport identity"
@@ -620,7 +619,6 @@ mod tests {
                 ReferenceIdentity::ip("127.0.0.1".parse().expect("should parse IP")),
                 443,
                 VerifyMode::Secure,
-                ApplicationMode::Http1Required,
                 AddressPolicy::Dns,
             ),
             "IP identities should validate as IP and remain HTTP/1-only"

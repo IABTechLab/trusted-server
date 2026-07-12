@@ -15,13 +15,6 @@ pub enum VerifyMode {
     Insecure,
 }
 
-/// HTTP application protocols a connection may negotiate.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
-pub enum ApplicationMode {
-    Http1Required,
-    Http2Eligible,
-}
-
 /// How the logical origin selects its connection address.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub enum AddressPolicy {
@@ -55,7 +48,6 @@ pub struct OriginKey {
     reference: ReferenceIdentity,
     port: u16,
     verify: VerifyMode,
-    application: ApplicationMode,
     address: AddressPolicy,
 }
 
@@ -66,7 +58,6 @@ impl OriginKey {
         reference: ReferenceIdentity,
         port: u16,
         verify: VerifyMode,
-        application: ApplicationMode,
         address: AddressPolicy,
     ) -> Self {
         Self {
@@ -74,7 +65,6 @@ impl OriginKey {
             reference,
             port,
             verify,
-            application,
             address,
         }
     }
@@ -100,11 +90,6 @@ impl OriginKey {
     }
 
     #[must_use]
-    pub fn application_mode(&self) -> ApplicationMode {
-        self.application
-    }
-
-    #[must_use]
     pub fn address_policy(&self) -> AddressPolicy {
         self.address
     }
@@ -126,7 +111,6 @@ mod tests {
             ReferenceIdentity::dns("to.example.com"),
             443,
             VerifyMode::Secure,
-            ApplicationMode::Http1Required,
             AddressPolicy::Dns,
         )
     }
@@ -141,7 +125,6 @@ mod tests {
                 base.reference().clone(),
                 base.port(),
                 base.verify_mode(),
-                base.application_mode(),
                 base.address_policy(),
             ),
             OriginKey::new(
@@ -149,7 +132,6 @@ mod tests {
                 ReferenceIdentity::dns("other.example.com"),
                 base.port(),
                 base.verify_mode(),
-                base.application_mode(),
                 base.address_policy(),
             ),
             OriginKey::new(
@@ -157,7 +139,6 @@ mod tests {
                 base.reference().clone(),
                 8443,
                 base.verify_mode(),
-                base.application_mode(),
                 base.address_policy(),
             ),
             OriginKey::new(
@@ -165,7 +146,6 @@ mod tests {
                 base.reference().clone(),
                 base.port(),
                 VerifyMode::Insecure,
-                base.application_mode(),
                 base.address_policy(),
             ),
             OriginKey::new(
@@ -173,15 +153,6 @@ mod tests {
                 base.reference().clone(),
                 base.port(),
                 base.verify_mode(),
-                ApplicationMode::Http2Eligible,
-                base.address_policy(),
-            ),
-            OriginKey::new(
-                base.transport(),
-                base.reference().clone(),
-                base.port(),
-                base.verify_mode(),
-                base.application_mode(),
                 AddressPolicy::Resolve(pinned),
             ),
         ];
@@ -214,7 +185,6 @@ mod tests {
             ReferenceIdentity::dns("one.example.com"),
             443,
             VerifyMode::Secure,
-            ApplicationMode::Http1Required,
             AddressPolicy::Resolve(pin),
         );
         let second = OriginKey::new(
@@ -222,7 +192,6 @@ mod tests {
             ReferenceIdentity::dns("two.example.com"),
             443,
             VerifyMode::Secure,
-            ApplicationMode::Http1Required,
             AddressPolicy::Resolve(pin),
         );
 

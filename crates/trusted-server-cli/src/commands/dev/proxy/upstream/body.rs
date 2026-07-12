@@ -224,9 +224,7 @@ mod tests {
     use hyper::{HeaderMap, Request, Response};
     use hyper_util::rt::TokioIo;
 
-    use super::super::key::{
-        AddressPolicy, ApplicationMode, OriginKey, ReferenceIdentity, Transport, VerifyMode,
-    };
+    use super::super::key::{AddressPolicy, OriginKey, ReferenceIdentity, Transport, VerifyMode};
     use super::super::manager::Acquired;
     use super::*;
 
@@ -338,7 +336,6 @@ mod tests {
             ReferenceIdentity::dns("metrics.example"),
             443,
             VerifyMode::Secure,
-            ApplicationMode::Http1Required,
             AddressPolicy::Dns,
         );
         let Acquired::Open(reservation) = manager.acquire(key).await.expect("should reserve")

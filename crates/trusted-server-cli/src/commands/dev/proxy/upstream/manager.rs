@@ -626,7 +626,7 @@ mod tests {
 
     use super::*;
     use crate::commands::dev::proxy::upstream::key::{
-        AddressPolicy, ApplicationMode, ReferenceIdentity, Transport, VerifyMode,
+        AddressPolicy, ReferenceIdentity, Transport, VerifyMode,
     };
 
     fn key(host: &str) -> OriginKey {
@@ -635,7 +635,6 @@ mod tests {
             ReferenceIdentity::dns(host),
             443,
             VerifyMode::Secure,
-            ApplicationMode::Http1Required,
             AddressPolicy::Dns,
         )
     }

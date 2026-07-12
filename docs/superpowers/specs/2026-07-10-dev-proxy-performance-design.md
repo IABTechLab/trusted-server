@@ -118,25 +118,21 @@ reference identity: normalized DNS TO | IP TO
 port
 address policy: logical DNS policy or concrete --resolve pin
 TLS verification: secure | insecure
-application mode: HTTP/1 required | HTTP/2 eligible
 ```
 
 The rewritten HTTP `Host` value is not itself an HTTP/1.1 transport key because
 sequential requests may carry different Host values over a connection to the
-same logical TO origin. HTTP/2 is stricter: it is eligible only when
-`--rewrite-host` makes the request authority equal the TO hostname authenticated
-by TLS. A default rule that sends `Host: FROM` forces HTTP/1.1, preserving the
-existing deliberate separation between SNI (`TO`) and Host (`FROM`) without
-relying on cross-origin HTTP/2 behavior.
+same logical TO origin. The retained implementation is HTTP/1.1-only, so
+rewritten versus preserved Host values do not split a pool whose transport and
+authenticated TO identity are otherwise equal.
 
 The TO reference identity is either a normalized DNS hostname or an IP literal,
 matching Rustls `ServerName`. For DNS identities, TLS sends SNI equal to TO. For
 IP identities, TLS sends no DNS SNI and secure mode validates an IP SAN, matching
-current behavior. IP-literal rules are HTTP/1-required; HTTP/2 eligibility is
-limited to DNS TO identities whose rewritten authority equals TO.
+current behavior.
 
-The stable pool key is `(transport, normalized TO reference identity, port, verification
-mode, application mode, address policy)`. For `--resolve`, address policy
+The stable pool key is `(transport, normalized TO reference identity, port,
+verification mode, address policy)`. For `--resolve`, address policy
 contains the pinned IP. For DNS, address policy is the logical DNS policy, not a
 fallback-varying peer IP. Each connection record stores its actual peer address
 and DNS generation for diagnostics, but multi-address fallback does not create a
@@ -158,18 +154,16 @@ Create a dedicated `upstream` module responsible for:
 - opening TCP sockets under the configured connect timeout;
 - applying measured socket options;
 - performing TLS negotiation and verification;
-- selecting HTTP/1.1 or HTTP/2 from ALPN;
 - leasing and returning reusable HTTP/1.1 connections;
-- multiplexing requests over HTTP/2 connections;
 - tracking connection lifecycle metrics.
 
 Use a small custom transport manager because the design requires explicit live
 and waiter bounds, response-body-controlled lease return, exact SNI-host
-isolation, address-policy identity, and serialized HTTP/2 protocol discovery.
+isolation, address-policy identity, and deterministic lifecycle reconciliation.
 Hyper-util's general client pool does not expose all of those policies as one
 auditable state machine. The custom manager still uses Hyper's maintained
-HTTP/1.1 and HTTP/2 connection drivers, but owns leasing, limits, and the
-complete origin key itself.
+HTTP/1.1 connection driver, but owns leasing, limits, and the complete origin
+key itself.
 
 The manager actor is intentionally a single serialization point for
 acquire/return/accounting commands. This channel hop is proportionate at local
@@ -367,6 +361,10 @@ it never assumes a consumed streaming body is reconstructable.
 
 ### Upstream HTTP/2
 
+This section records the conditional experiment design. The feasibility gate
+failed, so none of the application-mode keying, ALPN discovery, multiplexing, or
+HTTP/2 retry machinery described below is retained in production.
+
 An HTTP/2-eligible TLS client configuration advertises `h2` followed by
 `http/1.1`. ALPN selects the protocol; absence of ALPN falls back to HTTP/1.1.
 
@@ -439,12 +437,10 @@ responses supported by Hyper. If required trailers or informational responses
 cannot be preserved with the selected Hyper APIs, HTTP/2 is not shipped; the
 proxy does not silently weaken semantics to retain a benchmark win.
 
-TLS client configurations are cached on two independent axes: verification mode
-(`secure` or `insecure`) and application mode (`HTTP/1 required` or `HTTP/2
-eligible`). This yields up to four immutable configurations. HTTP/1-required
-configurations advertise only `http/1.1`; eligible configurations advertise
-`h2, http/1.1`. A cache keyed only by `--insecure` is prohibited because it could
-advertise HTTP/2 on a `Host: FROM` rule.
+The experiment would have required TLS client configurations cached on both
+verification and application mode. Because HTTP/2 was rejected, retained TLS
+client configurations are keyed only by verification mode (`secure` or
+`insecure`) and both advertise only `http/1.1`.
 
 HTTP/2 is not part of the initial HTTP/1 pooling delivery. Its entry gate uses
 the named remote-latency workload and two controlled variants after two warmups:
@@ -768,8 +764,8 @@ corresponding experiment clears its entry gate and its code is retained.
 - Origin-key equality and separation across every security-relevant field.
 - DNS and IP TO reference identities, including DNS SNI, no DNS SNI for IP,
   DNS-SAN/IP-SAN verification, and IP rules remaining HTTP/1-required.
-- TLS client configuration separation across secure/insecure and HTTP/1
-  required/HTTP/2 eligible modes.
+- TLS client configuration separation across secure/insecure modes, with both
+  configurations advertising only HTTP/1.1.
 - DNS cache hit, expiry, eviction, multi-address fallback, and `--resolve`
   bypass, including concurrent miss coalescing and error fan-out.
 - Buffered head parsing at chunk boundaries, exact limit, oversized input,
@@ -829,13 +825,13 @@ gate and its code is retained.
   acquire, cancellation while queued, and atomic races against admission and
   timeout; each resolves the ticket and accounting exactly once.
 - Origin-key tests vary protocol, TO reference identity, port, address policy,
-  verification mode, and application mode independently, including combinations
-  that cannot arise in one CLI invocation because `--insecure` and `--resolve`
-  are global. Cross-rule integration tests use feasible same-process cases:
+  and verification mode independently, including combinations that cannot arise
+  in one CLI invocation because `--insecure` and `--resolve` are global.
+  Cross-rule integration tests use feasible same-process cases:
   shared TO with different FROM values, rewritten versus preserved Host in
   separate proxy configurations, and distinct TO/port mappings. They assert
-  intended HTTP/1.1 reuse, prohibited cross-key reuse, correct SNI/Host and
-  HTTP/2 authority, authoritative forwarding headers, and that per-request
+  intended HTTP/1.1 reuse, prohibited cross-key reuse, correct SNI/Host,
+  authoritative forwarding headers, and that per-request
   Authorization values do not persist onto later requests on a reused
   connection.
 - HTTP/2 multiplexes concurrent requests and falls back to HTTP/1.1.

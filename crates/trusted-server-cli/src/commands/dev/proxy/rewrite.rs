@@ -5,9 +5,7 @@ use std::net::IpAddr;
 use hyper::header::HeaderValue;
 use rustls::pki_types::ServerName;
 
-use super::upstream::key::{
-    AddressPolicy, ApplicationMode, OriginKey, ReferenceIdentity, Transport, VerifyMode,
-};
+use super::upstream::key::{AddressPolicy, OriginKey, ReferenceIdentity, Transport, VerifyMode};
 
 /// A rewrite-target authority: host plus a resolved port and its scheme default.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,25 +184,12 @@ impl Rule {
         } else {
             Transport::Tls
         };
-        let application =
-            if !plaintext && rewrite_host && matches!(&reference, ReferenceIdentity::Dns(_)) {
-                ApplicationMode::Http2Eligible
-            } else {
-                ApplicationMode::Http1Required
-            };
         let verify = if insecure {
             VerifyMode::Insecure
         } else {
             VerifyMode::Secure
         };
-        let origin_key = OriginKey::new(
-            transport,
-            reference,
-            to.port,
-            verify,
-            application,
-            address_policy,
-        );
+        let origin_key = OriginKey::new(transport, reference, to.port, verify, address_policy);
         let outcome = RewriteOutcome {
             sni,
             host_header,
@@ -392,6 +377,28 @@ mod tests {
                 .to
                 .host(),
             "first.edgecompute.app"
+        );
+    }
+
+    #[test]
+    fn request_local_host_rewrite_does_not_split_http1_pool() {
+        let preserved = rule(
+            "www.example-publisher.com",
+            "to.edgecompute.app",
+            false,
+            false,
+        );
+        let rewritten = rule(
+            "www.example-publisher.com",
+            "to.edgecompute.app",
+            true,
+            false,
+        );
+
+        assert_eq!(
+            preserved.origin_key(),
+            rewritten.origin_key(),
+            "request-local Host choice must not split retained HTTP/1 connections"
         );
     }
 
