@@ -125,6 +125,14 @@ SSAT auction → winner (bid.creative held) → build_bid_map inserts adm
   falls back to cache when `adm` absent; `injectAdmIntoSlot` does **not** fire
   without the `injectAdmForTesting` flag.
 
+## Precondition
+
+This changes only the render bridge's *data source* — local `adm` vs a PBS Cache
+fetch — **when GAM's Prebid line item already serves the Prebid Universal
+Creative**. It does not change GAM competition, nor whether the PUC fires. A
+publisher without Prebid line items in GAM sees no behavioral change (same as
+the current cache path).
+
 ## Risks / accepted costs
 
 - **Page weight**: every SSAT navigation response now carries winners' creatives

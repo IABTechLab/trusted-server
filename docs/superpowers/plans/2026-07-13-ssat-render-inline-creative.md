@@ -73,9 +73,12 @@ pub(crate) fn build_bid_map(
 
 - [ ] **Step 4: Run — expect PASS.**
 
-- [ ] **Step 5: Update the 3 call sites** so the crate compiles:
-  - `publisher.rs:~853`, `~1241`, `~2390`: pass `render_adm = true, debug_bid = settings.debug.inject_adm_for_testing`.
-  - The pure-test caller at `~4043`: `build_bid_map(&winning_bids, PriceGranularity::Dense, false, false)`.
+- [ ] **Step 5: Thread the flag through `write_bids_to_state` and update the other call sites** so the crate compiles.
+  Note the real call graph: `write_bids_to_state` (`~846`) owns an `inject_adm: bool` param and calls both `build_bid_map` (`~853`) and `build_bids_script` (`~854`). Its callers at `~695`/`~1241` pass `settings.debug.inject_adm_for_testing`. `handle_page_bids` (`~2390`) calls `build_bid_map` directly.
+  - In `write_bids_to_state`: rename the param `inject_adm_for_testing`; call `build_bid_map(winning_bids, price_granularity, /* render_adm */ true, /* debug_bid */ inject_adm_for_testing)`; pass the same flag to `build_bids_script` (Task 2).
+  - Callers `~695` and `~1241`: **no change** (already pass the flag to `write_bids_to_state`).
+  - `handle_page_bids` (`~2390`): `build_bid_map(&winning_bids, co_config.price_granularity, /* render_adm */ true, /* debug_bid */ settings.debug.inject_adm_for_testing)`.
+  - Pure-test caller (`~4043`): `build_bid_map(&winning_bids, PriceGranularity::Dense, false, false)`.
 
 - [ ] **Step 6: Run** `cargo check-fastly` — expect clean.
 
@@ -119,11 +122,16 @@ pub(crate) fn build_bids_script(
 }
 ```
 
-- [ ] **Step 4: Update the caller** at `~853/854` to pass `settings.debug.inject_adm_for_testing`; update the empty-bids helper at `~2033` and any test expectations that pin the old script string.
+- [ ] **Step 4: Update `build_bids_script` callers:**
+  - `write_bids_to_state` (`~854`): pass the `inject_adm_for_testing` param threaded in Task 1.
+  - `build_empty_bids_script` (`~2032`) has **no settings access** — pass `false` (no bids ⇒ no `adm` ⇒ flag inert). Documented tradeoff: an empty *initial* nav on a testing build emits `injectAdmForTesting=false`, so a later SPA-loaded `adm` won't fire the test bypass; acceptable (production is always `false`).
+  - Fix any test that pins the old `bids` `<script>` string.
 
-- [ ] **Step 5: Run — expect PASS.** `cargo test-fastly bids_script_emits_inject_adm_for_testing_flag`
+- [ ] **Step 5: SPA path needs no flag.** Confirm `handle_page_bids` (`~2390`) returns JSON (not a `<script>`) — the flag is set once on the initial nav load and persists on `window.tsjs` across SPA navigations. No flag emission there.
 
-- [ ] **Step 6: Commit** — `git commit -m "Emit injectAdmForTesting flag on window.tsjs with bids"`
+- [ ] **Step 6: Run — expect PASS.** `cargo test-fastly bids_script_emits_inject_adm_for_testing_flag`
+
+- [ ] **Step 7: Commit** — `git commit -m "Emit injectAdmForTesting flag on window.tsjs with bids"`
 
 ---
 
@@ -170,19 +178,26 @@ fn build_bids_script_escapes_hostile_adm() {
 
 - [ ] **Step 2: Run — expect FAIL.** `cd crates/trusted-server-js/lib && npx vitest run <file>`
 
-- [ ] **Step 3: Implement** — change the guard:
+- [ ] **Step 3: Add the field to the `TsjsApi` type** (`crates/trusted-server-js/lib/src/core/types.ts`, or `core/global.d.ts` — grep `interface TsjsApi`):
 
 ```ts
-if (bid.adm && window.tsjs?.injectAdmForTesting) {
+injectAdmForTesting?: boolean;
+```
+Without it, `tsc`/vitest fail to typecheck `window.tsjs.injectAdmForTesting`.
+
+- [ ] **Step 4: Implement** — change the guard (`gpt/index.ts:~599`; `ts` is the local `window.tsjs`):
+
+```ts
+if (bid.adm && ts.injectAdmForTesting) {
   injectAdmIntoSlot(divId, bid.adm);
 }
 ```
 
-- [ ] **Step 4: Add the companion test** — with `injectAdmForTesting: true`, `injectAdmIntoSlot` IS called.
+- [ ] **Step 5: Add the companion test** — with `injectAdmForTesting: true`, `injectAdmIntoSlot` IS called.
 
-- [ ] **Step 5: Run — expect PASS.**
+- [ ] **Step 6: Run — expect PASS.**
 
-- [ ] **Step 6: Commit** — `git commit -m "Gate GAM-bypass adm injection behind injectAdmForTesting flag"`
+- [ ] **Step 7: Commit** — `git commit -m "Gate GAM-bypass adm injection behind injectAdmForTesting flag"`
 
 ---
 
@@ -193,8 +208,9 @@ if (bid.adm && window.tsjs?.injectAdmForTesting) {
 
 - [ ] **Step 1:** Check for an existing `installTsRenderBridge` test. If a "serves local adm without cache fetch" case is missing, add: given a bid with `adm` and `hb_cache_*`, a `"Prebid Request"` for its `hb_adid` is answered from `adm` and **no `fetch`** occurs.
 - [ ] **Step 2:** Add the fallback case: bid with `hb_cache_*` but no `adm` → bridge fetches from cache.
-- [ ] **Step 3: Run — expect PASS.**
-- [ ] **Step 4: Commit** — `git commit -m "Cover bridge local-adm render and cache fallback"`
+- [ ] **Step 3:** Assert win/billing beacons still fire on the local-`adm` path — `fireWinBillingBeacons` runs in the `adm` branch (`gpt/index.ts:~904`), so removing the cache fetch must not drop `nurl`/`burl` beacons.
+- [ ] **Step 4: Run — expect PASS.**
+- [ ] **Step 5: Commit** — `git commit -m "Cover bridge local-adm render, cache fallback, and win beacons"`
 
 ---
 
@@ -213,3 +229,4 @@ if (bid.adm && window.tsjs?.injectAdmForTesting) {
 - Do NOT remove `hb_cache_host`/`hb_cache_path` — they are the fallback.
 - Do NOT ship the `debug_bid` blob in production (Task 1 keeps it behind the flag).
 - Page-weight cost (inline creatives, uncacheable response) is accepted per spec; size-capping is out of scope.
+- **Precondition (sets expectations):** this only changes the render bridge's *data source* (local `adm` vs cache fetch) **when GAM's Prebid line item already serves the Prebid Universal Creative**. It does not change GAM competition, nor whether the PUC fires. A publisher without Prebid line items in GAM sees no change — same as today's cache path.
