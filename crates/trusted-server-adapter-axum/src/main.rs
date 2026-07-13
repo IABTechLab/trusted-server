@@ -1,6 +1,10 @@
 use edgezero_adapter_axum::dev_server::{AxumDevServer, AxumDevServerConfig};
 use edgezero_core::app::Hooks as _;
 use trusted_server_adapter_axum::app::TrustedServerApp;
+use trusted_server_adapter_axum::registries::{
+    build_config_registry_axum, build_kv_registry_axum, build_secret_registry_axum,
+};
+use trusted_server_core::stores::STORES_METADATA;
 
 #[allow(clippy::print_stderr)]
 fn main() {
@@ -21,7 +25,22 @@ fn main() {
 
     log::info!("Listening on http://{}", config.addr);
     let router = TrustedServerApp::routes();
-    if let Err(err) = AxumDevServer::with_config(router, config).run() {
+
+    // Keep AxumDevServer::with_config (preserves PORT/axum.toml) and attach the
+    // Trusted Server store registries so request-time reads resolve non-default
+    // logical store ids through the registry-backed composite stores.
+    let mut server = AxumDevServer::with_config(router, config);
+    if let Some(registry) = build_config_registry_axum(&STORES_METADATA) {
+        server = server.with_config_registry(registry);
+    }
+    if let Some(registry) = build_kv_registry_axum(&STORES_METADATA) {
+        server = server.with_kv_registry(registry);
+    }
+    if let Some(registry) = build_secret_registry_axum(&STORES_METADATA) {
+        server = server.with_secret_registry(registry);
+    }
+
+    if let Err(err) = server.run() {
         log::error!("trusted-server-adapter-axum failed: {err}");
         std::process::exit(1);
     }

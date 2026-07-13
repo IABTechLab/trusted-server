@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 
 use crate::consent::jurisdiction::Jurisdiction;
 use crate::consent::types::{ConsentContext, ConsentSource};
-use crate::platform::PlatformKvStore;
+use crate::platform::KvHandle;
 
 // ---------------------------------------------------------------------------
 // KV body (JSON, stored as value)
@@ -210,7 +210,7 @@ fn parse_jurisdiction(s: &str) -> Jurisdiction {
 /// Entries written before PR5 have an empty `fp` (via `#[serde(default)]`),
 /// which never matches a computed fingerprint and triggers a self-healing
 /// re-write.
-fn fingerprint_unchanged(store: &dyn PlatformKvStore, key: &str, new_fp: &str) -> bool {
+fn fingerprint_unchanged(store: &KvHandle, key: &str, new_fp: &str) -> bool {
     let bytes = match futures::executor::block_on(store.get_bytes(key)) {
         Ok(Some(bytes)) => bytes,
         _ => return false,
@@ -232,7 +232,7 @@ fn fingerprint_unchanged(store: &dyn PlatformKvStore, key: &str, new_fp: &str) -
 /// * `store` — KV store opened by the adapter.
 /// * `ec_id` — Edge Cookie ID used as the KV key.
 #[must_use]
-pub fn load_consent_from_kv(store: &dyn PlatformKvStore, ec_id: &str) -> Option<ConsentContext> {
+pub fn load_consent_from_kv(store: &KvHandle, ec_id: &str) -> Option<ConsentContext> {
     let bytes = match futures::executor::block_on(store.get_bytes(ec_id)) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => {
@@ -272,12 +272,9 @@ pub fn load_consent_from_kv(store: &dyn PlatformKvStore, ec_id: &str) -> Option<
 /// * `ec_id` — Edge Cookie ID used as the KV key.
 /// * `ctx` — Current request's consent context.
 /// * `max_age_days` — TTL for the entry, matching `max_consent_age_days`.
-pub fn save_consent_to_kv(
-    store: &dyn PlatformKvStore,
-    ec_id: &str,
-    ctx: &ConsentContext,
-    max_age_days: u32,
-) {
+///
+/// The TTL is clamped to [`KvHandle::MAX_TTL`] — see [`consent_kv_ttl`].
+pub fn save_consent_to_kv(store: &KvHandle, ec_id: &str, ctx: &ConsentContext, max_age_days: u32) {
     if ctx.is_empty() {
         log::debug!("Skipping consent KV write: consent is empty");
         return;
@@ -301,16 +298,49 @@ pub fn save_consent_to_kv(
         }
     };
 
-    let ttl = std::time::Duration::from_secs(u64::from(max_age_days) * 86_400);
+    let ttl = consent_kv_ttl(max_age_days);
 
     match futures::executor::block_on(store.put_bytes_with_ttl(ec_id, body, ttl)) {
         Ok(()) => {
-            log::info!("Saved consent to KV store (ttl={max_age_days}d)");
+            log::info!("Saved consent to KV store (ttl={ttl:?})");
         }
         Err(e) => {
             log::warn!("Failed to write consent to KV store: {e}");
         }
     }
+}
+
+/// Consent KV entry TTL for `max_age_days`, clamped to [`KvHandle::MAX_TTL`].
+///
+/// `EdgeZero`'s [`KvHandle`] validates writes and rejects any TTL above
+/// [`KvHandle::MAX_TTL`] (1 year) with a validation error. Trusted Server's
+/// consent lifetime follows the IAB TCF norm of 13 months
+/// (`MAX_CONSENT_AGE_DAYS` = 395 days) and operators may configure up to 3650
+/// days, so the configured TTL routinely exceeds that cap. Without this clamp
+/// the write is rejected and — because consent KV failures are deliberately
+/// non-fatal — consent would silently never persist.
+///
+/// The clamp is **fail-safe**: the entry expires *earlier* than the configured
+/// consent lifetime, so a returning user is re-prompted sooner rather than
+/// having stale consent honored past its window. It never extends retention.
+///
+/// This is an **interim** measure. Remove it once `EdgeZero` raises or
+/// parameterizes `KvHandle::MAX_TTL` (upstream ask filed); at that point pass
+/// the configured TTL through unchanged.
+fn consent_kv_ttl(max_age_days: u32) -> std::time::Duration {
+    let configured = std::time::Duration::from_secs(u64::from(max_age_days) * 86_400);
+
+    if configured > KvHandle::MAX_TTL {
+        log::warn!(
+            "Consent KV TTL {configured:?} (max_consent_age_days={max_age_days}) exceeds the \
+             KV store maximum of {:?}; clamping. Consent entries will expire earlier than the \
+             configured consent lifetime.",
+            KvHandle::MAX_TTL
+        );
+        return KvHandle::MAX_TTL;
+    }
+
+    configured
 }
 
 /// Deletes a consent entry from the KV store for a given EC ID.
@@ -320,7 +350,7 @@ pub fn save_consent_to_kv(
 ///
 /// Errors are logged but never propagated — KV failures must not
 /// break the request pipeline.
-pub fn delete_consent_from_kv(store: &dyn PlatformKvStore, ec_id: &str) {
+pub fn delete_consent_from_kv(store: &KvHandle, ec_id: &str) {
     match futures::executor::block_on(store.delete(ec_id)) {
         Ok(()) => {
             log::info!("Deleted consent KV entry (consent revoked)");
@@ -533,10 +563,12 @@ mod tests {
 #[cfg(test)]
 mod new_api_tests {
     use super::*;
+    use std::sync::Arc;
+
     use edgezero_core::key_value_store::NoopKvStore;
 
-    fn noop() -> NoopKvStore {
-        NoopKvStore
+    fn noop() -> KvHandle {
+        KvHandle::new(Arc::new(NoopKvStore))
     }
 
     #[test]
@@ -554,6 +586,125 @@ mod new_api_tests {
     #[test]
     fn delete_does_not_panic_with_noop_store() {
         delete_consent_from_kv(&noop(), "some-ec-id");
+    }
+
+    /// In-memory KV double that records the TTL each write was issued with, so
+    /// tests can assert the consent TTL clamp.
+    #[derive(Default)]
+    struct RecordingKvStore {
+        entries: std::sync::Mutex<std::collections::HashMap<String, bytes::Bytes>>,
+        ttls: std::sync::Mutex<Vec<std::time::Duration>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl crate::platform::PlatformKvStore for RecordingKvStore {
+        async fn get_bytes(
+            &self,
+            key: &str,
+        ) -> Result<Option<bytes::Bytes>, crate::platform::KvError> {
+            Ok(self
+                .entries
+                .lock()
+                .expect("should lock entries")
+                .get(key)
+                .cloned())
+        }
+
+        async fn put_bytes(
+            &self,
+            key: &str,
+            value: bytes::Bytes,
+        ) -> Result<(), crate::platform::KvError> {
+            self.entries
+                .lock()
+                .expect("should lock entries")
+                .insert(key.to_owned(), value);
+            Ok(())
+        }
+
+        async fn put_bytes_with_ttl(
+            &self,
+            key: &str,
+            value: bytes::Bytes,
+            ttl: std::time::Duration,
+        ) -> Result<(), crate::platform::KvError> {
+            self.ttls.lock().expect("should lock ttls").push(ttl);
+            self.put_bytes(key, value).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), crate::platform::KvError> {
+            self.entries
+                .lock()
+                .expect("should lock entries")
+                .remove(key);
+            Ok(())
+        }
+
+        async fn list_keys_page(
+            &self,
+            _prefix: &str,
+            _cursor: Option<&str>,
+            _limit: usize,
+        ) -> Result<edgezero_core::key_value_store::KvPage, crate::platform::KvError> {
+            Ok(edgezero_core::key_value_store::KvPage::default())
+        }
+    }
+
+    #[test]
+    fn consent_kv_ttl_clamps_to_kv_maximum() {
+        // The IAB TCF default (395 days) exceeds KvHandle::MAX_TTL (1 year) and
+        // must be clamped rather than rejected at the KvHandle validation gate.
+        assert_eq!(
+            consent_kv_ttl(MAX_CONSENT_AGE_DAYS_FOR_TEST),
+            KvHandle::MAX_TTL,
+            "a consent TTL above the KV maximum should clamp to KvHandle::MAX_TTL"
+        );
+
+        // The operator-configurable ceiling (3650 days) also clamps.
+        assert_eq!(
+            consent_kv_ttl(3650),
+            KvHandle::MAX_TTL,
+            "the maximum configurable consent age should clamp to KvHandle::MAX_TTL"
+        );
+
+        // A TTL under the cap passes through untouched.
+        assert_eq!(
+            consent_kv_ttl(30),
+            std::time::Duration::from_secs(30 * 86_400),
+            "a consent TTL below the KV maximum should pass through unchanged"
+        );
+    }
+
+    /// The IAB TCF consent lifetime Trusted Server defaults to (13 months).
+    const MAX_CONSENT_AGE_DAYS_FOR_TEST: u32 = 395;
+
+    #[test]
+    fn save_with_default_consent_age_writes_and_round_trips_with_clamped_ttl() {
+        // Regression: routing consent persistence through KvHandle made the
+        // default 395-day TTL fail KvHandle::validate_ttl, so the write was
+        // rejected and — because consent KV failures are non-fatal — consent
+        // silently never persisted. The clamp must make this write succeed.
+        let store = Arc::new(RecordingKvStore::default());
+        let handle = KvHandle::new(Arc::clone(&store) as Arc<dyn crate::platform::PlatformKvStore>);
+        let ctx = make_test_context();
+
+        save_consent_to_kv(&handle, "test-ec-id", &ctx, MAX_CONSENT_AGE_DAYS_FOR_TEST);
+
+        // The entry actually landed and round-trips.
+        let loaded = load_consent_from_kv(&handle, "test-ec-id")
+            .expect("should persist consent at the default 395-day consent age");
+        assert_eq!(
+            loaded.raw_us_privacy, ctx.raw_us_privacy,
+            "persisted consent should round-trip"
+        );
+
+        // And it was written with the clamped TTL, not the configured 395 days.
+        let ttls = store.ttls.lock().expect("should lock ttls");
+        assert_eq!(
+            ttls.as_slice(),
+            &[KvHandle::MAX_TTL],
+            "should write exactly once with the TTL clamped to KvHandle::MAX_TTL"
+        );
     }
 
     #[test]

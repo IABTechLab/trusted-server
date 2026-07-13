@@ -7,11 +7,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, header};
+use edgezero_core::store_registry::{ConfigRegistry, KvRegistry, SecretRegistry};
 use error_stack::{Report, ResultExt as _};
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
-    PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
-    PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId, StoreName,
+    ClientInfo, CompositeConfigStore, CompositeSecretStore, GeoInfo, PlatformBackend,
+    PlatformBackendSpec, PlatformConfigStore, PlatformConfigWriter, PlatformError, PlatformGeo,
+    PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
+    PlatformSecretStore, PlatformSecretWriter, PlatformSelectResult, RuntimeServices, StoreId,
+    StoreName,
 };
 
 // ---------------------------------------------------------------------------
@@ -89,6 +92,16 @@ impl PlatformConfigStore for AxumPlatformConfigStore {
     }
 }
 
+impl PlatformConfigWriter for AxumPlatformConfigStore {
+    fn put(&self, store_id: &StoreId, key: &str, value: &str) -> Result<(), Report<PlatformError>> {
+        PlatformConfigStore::put(self, store_id, key, value)
+    }
+
+    fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>> {
+        PlatformConfigStore::delete(self, store_id, key)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PlatformSecretStore
 // ---------------------------------------------------------------------------
@@ -140,6 +153,21 @@ impl PlatformSecretStore for AxumPlatformSecretStore {
         );
         Err(Report::new(PlatformError::SecretStore)
             .attach("secret store deletes are not supported on the Axum dev server"))
+    }
+}
+
+impl PlatformSecretWriter for AxumPlatformSecretStore {
+    fn create(
+        &self,
+        store_id: &StoreId,
+        name: &str,
+        value: &str,
+    ) -> Result<(), Report<PlatformError>> {
+        PlatformSecretStore::create(self, store_id, name, value)
+    }
+
+    fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>> {
+        PlatformSecretStore::delete(self, store_id, name)
     }
 }
 
@@ -539,29 +567,49 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
         .map(|addr| addr.ip());
 
     use trusted_server_core::platform::{
-        PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformKvStore, PlatformSecretStore,
+        PlatformBackend, PlatformConfigWriter, PlatformGeo, PlatformKvStore, PlatformSecretWriter,
     };
 
     // Stateless shims are promoted to process-wide statics so callers clone
     // an existing Arc instead of allocating a new one per request.
-    static CONFIG_STORE: std::sync::OnceLock<Arc<dyn PlatformConfigStore>> =
+    static CONFIG_WRITER: std::sync::OnceLock<Arc<dyn PlatformConfigWriter>> =
         std::sync::OnceLock::new();
-    static SECRET_STORE: std::sync::OnceLock<Arc<dyn PlatformSecretStore>> =
+    static SECRET_WRITER: std::sync::OnceLock<Arc<dyn PlatformSecretWriter>> =
         std::sync::OnceLock::new();
     static KV_STORE: std::sync::OnceLock<Arc<dyn PlatformKvStore>> = std::sync::OnceLock::new();
     static BACKEND: std::sync::OnceLock<Arc<dyn PlatformBackend>> = std::sync::OnceLock::new();
     static GEO: std::sync::OnceLock<Arc<dyn PlatformGeo>> = std::sync::OnceLock::new();
 
+    // Config/secret reads resolve through the whole registry (from request
+    // extensions, inserted by the AxumDevServer registry setters) so non-default
+    // logical ids resolve; writes delegate to the env-backed dev-server stores
+    // (which reject writes). An absent registry makes composite reads error
+    // rather than silently reading a default store.
+    let config_reader = ctx.request().extensions().get::<ConfigRegistry>().cloned();
+    let secret_reader = ctx.request().extensions().get::<SecretRegistry>().cloned();
+    let kv_registry = ctx.request().extensions().get::<KvRegistry>().cloned();
+    let config_writer = Arc::clone(
+        CONFIG_WRITER
+            .get_or_init(|| Arc::new(AxumPlatformConfigStore) as Arc<dyn PlatformConfigWriter>),
+    );
+    let secret_writer = Arc::clone(
+        SECRET_WRITER
+            .get_or_init(|| Arc::new(AxumPlatformSecretStore) as Arc<dyn PlatformSecretWriter>),
+    );
+
     RuntimeServices::builder()
-        .config_store(Arc::clone(CONFIG_STORE.get_or_init(|| {
-            Arc::new(AxumPlatformConfigStore) as Arc<dyn PlatformConfigStore>
-        })))
-        .secret_store(Arc::clone(SECRET_STORE.get_or_init(|| {
-            Arc::new(AxumPlatformSecretStore) as Arc<dyn PlatformSecretStore>
-        })))
+        .config_store(Arc::new(CompositeConfigStore::new(
+            config_reader,
+            config_writer,
+        )))
+        .secret_store(Arc::new(CompositeSecretStore::new(
+            secret_reader,
+            secret_writer,
+        )))
         .kv_store(Arc::clone(KV_STORE.get_or_init(|| {
             Arc::new(trusted_server_core::platform::UnavailableKvStore) as Arc<dyn PlatformKvStore>
         })))
+        .kv_registry(kv_registry)
         .backend(Arc::clone(BACKEND.get_or_init(|| {
             Arc::new(AxumPlatformBackend) as Arc<dyn PlatformBackend>
         })))
@@ -587,11 +635,313 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod registry_test_support {
+    //! In-memory store doubles and a `RequestContext` builder that seeds the
+    //! three `EdgeZero` registries into request extensions, so adapter tests can
+    //! exercise non-default logical store resolution through the composite.
+
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    // `bytes` is not a direct dependency of this crate; use the re-export from the
+    // `axum` dev-dependency so no new dependency edge (and Cargo.lock churn) is
+    // introduced for test-only code.
+    use axum::body::Bytes;
+    use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
+    use edgezero_core::context::RequestContext;
+    use edgezero_core::http::request_builder;
+    use edgezero_core::key_value_store::{KvError, KvHandle, KvPage, KvStore};
+    use edgezero_core::params::PathParams;
+    use edgezero_core::secret_store::{SecretError, SecretHandle, SecretStore};
+    use edgezero_core::store_registry::{
+        BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry,
+        StoreRegistry,
+    };
+
+    /// In-memory [`ConfigStore`] double keyed by lookup key.
+    struct MemConfigStore {
+        data: HashMap<String, String>,
+    }
+
+    #[async_trait(?Send)]
+    impl ConfigStore for MemConfigStore {
+        async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+            Ok(self.data.get(key).cloned())
+        }
+    }
+
+    /// In-memory [`SecretStore`] double keyed by `"{store_name}/{key}"`.
+    struct MemSecretStore {
+        data: HashMap<String, Bytes>,
+    }
+
+    #[async_trait(?Send)]
+    impl SecretStore for MemSecretStore {
+        async fn get_bytes(
+            &self,
+            store_name: &str,
+            key: &str,
+        ) -> Result<Option<Bytes>, SecretError> {
+            Ok(self.data.get(&format!("{store_name}/{key}")).cloned())
+        }
+    }
+
+    /// In-memory [`KvStore`] double.
+    #[derive(Default)]
+    struct MemKvStore {
+        data: Mutex<HashMap<String, Bytes>>,
+    }
+
+    #[async_trait(?Send)]
+    impl KvStore for MemKvStore {
+        async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
+            Ok(self.data.lock().expect("should lock").get(key).cloned())
+        }
+
+        async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
+            self.data
+                .lock()
+                .expect("should lock")
+                .insert(key.to_owned(), value);
+            Ok(())
+        }
+
+        async fn put_bytes_with_ttl(
+            &self,
+            key: &str,
+            value: Bytes,
+            _ttl: std::time::Duration,
+        ) -> Result<(), KvError> {
+            self.put_bytes(key, value).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), KvError> {
+            self.data.lock().expect("should lock").remove(key);
+            Ok(())
+        }
+
+        async fn list_keys_page(
+            &self,
+            _prefix: &str,
+            _cursor: Option<&str>,
+            _limit: usize,
+        ) -> Result<KvPage, KvError> {
+            Ok(KvPage::default())
+        }
+    }
+
+    /// Build a [`ConfigRegistry`] from `(store_id, key, value)` entries.
+    pub(super) fn config_registry(entries: &[(&str, &str, &str)], default: &str) -> ConfigRegistry {
+        let mut by_store: BTreeMap<String, HashMap<String, String>> = BTreeMap::new();
+        for (id, key, value) in entries {
+            by_store
+                .entry((*id).to_owned())
+                .or_default()
+                .insert((*key).to_owned(), (*value).to_owned());
+        }
+        let by_id: BTreeMap<String, ConfigStoreBinding> = by_store
+            .into_iter()
+            .map(|(id, data)| {
+                let binding = ConfigStoreBinding {
+                    default_key: id.clone(),
+                    handle: ConfigStoreHandle::new(Arc::new(MemConfigStore { data })),
+                };
+                (id, binding)
+            })
+            .collect();
+        StoreRegistry::from_parts(by_id, default.to_owned())
+            .expect("should build a non-empty config registry")
+    }
+
+    /// Build a [`SecretRegistry`] from `(store_id, key, value)` entries.
+    pub(super) fn secret_registry(
+        entries: &[(&str, &str, &[u8])],
+        default: &str,
+    ) -> SecretRegistry {
+        let mut data: HashMap<String, Bytes> = HashMap::new();
+        let mut ids: BTreeMap<String, ()> = BTreeMap::new();
+        for (id, key, value) in entries {
+            data.insert(format!("{id}/{key}"), Bytes::copy_from_slice(value));
+            ids.insert((*id).to_owned(), ());
+        }
+        let handle = SecretHandle::new(Arc::new(MemSecretStore { data }));
+        let by_id: BTreeMap<String, BoundSecretStore> = ids
+            .into_keys()
+            .map(|id| {
+                let bound = BoundSecretStore::new(handle.clone(), id.clone());
+                (id, bound)
+            })
+            .collect();
+        StoreRegistry::from_parts(by_id, default.to_owned())
+            .expect("should build a non-empty secret registry")
+    }
+
+    /// Build a [`KvRegistry`] from `(store_id, key, value)` entries; each id maps
+    /// to its own in-memory store so distinct ids are observably distinct.
+    pub(super) fn kv_registry(entries: &[(&str, &str, &[u8])], default: &str) -> KvRegistry {
+        let mut by_store: BTreeMap<String, Arc<MemKvStore>> = BTreeMap::new();
+        for (id, key, value) in entries {
+            let store = by_store.entry((*id).to_owned()).or_default();
+            store
+                .data
+                .lock()
+                .expect("should lock")
+                .insert((*key).to_owned(), Bytes::copy_from_slice(value));
+        }
+        let by_id: BTreeMap<String, KvHandle> = by_store
+            .into_iter()
+            .map(|(id, store)| (id, KvHandle::new(store)))
+            .collect();
+        StoreRegistry::from_parts(by_id, default.to_owned())
+            .expect("should build a non-empty kv registry")
+    }
+
+    /// Build a [`RequestContext`] with the three registries inserted into request
+    /// extensions, mirroring the dev server's registry wiring.
+    pub(super) fn test_context_with_registries(
+        config: Option<ConfigRegistry>,
+        kv: Option<KvRegistry>,
+        secrets: Option<SecretRegistry>,
+    ) -> RequestContext {
+        let mut builder = request_builder().method("GET").uri("https://example.com/");
+        if let Some(config) = config {
+            builder = builder.extension(config);
+        }
+        if let Some(kv) = kv {
+            builder = builder.extension(kv);
+        }
+        if let Some(secrets) = secrets {
+            builder = builder.extension(secrets);
+        }
+        let req = builder
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build test request");
+        RequestContext::new(req, PathParams::default())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use edgezero_core::body::Body as EdgeBody;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    use super::registry_test_support::{
+        config_registry, kv_registry, secret_registry, test_context_with_registries,
+    };
+
+    #[test]
+    fn config_store_resolves_nondefault_jwks_store() {
+        // Arrange: registry with the default config store plus a non-default
+        // `jwks_store` (D5: default config id is `trusted_server_config`).
+        let config = config_registry(
+            &[
+                ("trusted_server_config", "current-kid", "kid-1"),
+                ("jwks_store", "kid-1", "{\"kty\":\"OKP\"}"),
+            ],
+            "trusted_server_config",
+        );
+        let ctx = test_context_with_registries(Some(config), None, None);
+        let services = build_runtime_services(&ctx);
+
+        // Act + Assert: the non-default config id resolves through the composite.
+        let jwk = services
+            .config_store()
+            .get(&StoreName::from("jwks_store"), "kid-1")
+            .expect("should resolve the non-default jwks_store through the composite");
+        assert_eq!(
+            jwk, "{\"kty\":\"OKP\"}",
+            "should read the seeded value from the non-default config store"
+        );
+
+        // Unknown id is a strict error, never a silent fallback.
+        assert!(
+            services
+                .config_store()
+                .get(&StoreName::from("no_such_store"), "kid-1")
+                .is_err(),
+            "unknown config id should error, not fall back to the default store"
+        );
+    }
+
+    #[test]
+    fn secret_store_resolves_nondefault_ts_secrets_and_s3_auth() {
+        // Arrange: registry with the default secret store plus non-default
+        // `ts_secrets` (DataDome) and `s3_auth` (S3 SigV4) ids.
+        let secrets = secret_registry(
+            &[
+                ("trusted_server_secrets", "API_KEY", b"default-key"),
+                ("ts_secrets", "server-side-key", b"dd-secret"),
+                ("s3_auth", "aws-secret-access-key", b"s3-secret"),
+            ],
+            "trusted_server_secrets",
+        );
+        let ctx = test_context_with_registries(None, None, Some(secrets));
+        let services = build_runtime_services(&ctx);
+
+        let dd = services
+            .secret_store()
+            .get_bytes(&StoreName::from("ts_secrets"), "server-side-key")
+            .expect("should resolve ts_secrets through the composite");
+        assert_eq!(dd, b"dd-secret", "should read the seeded DataDome secret");
+
+        let s3 = services
+            .secret_store()
+            .get_bytes(&StoreName::from("s3_auth"), "aws-secret-access-key")
+            .expect("should resolve s3_auth through the composite");
+        assert_eq!(s3, b"s3-secret", "should read the seeded S3 secret");
+
+        assert!(
+            services
+                .secret_store()
+                .get_bytes(&StoreName::from("no_such_store"), "x")
+                .is_err(),
+            "unknown secret id should error, not fall back to the default store"
+        );
+    }
+
+    #[tokio::test]
+    async fn kv_handle_named_resolves_consent_store() {
+        // Arrange: registry with the default KV store plus a non-default
+        // `consent_store`, each carrying a different value for the same key.
+        let kv = kv_registry(
+            &[
+                ("trusted_server_kv", "marker", b"default-value"),
+                ("consent_store", "marker", b"consent-value"),
+            ],
+            "trusted_server_kv",
+        );
+        let ctx = test_context_with_registries(None, Some(kv), None);
+        let services = build_runtime_services(&ctx);
+
+        // The named store resolves and is distinct from the default request-path
+        // KV store (which is the dev server's unavailable store).
+        let handle = services
+            .kv_handle_named("consent_store")
+            .expect("should resolve the consent_store handle");
+        let value = handle
+            .get_bytes("marker")
+            .await
+            .expect("should read from consent_store")
+            .expect("should find the seeded key");
+        assert_eq!(
+            value.as_ref(),
+            b"consent-value",
+            "named lookup should read the consent_store value, not the default"
+        );
+        assert!(
+            services.kv_handle().get_bytes("marker").await.is_err(),
+            "the default request-path KV store is distinct from consent_store"
+        );
+
+        // Unknown id yields None.
+        assert!(
+            services.kv_handle_named("no_such_store").is_none(),
+            "unknown KV id should resolve to None"
+        );
+    }
 
     #[test]
     fn config_store_reads_from_env_var() {

@@ -82,11 +82,11 @@ pub struct ConsentPipelineInput<'a> {
     /// - **Read fallback**: loads consent from KV when cookies are absent.
     /// - **Write-on-change**: persists cookie-sourced consent to KV.
     pub ec_id: Option<&'a str>,
-    /// KV store for consent persistence.
+    /// KV store handle for consent persistence.
     ///
     /// `None` when consent persistence is not configured for this request, or
     /// when the caller intentionally skips consent KV access.
-    pub kv_store: Option<&'a dyn crate::platform::PlatformKvStore>,
+    pub kv_store: Option<crate::platform::KvHandle>,
 }
 
 /// Extracts, decodes, and normalizes consent signals from a request.
@@ -125,7 +125,7 @@ pub fn build_consent_context(input: &ConsentPipelineInput<'_>) -> ConsentContext
     // Read fallback: when the request carries no consent signals, fall back
     // to consent persisted in KV for this EC ID (when persistence is wired).
     if signals.is_empty() {
-        if let (Some(ec_id), Some(store)) = (input.ec_id, input.kv_store) {
+        if let (Some(ec_id), Some(store)) = (input.ec_id, input.kv_store.as_ref()) {
             if let Some(mut ctx) = kv::load_consent_from_kv(store, ec_id) {
                 // Jurisdiction is request-local: derive it from the current
                 // geo rather than the value stored with the persisted entry.
@@ -172,7 +172,7 @@ pub fn build_consent_context(input: &ConsentPipelineInput<'_>) -> ConsentContext
     // Write-on-change: persist cookie-sourced consent for this EC ID (when
     // persistence is wired). The helper skips empty contexts and unchanged
     // fingerprints internally.
-    if let (Some(ec_id), Some(store)) = (input.ec_id, input.kv_store) {
+    if let (Some(ec_id), Some(store)) = (input.ec_id, input.kv_store.as_ref()) {
         kv::save_consent_to_kv(store, ec_id, &ctx, input.config.max_consent_age_days);
     }
 
@@ -1490,6 +1490,12 @@ mod tests {
         }
     }
 
+    /// Wrap a fresh [`InMemoryKvStore`] double in a [`KvHandle`] for consent
+    /// persistence tests.
+    fn kv_handle() -> crate::platform::KvHandle {
+        crate::platform::KvHandle::new(std::sync::Arc::new(InMemoryKvStore::new()))
+    }
+
     #[async_trait::async_trait(?Send)]
     impl crate::platform::PlatformKvStore for InMemoryKvStore {
         async fn get_bytes(
@@ -1548,7 +1554,7 @@ mod tests {
         let jar = parse_cookies_to_jar("us_privacy=1YNN");
         let req = build_request();
         let config = ConsentConfig::default();
-        let store = InMemoryKvStore::new();
+        let store = kv_handle();
 
         let ctx = build_consent_context(&ConsentPipelineInput {
             jar: Some(&jar),
@@ -1556,7 +1562,7 @@ mod tests {
             config: &config,
             geo: None,
             ec_id: Some("test-ec-id"),
-            kv_store: Some(&store),
+            kv_store: Some(store.clone()),
         });
 
         assert_eq!(
@@ -1576,7 +1582,7 @@ mod tests {
     #[test]
     fn pipeline_falls_back_to_kv_consent_when_request_has_no_signals() {
         let config = ConsentConfig::default();
-        let store = InMemoryKvStore::new();
+        let store = kv_handle();
 
         // First request carries a consent cookie — persisted to KV.
         let jar = parse_cookies_to_jar("us_privacy=1YNN");
@@ -1587,7 +1593,7 @@ mod tests {
             config: &config,
             geo: None,
             ec_id: Some("test-ec-id"),
-            kv_store: Some(&store),
+            kv_store: Some(store.clone()),
         });
 
         // Second request has no consent signals — must fall back to KV.
@@ -1598,7 +1604,7 @@ mod tests {
             config: &config,
             geo: None,
             ec_id: Some("test-ec-id"),
-            kv_store: Some(&store),
+            kv_store: Some(store.clone()),
         });
 
         assert_eq!(
@@ -1613,7 +1619,7 @@ mod tests {
         let jar = parse_cookies_to_jar("us_privacy=1YNN");
         let req = build_request();
         let config = ConsentConfig::default();
-        let store = InMemoryKvStore::new();
+        let store = kv_handle();
 
         // ec_id is absent, so the pipeline must not touch the KV store.
         build_consent_context(&ConsentPipelineInput {
@@ -1622,7 +1628,7 @@ mod tests {
             config: &config,
             geo: None,
             ec_id: None,
-            kv_store: Some(&store),
+            kv_store: Some(store.clone()),
         });
 
         assert!(

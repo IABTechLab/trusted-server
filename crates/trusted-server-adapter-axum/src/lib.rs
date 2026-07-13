@@ -10,3 +10,5 @@ pub mod app;
 pub mod middleware;
 /// Platform-trait implementations backed by env vars and `reqwest`.
 pub mod platform;
+/// Per-request store registry builders for the dev server.
+pub mod registries;
