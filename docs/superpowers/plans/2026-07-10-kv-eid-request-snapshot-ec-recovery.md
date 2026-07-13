@@ -26,6 +26,7 @@
 ### Task 1: Define EC KV Snapshot Semantics
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/ec/mod.rs`
 - Modify: `crates/trusted-server-core/src/ec/kv.rs`
 - Test: `crates/trusted-server-core/src/ec/mod.rs`
@@ -78,6 +79,7 @@ Expected: existing generation and failure rollback tests pass.
 ### Task 2: Add Snapshot-Aware KV Mutations
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/ec/kv.rs`
 - Test: `crates/trusted-server-core/src/ec/kv.rs`
 
@@ -112,6 +114,7 @@ Expected: all KV tests pass.
 ### Task 3: Separate EID Collection from Persistence
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/ec/prebid_eids.rs`
 - Test: `crates/trusted-server-core/src/ec/prebid_eids.rs`
 
@@ -138,6 +141,7 @@ Run: `cargo test -p trusted-server-core ec::prebid_eids::tests`
 ### Task 4: Implement Finalize Recovery and Persisted Outcomes
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/ec/finalize.rs`
 - Modify: `crates/trusted-server-core/src/ec/mod.rs`
 - Test: `crates/trusted-server-core/src/ec/finalize.rs`
@@ -183,6 +187,7 @@ Run: `cargo test -p trusted-server-core ec::tests`
 ### Task 5: Thread Snapshot and Browser Eligibility Through Call Sites
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/publisher.rs`
 - Modify: `crates/trusted-server-adapter-fastly/src/app.rs`
 - Modify: `crates/trusted-server-adapter-axum/src/app.rs`
@@ -216,6 +221,7 @@ Expected: all call sites compile before auction behavior changes.
 ### Task 6: Resolve Auction EIDs and Schedule Origin from the Snapshot
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/auction/endpoints.rs`
 - Modify: `crates/trusted-server-core/src/publisher.rs`
 - Test: `crates/trusted-server-core/src/auction/endpoints.rs`
@@ -268,6 +274,7 @@ Run: `cargo test -p trusted-server-core publisher::tests`
 ### Task 7: Thread Finalize Outcome Through Fastly
 
 **Files:**
+
 - Modify: `crates/trusted-server-adapter-fastly/src/app.rs`
 - Modify: `crates/trusted-server-adapter-fastly/src/main.rs`
 - Test: `crates/trusted-server-adapter-fastly/src/app.rs`
@@ -292,6 +299,7 @@ Run: `cargo test-fastly ec_finalize_state`
 ### Task 8: Reuse Finalized State in Pull Sync
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/ec/pull_sync.rs`
 - Modify: `crates/trusted-server-adapter-fastly/src/main.rs`
 - Test: `crates/trusted-server-core/src/ec/pull_sync.rs`
@@ -319,6 +327,7 @@ Run: `cargo test -p trusted-server-core ec::pull_sync::tests`
 ### Task 9: Run Regression Suites
 
 **Files:**
+
 - Modify as required: `crates/trusted-server-adapter-axum/src/app.rs`
 - Modify as required: `crates/trusted-server-adapter-cloudflare/src/app.rs`
 - Modify as required: `crates/trusted-server-adapter-spin/src/app.rs`
@@ -377,6 +386,7 @@ Confirm no #880 completeness marker, partner fingerprint, or unrelated refactor 
 ### Task 10: Final Code Review
 
 **Files:**
+
 - Review all modified production and test files
 
 - [ ] **Step 1: Review against the approved spec**
