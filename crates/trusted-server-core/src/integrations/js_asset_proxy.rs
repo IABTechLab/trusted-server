@@ -587,6 +587,8 @@ mod tests {
             request_host: "publisher.example.com".to_string(),
             request_scheme: "https".to_string(),
             integrations,
+            ad_slots_script: None,
+            ad_bids_state: Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
         });
         let pipeline_config = PipelineConfig {
