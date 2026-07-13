@@ -522,16 +522,13 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
 ///
 /// # Degraded features in dev
 ///
-/// KV store is [`trusted_server_core::platform::UnavailableKvStore`] — any route
-/// touching synthetic-ID or consent KV will degrade gracefully. A `warn` log is
+/// The generic runtime KV slot uses
+/// [`trusted_server_core::platform::UnavailableKvStore`]. A `warn` log is
 /// emitted once per process.
 pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> RuntimeServices {
     static KV_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     KV_WARNED.get_or_init(|| {
-        log::warn!(
-            "Axum dev server: KV store is unavailable (UnavailableKvStore). \
-             Routes that depend on synthetic-ID or consent KV will degrade gracefully."
-        );
+        log::warn!("Axum dev server: generic runtime KV is unavailable (UnavailableKvStore).");
     });
 
     let client_ip = edgezero_adapter_axum::context::AxumRequestContext::get(ctx.request())

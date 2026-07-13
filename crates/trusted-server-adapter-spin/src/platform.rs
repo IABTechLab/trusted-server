@@ -202,14 +202,9 @@ fn spin_secret_variable_name(
 ///
 /// Delegates all operations through `KvHandle`'s raw-bytes API. Spin KV has no
 /// native TTL support, so [`put_bytes_with_ttl`](KvStore::put_bytes_with_ttl)
-/// *errors* (`KvError::Validation`) rather than silently writing a non-expiring
-/// record — the privacy-safe failure mode. Consequently TTL-backed consent
-/// persistence (`save_consent_to_kv`) is unavailable on Spin: each write returns
-/// the error, which the core caller logs and treats as non-fatal (consistent
-/// with all adapters — failing to persist consent never breaks the request, and
-/// not persisting is the safe direction). Operators configuring
-/// `settings.consent.consent_store` on Spin should expect stored-consent
-/// fallback not to function.
+/// returns `KvError::Validation` rather than silently writing a non-expiring
+/// record. Callers of the generic platform KV interface must handle that
+/// capability difference explicitly.
 struct KvHandleAdapter(KvHandle);
 
 #[async_trait::async_trait(?Send)]

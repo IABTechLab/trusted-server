@@ -2660,6 +2660,38 @@ mod tests {
     }
 
     #[test]
+    fn settings_rejects_removed_consent_store_toml() {
+        let toml = format!(
+            "{}\n[consent]\nconsent_store = \"legacy-consent-store\"\n",
+            crate_test_settings_str()
+        );
+
+        let err = Settings::from_toml(&toml)
+            .expect_err("should reject the removed consent_store TOML field");
+
+        assert!(
+            format!("{err:?}").contains("consent_store"),
+            "should identify the removed field: {err:?}"
+        );
+    }
+
+    #[test]
+    fn settings_rejects_removed_consent_store_json() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse baseline settings");
+        let mut value = serde_json::to_value(settings).expect("should serialize baseline settings");
+        value["consent"]["consent_store"] = json!("legacy-consent-store");
+
+        let err = Settings::from_json_value(value)
+            .expect_err("should reject the removed consent_store JSON field");
+
+        assert!(
+            format!("{err:?}").contains("consent_store"),
+            "should identify the removed field: {err:?}"
+        );
+    }
+
+    #[test]
     fn test_settings_from_valid_toml() {
         let toml_str = crate_test_settings_str();
         let settings = Settings::from_toml(&toml_str);

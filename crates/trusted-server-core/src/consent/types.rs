@@ -7,7 +7,7 @@
 //! - [`UsPrivacy`] / [`PrivacyFlag`] — decoded US Privacy (CCPA) 4-char string
 //! - [`TcfConsent`] — decoded TCF v2 core consent data
 //! - [`GppConsent`] — decoded GPP consent data
-//! - [`ConsentSource`] — how consent was sourced (cookie, KV store, etc.)
+//! - [`ConsentSource`] — how consent was sourced (cookie or policy default)
 
 use core::fmt;
 
@@ -383,8 +383,6 @@ impl fmt::Display for UsPrivacy {
 pub enum ConsentSource {
     /// Read from cookies on the incoming request.
     Cookie,
-    /// Loaded from KV store via Edge Cookie (EC) ID lookup.
-    KvStore,
     /// Applied from explicit publisher policy defaults.
     PolicyDefault,
     /// No consent data available.
