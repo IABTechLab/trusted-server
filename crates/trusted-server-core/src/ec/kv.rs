@@ -1447,6 +1447,30 @@ mod tests {
     }
 
     #[test]
+    fn upsert_partner_id_if_exists_retries_cas_conflict() {
+        let graph = KvIdentityGraph::new(ConflictInjectingEcKv::new(1, false));
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        graph
+            .create(&ec_id, &live_entry())
+            .expect("should seed live entry");
+
+        let result = graph
+            .upsert_partner_id_if_exists(&ec_id, "ssp_x", "uid-1")
+            .expect("should retry and write after one generation conflict");
+
+        assert_eq!(result, UpsertResult::Written);
+        let (entry, _) = graph
+            .get(&ec_id)
+            .expect("should read persisted entry")
+            .expect("should retain entry after conflict");
+        assert_eq!(
+            entry.ids.get("ssp_x").map(|id| id.uid.as_str()),
+            Some("uid-1"),
+            "should persist requested UID after retry"
+        );
+    }
+
+    #[test]
     fn upsert_partner_id_if_exists_rejects_tombstone() {
         let kv = KvIdentityGraph::in_memory("test_store");
         let ec_id = format!("{}.ABC123", "a".repeat(64));
