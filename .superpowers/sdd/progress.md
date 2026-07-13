@@ -74,7 +74,33 @@ Branch: worktree-edgezero-migration-spec
   store names, example/fixtures, user docs, tests) + re-declare as registry ids. Under D7
   logical id == physical store name; operators with hyphenated physical stores use
   EDGEZERO__STORES__<KIND>__<ID>__NAME (documented, not implemented here).
-- Task 5 SPLIT: 5a = the convergence rename (dispatched); 5b = composite wiring + named-KV.
+- Task 5 SPLIT: 5a = the convergence rename; 5b = composite wiring + named-KV.
+- Task 5a: COMPLETE (33ff05884) — s3-auth→s3_auth, datadome-ip-bypass→datadome_ip_bypass
+  everywhere (code, manifests' physical store names, example/fixtures, 3 user guides w/
+  __NAME contract note); re-declared in edgezero.toml + STORES_METADATA. Zero stray hyphens.
+  core 1630, spin manifest PASS, parity 13/0, clippy/fmt clean.
+## 2026-07-13 Task 5b findings (both VERIFIED) + operator decision
+- BLOCKER (found by 5b implementer): edgezero `KvHandle::put_bytes_with_ttl` validates against
+  `MAX_TTL = 365d` (key_value_store.rs:378), but TS `MAX_CONSENT_AGE_DAYS = 395` (consent_config.rs:10,
+  the IAB 13-month norm). Consent MUST go through KvHandle (KvRegistry::named only yields KvHandle),
+  so migrating consent → KvHandle would fail TTL validation, and save_consent_to_kv SWALLOWS KV
+  failures → consent silently never persists. On Task 6's critical path too; cannot be dodged.
+  DECISION: clamp consent KV TTL to edgezero's public MAX_TTL + warn log (interim, fail-safe:
+  consent expires ~1mo earlier → earlier re-prompt, still IAB-compliant). MAX_CONSENT_AGE_DAYS
+  stays 395. Upstream ask FILED: https://github.com/stackpop/edgezero/issues/323 (raise or
+  parameterize MAX_TTL; at minimum make an over-cap write a typed error that can't be swallowed).
+  REMOVE the clamp once #323 ships and the pin is bumped.
+- FINDING for Task 6: the plan's `publisher.rs:626` consent call site DOES NOT EXIST. The only
+  production `build_consent_context` caller is `ec/mod.rs:216`, passing `kv_store: None` — consent
+  KV persistence is DORMANT in the shared path. Task 6 must RE-ESTABLISH the consent KV call site,
+  not "flip" it. (All other build_consent_context refs are tests/docs.)
+
+- Task 5b: dispatched — Axum registries via PUBLIC edgezero constructors (AxumConfigStore +
+  PersistentKvStore::new, TS-chosen redb paths, no private replication/parity test since TS
+  supplies the whole registry via with_kv_registry → authoritative); keep AxumDevServer::
+  with_config for PORT. Core kv_handle_named + kv_registry field; consent → KvHandle
+  (ConsentPipelineInput + persistence fns + all consumers atomically); writer trait impls for
+  Axum/CF/Spin. Fastly NOT touched (publisher consent stays on kv_handle() until Task 6).
 
 ## (superseded) DEFERRED decision — config-contract
 - s3-auth (secret; settings.rs:655 default_s3_secret_store) and datadome-ip-bypass

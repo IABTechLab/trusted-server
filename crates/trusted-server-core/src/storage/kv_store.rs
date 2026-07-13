@@ -325,8 +325,8 @@ pub fn save_consent_to_kv(store: &KvHandle, ec_id: &str, ctx: &ConsentContext, m
 /// having stale consent honored past its window. It never extends retention.
 ///
 /// This is an **interim** measure. Remove it once `EdgeZero` raises or
-/// parameterizes `KvHandle::MAX_TTL` (upstream ask filed); at that point pass
-/// the configured TTL through unchanged.
+/// parameterizes `KvHandle::MAX_TTL` (upstream ask: `stackpop/edgezero#323`);
+/// at that point pass the configured TTL through unchanged.
 fn consent_kv_ttl(max_age_days: u32) -> std::time::Duration {
     let configured = std::time::Duration::from_secs(u64::from(max_age_days) * 86_400);
 
