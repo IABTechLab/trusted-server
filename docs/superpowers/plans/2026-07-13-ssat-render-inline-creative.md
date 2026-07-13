@@ -4,7 +4,7 @@
 
 **Goal:** Render SSAT-winning creatives from the copy trusted-server already holds (no render-time PBS Cache round trip), while keeping GAM in the loop.
 
-**Architecture:** Always include the winning `adm` in `window.tsjs.bids` so the existing `installTsRenderBridge` serves it locally when GAM's Prebid Universal Creative fires. Keep `hb_cache_*` as a fallback. Split the render `adm` from the debug-only `debug_bid` blob, and gate the GAM-bypass path (`injectAdmIntoSlot`) behind an explicit `window.tsjs.injectAdmForTesting` flag so production keeps GAM.
+**Architecture:** Always include the winning `adm` in `window.tsjs.bids` so the existing `installTsRenderBridge` serves it locally when GAM's Prebid Universal Creative fires. Keep `hb_cache_*` as the fallback for an *absent* `adm`. Keep the verbose `debug_bid` blob behind the testing flag, and gate the GAM-bypass path (`injectAdmIntoSlot`) on the per-bid `debug_bid` field — no global flag, no `TsjsApi` change.
 
 **Tech Stack:** Rust (`trusted-server-core`, wasm32-wasip1 via Viceroy), TypeScript (`trusted-server-js`, vitest).
 
@@ -16,55 +16,61 @@
 
 | File | Responsibility | Change |
 | --- | --- | --- |
-| `crates/trusted-server-core/src/publisher.rs` | Build `window.tsjs.bids` + injection | Split `include_adm`→`render_adm`+`debug_bid`; always insert `adm`; emit `injectAdmForTesting` flag |
-| `crates/trusted-server-js/lib/src/integrations/gpt/index.ts` | Client render paths | Gate `injectAdmIntoSlot` on the flag |
-| `crates/trusted-server-js/lib/test/integrations/gpt/*.test.ts` | JS tests | Bypass-off-without-flag; bridge-serves-local-adm |
+| `crates/trusted-server-core/src/publisher.rs` | Build `window.tsjs.bids` | Always insert `adm`; rename `include_adm`→`include_debug_bid` (gates only the blob) |
+| `crates/trusted-server-js/lib/src/integrations/gpt/index.ts` | Client render paths | Gate `injectAdmIntoSlot` on `bid.adm && bid.debug_bid` |
+| `crates/trusted-server-js/lib/test/integrations/gpt/ad_init.test.ts` | JS tests | Rename "debug adm"→"inline/local adm"; add bypass-gate test |
 
 ---
 
-## Task 1: Split `build_bid_map` flags and always include render `adm`
+## Task 1: `build_bid_map` — always include `adm`, gate only `debug_bid`
 
 **Files:**
-- Modify: `crates/trusted-server-core/src/publisher.rs` (`build_bid_map` ~1933)
+- Modify: `crates/trusted-server-core/src/publisher.rs` (`build_bid_map` ~1933; `write_bids_to_state` ~846; callers)
 - Test: same file, `#[cfg(test)] mod tests`
 
-- [ ] **Step 1: Write failing test** — production path includes `adm`, excludes `debug_bid`.
+- [ ] **Step 1: Write failing test** — `adm` present for a winner regardless of the debug flag; `debug_bid` only when the flag is set.
 
 ```rust
 #[test]
-fn build_bid_map_includes_adm_for_render_without_debug_bid() {
+fn build_bid_map_always_includes_adm_and_gates_debug_bid() {
     let mut winning = std::collections::HashMap::new();
-    let mut bid = /* build a Bid with creative Some("<div>x</div>"), price Some(1.0) */;
-    winning.insert("ad-header-0".to_string(), bid);
-    // render_adm = true (production), debug_bid = false
-    let map = build_bid_map(&winning, PriceGranularity::Dense, true, false);
-    let slot = map["ad-header-0"].as_object().expect("slot obj");
-    assert_eq!(slot["adm"], serde_json::json!("<div>x</div>"), "render adm present");
-    assert!(!slot.contains_key("debug_bid"), "debug_bid absent in production");
+    winning.insert("ad-header-0".to_string(), make_test_bid_with_creative("<div>x</div>"));
+    // include_debug_bid = false (production)
+    let map = build_bid_map(&winning, PriceGranularity::Dense, false);
+    let slot = map["ad-header-0"]
+        .as_object()
+        .expect("should contain an object for the winning slot");
+    assert_eq!(
+        slot["adm"],
+        serde_json::json!("<div>x</div>"),
+        "should include creative markup for local rendering"
+    );
+    assert!(
+        !slot.contains_key("debug_bid"),
+        "should omit the debug_bid blob when the testing flag is off"
+    );
 }
 ```
 
-- [ ] **Step 2: Run — expect FAIL** (signature mismatch: `build_bid_map` takes 3 args).
+- [ ] **Step 2: Run — expect FAIL** (signature is 3-arg with `include_adm` semantics; adm currently gated off).
 
-Run: `cargo test-fastly build_bid_map_includes_adm_for_render_without_debug_bid`
+Run: `cargo test-fastly build_bid_map_always_includes_adm_and_gates_debug_bid`
 
-- [ ] **Step 3: Implement** — change signature and body:
+- [ ] **Step 3: Implement** — rename the param and split the gating:
 
 ```rust
 pub(crate) fn build_bid_map(
     winning_bids: &std::collections::HashMap<String, Bid>,
     granularity: crate::price_bucket::PriceGranularity,
-    render_adm: bool,
-    debug_bid: bool,
+    include_debug_bid: bool,
 ) -> serde_json::Map<String, serde_json::Value> {
     // ... unchanged hb_* / cache / nurl / burl inserts ...
-    // Replace the single `if include_adm { adm + debug_bid }` block with:
-    if render_adm {
-        if let Some(ref adm) = bid.creative {
-            obj.insert("adm".to_string(), serde_json::Value::String(adm.clone()));
-        }
+    // Always include the creative for local rendering.
+    if let Some(ref adm) = bid.creative {
+        obj.insert("adm".to_string(), serde_json::Value::String(adm.clone()));
     }
-    if debug_bid {
+    // Verbose debug blob only under the testing flag.
+    if include_debug_bid {
         obj.insert("debug_bid".to_string(), serde_json::json!({ /* unchanged blob */ }));
     }
     // ...
@@ -73,69 +79,21 @@ pub(crate) fn build_bid_map(
 
 - [ ] **Step 4: Run — expect PASS.**
 
-- [ ] **Step 5: Thread the flag through `write_bids_to_state` and update the other call sites** so the crate compiles.
-  Note the real call graph: `write_bids_to_state` (`~846`) owns an `inject_adm: bool` param and calls both `build_bid_map` (`~853`) and `build_bids_script` (`~854`). Its callers at `~695`/`~1241` pass `settings.debug.inject_adm_for_testing`. `handle_page_bids` (`~2390`) calls `build_bid_map` directly.
-  - In `write_bids_to_state`: rename the param `inject_adm_for_testing`; call `build_bid_map(winning_bids, price_granularity, /* render_adm */ true, /* debug_bid */ inject_adm_for_testing)`; pass the same flag to `build_bids_script` (Task 2).
-  - Callers `~695` and `~1241`: **no change** (already pass the flag to `write_bids_to_state`).
-  - `handle_page_bids` (`~2390`): `build_bid_map(&winning_bids, co_config.price_granularity, /* render_adm */ true, /* debug_bid */ settings.debug.inject_adm_for_testing)`.
-  - Pure-test caller (`~4043`): `build_bid_map(&winning_bids, PriceGranularity::Dense, false, false)`.
+- [ ] **Step 5: Update call sites** so the crate compiles (real call graph):
+  - `write_bids_to_state` (`~846`): rename its `inject_adm: bool` param to `include_debug_bid`; call `build_bid_map(winning_bids, price_granularity, include_debug_bid)` (`~853`). `build_bids_script` is **unchanged**.
+  - Callers `~695` / `~1241`: no change (already pass `settings.debug.inject_adm_for_testing`).
+  - `handle_page_bids` (`~2390`): `build_bid_map(&winning_bids, co_config.price_granularity, settings.debug.inject_adm_for_testing)`.
+  - Pure-test caller (`~4043`): `build_bid_map(&winning_bids, PriceGranularity::Dense, false)`.
 
-- [ ] **Step 6: Run** `cargo check-fastly` — expect clean.
+- [ ] **Step 6: Update any test that asserted "no adm" on the production path** — production now always carries `adm`; adjust expectations to the new behavior.
 
-- [ ] **Step 7: Commit** — `git commit -m "Split build_bid_map render adm from debug_bid blob"`
+- [ ] **Step 7: Run** `cargo check-fastly` — expect clean.
 
----
-
-## Task 2: Emit the `injectAdmForTesting` flag with the bids script
-
-**Files:**
-- Modify: `crates/trusted-server-core/src/publisher.rs` (`build_bids_script` ~2018 + its caller ~853)
-
-- [ ] **Step 1: Write failing test** — script sets the flag.
-
-```rust
-#[test]
-fn bids_script_emits_inject_adm_for_testing_flag() {
-    let script = build_bids_script(&serde_json::Map::new(), true);
-    assert!(script.contains("injectAdmForTesting=true"), "flag emitted: {script}");
-    let off = build_bids_script(&serde_json::Map::new(), false);
-    assert!(off.contains("injectAdmForTesting=false"), "flag false: {off}");
-}
-```
-
-- [ ] **Step 2: Run — expect FAIL** (arity).
-
-- [ ] **Step 3: Implement** — add a bool param and emit the flag on `window.tsjs`:
-
-```rust
-pub(crate) fn build_bids_script(
-    bid_map: &serde_json::Map<String, serde_json::Value>,
-    inject_adm_for_testing: bool,
-) -> String {
-    let json = serde_json::to_string(bid_map).expect("serialize bid map");
-    let escaped = html_escape_for_script(&json);
-    format!(
-        "<script>(window.tsjs=window.tsjs||{{}}).injectAdmForTesting={inject_adm_for_testing};\
-         (window.tsjs=window.tsjs||{{}}).bids=JSON.parse(\"{escaped}\");\
-         (function(){{var f=window.tsjs.adInit;if(typeof f===\"function\")f();}})();</script>"
-    )
-}
-```
-
-- [ ] **Step 4: Update `build_bids_script` callers:**
-  - `write_bids_to_state` (`~854`): pass the `inject_adm_for_testing` param threaded in Task 1.
-  - `build_empty_bids_script` (`~2032`) has **no settings access** — pass `false` (no bids ⇒ no `adm` ⇒ flag inert). Documented tradeoff: an empty *initial* nav on a testing build emits `injectAdmForTesting=false`, so a later SPA-loaded `adm` won't fire the test bypass; acceptable (production is always `false`).
-  - Fix any test that pins the old `bids` `<script>` string.
-
-- [ ] **Step 5: SPA path needs no flag.** Confirm `handle_page_bids` (`~2390`) returns JSON (not a `<script>`) — the flag is set once on the initial nav load and persists on `window.tsjs` across SPA navigations. No flag emission there.
-
-- [ ] **Step 6: Run — expect PASS.** `cargo test-fastly bids_script_emits_inject_adm_for_testing_flag`
-
-- [ ] **Step 7: Commit** — `git commit -m "Emit injectAdmForTesting flag on window.tsjs with bids"`
+- [ ] **Step 8: Commit** — `git commit -m "Always include adm in bid map; gate only debug_bid blob"`
 
 ---
 
-## Task 3: Escaping regression — hostile `adm` cannot break out of `<script>`
+## Task 2: Escaping regression — hostile `adm` cannot break out of `<script>`
 
 **Files:**
 - Modify: `crates/trusted-server-core/src/publisher.rs` tests
@@ -146,87 +104,104 @@ pub(crate) fn build_bids_script(
 #[test]
 fn build_bids_script_escapes_hostile_adm() {
     let mut winning = std::collections::HashMap::new();
-    let mut bid = /* Bid, price Some(1.0), creative Some("</script><script>alert(1)</script>\u{2028}") */;
-    winning.insert("s".to_string(), bid);
-    let map = build_bid_map(&winning, PriceGranularity::Dense, true, false);
-    let script = build_bids_script(&map, false);
-    // Raw </script> must not survive; U+2028 must be unicode-escaped.
-    assert!(!script.contains("</script><script>"), "no raw breakout: {script}");
-    assert!(!script.contains('\u{2028}'), "U+2028 escaped");
+    winning.insert(
+        "s".to_string(),
+        make_test_bid_with_creative("</script><script>alert(1)</script>\u{2028}"),
+    );
+    let map = build_bid_map(&winning, PriceGranularity::Dense, false);
+    let script = build_bids_script(&map);
+    assert!(
+        !script.contains("</script><script>"),
+        "should not let a hostile adm break out of the script context"
+    );
+    assert!(
+        !script.contains('\u{2028}'),
+        "should unicode-escape U+2028 in the adm"
+    );
 }
 ```
 
 - [ ] **Step 2: Run — expect PASS** (existing `html_escape_for_script` already handles it — this pins the guarantee).
 
-- [ ] **Step 3: Commit** — `git commit -m "Pin escaping guarantee for inline adm"`
+Run: `cargo test-fastly build_bids_script_escapes_hostile_adm`
+
+- [ ] **Step 3: Commit** — `git commit -m "Pin script-context escaping guarantee for inline adm"`
 
 ---
 
-## Task 4: Gate the GAM-bypass (`injectAdmIntoSlot`) behind the flag
+## Task 3: Gate the GAM-bypass (`injectAdmIntoSlot`) on `bid.debug_bid`
 
 **Files:**
 - Modify: `crates/trusted-server-js/lib/src/integrations/gpt/index.ts:~599`
-- Test: `crates/trusted-server-js/lib/test/integrations/gpt/` (add/extend a test file)
+- Test: `crates/trusted-server-js/lib/test/integrations/gpt/ad_init.test.ts`
 
-- [ ] **Step 1: Write failing vitest** — bypass does NOT fire when the flag is off, even with `bid.adm`.
+- [ ] **Step 1: Write failing vitest** — bypass does NOT fire in production (no `debug_bid`), even with `bid.adm`.
 
 ```ts
-// window.tsjs = { bids: { 'ad-header-0': { adm: '<div>x</div>' } }, injectAdmForTesting: false }
+// window.tsjs.bids = { 'ad-header-0': { adm: '<div>x</div>' } }  // no debug_bid
 // simulate slotRenderEnded for ad-header-0
-// assert injectAdmIntoSlot was NOT called (spy) — the bridge handles render instead
+// spy on injectAdmIntoSlot → assert NOT called (the bridge handles render)
 ```
 
-- [ ] **Step 2: Run — expect FAIL.** `cd crates/trusted-server-js/lib && npx vitest run <file>`
+- [ ] **Step 2: Run — expect FAIL.** `cd crates/trusted-server-js/lib && npx vitest run ad_init`
 
-- [ ] **Step 3: Add the field to the `TsjsApi` type** (`crates/trusted-server-js/lib/src/core/types.ts`, or `core/global.d.ts` — grep `interface TsjsApi`):
-
-```ts
-injectAdmForTesting?: boolean;
-```
-Without it, `tsc`/vitest fail to typecheck `window.tsjs.injectAdmForTesting`.
-
-- [ ] **Step 4: Implement** — change the guard (`gpt/index.ts:~599`; `ts` is the local `window.tsjs`):
+- [ ] **Step 3: Implement** — change the guard (`ts` is the local `window.tsjs`):
 
 ```ts
-if (bid.adm && ts.injectAdmForTesting) {
+// Direct GAM replacement is a testing-only bypass. `debug_bid` is present only
+// when inject_adm_for_testing is on, so it doubles as the per-bid gate — no
+// global flag needed, and it is correct across SPA auction responses.
+if (bid.adm && bid.debug_bid) {
   injectAdmIntoSlot(divId, bid.adm);
 }
 ```
 
-- [ ] **Step 5: Add the companion test** — with `injectAdmForTesting: true`, `injectAdmIntoSlot` IS called.
+- [ ] **Step 4: Add companion test** — with `bid.debug_bid` present, `injectAdmIntoSlot` IS called.
 
-- [ ] **Step 6: Run — expect PASS.**
+- [ ] **Step 5: Run — expect PASS.**
 
-- [ ] **Step 7: Commit** — `git commit -m "Gate GAM-bypass adm injection behind injectAdmForTesting flag"`
+- [ ] **Step 6: Commit** — `git commit -m "Gate GAM-bypass adm injection on per-bid debug_bid"`
 
 ---
 
-## Task 5: Bridge serves local `adm` (no cache fetch) — confirm/extend
+## Task 4: Reconcile existing bridge tests (no duplicates)
 
 **Files:**
-- Test: `crates/trusted-server-js/lib/test/integrations/gpt/` (bridge tests)
+- Modify: `crates/trusted-server-js/lib/test/integrations/gpt/ad_init.test.ts`
 
-- [ ] **Step 1:** Check for an existing `installTsRenderBridge` test. If a "serves local adm without cache fetch" case is missing, add: given a bid with `adm` and `hb_cache_*`, a `"Prebid Request"` for its `hb_adid` is answered from `adm` and **no `fetch`** occurs.
-- [ ] **Step 2:** Add the fallback case: bid with `hb_cache_*` but no `adm` → bridge fetches from cache.
-- [ ] **Step 3:** Assert win/billing beacons still fire on the local-`adm` path — `fireWinBillingBeacons` runs in the `adm` branch (`gpt/index.ts:~904`), so removing the cache fetch must not drop `nurl`/`burl` beacons.
-- [ ] **Step 4: Run — expect PASS.**
-- [ ] **Step 5: Commit** — `git commit -m "Cover bridge local-adm render, cache fallback, and win beacons"`
+`ad_init.test.ts` already covers: PBS Cache fetch when `adm` absent; local `adm`
+response without a cache fetch; `nurl`/`burl` on the local path; cache-fetch
+concurrency + beacon dedup. Do **not** duplicate them.
+
+- [ ] **Step 1:** Rename "debug adm" terminology → "inline/local adm" in the existing bridge tests.
+- [ ] **Step 2:** Confirm the local-`adm` test fixtures carry **both** `hb_cache_*` coordinates **and** inline `adm`, proving the bridge prefers local `adm` even when cache coords are present (the production shape).
+- [ ] **Step 3: Run — expect PASS.** `cd crates/trusted-server-js/lib && npx vitest run ad_init`
+- [ ] **Step 4: Commit** — `git commit -m "Rename debug-adm test terminology to inline/local adm"`
 
 ---
 
-## Task 6: Full verification
+## Task 5: Full verification
 
 - [ ] **Step 1:** `cargo fmt --all -- --check`
 - [ ] **Step 2:** `cargo test-fastly && cargo test-axum && cargo test-cloudflare && cargo test-spin`
-- [ ] **Step 3:** `cargo clippy-fastly` (and axum/cloudflare/spin per CI gate)
+- [ ] **Step 3:** Clippy — exact CI-gate commands:
+  ```
+  cargo clippy-fastly
+  cargo clippy-axum
+  cargo clippy-cloudflare
+  cargo clippy-cloudflare-wasm
+  cargo clippy-spin-native
+  cargo clippy-spin-wasm
+  ```
 - [ ] **Step 4:** `cd crates/trusted-server-js/lib && npx vitest run && npm run format && node build-all.mjs`
-- [ ] **Step 5:** Manual: with `[debug].auction_html_comment` off and inline adm on, load a nav page; confirm the winning creative renders **without** a request to `hb_cache_host` (Network tab) and GAM still received `hb_pb`.
+- [ ] **Step 5:** Manual: with `[debug].auction_html_comment` off, load a nav page; confirm the winning creative renders **without** a request to `hb_cache_host` (Network tab) and GAM still received `hb_pb`.
 - [ ] **Step 6: Commit** any format fixes.
 
 ---
 
 ## Notes
-- Do NOT remove `hb_cache_host`/`hb_cache_path` — they are the fallback.
+- Do NOT remove `hb_cache_host`/`hb_cache_path` — they are the fallback for an **absent** `adm`. Render failure *after* `adm` is supplied is not detectable and does not fall back (spec Risks).
 - Do NOT ship the `debug_bid` blob in production (Task 1 keeps it behind the flag).
-- Page-weight cost (inline creatives, uncacheable response) is accepted per spec; size-capping is out of scope.
-- **Precondition (sets expectations):** this only changes the render bridge's *data source* (local `adm` vs cache fetch) **when GAM's Prebid line item already serves the Prebid Universal Creative**. It does not change GAM competition, nor whether the PUC fires. A publisher without Prebid line items in GAM sees no change — same as today's cache path.
+- No global `window.tsjs` flag, no `TsjsApi` change — the bypass gate is the per-bid `debug_bid`.
+- Page-weight cost (inline creatives, uncacheable response) accepted per spec; size-capping out of scope.
+- **Precondition:** only changes the bridge's data source when GAM's Prebid line item already serves the PUC — no change to GAM competition or whether the PUC fires.
