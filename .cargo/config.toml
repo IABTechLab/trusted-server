@@ -49,7 +49,8 @@ clippy-spin-native = ["clippy", "-p", "trusted-server-adapter-spin", "--all-targ
 clippy-spin-wasm = ["clippy", "-p", "trusted-server-adapter-spin", "--target", "wasm32-wasip1", "--features", "spin", "--lib", "--", "-D", "warnings"]
 test-spin = ["test", "-p", "trusted-server-adapter-spin"]
 
-# --- ts operator CLI (native host; per-OS target overrides the wasm default) ---
+# --- ts operator CLI (native host; install uses the current host platform) ---
+install-cli = ["install", "--path", "crates/trusted-server-cli", "--bin", "ts", "--locked", "--force"]
 build_cli_linux = ["build", "--package", "trusted-server-cli", "--target", "x86_64-unknown-linux-gnu"]
 build_cli_macos = ["build", "--package", "trusted-server-cli", "--target", "aarch64-apple-darwin"]
 run_cli_linux = ["run", "--package", "trusted-server-cli", "--target", "x86_64-unknown-linux-gnu", "--"]
