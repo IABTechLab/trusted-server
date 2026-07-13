@@ -128,7 +128,9 @@ Verify stores are linked to your active service version:
 fastly resource-link list --service-id <service-id> --version <active-version>
 ```
 
-If EC sync returns `kv_unavailable` or identify responses are degraded, first check that the identity store is present and linked to the active version. Legacy partner/consent KV bindings can be removed once no deployment-specific tooling depends on them.
+If EC sync returns `kv_unavailable` or identify responses are degraded, first check that the identity store is present and linked to the active version.
+
+Before upgrading a deployment that used the legacy consent store, remove `[consent].consent_store` from TOML or JSON/app-config; strict configuration loading rejects the removed field. Remove its local Viceroy fixture and active Fastly resource link as well. The old records are not read or migrated into `ec.ec_store` and must not be copied there. You may retain the old store unchanged for a defined rollback window, then delete the store and its records.
 
 ## Next Steps
 

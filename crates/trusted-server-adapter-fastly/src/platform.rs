@@ -1,16 +1,12 @@
 //! Fastly-backed implementations of the platform traits defined in
 //! `trusted-server-core::platform`.
 
-use std::io::Read as _;
-use std::net::IpAddr;
-use std::sync::Arc;
-
 use bytes::Bytes;
-use edgezero_adapter_fastly::key_value_store::FastlyKvStore;
-use edgezero_core::key_value_store::KvError;
 use error_stack::{Report, ResultExt};
 use fastly::geo::{geo_lookup, Geo};
 use fastly::{ConfigStore, Request, SecretStore};
+use std::io::Read as _;
+use std::net::IpAddr;
 
 use crate::backend::BackendConfig;
 pub(crate) use trusted_server_core::platform::UnavailableKvStore;
@@ -18,8 +14,8 @@ use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
     PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformImageOptimizerCrop,
     PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions, PlatformImageOptimizerParams,
-    PlatformImageOptimizerRegion, PlatformKvStore, PlatformPendingRequest, PlatformResponse,
-    PlatformSecretStore, PlatformSelectResult, StoreId, StoreName,
+    PlatformImageOptimizerRegion, PlatformPendingRequest, PlatformResponse, PlatformSecretStore,
+    PlatformSelectResult, StoreId, StoreName,
 };
 
 // ---------------------------------------------------------------------------
@@ -581,16 +577,6 @@ pub fn client_info_from_request(req: &Request) -> ClientInfo {
         server_hostname: std::env::var("FASTLY_HOSTNAME").ok(),
         server_region: std::env::var("FASTLY_REGION").ok(),
     }
-}
-
-/// Open a named KV store as a [`PlatformKvStore`] implementation.
-///
-/// # Errors
-///
-/// Returns [`KvError::Unavailable`] when the store does not exist, or
-/// [`KvError::Internal`] when the Fastly SDK fails to open it.
-pub fn open_kv_store(store_name: &str) -> Result<Arc<dyn PlatformKvStore>, KvError> {
-    FastlyKvStore::open(store_name).map(|store| Arc::new(store) as Arc<dyn PlatformKvStore>)
 }
 
 // ---------------------------------------------------------------------------

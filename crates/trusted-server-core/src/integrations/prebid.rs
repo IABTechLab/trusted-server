@@ -1504,8 +1504,8 @@ impl PrebidAuctionProvider {
         // Build user object — populate consent at both OpenRTB 2.6 top-level
         // and Prebid ext-based locations (dual placement).
         // In cookies_only mode, cookie-sourced consent travels through the
-        // forwarded Cookie header. KV/policy-sourced consent has no inbound
-        // cookie to forward, so carry it in the OpenRTB body instead.
+        // forwarded Cookie header. Policy-sourced consent has no inbound cookie
+        // to forward, so carry it in the OpenRTB body instead.
         let consent_ctx = request.user.consent.as_ref().filter(|ctx| {
             self.config.consent_forwarding.includes_body_consent()
                 || !matches!(ctx.source, crate::consent::ConsentSource::Cookie)
@@ -3830,16 +3830,16 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn to_openrtb_includes_kv_consent_when_cookies_only_has_no_cookie_to_forward() {
+    fn to_openrtb_includes_policy_default_consent_when_cookies_only_has_no_cookie_to_forward() {
         let mut config = base_config();
         config.consent_forwarding = ConsentForwardingMode::CookiesOnly;
         let provider = PrebidAuctionProvider::new(config);
         let mut auction_request = create_test_auction_request();
         auction_request.user.consent = Some(ConsentContext {
-            raw_tc_string: Some("BOkv-backed-consent-string".to_string()),
+            raw_tc_string: Some("BOpolicy-consent-string".to_string()),
             raw_us_privacy: Some("1YNN".to_string()),
             gdpr_applies: true,
-            source: ConsentSource::KvStore,
+            source: ConsentSource::PolicyDefault,
             ..Default::default()
         });
 
@@ -3860,15 +3860,15 @@ external_bundle_sri = "sha384-AAAA"
 
         assert_eq!(
             openrtb.user.as_ref().and_then(|u| u.consent.as_deref()),
-            Some("BOkv-backed-consent-string"),
-            "cookies_only should fall back to body consent when consent came from KV"
+            Some("BOpolicy-consent-string"),
+            "cookies_only should carry policy-sourced consent in the body"
         );
         let regs = openrtb.regs.as_ref().expect("should include consent regs");
         assert_eq!(regs.gdpr, Some(true), "should carry GDPR applicability");
         assert_eq!(
             regs.us_privacy.as_deref(),
             Some("1YNN"),
-            "should carry non-cookie consent strings from KV"
+            "should carry policy-sourced consent strings"
         );
     }
 

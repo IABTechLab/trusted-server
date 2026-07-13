@@ -378,7 +378,13 @@ TRUSTED_SERVER__TESTER_COOKIE__ENABLED=true
 
 ## EC Configuration
 
-Settings for generating privacy-preserving Edge Cookie identifiers. The `ec_store` KV store is the only KV-backed EC lifecycle store; it holds identity graph state, minimal consent metadata, source-domain keyed partner UIDs, and withdrawal tombstones. Consent configuration controls request-local interpretation and forwarding, not separate KV persistence.
+Settings for generating privacy-preserving Edge Cookie identifiers. The `ec_store` KV store is the only KV-backed EC lifecycle store; it holds identity graph state, minimal consent metadata, source-domain keyed partner UIDs, and withdrawal tombstones. Live consent is interpreted from request cookies, headers, geolocation, and policy defaults, not separate KV persistence.
+
+### Migrating from `consent_store`
+
+The legacy `[consent].consent_store` setting has been removed. Trusted Server uses a strict configuration schema, so TOML and JSON/app-config that still contain `consent_store` fail during configuration loading. Remove the field before upgrading; it is not accepted as an ignored or deprecated option.
+
+Legacy consent-store records are not read or migrated into `ec.ec_store`. Their payload schema is not authoritative EC lifecycle state, so do not copy those records into the identity store. You may retain the old store unchanged for a defined rollback window, then unlink its platform resource binding and delete it. No browser-cookie or EC identity-store migration is required.
 
 ### `[ec]`
 
