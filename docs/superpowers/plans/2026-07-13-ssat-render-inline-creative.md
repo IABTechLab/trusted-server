@@ -34,7 +34,11 @@
 #[test]
 fn build_bid_map_always_includes_adm_and_gates_debug_bid() {
     let mut winning = std::collections::HashMap::new();
-    winning.insert("ad-header-0".to_string(), make_test_bid_with_creative("<div>x</div>"));
+    // Reuse the existing `make_bid(slot_id, price, bidder, ad_id, nurl, burl)`
+    // helper (~:3969); it sets `creative: None`, so set the creative here.
+    let mut bid = make_bid("ad-header-0", 1.50, "kargo", "abc123", "https://ssp/win", "https://ssp/bill");
+    bid.creative = Some("<div>x</div>".to_string());
+    winning.insert("ad-header-0".to_string(), bid);
     // include_debug_bid = false (production)
     let map = build_bid_map(&winning, PriceGranularity::Dense, false);
     let slot = map["ad-header-0"]
@@ -104,10 +108,10 @@ pub(crate) fn build_bid_map(
 #[test]
 fn build_bids_script_escapes_hostile_adm() {
     let mut winning = std::collections::HashMap::new();
-    winning.insert(
-        "s".to_string(),
-        make_test_bid_with_creative("</script><script>alert(1)</script>\u{2028}"),
-    );
+    let mut bid = make_bid("s", 1.50, "kargo", "abc123", "https://ssp/win", "https://ssp/bill");
+    // Both line/paragraph separators — the spec promises escaping for each.
+    bid.creative = Some("</script><script>alert(1)</script>\u{2028}\u{2029}".to_string());
+    winning.insert("s".to_string(), bid);
     let map = build_bid_map(&winning, PriceGranularity::Dense, false);
     let script = build_bids_script(&map);
     assert!(
@@ -115,8 +119,8 @@ fn build_bids_script_escapes_hostile_adm() {
         "should not let a hostile adm break out of the script context"
     );
     assert!(
-        !script.contains('\u{2028}'),
-        "should unicode-escape U+2028 in the adm"
+        !script.contains('\u{2028}') && !script.contains('\u{2029}'),
+        "should unicode-escape both U+2028 and U+2029 in the adm"
     );
 }
 ```
@@ -135,12 +139,15 @@ Run: `cargo test-fastly build_bids_script_escapes_hostile_adm`
 - Modify: `crates/trusted-server-js/lib/src/integrations/gpt/index.ts:~599`
 - Test: `crates/trusted-server-js/lib/test/integrations/gpt/ad_init.test.ts`
 
-- [ ] **Step 1: Write failing vitest** — bypass does NOT fire in production (no `debug_bid`), even with `bid.adm`.
+- [ ] **Step 1: Write failing vitest — observable behavior (not a spy).** `injectAdmIntoSlot` is module-private, so assert its *effect* on the DOM:
 
 ```ts
-// window.tsjs.bids = { 'ad-header-0': { adm: '<div>x</div>' } }  // no debug_bid
-// simulate slotRenderEnded for ad-header-0
-// spy on injectAdmIntoSlot → assert NOT called (the bridge handles render)
+// Setup:
+//   bids['ad-header-0'] = { adm: '<iframe src="https://cdn.example/creative.html"></iframe>' }  // NO debug_bid
+//   place an existing GAM iframe (src="about:blank") in the slot div
+//   capture the slotRenderEnded listener, fire it for 'ad-header-0'
+// Assert (production): the GAM iframe src stays 'about:blank'
+//   — the bypass did not fire; the render bridge handles it.
 ```
 
 - [ ] **Step 2: Run — expect FAIL.** `cd crates/trusted-server-js/lib && npx vitest run ad_init`
@@ -156,7 +163,7 @@ if (bid.adm && bid.debug_bid) {
 }
 ```
 
-- [ ] **Step 4: Add companion test** — with `bid.debug_bid` present, `injectAdmIntoSlot` IS called.
+- [ ] **Step 4: Add companion test (testing mode)** — same setup but with `bid.debug_bid` present. Fire `slotRenderEnded` → assert the slot iframe's `src` **changes to** the creative URL (`https://cdn.example/creative.html`), proving `injectAdmIntoSlot` ran.
 
 - [ ] **Step 5: Run — expect PASS.**
 
@@ -194,8 +201,9 @@ concurrency + beacon dedup. Do **not** duplicate them.
   cargo clippy-spin-wasm
   ```
 - [ ] **Step 4:** `cd crates/trusted-server-js/lib && npx vitest run && npm run format && node build-all.mjs`
-- [ ] **Step 5:** Manual: with `[debug].auction_html_comment` off, load a nav page; confirm the winning creative renders **without** a request to `hb_cache_host` (Network tab) and GAM still received `hb_pb`.
-- [ ] **Step 6: Commit** any format fixes.
+- [ ] **Step 5:** Docs format (these spec/plan docs changed): `cd docs && npm run format`
+- [ ] **Step 6:** Manual: with `[debug].auction_html_comment` off, load a nav page; confirm the winning creative renders **without** a request to `hb_cache_host` (Network tab) and GAM still received `hb_pb`.
+- [ ] **Step 7: Commit** any format fixes.
 
 ---
 
