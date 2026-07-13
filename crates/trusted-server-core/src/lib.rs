@@ -67,7 +67,6 @@ pub(crate) mod s3_sigv4;
 pub mod secret_resolution;
 pub mod settings;
 pub mod settings_data;
-pub mod storage;
 pub mod streaming_processor;
 pub mod streaming_replacer;
 pub mod test_support;
