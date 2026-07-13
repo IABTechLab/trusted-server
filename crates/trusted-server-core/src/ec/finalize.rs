@@ -16,6 +16,7 @@ use super::generation::{generate_ec_id, is_valid_ec_id};
 use super::kv::{apply_partner_id_updates, CreateIfAbsentOutcome, KvIdentityGraph};
 use super::kv_types::KvEntry;
 use super::prebid_eids::collect_eid_cookie_updates;
+use super::pull_sync_marker::{expire_marker, reconcile_marker};
 use super::registry::PartnerRegistry;
 use super::{current_timestamp, EcContext, EcKvSnapshot};
 
@@ -47,6 +48,7 @@ pub fn ec_finalize_response(
     sharedid_cookie: Option<&str>,
     response: &mut Response<EdgeBody>,
 ) {
+    ec_context.validate_pull_sync_marker(settings, registry);
     let consent_allows_ec = ec_consent_granted(ec_context.consent());
     let consent_withdrawn = ec_consent_withdrawn(ec_context.consent());
 
@@ -57,8 +59,12 @@ pub fn ec_finalize_response(
         // consent input.
         clear_ec_headers_on_response(response, Some(registry));
 
-        // Only expire the browser cookie and tombstone the identity-graph row
-        // when the request carries an explicit withdrawal signal.
+        if consent_withdrawn {
+            expire_marker(ec_context.pull_sync_marker_mut(), response);
+        }
+
+        // Only expire the EC cookie and tombstone the identity-graph row when
+        // explicit withdrawal accompanies an EC cookie.
         if consent_withdrawn && ec_context.cookie_was_present() {
             expire_ec_cookie(settings, response);
 
@@ -102,6 +108,8 @@ pub fn ec_finalize_response(
             }
         }
 
+        reconcile_pull_sync_marker(settings, registry, ec_context, response);
+
         // Ordinary returning-user page views no longer refresh the browser
         // cookie, emit the EC header, or update KV TTL.
         return;
@@ -113,6 +121,7 @@ pub fn ec_finalize_response(
     if ec_context.ec_generated() {
         let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value().map(str::to_owned)) else {
             log::info!("Skipping generated EC response write because KV graph is unavailable");
+            reconcile_pull_sync_marker(settings, registry, ec_context, response);
             return;
         };
 
@@ -129,6 +138,26 @@ pub fn ec_finalize_response(
             log::warn!("Skipping generated EC cookie because backing row is not authoritative");
         }
     }
+
+    reconcile_pull_sync_marker(settings, registry, ec_context, response);
+}
+
+fn reconcile_pull_sync_marker(
+    settings: &Settings,
+    registry: &PartnerRegistry,
+    ec_context: &mut EcContext,
+    response: &mut Response<EdgeBody>,
+) {
+    let ec_id = ec_context.ec_value().map(str::to_owned);
+    let snapshot = ec_context.kv_snapshot().clone();
+    reconcile_marker(
+        settings,
+        registry,
+        ec_id.as_deref(),
+        &snapshot,
+        ec_context.pull_sync_marker_mut(),
+        response,
+    );
 }
 
 fn recover_orphaned_ec(
@@ -979,6 +1008,104 @@ mod tests {
         assert!(
             graph.get(&cookie_ec).expect("should read store").is_none(),
             "a missing second ID must never be created by withdrawal"
+        );
+    }
+
+    #[test]
+    fn finalize_sets_marker_for_complete_pull_partner_snapshot() {
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("compl1");
+        let mut partner = make_partner("ssp.example.com");
+        partner.pull_sync_enabled = true;
+        partner.pull_sync_url = Some("https://sync.example.com/pull".to_owned());
+        partner.pull_sync_allowed_domains = vec!["sync.example.com".to_owned()];
+        partner.ts_pull_token = Some(Redacted::new("pull-token".to_owned()));
+        let registry = PartnerRegistry::from_config(&[partner]).expect("should build registry");
+        let mut ec_context = make_context(
+            Some(&ec_id),
+            Some(&ec_id),
+            true,
+            false,
+            Jurisdiction::NonRegulated,
+        );
+        let mut entry = live_entry();
+        entry.ids.insert(
+            "ssp.example.com".to_owned(),
+            crate::ec::kv_types::KvPartnerId {
+                uid: "partner-uid".to_owned(),
+            },
+        );
+        ec_context.set_kv_snapshot(EcKvSnapshot::Present {
+            ec_id,
+            entry: Box::new(entry),
+            generation: Some(1),
+        });
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            None,
+            &registry,
+            None,
+            None,
+            &mut response,
+        );
+
+        let cookies = response
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>();
+        assert!(
+            cookies
+                .iter()
+                .any(|cookie| cookie.starts_with("ts-ec-pull-complete=v1.")),
+            "complete snapshot should issue the marker"
+        );
+    }
+
+    #[test]
+    fn explicit_withdrawal_expires_marker_without_ec_cookie() {
+        let settings = create_test_settings();
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            gpc: true,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let mut ec_context = make_context_with_consent(None, None, false, false, consent);
+        ec_context.set_pull_sync_marker_for_test(
+            crate::ec::pull_sync_marker::PullSyncMarkerState::Invalid,
+        );
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            None,
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        let cookies = response
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>();
+        assert!(
+            cookies.iter().any(|cookie| {
+                cookie.starts_with("ts-ec-pull-complete=;") && cookie.contains("Max-Age=0")
+            }),
+            "withdrawal should expire the marker independently of EC cookie state"
+        );
+        assert!(
+            cookies.iter().all(|cookie| !cookie.starts_with("ts-ec=;")),
+            "missing EC cookie should not add an EC-cookie expiry"
         );
     }
 

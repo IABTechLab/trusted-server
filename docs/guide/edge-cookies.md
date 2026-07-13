@@ -230,6 +230,14 @@ The relevant OpenRTB structure forwarded to Prebid Server and downstream partner
 
 Server-resolved EIDs and current-request Prebid EIDs are deduplicated by `source + uid.id`. When a partner UID already exists in KV, pull sync does not periodically refresh it; browser-side Prebid sync can still replace the stored UID if a later `ts-eids` cookie carries a different value for the same configured partner source.
 
+### Pull-Sync Completeness Marker
+
+When the identity graph contains a UID for every pull-enabled partner, Trusted Server sets a signed, host-only `ts-ec-pull-complete` cookie. The cookie contains no partner UID or EC ID. It authenticates a one-hour expiration and a fingerprint of the current pull-partner source-domain set, bound to the active EC ID with key material derived from `ec.passphrase`.
+
+A valid marker avoids a KV lookup only when pull-sync completeness is the sole reason to inspect the row. Auctions that need stored EIDs, browser EID-cookie ingestion, explicit withdrawal, generation, and detected orphan recovery continue to use KV. Partner-set changes, passphrase rotation, malformed values, and expiration invalidate the marker and fall back to the normal KV path. The one-hour bound also limits how long deletion of a previously complete row can go undetected.
+
+Pull sync runs after response delivery, so a partner response that fills the last missing UID cannot set the marker on that already-sent response. A later eligible request verifies the completed row and issues the marker. Explicit withdrawal expires both `ts-ec` and `ts-ec-pull-complete` even when KV is unavailable.
+
 ## Configuration
 
 Configure EC settings in `trusted-server.toml`. See the full [Configuration Reference](/guide/configuration) for the `[ec]` section and environment variable overrides.

@@ -41,7 +41,7 @@ use crate::auction::types::{
     AuctionContext, AuctionRequest, Bid, DeviceInfo, PublisherInfo, SiteInfo, UserInfo,
 };
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
-use crate::constants::{COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
+use crate::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
 use crate::cookies::handle_request_cookies;
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::registry::PartnerRegistry;
@@ -765,13 +765,25 @@ fn request_head_snapshot(req: &Request<EdgeBody>) -> Request<EdgeBody> {
     snapshot
 }
 
-fn should_preload_ec_snapshot(
+#[derive(Clone, Copy)]
+struct EcSnapshotPreloadInput {
     is_navigation: bool,
     is_get: bool,
     has_ec_id: bool,
     has_kv: bool,
-) -> bool {
-    is_navigation && is_get && has_ec_id && has_kv
+    marker_valid: bool,
+    auction_needs_row: bool,
+    eid_cookie_may_need_persistence: bool,
+    snapshot_already_read: bool,
+}
+
+fn should_preload_ec_snapshot(input: &EcSnapshotPreloadInput) -> bool {
+    let eligible = input.is_navigation && input.is_get && input.has_ec_id && input.has_kv;
+    let marker_can_skip = input.marker_valid
+        && !input.auction_needs_row
+        && !input.eid_cookie_may_need_persistence
+        && !input.snapshot_already_read;
+    eligible && !marker_can_skip
 }
 
 /// Rewrites a downstream request into an outbound publisher-origin request.
@@ -1398,6 +1410,9 @@ pub async fn handle_publisher_request(
         .map(str::to_owned);
     let ec_id = ec_id_owned.as_deref();
     let cookie_jar = handle_request_cookies(&req)?;
+    if let Some(registry) = auction.registry {
+        ec_context.validate_pull_sync_marker(settings, registry);
+    }
     let geo = ec_context.geo_info().cloned();
 
     let parsed_origin = url::Url::parse(&settings.publisher.origin_url).change_context(
@@ -1505,8 +1520,25 @@ pub async fn handle_publisher_request(
 
     let auction_client_request = request_head_snapshot(&req);
     let mut origin_request = Some(req);
-    let should_preload_ec =
-        should_preload_ec_snapshot(is_navigation, is_get, ec_id.is_some(), kv.is_some());
+    let eid_cookie_may_need_persistence = cookie_jar
+        .as_ref()
+        .is_some_and(|jar| jar.get(COOKIE_TS_EIDS).is_some() || jar.get(COOKIE_SHAREDID).is_some());
+    let should_preload_ec = should_preload_ec_snapshot(&EcSnapshotPreloadInput {
+        is_navigation,
+        is_get,
+        has_ec_id: ec_id.is_some(),
+        has_kv: kv.is_some(),
+        marker_valid: ec_context.pull_sync_marker().is_valid(),
+        auction_needs_row: should_run_auction
+            && auction
+                .registry
+                .is_some_and(|registry| !registry.is_empty()),
+        eid_cookie_may_need_persistence,
+        snapshot_already_read: !matches!(
+            ec_context.kv_snapshot(),
+            crate::ec::EcKvSnapshot::NotRead
+        ),
+    });
     let mut pending_origin = None;
     if should_preload_ec && services.http_client().supports_concurrent_fanout() {
         let mut origin_req = origin_request.take().ok_or_else(|| {
@@ -2550,11 +2582,60 @@ mod tests {
 
     #[test]
     fn ec_snapshot_preload_requires_navigation_get_ec_and_kv() {
-        assert!(should_preload_ec_snapshot(true, true, true, true));
-        assert!(!should_preload_ec_snapshot(false, true, true, true));
-        assert!(!should_preload_ec_snapshot(true, false, true, true));
-        assert!(!should_preload_ec_snapshot(true, true, false, true));
-        assert!(!should_preload_ec_snapshot(true, true, true, false));
+        let baseline = EcSnapshotPreloadInput {
+            is_navigation: true,
+            is_get: true,
+            has_ec_id: true,
+            has_kv: true,
+            marker_valid: false,
+            auction_needs_row: false,
+            eid_cookie_may_need_persistence: false,
+            snapshot_already_read: false,
+        };
+        assert!(should_preload_ec_snapshot(&baseline));
+        assert!(!should_preload_ec_snapshot(&EcSnapshotPreloadInput {
+            is_navigation: false,
+            ..baseline
+        }));
+        assert!(!should_preload_ec_snapshot(&EcSnapshotPreloadInput {
+            is_get: false,
+            ..baseline
+        }));
+        assert!(!should_preload_ec_snapshot(&EcSnapshotPreloadInput {
+            has_ec_id: false,
+            ..baseline
+        }));
+        assert!(!should_preload_ec_snapshot(&EcSnapshotPreloadInput {
+            has_kv: false,
+            ..baseline
+        }));
+    }
+
+    #[test]
+    fn valid_marker_skips_only_when_no_other_consumer_needs_snapshot() {
+        let marker_only = EcSnapshotPreloadInput {
+            is_navigation: true,
+            is_get: true,
+            has_ec_id: true,
+            has_kv: true,
+            marker_valid: true,
+            auction_needs_row: false,
+            eid_cookie_may_need_persistence: false,
+            snapshot_already_read: false,
+        };
+        assert!(!should_preload_ec_snapshot(&marker_only));
+        assert!(should_preload_ec_snapshot(&EcSnapshotPreloadInput {
+            auction_needs_row: true,
+            ..marker_only
+        }));
+        assert!(should_preload_ec_snapshot(&EcSnapshotPreloadInput {
+            eid_cookie_may_need_persistence: true,
+            ..marker_only
+        }));
+        assert!(should_preload_ec_snapshot(&EcSnapshotPreloadInput {
+            snapshot_already_read: true,
+            ..marker_only
+        }));
     }
     use crate::auction::types::{AdFormat, AdSlot, MediaType};
     use crate::consent::ConsentContext;
@@ -2682,6 +2763,142 @@ mod tests {
             http_calls_at_lookup.load(Ordering::SeqCst),
             result.is_ok(),
         )
+    }
+
+    #[derive(Clone, Copy)]
+    enum MarkerProbe {
+        Valid,
+        Malformed,
+        WrongEc,
+        Expired,
+        PartnerSetMismatch,
+    }
+
+    fn marker_partner(source_domain: &str) -> crate::settings::EcPartner {
+        crate::settings::EcPartner {
+            name: format!("Marker partner {source_domain}"),
+            source_domain: source_domain.to_owned(),
+            openrtb_atype: crate::settings::EcPartner::default_openrtb_atype(),
+            bidstream_enabled: true,
+            api_token: crate::redacted::Redacted::new(format!(
+                "marker-{source_domain}-api-token-32-bytes-minimum"
+            )),
+            batch_rate_limit: crate::settings::EcPartner::default_batch_rate_limit(),
+            pull_sync_enabled: true,
+            pull_sync_url: Some(format!("https://sync.{source_domain}/pull")),
+            pull_sync_allowed_domains: vec![format!("sync.{source_domain}")],
+            pull_sync_ttl_sec: crate::settings::EcPartner::default_pull_sync_ttl_sec(),
+            pull_sync_rate_limit: crate::settings::EcPartner::default_pull_sync_rate_limit(),
+            ts_pull_token: Some(crate::redacted::Redacted::new("pull-token".to_owned())),
+        }
+    }
+
+    async fn run_marker_lookup_probe(probe: MarkerProbe, has_eid_cookie: bool) -> usize {
+        let mut settings = create_test_settings();
+        settings.ec.partners = vec![marker_partner("ssp.example.com")];
+        let registry = PartnerRegistry::from_config(&settings.ec.partners)
+            .expect("should build pull partner registry");
+        let http = Arc::new(StubHttpClient::new());
+        http.set_concurrent_fanout(true);
+        http.push_response(200, b"<html><body>ok</body></html>".to_vec());
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let graph = KvIdentityGraph::new(OrderRecordingKv {
+            inner: InMemoryEcKv::new("marker-store"),
+            http: Arc::clone(&http),
+            http_calls_at_lookup: Arc::new(AtomicUsize::new(0)),
+            lookups: Arc::clone(&lookups),
+        });
+        let services = build_services_with_http_client(
+            Arc::clone(&http) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let ec_id = format!("{}.CkId01", "b".repeat(64));
+        let marker = match probe {
+            MarkerProbe::Valid => {
+                crate::ec::pull_sync_marker::create_marker_for_test(&settings, &registry, &ec_id)
+            }
+            MarkerProbe::Malformed => "not-a-marker".to_owned(),
+            MarkerProbe::WrongEc => crate::ec::pull_sync_marker::create_marker_for_test(
+                &settings,
+                &registry,
+                &format!("{}.Other1", "c".repeat(64)),
+            ),
+            MarkerProbe::Expired => {
+                crate::ec::pull_sync_marker::create_marker_for_test_with_expiry(
+                    &settings,
+                    &registry,
+                    &ec_id,
+                    crate::ec::current_timestamp().saturating_sub(1),
+                )
+            }
+            MarkerProbe::PartnerSetMismatch => {
+                let other_registry =
+                    PartnerRegistry::from_config(&[marker_partner("other.example.com")])
+                        .expect("should build alternate registry");
+                crate::ec::pull_sync_marker::create_marker_for_test(
+                    &settings,
+                    &other_registry,
+                    &ec_id,
+                )
+            }
+        };
+        let mut ec_context = EcContext::new_for_test_with_ip(
+            Some(ec_id),
+            scheduling_consent(),
+            Some("203.0.113.7".to_owned()),
+        );
+        ec_context.set_pull_sync_marker_for_test(
+            crate::ec::pull_sync_marker::PullSyncMarkerState::from_cookie(Some(marker)),
+        );
+        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let mut request = navigation_request();
+        if has_eid_cookie {
+            request
+                .headers_mut()
+                .insert(header::COOKIE, HeaderValue::from_static("ts-eids=present"));
+        }
+
+        let result = handle_publisher_request(
+            &settings,
+            &services,
+            Some(&graph),
+            &mut ec_context,
+            AuctionDispatch {
+                orchestrator: &orchestrator,
+                slots: &[],
+                registry: Some(&registry),
+            },
+            request,
+        )
+        .await;
+
+        assert!(result.is_ok(), "should proxy the origin response");
+        lookups.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn valid_completeness_marker_skips_pull_only_snapshot_lookup() {
+        assert_eq!(run_marker_lookup_probe(MarkerProbe::Valid, false).await, 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_markers_fall_back_to_snapshot_lookup() {
+        for probe in [
+            MarkerProbe::Malformed,
+            MarkerProbe::WrongEc,
+            MarkerProbe::Expired,
+            MarkerProbe::PartnerSetMismatch,
+        ] {
+            assert_eq!(
+                run_marker_lookup_probe(probe, false).await,
+                1,
+                "invalid marker should retain the normal preload"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_marker_does_not_skip_eid_cookie_persistence_lookup() {
+        assert_eq!(run_marker_lookup_probe(MarkerProbe::Valid, true).await, 1);
     }
 
     #[tokio::test]

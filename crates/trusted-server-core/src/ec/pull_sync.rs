@@ -22,6 +22,7 @@ use crate::settings::Settings;
 use super::generation::{ec_hash, is_valid_ec_id};
 use super::kv::{KvIdentityGraph, PartnerIdUpdate};
 use super::kv_types::KvEntry;
+use super::pull_sync_marker::entry_is_pull_complete;
 use super::rate_limiter::RateLimiter;
 use super::registry::{PartnerConfig, PartnerRegistry};
 
@@ -59,14 +60,22 @@ struct PullSyncResponse {
 ///
 /// Returns `None` when consent denies EC or there is no active EC ID.
 #[must_use]
-pub fn build_pull_sync_context(ec_context: &EcContext) -> Option<PullSyncContext> {
-    if !ec_context.ec_allowed() {
+pub fn build_pull_sync_context(
+    ec_context: &EcContext,
+    registry: &PartnerRegistry,
+) -> Option<PullSyncContext> {
+    if registry.pull_enabled_partners().is_empty() || !ec_context.ec_allowed() {
         return None;
     }
 
     let ec_id_ref = ec_context.ec_value()?;
     if !is_valid_ec_id(ec_id_ref) {
         log::debug!("Pull sync: skipping dispatch because active EC ID is invalid format");
+        return None;
+    }
+
+    let entry = ec_context.kv_snapshot().entry_for(ec_id_ref)?;
+    if !entry.consent.ok || entry_is_pull_complete(entry, registry) {
         return None;
     }
 
@@ -92,14 +101,18 @@ pub fn dispatch_pull_sync(
     services: &RuntimeServices,
 ) {
     let now = current_timestamp();
+    let mut pull_partners = registry.pull_enabled_partners();
+
+    if pull_partners.is_empty() {
+        return;
+    }
+
     let Some(kv_entry) = context.snapshot.entry_for(context.ec_id()) else {
         return;
     };
     if !kv_entry.consent.ok {
         return;
     }
-
-    let mut pull_partners = registry.pull_enabled_partners();
 
     // Sort by source domain for deterministic ordering, then apply a rotating
     // hourly offset so that different partners get dispatch priority (§10.3).
@@ -109,10 +122,6 @@ pub fn dispatch_pull_sync(
         "Pull sync: {} pull-enabled partners after filtering",
         pull_partners.len(),
     );
-
-    if pull_partners.is_empty() {
-        return;
-    }
 
     // Rotate the partner list so that the starting partner changes each
     // hour. This ensures fair distribution when max_concurrency limits
@@ -493,9 +502,13 @@ mod tests {
             ..ConsentContext::default()
         };
         let ec_id = format!("{}.ABC123", "a".repeat(64));
-        let ec_context = EcContext::new_for_test(Some(ec_id), consent);
+        let mut ec_context = EcContext::new_for_test(Some(ec_id.clone()), consent);
+        let graph = KvIdentityGraph::in_memory("pull_store");
+        ec_context.set_kv_snapshot(seed_present_snapshot(&graph, &ec_id));
+        let registry = PartnerRegistry::from_config(&[pull_enabled_ec_partner("ssp.example.com")])
+            .expect("should build registry");
 
-        let context = build_pull_sync_context(&ec_context)
+        let context = build_pull_sync_context(&ec_context, &registry)
             .expect("should build pull sync context for valid EC");
         assert_eq!(
             context.ec_id(),
@@ -511,11 +524,50 @@ mod tests {
             ..ConsentContext::default()
         };
         let ec_context = EcContext::new_for_test(Some("invalid-ec".to_owned()), consent);
+        let registry = PartnerRegistry::from_config(&[pull_enabled_ec_partner("ssp.example.com")])
+            .expect("should build registry");
 
-        let context = build_pull_sync_context(&ec_context);
+        let context = build_pull_sync_context(&ec_context, &registry);
         assert!(
             context.is_none(),
             "should reject pull sync context when EC ID format is invalid"
+        );
+    }
+
+    #[test]
+    fn build_pull_sync_context_skips_empty_registry_and_complete_snapshot() {
+        let consent = ConsentContext {
+            jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+            ..ConsentContext::default()
+        };
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mut ec_context = EcContext::new_for_test(Some(ec_id.clone()), consent);
+        let graph = KvIdentityGraph::in_memory("pull_store");
+        let mut snapshot = seed_present_snapshot(&graph, &ec_id);
+        let registry = PartnerRegistry::from_config(&[pull_enabled_ec_partner("ssp.example.com")])
+            .expect("should build registry");
+
+        assert!(
+            build_pull_sync_context(&ec_context, &PartnerRegistry::empty()).is_none(),
+            "no pull partners should skip before graph construction"
+        );
+        assert!(
+            build_pull_sync_context(&ec_context, &registry).is_none(),
+            "an unread snapshot should skip before graph construction"
+        );
+
+        if let EcKvSnapshot::Present { entry, .. } = &mut snapshot {
+            entry.ids.insert(
+                "ssp.example.com".to_owned(),
+                crate::ec::kv_types::KvPartnerId {
+                    uid: "uid".to_owned(),
+                },
+            );
+        }
+        ec_context.set_kv_snapshot(snapshot);
+        assert!(
+            build_pull_sync_context(&ec_context, &registry).is_none(),
+            "a complete snapshot should skip post-send work"
         );
     }
 
@@ -820,6 +872,69 @@ mod tests {
             generation, 2,
             "two partner responses across batches must persist in exactly one bulk write"
         );
+    }
+
+    #[test]
+    fn dispatch_pull_sync_calls_and_persists_only_missing_partner() {
+        let mut settings = create_test_settings();
+        settings.ec.pull_sync_concurrency = 4;
+        let registry = PartnerRegistry::from_config(&[
+            pull_enabled_ec_partner("alpha.example.com"),
+            pull_enabled_ec_partner("beta.example.com"),
+        ])
+        .expect("should build pull registry");
+        let graph = KvIdentityGraph::in_memory("pull_store");
+        let ec_id = snapshot_ec_id();
+        graph
+            .create(
+                &ec_id,
+                &KvEntry::minimal("alpha.example.com", "existing-alpha", 1_000),
+            )
+            .expect("should seed partial entry");
+        let snapshot = graph.load_snapshot(&ec_id);
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, br#"{"uid":"new-beta"}"#.to_vec());
+        let services = build_services_with_http_client(stub.clone());
+        let context = PullSyncContext {
+            ec_id: ec_id.clone(),
+            snapshot,
+        };
+
+        dispatch_pull_sync(
+            &settings,
+            &graph,
+            &registry,
+            &AllowAllRateLimiter,
+            &context,
+            &services,
+        );
+
+        assert_eq!(
+            stub.recorded_backend_names().len(),
+            1,
+            "should call only the missing partner"
+        );
+        let (entry, generation) = graph
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("entry should exist");
+        assert_eq!(
+            entry
+                .ids
+                .get("alpha.example.com")
+                .map(|partner_id| partner_id.uid.as_str()),
+            Some("existing-alpha"),
+            "existing UID should remain unchanged"
+        );
+        assert_eq!(
+            entry
+                .ids
+                .get("beta.example.com")
+                .map(|partner_id| partner_id.uid.as_str()),
+            Some("new-beta"),
+            "missing UID should persist"
+        );
+        assert_eq!(generation, 2, "missing UID should use one bulk CAS write");
     }
 
     #[test]
