@@ -4,7 +4,7 @@
 
 **Goal:** Render SSAT-winning creatives from the copy trusted-server already holds (no render-time PBS Cache round trip), while keeping GAM in the loop.
 
-**Architecture:** Always include the winning `adm` in `window.tsjs.bids` so the existing `installTsRenderBridge` serves it locally when GAM's Prebid Universal Creative fires. Keep `hb_cache_*` as the fallback for an *absent* `adm`. Keep the verbose `debug_bid` blob behind the testing flag, and gate the GAM-bypass path (`injectAdmIntoSlot`) on the per-bid `debug_bid` field — no global flag, no `TsjsApi` change.
+**Architecture:** Always include the winning `adm` in `window.tsjs.bids` so the existing `installTsRenderBridge` serves it locally when GAM's Prebid Universal Creative fires. Keep `hb_cache_*` as the fallback for an _absent_ `adm`. Keep the verbose `debug_bid` blob behind the testing flag, and gate the GAM-bypass path (`injectAdmIntoSlot`) on the per-bid `debug_bid` field — no global flag, no `TsjsApi` change.
 
 **Tech Stack:** Rust (`trusted-server-core`, wasm32-wasip1 via Viceroy), TypeScript (`trusted-server-js`, vitest).
 
@@ -14,17 +14,18 @@
 
 ## File Structure
 
-| File | Responsibility | Change |
-| --- | --- | --- |
-| `crates/trusted-server-core/src/publisher.rs` | Build `window.tsjs.bids` | Always insert `adm`; rename `include_adm`→`include_debug_bid` (gates only the blob) |
-| `crates/trusted-server-js/lib/src/integrations/gpt/index.ts` | Client render paths | Gate `injectAdmIntoSlot` on `bid.adm && bid.debug_bid` |
-| `crates/trusted-server-js/lib/test/integrations/gpt/ad_init.test.ts` | JS tests | Rename "debug adm"→"inline/local adm"; add bypass-gate test |
+| File                                                                 | Responsibility           | Change                                                                              |
+| -------------------------------------------------------------------- | ------------------------ | ----------------------------------------------------------------------------------- |
+| `crates/trusted-server-core/src/publisher.rs`                        | Build `window.tsjs.bids` | Always insert `adm`; rename `include_adm`→`include_debug_bid` (gates only the blob) |
+| `crates/trusted-server-js/lib/src/integrations/gpt/index.ts`         | Client render paths      | Gate `injectAdmIntoSlot` on `bid.adm && bid.debug_bid`                              |
+| `crates/trusted-server-js/lib/test/integrations/gpt/ad_init.test.ts` | JS tests                 | Rename "debug adm"→"inline/local adm"; add bypass-gate test                         |
 
 ---
 
 ## Task 1: `build_bid_map` — always include `adm`, gate only `debug_bid`
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/publisher.rs` (`build_bid_map` ~1933; `write_bids_to_state` ~846; callers)
 - Test: same file, `#[cfg(test)] mod tests`
 
@@ -100,6 +101,7 @@ pub(crate) fn build_bid_map(
 ## Task 2: Escaping regression — hostile `adm` cannot break out of `<script>`
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/publisher.rs` tests
 
 - [ ] **Step 1: Write test** — a `</script>` + `U+2028` adm is neutralized in the emitted script.
@@ -136,10 +138,11 @@ Run: `cargo test-fastly build_bids_script_escapes_hostile_adm`
 ## Task 3: Gate the GAM-bypass (`injectAdmIntoSlot`) on `bid.debug_bid`
 
 **Files:**
+
 - Modify: `crates/trusted-server-js/lib/src/integrations/gpt/index.ts:~599`
 - Test: `crates/trusted-server-js/lib/test/integrations/gpt/ad_init.test.ts`
 
-- [ ] **Step 1: Write failing vitest — observable behavior (not a spy).** `injectAdmIntoSlot` is module-private, so assert its *effect* on the DOM:
+- [ ] **Step 1: Write failing vitest — observable behavior (not a spy).** `injectAdmIntoSlot` is module-private, so assert its _effect_ on the DOM:
 
 ```ts
 // Setup:
@@ -159,7 +162,7 @@ Run: `cargo test-fastly build_bids_script_escapes_hostile_adm`
 // when inject_adm_for_testing is on, so it doubles as the per-bid gate — no
 // global flag needed, and it is correct across SPA auction responses.
 if (bid.adm && bid.debug_bid) {
-  injectAdmIntoSlot(divId, bid.adm);
+  injectAdmIntoSlot(divId, bid.adm)
 }
 ```
 
@@ -174,6 +177,7 @@ if (bid.adm && bid.debug_bid) {
 ## Task 4: Reconcile existing bridge tests (no duplicates)
 
 **Files:**
+
 - Modify: `crates/trusted-server-js/lib/test/integrations/gpt/ad_init.test.ts`
 
 `ad_init.test.ts` already covers: PBS Cache fetch when `adm` absent; local `adm`
@@ -208,7 +212,8 @@ concurrency + beacon dedup. Do **not** duplicate them.
 ---
 
 ## Notes
-- Do NOT remove `hb_cache_host`/`hb_cache_path` — they are the fallback for an **absent** `adm`. Render failure *after* `adm` is supplied is not detectable and does not fall back (spec Risks).
+
+- Do NOT remove `hb_cache_host`/`hb_cache_path` — they are the fallback for an **absent** `adm`. Render failure _after_ `adm` is supplied is not detectable and does not fall back (spec Risks).
 - Do NOT ship the `debug_bid` blob in production (Task 1 keeps it behind the flag).
 - No global `window.tsjs` flag, no `TsjsApi` change — the bypass gate is the per-bid `debug_bid`.
 - Page-weight cost (inline creatives, uncacheable response) accepted per spec; size-capping out of scope.

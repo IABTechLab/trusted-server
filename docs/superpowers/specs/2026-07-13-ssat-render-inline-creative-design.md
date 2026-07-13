@@ -14,7 +14,7 @@ time from PBS Cache:
 https://<hb_cache_host><hb_cache_path>?uuid=<hb_adid>
 ```
 
-This is an extra network round trip *after* the GAM call, even though
+This is an extra network round trip _after_ the GAM call, even though
 trusted-server already holds the winning creative markup (`bid.creative`) from
 the server-side auction it just ran. The client-side `/auction` flow never does
 this — Prebid.js renders the winner from the copy it already has in the browser.
@@ -27,7 +27,7 @@ while keeping GAM in the loop (the header bid still competes against GAM's own
 demand via `hb_pb`).
 
 Non-goal: bypassing GAM. SSAT winners must still compete in GAM; we only remove
-the round trip that happens *after* GAM has already picked the TS line item.
+the round trip that happens _after_ GAM has already picked the TS line item.
 
 ## Current flow (verified in code)
 
@@ -47,7 +47,7 @@ the round trip that happens *after* GAM has already picked the TS line item.
    - **fetches from PBS Cache** using `hb_cache_host`/`hb_cache_path` (the round
      trip we want to remove).
 5. A separate consumer, `injectAdmIntoSlot` ([gpt/index.ts:599]), fires on
-   `if (bid.adm)` and **replaces the GAM creative directly** — a GAM *bypass*.
+   `if (bid.adm)` and **replaces the GAM creative directly** — a GAM _bypass_.
    Its "testing only" status is a comment, not an actual gate.
 
 ## Design
@@ -55,6 +55,7 @@ the round trip that happens *after* GAM has already picked the TS line item.
 ### 1. Always include the render `adm`; keep `debug_bid` gated
 
 `build_bid_map`:
+
 - **Always** insert `adm` (from `bid.creative`) for a winner when present —
   there is no runtime reason to withhold it, so it is not parameterized.
 - Insert the verbose `debug_bid` blob **only** when the testing flag is set. The
@@ -62,7 +63,7 @@ the round trip that happens *after* GAM has already picked the TS line item.
 
 `hb_cache_host`/`hb_cache_path` remain inserted unconditionally.
 
-### 2. Bridge renders local `adm`; cache is the fallback for an *absent* `adm`
+### 2. Bridge renders local `adm`; cache is the fallback for an _absent_ `adm`
 
 `installTsRenderBridge` already prefers `matchedBid.adm` and falls back to PBS
 Cache. Once `adm` is present in production, the local render becomes the default
@@ -70,7 +71,7 @@ and the round trip disappears.
 
 **Fallback scope (corrected):** the bridge posts the markup to the PUC and
 returns; it receives **no render-success signal**. So the PBS Cache fallback
-fires only when `adm` is **absent or empty** — *not* when `adm` is present but
+fires only when `adm` is **absent or empty** — _not_ when `adm` is present but
 fails to render. Render failures after `adm` is supplied are not currently
 detectable and do not trigger fallback.
 
@@ -84,7 +85,7 @@ the bypass on the per-bid `debug_bid` field, which is already present **iff**
 
 ```ts
 if (bid.adm && bid.debug_bid) {
-  injectAdmIntoSlot(divId, bid.adm);
+  injectAdmIntoSlot(divId, bid.adm)
 }
 ```
 
@@ -106,12 +107,12 @@ Universal Creative implementation, not on TS.
 
 ## Components changed
 
-| Unit | Change |
-| --- | --- |
-| `build_bid_map` (Rust) | Always insert `adm` when `bid.creative` is `Some`. Rename `include_adm` → `include_debug_bid`, gating only the `debug_bid` blob. |
-| `build_bid_map` callers | Pass `include_debug_bid = inject_adm_for_testing`. |
-| `gpt/index.ts` `injectAdmIntoSlot` call site | Gate on `bid.adm && bid.debug_bid`. |
-| bridge/`ad_init` tests (JS) | Rename "debug adm" → "inline/local adm"; confirm existing coverage. |
+| Unit                                         | Change                                                                                                                           |
+| -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `build_bid_map` (Rust)                       | Always insert `adm` when `bid.creative` is `Some`. Rename `include_adm` → `include_debug_bid`, gating only the `debug_bid` blob. |
+| `build_bid_map` callers                      | Pass `include_debug_bid = inject_adm_for_testing`.                                                                               |
+| `gpt/index.ts` `injectAdmIntoSlot` call site | Gate on `bid.adm && bid.debug_bid`.                                                                                              |
+| bridge/`ad_init` tests (JS)                  | Rename "debug adm" → "inline/local adm"; confirm existing coverage.                                                              |
 
 No `build_bids_script` change, no `window.tsjs` flag, no `TsjsApi` change.
 
@@ -129,7 +130,7 @@ SSAT auction → winner (bid.creative held) → build_bid_map inserts adm
 
 ## Precondition
 
-This changes only the render bridge's *data source* — local `adm` vs a PBS Cache
+This changes only the render bridge's _data source_ — local `adm` vs a PBS Cache
 fetch — **when GAM's Prebid line item already serves the PUC**. It does not
 change GAM competition, nor whether the PUC fires. A publisher without Prebid
 line items in GAM sees no behavioral change.
