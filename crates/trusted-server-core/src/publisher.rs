@@ -855,12 +855,23 @@ pub(crate) fn write_bids_to_state(
     *ad_bids_state.lock().expect("should lock bid state") = Some(bids_script);
 }
 
-/// Prepend an HTML comment summarising the auction result onto the shared
-/// `ad_bids_state` so it lands directly before the injected bids `<script>`.
+/// Maximum serialized size (in bytes) of a dump embedded in the `ts-debug`
+/// comment. A PBS response with many bids can carry megabytes of creative
+/// markup; cap it so leaving
+/// [`auction_html_comment`](crate::settings::DebugConfig::auction_html_comment)
+/// enabled cannot bloat every page render without bound.
+const MAX_AUCTION_DEBUG_DUMP_BYTES: usize = 256 * 1024;
+
+/// Prepend a `<!-- ts-debug: ... -->` HTML comment carrying the full auction
+/// result — pipeline stats plus every provider response, including each bid's
+/// raw `adm` creative markup — onto the shared `ad_bids_state` so it lands
+/// directly before the injected bids `<script>`. Gated by
+/// [`auction_html_comment`](crate::settings::DebugConfig::auction_html_comment);
+/// never enable in production.
 ///
 /// `path_label` differentiates the streaming-with-auction-hold path (`stream`)
-/// from the buffered path (`buffered`) in the resulting `<!-- ts-debug: -->`
-/// marker so on-page debugging can tell which code path produced the bids.
+/// from the buffered path (`buffered`) in the marker so on-page debugging can
+/// tell which code path produced the bids.
 pub(crate) fn prepend_auction_debug_comment(
     path_label: &str,
     result: &crate::auction::orchestrator::OrchestrationResult,
@@ -871,27 +882,47 @@ pub(crate) fn prepend_auction_debug_comment(
         Some(r) => format!("ok({}_bids)", r.bids.len()),
         None => "none".to_string(),
     };
-    // Full per-provider (and mediator) dump so the operator can see exactly what
-    // each SSP returned — `status` (nobid vs error vs success), every `bids`
-    // entry, and `metadata` (which carries PBS `ext.errors` / `ext.debug.httpcalls`
-    // when prebid `debug=true`) — without needing log access.
+    // Full per-provider dump so the operator can see exactly what each SSP
+    // returned — `status` (nobid vs error vs success), every `bids` entry, and
+    // `metadata` — without needing log access.
     //
     // `Bid.creative` and provider metadata are attacker/partner-influenced and
-    // may contain `-->` (or the `--!>` variant), which would terminate the HTML
-    // comment early and leak the remaining markup into the live DOM. Neutralise
-    // both terminators before embedding so the dump stays inside the comment.
-    let neutralise_comment_terminators =
-        |json: String| -> String { json.replace("-->", "-- >").replace("--!>", "-- !>") };
-    let providers_dump = serde_json::to_string_pretty(&result.provider_responses)
-        .map(neutralise_comment_terminators)
+    // may contain an HTML5 comment terminator (`-->`, or the `--!>`
+    // comment-end-bang variant), which would end the comment early and leak the
+    // remaining markup into the live DOM. Neutralise both, then cap the size so
+    // a large SSP response cannot bloat the page.
+    //
+    // NB: a single `replace("--", …)` is deliberately NOT used — because
+    // `str::replace` is non-overlapping, it re-forms a live `-->` / `--!>` at
+    // the junction of an odd dash-run (`--->` -> `- -->`, `----->` -> `- -- -->`),
+    // reintroducing exactly the terminator we are trying to remove. The two
+    // targeted replacements below cannot re-form either sequence.
+    let render_dump = |json: String| -> String {
+        let neutralised = json.replace("-->", "-- >").replace("--!>", "-- !>");
+        if neutralised.len() > MAX_AUCTION_DEBUG_DUMP_BYTES {
+            let end = neutralised.floor_char_boundary(MAX_AUCTION_DEBUG_DUMP_BYTES);
+            format!("{}…(truncated)", &neutralised[..end])
+        } else {
+            neutralised
+        }
+    };
+    let providers_dump = serde_json::to_string(&result.provider_responses)
+        .map(render_dump)
         .unwrap_or_else(|e| format!("<provider_responses serialize error: {e}>"));
-    let mediator_dump = serde_json::to_string_pretty(&result.mediator_response)
-        .map(neutralise_comment_terminators)
-        .unwrap_or_else(|e| format!("<mediator_response serialize error: {e}>"));
+    // Only dump the mediator response when one actually ran; otherwise the
+    // `mediator=none` on the summary line already conveys it.
+    let mediator_line = match &result.mediator_response {
+        Some(_) => {
+            let dump = serde_json::to_string(&result.mediator_response)
+                .map(render_dump)
+                .unwrap_or_else(|e| format!("<mediator_response serialize error: {e}>"));
+            format!("\nmediator_response={dump}")
+        }
+        None => String::new(),
+    };
     let debug_comment = format!(
         "<!-- ts-debug: path={path_label} ssp={ssp_count} mediator={mediator_info} winning={} time={}ms\n\
-         provider_responses={providers_dump}\n\
-         mediator_response={mediator_dump}\n\
+         provider_responses={providers_dump}{mediator_line}\n\
          -->",
         result.winning_bids.len(),
         result.total_time_ms,
@@ -2457,57 +2488,17 @@ mod tests {
     use flate2::write::GzEncoder;
 
     use super::*;
+    use crate::auction::orchestrator::OrchestrationResult;
+    use crate::auction::types::AuctionResponse;
     use crate::auction::types::{AdFormat, AdSlot, MediaType};
     use crate::integrations::IntegrationRegistry;
-
-    #[test]
-    fn auction_debug_comment_dumps_provider_status_and_neutralises_terminators() {
-        use crate::auction::orchestrator::OrchestrationResult;
-        use crate::auction::types::AuctionResponse;
-
-        // One provider that returned nothing (the `winning=0` case) and one that
-        // returned a bid whose creative embeds an HTML-comment terminator.
-        let no_bid = AuctionResponse::no_bid("prebid", 665);
-        let mut bid = make_test_bid_with_creative("<div>evil-->break</div>");
-        bid.slot_id = "ad-header-0".to_string();
-        let with_bid = AuctionResponse::success("aps", vec![bid], 42);
-
-        let result = OrchestrationResult {
-            provider_responses: vec![no_bid, with_bid],
-            mediator_response: None,
-            winning_bids: std::collections::HashMap::new(),
-            total_time_ms: 665,
-            metadata: std::collections::HashMap::new(),
-        };
-
-        let state = Arc::new(Mutex::new(Some("BIDS_SCRIPT".to_string())));
-        prepend_auction_debug_comment("stream", &result, &state);
-        let comment = state
-            .lock()
-            .expect("should lock state")
-            .clone()
-            .expect("should have comment");
-
-        assert!(
-            comment.contains("\"status\": \"nobid\""),
-            "should surface the no-bid provider status: {comment}"
-        );
-        assert!(
-            comment.contains("provider_responses="),
-            "should dump the provider_responses payload"
-        );
-        // The creative's `-->` must be neutralised so the only comment terminator
-        // is the trailing one — otherwise embedded markup would leak into the DOM.
-        assert_eq!(
-            comment.matches("-->").count(),
-            1,
-            "creative `-->` must be neutralised, leaving only the closing terminator: {comment}"
-        );
-        assert!(
-            comment.contains("evil-- >break"),
-            "should retain the creative content with the terminator neutralised"
-        );
-    }
+    use crate::platform::test_support::{
+        build_services_with_http_client, noop_services, StubHttpClient,
+    };
+    use crate::test_support::tests::create_test_settings;
+    use edgezero_core::body::Body as EdgeBody;
+    use http::{header, Method, Request as HttpRequest, StatusCode};
+    use std::sync::Arc;
 
     fn make_test_bid_with_creative(creative: &str) -> Bid {
         Bid {
@@ -2529,13 +2520,75 @@ mod tests {
         }
     }
 
-    use crate::platform::test_support::{
-        build_services_with_http_client, noop_services, StubHttpClient,
-    };
-    use crate::test_support::tests::create_test_settings;
-    use edgezero_core::body::Body as EdgeBody;
-    use http::{header, Method, Request as HttpRequest, StatusCode};
-    use std::sync::Arc;
+    /// Build the ts-debug comment for a one-bid auction whose creative is
+    /// `creative`, so tests can assert on the rendered dump.
+    fn dump_comment_for_creative(creative: &str) -> String {
+        let mut bid = make_test_bid_with_creative(creative);
+        bid.slot_id = "ad-header-0".to_string();
+        let result = OrchestrationResult {
+            provider_responses: vec![
+                AuctionResponse::no_bid("prebid", 665),
+                AuctionResponse::success("aps", vec![bid], 42),
+            ],
+            mediator_response: None,
+            winning_bids: std::collections::HashMap::new(),
+            total_time_ms: 665,
+            metadata: std::collections::HashMap::new(),
+        };
+        let state = Arc::new(Mutex::new(Some("BIDS_SCRIPT".to_string())));
+        prepend_auction_debug_comment("stream", &result, &state);
+        let comment = state
+            .lock()
+            .expect("should lock state")
+            .clone()
+            .expect("should have comment");
+        comment
+    }
+
+    #[test]
+    fn auction_debug_comment_dumps_provider_status() {
+        let comment = dump_comment_for_creative("<div>plain</div>");
+        // Compact (non-pretty) JSON: `"status":"nobid"` with no spaces.
+        assert!(
+            comment.contains("\"status\":\"nobid\""),
+            "should surface the no-bid provider status: {comment}"
+        );
+        assert!(
+            comment.contains("provider_responses="),
+            "should dump the provider_responses payload"
+        );
+        // No mediator ran, so its line is omitted (mediator=none already says so).
+        assert!(
+            !comment.contains("mediator_response="),
+            "should omit mediator_response when no mediator ran: {comment}"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_neutralises_every_comment_terminator_vector() {
+        // Each vector reaches HTML5 comment-end state via a distinct tokenizer
+        // path. A single `replace("--", …)` would re-form a terminator on the
+        // odd-dash-run cases; the targeted two-replace must leave the comment's
+        // own trailing `-->` as the only surviving terminator and drop `--!>`.
+        for creative in [
+            "<div>evil-->break</div>",
+            "--!><img src=x onerror=alert(1)>",
+            "<!--><img src=x onerror=alert(1)>",
+            "<!--!><img src=x onerror=alert(1)>",
+            "----!><img src=x onerror=alert(1)>",
+        ] {
+            let comment = dump_comment_for_creative(creative);
+            assert_eq!(
+                comment.matches("-->").count(),
+                1,
+                "exactly one `-->` (the terminator) must survive for {creative:?}: {comment}"
+            );
+            assert!(
+                !comment.contains("--!>"),
+                "the `--!>` nested terminator must not survive for {creative:?}: {comment}"
+            );
+        }
+    }
 
     struct ChunkedReader {
         chunks: std::collections::VecDeque<Vec<u8>>,

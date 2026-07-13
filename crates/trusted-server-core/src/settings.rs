@@ -1901,9 +1901,11 @@ pub struct DebugConfig {
     #[serde(default)]
     pub ja4_endpoint_enabled: bool,
 
-    /// Inject a `<!-- ts-debug: ... -->` HTML comment before `</body>` showing
-    /// auction pipeline stats (SSP count, mediator status, winning bid count).
-    /// Never enable in production — visible in page source.
+    /// Inject a `<!-- ts-debug: ... -->` HTML comment before `</body>` dumping
+    /// the full per-provider auction result: pipeline stats (SSP count, mediator
+    /// status, winning bid count) plus every provider response — including each
+    /// bid's raw `adm` creative markup and provider metadata. Never enable in
+    /// production — visible in page source and injects raw HTML from SSPs.
     #[serde(default)]
     pub auction_html_comment: bool,
 

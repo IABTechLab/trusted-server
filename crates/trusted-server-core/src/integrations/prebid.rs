@@ -2123,24 +2123,25 @@ impl AuctionProvider for PrebidAuctionProvider {
         })?;
 
         if !status.is_success() {
-            log::warn!("Prebid returned non-success status: {}", status,);
             let body_preview = String::from_utf8_lossy(&body_bytes);
-            if log::log_enabled!(log::Level::Trace) {
-                log::trace!(
-                    "Prebid error response body: {}",
-                    &body_preview[..body_preview.floor_char_boundary(1000)]
-                );
-            }
-            // Surface the HTTP status and a body snippet on the response metadata
-            // so the ts-debug auction dump shows *why* prebid errored (e.g. a 4xx
-            // from a PBS that rejects the unsigned server-side request) without
-            // needing log access. A bare `AuctionResponse::error` yields empty
-            // metadata, which is indistinguishable from other failures in the dump.
-            let body_snippet = body_preview[..body_preview.floor_char_boundary(512)].to_string();
+            // SECURITY: the PBS response body is upstream-controlled and may leak
+            // internal detail (hostnames, stack traces, auth hints). Per the
+            // invariant documented in `auction/orchestrator.rs`, it MUST NOT reach
+            // the public `/auction` response, which happens if it lands in
+            // `AuctionResponse.metadata` (cloned verbatim into
+            // `ext.orchestrator.provider_details[].metadata`). Log the snippet
+            // server-side and surface only the numeric HTTP status — enough for an
+            // operator to tell an error from a no-bid without publishing the body.
+            log::warn!(
+                "Prebid returned non-success status {status}: {}",
+                &body_preview[..body_preview.floor_char_boundary(512)]
+            );
             return Ok(AuctionResponse::error("prebid", response_time_ms)
-                .with_metadata("error_type", serde_json::json!("http_status"))
-                .with_metadata("status", serde_json::json!(status.as_u16()))
-                .with_metadata("body", serde_json::json!(body_snippet)));
+                .with_metadata(
+                    "error_type",
+                    serde_json::json!(crate::auction::orchestrator::ERROR_TYPE_HTTP_STATUS),
+                )
+                .with_metadata("status", serde_json::json!(status.as_u16())));
         }
 
         let response_json: Json =
@@ -2242,7 +2243,8 @@ mod tests {
     use super::*;
     use crate::auction::test_support::create_test_auction_context as shared_test_auction_context;
     use crate::auction::types::{
-        AdFormat, AdSlot, AuctionContext, AuctionRequest, DeviceInfo, PublisherInfo, UserInfo,
+        AdFormat, AdSlot, AuctionContext, AuctionRequest, BidStatus, DeviceInfo, PublisherInfo,
+        UserInfo,
     };
 
     use crate::consent::{ConsentContext, ConsentSource};
@@ -2351,14 +2353,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_response_attaches_status_and_body_metadata_on_http_error() {
-        use crate::auction::types::BidStatus;
-
+    fn parse_response_attaches_status_metadata_without_leaking_body_on_http_error() {
         let provider = PrebidAuctionProvider::new(base_config());
         let response = PlatformResponse::new(
             edgezero_core::http::response_builder()
                 .status(403)
-                .body(EdgeBody::from(br#"{"error":"missing signature"}"#.to_vec()))
+                .body(EdgeBody::from(
+                    br#"{"error":"upstream-secret-detail"}"#.to_vec(),
+                ))
                 .expect("should build test response"),
         );
 
@@ -2373,18 +2375,24 @@ mod tests {
         assert_eq!(
             result.metadata["error_type"],
             json!("http_status"),
-            "should tag the error path so the auction dump is distinguishable"
+            "should tag the error path so telemetry buckets it as an http status error"
         );
         assert_eq!(
             result.metadata["status"],
             json!(403),
             "should surface the upstream HTTP status code"
         );
+        // SECURITY: the upstream response body must never reach the public
+        // /auction response via AuctionResponse.metadata.
         assert!(
-            result.metadata["body"]
+            !result.metadata.contains_key("body"),
+            "upstream response body must not be surfaced on the response metadata"
+        );
+        assert!(
+            !result.metadata.values().any(|v| v
                 .as_str()
-                .is_some_and(|body| body.contains("missing signature")),
-            "should include the response body snippet"
+                .is_some_and(|s| s.contains("upstream-secret-detail"))),
+            "no metadata value may contain the upstream body"
         );
     }
 

@@ -800,6 +800,7 @@ fn provider_status(response: &AuctionResponse) -> &'static str {
             Some("parse_response") => "parse_error",
             Some("transport") => "transport_error",
             Some("timeout") => "timeout",
+            Some("http_status") => "http_status_error",
             _ => "transport_error",
         },
         BidStatus::Pending => "timeout",
