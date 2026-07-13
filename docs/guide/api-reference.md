@@ -157,9 +157,35 @@ re-evaluated within the recheck window).
 
 ### POST /\_ts/api/v1/batch-sync
 
-Server-to-server batch sync endpoint for writing EC ID to partner UID mappings. Mapping timestamps are retained in the request schema for compatibility, but they no longer order writes because EC identity entries do not store per-partner sync timestamps. Valid mappings use idempotent last-write-wins semantics.
+Server-to-server batch sync endpoint for writing EC ID to partner UID mappings. Mapping timestamps are retained in the request schema for compatibility, but they no longer order writes because EC identity entries do not store per-partner sync timestamps.
 
 **Auth:** Bearer token (`Authorization: Bearer <partner-api-key>`)
+
+**Batch processing behavior:**
+
+- Every mapping is validated before any KV update. Validation errors retain their
+  original input index.
+- Valid mappings are grouped by normalized EC ID: only the 64-character hex
+  prefix is lowercased; the six-character suffix remains case-sensitive.
+- Groups are processed in first-valid-occurrence order, with one call to the
+  CAS-protected KV update path per distinct normalized EC ID. Within a group, the
+  last valid `partner_uid` in request order is persisted. An invalid mapping
+  never replaces a group's final UID.
+- A successful or unchanged update accepts every valid mapping in its group.
+  Missing and withdrawn EC entries reject every valid mapping in their group as
+  `ineligible`.
+- If a KV infrastructure failure occurs, every valid mapping in the failing
+  group and each unprocessed valid group is rejected as `kv_unavailable`; no
+  later group is updated. Already processed groups keep their outcomes, and
+  validation errors are preserved.
+- `errors` is sorted by original input index. Therefore each input has exactly
+  one outcome and `accepted + rejected` equals the number of submitted
+  mappings. The endpoint returns `200 OK` only when all mappings are accepted;
+  otherwise it returns `207 Multi-Status`.
+
+Groupwise failure behavior is intentional: for `A(valid), B(valid), A(valid)`,
+if A's group succeeds and B's group has an infrastructure failure, both A
+mappings are accepted even though the second A appears after B in the input.
 
 **Request Body:**
 
