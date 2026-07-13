@@ -6,19 +6,15 @@
 use std::collections::HashSet;
 
 use edgezero_core::body::Body as EdgeBody;
-use error_stack::Report;
 use http::Response;
 
 use super::consent::{ec_consent_granted, ec_consent_withdrawn};
-use crate::error::TrustedServerError;
 use crate::settings::Settings;
 
 use super::EcContext;
 use super::cookies::{expire_ec_cookie, set_ec_cookie};
 use super::generation::{generate_ec_id, is_valid_ec_id};
-use super::kv::{
-    CreateIfAbsentOutcome, KvIdentityGraph, TombstoneOutcome, apply_partner_id_updates,
-};
+use super::kv::{CreateIfAbsentOutcome, KvIdentityGraph, apply_partner_id_updates};
 use super::kv_types::KvEntry;
 use super::prebid_eids::collect_eid_cookie_updates;
 use super::pull_sync_marker::{expire_marker, reconcile_marker};
@@ -349,46 +345,27 @@ fn finalize_unusable_consent(
             // the context — pull sync discloses the raw EC ID to partners —
             // sees the tombstone that was just written. Only the active ID has
             // a snapshot in the context to correct.
-            let outcome = graph.write_withdrawal_tombstone(ec_id, |snapshot| {
-                if ec_context.ec_value() == Some(ec_id) {
-                    ec_context.set_kv_snapshot(snapshot);
-                }
-            });
-            log_tombstone_outcome(ec_id, outcome);
+            let initial = if ec_context.kv_snapshot().belongs_to(ec_id) {
+                ec_context.kv_snapshot().clone()
+            } else {
+                EcKvSnapshot::NotRead
+            };
+            let outcome = graph.tombstone_existing_from_snapshot(ec_id, initial);
+            // The browser cookie is already cleared, so a failed tombstone
+            // leaves a live row that server-side consumers still read as
+            // consented. Report every failure, including the non-active cookie
+            // ID whose outcome is not retained on the request context.
+            if matches!(outcome, EcKvSnapshot::Failed { .. }) {
+                log::warn!(
+                    "EC withdrawal tombstone failed for '{}': the identity-graph row may \
+                     still be live with consent granted",
+                    log_id(ec_id)
+                );
+            }
+            if ec_context.ec_value() == Some(ec_id) {
+                ec_context.set_kv_snapshot(outcome);
+            }
         });
-    }
-}
-
-/// Records what happened to one withdrawal tombstone.
-///
-/// An unknown identity is expected traffic rather than a fault: the identifier
-/// comes from a client-supplied cookie, so it may name something this
-/// deployment never issued. An error is different: nothing was recorded, so a
-/// real row may have gone unmarked, and that is logged as a fault. The browser
-/// cookie is expired in every case, and that is the primary enforcement.
-fn log_tombstone_outcome(
-    ec_id: &str,
-    outcome: Result<TombstoneOutcome, Report<TrustedServerError>>,
-) {
-    match outcome {
-        Ok(TombstoneOutcome::Written) => {}
-        Ok(TombstoneOutcome::UnknownIdentity) => {
-            log::debug!(
-                "Skipping withdrawal tombstone for unknown EC ID '{}'",
-                log_id(ec_id),
-            );
-        }
-        Err(err) => {
-            // Covers both a failed write and a check that could not determine
-            // whether the identity exists. Either way no marker was recorded,
-            // so a withdrawal may go unrecorded for the batch-sync window; the
-            // browser cookie is expired regardless.
-            log::error!(
-                "Could not record the withdrawal of EC ID '{}', so it may go unrecorded \
-                 for the batch-sync window; the browser cookie is still expired: {err:?}",
-                log_id(ec_id),
-            );
-        }
     }
 }
 
@@ -1603,6 +1580,151 @@ mod tests {
         assert!(
             graph.get(&cookie_ec).expect("should read store").is_none(),
             "a missing second ID must never be created by withdrawal"
+        );
+    }
+
+    #[test]
+    fn finalize_withdrawal_tombstones_both_present_ids_once() {
+        let settings = create_test_settings();
+        let active_ec = sample_ec_id("activ3");
+        let cookie_ec = sample_ec_id("cook3e");
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            gpc: true,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let mut ec_context =
+            make_context_with_consent(Some(&active_ec), Some(&cookie_ec), true, false, consent);
+        let graph = KvIdentityGraph::in_memory("test_store");
+        graph
+            .create(
+                &active_ec,
+                &KvEntry::minimal("active.example.com", "active-uid", 1_000),
+            )
+            .expect("should seed active row");
+        graph
+            .create(
+                &cookie_ec,
+                &KvEntry::minimal("cookie.example.com", "cookie-uid", 1_000),
+            )
+            .expect("should seed cookie row");
+        ec_context.set_kv_snapshot(graph.load_snapshot(&active_ec));
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        let (active_tombstone, active_generation) = graph
+            .get(&active_ec)
+            .expect("should read active row")
+            .expect("should retain active tombstone");
+        let (cookie_tombstone, cookie_generation) = graph
+            .get(&cookie_ec)
+            .expect("should read cookie row")
+            .expect("should retain cookie tombstone");
+        assert!(
+            !active_tombstone.consent.ok,
+            "active row should be withdrawn"
+        );
+        assert!(
+            active_tombstone.ids.is_empty(),
+            "active IDs should be cleared"
+        );
+        assert!(
+            !cookie_tombstone.consent.ok,
+            "cookie row should be withdrawn"
+        );
+        assert!(
+            cookie_tombstone.ids.is_empty(),
+            "cookie IDs should be cleared"
+        );
+
+        let mut repeated_response = empty_response();
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut repeated_response,
+        );
+
+        assert_eq!(
+            graph
+                .get(&active_ec)
+                .expect("should read active row")
+                .expect("should retain active tombstone")
+                .1,
+            active_generation,
+            "repeated finalization should not rewrite active tombstone"
+        );
+        assert_eq!(
+            graph
+                .get(&cookie_ec)
+                .expect("should read cookie row")
+                .expect("should retain cookie tombstone")
+                .1,
+            cookie_generation,
+            "repeated finalization should not rewrite cookie tombstone"
+        );
+    }
+
+    #[test]
+    fn finalize_withdrawal_keeps_cookie_deletion_on_kv_failure() {
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("failw1");
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            gpc: true,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let mut ec_context =
+            make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent);
+        let graph = KvIdentityGraph::failing("unavailable-store");
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        let cookies = response
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            response.status(),
+            200,
+            "KV failure should not change response status"
+        );
+        assert!(
+            cookies
+                .iter()
+                .any(|cookie| { cookie.starts_with("ts-ec=;") && cookie.contains("Max-Age=0") }),
+            "KV failure should not prevent EC cookie deletion"
+        );
+        assert!(
+            cookies.iter().any(|cookie| {
+                cookie.starts_with("ts-ec-pull-complete=;") && cookie.contains("Max-Age=0")
+            }),
+            "KV failure should not prevent marker deletion"
         );
     }
 
