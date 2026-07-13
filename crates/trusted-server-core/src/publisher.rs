@@ -843,14 +843,14 @@ pub(crate) fn write_bids_to_state(
     winning_bids: &std::collections::HashMap<String, Bid>,
     price_granularity: PriceGranularity,
     ad_bids_state: &Arc<Mutex<Option<String>>>,
-    inject_adm: bool,
+    include_debug_bid: bool,
 ) {
     log::debug!(
         "write_bids_to_state: {} winning bid(s): [{}]",
         winning_bids.len(),
         winning_bids.keys().cloned().collect::<Vec<_>>().join(", ")
     );
-    let bid_map = build_bid_map(winning_bids, price_granularity, inject_adm);
+    let bid_map = build_bid_map(winning_bids, price_granularity, include_debug_bid);
     let bids_script = build_bids_script(&bid_map);
     *ad_bids_state.lock().expect("should lock bid state") = Some(bids_script);
 }
@@ -1933,7 +1933,7 @@ fn html_escape_for_script(s: &str) -> String {
 pub(crate) fn build_bid_map(
     winning_bids: &std::collections::HashMap<String, Bid>,
     granularity: crate::price_bucket::PriceGranularity,
-    include_adm: bool,
+    include_debug_bid: bool,
 ) -> serde_json::Map<String, serde_json::Value> {
     winning_bids
         .iter()
@@ -1978,12 +1978,16 @@ pub(crate) fn build_bid_map(
                 if let Some(ref burl) = bid.burl {
                     obj.insert("burl".to_string(), serde_json::Value::String(burl.clone()));
                 }
-                // Include raw creative markup only for explicit debug injection.
-                // The pbRender bridge can use it while PBS Cache is unavailable.
-                if include_adm {
-                    if let Some(ref adm) = bid.creative {
-                        obj.insert("adm".to_string(), serde_json::Value::String(adm.clone()));
-                    }
+                // Always include the winning creative so the pbRender bridge can
+                // render it locally when GAM serves the Prebid Universal Creative
+                // — no PBS Cache round trip. The `hb_cache_*` coordinates above
+                // remain as the fallback for an absent `adm`.
+                if let Some(ref adm) = bid.creative {
+                    obj.insert("adm".to_string(), serde_json::Value::String(adm.clone()));
+                }
+                // Verbose per-bid debug blob only under the testing flag; also
+                // doubles as the client-side gate for the direct GAM-replace path.
+                if include_debug_bid {
                     obj.insert(
                         "debug_bid".to_string(),
                         serde_json::json!({
@@ -4071,7 +4075,7 @@ mod tests {
         }
 
         #[test]
-        fn client_bid_map_omits_adm_by_default() {
+        fn client_bid_map_includes_adm_and_omits_debug_bid_by_default() {
             let mut winning_bids = HashMap::new();
             let mut bid = make_bid(
                 "atf_sidebar_ad",
@@ -4084,38 +4088,10 @@ mod tests {
             bid.creative = Some("<div>Creative</div>".to_string());
             winning_bids.insert("atf_sidebar_ad".to_string(), bid);
 
+            // Production path (include_debug_bid = false): the creative is always
+            // included so the bridge can render it locally, but the verbose
+            // debug_bid blob is not.
             let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
-            let obj = map
-                .get("atf_sidebar_ad")
-                .expect("should have bid entry")
-                .as_object()
-                .expect("should be object");
-
-            assert!(
-                obj.get("adm").is_none(),
-                "should omit adm when debug injection is disabled"
-            );
-            assert!(
-                obj.get("debug_bid").is_none(),
-                "should omit debug bid when debug injection is disabled"
-            );
-        }
-
-        #[test]
-        fn client_bid_map_includes_adm_when_debug_injection_enabled() {
-            let mut winning_bids = HashMap::new();
-            let mut bid = make_bid(
-                "atf_sidebar_ad",
-                1.50,
-                "kargo",
-                "abc123",
-                "https://ssp/win",
-                "https://ssp/bill",
-            );
-            bid.creative = Some("<div>Creative</div>".to_string());
-            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
-
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, true);
             let obj = map
                 .get("atf_sidebar_ad")
                 .expect("should have bid entry")
@@ -4125,7 +4101,39 @@ mod tests {
             assert_eq!(
                 obj.get("adm").and_then(|v| v.as_str()),
                 Some("<div>Creative</div>"),
-                "should include adm when debug injection is enabled"
+                "should include creative markup for local rendering by default"
+            );
+            assert!(
+                obj.get("debug_bid").is_none(),
+                "should omit the debug_bid blob when debug injection is disabled"
+            );
+        }
+
+        #[test]
+        fn build_bids_script_escapes_hostile_adm() {
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "s",
+                1.50,
+                "kargo",
+                "abc123",
+                "https://ssp/win",
+                "https://ssp/bill",
+            );
+            // A hostile creative that tries to break out of the <script> and
+            // includes both line/paragraph separators the spec promises to escape.
+            bid.creative = Some("</script><script>alert(1)</script>\u{2028}\u{2029}".to_string());
+            winning_bids.insert("s".to_string(), bid);
+
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
+            let script = build_bids_script(&map);
+            assert!(
+                !script.contains("</script><script>"),
+                "should not let a hostile adm break out of the script context"
+            );
+            assert!(
+                !script.contains('\u{2028}') && !script.contains('\u{2029}'),
+                "should unicode-escape both U+2028 and U+2029 in the adm"
             );
         }
 
