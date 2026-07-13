@@ -593,10 +593,13 @@ export function installTsAdInit(): void {
           // Read ts.bids live (not the snapshot above) so post-navigation bid data is used.
           const bid = (ts.bids ?? {})[slotId] ?? {};
 
-          // GAM interceptor (testing): when adm is present, replace the GAM creative.
-          // Adapted from PR #241 — uses window.tsjs.bids[slotId].adm instead of pbjs.
-          // Only active when inject_adm_for_testing injects adm into bids server-side.
-          if (bid.adm) {
+          // GAM interceptor (testing bypass): directly replace the GAM creative.
+          // `adm` is now always injected in production, so it can no longer gate
+          // this path. `debug_bid` is present only when inject_adm_for_testing is
+          // on, so it is the per-bid signal that the testing bypass is enabled.
+          // In production the render bridge serves the creative and GAM stays in
+          // the loop; this direct replace stays testing-only.
+          if (bid.adm && bid.debug_bid) {
             injectAdmIntoSlot(divId, bid.adm);
           }
         });
@@ -902,7 +905,7 @@ export function installTsRenderBridge(): void {
         })
       );
       fireWinBillingBeacons(slotId, matchedBid);
-      log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from debug adm`);
+      log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from inline adm`);
       return;
     }
 
