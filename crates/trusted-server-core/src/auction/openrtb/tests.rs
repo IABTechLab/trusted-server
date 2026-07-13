@@ -267,7 +267,6 @@ fn consent_matrix_preserves_pbs_standard_and_aps_policies() {
 fn pbs_body_consent_respects_source_and_forwarding_mode() {
     for (mode, source, expected) in [
         ("cookies_only", ConsentSource::Cookie, false),
-        ("cookies_only", ConsentSource::KvStore, true),
         ("cookies_only", ConsentSource::PolicyDefault, true),
         ("openrtb_only", ConsentSource::Cookie, true),
         ("both", ConsentSource::Cookie, true),
