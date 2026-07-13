@@ -769,6 +769,11 @@ impl KvIdentityGraph {
     }
 
     /// Writes a tombstone only when an authoritative row already exists.
+    ///
+    /// An authoritative `Missing` snapshot is a no-op (nothing to withdraw). A
+    /// non-authoritative snapshot — a prior read that `Failed`, or one lacking a
+    /// usable generation — is re-read so a transient read error never silently
+    /// drops a consent withdrawal.
     pub(crate) fn tombstone_existing_from_snapshot(
         &self,
         ec_id: &str,
@@ -783,9 +788,6 @@ impl KvIdentityGraph {
                     ..
                 } if snapshot_id == ec_id => generation,
                 EcKvSnapshot::Missing {
-                    ec_id: ref snapshot_id,
-                } if snapshot_id == ec_id => return current,
-                EcKvSnapshot::Failed {
                     ec_id: ref snapshot_id,
                 } if snapshot_id == ec_id => return current,
                 _ => {
@@ -1916,5 +1918,34 @@ mod tests {
             graph.get(&ec_id).expect("should read store").is_none(),
             "must not recreate the disappeared key"
         );
+    }
+
+    #[test]
+    fn tombstone_existing_from_snapshot_reretries_failed_snapshot_read() {
+        // A prior request-scoped read failed, so the snapshot is `Failed`. A
+        // withdrawal must not silently drop consent removal: re-read the store
+        // and tombstone the row if it is authoritatively present.
+        let kv = KvIdentityGraph::in_memory("test_store");
+        let ec_id = snapshot_ec_id();
+        kv.create(&ec_id, &live_entry()).expect("should seed live");
+
+        let outcome = kv.tombstone_existing_from_snapshot(
+            &ec_id,
+            EcKvSnapshot::Failed {
+                ec_id: ec_id.clone(),
+            },
+        );
+
+        assert!(
+            outcome
+                .entry_for(&ec_id)
+                .is_some_and(|entry| !entry.consent.ok),
+            "a failed snapshot must re-read and persist the tombstone"
+        );
+        let (stored, _) = kv
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("should preserve existing key");
+        assert!(!stored.consent.ok, "withdrawal must reach the store");
     }
 }
