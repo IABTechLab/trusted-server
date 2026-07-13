@@ -1012,6 +1012,151 @@ mod tests {
     }
 
     #[test]
+    fn finalize_withdrawal_tombstones_both_present_ids_once() {
+        let settings = create_test_settings();
+        let active_ec = sample_ec_id("activ3");
+        let cookie_ec = sample_ec_id("cook3e");
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            gpc: true,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let mut ec_context =
+            make_context_with_consent(Some(&active_ec), Some(&cookie_ec), true, false, consent);
+        let graph = KvIdentityGraph::in_memory("test_store");
+        graph
+            .create(
+                &active_ec,
+                &KvEntry::minimal("active.example.com", "active-uid", 1_000),
+            )
+            .expect("should seed active row");
+        graph
+            .create(
+                &cookie_ec,
+                &KvEntry::minimal("cookie.example.com", "cookie-uid", 1_000),
+            )
+            .expect("should seed cookie row");
+        ec_context.set_kv_snapshot(graph.load_snapshot(&active_ec));
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        let (active_tombstone, active_generation) = graph
+            .get(&active_ec)
+            .expect("should read active row")
+            .expect("should retain active tombstone");
+        let (cookie_tombstone, cookie_generation) = graph
+            .get(&cookie_ec)
+            .expect("should read cookie row")
+            .expect("should retain cookie tombstone");
+        assert!(
+            !active_tombstone.consent.ok,
+            "active row should be withdrawn"
+        );
+        assert!(
+            active_tombstone.ids.is_empty(),
+            "active IDs should be cleared"
+        );
+        assert!(
+            !cookie_tombstone.consent.ok,
+            "cookie row should be withdrawn"
+        );
+        assert!(
+            cookie_tombstone.ids.is_empty(),
+            "cookie IDs should be cleared"
+        );
+
+        let mut repeated_response = empty_response();
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut repeated_response,
+        );
+
+        assert_eq!(
+            graph
+                .get(&active_ec)
+                .expect("should read active row")
+                .expect("should retain active tombstone")
+                .1,
+            active_generation,
+            "repeated finalization should not rewrite active tombstone"
+        );
+        assert_eq!(
+            graph
+                .get(&cookie_ec)
+                .expect("should read cookie row")
+                .expect("should retain cookie tombstone")
+                .1,
+            cookie_generation,
+            "repeated finalization should not rewrite cookie tombstone"
+        );
+    }
+
+    #[test]
+    fn finalize_withdrawal_keeps_cookie_deletion_on_kv_failure() {
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("failw1");
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            gpc: true,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let mut ec_context =
+            make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent);
+        let graph = KvIdentityGraph::failing("unavailable-store");
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        let cookies = response
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            response.status(),
+            200,
+            "KV failure should not change response status"
+        );
+        assert!(
+            cookies
+                .iter()
+                .any(|cookie| { cookie.starts_with("ts-ec=;") && cookie.contains("Max-Age=0") }),
+            "KV failure should not prevent EC cookie deletion"
+        );
+        assert!(
+            cookies.iter().any(|cookie| {
+                cookie.starts_with("ts-ec-pull-complete=;") && cookie.contains("Max-Age=0")
+            }),
+            "KV failure should not prevent marker deletion"
+        );
+    }
+
+    #[test]
     fn finalize_sets_marker_for_complete_pull_partner_snapshot() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("compl1");
