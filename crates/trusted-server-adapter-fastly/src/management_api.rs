@@ -22,7 +22,7 @@ use base64::{engine::general_purpose, Engine as _};
 use error_stack::{Report, ResultExt};
 use fastly::http::{Method, StatusCode};
 use fastly::{Request, Response};
-use trusted_server_core::platform::{PlatformError, PlatformSecretStore, StoreName};
+use trusted_server_core::platform::{PlatformError, StoreName};
 
 use crate::backend::BackendConfig;
 use crate::platform::FastlyPlatformSecretStore;
@@ -127,10 +127,15 @@ impl FastlyManagementApiClient {
             .change_context(PlatformError::Backend)
             .attach("failed to register Fastly management API backend")?;
 
-        let api_key = FastlyPlatformSecretStore
-            .get_string(&StoreName::from(API_KEYS_STORE), API_KEY_ENTRY)
-            .change_context(PlatformError::SecretStore)
-            .attach("failed to read Fastly API key from secret store")?;
+        // Deliberate direct (non-registry) read: `api-keys` is a Fastly-only
+        // management store, outside the logical store registry. See
+        // `FastlyPlatformSecretStore::read_management_secret`.
+        let api_key = FastlyPlatformSecretStore::read_management_secret(
+            &StoreName::from(API_KEYS_STORE),
+            API_KEY_ENTRY,
+        )
+        .change_context(PlatformError::SecretStore)
+        .attach("failed to read Fastly API key from secret store")?;
 
         log::debug!("FastlyManagementApiClient: initialized for management API operations");
 

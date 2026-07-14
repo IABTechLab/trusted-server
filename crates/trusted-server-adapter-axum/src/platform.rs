@@ -11,10 +11,9 @@ use edgezero_core::store_registry::{ConfigRegistry, KvRegistry, SecretRegistry};
 use error_stack::{Report, ResultExt as _};
 use trusted_server_core::platform::{
     ClientInfo, CompositeConfigStore, CompositeSecretStore, GeoInfo, PlatformBackend,
-    PlatformBackendSpec, PlatformConfigStore, PlatformConfigWriter, PlatformError, PlatformGeo,
-    PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
-    PlatformSecretStore, PlatformSecretWriter, PlatformSelectResult, RuntimeServices, StoreId,
-    StoreName,
+    PlatformBackendSpec, PlatformConfigWriter, PlatformError, PlatformGeo, PlatformHttpClient,
+    PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, PlatformSecretWriter,
+    PlatformSelectResult, RuntimeServices, StoreId,
 };
 
 // ---------------------------------------------------------------------------
@@ -28,42 +27,18 @@ fn normalize_env_segment(s: &str) -> String {
     s.to_uppercase().replace(['-', '.', ' '], "_")
 }
 
-fn config_env_var(store_name: &str, key: &str) -> String {
-    format!(
-        "TRUSTED_SERVER_CONFIG_{}_{}",
-        normalize_env_segment(store_name),
-        normalize_env_segment(key),
-    )
-}
-
-fn secret_env_var(store_name: &str, key: &str) -> String {
-    format!(
-        "TRUSTED_SERVER_SECRET_{}_{}",
-        normalize_env_segment(store_name),
-        normalize_env_segment(key),
-    )
-}
-
 // ---------------------------------------------------------------------------
-// PlatformConfigStore
+// PlatformConfigWriter
 // ---------------------------------------------------------------------------
 
-/// Environment-variable–backed config store for the Axum dev server.
+/// Write-only config store for the Axum dev server.
 ///
-/// Reads from `TRUSTED_SERVER_CONFIG_{STORE}_{KEY}` (uppercased, hyphens→underscores).
-/// Write operations are unsupported in local development.
+/// Config reads resolve through the `EdgeZero` config registry behind
+/// [`CompositeConfigStore`], so this type only supplies the composite's write
+/// delegate. Writes are unsupported in local development and always error.
 pub struct AxumPlatformConfigStore;
 
-impl PlatformConfigStore for AxumPlatformConfigStore {
-    fn get(&self, store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
-        let var_name = config_env_var(store_name.as_ref(), key);
-        std::env::var(&var_name).map_err(|_| {
-            Report::new(PlatformError::ConfigStore).attach(format!(
-                "env var '{var_name}' not set — export it to supply this config value"
-            ))
-        })
-    }
-
+impl PlatformConfigWriter for AxumPlatformConfigStore {
     fn put(
         &self,
         store_id: &StoreId,
@@ -92,42 +67,18 @@ impl PlatformConfigStore for AxumPlatformConfigStore {
     }
 }
 
-impl PlatformConfigWriter for AxumPlatformConfigStore {
-    fn put(&self, store_id: &StoreId, key: &str, value: &str) -> Result<(), Report<PlatformError>> {
-        PlatformConfigStore::put(self, store_id, key, value)
-    }
-
-    fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>> {
-        PlatformConfigStore::delete(self, store_id, key)
-    }
-}
-
 // ---------------------------------------------------------------------------
-// PlatformSecretStore
+// PlatformSecretWriter
 // ---------------------------------------------------------------------------
 
-/// Environment-variable–backed secret store for the Axum dev server.
+/// Write-only secret store for the Axum dev server.
 ///
-/// Reads from `TRUSTED_SERVER_SECRET_{STORE}_{KEY}` as raw UTF-8 bytes.
-/// Write operations are unsupported in local development.
+/// Secret reads resolve through the `EdgeZero` secret registry behind
+/// [`CompositeSecretStore`]. Writes are unsupported in local development and
+/// always error.
 pub struct AxumPlatformSecretStore;
 
-impl PlatformSecretStore for AxumPlatformSecretStore {
-    fn get_bytes(
-        &self,
-        store_name: &StoreName,
-        key: &str,
-    ) -> Result<Vec<u8>, Report<PlatformError>> {
-        let var_name = secret_env_var(store_name.as_ref(), key);
-        std::env::var(&var_name)
-            .map(String::into_bytes)
-            .map_err(|_| {
-                Report::new(PlatformError::SecretStore).attach(format!(
-                    "env var '{var_name}' not set — export it to supply this secret value"
-                ))
-            })
-    }
-
+impl PlatformSecretWriter for AxumPlatformSecretStore {
     fn create(
         &self,
         store_id: &StoreId,
@@ -153,21 +104,6 @@ impl PlatformSecretStore for AxumPlatformSecretStore {
         );
         Err(Report::new(PlatformError::SecretStore)
             .attach("secret store deletes are not supported on the Axum dev server"))
-    }
-}
-
-impl PlatformSecretWriter for AxumPlatformSecretStore {
-    fn create(
-        &self,
-        store_id: &StoreId,
-        name: &str,
-        value: &str,
-    ) -> Result<(), Report<PlatformError>> {
-        PlatformSecretStore::create(self, store_id, name, value)
-    }
-
-    fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>> {
-        PlatformSecretStore::delete(self, store_id, name)
     }
 }
 
@@ -827,6 +763,7 @@ mod tests {
     use edgezero_core::body::Body as EdgeBody;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use trusted_server_core::platform::StoreName;
 
     use super::registry_test_support::{
         config_registry, kv_registry, secret_registry, test_context_with_registries,
@@ -944,42 +881,38 @@ mod tests {
     }
 
     #[test]
-    fn config_store_reads_from_env_var() {
-        temp_env::with_var(
-            "TRUSTED_SERVER_CONFIG_MY_STORE_MY_KEY",
-            Some("test-value"),
-            || {
-                let store = AxumPlatformConfigStore;
-                let result = store
-                    .get(&StoreName::from("my-store"), "my-key")
-                    .expect("should read env var");
-                assert_eq!(result, "test-value", "should return env var value");
-            },
+    fn config_writer_rejects_writes_on_the_dev_server() {
+        let writer = AxumPlatformConfigStore;
+
+        assert!(
+            writer
+                .put(&StoreId::from("jwks_store"), "current-kid", "kid-1")
+                .is_err(),
+            "the Axum dev server should reject config writes"
+        );
+        assert!(
+            writer
+                .delete(&StoreId::from("jwks_store"), "kid-1")
+                .is_err(),
+            "the Axum dev server should reject config deletes"
         );
     }
 
     #[test]
-    fn config_store_returns_error_for_missing_env_var() {
-        let store = AxumPlatformConfigStore;
-        let result = store.get(
-            &StoreName::from("nonexistent-store-zzz"),
-            "nonexistent-key-zzz",
-        );
-        assert!(result.is_err(), "should error for missing env var");
-    }
+    fn secret_writer_rejects_writes_on_the_dev_server() {
+        let writer = AxumPlatformSecretStore;
 
-    #[test]
-    fn secret_store_reads_bytes_from_env_var() {
-        temp_env::with_var(
-            "TRUSTED_SERVER_SECRET_MY_SECRETS_MY_SECRET",
-            Some("hello"),
-            || {
-                let store = AxumPlatformSecretStore;
-                let result = store
-                    .get_bytes(&StoreName::from("my-secrets"), "my-secret")
-                    .expect("should read env var as bytes");
-                assert_eq!(result, b"hello", "should return raw bytes");
-            },
+        assert!(
+            writer
+                .create(&StoreId::from("signing_keys"), "kid-1", "value")
+                .is_err(),
+            "the Axum dev server should reject secret writes"
+        );
+        assert!(
+            writer
+                .delete(&StoreId::from("signing_keys"), "kid-1")
+                .is_err(),
+            "the Axum dev server should reject secret deletes"
         );
     }
 

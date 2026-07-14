@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::key_value_store::{KvHandle, KvPage, KvStore};
 use edgezero_core::store_registry::{ConfigRegistry, KvRegistry, SecretRegistry};
 use error_stack::Report;
@@ -11,7 +10,7 @@ use trusted_server_core::platform::{
     ClientInfo, CompositeConfigStore, CompositeSecretStore, GeoInfo, KvError, PlatformBackend,
     PlatformBackendSpec, PlatformConfigStore, PlatformConfigWriter, PlatformError, PlatformGeo,
     PlatformHttpClient, PlatformKvStore, PlatformSecretStore, PlatformSecretWriter,
-    RuntimeServices, StoreId, StoreName, UnavailableKvStore,
+    RuntimeServices, StoreId, UnavailableKvStore,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -30,11 +29,7 @@ use trusted_server_core::platform::{
 
 struct NoopConfigStore;
 
-impl PlatformConfigStore for NoopConfigStore {
-    fn get(&self, _: &StoreName, _: &str) -> Result<String, Report<PlatformError>> {
-        Err(Report::new(PlatformError::ConfigStore).attach("config store not available"))
-    }
-
+impl PlatformConfigWriter for NoopConfigStore {
     fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
         Err(Report::new(PlatformError::ConfigStore).attach("config store not available"))
     }
@@ -44,44 +39,15 @@ impl PlatformConfigStore for NoopConfigStore {
     }
 }
 
-impl PlatformConfigWriter for NoopConfigStore {
-    fn put(&self, store_id: &StoreId, key: &str, value: &str) -> Result<(), Report<PlatformError>> {
-        PlatformConfigStore::put(self, store_id, key, value)
-    }
-
-    fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>> {
-        PlatformConfigStore::delete(self, store_id, key)
-    }
-}
-
 struct NoopSecretStore;
 
-impl PlatformSecretStore for NoopSecretStore {
-    fn get_bytes(&self, _: &StoreName, _: &str) -> Result<Vec<u8>, Report<PlatformError>> {
-        Err(Report::new(PlatformError::SecretStore).attach("secret store not available"))
-    }
-
+impl PlatformSecretWriter for NoopSecretStore {
     fn create(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
         Err(Report::new(PlatformError::SecretStore).attach("secret store not available"))
     }
 
     fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
         Err(Report::new(PlatformError::SecretStore).attach("secret store not available"))
-    }
-}
-
-impl PlatformSecretWriter for NoopSecretStore {
-    fn create(
-        &self,
-        store_id: &StoreId,
-        name: &str,
-        value: &str,
-    ) -> Result<(), Report<PlatformError>> {
-        PlatformSecretStore::create(self, store_id, name, value)
-    }
-
-    fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>> {
-        PlatformSecretStore::delete(self, store_id, name)
     }
 }
 
@@ -113,48 +79,6 @@ impl PlatformBackend for NoopBackend {
 // edgezero handle adapters — no #[cfg] needed; platform-specific store
 // construction is handled by edgezero's run_app before we receive the ctx.
 // ---------------------------------------------------------------------------
-
-/// Bridges edgezero's [`ConfigStoreHandle`] (injected by `run_app` from the
-/// `TRUSTED_SERVER_CONFIG` env-var binding) to [`PlatformConfigStore`].
-///
-/// Reads delegate through the handle. Writes are unsupported on all current
-/// adapter targets and return errors.
-///
-/// Note: Cloudflare config is a single flat JSON env-var binding — all keys
-/// live in one namespace. The `store_name` argument is intentionally ignored;
-/// callers cannot route to a different store by passing a different name.
-struct ConfigStoreHandleAdapter(ConfigStoreHandle);
-
-impl PlatformConfigStore for ConfigStoreHandleAdapter {
-    fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
-        futures::executor::block_on(self.0.get(key))
-            .map_err(|e| {
-                Report::new(PlatformError::ConfigStore)
-                    .attach(format!("config store lookup failed: {e}"))
-            })?
-            .ok_or_else(|| {
-                Report::new(PlatformError::ConfigStore).attach(format!("key not found: {key}"))
-            })
-    }
-
-    fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::ConfigStore).attach("config store writes are not supported"))
-    }
-
-    fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::ConfigStore).attach("config store writes are not supported"))
-    }
-}
-
-impl PlatformConfigWriter for ConfigStoreHandleAdapter {
-    fn put(&self, store_id: &StoreId, key: &str, value: &str) -> Result<(), Report<PlatformError>> {
-        PlatformConfigStore::put(self, store_id, key, value)
-    }
-
-    fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>> {
-        PlatformConfigStore::delete(self, store_id, key)
-    }
-}
 
 /// Bridges edgezero's [`KvHandle`] (injected by `run_app` from the
 /// `TRUSTED_SERVER_KV` KV namespace binding) to [`PlatformKvStore`].
@@ -530,72 +454,16 @@ impl PlatformHttpClient for CloudflareHttpClient {
 // call IS synchronous at the JS level, so we call it directly here.
 // ---------------------------------------------------------------------------
 
-/// Bridges [`worker::Env`] secrets to [`PlatformSecretStore`] by calling
-/// `env.secret(key)` synchronously. Writes and deletes return errors.
-#[cfg(target_arch = "wasm32")]
-struct CloudflareSecretStoreAdapter {
-    env: worker::Env,
-}
-
-#[cfg(target_arch = "wasm32")]
-impl PlatformSecretStore for CloudflareSecretStoreAdapter {
-    fn get_bytes(
-        &self,
-        _store_name: &StoreName,
-        key: &str,
-    ) -> Result<Vec<u8>, Report<PlatformError>> {
-        match self.env.secret(key) {
-            // worker 0.7: Secret implements Display via JsValue::as_string() which
-            // returns the raw JS string value with no wrapping or debug formatting.
-            // Verified in worker-rs src/env.rs: `impl Display for Secret { fn fmt ->
-            // write!(f, "{}", self.inner.as_string().unwrap_or_default()) }`.
-            Ok(secret) => Ok(secret.to_string().into_bytes()),
-            Err(err) => Err(Report::new(PlatformError::SecretStore)
-                .attach(format!("secret lookup failed for key `{key}`: {err}"))),
-        }
-    }
-
-    fn create(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::SecretStore)
-            .attach("secret store writes are not supported on Cloudflare Workers"))
-    }
-
-    fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::SecretStore)
-            .attach("secret store writes are not supported on Cloudflare Workers"))
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-impl PlatformSecretWriter for CloudflareSecretStoreAdapter {
-    fn create(
-        &self,
-        store_id: &StoreId,
-        name: &str,
-        value: &str,
-    ) -> Result<(), Report<PlatformError>> {
-        PlatformSecretStore::create(self, store_id, name, value)
-    }
-
-    fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>> {
-        PlatformSecretStore::delete(self, store_id, name)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // build_runtime_services
 // ---------------------------------------------------------------------------
 
 /// Construct [`RuntimeServices`] for an incoming Cloudflare Workers request.
 ///
-/// Config and KV are sourced from the edgezero handles that `run_app` injects
-/// before routing — via the `TRUSTED_SERVER_CONFIG` env-var binding and the
-/// `TRUSTED_SERVER_KV` KV namespace declared in `cloudflare.toml`. No
-/// platform-specific `#[cfg]` is required for these two stores.
-///
-/// Secrets still require direct `worker::Env` access because
-/// `SecretHandle::get_bytes` is async while `PlatformSecretStore::get_bytes`
-/// is sync; the underlying `env.secret()` call is synchronous at the JS level.
+/// Config, secret, and KV reads resolve through the `EdgeZero` store registries
+/// that `run_app` injects into the request extensions before routing. Cloudflare
+/// exposes no config- or secret-store write API, so both write delegates handed
+/// to the composites reject writes.
 ///
 /// Geo information is read from Cloudflare's injected request headers
 /// (`cf-ipcountry`, etc.) which are present on all plans; headers absent on
@@ -609,14 +477,12 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
     let http_client: Arc<dyn PlatformHttpClient> = Arc::new(UnavailableHttpClient);
 
     // Config reads resolve through the whole ConfigRegistry (from request
-    // extensions) so non-default logical ids (e.g. `jwks_store`) resolve; writes
-    // delegate to the run_app-injected default config handle. An absent registry
-    // makes composite reads error rather than silently reading a default store.
+    // extensions) so non-default logical ids (e.g. `jwks_store`) resolve. An
+    // absent registry makes composite reads error rather than silently reading a
+    // default store. Cloudflare has no config-store write API (config arrives as
+    // a `[vars]` binding), so the write delegate always errors.
     let config_reader = ctx.request().extensions().get::<ConfigRegistry>().cloned();
-    let config_writer: Arc<dyn PlatformConfigWriter> = ctx
-        .config_store_default()
-        .map(|h| Arc::new(ConfigStoreHandleAdapter(h)) as Arc<dyn PlatformConfigWriter>)
-        .unwrap_or_else(|| Arc::new(NoopConfigStore));
+    let config_writer: Arc<dyn PlatformConfigWriter> = Arc::new(NoopConfigStore);
     let config_store: Arc<dyn PlatformConfigStore> =
         Arc::new(CompositeConfigStore::new(config_reader, config_writer));
 
@@ -629,18 +495,9 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
     let kv_registry = ctx.request().extensions().get::<KvRegistry>().cloned();
 
     // Secret reads resolve through the whole SecretRegistry (from request
-    // extensions); writes delegate to the wasm32 env.secret()-backed writer.
+    // extensions). Cloudflare secrets are deploy-time bindings with no runtime
+    // write API, so the write delegate rejects writes.
     let secret_reader = ctx.request().extensions().get::<SecretRegistry>().cloned();
-    #[cfg(target_arch = "wasm32")]
-    let secret_writer: Arc<dyn PlatformSecretWriter> =
-        edgezero_adapter_cloudflare::context::CloudflareRequestContext::get(ctx.request())
-            .map(|cf_ctx| {
-                Arc::new(CloudflareSecretStoreAdapter {
-                    env: cf_ctx.env().clone(),
-                }) as Arc<dyn PlatformSecretWriter>
-            })
-            .unwrap_or_else(|| Arc::new(NoopSecretStore));
-    #[cfg(not(target_arch = "wasm32"))]
     let secret_writer: Arc<dyn PlatformSecretWriter> = Arc::new(NoopSecretStore);
     let secret_store: Arc<dyn PlatformSecretStore> =
         Arc::new(CompositeSecretStore::new(secret_reader, secret_writer));
@@ -963,6 +820,7 @@ mod tests {
     use edgezero_core::context::RequestContext;
     use edgezero_core::http::{HeaderValue, request_builder};
     use edgezero_core::params::PathParams;
+    use trusted_server_core::platform::StoreName;
 
     use super::registry_test_support::{
         config_registry, kv_registry, secret_registry, test_context_with_registries,

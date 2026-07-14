@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::key_value_store::{KvHandle, KvPage, KvStore};
 use edgezero_core::store_registry::{ConfigRegistry, KvRegistry, SecretRegistry};
 use error_stack::Report;
@@ -13,7 +12,7 @@ use trusted_server_core::platform::{
     ClientInfo, CompositeConfigStore, CompositeSecretStore, GeoInfo, KvError, PlatformBackend,
     PlatformBackendSpec, PlatformConfigStore, PlatformConfigWriter, PlatformError, PlatformGeo,
     PlatformHttpClient, PlatformKvStore, PlatformSecretStore, PlatformSecretWriter,
-    RuntimeServices, StoreId, StoreName, UnavailableKvStore,
+    RuntimeServices, StoreId, UnavailableKvStore,
 };
 
 #[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
@@ -41,69 +40,44 @@ type HeaderPairs = Vec<(String, Vec<u8>)>;
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 type BufferedResponseParts = (HeaderPairs, Vec<u8>);
 
-const SPIN_VARIABLE_HEX: &[u8; 16] = b"0123456789abcdef";
-
 // ---------------------------------------------------------------------------
-// Noop stubs — used when a handle is absent (native CI, missing binding)
+// Write delegates — Spin has no runtime config/secret write API
 // ---------------------------------------------------------------------------
 
+/// Write-only config store for Spin.
+///
+/// Config reads resolve through the `EdgeZero` config registry behind
+/// [`CompositeConfigStore`]; Spin exposes no config write API, so writes error.
 struct NoopConfigStore;
 
-impl PlatformConfigStore for NoopConfigStore {
-    fn get(&self, _: &StoreName, _: &str) -> Result<String, Report<PlatformError>> {
-        Err(Report::new(PlatformError::ConfigStore).attach("config store not available"))
-    }
-
+impl PlatformConfigWriter for NoopConfigStore {
     fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::ConfigStore).attach("config store writes are not supported"))
+        Err(Report::new(PlatformError::ConfigStore)
+            .attach("config store writes are not supported on Spin"))
     }
 
     fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::ConfigStore).attach("config store writes are not supported"))
+        Err(Report::new(PlatformError::ConfigStore)
+            .attach("config store deletes are not supported on Spin"))
     }
 }
 
-impl PlatformConfigWriter for NoopConfigStore {
-    fn put(&self, store_id: &StoreId, key: &str, value: &str) -> Result<(), Report<PlatformError>> {
-        PlatformConfigStore::put(self, store_id, key, value)
-    }
-
-    fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>> {
-        PlatformConfigStore::delete(self, store_id, key)
-    }
-}
-
-#[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
+/// Write-only secret store for Spin.
+///
+/// Secret reads resolve through the `EdgeZero` secret registry behind
+/// [`CompositeSecretStore`]; Spin secrets are manifest-declared component
+/// variables with no runtime write API, so writes error.
 struct NoopSecretStore;
 
-#[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
-impl PlatformSecretStore for NoopSecretStore {
-    fn get_bytes(&self, _: &StoreName, _: &str) -> Result<Vec<u8>, Report<PlatformError>> {
-        Err(Report::new(PlatformError::SecretStore).attach("secret store not available"))
-    }
-
+impl PlatformSecretWriter for NoopSecretStore {
     fn create(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::SecretStore).attach("secret store not available"))
+        Err(Report::new(PlatformError::SecretStore)
+            .attach("secret store writes are not supported on Spin"))
     }
 
     fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::SecretStore).attach("secret store not available"))
-    }
-}
-
-#[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
-impl PlatformSecretWriter for NoopSecretStore {
-    fn create(
-        &self,
-        store_id: &StoreId,
-        name: &str,
-        value: &str,
-    ) -> Result<(), Report<PlatformError>> {
-        PlatformSecretStore::create(self, store_id, name, value)
-    }
-
-    fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>> {
-        PlatformSecretStore::delete(self, store_id, name)
+        Err(Report::new(PlatformError::SecretStore)
+            .attach("secret store deletes are not supported on Spin"))
     }
 }
 
@@ -134,107 +108,6 @@ impl PlatformBackend for NoopBackend {
 // ---------------------------------------------------------------------------
 // edgezero handle adapters — injected by edgezero_adapter_spin::run_app
 // ---------------------------------------------------------------------------
-
-/// Bridges edgezero's [`ConfigStoreHandle`] to [`PlatformConfigStore`].
-///
-/// Reads delegate through the handle after mapping Trusted Server keys to Spin
-/// variable names. Writes are unsupported on current Spin runtime config and
-/// return typed errors.
-struct ConfigStoreHandleAdapter(ConfigStoreHandle);
-
-impl PlatformConfigStore for ConfigStoreHandleAdapter {
-    fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
-        let variable_name = spin_variable_name(key, PlatformError::ConfigStore)?;
-        futures::executor::block_on(self.0.get(&variable_name))
-            .map_err(|e| {
-                Report::new(PlatformError::ConfigStore)
-                    .attach(format!(
-                        "config store lookup failed for key `{key}` as Spin variable `{variable_name}`: {e}"
-                    ))
-            })?
-            .ok_or_else(|| {
-                Report::new(PlatformError::ConfigStore).attach(format!(
-                    "key `{key}` not found as Spin variable `{variable_name}`"
-                ))
-            })
-    }
-
-    fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::ConfigStore)
-            .attach("config store writes are not supported on Spin"))
-    }
-
-    fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::ConfigStore)
-            .attach("config store writes are not supported on Spin"))
-    }
-}
-
-impl PlatformConfigWriter for ConfigStoreHandleAdapter {
-    fn put(&self, store_id: &StoreId, key: &str, value: &str) -> Result<(), Report<PlatformError>> {
-        PlatformConfigStore::put(self, store_id, key, value)
-    }
-
-    fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>> {
-        PlatformConfigStore::delete(self, store_id, key)
-    }
-}
-
-fn spin_variable_name(
-    key: &str,
-    error_context: PlatformError,
-) -> Result<String, Report<PlatformError>> {
-    if key.is_empty() {
-        return Err(Report::new(error_context).attach("Spin variable key must not be empty"));
-    }
-
-    // Spin requires each _-separated word to start with an ASCII letter.
-    // Reject at the encoder boundary so no caller can accidentally produce aliasing
-    // (e.g. "1foo" and "n1foo" both encoding to the same variable name).
-    if !key.starts_with(|c: char| c.is_ascii_lowercase()) {
-        return Err(Report::new(error_context).attach(format!(
-            "Spin variable key `{key}` must start with a lowercase ASCII letter"
-        )));
-    }
-
-    // `v_` prefix + worst-case 4 bytes per char for escape sequences.
-    let mut out = String::with_capacity(key.len() * 4 + 3);
-    out.push_str("v_");
-
-    for ch in key.chars() {
-        match ch {
-            'a'..='z' | '0'..='9' => out.push(ch),
-            'A'..='Z' | '-' | '_' | '.' | ':' => {
-                push_spin_variable_escape(&mut out, ch as u8);
-            }
-            _ => {
-                return Err(Report::new(error_context).attach(format!(
-                    "Spin variable key `{key}` contains unsupported character `{ch}`"
-                )));
-            }
-        }
-    }
-
-    Ok(out)
-}
-
-fn push_spin_variable_escape(out: &mut String, byte: u8) {
-    out.push('_');
-    out.push('x');
-    out.push(SPIN_VARIABLE_HEX[(byte >> 4) as usize] as char);
-    out.push(SPIN_VARIABLE_HEX[(byte & 0x0f) as usize] as char);
-}
-
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-fn spin_secret_variable_name(
-    store_name: &StoreName,
-    key: &str,
-) -> Result<String, Report<PlatformError>> {
-    let store_variable = spin_variable_name(store_name.as_ref(), PlatformError::SecretStore)?;
-    let key_variable = spin_variable_name(key, PlatformError::SecretStore)?;
-
-    Ok(format!("{store_variable}_{key_variable}"))
-}
 
 /// Bridges edgezero's [`KvHandle`] to [`PlatformKvStore`].
 ///
@@ -690,77 +563,15 @@ fn into_spin_method(method: &edgezero_core::http::Method) -> spin_sdk::http::Met
 }
 
 // ---------------------------------------------------------------------------
-// SpinSecretStoreAdapter — WASM target + spin feature only
-// ---------------------------------------------------------------------------
-
-/// Bridges Spin component variables to [`PlatformSecretStore`].
-///
-/// # Limitations
-///
-/// - **UTF-8 only.** `spin_sdk::variables::get` returns a `String`, so all
-///   secret values must be valid UTF-8. JSON-encoded signing keys work today;
-///   raw binary secrets (e.g. bare Ed25519 bytes) would silently fail at the
-///   Spin runtime layer.
-///
-/// - **Plaintext at rest.** Spin component variables are unencrypted in the
-///   application manifest by default. Production deployments must back variables
-///   with a real secret-provider source (e.g. Vault, Azure Key Vault) to avoid
-///   storing signing keys in plaintext on disk.
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-struct SpinSecretStoreAdapter;
-
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-impl PlatformSecretStore for SpinSecretStoreAdapter {
-    fn get_bytes(
-        &self,
-        store_name: &StoreName,
-        key: &str,
-    ) -> Result<Vec<u8>, Report<PlatformError>> {
-        let variable_name = spin_secret_variable_name(store_name, key)?;
-        match futures::executor::block_on(spin_sdk::variables::get(&variable_name)) {
-            Ok(value) => Ok(value.into_bytes()),
-            Err(error) => Err(Report::new(PlatformError::SecretStore).attach(format!(
-                "secret lookup failed for key `{key}` as Spin variable `{variable_name}`: {error}"
-            ))),
-        }
-    }
-
-    fn create(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::SecretStore)
-            .attach("secret store writes are not supported on Spin"))
-    }
-
-    fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::SecretStore)
-            .attach("secret store deletes are not supported on Spin"))
-    }
-}
-
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-impl PlatformSecretWriter for SpinSecretStoreAdapter {
-    fn create(
-        &self,
-        store_id: &StoreId,
-        name: &str,
-        value: &str,
-    ) -> Result<(), Report<PlatformError>> {
-        PlatformSecretStore::create(self, store_id, name, value)
-    }
-
-    fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>> {
-        PlatformSecretStore::delete(self, store_id, name)
-    }
-}
-
-// ---------------------------------------------------------------------------
 // build_runtime_services
 // ---------------------------------------------------------------------------
 
 /// Construct [`RuntimeServices`] for an incoming Spin request.
 ///
-/// Config and KV are sourced from the `EdgeZero` handles that `run_app` injects
-/// before routing. Secrets are read synchronously from Spin component
-/// variables because Trusted Server's platform secret trait is sync.
+/// Config, secret, and KV reads resolve through the `EdgeZero` store registries
+/// that `run_app` injects into the request extensions before routing. Spin has
+/// no runtime config- or secret-store write API, so both write delegates handed
+/// to the composites reject writes.
 #[must_use]
 pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> RuntimeServices {
     let client_ip = extract_client_ip(ctx);
@@ -771,14 +582,11 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
     let http_client: Arc<dyn PlatformHttpClient> = Arc::new(UnavailableHttpClient);
 
     // Config reads resolve through the whole ConfigRegistry (from request
-    // extensions) so non-default logical ids (e.g. `jwks_store`) resolve; writes
-    // delegate to the run_app-injected default config handle. An absent registry
-    // makes composite reads error rather than silently reading a default store.
+    // extensions) so non-default logical ids (e.g. `jwks_store`) resolve. An
+    // absent registry makes composite reads error rather than silently reading a
+    // default store.
     let config_reader = ctx.request().extensions().get::<ConfigRegistry>().cloned();
-    let config_writer: Arc<dyn PlatformConfigWriter> = ctx
-        .config_store_default()
-        .map(|h| Arc::new(ConfigStoreHandleAdapter(h)) as Arc<dyn PlatformConfigWriter>)
-        .unwrap_or_else(|| Arc::new(NoopConfigStore));
+    let config_writer: Arc<dyn PlatformConfigWriter> = Arc::new(NoopConfigStore);
     let config_store: Arc<dyn PlatformConfigStore> =
         Arc::new(CompositeConfigStore::new(config_reader, config_writer));
 
@@ -791,11 +599,9 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
     let kv_registry = ctx.request().extensions().get::<KvRegistry>().cloned();
 
     // Secret reads resolve through the whole SecretRegistry (from request
-    // extensions); writes delegate to the Spin-variable-backed writer.
+    // extensions). Spin component variables are manifest-declared with no runtime
+    // write API, so the write delegate rejects writes.
     let secret_reader = ctx.request().extensions().get::<SecretRegistry>().cloned();
-    #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-    let secret_writer: Arc<dyn PlatformSecretWriter> = Arc::new(SpinSecretStoreAdapter);
-    #[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
     let secret_writer: Arc<dyn PlatformSecretWriter> = Arc::new(NoopSecretStore);
     let secret_store: Arc<dyn PlatformSecretStore> =
         Arc::new(CompositeSecretStore::new(secret_reader, secret_writer));
@@ -1047,6 +853,7 @@ mod tests {
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use std::io::Write as _;
+    use trusted_server_core::platform::StoreName;
 
     use super::registry_test_support::{
         config_registry, kv_registry, secret_registry, test_context_with_registries,
@@ -1254,103 +1061,6 @@ mod tests {
                 .expect("should not fail")
                 .is_none(),
             "should return None for any client IP"
-        );
-    }
-
-    #[test]
-    fn spin_variable_name_encodes_trusted_server_keys() {
-        assert_eq!(
-            spin_variable_name("current-kid", PlatformError::ConfigStore)
-                .expect("should encode current kid key"),
-            "v_current_x2dkid"
-        );
-        assert_eq!(
-            spin_variable_name("active-kids", PlatformError::ConfigStore)
-                .expect("should encode active kids key"),
-            "v_active_x2dkids"
-        );
-        assert_eq!(
-            spin_variable_name("ts-2026-05-25", PlatformError::ConfigStore)
-                .expect("should encode generated kid"),
-            "v_ts_x2d2026_x2d05_x2d25"
-        );
-        // Digit-leading keys are rejected at the encoder boundary.
-        assert!(
-            spin_variable_name("2026-key", PlatformError::ConfigStore).is_err(),
-            "should reject digit-leading key"
-        );
-    }
-
-    #[test]
-    fn spin_encoder_accepts_every_creatable_kid() {
-        // Portability contract: core's create/rotate validation (kid_is_creatable)
-        // must never admit a kid the Spin variable encoder rejects — otherwise such
-        // a kid would 400 on create across every adapter yet 5xx at storage on Spin.
-        // This pins core >= encoder strictness so the duplicated lowercase-leading
-        // rule in validate_kid and spin_variable_name cannot silently drift.
-        use trusted_server_core::request_signing::kid_is_creatable;
-
-        let samples = [
-            "a",
-            "kid",
-            "ts-2026-05-25",
-            "azAZ09-_.:",
-            "k.id:with_all-chars",
-            "KidA",
-            "_kid",
-            "-kid",
-            ".kid",
-            ":kid",
-            "1foo",
-            "0abc",
-            "",
-            "a,b",
-            "a b",
-            "kid/name",
-        ];
-        for kid in samples {
-            if kid_is_creatable(kid) {
-                assert!(
-                    spin_variable_name(kid, PlatformError::ConfigStore).is_ok(),
-                    "core accepts kid `{kid}` but the Spin encoder rejects it \
-                     (portability contract broken)"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn spin_secret_variable_name_prefixes_store_name() {
-        assert_eq!(
-            spin_secret_variable_name(&StoreName::from("signing_keys"), "ts-2026-05-25")
-                .expect("should encode secret variable name"),
-            "v_signing_x5fkeys_v_ts_x2d2026_x2d05_x2d25"
-        );
-    }
-
-    #[test]
-    fn spin_variable_name_rejects_unsupported_characters() {
-        assert!(
-            spin_variable_name("kid/name", PlatformError::ConfigStore).is_err(),
-            "should reject characters outside the supported Spin variable mapping"
-        );
-    }
-
-    #[test]
-    fn spin_variable_name_does_not_collapse_distinct_allowed_kids() {
-        let mut names = std::collections::BTreeSet::new();
-        // Only lowercase-leading keys are accepted; "KidA" is rejected at the boundary.
-        for kid in ["kid-a", "kid.a", "kid:a", "kid_a", "kid_2da", "kida"] {
-            let variable_name = spin_variable_name(kid, PlatformError::ConfigStore)
-                .expect("should encode allowed kid characters");
-            assert!(
-                names.insert(variable_name.clone()),
-                "Spin variable mapping must not collide for kid `{kid}` as `{variable_name}`"
-            );
-        }
-        assert!(
-            spin_variable_name("KidA", PlatformError::ConfigStore).is_err(),
-            "should reject uppercase-leading kid at the encoder boundary"
         );
     }
 
@@ -1661,26 +1371,6 @@ mod tests {
             MAX_DECOMPRESSED_SIZE,
             8 * 1024 * 1024,
             "production limit must stay within Spin WASM heap budget"
-        );
-    }
-
-    #[test]
-    fn spin_variable_name_rejects_digit_leading_key() {
-        // Encoder enforces the lowercase-letter start contract at the boundary so
-        // no caller can produce aliasing (e.g. "1foo" and "n1foo" would collide).
-        let result = spin_variable_name("1foo", PlatformError::ConfigStore);
-        assert!(
-            result.is_err(),
-            "should reject digit-leading key at the encoder boundary"
-        );
-    }
-
-    #[test]
-    fn spin_variable_name_rejects_uppercase_leading_key() {
-        let result = spin_variable_name("Foo", PlatformError::ConfigStore);
-        assert!(
-            result.is_err(),
-            "should reject uppercase-leading key at the encoder boundary"
         );
     }
 

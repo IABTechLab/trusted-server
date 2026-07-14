@@ -368,6 +368,20 @@ mod tests {
             )],
             "write must delegate to the writer with the same StoreId, key, and value"
         );
+
+        // Key rotation also retires keys: delete must delegate too.
+        composite
+            .delete(&StoreId::from("jwks_store"), "kid-1")
+            .expect("should delegate delete");
+        assert_eq!(
+            writer
+                .deletes
+                .lock()
+                .expect("should acquire writer lock")
+                .as_slice(),
+            &[("jwks_store".to_owned(), "kid-1".to_owned())],
+            "delete must delegate to the writer with the same StoreId and key"
+        );
     }
 
     #[test]
@@ -431,6 +445,19 @@ mod tests {
                 .as_slice(),
             &[("ts_secrets".to_owned(), "new".to_owned(), "val".to_owned())],
             "create must delegate to the writer with the same StoreId"
+        );
+
+        composite
+            .delete(&StoreId::from("ts_secrets"), "new")
+            .expect("should delegate delete");
+        assert_eq!(
+            writer
+                .deletes
+                .lock()
+                .expect("should acquire writer lock")
+                .as_slice(),
+            &[("ts_secrets".to_owned(), "new".to_owned())],
+            "delete must delegate to the writer with the same StoreId"
         );
     }
 

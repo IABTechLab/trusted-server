@@ -1228,9 +1228,10 @@ mod tests {
         RequestFilterEffects, RequestFilterInput,
     };
     use trusted_server_core::platform::{
-        ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformError, PlatformHttpClient,
-        PlatformHttpRequest, PlatformKvStore, PlatformPendingRequest, PlatformResponse,
-        PlatformSelectResult, RuntimeServices,
+        ClientInfo, CompositeConfigStore, CompositeSecretStore, PlatformBackend,
+        PlatformBackendSpec, PlatformError, PlatformHttpClient, PlatformHttpRequest,
+        PlatformKvStore, PlatformPendingRequest, PlatformResponse, PlatformSelectResult,
+        RuntimeServices,
     };
     use trusted_server_core::settings::Settings;
 
@@ -2271,9 +2272,18 @@ mod tests {
     }
 
     fn streaming_runtime_services() -> RuntimeServices {
+        // Mirror the production shape: reads go through the registry-backed
+        // composite (no registry here — this route performs no config/secret
+        // read), writes delegate to the management-API stores.
         RuntimeServices::builder()
-            .config_store(Arc::new(crate::platform::FastlyPlatformConfigStore))
-            .secret_store(Arc::new(crate::platform::FastlyPlatformSecretStore))
+            .config_store(Arc::new(CompositeConfigStore::new(
+                None,
+                Arc::new(crate::platform::FastlyPlatformConfigStore),
+            )))
+            .secret_store(Arc::new(CompositeSecretStore::new(
+                None,
+                Arc::new(crate::platform::FastlyPlatformSecretStore),
+            )))
             .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
             .backend(Arc::new(FixedBackend))
             .http_client(Arc::new(StreamingHttpClient))

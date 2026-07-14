@@ -7,28 +7,29 @@ use std::net::IpAddr;
 use bytes::Bytes;
 use error_stack::{Report, ResultExt};
 use fastly::geo::{geo_lookup, Geo};
-use fastly::{ConfigStore, Request, SecretStore};
+use fastly::{Request, SecretStore};
 
 use crate::backend::BackendConfig;
 pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore,
-    PlatformConfigWriter, PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
-    PlatformImageOptimizerCrop, PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions,
-    PlatformImageOptimizerParams, PlatformImageOptimizerRegion, PlatformPendingRequest,
-    PlatformResponse, PlatformSecretStore, PlatformSecretWriter, PlatformSelectResult, StoreId,
-    StoreName,
+    ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigWriter, PlatformError,
+    PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformImageOptimizerCrop,
+    PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions, PlatformImageOptimizerParams,
+    PlatformImageOptimizerRegion, PlatformPendingRequest, PlatformResponse, PlatformSecretWriter,
+    PlatformSelectResult, StoreId, StoreName,
 };
 
 // ---------------------------------------------------------------------------
 // FastlyPlatformConfigStore
 // ---------------------------------------------------------------------------
 
-/// Fastly [`ConfigStore`]-backed implementation of [`PlatformConfigStore`].
+/// Fastly management-API-backed **write-only** config store.
 ///
-/// Stateless — the store name is supplied per call, matching the trait
-/// signature. This replaces the store-name-at-construction pattern of
-/// the legacy `FastlyConfigStore` (removed).
+/// Stateless — the store id is supplied per call. Reads are *not* implemented:
+/// every runtime config read resolves through the `EdgeZero` [`ConfigRegistry`]
+/// behind
+/// [`CompositeConfigStore`](trusted_server_core::platform::CompositeConfigStore),
+/// so this type only supplies the composite's write delegate.
 ///
 /// # Write cost
 ///
@@ -37,28 +38,17 @@ use trusted_server_core::platform::{
 /// one request pay one round-trip per call. The `"api-keys"` secret store is
 /// opened per call to read the management token; the Fastly Compute SDK caches
 /// the open handle so that cost is negligible.
+///
+/// [`ConfigRegistry`]: edgezero_core::store_registry::ConfigRegistry
 pub struct FastlyPlatformConfigStore;
 
-impl PlatformConfigStore for FastlyPlatformConfigStore {
-    fn get(&self, store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
-        let name = store_name.as_ref();
-        let store = ConfigStore::try_open(name).map_err(|e| {
-            Report::new(PlatformError::ConfigStore)
-                .attach(format!("failed to open config store '{name}': {e}"))
-        })?;
-        store
-            .try_get(key)
-            .map_err(|e| {
-                Report::new(PlatformError::ConfigStore).attach(format!(
-                    "lookup for key '{key}' in config store '{name}' failed: {e}"
-                ))
-            })?
-            .ok_or_else(|| {
-                Report::new(PlatformError::ConfigStore)
-                    .attach(format!("key '{key}' not found in config store '{name}'"))
-            })
-    }
-
+/// Write half supplied to
+/// [`CompositeConfigStore`](trusted_server_core::platform::CompositeConfigStore)
+/// as the management-API write delegate (key rotation).
+///
+/// Core cannot implement this trait for an adapter-owned type (orphan rule), so
+/// each adapter impls it for its own store.
+impl PlatformConfigWriter for FastlyPlatformConfigStore {
     fn put(&self, store_id: &StoreId, key: &str, value: &str) -> Result<(), Report<PlatformError>> {
         let client = crate::management_api::FastlyManagementApiClient::new()?;
         client.update_config_item(store_id.as_ref(), key, value)
@@ -70,46 +60,48 @@ impl PlatformConfigStore for FastlyPlatformConfigStore {
     }
 }
 
-/// Write half of [`FastlyPlatformConfigStore`], supplied to
-/// [`CompositeConfigStore`](trusted_server_core::platform::CompositeConfigStore)
-/// as the management-API write delegate.
-///
-/// Core cannot implement this trait for an adapter-owned type (orphan rule), so
-/// each adapter impls it for its own store, forwarding to the existing
-/// [`PlatformConfigStore`] write methods.
-impl PlatformConfigWriter for FastlyPlatformConfigStore {
-    fn put(&self, store_id: &StoreId, key: &str, value: &str) -> Result<(), Report<PlatformError>> {
-        PlatformConfigStore::put(self, store_id, key, value)
-    }
-
-    fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>> {
-        PlatformConfigStore::delete(self, store_id, key)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // FastlyPlatformSecretStore
 // ---------------------------------------------------------------------------
 
-/// Fastly [`SecretStore`]-backed implementation of [`PlatformSecretStore`].
+/// Fastly [`SecretStore`]-backed **write-only** secret store, plus the one
+/// management-store read described below.
 ///
-/// Stateless — the store name is supplied per call. This replaces the
-/// store-name-at-construction pattern of the legacy `FastlySecretStore`
-/// (removed).
+/// Stateless — the store id is supplied per call. Runtime secret reads resolve
+/// through the `EdgeZero` [`SecretRegistry`] behind
+/// [`CompositeSecretStore`](trusted_server_core::platform::CompositeSecretStore),
+/// so this type implements no read trait.
 ///
 /// # Write cost
 ///
 /// `create` and `delete` have the same per-call
 /// [`crate::management_api::FastlyManagementApiClient`] cost described on
 /// [`FastlyPlatformConfigStore`].
+///
+/// [`SecretRegistry`]: edgezero_core::store_registry::SecretRegistry
 pub struct FastlyPlatformSecretStore;
 
-impl PlatformSecretStore for FastlyPlatformSecretStore {
-    fn get_bytes(
-        &self,
+impl FastlyPlatformSecretStore {
+    /// Reads a secret directly from a Fastly secret store, bypassing the
+    /// `EdgeZero` registry.
+    ///
+    /// **Do not "clean this up".** This is the single deliberate direct read
+    /// left on Fastly: [`crate::management_api::FastlyManagementApiClient`]
+    /// bootstraps itself from the `api-keys` secret store, a Fastly-only
+    /// *management* store that is intentionally **not** part of the logical
+    /// store registry (it is absent from `STORES_METADATA`, and its hyphenated
+    /// id could not be a registry id anyway). It therefore cannot be read
+    /// through the registry composite, and removing this method breaks every
+    /// management-API write, including key rotation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::SecretStore`] when the store cannot be opened,
+    /// the key does not exist, decryption fails, or the value is not UTF-8.
+    pub(crate) fn read_management_secret(
         store_name: &StoreName,
         key: &str,
-    ) -> Result<Vec<u8>, Report<PlatformError>> {
+    ) -> Result<String, Report<PlatformError>> {
         let name = store_name.as_ref();
         // Unlike ConfigStore::open (which panics), SecretStore::open already
         // returns Result — there is no try_open variant on SecretStore.
@@ -128,15 +120,22 @@ impl PlatformSecretStore for FastlyPlatformSecretStore {
                 Report::new(PlatformError::SecretStore)
                     .attach(format!("key '{key}' not found in secret store '{name}'"))
             })?;
-        secret
-            .try_plaintext()
-            .map(|bytes| bytes.to_vec())
-            .map_err(|e| {
-                Report::new(PlatformError::SecretStore)
-                    .attach(format!("failed to decrypt secret '{key}': {e}"))
-            })
+        let bytes = secret.try_plaintext().map_err(|e| {
+            Report::new(PlatformError::SecretStore)
+                .attach(format!("failed to decrypt secret '{key}': {e}"))
+        })?;
+        String::from_utf8(bytes.to_vec()).map_err(|e| {
+            Report::new(PlatformError::SecretStore)
+                .attach(format!("secret '{key}' is not valid UTF-8: {e}"))
+        })
     }
+}
 
+/// Write half supplied to
+/// [`CompositeSecretStore`](trusted_server_core::platform::CompositeSecretStore)
+/// as the management-API write delegate (see [`PlatformConfigWriter`] above for
+/// why the impl lives in the adapter).
+impl PlatformSecretWriter for FastlyPlatformSecretStore {
     fn create(
         &self,
         store_id: &StoreId,
@@ -150,25 +149,6 @@ impl PlatformSecretStore for FastlyPlatformSecretStore {
     fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>> {
         let client = crate::management_api::FastlyManagementApiClient::new()?;
         client.delete_secret(store_id.as_ref(), name)
-    }
-}
-
-/// Write half of [`FastlyPlatformSecretStore`], supplied to
-/// [`CompositeSecretStore`](trusted_server_core::platform::CompositeSecretStore)
-/// as the management-API write delegate (see [`PlatformConfigWriter`] above for
-/// why the impl lives in the adapter).
-impl PlatformSecretWriter for FastlyPlatformSecretStore {
-    fn create(
-        &self,
-        store_id: &StoreId,
-        name: &str,
-        value: &str,
-    ) -> Result<(), Report<PlatformError>> {
-        PlatformSecretStore::create(self, store_id, name, value)
-    }
-
-    fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>> {
-        PlatformSecretStore::delete(self, store_id, name)
     }
 }
 

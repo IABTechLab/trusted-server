@@ -55,9 +55,10 @@ use fastly::ConfigStore;
 /// pointer", which would break discovery, signature verification, key rotation,
 /// and the `DataDome` IP bypass.
 ///
-/// This reads exactly as
-/// [`FastlyPlatformConfigStore::get`](crate::platform::FastlyPlatformConfigStore)
-/// does today, so the registry cutover is behavior-preserving.
+/// This reads exactly as the pre-registry
+/// [`FastlyPlatformConfigStore`](crate::platform::FastlyPlatformConfigStore)
+/// read did, so the registry cutover is behavior-preserving. (That read impl is
+/// now gone: the store is write-only and all reads come through this registry.)
 ///
 /// **Do not collapse the two store kinds into one.** See
 /// [`build_config_registry`] for which id gets which.
