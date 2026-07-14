@@ -26,10 +26,11 @@ use crate::settings::Settings;
 use super::formats::{convert_to_openrtb_response, convert_tsjs_to_auction_request};
 use super::telemetry::{
     build_auction_events, emit_auction_events_best_effort_lazy, AuctionObservationContext,
-    AuctionSource, AuctionTerminalOutcome,
+    AuctionTerminalOutcome,
 };
 use super::types::AuctionContext;
 use super::AuctionOrchestrator;
+use super::AuctionSource;
 
 const MAX_CLIENT_EID_SOURCES: usize = 64;
 const MAX_CLIENT_UIDS_PER_SOURCE: usize = 32;

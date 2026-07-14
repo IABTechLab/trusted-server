@@ -11,6 +11,7 @@ use error_stack::Report;
 use serde::Serialize;
 use uuid::Uuid;
 
+use crate::auction::admission::AuctionSource;
 use crate::auction::orchestrator::OrchestrationResult;
 use crate::auction::types::{AuctionRequest, AuctionResponse, Bid, BidStatus, MediaType};
 use crate::ec::EcContext;
@@ -19,27 +20,6 @@ use crate::platform::RuntimeServices;
 
 const MAX_PAGE_PATH_BYTES: usize = 256;
 const DYNAMIC_SEGMENT_REPLACEMENT: &str = ":id";
-
-/// Source path that initiated an auction candidate.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum AuctionSource {
-    /// Initial publisher navigation using server-side ad templates.
-    InitialNavigation,
-    /// SPA navigation through `GET /__ts/page-bids`.
-    SpaNavigation,
-    /// Explicit `POST /auction` API.
-    AuctionApi,
-}
-
-impl AuctionSource {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::InitialNavigation => "initial_navigation",
-            Self::SpaNavigation => "spa_navigation",
-            Self::AuctionApi => "auction_api",
-        }
-    }
-}
 
 /// Terminal status for one auction observation.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

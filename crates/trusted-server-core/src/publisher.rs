@@ -35,11 +35,12 @@ use crate::auction::orchestrator::{
 };
 use crate::auction::telemetry::{
     build_auction_events, emit_auction_events_best_effort_lazy, AuctionObservationContext,
-    AuctionSource, AuctionTerminalOutcome,
+    AuctionTerminalOutcome,
 };
 use crate::auction::types::{
     AuctionContext, AuctionRequest, Bid, DeviceInfo, PublisherInfo, SiteInfo, UserInfo,
 };
+use crate::auction::AuctionSource;
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
 use crate::constants::{COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
 use crate::cookies::handle_request_cookies;
