@@ -295,6 +295,45 @@ describe('prebid/installPrebidNpm', () => {
       expect(payload.eids).toBeUndefined();
     });
 
+    it('buildRequests preserves canonical slot fields in the /auction payload', () => {
+      const spec = getAdapterSpec();
+
+      const result = spec.buildRequests([
+        {
+          adUnitCode: 'div-gpt-1',
+          bidder: 'trustedServer',
+          mediaTypes: {
+            banner: { sizes: [[300, 250]] },
+            video: { playerSize: [[640, 480]] },
+            native: { sizes: [[1, 1]] },
+          },
+          floorUsd: 0.75,
+          targeting: {
+            pos: 'atf',
+            enabled: true,
+            segments: ['a', 2, false],
+          },
+          params: {},
+        },
+      ]);
+
+      const payload = JSON.parse(result.data);
+      expect(payload.adUnits[0]).toMatchObject({
+        code: 'div-gpt-1',
+        mediaTypes: {
+          banner: { sizes: [[300, 250]] },
+          video: { playerSize: [[640, 480]] },
+          native: { sizes: [[1, 1]] },
+        },
+        floorUsd: 0.75,
+        targeting: {
+          pos: 'atf',
+          enabled: true,
+          segments: ['a', 2, false],
+        },
+      });
+    });
+
     it('buildRequests includes current Prebid EIDs in the /auction payload', () => {
       const spec = getAdapterSpec();
       mockGetUserIdsAsEids.mockReturnValue([

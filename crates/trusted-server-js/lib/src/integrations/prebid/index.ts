@@ -223,15 +223,26 @@ type PbjsConfig = Parameters<typeof pbjs.setConfig>[0];
 type TrustedServerBid = { bidder?: string; params?: Record<string, unknown> };
 type BannerSize = [number, number];
 type TrustedServerBanner = { sizes: BannerSize[]; name?: string };
+type TrustedServerVideo = { playerSize?: BannerSize[]; sizes?: BannerSize[] };
+type TrustedServerNative = { sizes?: BannerSize[] };
 type TrustedServerAdUnit = {
   code?: string;
-  mediaTypes?: { banner?: TrustedServerBanner };
+  mediaTypes?: {
+    banner?: TrustedServerBanner;
+    video?: TrustedServerVideo;
+    native?: TrustedServerNative;
+  };
   bids?: TrustedServerBid[];
+  floorUsd?: number;
+  targeting?: Record<string, unknown>;
 };
 type TrustedServerBidRequest = {
   adUnitCode?: string;
   code?: string;
   bidId?: string;
+  mediaTypes?: TrustedServerAdUnit['mediaTypes'];
+  floorUsd?: number;
+  targeting?: Record<string, unknown>;
 };
 type TrustedServerRequest = {
   method: 'POST';

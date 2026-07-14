@@ -155,6 +155,44 @@ describe('auction/buildAdRequest', () => {
     expect(result.adUnits[0].bids[0].bidder).toBe('a');
     expect(result.adUnits[0].bids[1].bidder).toBe('b');
   });
+
+  it('preserves canonical slot economics targeting and non-banner media', () => {
+    const result = buildAdRequest(
+      [
+        {
+          code: 'slot-1',
+          mediaTypes: {
+            banner: { sizes: [[300, 250]] },
+            video: { playerSize: [[640, 480]] },
+            native: { sizes: [[1, 1]] },
+          },
+          floorUsd: 0.75,
+          targeting: {
+            pos: 'atf',
+            enabled: true,
+            segments: ['a', 2, false],
+          },
+          bids: [{ bidder: 'appnexus', params: {} }],
+        },
+      ],
+      { pageUrl: TEST_PAGE_URL }
+    );
+
+    expect(result.adUnits[0]).toMatchObject({
+      code: 'slot-1',
+      mediaTypes: {
+        banner: { sizes: [[300, 250]] },
+        video: { playerSize: [[640, 480]] },
+        native: { sizes: [[1, 1]] },
+      },
+      floorUsd: 0.75,
+      targeting: {
+        pos: 'atf',
+        enabled: true,
+        segments: ['a', 2, false],
+      },
+    });
+  });
 });
 
 describe('auction/parseAuctionResponse', () => {

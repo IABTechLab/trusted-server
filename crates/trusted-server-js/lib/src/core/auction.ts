@@ -13,8 +13,12 @@ export interface AdRequestUnit {
   code: string;
   mediaTypes: {
     banner?: { sizes: number[][] };
+    video?: { playerSize?: number[][]; sizes?: number[][] };
+    native?: { sizes?: number[][] };
   };
   bids: Array<{ bidder: string; params: Record<string, unknown> }>;
+  floorUsd?: number;
+  targeting?: Record<string, unknown>;
 }
 
 /** A user identifier within an auction-level EID entry. */
@@ -79,14 +83,22 @@ export function buildAdRequest(
   for (const u of units) {
     const code: string = u.adUnitCode ?? u.code ?? '';
     if (!unitMap.has(code)) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const mediaTypes: any = {};
-      if (u.mediaTypes?.banner) {
-        mediaTypes.banner = {
-          sizes: u.mediaTypes.banner.sizes ?? u.sizes ?? [],
-        };
+      const unit: AdRequestUnit = {
+        code,
+        mediaTypes: buildMediaTypes(u),
+        bids: [],
+      };
+
+      if (typeof u.floorUsd === 'number') {
+        unit.floorUsd = u.floorUsd;
+      } else if (typeof u.floor === 'number') {
+        unit.floorUsd = u.floor;
       }
-      unitMap.set(code, { code, mediaTypes, bids: [] });
+      if (u.targeting && typeof u.targeting === 'object' && !Array.isArray(u.targeting)) {
+        unit.targeting = { ...u.targeting };
+      }
+
+      unitMap.set(code, unit);
     }
 
     // If the source object carries a `bidder` field (Prebid BidRequest style),
@@ -115,6 +127,32 @@ export function buildAdRequest(
     request.eids = options.eids;
   }
   return request;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function buildMediaTypes(unit: any): AdRequestUnit['mediaTypes'] {
+  const mediaTypes: AdRequestUnit['mediaTypes'] = {};
+  if (unit.mediaTypes?.banner) {
+    mediaTypes.banner = {
+      sizes: unit.mediaTypes.banner.sizes ?? unit.sizes ?? [],
+    };
+  }
+  if (unit.mediaTypes?.video) {
+    mediaTypes.video = {};
+    if (Array.isArray(unit.mediaTypes.video.playerSize)) {
+      mediaTypes.video.playerSize = unit.mediaTypes.video.playerSize;
+    }
+    if (Array.isArray(unit.mediaTypes.video.sizes)) {
+      mediaTypes.video.sizes = unit.mediaTypes.video.sizes;
+    }
+  }
+  if (unit.mediaTypes?.native) {
+    mediaTypes.native = {};
+    if (Array.isArray(unit.mediaTypes.native.sizes)) {
+      mediaTypes.native.sizes = unit.mediaTypes.native.sizes;
+    }
+  }
+  return mediaTypes;
 }
 
 // ---------------------------------------------------------------------------

@@ -26,6 +26,7 @@ pub mod telemetry;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod types;
+pub mod validation;
 
 pub use admission::AuctionSource;
 pub use config::AuctionConfig;

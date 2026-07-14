@@ -9,10 +9,9 @@ use error_stack::{ensure, Report, ResultExt};
 use http::{header, HeaderValue, Request, Response, StatusCode};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
-use crate::auction::context::ContextValue;
 use crate::consent::ConsentContext;
 use crate::constants::{HEADER_X_TS_EC_CONSENT, HEADER_X_TS_EIDS, HEADER_X_TS_EIDS_TRUNCATED};
 use crate::creative;
@@ -27,6 +26,10 @@ use super::orchestrator::OrchestrationResult;
 use super::types::{
     AdFormat, AdSlot, AuctionRequest, DeviceInfo, MediaType, OrchestratorExt, ProviderSummary,
     PublisherInfo, SiteInfo, UserInfo,
+};
+use super::validation::{
+    validate_context, validate_slots, AuctionInputLimits, FiniteNonNegativeF64, RawAdSlot,
+    RawBidder, TargetingValue,
 };
 
 /// Apply private no-store caching headers to auction endpoint responses.
@@ -70,6 +73,9 @@ pub struct AdUnit {
     pub code: String,
     pub media_types: Option<MediaTypes>,
     pub bids: Option<Vec<BidConfig>>,
+    pub floor_usd: Option<f64>,
+    #[serde(default)]
+    pub targeting: BTreeMap<String, JsonValue>,
 }
 
 /// Inline bidder params for one SSP within an [`AdUnit`].
@@ -86,14 +92,33 @@ pub struct BidConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaTypes {
     pub banner: Option<BannerUnit>,
+    pub video: Option<VideoUnit>,
+    pub native: Option<NativeUnit>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BannerUnit {
+    pub sizes: Vec<Vec<u32>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoUnit {
+    #[serde(default)]
+    pub player_size: Vec<Vec<u32>>,
+    #[serde(default)]
+    pub sizes: Vec<Vec<u32>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeUnit {
+    #[serde(default)]
     pub sizes: Vec<Vec<u32>>,
 }
 
@@ -122,45 +147,25 @@ pub fn convert_tsjs_to_auction_request(
 ) -> Result<AuctionRequest, Report<TrustedServerError>> {
     let ec_id = ec_id.map(str::to_owned);
 
-    // Convert ad units to slots
-    let mut slots = Vec::new();
-    for unit in &body.ad_units {
-        if let Some(media_types) = &unit.media_types {
-            if let Some(banner) = &media_types.banner {
-                let mut formats = Vec::new();
-                for size in &banner.sizes {
-                    ensure!(
-                        size.len() == 2,
-                        TrustedServerError::BadRequest {
-                            message: "Invalid banner size; expected [width, height]".to_string(),
-                        }
-                    );
-
-                    formats.push(AdFormat {
-                        width: size[0],
-                        height: size[1],
-                        media_type: MediaType::Banner,
-                    });
-                }
-
-                // Extract bidder params from the bids array
-                let mut bidders = HashMap::new();
-                if let Some(bids) = &unit.bids {
-                    for bid in bids {
-                        bidders.insert(bid.bidder.clone(), bid.params.clone());
-                    }
-                }
-
-                slots.push(AdSlot {
-                    id: unit.code.clone(),
-                    formats,
-                    floor_price: None,
-                    targeting: HashMap::new(),
-                    bidders,
-                });
-            }
-        }
-    }
+    let raw_slots = body
+        .ad_units
+        .iter()
+        .map(raw_slot_from_ad_unit)
+        .collect::<Result<Vec<_>, _>>()?;
+    let slots = validate_slots(raw_slots, &AuctionInputLimits::default())?
+        .into_iter()
+        .map(|slot| AdSlot {
+            id: slot.id.as_str().to_string(),
+            formats: slot.formats,
+            floor_price: slot.floor_usd.map(FiniteNonNegativeF64::get),
+            targeting: slot
+                .targeting
+                .into_iter()
+                .map(|(key, value)| (key, targeting_value_to_json(value)))
+                .collect(),
+            bidders: slot.bidders.into_iter().collect(),
+        })
+        .collect();
 
     // Build device info with user-agent (always) and geo (if available)
     let device = Some(DeviceInfo {
@@ -173,38 +178,17 @@ pub fn convert_tsjs_to_auction_request(
         geo,
     });
 
-    // Forward allowed config entries from the JS request into the context map.
-    // Only keys listed in `auction.allowed_context_keys` are accepted;
-    // unrecognised keys are silently dropped to prevent injection of
-    // arbitrary data by a malicious client payload.
-    let mut context = HashMap::new();
-    if let Some(ref config) = body.config {
-        if let Some(obj) = config.as_object() {
-            for (key, value) in obj {
-                if settings.auction.allowed_context_keys.contains(key) {
-                    match serde_json::from_value::<ContextValue>(value.clone()) {
-                        Ok(cv) => {
-                            context.insert(key.clone(), cv);
-                        }
-                        Err(_) => {
-                            log::debug!(
-                                "Auction context: dropping key '{}' with unsupported type",
-                                key
-                            );
-                        }
-                    }
-                } else {
-                    log::debug!("Auction context: dropping disallowed key '{}'", key);
-                }
-            }
-            if !context.is_empty() {
-                log::debug!(
-                    "Auction request context: {} entries ({})",
-                    context.len(),
-                    context.keys().cloned().collect::<Vec<_>>().join(", ")
-                );
-            }
-        }
+    let context = validate_context(
+        body.config.as_ref(),
+        &settings.auction.allowed_context_keys,
+        &AuctionInputLimits::default(),
+    )?;
+    if !context.is_empty() {
+        log::debug!(
+            "Auction request context: {} entries ({})",
+            context.len(),
+            context.keys().cloned().collect::<Vec<_>>().join(", ")
+        );
     }
 
     Ok(AuctionRequest {
@@ -226,6 +210,89 @@ pub fn convert_tsjs_to_auction_request(
         }),
         context,
     })
+}
+
+fn raw_slot_from_ad_unit(unit: &AdUnit) -> Result<RawAdSlot, Report<TrustedServerError>> {
+    let formats = formats_from_media_types(unit.media_types.as_ref())?;
+    let bidders = unit
+        .bids
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|bid| RawBidder {
+            name: bid.bidder.clone(),
+            params: bid.params.clone(),
+        })
+        .collect();
+
+    Ok(RawAdSlot {
+        id: unit.code.clone(),
+        formats,
+        floor_usd: unit.floor_usd,
+        targeting: unit.targeting.clone(),
+        bidders,
+    })
+}
+
+fn formats_from_media_types(
+    media_types: Option<&MediaTypes>,
+) -> Result<Vec<AdFormat>, Report<TrustedServerError>> {
+    let mut formats = Vec::new();
+    let Some(media_types) = media_types else {
+        return Ok(formats);
+    };
+
+    if let Some(banner) = &media_types.banner {
+        append_sized_formats(&mut formats, &banner.sizes, &MediaType::Banner, "banner")?;
+    }
+    if let Some(video) = &media_types.video {
+        let sizes = if video.player_size.is_empty() {
+            &video.sizes
+        } else {
+            &video.player_size
+        };
+        append_sized_formats(&mut formats, sizes, &MediaType::Video, "video")?;
+    }
+    if let Some(native) = &media_types.native {
+        append_sized_formats(&mut formats, &native.sizes, &MediaType::Native, "native")?;
+    }
+
+    Ok(formats)
+}
+
+fn append_sized_formats(
+    formats: &mut Vec<AdFormat>,
+    sizes: &[Vec<u32>],
+    media_type: &MediaType,
+    media_type_name: &str,
+) -> Result<(), Report<TrustedServerError>> {
+    for size in sizes {
+        ensure!(
+            size.len() == 2,
+            TrustedServerError::BadRequest {
+                message: format!("Invalid {media_type_name} size; expected [width, height]"),
+            }
+        );
+
+        formats.push(AdFormat {
+            width: size[0],
+            height: size[1],
+            media_type: media_type.clone(),
+        });
+    }
+
+    Ok(())
+}
+
+fn targeting_value_to_json(value: TargetingValue) -> JsonValue {
+    match value {
+        TargetingValue::String(value) => JsonValue::String(value),
+        TargetingValue::Number(value) => JsonValue::from(value),
+        TargetingValue::Boolean(value) => JsonValue::Bool(value),
+        TargetingValue::Array(values) => {
+            JsonValue::Array(values.into_iter().map(targeting_value_to_json).collect())
+        }
+    }
 }
 
 fn auction_page_url(body: &AdRequest, settings: &Settings) -> String {
@@ -384,13 +451,14 @@ pub fn convert_to_openrtb_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auction::context::ContextValue;
     use crate::auction::types::{AuctionResponse, Bid, BidStatus};
     use crate::openrtb::{Eid, Uid};
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
     use http::Method;
     use serde_json::json;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     fn make_request() -> Request<EdgeBody> {
         Request::builder()
@@ -495,6 +563,8 @@ mod tests {
                     banner: Some(BannerUnit {
                         sizes: vec![vec![300, 250], vec![728, 90]],
                     }),
+                    video: None,
+                    native: None,
                 }),
                 bids: Some(vec![
                     BidConfig {
@@ -506,6 +576,8 @@ mod tests {
                         params: json!({ "accountId": 456 }),
                     },
                 ]),
+                floor_usd: None,
+                targeting: BTreeMap::new(),
             }],
             config,
             eids: None,
@@ -673,6 +745,73 @@ mod tests {
     }
 
     #[test]
+    fn convert_tsjs_to_auction_request_preserves_slot_economics_targeting_and_media() {
+        let settings = make_settings();
+        let body = AdRequest {
+            version: None,
+            page_url: None,
+            ad_units: vec![AdUnit {
+                code: "div-gpt-top".to_string(),
+                media_types: Some(MediaTypes {
+                    banner: Some(BannerUnit {
+                        sizes: vec![vec![300, 250]],
+                    }),
+                    video: Some(VideoUnit {
+                        player_size: vec![vec![640, 480]],
+                        sizes: vec![],
+                    }),
+                    native: Some(NativeUnit {
+                        sizes: vec![vec![1, 1]],
+                    }),
+                }),
+                bids: Some(vec![BidConfig {
+                    bidder: "appnexus".to_string(),
+                    params: json!({ "placementId": 123 }),
+                }]),
+                floor_usd: Some(0.75),
+                targeting: BTreeMap::from([
+                    ("pos".to_string(), json!("atf")),
+                    ("enabled".to_string(), json!(true)),
+                    ("segments".to_string(), json!(["a", 2, false])),
+                ]),
+            }],
+            config: None,
+            eids: None,
+        };
+
+        let auction_request = convert_body_to_auction_request(&body, &settings);
+        let slot = &auction_request.slots[0];
+
+        assert_eq!(slot.floor_price, Some(0.75), "should preserve floor");
+        assert_eq!(
+            slot.formats,
+            vec![
+                AdFormat {
+                    width: 300,
+                    height: 250,
+                    media_type: MediaType::Banner,
+                },
+                AdFormat {
+                    width: 640,
+                    height: 480,
+                    media_type: MediaType::Video,
+                },
+                AdFormat {
+                    width: 1,
+                    height: 1,
+                    media_type: MediaType::Native,
+                },
+            ],
+            "should preserve all declared media formats"
+        );
+        assert_eq!(
+            slot.targeting.get("segments"),
+            Some(&json!(["a", 2.0, false])),
+            "should preserve scalar targeting arrays"
+        );
+    }
+
+    #[test]
     fn convert_tsjs_to_auction_request_populates_publisher_user_device_and_site_metadata() {
         let settings = make_settings();
         let body = make_banner_body(None);
@@ -736,20 +875,17 @@ mod tests {
     }
 
     #[test]
-    fn convert_tsjs_to_auction_request_filters_context_values() {
+    fn convert_tsjs_to_auction_request_preserves_allowed_context_values() {
         let mut settings = make_settings();
         settings.auction.allowed_context_keys = HashSet::from([
             "segments".to_string(),
             "lockr_id".to_string(),
             "count".to_string(),
-            "unsupported".to_string(),
         ]);
         let body = make_banner_body(Some(json!({
             "segments": ["seg-a", "seg-b"],
             "lockr_id": "lockr-123",
-            "count": 2,
-            "unsupported": { "nested": true },
-            "blocked": "drop-me"
+            "count": 2
         })));
         let auction_request = convert_body_to_auction_request(&body, &settings);
 
@@ -771,18 +907,65 @@ mod tests {
             Some(&ContextValue::Number(2.0)),
             "should keep allowed number context values"
         );
+    }
+
+    #[test]
+    fn convert_tsjs_to_auction_request_rejects_disallowed_context_values() {
+        let mut settings = make_settings();
+        settings.auction.allowed_context_keys = HashSet::from(["segments".to_string()]);
+        let body = make_banner_body(Some(json!({
+            "segments": ["seg-a", "seg-b"],
+            "blocked": "drop-me"
+        })));
+        let req = make_request();
+        let services = noop_services();
+
+        let err = convert_tsjs_to_auction_request(
+            &body,
+            &settings,
+            &services,
+            &req,
+            ConsentContext::default(),
+            Some("existing-ec-id"),
+            None,
+        )
+        .expect_err("should reject disallowed context key");
+
         assert!(
-            !auction_request.context.contains_key("unsupported"),
-            "should drop allowed keys with unsupported value types"
-        );
-        assert!(
-            !auction_request.context.contains_key("blocked"),
-            "should drop disallowed context keys"
+            format!("{err:?}").contains("disallowed context key"),
+            "should explain disallowed context"
         );
     }
 
     #[test]
-    fn convert_tsjs_to_auction_request_allows_empty_banner_sizes() {
+    fn convert_tsjs_to_auction_request_rejects_unsupported_context_values() {
+        let mut settings = make_settings();
+        settings.auction.allowed_context_keys = HashSet::from(["segments".to_string()]);
+        let body = make_banner_body(Some(json!({
+            "segments": { "nested": true }
+        })));
+        let req = make_request();
+        let services = noop_services();
+
+        let err = convert_tsjs_to_auction_request(
+            &body,
+            &settings,
+            &services,
+            &req,
+            ConsentContext::default(),
+            Some("existing-ec-id"),
+            None,
+        )
+        .expect_err("should reject unsupported context value");
+
+        assert!(
+            format!("{err:?}").contains("unsupported type"),
+            "should explain unsupported context"
+        );
+    }
+
+    #[test]
+    fn convert_tsjs_to_auction_request_rejects_empty_banner_sizes() {
         let settings = make_settings();
         let req = make_request();
         let services = noop_services();
@@ -793,14 +976,18 @@ mod tests {
                 code: "div-gpt-top".to_string(),
                 media_types: Some(MediaTypes {
                     banner: Some(BannerUnit { sizes: vec![] }),
+                    video: None,
+                    native: None,
                 }),
                 bids: None,
+                floor_usd: None,
+                targeting: BTreeMap::new(),
             }],
             config: None,
             eids: None,
         };
 
-        let auction_request = convert_tsjs_to_auction_request(
+        let err = convert_tsjs_to_auction_request(
             &body,
             &settings,
             &services,
@@ -809,12 +996,11 @@ mod tests {
             Some("existing-ec-id"),
             None,
         )
-        .expect("should convert request with empty banner sizes");
+        .expect_err("should reject request with empty banner sizes");
 
-        assert_eq!(auction_request.slots.len(), 1, "should create one slot");
         assert!(
-            auction_request.slots[0].formats.is_empty(),
-            "should preserve current behavior by allowing empty formats"
+            format!("{err:?}").contains("at least one format"),
+            "should explain missing formats"
         );
     }
 
@@ -832,8 +1018,12 @@ mod tests {
                     banner: Some(BannerUnit {
                         sizes: vec![vec![300, 250, 1]],
                     }),
+                    video: None,
+                    native: None,
                 }),
                 bids: None,
+                floor_usd: None,
+                targeting: BTreeMap::new(),
             }],
             config: None,
             eids: None,
@@ -857,7 +1047,7 @@ mod tests {
     }
 
     #[test]
-    fn convert_tsjs_to_auction_request_skips_units_without_banner_media() {
+    fn convert_tsjs_to_auction_request_rejects_units_without_media_formats() {
         let settings = make_settings();
         let req = make_request();
         let services = noop_services();
@@ -869,18 +1059,26 @@ mod tests {
                     code: "no-media".to_string(),
                     media_types: None,
                     bids: None,
+                    floor_usd: None,
+                    targeting: BTreeMap::new(),
                 },
                 AdUnit {
                     code: "no-banner".to_string(),
-                    media_types: Some(MediaTypes { banner: None }),
+                    media_types: Some(MediaTypes {
+                        banner: None,
+                        video: None,
+                        native: None,
+                    }),
                     bids: None,
+                    floor_usd: None,
+                    targeting: BTreeMap::new(),
                 },
             ],
             config: None,
             eids: None,
         };
 
-        let auction_request = convert_tsjs_to_auction_request(
+        let err = convert_tsjs_to_auction_request(
             &body,
             &settings,
             &services,
@@ -889,11 +1087,11 @@ mod tests {
             Some("existing-ec-id"),
             None,
         )
-        .expect("should skip unsupported media units");
+        .expect_err("should reject unsupported media units");
 
         assert!(
-            auction_request.slots.is_empty(),
-            "should only create slots for banner media"
+            format!("{err:?}").contains("at least one format"),
+            "should explain missing formats"
         );
     }
 
@@ -1228,8 +1426,12 @@ mod convert_tests {
                     banner: Some(BannerUnit {
                         sizes: vec![vec![300, 250]],
                     }),
+                    video: None,
+                    native: None,
                 }),
                 bids: None,
+                floor_usd: None,
+                targeting: BTreeMap::new(),
             }],
             config: None,
             eids: None,
@@ -1259,11 +1461,15 @@ mod convert_tests {
                     banner: Some(BannerUnit {
                         sizes: vec![vec![970, 90]],
                     }),
+                    video: None,
+                    native: None,
                 }),
                 bids: Some(vec![BidConfig {
                     bidder: "kargo".to_string(),
                     params: serde_json::json!({ "placementId": "client_123" }),
                 }]),
+                floor_usd: None,
+                targeting: BTreeMap::new(),
             }],
             config: None,
             eids: None,
@@ -1302,7 +1508,6 @@ mod convert_tests {
             ad_units: vec![],
             config: Some(serde_json::json!({
                 "permutive_segments": ["seg1", "seg2"],
-                "disallowed_key": "should be dropped",
             })),
             eids: None,
         };
@@ -1322,10 +1527,6 @@ mod convert_tests {
             auction_request.context.contains_key("permutive_segments"),
             "allowed key should be in auction context"
         );
-        assert!(
-            !auction_request.context.contains_key("disallowed_key"),
-            "unlisted key should be dropped"
-        );
     }
 
     #[test]
@@ -1340,8 +1541,12 @@ mod convert_tests {
                     banner: Some(BannerUnit {
                         sizes: vec![vec![300, 250, 99]], // invalid — 3 elements
                     }),
+                    video: None,
+                    native: None,
                 }),
                 bids: None,
+                floor_usd: None,
+                targeting: BTreeMap::new(),
             }],
             config: None,
             eids: None,
