@@ -18,20 +18,20 @@ use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use futures::StreamExt as _;
-use http::{header, Method, Request, Response, StatusCode};
+use http::{Method, Request, Response, StatusCode, header};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    collect_response_bounded, AttributeRewriteAction, IntegrationAttributeContext,
-    IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
-    IntegrationScriptContext, IntegrationScriptRewriter, ScriptRewriteAction,
-    UPSTREAM_SDK_MAX_RESPONSE_BYTES,
+    AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
+    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration, IntegrationScriptContext,
+    IntegrationScriptRewriter, ScriptRewriteAction, UPSTREAM_SDK_MAX_RESPONSE_BYTES,
+    collect_response_bounded,
 };
 use crate::platform::RuntimeServices;
-use crate::proxy::{proxy_request, ProxyRequestConfig};
+use crate::proxy::{ProxyRequestConfig, proxy_request};
 use crate::settings::{IntegrationConfig, Settings};
 
 const GTM_INTEGRATION_ID: &str = "google_tag_manager";
@@ -457,44 +457,41 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
 
         // Validate body size for POST requests to prevent memory pressure
         // Check Content-Length header if present for early rejection
-        if method == Method::POST {
-            if let Some(content_length_str) = req
+        if method == Method::POST
+            && let Some(content_length_str) = req
                 .headers()
                 .get(header::CONTENT_LENGTH)
                 .and_then(|value| value.to_str().ok())
-            {
-                match content_length_str.parse::<usize>() {
-                    Ok(content_length) => {
-                        // Early rejection based on Content-Length
-                        if content_length > self.config.max_beacon_body_size {
-                            log::warn!(
-                                "Rejecting POST beacon with Content-Length {} exceeding max {}",
-                                content_length,
-                                self.config.max_beacon_body_size
-                            );
-                            return Response::builder()
-                                .status(StatusCode::PAYLOAD_TOO_LARGE)
-                                .body(EdgeBody::empty())
-                                .change_context(Self::error(
-                                    "Failed to build GTM payload-too-large response",
-                                ));
-                        }
-                    }
-                    Err(_) => {
-                        // Invalid Content-Length header
-                        log::warn!("POST request with malformed Content-Length header");
+        {
+            match content_length_str.parse::<usize>() {
+                Ok(content_length) => {
+                    // Early rejection based on Content-Length
+                    if content_length > self.config.max_beacon_body_size {
+                        log::warn!(
+                            "Rejecting POST beacon with Content-Length {} exceeding max {}",
+                            content_length,
+                            self.config.max_beacon_body_size
+                        );
                         return Response::builder()
-                            .status(StatusCode::BAD_REQUEST)
+                            .status(StatusCode::PAYLOAD_TOO_LARGE)
                             .body(EdgeBody::empty())
                             .change_context(Self::error(
-                                "Failed to build GTM bad-request response",
+                                "Failed to build GTM payload-too-large response",
                             ));
                     }
                 }
+                Err(_) => {
+                    // Invalid Content-Length header
+                    log::warn!("POST request with malformed Content-Length header");
+                    return Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(EdgeBody::empty())
+                        .change_context(Self::error("Failed to build GTM bad-request response"));
+                }
             }
-            // If Content-Length is missing, we'll check actual size after read
-            // This maintains compatibility with HTTP/2 and intermediaries
         }
+        // If Content-Length is missing, we'll check actual size after read
+        // This maintains compatibility with HTTP/2 and intermediaries
 
         let Some(target_url) = self.build_target_url(&req, &path) else {
             return Response::builder()
@@ -664,7 +661,7 @@ impl IntegrationScriptRewriter for GoogleTagManagerIntegration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
+    use crate::html_processor::{HtmlProcessorConfig, create_html_processor};
     use crate::integrations::{
         AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
         IntegrationDocumentState, IntegrationRegistry, IntegrationScriptContext,
@@ -1102,21 +1099,31 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
         // GTM.js, Gtag.js (/js and .js), and 4 Collect endpoints (GET/POST for standard & dual-tagging)
         assert_eq!(routes.len(), 7);
 
-        assert!(routes
-            .iter()
-            .any(|r| r.path == "/integrations/google_tag_manager/gtm.js"));
-        assert!(routes
-            .iter()
-            .any(|r| r.path == "/integrations/google_tag_manager/gtag/js"));
-        assert!(routes
-            .iter()
-            .any(|r| r.path == "/integrations/google_tag_manager/gtag.js"));
-        assert!(routes
-            .iter()
-            .any(|r| r.path == "/integrations/google_tag_manager/collect"));
-        assert!(routes
-            .iter()
-            .any(|r| r.path == "/integrations/google_tag_manager/g/collect"));
+        assert!(
+            routes
+                .iter()
+                .any(|r| r.path == "/integrations/google_tag_manager/gtm.js")
+        );
+        assert!(
+            routes
+                .iter()
+                .any(|r| r.path == "/integrations/google_tag_manager/gtag/js")
+        );
+        assert!(
+            routes
+                .iter()
+                .any(|r| r.path == "/integrations/google_tag_manager/gtag.js")
+        );
+        assert!(
+            routes
+                .iter()
+                .any(|r| r.path == "/integrations/google_tag_manager/collect")
+        );
+        assert!(
+            routes
+                .iter()
+                .any(|r| r.path == "/integrations/google_tag_manager/g/collect")
+        );
     }
 
     #[test]
@@ -1468,9 +1475,9 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
             });
 
             assert!(
-            has_header_override,
-            "collect routes should strip client IP by overriding X-Forwarded-For with empty string"
-        );
+                has_header_override,
+                "collect routes should strip client IP by overriding X-Forwarded-For with empty string"
+            );
         });
     }
 

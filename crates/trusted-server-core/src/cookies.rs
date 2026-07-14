@@ -6,8 +6,8 @@
 use cookie::{Cookie, CookieJar};
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt as _};
-use http::header;
 use http::Request;
+use http::header;
 
 use crate::constants::{COOKIE_EUCONSENT_V2, COOKIE_GPP, COOKIE_GPP_SID, COOKIE_US_PRIVACY};
 use crate::error::TrustedServerError;
@@ -112,10 +112,10 @@ pub fn forward_cookie_header(
         match cookie_value.to_str() {
             Ok(s) => {
                 let stripped = strip_cookies(s, CONSENT_COOKIE_NAMES);
-                if !stripped.is_empty() {
-                    if let Ok(value) = http::HeaderValue::from_str(&stripped) {
-                        to.headers_mut().append(header::COOKIE, value);
-                    }
+                if !stripped.is_empty()
+                    && let Ok(value) = http::HeaderValue::from_str(&stripped)
+                {
+                    to.headers_mut().append(header::COOKIE, value);
                 }
             }
             Err(_) => {

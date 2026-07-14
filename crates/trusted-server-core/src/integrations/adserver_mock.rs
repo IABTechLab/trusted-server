@@ -7,23 +7,23 @@
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use http::{header, Method};
+use http::{Method, header};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value as Json};
+use serde_json::{Value as Json, json};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use validator::Validate;
 
-use crate::auction::context::{build_url_with_context_params, ContextQueryParams};
+use crate::auction::context::{ContextQueryParams, build_url_with_context_params};
 use crate::auction::provider::AuctionProvider;
 use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus, MediaType,
 };
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    collect_response_bounded, ensure_integration_backend_with_timeout,
-    predict_integration_backend_name, UPSTREAM_RTB_MAX_RESPONSE_BYTES,
+    UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
+    ensure_integration_backend_with_timeout, predict_integration_backend_name,
 };
 use crate::platform::{
     PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, RuntimeServices,
@@ -430,24 +430,24 @@ impl AuctionProvider for AdServerMockProvider {
             })?;
 
         // Set Host header with port to ensure mocktioneer generates correct iframe URLs
-        if let Ok(url) = url::Url::parse(&self.config.endpoint) {
-            if let Some(host) = url.host_str() {
-                let host_with_port = if let Some(port) = url.port() {
-                    format!("{}:{}", host, port)
-                } else {
-                    host.to_string()
-                };
-                match header::HeaderValue::from_str(&host_with_port) {
-                    Ok(value) => {
-                        req.headers_mut().insert(header::HOST, value);
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "Failed to build Host header for '{}': {}",
-                            host_with_port,
-                            e
-                        );
-                    }
+        if let Ok(url) = url::Url::parse(&self.config.endpoint)
+            && let Some(host) = url.host_str()
+        {
+            let host_with_port = if let Some(port) = url.port() {
+                format!("{}:{}", host, port)
+            } else {
+                host.to_string()
+            };
+            match header::HeaderValue::from_str(&host_with_port) {
+                Ok(value) => {
+                    req.headers_mut().insert(header::HOST, value);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to build Host header for '{}': {}",
+                        host_with_port,
+                        e
+                    );
                 }
             }
         }

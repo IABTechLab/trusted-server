@@ -11,7 +11,7 @@ use serde::Deserialize;
 use crate::error::TrustedServerError;
 use crate::platform::{RuntimeServices, StoreName};
 
-use super::{DataDomeConfig, DATADOME_INTEGRATION_ID};
+use super::{DATADOME_INTEGRATION_ID, DataDomeConfig};
 
 /// Configured source for dynamic IP CIDR bypass lists.
 #[derive(Debug, Clone, Deserialize)]
@@ -398,10 +398,10 @@ impl ProtectionExclusionRule {
         services: &RuntimeServices,
         cache_ttl: Duration,
     ) -> bool {
-        if let Some(methods) = &self.methods {
-            if !methods.matches(facts.method) {
-                return false;
-            }
+        if let Some(methods) = &self.methods
+            && !methods.matches(facts.method)
+        {
+            return false;
         }
 
         self.matcher.matches(facts, services, cache_ttl)
@@ -657,7 +657,7 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use crate::platform::test_support::{
-        build_services_with_config_and_secret, HashMapConfigStore, NoopSecretStore,
+        HashMapConfigStore, NoopSecretStore, build_services_with_config_and_secret,
     };
 
     use super::*;
@@ -713,16 +713,20 @@ mod tests {
         let cidr = "2001:db8::/32"
             .parse::<IpCidr>()
             .expect("should parse CIDR");
-        assert!(cidr.contains(IpAddr::V6(
-            "2001:db8::1"
-                .parse::<Ipv6Addr>()
-                .expect("should parse IPv6")
-        )));
-        assert!(!cidr.contains(IpAddr::V6(
-            "2001:db9::1"
-                .parse::<Ipv6Addr>()
-                .expect("should parse IPv6")
-        )));
+        assert!(
+            cidr.contains(IpAddr::V6(
+                "2001:db8::1"
+                    .parse::<Ipv6Addr>()
+                    .expect("should parse IPv6")
+            ))
+        );
+        assert!(
+            !cidr.contains(IpAddr::V6(
+                "2001:db9::1"
+                    .parse::<Ipv6Addr>()
+                    .expect("should parse IPv6")
+            ))
+        );
     }
 
     #[test]

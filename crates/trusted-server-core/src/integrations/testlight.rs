@@ -3,8 +3,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use http::header::{self, HeaderValue};
 use http::Response;
+use http::header::{self, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use validator::Validate;
@@ -12,13 +12,12 @@ use validator::Validate;
 use crate::edge_cookie::get_ec_id;
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    collect_body_bounded, collect_response_bounded, AttributeRewriteAction,
-    IntegrationAttributeContext, IntegrationAttributeRewriter, IntegrationEndpoint,
-    IntegrationProxy, IntegrationRegistration, INTEGRATION_MAX_BODY_BYTES,
-    UPSTREAM_RTB_MAX_RESPONSE_BYTES,
+    AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
+    IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+    UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_body_bounded, collect_response_bounded,
 };
 use crate::platform::RuntimeServices;
-use crate::proxy::{proxy_request, ProxyRequestConfig};
+use crate::proxy::{ProxyRequestConfig, proxy_request};
 use crate::settings::{IntegrationConfig, Settings};
 use crate::tsjs;
 
@@ -277,8 +276,8 @@ fn default_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::test_support::{build_services_with_http_client, StubHttpClient};
-    use crate::test_support::tests::{create_test_settings, VALID_SYNTHETIC_ID};
+    use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
+    use crate::test_support::tests::{VALID_SYNTHETIC_ID, create_test_settings};
     use crate::tsjs;
     use http::Method;
     use serde_json::json;

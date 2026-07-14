@@ -4,8 +4,8 @@ use std::fmt;
 use edgezero_core::http::{Request as EdgeRequest, Response as EdgeResponse};
 use error_stack::Report;
 
-use super::image_optimizer::PlatformImageOptimizerOptions;
 use super::PlatformError;
+use super::image_optimizer::PlatformImageOptimizerOptions;
 
 /// Outbound HTTP request paired with a pre-resolved backend name.
 ///

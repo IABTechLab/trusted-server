@@ -2,7 +2,7 @@
 use config::{Config, Environment, File, FileFormat};
 use error_stack::{Report, ResultExt};
 use regex::Regex;
-use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
@@ -1269,8 +1269,9 @@ fn validate_image_optimizer_format(
     value: &str,
 ) -> Result<(), Report<TrustedServerError>> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "auto" | "avif" | "gif" | "jpeg" | "jpg" | "jxl" | "jpegxl" | "mp4" | "png"
-        | "webp" => Ok(()),
+        "auto" | "avif" | "gif" | "jpeg" | "jpg" | "jxl" | "jpegxl" | "mp4" | "png" | "webp" => {
+            Ok(())
+        }
         _ => Err(Report::new(TrustedServerError::Configuration {
             message: format!(
                 "image_optimizer.profile_sets `{set_name}` profile `{profile_name}` has unsupported format `{value}`"
@@ -2672,12 +2673,12 @@ mod tests {
 
     use crate::auction::build_orchestrator;
     use crate::integrations::{
+        IntegrationRegistry,
         datadome::{DataDomeConfig, ProtectionMatcherConfig},
         gpt::GptConfig,
         nextjs::NextJsIntegrationConfig,
         prebid::PrebidIntegrationConfig,
         testlight::TestlightConfig,
-        IntegrationRegistry,
     };
     use crate::redacted::Redacted;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
@@ -3448,10 +3449,7 @@ origin_host_header_overide = "www.example.com""#,
             [
                 (origin_key, Some("https://origin.test-publisher.com")),
                 (format!("{datadome_prefix}ENABLED"), Some("true")),
-                (
-                    format!("{datadome_prefix}ENABLE_PROTECTION"),
-                    Some("true"),
-                ),
+                (format!("{datadome_prefix}ENABLE_PROTECTION"), Some("true")),
                 (
                     format!("{datadome_prefix}PROTECTION_EXCLUDED_METHODS{separator}0"),
                     Some("OPTIONS"),
@@ -3485,19 +3483,27 @@ origin_host_header_overide = "www.example.com""#,
                     Some("legacy-static-get-head"),
                 ),
                 (
-                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}METHODS{separator}0"),
+                    format!(
+                        "{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}METHODS{separator}0"
+                    ),
                     Some("GET"),
                 ),
                 (
-                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}METHODS{separator}1"),
+                    format!(
+                        "{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}METHODS{separator}1"
+                    ),
                     Some("HEAD"),
                 ),
                 (
-                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}TYPE"),
+                    format!(
+                        "{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}TYPE"
+                    ),
                     Some("path_regex"),
                 ),
                 (
-                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}PATTERNS{separator}0"),
+                    format!(
+                        "{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}PATTERNS{separator}0"
+                    ),
                     Some(r"(?i)\.(css|js)$"),
                 ),
                 (
@@ -3505,11 +3511,15 @@ origin_host_header_overide = "www.example.com""#,
                     Some("next-rsc"),
                 ),
                 (
-                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}1{separator}TYPE"),
+                    format!(
+                        "{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}1{separator}TYPE"
+                    ),
                     Some("query_param_non_empty"),
                 ),
                 (
-                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}1{separator}NAMES{separator}0"),
+                    format!(
+                        "{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}1{separator}NAMES{separator}0"
+                    ),
                     Some("_rsc"),
                 ),
             ],
@@ -3537,8 +3547,7 @@ origin_host_header_overide = "www.example.com""#,
                     "should parse indexed IP CIDR list"
                 );
                 assert_eq!(
-                    cfg.protection_excluded_ip_cidr_sources[0].key,
-                    "googlebot_ips",
+                    cfg.protection_excluded_ip_cidr_sources[0].key, "googlebot_ips",
                     "should parse indexed CIDR source list"
                 );
                 assert!(matches!(
@@ -4802,67 +4811,99 @@ origin_host_header_overide = "www.example.com""#,
         let separator = ENVIRONMENT_VARIABLE_SEPARATOR;
         let vars = [
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}PREFIX"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}PREFIX"
+                ),
                 Some("/.image/"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}ORIGIN_URL"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}ORIGIN_URL"
+                ),
                 Some("https://bucket.s3.us-west-2.amazonaws.com"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}AUTH{separator}TYPE"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}AUTH{separator}TYPE"
+                ),
                 Some("s3_sigv4"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}AUTH{separator}REGION"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}AUTH{separator}REGION"
+                ),
                 Some("us-west-2"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}AUTH{separator}ORIGIN_QUERY"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}AUTH{separator}ORIGIN_QUERY"
+                ),
                 Some("strip"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}IMAGE_OPTIMIZER{separator}ENABLED"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}IMAGE_OPTIMIZER{separator}ENABLED"
+                ),
                 Some("true"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}IMAGE_OPTIMIZER{separator}REGION"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}IMAGE_OPTIMIZER{separator}REGION"
+                ),
                 Some("us_west"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}IMAGE_OPTIMIZER{separator}PROFILE_SET"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}IMAGE_OPTIMIZER{separator}PROFILE_SET"
+                ),
                 Some("default_images"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}BASE_PARAMS"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}BASE_PARAMS"
+                ),
                 Some("quality=70&resize-filter=bicubic"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}DEFAULT_PROFILE"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}DEFAULT_PROFILE"
+                ),
                 Some("w828"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}PROFILES{separator}W828"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}PROFILES{separator}W828"
+                ),
                 Some("format=auto&width=828"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}PROFILES{separator}W1536"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}PROFILES{separator}W1536"
+                ),
                 Some("format=auto&width=1536"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}ASPECT_RATIOS{separator}ALLOWED"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}ASPECT_RATIOS{separator}ALLOWED"
+                ),
                 Some("[\"1-1\",\"16-9\"]"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}ASPECT_RATIOS{separator}PROFILES"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}ASPECT_RATIOS{separator}PROFILES"
+                ),
                 Some("[\"w828\",\"w1536\"]"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}CROP_OFFSETS{separator}ENABLED"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}CROP_OFFSETS{separator}ENABLED"
+                ),
                 Some("true"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}CROP_OFFSETS{separator}BUCKETS"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}CROP_OFFSETS{separator}BUCKETS"
+                ),
                 Some("[10,30,50,70,90]"),
             ),
         ];
