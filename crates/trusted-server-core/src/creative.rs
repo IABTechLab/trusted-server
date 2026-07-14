@@ -41,7 +41,7 @@ use crate::http_util::compute_encrypted_sha256_token;
 use crate::settings::Settings;
 use crate::streaming_processor::StreamProcessor;
 use crate::tsjs;
-use lol_html::{element, html_content::ContentType, text, HtmlRewriter, Settings as HtmlSettings};
+use lol_html::{HtmlRewriter, Settings as HtmlSettings, element, html_content::ContentType, text};
 use std::io;
 
 /// Maximum size of response body that can be buffered for rewriting.
@@ -92,7 +92,7 @@ pub(super) fn rewrite_style_urls(settings: &Settings, style: &str) -> String {
     while let Some(off) = lower[scan..].find("url(") {
         let start = scan + off;
         let open = start + 4; // after 'url('
-                              // write prefix including 'url('
+        // write prefix including 'url('
         out.push_str(&style[write_pos..open]);
         // find closing ')'
         let close = if let Some(c) = lower[open..].find(')') {
@@ -520,15 +520,15 @@ pub fn rewrite_creative_html(settings: &Settings, markup: &str) -> String {
                 }),
                 // Image src + data-src
                 element!("img", |el| {
-                    if let Some(src) = el.get_attribute("src") {
-                        if let Some(p) = proxy_if_abs(settings, &src) {
-                            let _ = el.set_attribute("src", &p);
-                        }
+                    if let Some(src) = el.get_attribute("src")
+                        && let Some(p) = proxy_if_abs(settings, &src)
+                    {
+                        let _ = el.set_attribute("src", &p);
                     }
-                    if let Some(dsrc) = el.get_attribute("data-src") {
-                        if let Some(p) = proxy_if_abs(settings, &dsrc) {
-                            let _ = el.set_attribute("data-src", &p);
-                        }
+                    if let Some(dsrc) = el.get_attribute("data-src")
+                        && let Some(p) = proxy_if_abs(settings, &dsrc)
+                    {
+                        let _ = el.set_attribute("data-src", &p);
                     }
                     Ok(())
                 }),
@@ -609,12 +609,12 @@ pub fn rewrite_creative_html(settings: &Settings, markup: &str) -> String {
                 ),
                 // Click-through links
                 element!("a[href], area[href]", |el| {
-                    if let Some(href) = el.get_attribute("href") {
-                        if let Some(abs) = to_abs(settings, &href) {
-                            let click = build_click_url(settings, &abs);
-                            let _ = el.set_attribute("href", &click);
-                            let _ = el.set_attribute("data-tsclick", &click);
-                        }
+                    if let Some(href) = el.get_attribute("href")
+                        && let Some(abs) = to_abs(settings, &href)
+                    {
+                        let click = build_click_url(settings, &abs);
+                        let _ = el.set_attribute("href", &click);
+                        let _ = el.set_attribute("data-tsclick", &click);
                     }
                     Ok(())
                 }),
@@ -639,10 +639,10 @@ pub fn rewrite_creative_html(settings: &Settings, markup: &str) -> String {
                 }),
                 // iframes
                 element!("iframe", |el| {
-                    if let Some(src) = el.get_attribute("src") {
-                        if let Some(p) = proxy_if_abs(settings, src.as_str()) {
-                            let _ = el.set_attribute("src", &p);
-                        }
+                    if let Some(src) = el.get_attribute("src")
+                        && let Some(p) = proxy_if_abs(settings, src.as_str())
+                    {
+                        let _ = el.set_attribute("src", &p);
                     }
                     Ok(())
                 }),

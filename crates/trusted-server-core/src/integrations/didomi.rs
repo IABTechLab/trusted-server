@@ -3,16 +3,17 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use http::header::{self, HeaderMap, HeaderValue};
 use http::Method;
+use http::header::{self, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use url::Url;
 use validator::{Validate, ValidationError};
 
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    collect_body_bounded, ensure_integration_backend, IntegrationEndpoint, IntegrationHeadInjector,
-    IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, INTEGRATION_MAX_BODY_BYTES,
+    INTEGRATION_MAX_BODY_BYTES, IntegrationEndpoint, IntegrationHeadInjector,
+    IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, collect_body_bounded,
+    ensure_integration_backend,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
@@ -367,7 +368,7 @@ mod tests {
 
     use super::*;
     use crate::integrations::{IntegrationDocumentState, IntegrationRegistry};
-    use crate::platform::test_support::{build_services_with_http_client, StubHttpClient};
+    use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
     use crate::test_support::tests::create_test_settings;
     use http::Method;
     use std::net::{IpAddr, Ipv4Addr};

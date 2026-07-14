@@ -8,7 +8,7 @@ use futures::StreamExt as _;
 use url::Url;
 
 use crate::error::TrustedServerError;
-use crate::platform::{PlatformBackendSpec, RuntimeServices, DEFAULT_FIRST_BYTE_TIMEOUT};
+use crate::platform::{DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, RuntimeServices};
 use crate::settings::Settings;
 
 pub mod adserver_mock;

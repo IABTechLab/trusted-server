@@ -350,7 +350,7 @@ impl<'a> BackendConfig<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_host_header, BackendConfig};
+    use super::{BackendConfig, compute_host_header};
 
     // Tests for compute_host_header - the fix for port preservation in Host header
     #[test]

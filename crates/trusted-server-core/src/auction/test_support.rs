@@ -4,7 +4,7 @@ use edgezero_core::body::Body as EdgeBody;
 use http::Request;
 
 use super::AuctionContext;
-use crate::platform::{test_support::noop_services, RuntimeServices};
+use crate::platform::{RuntimeServices, test_support::noop_services};
 use crate::settings::Settings;
 
 static TEST_SERVICES: LazyLock<RuntimeServices> = LazyLock::new(noop_services);

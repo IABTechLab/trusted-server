@@ -44,45 +44,43 @@ fn main() {
     }
 
     // Install deps if node_modules missing
-    if !skip {
-        if let Some(npm_path) = npm.as_deref() {
-            if !ts_dir.join("node_modules").exists() {
-                let status = Command::new(npm_path)
-                    .arg("ci")
-                    .current_dir(&ts_dir)
-                    .status();
-                if !status.as_ref().is_ok_and(ExitStatus::success) {
-                    warn!("tsjs: npm ci failed; using existing dist if available");
-                }
-            }
+    if !skip
+        && let Some(npm_path) = npm.as_deref()
+        && !ts_dir.join("node_modules").exists()
+    {
+        let status = Command::new(npm_path)
+            .arg("ci")
+            .current_dir(&ts_dir)
+            .status();
+        if !status.as_ref().is_ok_and(ExitStatus::success) {
+            warn!("tsjs: npm ci failed; using existing dist if available");
         }
     }
 
     // Run tests if requested
-    if !skip && env::var("TSJS_TEST").is_ok_and(|value| value == "1") {
-        if let Some(npm_path) = npm.as_deref() {
-            Command::new(npm_path)
-                .args(["run", "test", "--", "--run"])
-                .current_dir(&ts_dir)
-                .status()
-                .expect("should run requested TSJS tests");
-        }
+    if !skip
+        && env::var("TSJS_TEST").is_ok_and(|value| value == "1")
+        && let Some(npm_path) = npm.as_deref()
+    {
+        Command::new(npm_path)
+            .args(["run", "test", "--", "--run"])
+            .current_dir(&ts_dir)
+            .status()
+            .expect("should run requested TSJS tests");
     }
 
     // Build all module files
-    if !skip {
-        if let Some(npm_path) = npm.as_deref() {
-            info!("tsjs: Building per-module bundles");
+    if !skip && let Some(npm_path) = npm.as_deref() {
+        info!("tsjs: Building per-module bundles");
 
-            let status = Command::new(npm_path)
-                .args(["run", "build"])
-                .current_dir(&ts_dir)
-                .status();
-            assert!(
-                status.as_ref().is_ok_and(ExitStatus::success),
-                "tsjs: npm run build failed - refusing to use stale bundles"
-            );
-        }
+        let status = Command::new(npm_path)
+            .args(["run", "build"])
+            .current_dir(&ts_dir)
+            .status();
+        assert!(
+            status.as_ref().is_ok_and(ExitStatus::success),
+            "tsjs: npm run build failed - refusing to use stale bundles"
+        );
     }
 
     // Discover all tsjs-*.js files in dist/

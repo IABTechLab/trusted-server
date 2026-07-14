@@ -15,14 +15,14 @@ use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::pull_sync::{
-    build_pull_sync_context, dispatch_pull_sync, PullSyncContext,
+    PullSyncContext, build_pull_sync_context, dispatch_pull_sync,
 };
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::integrations::RequestFilterEffects;
 use trusted_server_core::platform::PlatformGeo as _;
 use trusted_server_core::platform::RuntimeServices;
-use trusted_server_core::proxy::{stream_asset_body, AssetProxyCachePolicy};
+use trusted_server_core::proxy::{AssetProxyCachePolicy, stream_asset_body};
 use trusted_server_core::settings::Settings;
 
 mod app;
@@ -36,10 +36,10 @@ mod platform;
 mod rate_limiter;
 mod tinybird;
 
-use crate::app::{load_settings_from_config_store, EcFinalizeState, TrustedServerApp};
+use crate::app::{EcFinalizeState, TrustedServerApp, load_settings_from_config_store};
 use crate::ec_kv::FastlyEcKvStore;
-use crate::middleware::{apply_finalize_headers, resolve_geo_for_response, HEADER_X_TS_FINALIZED};
-use crate::platform::{client_info_from_request, FastlyPlatformGeo};
+use crate::middleware::{HEADER_X_TS_FINALIZED, apply_finalize_headers, resolve_geo_for_response};
+use crate::platform::{FastlyPlatformGeo, client_info_from_request};
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 
 const TRUSTED_SERVER_CONFIG_STORE: &str = "trusted_server_config";
@@ -312,10 +312,10 @@ fn run_edgezero_pull_sync_after_send(
     partner_registry: &PartnerRegistry,
     ec_state: &EcFinalizeState,
 ) {
-    if ec_state.is_real_browser {
-        if let Some(context) = build_pull_sync_context(&ec_state.ec_context) {
-            run_pull_sync_after_send(settings, partner_registry, &context, &ec_state.services);
-        }
+    if ec_state.is_real_browser
+        && let Some(context) = build_pull_sync_context(&ec_state.ec_context)
+    {
+        run_pull_sync_after_send(settings, partner_registry, &context, &ec_state.services);
     }
 }
 
@@ -458,10 +458,10 @@ pub(crate) fn extract_cookie_value(req: &HttpRequest, name: &str) -> Option<Stri
     let cookie_header = req.headers().get("cookie").and_then(|v| v.to_str().ok())?;
     for pair in cookie_header.split(';') {
         let pair = pair.trim();
-        if let Some((key, value)) = pair.split_once('=') {
-            if key.trim() == name {
-                return Some(value.trim().to_owned());
-            }
+        if let Some((key, value)) = pair.split_once('=')
+            && key.trim() == name
+        {
+            return Some(value.trim().to_owned());
         }
     }
     None
@@ -483,8 +483,8 @@ pub(crate) fn derive_device_signals(req: &FastlyRequest) -> DeviceSignals {
 mod tests {
     use super::*;
     use edgezero_core::body::Body as EdgeBody;
-    use edgezero_core::http::response_builder;
     use edgezero_core::http::HeaderValue;
+    use edgezero_core::http::response_builder;
     use fastly::mime;
 
     fn test_settings() -> Settings {
