@@ -307,6 +307,11 @@ fn process_response_streaming<W: Write>(
 /// [`HtmlProcessorConfig::with_ad_state`], so the canonical builder stays the
 /// single source of truth: a future field added to `from_settings` is
 /// inherited here automatically.
+///
+/// The returned processor owns its state and borrows none of the arguments.
+/// `use<>` states that explicitly: without it, Rust 2024 would have the opaque
+/// type capture every input lifetime, forcing callers to keep the settings and
+/// registry alive for as long as the processor.
 fn create_html_stream_processor(
     origin_host: &str,
     request_host: &str,
@@ -315,7 +320,7 @@ fn create_html_stream_processor(
     integration_registry: &IntegrationRegistry,
     ad_slots_script: Option<String>,
     ad_bids_state: Arc<Mutex<Option<String>>>,
-) -> Result<impl StreamProcessor, Report<TrustedServerError>> {
+) -> Result<impl StreamProcessor + use<>, Report<TrustedServerError>> {
     use crate::html_processor::{HtmlProcessorConfig, create_html_processor};
 
     let config = HtmlProcessorConfig::from_settings(
