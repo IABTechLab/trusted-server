@@ -58,6 +58,7 @@ tokio-rustls = { workspace = true }
 webpki-roots = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 x509-parser = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
