@@ -1344,6 +1344,59 @@ TRUSTED_SERVER__HANDLERS__0__PASSWORD=$(cat /run/secrets/admin_password)
 ✅ Store in secure secret management (Fastly Secret Store, Vault)  
 ✅ Use different secrets per environment
 
+#### Secret store references (store mode)
+
+Instead of authoring secret values inline, secret-bearing fields can hold the
+**name** of an entry in the platform secret store, resolved at startup. This
+keeps plaintext secrets out of the pushed config blob. Covered fields:
+`publisher.proxy_secret`, `ec.passphrase`, `ec.partners[].api_token`,
+`ec.partners[].ts_pull_token`, and `handlers[].password`.
+
+Enable it and replace each value with a key name:
+
+```toml
+[publisher]
+proxy_secret = "proxy_secret"        # name of the secret-store entry
+
+[ec]
+passphrase = "ec_passphrase"
+
+[secrets]
+enabled = true
+store = "ts_secrets"                 # secret store to resolve against
+```
+
+Seed the store with your **existing** values first — regenerating
+`ec.passphrase` rotates every visitor ID, and regenerating
+`publisher.proxy_secret` invalidates outstanding proxy URL tokens. The Fastly
+CLI reads the value from stdin or a file; there is **no** `--secret` flag:
+
+```bash
+printf %s "$EC_PASSPHRASE" | \
+  fastly secret-store-entry create --store-id <ID> --name ec_passphrase --stdin
+```
+
+**Do not combine store mode with secret env overrides.** The `ts config push`
+env overlay applies `TRUSTED_SERVER__*` overrides at push time. A leftover
+secret override such as `TRUSTED_SERVER__EC__PASSPHRASE` would overwrite the
+key **name** with the real value and persist it as **plaintext** in the config
+blob. Deploy validation **rejects this**: with store mode enabled, `ts config
+push` / `diff` / `validate` fail if any covered secret override is set —
+
+- `TRUSTED_SERVER__PUBLISHER__PROXY_SECRET`
+- `TRUSTED_SERVER__EC__PASSPHRASE`
+- `TRUSTED_SERVER__EC__PARTNERS__<n>__API_TOKEN`
+- `TRUSTED_SERVER__EC__PARTNERS__<n>__TS_PULL_TOKEN`
+- `TRUSTED_SERVER__HANDLERS__<n>__PASSWORD`
+
+Unset those variables (seed the secret store with the real values instead).
+Non-secret overrides are unaffected, so you do not need `--no-env`.
+
+Rollout order: deploy the new WASM first (an older binary rejects the
+`[secrets]` blob), then seed the secret store, then push the store-mode config.
+Resolution is fail-closed — a missing or invalid secret makes the service
+return a startup error rather than serving with an unresolved value.
+
 **Don't**:
 ❌ Commit secrets to version control  
 ❌ Use default/placeholder values  

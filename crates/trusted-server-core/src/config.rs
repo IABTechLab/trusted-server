@@ -21,7 +21,7 @@ use crate::integrations::{
     lockr::LockrConfig, nextjs::NextJsIntegrationConfig, osano::OsanoConfig,
     permutive::PermutiveConfig, prebid, sourcepoint::SourcepointConfig, testlight::TestlightConfig,
 };
-use crate::settings::{IntegrationConfig, Settings};
+use crate::settings::{IntegrationConfig, SecretFieldMode, Settings};
 
 const DEPLOY_VALIDATION_FIELD: &str = "trusted_server";
 #[cfg(test)]
@@ -91,7 +91,8 @@ impl<'de> Deserialize<'de> for TrustedServerAppConfig {
         D: Deserializer<'de>,
     {
         let settings = Settings::deserialize(deserializer)?;
-        let settings = Settings::finalize_deserialized(settings, "Configuration")
+        let mode = settings.secret_field_mode();
+        let settings = Settings::finalize_deserialized(settings, "Configuration", mode)
             .map_err(serde::de::Error::custom)?;
         Ok(Self { settings })
     }
@@ -105,11 +106,12 @@ impl Validate for TrustedServerAppConfig {
 }
 
 impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
-    // Phase 1 intentionally preserves the existing inline-settings model:
-    // `ts config push` publishes the validated Trusted Server config as one
-    // app-config blob. Migrating app-level secrets to `EdgeZero` secret-store
-    // references needs nested/array extraction support and operator migration
-    // work tracked separately.
+    // Empty on purpose: EdgeZero's `#[secret]` reflection only handles
+    // top-level fields, while Trusted Server secrets are nested/array
+    // fields. Secret-store references are instead handled in-repo by
+    // `crate::secret_refs` (gated by `[secrets]`), which mirrors EdgeZero's
+    // key-names-at-rest semantics so the nested `#[secret]` derive can
+    // replace it once available upstream.
     const SECRET_FIELDS: &'static [edgezero_core::app_config::SecretField] = &[];
 }
 
@@ -124,11 +126,78 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
 ///
 /// Returns [`TrustedServerError`] when the config should not be deployed.
 pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
-    settings.reject_placeholder_secrets()?;
+    let mode = settings.secret_field_mode();
+    match mode {
+        // Store mode: secret fields hold key names; value checks
+        // (placeholders, token length) run at runtime against the resolved
+        // values instead.
+        SecretFieldMode::KeyNames => {
+            settings.validate_secret_key_names()?;
+            reject_conflicting_secret_env_overrides(std::env::vars())?;
+        }
+        SecretFieldMode::ResolvedValues => settings.reject_placeholder_secrets()?,
+    }
     let enabled_auction_providers = validate_enabled_integrations(settings)?;
     validate_auction_provider_names(settings, &enabled_auction_providers)?;
-    PartnerRegistry::from_config(&settings.ec.partners).map(|_| ())?;
+    PartnerRegistry::from_config_with_secret_mode(&settings.ec.partners, mode).map(|_| ())?;
     Ok(())
+}
+
+/// Returns `true` if `name` is a `TRUSTED_SERVER__…` env override that targets
+/// a store-mode secret field.
+///
+/// The `ts config push` env overlay maps `TRUSTED_SERVER__<SECTION>__…__<KEY>`
+/// onto config fields. For the fields covered by store mode, such an override
+/// would replace the secret-ref key NAME with the override's value.
+fn is_covered_secret_override(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    let Some(rest) = upper.strip_prefix("TRUSTED_SERVER__") else {
+        return false;
+    };
+    rest == "PUBLISHER__PROXY_SECRET"
+        || rest == "EC__PASSPHRASE"
+        || (rest.starts_with("EC__PARTNERS__")
+            && (rest.ends_with("__API_TOKEN") || rest.ends_with("__TS_PULL_TOKEN")))
+        || (rest.starts_with("HANDLERS__") && rest.ends_with("__PASSWORD"))
+}
+
+/// Rejects `TRUSTED_SERVER__…` env overrides for secret fields while store
+/// mode is enabled.
+///
+/// `ts config push` applies the env overlay by default, which would overwrite
+/// a secret-ref key NAME with the override's value and persist it as
+/// **plaintext** in the pushed config blob (then fail at runtime because the
+/// value is not a valid secret key). In store mode those overrides must not be
+/// set — seed the secret store instead. This rejects the dangerous combination
+/// at push / diff / validate time, regardless of `--no-env`, so a later push
+/// that forgets the flag cannot leak.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] naming each offending
+/// variable when one or more covered overrides are set to a non-empty value.
+fn reject_conflicting_secret_env_overrides<I>(vars: I) -> Result<(), Report<TrustedServerError>>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut offenders: Vec<String> = vars
+        .into_iter()
+        .filter(|(name, value)| !value.is_empty() && is_covered_secret_override(name))
+        .map(|(name, _)| name)
+        .collect();
+    if offenders.is_empty() {
+        return Ok(());
+    }
+    offenders.sort_unstable();
+    offenders.dedup();
+    Err(Report::new(TrustedServerError::Configuration {
+        message: format!(
+            "[secrets] store mode is enabled, but these environment overrides would overwrite \
+             secret key names with plaintext values at push time: {}. Unset them (seed the \
+             secret store with the real values instead) or disable store mode.",
+            offenders.join(", ")
+        ),
+    }))
 }
 
 fn validate_enabled_integrations(
@@ -213,6 +282,8 @@ fn report_to_validation_errors(report: &Report<TrustedServerError>) -> Validatio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::redacted::Redacted;
+    use crate::settings::EcPartner;
     use crate::test_support::tests::crate_test_settings_str;
 
     fn valid_settings() -> Settings {
@@ -249,6 +320,118 @@ mod tests {
             "test-publisher.com",
             "should load publisher settings"
         );
+    }
+
+    fn store_mode_settings_with_key_names() -> Settings {
+        let mut settings = valid_settings();
+        settings.secrets.enabled = true;
+        settings.publisher.proxy_secret = Redacted::new("proxy_secret".to_owned());
+        settings.ec.passphrase = Redacted::new("ec_passphrase".to_owned());
+        for handler in &mut settings.handlers {
+            handler.password = Redacted::new("admin_password".to_owned());
+        }
+        settings
+    }
+
+    #[test]
+    fn deploy_validation_accepts_key_name_secrets_in_store_mode() {
+        let settings = store_mode_settings_with_key_names();
+
+        validate_settings_for_deploy(&settings)
+            .expect("should accept key-name secrets in store mode");
+    }
+
+    #[test]
+    fn deploy_validation_accepts_key_name_partner_tokens_in_store_mode() {
+        let mut settings = store_mode_settings_with_key_names();
+        let partner_toml = r#"
+            name = "Example Partner"
+            source_domain = "partner.example"
+            api_token = "partner_api_token"
+        "#;
+        settings.ec.partners =
+            vec![toml::from_str::<EcPartner>(partner_toml).expect("should parse partner fixture")];
+
+        validate_settings_for_deploy(&settings)
+            .expect("should accept short key-name partner tokens in store mode");
+    }
+
+    #[test]
+    fn deploy_validation_rejects_whitespace_key_names_in_store_mode() {
+        let mut settings = store_mode_settings_with_key_names();
+        settings.ec.passphrase = Redacted::new("has space".to_owned());
+
+        let err = validate_settings_for_deploy(&settings)
+            .expect_err("should reject whitespace in secret key names");
+
+        assert!(
+            err.to_string().contains("ec.passphrase"),
+            "error should mention the offending field: {err}"
+        );
+    }
+
+    #[test]
+    fn deploy_validation_rejects_empty_key_names_in_store_mode() {
+        let mut settings = store_mode_settings_with_key_names();
+        settings.publisher.proxy_secret = Redacted::new(String::new());
+
+        let err = validate_settings_for_deploy(&settings)
+            .expect_err("should reject empty secret key names");
+
+        assert!(
+            err.to_string().contains("publisher.proxy_secret"),
+            "error should mention the offending field: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_covered_secret_env_overrides_in_store_mode() {
+        let vars = vec![
+            ("PATH".to_owned(), "/usr/bin".to_owned()),
+            (
+                "TRUSTED_SERVER__EC__PASSPHRASE".to_owned(),
+                "real-secret".to_owned(),
+            ),
+            (
+                "TRUSTED_SERVER__EC__PARTNERS__0__TS_PULL_TOKEN".to_owned(),
+                "real-token".to_owned(),
+            ),
+            (
+                "TRUSTED_SERVER__HANDLERS__1__PASSWORD".to_owned(),
+                "real-pass".to_owned(),
+            ),
+        ];
+
+        let err = reject_conflicting_secret_env_overrides(vars)
+            .expect_err("covered secret overrides must be rejected in store mode");
+        let message = err.to_string();
+
+        assert!(
+            message.contains("TRUSTED_SERVER__EC__PASSPHRASE")
+                && message.contains("TS_PULL_TOKEN")
+                && message.contains("HANDLERS__1__PASSWORD"),
+            "error should name every offending override: {message}"
+        );
+    }
+
+    #[test]
+    fn allows_non_secret_and_empty_env_overrides() {
+        let vars = vec![
+            // Non-secret override — legitimate, must not be rejected.
+            (
+                "TRUSTED_SERVER__PUBLISHER__DOMAIN".to_owned(),
+                "example.com".to_owned(),
+            ),
+            // Covered field but empty value — does not overlay, so allowed.
+            (
+                "TRUSTED_SERVER__PUBLISHER__PROXY_SECRET".to_owned(),
+                String::new(),
+            ),
+            ("HOME".to_owned(), "/home/op".to_owned()),
+        ];
+
+        reject_conflicting_secret_env_overrides(vars)
+            .expect("non-secret and empty overrides must be allowed");
     }
 
     #[test]

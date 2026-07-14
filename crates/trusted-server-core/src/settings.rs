@@ -9,7 +9,7 @@ use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::OnceLock;
 use url::Url;
-use validator::{Validate, ValidationError};
+use validator::{Validate, ValidationError, ValidationErrors, ValidationErrorsKind};
 
 use crate::auction_config_types::AuctionConfig;
 use crate::consent_config::ConsentConfig;
@@ -1926,6 +1926,87 @@ pub struct TesterCookieConfig {
     pub enabled: bool,
 }
 
+/// Secret-store reference mode for secret-bearing settings fields.
+///
+/// When [`SecretsSettings::enabled`] is `true`, secret fields in the app
+/// config hold secret-store **key names** instead of secret values. The
+/// runtime resolves them from the platform secret store at settings load.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct SecretsSettings {
+    /// Enables key-name resolution from the platform secret store.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Secret store name holding the referenced secrets.
+    #[serde(default = "default_secrets_store")]
+    #[validate(length(min = 1))]
+    pub store: String,
+}
+
+impl Default for SecretsSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            store: default_secrets_store(),
+        }
+    }
+}
+
+impl SecretsSettings {
+    /// Returns `true` when store mode is disabled.
+    ///
+    /// Used to omit the `[secrets]` section from the serialized app-config
+    /// blob whenever store mode is off, so that a binary predating this field
+    /// (which uses `#[serde(deny_unknown_fields)]`) still accepts a blob
+    /// pushed by a newer CLI. `store` is only meaningful when `enabled`, so a
+    /// disabled section carries nothing worth serializing (a custom `store`
+    /// with `enabled = false` is inert). Store mode (`enabled = true`) always
+    /// serializes and therefore requires the newer binary — as intended.
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        !self.enabled
+    }
+}
+
+fn default_secrets_store() -> String {
+    "ts_secrets".to_owned()
+}
+
+/// How secret-bearing fields should be validated during settings
+/// finalization.
+///
+/// Push-side tooling sees secret-store key names and must skip value-shape
+/// validators; the runtime sees resolved secret values and must run
+/// everything.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SecretFieldMode {
+    /// Fields hold resolved secret values — run every validator.
+    ResolvedValues,
+    /// Fields hold secret-store key names — skip value-shape validators.
+    KeyNames,
+}
+
+/// Removes `ec.passphrase` value-shape errors from `errors`, returning
+/// `None` when nothing else remains.
+///
+/// Key-name mode defers passphrase shape checks to runtime, where the
+/// resolved value is validated. The passphrase minimum-length rule is the
+/// only serde-level validator a legitimate key name can trip; every other
+/// secret-field validator only rejects empty values.
+fn strip_key_name_validation_errors(mut errors: ValidationErrors) -> Option<ValidationErrors> {
+    if let Some(ValidationErrorsKind::Struct(inner)) = errors.errors_mut().get_mut("ec") {
+        inner.errors_mut().remove("passphrase");
+        if inner.is_empty() {
+            errors.errors_mut().remove("ec");
+        }
+    }
+    if errors.is_empty() {
+        None
+    } else {
+        Some(errors)
+    }
+}
+
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -1961,6 +2042,9 @@ pub struct Settings {
     pub tinybird: TinybirdSettings,
     #[serde(default)]
     pub debug: DebugConfig,
+    #[serde(default, skip_serializing_if = "SecretsSettings::is_disabled")]
+    #[validate(nested)]
+    pub secrets: SecretsSettings,
 }
 
 impl Settings {
@@ -1975,13 +2059,17 @@ impl Settings {
                 message: "Failed to deserialize TOML configuration".to_string(),
             })?;
 
-        Self::finalize_deserialized(settings, "Configuration")
+        let mode = settings.secret_field_mode();
+        Self::finalize_deserialized(settings, "Configuration", mode)
     }
 
     /// Creates a new [`Settings`] instance from a JSON value.
     ///
     /// Runtime config-store loading uses this after verifying the `app_config`
-    /// blob envelope and extracting the same typed settings shape.
+    /// blob envelope and extracting the same typed settings shape. Callers
+    /// must resolve secret-store references first
+    /// ([`crate::secret_refs::resolve_secret_refs`]); secret fields are
+    /// validated as resolved values regardless of `[secrets]` mode.
     ///
     /// # Errors
     ///
@@ -1992,7 +2080,7 @@ impl Settings {
                 message: "Failed to deserialize JSON configuration".to_string(),
             })?;
 
-        Self::finalize_deserialized(settings, "Configuration")
+        Self::finalize_deserialized(settings, "Configuration", SecretFieldMode::ResolvedValues)
     }
 
     /// Creates a new [`Settings`] instance from a TOML string with legacy
@@ -2027,12 +2115,29 @@ impl Settings {
                     message: "Failed to deserialize configuration".to_string(),
                 })?;
 
-        Self::finalize_deserialized(settings, "Build-time configuration")
+        Self::finalize_deserialized(
+            settings,
+            "Build-time configuration",
+            SecretFieldMode::ResolvedValues,
+        )
+    }
+
+    /// Returns how secret-bearing fields should be validated for this
+    /// configuration: key names when `[secrets]` mode is enabled, resolved
+    /// values otherwise.
+    #[must_use]
+    pub fn secret_field_mode(&self) -> SecretFieldMode {
+        if self.secrets.enabled {
+            SecretFieldMode::KeyNames
+        } else {
+            SecretFieldMode::ResolvedValues
+        }
     }
 
     pub(crate) fn finalize_deserialized(
         mut settings: Self,
         validation_label: &str,
+        mode: SecretFieldMode,
     ) -> Result<Self, Report<TrustedServerError>> {
         settings.integrations.normalize();
         settings.proxy.normalize();
@@ -2041,14 +2146,28 @@ impl Settings {
 
         settings.prepare_runtime()?;
 
-        settings.validate().map_err(|err| {
-            Report::new(TrustedServerError::Configuration {
-                message: format!("{validation_label} validation failed: {err}"),
-            })
-        })?;
+        settings
+            .validate()
+            .map_or_else(
+                |err| match mode {
+                    SecretFieldMode::KeyNames => match strip_key_name_validation_errors(err) {
+                        None => Ok(()),
+                        Some(remaining) => Err(remaining),
+                    },
+                    SecretFieldMode::ResolvedValues => Err(err),
+                },
+                Ok,
+            )
+            .map_err(|err| {
+                Report::new(TrustedServerError::Configuration {
+                    message: format!("{validation_label} validation failed: {err}"),
+                })
+            })?;
 
         settings.validate_admin_coverage()?;
-        settings.validate_admin_handler_passwords()?;
+        if mode == SecretFieldMode::ResolvedValues {
+            settings.validate_admin_handler_passwords()?;
+        }
 
         Ok(settings)
     }
@@ -2107,6 +2226,65 @@ impl Settings {
             .as_ref()
             .map(|co| co.slot.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// Validates that every secret-bearing field holds a plausible secret
+    /// key NAME (store mode): non-empty, without whitespace or control
+    /// characters.
+    ///
+    /// Field coverage matches [`Self::reject_placeholder_secrets`] and
+    /// [`crate::secret_refs`]. Value-shape checks (length, placeholders) run
+    /// at runtime against the resolved values instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Configuration`] listing every offending
+    /// field path. Messages never include the field values.
+    pub fn validate_secret_key_names(&self) -> Result<(), Report<TrustedServerError>> {
+        fn is_invalid_key_name(key_name: &str) -> bool {
+            key_name.is_empty()
+                || key_name
+                    .chars()
+                    .any(|c| c.is_whitespace() || c.is_control())
+        }
+
+        let mut invalid_fields: Vec<String> = Vec::new();
+
+        if is_invalid_key_name(self.publisher.proxy_secret.expose()) {
+            invalid_fields.push("publisher.proxy_secret".to_owned());
+        }
+        if is_invalid_key_name(self.ec.passphrase.expose()) {
+            invalid_fields.push("ec.passphrase".to_owned());
+        }
+        for partner in &self.ec.partners {
+            if is_invalid_key_name(partner.api_token.expose()) {
+                invalid_fields.push(format!("ec.partners[{}].api_token", partner.source_domain));
+            }
+            if let Some(ts_pull_token) = &partner.ts_pull_token {
+                if is_invalid_key_name(ts_pull_token.expose()) {
+                    invalid_fields.push(format!(
+                        "ec.partners[{}].ts_pull_token",
+                        partner.source_domain
+                    ));
+                }
+            }
+        }
+        for handler in &self.handlers {
+            if is_invalid_key_name(handler.password.expose()) {
+                invalid_fields.push(format!("handlers[{}].password", handler.path));
+            }
+        }
+
+        if invalid_fields.is_empty() {
+            return Ok(());
+        }
+
+        Err(Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "secret key names must be non-empty without whitespace or control characters: {}",
+                invalid_fields.join(", ")
+            ),
+        }))
     }
 
     /// Rejects known placeholder secret values.
@@ -2601,6 +2779,179 @@ mod tests {
     };
     use crate::redacted::Redacted;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
+
+    #[test]
+    fn secrets_section_defaults_to_disabled_inline_mode() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse settings without [secrets] section");
+
+        assert!(!settings.secrets.enabled, "should default to inline mode");
+        assert_eq!(
+            settings.secrets.store, "ts_secrets",
+            "should default to ts_secrets store"
+        );
+    }
+
+    #[test]
+    fn secrets_section_parses_enabled_and_store() {
+        let toml = format!(
+            "{}\n[secrets]\nenabled = true\nstore = \"custom_secrets\"\n",
+            crate_test_settings_str()
+        );
+
+        let settings = Settings::from_toml(&toml).expect("should parse [secrets] section");
+
+        assert!(settings.secrets.enabled, "should enable store mode");
+        assert_eq!(
+            settings.secrets.store, "custom_secrets",
+            "should read store name"
+        );
+    }
+
+    #[test]
+    fn key_names_mode_accepts_short_passphrase_ref() {
+        let toml = format!(
+            "{}\n[secrets]\nenabled = true\n",
+            crate_test_settings_str().replace("test-secret-key-32-bytes-minimum", "ec_passphrase")
+        );
+
+        let settings =
+            Settings::from_toml(&toml).expect("should accept key-name passphrase in store mode");
+
+        assert_eq!(
+            settings.ec.passphrase.expose(),
+            "ec_passphrase",
+            "should keep the key name until runtime resolution"
+        );
+    }
+
+    #[test]
+    fn resolved_values_mode_still_rejects_short_passphrase() {
+        let toml = crate_test_settings_str().replace("test-secret-key-32-bytes-minimum", "short");
+
+        let err = Settings::from_toml(&toml).expect_err("should reject short passphrase inline");
+
+        assert!(
+            err.to_string().contains("validation failed"),
+            "should fail validation: {err}"
+        );
+    }
+
+    #[test]
+    fn key_names_mode_still_rejects_non_secret_field_errors() {
+        // Break a non-secret validated field while in store mode: the
+        // key-name exemption must not swallow unrelated validation errors.
+        let toml = format!(
+            "{}\n[secrets]\nenabled = true\nstore = \"\"\n",
+            crate_test_settings_str()
+        );
+
+        let err = Settings::from_toml(&toml)
+            .expect_err("should reject empty secrets.store in store mode");
+
+        assert!(
+            err.to_string().contains("validation failed"),
+            "should fail validation: {err}"
+        );
+    }
+
+    #[test]
+    fn key_names_mode_skips_admin_placeholder_password_check() {
+        // `password` is an admin placeholder value inline, but a legitimate
+        // secret key NAME in store mode; the parse-time check must defer to
+        // runtime, which validates the resolved value.
+        let toml = format!(
+            "{}\n[secrets]\nenabled = true\n",
+            crate_test_settings_str()
+                .replace("password = \"admin-pass\"", "password = \"password\"")
+        );
+
+        let settings = Settings::from_toml(&toml)
+            .expect("should accept key-name admin password in store mode");
+
+        assert_eq!(
+            settings.handlers[1].password.expose(),
+            "password",
+            "should keep the key name until runtime resolution"
+        );
+    }
+
+    #[test]
+    fn resolved_values_mode_still_rejects_admin_placeholder_password() {
+        let toml = crate_test_settings_str()
+            .replace("password = \"admin-pass\"", "password = \"password\"");
+
+        let err = Settings::from_toml(&toml)
+            .expect_err("should reject placeholder admin password inline");
+
+        assert!(
+            err.to_string().contains("placeholder password"),
+            "should mention placeholder password: {err}"
+        );
+    }
+
+    #[test]
+    fn default_secrets_omitted_from_serialization() {
+        // Wire compatibility: a blob pushed by a newer CLI for an ordinary
+        // inline config must not carry a `secrets` field, or a binary
+        // predating this field (with `deny_unknown_fields`) rejects it.
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse inline settings");
+
+        let json = serde_json::to_value(&settings).expect("should serialize");
+
+        assert!(
+            json.get("secrets").is_none(),
+            "default (inline) secrets section must be omitted from the blob"
+        );
+    }
+
+    #[test]
+    fn store_mode_secrets_are_serialized() {
+        let toml = format!("{}\n[secrets]\nenabled = true\n", crate_test_settings_str());
+        let settings = Settings::from_toml(&toml).expect("should parse store-mode settings");
+
+        let json = serde_json::to_value(&settings).expect("should serialize");
+
+        assert_eq!(
+            json.pointer("/secrets/enabled"),
+            Some(&serde_json::Value::Bool(true)),
+            "store-mode secrets section must be serialized"
+        );
+    }
+
+    #[test]
+    fn disabled_secrets_with_custom_store_are_omitted() {
+        // Wire compatibility: a disabled section is inert, so even a
+        // non-default `store` must be omitted or old binaries reject the blob.
+        let toml = format!(
+            "{}\n[secrets]\nenabled = false\nstore = \"custom_secrets\"\n",
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml).expect("should parse disabled custom-store");
+
+        let json = serde_json::to_value(&settings).expect("should serialize");
+
+        assert!(
+            json.get("secrets").is_none(),
+            "disabled secrets section must be omitted even with a custom store"
+        );
+    }
+
+    #[test]
+    fn secrets_section_rejects_unknown_fields() {
+        let toml = format!(
+            "{}\n[secrets]\nenabled = true\ntypo = true\n",
+            crate_test_settings_str()
+        );
+
+        let err = Settings::from_toml(&toml).expect_err("should reject unknown [secrets] field");
+
+        assert!(
+            err.to_string().contains("deserialize"),
+            "should fail deserialization: {err}"
+        );
+    }
 
     #[test]
     fn tinybird_defaults_to_disabled_placeholders() {

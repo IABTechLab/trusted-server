@@ -63,6 +63,7 @@ pub mod request_signing;
 pub mod response_privacy;
 pub mod rsc_flight;
 pub(crate) mod s3_sigv4;
+pub mod secret_refs;
 pub mod settings;
 pub mod settings_data;
 pub mod storage;
