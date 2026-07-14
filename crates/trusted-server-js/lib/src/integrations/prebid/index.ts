@@ -237,7 +237,10 @@ type TrustedServerRequest = {
   method: 'POST';
   url: string;
   data: string;
-  options: { contentType: 'application/json' };
+  options: {
+    contentType: 'application/json';
+    customHeaders: { 'X-TSJS-Auction': '1' };
+  };
   bidRequests: TrustedServerBidRequest[];
   tsjsBidRequests: TrustedServerBidRequest[];
 };
@@ -524,7 +527,10 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
         method: 'POST',
         url: auctionEndpoint,
         data: JSON.stringify(payload),
-        options: { contentType: 'application/json' },
+        options: {
+          contentType: 'application/json',
+          customHeaders: { 'X-TSJS-Auction': '1' },
+        },
         // Keep bid requests on the request object so interpretResponse can
         // map bids without relying on shared mutable adapter state.
         bidRequests: requestScopedBidRequests,

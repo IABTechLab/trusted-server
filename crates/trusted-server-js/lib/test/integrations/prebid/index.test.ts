@@ -282,7 +282,10 @@ describe('prebid/installPrebidNpm', () => {
 
       expect(result.method).toBe('POST');
       expect(result.url).toBe('/auction');
-      expect(result.options).toEqual({ contentType: 'application/json' });
+      expect(result.options).toEqual({
+        contentType: 'application/json',
+        customHeaders: { 'X-TSJS-Auction': '1' },
+      });
 
       const payload = JSON.parse(result.data);
       expect(payload.adUnits).toHaveLength(1);

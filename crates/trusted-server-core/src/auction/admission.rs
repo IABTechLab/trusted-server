@@ -342,6 +342,34 @@ pub fn deny_invalid_body(draft: AuctionAdmissionDraft) -> AdmissionDenial {
     }
 }
 
+/// Convert a draft into a payload-size denial after bounded body collection.
+#[must_use]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "consuming the draft prevents callers from reusing a failed admission attempt"
+)]
+pub fn deny_payload_too_large(draft: AuctionAdmissionDraft) -> AdmissionDenial {
+    let AuctionAdmissionDraft {
+        auction_id,
+        source,
+        publisher_origin: _,
+        consent: _,
+        request_metadata: _,
+        auction_enabled: _,
+        request_allowed: _,
+        auction_allowed: _,
+        identity_allowed: _,
+        eids_allowed: _,
+        decision_reason: _,
+    } = draft;
+    AdmissionDenial {
+        auction_id,
+        source,
+        telemetry_path: None,
+        kind: AdmissionDenialKind::PayloadTooLarge,
+    }
+}
+
 /// Convert an admission denial into a plain HTTP response.
 ///
 /// # Errors

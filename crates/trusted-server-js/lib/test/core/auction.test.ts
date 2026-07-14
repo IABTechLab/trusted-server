@@ -265,7 +265,7 @@ describe('auction/sendAuction', () => {
       '/auction',
       expect.objectContaining({
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', 'X-TSJS-Auction': '1' },
         body: JSON.stringify(request),
       })
     );

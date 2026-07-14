@@ -29,6 +29,17 @@ use super::types::{
     PublisherInfo, SiteInfo, UserInfo,
 };
 
+/// Apply private no-store caching headers to auction endpoint responses.
+pub fn apply_auction_response_privacy(response: &mut Response<EdgeBody>) {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response
+        .headers_mut()
+        .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+}
+
 /// Request body for `POST /auction` (tsjs / Prebid.js wire format).
 ///
 /// `adUnits` lists the placements to bid on. `config` carries optional

@@ -172,7 +172,7 @@ export async function sendAuction(endpoint: string, request: AdRequest): Promise
   try {
     const res = await fetch(endpoint, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'X-TSJS-Auction': '1' },
       credentials: 'same-origin',
       body: JSON.stringify(request),
       keepalive: true,

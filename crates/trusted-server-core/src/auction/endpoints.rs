@@ -4,12 +4,17 @@ use std::collections::HashMap;
 
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use http::{header, Request, Response, StatusCode};
+use http::{header, Request, Response};
 use serde_json::Value as JsonValue;
+use url::Url;
 
+use crate::auction::admission::{
+    admission_denial_response, admit_auction_http, deny_invalid_body, deny_payload_too_large,
+    finalize_admission, AdmissionDenial,
+};
 use crate::auction::formats::AdRequest;
 use crate::auction::orchestrator::OrchestrationResult;
-use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
+use crate::consent::gate_eids_by_consent;
 use crate::constants::COOKIE_TS_EIDS;
 use crate::ec::eids::{resolve_partner_ids, to_eids};
 use crate::ec::kv::KvIdentityGraph;
@@ -23,7 +28,9 @@ use crate::openrtb::{Eid, Uid};
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
-use super::formats::{convert_to_openrtb_response, convert_tsjs_to_auction_request};
+use super::formats::{
+    apply_auction_response_privacy, convert_to_openrtb_response, convert_tsjs_to_auction_request,
+};
 use super::telemetry::{
     build_auction_events, emit_auction_events_best_effort_lazy, AuctionObservationContext,
     AuctionTerminalOutcome,
@@ -40,7 +47,7 @@ const MAX_CLIENT_EID_SOURCE_BYTES: usize = 255;
 /// the largest realistic Prebid-derived auction request (hundreds of ad units
 /// with EID arrays) while preventing an authenticated client from consuming
 /// arbitrary WASM linear memory.
-const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
+const MAX_AUCTION_BODY_SIZE: usize = crate::auction::admission::MAX_AUCTION_BODY_BYTES;
 
 /// Handle auction request from `POST /auction`.
 ///
@@ -115,44 +122,26 @@ pub async fn handle_auction(
     services: &RuntimeServices,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    // Reject oversized bodies before core buffers/parses them. The Content-Length
-    // pre-check stops well-behaved clients early; the post-read check defends
-    // against clients that lie about (or omit) the header.
-    let content_length_exceeded = req
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<usize>().ok())
-        .is_some_and(|length| length > MAX_AUCTION_BODY_SIZE);
-    if content_length_exceeded {
-        return Response::builder()
-            .status(StatusCode::PAYLOAD_TOO_LARGE)
-            .header(header::CONTENT_TYPE, "text/plain")
-            .body(EdgeBody::from(format!(
-                "Request body exceeds {MAX_AUCTION_BODY_SIZE} byte limit"
-            )))
-            .change_context(TrustedServerError::Auction {
-                message: "Auction request body exceeded maximum size".to_string(),
-            });
-    }
+    let draft = match admit_auction_http(
+        settings,
+        AuctionSource::AuctionApi,
+        &req,
+        ec_context,
+        services.client_info(),
+    ) {
+        Ok(draft) => draft,
+        Err(denial) => return auction_denial_response(&denial),
+    };
 
     let (parts, body) = req.into_parts();
-    let body_bytes = body.into_bytes().unwrap_or_default();
-    if body_bytes.len() > MAX_AUCTION_BODY_SIZE {
-        return Response::builder()
-            .status(StatusCode::PAYLOAD_TOO_LARGE)
-            .header(header::CONTENT_TYPE, "text/plain")
-            .body(EdgeBody::from(format!(
-                "Request body exceeds {MAX_AUCTION_BODY_SIZE} byte limit"
-            )))
-            .change_context(TrustedServerError::Auction {
-                message: "Auction request body exceeded maximum size".to_string(),
-            });
-    }
-    let body: AdRequest =
-        serde_json::from_slice(&body_bytes).change_context(TrustedServerError::BadRequest {
-            message: "Failed to parse auction request body".to_string(),
-        })?;
+    let body_bytes = match body.into_bytes_bounded(MAX_AUCTION_BODY_SIZE).await {
+        Ok(body_bytes) => body_bytes,
+        Err(_) => return auction_denial_response(&deny_payload_too_large(draft)),
+    };
+    let body: AdRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(body) => body,
+        Err(_) => return auction_denial_response(&deny_invalid_body(draft)),
+    };
 
     log::info!(
         "Auction request received for {} ad units",
@@ -160,6 +149,8 @@ pub async fn handle_auction(
     );
 
     let http_req = Request::from_parts(parts, EdgeBody::empty());
+    let page_url = auction_page_url(settings);
+    let admission = finalize_admission(draft, page_url);
 
     // Story 5 middleware contract: auction is a read-only EC route.
     // It must not generate EC IDs; it only consumes pre-routed context.
@@ -169,7 +160,7 @@ pub async fn handle_auction(
     } else {
         None
     };
-    let consent_context = ec_context.consent().clone();
+    let consent_context = admission.consent().clone();
 
     // Server-side auction consent gate. The publisher-navigation and
     // `/__ts/page-bids` paths fail closed for GDPR/unknown jurisdictions that
@@ -178,7 +169,7 @@ pub async fn handle_auction(
     // a no-bid response here prevents outbound PBS/APS calls and the forwarding
     // of request-derived signals (UA/IP/geo, and cookies under some Prebid
     // consent-forwarding modes) for traffic that must not run an auction.
-    if !consent_allows_server_side_auction(&consent_context) {
+    if !admission.auction_allowed() {
         log::info!(
             "/auction: server-side auction consent gate denied; returning no-bid response without contacting providers"
         );
@@ -216,12 +207,12 @@ pub async fn handle_auction(
             total_time_ms: 0,
             metadata: HashMap::new(),
         };
-        return convert_to_openrtb_response(
+        return private_auction_response(convert_to_openrtb_response(
             &empty_result,
             settings,
             &auction_request,
             ec_context.ec_allowed(),
-        );
+        ));
     }
 
     // Parse client-provided EIDs from the current request body. When the
@@ -337,7 +328,36 @@ pub async fn handle_auction(
     );
 
     // Convert to OpenRTB response format with inline creative HTML
-    convert_to_openrtb_response(&result, settings, &auction_request, ec_context.ec_allowed())
+    private_auction_response(convert_to_openrtb_response(
+        &result,
+        settings,
+        &auction_request,
+        ec_context.ec_allowed(),
+    ))
+}
+
+fn auction_denial_response(
+    denial: &AdmissionDenial,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    let mut response =
+        admission_denial_response(denial).change_context(TrustedServerError::Auction {
+            message: "Failed to build auction admission denial response".to_string(),
+        })?;
+    apply_auction_response_privacy(&mut response);
+    Ok(response)
+}
+
+fn private_auction_response(
+    response: Result<Response<EdgeBody>, Report<TrustedServerError>>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    let mut response = response?;
+    apply_auction_response_privacy(&mut response);
+    Ok(response)
+}
+
+fn auction_page_url(settings: &Settings) -> Url {
+    Url::parse(&format!("https://{}", settings.publisher.domain))
+        .expect("should build page URL from validated publisher domain")
 }
 
 /// Resolves partner EIDs from the KV identity graph for bidstream decoration.
@@ -550,6 +570,7 @@ pub(crate) fn merge_auction_eids(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auction::build_orchestrator;
     use crate::auction::config::AuctionConfig;
     use crate::auction::provider::AuctionProvider;
     use crate::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink};
@@ -564,6 +585,7 @@ mod tests {
     use crate::test_support::tests::create_test_settings;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine as _;
+    use http::StatusCode;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
@@ -611,6 +633,43 @@ mod tests {
         )
     }
 
+    fn valid_auction_body() -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "adUnits": [
+                {
+                    "code": "div-gpt-ad-1",
+                    "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+                }
+            ]
+        }))
+        .expect("should serialize auction body")
+    }
+
+    fn admitted_auction_request(body: impl Into<EdgeBody>) -> Request<EdgeBody> {
+        Request::builder()
+            .method("POST")
+            .uri("https://test-publisher.example/auction")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ORIGIN, "https://test-publisher.example")
+            .header("x-tsjs-auction", "1")
+            .header("sec-fetch-site", "same-origin")
+            .body(body.into())
+            .expect("should build admitted auction request")
+    }
+
+    fn assert_auction_response_privacy(response: &Response<EdgeBody>) {
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&http::HeaderValue::from_static("private, no-store")),
+            "auction response should be private and non-cacheable"
+        );
+        assert_eq!(
+            response.headers().get(header::PRAGMA),
+            Some(&http::HeaderValue::from_static("no-cache")),
+            "auction response should include legacy no-cache header"
+        );
+    }
+
     /// Provider that fails the test if it is ever contacted. Used to prove the
     /// `/auction` consent gate short-circuits before any outbound bid request.
     struct PanicOnBidProvider;
@@ -652,7 +711,8 @@ mod tests {
         // a server-side auction. The /auction endpoint must short-circuit to a
         // no-bid response before dispatching to any provider — matching the
         // publisher-navigation and /__ts/page-bids paths.
-        let settings = create_test_settings();
+        let mut settings = create_test_settings();
+        settings.auction.enabled = true;
         let config = AuctionConfig {
             enabled: true,
             providers: vec!["panic_provider".to_string()],
@@ -678,6 +738,9 @@ mod tests {
         let req = Request::builder()
             .method("POST")
             .uri("https://test-publisher.com/auction")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ORIGIN, "https://test-publisher.com")
+            .header("x-tsjs-auction", "1")
             .body(EdgeBody::from(
                 serde_json::to_vec(&body).expect("should serialize body"),
             ))
@@ -780,7 +843,8 @@ mod tests {
         // because no TCF signal is present and GDPR does not apply. Client EIDs
         // supplied in the request body/cookie must NOT be forwarded — the
         // outgoing auction request must have `user.eids == None`.
-        let settings = create_test_settings();
+        let mut settings = create_test_settings();
+        settings.auction.enabled = true;
         let config = AuctionConfig {
             enabled: true,
             providers: vec!["eid_capturing_provider".to_string()],
@@ -832,6 +896,9 @@ mod tests {
         let req = Request::builder()
             .method("POST")
             .uri("https://test-publisher.com/auction")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ORIGIN, "https://test-publisher.com")
+            .header("x-tsjs-auction", "1")
             .header("cookie", format!("{COOKIE_TS_EIDS}={encoded_cookie}"))
             .body(EdgeBody::from(
                 serde_json::to_vec(&body).expect("should serialize body"),
@@ -1211,6 +1278,183 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn handle_auction_requires_tsjs_header_before_dispatch() {
+        let settings = create_test_settings();
+        let orchestrator = build_orchestrator(&settings).expect("should build orchestrator");
+        let services = noop_services();
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://test-publisher.example/auction")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ORIGIN, "https://test-publisher.example")
+            .body(EdgeBody::from(valid_auction_body()))
+            .expect("should build auction request");
+
+        let response = handle_auction(
+            &settings,
+            &orchestrator,
+            None,
+            None,
+            &ec_context,
+            &services,
+            req,
+        )
+        .await
+        .expect("should convert admission denial into response");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_auction_response_privacy(&response);
+    }
+
+    #[tokio::test]
+    async fn handle_auction_maps_admission_denials_to_private_responses() {
+        let settings = create_test_settings();
+        let orchestrator = build_orchestrator(&settings).expect("should build orchestrator");
+        let services = noop_services();
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+
+        let cases = [
+            (
+                "cross-site fetch metadata",
+                Request::builder()
+                    .method("POST")
+                    .uri("https://test-publisher.example/auction")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ORIGIN, "https://test-publisher.example")
+                    .header("x-tsjs-auction", "1")
+                    .header("sec-fetch-site", "cross-site")
+                    .body(EdgeBody::from(valid_auction_body()))
+                    .expect("should build request"),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "mismatched origin",
+                Request::builder()
+                    .method("POST")
+                    .uri("https://test-publisher.example/auction")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ORIGIN, "https://evil.example")
+                    .header("x-tsjs-auction", "1")
+                    .body(EdgeBody::from(valid_auction_body()))
+                    .expect("should build request"),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "missing content type",
+                Request::builder()
+                    .method("POST")
+                    .uri("https://test-publisher.example/auction")
+                    .header(header::ORIGIN, "https://test-publisher.example")
+                    .header("x-tsjs-auction", "1")
+                    .body(EdgeBody::from(valid_auction_body()))
+                    .expect("should build request"),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (
+                "advertised body too large",
+                Request::builder()
+                    .method("POST")
+                    .uri("https://test-publisher.example/auction")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ORIGIN, "https://test-publisher.example")
+                    .header("x-tsjs-auction", "1")
+                    .header(
+                        header::CONTENT_LENGTH,
+                        (MAX_AUCTION_BODY_SIZE + 1).to_string(),
+                    )
+                    .body(EdgeBody::from(valid_auction_body()))
+                    .expect("should build request"),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+        ];
+
+        for (name, req, expected_status) in cases {
+            let response = handle_auction(
+                &settings,
+                &orchestrator,
+                None,
+                None,
+                &ec_context,
+                &services,
+                req,
+            )
+            .await
+            .expect("should convert admission denial into response");
+
+            assert_eq!(response.status(), expected_status, "{name}");
+            assert_auction_response_privacy(&response);
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_auction_returns_private_bad_request_for_malformed_json() {
+        let settings = create_test_settings();
+        let orchestrator = build_orchestrator(&settings).expect("should build orchestrator");
+        let services = noop_services();
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let req = admitted_auction_request(b"not-json".as_slice());
+
+        let response = handle_auction(
+            &settings,
+            &orchestrator,
+            None,
+            None,
+            &ec_context,
+            &services,
+            req,
+        )
+        .await
+        .expect("should convert malformed body into response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_auction_response_privacy(&response);
+    }
+
+    #[tokio::test]
+    async fn handle_auction_disabled_returns_private_no_bid_after_admission_without_dispatch() {
+        let mut settings = create_test_settings();
+        settings.auction.enabled = false;
+        let config = AuctionConfig {
+            enabled: false,
+            providers: vec!["panic_provider".to_string()],
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        };
+        let mut orchestrator = AuctionOrchestrator::new(config);
+        orchestrator.register_provider(Arc::new(PanicOnBidProvider));
+        let services = noop_services();
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let req = admitted_auction_request(valid_auction_body());
+
+        let response = handle_auction(
+            &settings,
+            &orchestrator,
+            None,
+            None,
+            &ec_context,
+            &services,
+            req,
+        )
+        .await
+        .expect("disabled auction should return no-bid response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_auction_response_privacy(&response);
+        let body_bytes = response.into_body().into_bytes().unwrap_or_default();
+        let parsed: JsonValue =
+            serde_json::from_slice(&body_bytes).expect("response body should be valid JSON");
+        assert!(
+            parsed
+                .get("seatbid")
+                .and_then(JsonValue::as_array)
+                .is_none_or(Vec::is_empty),
+            "disabled auction must return no bids, got: {parsed}"
+        );
+    }
+
     #[test]
     fn auction_rejects_oversized_body() {
         futures::executor::block_on(async {
@@ -1231,6 +1475,9 @@ mod tests {
             let req = HttpRequest::builder()
                 .method(Method::POST)
                 .uri("https://test.com/auction")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ORIGIN, "https://test.com")
+                .header("x-tsjs-auction", "1")
                 .body(EdgeBody::from(oversized))
                 .expect("should build request");
             let response = handle_auction(
@@ -1253,16 +1500,15 @@ mod tests {
     }
 
     #[test]
-    fn auction_rejects_streaming_body_instead_of_treating_as_empty() {
+    fn auction_rejects_malformed_streaming_body_with_private_bad_request() {
         futures::executor::block_on(async {
             use bytes::Bytes;
             use edgezero_core::body::Body as EdgeBody;
-            use http::{Method, Request as HttpRequest};
+            use http::{Method, Request as HttpRequest, StatusCode};
 
             use crate::auction::build_orchestrator;
             use crate::consent::ConsentContext;
             use crate::ec::EcContext;
-            use crate::error::TrustedServerError;
             use crate::platform::test_support::noop_services;
             use crate::test_support::tests::create_test_settings;
 
@@ -1274,10 +1520,13 @@ mod tests {
             let req = HttpRequest::builder()
                 .method(Method::POST)
                 .uri("https://test.com/auction")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ORIGIN, "https://test.com")
+                .header("x-tsjs-auction", "1")
                 .body(EdgeBody::stream(stream))
                 .expect("should build request");
 
-            let result = handle_auction(
+            let response = handle_auction(
                 &settings,
                 &orchestrator,
                 None,
@@ -1286,16 +1535,15 @@ mod tests {
                 &services,
                 req,
             )
-            .await;
+            .await
+            .expect("should convert malformed streaming body into response");
 
-            let err = match result {
-                Ok(_) => panic!("streaming body should be rejected"),
-                Err(err) => err,
-            };
-            assert!(
-                matches!(err.current_context(), TrustedServerError::BadRequest { .. }),
-                "streaming request body should fail as bad request"
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "malformed streaming request body should fail as bad request"
             );
+            assert_auction_response_privacy(&response);
         });
     }
 }
