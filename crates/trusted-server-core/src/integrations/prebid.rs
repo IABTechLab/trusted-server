@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1424,10 +1424,22 @@ impl PrebidAuctionProvider {
                 // Only pass through keys that are known PBS bidders — skip provider-specific
                 // keys like "aps" which belong to their own separate auction provider.
                 let mut bidder: HashMap<String, Json> = HashMap::new();
+                // Bidders the publisher explicitly supplied — including an
+                // explicit empty `{}`. A configured bidder that exists only
+                // because `expand_trusted_server_bidders` fabricated an empty
+                // params object is NOT explicit and must not ship as
+                // `"bidder": {}` (which PBS rejects).
+                let mut explicit_bidders: HashSet<String> = HashSet::new();
                 for (name, params) in &slot.bidders {
                     if name == TRUSTED_SERVER_BIDDER {
+                        if let Some(per_bidder) =
+                            params.get(BIDDER_PARAMS_KEY).and_then(Json::as_object)
+                        {
+                            explicit_bidders.extend(per_bidder.keys().cloned());
+                        }
                         bidder.extend(expand_trusted_server_bidders(&self.config.bidders, params));
                     } else if self.config.bidders.iter().any(|b| b == name) {
+                        explicit_bidders.insert(name.clone());
                         bidder.insert(name.clone(), params.clone());
                     } else if name != "aps" {
                         // `aps` is intentionally handled by its own provider. Any
@@ -1443,16 +1455,32 @@ impl PrebidAuctionProvider {
                     }
                 }
 
-                // When no inline PBS bidder params exist (e.g. creative-opportunity slots
-                // whose PBS params live in stored requests), tell PBS to resolve bidder
-                // config from the stored request keyed by this slot ID.
+                // Apply canonical and compatibility-derived rules in normalized
+                // order. An override rule can populate a bidder that arrived with
+                // empty params, promoting a fabricated empty into a valid bidder.
+                for (name, params) in &mut bidder {
+                    self.bid_param_override_engine
+                        .apply(BidParamOverrideFacts { bidder: name, zone }, params);
+                }
+
+                // Drop bidders that are still an empty object after overrides and
+                // were not explicitly supplied. Shipping `"bidder": {}` makes PBS
+                // reject the imp; an explicit empty object is preserved so genuine
+                // publisher misconfiguration stays visible.
+                bidder.retain(|name, params| {
+                    let is_empty_object = params.as_object().is_some_and(serde_json::Map::is_empty);
+                    !is_empty_object || explicit_bidders.contains(name)
+                });
+
+                // When no eligible PBS bidder params remain (e.g. creative-opportunity
+                // slots whose PBS params live in stored requests, or a slot whose
+                // configured bidders all resolved to fabricated empties), tell PBS to
+                // resolve bidder config from the stored request keyed by this slot ID.
                 //
-                // This cannot fire for the client /auction path: the JS adapter
-                // injects a `trustedServer` entry into every ad unit, so `bidder`
-                // is only empty for server-side creative-opportunity slots with
-                // no inline provider params (or when `config.bidders` is empty,
-                // where PBS previously received an empty bidder map and returned
-                // no bids — a stored-request miss is the same no-bid outcome).
+                // This cannot fire for a client /auction slot that carries real
+                // inline params: the JS adapter injects a `trustedServer` entry, and
+                // any bidder with params survives the drop above. It falls back only
+                // when nothing eligible remains — the same no-bid outcome as before.
                 let storedrequest = if bidder.is_empty() {
                     Some(ImpStoredRequest {
                         id: slot.id.clone(),
@@ -1460,12 +1488,6 @@ impl PrebidAuctionProvider {
                 } else {
                     None
                 };
-
-                // Apply canonical and compatibility-derived rules in normalized order.
-                for (name, params) in &mut bidder {
-                    self.bid_param_override_engine
-                        .apply(BidParamOverrideFacts { bidder: name, zone }, params);
-                }
 
                 Some(Imp {
                     id: Some(slot.id.clone()),
@@ -5947,6 +5969,131 @@ set = { placementId = "explicit_header" }
         assert_eq!(
             prebid["bidder"]["kargo"]["placementId"], "client_123",
             "should use inline bidder params from trustedServer expansion"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_drops_fabricated_empty_bidder_params() {
+        // config.bidders lists three, but the slot supplies inline params only
+        // for kargo. Without a matching override, triplelift and criteo would
+        // expand to empty `{}` objects — invalid bidder entries PBS rejects.
+        // They must be dropped; the valid kargo bidder must still ship.
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+bidders = ["kargo", "triplelift", "criteo"]
+"#,
+        );
+
+        let slot = make_ts_slot(
+            "ad-header-0",
+            &json!({ "kargo": { "placementId": "kn1" } }),
+            None,
+        );
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(config, &request);
+        let params = bidder_params(&ortb);
+
+        assert_eq!(
+            params["kargo"]["placementId"], "kn1",
+            "should keep the valid inline bidder"
+        );
+        assert!(
+            !params.contains_key("triplelift"),
+            "should drop a fabricated empty bidder with no inline params or override"
+        );
+        assert!(
+            !params.contains_key("criteo"),
+            "should drop a fabricated empty bidder with no inline params or override"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_preserves_an_explicitly_empty_bidder() {
+        // A publisher-supplied empty `{}` is a real (if misconfigured) signal and
+        // must survive so the misconfiguration stays visible — unlike a fabricated
+        // empty, which is dropped.
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+bidders = ["kargo"]
+"#,
+        );
+
+        let slot = make_ts_slot("ad-header-0", &json!({ "kargo": {} }), None);
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(config, &request);
+        let params = bidder_params(&ortb);
+
+        assert_eq!(
+            params["kargo"],
+            json!({}),
+            "should preserve an explicitly supplied empty bidder object"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_keeps_a_fabricated_bidder_that_an_override_populates() {
+        // criteo has no inline params (fabricated empty), but an override rule
+        // fills it — so it is valid and must ship, not be dropped.
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+bidders = ["criteo"]
+
+[integrations.prebid.bid_param_overrides.criteo]
+networkId = 99999
+"#,
+        );
+
+        let slot = make_ts_slot("ad-header-0", &json!({}), None);
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(config, &request);
+        let params = bidder_params(&ortb);
+
+        assert_eq!(
+            params["criteo"]["networkId"], 99999,
+            "override should populate the fabricated empty bidder, keeping it"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_falls_back_to_stored_request_when_all_bidders_are_fabricated_empty() {
+        // config.bidders present, but the slot supplies no inline params and no
+        // override matches — every configured bidder resolves to a fabricated
+        // empty and is dropped, leaving PBS to resolve via the stored request.
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+bidders = ["kargo", "triplelift"]
+"#,
+        );
+
+        let slot = make_ts_slot("ad-header-0", &json!({}), None);
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(config, &request);
+        let ext = ortb.imp[0].ext.as_ref().expect("should have imp ext");
+        let prebid = ext.get("prebid").expect("should have prebid in ext");
+
+        assert!(
+            prebid.get("bidder").is_none(),
+            "should drop all fabricated empty bidders"
+        );
+        assert_eq!(
+            prebid["storedrequest"]["id"], "ad-header-0",
+            "should fall back to stored request when no eligible bidders remain"
         );
     }
 
