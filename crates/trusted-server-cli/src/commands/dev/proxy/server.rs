@@ -334,7 +334,11 @@ async fn blind_tunnel(
     let mut upstream = match connect_upstream(host, port, resolve, connect_timeout).await {
         Ok(stream) => stream,
         Err(err) => {
-            log::warn!("blind tunnel to {host}:{port} failed: {err}");
+            // Only unmatched hosts reach the blind tunnel, and real pages reference
+            // many third-party domains that are dead, blackholed, or DNS-blocked.
+            // Logging those at `warn` would drown out failures on mapped upstreams,
+            // so keep them at `debug`; the browser still sees the `502`.
+            log::debug!("blind tunnel to {host}:{port} failed: {err}");
             return respond_status_line(&mut client, StatusCode::BAD_GATEWAY).await;
         }
     };
