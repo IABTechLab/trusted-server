@@ -8,7 +8,7 @@ use http::{header, Request};
 use serde_json::Value as JsonValue;
 
 use crate::auction::admission::AuctionAdmission;
-use crate::consent::gate_eids_by_consent;
+use crate::consent::{gate_eids_by_consent, ConsentContext};
 use crate::constants::COOKIE_TS_EIDS;
 use crate::ec::eids::{resolve_partner_ids, to_eids};
 use crate::ec::kv::KvIdentityGraph;
@@ -35,6 +35,7 @@ pub(crate) struct AuctionIdentityInput<'a> {
 }
 
 /// Resolved auction identity after precedence, merge, and consent gates.
+#[derive(Clone)]
 pub(crate) struct AuctionIdentity {
     pub ec_id: Option<String>,
     pub eids: Option<Vec<Eid>>,
@@ -55,6 +56,34 @@ pub(crate) fn resolve_auction_identity(input: AuctionIdentityInput<'_>) -> Aucti
     let kv_eids = resolve_auction_eids(input.kv, input.registry, input.ec_context);
     let merged_eids = merge_auction_eids(client_eids, kv_eids);
     let eids = gate_eids_by_consent(merged_eids, Some(input.admission.consent()));
+
+    AuctionIdentity { ec_id, eids }
+}
+
+/// Resolve EC and EIDs for the initial-navigation path, which runs before an
+/// admission record exists.
+///
+/// Mirrors [`resolve_auction_identity`] but takes the already-decided EC and
+/// consent inputs directly instead of reading them from an
+/// [`AuctionAdmission`]. Merges the `ts-eids` browser fallback with EC-keyed KV
+/// EIDs and applies the consent gate.
+pub(crate) fn resolve_navigation_identity(
+    ec_id: Option<&str>,
+    ts_eids_cookie: Option<&str>,
+    kv: Option<&KvIdentityGraph>,
+    registry: Option<&PartnerRegistry>,
+    ec_context: &EcContext,
+    consent: &ConsentContext,
+) -> AuctionIdentity {
+    let ec_id = ec_id.map(str::to_owned);
+    let client_eids = if ec_id.is_some() {
+        resolve_client_auction_eids(None, ts_eids_cookie)
+    } else {
+        None
+    };
+    let kv_eids = resolve_auction_eids(kv, registry, ec_context);
+    let merged_eids = merge_auction_eids(client_eids, kv_eids);
+    let eids = gate_eids_by_consent(merged_eids, Some(consent));
 
     AuctionIdentity { ec_id, eids }
 }

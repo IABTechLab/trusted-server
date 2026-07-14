@@ -9,28 +9,28 @@ use url::Url;
 
 use crate::auction::admission::{
     admission_denial_response, admit_auction_http, deny_invalid_body, deny_payload_too_large,
-    finalize_admission, AdmissionDenial, AuctionAdmissionDraft,
+    finalize_admission, AdmissionDenial, AuctionAdmission, AuctionAdmissionDraft,
 };
 use crate::auction::formats::AdRequest;
 use crate::auction::identity::{
-    extract_ts_eids_cookie, resolve_auction_identity, AuctionIdentityInput,
+    extract_ts_eids_cookie, resolve_auction_identity, AuctionIdentity, AuctionIdentityInput,
 };
 use crate::auction::orchestrator::OrchestrationResult;
+use crate::auction::request::{build_canonical_request, canonical_input_from_ad_request};
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::registry::PartnerRegistry;
 use crate::ec::EcContext;
 use crate::error::TrustedServerError;
+use crate::geo::GeoInfo;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
-use super::formats::{
-    apply_auction_response_privacy, convert_to_openrtb_response, convert_tsjs_to_auction_request,
-};
+use super::formats::{apply_auction_response_privacy, convert_to_openrtb_response};
 use super::telemetry::{
     build_auction_events, emit_auction_events_best_effort_lazy, AuctionObservationContext,
     AuctionTerminalOutcome,
 };
-use super::types::AuctionContext;
+use super::types::{AuctionContext, DeviceInfo};
 use super::AuctionOrchestrator;
 use super::AuctionSource;
 
@@ -153,10 +153,6 @@ pub async fn handle_auction(
 
     // Story 5 middleware contract: auction is a read-only EC route.
     // It must not generate EC IDs; it only consumes pre-routed context.
-    // Only forward the EC ID to auction partners when consent allows it.
-    let ec_id = ec_context
-        .ec_value()
-        .filter(|_| admission.identity_allowed());
     let consent_context = admission.consent().clone();
 
     // Server-side auction consent gate. The publisher-navigation and
@@ -172,15 +168,22 @@ pub async fn handle_auction(
         );
         // Build the request shape locally (no outbound calls, no geo lookup, no
         // EID resolution) so the no-bid OpenRTB response echoes the request id.
-        let auction_request = convert_tsjs_to_auction_request(
-            &body,
-            settings,
-            services,
-            &http_req,
-            consent_context,
-            ec_id,
-            None,
+        // Only forward the EC ID when consent allows it.
+        let ec_id = ec_context
+            .ec_value()
+            .filter(|_| admission.identity_allowed())
+            .map(str::to_owned);
+        let canonical = build_canonical_request(
+            &admission,
+            canonical_input_from_ad_request(
+                settings,
+                &body,
+                AuctionIdentity { ec_id, eids: None },
+                consent_context,
+                auction_device_snapshot(&admission, None),
+            )?,
         )?;
+        let auction_request = canonical.to_auction_request();
         let observation = AuctionObservationContext::from_auction_request(
             AuctionSource::AuctionApi,
             &auction_request,
@@ -221,9 +224,8 @@ pub async fn handle_auction(
         registry,
         ec_context,
     });
-    let ec_id = identity.ec_id.as_deref();
 
-    // Look up geo for device info.
+    // Look up geo for the device snapshot.
     let geo = services
         .geo()
         .lookup(services.client_info().client_ip)
@@ -232,18 +234,20 @@ pub async fn handle_auction(
             None
         });
 
-    // Convert tsjs request format to auction request
-    let mut auction_request = convert_tsjs_to_auction_request(
-        &body,
-        settings,
-        services,
-        &http_req,
-        consent_context,
-        ec_id,
-        geo,
+    // Build the canonical request from the admitted attempt, resolved identity,
+    // and device snapshot, then project it to the legacy request the
+    // orchestrator still consumes.
+    let canonical = build_canonical_request(
+        &admission,
+        canonical_input_from_ad_request(
+            settings,
+            &body,
+            identity,
+            consent_context,
+            auction_device_snapshot(&admission, geo),
+        )?,
     )?;
-
-    auction_request.user.eids = identity.eids;
+    let auction_request = canonical.to_auction_request();
 
     // Create auction context
     let context = AuctionContext {
@@ -372,6 +376,20 @@ fn same_origin(left: &Url, right: &Url) -> bool {
         && left.host_str().map(str::to_ascii_lowercase)
             == right.host_str().map(str::to_ascii_lowercase)
         && left.port_or_known_default() == right.port_or_known_default()
+}
+
+/// Snapshot device data from the admitted request metadata plus an optional geo
+/// lookup, delegating to the shared canonical device snapshot.
+fn auction_device_snapshot(
+    admission: &AuctionAdmission,
+    geo: Option<GeoInfo>,
+) -> Option<DeviceInfo> {
+    let metadata = admission.request_metadata();
+    crate::auction::request::auction_device_snapshot(
+        metadata.user_agent.clone(),
+        metadata.client_ip.clone(),
+        geo,
+    )
 }
 
 #[cfg(test)]

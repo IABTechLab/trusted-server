@@ -22,32 +22,32 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use cookie::CookieJar;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::{header, HeaderValue, Method, Request, Response, StatusCode, Uri};
 
 use crate::auction::admission::{
     admission_denial_response, admit_auction_http, deny_invalid_body, finalize_admission,
-    AdmissionDenial, AuctionAdmission, AuctionAdmissionDraft,
+    AdmissionDenial, AuctionAdmissionDraft,
 };
 use crate::auction::formats::apply_auction_response_privacy;
 use crate::auction::identity::{
-    merge_auction_eids, resolve_auction_eids, resolve_auction_identity,
-    resolve_client_auction_eids, AuctionIdentityInput,
+    resolve_auction_identity, resolve_navigation_identity, AuctionIdentityInput,
 };
 use crate::auction::orchestrator::{
     AuctionOrchestrator, DispatchAuctionOutcome, DispatchedAuction,
+};
+use crate::auction::request::{
+    build_canonical_request, build_navigation_canonical_request,
+    canonical_input_from_creative_opportunities,
 };
 use crate::auction::telemetry::{
     build_auction_events, emit_auction_events_best_effort_lazy, AuctionObservationContext,
     AuctionTerminalOutcome,
 };
-use crate::auction::types::{
-    AuctionContext, AuctionRequest, Bid, DeviceInfo, PublisherInfo, SiteInfo, UserInfo,
-};
+use crate::auction::types::{AuctionContext, AuctionRequest, Bid};
 use crate::auction::AuctionSource;
-use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
+use crate::consent::consent_allows_server_side_auction;
 use crate::constants::{COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
 use crate::cookies::handle_request_cookies;
 use crate::ec::kv::KvIdentityGraph;
@@ -56,7 +56,7 @@ use crate::ec::EcContext;
 use crate::error::TrustedServerError;
 use crate::http_util::{is_navigation_request, serve_static_with_etag, RequestInfo};
 use crate::integrations::IntegrationRegistry;
-use crate::platform::{GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices};
+use crate::platform::{PlatformBackendSpec, PlatformHttpRequest, RuntimeServices};
 use crate::price_bucket::{price_bucket, PriceGranularity};
 use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::Settings;
@@ -1476,83 +1476,97 @@ pub async fn handle_publisher_request(
         );
 
         if should_run_auction {
-            let slots_ctx = MatchedSlotsContext {
-                matched_slots: &matched_slots,
-                request_path: &request_path,
-            };
-            let mut auction_request = build_auction_request(
-                &slots_ctx,
+            let ts_eids_cookie = cookie_jar
+                .as_ref()
+                .and_then(|jar| jar.get(COOKIE_TS_EIDS))
+                .map(|cookie| cookie.value().to_owned());
+            let identity = resolve_navigation_identity(
                 ec_id,
+                ts_eids_cookie.as_deref(),
+                kv,
+                auction.registry,
+                ec_context,
                 &consent_context,
-                &request_info,
+            );
+            let device = crate::auction::request::auction_device_snapshot(
                 req.headers()
                     .get("user-agent")
-                    .and_then(|v| v.to_str().ok()),
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned),
+                services.client_info().client_ip.map(|ip| ip.to_string()),
+                geo.clone(),
             );
-            apply_auction_eids_and_device(
-                &mut auction_request,
-                &AuctionEidTargeting {
-                    cookie_jar: cookie_jar.as_ref(),
-                    ec_id,
-                    admission: None,
-                    kv,
-                    partner_registry: auction.registry,
-                    ec_context,
-                    services,
-                    geo: geo.as_ref(),
-                    path_label: "Server-side",
-                },
-            );
-            let auction_context = AuctionContext {
-                settings,
-                request: &req,
-                timeout_ms: auction_timeout_ms,
-                provider_responses: None,
-                services,
-            };
-            match auction
-                .orchestrator
-                .dispatch_auction(&auction_request, &auction_context)
-                .await
-            {
-                DispatchAuctionOutcome::Dispatched(dispatched) => {
-                    auction_request_for_telemetry = Some(auction_request);
-                    auction_observation = Some(observation);
-                    Some(dispatched)
+            match build_navigation_canonical_request(
+                &request_info,
+                &request_path,
+                canonical_input_from_creative_opportunities(
+                    settings,
+                    &matched_slots,
+                    identity,
+                    consent_context.clone(),
+                    device,
+                ),
+            ) {
+                Ok(canonical) => {
+                    let auction_request = canonical.to_auction_request();
+                    let auction_context = AuctionContext {
+                        settings,
+                        request: &req,
+                        timeout_ms: auction_timeout_ms,
+                        provider_responses: None,
+                        services,
+                    };
+                    match auction
+                        .orchestrator
+                        .dispatch_auction(&auction_request, &auction_context)
+                        .await
+                    {
+                        DispatchAuctionOutcome::Dispatched(dispatched) => {
+                            auction_request_for_telemetry = Some(auction_request);
+                            auction_observation = Some(observation);
+                            Some(dispatched)
+                        }
+                        DispatchAuctionOutcome::DispatchFailed {
+                            request,
+                            provider_responses,
+                            elapsed_ms,
+                        } => {
+                            emit_auction_events_best_effort_lazy(services, || {
+                                build_auction_events(
+                                    observation,
+                                    AuctionTerminalOutcome::DispatchFailed {
+                                        request: &request,
+                                        provider_responses: &provider_responses,
+                                        reason: "dispatch_failed",
+                                        elapsed_ms,
+                                    },
+                                )
+                            })
+                            .await;
+                            None
+                        }
+                        DispatchAuctionOutcome::NotStarted => {
+                            let elapsed_ms = observation.elapsed_ms();
+                            emit_auction_events_best_effort_lazy(services, || {
+                                build_auction_events(
+                                    observation,
+                                    AuctionTerminalOutcome::DispatchFailed {
+                                        request: &auction_request,
+                                        provider_responses: &[],
+                                        reason: "no_provider_dispatched",
+                                        elapsed_ms,
+                                    },
+                                )
+                            })
+                            .await;
+                            None
+                        }
+                    }
                 }
-                DispatchAuctionOutcome::DispatchFailed {
-                    request,
-                    provider_responses,
-                    elapsed_ms,
-                } => {
-                    emit_auction_events_best_effort_lazy(services, || {
-                        build_auction_events(
-                            observation,
-                            AuctionTerminalOutcome::DispatchFailed {
-                                request: &request,
-                                provider_responses: &provider_responses,
-                                reason: "dispatch_failed",
-                                elapsed_ms,
-                            },
-                        )
-                    })
-                    .await;
-                    None
-                }
-                DispatchAuctionOutcome::NotStarted => {
-                    let elapsed_ms = observation.elapsed_ms();
-                    emit_auction_events_best_effort_lazy(services, || {
-                        build_auction_events(
-                            observation,
-                            AuctionTerminalOutcome::DispatchFailed {
-                                request: &auction_request,
-                                provider_responses: &[],
-                                reason: "no_provider_dispatched",
-                                elapsed_ms,
-                            },
-                        )
-                    })
-                    .await;
+                Err(err) => {
+                    log::warn!(
+                        "initial navigation: failed to build canonical auction request: {err:?}"
+                    );
                     None
                 }
             }
@@ -1783,142 +1797,6 @@ pub async fn handle_publisher_request(
                 }),
             })
         }
-    }
-}
-
-/// Bundle of the per-request creative-opportunity inputs that travel together.
-///
-/// Extracted so `build_auction_request` stays under the project's
-/// 7-argument cap (`matched_slots` + `request_path` live for the same
-/// request scope and are passed together everywhere).
-pub(crate) struct MatchedSlotsContext<'a> {
-    pub matched_slots: &'a [crate::creative_opportunities::CreativeOpportunitySlot],
-    pub request_path: &'a str,
-}
-
-/// Borrowed inputs for [`apply_auction_eids_and_device`], bundled to keep the
-/// helper within the project's 7-argument cap.
-struct AuctionEidTargeting<'a> {
-    cookie_jar: Option<&'a CookieJar>,
-    ec_id: Option<&'a str>,
-    admission: Option<&'a AuctionAdmission>,
-    kv: Option<&'a KvIdentityGraph>,
-    partner_registry: Option<&'a PartnerRegistry>,
-    ec_context: &'a EcContext,
-    services: &'a RuntimeServices,
-    geo: Option<&'a GeoInfo>,
-    /// Prefix for the consent-stripped warning (e.g. `"Server-side"`).
-    path_label: &'a str,
-}
-
-/// Resolves client + KV EIDs, consent-gates them onto `auction_request`, and
-/// attaches the client IP/geo to its device record.
-///
-/// Shared verbatim by the initial-page and page-bids dispatch paths so the EID
-/// resolution and consent gating live in one place; `path_label` only varies
-/// the consent-stripped warning message.
-fn apply_auction_eids_and_device(
-    auction_request: &mut AuctionRequest,
-    targeting: &AuctionEidTargeting<'_>,
-) {
-    let ts_eids_value = targeting
-        .cookie_jar
-        .and_then(|j| j.get(COOKIE_TS_EIDS))
-        .map(|c| c.value().to_owned());
-
-    let resolved_eids = if let Some(admission) = targeting.admission {
-        resolve_auction_identity(AuctionIdentityInput {
-            admission,
-            request_eids: None,
-            ts_eids_cookie: ts_eids_value.as_deref(),
-            kv: targeting.kv,
-            registry: targeting.partner_registry,
-            ec_context: targeting.ec_context,
-        })
-        .eids
-    } else {
-        let client_eids = if targeting.ec_id.is_some() {
-            resolve_client_auction_eids(None, ts_eids_value.as_deref())
-        } else {
-            None
-        };
-        let kv_eids = resolve_auction_eids(
-            targeting.kv,
-            targeting.partner_registry,
-            targeting.ec_context,
-        );
-        let merged_eids = merge_auction_eids(client_eids, kv_eids);
-        gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref())
-    };
-
-    let had_eids = resolved_eids.as_ref().is_some_and(|v| !v.is_empty());
-    auction_request.user.eids = resolved_eids;
-    if had_eids && auction_request.user.eids.is_none() {
-        log::warn!(
-            "{} auction EIDs stripped by TCF consent gating",
-            targeting.path_label
-        );
-    }
-    let client_ip = targeting
-        .services
-        .client_info()
-        .client_ip
-        .map(|ip| ip.to_string());
-    if client_ip.is_some() || targeting.geo.is_some() {
-        let device = auction_request.device.get_or_insert(DeviceInfo {
-            user_agent: None,
-            ip: None,
-            geo: None,
-        });
-        device.ip = client_ip;
-        device.geo = targeting.geo.cloned();
-    }
-}
-
-/// Build an [`AuctionRequest`] from matched creative opportunity slots.
-pub(crate) fn build_auction_request(
-    slots_ctx: &MatchedSlotsContext<'_>,
-    ec_id: Option<&str>,
-    consent_context: &crate::consent::ConsentContext,
-    request_info: &crate::http_util::RequestInfo,
-    user_agent: Option<&str>,
-) -> AuctionRequest {
-    let slots = slots_ctx
-        .matched_slots
-        .iter()
-        .map(crate::creative_opportunities::CreativeOpportunitySlot::to_ad_slot)
-        .collect();
-    let page_url = format!(
-        "{}://{}{}",
-        request_info.scheme, request_info.host, slots_ctx.request_path
-    );
-    let ec_id = ec_id.filter(|id| !id.is_empty());
-    let request_id = ec_id.map_or_else(
-        || format!("ts-req-{}", uuid::Uuid::new_v4().simple()),
-        |id| format!("ts-{id}"),
-    );
-    AuctionRequest {
-        id: request_id,
-        slots,
-        publisher: PublisherInfo {
-            domain: request_info.host.clone(),
-            page_url: Some(page_url.clone()),
-        },
-        user: UserInfo {
-            id: ec_id.map(str::to_string),
-            consent: Some(consent_context.clone()),
-            eids: None,
-        },
-        device: user_agent.filter(|ua| !ua.is_empty()).map(|ua| DeviceInfo {
-            user_agent: Some(ua.to_string()),
-            ip: None,
-            geo: None,
-        }),
-        site: Some(SiteInfo {
-            domain: request_info.host.clone(),
-            page: page_url,
-        }),
-        context: std::collections::HashMap::new(),
     }
 }
 
@@ -2313,9 +2191,6 @@ pub async fn handle_page_bids(
             .collect();
 
     let request_info = crate::http_util::RequestInfo::from_request(&req, services.client_info());
-    let ec_id = ec_context
-        .ec_value()
-        .filter(|_| admission.identity_allowed());
     let consent_context = admission.consent();
     let geo = ec_context.geo_info().cloned();
     let cookie_jar = handle_request_cookies(&req)?;
@@ -2363,77 +2238,88 @@ pub async fn handle_page_bids(
             ec_context,
         );
         if ad_stack_enabled && !is_bot && !is_prefetch {
-            let slots_ctx = MatchedSlotsContext {
-                matched_slots: &matched_slots,
-                request_path: &path_param,
-            };
-            let mut auction_request = build_auction_request(
-                &slots_ctx,
-                ec_id,
-                consent_context,
-                &request_info,
+            let ts_eids_cookie = cookie_jar
+                .as_ref()
+                .and_then(|jar| jar.get(COOKIE_TS_EIDS))
+                .map(|cookie| cookie.value().to_owned());
+            let identity = resolve_auction_identity(AuctionIdentityInput {
+                admission: &admission,
+                request_eids: None,
+                ts_eids_cookie: ts_eids_cookie.as_deref(),
+                kv,
+                registry: auction.registry,
+                ec_context,
+            });
+            let device = crate::auction::request::auction_device_snapshot(
                 req.headers()
                     .get("user-agent")
-                    .and_then(|v| v.to_str().ok()),
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned),
+                services.client_info().client_ip.map(|ip| ip.to_string()),
+                geo.clone(),
             );
-            apply_auction_eids_and_device(
-                &mut auction_request,
-                &AuctionEidTargeting {
-                    cookie_jar: cookie_jar.as_ref(),
-                    ec_id,
-                    admission: Some(&admission),
-                    kv,
-                    partner_registry: auction.registry,
-                    ec_context,
-                    services,
-                    geo: geo.as_ref(),
-                    path_label: "Page-bids",
-                },
-            );
-            let timeout_ms = co_config
-                .auction_timeout_ms
-                .unwrap_or(settings.auction.timeout_ms);
-            let auction_context = AuctionContext {
-                settings,
-                request: &req,
-                timeout_ms,
-                provider_responses: None,
-                services,
-            };
-            match auction
-                .orchestrator
-                .run_auction(&auction_request, &auction_context)
-                .await
-            {
-                Ok(result) => {
-                    let winning_bids = result.winning_bids.clone();
-                    emit_auction_events_best_effort_lazy(services, || {
-                        build_auction_events(
-                            observation,
-                            AuctionTerminalOutcome::Completed {
-                                request: &auction_request,
-                                result: &result,
-                            },
-                        )
-                    })
-                    .await;
-                    winning_bids
+            match build_canonical_request(
+                &admission,
+                canonical_input_from_creative_opportunities(
+                    settings,
+                    &matched_slots,
+                    identity,
+                    consent_context.clone(),
+                    device,
+                ),
+            ) {
+                Ok(canonical) => {
+                    let auction_request = canonical.to_auction_request();
+                    let timeout_ms = co_config
+                        .auction_timeout_ms
+                        .unwrap_or(settings.auction.timeout_ms);
+                    let auction_context = AuctionContext {
+                        settings,
+                        request: &req,
+                        timeout_ms,
+                        provider_responses: None,
+                        services,
+                    };
+                    match auction
+                        .orchestrator
+                        .run_auction(&auction_request, &auction_context)
+                        .await
+                    {
+                        Ok(result) => {
+                            let winning_bids = result.winning_bids.clone();
+                            emit_auction_events_best_effort_lazy(services, || {
+                                build_auction_events(
+                                    observation,
+                                    AuctionTerminalOutcome::Completed {
+                                        request: &auction_request,
+                                        result: &result,
+                                    },
+                                )
+                            })
+                            .await;
+                            winning_bids
+                        }
+                        Err(e) => {
+                            log::warn!("page-bids auction failed: {e:?}");
+                            let elapsed_ms = observation.elapsed_ms();
+                            emit_auction_events_best_effort_lazy(services, || {
+                                build_auction_events(
+                                    observation,
+                                    AuctionTerminalOutcome::ExecutionFailed {
+                                        request: Some(&auction_request),
+                                        provider_responses: &[],
+                                        reason: "execution_failed",
+                                        elapsed_ms,
+                                    },
+                                )
+                            })
+                            .await;
+                            std::collections::HashMap::new()
+                        }
+                    }
                 }
-                Err(e) => {
-                    log::warn!("page-bids auction failed: {e:?}");
-                    let elapsed_ms = observation.elapsed_ms();
-                    emit_auction_events_best_effort_lazy(services, || {
-                        build_auction_events(
-                            observation,
-                            AuctionTerminalOutcome::ExecutionFailed {
-                                request: Some(&auction_request),
-                                provider_responses: &[],
-                                reason: "execution_failed",
-                                elapsed_ms,
-                            },
-                        )
-                    })
-                    .await;
+                Err(err) => {
+                    log::warn!("page-bids: failed to build canonical auction request: {err:?}");
                     std::collections::HashMap::new()
                 }
             }
@@ -2514,7 +2400,7 @@ mod tests {
     use flate2::write::GzEncoder;
 
     use super::*;
-    use crate::auction::types::{AdFormat, AdSlot, MediaType};
+    use crate::auction::types::{AdFormat, AdSlot, MediaType, PublisherInfo, UserInfo};
     use crate::integrations::IntegrationRegistry;
     use crate::platform::test_support::{
         build_services_with_http_client, noop_services, StubHttpClient,
@@ -4002,15 +3888,12 @@ mod tests {
     #[cfg(test)]
     mod creative_opportunities_tests {
         use super::super::{
-            build_ad_slots_script, build_auction_request, build_bid_map, build_bids_script,
-            html_escape_for_script, MatchedSlotsContext,
+            build_ad_slots_script, build_bid_map, build_bids_script, html_escape_for_script,
         };
         use crate::auction::types::{Bid, MediaType};
-        use crate::consent::ConsentContext;
         use crate::creative_opportunities::{
             CreativeOpportunitiesConfig, CreativeOpportunityFormat, CreativeOpportunitySlot,
         };
-        use crate::http_util::RequestInfo;
         use crate::price_bucket::PriceGranularity;
         use std::collections::HashMap;
 
@@ -4451,67 +4334,6 @@ mod tests {
             assert!(
                 !script.contains("prevGptSlots"),
                 "should not use TS-owned slots as adInit success signal"
-            );
-        }
-
-        #[test]
-        fn auction_request_without_ec_id_omits_user_id_and_uses_non_ec_request_id() {
-            let slot = make_slot();
-            let slots = [slot];
-            let slots_ctx = MatchedSlotsContext {
-                matched_slots: &slots,
-                request_path: "/2024/01/my-article/",
-            };
-            let request_info = RequestInfo {
-                host: "publisher.example.com".to_string(),
-                scheme: "https".to_string(),
-            };
-
-            let request = build_auction_request(
-                &slots_ctx,
-                None,
-                &ConsentContext::default(),
-                &request_info,
-                Some("Mozilla/5.0"),
-            );
-
-            assert_eq!(request.user.id, None, "should not forward an EC user id");
-            assert!(
-                request.id.starts_with("ts-req-"),
-                "should use a non-EC request id, got {}",
-                request.id
-            );
-        }
-
-        #[test]
-        fn auction_request_with_ec_id_sets_user_id_and_ec_request_id() {
-            let slot = make_slot();
-            let slots = [slot];
-            let slots_ctx = MatchedSlotsContext {
-                matched_slots: &slots,
-                request_path: "/2024/01/my-article/",
-            };
-            let request_info = RequestInfo {
-                host: "publisher.example.com".to_string(),
-                scheme: "https".to_string(),
-            };
-
-            let request = build_auction_request(
-                &slots_ctx,
-                Some("ec-abc"),
-                &ConsentContext::default(),
-                &request_info,
-                Some("Mozilla/5.0"),
-            );
-
-            assert_eq!(
-                request.user.id.as_deref(),
-                Some("ec-abc"),
-                "should forward EC id when identity consent allows it"
-            );
-            assert_eq!(
-                request.id, "ts-ec-abc",
-                "should preserve existing EC-derived request id when present"
             );
         }
 
