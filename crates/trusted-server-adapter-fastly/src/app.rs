@@ -92,6 +92,7 @@ use edgezero_core::http::{
     header, HandlerFuture, HeaderValue, Method, Request, Response, StatusCode,
 };
 use edgezero_core::router::RouterService;
+use edgezero_core::store_registry::{ConfigRegistry, KvRegistry, SecretRegistry};
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::AuctionTelemetrySink;
@@ -111,7 +112,10 @@ use trusted_server_core::integrations::{
     IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects, RequestFilterRegistryInput,
     RequestFilterRegistryOutcome,
 };
-use trusted_server_core::platform::{ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices};
+use trusted_server_core::platform::{
+    ClientInfo, CompositeConfigStore, CompositeSecretStore, GeoInfo, PlatformKvStore,
+    RuntimeServices,
+};
 use trusted_server_core::proxy::{
     handle_asset_proxy_request, handle_first_party_click, handle_first_party_proxy,
     handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, AssetProxyCachePolicy,
@@ -130,8 +134,8 @@ use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester}
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::{
-    open_kv_store, FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformGeo,
-    FastlyPlatformHttpClient, FastlyPlatformSecretStore, UnavailableKvStore,
+    FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformGeo, FastlyPlatformHttpClient,
+    FastlyPlatformSecretStore, UnavailableKvStore,
 };
 
 // ---------------------------------------------------------------------------
@@ -197,36 +201,6 @@ fn warn_if_certificate_check_disabled(settings: &Settings) {
     }
 }
 
-/// Resolves per-request consent KV store services for routes that read consent data.
-///
-/// When `settings.consent.consent_store` is configured and the named KV store cannot
-/// be opened, returns `Err` so the caller can respond with 503 (fail-closed). This is
-/// intentional hardening over the legacy `route_request` path, which builds
-/// `runtime_services` with `UnavailableKvStore` and never opens the named consent
-/// store, so it never fails closed — the `EdgeZero` path instead makes consent-dependent
-/// routes unavailable rather than proceeding without consent.
-///
-/// # Errors
-///
-/// Returns an error when the configured consent store cannot be opened.
-pub(crate) fn runtime_services_for_consent_route(
-    settings: &Settings,
-    runtime_services: &RuntimeServices,
-) -> Result<RuntimeServices, Report<TrustedServerError>> {
-    let Some(store_name) = settings.consent.consent_store.as_deref() else {
-        return Ok(runtime_services.clone());
-    };
-
-    open_kv_store(store_name)
-        .map(|store| runtime_services.clone().with_kv_store(store))
-        .map_err(|e| {
-            Report::new(TrustedServerError::KvStore {
-                store_name: store_name.to_string(),
-                message: e.to_string(),
-            })
-        })
-}
-
 // ---------------------------------------------------------------------------
 // Per-request RuntimeServices
 // ---------------------------------------------------------------------------
@@ -242,6 +216,16 @@ pub(crate) fn runtime_services_for_consent_route(
 /// absent (e.g. tests that dispatch without the entry point). Scheme detection
 /// continues to rely on the trusted `fastly-ssl` header injected by
 /// `edgezero_main` after sanitization.
+///
+/// Config and secret reads resolve through the `EdgeZero` registries that
+/// `edgezero_main` inserts into the request extensions (see
+/// [`crate::registries`]), wrapped in [`CompositeConfigStore`] /
+/// [`CompositeSecretStore`] so that non-default logical ids (`jwks_store`,
+/// `ts_secrets`, …) resolve by name; writes still delegate to the Fastly
+/// management-API impls. An absent registry makes reads error rather than
+/// silently falling back to the default store. The [`KvRegistry`] is handed to
+/// [`RuntimeServices`] so `kv_handle_named` can resolve non-default KV stores
+/// such as the consent store.
 fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
     let client_info = ctx
         .request()
@@ -253,10 +237,21 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
             ..ClientInfo::default()
         });
 
+    let config_reader = ctx.request().extensions().get::<ConfigRegistry>().cloned();
+    let secret_reader = ctx.request().extensions().get::<SecretRegistry>().cloned();
+    let kv_registry = ctx.request().extensions().get::<KvRegistry>().cloned();
+
     RuntimeServices::builder()
-        .config_store(Arc::new(FastlyPlatformConfigStore))
-        .secret_store(Arc::new(FastlyPlatformSecretStore))
+        .config_store(Arc::new(CompositeConfigStore::new(
+            config_reader,
+            Arc::new(FastlyPlatformConfigStore),
+        )))
+        .secret_store(Arc::new(CompositeSecretStore::new(
+            secret_reader,
+            Arc::new(FastlyPlatformSecretStore),
+        )))
         .kv_store(Arc::clone(&state.default_kv_store))
+        .kv_registry(kv_registry)
         .backend(Arc::new(FastlyPlatformBackend))
         .http_client(Arc::new(FastlyPlatformHttpClient))
         .geo(Arc::new(FastlyPlatformGeo))
@@ -590,10 +585,10 @@ async fn run_named_route(
         NamedRouteHandler::SetTester => handle_set_tester(&state.settings),
         NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
         NamedRouteHandler::Auction => {
-            // The auction reads consent data, so the consent KV store must be
-            // available — fail closed with 503 when it is configured but
-            // cannot be opened, matching legacy behavior.
-            let consent_services = runtime_services_for_consent_route(&state.settings, services)?;
+            // The auction reads consent data and fails closed with 503 when the
+            // configured consent store cannot be resolved. That guard now lives
+            // in core (`consent::resolve_consent_kv`, called by `handle_auction`)
+            // so every adapter gets it, not just Fastly.
             let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
             let registry_ref = if partner_registry.is_empty() {
                 None
@@ -606,7 +601,7 @@ async fn run_named_route(
                 ec.kv_graph.as_ref(),
                 registry_ref,
                 &ec.ec_context,
-                &consent_services,
+                services,
                 req,
             )
             .await
@@ -618,10 +613,8 @@ async fn run_named_route(
             if req.method() == Method::OPTIONS {
                 return Ok(page_bids_preflight_denied());
             }
-            // Like the auction, page-bids reads consent data, so the consent KV
-            // store must be available — fail closed with 503 when configured but
-            // unopenable, matching legacy.
-            let consent_services = runtime_services_for_consent_route(&state.settings, services)?;
+            // Like the auction, page-bids reads consent data; `handle_page_bids`
+            // applies the core fail-closed consent guard.
             let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
             let registry_ref = if partner_registry.is_empty() {
                 None
@@ -635,7 +628,7 @@ async fn run_named_route(
             };
             handle_page_bids(
                 &state.settings,
-                &consent_services,
+                services,
                 ec.kv_graph.as_ref(),
                 auction,
                 &ec.ec_context,
@@ -769,49 +762,45 @@ async fn dispatch_fallback(
             }
         }
 
-        // Publisher pages read consent data, so the consent KV store must be
-        // available — fail closed with 503 when it is configured but cannot
-        // be opened, matching legacy behavior.
-        match runtime_services_for_consent_route(&state.settings, services) {
-            Ok(publisher_services) => {
-                // Run the server-side auction with the configured creative-
-                // opportunity slots and collect the dispatched bids in the
-                // buffered finalize (`buffer_publisher_response_async`), matching
-                // the legacy streaming path. `handle_publisher_request` matches the
-                // slots against the request path. The partner registry plus the
-                // EC identity-graph KV (`ec.kv_graph`) enrich the bid request with
-                // server-side EIDs, same as the legacy auction.
-                let slots = state.settings.creative_opportunity_slots();
-                match PartnerRegistry::from_config(&state.settings.ec.partners) {
-                    Ok(partner_registry) => {
-                        let auction = AuctionDispatch {
-                            orchestrator: &state.orchestrator,
-                            slots,
-                            registry: Some(&partner_registry),
-                        };
-                        match handle_publisher_request(
+        // Publisher pages read consent data. `handle_publisher_request` applies
+        // the core fail-closed consent guard (503 when the configured consent
+        // store cannot be resolved), so no adapter-level pre-check is needed.
+        //
+        // Run the server-side auction with the configured creative-opportunity
+        // slots and collect the dispatched bids in the buffered finalize
+        // (`buffer_publisher_response_async`), matching the legacy streaming
+        // path. `handle_publisher_request` matches the slots against the request
+        // path. The partner registry plus the EC identity-graph KV
+        // (`ec.kv_graph`) enrich the bid request with server-side EIDs, same as
+        // the legacy auction.
+        let slots = state.settings.creative_opportunity_slots();
+        match PartnerRegistry::from_config(&state.settings.ec.partners) {
+            Ok(partner_registry) => {
+                let auction = AuctionDispatch {
+                    orchestrator: &state.orchestrator,
+                    slots,
+                    registry: Some(&partner_registry),
+                };
+                match handle_publisher_request(
+                    &state.settings,
+                    services,
+                    ec.kv_graph.as_ref(),
+                    &mut ec.ec_context,
+                    auction,
+                    req,
+                )
+                .await
+                {
+                    Ok(pub_response) => {
+                        buffer_publisher_response_async(
+                            pub_response,
+                            &method,
                             &state.settings,
-                            &publisher_services,
-                            ec.kv_graph.as_ref(),
-                            &mut ec.ec_context,
-                            auction,
-                            req,
+                            &state.registry,
+                            &state.orchestrator,
+                            services,
                         )
                         .await
-                        {
-                            Ok(pub_response) => {
-                                buffer_publisher_response_async(
-                                    pub_response,
-                                    &method,
-                                    &state.settings,
-                                    &state.registry,
-                                    &state.orchestrator,
-                                    &publisher_services,
-                                )
-                                .await
-                            }
-                            Err(e) => Err(e),
-                        }
                     }
                     Err(e) => Err(e),
                 }
@@ -2006,6 +1995,60 @@ mod tests {
     }
 
     #[test]
+    fn oneshot_discovery_reads_jwks_via_registry() {
+        // The EdgeZero dispatch path reads the JWKS document through the
+        // ConfigRegistry that `edgezero_main` injects into request extensions —
+        // resolving the non-default `jwks_store` logical id via the composite
+        // config store, not a direct per-store open. Without the injected
+        // registry the composite read errors, so a 200 with the seeded kids
+        // proves the registry is the read path.
+        let router = test_router();
+        let mut req = empty_request(Method::GET, "/.well-known/trusted-server.json");
+        let registry =
+            crate::registries::build_config_registry(&trusted_server_core::stores::STORES_METADATA)
+                .expect("should build the config registry from the declared stores");
+        req.extensions_mut().insert(registry);
+
+        let response = route(&router, req);
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "discovery should read JWKS through the injected ConfigRegistry"
+        );
+        let body = String::from_utf8(
+            response
+                .into_body()
+                .into_bytes()
+                .expect("should buffer the discovery body")
+                .to_vec(),
+        )
+        .expect("discovery body should be utf-8");
+        assert!(
+            body.contains("ts-2025-10-A"),
+            "discovery should surface the kid seeded in the `jwks_store` config store"
+        );
+    }
+
+    #[test]
+    fn oneshot_discovery_without_registry_fails_rather_than_falling_back() {
+        // Strictness guard: with no ConfigRegistry in extensions the composite
+        // read must error instead of silently falling back to a direct store
+        // open. This is what makes the registry the single read path.
+        let router = test_router();
+        let response = route(
+            &router,
+            empty_request(Method::GET, "/.well-known/trusted-server.json"),
+        );
+
+        assert_ne!(
+            response.status(),
+            StatusCode::OK,
+            "an absent ConfigRegistry must not silently fall back to a direct config-store read"
+        );
+    }
+
+    #[test]
     fn dispatch_unregistered_method_returns_405_at_router_level() {
         // Documents the known router-level behavior for verbs outside the
         // publisher_fallback_methods() list (e.g. TRACE, CONNECT): the RouterService
@@ -2070,9 +2113,10 @@ mod tests {
             "publisher fallback should fail closed when configured consent KV cannot be opened"
         );
 
-        // Integration routes must NOT require the consent KV — runtime_services_for_consent_route
-        // is wired only into the publisher and auction branches of dispatch_fallback, not into
-        // the integration proxy branch. A missing consent store must not 503 integration routes.
+        // Integration routes must NOT require the consent KV — the core fail-closed
+        // guard (`consent::resolve_consent_kv`) runs inside the auction, page-bids,
+        // and publisher handlers only, never on the integration proxy branch of
+        // dispatch_fallback. A missing consent store must not 503 integration routes.
         let integration_response = route(
             &router,
             empty_request(Method::GET, "/integrations/datadome/tags.js"),
@@ -2081,6 +2125,38 @@ mod tests {
             integration_response.status(),
             StatusCode::SERVICE_UNAVAILABLE,
             "integration routes should be unaffected by a missing consent KV store"
+        );
+    }
+
+    #[test]
+    fn declared_consent_store_resolves_through_the_injected_kv_registry() {
+        // Guards the removal of the Fastly-only `runtime_services_for_consent_route`
+        // wrapper: the consent store is now selected by logical id through the
+        // injected KvRegistry. With the declared `consent_store` id configured and
+        // the registry present, the auction must NOT fail closed — proving the
+        // named lookup resolves rather than the (removed) direct reopen.
+        let mut settings = settings_with_missing_consent_store();
+        settings.consent.consent_store = Some("consent_store".to_string());
+        let state = app_state_for_settings(settings);
+        let router = TrustedServerApp::routes_for_state(&state);
+
+        let registry =
+            crate::registries::build_kv_registry(&trusted_server_core::stores::STORES_METADATA)
+                .expect("should build the KV registry from the declared stores");
+        let mut req = request_builder()
+            .method(Method::POST)
+            .uri("/auction")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({ "adUnits": [] }).to_string()))
+            .expect("should build auction request");
+        req.extensions_mut().insert(registry);
+
+        let response = route(&router, req);
+
+        assert_ne!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a declared consent store present in the injected KvRegistry must resolve, not fail closed"
         );
     }
 

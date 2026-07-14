@@ -40,7 +40,9 @@ use crate::auction::telemetry::{
 use crate::auction::types::{
     AuctionContext, AuctionRequest, Bid, DeviceInfo, PublisherInfo, SiteInfo, UserInfo,
 };
-use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
+use crate::consent::{
+    consent_allows_server_side_auction, gate_eids_by_consent, resolve_consent_kv,
+};
 use crate::constants::{COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
 use crate::cookies::handle_request_cookies;
 use crate::ec::kv::KvIdentityGraph;
@@ -1297,8 +1299,9 @@ pub struct AuctionDispatch<'a> {
 ///
 /// # Errors
 ///
-/// Returns a [`TrustedServerError`] if the proxy request fails or the
-/// origin backend is unreachable.
+/// Returns a [`TrustedServerError`] if the configured consent KV store cannot be
+/// resolved (fail closed), the proxy request fails, or the origin backend is
+/// unreachable.
 pub async fn handle_publisher_request(
     settings: &Settings,
     services: &RuntimeServices,
@@ -1307,6 +1310,11 @@ pub async fn handle_publisher_request(
     auction: AuctionDispatch<'_>,
     mut req: Request<EdgeBody>,
 ) -> Result<PublisherResponse, Report<TrustedServerError>> {
+    // Fail-closed consent guard — see [`resolve_consent_kv`]. Publisher pages
+    // act on consent data, so a configured-but-unresolvable consent store makes
+    // the page unavailable (503) instead of serving it without consent.
+    let _consent_kv = resolve_consent_kv(settings, services)?;
+
     log::debug!("Proxying request to publisher_origin");
 
     // Prebid.js requests are not intercepted here anymore. The HTML processor removes
@@ -2191,7 +2199,8 @@ fn normalize_page_bids_path(raw: &str) -> String {
 ///
 /// # Errors
 ///
-/// Returns [`TrustedServerError`] if cookie parsing or EC ID generation fails.
+/// Returns [`TrustedServerError`] if the configured consent KV store cannot be
+/// resolved (fail closed), or if cookie parsing or EC ID generation fails.
 pub async fn handle_page_bids(
     settings: &Settings,
     services: &RuntimeServices,
@@ -2200,6 +2209,10 @@ pub async fn handle_page_bids(
     ec_context: &EcContext,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    // Fail-closed consent guard — like the auction, page-bids acts on consent
+    // data, so it must not run with a configured-but-unresolvable consent store.
+    let _consent_kv = resolve_consent_kv(settings, services)?;
+
     let Some(co_config) = &settings.creative_opportunities else {
         let mut response = Response::new(EdgeBody::from("Creative opportunities not configured"));
         *response.status_mut() = StatusCode::NOT_FOUND;

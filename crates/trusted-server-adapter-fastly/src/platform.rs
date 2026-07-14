@@ -3,11 +3,8 @@
 
 use std::io::Read as _;
 use std::net::IpAddr;
-use std::sync::Arc;
 
 use bytes::Bytes;
-use edgezero_adapter_fastly::key_value_store::FastlyKvStore;
-use edgezero_core::key_value_store::KvError;
 use error_stack::{Report, ResultExt};
 use fastly::geo::{geo_lookup, Geo};
 use fastly::{ConfigStore, Request, SecretStore};
@@ -15,11 +12,12 @@ use fastly::{ConfigStore, Request, SecretStore};
 use crate::backend::BackendConfig;
 pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
-    PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformImageOptimizerCrop,
-    PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions, PlatformImageOptimizerParams,
-    PlatformImageOptimizerRegion, PlatformKvStore, PlatformPendingRequest, PlatformResponse,
-    PlatformSecretStore, PlatformSelectResult, StoreId, StoreName,
+    ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore,
+    PlatformConfigWriter, PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
+    PlatformImageOptimizerCrop, PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions,
+    PlatformImageOptimizerParams, PlatformImageOptimizerRegion, PlatformPendingRequest,
+    PlatformResponse, PlatformSecretStore, PlatformSecretWriter, PlatformSelectResult, StoreId,
+    StoreName,
 };
 
 // ---------------------------------------------------------------------------
@@ -69,6 +67,23 @@ impl PlatformConfigStore for FastlyPlatformConfigStore {
     fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>> {
         let client = crate::management_api::FastlyManagementApiClient::new()?;
         client.delete_config_item(store_id.as_ref(), key)
+    }
+}
+
+/// Write half of [`FastlyPlatformConfigStore`], supplied to
+/// [`CompositeConfigStore`](trusted_server_core::platform::CompositeConfigStore)
+/// as the management-API write delegate.
+///
+/// Core cannot implement this trait for an adapter-owned type (orphan rule), so
+/// each adapter impls it for its own store, forwarding to the existing
+/// [`PlatformConfigStore`] write methods.
+impl PlatformConfigWriter for FastlyPlatformConfigStore {
+    fn put(&self, store_id: &StoreId, key: &str, value: &str) -> Result<(), Report<PlatformError>> {
+        PlatformConfigStore::put(self, store_id, key, value)
+    }
+
+    fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>> {
+        PlatformConfigStore::delete(self, store_id, key)
     }
 }
 
@@ -135,6 +150,25 @@ impl PlatformSecretStore for FastlyPlatformSecretStore {
     fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>> {
         let client = crate::management_api::FastlyManagementApiClient::new()?;
         client.delete_secret(store_id.as_ref(), name)
+    }
+}
+
+/// Write half of [`FastlyPlatformSecretStore`], supplied to
+/// [`CompositeSecretStore`](trusted_server_core::platform::CompositeSecretStore)
+/// as the management-API write delegate (see [`PlatformConfigWriter`] above for
+/// why the impl lives in the adapter).
+impl PlatformSecretWriter for FastlyPlatformSecretStore {
+    fn create(
+        &self,
+        store_id: &StoreId,
+        name: &str,
+        value: &str,
+    ) -> Result<(), Report<PlatformError>> {
+        PlatformSecretStore::create(self, store_id, name, value)
+    }
+
+    fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>> {
+        PlatformSecretStore::delete(self, store_id, name)
     }
 }
 
@@ -581,16 +615,6 @@ pub fn client_info_from_request(req: &Request) -> ClientInfo {
         server_hostname: std::env::var("FASTLY_HOSTNAME").ok(),
         server_region: std::env::var("FASTLY_REGION").ok(),
     }
-}
-
-/// Open a named KV store as a [`PlatformKvStore`] implementation.
-///
-/// # Errors
-///
-/// Returns [`KvError::Unavailable`] when the store does not exist, or
-/// [`KvError::Internal`] when the Fastly SDK fails to open it.
-pub fn open_kv_store(store_name: &str) -> Result<Arc<dyn PlatformKvStore>, KvError> {
-    FastlyKvStore::open(store_name).map(|store| Arc::new(store) as Arc<dyn PlatformKvStore>)
 }
 
 // ---------------------------------------------------------------------------

@@ -7,7 +7,9 @@
 //! [`PlatformConfigWriter`](super::PlatformConfigWriter) /
 //! [`PlatformSecretWriter`](super::PlatformSecretWriter).
 
+use std::future::Future;
 use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 
 use edgezero_core::store_registry::{ConfigRegistry, SecretRegistry};
 use error_stack::Report;
@@ -17,6 +19,36 @@ use super::{
     PlatformConfigStore, PlatformConfigWriter, PlatformError, PlatformSecretStore,
     PlatformSecretWriter, StoreId, StoreName,
 };
+
+/// Drives a store future to completion from a synchronous trait method.
+///
+/// The `EdgeZero` store traits are async while
+/// [`PlatformConfigStore`]/[`PlatformSecretStore`] are sync, so the future must
+/// be driven here. It is polled **once** first, because on Fastly the whole
+/// request already runs inside a `futures::executor::block_on` (the entry point
+/// drives `router().oneshot()` that way, as `EdgeZero`'s own Fastly dispatch
+/// does) and starting a second `futures` executor on that thread panics with
+/// `EnterError`. The Fastly config/secret stores are synchronous underneath
+/// their async signature, so the first poll is always `Ready` and no nested
+/// executor is created.
+///
+/// **Load-bearing assumption:** the Fastly config and secret stores are
+/// synchronous underneath their async signature (the Fastly SDK lookups are
+/// blocking calls inside an `async fn`), so on Fastly the first poll is always
+/// `Ready`. A store that *genuinely* yields still completes through
+/// [`block_on`] — which is correct on adapters whose runtime allows a nested
+/// `futures` executor, but would reintroduce the `EnterError` panic on Fastly.
+/// Any future Fastly store that really awaits must therefore be driven
+/// differently (or the sync trait surface pushed async).
+fn resolve_store_future<F: Future>(future: F) -> F::Output {
+    let mut future = Box::pin(future);
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
+    match future.as_mut().poll(&mut context) {
+        Poll::Ready(output) => output,
+        Poll::Pending => block_on(future),
+    }
+}
 
 /// Config store whose reads resolve through an `EdgeZero` [`ConfigRegistry`] and
 /// whose writes delegate to a management-path [`PlatformConfigWriter`].
@@ -51,7 +83,7 @@ impl PlatformConfigStore for CompositeConfigStore {
         let binding = registry
             .named(store_name.as_ref())
             .ok_or_else(|| Report::new(PlatformError::ConfigStore))?;
-        match block_on(binding.handle.get(key)) {
+        match resolve_store_future(binding.handle.get(key)) {
             Ok(Some(value)) => Ok(value),
             Ok(None) => Err(Report::new(PlatformError::ConfigStore)
                 .attach(format!("config key `{key}` not found"))),
@@ -106,7 +138,7 @@ impl PlatformSecretStore for CompositeSecretStore {
         let bound = registry
             .named(store_name.as_ref())
             .ok_or_else(|| Report::new(PlatformError::SecretStore))?;
-        match block_on(bound.get_bytes(key)) {
+        match resolve_store_future(bound.get_bytes(key)) {
             Ok(Some(bytes)) => Ok(bytes.to_vec()),
             Ok(None) => Err(Report::new(PlatformError::SecretStore)
                 .attach(format!("secret key `{key}` not found"))),

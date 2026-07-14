@@ -9,7 +9,9 @@ use serde_json::Value as JsonValue;
 
 use crate::auction::formats::AdRequest;
 use crate::auction::orchestrator::OrchestrationResult;
-use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
+use crate::consent::{
+    consent_allows_server_side_auction, gate_eids_by_consent, resolve_consent_kv,
+};
 use crate::constants::COOKIE_TS_EIDS;
 use crate::ec::eids::{resolve_partner_ids, to_eids};
 use crate::ec::kv::KvIdentityGraph;
@@ -101,6 +103,7 @@ const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
 /// # Errors
 ///
 /// Returns an error if:
+/// - The configured consent KV store cannot be resolved (fail closed)
 /// - The request body cannot be parsed
 /// - The auction request conversion fails (e.g., invalid ad units)
 /// - The auction execution fails
@@ -114,6 +117,13 @@ pub async fn handle_auction(
     services: &RuntimeServices,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    // Fail-closed consent guard. The auction acts on consent data (carried on
+    // `ec_context`), so a consent store that is configured but unresolvable
+    // makes this route unavailable (503) rather than letting it proceed on an
+    // incomplete consent picture. The handle itself is unused here — consent
+    // persistence is wired in the EC pipeline, not the auction.
+    let _consent_kv = resolve_consent_kv(settings, services)?;
+
     // Reject oversized bodies before core buffers/parses them. The Content-Length
     // pre-check stops well-behaved clients early; the post-read check defends
     // against clients that lie about (or omit) the header.

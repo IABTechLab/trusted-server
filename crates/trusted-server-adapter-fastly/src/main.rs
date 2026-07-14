@@ -34,6 +34,7 @@ mod management_api;
 mod middleware;
 mod platform;
 mod rate_limiter;
+mod registries;
 mod tinybird;
 
 use crate::app::{load_settings_from_config_store, EcFinalizeState, TrustedServerApp};
@@ -162,11 +163,29 @@ fn edgezero_main(mut req: FastlyRequest) {
     // Dispatch directly through the EdgeZero router without an intermediate
     // fastly::Response conversion. That preserves duplicate header values such
     // as multiple Set-Cookie headers.
+    // Build the EdgeZero store registries for this request. EdgeZero's own Fastly
+    // builders are private and this adapter dispatches through its own `oneshot`,
+    // so the registries are built locally and inserted into the request
+    // extensions, where `build_per_request_services` reads them back.
+    let stores = trusted_server_core::stores::STORES_METADATA;
+    let config_registry = registries::build_config_registry(&stores);
+    let kv_registry = registries::build_kv_registry(&stores);
+    let secret_registry = registries::build_secret_registry(&stores);
+
     let mut response = match into_core_request(req) {
         Ok(mut core_req) => {
             core_req.extensions_mut().insert(config_store);
             core_req.extensions_mut().insert(device_signals);
             core_req.extensions_mut().insert(client_info);
+            if let Some(registry) = config_registry {
+                core_req.extensions_mut().insert(registry);
+            }
+            if let Some(registry) = kv_registry {
+                core_req.extensions_mut().insert(registry);
+            }
+            if let Some(registry) = secret_registry {
+                core_req.extensions_mut().insert(registry);
+            }
             match futures::executor::block_on(app.router().oneshot(core_req)) {
                 Ok(response) => response,
                 Err(error) => edge_error_response(error),
