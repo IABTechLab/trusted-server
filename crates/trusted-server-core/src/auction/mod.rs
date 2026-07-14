@@ -21,6 +21,7 @@ pub mod formats;
 pub mod identity;
 pub mod orchestrator;
 pub mod provider;
+pub mod request;
 pub mod telemetry;
 #[cfg(test)]
 pub(crate) mod test_support;
