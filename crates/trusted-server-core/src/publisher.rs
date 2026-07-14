@@ -27,9 +27,14 @@ use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::{header, HeaderValue, Method, Request, Response, StatusCode, Uri};
 
+use crate::auction::admission::{
+    admission_denial_response, admit_auction_http, deny_invalid_body, finalize_admission,
+    AdmissionDenial, AuctionAdmissionDraft,
+};
 use crate::auction::endpoints::{
     merge_auction_eids, resolve_auction_eids, resolve_client_auction_eids,
 };
+use crate::auction::formats::apply_auction_response_privacy;
 use crate::auction::orchestrator::{
     AuctionOrchestrator, DispatchAuctionOutcome, DispatchedAuction,
 };
@@ -59,6 +64,7 @@ use crate::streaming_replacer::create_url_replacer;
 
 const SUPPORTED_ENCODING_VALUES: [&str; 3] = ["gzip", "deflate", "br"];
 const DEFAULT_PUBLISHER_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_PAGE_BIDS_PATH_BYTES: usize = 2048;
 
 /// Read buffer size for streaming body processing and brotli internal buffers.
 /// Both the `Decompressor` and `CompressorWriter` use this value so all
@@ -2115,68 +2121,114 @@ fn is_supported_content_encoding(encoding: &str) -> bool {
     matches!(encoding, "" | "identity" | "gzip" | "deflate" | "br")
 }
 
-/// Same-origin gate for `/__ts/page-bids`.
-///
-/// The endpoint is a side-effecting GET: it dispatches real PBS/APS auctions
-/// and forwards request-derived signals (IP, UA, geo, consent) to partners.
-/// Without a gate, any third-party page could trigger it from a visitor's
-/// browser (it cannot read the JSON, but it burns SSP quota and leaks
-/// outbound partner calls).
-///
-/// A request is allowed when:
-/// - `Sec-Fetch-Site` is `same-origin` (the tsjs SPA hook fetches a relative
-///   URL, so a genuine same-origin navigation always reports this). `same-site`
-///   is intentionally rejected: it admits sibling origins under the same
-///   registrable domain, which are not trusted to spend SSP quota on the
-///   visitor's behalf.
-/// - `Sec-Fetch-Site` is absent (legacy client predating Fetch Metadata) **and**
-///   the request carries the non-simple `X-TSJS-Page-Bids` header set by the
-///   tsjs SPA hook — cross-origin callers cannot attach it without a CORS
-///   preflight, which this endpoint never grants.
-fn page_bids_request_allowed(req: &Request<EdgeBody>) -> bool {
-    match req
-        .headers()
-        .get("sec-fetch-site")
-        .and_then(|v| v.to_str().ok())
-    {
-        Some(site) => site == "same-origin",
-        None => req.headers().contains_key("x-tsjs-page-bids"),
-    }
-}
-
 /// Builds the `403 Forbidden` returned when the side-effecting
 /// `/__ts/page-bids` endpoint refuses a request — both the CORS preflight
-/// (`OPTIONS`) and the GET cross-site gate ([`page_bids_request_allowed`])
-/// return this single denial shape.
+/// (`OPTIONS`) and the shared admission origin/header gate return this denial
+/// shape.
 ///
-/// The GET handler's [`page_bids_request_allowed`] gate trusts the
-/// `X-TSJS-Page-Bids` header precisely because this endpoint never grants a
-/// preflight; letting `OPTIONS` fall through to the publisher origin (which may
-/// return permissive CORS) would defeat that, allowing a cross-site page to
-/// trigger real PBS/APS auctions from a visitor's browser. Every adapter returns
-/// this same response for `OPTIONS /__ts/page-bids`.
+/// The GET handler trusts the `X-TSJS-Page-Bids` header precisely because this
+/// endpoint never grants a preflight; letting `OPTIONS` fall through to the
+/// publisher origin (which may return permissive CORS) would defeat that,
+/// allowing a cross-site page to trigger real PBS/APS auctions from a visitor's
+/// browser. Every adapter returns this same response for
+/// `OPTIONS /__ts/page-bids`.
+#[must_use]
 pub fn page_bids_preflight_denied() -> Response<EdgeBody> {
     let mut response = Response::new(EdgeBody::from("Forbidden"));
     *response.status_mut() = StatusCode::FORBIDDEN;
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("private, no-store"),
-    );
+    apply_auction_response_privacy(&mut response);
     response
 }
 
-/// Normalizes the client-supplied `path` query parameter before glob matching.
-///
-/// The SPA hook sends `location.pathname`, but the parameter is
-/// client-controlled: strip any query string or fragment and force a leading
-/// `/` so slot `page_patterns` always match against a canonical path shape.
-fn normalize_page_bids_path(raw: &str) -> String {
-    let path = raw.split(['?', '#']).next().unwrap_or("");
-    if path.starts_with('/') {
-        path.to_string()
-    } else {
-        format!("/{path}")
+fn page_bids_denial_response(
+    denial: &AdmissionDenial,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    let mut response =
+        admission_denial_response(denial).change_context(TrustedServerError::Auction {
+            message: "Failed to build page-bids admission denial response".to_string(),
+        })?;
+    apply_auction_response_privacy(&mut response);
+    Ok(response)
+}
+
+fn page_bids_page_url(draft: &AuctionAdmissionDraft, req: &Request<EdgeBody>) -> Option<url::Url> {
+    let raw_path = page_bids_raw_path(req).unwrap_or("/");
+    if raw_path.len() > MAX_PAGE_BIDS_PATH_BYTES {
+        return None;
     }
+
+    let decoded_path = decode_form_component(raw_path)?;
+    if decoded_path.len() > MAX_PAGE_BIDS_PATH_BYTES {
+        return None;
+    }
+
+    let normalized_path = if decoded_path.is_empty() {
+        "/"
+    } else {
+        decoded_path.as_str()
+    };
+    let page_url = draft.publisher_origin().join(normalized_path).ok()?;
+    if !page_url.username().is_empty()
+        || page_url.password().is_some()
+        || page_url.fragment().is_some()
+        || !same_origin(&page_url, draft.publisher_origin())
+    {
+        return None;
+    }
+
+    Some(page_url)
+}
+
+fn page_bids_raw_path(req: &Request<EdgeBody>) -> Option<&str> {
+    req.uri().query().and_then(|query| {
+        query.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (key == "path").then_some(value)
+        })
+    })
+}
+
+fn decode_form_component(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' => {
+                let high = bytes.get(index + 1).copied().and_then(hex_value)?;
+                let low = bytes.get(index + 2).copied().and_then(hex_value)?;
+                decoded.push((high << 4) | low);
+                index += 3;
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn same_origin(left: &url::Url, right: &url::Url) -> bool {
+    left.scheme().eq_ignore_ascii_case(right.scheme())
+        && left.host_str().map(str::to_ascii_lowercase)
+            == right.host_str().map(str::to_ascii_lowercase)
+        && left.port_or_known_default() == right.port_or_known_default()
 }
 
 /// Handle `GET /__ts/page-bids?path=<path>` — server-side auction for SPA navigation.
@@ -2207,27 +2259,35 @@ pub async fn handle_page_bids(
         return Ok(response);
     };
 
-    // CSRF-style gate: refuse cross-site invocations before any auction work.
-    if !page_bids_request_allowed(&req) {
-        log::debug!(
-            "page-bids: rejecting request (sec-fetch-site={:?}, tsjs header present={})",
-            req.headers()
-                .get("sec-fetch-site")
-                .and_then(|v| v.to_str().ok()),
-            req.headers().contains_key("x-tsjs-page-bids")
-        );
-        return Ok(page_bids_preflight_denied());
-    }
-
-    let path_param = req
-        .uri()
-        .query()
-        .and_then(|query| {
-            url::form_urlencoded::parse(query.as_bytes())
-                .find(|(k, _)| k == "path")
-                .map(|(_, v)| normalize_page_bids_path(&v))
-        })
-        .unwrap_or_else(|| "/".to_string());
+    let admission_draft = match admit_auction_http(
+        settings,
+        AuctionSource::SpaNavigation,
+        &req,
+        ec_context,
+        services.client_info(),
+    ) {
+        Ok(admission_draft) => admission_draft,
+        Err(denial) => {
+            log::debug!(
+                "page-bids: rejecting request during admission (kind={:?}, sec-fetch-site={:?}, tsjs header present={})",
+                denial.kind(),
+                req.headers()
+                    .get("sec-fetch-site")
+                    .and_then(|v| v.to_str().ok()),
+                req.headers().contains_key("x-tsjs-page-bids")
+            );
+            return page_bids_denial_response(&denial);
+        }
+    };
+    let page_url = match page_bids_page_url(&admission_draft, &req) {
+        Some(page_url) => page_url,
+        None => {
+            let denial = deny_invalid_body(admission_draft);
+            return page_bids_denial_response(&denial);
+        }
+    };
+    let admission = finalize_admission(admission_draft, page_url);
+    let path_param = admission.telemetry_path().to_owned();
 
     let matched_slots: Vec<_> =
         crate::creative_opportunities::match_slots(auction.slots, &path_param)
@@ -2236,14 +2296,12 @@ pub async fn handle_page_bids(
             .collect();
 
     let request_info = crate::http_util::RequestInfo::from_request(&req, services.client_info());
-    let ec_id = ec_context.ec_value().filter(|_| ec_context.ec_allowed());
-    let consent_context = ec_context.consent();
+    let ec_id = ec_context
+        .ec_value()
+        .filter(|_| admission.identity_allowed());
+    let consent_context = admission.consent();
     let geo = ec_context.geo_info().cloned();
     let cookie_jar = handle_request_cookies(&req)?;
-
-    // Same fail-closed jurisdiction-aware gate the publisher navigation path
-    // uses — relies on the adapter's geo-aware EC context.
-    let consent_allows_auction = consent_allows_server_side_auction(consent_context);
 
     // Same bot / prefetch guards the publisher path uses — without them this
     // endpoint would fire real SSP auctions on Sec-Purpose=prefetch warm-up
@@ -2251,7 +2309,7 @@ pub async fn handle_page_bids(
     let is_prefetch = is_prefetch_request(&req);
     let is_bot = is_bot_user_agent(&req);
 
-    let auction_enabled = auction.orchestrator.is_enabled();
+    let auction_enabled = admission.auction_enabled();
     if !auction_enabled {
         log::debug!("page-bids: [auction].enabled is false — skipping auction");
     } else if matched_slots.is_empty() {
@@ -2275,7 +2333,7 @@ pub async fn handle_page_bids(
     // the client create/refresh GPT slots. Bot/prefetch requests, by contrast,
     // keep their slot definitions (the placement structure is unchanged) but
     // skip the live auction, matching the existing bot/prefetch behaviour.
-    let ad_stack_enabled = auction_enabled && consent_allows_auction;
+    let ad_stack_enabled = admission.auction_allowed();
 
     let winning_bids = if matched_slots.is_empty() {
         std::collections::HashMap::new()
@@ -2364,7 +2422,7 @@ pub async fn handle_page_bids(
         } else {
             let skip_reason = if !auction_enabled {
                 "auction_disabled"
-            } else if !consent_allows_auction {
+            } else if !admission.auction_allowed() {
                 "consent_denied"
             } else if is_bot {
                 "bot"
@@ -4577,6 +4635,7 @@ mod tests {
             // Pass the same-origin gate the way a browser fetch from the
             // publisher page does.
             set_test_header(&mut req, "sec-fetch-site", "same-origin");
+            set_test_header(&mut req, "x-tsjs-page-bids", "1");
             req
         }
 
@@ -4640,11 +4699,11 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn missing_fetch_metadata_without_tsjs_header_is_rejected() {
+        async fn missing_custom_header_is_rejected_even_with_same_origin_fetch_metadata() {
             let settings = settings_with_co();
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let mut req = make_page_bids_request("/2024/01/my-article/");
-            req.headers_mut().remove("sec-fetch-site");
+            req.headers_mut().remove("x-tsjs-page-bids");
 
             let response =
                 run_page_bids_response(&settings, &orchestrator, &article_slot(), req).await;
@@ -4652,7 +4711,7 @@ mod tests {
             assert_eq!(
                 response.status(),
                 StatusCode::FORBIDDEN,
-                "request with neither fetch metadata nor tsjs header should be rejected"
+                "page-bids request without the tsjs header should be rejected"
             );
         }
 
@@ -4662,7 +4721,6 @@ mod tests {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let mut req = make_page_bids_request("/2024/01/my-article/");
             req.headers_mut().remove("sec-fetch-site");
-            set_test_header(&mut req, "x-tsjs-page-bids", "1");
 
             let response =
                 run_page_bids_response(&settings, &orchestrator, &article_slot(), req).await;
@@ -4675,13 +4733,11 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn same_site_fetch_metadata_is_rejected() {
+        async fn mismatched_origin_is_rejected() {
             let settings = settings_with_co();
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let mut req = make_page_bids_request("/2024/01/my-article/");
-            // `same-site` admits sibling origins under the same registrable
-            // domain — not trusted to spend SSP quota.
-            set_test_header(&mut req, "sec-fetch-site", "same-site");
+            set_test_header(&mut req, "origin", "https://evil.example");
 
             let response =
                 run_page_bids_response(&settings, &orchestrator, &article_slot(), req).await;
@@ -4689,7 +4745,93 @@ mod tests {
             assert_eq!(
                 response.status(),
                 StatusCode::FORBIDDEN,
-                "same-site request should be rejected; only same-origin is trusted"
+                "origin must match the adapter-attested publisher origin"
+            );
+        }
+
+        #[tokio::test]
+        async fn missing_request_content_type_is_allowed_for_get_page_bids() {
+            let settings = settings_with_co();
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let req = make_page_bids_request("/2024/01/my-article/");
+
+            let response =
+                run_page_bids_response(&settings, &orchestrator, &article_slot(), req).await;
+
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "GET page-bids must not require a request Content-Type"
+            );
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE),
+                Some(&HeaderValue::from_static("application/json")),
+                "page-bids response should remain JSON"
+            );
+        }
+
+        #[tokio::test]
+        async fn cross_origin_absolute_path_is_rejected() {
+            let settings = settings_with_co();
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let req = make_page_bids_request("https://evil.example/2024/01/my-article/");
+
+            let response =
+                run_page_bids_response(&settings, &orchestrator, &article_slot(), req).await;
+
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "absolute page-bids path must stay on the publisher origin"
+            );
+        }
+
+        #[tokio::test]
+        async fn fragment_in_supplied_path_is_rejected() {
+            let settings = settings_with_co();
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let req = make_page_bids_request("/2024/01/my-article/%23section");
+
+            let response =
+                run_page_bids_response(&settings, &orchestrator, &article_slot(), req).await;
+
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "fragments must be rejected instead of silently stripped"
+            );
+        }
+
+        #[tokio::test]
+        async fn overly_long_supplied_path_is_rejected() {
+            let settings = settings_with_co();
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let path = format!("/{}", "a".repeat(2049));
+            let req = make_page_bids_request(&path);
+
+            let response =
+                run_page_bids_response(&settings, &orchestrator, &article_slot(), req).await;
+
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "page-bids path values longer than 2048 bytes should be rejected"
+            );
+        }
+
+        #[tokio::test]
+        async fn invalid_utf8_supplied_path_is_rejected() {
+            let settings = settings_with_co();
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let req = make_page_bids_request("/2024/%FF/article/");
+
+            let response =
+                run_page_bids_response(&settings, &orchestrator, &article_slot(), req).await;
+
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "invalid UTF-8 in page-bids path should be rejected"
             );
         }
 
@@ -4811,35 +4953,6 @@ mod tests {
                     .len(),
                 0,
                 "non-matching URL should produce zero bids"
-            );
-        }
-
-        #[test]
-        fn normalize_page_bids_path_strips_query_fragment_and_forces_leading_slash() {
-            assert_eq!(
-                normalize_page_bids_path("/2024/01/article/"),
-                "/2024/01/article/",
-                "canonical path should pass through unchanged"
-            );
-            assert_eq!(
-                normalize_page_bids_path("/2024/01/article/?utm_source=x"),
-                "/2024/01/article/",
-                "query string should be stripped before glob matching"
-            );
-            assert_eq!(
-                normalize_page_bids_path("/2024/01/article/#section"),
-                "/2024/01/article/",
-                "fragment should be stripped before glob matching"
-            );
-            assert_eq!(
-                normalize_page_bids_path("2024/01/article/"),
-                "/2024/01/article/",
-                "missing leading slash should be added"
-            );
-            assert_eq!(
-                normalize_page_bids_path(""),
-                "/",
-                "empty path should normalize to root"
             );
         }
 

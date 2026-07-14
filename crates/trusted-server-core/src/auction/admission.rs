@@ -20,6 +20,8 @@ pub const MAX_AUCTION_BODY_BYTES: usize = 256 * 1024;
 
 const AUCTION_HEADER_NAME: &str = "x-tsjs-auction";
 const AUCTION_HEADER_VALUE: &str = "1";
+const PAGE_BIDS_HEADER_NAME: &str = "x-tsjs-page-bids";
+const PAGE_BIDS_HEADER_VALUE: &str = "1";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum AuctionSource {
@@ -88,6 +90,11 @@ impl AuctionAdmissionDraft {
     #[must_use]
     pub fn auction_id(&self) -> Uuid {
         self.auction_id
+    }
+
+    #[must_use]
+    pub fn publisher_origin(&self) -> &Url {
+        &self.publisher_origin
     }
 }
 
@@ -445,13 +452,16 @@ fn has_json_content_type(req: &Request<EdgeBody>) -> bool {
 }
 
 fn auction_header_allowed(source: AuctionSource, req: &Request<EdgeBody>) -> bool {
-    if source != AuctionSource::AuctionApi {
-        return true;
-    }
+    let (name, expected_value) = match source {
+        AuctionSource::InitialNavigation => return true,
+        AuctionSource::SpaNavigation => (PAGE_BIDS_HEADER_NAME, PAGE_BIDS_HEADER_VALUE),
+        AuctionSource::AuctionApi => (AUCTION_HEADER_NAME, AUCTION_HEADER_VALUE),
+    };
+
     req.headers()
-        .get(AUCTION_HEADER_NAME)
+        .get(name)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.trim() == AUCTION_HEADER_VALUE)
+        .is_some_and(|value| value.trim() == expected_value)
 }
 
 fn origin_allowed(req: &Request<EdgeBody>, publisher_origin: &Url) -> bool {
