@@ -25,6 +25,20 @@ git clone https://github.com/IABTechLab/trusted-server.git
 cd trusted-server
 ```
 
+### Install the CLI
+
+Install the `ts` operator CLI for your current platform:
+
+```bash
+cargo install-cli
+
+# If your shell cannot find `ts`, add Cargo's bin directory to PATH
+export PATH="$HOME/.cargo/bin:$PATH"
+ts --help
+```
+
+See [Trusted Server CLI](/guide/cli) for command details.
+
 ## Local Development
 
 Trusted Server supports two local development modes:
