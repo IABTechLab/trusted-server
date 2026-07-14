@@ -1694,7 +1694,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     expect(originalRefresh).toHaveBeenCalledWith(undefined, undefined);
   });
 
-  it('keeps explicit unrelated and mixed delivery lists on the synthetic path', () => {
+  it('keeps explicit unrelated lists synthetic and bypasses mixed delivery lists', () => {
     const coveredSlot = {
       getSlotElementId: () => 'example-covered',
       getTargeting: () => [],
@@ -1721,15 +1721,11 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
       },
     } as any);
 
-    expect(mockRequestBids).toHaveBeenCalledTimes(3);
+    expect(mockRequestBids).toHaveBeenCalledTimes(2);
     expect(mockRequestBids.mock.calls[1][0].adUnits.map((unit: any) => unit.code)).toEqual([
       'example-unrelated',
     ]);
-    expect(mockRequestBids.mock.calls[2][0].adUnits.map((unit: any) => unit.code)).toEqual([
-      'example-covered',
-      'example-unrelated',
-    ]);
-    expect(coveredSlot.clearTargeting).toHaveBeenCalledWith('hb_pb');
+    expect(coveredSlot.clearTargeting).not.toHaveBeenCalled();
     expect(unrelatedSlot.clearTargeting).toHaveBeenCalledWith('ts_initial');
     expect(unrelatedSlot.clearTargeting).toHaveBeenCalledWith('hb_cache_path');
     expect(originalRefresh).toHaveBeenCalledTimes(2);
@@ -1737,7 +1733,183 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     expect(originalRefresh).toHaveBeenNthCalledWith(2, [coveredSlot, unrelatedSlot], undefined);
   });
 
-  it('treats a microtask refresh after publisher delivery as an independent auction', async () => {
+  it('bypasses an explicit delivery refresh with four covered slots and a GAM-only extra', () => {
+    const coveredSlots = Array.from({ length: 4 }, (_, index) => ({
+      getSlotElementId: () => `example-covered-${index}`,
+      getTargeting: () => [],
+      clearTargeting: vi.fn(),
+    }));
+    const gamOnlySlot = {
+      getSlotElementId: () => 'example-gam-only-interstitial',
+      getTargeting: () => [],
+      clearTargeting: vi.fn(),
+    };
+    const refreshSlots = [...coveredSlots, gamOnlySlot];
+    const { originalRefresh, pubads } = installGpt(refreshSlots);
+    mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+      opts?.bidsBackHandler?.();
+    });
+    const pbjs = installPrebidNpm();
+
+    pbjs.requestBids({
+      adUnits: coveredSlots.map((_, index) => ({
+        code: `example-covered-${index}`,
+        bids: [{ bidder: 'exampleServer', params: { placement: index } }],
+      })),
+      bidsBackHandler: () => pubads.refresh(refreshSlots),
+    } as any);
+
+    expect(mockRequestBids).toHaveBeenCalledTimes(1);
+    refreshSlots.forEach((slot) => expect(slot.clearTargeting).not.toHaveBeenCalled());
+    expect(originalRefresh).toHaveBeenCalledTimes(1);
+    expect(originalRefresh).toHaveBeenCalledWith(refreshSlots, undefined);
+  });
+
+  it('bypasses a targeted delivery refresh shortly after the publisher callback returns', () => {
+    vi.useFakeTimers();
+    try {
+      const coveredSlots = Array.from({ length: 4 }, (_, index) => ({
+        getSlotElementId: () => `example-targeted-${index}`,
+        getTargeting: () => [],
+        getSizes: () => [[300, 250]],
+        clearTargeting: vi.fn(),
+      }));
+      const gamOnlySlot = {
+        getSlotElementId: () => 'example-targeted-interstitial',
+        getTargeting: () => [],
+        clearTargeting: vi.fn(),
+      };
+      const refreshSlots = [...coveredSlots, gamOnlySlot];
+      const { originalRefresh, pubads } = installGpt(refreshSlots);
+      const setTargetingForGPTAsync = vi.fn();
+      (mockPbjs as any).setTargetingForGPTAsync = setTargetingForGPTAsync;
+      let refreshAfterCallback: (() => void) | undefined;
+      mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+        opts?.bidsBackHandler?.();
+        const pendingRefresh = refreshAfterCallback;
+        refreshAfterCallback = undefined;
+        if (pendingRefresh) setTimeout(pendingRefresh, 750);
+      });
+      const pbjs = installPrebidNpm();
+      const coveredCodes = coveredSlots.map((slot) => slot.getSlotElementId());
+
+      pbjs.requestBids({
+        adUnits: coveredCodes.map((code, index) => ({
+          code,
+          bids: [{ bidder: 'exampleServer', params: { placement: index } }],
+        })),
+        bidsBackHandler: () => {
+          (pbjs as any).setTargetingForGPTAsync([gamOnlySlot.getSlotElementId(), ...coveredCodes]);
+          refreshAfterCallback = () => pubads.refresh(refreshSlots);
+        },
+      } as any);
+
+      expect(mockRequestBids).toHaveBeenCalledTimes(1);
+      expect(setTargetingForGPTAsync).toHaveBeenCalledWith([
+        gamOnlySlot.getSlotElementId(),
+        ...coveredCodes,
+      ]);
+      expect((mockPbjs as any).setTargetingForGPTAsync).toBe(setTargetingForGPTAsync);
+
+      vi.advanceTimersByTime(750);
+
+      refreshSlots.forEach((slot) => expect(slot.clearTargeting).not.toHaveBeenCalled());
+      expect(originalRefresh).toHaveBeenCalledTimes(1);
+      expect(originalRefresh).toHaveBeenCalledWith(refreshSlots, undefined);
+
+      vi.runOnlyPendingTimers();
+      pubads.refresh([coveredSlots[0]]);
+
+      expect(mockRequestBids).toHaveBeenCalledTimes(2);
+      expect(coveredSlots[0].clearTargeting).toHaveBeenCalledWith('hb_pb');
+      expect(originalRefresh).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.runOnlyPendingTimers();
+      vi.useRealTimers();
+      delete (mockPbjs as any).setTargetingForGPTAsync;
+    }
+  });
+
+  it('expires a targeted delivery context before a later event-loop task', () => {
+    vi.useFakeTimers();
+    try {
+      const slot = {
+        getSlotElementId: () => 'example-expiring-delivery',
+        getTargeting: () => [],
+        getSizes: () => [[300, 250]],
+        clearTargeting: vi.fn(),
+      };
+      const { originalRefresh, pubads } = installGpt([slot]);
+      (mockPbjs as any).setTargetingForGPTAsync = vi.fn();
+      mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+        opts?.bidsBackHandler?.();
+      });
+      const pbjs = installPrebidNpm();
+
+      pbjs.requestBids({
+        adUnits: [
+          { code: 'example-expiring-delivery', bids: [{ bidder: 'exampleServer', params: {} }] },
+        ],
+        bidsBackHandler: () => (pbjs as any).setTargetingForGPTAsync(['example-expiring-delivery']),
+      } as any);
+      vi.runOnlyPendingTimers();
+      pubads.refresh([slot]);
+
+      expect(mockRequestBids).toHaveBeenCalledTimes(2);
+      expect(slot.clearTargeting).toHaveBeenCalledWith('hb_pb');
+      expect(originalRefresh).toHaveBeenCalledTimes(1);
+      expect(originalRefresh).toHaveBeenCalledWith([slot], undefined);
+    } finally {
+      vi.runOnlyPendingTimers();
+      vi.useRealTimers();
+      delete (mockPbjs as any).setTargetingForGPTAsync;
+    }
+  });
+
+  it('bypasses a mixed explicit delivery list spanning nested contexts', () => {
+    const outerSlot = {
+      getSlotElementId: () => 'example-outer-delivery',
+      getTargeting: () => [],
+      clearTargeting: vi.fn(),
+    };
+    const innerSlot = {
+      getSlotElementId: () => 'example-inner-delivery',
+      getTargeting: () => [],
+      clearTargeting: vi.fn(),
+    };
+    const gamOnlySlot = {
+      getSlotElementId: () => 'example-gam-only-interstitial',
+      getTargeting: () => [],
+      clearTargeting: vi.fn(),
+    };
+    const refreshSlots = [innerSlot, outerSlot, gamOnlySlot];
+    const { originalRefresh, pubads } = installGpt(refreshSlots);
+    mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+      opts?.bidsBackHandler?.();
+    });
+    const pbjs = installPrebidNpm();
+
+    pbjs.requestBids({
+      adUnits: [
+        { code: 'example-outer-delivery', bids: [{ bidder: 'exampleServer', params: {} }] },
+      ],
+      bidsBackHandler: () => {
+        pbjs.requestBids({
+          adUnits: [
+            { code: 'example-inner-delivery', bids: [{ bidder: 'exampleServer', params: {} }] },
+          ],
+          bidsBackHandler: () => pubads.refresh(refreshSlots),
+        } as any);
+      },
+    } as any);
+
+    expect(mockRequestBids).toHaveBeenCalledTimes(2);
+    refreshSlots.forEach((slot) => expect(slot.clearTargeting).not.toHaveBeenCalled());
+    expect(originalRefresh).toHaveBeenCalledTimes(1);
+    expect(originalRefresh).toHaveBeenCalledWith(refreshSlots, undefined);
+  });
+
+  it('treats a microtask refresh without a targeting signal as an independent auction', async () => {
     const slot = {
       getSlotElementId: () => 'example-deferred-refresh',
       getTargeting: () => [],
