@@ -287,14 +287,23 @@ impl Default for ApsConfig {
     }
 }
 
-/// Validator for [`ApsConfig::pub_id`]: rejects the known template placeholder
-/// publisher ID. Non-emptiness is enforced by the built-in `length` validator;
-/// this runs only when APS is enabled, because integration configs validate
-/// lazily via `get_typed`.
+/// Validator for [`ApsConfig::pub_id`]: rejects blank publisher IDs and the
+/// known template placeholder. The built-in `length` validator counts
+/// whitespace, so a whitespace-only `pub_id` has to be rejected here. This runs
+/// only when APS is enabled, because integration configs validate lazily via
+/// `get_typed`.
 fn validate_aps_pub_id(pub_id: &str) -> Result<(), ValidationError> {
+    let pub_id = pub_id.trim();
+
+    if pub_id.is_empty() {
+        let mut err = ValidationError::new("aps_pub_id_blank");
+        err.message = Some("pub_id must not be blank".into());
+        return Err(err);
+    }
+
     if ApsConfig::PUB_ID_PLACEHOLDERS
         .iter()
-        .any(|placeholder| placeholder.eq_ignore_ascii_case(pub_id.trim()))
+        .any(|placeholder| placeholder.eq_ignore_ascii_case(pub_id))
     {
         return Err(ValidationError::new("aps_pub_id_placeholder"));
     }

@@ -289,10 +289,13 @@ enabled = false
 # api_origin = "https://api.example.com"
 
 # Sourcepoint CMP first-party proxy.
+# `cdn_origin` is intentionally omitted: the upstream CDN origin is pinned to
+# Sourcepoint's own host and is not operator-selectable. Leave it unset so the
+# validated default applies — overriding it with any other host fails config
+# validation.
 # [integrations.sourcepoint]
 # enabled = true
 # rewrite_sdk = true
-# cdn_origin = "https://cdn.example.com"
 # cache_ttl_seconds = 3600
 # auth_cookie_name = "sp_auth"      # optional: forward a custom authCookie upstream
 

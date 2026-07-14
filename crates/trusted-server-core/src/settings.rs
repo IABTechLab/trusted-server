@@ -287,6 +287,15 @@ impl IntegrationSettings {
             },
         )?;
 
+        // Field validation runs only for integrations that resolve to enabled.
+        // An integration whose `enabled` flag is omitted falls back to its
+        // serde default, which the explicit-`false` fast path above cannot
+        // observe. Validating before this check would reject documented
+        // template placeholders in sections that are not actually turned on.
+        if !config.is_enabled() {
+            return Ok(None);
+        }
+
         config.validate().map_err(|err| {
             Report::new(TrustedServerError::Configuration {
                 message: format!(
@@ -294,10 +303,6 @@ impl IntegrationSettings {
                 ),
             })
         })?;
-
-        if !config.is_enabled() {
-            return Ok(None);
-        }
 
         Ok(Some(config))
     }
@@ -2196,14 +2201,17 @@ impl Settings {
         if Publisher::is_placeholder_origin_url(&self.publisher.origin_url) {
             insecure_fields.push("publisher.origin_url".to_owned());
         }
+        // Checked whenever the block is present, not just when it is enabled:
+        // the key rotate/deactivate admin routes are registered unconditionally
+        // and read these store IDs without consulting `enabled`, so placeholder
+        // IDs behind a disabled block would still reach key management at
+        // runtime.
         if let Some(request_signing) = &self.request_signing {
-            if request_signing.enabled {
-                if RequestSigning::is_placeholder_store_id(&request_signing.config_store_id) {
-                    insecure_fields.push("request_signing.config_store_id".to_owned());
-                }
-                if RequestSigning::is_placeholder_store_id(&request_signing.secret_store_id) {
-                    insecure_fields.push("request_signing.secret_store_id".to_owned());
-                }
+            if RequestSigning::is_placeholder_store_id(&request_signing.config_store_id) {
+                insecure_fields.push("request_signing.config_store_id".to_owned());
+            }
+            if RequestSigning::is_placeholder_store_id(&request_signing.secret_store_id) {
+                insecure_fields.push("request_signing.secret_store_id".to_owned());
             }
         }
 
