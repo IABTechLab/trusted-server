@@ -18,6 +18,7 @@ use serde_json::Value as Json;
 use url::{Url, Url as ParsedUrl};
 use validator::{Validate, ValidationError};
 
+use crate::auction::orchestrator::ERROR_TYPE_HTTP_STATUS;
 use crate::auction::provider::AuctionProvider;
 use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid, MediaType,
@@ -62,7 +63,6 @@ const ZONE_KEY: &str = "zone";
 /// Default currency for `OpenRTB` bid floors and responses.
 const DEFAULT_CURRENCY: &str = "USD";
 
-const PREBID_ERROR_TYPE_UPSTREAM_HTTP: &str = "upstream_http";
 const PREBID_PUBLIC_ERROR_MESSAGE_CHARS: usize = 500;
 const PREBID_ERROR_BODY_PREVIEW_CHARS: usize = 1000;
 const PREBID_ERROR_BODY_PREVIEW_BYTES: usize = PREBID_ERROR_BODY_PREVIEW_CHARS * 4;
@@ -2010,10 +2010,7 @@ impl PrebidAuctionProvider {
             let status_code = status.as_u16();
             let mut auction_response =
                 AuctionResponse::error(PREBID_INTEGRATION_ID, response_time_ms)
-                    .with_metadata(
-                        "error_type",
-                        serde_json::json!(PREBID_ERROR_TYPE_UPSTREAM_HTTP),
-                    )
+                    .with_metadata("error_type", serde_json::json!(ERROR_TYPE_HTTP_STATUS))
                     .with_metadata("http_status", serde_json::json!(status_code))
                     .with_metadata(
                         "message",
@@ -5143,7 +5140,7 @@ external_bundle_sri = "sha384-AAAA"
         );
         assert_eq!(
             auction_response.metadata["error_type"],
-            json!(PREBID_ERROR_TYPE_UPSTREAM_HTTP)
+            json!(ERROR_TYPE_HTTP_STATUS)
         );
         assert_eq!(auction_response.metadata["http_status"], json!(400));
         assert_eq!(
