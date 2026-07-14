@@ -4,8 +4,7 @@ use std::collections::HashMap;
 
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use http::{header, Request, Response};
-use serde_json::Value as JsonValue;
+use http::{Request, Response};
 use url::Url;
 
 use crate::auction::admission::{
@@ -13,18 +12,14 @@ use crate::auction::admission::{
     finalize_admission, AdmissionDenial,
 };
 use crate::auction::formats::AdRequest;
+use crate::auction::identity::{
+    extract_ts_eids_cookie, resolve_auction_identity, AuctionIdentityInput,
+};
 use crate::auction::orchestrator::OrchestrationResult;
-use crate::consent::gate_eids_by_consent;
-use crate::constants::COOKIE_TS_EIDS;
-use crate::ec::eids::{resolve_partner_ids, to_eids};
 use crate::ec::kv::KvIdentityGraph;
-use crate::ec::kv_types::MAX_UID_LENGTH;
-use crate::ec::log_id;
-use crate::ec::prebid_eids::parse_prebid_eids_cookie;
 use crate::ec::registry::PartnerRegistry;
 use crate::ec::EcContext;
 use crate::error::TrustedServerError;
-use crate::openrtb::{Eid, Uid};
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
@@ -38,10 +33,6 @@ use super::telemetry::{
 use super::types::AuctionContext;
 use super::AuctionOrchestrator;
 use super::AuctionSource;
-
-const MAX_CLIENT_EID_SOURCES: usize = 64;
-const MAX_CLIENT_UIDS_PER_SOURCE: usize = 32;
-const MAX_CLIENT_EID_SOURCE_BYTES: usize = 255;
 
 /// Maximum accepted JSON body size for `/auction`. Picked to comfortably fit
 /// the largest realistic Prebid-derived auction request (hundreds of ad units
@@ -155,11 +146,9 @@ pub async fn handle_auction(
     // Story 5 middleware contract: auction is a read-only EC route.
     // It must not generate EC IDs; it only consumes pre-routed context.
     // Only forward the EC ID to auction partners when consent allows it.
-    let ec_id = if ec_context.ec_allowed() {
-        ec_context.ec_value()
-    } else {
-        None
-    };
+    let ec_id = ec_context
+        .ec_value()
+        .filter(|_| admission.identity_allowed());
     let consent_context = admission.consent().clone();
 
     // Server-side auction consent gate. The publisher-navigation and
@@ -215,31 +204,16 @@ pub async fn handle_auction(
         ));
     }
 
-    // Parse client-provided EIDs from the current request body. When the
-    // current request does not include them, fall back to the persisted
-    // `ts-eids` cookie so later requests can still forward the browser's
-    // full OpenRTB-style EID structure.
-    //
-    // Gate this on the same identity-consent condition as the EC ID
-    // (`ec_id.is_some()`, which is already filtered by `ec_context.ec_allowed()`).
-    // Otherwise a US/GPC or US-Privacy opt-out context — where EC identity use is
-    // denied but a non-personalized auction may still run — could forward
-    // persistent client EIDs from the body/cookie, since `gate_eids_by_consent`
-    // only strips on TCF/GDPR signals. This matches the publisher and
-    // `/__ts/page-bids` paths, which also resolve client EIDs only when
-    // `ec_id.is_some()`.
-    let client_eids = if ec_id.is_some() {
-        resolve_client_auction_eids(
-            body.eids.as_ref(),
-            extract_cookie_value(&http_req, COOKIE_TS_EIDS).as_deref(),
-        )
-    } else {
-        None
-    };
-
-    // Resolve partner EIDs from the KV identity graph when the user has
-    // a valid EC and both KV and partner stores are available.
-    let eids = resolve_auction_eids(kv, registry, ec_context);
+    let ts_eids_cookie = extract_ts_eids_cookie(&http_req);
+    let identity = resolve_auction_identity(AuctionIdentityInput {
+        admission: &admission,
+        request_eids: body.eids.as_ref(),
+        ts_eids_cookie: ts_eids_cookie.as_deref(),
+        kv,
+        registry,
+        ec_context,
+    });
+    let ec_id = identity.ec_id.as_deref();
 
     // Look up geo for device info.
     let geo = services
@@ -261,15 +235,7 @@ pub async fn handle_auction(
         geo,
     )?;
 
-    // Merge current-request client EIDs with KV-resolved EIDs, then apply
-    // consent gating before attaching them to the auction request.
-    let merged_eids = merge_auction_eids(client_eids, eids);
-    let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
-    auction_request.user.eids =
-        gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref());
-    if had_eids && auction_request.user.eids.is_none() {
-        log::warn!("Auction EIDs stripped by TCF consent gating");
-    }
+    auction_request.user.eids = identity.eids;
 
     // Create auction context
     let context = AuctionContext {
@@ -360,224 +326,26 @@ fn auction_page_url(settings: &Settings) -> Url {
         .expect("should build page URL from validated publisher domain")
 }
 
-/// Resolves partner EIDs from the KV identity graph for bidstream decoration.
-///
-/// Returns `None` when any prerequisite is missing (no KV store, no partner
-/// store, no EC, consent denied). On KV or partner-resolution errors, logs a
-/// warning and returns empty EIDs so the auction can proceed in degraded mode.
-pub(crate) fn resolve_auction_eids(
-    kv: Option<&KvIdentityGraph>,
-    registry: Option<&PartnerRegistry>,
-    ec_context: &EcContext,
-) -> Option<Vec<Eid>> {
-    let kv = kv?;
-    let registry = registry?;
-
-    if !ec_context.ec_allowed() {
-        return None;
-    }
-
-    let ec_id = ec_context.ec_value()?;
-
-    let entry = match kv.get(ec_id) {
-        Ok(Some((entry, _generation))) => entry,
-        Ok(None) => return Some(Vec::new()),
-        Err(err) => {
-            log::warn!(
-                "Auction KV read failed for EC ID '{}': {err:?}",
-                log_id(ec_id)
-            );
-            return Some(Vec::new());
-        }
-    };
-
-    let resolved = resolve_partner_ids(registry, &entry);
-    Some(to_eids(&resolved))
-}
-
-fn extract_cookie_value(req: &Request<EdgeBody>, name: &str) -> Option<String> {
-    let cookie_header = req
-        .headers()
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())?;
-    for pair in cookie_header.split(';') {
-        let pair = pair.trim();
-        if let Some((key, value)) = pair.split_once('=') {
-            if key.trim() == name {
-                return Some(value.trim().to_owned());
-            }
-        }
-    }
-    None
-}
-
-pub(crate) fn resolve_client_auction_eids(
-    raw: Option<&JsonValue>,
-    cookie_value: Option<&str>,
-) -> Option<Vec<Eid>> {
-    parse_client_auction_eids(raw).or_else(|| parse_cookie_auction_eids(cookie_value))
-}
-
-fn parse_cookie_auction_eids(cookie_value: Option<&str>) -> Option<Vec<Eid>> {
-    let cookie_value = cookie_value?;
-    match parse_prebid_eids_cookie(cookie_value) {
-        Ok(eids) if eids.is_empty() => None,
-        Ok(eids) => Some(eids),
-        Err(_) => {
-            log::trace!("Auction EIDs: failed to parse ts-eids cookie; dropping");
-            None
-        }
-    }
-}
-
-fn parse_client_auction_eids(raw: Option<&JsonValue>) -> Option<Vec<Eid>> {
-    let Some(JsonValue::Array(entries)) = raw else {
-        return None;
-    };
-
-    let mut eids = Vec::new();
-
-    for entry in entries {
-        if eids.len() >= MAX_CLIENT_EID_SOURCES {
-            log::debug!(
-                "Auction EIDs: reached max client EID source count ({MAX_CLIENT_EID_SOURCES})"
-            );
-            break;
-        }
-        let JsonValue::Object(entry) = entry else {
-            log::debug!("Auction EIDs: dropping malformed client EID entry");
-            continue;
-        };
-
-        let Some(source) = entry
-            .get("source")
-            .and_then(JsonValue::as_str)
-            .filter(|source| !source.trim().is_empty())
-            .filter(|source| source.len() <= MAX_CLIENT_EID_SOURCE_BYTES)
-            .map(str::to_owned)
-        else {
-            continue;
-        };
-
-        let Some(JsonValue::Array(raw_uids)) = entry.get("uids") else {
-            continue;
-        };
-
-        let uids: Vec<_> = raw_uids
-            .iter()
-            .filter_map(parse_client_auction_uid)
-            .take(MAX_CLIENT_UIDS_PER_SOURCE)
-            .collect();
-        if uids.is_empty() {
-            continue;
-        }
-
-        eids.push(Eid { source, uids });
-    }
-
-    if eids.is_empty() {
-        None
-    } else {
-        Some(eids)
-    }
-}
-
-fn parse_client_auction_uid(raw: &JsonValue) -> Option<Uid> {
-    let JsonValue::Object(uid) = raw else {
-        return None;
-    };
-
-    let id = uid
-        .get("id")
-        .and_then(JsonValue::as_str)
-        .filter(|id| !id.trim().is_empty())
-        .filter(|id| id.len() <= MAX_UID_LENGTH)?
-        .to_owned();
-
-    let atype = uid
-        .get("atype")
-        .and_then(JsonValue::as_u64)
-        .and_then(|atype| u8::try_from(atype).ok());
-
-    let ext = match uid.get("ext") {
-        Some(JsonValue::Object(_)) => uid.get("ext").cloned(),
-        _ => None,
-    };
-
-    Some(Uid { id, atype, ext })
-}
-
-pub(crate) fn merge_auction_eids(
-    client_eids: Option<Vec<Eid>>,
-    resolved_eids: Option<Vec<Eid>>,
-) -> Option<Vec<Eid>> {
-    let mut merged = Vec::new();
-
-    for eid in resolved_eids
-        .into_iter()
-        .flatten()
-        .chain(client_eids.into_iter().flatten())
-    {
-        if eid.source.is_empty() {
-            continue;
-        }
-
-        let source_index = match merged
-            .iter()
-            .position(|existing: &Eid| existing.source == eid.source)
-        {
-            Some(index) => index,
-            None => {
-                merged.push(Eid {
-                    source: eid.source.clone(),
-                    uids: Vec::new(),
-                });
-                merged.len() - 1
-            }
-        };
-
-        for uid in eid.uids {
-            if uid.id.trim().is_empty() || uid.id.len() > MAX_UID_LENGTH {
-                continue;
-            }
-
-            if let Some(existing_uid) = merged[source_index]
-                .uids
-                .iter_mut()
-                .find(|existing| existing.id == uid.id)
-            {
-                if existing_uid.atype.is_none() {
-                    existing_uid.atype = uid.atype;
-                }
-                if existing_uid.ext.is_none() {
-                    existing_uid.ext = uid.ext;
-                }
-            } else {
-                merged[source_index].uids.push(uid);
-            }
-        }
-    }
-
-    merged.retain(|eid| !eid.uids.is_empty());
-
-    if merged.is_empty() {
-        None
-    } else {
-        Some(merged)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auction::build_orchestrator;
     use crate::auction::config::AuctionConfig;
+    use crate::auction::identity::test_limits::{
+        MAX_CLIENT_EID_SOURCES, MAX_CLIENT_UIDS_PER_SOURCE,
+    };
+    use crate::auction::identity::{
+        merge_auction_eids, parse_client_auction_eids, resolve_auction_eids,
+        resolve_client_auction_eids,
+    };
     use crate::auction::provider::AuctionProvider;
     use crate::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink};
     use crate::auction::types::{AuctionRequest, AuctionResponse};
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::ConsentContext;
-    use crate::openrtb::Uid;
+    use crate::constants::COOKIE_TS_EIDS;
+    use crate::ec::kv_types::MAX_UID_LENGTH;
+    use crate::openrtb::{Eid, Uid};
     use crate::platform::test_support::{
         noop_services, NoopBackend, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore,
     };
@@ -585,8 +353,9 @@ mod tests {
     use crate::test_support::tests::create_test_settings;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine as _;
-    use http::StatusCode;
+    use http::{header, StatusCode};
     use serde_json::json;
+    use serde_json::Value as JsonValue;
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]

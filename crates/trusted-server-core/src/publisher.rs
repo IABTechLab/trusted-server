@@ -29,12 +29,13 @@ use http::{header, HeaderValue, Method, Request, Response, StatusCode, Uri};
 
 use crate::auction::admission::{
     admission_denial_response, admit_auction_http, deny_invalid_body, finalize_admission,
-    AdmissionDenial, AuctionAdmissionDraft,
-};
-use crate::auction::endpoints::{
-    merge_auction_eids, resolve_auction_eids, resolve_client_auction_eids,
+    AdmissionDenial, AuctionAdmission, AuctionAdmissionDraft,
 };
 use crate::auction::formats::apply_auction_response_privacy;
+use crate::auction::identity::{
+    merge_auction_eids, resolve_auction_eids, resolve_auction_identity,
+    resolve_client_auction_eids, AuctionIdentityInput,
+};
 use crate::auction::orchestrator::{
     AuctionOrchestrator, DispatchAuctionOutcome, DispatchedAuction,
 };
@@ -1493,6 +1494,7 @@ pub async fn handle_publisher_request(
                 &AuctionEidTargeting {
                     cookie_jar: cookie_jar.as_ref(),
                     ec_id,
+                    admission: None,
                     kv,
                     partner_registry: auction.registry,
                     ec_context,
@@ -1799,6 +1801,7 @@ pub(crate) struct MatchedSlotsContext<'a> {
 struct AuctionEidTargeting<'a> {
     cookie_jar: Option<&'a CookieJar>,
     ec_id: Option<&'a str>,
+    admission: Option<&'a AuctionAdmission>,
     kv: Option<&'a KvIdentityGraph>,
     partner_registry: Option<&'a PartnerRegistry>,
     ec_context: &'a EcContext,
@@ -1822,20 +1825,34 @@ fn apply_auction_eids_and_device(
         .cookie_jar
         .and_then(|j| j.get(COOKIE_TS_EIDS))
         .map(|c| c.value().to_owned());
-    let client_eids = if targeting.ec_id.is_some() {
-        resolve_client_auction_eids(None, ts_eids_value.as_deref())
+
+    let resolved_eids = if let Some(admission) = targeting.admission {
+        resolve_auction_identity(AuctionIdentityInput {
+            admission,
+            request_eids: None,
+            ts_eids_cookie: ts_eids_value.as_deref(),
+            kv: targeting.kv,
+            registry: targeting.partner_registry,
+            ec_context: targeting.ec_context,
+        })
+        .eids
     } else {
-        None
+        let client_eids = if targeting.ec_id.is_some() {
+            resolve_client_auction_eids(None, ts_eids_value.as_deref())
+        } else {
+            None
+        };
+        let kv_eids = resolve_auction_eids(
+            targeting.kv,
+            targeting.partner_registry,
+            targeting.ec_context,
+        );
+        let merged_eids = merge_auction_eids(client_eids, kv_eids);
+        gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref())
     };
-    let kv_eids = resolve_auction_eids(
-        targeting.kv,
-        targeting.partner_registry,
-        targeting.ec_context,
-    );
-    let merged_eids = merge_auction_eids(client_eids, kv_eids);
-    let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
-    auction_request.user.eids =
-        gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref());
+
+    let had_eids = resolved_eids.as_ref().is_some_and(|v| !v.is_empty());
+    auction_request.user.eids = resolved_eids;
     if had_eids && auction_request.user.eids.is_none() {
         log::warn!(
             "{} auction EIDs stripped by TCF consent gating",
@@ -2364,6 +2381,7 @@ pub async fn handle_page_bids(
                 &AuctionEidTargeting {
                     cookie_jar: cookie_jar.as_ref(),
                     ec_id,
+                    admission: Some(&admission),
                     kv,
                     partner_registry: auction.registry,
                     ec_context,

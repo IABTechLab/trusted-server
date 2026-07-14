@@ -18,6 +18,7 @@ pub mod config;
 pub mod context;
 pub mod endpoints;
 pub mod formats;
+pub mod identity;
 pub mod orchestrator;
 pub mod provider;
 pub mod telemetry;

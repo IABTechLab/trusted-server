@@ -89,13 +89,13 @@ pub struct UserInfo {
     /// cookies/headers, not from stored data.
     #[serde(skip)]
     pub consent: Option<crate::consent::ConsentContext>,
-    /// Extended User IDs parsed from the [`crate::constants::COOKIE_TS_EIDS`] cookie.
+    /// Extended User IDs resolved for the auction bidstream.
     ///
-    /// Raw (un-gated) values from the browser; consent gating via
-    /// [`crate::consent::gate_eids_by_consent`] is applied centrally in the
-    /// endpoint handlers (the auction and page-bids paths) before any EID
-    /// reaches a bid request — the provider layer just forwards already-gated
-    /// EIDs.
+    /// Values can originate from the `/auction` request body, the
+    /// [`crate::constants::COOKIE_TS_EIDS`] cookie, or server-side KV partner
+    /// resolution keyed by EC. Endpoint handlers merge and consent-gate these
+    /// values before they reach providers; provider integrations only forward
+    /// already-gated EIDs.
     #[serde(skip)]
     pub eids: Option<Vec<crate::openrtb::Eid>>,
 }
