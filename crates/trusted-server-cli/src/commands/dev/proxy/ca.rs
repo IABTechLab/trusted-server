@@ -130,6 +130,8 @@ impl CertAuthority {
     ///
     /// Panics if the leaf-cache mutex is poisoned by a prior panic while held.
     pub fn server_config(&self, host: &str) -> Result<Arc<ServerConfig>, Report<CaError>> {
+        let normalized = host.to_ascii_lowercase();
+        let host = normalized.as_str();
         // Fast path: return a cached config without holding the lock during minting.
         {
             let cache = self
@@ -150,6 +152,19 @@ impl CertAuthority {
         // Double-check: another task may have minted concurrently.
         let entry = cache.entry(host.to_string()).or_insert(config);
         Ok(Arc::clone(entry))
+    }
+
+    /// Reports whether a normalized leaf identity is already cached.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the leaf-cache mutex was poisoned by an earlier panic.
+    #[must_use]
+    pub fn is_cached(&self, host: &str) -> bool {
+        self.leaves
+            .lock()
+            .expect("should be able to acquire leaf cache lock")
+            .contains_key(&host.to_ascii_lowercase())
     }
 
     fn mint(&self, host: &str) -> Result<ServerConfig, Report<CaError>> {
@@ -303,6 +318,19 @@ mod tests {
             .server_config("other.example.com")
             .expect("should mint other");
         assert!(!Arc::ptr_eq(&a, &c), "different host mints a new config");
+    }
+
+    #[test]
+    fn leaf_cache_normalizes_dns_case() {
+        let dir = tempfile::tempdir().expect("should create tempdir");
+        let ca = CertAuthority::load_or_generate(dir.path()).expect("should generate");
+        let lower = ca
+            .server_config("www.example.com")
+            .expect("mint lowercase leaf");
+        let mixed = ca
+            .server_config("WWW.Example.COM")
+            .expect("reuse mixed-case leaf");
+        assert!(Arc::ptr_eq(&lower, &mixed));
     }
 
     #[test]
