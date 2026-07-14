@@ -45,6 +45,7 @@ const TS_REFRESH_TARGETING_KEYS = [
   'hb_cache_host',
   'hb_cache_path',
 ] as const;
+const PUBLISHER_DELIVERY_CONTEXT_TIMEOUT_MS = 1000;
 
 /** Configuration options for the Prebid integration. */
 export interface PrebidNpmConfig {
@@ -234,7 +235,12 @@ type PublisherAdUnitSnapshot = {
   clientSideBids: ClientSideBidSnapshot[];
   zone?: string;
 };
-type PublisherDeliveryContext = { remainingCodes: Set<string> };
+type PublisherDeliveryContext = {
+  remainingCodes: Set<string>;
+  retainForTargetedRefresh: boolean;
+  cleanupTimer?: ReturnType<typeof setTimeout>;
+};
+type SetTargetingForGptAsync = (...args: unknown[]) => unknown;
 
 let publisherAdUnitSnapshots = new Map<string, PublisherAdUnitSnapshot>();
 let syntheticRefreshAdUnits = new WeakSet<TrustedServerAdUnit>();
@@ -577,8 +583,24 @@ function clearRefreshTargeting(slot: RefreshGptSlot): void {
 }
 
 function removePublisherDeliveryContext(context: PublisherDeliveryContext): void {
+  if (context.cleanupTimer !== undefined) {
+    clearTimeout(context.cleanupTimer);
+    context.cleanupTimer = undefined;
+  }
   const index = activePublisherDeliveryContexts.lastIndexOf(context);
   if (index >= 0) activePublisherDeliveryContexts.splice(index, 1);
+}
+
+function targetingCoversPublisherDeliveryContext(
+  adUnitCodes: unknown,
+  context: PublisherDeliveryContext
+): boolean {
+  if (adUnitCodes === undefined) return context.remainingCodes.size > 0;
+  const codes = typeof adUnitCodes === 'string' ? [adUnitCodes] : adUnitCodes;
+  return (
+    Array.isArray(codes) &&
+    codes.some((code) => typeof code === 'string' && context.remainingCodes.has(code))
+  );
 }
 
 function consumeBarePublisherDeliveryContext(): boolean {
@@ -586,6 +608,7 @@ function consumeBarePublisherDeliveryContext(): boolean {
     const context = activePublisherDeliveryContexts[index];
     if (context.remainingCodes.size === 0) continue;
     context.remainingCodes.clear();
+    removePublisherDeliveryContext(context);
     return true;
   }
   return false;
@@ -594,30 +617,35 @@ function consumeBarePublisherDeliveryContext(): boolean {
 function consumeExplicitPublisherDeliveryContext(targetSlots: RefreshGptSlot[]): boolean {
   if (targetSlots.length === 0) return false;
 
-  for (let index = activePublisherDeliveryContexts.length - 1; index >= 0; index -= 1) {
-    const context = activePublisherDeliveryContexts[index];
-    const coveredCodes: string[] = [];
-    let allCovered = true;
+  // Publishers may include GAM-only slots in the same explicit refresh that
+  // delivers a completed Prebid auction. Attribute the call to delivery when
+  // any slot is covered, while consuming only the covered codes so an
+  // unrelated-only refresh still follows the synthetic auction path.
+  const matches = new Map<PublisherDeliveryContext, Set<string>>();
+  for (const slot of targetSlots) {
+    const injectedSlot = findInjectedSlotForRefresh(slot);
+    const candidates = [refreshSlotElementId(slot), injectedSlot?.div_id];
 
-    for (const slot of targetSlots) {
-      const injectedSlot = findInjectedSlotForRefresh(slot);
-      const candidates = [refreshSlotElementId(slot), injectedSlot?.div_id];
+    for (let index = activePublisherDeliveryContexts.length - 1; index >= 0; index -= 1) {
+      const context = activePublisherDeliveryContexts[index];
       const coveredCode = candidates.find(
         (code): code is string => !!code && context.remainingCodes.has(code)
       );
-      if (!coveredCode) {
-        allCovered = false;
-        break;
-      }
-      coveredCodes.push(coveredCode);
-    }
+      if (!coveredCode) continue;
 
-    if (!allCovered) continue;
-    coveredCodes.forEach((code) => context.remainingCodes.delete(code));
-    return true;
+      const contextMatches = matches.get(context) ?? new Set<string>();
+      contextMatches.add(coveredCode);
+      matches.set(context, contextMatches);
+      break;
+    }
   }
 
-  return false;
+  if (matches.size === 0) return false;
+  for (const [context, coveredCodes] of matches) {
+    coveredCodes.forEach((code) => context.remainingCodes.delete(code));
+    if (context.remainingCodes.size === 0) removePublisherDeliveryContext(context);
+  }
+  return true;
 }
 
 function collectAuctionEids(): AuctionEid[] | undefined {
@@ -658,7 +686,7 @@ function collectAuctionEids(): AuctionEid[] | undefined {
 export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs {
   publisherAdUnitSnapshots = new Map();
   syntheticRefreshAdUnits = new WeakSet();
-  activePublisherDeliveryContexts.length = 0;
+  [...activePublisherDeliveryContexts].forEach(removePublisherDeliveryContext);
 
   const injected = getInjectedConfig();
   const merged: PrebidNpmConfig = {
@@ -836,14 +864,43 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
 
       const context: PublisherDeliveryContext = {
         remainingCodes: new Set(publisherAdUnitCodes),
+        retainForTargetedRefresh: false,
       };
-      // Delivery attribution is intentionally synchronous and ends as soon as
-      // the publisher's original callback returns.
+      const targetingPbjs = pbjs as unknown as {
+        setTargetingForGPTAsync?: SetTargetingForGptAsync;
+      };
+      const originalSetTargeting = targetingPbjs.setTargetingForGPTAsync;
+      let targetingWrapper: SetTargetingForGptAsync | undefined;
+      if (typeof originalSetTargeting === 'function') {
+        targetingWrapper = (...targetingArgs: unknown[]) => {
+          const result = originalSetTargeting.apply(targetingPbjs, targetingArgs);
+          if (targetingCoversPublisherDeliveryContext(targetingArgs[0], context)) {
+            context.retainForTargetedRefresh = true;
+          }
+          return result;
+        };
+        targetingPbjs.setTargetingForGPTAsync = targetingWrapper;
+      }
+
       activePublisherDeliveryContexts.push(context);
       try {
         originalBidsBack.apply(this, args as Parameters<typeof originalBidsBack>);
       } finally {
-        removePublisherDeliveryContext(context);
+        if (targetingWrapper && targetingPbjs.setTargetingForGPTAsync === targetingWrapper) {
+          targetingPbjs.setTargetingForGPTAsync = originalSetTargeting;
+        }
+        if (context.retainForTargetedRefresh && context.remainingCodes.size > 0) {
+          // Some publisher wrappers set targeting in bidsBackHandler, return,
+          // and schedule the matching GPT refresh shortly afterward. Retain
+          // this one-shot context only after that targeting signal, with a
+          // bounded expiry so a later independent refresh remains independent.
+          context.cleanupTimer = setTimeout(
+            () => removePublisherDeliveryContext(context),
+            PUBLISHER_DELIVERY_CONTEXT_TIMEOUT_MS
+          );
+        } else {
+          removePublisherDeliveryContext(context);
+        }
       }
     };
 
