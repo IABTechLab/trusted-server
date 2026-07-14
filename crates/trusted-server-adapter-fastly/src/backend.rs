@@ -64,6 +64,7 @@ pub struct BackendConfig<'a> {
     first_byte_timeout: Duration,
     between_bytes_timeout: Duration,
     host_header_override: Option<&'a str>,
+    discriminator: Option<&'a str>,
 }
 
 impl<'a> BackendConfig<'a> {
@@ -81,6 +82,7 @@ impl<'a> BackendConfig<'a> {
             first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
             between_bytes_timeout: DEFAULT_BETWEEN_BYTES_TIMEOUT,
             host_header_override: None,
+            discriminator: None,
         }
     }
 
@@ -128,14 +130,30 @@ impl<'a> BackendConfig<'a> {
         self
     }
 
+    /// Set an optional stable discriminator folded into the backend name.
+    ///
+    /// Two callers targeting the same origin with the same transport timeout
+    /// otherwise share a backend name. Auction response correlation keys on the
+    /// backend name, so a shared name would let one provider's response be
+    /// parsed as another's. A per-provider discriminator keeps the names
+    /// distinct while staying stable across requests.
+    #[must_use]
+    pub fn discriminator(mut self, discriminator: Option<&'a str>) -> Self {
+        self.discriminator = discriminator;
+        self
+    }
+
     /// Compute the deterministic backend name and resolved port without
     /// registering anything.
     ///
-    /// The name encodes scheme, host, port, certificate setting, and
-    /// first-byte timeout so that backends with different configurations
-    /// never collide.  Including the timeout prevents "first-registration-wins"
-    /// poisoning where a later request for the same origin with a tighter
-    /// timeout would silently inherit the original registration's value.
+    /// The name encodes scheme, host, port, certificate setting, optional
+    /// discriminator, and the first-byte/between-bytes timeouts so that
+    /// backends with different configurations never collide.  Including the
+    /// timeout prevents "first-registration-wins" poisoning where a later
+    /// request for the same origin with a tighter timeout would silently
+    /// inherit the original registration's value. Including the discriminator
+    /// keeps two callers that target the same origin with the same timeout
+    /// (e.g. two auction providers behind one gateway) on distinct backends.
     fn compute_name(&self) -> Result<(String, u16), Report<TrustedServerError>> {
         if self.host.is_empty() {
             return Err(Report::new(TrustedServerError::Proxy {
@@ -174,13 +192,18 @@ impl<'a> BackendConfig<'a> {
         } else {
             "_nocert"
         };
+        let discriminator_suffix = self
+            .discriminator
+            .map(|d| format!("_p_{}", sanitize_backend_name_component(d)))
+            .unwrap_or_default();
         let first_byte_timeout_ms = self.first_byte_timeout.as_millis();
         let between_bytes_timeout_ms = self.between_bytes_timeout.as_millis();
         let backend_name = format!(
-            "backend_{}{}{}_fb{}_bb{}",
+            "backend_{}{}{}{}_fb{}_bb{}",
             sanitize_backend_name_component(&name_base),
             host_override_suffix,
             cert_suffix,
+            discriminator_suffix,
             first_byte_timeout_ms,
             between_bytes_timeout_ms
         );

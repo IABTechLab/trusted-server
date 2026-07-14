@@ -649,6 +649,33 @@ pub(crate) fn noop_services_with_client_ip(ip: IpAddr) -> RuntimeServices {
         .build()
 }
 
+/// Build a [`RuntimeServices`] with a caller-supplied [`PlatformBackend`] and
+/// HTTP client.
+///
+/// Lets auction tests inject a backend whose
+/// [`PlatformBackend::canonicalize_transport_timeout_ms`] returns a controlled
+/// value, so the orchestrator's transport-timeout wiring can be asserted
+/// deterministically without depending on wall-clock timing.
+pub(crate) fn build_services_with_backend_and_http_client(
+    backend: Arc<dyn PlatformBackend>,
+    http_client: Arc<dyn PlatformHttpClient>,
+) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(backend)
+        .http_client(http_client)
+        .geo(Arc::new(NoopGeo))
+        .client_info(ClientInfo {
+            client_ip: None,
+            tls_protocol: None,
+            tls_cipher: None,
+            ..ClientInfo::default()
+        })
+        .build()
+}
+
 /// Build a [`RuntimeServices`] with a custom secret store, [`StubBackend`], and HTTP client.
 pub(crate) fn build_services_with_secret_and_http_client(
     secret_store: impl PlatformSecretStore + 'static,
@@ -856,6 +883,7 @@ mod tests {
             certificate_check: true,
             first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
             between_bytes_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
+            discriminator: None,
         };
         let name = stub.ensure(&spec).expect("should return a backend name");
         assert_eq!(name, "stub-backend", "should return fixed name");

@@ -157,64 +157,6 @@ fn remaining_budget_ms(start: Instant, timeout_ms: u32) -> u32 {
     timeout_ms.saturating_sub(elapsed)
 }
 
-/// Transport-timeout quantum for auction backends.
-///
-/// See [`quantize_transport_timeout_ms`] for why provider transport timeouts
-/// are rounded to this granularity.
-const TRANSPORT_TIMEOUT_QUANTUM_MS: u32 = 250;
-
-/// Round a transport timeout down to a [`TRANSPORT_TIMEOUT_QUANTUM_MS`] multiple.
-///
-/// The Fastly adapter embeds the first-byte and between-bytes timeouts in the
-/// dynamic backend name so a registration can never be silently reused with a
-/// different transport configuration. Deriving those timeouts from the
-/// remaining wall-clock budget minted a new backend name on nearly every
-/// request, which defeated cross-request TCP/TLS connection reuse (Fastly
-/// pools connections per backend name) and accumulated registrations toward
-/// the per-service dynamic backend limit.
-///
-/// Quantizing the value — not just the name — keeps the registered backend
-/// configuration aligned with its name. Rounding down never extends a
-/// transport cap past the auction deadline, which matters on the mediator and
-/// dispatched-collect paths where the backend timeouts (not a select-loop
-/// deadline check) bound the `</body>` hold.
-#[inline]
-fn quantize_transport_timeout_ms(timeout_ms: u32) -> u32 {
-    (timeout_ms / TRANSPORT_TIMEOUT_QUANTUM_MS) * TRANSPORT_TIMEOUT_QUANTUM_MS
-}
-
-/// Compute the transport timeout for a provider launch from the remaining
-/// auction budget and the provider's configured timeout.
-///
-/// The configured timeout is a per-provider constant, so using it verbatim
-/// already yields a stable backend name — including configured values below
-/// one quantum, which must not be rounded away or the provider could never
-/// launch. Only when the remaining budget is the binding constraint does the
-/// wall-clock-derived value enter the name, and that value is quantized via
-/// [`quantize_transport_timeout_ms`] so it cannot mint a new backend name on
-/// every request.
-///
-/// A remaining budget below one quantum is passed through exactly rather
-/// than rounded to zero: rounding up would extend the transport cap past the
-/// deadline, and rounding down would skip the launch and hard-fail auctions
-/// whose configured budget is under one quantum. Name churn in this regime
-/// is bounded to sub-quantum values and matches the pre-quantization
-/// behavior. The result never exceeds `remaining_ms` and is zero only when
-/// `remaining_ms` or `configured_ms` is zero, which callers treat as
-/// "budget exhausted — skip the launch".
-#[inline]
-fn effective_transport_timeout_ms(remaining_ms: u32, configured_ms: u32) -> u32 {
-    if remaining_ms >= configured_ms {
-        return configured_ms;
-    }
-    let quantized = quantize_transport_timeout_ms(remaining_ms);
-    if quantized == 0 {
-        remaining_ms
-    } else {
-        quantized
-    }
-}
-
 /// Manages auction execution across multiple providers.
 pub struct AuctionOrchestrator {
     config: AuctionConfig,
@@ -338,11 +280,16 @@ impl AuctionOrchestrator {
             // Give the mediator only the remaining time from the auction
             // deadline, not the full timeout — the bidding phase already
             // consumed part of it, and the mediator has no select-loop
-            // deadline backstop. Quantized for backend-name stability (see
-            // effective_transport_timeout_ms).
+            // deadline backstop. The platform canonicalizes the value for
+            // backend-name stability (see
+            // `PlatformBackend::canonicalize_transport_timeout_ms`); it never
+            // exceeds the remaining budget. See the transport-deadline note on
+            // `run_providers_parallel` for the limits of this bound.
             let remaining_ms = remaining_budget_ms(mediation_start, context.timeout_ms);
-            let mediator_timeout =
-                effective_transport_timeout_ms(remaining_ms, mediator.timeout_ms());
+            let mediator_timeout = context
+                .services
+                .backend()
+                .canonicalize_transport_timeout_ms(remaining_ms, mediator.timeout_ms());
 
             if mediator_timeout == 0 {
                 log::warn!("Auction timeout exhausted during bidding phase; skipping mediator");
@@ -525,11 +472,14 @@ impl AuctionOrchestrator {
 
             // Give each provider only the remaining time from the auction
             // deadline so that backend transport timeouts do not extend past
-            // the overall budget, quantized for backend-name stability (see
-            // effective_transport_timeout_ms).
+            // the overall budget. The platform canonicalizes the value for
+            // backend-name stability (see
+            // `PlatformBackend::canonicalize_transport_timeout_ms`).
             let remaining_ms = remaining_budget_ms(auction_start, context.timeout_ms);
-            let effective_timeout =
-                effective_transport_timeout_ms(remaining_ms, provider.timeout_ms());
+            let effective_timeout = context
+                .services
+                .backend()
+                .canonicalize_transport_timeout_ms(remaining_ms, provider.timeout_ms());
 
             if effective_timeout == 0 {
                 log::warn!("Auction timeout exhausted before launching provider request; skipping");
@@ -580,15 +530,35 @@ impl AuctionOrchestrator {
                             );
                             backend_name.clone()
                         });
-                    backend_to_provider.insert(
-                        request_backend_name.clone(),
-                        (provider.provider_name(), start_time, provider.as_ref()),
-                    );
-                    pending_requests.push(pending);
-                    log::debug!(
-                        "Request to '{}' launched successfully",
-                        provider.provider_name()
-                    );
+                    // Responses are correlated back to providers by backend
+                    // name. If another provider this auction already claimed
+                    // this name (e.g. two providers on one origin whose specs
+                    // canonicalize to the same backend), inserting here would
+                    // silently overwrite the first mapping and misattribute or
+                    // drop a response. Fail this launch attributably instead.
+                    if backend_to_provider.contains_key(&request_backend_name) {
+                        let response_time_ms = start_time.elapsed().as_millis() as u64;
+                        log::warn!(
+                            "Provider '{}' resolved to backend name '{}' already claimed by another \
+                             provider this auction; skipping launch to avoid response misattribution",
+                            provider.provider_name(),
+                            request_backend_name,
+                        );
+                        responses.push(provider_launch_failed_response(
+                            provider.provider_name(),
+                            response_time_ms,
+                        ));
+                    } else {
+                        backend_to_provider.insert(
+                            request_backend_name.clone(),
+                            (provider.provider_name(), start_time, provider.as_ref()),
+                        );
+                        pending_requests.push(pending);
+                        log::debug!(
+                            "Request to '{}' launched successfully",
+                            provider.provider_name()
+                        );
+                    }
                 }
                 Err(e) => {
                     let response_time_ms = start_time.elapsed().as_millis() as u64;
@@ -621,14 +591,25 @@ impl AuctionOrchestrator {
         );
 
         // Phase 2: Wait for responses using select() to process as they become ready.
-        // Enforce the auction deadline: after each select() returns, check
-        // elapsed time and drop remaining requests if the timeout is exceeded.
+        // After each select() returns, check elapsed time and drop remaining
+        // requests once the auction deadline passes.
         //
-        // NOTE: `select()` blocks until at least one backend responds and, on
-        // some adapters, buffers the selected response body before returning.
-        // Hard deadline enforcement therefore depends on every backend's
-        // first-byte and between-bytes timeouts being set to at most the
-        // remaining auction budget, which Phase 1 above guarantees.
+        // TRANSPORT-DEADLINE NOTE: this select loop is the only *absolute*
+        // wall-clock bound on the parallel path — it drops still-pending
+        // requests once `auction_start.elapsed()` exceeds the deadline. The
+        // per-backend transport timeouts set in Phase 1 are a complementary,
+        // not equivalent, bound: Fastly's connect timeout is a fixed ~1s, the
+        // first-byte timeout only starts after the connection is established,
+        // and the between-bytes timeout is an inactivity timer that resets on
+        // every byte received. A backend that connects slowly or trickles one
+        // byte just inside the between-bytes window can therefore outlive the
+        // configured budget. Bounding them to the remaining budget (Phase 1)
+        // guarantees they never *extend past* the deadline by their own
+        // configuration, but does not by itself enforce a hard total-response
+        // deadline. Paths without this select loop (the mediator and the
+        // dispatched-collect body read) inherit that weaker bound; a true
+        // absolute deadline carried through the platform HTTP API is tracked
+        // as follow-up work (see the streaming/deadline effort, #849).
         let mut remaining = pending_requests;
 
         while !remaining.is_empty() {
@@ -937,11 +918,13 @@ impl AuctionOrchestrator {
                 continue;
             }
 
-            // Remaining budget quantized for backend-name stability (see
-            // effective_transport_timeout_ms).
+            // Remaining budget canonicalized by the platform for backend-name
+            // stability (see `PlatformBackend::canonicalize_transport_timeout_ms`).
             let remaining_ms = remaining_budget_ms(auction_start, context.timeout_ms);
-            let effective_timeout =
-                effective_transport_timeout_ms(remaining_ms, provider.timeout_ms());
+            let effective_timeout = context
+                .services
+                .backend()
+                .canonicalize_transport_timeout_ms(remaining_ms, provider.timeout_ms());
 
             if effective_timeout == 0 {
                 log::warn!(
@@ -974,21 +957,39 @@ impl AuctionOrchestrator {
             let start_time = Instant::now();
             match provider.request_bids(request, &provider_context).await {
                 Ok(pending) => {
-                    log::info!(
-                        "Dispatching bid request to '{}' (backend: {}, budget: {}ms)",
-                        provider.provider_name(),
-                        backend_name,
-                        effective_timeout
-                    );
-                    backend_to_provider.insert(
-                        backend_name.clone(),
-                        (
-                            provider.provider_name().to_string(),
-                            start_time,
-                            Arc::clone(provider),
-                        ),
-                    );
-                    pending_requests.push(pending.with_backend_name(backend_name));
+                    // See the parallel path: a backend name already claimed by
+                    // another provider this auction would misattribute the
+                    // collected response, so fail this launch attributably
+                    // rather than overwrite the mapping.
+                    if backend_to_provider.contains_key(&backend_name) {
+                        let response_time_ms = start_time.elapsed().as_millis() as u64;
+                        log::warn!(
+                            "Provider '{}' resolved to backend name '{}' already claimed by another \
+                             provider this auction; skipping dispatch to avoid response misattribution",
+                            provider.provider_name(),
+                            backend_name,
+                        );
+                        launch_responses.push(provider_launch_failed_response(
+                            provider.provider_name(),
+                            response_time_ms,
+                        ));
+                    } else {
+                        log::info!(
+                            "Dispatching bid request to '{}' (backend: {}, budget: {}ms)",
+                            provider.provider_name(),
+                            backend_name,
+                            effective_timeout
+                        );
+                        backend_to_provider.insert(
+                            backend_name.clone(),
+                            (
+                                provider.provider_name().to_string(),
+                                start_time,
+                                Arc::clone(provider),
+                            ),
+                        );
+                        pending_requests.push(pending.with_backend_name(backend_name));
+                    }
                 }
                 Err(e) => {
                     let response_time_ms = start_time.elapsed().as_millis() as u64;
@@ -1189,21 +1190,27 @@ impl AuctionOrchestrator {
             match self.providers.get(mediator_name.as_str()) {
                 Some(mediator) => {
                     // Cap the mediator at whichever is tighter: its own configured
-                    // timeout or the remaining auction budget (A_deadline).  The old
-                    // comment here claimed origin drain could exhaust the budget before
-                    // collection, but SSP backends are given first-byte and between-bytes
-                    // timeouts equal to effective_timeout (capped at their provider
-                    // timeout) at dispatch time, so they cannot run past A_deadline
-                    // independently. Giving the mediator an uncapped timeout lets it run
-                    // past A_deadline, violating the bounded hold invariant.
-                    // The mediator's only time bound on this path is its
-                    // backend transport timeout, so the effective value must
-                    // never exceed the remaining budget. Quantized for
-                    // backend-name stability (see
-                    // effective_transport_timeout_ms).
+                    // timeout or the remaining auction budget (A_deadline). Giving
+                    // the mediator an uncapped timeout would let it hold `</body>`
+                    // well past A_deadline, so the effective value must never
+                    // exceed the remaining budget.
+                    //
+                    // Caveat: unlike the parallel select loop, this path has no
+                    // absolute wall-clock backstop around the mediator call, and a
+                    // backend transport timeout bounds first-byte/inactivity rather
+                    // than total response time (see the transport-deadline note on
+                    // `run_providers_parallel`). Capping the value to the remaining
+                    // budget therefore prevents the mediator from *extending* the
+                    // hold by its own configuration, but a slow-connecting or
+                    // byte-trickling mediator can still overrun; a true absolute
+                    // deadline is tracked as follow-up (#849).
+                    //
+                    // The platform canonicalizes the value for backend-name
+                    // stability (see `PlatformBackend::canonicalize_transport_timeout_ms`).
                     let remaining = remaining_budget_ms(auction_start, timeout_ms);
-                    let mediator_timeout =
-                        effective_transport_timeout_ms(remaining, mediator.timeout_ms());
+                    let mediator_timeout = services
+                        .backend()
+                        .canonicalize_transport_timeout_ms(remaining, mediator.timeout_ms());
                     if mediator_timeout == 0 {
                         log::warn!(
                             "A_deadline exhausted before mediator '{}' — returning {} SSP bids without mediation",
@@ -1397,9 +1404,13 @@ mod tests {
         MediaType, PublisherInfo, UserInfo,
     };
     use crate::error::TrustedServerError;
-    use crate::platform::test_support::{build_services_with_http_client, StubHttpClient};
+    use crate::platform::test_support::{
+        build_services_with_backend_and_http_client, build_services_with_http_client,
+        StubHttpClient,
+    };
     use crate::platform::{
-        PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, RuntimeServices,
+        PlatformBackend, PlatformBackendSpec, PlatformError, PlatformHttpRequest,
+        PlatformPendingRequest, PlatformResponse, RuntimeServices,
     };
     use crate::test_support::tests::crate_test_settings_str;
     use error_stack::{Report, ResultExt};
@@ -1412,15 +1423,19 @@ mod tests {
     // Minimal test double for AuctionProvider
     // ---------------------------------------------------------------------------
 
-    /// Minimal stub provider. Optionally records every transport timeout it
-    /// observes — the value passed to `backend_name` and the
-    /// `context.timeout_ms` handed to `request_bids` — so tests can assert
-    /// the orchestrator quantizes them.
+    /// Minimal stub provider. Optionally records the transport timeouts it
+    /// observes, keeping the value passed to `backend_name` (which derives the
+    /// predicted backend name) separate from the `context.timeout_ms` handed to
+    /// `request_bids` (which configures the registered request). Recording them
+    /// separately lets tests assert the orchestrator hands the *same*
+    /// canonicalized value to both — a divergence would land responses in the
+    /// "unknown backend" branch and drop bids.
     struct StubAuctionProvider {
         name: &'static str,
         backend: &'static str,
         configured_timeout_ms: u32,
-        observed_timeouts: Option<Arc<Mutex<Vec<u32>>>>,
+        predicted_timeouts: Option<Arc<Mutex<Vec<u32>>>>,
+        request_timeouts: Option<Arc<Mutex<Vec<u32>>>>,
     }
 
     impl StubAuctionProvider {
@@ -1429,7 +1444,8 @@ mod tests {
                 name,
                 backend,
                 configured_timeout_ms: 2000,
-                observed_timeouts: None,
+                predicted_timeouts: None,
+                request_timeouts: None,
             }
         }
 
@@ -1437,18 +1453,20 @@ mod tests {
             name: &'static str,
             backend: &'static str,
             configured_timeout_ms: u32,
-            observed_timeouts: Arc<Mutex<Vec<u32>>>,
+            predicted_timeouts: Arc<Mutex<Vec<u32>>>,
+            request_timeouts: Arc<Mutex<Vec<u32>>>,
         ) -> Self {
             Self {
                 name,
                 backend,
                 configured_timeout_ms,
-                observed_timeouts: Some(observed_timeouts),
+                predicted_timeouts: Some(predicted_timeouts),
+                request_timeouts: Some(request_timeouts),
             }
         }
 
-        fn record(&self, timeout_ms: u32) {
-            if let Some(observed) = &self.observed_timeouts {
+        fn record(slot: &Option<Arc<Mutex<Vec<u32>>>>, timeout_ms: u32) {
+            if let Some(observed) = slot {
                 observed
                     .lock()
                     .expect("should lock observed timeouts")
@@ -1468,7 +1486,7 @@ mod tests {
             _request: &AuctionRequest,
             context: &AuctionContext<'_>,
         ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
-            self.record(context.timeout_ms);
+            Self::record(&self.request_timeouts, context.timeout_ms);
             let req = PlatformHttpRequest::new(
                 http::Request::builder()
                     .method("POST")
@@ -1504,7 +1522,7 @@ mod tests {
         }
 
         fn backend_name(&self, _services: &RuntimeServices, timeout_ms: u32) -> Option<String> {
-            self.record(timeout_ms);
+            Self::record(&self.predicted_timeouts, timeout_ms);
             Some(self.backend.to_string())
         }
     }
@@ -2038,94 +2056,71 @@ mod tests {
         );
     }
 
-    #[test]
-    fn quantize_transport_timeout_floors_to_quantum() {
-        assert_eq!(
-            super::quantize_transport_timeout_ms(0),
-            0,
-            "should keep zero at zero"
-        );
-        assert_eq!(
-            super::quantize_transport_timeout_ms(249),
-            0,
-            "should floor a sub-quantum budget to zero"
-        );
-        assert_eq!(
-            super::quantize_transport_timeout_ms(250),
-            250,
-            "should keep an exact quantum multiple unchanged"
-        );
-        assert_eq!(
-            super::quantize_transport_timeout_ms(999),
-            750,
-            "should floor to the next-lower quantum multiple"
-        );
-        assert_eq!(
-            super::quantize_transport_timeout_ms(2000),
-            2000,
-            "should keep a larger exact quantum multiple unchanged"
-        );
+    /// Test backend whose [`PlatformBackend::canonicalize_transport_timeout_ms`]
+    /// returns a fixed value regardless of the wall-clock budget, so the
+    /// orchestrator's transport-timeout wiring can be asserted without timing
+    /// flakiness. Records every `(remaining_ms, configured_ms)` pair it sees.
+    ///
+    /// The exact quantization arithmetic lives in the Fastly adapter (the only
+    /// platform that overrides `canonicalize_transport_timeout_ms`); these core
+    /// tests only prove the orchestrator applies whatever the platform returns
+    /// and applies it identically to the predicted name and the launched
+    /// request.
+    struct CanonicalTimeoutBackend {
+        canonical_ms: u32,
+        calls: Arc<Mutex<Vec<(u32, u32)>>>,
+    }
+
+    impl CanonicalTimeoutBackend {
+        fn new(canonical_ms: u32, calls: Arc<Mutex<Vec<(u32, u32)>>>) -> Self {
+            Self {
+                canonical_ms,
+                calls,
+            }
+        }
+    }
+
+    impl PlatformBackend for CanonicalTimeoutBackend {
+        fn predict_name(
+            &self,
+            _spec: &PlatformBackendSpec,
+        ) -> Result<String, Report<PlatformError>> {
+            Ok("stub-backend".to_owned())
+        }
+
+        fn ensure(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+            Ok("stub-backend".to_owned())
+        }
+
+        fn canonicalize_transport_timeout_ms(&self, remaining_ms: u32, configured_ms: u32) -> u32 {
+            self.calls
+                .lock()
+                .expect("should lock canonicalize calls")
+                .push((remaining_ms, configured_ms));
+            self.canonical_ms
+        }
     }
 
     #[test]
-    fn effective_transport_timeout_prefers_configured_constant() {
-        assert_eq!(
-            super::effective_transport_timeout_ms(2000, 1000),
-            1000,
-            "should use the configured timeout verbatim when the budget allows"
-        );
-        assert_eq!(
-            super::effective_transport_timeout_ms(2000, 100),
-            100,
-            "should preserve a sub-quantum configured timeout — quantizing it away would permanently disable the provider"
-        );
-        assert_eq!(
-            super::effective_transport_timeout_ms(999, 2000),
-            750,
-            "should quantize the budget-bound value down to the 750ms bucket"
-        );
-        assert_eq!(
-            super::effective_transport_timeout_ms(300, 2000),
-            250,
-            "should quantize a tight budget down to one quantum"
-        );
-        assert_eq!(
-            super::effective_transport_timeout_ms(200, 2000),
-            200,
-            "should pass a sub-quantum budget through exactly instead of rounding to zero"
-        );
-        assert_eq!(
-            super::effective_transport_timeout_ms(50, 100),
-            50,
-            "should pass through when the budget is below both the quantum and the configured timeout"
-        );
-        assert_eq!(
-            super::effective_transport_timeout_ms(0, 1000),
-            0,
-            "should return zero for an exhausted budget so the launch is skipped"
-        );
-        assert_eq!(
-            super::effective_transport_timeout_ms(100, 0),
-            0,
-            "should return zero for a zero configured timeout so the launch is skipped"
-        );
-    }
-
-    #[test]
-    fn sub_quantum_configured_timeout_still_launches_provider() {
+    fn parallel_launch_applies_canonical_timeout_to_name_and_request() {
         futures::executor::block_on(async {
-            // A provider whose configured timeout is below one quantum must
-            // still launch with its exact configured value: the constant is
-            // name-stable on its own, so only budget-derived values are
-            // quantized.
+            // The orchestrator must hand the platform-canonicalized value to
+            // BOTH `backend_name` (which derives the correlation key) and
+            // `request_bids` (via `context.timeout_ms`). Recording them
+            // separately and asserting exact equality catches a regression that
+            // predicts one bucket but registers another — which would drop the
+            // response into the "unknown backend" branch.
             let stub = Arc::new(StubHttpClient::new());
             stub.push_response(200, b"{}".to_vec());
-            let services = build_services_with_http_client(stub);
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let backend = Arc::new(CanonicalTimeoutBackend::new(750, Arc::clone(&calls)));
+            let services = build_services_with_backend_and_http_client(backend, stub);
             // SAFETY: `Box::leak` creates a `'static` reference for test use only.
             // The leaked allocation is bounded to the test process lifetime.
             let services: &'static RuntimeServices = Box::leak(Box::new(services));
 
-            let observed = Arc::new(Mutex::new(Vec::new()));
+            let predicted = Arc::new(Mutex::new(Vec::new()));
+            let requested = Arc::new(Mutex::new(Vec::new()));
             let config = AuctionConfig {
                 enabled: true,
                 providers: vec!["bidder".to_string()],
@@ -2137,8 +2132,9 @@ mod tests {
             orchestrator.register_provider(Arc::new(StubAuctionProvider::recording(
                 "bidder",
                 "bidder-backend",
-                100,
-                Arc::clone(&observed),
+                1000,
+                Arc::clone(&predicted),
+                Arc::clone(&requested),
             )));
 
             let request = create_test_auction_request();
@@ -2161,176 +2157,110 @@ mod tests {
                 .await
                 .expect("should complete auction");
 
-            let observed = observed.lock().expect("should lock observed timeouts");
-            assert!(
-                !observed.is_empty(),
-                "should launch the sub-quantum-configured provider"
-            );
-            for timeout in observed.iter() {
-                assert_eq!(
-                    *timeout, 100,
-                    "should pass the configured 100ms timeout through unchanged"
-                );
-            }
-        });
-    }
-
-    #[test]
-    fn parallel_path_quantizes_provider_transport_timeout() {
-        futures::executor::block_on(async {
-            // A 999ms budget must reach the provider as the 750ms quantum
-            // bucket — both in backend_name (which derives the Fastly backend
-            // name) and in context.timeout_ms (which configures the backend
-            // and payload deadlines) — so the backend name stays stable
-            // across requests with slightly different remaining budgets.
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response(200, b"{}".to_vec());
-            let services = build_services_with_http_client(stub);
-            // SAFETY: `Box::leak` creates a `'static` reference for test use only.
-            // The leaked allocation is bounded to the test process lifetime.
-            let services: &'static RuntimeServices = Box::leak(Box::new(services));
-
-            let observed = Arc::new(Mutex::new(Vec::new()));
-            let config = AuctionConfig {
-                enabled: true,
-                providers: vec!["bidder".to_string()],
-                timeout_ms: 999,
-                mediator: None,
-                ..Default::default()
-            };
-            let mut orchestrator = AuctionOrchestrator::new(config);
-            orchestrator.register_provider(Arc::new(StubAuctionProvider::recording(
-                "bidder",
-                "bidder-backend",
-                2000,
-                Arc::clone(&observed),
-            )));
-
-            let request = create_test_auction_request();
-            let settings = create_test_settings();
-            let req = http::Request::builder()
-                .method(http::Method::GET)
-                .uri("https://example.com/test")
-                .body(edgezero_core::body::Body::empty())
-                .expect("should build request");
-            let context = AuctionContext {
-                settings: &settings,
-                request: &req,
-                timeout_ms: 999,
-                provider_responses: None,
-                services,
-            };
-
-            orchestrator
-                .run_auction(&request, &context)
-                .await
-                .expect("should complete auction");
-
-            let observed = observed.lock().expect("should lock observed timeouts");
-            assert!(
-                !observed.is_empty(),
-                "should record provider transport timeouts"
-            );
-            for timeout in observed.iter() {
-                assert!(
-                    *timeout % super::TRANSPORT_TIMEOUT_QUANTUM_MS == 0
-                        && *timeout > 0
-                        && *timeout <= 750,
-                    "should floor the 999ms budget to a quantum bucket at or below 750ms, got {timeout}ms"
-                );
-            }
-        });
-    }
-
-    #[test]
-    fn sub_quantum_budget_launches_with_exact_remaining_timeout() {
-        futures::executor::block_on(async {
-            // A configured auction budget below one quantum must still launch
-            // providers with the exact remaining budget — rounding it to zero
-            // would hard-fail every auction for publishers with sub-250ms
-            // budgets.
-            let stub = Arc::new(StubHttpClient::new());
-            stub.push_response(200, b"{}".to_vec());
-            let services = build_services_with_http_client(stub);
-            // SAFETY: `Box::leak` creates a `'static` reference for test use only.
-            // The leaked allocation is bounded to the test process lifetime.
-            let services: &'static RuntimeServices = Box::leak(Box::new(services));
-
-            let observed = Arc::new(Mutex::new(Vec::new()));
-            let config = AuctionConfig {
-                enabled: true,
-                providers: vec!["bidder".to_string()],
-                timeout_ms: 200,
-                mediator: None,
-                ..Default::default()
-            };
-            let mut orchestrator = AuctionOrchestrator::new(config);
-            orchestrator.register_provider(Arc::new(StubAuctionProvider::recording(
-                "bidder",
-                "bidder-backend",
-                2000,
-                Arc::clone(&observed),
-            )));
-
-            let request = create_test_auction_request();
-            let settings = create_test_settings();
-            let req = http::Request::builder()
-                .method(http::Method::GET)
-                .uri("https://example.com/test")
-                .body(edgezero_core::body::Body::empty())
-                .expect("should build request");
-            let context = AuctionContext {
-                settings: &settings,
-                request: &req,
-                timeout_ms: 200,
-                provider_responses: None,
-                services,
-            };
-
-            let result = orchestrator
-                .run_auction(&request, &context)
-                .await
-                .expect("should complete auction with a sub-quantum budget");
-
+            let predicted = predicted.lock().expect("should lock predicted");
+            let requested = requested.lock().expect("should lock requested");
             assert_eq!(
-                result.provider_responses.len(),
-                1,
-                "should launch the provider despite the sub-quantum budget"
+                *predicted,
+                vec![750],
+                "backend_name should receive the canonicalized value"
             );
-            let observed = observed.lock().expect("should lock observed timeouts");
+            assert_eq!(
+                *requested,
+                vec![750],
+                "request_bids should receive the same canonicalized value"
+            );
+            assert_eq!(
+                *predicted, *requested,
+                "predicted and registered transport timeouts must be identical"
+            );
+
+            let calls = calls.lock().expect("should lock calls");
+            assert_eq!(calls.len(), 1, "should canonicalize once for the launch");
+            let (remaining_ms, configured_ms) = calls[0];
+            assert_eq!(
+                configured_ms, 1000,
+                "should pass the provider's configured timeout as the configured bound"
+            );
             assert!(
-                !observed.is_empty(),
-                "should record provider transport timeouts"
+                remaining_ms > 0 && remaining_ms <= 2000,
+                "should pass the live remaining budget, got {remaining_ms}ms"
             );
-            for timeout in observed.iter() {
-                assert!(
-                    *timeout > 0 && *timeout <= 200,
-                    "should pass the exact sub-quantum remaining budget through, got {timeout}ms"
-                );
-            }
         });
     }
 
     #[test]
-    fn synchronous_mediation_quantizes_mediator_timeout() {
+    fn zero_canonical_timeout_skips_parallel_launch() {
         futures::executor::block_on(async {
-            // The mediator has no select-loop deadline backstop, so its
-            // transport timeout must be quantized by rounding down: a
-            // quantum-aligned value no larger than the remaining budget.
+            // A platform that canonicalizes to zero signals "budget exhausted";
+            // the orchestrator must skip the launch. With the only provider
+            // skipped, no requests launch and the auction errors.
+            let stub = Arc::new(StubHttpClient::new());
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let backend = Arc::new(CanonicalTimeoutBackend::new(0, Arc::clone(&calls)));
+            let services = build_services_with_backend_and_http_client(backend, stub);
+            // SAFETY: `Box::leak` creates a `'static` reference for test use only.
+            // The leaked allocation is bounded to the test process lifetime.
+            let services: &'static RuntimeServices = Box::leak(Box::new(services));
+
+            let config = AuctionConfig {
+                enabled: true,
+                providers: vec!["bidder".to_string()],
+                timeout_ms: 2000,
+                mediator: None,
+                ..Default::default()
+            };
+            let mut orchestrator = AuctionOrchestrator::new(config);
+            orchestrator.register_provider(Arc::new(StubAuctionProvider::new(
+                "bidder",
+                "bidder-backend",
+            )));
+
+            let request = create_test_auction_request();
+            let settings = create_test_settings();
+            let req = http::Request::builder()
+                .method(http::Method::GET)
+                .uri("https://example.com/test")
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build request");
+            let context = AuctionContext {
+                settings: &settings,
+                request: &req,
+                timeout_ms: 2000,
+                provider_responses: None,
+                services,
+            };
+
+            let result = orchestrator.run_auction(&request, &context).await;
+            assert!(
+                result.is_err(),
+                "should error when the only provider is skipped for an exhausted budget"
+            );
+        });
+    }
+
+    #[test]
+    fn synchronous_mediation_applies_canonical_timeout_to_mediator() {
+        futures::executor::block_on(async {
+            // The mediator runs after the bidding phase and has no select-loop
+            // backstop; it must still receive the platform-canonicalized value
+            // for both prediction and request.
             let stub = Arc::new(StubHttpClient::new());
             stub.push_response(200, b"{}".to_vec()); // bidder send_async
             stub.push_response(200, b"{}".to_vec()); // mediator send_async
-            let services = build_services_with_http_client(stub);
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let backend = Arc::new(CanonicalTimeoutBackend::new(500, Arc::clone(&calls)));
+            let services = build_services_with_backend_and_http_client(backend, stub);
             // SAFETY: `Box::leak` creates a `'static` reference for test use only.
             // The leaked allocation is bounded to the test process lifetime.
             let services: &'static RuntimeServices = Box::leak(Box::new(services));
 
-            let observed = Arc::new(Mutex::new(Vec::new()));
+            let predicted = Arc::new(Mutex::new(Vec::new()));
+            let requested = Arc::new(Mutex::new(Vec::new()));
             let config = AuctionConfig {
                 enabled: true,
                 providers: vec!["bidder".to_string()],
                 mediator: Some("mediator".to_string()),
-                timeout_ms: 999,
+                timeout_ms: 2000,
                 ..Default::default()
             };
             let mut orchestrator = AuctionOrchestrator::new(config);
@@ -2342,7 +2272,8 @@ mod tests {
                 "mediator",
                 "mediator-backend",
                 2000,
-                Arc::clone(&observed),
+                Arc::clone(&predicted),
+                Arc::clone(&requested),
             )));
 
             let request = create_test_auction_request();
@@ -2355,7 +2286,7 @@ mod tests {
             let context = AuctionContext {
                 settings: &settings,
                 request: &req,
-                timeout_ms: 999,
+                timeout_ms: 2000,
                 provider_responses: None,
                 services,
             };
@@ -2365,41 +2296,50 @@ mod tests {
                 .await
                 .expect("should complete mediated auction");
 
-            let observed = observed.lock().expect("should lock observed timeouts");
-            assert!(!observed.is_empty(), "should run the mediator");
-            for timeout in observed.iter() {
-                assert!(
-                    *timeout % super::TRANSPORT_TIMEOUT_QUANTUM_MS == 0,
-                    "mediator timeout {timeout}ms should be quantum-aligned"
-                );
-                assert!(
-                    *timeout > 0 && *timeout <= 750,
-                    "mediator timeout {timeout}ms should be positive and floored below the 999ms budget"
-                );
-            }
+            let predicted = predicted.lock().expect("should lock predicted");
+            let requested = requested.lock().expect("should lock requested");
+            // The orchestrator hands the mediator its budget through
+            // `context.timeout_ms` and calls `request_bids` directly; it does not
+            // call the mediator's `backend_name` (the mediator self-registers its
+            // backend), so only the request side is observed here.
+            assert!(
+                predicted.is_empty(),
+                "orchestrator should not separately predict a backend name for the mediator"
+            );
+            assert_eq!(
+                *requested,
+                vec![500],
+                "mediator request should use the canonical value"
+            );
         });
     }
 
     #[test]
-    fn dispatched_collect_quantizes_mediator_timeout() {
+    fn dispatched_collect_applies_canonical_timeout_to_both_paths() {
         futures::executor::block_on(async {
-            // Same invariant as the synchronous path, on the split
-            // dispatch/collect path used by publisher page rendering.
+            // Same wiring invariant on the split dispatch/collect path used by
+            // publisher page rendering: the dispatched bidder and the collected
+            // mediator both receive the canonicalized value for prediction and
+            // request.
             let stub = Arc::new(StubHttpClient::new());
             stub.push_response(200, b"{}".to_vec()); // bidder send_async
             stub.push_response(200, b"{}".to_vec()); // mediator send_async
-            let services = build_services_with_http_client(stub);
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let backend = Arc::new(CanonicalTimeoutBackend::new(500, Arc::clone(&calls)));
+            let services = build_services_with_backend_and_http_client(backend, stub);
             // SAFETY: `Box::leak` creates a `'static` reference for test use only.
             // The leaked allocation is bounded to the test process lifetime.
             let services: &'static RuntimeServices = Box::leak(Box::new(services));
 
-            let observed_bidder = Arc::new(Mutex::new(Vec::new()));
-            let observed_mediator = Arc::new(Mutex::new(Vec::new()));
+            let bidder_predicted = Arc::new(Mutex::new(Vec::new()));
+            let bidder_requested = Arc::new(Mutex::new(Vec::new()));
+            let mediator_predicted = Arc::new(Mutex::new(Vec::new()));
+            let mediator_requested = Arc::new(Mutex::new(Vec::new()));
             let config = AuctionConfig {
                 enabled: true,
                 providers: vec!["bidder".to_string()],
                 mediator: Some("mediator".to_string()),
-                timeout_ms: 999,
+                timeout_ms: 2000,
                 ..Default::default()
             };
             let mut orchestrator = AuctionOrchestrator::new(config);
@@ -2407,13 +2347,15 @@ mod tests {
                 "bidder",
                 "bidder-backend",
                 2000,
-                Arc::clone(&observed_bidder),
+                Arc::clone(&bidder_predicted),
+                Arc::clone(&bidder_requested),
             )));
             orchestrator.register_provider(Arc::new(StubAuctionProvider::recording(
                 "mediator",
                 "mediator-backend",
                 2000,
-                Arc::clone(&observed_mediator),
+                Arc::clone(&mediator_predicted),
+                Arc::clone(&mediator_requested),
             )));
 
             let request = create_test_auction_request();
@@ -2426,7 +2368,7 @@ mod tests {
             let context = AuctionContext {
                 settings: &settings,
                 request: &req,
-                timeout_ms: 999,
+                timeout_ms: 2000,
                 provider_responses: None,
                 services,
             };
@@ -2439,34 +2381,190 @@ mod tests {
                 .collect_dispatched_auction(dispatched, services, &context)
                 .await;
 
-            let observed_bidder = observed_bidder.lock().expect("should lock bidder timeouts");
-            assert!(
-                !observed_bidder.is_empty(),
-                "should record dispatched bidder timeouts"
-            );
-            for timeout in observed_bidder.iter() {
-                assert!(
-                    *timeout % super::TRANSPORT_TIMEOUT_QUANTUM_MS == 0
-                        && *timeout > 0
-                        && *timeout <= 750,
-                    "dispatched bidder timeout should floor 999ms to a quantum bucket at or below 750ms, got {timeout}ms"
-                );
-            }
-
-            let observed_mediator = observed_mediator
+            let bidder_predicted = bidder_predicted
                 .lock()
-                .expect("should lock mediator timeouts");
-            assert!(!observed_mediator.is_empty(), "should run the mediator");
-            for timeout in observed_mediator.iter() {
-                assert!(
-                    *timeout % super::TRANSPORT_TIMEOUT_QUANTUM_MS == 0,
-                    "mediator timeout {timeout}ms should be quantum-aligned"
-                );
-                assert!(
-                    *timeout > 0 && *timeout <= 750,
-                    "mediator timeout {timeout}ms should be positive and floored below the 999ms budget"
-                );
-            }
+                .expect("should lock bidder predicted");
+            let bidder_requested = bidder_requested
+                .lock()
+                .expect("should lock bidder requested");
+            assert_eq!(
+                *bidder_predicted,
+                vec![500],
+                "dispatched bidder name should use canonical value"
+            );
+            assert_eq!(
+                *bidder_requested,
+                vec![500],
+                "dispatched bidder request should use canonical value"
+            );
+            assert_eq!(
+                *bidder_predicted, *bidder_requested,
+                "dispatched bidder predicted and registered timeouts must be identical"
+            );
+
+            let mediator_predicted = mediator_predicted
+                .lock()
+                .expect("should lock mediator predicted");
+            let mediator_requested = mediator_requested
+                .lock()
+                .expect("should lock mediator requested");
+            // As on the synchronous path, the orchestrator calls the mediator's
+            // `request_bids` directly without predicting a backend name for it.
+            assert!(
+                mediator_predicted.is_empty(),
+                "orchestrator should not separately predict a backend name for the mediator"
+            );
+            assert_eq!(
+                *mediator_requested,
+                vec![500],
+                "mediator request should use the canonical value"
+            );
+        });
+    }
+
+    #[test]
+    fn parallel_duplicate_backend_name_fails_second_provider_attributably() {
+        futures::executor::block_on(async {
+            // Two providers that canonicalize to the SAME backend name (e.g. two
+            // auction providers behind one gateway origin). The correlation map
+            // keys on backend name, so the second must not silently overwrite
+            // the first — it must fail attributably so no bid is misparsed or
+            // lost.
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"{}".to_vec()); // provider-a send_async
+            stub.push_response(200, b"{}".to_vec()); // provider-b send_async (dropped after guard)
+            let services = build_services_with_http_client(stub);
+            // SAFETY: `Box::leak` creates a `'static` reference for test use only.
+            // The leaked allocation is bounded to the test process lifetime.
+            let services: &'static RuntimeServices = Box::leak(Box::new(services));
+
+            let config = AuctionConfig {
+                enabled: true,
+                providers: vec!["provider-a".to_string(), "provider-b".to_string()],
+                timeout_ms: 2000,
+                mediator: None,
+                ..Default::default()
+            };
+            let mut orchestrator = AuctionOrchestrator::new(config);
+            orchestrator.register_provider(Arc::new(StubAuctionProvider::new(
+                "provider-a",
+                "shared-backend",
+            )));
+            orchestrator.register_provider(Arc::new(StubAuctionProvider::new(
+                "provider-b",
+                "shared-backend",
+            )));
+
+            let request = create_test_auction_request();
+            let settings = create_test_settings();
+            let req = http::Request::builder()
+                .method(http::Method::GET)
+                .uri("https://example.com/test")
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build request");
+            let context = AuctionContext {
+                settings: &settings,
+                request: &req,
+                timeout_ms: 2000,
+                provider_responses: None,
+                services,
+            };
+
+            let result = orchestrator
+                .run_auction(&request, &context)
+                .await
+                .expect("should complete auction despite the name collision");
+
+            assert_eq!(
+                result.provider_responses.len(),
+                2,
+                "should account for both providers"
+            );
+            let provider_a = result
+                .provider_responses
+                .iter()
+                .find(|r| r.provider == "provider-a")
+                .expect("should have provider-a response");
+            let provider_b = result
+                .provider_responses
+                .iter()
+                .find(|r| r.provider == "provider-b")
+                .expect("should have provider-b response");
+            assert_eq!(
+                provider_a.status,
+                BidStatus::Success,
+                "the first provider on the shared name should launch and succeed"
+            );
+            assert_eq!(
+                provider_b.status,
+                BidStatus::Error,
+                "the second provider on the shared name should fail attributably, not be dropped"
+            );
+        });
+    }
+
+    #[test]
+    fn dispatched_duplicate_backend_name_fails_second_provider_attributably() {
+        futures::executor::block_on(async {
+            // Same collision defense on the dispatch/collect path.
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"{}".to_vec()); // provider-a send_async
+            stub.push_response(200, b"{}".to_vec()); // provider-b send_async (dropped after guard)
+            let services = build_services_with_http_client(stub);
+            // SAFETY: `Box::leak` creates a `'static` reference for test use only.
+            // The leaked allocation is bounded to the test process lifetime.
+            let services: &'static RuntimeServices = Box::leak(Box::new(services));
+
+            let config = AuctionConfig {
+                enabled: true,
+                providers: vec!["provider-a".to_string(), "provider-b".to_string()],
+                timeout_ms: 2000,
+                mediator: None,
+                ..Default::default()
+            };
+            let mut orchestrator = AuctionOrchestrator::new(config);
+            orchestrator.register_provider(Arc::new(StubAuctionProvider::new(
+                "provider-a",
+                "shared-backend",
+            )));
+            orchestrator.register_provider(Arc::new(StubAuctionProvider::new(
+                "provider-b",
+                "shared-backend",
+            )));
+
+            let request = create_test_auction_request();
+            let settings = create_test_settings();
+            let req = http::Request::builder()
+                .method(http::Method::GET)
+                .uri("https://example.com/test")
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build request");
+            let context = AuctionContext {
+                settings: &settings,
+                request: &req,
+                timeout_ms: 2000,
+                provider_responses: None,
+                services,
+            };
+
+            let dispatched = match orchestrator.dispatch_auction(&request, &context).await {
+                DispatchAuctionOutcome::Dispatched(dispatched) => dispatched,
+                _ => panic!("should dispatch the first provider despite the name collision"),
+            };
+            let result = orchestrator
+                .collect_dispatched_auction(dispatched, services, &context)
+                .await;
+
+            let provider_b = result
+                .provider_responses
+                .iter()
+                .find(|r| r.provider == "provider-b")
+                .expect("should have provider-b response");
+            assert_eq!(
+                provider_b.status,
+                BidStatus::Error,
+                "the second provider on the shared name should fail attributably, not be dropped"
+            );
         });
     }
 

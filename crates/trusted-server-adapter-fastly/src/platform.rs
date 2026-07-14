@@ -156,6 +156,40 @@ fn backend_config_from_spec(spec: &PlatformBackendSpec) -> BackendConfig<'_> {
         .certificate_check(spec.certificate_check)
         .first_byte_timeout(spec.first_byte_timeout)
         .between_bytes_timeout(spec.between_bytes_timeout)
+        .discriminator(spec.discriminator.as_deref())
+}
+
+/// Transport-timeout quantum for auction backends (see
+/// [`FastlyPlatformBackend::canonicalize_transport_timeout_ms`]).
+const TRANSPORT_TIMEOUT_QUANTUM_MS: u32 = 250;
+
+/// Coarse rungs for budget-bound transport timeouts below one quantum,
+/// ordered high to low.
+///
+/// A budget-bound value at or above one quantum is floored to a
+/// [`TRANSPORT_TIMEOUT_QUANTUM_MS`] multiple. Below one quantum, passing the
+/// exact wall-clock remainder through would mint a distinct backend name for
+/// every millisecond in `1..250`, so the near-exhausted tail alone could
+/// exceed Fastly's per-service dynamic backend limit. Snapping to this finite
+/// ladder instead bounds the number of budget-derived names an origin can
+/// produce. Budgets below the smallest rung round to zero, which callers treat
+/// as "budget exhausted — skip the launch".
+const SUB_QUANTUM_LADDER_MS: [u32; 4] = [200, 150, 100, 50];
+
+/// Round a budget-bound transport timeout down to a stable bucket.
+///
+/// At or above one quantum, floors to a [`TRANSPORT_TIMEOUT_QUANTUM_MS`]
+/// multiple. Below one quantum, snaps down to the greatest
+/// [`SUB_QUANTUM_LADDER_MS`] rung no larger than `remaining_ms` (or zero).
+fn quantize_transport_timeout_ms(remaining_ms: u32) -> u32 {
+    let floored = (remaining_ms / TRANSPORT_TIMEOUT_QUANTUM_MS) * TRANSPORT_TIMEOUT_QUANTUM_MS;
+    if floored > 0 {
+        return floored;
+    }
+    SUB_QUANTUM_LADDER_MS
+        .into_iter()
+        .find(|&rung| rung <= remaining_ms)
+        .unwrap_or(0)
 }
 
 impl PlatformBackend for FastlyPlatformBackend {
@@ -169,6 +203,28 @@ impl PlatformBackend for FastlyPlatformBackend {
         backend_config_from_spec(spec)
             .ensure()
             .change_context(PlatformError::Backend)
+    }
+
+    /// Quantize the transport timeout so budget-derived values do not mint a
+    /// new dynamic backend name on every request.
+    ///
+    /// Fastly embeds the first-byte and between-bytes timeouts in the dynamic
+    /// backend name (see [`BackendConfig`]) and pools connections per backend
+    /// name. A per-request wall-clock budget would otherwise defeat that
+    /// pooling and accumulate registrations toward the per-service dynamic
+    /// backend limit.
+    ///
+    /// A provider's own configured timeout is a constant, so when it is the
+    /// binding constraint it is returned verbatim — including sub-quantum
+    /// configured values, which must not be rounded away or the provider could
+    /// never launch. Only the budget-bound value is snapped to a stable bucket
+    /// via [`quantize_transport_timeout_ms`]. Rounding down never extends a
+    /// transport cap past the remaining budget.
+    fn canonicalize_transport_timeout_ms(&self, remaining_ms: u32, configured_ms: u32) -> u32 {
+        if remaining_ms >= configured_ms {
+            return configured_ms;
+        }
+        quantize_transport_timeout_ms(remaining_ms)
     }
 }
 
@@ -637,6 +693,7 @@ mod tests {
             certificate_check: true,
             first_byte_timeout: Duration::from_secs(15),
             between_bytes_timeout: Duration::from_secs(15),
+            discriminator: None,
         };
 
         let name = backend
@@ -660,6 +717,7 @@ mod tests {
             certificate_check: true,
             first_byte_timeout: Duration::from_secs(15),
             between_bytes_timeout: Duration::from_secs(15),
+            discriminator: None,
         };
 
         let name = backend
@@ -683,6 +741,7 @@ mod tests {
             certificate_check: false,
             first_byte_timeout: Duration::from_secs(15),
             between_bytes_timeout: Duration::from_secs(15),
+            discriminator: None,
         };
 
         let name = backend
@@ -706,6 +765,7 @@ mod tests {
             certificate_check: true,
             first_byte_timeout: Duration::from_secs(15),
             between_bytes_timeout: Duration::from_secs(15),
+            discriminator: None,
         };
 
         let result = backend.predict_name(&spec);
@@ -724,6 +784,7 @@ mod tests {
             certificate_check: true,
             first_byte_timeout: Duration::from_millis(2000),
             between_bytes_timeout: Duration::from_millis(2000),
+            discriminator: None,
         };
 
         let name = backend
@@ -752,6 +813,7 @@ mod tests {
             certificate_check: true,
             first_byte_timeout: Duration::from_millis(750),
             between_bytes_timeout: Duration::from_millis(750),
+            discriminator: None,
         };
 
         let predicted = backend
@@ -935,6 +997,144 @@ mod tests {
         assert!(
             format!("{err:?}").contains("streaming request body"),
             "should describe the unsupported streaming body: {err:?}"
+        );
+    }
+
+    // --- FastlyPlatformBackend::canonicalize_transport_timeout_ms -----------
+
+    #[test]
+    fn canonicalize_prefers_configured_timeout_when_budget_allows() {
+        let backend = FastlyPlatformBackend;
+        assert_eq!(
+            backend.canonicalize_transport_timeout_ms(2000, 1000),
+            1000,
+            "should use the configured timeout verbatim when the budget allows"
+        );
+        assert_eq!(
+            backend.canonicalize_transport_timeout_ms(2000, 100),
+            100,
+            "should preserve a sub-quantum configured constant — it is name-stable on its own"
+        );
+    }
+
+    #[test]
+    fn canonicalize_floors_budget_bound_value_to_quantum() {
+        let backend = FastlyPlatformBackend;
+        assert_eq!(
+            backend.canonicalize_transport_timeout_ms(999, 2000),
+            750,
+            "should floor a 999ms budget to the 750ms quantum bucket"
+        );
+        assert_eq!(
+            backend.canonicalize_transport_timeout_ms(300, 2000),
+            250,
+            "should floor a tight budget down to one quantum"
+        );
+        assert_eq!(
+            backend.canonicalize_transport_timeout_ms(250, 2000),
+            250,
+            "should keep an exact quantum multiple"
+        );
+    }
+
+    #[test]
+    fn canonicalize_snaps_sub_quantum_budget_to_bounded_ladder() {
+        let backend = FastlyPlatformBackend;
+        // Exact wall-clock values in 1..250 must NOT pass through — that is the
+        // unbounded-cardinality regression this ladder closes.
+        assert_eq!(
+            backend.canonicalize_transport_timeout_ms(249, 2000),
+            200,
+            "should snap a sub-quantum budget down to the greatest ladder rung, not pass 249 through"
+        );
+        assert_eq!(backend.canonicalize_transport_timeout_ms(200, 2000), 200);
+        assert_eq!(backend.canonicalize_transport_timeout_ms(150, 2000), 150);
+        assert_eq!(backend.canonicalize_transport_timeout_ms(100, 2000), 100);
+        assert_eq!(backend.canonicalize_transport_timeout_ms(50, 2000), 50);
+        assert_eq!(
+            backend.canonicalize_transport_timeout_ms(49, 2000),
+            0,
+            "a budget below the smallest rung rounds to zero (launch skipped)"
+        );
+        assert_eq!(
+            backend.canonicalize_transport_timeout_ms(0, 1000),
+            0,
+            "an exhausted budget canonicalizes to zero"
+        );
+        assert_eq!(
+            backend.canonicalize_transport_timeout_ms(100, 0),
+            0,
+            "a zero configured timeout canonicalizes to zero"
+        );
+    }
+
+    #[test]
+    fn canonicalize_budget_derived_names_stay_within_a_safe_cardinality() {
+        // Enumerate every reachable remaining budget for a normal 2000ms
+        // ceiling and confirm the number of distinct backend-name-bearing
+        // transport values an origin can mint stays far below Fastly's
+        // per-service dynamic backend limit (documented default 200).
+        let backend = FastlyPlatformBackend;
+        let configured = 2000;
+        let mut distinct = std::collections::BTreeSet::new();
+        for remaining in 0..=configured {
+            let value = backend.canonicalize_transport_timeout_ms(remaining, configured);
+            if value > 0 {
+                distinct.insert(value);
+            }
+            // No arbitrary clock-derived value may leak: every canonical value
+            // is either a quantum multiple or one of the bounded ladder rungs.
+            assert!(
+                value == 0
+                    || value % TRANSPORT_TIMEOUT_QUANTUM_MS == 0
+                    || SUB_QUANTUM_LADDER_MS.contains(&value),
+                "canonical value {value}ms (from remaining {remaining}ms) is neither a quantum \
+                 multiple nor a ladder rung"
+            );
+        }
+        assert!(
+            distinct.len() <= 16,
+            "budget-derived transport values should stay well under the dynamic backend limit, \
+             got {} distinct values: {distinct:?}",
+            distinct.len()
+        );
+    }
+
+    // --- FastlyPlatformBackend::predict_name discriminator ------------------
+
+    #[test]
+    fn predict_name_includes_provider_discriminator() {
+        let backend = FastlyPlatformBackend;
+        let base = PlatformBackendSpec {
+            scheme: "https".to_string(),
+            host: "gateway.example.com".to_string(),
+            port: None,
+            host_header_override: None,
+            certificate_check: true,
+            first_byte_timeout: Duration::from_millis(750),
+            between_bytes_timeout: Duration::from_millis(750),
+            discriminator: Some("prebid".to_string()),
+        };
+        let prebid_name = backend
+            .predict_name(&base)
+            .expect("should predict name with discriminator");
+        assert!(
+            prebid_name.contains("_p_prebid"),
+            "should fold the provider discriminator into the name, got {prebid_name}"
+        );
+
+        // Same origin + same transport timeout, different provider → distinct
+        // backend names, so auction response correlation cannot cross them.
+        let aps = PlatformBackendSpec {
+            discriminator: Some("aps".to_string()),
+            ..base.clone()
+        };
+        let aps_name = backend
+            .predict_name(&aps)
+            .expect("should predict name for the second provider");
+        assert_ne!(
+            prebid_name, aps_name,
+            "two providers on one origin must not share a backend name"
         );
     }
 }
