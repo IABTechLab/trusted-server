@@ -522,7 +522,10 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       if (hasUserIdApi && !auctionEids) {
         clearPrebidEidsCookie();
       }
-      const payload = buildAdRequest(validBidRequests, { eids: auctionEids });
+      const payload = buildAdRequest(validBidRequests, {
+        pageUrl: window.location.href,
+        eids: auctionEids,
+      });
       return {
         method: 'POST',
         url: auctionEndpoint,

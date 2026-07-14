@@ -1,7 +1,25 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { buildAdRequest, parseAuctionResponse, sendAuction } from '../../src/core/auction';
 
+const TEST_PAGE_URL = 'https://publisher.example/page';
+
 describe('auction/buildAdRequest', () => {
+  it('includes version 2 and explicit pageUrl', () => {
+    const result = buildAdRequest(
+      [
+        {
+          code: 'div-1',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          bids: [{ bidder: 'appnexus', params: {} }],
+        },
+      ],
+      { pageUrl: 'https://publisher.example/article?x=1#section' }
+    );
+
+    expect(result.version).toBe(2);
+    expect(result.pageUrl).toBe('https://publisher.example/article?x=1#section');
+  });
+
   it('builds from tsjs AdUnit objects', () => {
     const units = [
       {
@@ -21,7 +39,7 @@ describe('auction/buildAdRequest', () => {
       },
     ];
 
-    const result = buildAdRequest(units);
+    const result = buildAdRequest(units, { pageUrl: TEST_PAGE_URL });
 
     expect(result.adUnits).toHaveLength(1);
     expect(result.adUnits[0].code).toBe('div-1');
@@ -56,7 +74,7 @@ describe('auction/buildAdRequest', () => {
       },
     ];
 
-    const result = buildAdRequest(bidRequests);
+    const result = buildAdRequest(bidRequests, { pageUrl: TEST_PAGE_URL });
 
     expect(result.adUnits).toHaveLength(2);
 
@@ -73,7 +91,7 @@ describe('auction/buildAdRequest', () => {
   });
 
   it('handles empty units array', () => {
-    const result = buildAdRequest([]);
+    const result = buildAdRequest([], { pageUrl: TEST_PAGE_URL });
     expect(result.adUnits).toEqual([]);
   });
 
@@ -87,6 +105,7 @@ describe('auction/buildAdRequest', () => {
         },
       ],
       {
+        pageUrl: TEST_PAGE_URL,
         eids: [
           {
             source: 'adserver.org',
@@ -118,7 +137,7 @@ describe('auction/buildAdRequest', () => {
 
   it('handles units without mediaTypes', () => {
     const units = [{ code: 'div-1', bids: [{ bidder: 'appnexus' }] }];
-    const result = buildAdRequest(units);
+    const result = buildAdRequest(units, { pageUrl: TEST_PAGE_URL });
 
     expect(result.adUnits).toHaveLength(1);
     expect(result.adUnits[0].mediaTypes).toEqual({});
@@ -130,7 +149,7 @@ describe('auction/buildAdRequest', () => {
       { code: 'slot-1', mediaTypes: { banner: { sizes: [[300, 250]] } }, bids: [{ bidder: 'b' }] },
     ];
 
-    const result = buildAdRequest(units);
+    const result = buildAdRequest(units, { pageUrl: TEST_PAGE_URL });
     expect(result.adUnits).toHaveLength(1);
     expect(result.adUnits[0].bids).toHaveLength(2);
     expect(result.adUnits[0].bids[0].bidder).toBe('a');

@@ -40,7 +40,7 @@ export function requestAds(
   try {
     const adUnits = getAllUnits();
     const config = collectContext();
-    const payload = { ...buildAdRequest(adUnits), config };
+    const payload = { ...buildAdRequest(adUnits, { pageUrl: window.location.href }), config };
     log.debug('requestAds: payload', { units: adUnits.length, contextKeys: Object.keys(config) });
 
     // Use unified auction endpoint

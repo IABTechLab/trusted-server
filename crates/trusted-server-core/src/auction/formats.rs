@@ -48,6 +48,8 @@ pub fn apply_auction_response_privacy(response: &mut Response<EdgeBody>) {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdRequest {
+    pub version: Option<u8>,
+    pub page_url: Option<String>,
     pub ad_units: Vec<AdUnit>,
     pub config: Option<JsonValue>,
     pub eids: Option<JsonValue>,
@@ -210,7 +212,7 @@ pub fn convert_tsjs_to_auction_request(
         slots,
         publisher: PublisherInfo {
             domain: settings.publisher.domain.clone(),
-            page_url: Some(format!("https://{}", settings.publisher.domain)),
+            page_url: Some(auction_page_url(body, settings)),
         },
         user: UserInfo {
             id: ec_id,
@@ -220,10 +222,16 @@ pub fn convert_tsjs_to_auction_request(
         device,
         site: Some(SiteInfo {
             domain: settings.publisher.domain.clone(),
-            page: format!("https://{}", settings.publisher.domain),
+            page: auction_page_url(body, settings),
         }),
         context,
     })
+}
+
+fn auction_page_url(body: &AdRequest, settings: &Settings) -> String {
+    body.page_url
+        .clone()
+        .unwrap_or_else(|| format!("https://{}", settings.publisher.domain))
 }
 
 /// Convert `OrchestrationResult` to `OpenRTB` response format.
@@ -479,6 +487,8 @@ mod tests {
 
     fn make_banner_body(config: Option<JsonValue>) -> AdRequest {
         AdRequest {
+            version: None,
+            page_url: None,
             ad_units: vec![AdUnit {
                 code: "div-gpt-top".to_string(),
                 media_types: Some(MediaTypes {
@@ -777,6 +787,8 @@ mod tests {
         let req = make_request();
         let services = noop_services();
         let body = AdRequest {
+            version: None,
+            page_url: None,
             ad_units: vec![AdUnit {
                 code: "div-gpt-top".to_string(),
                 media_types: Some(MediaTypes {
@@ -812,6 +824,8 @@ mod tests {
         let req = make_request();
         let services = noop_services();
         let body = AdRequest {
+            version: None,
+            page_url: None,
             ad_units: vec![AdUnit {
                 code: "div-gpt-top".to_string(),
                 media_types: Some(MediaTypes {
@@ -848,6 +862,8 @@ mod tests {
         let req = make_request();
         let services = noop_services();
         let body = AdRequest {
+            version: None,
+            page_url: None,
             ad_units: vec![
                 AdUnit {
                     code: "no-media".to_string(),
@@ -1204,6 +1220,8 @@ mod convert_tests {
         // An empty bidders map triggers the PBS stored-request fallback:
         // the PBS provider sets imp.ext.prebid.storedrequest = { id: "<code>" }.
         let body = AdRequest {
+            version: None,
+            page_url: None,
             ad_units: vec![AdUnit {
                 code: "atf_sidebar_ad".to_string(),
                 media_types: Some(MediaTypes {
@@ -1233,6 +1251,8 @@ mod convert_tests {
         // When bids are supplied, each bidder+params pair should appear in the
         // slot's bidders map so PBS receives inline params.
         let body = AdRequest {
+            version: None,
+            page_url: None,
             ad_units: vec![AdUnit {
                 code: "homepage_header_ad".to_string(),
                 media_types: Some(MediaTypes {
@@ -1277,6 +1297,8 @@ mod convert_tests {
         let req = make_req();
 
         let body = AdRequest {
+            version: None,
+            page_url: None,
             ad_units: vec![],
             config: Some(serde_json::json!({
                 "permutive_segments": ["seg1", "seg2"],
@@ -1310,6 +1332,8 @@ mod convert_tests {
     fn invalid_banner_size_returns_error() {
         // Banner sizes must be [width, height] pairs; a 3-element size is invalid.
         let body = AdRequest {
+            version: None,
+            page_url: None,
             ad_units: vec![AdUnit {
                 code: "bad_slot".to_string(),
                 media_types: Some(MediaTypes {

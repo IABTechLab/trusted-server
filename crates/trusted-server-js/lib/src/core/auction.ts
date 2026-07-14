@@ -32,6 +32,8 @@ export interface AuctionEid {
 
 /** The payload POSTed to the /auction orchestrator. */
 export interface AdRequest {
+  version: 2;
+  pageUrl: string;
   adUnits: AdRequestUnit[];
   config?: Record<string, unknown>;
   eids?: AuctionEid[];
@@ -68,7 +70,10 @@ export interface AuctionBid {
  * objects (which carry `adUnitCode` instead of `code`).
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function buildAdRequest(units: any[], options?: { eids?: AuctionEid[] }): AdRequest {
+export function buildAdRequest(
+  units: any[],
+  options: { pageUrl: string; eids?: AuctionEid[] }
+): AdRequest {
   const unitMap = new Map<string, AdRequestUnit>();
 
   for (const u of units) {
@@ -101,7 +106,11 @@ export function buildAdRequest(units: any[], options?: { eids?: AuctionEid[] }):
     }
   }
 
-  const request: AdRequest = { adUnits: [...unitMap.values()] };
+  const request: AdRequest = {
+    version: 2,
+    pageUrl: options.pageUrl,
+    adUnits: [...unitMap.values()],
+  };
   if (options?.eids && options.eids.length > 0) {
     request.eids = options.eids;
   }

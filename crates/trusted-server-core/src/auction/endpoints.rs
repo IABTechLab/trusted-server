@@ -4,12 +4,12 @@ use std::collections::HashMap;
 
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use http::{Request, Response};
+use http::{header, Request, Response};
 use url::Url;
 
 use crate::auction::admission::{
     admission_denial_response, admit_auction_http, deny_invalid_body, deny_payload_too_large,
-    finalize_admission, AdmissionDenial,
+    finalize_admission, AdmissionDenial, AuctionAdmissionDraft,
 };
 use crate::auction::formats::AdRequest;
 use crate::auction::identity::{
@@ -39,6 +39,7 @@ use super::AuctionSource;
 /// with EID arrays) while preventing an authenticated client from consuming
 /// arbitrary WASM linear memory.
 const MAX_AUCTION_BODY_SIZE: usize = crate::auction::admission::MAX_AUCTION_BODY_BYTES;
+const MAX_AUCTION_PAGE_URL_BYTES: usize = 2048;
 
 /// Handle auction request from `POST /auction`.
 ///
@@ -129,10 +130,13 @@ pub async fn handle_auction(
         Ok(body_bytes) => body_bytes,
         Err(_) => return auction_denial_response(&deny_payload_too_large(draft)),
     };
-    let body: AdRequest = match serde_json::from_slice(&body_bytes) {
+    let mut body: AdRequest = match serde_json::from_slice(&body_bytes) {
         Ok(body) => body,
         Err(_) => return auction_denial_response(&deny_invalid_body(draft)),
     };
+    if !matches!(body.version, None | Some(1) | Some(2)) {
+        return auction_denial_response(&deny_invalid_body(draft));
+    }
 
     log::info!(
         "Auction request received for {} ad units",
@@ -140,7 +144,11 @@ pub async fn handle_auction(
     );
 
     let http_req = Request::from_parts(parts, EdgeBody::empty());
-    let page_url = auction_page_url(settings);
+    let page_url = match auction_page_url(&draft, &body, &http_req) {
+        Some(page_url) => page_url,
+        None => return auction_denial_response(&deny_invalid_body(draft)),
+    };
+    body.page_url = Some(page_url.as_str().to_string());
     let admission = finalize_admission(draft, page_url);
 
     // Story 5 middleware contract: auction is a read-only EC route.
@@ -321,9 +329,49 @@ fn private_auction_response(
     Ok(response)
 }
 
-fn auction_page_url(settings: &Settings) -> Url {
-    Url::parse(&format!("https://{}", settings.publisher.domain))
-        .expect("should build page URL from validated publisher domain")
+fn auction_page_url(
+    draft: &AuctionAdmissionDraft,
+    body: &AdRequest,
+    req: &Request<EdgeBody>,
+) -> Option<Url> {
+    if let Some(page_url) = body.page_url.as_deref() {
+        return normalize_auction_page_url(page_url, draft.publisher_origin());
+    }
+
+    if let Some(referer) = req
+        .headers()
+        .get(header::REFERER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| normalize_auction_page_url(value, draft.publisher_origin()))
+    {
+        return Some(referer);
+    }
+
+    Some(draft.publisher_origin().clone())
+}
+
+fn normalize_auction_page_url(raw: &str, publisher_origin: &Url) -> Option<Url> {
+    if raw.len() > MAX_AUCTION_PAGE_URL_BYTES {
+        return None;
+    }
+
+    let mut page_url = Url::parse(raw).ok()?;
+    page_url.set_fragment(None);
+    if !page_url.username().is_empty()
+        || page_url.password().is_some()
+        || !same_origin(&page_url, publisher_origin)
+    {
+        return None;
+    }
+
+    Some(page_url)
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme().eq_ignore_ascii_case(right.scheme())
+        && left.host_str().map(str::to_ascii_lowercase)
+            == right.host_str().map(str::to_ascii_lowercase)
+        && left.port_or_known_default() == right.port_or_known_default()
 }
 
 #[cfg(test)]
@@ -601,6 +649,290 @@ mod tests {
 
         fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
             Some("capture-backend".to_string())
+        }
+    }
+
+    /// Provider that records the page URL from the outgoing auction request,
+    /// then fails launch so no transport handle is required.
+    struct PageCapturingProvider {
+        page: Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl AuctionProvider for PageCapturingProvider {
+        fn provider_name(&self) -> &'static str {
+            "page_capturing_provider"
+        }
+
+        async fn request_bids(
+            &self,
+            request: &AuctionRequest,
+            _context: &AuctionContext<'_>,
+        ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+            *self.page.lock().expect("should lock captured page") =
+                request.site.as_ref().map(|site| site.page.clone());
+            Err(Report::new(TrustedServerError::Auction {
+                message: "capture only".to_string(),
+            }))
+        }
+
+        async fn parse_response(
+            &self,
+            _response: PlatformResponse,
+            _response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            panic!("parse_response must not run when the launch fails");
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            100
+        }
+
+        fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
+            Some("capture-backend".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_auction_uses_valid_body_page_url_for_provider_request() {
+        let mut settings = create_test_settings();
+        settings.auction.enabled = true;
+        let config = AuctionConfig {
+            enabled: true,
+            providers: vec!["page_capturing_provider".to_string()],
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        };
+        let mut orchestrator = AuctionOrchestrator::new(config);
+        let captured_page = Arc::new(std::sync::Mutex::new(None));
+        orchestrator.register_provider(Arc::new(PageCapturingProvider {
+            page: Arc::clone(&captured_page),
+        }));
+        let services = noop_services();
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let body = json!({
+            "version": 2,
+            "pageUrl": "https://test-publisher.com/article?utm=1#section",
+            "adUnits": [
+                {
+                    "code": "div-gpt-ad-1",
+                    "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+                }
+            ]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://test-publisher.com/auction")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ORIGIN, "https://test-publisher.com")
+            .header("x-tsjs-auction", "1")
+            .body(EdgeBody::from(
+                serde_json::to_vec(&body).expect("should serialize body"),
+            ))
+            .expect("should build auction request");
+
+        let _ = handle_auction(
+            &settings,
+            &orchestrator,
+            None,
+            None,
+            &ec_context,
+            &services,
+            req,
+        )
+        .await;
+
+        assert_eq!(
+            captured_page
+                .lock()
+                .expect("should lock captured page")
+                .as_deref(),
+            Some("https://test-publisher.com/article?utm=1"),
+            "provider request should use validated body pageUrl without fragment"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_auction_falls_back_to_same_origin_referer_for_page_url() {
+        let mut settings = create_test_settings();
+        settings.auction.enabled = true;
+        let config = AuctionConfig {
+            enabled: true,
+            providers: vec!["page_capturing_provider".to_string()],
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        };
+        let mut orchestrator = AuctionOrchestrator::new(config);
+        let captured_page = Arc::new(std::sync::Mutex::new(None));
+        orchestrator.register_provider(Arc::new(PageCapturingProvider {
+            page: Arc::clone(&captured_page),
+        }));
+        let services = noop_services();
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let body = json!({
+            "adUnits": [
+                {
+                    "code": "div-gpt-ad-1",
+                    "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+                }
+            ]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://test-publisher.com/auction")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ORIGIN, "https://test-publisher.com")
+            .header(
+                header::REFERER,
+                "https://test-publisher.com/referer-page?x=1#frag",
+            )
+            .header("x-tsjs-auction", "1")
+            .body(EdgeBody::from(
+                serde_json::to_vec(&body).expect("should serialize body"),
+            ))
+            .expect("should build auction request");
+
+        let _ = handle_auction(
+            &settings,
+            &orchestrator,
+            None,
+            None,
+            &ec_context,
+            &services,
+            req,
+        )
+        .await;
+
+        assert_eq!(
+            captured_page
+                .lock()
+                .expect("should lock captured page")
+                .as_deref(),
+            Some("https://test-publisher.com/referer-page?x=1"),
+            "provider request should fall back to same-origin referer without fragment"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_auction_rejects_unsupported_request_version_before_dispatch() {
+        let mut settings = create_test_settings();
+        settings.auction.enabled = true;
+        let config = AuctionConfig {
+            enabled: true,
+            providers: vec!["panic_provider".to_string()],
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        };
+        let mut orchestrator = AuctionOrchestrator::new(config);
+        orchestrator.register_provider(Arc::new(PanicOnBidProvider));
+        let services = noop_services();
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let body = json!({
+            "version": 99,
+            "pageUrl": "https://test-publisher.com/article",
+            "adUnits": [
+                {
+                    "code": "div-gpt-ad-1",
+                    "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+                }
+            ]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://test-publisher.com/auction")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ORIGIN, "https://test-publisher.com")
+            .header("x-tsjs-auction", "1")
+            .body(EdgeBody::from(
+                serde_json::to_vec(&body).expect("should serialize body"),
+            ))
+            .expect("should build auction request");
+
+        let response = handle_auction(
+            &settings,
+            &orchestrator,
+            None,
+            None,
+            &ec_context,
+            &services,
+            req,
+        )
+        .await
+        .expect("unsupported version should return a response");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "unsupported request version should be rejected as a bad request"
+        );
+        assert_auction_response_privacy(&response);
+    }
+
+    #[tokio::test]
+    async fn handle_auction_rejects_invalid_body_page_url_before_dispatch() {
+        let invalid_page_urls = [
+            "https://evil.example/article".to_string(),
+            "https://user:pass@test-publisher.com/article".to_string(),
+            "not a url".to_string(),
+            format!("https://test-publisher.com/{}", "a".repeat(2049)),
+        ];
+
+        for page_url in invalid_page_urls {
+            let mut settings = create_test_settings();
+            settings.auction.enabled = true;
+            let config = AuctionConfig {
+                enabled: true,
+                providers: vec!["panic_provider".to_string()],
+                timeout_ms: 2000,
+                mediator: None,
+                ..Default::default()
+            };
+            let mut orchestrator = AuctionOrchestrator::new(config);
+            orchestrator.register_provider(Arc::new(PanicOnBidProvider));
+            let services = noop_services();
+            let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+            let body = json!({
+                "version": 2,
+                "pageUrl": page_url,
+                "adUnits": [
+                    {
+                        "code": "div-gpt-ad-1",
+                        "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+                    }
+                ]
+            });
+            let req = Request::builder()
+                .method("POST")
+                .uri("https://test-publisher.com/auction")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ORIGIN, "https://test-publisher.com")
+                .header("x-tsjs-auction", "1")
+                .body(EdgeBody::from(
+                    serde_json::to_vec(&body).expect("should serialize body"),
+                ))
+                .expect("should build auction request");
+
+            let response = handle_auction(
+                &settings,
+                &orchestrator,
+                None,
+                None,
+                &ec_context,
+                &services,
+                req,
+            )
+            .await
+            .expect("invalid page URL should return a response");
+
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "invalid pageUrl {page_url:?} should be rejected as a bad request"
+            );
+            assert_auction_response_privacy(&response);
         }
     }
 

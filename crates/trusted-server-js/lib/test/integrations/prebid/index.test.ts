@@ -288,6 +288,8 @@ describe('prebid/installPrebidNpm', () => {
       });
 
       const payload = JSON.parse(result.data);
+      expect(payload.version).toBe(2);
+      expect(payload.pageUrl).toBe(window.location.href);
       expect(payload.adUnits).toHaveLength(1);
       expect(payload.adUnits[0].code).toBe('div-gpt-1');
       expect(payload.eids).toBeUndefined();
