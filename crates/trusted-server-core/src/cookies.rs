@@ -89,6 +89,20 @@ pub fn strip_cookies(cookie_header: &str, cookie_names: &[&str]) -> String {
         .join("; ")
 }
 
+/// Keeps only named cookies from a `Cookie` header value string.
+///
+/// Invalid cookie pairs are skipped. Returns an empty string when no valid
+/// allowlisted cookies are present.
+#[must_use]
+pub fn allowlist_cookies(cookie_header: &str, cookie_names: &[&str]) -> String {
+    Cookie::split_parse(cookie_header)
+        .filter_map(Result::ok)
+        .filter(|cookie| cookie_names.contains(&cookie.name()))
+        .map(|cookie| format!("{}={}", cookie.name(), cookie.value()))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// Copies the `Cookie` header from one request to another, optionally
 /// stripping consent cookies.
 ///
@@ -404,5 +418,33 @@ mod tests {
         let header = "euconsent-v2=BOE=xyz; session=abc=123=def";
         let stripped = strip_cookies(header, CONSENT_COOKIE_NAMES);
         assert_eq!(stripped, "session=abc=123=def");
+    }
+
+    #[test]
+    fn test_allowlist_cookies_keeps_only_consent_cookies() {
+        let header =
+            "ts-ec=ec1; euconsent-v2=BOE; __gpp=DBAC; __gpp_sid=2; us_privacy=1YNN; session=abc";
+        let allowlisted = allowlist_cookies(header, CONSENT_COOKIE_NAMES);
+
+        assert_eq!(
+            allowlisted,
+            "euconsent-v2=BOE; __gpp=DBAC; __gpp_sid=2; us_privacy=1YNN"
+        );
+    }
+
+    #[test]
+    fn test_allowlist_cookies_omits_invalid_pairs() {
+        let header = "session=abc; invalid pair; euconsent-v2=BOE; __gpp=DBAC";
+        let allowlisted = allowlist_cookies(header, CONSENT_COOKIE_NAMES);
+
+        assert_eq!(allowlisted, "euconsent-v2=BOE; __gpp=DBAC");
+    }
+
+    #[test]
+    fn test_allowlist_cookies_returns_empty_without_consent_cookies() {
+        let header = "ts-ec=ec1; session=abc";
+        let allowlisted = allowlist_cookies(header, CONSENT_COOKIE_NAMES);
+
+        assert_eq!(allowlisted, "");
     }
 }

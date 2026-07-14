@@ -23,7 +23,7 @@ use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid, MediaType,
 };
 use crate::consent_config::ConsentForwardingMode;
-use crate::cookies::{strip_cookies, CONSENT_COOKIE_NAMES};
+use crate::cookies::{allowlist_cookies, CONSENT_COOKIE_NAMES};
 use crate::error::TrustedServerError;
 use crate::http_util::RequestInfo;
 use crate::integrations::{
@@ -1262,9 +1262,8 @@ fn non_empty_override_object(
 /// synthesized from `client_ip` — the platform-attested client address —
 /// matching the trusted IP already sent in `OpenRTB` `device.ip`.
 ///
-/// In [`ConsentForwardingMode::OpenrtbOnly`] mode, consent cookies are
-/// stripped from the `Cookie` header since consent travels exclusively
-/// through the `OpenRTB` body.
+/// In [`ConsentForwardingMode::OpenrtbOnly`] mode, no `Cookie` header is
+/// forwarded. In cookie-forwarding modes, only consent cookies are forwarded.
 fn copy_request_headers(
     from: &http::Request<EdgeBody>,
     to: &mut http::Request<EdgeBody>,
@@ -1290,26 +1289,18 @@ fn copy_request_headers(
         return;
     };
 
-    if !consent_forwarding.strips_consent_cookies() {
-        to.headers_mut()
-            .insert(header::COOKIE, cookie_value.clone());
+    if matches!(consent_forwarding, ConsentForwardingMode::OpenrtbOnly) {
         return;
     }
 
-    match cookie_value.to_str() {
-        Ok(value) => {
-            let stripped = strip_cookies(value, CONSENT_COOKIE_NAMES);
-            if stripped.is_empty() {
-                return;
-            }
-
-            if let Ok(cookie_header) = HeaderValue::from_str(&stripped) {
-                to.headers_mut().insert(header::COOKIE, cookie_header);
-            }
+    if let Ok(value) = cookie_value.to_str() {
+        let allowlisted = allowlist_cookies(value, CONSENT_COOKIE_NAMES);
+        if allowlisted.is_empty() {
+            return;
         }
-        Err(_) => {
-            to.headers_mut()
-                .insert(header::COOKIE, cookie_value.clone());
+
+        if let Ok(cookie_header) = HeaderValue::from_str(&allowlisted) {
+            to.headers_mut().insert(header::COOKIE, cookie_header);
         }
     }
 }
@@ -6300,5 +6291,89 @@ set = { networkId = 42 }
             !to.headers().contains_key("x-forwarded-for"),
             "should not forward the client-supplied XFF when no attested IP exists"
         );
+    }
+
+    #[test]
+    fn copy_request_headers_omits_cookie_header_for_openrtb_only_consent() {
+        let from = http::Request::builder()
+            .uri("https://publisher.example.com/")
+            .header(
+                header::COOKIE,
+                "ts-ec=ec1; euconsent-v2=BOE; __gpp=DBAC; __gpp_sid=2; us_privacy=1YNN; session=abc",
+            )
+            .body(EdgeBody::empty())
+            .expect("should build inbound request");
+        let mut to = http::Request::builder()
+            .uri("https://pbs.example.com/openrtb2/auction")
+            .body(EdgeBody::empty())
+            .expect("should build outbound request");
+
+        copy_request_headers(&from, &mut to, ConsentForwardingMode::OpenrtbOnly, None);
+
+        assert!(
+            !to.headers().contains_key(header::COOKIE),
+            "openrtb_only should not forward any Cookie header"
+        );
+    }
+
+    #[test]
+    fn copy_request_headers_forwards_only_consent_cookies_for_cookie_modes() {
+        for mode in [
+            ConsentForwardingMode::CookiesOnly,
+            ConsentForwardingMode::Both,
+        ] {
+            let from = http::Request::builder()
+                .uri("https://publisher.example.com/")
+                .header(
+                    header::COOKIE,
+                    "ts-ec=ec1; euconsent-v2=BOE; __gpp=DBAC; __gpp_sid=2; us_privacy=1YNN; session=abc",
+                )
+                .body(EdgeBody::empty())
+                .expect("should build inbound request");
+            let mut to = http::Request::builder()
+                .uri("https://pbs.example.com/openrtb2/auction")
+                .body(EdgeBody::empty())
+                .expect("should build outbound request");
+
+            copy_request_headers(&from, &mut to, mode, None);
+
+            let forwarded = to
+                .headers()
+                .get(header::COOKIE)
+                .and_then(|v| v.to_str().ok())
+                .expect("should forward consent Cookie header");
+            assert_eq!(
+                forwarded, "euconsent-v2=BOE; __gpp=DBAC; __gpp_sid=2; us_privacy=1YNN",
+                "{mode:?} should forward only consent cookies"
+            );
+        }
+    }
+
+    #[test]
+    fn copy_request_headers_omits_invalid_cookie_header_for_cookie_modes() {
+        let invalid_cookie_value = HeaderValue::from_bytes(b"\xff\xfe=value")
+            .expect("should build non-UTF-8 header value");
+        for mode in [
+            ConsentForwardingMode::CookiesOnly,
+            ConsentForwardingMode::Both,
+        ] {
+            let mut from = http::Request::builder()
+                .uri("https://publisher.example.com/")
+                .body(EdgeBody::empty())
+                .expect("should build inbound request");
+            from.headers_mut()
+                .insert(header::COOKIE, invalid_cookie_value.clone());
+            let mut to = http::Request::builder()
+                .uri("https://pbs.example.com/openrtb2/auction")
+                .body(EdgeBody::empty())
+                .expect("should build outbound request");
+
+            copy_request_headers(&from, &mut to, mode, None);
+
+            assert!(
+                !to.headers().contains_key(header::COOKIE),
+                "{mode:?} should omit invalid Cookie header instead of forwarding raw bytes"
+            );
+        }
     }
 }
