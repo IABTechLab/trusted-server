@@ -14,21 +14,64 @@ use tokio_rustls::TlsConnector;
 use super::body::RequestUploadBody;
 use super::dns::DnsCache;
 use super::key::{AddressPolicy, OriginKey, ReferenceIdentity, Transport, VerifyMode};
-use super::manager::{ConnectionId, Manager};
+use super::manager::{ConnectionId, Lease, Manager, Reservation};
 use crate::commands::dev::proxy::metrics::ProxyMetrics;
 
+/// HTTP/1 request sender whose upload body preserves streaming frames.
 pub type UpstreamSender = SendRequest<RequestUploadBody>;
 
+/// Successfully opened sender plus its driver controls and manager reservation.
 pub struct OpenedConnection {
-    pub sender: UpstreamSender,
-    pub abort: AbortHandle,
-    pub start: oneshot::Sender<()>,
+    sender: Option<UpstreamSender>,
+    abort: AbortHandle,
+    start: Option<oneshot::Sender<()>>,
+    reservation: Option<Reservation>,
+}
+
+impl OpenedConnection {
+    /// Acknowledges the successful connector result and registers its driver.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if internal code attempts to register the same opened
+    /// connection more than once.
+    pub fn register(
+        mut self,
+        manager: &Manager<UpstreamSender>,
+    ) -> (Lease<UpstreamSender>, oneshot::Sender<()>) {
+        let sender = self.sender.take().expect("should retain opened sender");
+        let start = self.start.take().expect("should retain driver start latch");
+        let reservation = self
+            .reservation
+            .take()
+            .expect("should retain connector reservation");
+        let lease = reservation.register(manager, sender, self.abort.clone());
+        (lease, start)
+    }
+}
+
+impl Drop for OpenedConnection {
+    fn drop(&mut self) {
+        if let Some(reservation) = self.reservation.take() {
+            reservation.abort_established(&self.abort);
+        }
+    }
+}
+
+struct EstablishedConnection {
+    sender: UpstreamSender,
+    abort: AbortHandle,
+    start: oneshot::Sender<()>,
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Timeouts and harness-only delays used while opening an upstream connection.
 pub struct ConnectPolicy {
+    /// Total deadline for DNS, TCP, TLS, and HTTP handshaking.
     pub timeout: Duration,
+    /// Harness-only delay before TCP connection attempts.
     pub connect_delay: Duration,
+    /// Harness-only delay before TLS handshaking.
     pub tls_delay: Duration,
 }
 
@@ -38,6 +81,9 @@ pub struct PendingConnection {
 }
 
 impl PendingConnection {
+    /// Spawns one connector while transferring manager-reservation ownership
+    /// into its task.
+    #[must_use]
     pub fn spawn(
         key: OriginKey,
         sni: Option<ServerName<'static>>,
@@ -45,11 +91,18 @@ impl PendingConnection {
         metrics: Arc<ProxyMetrics>,
         manager: Arc<Manager<UpstreamSender>>,
         dns: Arc<DnsCache>,
-        id: ConnectionId,
+        reservation: Reservation,
     ) -> Self {
         Self {
             task: Some(tokio::spawn(async move {
-                open(&key, sni, policy, metrics, manager, dns, id).await
+                let id = reservation.id();
+                let established = open(&key, sni, policy, metrics, manager, dns, id).await?;
+                Ok(OpenedConnection {
+                    sender: Some(established.sender),
+                    abort: established.abort,
+                    start: Some(established.start),
+                    reservation: Some(reservation),
+                })
             })),
         }
     }
@@ -100,7 +153,7 @@ impl Drop for PendingConnection {
 /// # Errors
 ///
 /// Returns the underlying DNS, connection, TLS, or HTTP handshake error.
-pub async fn open(
+async fn open(
     key: &OriginKey,
     sni: Option<ServerName<'static>>,
     policy: ConnectPolicy,
@@ -108,7 +161,7 @@ pub async fn open(
     manager: Arc<Manager<UpstreamSender>>,
     dns: Arc<DnsCache>,
     id: ConnectionId,
-) -> Result<OpenedConnection, Report<io::Error>> {
+) -> Result<EstablishedConnection, Report<io::Error>> {
     let deadline = tokio::time::Instant::now() + policy.timeout;
     let addresses: Vec<std::net::SocketAddr> = match key.address_policy() {
         AddressPolicy::Resolve(address) => vec![(address, key.port()).into()],
@@ -185,7 +238,7 @@ async fn handshake<I>(
     manager: Arc<Manager<UpstreamSender>>,
     id: ConnectionId,
     metrics: Arc<ProxyMetrics>,
-) -> Result<OpenedConnection, Report<io::Error>>
+) -> Result<EstablishedConnection, Report<io::Error>>
 where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
@@ -204,7 +257,7 @@ where
             log::debug!("upstream connection closed: {error}");
         }
     });
-    Ok(OpenedConnection {
+    Ok(EstablishedConnection {
         sender,
         abort: task.abort_handle(),
         start,
@@ -279,9 +332,15 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::aws_lc_rs::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
+        static SCHEMES: std::sync::OnceLock<Vec<rustls::SignatureScheme>> =
+            std::sync::OnceLock::new();
+        SCHEMES
+            .get_or_init(|| {
+                rustls::crypto::aws_lc_rs::default_provider()
+                    .signature_verification_algorithms
+                    .supported_schemes()
+            })
+            .clone()
     }
 }
 
@@ -345,20 +404,27 @@ mod tests {
             Arc::new(ProxyMetrics::default()),
             Arc::clone(&manager),
             Arc::new(DnsCache::default()),
-            id,
+            reservation,
         );
         let abort = pending.abort_handle();
         manager.register_connector(id, abort.clone());
 
         drop(pending);
-        drop(reservation);
-        tokio::task::yield_now().await;
-
-        assert!(
-            abort.is_finished(),
-            "connector task should be aborted on drop"
-        );
-        let Acquired::Open(replacement) = manager.acquire(key()).await.expect("should reconcile")
+        let replacement = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.acquire(key()).await }
+        });
+        while !abort.is_finished() {
+            assert!(
+                !replacement.is_finished(),
+                "replacement capacity must remain blocked until connector cancellation completes"
+            );
+            tokio::task::yield_now().await;
+        }
+        let Acquired::Open(replacement) = replacement
+            .await
+            .expect("should join replacement")
+            .expect("should reconcile")
         else {
             panic!("should admit one replacement");
         };
@@ -399,13 +465,12 @@ mod tests {
             Arc::new(ProxyMetrics::default()),
             Arc::clone(&manager),
             Arc::new(DnsCache::default()),
-            id,
+            reservation,
         );
         let abort = pending.abort_handle();
         manager.register_connector(id, abort.clone());
 
         let owner = tokio::spawn(async move {
-            let _reservation = reservation;
             let _pending = pending;
             panic!("exercise connector owner unwind");
         });
@@ -417,5 +482,48 @@ mod tests {
             manager.acquire(key()).await,
             Ok(Acquired::Open(_))
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_waits_for_connector_cancellation_completion() {
+        let manager = Manager::start(PoolLimits {
+            per_origin_live: 1,
+            global_live: 1,
+            ..PoolLimits::default()
+        });
+        let Acquired::Open(reservation) = manager.acquire(key()).await.expect("should reserve")
+        else {
+            panic!("should open connector reservation");
+        };
+        let id = reservation.id();
+        let pending = PendingConnection::spawn(
+            key(),
+            Some(ServerName::from(IpAddr::V4(Ipv4Addr::LOCALHOST))),
+            delayed_policy(),
+            Arc::new(ProxyMetrics::default()),
+            Arc::clone(&manager),
+            Arc::new(DnsCache::default()),
+            reservation,
+        );
+        let abort = pending.abort_handle();
+        manager.register_connector(id, abort.clone());
+
+        let shutdown = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.shutdown().await }
+        });
+        while !abort.is_finished() {
+            assert!(
+                !shutdown.is_finished(),
+                "shutdown must not acknowledge while the connector task is still live"
+            );
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        assert!(
+            shutdown.is_finished(),
+            "shutdown should acknowledge after connector cleanup reconciles capacity"
+        );
+        drop(pending);
     }
 }

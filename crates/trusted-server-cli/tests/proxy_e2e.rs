@@ -493,6 +493,75 @@ async fn response_trailers_finish_before_connection_reuse() {
 }
 
 #[tokio::test]
+async fn request_and_response_trailers_cross_the_upstream_leg() {
+    let upstream = support::start_request_trailer_upstream().await;
+    let cfg = support::test_config(&upstream.addr);
+    let ca = Arc::new(support::dev_ca());
+    let proxy = support::spawn_proxy(cfg, ca).await;
+
+    let (body, trailers) = support::drive_request_trailer(proxy).await;
+
+    assert_eq!(body, b"accepted");
+    assert!(
+        trailers
+            .to_ascii_lowercase()
+            .contains("x-response-accepted: yes"),
+        "conditional response trailer should reach the browser: {trailers:?}"
+    );
+    assert_eq!(upstream.snapshot().requests, 1);
+    assert_eq!(upstream.snapshot().failures, 0);
+}
+
+#[tokio::test]
+async fn unreachable_origin_counts_one_terminal_request_failure() {
+    let unused =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("should reserve an unused loopback port");
+    let unreachable = unused.local_addr().expect("should read unused port");
+    drop(unused);
+    let cfg = support::test_config(&unreachable);
+    let ca = Arc::new(support::dev_ca());
+    let (proxy, state) = support::spawn_proxy_with_state(cfg, ca).await;
+
+    let responses =
+        support::drive_sequential_requests_through_proxy(proxy, &["/unreachable"]).await;
+    assert_eq!(responses[0].status, 502);
+    wait_for_request_metrics(&state, 0, 1).await;
+
+    let snapshot = state.metrics.snapshot();
+    assert_eq!(snapshot.requests_completed, 0);
+    assert_eq!(snapshot.requests_failed, 1);
+}
+
+#[tokio::test]
+async fn failed_acquisition_records_latency_and_one_failure() {
+    let unused =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("should reserve an unused loopback port");
+    let unreachable = unused.local_addr().expect("should read unused port");
+    drop(unused);
+    let cfg = support::test_config(&unreachable);
+    let ca = Arc::new(support::dev_ca());
+    let options = trusted_server_cli::commands::dev::proxy::upstream::UpstreamOptions {
+        limits: trusted_server_cli::commands::dev::proxy::upstream::manager::PoolLimits {
+            per_origin_live: 0,
+            global_live: 0,
+            acquire_timeout: Duration::ZERO,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let (proxy, state) = support::spawn_proxy_with_upstream_options(cfg, ca, options).await;
+
+    let responses = support::drive_sequential_requests_through_proxy(proxy, &["/overloaded"]).await;
+    assert_eq!(responses[0].status, 502);
+    wait_for_request_metrics(&state, 0, 1).await;
+
+    let snapshot = state.metrics.snapshot();
+    assert_eq!(snapshot.requests_completed, 0);
+    assert_eq!(snapshot.requests_failed, 1);
+    assert_eq!(snapshot.pool_acquisition_latency.total(), 1);
+}
+
+#[tokio::test]
 async fn mismatched_host_over_mitm_tunnel_is_refused_with_421() {
     // CONNECT a mapped host (so the tunnel is MITM'd), then send a request whose
     // Host header matches NO rule. It must be refused with 421 (Misdirected

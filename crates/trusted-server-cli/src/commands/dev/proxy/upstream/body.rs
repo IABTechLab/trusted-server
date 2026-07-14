@@ -16,7 +16,9 @@ const COMPLETE: u8 = 1;
 const FAILED: u8 = 2;
 
 #[derive(Debug, derive_more::Display)]
+/// Error emitted while streaming the browser request body upstream.
 pub enum ProxyBodyError {
+    /// Hyper rejected or failed an incoming body frame.
     #[display("upstream request body failed")]
     Hyper(hyper::Error),
 }
@@ -29,8 +31,10 @@ impl core::error::Error for ProxyBodyError {
     }
 }
 
+/// Type-erased streaming request body used by the upstream HTTP/1 sender.
 pub type ProxyRequestBody = BoxBody<Bytes, ProxyBodyError>;
 
+/// Request-body adapter that tracks terminal upload completion without buffering.
 pub struct RequestUploadBody {
     inner: ProxyRequestBody,
     state: Arc<AtomicU8>,
@@ -38,11 +42,13 @@ pub struct RequestUploadBody {
 
 impl RequestUploadBody {
     #[must_use]
+    /// Wraps a browser request body and returns its shared completion state.
     pub fn new(inner: Incoming, known_empty: bool) -> (Self, Arc<AtomicU8>) {
         Self::from_boxed(inner.map_err(ProxyBodyError::Hyper).boxed(), known_empty)
     }
 
     #[must_use]
+    /// Creates a replay-safe, already-complete empty request body.
     pub fn empty() -> Self {
         let body = http_body_util::Empty::<Bytes>::new()
             .map_err(|never| match never {})
@@ -105,6 +111,7 @@ impl Drop for RequestUploadBody {
     }
 }
 
+/// Response-body adapter that returns healthy connections only after terminal EOS.
 pub struct PooledResponseBody {
     inner: Incoming,
     lease: Option<Lease<UpstreamSender>>,
@@ -117,6 +124,8 @@ pub struct PooledResponseBody {
 }
 
 impl PooledResponseBody {
+    /// Wraps an upstream response and owns its lease until response and upload
+    /// lifecycle conditions decide whether reuse is safe.
     pub fn new(
         inner: Incoming,
         lease: Lease<UpstreamSender>,

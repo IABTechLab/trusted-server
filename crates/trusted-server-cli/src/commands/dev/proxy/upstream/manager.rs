@@ -12,17 +12,27 @@ use super::key::OriginKey;
 const ORDINARY_CHANNEL_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+/// Actor-owned identity for one connecting or live upstream connection.
 pub struct ConnectionId(u64);
 
 #[derive(Debug, Clone, Copy)]
+/// Hard connection, idle, waiter, and timeout bounds for the pool actor.
 pub struct PoolLimits {
+    /// Maximum connecting plus live connections per origin.
     pub per_origin_live: usize,
+    /// Maximum connecting plus live connections across all origins.
     pub global_live: usize,
+    /// Maximum reusable idle connections retained per origin.
     pub per_origin_idle: usize,
+    /// Maximum reusable idle connections retained globally.
     pub global_idle: usize,
+    /// Maximum queued acquisition waiters per origin.
     pub per_origin_waiters: usize,
+    /// Maximum queued acquisition waiters globally.
     pub global_waiters: usize,
+    /// Maximum duration for one acquisition request.
     pub acquire_timeout: Duration,
+    /// Maximum duration for retaining an idle connection.
     pub idle_timeout: Duration,
 }
 
@@ -42,25 +52,38 @@ impl Default for PoolLimits {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+/// Terminal manager acquisition failure.
 pub enum AcquireError {
+    /// A bounded waiter limit was already full.
     Overloaded,
+    /// No connection became available before the acquisition deadline.
     TimedOut,
+    /// The manager is shutting down or has stopped.
     ShuttingDown,
 }
 
+/// Sender plus lifecycle controls retained while a connection is idle or leased.
 pub struct IdleConnection<T> {
+    /// Actor-owned connection identity.
     pub id: ConnectionId,
+    /// Complete reusable origin identity.
     pub key: OriginKey,
+    /// Protocol sender or test value carried by the connection.
     pub value: T,
+    /// Abort handle for its independently running driver.
     pub abort: AbortHandle,
 }
 
+/// Exclusive connection lease returned to one requester.
 pub struct Lease<T> {
+    /// Leased connection payload and lifecycle controls.
     pub connection: IdleConnection<T>,
+    /// Whether this lease came from the idle pool.
     pub reused: bool,
     queue_wait: Option<Duration>,
 }
 
+/// Exclusive capacity reservation retained while a connector is in flight.
 pub struct Reservation {
     id: ConnectionId,
     key: OriginKey,
@@ -71,15 +94,18 @@ pub struct Reservation {
 
 impl Reservation {
     #[must_use]
+    /// Returns the actor-owned identity allocated for this reservation.
     pub fn id(&self) -> ConnectionId {
         self.id
     }
 
     #[must_use]
+    /// Returns the complete origin identity reserved by this connector.
     pub fn key(&self) -> &OriginKey {
         &self.key
     }
 
+    /// Transitions a successful connector reservation to a live driver lease.
     pub fn register<T: Send + 'static>(
         mut self,
         manager: &Manager<T>,
@@ -99,6 +125,16 @@ impl Reservation {
             queue_wait: self.queue_wait,
         }
     }
+
+    /// Transitions an established but unclaimed connection to a live driver,
+    /// then aborts it without releasing capacity before [`Manager::driver_closed`].
+    pub(crate) fn abort_established(mut self, abort: &AbortHandle) {
+        let _ = self
+            .control
+            .send(Control::DriverRegistered(self.id, abort.clone()));
+        self.completed = true;
+        abort.abort();
+    }
 }
 
 impl Drop for Reservation {
@@ -109,13 +145,17 @@ impl Drop for Reservation {
     }
 }
 
+/// Result of acquiring either an idle sender or capacity for a new connector.
 pub enum Acquired<T> {
+    /// Existing idle connection leased for reuse.
     Reused(Lease<T>),
+    /// Reservation that must be transferred into a connector task.
     Open(Reservation),
 }
 
 impl<T> Acquired<T> {
     #[must_use]
+    /// Returns time spent queued behind capacity, when queuing occurred.
     pub fn queue_wait(&self) -> Option<Duration> {
         match self {
             Self::Reused(lease) => lease.queue_wait,
@@ -190,6 +230,7 @@ enum Control {
     Shutdown(oneshot::Sender<()>),
 }
 
+/// Handle for the bounded single-owner connection-pool actor.
 pub struct Manager<T> {
     ordinary: mpsc::Sender<Command<T>>,
     control: mpsc::UnboundedSender<Control>,
@@ -199,6 +240,7 @@ pub struct Manager<T> {
 
 impl<T: Send + 'static> Manager<T> {
     #[must_use]
+    /// Starts the manager actor with explicit hard bounds.
     pub fn start(limits: PoolLimits) -> Arc<Self> {
         let (ordinary, ordinary_rx) = mpsc::channel(ORDINARY_CHANNEL_CAPACITY);
         // This lane is API-unbounded so synchronous Drop paths cannot lose lifecycle
@@ -265,6 +307,7 @@ impl<T: Send + 'static> Manager<T> {
         result
     }
 
+    /// Returns an idle connection to the actor without awaiting a bounded lane.
     pub fn return_idle(&self, connection: IdleConnection<T>) {
         if let Err(error) = self.ordinary.try_send(Command::Return(connection))
             && let Command::Return(connection) = error.into_inner()
@@ -273,6 +316,7 @@ impl<T: Send + 'static> Manager<T> {
         }
     }
 
+    /// Reports confirmed termination of one registered connection driver.
     pub fn driver_closed(&self, id: ConnectionId) {
         let _ = self.control.send(Control::DriverClosed(id));
     }
@@ -285,6 +329,7 @@ impl<T: Send + 'static> Manager<T> {
         let _ = self.control.send(Control::DriverRegistered(id, abort));
     }
 
+    /// Aborts all connectors and drivers and waits for capacity reconciliation.
     pub async fn shutdown(&self) {
         let (reply, received) = oneshot::channel();
         if self.control.send(Control::Shutdown(reply)).is_ok() {
@@ -459,22 +504,31 @@ impl<T: Send + 'static> Actor<T> {
         result
     }
 
-    fn return_connection(&mut self, connection: IdleConnection<T>) {
+    fn return_connection(&mut self, mut connection: IdleConnection<T>) {
         if self.closing || !self.live.contains_key(&connection.id) {
             connection.abort.abort();
             return;
         }
-        if let Some(index) = self.waiters.iter().position(|waiter| {
-            waiter.allow_reuse && waiter.key == connection.key && !waiter.ticket.is_cancelled()
-        }) {
+        while let Some(index) = self
+            .waiters
+            .iter()
+            .position(|waiter| waiter.allow_reuse && waiter.key == connection.key)
+        {
             let waiter = self.waiters.remove(index).expect("should find waiter");
-            if waiter.ticket.resolve() {
-                let _ = waiter.reply.send(Ok(Acquired::Reused(Lease {
-                    connection,
-                    reused: true,
-                    queue_wait: waiter.queue_started.map(|started| started.elapsed()),
-                })));
-                return;
+            if !waiter.ticket.resolve() {
+                continue;
+            }
+            let result = Ok(Acquired::Reused(Lease {
+                connection,
+                reused: true,
+                queue_wait: waiter.queue_started.map(|started| started.elapsed()),
+            }));
+            match waiter.reply.send(result) {
+                Ok(()) => return,
+                Err(Ok(Acquired::Reused(lease))) => connection = lease.connection,
+                Err(Ok(Acquired::Open(_)) | Err(_)) => {
+                    unreachable!("return handoff constructs only a reused lease")
+                }
             }
         }
         let origin_idle = self.idle.get(&connection.key).map_or(0, VecDeque::len);
@@ -623,6 +677,7 @@ async fn sleep_until_optional(deadline: Option<Instant>) {
 #[cfg(test)]
 mod tests {
     use std::net::IpAddr;
+    use std::sync::Barrier;
 
     use super::*;
     use crate::commands::dev::proxy::upstream::key::{
@@ -641,6 +696,21 @@ mod tests {
 
     fn abort_handle() -> AbortHandle {
         tokio::spawn(std::future::pending::<()>()).abort_handle()
+    }
+
+    struct DelayedDriverClosed {
+        manager: Arc<Manager<()>>,
+        id: ConnectionId,
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: Arc<Barrier>,
+    }
+
+    impl Drop for DelayedDriverClosed {
+        fn drop(&mut self) {
+            let _ = self.entered.send(());
+            self.release.wait();
+            self.manager.driver_closed(self.id);
+        }
     }
 
     #[test]
@@ -810,6 +880,65 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abandoned_established_connection_retains_capacity_until_driver_exit() {
+        let manager = Manager::start(PoolLimits {
+            per_origin_live: 1,
+            global_live: 1,
+            ..PoolLimits::default()
+        });
+        let origin = key("established.example");
+        let Acquired::Open(reservation) = manager.acquire(origin.clone()).await.expect("reserve")
+        else {
+            panic!("should reserve connector capacity");
+        };
+        let id = reservation.id();
+        let (entered, observed) = std::sync::mpsc::sync_channel(1);
+        let release = Arc::new(Barrier::new(2));
+        let driver = tokio::spawn({
+            let guard = DelayedDriverClosed {
+                manager: Arc::clone(&manager),
+                id,
+                entered,
+                release: Arc::clone(&release),
+            };
+            async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            }
+        });
+        manager.register_connector(id, driver.abort_handle());
+        reservation.abort_established(&driver.abort_handle());
+        tokio::task::spawn_blocking(move || observed.recv())
+            .await
+            .expect("should join driver-drop observer")
+            .expect("driver drop should begin");
+
+        let replacement = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move { manager.acquire(origin).await }
+        });
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !replacement.is_finished(),
+            "replacement must remain blocked before confirmed DriverClosed"
+        );
+
+        release.wait();
+        assert!(
+            driver
+                .await
+                .expect_err("driver should be aborted")
+                .is_cancelled()
+        );
+        assert!(matches!(
+            replacement.await.expect("replacement should join"),
+            Ok(Acquired::Open(_))
+        ));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn priority_shutdown_overtakes_a_saturated_ordinary_lane() {
         let limits = PoolLimits::default();
@@ -882,6 +1011,62 @@ mod tests {
         manager.driver_closed(id);
         tokio::task::yield_now().await;
         assert!(matches!(fresh.await.expect("join"), Ok(Acquired::Open(_))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_waiter_delivery_hands_connection_to_next_waiter() {
+        let limits = PoolLimits::default();
+        let (_ordinary, ordinary_rx) = mpsc::channel(ORDINARY_CHANNEL_CAPACITY);
+        let (control, control_rx) = mpsc::unbounded_channel();
+        let mut actor = Actor::new(limits, ordinary_rx, control_rx, control);
+        let origin = key("handoff.example");
+        let id = ConnectionId(1);
+        actor.live.insert(
+            id,
+            LiveConnection {
+                key: origin.clone(),
+                abort: None,
+            },
+        );
+
+        let (first_reply, first_received) = oneshot::channel();
+        drop(first_received);
+        actor.waiters.push_back(AcquireRequest {
+            sequence: 1,
+            key: origin.clone(),
+            deadline: Instant::now() + limits.acquire_timeout,
+            ticket: Arc::new(AcquireTicket::new()),
+            allow_reuse: true,
+            queue_started: Some(Instant::now()),
+            reply: first_reply,
+        });
+        let (second_reply, mut second_received) = oneshot::channel();
+        actor.waiters.push_back(AcquireRequest {
+            sequence: 2,
+            key: origin.clone(),
+            deadline: Instant::now() + limits.acquire_timeout,
+            ticket: Arc::new(AcquireTicket::new()),
+            allow_reuse: true,
+            queue_started: Some(Instant::now()),
+            reply: second_reply,
+        });
+
+        actor.return_connection(IdleConnection {
+            id,
+            key: origin,
+            value: 7_u8,
+            abort: abort_handle(),
+        });
+
+        let Acquired::Reused(lease) = second_received
+            .try_recv()
+            .expect("second waiter should receive the recovered connection")
+            .expect("handoff should succeed")
+        else {
+            panic!("handoff should reuse the returned connection");
+        };
+        assert_eq!(lease.connection.value, 7);
+        assert!(actor.waiters.is_empty(), "both waiters should be removed");
     }
 
     #[tokio::test(start_paused = true)]

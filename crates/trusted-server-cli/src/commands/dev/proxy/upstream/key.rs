@@ -4,38 +4,48 @@ use std::sync::Arc;
 /// Upstream transport protocol.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub enum Transport {
+    /// Direct HTTP/1 over TCP.
     Plaintext,
+    /// HTTP/1 over authenticated TLS.
     Tls,
 }
 
 /// Certificate-verification policy for a TLS connection.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub enum VerifyMode {
+    /// Validate the upstream certificate against public roots.
     Secure,
+    /// Accept any upstream certificate after the CLI emits its warning.
     Insecure,
 }
 
 /// How the logical origin selects its connection address.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub enum AddressPolicy {
+    /// Resolve the reference identity through DNS.
     Dns,
+    /// Connect to an explicitly pinned address while preserving TLS identity.
     Resolve(IpAddr),
 }
 
 /// Exact DNS or IP identity authenticated by upstream TLS.
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub enum ReferenceIdentity {
+    /// Normalized DNS identity.
     Dns(Arc<str>),
+    /// Literal IP identity.
     Ip(IpAddr),
 }
 
 impl ReferenceIdentity {
     #[must_use]
+    /// Creates a lowercased DNS reference identity.
     pub fn dns(host: &str) -> Self {
         Self::Dns(Arc::from(host.to_ascii_lowercase()))
     }
 
     #[must_use]
+    /// Creates a literal IP reference identity.
     pub fn ip(address: IpAddr) -> Self {
         Self::Ip(address)
     }
@@ -53,6 +63,7 @@ pub struct OriginKey {
 
 impl OriginKey {
     #[must_use]
+    /// Creates the complete identity that controls connection reuse.
     pub fn new(
         transport: Transport,
         reference: ReferenceIdentity,
@@ -70,26 +81,31 @@ impl OriginKey {
     }
 
     #[must_use]
+    /// Returns the upstream transport.
     pub fn transport(&self) -> Transport {
         self.transport
     }
 
     #[must_use]
+    /// Returns the logical DNS or IP identity.
     pub fn reference(&self) -> &ReferenceIdentity {
         &self.reference
     }
 
     #[must_use]
+    /// Returns the logical upstream port.
     pub fn port(&self) -> u16 {
         self.port
     }
 
     #[must_use]
+    /// Returns the TLS certificate-verification policy.
     pub fn verify_mode(&self) -> VerifyMode {
         self.verify
     }
 
     #[must_use]
+    /// Returns the DNS or pinned-address connection policy.
     pub fn address_policy(&self) -> AddressPolicy {
         self.address
     }

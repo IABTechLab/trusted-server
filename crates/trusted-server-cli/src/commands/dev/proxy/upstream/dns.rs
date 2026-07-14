@@ -255,7 +255,7 @@ async fn run_lookup(
 ) {
     let result = resolve(resolver, &key, deadline, &metrics).await;
     let shared = result.as_ref().map(Arc::clone).map_err(OwnedError::from_io);
-    let _ = signal.send(Some(shared.clone()));
+    signal.send_replace(Some(shared.clone()));
 
     let mut state = state.lock().await;
     let still_owner = matches!(
@@ -444,6 +444,61 @@ mod tests {
             .send(Ok(vec!["127.0.0.1:443".parse().expect("socket")]))
             .expect("should deliver result");
         assert_eq!(second.await.expect("join").expect("shared lookup").len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_lookup_is_retained_when_every_initial_waiter_cancels() {
+        let (cache, mut requests) = fake_cache();
+        let metrics = Arc::new(ProxyMetrics::default());
+        let first = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            let metrics = Arc::clone(&metrics);
+            async move {
+                cache
+                    .lookup(
+                        "late.test",
+                        443,
+                        Instant::now() + Duration::from_secs(5),
+                        metrics,
+                    )
+                    .await
+            }
+        });
+        let request = requests.recv().await.expect("should start lookup");
+        first.abort();
+        let _ = first.await;
+
+        let key = CacheKey {
+            host: Arc::from("late.test"),
+            port: 443,
+        };
+        let state = cache.state.lock().await;
+        let signal = match state.entries.get(&key) {
+            Some(Entry::Loading { signal, .. }) => signal.clone(),
+            _ => panic!("lookup should remain loading while resolver is pending"),
+        };
+        request
+            .result
+            .send(Ok(vec!["127.0.0.1:443".parse().expect("socket")]))
+            .expect("should complete lookup");
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while signal.borrow().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed value should be retained before cache-state replacement");
+        let late = signal.subscribe();
+        let retained = late
+            .borrow()
+            .clone()
+            .expect("late subscriber should immediately observe completion");
+        let Ok(addresses) = retained else {
+            panic!("lookup should succeed");
+        };
+        assert_eq!(addresses.len(), 1);
+        drop(state);
     }
 
     #[tokio::test]

@@ -631,6 +631,71 @@ fn strip_hop_by_hop(headers: &mut hyper::HeaderMap) {
     }
 }
 
+struct UpstreamTrailerMetadata {
+    declarations: Vec<HeaderName>,
+    accepts_response_trailers: bool,
+}
+
+impl UpstreamTrailerMetadata {
+    fn capture(headers: &hyper::HeaderMap) -> Self {
+        let declarations = headers
+            .get_all(hyper::header::TRAILER)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .filter_map(|name| HeaderName::from_bytes(name.trim().as_bytes()).ok())
+            .filter(is_safe_trailer_field)
+            .collect();
+        let accepts_response_trailers = headers
+            .get_all(hyper::header::TE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .any(|token| token.trim().eq_ignore_ascii_case("trailers"));
+        Self {
+            declarations,
+            accepts_response_trailers,
+        }
+    }
+
+    fn regenerate(self, headers: &mut hyper::HeaderMap) {
+        for declaration in self.declarations {
+            headers.append(
+                hyper::header::TRAILER,
+                HeaderValue::from_str(declaration.as_str())
+                    .expect("should serialize a validated trailer field name"),
+            );
+        }
+        if self.accepts_response_trailers {
+            headers.insert(hyper::header::TE, HeaderValue::from_static("trailers"));
+            headers.insert(hyper::header::CONNECTION, HeaderValue::from_static("TE"));
+        }
+    }
+}
+
+fn is_safe_trailer_field(name: &HeaderName) -> bool {
+    !matches!(
+        name.as_str(),
+        "authorization"
+            | "cache-control"
+            | "connection"
+            | "content-encoding"
+            | "content-length"
+            | "content-range"
+            | "content-type"
+            | "host"
+            | "keep-alive"
+            | "max-forwards"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "set-cookie"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
 /// Applies the rewrite outcome: strips inbound hop-by-hop headers, then sets
 /// upstream `Host`, `X-Forwarded-Host`/`X-Orig-Host` (both `FROM`, after
 /// stripping any higher-priority inbound `Forwarded`), an authoritative
@@ -642,6 +707,7 @@ fn rewrite_headers(
     outcome: &super::rewrite::RewriteOutcome,
     basic_auth: Option<&super::config::BasicAuth>,
 ) {
+    let trailer_metadata = UpstreamTrailerMetadata::capture(headers);
     // Strip hop-by-hop headers first, so a client cannot flag the authoritative
     // headers we stamp below as connection-specific and have them dropped.
     strip_hop_by_hop(headers);
@@ -680,6 +746,7 @@ fn rewrite_headers(
     {
         headers.insert(hyper::header::AUTHORIZATION, auth.header_value().clone());
     }
+    trailer_metadata.regenerate(headers);
 }
 
 fn status_response(status: StatusCode) -> Response<BoxBody<Bytes, hyper::Error>> {
@@ -864,6 +931,47 @@ mod tests {
         assert!(
             !metadata.replayable(),
             "chunked upload must never enter stale replay"
+        );
+    }
+
+    #[test]
+    fn rewrite_headers_regenerates_safe_request_trailer_metadata() {
+        let outcome = rewrite_outcome("to.edgecompute.app");
+        let mut headers = hyper::HeaderMap::new();
+        headers.append(
+            hyper::header::TRAILER,
+            HeaderValue::from_static("x-request-checksum, content-length"),
+        );
+        headers.append(
+            hyper::header::TRAILER,
+            HeaderValue::from_static("authorization, x-request-proof"),
+        );
+        headers.insert(
+            hyper::header::TE,
+            HeaderValue::from_static("gzip, trailers"),
+        );
+        headers.insert(
+            hyper::header::CONNECTION,
+            HeaderValue::from_static("keep-alive, TE"),
+        );
+
+        rewrite_headers(&mut headers, &outcome, None);
+
+        let declarations: Vec<_> = headers
+            .get_all(hyper::header::TRAILER)
+            .iter()
+            .map(|value| value.to_str().expect("should encode trailer name"))
+            .collect();
+        assert_eq!(declarations, ["x-request-checksum", "x-request-proof"]);
+        assert_eq!(
+            headers.get(hyper::header::TE).expect("should restore TE"),
+            "trailers"
+        );
+        assert_eq!(
+            headers
+                .get(hyper::header::CONNECTION)
+                .expect("should declare TE hop-by-hop"),
+            "TE"
         );
     }
 

@@ -76,6 +76,9 @@ async fn perf_pooled_saturation_concurrency_twenty() {
 #[tokio::test]
 #[ignore = "manual performance workload"]
 async fn perf_http1_remote_model() {
+    let variant = perf_variant();
+    validate_remote_variant(&variant)
+        .expect("remote workload requires TS_PERF_VARIANT=remote_baseline or remote_pooled");
     run_concurrent_pooled("http1_remote_model_30_30_25", 20).await;
 }
 
@@ -147,6 +150,22 @@ async fn run_concurrent_pooled(workload: &str, concurrency: usize) {
 
 fn perf_variant() -> String {
     std::env::var("TS_PERF_VARIANT").unwrap_or_else(|_| "pooled".to_string())
+}
+
+fn validate_remote_variant(variant: &str) -> Result<(), &'static str> {
+    match variant {
+        "remote_baseline" | "remote_pooled" => Ok(()),
+        _ => Err("remote workload requires a remote_* performance variant"),
+    }
+}
+
+#[test]
+fn remote_workload_accepts_only_remote_variants() {
+    assert!(validate_remote_variant("remote_baseline").is_ok());
+    assert!(validate_remote_variant("remote_pooled").is_ok());
+    assert!(validate_remote_variant("baseline").is_err());
+    assert!(validate_remote_variant("pooled").is_err());
+    assert!(validate_remote_variant("cap20").is_err());
 }
 
 fn numbered_paths() -> Vec<String> {

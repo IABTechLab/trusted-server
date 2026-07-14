@@ -387,6 +387,84 @@ pub async fn start_trailer_upstream() -> Upstream {
     start_scripted_upstream(ScriptedResponse::Trailers).await
 }
 
+/// Starts an origin that accepts a declared request trailer and returns a
+/// response trailer only when the proxy also forwards `TE: trailers`.
+pub async fn start_request_trailer_upstream() -> Upstream {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("should bind request-trailer upstream");
+    let addr = listener.local_addr().expect("should read scripted address");
+    let acceptor = upstream_tls_acceptor();
+    let counters = Arc::new(UpstreamCounters::default());
+    let task_counters = Arc::clone(&counters);
+    tokio::spawn(async move {
+        let Ok((tcp, _)) = listener.accept().await else {
+            return;
+        };
+        task_counters
+            .accepted_connections
+            .fetch_add(1, Ordering::Relaxed);
+        let Ok(mut tls) = acceptor.accept(tcp).await else {
+            task_counters.failures.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        task_counters.tls_handshakes.fetch_add(1, Ordering::Relaxed);
+
+        let mut encoded = Vec::new();
+        let mut scratch = [0_u8; 1024];
+        let head_end = loop {
+            if let Some(position) = find_subslice(&encoded, b"\r\n\r\n") {
+                break position + 4;
+            }
+            let Ok(count) = tls.read(&mut scratch).await else {
+                return;
+            };
+            if count == 0 {
+                return;
+            }
+            encoded.extend_from_slice(&scratch[..count]);
+        };
+        let head = String::from_utf8_lossy(&encoded[..head_end]).to_string();
+        let body_prefix = encoded.split_off(head_end);
+        let Some((body, trailers)) = decode_chunked_body(&mut tls, body_prefix).await else {
+            task_counters.failures.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        task_counters.requests.fetch_add(1, Ordering::Relaxed);
+        let trailer_declared = header_value(&head, "trailer")
+            .is_some_and(|value| value.eq_ignore_ascii_case("x-request-checksum"));
+        let accepts_trailers = header_value(&head, "te").is_some_and(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("trailers"))
+        });
+        let connection_declares_te = header_value(&head, "connection").is_some_and(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("te"))
+        });
+        let request_trailer_arrived = trailers
+            .to_ascii_lowercase()
+            .contains("x-request-checksum: verified");
+        let accepted = body == b"data"
+            && trailer_declared
+            && accepts_trailers
+            && connection_declares_te
+            && request_trailer_arrived;
+        let response = if accepted {
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: x-response-accepted\r\nConnection: keep-alive\r\n\r\n8\r\naccepted\r\n0\r\nx-response-accepted: yes\r\n\r\n"
+                .as_slice()
+        } else {
+            b"HTTP/1.1 400 Bad Request\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n0\r\n\r\n"
+                .as_slice()
+        };
+        if tls.write_all(response).await.is_err() || tls.flush().await.is_err() {
+            task_counters.failures.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    Upstream { addr, counters }
+}
+
 #[derive(Clone, Copy)]
 enum ScriptedResponse {
     Early,
@@ -754,6 +832,31 @@ pub async fn spawn_proxy_with_state(
     };
     let state =
         trusted_server_cli::commands::dev::proxy::ProxyState::with_upstream_options(cfg, options);
+    let pac: Arc<str> = Arc::from("function FindProxyForURL(u, h) { return \"DIRECT\"; }");
+    let task_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        let _ = server::serve_on_with_state(listener, task_state, ca, pac).await;
+    });
+    (addr, state)
+}
+
+/// Spawns the proxy with explicit upstream options for boundary-condition tests.
+pub async fn spawn_proxy_with_upstream_options(
+    cfg: config::ResolvedConfig,
+    ca: Arc<ca::CertAuthority>,
+    options: trusted_server_cli::commands::dev::proxy::upstream::UpstreamOptions,
+) -> (
+    SocketAddr,
+    Arc<trusted_server_cli::commands::dev::proxy::ProxyState>,
+) {
+    let listener = server::bind(cfg.listen)
+        .await
+        .expect("should bind proxy listener");
+    let addr = listener.local_addr().expect("should read proxy addr");
+    let state = trusted_server_cli::commands::dev::proxy::ProxyState::with_upstream_options(
+        Arc::new(cfg),
+        options,
+    );
     let pac: Arc<str> = Arc::from("function FindProxyForURL(u, h) { return \"DIRECT\"; }");
     let task_state = Arc::clone(&state);
     tokio::spawn(async move {
@@ -1321,6 +1424,21 @@ pub async fn drive_trailer_requests(proxy: SocketAddr) -> Vec<(Vec<u8>, String)>
         );
     }
     responses
+}
+
+/// Sends a chunked request with a declared trailer and asks the origin to
+/// return response trailers.
+pub async fn drive_request_trailer(proxy: SocketAddr) -> (Vec<u8>, String) {
+    let mut tls = open_mitm_client(proxy).await;
+    let request = format!(
+        "POST /request-trailer HTTP/1.1\r\nHost: {FROM_HOST}\r\nTransfer-Encoding: chunked\r\nTrailer: x-request-checksum\r\nTE: trailers\r\nConnection: TE\r\n\r\n4\r\ndata\r\n0\r\nx-request-checksum: verified\r\n\r\n"
+    );
+    tls.write_all(request.as_bytes())
+        .await
+        .expect("should send request trailers");
+    read_chunked_response(&mut tls)
+        .await
+        .expect("origin should return a chunked response with trailers")
 }
 
 /// Streams `body` through the proxy with chunked request framing and returns

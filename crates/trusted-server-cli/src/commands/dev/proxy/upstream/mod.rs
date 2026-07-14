@@ -1,7 +1,12 @@
+/// Streaming upload and pooled response-body adapters.
 pub mod body;
+/// DNS/TCP/TLS/HTTP connection establishment.
 pub mod connect;
+/// Bounded TTL DNS cache with concurrent-miss coalescing.
 pub mod dns;
+/// Strong upstream origin identity types.
 pub mod key;
+/// Bounded connection-pool actor and lifecycle types.
 pub mod manager;
 
 use std::sync::Arc;
@@ -29,6 +34,7 @@ pub struct RequestMetadata {
 
 impl RequestMetadata {
     #[must_use]
+    /// Captures framing and replay facts before hop-by-hop sanitation.
     pub fn capture<B: Body>(request: &Request<B>) -> Self {
         let unframed = !request
             .headers()
@@ -52,11 +58,13 @@ impl RequestMetadata {
     }
 
     #[must_use]
+    /// Returns whether the browser upload is already known to be complete.
     pub fn upload_initially_complete(self) -> bool {
         self.upload_initially_complete
     }
 
     #[must_use]
+    /// Returns whether the request can be reconstructed for one safe stale retry.
     pub fn replayable(self) -> bool {
         self.replayable
     }
@@ -90,11 +98,38 @@ impl ReplayTemplate {
     }
 }
 
+/// Process-shared bounded upstream HTTP/1 client and DNS cache.
 pub struct UpstreamClient {
     manager: Arc<Manager<UpstreamSender>>,
     metrics: Arc<ProxyMetrics>,
     connect_policy: connect::ConnectPolicy,
     dns: Arc<dns::DnsCache>,
+}
+
+struct SendOutcomeGuard<'a> {
+    metrics: &'a ProxyMetrics,
+    handed_to_response_body: bool,
+}
+
+impl<'a> SendOutcomeGuard<'a> {
+    fn new(metrics: &'a ProxyMetrics) -> Self {
+        Self {
+            metrics,
+            handed_to_response_body: false,
+        }
+    }
+
+    fn hand_to_response_body(&mut self) {
+        self.handed_to_response_body = true;
+    }
+}
+
+impl Drop for SendOutcomeGuard<'_> {
+    fn drop(&mut self) {
+        if !self.handed_to_response_body {
+            self.metrics.record_request_failed();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -115,10 +150,15 @@ async fn acquire_for_mode<T: Send + 'static>(
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Production pool defaults plus harness-only upstream timing controls.
 pub struct UpstreamOptions {
+    /// Manager connection, idle, waiter, and timeout bounds.
     pub limits: manager::PoolLimits,
+    /// Whether successful DNS results are cached for the bounded TTL.
     pub dns_cache: bool,
+    /// Harness-only delay before each new TCP connection.
     pub connect_delay: Duration,
+    /// Harness-only delay before each new TLS handshake.
     pub tls_delay: Duration,
 }
 
@@ -135,11 +175,13 @@ impl Default for UpstreamOptions {
 
 impl UpstreamClient {
     #[must_use]
+    /// Creates a client with production pool and DNS defaults.
     pub fn new(metrics: Arc<ProxyMetrics>, connect_timeout: Duration) -> Self {
         Self::with_options(metrics, connect_timeout, UpstreamOptions::default())
     }
 
     #[must_use]
+    /// Creates a client with explicit harness or boundary-test options.
     pub fn with_options(
         metrics: Arc<ProxyMetrics>,
         connect_timeout: Duration,
@@ -169,6 +211,7 @@ impl UpstreamClient {
         rule: &Rule,
         outcome: &RewriteOutcome,
     ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, Report<ProxyError>> {
+        let mut outcome_guard = SendOutcomeGuard::new(&self.metrics);
         let request_started = tokio::time::Instant::now();
         let replay_template = ReplayTemplate::capture(&request, metadata);
         let mut stale_retry = false;
@@ -176,14 +219,12 @@ impl UpstreamClient {
         let mut lease = loop {
             let acquisition_started = tokio::time::Instant::now();
             let acquired =
-                acquire_for_mode(&self.manager, rule.origin_key().clone(), acquisition_mode)
-                    .await
-                    .map_err(|error| {
-                        Report::new(ProxyError::Server)
-                            .attach(format!("pool acquire failed: {error:?}"))
-                    })?;
+                acquire_for_mode(&self.manager, rule.origin_key().clone(), acquisition_mode).await;
             self.metrics
                 .record_pool_acquisition(acquisition_started.elapsed());
+            let acquired = acquired.map_err(|error| {
+                Report::new(ProxyError::Server).attach(format!("pool acquire failed: {error:?}"))
+            })?;
             if let Some(queue_wait) = acquired.queue_wait() {
                 self.metrics.record_queue_wait(queue_wait);
             }
@@ -195,6 +236,7 @@ impl UpstreamClient {
                 }
                 Acquired::Open(reservation) => {
                     self.metrics.record_pool_miss();
+                    let connector_id = reservation.id();
                     let connector = connect::PendingConnection::spawn(
                         rule.origin_key().clone(),
                         outcome.sni.clone(),
@@ -202,16 +244,15 @@ impl UpstreamClient {
                         Arc::clone(&self.metrics),
                         Arc::clone(&self.manager),
                         Arc::clone(&self.dns),
-                        reservation.id(),
+                        reservation,
                     );
                     self.manager
-                        .register_connector(reservation.id(), connector.abort_handle());
+                        .register_connector(connector_id, connector.abort_handle());
                     let opened = connector
                         .finish()
                         .await
                         .change_context(ProxyError::Server)?;
-                    let start = opened.start;
-                    let lease = reservation.register(&self.manager, opened.sender, opened.abort);
+                    let (lease, start) = opened.register(&self.manager);
                     (lease, Some(start))
                 }
             };
@@ -229,7 +270,6 @@ impl UpstreamClient {
                 }
                 Err(error) => {
                     candidate.connection.abort.abort();
-                    self.metrics.record_request_failed();
                     return Err(Report::new(ProxyError::Server).attach(error.to_string()));
                 }
             }
@@ -243,6 +283,10 @@ impl UpstreamClient {
         let response = loop {
             match lease.connection.value.send_request(request).await {
                 Ok(response) => break response,
+                // Replaying a non-idempotent or streaming request could submit it
+                // twice after an origin processed the first attempt. Return 502
+                // instead unless pre-sanitization metadata proved an empty
+                // GET/HEAD/OPTIONS request can be reconstructed exactly.
                 Err(_error) if lease.reused && !stale_retry && replay_template.is_some() => {
                     stale_retry = true;
                     self.metrics.record_pool_stale();
@@ -261,7 +305,6 @@ impl UpstreamClient {
                 }
                 Err(error) => {
                     lease.connection.abort.abort();
-                    self.metrics.record_request_failed();
                     return Err(Report::new(ProxyError::Server).attach(error.to_string()));
                 }
             }
@@ -284,9 +327,11 @@ impl UpstreamClient {
             close_intent,
             Arc::clone(&self.metrics),
         );
+        outcome_guard.hand_to_response_body();
         Ok(Response::from_parts(parts, pooled.boxed()))
     }
 
+    /// Aborts connectors and drivers, then waits for lifecycle reconciliation.
     pub async fn shutdown(&self) {
         self.manager.shutdown().await;
     }
@@ -303,15 +348,12 @@ impl UpstreamClient {
         Report<ProxyError>,
     > {
         let acquisition_started = tokio::time::Instant::now();
-        let acquired = self
-            .manager
-            .acquire_fresh(rule.origin_key().clone())
-            .await
-            .map_err(|error| {
-                Report::new(ProxyError::Server).attach(format!("pool acquire failed: {error:?}"))
-            })?;
+        let acquired = self.manager.acquire_fresh(rule.origin_key().clone()).await;
         self.metrics
             .record_pool_acquisition(acquisition_started.elapsed());
+        let acquired = acquired.map_err(|error| {
+            Report::new(ProxyError::Server).attach(format!("pool acquire failed: {error:?}"))
+        })?;
         if let Some(queue_wait) = acquired.queue_wait() {
             self.metrics.record_queue_wait(queue_wait);
         }
@@ -322,6 +364,7 @@ impl UpstreamClient {
             }
             Acquired::Open(reservation) => {
                 self.metrics.record_pool_miss();
+                let connector_id = reservation.id();
                 let connector = connect::PendingConnection::spawn(
                     rule.origin_key().clone(),
                     outcome.sni.clone(),
@@ -329,16 +372,15 @@ impl UpstreamClient {
                     Arc::clone(&self.metrics),
                     Arc::clone(&self.manager),
                     Arc::clone(&self.dns),
-                    reservation.id(),
+                    reservation,
                 );
                 self.manager
-                    .register_connector(reservation.id(), connector.abort_handle());
+                    .register_connector(connector_id, connector.abort_handle());
                 let opened = connector
                     .finish()
                     .await
                     .change_context(ProxyError::Server)?;
-                let start = opened.start;
-                let lease = reservation.register(&self.manager, opened.sender, opened.abort);
+                let (lease, start) = opened.register(&self.manager);
                 Ok((lease, Some(start)))
             }
         }

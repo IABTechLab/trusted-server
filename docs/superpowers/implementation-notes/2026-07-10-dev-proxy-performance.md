@@ -141,7 +141,20 @@ A fresh adversarial review found and corrected seven lifecycle gaps before merge
 
 The exact remote model requested by the plan uses 100 empty GETs at concurrency
 20, 30 ms injected connection delay, 30 ms injected TLS delay, and a 25 ms
-upstream response delay. After two warmups and ten alternating runs:
+upstream response delay. The recorded run used the following exact alternating
+commands. Runs 1–2 were discarded as warmups; runs 3–12 produced the ten samples
+per variant:
+
+```bash
+for run in $(seq 1 12); do
+  echo "remote pair ${run}"
+  TS_PERF_VARIANT=remote_baseline cargo test --package trusted-server-cli --target aarch64-apple-darwin --test proxy_perf perf_http1_remote_model -- --ignored --nocapture --test-threads=1
+  TS_PERF_VARIANT=remote_pooled cargo test --package trusted-server-cli --target aarch64-apple-darwin --test proxy_perf perf_http1_remote_model -- --ignored --nocapture --test-threads=1
+done
+```
+
+The workload now rejects any variant other than `remote_baseline` or
+`remote_pooled`, so a default local-delay run cannot be labeled as remote.
 
 | Variant       | Median (µs) | p95 (µs) | MAD (µs) | Connections / handshakes | Failures |
 | ------------- | ----------: | -------: | -------: | -----------------------: | -------: |
