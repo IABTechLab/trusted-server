@@ -205,6 +205,70 @@ Client EIDs retain the existing hard limits: at most 64 sources, 32 UIDs per sou
 limit are truncated deterministically; blank or oversized source/UID values are dropped.
 Consent determines whether the bounded result is attached at all.
 
+#### 7.3.1 Identity provenance and precedence
+
+The EC cookie and the identity graph have distinct roles. On browser-facing paths,
+`ts-ec` supplies an existing EC value; Trusted Server does not fetch an EC from KV. The
+EC value is instead the lookup key used to resolve partner IDs from the KV identity
+graph. `/auction` and page-bids are read-only for EC creation: when no permitted EC is
+already available they do not mint one. Initial navigation may create an EC only after
+the shared admission and identity decision permits it.
+
+`/auction` resolves EIDs in this order:
+
+1. Parse bounded, same-request `eids[]` from the admitted JSON body.
+2. Only when body EIDs are absent, parse the bounded `ts-eids` cookie as a browser-input
+   fallback.
+3. When EC use is permitted and the adapter exposes KV identity, resolve registered
+   partner IDs from KV using the existing EC as the lookup key.
+4. Merge KV-resolved EIDs first and client EIDs second, grouping by exact `source` and
+   deduplicating by exact `uid.id`. A duplicate retains server-resolved metadata and
+   fills only missing `atype` or `ext` metadata from the client value. Distinct UIDs for
+   one source are preserved.
+5. Apply the shared identity and consent decision to the complete merged set. A denial
+   removes both `user.id` and all EIDs before any provider request is built.
+
+Initial-navigation and page-bids requests have no same-request EID body. They merge the
+bounded `ts-eids` browser fallback with EC-keyed KV EIDs under the same rules. An
+adapter without KV may still use permitted browser EIDs, but its missing KV capability
+is declared and tested rather than silently presented as full identity parity. A KV
+miss is an empty server-resolved set, not an auction failure.
+
+The `ts-eids` cookie is browser-origin identity input. TSJS writes it from Prebid.js
+`getUserIdsAsEids()` output, and Trusted Server may ingest registered partner IDs from
+it into KV for future requests. It is not a serialized KV response and is never the
+transport used to send identity to PBS or another demand partner.
+
+#### 7.3.2 Identity wire-hop contract
+
+Tests and documentation distinguish the three transformations instead of treating a
+downstream bidder capture as the `/auction` wire request:
+
+| Hop                          | EID location               | Impression bidder location |
+| ---------------------------- | -------------------------- | -------------------------- |
+| Browser/TSJS to `/auction`   | top-level request `eids[]` | `adUnits[].bids[]`         |
+| Trusted Server to PBS        | OpenRTB `user.ext.eids`    | `imp[].ext.prebid.bidder`  |
+| PBS to an OpenRTB 2.6 bidder | OpenRTB `user.eids`        | `imp[].ext.bidder`         |
+
+The final row is PBS normalization for a bidder's declared OpenRTB version; it is not a
+second Trusted Server serializer. OpenRTB 2.5 bidder requests may retain the extension
+form. At every hop, EIDs travel in the bounded, consent-gated body. Neither `ts-ec` nor
+`ts-eids` is required or permitted as downstream cookie transport.
+
+#### 7.3.3 Browser identity response boundary
+
+Browser-facing auction responses do not expose merged or KV-resolved partner IDs in
+`x-ts-eids` or `x-ts-eids-truncated`. The current headers have no source-TSJS consumer,
+duplicate identity already carried in the request/provider body, and can make
+server-resolved partner IDs browser-readable without a partner-use policy. Phase 1
+removes them from the auction response contract and updates the obsolete setup/edge
+cookie documentation and tests.
+
+The server does not synthesize or overwrite `ts-eids` from KV. A future browser consumer
+for server-resolved EIDs requires a new versioned contract, explicit source-by-source
+authorization, consent review, size limits, and tests; it is not introduced as an
+implicit compatibility behavior.
+
 `integrations.prebid.account_id`, when configured, populates OpenRTB
 `site.publisher.id`. It is not injected into browser configuration unless a browser
 consumer actually needs it. Dead configuration is not retained for compatibility.
@@ -783,6 +847,8 @@ Adapter parity tests cover routing and behavior for:
 
 - Add shared origin/content-type/custom-header enforcement.
 - Stop raw cookie forwarding; allowlist consent cookies only.
+- Remove browser-facing `x-ts-eids`/`x-ts-eids-truncated`; do not persist KV EIDs back
+  into `ts-eids` without a separately approved contract.
 - Enforce the kill switch before provider work.
 - Add private/no-store responses and redacted request logging.
 - Normalize forwarded headers where missing.
@@ -791,7 +857,10 @@ Adapter parity tests cover routing and behavior for:
 
 Compatibility impact: undocumented direct `/auction` callers without the TS header or
 JSON content type stop working. This is an intentional security break and must be called
-out in release notes.
+out in release notes. The documented `x-ts-eids` and `x-ts-eids-truncated` response
+headers are also removed; operators or private clients that inspected them must use
+provider-side observability rather than reading partner identifiers back into the
+browser.
 
 ### Phase 2: Request and auction economics
 
@@ -844,10 +913,11 @@ but security fixes are not feature-disabled by default.
 ### 18.1 Test levels
 
 1. **Pure Rust unit tests** for admission, page normalization, slot/bid validation,
-   cookie allowlisting, macro resolution, floor/tie selection, and response projection.
+   identity provenance/merge/gating, cookie allowlisting, macro resolution, floor/tie
+   selection, and response projection.
 2. **Provider contract tests** for PBS, APS, and mediator 204/no-bid/errors, media
-   capabilities, malformed/unknown bids, floors, cache/notice extraction, and partial
-   failure.
+   capabilities, identity wire-hop placement, malformed/unknown bids, floors,
+   cache/notice extraction, and partial failure.
 3. **Rust path-parity fixtures** that feed equivalent logical auctions through initial,
    page-bids, and `/auction` construction and compare normalized requests/outcomes.
 4. **Vitest browser tests** for request headers/timeouts/callbacks, immutable ad units,
@@ -879,6 +949,12 @@ path:
 - cache creative with win and billing notices;
 - consent denied, GPC/US opt-out, missing consent in fail-closed jurisdiction, and
   consent allowed;
+- `/auction` body EIDs taking precedence over `ts-eids`, KV/client EID merge preserving
+  multiple UIDs, KV miss, no EC, and an adapter without KV identity;
+- TS-to-PBS `user.ext.eids`/`imp.ext.prebid.bidder`, a PBS OpenRTB 2.6 fixture with
+  `user.eids`/`imp.ext.bidder`, and no EC/EID/publisher cookies in the PBS headers;
+- browser-facing responses omitting `x-ts-eids` and `x-ts-eids-truncated` even when KV
+  or client EIDs were available to the provider request;
 - duplicate slot/provider/bidder/routing identifiers;
 - multi-size banner selecting a non-first size;
 - native/video client bidder with banner-only server provider;
@@ -940,6 +1016,10 @@ Public documentation must clearly distinguish:
 - notice ownership and lifecycle;
 - server candidate telemetry versus rendered impressions;
 - consent and cookie forwarding;
+- EC/EID provenance, merge precedence, consent gating, and the three identity wire
+  shapes;
+- the removal of browser-facing EID response headers and the fact that `ts-eids` is
+  browser-origin input rather than a KV export;
 - media/provider/adapter capabilities; and
 - refresh behavior and timeout tiers.
 
@@ -951,48 +1031,49 @@ adapter limitations.
 
 ## 20. Audit finding traceability
 
-| ID  | Confirmed discrepancy                                | Design disposition                           | Phase |
-| --- | ---------------------------------------------------- | -------------------------------------------- | ----- |
-| S1  | Raw publisher cookies forwarded to PBS               | Consent-cookie allowlist; fail closed        | 1     |
-| S2  | `/auction` cross-site triggerable                    | Shared same-origin/content-type/header gate  | 1     |
-| S3  | `/auction` bypasses auction kill switch              | Shared admission before provider work        | 1     |
-| S4  | Full OpenRTB debug logging contains sensitive data   | Shared redacted summaries                    | 1     |
-| S5  | `/auction` lacks explicit private/no-store           | Apply to every response class                | 1     |
-| S6  | Forwarded-header normalization differs by adapter    | Trusted platform normalization + tests       | 1     |
-| R1  | EC-derived auction IDs are reused                    | Fresh UUID per auction                       | 2     |
-| R2  | `/auction` loses actual page URL/path                | Canonical page with validated client URL     | 2     |
-| R3  | Empty/duplicate/zero-sized slots accepted            | `ValidatedAdSlot` invariants                 | 2     |
-| R4  | Media capability declarations are unused/inaccurate  | Enforce declarations; fix APS claim/request  | 2     |
-| R5  | Context, targeting, floors, and account ID disappear | Canonical typed request fields               | 2     |
-| R6  | Client/native consent can be more permissive         | Phase 1 suppression; Phase 4 dynamic updates | 1/4   |
-| E1  | Synchronous mediator failure discards direct bids    | Structured partial outcomes                  | 2     |
-| E2  | Floor filtering can erase eligible runner-up         | Preselection floor validation + fallback     | 2     |
-| E3  | Provider bids are not validated against request      | Shared `BidCandidate` validator              | 2     |
-| E4  | Equal-price ties depend on completion order          | Explicit deterministic comparator            | 2     |
-| E5  | Duplicate providers/routes execute or overwrite      | Configuration uniqueness errors              | 2     |
-| E6  | HTTP 204 is a parse failure                          | Map to `NoBid`                               | 2     |
-| E7  | All-provider launch failure differs by path          | Canonical no-winner with failure details     | 2     |
-| E8  | Overlapping server/client bidder runs twice          | Reject overlap at configuration time         | 2     |
-| B1  | `/auction` drops notice/cache/original identity      | Canonical bid and OpenRTB projection         | 3     |
-| B2  | Inline bid without adid/cache cannot render          | Original bid ID is renderer identity         | 3     |
-| B3  | Raw notice macros are invoked                        | Shared server macro resolver                 | 3     |
-| B4  | Win and billing fire at the same premature event     | Typed win/render lifecycle                   | 3     |
-| B5  | URL-based dedupe suppresses later auctions           | Auction/bid/event dedupe key                 | 3     |
-| B6  | Creative policy differs by path                      | One isolated production renderer             | 3     |
-| B7  | Bid dimensions are lost or defaulted                 | Preserve and require actual dimensions       | 3     |
-| B8  | Implicit/missing body close loses auction injection  | Exactly-once EOF fallback                    | 3     |
-| J1  | `requestAds` ignores timeout and calls back early    | AbortController + completion callback        | 4     |
-| J2  | Refresh loses request-scoped units/params            | Immutable normalized registry                | 4     |
-| J3  | Refresh coerces native/video to banner               | Preserve original media for client bidders   | 4     |
-| J4  | Prebid shim mutates publisher ad units               | Clone; never mutate caller objects           | 4     |
-| J5  | Refresh aliases do not cover all slot identities     | Canonical alias set                          | 4     |
-| T1  | Split-phase latency includes origin time             | Capture provider completion timestamps       | 5     |
-| T2  | Telemetry can mark wrong bid/price/media             | Canonical bid identity and clearing price    | 5     |
-| T3  | Mediator errors lose partial telemetry               | Build from structured provider outcomes      | 5     |
-| C1  | Rust/TypeScript wire contracts drift                 | Bidirectional versioned fixtures             | 5     |
-| C2  | Tinybird schema is independently maintained          | Versioned comparison/generation check        | 5     |
-| C3  | Public docs describe obsolete behavior               | Replace with current two-path guide          | 5     |
-| C4  | Production `adm` comments/types say debug-only       | Align contracts with renderer policy         | 3/5   |
+| ID  | Confirmed discrepancy                                 | Design disposition                           | Phase |
+| --- | ----------------------------------------------------- | -------------------------------------------- | ----- |
+| S1  | Raw publisher cookies forwarded to PBS                | Consent-cookie allowlist; fail closed        | 1     |
+| S2  | `/auction` cross-site triggerable                     | Shared same-origin/content-type/header gate  | 1     |
+| S3  | `/auction` bypasses auction kill switch               | Shared admission before provider work        | 1     |
+| S4  | Full OpenRTB debug logging contains sensitive data    | Shared redacted summaries                    | 1     |
+| S5  | `/auction` lacks explicit private/no-store            | Apply to every response class                | 1     |
+| S6  | Forwarded-header normalization differs by adapter     | Trusted platform normalization + tests       | 1     |
+| S7  | Browser responses expose merged EIDs with no consumer | Remove EID response headers                  | 1     |
+| R1  | EC-derived auction IDs are reused                     | Fresh UUID per auction                       | 2     |
+| R2  | `/auction` loses actual page URL/path                 | Canonical page with validated client URL     | 2     |
+| R3  | Empty/duplicate/zero-sized slots accepted             | `ValidatedAdSlot` invariants                 | 2     |
+| R4  | Media capability declarations are unused/inaccurate   | Enforce declarations; fix APS claim/request  | 2     |
+| R5  | Context, targeting, floors, and account ID disappear  | Canonical typed request fields               | 2     |
+| R6  | Client/native consent can be more permissive          | Phase 1 suppression; Phase 4 dynamic updates | 1/4   |
+| E1  | Synchronous mediator failure discards direct bids     | Structured partial outcomes                  | 2     |
+| E2  | Floor filtering can erase eligible runner-up          | Preselection floor validation + fallback     | 2     |
+| E3  | Provider bids are not validated against request       | Shared `BidCandidate` validator              | 2     |
+| E4  | Equal-price ties depend on completion order           | Explicit deterministic comparator            | 2     |
+| E5  | Duplicate providers/routes execute or overwrite       | Configuration uniqueness errors              | 2     |
+| E6  | HTTP 204 is a parse failure                           | Map to `NoBid`                               | 2     |
+| E7  | All-provider launch failure differs by path           | Canonical no-winner with failure details     | 2     |
+| E8  | Overlapping server/client bidder runs twice           | Reject overlap at configuration time         | 2     |
+| B1  | `/auction` drops notice/cache/original identity       | Canonical bid and OpenRTB projection         | 3     |
+| B2  | Inline bid without adid/cache cannot render           | Original bid ID is renderer identity         | 3     |
+| B3  | Raw notice macros are invoked                         | Shared server macro resolver                 | 3     |
+| B4  | Win and billing fire at the same premature event      | Typed win/render lifecycle                   | 3     |
+| B5  | URL-based dedupe suppresses later auctions            | Auction/bid/event dedupe key                 | 3     |
+| B6  | Creative policy differs by path                       | One isolated production renderer             | 3     |
+| B7  | Bid dimensions are lost or defaulted                  | Preserve and require actual dimensions       | 3     |
+| B8  | Implicit/missing body close loses auction injection   | Exactly-once EOF fallback                    | 3     |
+| J1  | `requestAds` ignores timeout and calls back early     | AbortController + completion callback        | 4     |
+| J2  | Refresh loses request-scoped units/params             | Immutable normalized registry                | 4     |
+| J3  | Refresh coerces native/video to banner                | Preserve original media for client bidders   | 4     |
+| J4  | Prebid shim mutates publisher ad units                | Clone; never mutate caller objects           | 4     |
+| J5  | Refresh aliases do not cover all slot identities      | Canonical alias set                          | 4     |
+| T1  | Split-phase latency includes origin time              | Capture provider completion timestamps       | 5     |
+| T2  | Telemetry can mark wrong bid/price/media              | Canonical bid identity and clearing price    | 5     |
+| T3  | Mediator errors lose partial telemetry                | Build from structured provider outcomes      | 5     |
+| C1  | Rust/TypeScript wire contracts drift                  | Bidirectional versioned fixtures             | 5     |
+| C2  | Tinybird schema is independently maintained           | Versioned comparison/generation check        | 5     |
+| C3  | Public docs describe obsolete behavior                | Replace with current two-path guide          | 5     |
+| C4  | Production `adm` comments/types say debug-only        | Align contracts with renderer policy         | 3/5   |
 
 ### Findings deliberately not treated as defects
 
@@ -1011,12 +1092,14 @@ This parity program is complete only when:
 1. all three entry paths use the canonical admission, request, validation, outcome, and
    telemetry contracts;
 2. no raw publisher cookie or sensitive full OpenRTB payload reaches PBS/logs by default;
-3. equivalent fixture auctions produce equivalent normalized outcomes;
-4. invalid/unsupported input fails explicitly and consistently;
-5. original bid/render/notice identity survives every response projection;
-6. executable creative markup can run only in the verified isolation boundary;
-7. win and billing notices use resolved URLs and correct lifecycle events;
-8. browser refresh preserves original publisher configuration and media;
-9. adapter limitations are validated before traffic;
-10. Rust, JS, adapter, formatting, clippy, and cross-language contract checks pass; and
-11. public documentation accurately describes deployed behavior and migration impacts.
+3. EC/EID provenance, precedence, consent gating, and wire-hop placement match the
+   versioned identity contract without exposing server-resolved EIDs to the browser;
+4. equivalent fixture auctions produce equivalent normalized outcomes;
+5. invalid/unsupported input fails explicitly and consistently;
+6. original bid/render/notice identity survives every response projection;
+7. executable creative markup can run only in the verified isolation boundary;
+8. win and billing notices use resolved URLs and correct lifecycle events;
+9. browser refresh preserves original publisher configuration and media;
+10. adapter limitations are validated before traffic;
+11. Rust, JS, adapter, formatting, clippy, and cross-language contract checks pass; and
+12. public documentation accurately describes deployed behavior and migration impacts.
