@@ -612,23 +612,40 @@ fn passthrough_finish_segments<P: StreamProcessor>(
 /// error paths that can still await (see [`abandon_hold_auction`]).
 struct DispatchedAuctionGuard {
     dispatched: Option<DispatchedAuction>,
+    /// Stays `true` from dispatch until collection (or telemetry-emitting
+    /// abandonment) reaches a terminal result. [`Self::take`] removes the
+    /// dispatched auction to hand it to the async collector but deliberately
+    /// leaves the guard armed, so a drop *while collection is still pending* —
+    /// a client disconnect at the collection await point — still logs the
+    /// loss. [`Self::disarm`] clears it only once collection has completed.
+    armed: bool,
 }
 
 impl DispatchedAuctionGuard {
     fn new(dispatched: DispatchedAuction) -> Self {
         Self {
             dispatched: Some(dispatched),
+            armed: true,
         }
     }
 
+    /// Remove the dispatched auction to begin collection. The guard stays armed
+    /// until [`Self::disarm`] is called, so a drop before collection reaches a
+    /// terminal result is still reported.
     fn take(&mut self) -> Option<DispatchedAuction> {
         self.dispatched.take()
+    }
+
+    /// Disarm the drop warning once collection (or telemetry-emitting
+    /// abandonment) has reached a terminal result.
+    fn disarm(&mut self) {
+        self.armed = false;
     }
 }
 
 impl Drop for DispatchedAuctionGuard {
     fn drop(&mut self) {
-        if self.dispatched.is_some() {
+        if self.armed {
             log::warn!(
                 "Dispatched server-side auction dropped without collection; SSP bid responses discarded (publisher body stream aborted or never polled)"
             );
@@ -668,6 +685,10 @@ async fn abandon_hold_auction(
             reason,
         )
         .await;
+        // Abandonment with telemetry is a terminal result, so the drop warning
+        // is no longer warranted. (A drop *during* the emit above still fires
+        // it, since the guard stays armed until here.)
+        state.dispatched.disarm();
     }
 }
 
@@ -721,6 +742,9 @@ async fn hold_step_decoded_chunk<P: StreamProcessor>(
                 collect_refs.settings,
             )
             .await;
+            // Collection reached a terminal result; disarm only now so a drop
+            // while the collect await above was still pending is reported.
+            state.dispatched.disarm();
 
             let held = state
                 .hold
@@ -835,6 +859,9 @@ async fn hold_finish_segments<P: StreamProcessor>(
             collect_refs.settings,
         )
         .await;
+        // Collection reached a terminal result; disarm only now so a drop while
+        // the collect await above was still pending is reported.
+        state.dispatched.disarm();
 
         let held = hold.finish();
         if let Some(encoded) = process_and_encode_chunk(
@@ -1046,7 +1073,17 @@ pub async fn buffer_publisher_response_async(
     services: &RuntimeServices,
 ) -> Result<Response<EdgeBody>, Report<crate::error::TrustedServerError>> {
     match publisher_response {
-        PublisherResponse::Buffered(response) => Ok(response),
+        PublisherResponse::Buffered(mut response) => {
+            // A buffered-unmodified response can carry an origin body (a stream
+            // on streaming-capable adapters). A bodiless response (HEAD, 204,
+            // 205, 304) must stay bodiless, so drop the body while preserving
+            // metadata such as `Content-Length`, matching the streaming
+            // finalizer.
+            if !response_carries_body(method, response.status()) {
+                *response.body_mut() = EdgeBody::empty();
+            }
+            Ok(response)
+        }
         PublisherResponse::Stream {
             mut response,
             body,
@@ -1113,7 +1150,18 @@ pub async fn publisher_response_into_streaming_response(
     services: RuntimeServices,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     match publisher_response {
-        PublisherResponse::Buffered(response) => Ok(response),
+        PublisherResponse::Buffered(mut response) => {
+            // Fastly requests the origin body as a stream before the response is
+            // classified, so a buffered-unmodified response can still hold an
+            // `EdgeBody::Stream`. A bodiless response (HEAD, 204, 205, 304) must
+            // stay bodiless — `send_edgezero_response` streams any
+            // `EdgeBody::Stream` to the client — so drop the body while
+            // preserving metadata such as `Content-Length`.
+            if !response_carries_body(method, response.status()) {
+                *response.body_mut() = EdgeBody::empty();
+            }
+            Ok(response)
+        }
         PublisherResponse::PassThrough { mut response, body } => {
             if response_carries_body(method, response.status()) {
                 *response.body_mut() = body;
@@ -1196,6 +1244,10 @@ pub async fn publisher_response_into_streaming_response(
                             &settings,
                         )
                         .await;
+                        // Collection reached a terminal result; disarm only now
+                        // so a drop while the collect await above was still
+                        // pending is reported.
+                        guard.disarm();
                     }
                 }
 
@@ -1268,12 +1320,15 @@ pub async fn publisher_response_into_streaming_response(
 /// Returns `true` when a buffered publisher response should carry a body and a
 /// recomputed `Content-Length`.
 ///
-/// `HEAD` responses and bodiless statuses (204, 304) carry no body; rewriting
-/// their `Content-Length` to the (empty) buffered length would mislead clients
-/// and caches, so the origin metadata is preserved instead.
+/// `HEAD` responses and bodiless statuses (204, 205, 304) carry no body;
+/// rewriting their `Content-Length` to the (empty) buffered length — or
+/// streaming an origin body for them at all — would mislead clients and caches
+/// and violate HTTP framing, so the origin metadata is preserved and the body
+/// is dropped instead.
 fn response_carries_body(method: &Method, status: StatusCode) -> bool {
     *method != Method::HEAD
         && status != StatusCode::NO_CONTENT
+        && status != StatusCode::RESET_CONTENT
         && status != StatusCode::NOT_MODIFIED
 }
 
@@ -3756,8 +3811,40 @@ mod tests {
             "204 responses must not get a recomputed Content-Length"
         );
         assert!(
+            !super::response_carries_body(&Method::GET, StatusCode::RESET_CONTENT),
+            "205 responses must not get a recomputed Content-Length"
+        );
+        assert!(
             !super::response_carries_body(&Method::GET, StatusCode::NOT_MODIFIED),
             "304 responses must not get a recomputed Content-Length"
+        );
+    }
+
+    #[test]
+    fn dispatched_auction_guard_stays_armed_until_collection_completes() {
+        // `take()` hands the dispatched auction to the async collector, but the
+        // guard must stay armed across the collection await so a drop while
+        // collection is still pending (a client disconnect at the await point)
+        // still logs the loss. Only `disarm()` — called once collection reaches
+        // a terminal result — clears the warning.
+        let mut guard = DispatchedAuctionGuard::new(DispatchedAuction::empty_for_test(
+            test_auction_request(),
+            10,
+        ));
+        assert!(guard.armed, "a freshly dispatched guard should be armed");
+
+        let _dispatched = guard
+            .take()
+            .expect("guard should yield the dispatched auction for collection");
+        assert!(
+            guard.armed,
+            "guard must stay armed across the collection await so a drop mid-collection is reported"
+        );
+
+        guard.disarm();
+        assert!(
+            !guard.armed,
+            "guard must disarm once collection reaches a terminal result"
         );
     }
 
@@ -5352,6 +5439,73 @@ mod tests {
             !css.contains("origin.example.com"),
             "streaming response body should not leave origin URLs unrewritten. Got: {css}"
         );
+    }
+
+    #[test]
+    fn publisher_response_streaming_finalize_drops_bodiless_buffered_stream_body() {
+        // Fastly requests the origin body as a stream before classification, so
+        // a buffered-unmodified response can hold an `EdgeBody::Stream`. The
+        // adapter streams any `EdgeBody::Stream` to the client, so bodiless
+        // responses must be normalized to carry no body while keeping metadata.
+        let settings = Arc::new(create_test_settings());
+        let registry = Arc::new(
+            IntegrationRegistry::new(&settings).expect("should create integration registry"),
+        );
+        let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+
+        let cases = [
+            (Method::HEAD, StatusCode::OK),
+            (Method::GET, StatusCode::NO_CONTENT),
+            (Method::GET, StatusCode::RESET_CONTENT),
+            (Method::GET, StatusCode::NOT_MODIFIED),
+        ];
+
+        for (method, status) in cases {
+            let response = Response::builder()
+                .status(status)
+                .header(header::CONTENT_LENGTH, "42")
+                .body(EdgeBody::stream(futures::stream::iter(vec![
+                    bytes::Bytes::from_static(b"origin body bytes that must not reach the client"),
+                ])))
+                .expect("should build response");
+            let publisher_response = PublisherResponse::Buffered(response);
+
+            let response = futures::executor::block_on(publisher_response_into_streaming_response(
+                publisher_response,
+                &method,
+                Arc::clone(&settings),
+                registry.as_ref(),
+                Arc::clone(&orchestrator),
+                noop_services(),
+            ))
+            .expect("should finalize buffered response");
+
+            assert!(
+                !matches!(response.body(), EdgeBody::Stream(_)),
+                "bodiless {method} {status} must not carry a streaming body"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok()),
+                Some("42"),
+                "bodiless {method} {status} must preserve the origin Content-Length"
+            );
+
+            let drained = futures::executor::block_on(
+                response
+                    .into_body()
+                    .into_bytes_bounded(settings.publisher.max_buffered_body_bytes),
+            )
+            .expect("body should drain")
+            .to_vec();
+            assert!(
+                drained.is_empty(),
+                "bodiless {method} {status} must deliver zero body bytes, got {} bytes",
+                drained.len()
+            );
+        }
     }
 
     #[test]
