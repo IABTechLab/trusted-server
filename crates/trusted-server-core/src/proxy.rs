@@ -12,7 +12,8 @@ use std::time::Duration;
 use web_time::{SystemTime, UNIX_EPOCH};
 
 use crate::cache_policy::{
-    apply_no_store_private_to_headers, CachePolicy, EdgeCacheHeader, NO_STORE_PRIVATE_CACHE_CONTROL,
+    apply_no_store_private_to_headers, cache_control_headers_are_private_or_no_store,
+    remove_edge_cache_headers, CachePolicy, EdgeCacheHeader, NO_STORE_PRIVATE_CACHE_CONTROL,
 };
 use crate::constants::{
     HEADER_ACCEPT, HEADER_ACCEPT_ENCODING, HEADER_ACCEPT_LANGUAGE, HEADER_REFERER,
@@ -125,7 +126,11 @@ impl AssetProxyCachePolicy {
             Self::OriginControlled => {}
             Self::NoStorePrivate => apply_no_store_cache_control(response),
             Self::Normalized(policy) => {
-                policy.apply_to_headers(response.headers_mut(), edge_header)
+                if cache_control_headers_are_private_or_no_store(response.headers()) {
+                    remove_edge_cache_headers(response.headers_mut());
+                } else {
+                    policy.apply_to_headers(response.headers_mut(), edge_header);
+                }
             }
         }
     }
@@ -3753,7 +3758,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_asset_proxy_request_applies_configured_normalized_cache_policy() {
+    fn handle_asset_proxy_request_replaces_third_party_cache_policy_for_rehosted_asset() {
         futures::executor::block_on(async {
             let stub = Arc::new(StubHttpClient::new());
             stub.push_response_with_headers(
@@ -3803,7 +3808,7 @@ mod tests {
             assert_eq!(
                 response_header(&response, header::CACHE_CONTROL),
                 Some("public, max-age=31536000, immutable"),
-                "core response should apply browser cache policy immediately"
+                "configured rehost policy should replace the third-party no-store directive"
             );
             assert!(
                 response.headers().get("surrogate-control").is_none(),
@@ -3823,6 +3828,43 @@ mod tests {
                 "Fastly finalization should render Surrogate-Control"
             );
         });
+    }
+
+    #[test]
+    fn normalized_asset_policy_preserves_final_private_or_no_store_directives() {
+        for cache_control in ["private, max-age=0", "no-store"] {
+            let mut response = edge_response_builder()
+                .header(header::CACHE_CONTROL, cache_control)
+                .header("surrogate-control", "max-age=31536000")
+                .header("cdn-cache-control", "max-age=31536000")
+                .header("cloudflare-cdn-cache-control", "max-age=31536000")
+                .body(EdgeBody::empty())
+                .expect("should build asset response");
+
+            AssetProxyCachePolicy::Normalized(CachePolicy::public_immutable(Duration::from_secs(
+                31_536_000,
+            )))
+            .apply_after_route_finalization(&mut response, EdgeCacheHeader::SurrogateControl);
+
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some(cache_control),
+                "final privacy directive should veto normalized cache policy"
+            );
+            assert!(
+                [
+                    "surrogate-control",
+                    "cdn-cache-control",
+                    "cloudflare-cdn-cache-control",
+                ]
+                .iter()
+                .all(|name| !response.headers().contains_key(*name)),
+                "final privacy directive should remove every edge-cache header"
+            );
+        }
     }
 
     #[test]

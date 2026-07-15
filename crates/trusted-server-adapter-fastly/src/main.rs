@@ -334,10 +334,11 @@ fn send_edgezero_response(
         effects.apply_to_response(&mut response);
     }
 
-    // Final cache guard: EC finalization and request-filter effects may have
-    // added a per-user Set-Cookie after `apply_finalize_headers` ran, so
-    // re-apply the privacy downgrade before send.
+    // Final cache guards: EC finalization and request-filter effects may have
+    // added a per-user Set-Cookie or a private/no-store directive after
+    // `apply_finalize_headers` and normalized asset policy reapplication ran.
     crate::middleware::enforce_set_cookie_cache_privacy(&mut response);
+    crate::middleware::enforce_uncacheable_cache_privacy(&mut response);
 
     let (parts, body) = response.into_parts();
 
