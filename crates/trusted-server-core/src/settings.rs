@@ -1894,7 +1894,7 @@ fn validate_tinybird_secret(value: &str, setting: &str) -> Result<(), Report<Tru
 }
 
 /// Cache behavior configuration.
-#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CacheSettings {
     /// Ordered static/rehosted asset rules. The first enabled matching rule wins.
@@ -1913,8 +1913,8 @@ impl CacheSettings {
     ///
     /// # Errors
     ///
-    /// Returns a configuration error if any rule ID is duplicate, matcher shape
-    /// is invalid, or a configured regex/glob cannot compile.
+    /// Returns a configuration error if any rule ID is duplicate, or if an
+    /// enabled rule has an invalid policy/matcher or cannot compile its regex/glob.
     pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
         let mut seen_ids = HashSet::new();
         for rule in &self.asset_rules {
@@ -1928,6 +1928,8 @@ impl CacheSettings {
                     message: format!("cache.asset_rules contains duplicate id `{}`", rule.id),
                 }));
             }
+        }
+        for rule in &self.asset_rules {
             rule.prepare_runtime()?;
         }
         Ok(())
@@ -1979,7 +1981,7 @@ pub struct CacheAssetRule {
     /// File extensions matched against the request path, case-insensitively.
     #[serde(default)]
     pub extensions: Vec<String>,
-    /// Require a hash-like token in the final path segment before the rule matches.
+    /// Require a supported bundler fingerprint suffix in the filename before matching.
     #[serde(default)]
     pub requires_hash_in_filename: bool,
     /// Browser-facing cache visibility.
@@ -2039,9 +2041,14 @@ impl CacheAssetRule {
     }
 
     fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+        if !self.enabled {
+            return Ok(());
+        }
+
         self.validate_matcher_shape()?;
         self.compiled_regex().map(|_| ())?;
         self.compiled_globs().map(|_| ())?;
+        self.validate_policy_shape()?;
         Ok(())
     }
 
@@ -2069,6 +2076,46 @@ impl CacheAssetRule {
                 ),
             }));
         }
+        Ok(())
+    }
+
+    fn validate_policy_shape(&self) -> Result<(), Report<TrustedServerError>> {
+        if self.browser_ttl_seconds.is_none() && self.edge_ttl_seconds.is_none() {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "cache.asset_rules `{}` must configure browser_ttl_seconds or edge_ttl_seconds",
+                    self.id
+                ),
+            }));
+        }
+
+        if !self.immutable {
+            return Ok(());
+        }
+
+        if self
+            .browser_ttl_seconds
+            .is_none_or(|browser_ttl| browser_ttl == 0)
+        {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "cache.asset_rules `{}` sets immutable without a positive browser_ttl_seconds",
+                    self.id
+                ),
+            }));
+        }
+
+        let preset_is_content_addressed =
+            matches!(self.preset, Some(CacheAssetPreset::NextJsStatic));
+        if !preset_is_content_addressed && !self.requires_hash_in_filename {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "cache.asset_rules `{}` sets immutable without requires_hash_in_filename or a content-addressed preset",
+                    self.id
+                ),
+            }));
+        }
+
         Ok(())
     }
 
@@ -2118,13 +2165,22 @@ impl CacheAssetRule {
     }
 
     fn matches_path(&self, path: &str) -> Result<bool, Report<TrustedServerError>> {
-        if !self.enabled {
-            return Ok(false);
-        }
-        if self.requires_hash_in_filename && !filename_contains_hash(path) {
+        if !self.enabled || !self.matcher_matches_path(path)? {
             return Ok(false);
         }
 
+        if self.requires_hash_in_filename && !filename_contains_fingerprint(path) {
+            log::debug!(
+                "cache asset rule `{}` rejects path `{path}` because the filename has no supported fingerprint",
+                self.id
+            );
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
+    fn matcher_matches_path(&self, path: &str) -> Result<bool, Report<TrustedServerError>> {
         if let Some(preset) = self.preset {
             return Ok(preset.matches_path(path));
         }
@@ -2202,11 +2258,44 @@ fn path_extension(path: &str) -> Option<String> {
     (!extension.is_empty()).then(|| extension.to_ascii_lowercase())
 }
 
-fn filename_contains_hash(path: &str) -> bool {
+fn filename_contains_fingerprint(path: &str) -> bool {
     let filename = path.rsplit('/').next().unwrap_or(path);
-    filename
-        .split(['.', '-', '_', '~'])
-        .any(|segment| segment.len() >= 8 && segment.chars().all(|ch| ch.is_ascii_hexdigit()))
+    let Some((stem, extension)) = filename.rsplit_once('.') else {
+        return false;
+    };
+    if stem.is_empty() || extension.is_empty() {
+        return false;
+    }
+
+    stem.char_indices()
+        .filter(|(_, ch)| matches!(ch, '.' | '-' | '_' | '~'))
+        .any(|(separator_index, separator)| {
+            let candidate_start = separator_index + separator.len_utf8();
+            let prefix = &stem[..separator_index];
+            let candidate = &stem[candidate_start..];
+            !prefix.is_empty() && fingerprint_candidate_is_supported(candidate)
+        })
+}
+
+fn fingerprint_candidate_is_supported(candidate: &str) -> bool {
+    let is_hex = candidate.len() >= 8
+        && candidate.chars().all(|ch| ch.is_ascii_hexdigit())
+        && candidate.chars().any(|ch| ch.is_ascii_alphabetic());
+    let is_esbuild_base32 = candidate.len() == 8
+        && candidate
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || matches!(ch, '2'..='7'))
+        && candidate.chars().any(|ch| ch.is_ascii_alphabetic());
+    let is_vite_base64url = candidate.len() == 8
+        && candidate
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+        && candidate.chars().any(|ch| ch.is_ascii_uppercase())
+        && candidate
+            .chars()
+            .any(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_'));
+
+    is_hex || is_esbuild_base32 || is_vite_base64url
 }
 
 /// Debug-only features. All flags default to `false` (off in production).
@@ -2271,7 +2360,6 @@ pub struct Settings {
     #[serde(default)]
     pub consent: ConsentConfig,
     #[serde(default)]
-    #[validate(nested)]
     pub cache: CacheSettings,
     #[serde(default)]
     pub proxy: Proxy,
@@ -3130,22 +3218,155 @@ mod tests {
             crate_test_settings_str()
         );
         let settings = Settings::from_toml(&toml_str).expect("should parse cache asset rule");
+        let expected_policy = CachePolicy::public_immutable(Duration::from_secs(31_536_000));
 
+        for path in [
+            "/assets/app.0123abcd.js",
+            "/assets/index-DA15JTLU.js",
+            "/assets/index-BsELY24f.js",
+            "/assets/app-VRTVD5R5.js",
+            "/assets/app-VCMCQCKZ.js",
+        ] {
+            assert_eq!(
+                settings
+                    .asset_cache_policy_for_path(path)
+                    .expect("should evaluate cache rules"),
+                Some(expected_policy),
+                "supported fingerprint should match asset rule for {path}"
+            );
+        }
+
+        for path in ["/assets/app.js", "/assets/deadbeef.js"] {
+            assert!(
+                settings
+                    .asset_cache_policy_for_path(path)
+                    .expect("should evaluate cache rules")
+                    .is_none(),
+                "non-fingerprinted filename should not match asset rule for {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn filename_fingerprint_gate_supports_conservative_bundler_suffixes() {
+        for (path, expected) in [
+            ("/assets/index-DA15JTLU.js", true),
+            ("/assets/index-BsELY24f.js", true),
+            ("/assets/index-aB_cD-12.js", true),
+            ("/assets/app-VRTVD5R5.js", true),
+            ("/assets/app-VCMCQCKZ.js", true),
+            ("/assets/app.a1B2c3D4.js", true),
+            ("/assets/main.a1b2c3d4e5f6.js", true),
+            ("/assets/index.8f3a2b1c.js", true),
+            ("/assets/app.deadbeef.js", true),
+            ("/assets/deadbeef.js", false),
+            ("/assets/VCMCQCKZ.js", false),
+            ("/assets/app.js", false),
+            ("/assets/app-manifest.js", false),
+            ("/assets/app-release2.js", false),
+            ("/assets/app.20260714.js", false),
+            ("/assets/app-abc123.js", false),
+            ("/assets/deadbeef/app.js", false),
+        ] {
+            assert_eq!(
+                filename_contains_fingerprint(path),
+                expected,
+                "fingerprint result should match for {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_cache_asset_rules_defer_matcher_and_policy_validation() {
+        let toml_str = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "disabled-invalid-regex"
+            enabled = false
+            path_regex = "["
+
+            [[cache.asset_rules]]
+            id = "disabled-placeholder"
+            enabled = false
+
+            [[cache.asset_rules]]
+            id = "disabled-unsafe-immutable"
+            enabled = false
+            path_prefix = "/assets/"
+            immutable = true
+        "#,
+            crate_test_settings_str()
+        );
+
+        let settings =
+            Settings::from_toml(&toml_str).expect("should defer disabled rule validation");
         assert!(
             settings
-                .asset_cache_policy_for_path("/assets/app.js")
-                .expect("should evaluate cache rules")
+                .asset_cache_policy_for_path("/assets/app-DA15JTLU.js")
+                .expect("should evaluate disabled cache rules")
                 .is_none(),
-            "broad allowlist should not match non-fingerprinted files when hash is required"
+            "disabled rules should never match"
         );
-        assert_eq!(
-            settings
-                .asset_cache_policy_for_path("/assets/app.0123abcd.js")
-                .expect("should evaluate cache rules"),
-            Some(CachePolicy::public_immutable(Duration::from_secs(
-                31_536_000
-            ))),
-            "fingerprinted asset should match the allowlist"
+    }
+
+    #[test]
+    fn cache_asset_rule_policy_validation_rejects_unsafe_config() {
+        let missing_ttl = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "missing-ttl"
+            enabled = true
+            path_prefix = "/assets/"
+        "#,
+            crate_test_settings_str()
+        );
+        let missing_ttl_err =
+            Settings::from_toml(&missing_ttl).expect_err("should reject rule without a TTL");
+        assert!(
+            format!("{missing_ttl_err:?}").contains("browser_ttl_seconds or edge_ttl_seconds"),
+            "should explain missing TTL: {missing_ttl_err:?}"
+        );
+
+        let immutable_without_fingerprint = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "unsafe-immutable"
+            enabled = true
+            path_prefix = "/assets/"
+            browser_ttl_seconds = 31536000
+            immutable = true
+        "#,
+            crate_test_settings_str()
+        );
+        let fingerprint_err = Settings::from_toml(&immutable_without_fingerprint)
+            .expect_err("should reject immutable rule without fingerprint requirement");
+        assert!(
+            format!("{fingerprint_err:?}").contains("requires_hash_in_filename"),
+            "should explain immutable fingerprint requirement: {fingerprint_err:?}"
+        );
+
+        let immutable_without_browser_ttl = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "immutable-without-browser-ttl"
+            enabled = true
+            path_prefix = "/assets/"
+            requires_hash_in_filename = true
+            browser_ttl_seconds = 0
+            edge_ttl_seconds = 31536000
+            immutable = true
+        "#,
+            crate_test_settings_str()
+        );
+        let browser_ttl_err = Settings::from_toml(&immutable_without_browser_ttl)
+            .expect_err("should reject immutable rule without positive browser TTL");
+        assert!(
+            format!("{browser_ttl_err:?}").contains("positive browser_ttl_seconds"),
+            "should explain immutable browser TTL requirement: {browser_ttl_err:?}"
         );
     }
 
@@ -3206,6 +3427,23 @@ mod tests {
         assert!(
             format!("{shape_err:?}").contains("exactly one matcher"),
             "should explain invalid matcher shape: {shape_err:?}"
+        );
+
+        let missing_matcher = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "missing-matcher"
+            enabled = true
+            browser_ttl_seconds = 60
+        "#,
+            crate_test_settings_str()
+        );
+        let missing_matcher_err =
+            Settings::from_toml(&missing_matcher).expect_err("should reject missing matcher");
+        assert!(
+            format!("{missing_matcher_err:?}").contains("exactly one matcher"),
+            "should explain missing matcher: {missing_matcher_err:?}"
         );
     }
 

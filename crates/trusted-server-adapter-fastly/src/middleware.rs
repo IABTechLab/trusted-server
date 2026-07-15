@@ -235,7 +235,9 @@ pub(crate) fn apply_finalize_headers(
 /// entry point (`main.rs`) can re-apply it after
 /// [`ec_finalize_response`](trusted_server_core::ec::finalize::ec_finalize_response)
 /// writes the EC identity `Set-Cookie`, using the single shared implementation.
-pub(crate) use trusted_server_core::response_privacy::enforce_set_cookie_cache_privacy;
+pub(crate) use trusted_server_core::response_privacy::{
+    enforce_set_cookie_cache_privacy, enforce_uncacheable_cache_privacy,
+};
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -493,6 +495,29 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("public, max-age=600"),
             "should leave a cookieless response untouched"
+        );
+    }
+
+    #[test]
+    fn enforce_uncacheable_cache_privacy_handles_late_filter_headers() {
+        let mut response = response_with_headers(&[
+            ("cache-control", "private, max-age=0"),
+            ("surrogate-control", "max-age=600"),
+        ]);
+
+        enforce_uncacheable_cache_privacy(&mut response);
+
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("private, max-age=0"),
+            "should preserve the late private directive"
+        );
+        assert!(
+            response.headers().get("surrogate-control").is_none(),
+            "should strip the normalized edge header after late filter effects"
         );
     }
 
