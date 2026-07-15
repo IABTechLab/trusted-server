@@ -44,11 +44,14 @@ into the initial cache-header PRs.
 - TS-owned Prebid delivery is covered by deferred TSJS module URLs. Publisher
   Prebid script URLs neutralized by TS are compatibility shims at stable URLs and
   must use `no-store` or a very short TTL, not a year-long immutable policy.
-- Rehosted assets are TS-owned copies once TS rewrites/hosts them. They should
-  use explicit normalized policies, with immutable only for TS-fingerprinted
-  rehosted URLs.
-- Fastly and Cloudflare are the MVP runtime targets. Akamai mapping is deferred
-  until Akamai is on the roadmap.
+- Fastly rehosted assets are TS-owned copies once TS rewrites/hosts them. A
+  matching rehost rule is authoritative over third-party origin cache defaults. Use
+  immutable only for TS-fingerprinted rehosted URLs, and preserve any later
+  TS/operator `private` or `no-store` decision as the final veto.
+- Fastly and Cloudflare are the MVP runtime targets. This slice emits their
+  runtime-specific directives; actual Fastly storage integration and cache-key
+  verification are tracked in [#908](https://github.com/IABTechLab/trusted-server/issues/908).
+  Akamai mapping is deferred until Akamai is on the roadmap.
 - Dynamic HTML/RSC/API caching, dynamic `Vary`/cache-key normalization,
   origin-template caching, transformed-template caching, true publisher-origin
   streaming, parser-context bid splice, EdgeZero streaming parity, and SSAT HTML
@@ -88,11 +91,13 @@ into the initial cache-header PRs.
   implemented through the shared rule engine and can be disabled/overridden.
 - Arbitrary publisher-origin assets remain origin-controlled unless matched by an
   enabled preset or publisher allowlist.
-- TS-owned rehosted assets have explicit normalized policies instead of blindly
-  passing through third-party defaults.
+- Fastly TS-owned rehosted assets have explicit normalized policies instead of
+  blindly passing through third-party defaults.
 - MVP adapters emit the correct edge-cache header from shared policy: Fastly
   `Surrogate-Control`, Cloudflare `CDN-Cache-Control` /
-  `Cloudflare-CDN-Cache-Control`, or portable `s-maxage` fallback.
+  `Cloudflare-CDN-Cache-Control`, or portable `s-maxage` fallback. Header
+  emission is complete; runtime storage and cache-key verification remain in
+  #908.
 - Deferred features are documented as deferred and are not accidentally
   implemented as hard-coded Next.js/dynamic-cache behavior.
 - Tests and target-matched checks pass for touched crates/adapters.
@@ -244,7 +249,8 @@ upgrades to publisher-origin assets.
 
 Make the shared policy output explicit per runtime before wiring the rule engine
 into more routes. This prevents new code from copying the current core
-Fastly-specific `Surrogate-Control` behavior.
+Fastly-specific `Surrogate-Control` behavior. This phase covers directive
+rendering only; runtime storage is tracked in #908.
 
 #### Code changes
 
@@ -283,10 +289,14 @@ assets, using the runtime edge-header mapping from PR 5.
   - `OriginControlled`
   - `NoStorePrivate`
   - `Normalized(CachePolicy)` from a matched enabled rule.
-- Apply normalized policy after route finalization but before final response
-  privacy hardening.
+- Apply normalized policy at the asset handler, then reapply its runtime edge
+  directive after route finalization only when the finalized response is still
+  cacheable. Final `private` or `no-store` directives veto reapplication and
+  remove edge-cache headers.
 - Preserve existing no-store/private handling for errors, signed failures, or
-  responses that set cookies/security headers.
+  responses that set cookies/security headers. A matched TS-owned rehost rule
+  intentionally replaces the third-party origin's cache defaults before this
+  final privacy veto.
 - Ensure operator `response_headers` cannot weaken protected private/no-store
   decisions.
 - For TS-owned rehosted copies:

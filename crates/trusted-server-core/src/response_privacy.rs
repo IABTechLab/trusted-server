@@ -17,11 +17,6 @@ use crate::cache_policy::{
 };
 use crate::settings::Settings;
 
-/// Runtime edge-cache headers stripped from private or cookie-bearing responses.
-pub use crate::cache_policy::EDGE_CACHE_HEADER_NAMES as SURROGATE_CACHE_HEADERS;
-/// Backwards-compatible name used by integrations that clear every edge-cache directive.
-pub use crate::cache_policy::EDGE_CACHE_HEADER_NAMES as CDN_CACHE_HEADERS;
-
 fn cache_control_is_private_or_no_store(response: &Response) -> bool {
     cache_control_headers_are_private_or_no_store(response.headers())
 }
@@ -36,6 +31,17 @@ pub(crate) fn enforce_synthesized_html_cache_privacy(response: &mut Response) {
         .apply_to_headers(response.headers_mut(), EdgeCacheHeader::None);
     response.headers_mut().remove(header::ETAG);
     response.headers_mut().remove(header::LAST_MODIFIED);
+}
+
+/// Removes runtime edge-cache headers from a response finalized as uncacheable.
+///
+/// Call this after any late response-header mutations so a final `private` or
+/// `no-store` directive cannot coexist with an independently authoritative edge
+/// cache header.
+pub fn enforce_uncacheable_cache_privacy(response: &mut Response) {
+    if cache_control_is_private_or_no_store(response) {
+        remove_edge_cache_headers(response.headers_mut());
+    }
 }
 
 /// Forces cookie-bearing responses to stay private to shared caches.
@@ -85,9 +91,7 @@ pub fn apply_response_headers_with_cache_privacy(settings: &Settings, response: 
     enforce_set_cookie_cache_privacy(response);
 
     let response_is_uncacheable = cache_control_is_private_or_no_store(response);
-    if response_is_uncacheable {
-        remove_edge_cache_headers(response.headers_mut());
-    }
+    enforce_uncacheable_cache_privacy(response);
 
     for (key, value) in &settings.response_headers {
         if response_is_uncacheable
@@ -113,9 +117,7 @@ pub fn apply_response_headers_with_cache_privacy(settings: &Settings, response: 
         response.headers_mut().insert(header_name, header_value);
     }
 
-    if cache_control_is_private_or_no_store(response) {
-        remove_edge_cache_headers(response.headers_mut());
-    }
+    enforce_uncacheable_cache_privacy(response);
 
     // Operator headers can themselves introduce Set-Cookie (alongside public
     // edge-cache headers) onto a previously cookieless response, which the
@@ -129,6 +131,8 @@ mod tests {
     use super::*;
 
     use edgezero_core::http::response_builder;
+
+    use crate::cache_policy::EDGE_CACHE_HEADER_NAMES;
 
     fn settings_with_response_headers(headers: &[(&str, &str)]) -> Settings {
         let mut s = Settings::from_toml(
@@ -178,7 +182,7 @@ mod tests {
         );
         for header_name in [header::ETAG.as_str(), header::LAST_MODIFIED.as_str()]
             .into_iter()
-            .chain(SURROGATE_CACHE_HEADERS.iter().copied())
+            .chain(EDGE_CACHE_HEADER_NAMES.iter().copied())
         {
             assert!(
                 !response.headers().contains_key(header_name),
@@ -307,7 +311,7 @@ mod tests {
             "private, no-store",
             "operator cache headers must not weaken an existing private response"
         );
-        for header_name in SURROGATE_CACHE_HEADERS {
+        for header_name in EDGE_CACHE_HEADER_NAMES {
             assert!(
                 !response.headers().contains_key(*header_name),
                 "operator headers must not restore shared caching through {header_name}"
@@ -338,6 +342,34 @@ mod tests {
                     .headers()
                     .contains_key("cloudflare-cdn-cache-control"),
             "uncacheable responses must not retain or receive edge-cache headers"
+        );
+    }
+
+    #[test]
+    fn final_uncacheable_guard_strips_edge_headers_without_a_cookie() {
+        let mut response = response_builder()
+            .header(header::CACHE_CONTROL, "no-store")
+            .header("surrogate-control", "max-age=600")
+            .header("cdn-cache-control", "max-age=600")
+            .header("cloudflare-cdn-cache-control", "max-age=600")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build response");
+
+        enforce_uncacheable_cache_privacy(&mut response);
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store"),
+            "final guard should preserve the uncacheable directive"
+        );
+        assert!(
+            EDGE_CACHE_HEADER_NAMES
+                .iter()
+                .all(|name| !response.headers().contains_key(*name)),
+            "final guard should remove every edge-cache header"
         );
     }
 

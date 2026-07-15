@@ -42,7 +42,7 @@ Origin ──▶ TS edge/shared cache ──▶ Browser cache
   - Portable fallback: `s-maxage` inside `Cache-Control`
 - **Browser cache:** controlled by `max-age` and related `Cache-Control` directives.
 
-A single `max-age` cannot express “hold at the edge for a year, but revalidate in the browser daily” or the reverse. TS should model these tiers separately and let adapters render the appropriate headers.
+A single `max-age` cannot express “hold at the edge for a year, but revalidate in the browser daily” or the reverse. TS should model these tiers separately and let adapters render the appropriate headers. Header rendering alone does not enable a runtime cache: Cloudflare Workers Cache must be enabled, and Fastly synthetic/final egress responses require explicit cache integration tracked in [#908](https://github.com/IABTechLab/trusted-server/issues/908).
 
 ## Policy model
 
@@ -63,18 +63,18 @@ Rules should be configurable. Built-in framework presets, such as Next.js `/_nex
 
 ## Target behavior by response class
 
-| Response class                                                  | Target policy                                                                 | Notes                                                                                                              |
-| --------------------------------------------------------------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| TSJS with matching `?v=<hash>`                                  | `Cache-Control: public, max-age=31536000, immutable` plus runtime edge header | The serving path must validate that `v` matches the bytes served.                                                  |
-| TSJS missing/mismatched `?v=`                                   | Short TTL or redirect to canonical hashed URL                                 | Do not mark immutable.                                                                                             |
-| TSJS deferred modules, including Prebid                         | Same as TSJS hash-matching policy                                             | Example: `/static/tsjs=tsjs-prebid.min.js?v=<hash>`.                                                               |
-| Publisher Prebid URL neutralized by TS                          | `no-store` or very short TTL                                                  | The empty compatibility shim is config-dependent and served at a stable publisher URL. Do not cache it for a year. |
-| Enabled framework preset static, e.g. Next.js `/_next/static/*` | `Cache-Control: public, max-age=31536000, immutable`                          | Applied through configurable preset/allowlist rules.                                                               |
-| TS-fingerprinted rehosted asset                                 | `Cache-Control: public, max-age=31536000, immutable`                          | Safe only when TS owns the fingerprinted URL.                                                                      |
-| Stable TS-owned/rehosted URL                                    | Conservative short browser TTL, optional longer edge TTL                      | Do not use `immutable`.                                                                                            |
-| Arbitrary publisher-origin CSS/JS/images                        | Origin-controlled by default                                                  | TS may upgrade only via enabled framework preset or publisher allowlist.                                           |
-| SSAT-assembled ad-stack HTML                                    | `Cache-Control: private, max-age=0`; strip runtime edge-cache headers         | Must never enter shared cache because it can contain per-user slot/bid data.                                       |
-| Dynamic HTML/RSC/API                                            | Origin-controlled in this slice                                               | Future dynamic caching belongs to #859.                                                                            |
+| Response class                                                  | Target policy                                                                 | Notes                                                                                                                        |
+| --------------------------------------------------------------- | ----------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| TSJS with matching `?v=<hash>`                                  | `Cache-Control: public, max-age=31536000, immutable` plus runtime edge header | The serving path must validate that `v` matches the bytes served.                                                            |
+| TSJS missing/mismatched `?v=`                                   | Short TTL or redirect to canonical hashed URL                                 | Do not mark immutable.                                                                                                       |
+| TSJS deferred modules, including Prebid                         | Same as TSJS hash-matching policy                                             | Example: `/static/tsjs=tsjs-prebid.min.js?v=<hash>`.                                                                         |
+| Publisher Prebid URL neutralized by TS                          | `no-store` or very short TTL                                                  | The empty compatibility shim is config-dependent and served at a stable publisher URL. Do not cache it for a year.           |
+| Enabled framework preset static, e.g. Next.js `/_next/static/*` | `Cache-Control: public, max-age=31536000, immutable`                          | Applied through configurable preset/allowlist rules.                                                                         |
+| Fastly TS-fingerprinted rehosted asset                          | `Cache-Control: public, max-age=31536000, immutable`                          | Safe only when TS owns the fingerprinted URL. A matched rehost rule is authoritative over third-party origin cache defaults. |
+| Stable Fastly TS-owned/rehosted URL                             | Conservative short browser TTL, optional longer edge TTL                      | Do not use `immutable`; later TS/operator `private` or `no-store` finalization remains a veto.                               |
+| Arbitrary publisher-origin CSS/JS/images                        | Origin-controlled by default                                                  | TS may upgrade only via enabled framework preset or publisher allowlist.                                                     |
+| SSAT-assembled ad-stack HTML                                    | `Cache-Control: private, max-age=0`; strip runtime edge-cache headers         | Must never enter shared cache because it can contain per-user slot/bid data.                                                 |
+| Dynamic HTML/RSC/API                                            | Origin-controlled in this slice                                               | Future dynamic caching belongs to #859.                                                                                      |
 
 ## TSJS-specific requirements
 
@@ -126,20 +126,20 @@ Adapters should render the shared policy as follows:
 | Cloudflare        | `CDN-Cache-Control` / `Cloudflare-CDN-Cache-Control` |
 | Portable fallback | `s-maxage` in `Cache-Control`                        |
 
-Akamai mapping is deferred until Akamai is on the roadmap.
+These mappings define emitted directives, not storage by themselves. The runtime must enable or implement the corresponding shared-cache mechanism. Akamai mapping is deferred until Akamai is on the roadmap.
 
 ## Acceptance criteria
 
-- [ ] Cache policy is represented as structured fields, not hard-coded header strings.
-- [ ] Built-in framework presets, including a disableable/overrideable Next.js `/_next/static/*` rule, are implemented through the shared cache-policy rule engine.
-- [ ] TSJS hash-matching requests for unified and deferred modules emit `public, max-age=31536000, immutable` plus the runtime edge header.
-- [ ] TSJS missing/mismatched hash requests do not get immutable caching.
-- [ ] TSJS hash generation is build-time or cached enough that HTML injection does not re-concatenate/re-hash the bundle per pageview.
-- [ ] Runtime cache-key configuration preserves the `v` query parameter for `/static/tsjs=`.
-- [ ] Neutralized publisher Prebid shim responses use `no-store` or a short TTL, not a year-long policy.
-- [ ] Arbitrary publisher-origin assets remain origin-controlled unless covered by an enabled framework preset or publisher allowlist.
-- [ ] TS-owned rehosted assets have explicit normalized cache policy; immutable is used only for TS-fingerprinted rehosted URLs.
-- [ ] SSAT-assembled ad-stack HTML continues to emit `private, max-age=0` and strips all runtime edge-cache headers.
-- [ ] Fastly and Cloudflare adapters emit the correct edge-cache header from the shared policy, with portable `s-maxage` fallback where needed.
-- [ ] Dynamic HTML/RSC/API Vary/cache-key normalization is not hard-coded in this PR and is deferred to #859.
-- [ ] SSAT streaming fixes and compression offload are not included in this PR and remain tracked by #857 and #858.
+- [x] Cache policy is represented as structured fields, not hard-coded header strings.
+- [x] Built-in framework presets, including a disableable/overrideable Next.js `/_next/static/*` rule, are implemented through the shared cache-policy rule engine.
+- [x] TSJS hash-matching requests for unified and deferred modules emit `public, max-age=31536000, immutable` plus the runtime edge header.
+- [x] TSJS missing/mismatched hash requests do not get immutable caching.
+- [x] TSJS hash generation is build-time or cached enough that HTML injection does not re-concatenate/re-hash the bundle per pageview.
+- [ ] Runtime cache-key configuration preserves the `v` query parameter for `/static/tsjs=`. Runtime verification is tracked in #908.
+- [x] Neutralized publisher Prebid shim responses use `no-store` or a short TTL, not a year-long policy.
+- [x] Arbitrary publisher-origin assets remain origin-controlled unless covered by an enabled framework preset or publisher allowlist.
+- [x] Fastly TS-owned rehosted assets have explicit normalized cache policy; immutable is used only for TS-fingerprinted rehosted URLs.
+- [x] SSAT-assembled ad-stack HTML continues to emit `private, max-age=0` and strips all runtime edge-cache headers.
+- [x] Fastly and Cloudflare adapters emit the correct edge-cache header from the shared policy, with portable `s-maxage` fallback where needed. Actual shared-cache storage remains tracked in #908.
+- [x] Dynamic HTML/RSC/API Vary/cache-key normalization is not hard-coded in this PR and is deferred to #859.
+- [x] SSAT streaming fixes and compression offload are not included in this PR and remain tracked by #857 and #858.
