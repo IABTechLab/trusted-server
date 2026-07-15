@@ -19,8 +19,13 @@ use crate::error::{CliResult, report_error};
 
 const SETTLE_QUIET_PERIOD: Duration = Duration::from_millis(750);
 const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const SETTLE_MAX_WAIT: Duration = Duration::from_secs(6);
-const NAVIGATION_TIMEOUT: Duration = Duration::from_secs(30);
+const SETTLE_MAX_WAIT: Duration = Duration::from_secs(12);
+/// How long to wait for the navigation `load` event (and, separately, the main
+/// document response) before falling through to the settle loop. Ad-heavy pages
+/// (video players, continuous ad refresh) may never fire `load`, so this is a
+/// soft bound: the settle loop is the real readiness signal and the scrape reads
+/// whatever rendered by then.
+const NAVIGATION_LOAD_TIMEOUT: Duration = Duration::from_secs(12);
 const BROWSER_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const RESOURCE_TIMING_BUFFER_WARNING_THRESHOLD: usize = 250;
 const RESOURCE_TIMING_BUFFER_WARNING: &str =
@@ -124,28 +129,41 @@ async fn collect_page_from_browser(
             .map_err(|error| report_error(format!("failed to set cookie `{name}`: {error}")))?;
     }
 
-    timeout(NAVIGATION_TIMEOUT, page.goto(target_url.as_str()))
-        .await
-        .map_err(|_| report_error(format!("timed out navigating to `{target_url}`")))?
-        .map_err(|error| report_error(format!("failed to navigate to `{target_url}`: {error}")))?;
-
-    let navigation_response = timeout(NAVIGATION_TIMEOUT, page.wait_for_navigation_response())
-        .await
-        .map_err(|_| {
-            report_error(format!(
-                "timed out waiting for main document navigation response from `{target_url}`"
-            ))
-        })?
-        .map_err(|error| {
-            report_error(format!(
-                "failed to read main document navigation response: {error}"
-            ))
-        })?;
-
     let mut warnings = Vec::new();
-    if let Some(warning) = validate_navigation_response(navigation_response)? {
-        warnings.push(warning);
+
+    // Navigate, but don't hard-fail when the `load` event never fires. Ad-heavy
+    // pages (video players, continuous ad refresh, anti-bot scripts) can keep
+    // the frame "loading" indefinitely, so a load-wait timeout is downgraded to
+    // a warning: the settle loop below is the real readiness signal and the
+    // scrape reads whatever rendered by then.
+    match timeout(NAVIGATION_LOAD_TIMEOUT, page.goto(target_url.as_str())).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => warnings.push(format!(
+            "navigation to `{target_url}` did not complete cleanly ({error}); results may be partial"
+        )),
+        Err(_) => warnings.push(format!(
+            "navigation to `{target_url}` did not fire `load` within {}s; results may be partial",
+            NAVIGATION_LOAD_TIMEOUT.as_secs()
+        )),
     }
+
+    // Best-effort read of the main-document response for status validation. When
+    // the load wait above times out the response is usually already buffered, so
+    // this returns promptly; tolerate a miss rather than failing the audit.
+    match timeout(NAVIGATION_LOAD_TIMEOUT, page.wait_for_navigation_response()).await {
+        Ok(Ok(navigation_response)) => {
+            if let Some(warning) = validate_navigation_response(navigation_response)? {
+                warnings.push(warning);
+            }
+        }
+        Ok(Err(error)) => warnings.push(format!(
+            "could not read the main document response from `{target_url}` ({error}); results may be partial"
+        )),
+        Err(_) => warnings.push(format!(
+            "timed out reading the main document response from `{target_url}`; results may be partial"
+        )),
+    }
+
     if !wait_for_page_settle(&page).await? {
         warnings.push(
             "browser audit timed out while waiting for the page to settle; results may be partial"
@@ -286,7 +304,11 @@ async fn wait_for_page_settle(page: &chromiumoxide::Page) -> CliResult<bool> {
             .into_value()
             .map_err(|error| report_error(format!("failed to decode resource count: {error}")))?;
 
-        if ready_state == "complete" {
+        // Accept `interactive` as well as `complete`: ad-heavy pages often never
+        // reach `complete` (the `load` event never fires), but their GPT slots
+        // are defined once the DOM is interactive, so a quiet network period at
+        // `interactive` is a valid settle signal for the slot scrape.
+        if ready_state == "complete" || ready_state == "interactive" {
             if previous_count == Some(resource_count) {
                 stable_for += SETTLE_POLL_INTERVAL;
             } else {
