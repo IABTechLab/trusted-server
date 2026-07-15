@@ -32,7 +32,7 @@
 //! | GET | `/first-party/click` | [`handle_first_party_click`] |
 //! | GET | `/first-party/sign` | [`handle_first_party_proxy_sign`] |
 //! | POST | `/first-party/sign` | [`handle_first_party_proxy_sign`] |
-//! | POST | `/first-party/proxy-rebuild` | [`handle_first_party_proxy_rebuild`] |
+//! | GET, POST | `/first-party/proxy-rebuild` | [`handle_first_party_proxy_rebuild`] |
 //! | GET | `/` and `/{*rest}` | tsjs (if `/static/tsjs=` prefix), integration proxy, or publisher fallback |
 //! | POST, HEAD, OPTIONS, PUT, PATCH, DELETE | `/` and `/{*rest}` | integration proxy or publisher fallback |
 //! | POST, HEAD, OPTIONS, PUT, PATCH, DELETE | named paths above | publisher fallback (legacy parity for non-primary methods) |
@@ -1104,7 +1104,7 @@ const NAMED_ROUTES: &[NamedRoute] = &[
     },
     NamedRoute {
         path: "/first-party/proxy-rebuild",
-        primary_methods: &[Method::POST],
+        primary_methods: &[Method::GET, Method::POST],
         handler: NamedRouteHandler::FirstPartyProxyRebuild,
     },
 ];
@@ -1559,6 +1559,20 @@ mod tests {
             Some("false"),
             "FinalizeResponseMiddleware must run even for auth-rejected responses"
         );
+    }
+
+    #[test]
+    fn proxy_rebuild_registers_get_and_post() {
+        let route = NAMED_ROUTES
+            .iter()
+            .find(|route| route.path == "/first-party/proxy-rebuild")
+            .expect("should register proxy rebuild route");
+        assert!(matches!(
+            route.handler,
+            NamedRouteHandler::FirstPartyProxyRebuild
+        ));
+        assert!(route.primary_methods.contains(&Method::GET));
+        assert!(route.primary_methods.contains(&Method::POST));
     }
 
     #[test]

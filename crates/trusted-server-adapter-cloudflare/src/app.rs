@@ -526,6 +526,12 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     handle_first_party_proxy_sign(&s.settings, &services, req).await
                 }),
             )
+            .get(
+                "/first-party/proxy-rebuild",
+                make_handler(Arc::clone(&state), |s, services, req| async move {
+                    handle_first_party_proxy_rebuild(&s.settings, &services, req).await
+                }),
+            )
             .post(
                 "/first-party/proxy-rebuild",
                 make_handler(Arc::clone(&state), |s, services, req| async move {

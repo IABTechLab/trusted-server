@@ -12,6 +12,10 @@ Creative processing transforms third-party ad creatives by rewriting URLs to go 
 - **Security** - Validated, signed URLs prevent tampering
 - **GDPR Compliance** - Controlled data sharing
 
+## Browser-facing first-party origin
+
+Set `[publisher].public_origin` to the browser-reachable Trusted Server origin, for example `https://ads.publisher.example`. Rewritten proxy, click, CSS, `srcset`, and injected creative TSJS URLs are absolute on that origin. When it is omitted, Trusted Server uses `https://{publisher.domain}` for compatibility. Relative creative source URLs and excluded third-party URLs remain unchanged.
+
 ## How It Works
 
 ```
@@ -33,9 +37,9 @@ Creative processing transforms third-party ad creatives by rewriting URLs to go 
                         ↓
 ┌──────────────────────────────────────────────────────┐
 │  Rewritten Creative HTML                             │
-│  <img src="/first-party/proxy?tsurl=...&tstoken=sig">│
-│  <iframe src="/first-party/proxy?tsurl=...&token=sig">│
-│  <style> .bg { background: url(/first-party/proxy...) }│
+│  <img src="https://ads.publisher.example/first-party/proxy?tsurl=...&tstoken=sig">│
+│  <iframe src="https://ads.publisher.example/first-party/proxy?tsurl=...&token=sig">│
+│  <style> .bg { background: url(https://ads.publisher.example/first-party/proxy...) }│
 └──────────────────────────────────────────────────────┘
 ```
 
@@ -78,10 +82,10 @@ When `with_streaming()` is enabled in `ProxyRequestConfig`, HTML/CSS processing 
 
 <!-- Rewritten -->
 <img
-  src="/first-party/proxy?tsurl=https://cdn.example.com/banner.jpg&tstoken=sig1"
+  src="https://ads.publisher.example/first-party/proxy?tsurl=https://cdn.example.com/banner.jpg&tstoken=sig1"
   srcset="
-    /first-party/proxy?tsurl=https://cdn.example.com/banner@1x.jpg&tstoken=sig2 1x,
-    /first-party/proxy?tsurl=https://cdn.example.com/banner@2x.jpg&tstoken=sig3 2x
+    https://ads.publisher.example/first-party/proxy?tsurl=https://cdn.example.com/banner@1x.jpg&tstoken=sig2 1x,
+    https://ads.publisher.example/first-party/proxy?tsurl=https://cdn.example.com/banner@2x.jpg&tstoken=sig3 2x
   "
 />
 ```

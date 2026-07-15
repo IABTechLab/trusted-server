@@ -467,6 +467,22 @@ async fn first_party_proxy_rebuild_is_routed() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_party_proxy_rebuild_get_is_routed() {
+    let router = test_router();
+    let req = request_builder()
+        .method("GET")
+        .uri("/first-party/proxy-rebuild")
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build request");
+    let resp = route(router, req).await;
+    assert_ne!(
+        resp.status().as_u16(),
+        404,
+        "GET /first-party/proxy-rebuild must be routed"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // First-party absolute-URI regression — Spin delivers a path-only request URI
 // (built from IncomingRequest::path_with_query), so the shared proxy/click/sign
@@ -548,21 +564,25 @@ async fn first_party_proxy_round_trip_through_spin_router() {
             .to_vec(),
     )
     .expect("sign response body should be UTF-8");
-    let href = json_string_field(&sign_body, "href")
-        .expect("sign response must include a signed href path");
+    let href =
+        json_string_field(&sign_body, "href").expect("sign response must include a signed href");
+    let (_, authority_and_path) = href
+        .split_once("://")
+        .expect("signed href should be absolute");
+    let (_, path_and_query) = authority_and_path
+        .split_once('/')
+        .expect("signed href should include a path");
+    let href_path_and_query = format!("/{path_and_query}");
     assert!(
-        href.starts_with("/first-party/proxy?"),
-        "signed href must target the proxy path, got: {href}"
+        href_path_and_query.starts_with("/first-party/proxy?"),
+        "signed href must target the proxy path"
     );
 
     let router = test_router();
     let proxy_req = request_builder()
         .method("GET")
-        .uri(href.clone())
-        .header(
-            "spin-full-url",
-            format!("https://www.publisher.example{href}"),
-        )
+        .uri(href_path_and_query)
+        .header("spin-full-url", href)
         .body(edgezero_core::body::Body::empty())
         .expect("should build proxy request");
     let proxy_resp = route(router, proxy_req).await;

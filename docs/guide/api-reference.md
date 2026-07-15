@@ -342,7 +342,8 @@ curl -X POST https://edge.example.com/first-party/sign \
 
 ```json
 {
-  "signed_url": "https://edge.example.com/first-party/proxy?tsurl=https://external.com/pixel.gif&tstoken=abc123..."
+  "href": "https://ads.publisher.example/first-party/proxy?tsurl=https://external.com/pixel.gif&tsexp=123&tstoken=abc123...",
+  "base": "https://external.com/pixel.gif"
 }
 ```
 
@@ -354,7 +355,7 @@ curl -X POST https://edge.example.com/first-party/sign \
 
 ---
 
-### POST /first-party/proxy-rebuild
+### GET/POST /first-party/proxy-rebuild
 
 URL mutation recovery endpoint. Rebuilds signed proxy URL after creative JavaScript modifies query parameters.
 
@@ -374,7 +375,8 @@ URL mutation recovery endpoint. Rebuilds signed proxy URL after creative JavaScr
 
 ```json
 {
-  "url": "https://edge.example.com/first-party/click?tsurl=https://advertiser.com&campaign=123&utm_source=banner&tstoken=new..."
+  "href": "https://ads.publisher.example/first-party/click?tsurl=https://advertiser.com&campaign=123&utm_source=banner&tstoken=new...",
+  "base": "https://advertiser.com"
 }
 ```
 

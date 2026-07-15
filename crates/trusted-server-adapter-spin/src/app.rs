@@ -154,7 +154,7 @@ fn named_fallback_paths() -> [(&'static str, &'static [Method]); 12] {
         ("/first-party/proxy", &[Method::GET]),
         ("/first-party/click", &[Method::GET]),
         ("/first-party/sign", &[Method::GET, Method::POST]),
-        ("/first-party/proxy-rebuild", &[Method::POST]),
+        ("/first-party/proxy-rebuild", &[Method::GET, Method::POST]),
     ]
 }
 
@@ -608,7 +608,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         };
         let fp_sign_post_handler = fp_sign_handler.clone();
 
-        // /first-party/proxy-rebuild
+        // GET + POST /first-party/proxy-rebuild — identical handler, cloned for both bindings.
         let s = Arc::clone(&state);
         let fp_rebuild_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
@@ -622,6 +622,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 )
             }
         };
+        let fp_rebuild_post_handler = fp_rebuild_handler.clone();
 
         // Shared fallback dispatch: routes to tsjs (GET only), integration proxy, or publisher.
         async fn dispatch(
@@ -741,7 +742,8 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .get("/first-party/click", fp_click_handler)
             .get("/first-party/sign", fp_sign_handler)
             .post("/first-party/sign", fp_sign_post_handler)
-            .post("/first-party/proxy-rebuild", fp_rebuild_handler);
+            .get("/first-party/proxy-rebuild", fp_rebuild_handler)
+            .post("/first-party/proxy-rebuild", fp_rebuild_post_handler);
 
         for method in LEGACY_ADMIN_DENY_METHODS {
             builder = builder.route("/admin/keys/rotate", method.clone(), legacy_admin_deny);

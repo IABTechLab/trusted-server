@@ -1,18 +1,15 @@
 import { log } from '../../core/log';
 
-const PROXY_PREFIX = '/first-party/proxy';
+import { isFirstPartyProxyUrl, resolveFirstPartyPath } from './first_party';
 
 export function shouldProxyExternalUrl(raw: string): boolean {
   const value = String(raw || '').trim();
   if (!value) return false;
   if (/^(data:|javascript:|blob:|about:)/i.test(value)) return false;
-  if (value.startsWith(PROXY_PREFIX)) return false;
+  if (isFirstPartyProxyUrl(value)) return false;
   try {
     const url = new URL(value, location.href);
-    if (url.origin === location.origin) {
-      if (url.pathname.startsWith(PROXY_PREFIX)) return false;
-      return false;
-    }
+    if (url.origin === location.origin) return false;
     return url.protocol === 'http:' || url.protocol === 'https:';
   } catch {
     return false;
@@ -28,12 +25,7 @@ export async function signProxyUrl(raw: string): Promise<string | null> {
     return null;
   }
 
-  let endpoint = '/first-party/sign';
-  try {
-    endpoint = new URL('/first-party/sign', location.href).toString();
-  } catch {
-    /* fall back to relative path */
-  }
+  const endpoint = resolveFirstPartyPath('/first-party/sign');
 
   try {
     const resp = await fetch(endpoint, {

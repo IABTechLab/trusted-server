@@ -432,6 +432,32 @@ async fn discovery_route_body_is_json_parity() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_rebuild_get_route_parity() {
+    let (axum_status, _) = axum_get("/first-party/proxy-rebuild").await;
+    let (cf_status, _) = cf_get("/first-party/proxy-rebuild").await;
+    let (spin_status, _) = spin_get("/first-party/proxy-rebuild").await;
+
+    for (adapter, status) in [
+        ("Axum", axum_status),
+        ("Cloudflare", cf_status),
+        ("Spin", spin_status),
+    ] {
+        assert_ne!(
+            status, 404,
+            "{adapter} GET /first-party/proxy-rebuild must be routed"
+        );
+    }
+    assert_eq!(
+        axum_status, cf_status,
+        "GET rebuild status must match: axum={axum_status} cf={cf_status}"
+    );
+    assert_eq!(
+        cf_status, spin_status,
+        "GET rebuild status must match: cf={cf_status} spin={spin_status}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn verify_signature_route_parity() {
     // known divergence: without real signing-key configuration the handler may
     // return 5xx. The parity assertion is that both adapters agree on the status
