@@ -19,6 +19,7 @@ use crate::integrations::{
     IntegrationScriptContext, ScriptRewriteAction,
 };
 use crate::publisher::build_empty_bids_script;
+use crate::publisher_late_binding::HtmlInjectionTracker;
 use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
 use crate::tsjs;
@@ -92,59 +93,15 @@ impl StreamProcessor for HtmlWithPostProcessing {
             return Ok(Vec::new());
         }
 
-        // Final chunk: run post-processors on the full accumulated output.
-        let full_output = std::mem::take(&mut self.accumulated_output);
-        if full_output.is_empty() {
-            return Ok(full_output);
-        }
-
-        let Ok(output_str) = std::str::from_utf8(&full_output) else {
-            return Ok(full_output);
-        };
-
-        let ctx = IntegrationHtmlContext {
-            request_host: &self.request_host,
-            request_scheme: &self.request_scheme,
-            origin_host: &self.origin_host,
-            document_state: &self.document_state,
-        };
-
-        // Preflight to avoid allocating a `String` unless at least one post-processor wants to run.
-        if !self
-            .post_processors
-            .iter()
-            .any(|p| p.should_process(output_str, &ctx))
-        {
-            return Ok(full_output);
-        }
-
-        let mut html = String::from_utf8(full_output).map_err(|e| {
-            io::Error::other(format!(
-                "HTML post-processing expected valid UTF-8 output: {e}"
-            ))
-        })?;
-
-        let mut changed = false;
-        for processor in &self.post_processors {
-            if processor.should_process(&html, &ctx) {
-                changed |= processor.post_process(&mut html, &ctx);
-            }
-        }
-
-        if changed {
-            log::debug!("HTML post-processing complete: output_len={}", html.len());
-        }
-
-        // Post-processors may append content (e.g. injected scripts); enforce the
-        // same cap on the final document so growth during post-processing cannot
-        // push the buffer past the limit either.
-        if html.len() > self.max_buffered_body_bytes {
-            return Err(io::Error::other(
-                "publisher body exceeded maximum buffered size",
-            ));
-        }
-
-        Ok(html.into_bytes())
+        run_html_post_processors(
+            std::mem::take(&mut self.accumulated_output),
+            &self.post_processors,
+            &self.origin_host,
+            &self.request_host,
+            &self.request_scheme,
+            &self.document_state,
+            self.max_buffered_body_bytes,
+        )
     }
 
     /// No-op. `HtmlWithPostProcessing` wraps a single-use
@@ -152,6 +109,87 @@ impl StreamProcessor for HtmlWithPostProcessing {
     /// state without resetting the rewriter would leave the processor
     /// in an inconsistent state, so this method intentionally does nothing.
     fn reset(&mut self) {}
+}
+
+/// Run registered full-document post-processors on already rewritten HTML.
+pub(crate) fn run_html_post_processors(
+    full_output: Vec<u8>,
+    post_processors: &[Arc<dyn IntegrationHtmlPostProcessor>],
+    origin_host: &str,
+    request_host: &str,
+    request_scheme: &str,
+    document_state: &IntegrationDocumentState,
+    max_buffered_body_bytes: usize,
+) -> Result<Vec<u8>, io::Error> {
+    if full_output.is_empty() || post_processors.is_empty() {
+        return Ok(full_output);
+    }
+
+    let Ok(output_str) = std::str::from_utf8(&full_output) else {
+        return Ok(full_output);
+    };
+
+    let ctx = IntegrationHtmlContext {
+        request_host,
+        request_scheme,
+        origin_host,
+        document_state,
+    };
+
+    if !post_processors
+        .iter()
+        .any(|processor| processor.should_process(output_str, &ctx))
+    {
+        return Ok(full_output);
+    }
+
+    let mut html = String::from_utf8(full_output).map_err(|e| {
+        io::Error::other(format!(
+            "HTML post-processing expected valid UTF-8 output: {e}"
+        ))
+    })?;
+
+    let mut changed = false;
+    for processor in post_processors {
+        if processor.should_process(&html, &ctx) {
+            changed |= processor.post_process(&mut html, &ctx);
+        }
+    }
+
+    if changed {
+        log::debug!("HTML post-processing complete: output_len={}", html.len());
+    }
+
+    if html.len() > max_buffered_body_bytes {
+        return Err(io::Error::other(
+            "publisher body exceeded maximum buffered size",
+        ));
+    }
+
+    Ok(html.into_bytes())
+}
+
+/// How SSAT bids are inserted into parser-confirmed body end tags.
+#[derive(Clone)]
+pub enum BidInjectionMode {
+    /// Read the current bids script from shared state at the body end tag.
+    DirectState,
+    /// Insert an opaque placeholder for a later parser-safe replacement pass.
+    Placeholder {
+        /// Placeholder HTML inserted before the body end tag.
+        html: String,
+        /// Shared tracker used for EOF fallback decisions.
+        tracker: Arc<HtmlInjectionTracker>,
+    },
+}
+
+/// Whether full-document HTML post-processors run inside this processor.
+#[derive(Clone, Copy)]
+pub enum HtmlPostProcessingMode {
+    /// Run registered full-document post-processors at EOF.
+    Enabled,
+    /// Skip post-processors so callers can run them after bid late binding.
+    Disabled,
 }
 
 /// Configuration for HTML processing
@@ -172,6 +210,13 @@ pub struct HtmlProcessorConfig {
     /// processor aborts. Mirrors `publisher.max_buffered_body_bytes` so the
     /// full-document buffering done for post-processors is bounded.
     pub max_buffered_body_bytes: usize,
+    /// Bid insertion strategy for parser-confirmed body end tags.
+    pub bid_injection_mode: BidInjectionMode,
+    /// Controls whether full-document post-processors run inside this processor.
+    pub post_processing_mode: HtmlPostProcessingMode,
+    /// Per-document integration state shared by script rewriters and optional
+    /// post-processors.
+    pub document_state: IntegrationDocumentState,
 }
 
 impl HtmlProcessorConfig {
@@ -192,6 +237,9 @@ impl HtmlProcessorConfig {
             ad_slots_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: settings.publisher.max_buffered_body_bytes,
+            bid_injection_mode: BidInjectionMode::DirectState,
+            post_processing_mode: HtmlPostProcessingMode::Enabled,
+            document_state: IntegrationDocumentState::default(),
         }
     }
 
@@ -212,6 +260,65 @@ impl HtmlProcessorConfig {
         self.ad_bids_state = ad_bids_state;
         self
     }
+
+    /// Insert `placeholder_html` at the parser-confirmed body end tag instead
+    /// of reading bids directly from shared state.
+    #[must_use]
+    pub fn with_bid_placeholder(
+        mut self,
+        placeholder_html: String,
+        tracker: Arc<HtmlInjectionTracker>,
+    ) -> Self {
+        self.bid_injection_mode = BidInjectionMode::Placeholder {
+            html: placeholder_html,
+            tracker,
+        };
+        self
+    }
+
+    /// Disable full-document post-processors for a caller-managed buffered pass.
+    #[must_use]
+    pub fn without_post_processing(mut self) -> Self {
+        self.post_processing_mode = HtmlPostProcessingMode::Disabled;
+        self
+    }
+
+    /// Use caller-provided document state for multi-phase processing.
+    #[must_use]
+    pub fn with_document_state(mut self, document_state: IntegrationDocumentState) -> Self {
+        self.document_state = document_state;
+        self
+    }
+}
+
+/// Build the executable snippet normally inserted at the start of `<head>`.
+#[must_use]
+pub(crate) fn build_head_bootstrap_snippet(
+    integrations: &IntegrationRegistry,
+    origin_host: &str,
+    request_host: &str,
+    request_scheme: &str,
+    document_state: &IntegrationDocumentState,
+    ad_slots_script: Option<&str>,
+) -> String {
+    let mut snippet = String::new();
+    if let Some(slots_script) = ad_slots_script {
+        snippet.push_str(slots_script);
+    }
+    let ctx = IntegrationHtmlContext {
+        request_host,
+        request_scheme,
+        origin_host,
+        document_state,
+    };
+    for insert in integrations.head_inserts(&ctx) {
+        snippet.push_str(&insert);
+    }
+    let immediate_ids = integrations.js_module_ids_immediate();
+    snippet.push_str(&tsjs::tsjs_script_tag(&immediate_ids));
+    let deferred_ids = integrations.js_module_ids_deferred();
+    snippet.push_str(&tsjs::tsjs_deferred_script_tags(&deferred_ids));
+    snippet
 }
 
 /// Create an HTML processor with URL replacement and integration hooks.
@@ -222,8 +329,11 @@ impl HtmlProcessorConfig {
 /// normal operation since no code holds the lock across a panic boundary.
 #[must_use]
 pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
-    let post_processors = config.integrations.html_post_processors();
-    let document_state = IntegrationDocumentState::default();
+    let post_processors = match config.post_processing_mode {
+        HtmlPostProcessingMode::Enabled => config.integrations.html_post_processors(),
+        HtmlPostProcessingMode::Disabled => Vec::new(),
+    };
+    let document_state = config.document_state.clone();
 
     // Simplified URL patterns structure - stores only core data and generates variants on-demand
     struct UrlPatterns {
@@ -294,6 +404,8 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     let script_rewriters = integration_registry.script_rewriters();
     let ad_slots_script = config.ad_slots_script.clone();
     let ad_bids_state = config.ad_bids_state.clone();
+    let bid_injection_mode = config.bid_injection_mode.clone();
+    let head_bid_injection_mode = bid_injection_mode.clone();
 
     let mut element_content_handlers = vec![
         // Inject unified tsjs bundle once at the start of <head>
@@ -304,33 +416,29 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             let document_state = document_state.clone();
             let ad_slots_script = ad_slots_script.clone();
             move |el| {
-                if !injected_tsjs.get() {
-                    let mut snippet = String::new();
-                    // Inject ad slots script first so it appears before tsjs bundle.
-                    if let Some(ref slots_script) = ad_slots_script {
-                        snippet.push_str(slots_script);
-                    }
-                    let ctx = IntegrationHtmlContext {
-                        request_host: &patterns.request_host,
-                        request_scheme: &patterns.request_scheme,
-                        origin_host: &patterns.origin_host,
-                        document_state: &document_state,
-                    };
-                    // First inject integration-specific config (e.g., window.__tsjs_prebid)
-                    // so it's available when the bundle's auto-init code reads it.
-                    for insert in integrations.head_inserts(&ctx) {
-                        snippet.push_str(&insert);
-                    }
-                    // Main bundle: core + non-deferred integrations (synchronous).
-                    let immediate_ids = integrations.js_module_ids_immediate();
-                    snippet.push_str(&tsjs::tsjs_script_tag(&immediate_ids));
-                    // Deferred bundles: large modules like prebid loaded after
-                    // HTML parsing completes. Empty when none are enabled.
-                    let deferred_ids = integrations.js_module_ids_deferred();
-                    snippet.push_str(&tsjs::tsjs_deferred_script_tags(&deferred_ids));
-                    el.prepend(&snippet, ContentType::Html);
-                    injected_tsjs.set(true);
+                if injected_tsjs.get() {
+                    return Ok(());
                 }
+                if let BidInjectionMode::Placeholder { tracker, .. } = &head_bid_injection_mode {
+                    if tracker.head_injected() || tracker.bid_placeholder_inserted() {
+                        injected_tsjs.set(true);
+                        return Ok(());
+                    }
+                }
+
+                let snippet = build_head_bootstrap_snippet(
+                    &integrations,
+                    &patterns.origin_host,
+                    &patterns.request_host,
+                    &patterns.request_scheme,
+                    &document_state,
+                    ad_slots_script.as_deref(),
+                );
+                if let BidInjectionMode::Placeholder { tracker, .. } = &head_bid_injection_mode {
+                    tracker.mark_head_injected();
+                }
+                el.prepend(&snippet, ContentType::Html);
+                injected_tsjs.set(true);
                 Ok(())
             }
         }),
@@ -345,24 +453,34 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             let state = ad_bids_state.clone();
             let injected_bids = injected_bids.clone();
             let has_slots = ad_slots_script.is_some();
+            let bid_injection_mode = bid_injection_mode.clone();
             move |el| {
                 if !has_slots {
                     return Ok(());
                 }
                 let state = state.clone();
                 let injected_bids = injected_bids.clone();
+                let bid_injection_mode = bid_injection_mode.clone();
                 if let Some(handlers) = el.end_tag_handlers() {
                     let handler: EndTagHandler<'static> =
                         Box::new(move |end_tag: &mut EndTag<'_>| {
                             if injected_bids.swap(true, Ordering::SeqCst) {
                                 return Ok(());
                             }
-                            let script_guard = state.lock().expect("should lock bid state");
-                            let bids_script = match &*script_guard {
-                                Some(s) => s.clone(),
-                                None => build_empty_bids_script(),
-                            };
-                            end_tag.before(&bids_script, ContentType::Html);
+                            match &bid_injection_mode {
+                                BidInjectionMode::DirectState => {
+                                    let script_guard = state.lock().expect("should lock bid state");
+                                    let bids_script = match &*script_guard {
+                                        Some(s) => s.clone(),
+                                        None => build_empty_bids_script(),
+                                    };
+                                    end_tag.before(&bids_script, ContentType::Html);
+                                }
+                                BidInjectionMode::Placeholder { html, tracker } => {
+                                    tracker.mark_bid_placeholder_inserted();
+                                    end_tag.before(html, ContentType::Html);
+                                }
+                            }
                             Ok(())
                         });
                     handlers.push(handler);
@@ -664,6 +782,9 @@ mod tests {
             ad_slots_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            bid_injection_mode: BidInjectionMode::DirectState,
+            post_processing_mode: HtmlPostProcessingMode::Enabled,
+            document_state: IntegrationDocumentState::default(),
         }
     }
 
@@ -1436,6 +1557,9 @@ mod tests {
             ),
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            bid_injection_mode: BidInjectionMode::DirectState,
+            post_processing_mode: HtmlPostProcessingMode::Enabled,
+            document_state: IntegrationDocumentState::default(),
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1509,6 +1633,9 @@ mod tests {
             ),
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            bid_injection_mode: BidInjectionMode::DirectState,
+            post_processing_mode: HtmlPostProcessingMode::Enabled,
+            document_state: IntegrationDocumentState::default(),
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1544,6 +1671,9 @@ mod tests {
             ),
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            bid_injection_mode: BidInjectionMode::DirectState,
+            post_processing_mode: HtmlPostProcessingMode::Enabled,
+            document_state: IntegrationDocumentState::default(),
         };
         let mut processor = create_html_processor(config);
         // Malformed HTML with two <body> elements (common in CMS template pages)
@@ -1578,6 +1708,9 @@ mod tests {
             ad_slots_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            bid_injection_mode: BidInjectionMode::DirectState,
+            post_processing_mode: HtmlPostProcessingMode::Enabled,
+            document_state: IntegrationDocumentState::default(),
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1630,6 +1763,9 @@ mod tests {
             ),
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            bid_injection_mode: BidInjectionMode::DirectState,
+            post_processing_mode: HtmlPostProcessingMode::Enabled,
+            document_state: IntegrationDocumentState::default(),
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1656,6 +1792,9 @@ mod tests {
             ad_slots_script: None,
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            bid_injection_mode: BidInjectionMode::DirectState,
+            post_processing_mode: HtmlPostProcessingMode::Enabled,
+            document_state: IntegrationDocumentState::default(),
         };
         let mut processor = create_html_processor(config);
         let output = processor

@@ -18,7 +18,7 @@
 //! into any [`Write`] (a `Vec<u8>` for buffered routes, a streaming writer for
 //! the streaming route). It is not a content-rewriting concern.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -54,6 +54,10 @@ use crate::http_util::{is_navigation_request, serve_static_with_etag, RequestInf
 use crate::integrations::IntegrationRegistry;
 use crate::platform::{GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices};
 use crate::price_bucket::{price_bucket, PriceGranularity};
+use crate::publisher_late_binding::{
+    BidPlaceholder, HtmlInjectionTracker, PlaceholderLateBinder, PlaceholderScan,
+    SSAT_HELD_TAIL_CAP_BYTES,
+};
 use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::Settings;
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
@@ -345,16 +349,56 @@ fn create_html_stream_processor(
     ad_slots_script: Option<String>,
     ad_bids_state: Arc<Mutex<Option<String>>>,
 ) -> Result<impl StreamProcessor, Report<TrustedServerError>> {
-    use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
-
-    let config = HtmlProcessorConfig::from_settings(
-        settings,
-        integration_registry,
+    create_html_stream_processor_with_options(HtmlStreamProcessorOptions {
         origin_host,
         request_host,
         request_scheme,
+        settings,
+        integration_registry,
+        ad_slots_script,
+        ad_bids_state,
+        late_binding: None,
+    })
+}
+
+struct HtmlLateBindingOptions<'a> {
+    placeholder: &'a BidPlaceholder,
+    tracker: Arc<HtmlInjectionTracker>,
+}
+
+struct HtmlStreamProcessorOptions<'a> {
+    origin_host: &'a str,
+    request_host: &'a str,
+    request_scheme: &'a str,
+    settings: &'a Settings,
+    integration_registry: &'a IntegrationRegistry,
+    ad_slots_script: Option<String>,
+    ad_bids_state: Arc<Mutex<Option<String>>>,
+    late_binding: Option<HtmlLateBindingOptions<'a>>,
+}
+
+fn create_html_stream_processor_with_options(
+    options: HtmlStreamProcessorOptions<'_>,
+) -> Result<impl StreamProcessor, Report<TrustedServerError>> {
+    use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
+
+    let mut config = HtmlProcessorConfig::from_settings(
+        options.settings,
+        options.integration_registry,
+        options.origin_host,
+        options.request_host,
+        options.request_scheme,
     )
-    .with_ad_state(ad_slots_script, ad_bids_state);
+    .with_ad_state(options.ad_slots_script, options.ad_bids_state);
+
+    if let Some(late_binding) = options.late_binding {
+        config = config
+            .with_bid_placeholder(
+                late_binding.placeholder.as_html().to_owned(),
+                late_binding.tracker,
+            )
+            .without_post_processing();
+    }
 
     Ok(create_html_processor(config))
 }
@@ -677,27 +721,24 @@ pub fn stream_publisher_body<W: Write>(
     process_response_streaming(body, output, &borrowed)
 }
 
-/// Stream publisher body with a `</body` tail hold for live bid injection.
+/// Stream publisher body with parser-safe SSAT bid late binding.
 ///
-/// Drives the origin body through the HTML pipeline one chunk at a time, using a
-/// small buffer that holds the first raw `</body` tail. When the origin body is
-/// exhausted (`read` returns `Ok(0)`):
+/// HTML SSAT responses insert a per-request placeholder from a `lol_html`
+/// parser-confirmed body end-tag handler. This function scans processed,
+/// uncompressed HTML output for that placeholder, collects any dispatched
+/// auction at that point, replaces the placeholder with the bids script, and
+/// resumes streaming. Raw origin bytes are never scanned for `</body>` syntax.
 ///
-/// 1. [`collect_dispatched_auction`](AuctionOrchestrator::collect_dispatched_auction)
-///    is awaited with the remaining deadline.
-/// 2. Winning bids are written to `ad_bids_state`.
-/// 3. The held tail is fed through the pipeline so `lol_html` fires its
-///    `</body>` handler with bids now in state.
-///
-/// For non-HTML content types the auction is collected before any body bytes
-/// are written (no `</body>` to inject).  If `params.dispatched_auction` is
-/// `None` the function falls back to the synchronous
-/// [`stream_publisher_body`] path.
+/// For non-HTML content types, any dispatched auction is collected before body
+/// bytes are written because there is no parser-confirmed body close for bid
+/// insertion. If no SSAT slots matched this HTML response, the function falls
+/// back to the synchronous pipeline unchanged.
 ///
 /// # Errors
 ///
-/// Returns an error if processing fails mid-stream. Headers are already
-/// committed at that point; the caller logs and drops the `StreamingBody`.
+/// Returns an error if processing fails mid-stream. Headers may already be
+/// committed at that point; streaming callers should log the error and drop the
+/// client body.
 pub async fn stream_publisher_body_async<W: Write>(
     body: EdgeBody,
     output: &mut W,
@@ -707,76 +748,100 @@ pub async fn stream_publisher_body_async<W: Write>(
     orchestrator: &AuctionOrchestrator,
     services: &RuntimeServices,
 ) -> Result<(), Report<TrustedServerError>> {
-    let Some(dispatched) = params.dispatched_auction.take() else {
-        // No auction — use the existing sync pipeline unchanged.
-        return stream_publisher_body(body, output, params, settings, integration_registry);
-    };
+    let dispatched = params.dispatched_auction.take();
     let telemetry = AuctionTelemetryCarry {
         observation: params.auction_observation.take(),
         auction_request: params.auction_request.take(),
     };
 
     let is_html = is_html_content_type(&params.content_type);
+    let needs_ssat_late_binding = is_html && params.ad_slots_script.is_some();
 
-    if !is_html {
-        // Non-HTML: collect auction first, then stream.  There is no </body>
-        // to hold, so delaying the entire body until collection is acceptable.
-        let placeholder = mediator_placeholder_request();
-        let result = orchestrator
-            .collect_dispatched_auction(
-                dispatched,
-                services,
-                &make_collect_context(settings, services, &placeholder),
-            )
-            .await;
-        if let (Some(observation), Some(auction_request)) =
-            (telemetry.observation, telemetry.auction_request.as_ref())
-        {
-            emit_auction_events_best_effort_lazy(services, || {
-                build_auction_events(
-                    observation,
-                    AuctionTerminalOutcome::Completed {
-                        request: auction_request,
-                        result: &result,
-                    },
+    if !needs_ssat_late_binding {
+        if let Some(dispatched) = dispatched {
+            // Non-HTML or no-slot responses have no SSAT body-close injection
+            // point. Collect before writing bytes so telemetry completes and the
+            // existing direct-state pipeline can preserve legacy behavior.
+            let placeholder = mediator_placeholder_request();
+            let result = orchestrator
+                .collect_dispatched_auction(
+                    dispatched,
+                    services,
+                    &make_collect_context(settings, services, &placeholder),
                 )
-            })
-            .await;
-        }
+                .await;
+            if let (Some(observation), Some(auction_request)) =
+                (telemetry.observation, telemetry.auction_request.as_ref())
+            {
+                emit_auction_events_best_effort_lazy(services, || {
+                    build_auction_events(
+                        observation,
+                        AuctionTerminalOutcome::Completed {
+                            request: auction_request,
+                            result: &result,
+                        },
+                    )
+                })
+                .await;
+            }
 
-        write_bids_to_state(
-            &result.winning_bids,
-            params.price_granularity,
-            &params.ad_bids_state,
-            settings.debug.inject_adm_for_testing,
-        );
+            write_bids_to_state(
+                &result.winning_bids,
+                params.price_granularity,
+                &params.ad_bids_state,
+                settings.debug.inject_adm_for_testing,
+            );
+        }
         return stream_publisher_body(body, output, params, settings, integration_registry);
     }
 
-    // HTML: build the processor once and drive it chunk by chunk.
-    // One-behind buffer: stream chunk N-1 immediately; hold chunk N until origin
-    // EOF, then await auction and process chunk N (which contains </body>).
-    let mut processor = match create_html_stream_processor(
-        &params.origin_host,
-        &params.request_host,
-        &params.request_scheme,
-        settings,
-        integration_registry,
-        params.ad_slots_script.as_deref().map(str::to_string),
-        params.ad_bids_state.clone(),
-    ) {
-        Ok(processor) => processor,
-        Err(err) => {
-            emit_abandoned_auction(
+    if integration_registry.has_html_post_processors() {
+        return buffer_html_late_binding_with_postprocessors(
+            body,
+            output,
+            BufferedLateBindingContext {
+                params,
+                settings,
+                integration_registry,
+                orchestrator,
                 services,
-                telemetry.observation,
                 dispatched,
-                "processor_init_error",
-            )
-            .await;
-            return Err(err);
-        }
-    };
+                telemetry,
+            },
+        )
+        .await;
+    }
+
+    let placeholder = BidPlaceholder::new();
+    let tracker = Arc::new(HtmlInjectionTracker::default());
+    let mut processor =
+        match create_html_stream_processor_with_options(HtmlStreamProcessorOptions {
+            origin_host: &params.origin_host,
+            request_host: &params.request_host,
+            request_scheme: &params.request_scheme,
+            settings,
+            integration_registry,
+            ad_slots_script: params.ad_slots_script.as_deref().map(str::to_string),
+            ad_bids_state: params.ad_bids_state.clone(),
+            late_binding: Some(HtmlLateBindingOptions {
+                placeholder: &placeholder,
+                tracker: Arc::clone(&tracker),
+            }),
+        }) {
+            Ok(processor) => processor,
+            Err(err) => {
+                if let Some(dispatched) = dispatched {
+                    emit_abandoned_auction(
+                        services,
+                        telemetry.observation,
+                        dispatched,
+                        "processor_init_error",
+                    )
+                    .await;
+                }
+                return Err(err);
+            }
+        };
 
     let compression = Compression::from_content_encoding(&params.content_encoding);
     stream_html_with_auction_hold(
@@ -793,8 +858,287 @@ pub async fn stream_publisher_body_async<W: Write>(
             services,
             settings,
         },
+        LateBindingStreamConfig {
+            placeholder: &placeholder,
+            tracker: Arc::clone(&tracker),
+            fallback: LateBindingFallbackContext {
+                origin_host: &params.origin_host,
+                request_host: &params.request_host,
+                request_scheme: &params.request_scheme,
+                integration_registry,
+                ad_slots_script: params.ad_slots_script.as_deref(),
+            },
+        },
     )
     .await
+}
+
+struct BufferedLateBindingContext<'a> {
+    params: &'a OwnedProcessResponseParams,
+    settings: &'a Settings,
+    integration_registry: &'a IntegrationRegistry,
+    orchestrator: &'a AuctionOrchestrator,
+    services: &'a RuntimeServices,
+    dispatched: Option<DispatchedAuction>,
+    telemetry: AuctionTelemetryCarry,
+}
+
+async fn buffer_html_late_binding_with_postprocessors<W: Write>(
+    body: EdgeBody,
+    output: &mut W,
+    mut ctx: BufferedLateBindingContext<'_>,
+) -> Result<(), Report<TrustedServerError>> {
+    use crate::html_processor::{
+        create_html_processor, run_html_post_processors, HtmlProcessorConfig,
+    };
+    use crate::integrations::IntegrationDocumentState;
+
+    let compression = Compression::from_content_encoding(&ctx.params.content_encoding);
+    let decoded = match decode_body_to_vec(
+        body,
+        compression,
+        ctx.settings.publisher.max_buffered_body_bytes,
+    ) {
+        Ok(decoded) => decoded,
+        Err(err) => {
+            if let Some(dispatched) = ctx.dispatched.take() {
+                emit_abandoned_auction(
+                    ctx.services,
+                    ctx.telemetry.observation.take(),
+                    dispatched,
+                    "buffered_decode_error",
+                )
+                .await;
+            }
+            return Err(err);
+        }
+    };
+
+    let placeholder = BidPlaceholder::new();
+    let tracker = Arc::new(HtmlInjectionTracker::default());
+    let document_state = IntegrationDocumentState::default();
+    let config = HtmlProcessorConfig::from_settings(
+        ctx.settings,
+        ctx.integration_registry,
+        &ctx.params.origin_host,
+        &ctx.params.request_host,
+        &ctx.params.request_scheme,
+    )
+    .with_ad_state(
+        ctx.params.ad_slots_script.clone(),
+        Arc::clone(&ctx.params.ad_bids_state),
+    )
+    .with_bid_placeholder(placeholder.as_html().to_owned(), Arc::clone(&tracker))
+    .without_post_processing()
+    .with_document_state(document_state.clone());
+    let mut processor = create_html_processor(config);
+    let held_tail_cap =
+        SSAT_HELD_TAIL_CAP_BYTES.min(ctx.settings.publisher.max_buffered_body_bytes);
+    let mut binder = PlaceholderLateBinder::new(&placeholder, held_tail_cap);
+    let mut late_bound = Vec::new();
+    let fallback = LateBindingFallbackContext {
+        origin_host: &ctx.params.origin_host,
+        request_host: &ctx.params.request_host,
+        request_scheme: &ctx.params.request_scheme,
+        integration_registry: ctx.integration_registry,
+        ad_slots_script: ctx.params.ad_slots_script.as_deref(),
+    };
+    let mut state = LateBindingState {
+        dispatched: ctx.dispatched,
+        telemetry: ctx.telemetry,
+        price_granularity: ctx.params.price_granularity,
+        ad_bids_state: &ctx.params.ad_bids_state,
+        orchestrator: ctx.orchestrator,
+        services: ctx.services,
+        settings: ctx.settings,
+        tracker: Arc::clone(&tracker),
+        fallback,
+        decoded_input_bytes: decoded.len(),
+        processed_output_bytes: 0,
+    };
+
+    for chunk in decoded.chunks(STREAM_CHUNK_SIZE) {
+        let processed =
+            processor
+                .process_chunk(chunk, false)
+                .change_context(TrustedServerError::Proxy {
+                    message: "Failed to process buffered publisher HTML".to_string(),
+                });
+        let processed = match processed {
+            Ok(processed) => processed,
+            Err(err) => {
+                abandon_pending_late_binding_auction(&mut state, "buffered_process_error").await;
+                return Err(err);
+            }
+        };
+        write_late_bound_processed_output(&mut late_bound, &mut binder, &processed, &mut state)
+            .await?;
+    }
+
+    let final_out = processor
+        .process_chunk(&[], true)
+        .change_context(TrustedServerError::Proxy {
+            message: "Failed to process buffered publisher HTML".to_string(),
+        });
+    let final_out = match final_out {
+        Ok(final_out) => final_out,
+        Err(err) => {
+            abandon_pending_late_binding_auction(&mut state, "buffered_process_error").await;
+            return Err(err);
+        }
+    };
+    write_late_bound_processed_output(&mut late_bound, &mut binder, &final_out, &mut state).await?;
+    let found_placeholder = binder.replaced();
+    let remainder = binder.finish();
+    write_checked_processed_output_or_abandon(
+        &mut late_bound,
+        &remainder,
+        &mut state,
+        "processed_output_error",
+    )
+    .await?;
+    if !found_placeholder {
+        if state.tracker.bid_placeholder_inserted() {
+            log::warn!(
+                "SSAT bid placeholder was inserted but not observed in buffered output; using EOF fallback"
+            );
+        }
+        resolve_late_bound_bids(&mut state).await;
+        let tail = build_eof_fallback_tail(
+            state.tracker.head_injected(),
+            &state.fallback,
+            state.ad_bids_state,
+        );
+        write_checked_processed_output_or_abandon(
+            &mut late_bound,
+            tail.as_bytes(),
+            &mut state,
+            "processed_output_error",
+        )
+        .await?;
+    }
+
+    let post_processors = ctx.integration_registry.html_post_processors();
+    let post_processed = run_html_post_processors(
+        late_bound,
+        &post_processors,
+        &ctx.params.origin_host,
+        &ctx.params.request_host,
+        &ctx.params.request_scheme,
+        &document_state,
+        ctx.settings.publisher.max_buffered_body_bytes,
+    )
+    .change_context(TrustedServerError::Proxy {
+        message: "Failed to post-process buffered publisher HTML".to_string(),
+    })?;
+
+    encode_processed_html_to_writer(&post_processed, compression, output)
+}
+
+fn decode_body_to_vec(
+    body: EdgeBody,
+    compression: Compression,
+    limit: usize,
+) -> Result<Vec<u8>, Report<TrustedServerError>> {
+    use brotli::Decompressor;
+    use flate2::read::{GzDecoder, ZlibDecoder};
+
+    let body = body_as_reader(body);
+    match compression {
+        Compression::None => read_to_vec_bounded(body, limit),
+        Compression::Gzip => read_to_vec_bounded(GzDecoder::new(body), limit),
+        Compression::Deflate => read_to_vec_bounded(ZlibDecoder::new(body), limit),
+        Compression::Brotli => {
+            read_to_vec_bounded(Decompressor::new(body, STREAM_CHUNK_SIZE), limit)
+        }
+    }
+}
+
+fn read_to_vec_bounded<R: Read>(
+    mut reader: R,
+    limit: usize,
+) -> Result<Vec<u8>, Report<TrustedServerError>> {
+    let mut output = Vec::new();
+    let mut buffer = vec![0u8; STREAM_CHUNK_SIZE];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(output),
+            Ok(n) => {
+                if output.len() + n > limit {
+                    return Err(Report::new(TrustedServerError::Proxy {
+                        message: "publisher decoded input exceeded maximum buffered size"
+                            .to_string(),
+                    }));
+                }
+                output.extend_from_slice(&buffer[..n]);
+            }
+            Err(err) => {
+                return Err(Report::new(TrustedServerError::Proxy {
+                    message: format!("Failed to decode publisher body: {err}"),
+                }));
+            }
+        }
+    }
+}
+
+fn encode_processed_html_to_writer<W: Write>(
+    bytes: &[u8],
+    compression: Compression,
+    output: &mut W,
+) -> Result<(), Report<TrustedServerError>> {
+    use brotli::enc::writer::CompressorWriter;
+    use brotli::enc::BrotliEncoderParams;
+    use flate2::write::{GzEncoder, ZlibEncoder};
+
+    match compression {
+        Compression::None => output
+            .write_all(bytes)
+            .change_context(TrustedServerError::Proxy {
+                message: "Failed to write buffered publisher HTML".to_string(),
+            }),
+        Compression::Gzip => {
+            let mut encoder = GzEncoder::new(output, flate2::Compression::default());
+            encoder
+                .write_all(bytes)
+                .change_context(TrustedServerError::Proxy {
+                    message: "Failed to write gzip publisher HTML".to_string(),
+                })?;
+            encoder.finish().change_context(TrustedServerError::Proxy {
+                message: "Failed to finalize gzip encoder".to_string(),
+            })?;
+            Ok(())
+        }
+        Compression::Deflate => {
+            let mut encoder = ZlibEncoder::new(output, flate2::Compression::default());
+            encoder
+                .write_all(bytes)
+                .change_context(TrustedServerError::Proxy {
+                    message: "Failed to write deflate publisher HTML".to_string(),
+                })?;
+            encoder.finish().change_context(TrustedServerError::Proxy {
+                message: "Failed to finalize deflate encoder".to_string(),
+            })?;
+            Ok(())
+        }
+        Compression::Brotli => {
+            let params = BrotliEncoderParams {
+                quality: 4,
+                lgwin: 22,
+                ..Default::default()
+            };
+            let mut encoder = CompressorWriter::with_params(output, STREAM_CHUNK_SIZE, &params);
+            encoder
+                .write_all(bytes)
+                .change_context(TrustedServerError::Proxy {
+                    message: "Failed to write brotli publisher HTML".to_string(),
+                })?;
+            encoder.flush().change_context(TrustedServerError::Proxy {
+                message: "Failed to finalize brotli encoder".to_string(),
+            })?;
+            let _ = encoder.into_inner();
+            Ok(())
+        }
+    }
 }
 
 /// Builds the canonical mediator placeholder [`Request`] passed to the collect
@@ -964,7 +1308,7 @@ impl AuctionTelemetryCarry {
 
 /// Bundles the auction-collection dependencies passed through the streaming helpers.
 struct AuctionCollectCtx<'a> {
-    dispatched: DispatchedAuction,
+    dispatched: Option<DispatchedAuction>,
     telemetry: AuctionTelemetryCarry,
     price_granularity: PriceGranularity,
     ad_bids_state: &'a Arc<Mutex<Option<String>>>,
@@ -973,14 +1317,29 @@ struct AuctionCollectCtx<'a> {
     settings: &'a Settings,
 }
 
-/// Run the close-body hold loop for HTML bodies, collecting the auction before
-/// the raw `</body` tail is processed so `lol_html` sees live bids.
+#[derive(Clone, Copy)]
+struct LateBindingFallbackContext<'a> {
+    origin_host: &'a str,
+    request_host: &'a str,
+    request_scheme: &'a str,
+    integration_registry: &'a IntegrationRegistry,
+    ad_slots_script: Option<&'a str>,
+}
+
+struct LateBindingStreamConfig<'a> {
+    placeholder: &'a BidPlaceholder,
+    tracker: Arc<HtmlInjectionTracker>,
+    fallback: LateBindingFallbackContext<'a>,
+}
+
+/// Run the parser-safe placeholder late-binding loop for HTML bodies.
 async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
     body: EdgeBody,
     output: &mut W,
     processor: &mut P,
     compression: Compression,
     ctx: AuctionCollectCtx<'_>,
+    late_binding: LateBindingStreamConfig<'_>,
 ) -> Result<(), Report<TrustedServerError>> {
     use brotli::enc::writer::CompressorWriter;
     use brotli::enc::BrotliEncoderParams;
@@ -988,13 +1347,36 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
     use flate2::read::{GzDecoder, ZlibDecoder};
     use flate2::write::{GzEncoder, ZlibEncoder};
 
+    let placeholder = late_binding.placeholder;
+    let tracker = late_binding.tracker;
+    let fallback_ctx = late_binding.fallback;
     let body = body_as_reader(body);
     match compression {
-        Compression::None => body_close_hold_loop(body, output, processor, ctx).await,
+        Compression::None => {
+            body_close_hold_loop(
+                body,
+                output,
+                processor,
+                placeholder,
+                Arc::clone(&tracker),
+                ctx,
+                fallback_ctx,
+            )
+            .await
+        }
         Compression::Gzip => {
             let decoder = GzDecoder::new(body);
             let mut encoder = GzEncoder::new(&mut *output, flate2::Compression::default());
-            body_close_hold_loop(decoder, &mut encoder, processor, ctx).await?;
+            body_close_hold_loop(
+                decoder,
+                &mut encoder,
+                processor,
+                placeholder,
+                Arc::clone(&tracker),
+                ctx,
+                fallback_ctx,
+            )
+            .await?;
             encoder.finish().change_context(TrustedServerError::Proxy {
                 message: "Failed to finalize gzip encoder".to_string(),
             })?;
@@ -1003,7 +1385,16 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
         Compression::Deflate => {
             let decoder = ZlibDecoder::new(body);
             let mut encoder = ZlibEncoder::new(&mut *output, flate2::Compression::default());
-            body_close_hold_loop(decoder, &mut encoder, processor, ctx).await?;
+            body_close_hold_loop(
+                decoder,
+                &mut encoder,
+                processor,
+                placeholder,
+                Arc::clone(&tracker),
+                ctx,
+                fallback_ctx,
+            )
+            .await?;
             encoder.finish().change_context(TrustedServerError::Proxy {
                 message: "Failed to finalize deflate encoder".to_string(),
             })?;
@@ -1018,150 +1409,154 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
             };
             let mut encoder =
                 CompressorWriter::with_params(&mut *output, STREAM_CHUNK_SIZE, &params);
-            body_close_hold_loop(decoder, &mut encoder, processor, ctx).await?;
+            body_close_hold_loop(
+                decoder,
+                &mut encoder,
+                processor,
+                placeholder,
+                Arc::clone(&tracker),
+                ctx,
+                fallback_ctx,
+            )
+            .await?;
             let _ = encoder.into_inner();
             Ok(())
         }
     }
 }
 
-const BODY_CLOSE_PREFIX: &[u8] = b"</body";
-
-struct BodyCloseHoldBuffer {
-    buffered: Vec<u8>,
-    found_close: bool,
+struct LateBindingState<'a> {
+    dispatched: Option<DispatchedAuction>,
+    telemetry: AuctionTelemetryCarry,
+    price_granularity: PriceGranularity,
+    ad_bids_state: &'a Arc<Mutex<Option<String>>>,
+    orchestrator: &'a AuctionOrchestrator,
+    services: &'a RuntimeServices,
+    settings: &'a Settings,
+    tracker: Arc<HtmlInjectionTracker>,
+    fallback: LateBindingFallbackContext<'a>,
+    decoded_input_bytes: usize,
+    processed_output_bytes: usize,
 }
 
-impl BodyCloseHoldBuffer {
-    fn new() -> Self {
-        Self {
-            buffered: Vec::new(),
-            found_close: false,
-        }
-    }
-
-    fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
-        self.buffered.extend_from_slice(chunk);
-
-        if self.found_close {
-            return Vec::new();
-        }
-
-        if let Some(pos) = find_ascii_case_insensitive(&self.buffered, BODY_CLOSE_PREFIX) {
-            self.found_close = true;
-            return self.buffered.drain(..pos).collect();
-        }
-
-        let keep_len = BODY_CLOSE_PREFIX.len().saturating_sub(1);
-        if self.buffered.len() <= keep_len {
-            return Vec::new();
-        }
-
-        let split_at = self.buffered.len() - keep_len;
-        self.buffered.drain(..split_at).collect()
-    }
-
-    fn found_close(&self) -> bool {
-        self.found_close
-    }
-
-    fn finish(self) -> Vec<u8> {
-        self.buffered
-    }
-}
-
-fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|window| {
-        window
-            .iter()
-            .zip(needle)
-            .all(|(left, right)| left.eq_ignore_ascii_case(right))
-    })
-}
-
-/// Core close-body hold loop.
-///
-/// Streams processed output until the first case-insensitive `</body` prefix is
-/// seen, then collects the auction, writes bids, and processes the held tail
-/// before reading post-body chunks. If no close-body tag is found, collection
-/// happens at EOF before finalization.
-async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
+/// Core parser-safe placeholder late-binding loop.
+async fn body_close_hold_loop<R: Read, W: Write, P: StreamProcessor>(
     mut reader: R,
     writer: &mut W,
     processor: &mut P,
+    placeholder: &BidPlaceholder,
+    tracker: Arc<HtmlInjectionTracker>,
     ctx: AuctionCollectCtx<'_>,
+    fallback_ctx: LateBindingFallbackContext<'_>,
 ) -> Result<(), Report<TrustedServerError>> {
     let AuctionCollectCtx {
         dispatched,
-        mut telemetry,
+        telemetry,
         price_granularity,
         ad_bids_state,
         orchestrator,
         services,
         settings,
     } = ctx;
+    let held_tail_cap = SSAT_HELD_TAIL_CAP_BYTES.min(settings.publisher.max_buffered_body_bytes);
+    let mut binder = PlaceholderLateBinder::new(placeholder, held_tail_cap);
+    let mut state = LateBindingState {
+        dispatched,
+        telemetry,
+        price_granularity,
+        ad_bids_state,
+        orchestrator,
+        services,
+        settings,
+        tracker,
+        fallback: fallback_ctx,
+        decoded_input_bytes: 0,
+        processed_output_bytes: 0,
+    };
     let mut buffer = vec![0u8; STREAM_CHUNK_SIZE];
-    let mut hold = Some(BodyCloseHoldBuffer::new());
-    let mut dispatched = Some(dispatched);
 
     loop {
         match reader.read(&mut buffer) {
             Ok(0) => {
-                if let Some(hold) = hold.take() {
-                    let dispatched = dispatched
-                        .take()
-                        .expect("should have dispatched auction to collect");
-                    collect_stream_auction(
-                        dispatched,
-                        telemetry.take(),
-                        price_granularity,
-                        ad_bids_state,
-                        orchestrator,
-                        services,
-                        settings,
-                    )
-                    .await;
-
-                    let held = hold.finish();
-                    write_processed_chunk(
-                        writer,
-                        processor,
-                        &held,
-                        false,
-                        "Failed to process held body close",
-                        "Failed to write held body close",
-                    )?;
-                }
-                // Signal EOF to lol_html (fires end() which flushes remaining state).
-                let final_out = processor.process_chunk(&[], true).change_context(
-                    TrustedServerError::Proxy {
-                        message: "Failed to finalize processor".to_string(),
-                    },
-                )?;
-                if !final_out.is_empty() {
-                    writer
-                        .write_all(&final_out)
+                let final_out =
+                    processor
+                        .process_chunk(&[], true)
                         .change_context(TrustedServerError::Proxy {
-                            message: "Failed to write finalized output".to_string(),
-                        })?;
+                            message: "Failed to finalize processor".to_string(),
+                        });
+                let final_out = match final_out {
+                    Ok(final_out) => final_out,
+                    Err(err) => {
+                        abandon_pending_late_binding_auction(&mut state, "stream_finalize_error")
+                            .await;
+                        return Err(err);
+                    }
+                };
+                write_late_bound_processed_output(writer, &mut binder, &final_out, &mut state)
+                    .await?;
+
+                let found_placeholder = binder.replaced();
+                let remainder = binder.finish();
+                write_checked_processed_output_or_abandon(
+                    writer,
+                    &remainder,
+                    &mut state,
+                    "processed_output_error",
+                )
+                .await?;
+
+                if !found_placeholder {
+                    if state.tracker.bid_placeholder_inserted() {
+                        log::warn!(
+                            "SSAT bid placeholder was inserted but not observed in processed output; using EOF fallback"
+                        );
+                    }
+                    resolve_late_bound_bids(&mut state).await;
+                    let tail = build_eof_fallback_tail(
+                        state.tracker.head_injected(),
+                        &state.fallback,
+                        state.ad_bids_state,
+                    );
+                    write_checked_processed_output_or_abandon(
+                        writer,
+                        tail.as_bytes(),
+                        &mut state,
+                        "processed_output_error",
+                    )
+                    .await?;
                 }
                 break;
             }
             Ok(n) => {
-                if let Some(hold_buffer) = hold.as_mut() {
-                    let ready = hold_buffer.push(&buffer[..n]);
-                    if let Err(err) = write_processed_chunk(
-                        writer,
-                        processor,
-                        &ready,
-                        false,
-                        "Failed to process chunk",
-                        "Failed to write chunk",
-                    ) {
-                        if let Some(dispatched) = dispatched.take() {
+                state.decoded_input_bytes = state.decoded_input_bytes.saturating_add(n);
+                if state.decoded_input_bytes > state.settings.publisher.max_buffered_body_bytes {
+                    if let Some(dispatched) = state.dispatched.take() {
+                        emit_abandoned_auction(
+                            state.services,
+                            state.telemetry.observation.take(),
+                            dispatched,
+                            "decoded_input_cap_exceeded",
+                        )
+                        .await;
+                    }
+                    return Err(Report::new(TrustedServerError::Proxy {
+                        message: "publisher decoded input exceeded maximum streaming size"
+                            .to_string(),
+                    }));
+                }
+
+                let processed = processor.process_chunk(&buffer[..n], false).change_context(
+                    TrustedServerError::Proxy {
+                        message: "Failed to process chunk".to_string(),
+                    },
+                );
+                let processed = match processed {
+                    Ok(processed) => processed,
+                    Err(err) => {
+                        if let Some(dispatched) = state.dispatched.take() {
                             emit_abandoned_auction(
-                                services,
-                                telemetry.observation.take(),
+                                state.services,
+                                state.telemetry.observation.take(),
                                 dispatched,
                                 "stream_process_error",
                             )
@@ -1169,51 +1564,15 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
                         }
                         return Err(err);
                     }
-
-                    if hold_buffer.found_close() {
-                        let dispatched = dispatched
-                            .take()
-                            .expect("should have dispatched auction to collect");
-                        collect_stream_auction(
-                            dispatched,
-                            telemetry.take(),
-                            price_granularity,
-                            ad_bids_state,
-                            orchestrator,
-                            services,
-                            settings,
-                        )
-                        .await;
-
-                        let held = hold
-                            .take()
-                            .expect("should have close-body hold buffer")
-                            .finish();
-                        write_processed_chunk(
-                            writer,
-                            processor,
-                            &held,
-                            false,
-                            "Failed to process held body close",
-                            "Failed to write held body close",
-                        )?;
-                    }
-                } else {
-                    write_processed_chunk(
-                        writer,
-                        processor,
-                        &buffer[..n],
-                        false,
-                        "Failed to process chunk",
-                        "Failed to write chunk",
-                    )?;
-                }
+                };
+                write_late_bound_processed_output(writer, &mut binder, &processed, &mut state)
+                    .await?;
             }
             Err(e) => {
-                if let Some(dispatched) = dispatched.take() {
+                if let Some(dispatched) = state.dispatched.take() {
                     emit_abandoned_auction(
-                        services,
-                        telemetry.observation.take(),
+                        state.services,
+                        state.telemetry.observation.take(),
                         dispatched,
                         "stream_read_error",
                     )
@@ -1229,6 +1588,166 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
     writer.flush().change_context(TrustedServerError::Proxy {
         message: "Failed to flush output".to_string(),
     })?;
+    Ok(())
+}
+
+async fn write_late_bound_processed_output<W: Write>(
+    writer: &mut W,
+    binder: &mut PlaceholderLateBinder,
+    processed: &[u8],
+    state: &mut LateBindingState<'_>,
+) -> Result<(), Report<TrustedServerError>> {
+    let scan = match binder.push(processed) {
+        Ok(scan) => scan,
+        Err(err) => {
+            abandon_pending_late_binding_auction(state, "placeholder_scan_error").await;
+            return Err(err);
+        }
+    };
+
+    match scan {
+        PlaceholderScan::Emit(bytes) => {
+            write_checked_processed_output_or_abandon(
+                writer,
+                &bytes,
+                state,
+                "processed_output_error",
+            )
+            .await
+        }
+        PlaceholderScan::Found { before, after } => {
+            write_checked_processed_output_or_abandon(
+                writer,
+                &before,
+                state,
+                "processed_output_error",
+            )
+            .await?;
+            resolve_late_bound_bids(state).await;
+            let replacement = build_body_close_replacement_tail(state);
+            write_checked_processed_output(writer, replacement.as_bytes(), state)?;
+            write_checked_processed_output(writer, &after, state)
+        }
+    }
+}
+
+async fn resolve_late_bound_bids(state: &mut LateBindingState<'_>) {
+    let Some(dispatched) = state.dispatched.take() else {
+        return;
+    };
+    collect_stream_auction(
+        dispatched,
+        state.telemetry.take(),
+        state.price_granularity,
+        state.ad_bids_state,
+        state.orchestrator,
+        state.services,
+        state.settings,
+    )
+    .await;
+}
+
+async fn abandon_pending_late_binding_auction(
+    state: &mut LateBindingState<'_>,
+    reason: &'static str,
+) {
+    let Some(dispatched) = state.dispatched.take() else {
+        return;
+    };
+    emit_abandoned_auction(
+        state.services,
+        state.telemetry.observation.take(),
+        dispatched,
+        reason,
+    )
+    .await;
+}
+
+async fn write_checked_processed_output_or_abandon<W: Write>(
+    writer: &mut W,
+    bytes: &[u8],
+    state: &mut LateBindingState<'_>,
+    reason: &'static str,
+) -> Result<(), Report<TrustedServerError>> {
+    match write_checked_processed_output(writer, bytes, state) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            abandon_pending_late_binding_auction(state, reason).await;
+            Err(err)
+        }
+    }
+}
+
+fn current_bids_script(ad_bids_state: &Arc<Mutex<Option<String>>>) -> String {
+    ad_bids_state
+        .lock()
+        .expect("should lock bid state")
+        .clone()
+        .unwrap_or_else(build_empty_bids_script)
+}
+
+fn build_body_close_replacement_tail(state: &LateBindingState<'_>) -> String {
+    if state.tracker.head_injected() {
+        return current_bids_script(state.ad_bids_state);
+    }
+
+    log::info!("SSAT bid injection used missing-head body-close fallback");
+    state.tracker.mark_head_injected();
+    build_bootstrap_and_bids_tail(&state.fallback, state.ad_bids_state)
+}
+
+fn build_eof_fallback_tail(
+    head_bootstrap_observed: bool,
+    fallback_ctx: &LateBindingFallbackContext<'_>,
+    ad_bids_state: &Arc<Mutex<Option<String>>>,
+) -> String {
+    if head_bootstrap_observed {
+        log::info!("SSAT bid injection used EOF fallback after head bootstrap");
+        return current_bids_script(ad_bids_state);
+    }
+
+    log::info!("SSAT bid injection used missing-head EOF fallback");
+    build_bootstrap_and_bids_tail(fallback_ctx, ad_bids_state)
+}
+
+fn build_bootstrap_and_bids_tail(
+    fallback_ctx: &LateBindingFallbackContext<'_>,
+    ad_bids_state: &Arc<Mutex<Option<String>>>,
+) -> String {
+    let document_state = crate::integrations::IntegrationDocumentState::default();
+    let mut tail = crate::html_processor::build_head_bootstrap_snippet(
+        fallback_ctx.integration_registry,
+        fallback_ctx.origin_host,
+        fallback_ctx.request_host,
+        fallback_ctx.request_scheme,
+        &document_state,
+        fallback_ctx.ad_slots_script,
+    );
+    tail.push_str(&current_bids_script(ad_bids_state));
+    tail
+}
+
+fn write_checked_processed_output<W: Write>(
+    writer: &mut W,
+    bytes: &[u8],
+    state: &mut LateBindingState<'_>,
+) -> Result<(), Report<TrustedServerError>> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+
+    state.processed_output_bytes = state.processed_output_bytes.saturating_add(bytes.len());
+    if state.processed_output_bytes > state.settings.publisher.max_buffered_body_bytes {
+        return Err(Report::new(TrustedServerError::Proxy {
+            message: "publisher processed output exceeded maximum streaming size".to_string(),
+        }));
+    }
+
+    writer
+        .write_all(bytes)
+        .change_context(TrustedServerError::Proxy {
+            message: "Failed to write processed publisher output".to_string(),
+        })?;
     Ok(())
 }
 
@@ -1300,35 +1819,6 @@ async fn collect_stream_auction(
     if settings.debug.auction_html_comment {
         prepend_auction_debug_comment("stream", &result, ad_bids_state);
     }
-}
-
-fn write_processed_chunk<W: Write, P: StreamProcessor>(
-    writer: &mut W,
-    processor: &mut P,
-    chunk: &[u8],
-    is_last: bool,
-    process_error: &str,
-    write_error: &str,
-) -> Result<(), Report<TrustedServerError>> {
-    if chunk.is_empty() && !is_last {
-        return Ok(());
-    }
-
-    let out =
-        processor
-            .process_chunk(chunk, is_last)
-            .change_context(TrustedServerError::Proxy {
-                message: process_error.to_string(),
-            })?;
-    if !out.is_empty() {
-        writer
-            .write_all(&out)
-            .change_context(TrustedServerError::Proxy {
-                message: write_error.to_string(),
-            })?;
-    }
-
-    Ok(())
 }
 
 /// Auction dispatch context passed to [`handle_publisher_request`].
@@ -2489,8 +2979,7 @@ pub async fn handle_page_bids(
 
 #[cfg(test)]
 mod tests {
-    use std::io::{self, Read as _, Write as _};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::io::{Read as _, Write as _};
 
     use brotli::enc::writer::CompressorWriter;
     use brotli::Decompressor;
@@ -2507,47 +2996,6 @@ mod tests {
     use edgezero_core::body::Body as EdgeBody;
     use http::{header, Method, Request as HttpRequest, StatusCode};
     use std::sync::Arc;
-
-    struct ChunkedReader {
-        chunks: std::collections::VecDeque<Vec<u8>>,
-        read_count: Arc<AtomicUsize>,
-    }
-
-    impl ChunkedReader {
-        fn new(chunks: &[&[u8]], read_count: Arc<AtomicUsize>) -> Self {
-            Self {
-                chunks: chunks.iter().map(|chunk| chunk.to_vec()).collect(),
-                read_count,
-            }
-        }
-    }
-
-    impl io::Read for ChunkedReader {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            let Some(chunk) = self.chunks.pop_front() else {
-                return Ok(0);
-            };
-            self.read_count.fetch_add(1, Ordering::SeqCst);
-            let len = chunk.len().min(buf.len());
-            buf[..len].copy_from_slice(&chunk[..len]);
-            Ok(len)
-        }
-    }
-
-    struct RecordingProcessor {
-        read_count: Arc<AtomicUsize>,
-        body_close_processed_at: Arc<AtomicUsize>,
-    }
-
-    impl StreamProcessor for RecordingProcessor {
-        fn process_chunk(&mut self, chunk: &[u8], _is_last: bool) -> Result<Vec<u8>, io::Error> {
-            if find_ascii_case_insensitive(chunk, BODY_CLOSE_PREFIX).is_some() {
-                self.body_close_processed_at
-                    .store(self.read_count.load(Ordering::SeqCst), Ordering::SeqCst);
-            }
-            Ok(chunk.to_vec())
-        }
-    }
 
     fn gzip_encode(input: &[u8]) -> Vec<u8> {
         let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -2599,6 +3047,28 @@ mod tests {
             auction_observation: None,
             auction_request: None,
             dispatched_auction: None,
+            price_granularity: Default::default(),
+        }
+    }
+
+    fn make_html_ssat_params(
+        settings: &Settings,
+        dispatched_auction: Option<DispatchedAuction>,
+    ) -> OwnedProcessResponseParams {
+        OwnedProcessResponseParams {
+            content_encoding: String::new(),
+            origin_host: settings.publisher.origin_host(),
+            origin_url: settings.publisher.origin_url.clone(),
+            request_host: settings.publisher.domain.clone(),
+            request_scheme: "https".to_owned(),
+            content_type: "text/html; charset=utf-8".to_owned(),
+            ad_slots_script: Some(
+                r#"<script>(window.tsjs=window.tsjs||{}).adSlots=[];</script>"#.to_owned(),
+            ),
+            ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            auction_observation: None,
+            auction_request: None,
+            dispatched_auction,
             price_granularity: Default::default(),
         }
     }
@@ -3109,93 +3579,217 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn body_close_hold_loop_processes_close_tail_before_reading_post_body_chunks() {
+    async fn ssat_late_binding_ignores_body_text_inside_script() {
         let settings = create_test_settings();
         let services = noop_services();
         let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let registry = IntegrationRegistry::empty_for_tests();
         let dispatched = DispatchedAuction::empty_for_test(test_auction_request(), 500);
-        let read_count = Arc::new(AtomicUsize::new(0));
-        let body_close_processed_at = Arc::new(AtomicUsize::new(0));
-        let reader = ChunkedReader::new(
-            &[
-                b"<html><body>painted</body>",
-                b"<script>late()</script>",
-                b"</html>",
-            ],
-            Arc::clone(&read_count),
-        );
-        let mut processor = RecordingProcessor {
-            read_count: Arc::clone(&read_count),
-            body_close_processed_at: Arc::clone(&body_close_processed_at),
-        };
-        let ad_bids_state = Arc::new(Mutex::new(None));
-        let ctx = AuctionCollectCtx {
-            dispatched,
-            telemetry: AuctionTelemetryCarry {
-                observation: None,
-                auction_request: None,
-            },
-            price_granularity: PriceGranularity::default(),
-            ad_bids_state: &ad_bids_state,
-            orchestrator: &orchestrator,
-            services: &services,
-            settings: &settings,
-        };
+        let mut params = make_html_ssat_params(&settings, Some(dispatched));
         let mut output = Vec::new();
+        let html = r#"<html><head></head><body><script>const marker = "</body>";</script><p>painted</p></body></html>"#;
 
-        body_close_hold_loop(reader, &mut output, &mut processor, ctx)
-            .await
-            .expect("should stream body with auction hold");
+        stream_publisher_body_async(
+            EdgeBody::from(html.as_bytes().to_vec()),
+            &mut output,
+            &mut params,
+            &settings,
+            &registry,
+            &orchestrator,
+            &services,
+        )
+        .await
+        .expect("should stream HTML with parser-safe late binding");
 
-        assert_eq!(
-            body_close_processed_at.load(Ordering::SeqCst),
-            1,
-            "close-body tail should be processed as soon as it is found, before later chunks are read"
+        let rewritten = String::from_utf8(output).expect("should be utf8");
+        assert!(
+            rewritten.contains("const marker = \"</body>\";"),
+            "script literal should remain script text"
         );
-        assert_eq!(
-            std::str::from_utf8(&output).expect("should be utf8"),
-            "<html><body>painted</body><script>late()</script></html>",
-            "post-body chunks should still stream in order"
+        let script_literal_pos = rewritten
+            .find("const marker")
+            .expect("should preserve script literal");
+        let bids_pos = rewritten
+            .find(".bids=JSON.parse")
+            .expect("should inject bids script");
+        let real_body_close_pos = rewritten.rfind("</body>").expect("should have body close");
+        assert!(
+            bids_pos > script_literal_pos,
+            "script literal must not trigger early bid insertion"
+        );
+        assert!(
+            bids_pos < real_body_close_pos,
+            "bids must be injected before the real parser-confirmed body close"
+        );
+        assert!(
+            !rewritten.contains("__TSJS_BIDS_PLACEHOLDER"),
+            "placeholder must not leak to the client"
         );
     }
 
-    #[test]
-    fn body_close_hold_buffer_holds_close_body_tail_in_single_chunk() {
-        let mut hold = BodyCloseHoldBuffer::new();
+    #[tokio::test]
+    async fn ssat_late_binding_appends_bids_at_eof_when_body_close_missing() {
+        let settings = create_test_settings();
+        let services = noop_services();
+        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let registry = IntegrationRegistry::empty_for_tests();
+        let mut params = make_html_ssat_params(&settings, None);
+        let mut output = Vec::new();
+        let html = b"<html><head></head><body><p>painted</p>";
 
-        let ready = hold.push(b"<html><body>painted</body></html>");
-        let held = hold.finish();
+        stream_publisher_body_async(
+            EdgeBody::from(html.to_vec()),
+            &mut output,
+            &mut params,
+            &settings,
+            &registry,
+            &orchestrator,
+            &services,
+        )
+        .await
+        .expect("should append EOF fallback bids");
 
-        assert_eq!(
-            std::str::from_utf8(&ready).expect("should be utf8"),
-            "<html><body>painted",
-            "content before </body> should stream before auction collection"
+        let rewritten = String::from_utf8(output).expect("should be utf8");
+        assert!(
+            rewritten.contains(".bids=JSON.parse"),
+            "missing body close should append bids at EOF"
         );
-        assert_eq!(
-            std::str::from_utf8(&held).expect("should be utf8"),
-            "</body></html>",
-            "the close-body tag and trailing bytes should be held"
+        assert!(
+            !rewritten.contains("__TSJS_BIDS_PLACEHOLDER"),
+            "placeholder must not leak on EOF fallback"
         );
     }
 
-    #[test]
-    fn body_close_hold_buffer_holds_close_body_tail_across_chunks() {
-        let mut hold = BodyCloseHoldBuffer::new();
+    #[tokio::test]
+    async fn ssat_late_binding_prepends_bootstrap_when_body_closes_without_head() {
+        let settings = create_test_settings();
+        let services = noop_services();
+        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let registry = IntegrationRegistry::empty_for_tests();
+        let mut params = make_html_ssat_params(&settings, None);
+        let mut output = Vec::new();
+        let html = b"<body><p>painted</p></body>";
 
-        let first = hold.push(b"<html><body>painted</bo");
-        let second = hold.push(b"dy></html>");
-        let held = hold.finish();
+        stream_publisher_body_async(
+            EdgeBody::from(html.to_vec()),
+            &mut output,
+            &mut params,
+            &settings,
+            &registry,
+            &orchestrator,
+            &services,
+        )
+        .await
+        .expect("should prepend missing-head bootstrap before body-close bids");
 
-        let streamed = [first, second].concat();
-        assert_eq!(
-            std::str::from_utf8(&streamed).expect("should be utf8"),
-            "<html><body>painted",
-            "split </body> bytes must not leak before auction collection"
+        let rewritten = String::from_utf8(output).expect("should be utf8");
+        let slots_pos = rewritten
+            .find(".adSlots=")
+            .expect("should inject ad slot state");
+        let bundle_pos = rewritten
+            .find("/static/tsjs=")
+            .expect("should inject tsjs script tag");
+        let bids_pos = rewritten
+            .find(".bids=JSON.parse")
+            .expect("should inject bids script");
+        let body_close_pos = rewritten.rfind("</body>").expect("should have body close");
+        assert!(
+            slots_pos < bundle_pos && bundle_pos < bids_pos && bids_pos < body_close_pos,
+            "missing-head body-close replacement should preserve executable order before </body>"
         );
-        assert_eq!(
-            std::str::from_utf8(&held).expect("should be utf8"),
-            "</body></html>",
-            "split close-body tag should be held intact"
+        assert!(
+            !rewritten.contains("__TSJS_BIDS_PLACEHOLDER"),
+            "placeholder must not leak on missing-head body-close replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssat_late_binding_appends_minimal_tail_when_head_and_body_close_missing() {
+        let settings = create_test_settings();
+        let services = noop_services();
+        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let registry = IntegrationRegistry::empty_for_tests();
+        let mut params = make_html_ssat_params(&settings, None);
+        let mut output = Vec::new();
+        let html = b"<div>fragment without document scaffolding</div>";
+
+        stream_publisher_body_async(
+            EdgeBody::from(html.to_vec()),
+            &mut output,
+            &mut params,
+            &settings,
+            &registry,
+            &orchestrator,
+            &services,
+        )
+        .await
+        .expect("should append missing-head EOF fallback tail");
+
+        let rewritten = String::from_utf8(output).expect("should be utf8");
+        let slots_pos = rewritten
+            .find(".adSlots=")
+            .expect("should append ad slot state");
+        let bundle_pos = rewritten
+            .find("/static/tsjs=")
+            .expect("should append tsjs script tag");
+        let bids_pos = rewritten
+            .find(".bids=JSON.parse")
+            .expect("should append bids script");
+        assert!(
+            slots_pos < bundle_pos && bundle_pos < bids_pos,
+            "fallback tail should preserve executable order"
+        );
+        assert!(
+            !rewritten.contains("__TSJS_BIDS_PLACEHOLDER"),
+            "placeholder must not leak on missing-head fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_ssat_postprocessor_path_rejects_processed_output_over_cap() {
+        let mut settings = create_test_settings();
+        settings.publisher.max_buffered_body_bytes = 96;
+        settings
+            .integrations
+            .insert_config(
+                "nextjs",
+                &serde_json::json!({
+                    "enabled": true,
+                    "rewrite_attributes": ["href"],
+                }),
+            )
+            .expect("should update nextjs config");
+        let services = noop_services();
+        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        assert!(
+            registry.has_html_post_processors(),
+            "nextjs should force the buffered post-processor path"
+        );
+        let mut params = make_html_ssat_params(&settings, None);
+        let mut output = Vec::new();
+        let html = b"<html><head></head><body>x</body></html>";
+        assert!(
+            html.len() < settings.publisher.max_buffered_body_bytes,
+            "decoded input should fit so the processed-output cap is exercised"
+        );
+
+        let err = stream_publisher_body_async(
+            EdgeBody::from(html.to_vec()),
+            &mut output,
+            &mut params,
+            &settings,
+            &registry,
+            &orchestrator,
+            &services,
+        )
+        .await
+        .expect_err("should reject processed output over cap");
+
+        let err = format!("{err:?}");
+        assert!(
+            err.contains("processed output exceeded"),
+            "error should come from the processed-output cap: {err}"
         );
     }
 
