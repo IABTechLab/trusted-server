@@ -188,12 +188,17 @@ fn matching_slot_index(existing: &[RenderSlot], discovered: &RenderSlot) -> Opti
     existing.iter().position(|slot| slot.key() == key)
 }
 
+/// Header comment emitted above the managed slot array. Stripped from the
+/// preserved scalar block on re-splice (see [`is_managed_comment_line`]) so
+/// repeated `generate` runs don't accumulate duplicate copies.
+const MANAGED_SLOTS_COMMENT: &str = "# Slots managed by `ts audit ad-templates generate`.";
+/// Second line of the managed-slot header comment.
+const MANAGED_SLOTS_REVIEW_COMMENT: &str =
+    "# Review page_patterns and formats before validating/pushing.";
+
 /// Renders merged slots as compact `[[creative_opportunities.slot]]` TOML blocks.
 pub(super) fn render_slots(slots: &[RenderSlot]) -> String {
-    let mut out = String::from(
-        "\n# Slots managed by `ts audit ad-templates generate`.\n\
-         # Review page_patterns and formats before validating/pushing.\n",
-    );
+    let mut out = format!("\n{MANAGED_SLOTS_COMMENT}\n{MANAGED_SLOTS_REVIEW_COMMENT}\n");
     for slot in slots {
         out.push_str("\n[[creative_opportunities.slot]]\n");
         out.push_str(&format!("id = {}\n", toml_string(&slot.id)));
@@ -409,9 +414,20 @@ pub(super) fn splice_creative_slots(
         .position(|line| is_unrelated_table(line))
         .map_or(lines.len(), |offset| start + offset);
 
-    let mut result = lines[..start].join("\n");
+    // Preserve everything before the slot array, but drop any prior managed
+    // header comment (and the blank lines it leaves behind): `rendered` re-emits
+    // it, so keeping the old copy would duplicate it on every re-splice.
+    let mut head_lines: Vec<&str> = lines[..start]
+        .iter()
+        .copied()
+        .filter(|line| !is_managed_comment_line(line))
+        .collect();
+    while head_lines.last().is_some_and(|line| line.trim().is_empty()) {
+        head_lines.pop();
+    }
+    let mut result = head_lines.join("\n");
     if !result.is_empty() {
-        result.push('\n');
+        result.push_str("\n\n");
     }
     result.push_str(rendered);
     result.push('\n');
@@ -476,6 +492,14 @@ fn strip_inline_comment(line: &str) -> &str {
 /// trailing inline `# comment` — both valid TOML.
 fn is_table_header(line: &str, section_header: &str) -> bool {
     strip_inline_comment(line.trim()) == section_header
+}
+
+/// Whether `line` is one of the managed header comment lines emitted by
+/// [`render_slots`]. Used to strip the prior copy on re-splice so repeated
+/// `generate` runs keep exactly one header comment.
+fn is_managed_comment_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed == MANAGED_SLOTS_COMMENT || trimmed == MANAGED_SLOTS_REVIEW_COMMENT
 }
 
 pub(super) fn replace_key_in_section(
@@ -679,6 +703,32 @@ mod tests {
                 && value["auction"]["enabled"].as_bool() == Some(true),
             "existing sections preserved when appending"
         );
+    }
+
+    #[test]
+    fn resplice_does_not_accumulate_managed_comment() {
+        // A re-run splices into a config that already carries the managed
+        // header comment; it must keep exactly one copy, not append another.
+        let first = splice_creative_slots(
+            "[publisher]\ndomain = \"x\"\n\n[auction]\nenabled = true\n",
+            Some("222"),
+            &header_rendered(),
+        )
+        .expect("first splice");
+        let second =
+            splice_creative_slots(&first, Some("222"), &header_rendered()).expect("second splice");
+        let third =
+            splice_creative_slots(&second, Some("222"), &header_rendered()).expect("third splice");
+
+        assert_eq!(
+            third
+                .lines()
+                .filter(|line| line.trim() == MANAGED_SLOTS_COMMENT)
+                .count(),
+            1,
+            "managed header comment must not accumulate across re-splices"
+        );
+        toml::from_str::<toml::Value>(&third).expect("re-spliced config stays valid TOML");
     }
 
     #[test]
