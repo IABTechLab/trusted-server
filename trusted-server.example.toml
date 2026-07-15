@@ -111,6 +111,10 @@ rewrite_script = true
 
 [auction]
 enabled = false
+# Defaults to true. Set false to return sanitized but unre-written winning-bid adm,
+# skipping proxy/click URL conversion and creative TSJS injection.
+# Sanitization is always applied and cannot be disabled by this setting.
+rewrite_creatives = true
 providers = []
 timeout_ms = 2000
 allowed_context_keys = []
