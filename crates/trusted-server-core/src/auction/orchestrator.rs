@@ -168,10 +168,22 @@ pub struct AuctionOrchestrator {
     providers: HashMap<String, Arc<dyn AuctionProvider>>,
 }
 
+fn should_warn_about_aps_without_mediator(config: &AuctionConfig) -> bool {
+    config.enabled
+        && config.providers.iter().any(|provider| provider == "aps")
+        && !config.has_mediator()
+}
+
 impl AuctionOrchestrator {
     /// Create a new orchestrator with the given configuration.
     #[must_use]
     pub fn new(config: AuctionConfig) -> Self {
+        if should_warn_about_aps_without_mediator(&config) {
+            log::warn!(
+                "APS is configured as a bidder without a mediator; APS returns encoded-price bids that cannot produce auction winners until a mediator is configured"
+            );
+        }
+
         Self {
             config,
             providers: HashMap::new(),
@@ -1735,6 +1747,38 @@ mod tests {
         assert!(
             message.starts_with("Auction error: "),
             "should preserve the current context display text"
+        );
+    }
+
+    #[test]
+    fn aps_without_mediator_requires_configuration_warning() {
+        let aps_without_mediator = AuctionConfig {
+            enabled: true,
+            providers: vec!["aps".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            super::should_warn_about_aps_without_mediator(&aps_without_mediator),
+            "should diagnose APS configurations that cannot select encoded-price bids"
+        );
+
+        let aps_with_mediator = AuctionConfig {
+            mediator: Some("mediator".to_string()),
+            ..aps_without_mediator
+        };
+        assert!(
+            !super::should_warn_about_aps_without_mediator(&aps_with_mediator),
+            "should not diagnose APS when a mediator is configured"
+        );
+
+        let auction_disabled = AuctionConfig {
+            enabled: false,
+            providers: vec!["aps".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            !super::should_warn_about_aps_without_mediator(&auction_disabled),
+            "should not diagnose disabled auctions"
         );
     }
 

@@ -296,6 +296,41 @@ pub struct ApsAuctionProvider {
     config: ApsConfig,
 }
 
+/// Reason an APS slot was not converted into a bid.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ApsSlotSkipReason {
+    NoFill,
+    NoEncodedPrice,
+    MalformedSize,
+}
+
+impl ApsSlotSkipReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoFill => "no_fill",
+            Self::NoEncodedPrice => "no_encoded_price",
+            Self::MalformedSize => "malformed_size",
+        }
+    }
+}
+
+#[derive(Default)]
+struct ApsSkippedSlotCounts {
+    no_fill: usize,
+    no_encoded_price: usize,
+    malformed_size: usize,
+}
+
+impl ApsSkippedSlotCounts {
+    fn record(&mut self, reason: ApsSlotSkipReason) {
+        match reason {
+            ApsSlotSkipReason::NoFill => self.no_fill += 1,
+            ApsSlotSkipReason::NoEncodedPrice => self.no_encoded_price += 1,
+            ApsSlotSkipReason::MalformedSize => self.malformed_size += 1,
+        }
+    }
+}
+
 impl ApsAuctionProvider {
     /// Create a new APS auction provider.
     #[must_use]
@@ -420,34 +455,20 @@ impl ApsAuctionProvider {
     /// Note: Price is NOT decoded here. The encoded price is stored in metadata
     /// and will be decoded by the mediation layer (mocktioneer). This simulates
     /// real-world APS where only Amazon/GAM can decode the proprietary price encoding.
-    fn parse_aps_slot(&self, slot: &ApsSlotResponse) -> Result<Bid, ()> {
+    fn parse_aps_slot(&self, slot: &ApsSlotResponse) -> Result<Bid, ApsSlotSkipReason> {
         // Only process filled slots (fif == "1")
         if slot.fif.as_deref() != Some("1") {
-            return Err(());
+            return Err(ApsSlotSkipReason::NoFill);
         }
 
         // Verify we have an encoded price field
-        let encoded_price = slot.amznbid.as_ref().or(slot.amznp.as_ref());
-        if encoded_price.is_none() {
-            log::debug!(
-                "APS: slot '{}' has no encoded price, skipping",
-                slot.slot_id
-            );
-            return Err(());
+        if slot.amznbid.is_none() && slot.amznp.is_none() {
+            return Err(ApsSlotSkipReason::NoEncodedPrice);
         }
 
         // Parse size from "WxH" format
-        let (width, height) = match Self::parse_size(&slot.size) {
-            Some(dims) => dims,
-            None => {
-                log::debug!(
-                    "APS: slot '{}' has malformed size '{}', skipping",
-                    slot.slot_id,
-                    slot.size
-                );
-                return Err(());
-            }
-        };
+        let (width, height) =
+            Self::parse_size(&slot.size).ok_or(ApsSlotSkipReason::MalformedSize)?;
 
         // Build metadata from targeting keys - includes encoded price for mediation
         let mut metadata = HashMap::new();
@@ -501,45 +522,58 @@ impl ApsAuctionProvider {
     ) -> AuctionResponse {
         let mut bids = Vec::new();
 
-        // Try to parse as ApsBidResponse with contextual wrapper
-        if let Ok(aps_response) = serde_json::from_value::<ApsBidResponse>(json.clone()) {
-            log::debug!(
-                "APS: parsed contextual response with {} slots",
-                aps_response.contextual.slots.len()
-            );
+        // Try to parse as ApsBidResponse with contextual wrapper.
+        match serde_json::from_value::<ApsBidResponse>(json.clone()) {
+            Ok(aps_response) => {
+                let contextual_status = aps_response
+                    .contextual
+                    .status
+                    .as_deref()
+                    .unwrap_or("absent")
+                    .to_string();
+                let returned_slots = aps_response.contextual.slots.len();
+                let mut skipped_slots = ApsSkippedSlotCounts::default();
 
-            for slot in aps_response.contextual.slots {
-                match self.parse_aps_slot(&slot) {
-                    Ok(mut bid) => {
-                        // Remap APS slot ID (e.g. "aps-slot-atf-sidebar") back to the
-                        // creative-opportunity slot ID (e.g. "atf_sidebar_ad") so the
-                        // mediator and bid_map can match by creative slot ID.
-                        if let Some(creative_id) = slot_map.get(&bid.slot_id) {
-                            bid.slot_id = creative_id.clone();
+                for slot in aps_response.contextual.slots {
+                    match self.parse_aps_slot(&slot) {
+                        Ok(mut bid) => {
+                            // Remap APS slot ID (e.g. "aps-slot-atf-sidebar") back to the
+                            // creative-opportunity slot ID (e.g. "atf_sidebar_ad") so the
+                            // mediator and bid_map can match by creative slot ID.
+                            if let Some(creative_id) = slot_map.get(&bid.slot_id) {
+                                bid.slot_id = creative_id.clone();
+                            }
+                            log::debug!(
+                                "APS: accepted bid for slot '{}' with encoded price awaiting mediation",
+                                bid.slot_id,
+                            );
+                            bids.push(bid);
                         }
-                        let encoded_price = bid
-                            .metadata
-                            .get("amznbid")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
-                        log::debug!(
-                            "APS: parsed bid for slot '{}' with encoded price (to be decoded by mediation)",
-                            bid.slot_id,
-                        );
-                        log::trace!(
-                            "APS: slot '{}' encoded price: {}",
-                            bid.slot_id,
-                            encoded_price
-                        );
-                        bids.push(bid);
-                    }
-                    Err(_) => {
-                        log::debug!("APS: skipped slot (no fill or invalid)");
+                        Err(reason) => {
+                            skipped_slots.record(reason);
+                            log::debug!(
+                                "APS: skipped slot '{}' (reason: {})",
+                                slot.slot_id,
+                                reason.as_str(),
+                            );
+                        }
                     }
                 }
+
+                log::info!(
+                    "APS response summary: latency={}ms, contextual_status={}, returned_slots={}, accepted_bids={}, skipped_no_fill={}, skipped_no_encoded_price={}, skipped_malformed_size={}",
+                    response_time_ms,
+                    contextual_status,
+                    returned_slots,
+                    bids.len(),
+                    skipped_slots.no_fill,
+                    skipped_slots.no_encoded_price,
+                    skipped_slots.malformed_size,
+                );
             }
-        } else {
-            log::warn!("APS: failed to parse response as contextual format");
+            Err(error) => {
+                log::warn!("APS: failed to parse response as contextual format: {error}");
+            }
         }
 
         if bids.is_empty() {
@@ -584,12 +618,6 @@ impl ApsAuctionProvider {
 
         // Transform to unified format
         let auction_response = self.parse_aps_response(&response_json, response_time_ms, slot_map);
-
-        log::info!(
-            "APS returned {} bids in {}ms",
-            auction_response.bids.len(),
-            response_time_ms
-        );
 
         Ok(auction_response)
     }
@@ -1090,6 +1118,57 @@ mod tests {
         // Should return no-bid since all slots are invalid
         assert_eq!(auction_response.status, BidStatus::NoBid);
         assert_eq!(auction_response.bids.len(), 0);
+    }
+
+    #[test]
+    fn aps_slot_skip_reasons_are_deterministic() {
+        let provider = ApsAuctionProvider::new(ApsConfig {
+            enabled: true,
+            pub_id: "5128".to_string(),
+            endpoint: default_endpoint(),
+            timeout_ms: 800,
+        });
+        let mut slot = ApsSlotResponse {
+            slot_id: "test-slot".to_string(),
+            size: "300x250".to_string(),
+            crid: None,
+            media_type: None,
+            fif: Some("0".to_string()),
+            targeting: vec![],
+            meta: vec![],
+            amzniid: None,
+            amznbid: None,
+            amznp: None,
+            amznsz: None,
+            amznactt: None,
+        };
+
+        assert_eq!(
+            provider
+                .parse_aps_slot(&slot)
+                .expect_err("should skip unfilled slot"),
+            ApsSlotSkipReason::NoFill,
+            "should classify unfilled slots"
+        );
+
+        slot.fif = Some("1".to_string());
+        assert_eq!(
+            provider
+                .parse_aps_slot(&slot)
+                .expect_err("should skip slot without encoded price"),
+            ApsSlotSkipReason::NoEncodedPrice,
+            "should classify slots without an encoded price"
+        );
+
+        slot.amznbid = Some("encoded-price".to_string());
+        slot.size = "invalid".to_string();
+        assert_eq!(
+            provider
+                .parse_aps_slot(&slot)
+                .expect_err("should skip slot with malformed size"),
+            ApsSlotSkipReason::MalformedSize,
+            "should classify slots with malformed size"
+        );
     }
 
     #[test]
