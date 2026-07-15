@@ -614,7 +614,8 @@ impl ApsAuctionProvider {
                 message: "Failed to parse APS response JSON".to_string(),
             })?;
 
-        log::trace!("APS: received response: {:?}", response_json);
+        // Temporary test-environment diagnostic: restore TRACE before merging this branch.
+        log::info!("APS: received response: {:?}", response_json);
 
         // Transform to unified format
         let auction_response = self.parse_aps_response(&response_json, response_time_ms, slot_map);
