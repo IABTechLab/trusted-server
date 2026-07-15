@@ -594,9 +594,11 @@ mod tests {
         });
 
         assert_eq!(result.expected, RuntimeAdStackExpected::No);
-        assert!(result
-            .blocking_gates()
-            .contains(&AdStackGateName::AuctionEnabled));
+        assert!(
+            result
+                .blocking_gates()
+                .contains(&AdStackGateName::AuctionEnabled)
+        );
     }
 
     #[test]
