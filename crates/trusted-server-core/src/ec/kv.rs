@@ -346,12 +346,12 @@ impl KvIdentityGraph {
                     // Re-read immediately to get a fresh generation. Sleeping in
                     // the CAS loop would block the edge compute request worker.
                     match self.get(ec_id)? {
-                        Some((refreshed, gen)) => {
+                        Some((refreshed, generation)) => {
                             if refreshed.consent.ok {
                                 // Someone else revived it — done.
                                 return Ok(());
                             }
-                            current_gen = gen;
+                            current_gen = generation;
                         }
                         None => return self.create(ec_id, entry),
                     }
@@ -870,8 +870,8 @@ mod tests {
     // CAS-conflict injection tests
     // -----------------------------------------------------------------------
 
-    use crate::ec::kv_backend::test_support::InMemoryEcKv;
     use crate::ec::kv_backend::EcKvLookup;
+    use crate::ec::kv_backend::test_support::InMemoryEcKv;
 
     /// [`EcKvStore`] wrapper that injects generation conflicts: the first
     /// `conflicts_remaining` `IfGenerationMatch` inserts return

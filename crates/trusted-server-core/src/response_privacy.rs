@@ -9,7 +9,7 @@
 //! cache such as Cloudflare would otherwise serve an operator/origin
 //! `Cache-Control: public` on a cookie-bearing response as-is.
 
-use edgezero_core::http::{header, HeaderName, HeaderValue, Response};
+use edgezero_core::http::{HeaderName, HeaderValue, Response, header};
 
 use crate::settings::Settings;
 

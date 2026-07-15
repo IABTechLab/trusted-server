@@ -11,9 +11,6 @@
 use std::fs;
 use std::path::PathBuf;
 
-// Pull in postprocess() and helpers from the openrtb crate's codegen module.
-include!("../../trusted-server-openrtb/src/codegen.rs");
-
 fn main() {
     let openrtb_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../trusted-server-openrtb");
     let proto_path = openrtb_dir.join("proto/openrtb.proto");
@@ -55,3 +52,8 @@ fn main() {
     // Clean up temp files.
     let _ = fs::remove_dir_all(&tmp);
 }
+
+// Pull in postprocess() and helpers from the openrtb crate's codegen module.
+// Placed after `main` because the included module carries a `#[cfg(test)]`
+// module, and items may not follow a test module.
+include!("../../trusted-server-openrtb/src/codegen.rs");
