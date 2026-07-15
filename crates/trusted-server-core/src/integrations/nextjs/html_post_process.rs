@@ -3,7 +3,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use lol_html::{text, Settings as RewriterSettings};
+use lol_html::{Settings as RewriterSettings, text};
 
 use crate::integrations::{IntegrationHtmlContext, IntegrationHtmlPostProcessor};
 
@@ -11,8 +11,8 @@ use super::rsc::rewrite_rsc_scripts_combined_with_limit;
 use super::rsc_placeholders::{
     NextJsRscPostProcessState, RSC_PAYLOAD_PLACEHOLDER_PREFIX, RSC_PAYLOAD_PLACEHOLDER_SUFFIX,
 };
-use super::shared::{find_rsc_push_payload_range, RscUrlRewriter};
-use super::{NextJsIntegrationConfig, NEXTJS_INTEGRATION_ID};
+use super::shared::{RscUrlRewriter, find_rsc_push_payload_range};
+use super::{NEXTJS_INTEGRATION_ID, NextJsIntegrationConfig};
 
 pub(crate) struct NextJsHtmlPostProcessor {
     config: Arc<NextJsIntegrationConfig>,
@@ -319,8 +319,7 @@ fn find_rsc_push_scripts(html: &str) -> Vec<RscPushScriptRange> {
         return Vec::new();
     }
 
-    let result = std::mem::take(&mut *ranges.borrow_mut());
-    result
+    std::mem::take(&mut *ranges.borrow_mut())
 }
 
 /// Rewrite RSC payload URLs in HTML by re-parsing the document.
@@ -737,31 +736,30 @@ mod tests {
 
                     if esc == b'u' && pos + 5 < bytes.len() {
                         let hex = &s[pos + 2..pos + 6];
-                        if hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                            if let Ok(code_unit) = u16::from_str_radix(hex, 16) {
-                                // Surrogate pairs use UTF-16 and expand to 4 bytes in UTF-8.
-                                if (0xD800..=0xDBFF).contains(&code_unit)
-                                    && pos + 11 < bytes.len()
-                                    && bytes[pos + 6] == b'\\'
-                                    && bytes[pos + 7] == b'u'
+                        if hex.chars().all(|c| c.is_ascii_hexdigit())
+                            && let Ok(code_unit) = u16::from_str_radix(hex, 16)
+                        {
+                            // Surrogate pairs use UTF-16 and expand to 4 bytes in UTF-8.
+                            if (0xD800..=0xDBFF).contains(&code_unit)
+                                && pos + 11 < bytes.len()
+                                && bytes[pos + 6] == b'\\'
+                                && bytes[pos + 7] == b'u'
+                            {
+                                let hex2 = &s[pos + 8..pos + 12];
+                                if hex2.chars().all(|c| c.is_ascii_hexdigit())
+                                    && let Ok(code_unit2) = u16::from_str_radix(hex2, 16)
+                                    && (0xDC00..=0xDFFF).contains(&code_unit2)
                                 {
-                                    let hex2 = &s[pos + 8..pos + 12];
-                                    if hex2.chars().all(|c| c.is_ascii_hexdigit()) {
-                                        if let Ok(code_unit2) = u16::from_str_radix(hex2, 16) {
-                                            if (0xDC00..=0xDFFF).contains(&code_unit2) {
-                                                pos += 12;
-                                                count += 4;
-                                                continue;
-                                            }
-                                        }
-                                    }
+                                    pos += 12;
+                                    count += 4;
+                                    continue;
                                 }
-
-                                let c = char::from_u32(u32::from(code_unit)).unwrap_or('\u{FFFD}');
-                                pos += 6;
-                                count += c.len_utf8();
-                                continue;
                             }
+
+                            let c = char::from_u32(u32::from(code_unit)).unwrap_or('\u{FFFD}');
+                            pos += 6;
+                            count += c.len_utf8();
+                            continue;
                         }
                     }
                 }

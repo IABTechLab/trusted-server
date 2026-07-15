@@ -82,6 +82,12 @@ jobs:
       - name: Run host-target CLI tests
         run: ./scripts/test-cli.sh
 
+      # The codegen crate is not a default member and no adapter alias builds it,
+      # so its tests only run if invoked explicitly on the host target.
+      - name: Run host-target OpenRTB codegen tests
+        run: |
+          cargo test --package trusted-server-openrtb-codegen --target "$(rustc -vV | sed -n 's/host: //p')"
+
       - name: Verify Fastly WASM release build
         run: cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
 

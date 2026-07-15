@@ -252,7 +252,7 @@ mod tests {
     use edgezero_core::body::Body;
     use edgezero_core::context::RequestContext;
     use edgezero_core::error::EdgeError;
-    use edgezero_core::http::{request_builder, response_builder, HeaderName, Method, StatusCode};
+    use edgezero_core::http::{HeaderName, Method, StatusCode, request_builder, response_builder};
     use edgezero_core::middleware::Next;
     use edgezero_core::params::PathParams;
     use error_stack::Report;

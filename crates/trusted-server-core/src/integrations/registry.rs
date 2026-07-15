@@ -9,8 +9,8 @@ use http::{Method, Request, Response};
 use matchit::Router;
 
 use crate::constants::HEADER_X_TS_EC;
-use crate::ec::kv::KvIdentityGraph;
 use crate::ec::EcContext;
+use crate::ec::kv::KvIdentityGraph;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::http_util::is_navigation_request;
@@ -159,10 +159,10 @@ impl IntegrationDocumentState {
             .lock()
             .expect("should lock integration document state");
 
-        if let Some(existing) = guard.get(integration_id) {
-            if let Ok(downcast) = Arc::clone(existing).downcast::<T>() {
-                return downcast;
-            }
+        if let Some(existing) = guard.get(integration_id)
+            && let Ok(downcast) = Arc::clone(existing).downcast::<T>()
+        {
+            return downcast;
         }
 
         let value: Arc<T> = Arc::new(init());
@@ -1313,7 +1313,7 @@ mod tests {
     use super::*;
     use crate::constants::COOKIE_TS_EC;
     use crate::platform::test_support::noop_services;
-    use http::{header, HeaderValue, StatusCode};
+    use http::{HeaderValue, StatusCode, header};
 
     // Mock integration proxy for testing
     struct MockProxy;
