@@ -371,7 +371,7 @@ describe('installTsAdInit', () => {
     expect(mockPubads.refresh).not.toHaveBeenCalled();
   });
 
-  it('keeps the GAM path when debug adm is present', async () => {
+  it('keeps the GAM path when a bid carries inline adm (adInit does not inject)', async () => {
     const slotEl = document.getElementById('div-atf-sidebar')!;
     const mockSlot = {
       addService: vi.fn().mockReturnThis(),
@@ -408,7 +408,7 @@ describe('installTsAdInit', () => {
           hb_pb: '0.20',
           hb_bidder: 'mocktioneer',
           hb_adid: 'debug-uuid',
-          adm: '<div>Debug creative</div>',
+          adm: '<div>Inline creative</div>',
         },
       },
     };
@@ -424,6 +424,80 @@ describe('installTsAdInit', () => {
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_adid', 'debug-uuid');
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_initial', '1');
     expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
+  });
+
+  // Helper: full adInit setup for a single slot whose bid carries an iframe adm.
+  // `debugBid` toggles the per-bid `debug_bid` field that gates the testing bypass.
+  async function fireSlotRenderWithAdm(debugBid: boolean): Promise<HTMLIFrameElement> {
+    let capturedListener: ((e: SlotRenderEvent) => void) | undefined;
+    const mockSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+      getTargeting: vi.fn().mockReturnValue(['abc']),
+    };
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([mockSlot]),
+      refresh: vi.fn(),
+      addEventListener: vi.fn((event: string, fn: (e: SlotRenderEvent) => void) => {
+        if (event === 'slotRenderEnded') capturedListener = fn;
+      }),
+    };
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(mockSlot),
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+    };
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {
+        atf_sidebar_ad: {
+          hb_pb: '1.00',
+          hb_bidder: 'kargo',
+          hb_adid: 'abc',
+          adm: '<iframe src="https://cdn.example/creative.html"></iframe>',
+          ...(debugBid ? { debug_bid: { slot_id: 'atf_sidebar_ad' } } : {}),
+        },
+      },
+    };
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    // A pre-existing GAM iframe; the bypass, if it runs, rewrites its src.
+    const slotEl = document.getElementById('div-atf-sidebar')!;
+    const gamIframe = document.createElement('iframe');
+    gamIframe.src = 'about:blank';
+    slotEl.appendChild(gamIframe);
+
+    expect(capturedListener).toBeDefined();
+    capturedListener!({ isEmpty: false, slot: mockSlot });
+    return gamIframe;
+  }
+
+  it('does not run the GAM-replace bypass without debug_bid (production)', async () => {
+    const gamIframe = await fireSlotRenderWithAdm(false);
+    // No debug_bid ⇒ testing bypass is off; the render bridge handles the creative
+    // and GAM stays in the loop, so the GAM iframe src is untouched.
+    expect(gamIframe.src).toBe('about:blank');
+  });
+
+  it('runs the GAM-replace bypass when debug_bid is present (testing)', async () => {
+    const gamIframe = await fireSlotRenderWithAdm(true);
+    // debug_bid present ⇒ inject_adm_for_testing on ⇒ direct GAM replace fires,
+    // rewriting the iframe to the creative URL from the adm.
+    expect(gamIframe.src).toBe('https://cdn.example/creative.html');
   });
 
   it('does not fire win/billing beacons from slotRenderEnded targeting alone', async () => {
@@ -1039,18 +1113,22 @@ describe('installTsRenderBridge', () => {
     beaconSpy.mockRestore();
   });
 
-  it('responds with adm without fetching PBS Cache when debug adm is available', async () => {
+  it('serves inline adm without fetching PBS Cache even when cache coords are present', async () => {
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
-    const debugAdm = '<div>Debug Creative</div>';
+    const inlineAdm = '<div>Inline Creative</div>';
     (window as TestWindow).tsjs = {
       bids: {
         homepage_header: {
           hb_adid: 'debug-adid',
           hb_bidder: 'mocktioneer',
           hb_pb: '0.20',
+          // Production shape: cache coordinates ARE present, but the bridge must
+          // prefer the local inline adm and skip the PBS Cache fetch.
+          hb_cache_host: 'cache.example.com',
+          hb_cache_path: '/pbc/v1/cache',
           nurl: 'https://debug.example/win',
           burl: 'https://debug.example/bill',
-          adm: debugAdm,
+          adm: inlineAdm,
         },
       },
       adSlots: [
@@ -1103,7 +1181,7 @@ describe('installTsRenderBridge', () => {
     const parsed = JSON.parse(portMessages[0]) as Record<string, any>;
     expect(parsed.message).toBe('Prebid Response');
     expect(parsed.adId).toBe('debug-adid');
-    expect(parsed.ad).toBe(debugAdm);
+    expect(parsed.ad).toBe(inlineAdm);
     expect(parsed.width).toBe(728);
     expect(parsed.height).toBe(90);
     expect(beaconSpy).toHaveBeenCalledWith('https://debug.example/win');
