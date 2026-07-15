@@ -79,6 +79,37 @@ Branch: worktree-edgezero-migration-spec
   everywhere (code, manifests' physical store names, example/fixtures, 3 user guides w/
   __NAME contract note); re-declared in edgezero.toml + STORES_METADATA. Zero stray hyphens.
   core 1630, spin manifest PASS, parity 13/0, clippy/fmt clean.
+## Task 6: COMPLETE (1be632f5b) — ALL FOUR ADAPTERS NOW ON THE EDGEZERO REGISTRY
+- Fastly registries.rs (KV/config/secret builders, H2b non-fatal per-store open), injected into the
+  custom oneshot path; Fastly writer impls + composite-backed build_per_request_services + kv_registry.
+- Core `resolve_consent_kv` fail-closed guard replaces the Fastly-only
+  `runtime_services_for_consent_route` (deleted, with open_kv_store + its 3 call sites). Guard applied to
+  auction + publisher + page-bids (the wrapper covered all three; the 503 gate asserts the publisher
+  fallback). BOTH mandatory 503 gates still pass. Now fail-closed on all four adapters.
+- Fastly 106/106; parity 13/13; all six clippy targets + wasm + fmt clean.
+- KEY FIX (Option B): edgezero's Fastly `ConfigStore::get` is ENVELOPE-ONLY (rejects non-BlobEnvelope
+  values), while Axum/CF are plain passthroughs. TS's non-default config stores hold PLAIN values
+  (jwks_store, datadome_ip_bypass) → binding them to it would 500 discovery/verify/rotation/DataDome.
+  So: default id → edgezero chunk-aware store; non-default ids → local plain store over
+  fastly::ConfigStore::try_get. Upstream asymmetry FILED: https://github.com/stackpop/edgezero/issues/324
+- KEY FIX: Fastly runs the whole request inside futures::executor::block_on, so the composite's inner
+  block_on aborted (EnterError). `resolve_store_future` now polls once with a noop waker, falling back to
+  block_on. Load-bearing assumption documented (Fastly stores are sync under an async signature).
+
+## Task 8 premise is STALE (do not trust the plan there)
+- Plan says "keep Fastly read impls until Phase 5 because legacy_main is live". main #744 DELETED
+  legacy_main; there is no legacy_main / build_runtime_services in adapter-fastly. Fastly IS in scope
+  for the write-only conversion. KNOWN exception to preserve: management_api.rs:130 reads the Fastly
+  api-keys secret (a management store deliberately outside the registry; hyphenated id anyway).
+
+## Open follow-ups (explicitly deferred, NOT bugs introduced here)
+- Consent KV persistence is DORMANT (ec/mod.rs passes kv_store: None) — enabling it is a FEATURE
+  decision, deliberately not made during a behavior-preserving migration. Plumbing now exists.
+- EC identity graph still opens FastlyEcKvStore directly (bypasses the registry) — scoped out.
+- Remove the consent TTL clamp when edgezero#323 ships.
+- Doc note owed: Axum dev secrets now resolve via EnvSecretStore (bare KEY env var) rather than
+  TRUSTED_SERVER_SECRET_{STORE}_{KEY}.
+
 ## 2026-07-13 Task 5b findings (both VERIFIED) + operator decision
 - BLOCKER (found by 5b implementer): edgezero `KvHandle::put_bytes_with_ttl` validates against
   `MAX_TTL = 365d` (key_value_store.rs:378), but TS `MAX_CONSENT_AGE_DAYS = 395` (consent_config.rs:10,
