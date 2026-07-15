@@ -132,8 +132,34 @@ The Prebid provider extracts metadata from the Prebid Server response and attach
 | `debug`     | `ext.debug`            | Prebid Server debug payload (httpcalls, resolvedrequest) |
 | `bidstatus` | `ext.prebid.bidstatus` | Per-bid status from every invited bidder                 |
 
+### Upstream HTTP errors
+
+When Prebid Server returns a non-2xx status, the provider detail always includes a safe error classification, HTTP status, and generic message:
+
+```json
+{
+  "error_type": "upstream_http",
+  "http_status": 400,
+  "message": "Prebid Server returned HTTP 400"
+}
+```
+
+With `debug = true`, Trusted Server also extracts the first error message from allowlisted JSON fields (`message`, `error`, `errors`, `detail`, `title`, or `reason`) or a plain-text response. The message is normalized to one line and limited to 500 characters:
+
+```json
+{
+  "error_type": "upstream_http",
+  "http_status": 400,
+  "message": "Prebid Server returned HTTP 400",
+  "upstream_message": "Invalid request: imp[0] has no valid bidders",
+  "upstream_message_truncated": false
+}
+```
+
+HTML error pages and unrecognized JSON payloads are not exposed. Debug mode also writes a bounded error-body preview to `tslog`, correlated with the auction ID.
+
 ::: warning
-Enabling `debug` increases response sizes and adds overhead. Use it in development or when diagnosing auction issues — not in production.
+Enabling `debug` increases response sizes and adds overhead. It can also expose bounded upstream diagnostics to `/auction` callers and logs. Use it temporarily when diagnosing auction issues, not as a permanent production setting.
 :::
 
 ### Test mode vs. debug
