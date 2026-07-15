@@ -11,6 +11,10 @@ pub struct AuctionConfig {
     #[serde(default)]
     pub enabled: bool,
 
+    /// Rewrite sanitized winning-bid creative HTML to first-party endpoints.
+    #[serde(default = "default_rewrite_creatives")]
+    pub rewrite_creatives: bool,
+
     /// Provider names that participate in bidding
     /// Simply list the provider names (e.g., ["prebid", "aps"])
     #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
@@ -41,6 +45,7 @@ impl Default for AuctionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            rewrite_creatives: default_rewrite_creatives(),
             providers: Vec::new(),
             mediator: None,
             timeout_ms: default_timeout(),
@@ -52,6 +57,10 @@ impl Default for AuctionConfig {
 
 fn default_timeout() -> u32 {
     2000
+}
+
+fn default_rewrite_creatives() -> bool {
+    true
 }
 
 fn default_creative_store() -> String {
@@ -77,5 +86,18 @@ impl AuctionConfig {
     #[must_use]
     pub fn has_mediator(&self) -> bool {
         self.mediator.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rewrite_creatives_defaults_to_true() {
+        assert!(
+            AuctionConfig::default().rewrite_creatives,
+            "should enable creative rewriting by default"
+        );
     }
 }
