@@ -37,7 +37,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use http::{header, Request, Response};
+use http::{Request, Response, header};
 use serde::{Deserialize, Serialize};
 use url::Url;
 use validator::Validate;
@@ -50,7 +50,7 @@ use crate::integrations::{
     IntegrationRegistration,
 };
 use crate::platform::RuntimeServices;
-use crate::proxy::{proxy_request, ProxyRequestConfig};
+use crate::proxy::{ProxyRequestConfig, proxy_request};
 use crate::settings::{IntegrationConfig, Settings};
 
 const GPT_INTEGRATION_ID: &str = "gpt";
@@ -1073,7 +1073,9 @@ mod tests {
         );
         assert_eq!(
             url.as_deref(),
-            Some("https://securepubads.g.doubleclick.net/pagead/managed/js/gpt/m202603020101/pubads_impl.js"),
+            Some(
+                "https://securepubads.g.doubleclick.net/pagead/managed/js/gpt/m202603020101/pubads_impl.js"
+            ),
             "should strip the integration prefix and build the upstream URL"
         );
     }
@@ -1086,7 +1088,9 @@ mod tests {
         );
         assert_eq!(
             url.as_deref(),
-            Some("https://securepubads.g.doubleclick.net/pagead/managed/js/gpt/m202603020101/pubads_impl.js?cb=123&foo=bar"),
+            Some(
+                "https://securepubads.g.doubleclick.net/pagead/managed/js/gpt/m202603020101/pubads_impl.js?cb=123&foo=bar"
+            ),
             "should preserve the query string in the upstream URL"
         );
     }

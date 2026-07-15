@@ -5,8 +5,8 @@
 //! - Converting internal auction results to `OpenRTB` 2.x responses
 
 use edgezero_core::body::Body as EdgeBody;
-use error_stack::{ensure, Report, ResultExt};
-use http::{header, HeaderValue, Request, Response, StatusCode};
+use error_stack::{Report, ResultExt, ensure};
+use http::{HeaderValue, Request, Response, StatusCode, header};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
@@ -19,7 +19,7 @@ use crate::creative;
 use crate::ec::eids::encode_eids_header;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
-use crate::openrtb::{to_openrtb_i32, OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid, ToExt};
+use crate::openrtb::{OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid, ToExt, to_openrtb_i32};
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
@@ -112,40 +112,40 @@ pub fn convert_tsjs_to_auction_request(
     // Convert ad units to slots
     let mut slots = Vec::new();
     for unit in &body.ad_units {
-        if let Some(media_types) = &unit.media_types {
-            if let Some(banner) = &media_types.banner {
-                let mut formats = Vec::new();
-                for size in &banner.sizes {
-                    ensure!(
-                        size.len() == 2,
-                        TrustedServerError::BadRequest {
-                            message: "Invalid banner size; expected [width, height]".to_string(),
-                        }
-                    );
-
-                    formats.push(AdFormat {
-                        width: size[0],
-                        height: size[1],
-                        media_type: MediaType::Banner,
-                    });
-                }
-
-                // Extract bidder params from the bids array
-                let mut bidders = HashMap::new();
-                if let Some(bids) = &unit.bids {
-                    for bid in bids {
-                        bidders.insert(bid.bidder.clone(), bid.params.clone());
+        if let Some(media_types) = &unit.media_types
+            && let Some(banner) = &media_types.banner
+        {
+            let mut formats = Vec::new();
+            for size in &banner.sizes {
+                ensure!(
+                    size.len() == 2,
+                    TrustedServerError::BadRequest {
+                        message: "Invalid banner size; expected [width, height]".to_string(),
                     }
-                }
+                );
 
-                slots.push(AdSlot {
-                    id: unit.code.clone(),
-                    formats,
-                    floor_price: None,
-                    targeting: HashMap::new(),
-                    bidders,
+                formats.push(AdFormat {
+                    width: size[0],
+                    height: size[1],
+                    media_type: MediaType::Banner,
                 });
             }
+
+            // Extract bidder params from the bids array
+            let mut bidders = HashMap::new();
+            if let Some(bids) = &unit.bids {
+                for bid in bids {
+                    bidders.insert(bid.bidder.clone(), bid.params.clone());
+                }
+            }
+
+            slots.push(AdSlot {
+                id: unit.code.clone(),
+                formats,
+                floor_price: None,
+                targeting: HashMap::new(),
+                bidders,
+            });
         }
     }
 
@@ -165,32 +165,32 @@ pub fn convert_tsjs_to_auction_request(
     // unrecognised keys are silently dropped to prevent injection of
     // arbitrary data by a malicious client payload.
     let mut context = HashMap::new();
-    if let Some(ref config) = body.config {
-        if let Some(obj) = config.as_object() {
-            for (key, value) in obj {
-                if settings.auction.allowed_context_keys.contains(key) {
-                    match serde_json::from_value::<ContextValue>(value.clone()) {
-                        Ok(cv) => {
-                            context.insert(key.clone(), cv);
-                        }
-                        Err(_) => {
-                            log::debug!(
-                                "Auction context: dropping key '{}' with unsupported type",
-                                key
-                            );
-                        }
+    if let Some(ref config) = body.config
+        && let Some(obj) = config.as_object()
+    {
+        for (key, value) in obj {
+            if settings.auction.allowed_context_keys.contains(key) {
+                match serde_json::from_value::<ContextValue>(value.clone()) {
+                    Ok(cv) => {
+                        context.insert(key.clone(), cv);
                     }
-                } else {
-                    log::debug!("Auction context: dropping disallowed key '{}'", key);
+                    Err(_) => {
+                        log::debug!(
+                            "Auction context: dropping key '{}' with unsupported type",
+                            key
+                        );
+                    }
                 }
+            } else {
+                log::debug!("Auction context: dropping disallowed key '{}'", key);
             }
-            if !context.is_empty() {
-                log::debug!(
-                    "Auction request context: {} entries ({})",
-                    context.len(),
-                    context.keys().cloned().collect::<Vec<_>>().join(", ")
-                );
-            }
+        }
+        if !context.is_empty() {
+            log::debug!(
+                "Auction request context: {} entries ({})",
+                context.len(),
+                context.keys().cloned().collect::<Vec<_>>().join(", ")
+            );
         }
     }
 

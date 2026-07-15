@@ -1,9 +1,11 @@
 [package]
 name = "trusted-server-openrtb-codegen"
-version = "0.1.0"
-edition = "2024"
-publish = false
-license = "Apache-2.0"
+description = "Protobuf codegen for the Trusted Server OpenRTB types."
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
 
 [dependencies]
-prost-build = "0.13"
+prost-build = { workspace = true }

@@ -9,7 +9,7 @@ use bytes::Bytes;
 use edgezero_adapter_fastly::key_value_store::FastlyKvStore;
 use edgezero_core::key_value_store::KvError;
 use error_stack::{Report, ResultExt};
-use fastly::geo::{geo_lookup, Geo};
+use fastly::geo::{Geo, geo_lookup};
 use fastly::{ConfigStore, Request, SecretStore};
 
 use crate::backend::BackendConfig;
@@ -364,19 +364,17 @@ fn fastly_response_to_platform(
     // Pre-flight: reject oversized responses before copying bytes into WASM heap.
     // Content-Length is advisory but covers most origin responses; chunked
     // responses without it fall through to the post-materialization check below.
-    if !stream_response {
-        if let Some(claimed_len) = resp
+    if !stream_response
+        && let Some(claimed_len) = resp
             .get_header("content-length")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.trim().parse::<usize>().ok())
-        {
-            if claimed_len > MAX_PLATFORM_RESPONSE_BODY_BYTES {
-                return Err(Report::new(PlatformError::HttpClient).attach(format!(
-                    "origin Content-Length {claimed_len} exceeds \
+        && claimed_len > MAX_PLATFORM_RESPONSE_BODY_BYTES
+    {
+        return Err(Report::new(PlatformError::HttpClient).attach(format!(
+            "origin Content-Length {claimed_len} exceeds \
                      {MAX_PLATFORM_RESPONSE_BODY_BYTES}-byte response body limit"
-                )));
-            }
-        }
+        )));
     }
 
     let status = resp.get_status();
@@ -467,7 +465,7 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         &self,
         pending_requests: Vec<PlatformPendingRequest>,
     ) -> Result<PlatformSelectResult, Report<PlatformError>> {
-        use fastly::http::request::{select, PendingRequest};
+        use fastly::http::request::{PendingRequest, select};
 
         if pending_requests.is_empty() {
             return Err(Report::new(PlatformError::HttpClient)

@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use ed25519_dalek::SigningKey;
 use error_stack::{Report, ResultExt as _};
 use rand::rngs::OsRng;

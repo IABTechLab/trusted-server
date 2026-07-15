@@ -18,7 +18,7 @@
 
 use std::io::Read;
 
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use error_stack::{Report, ResultExt};
 use fastly::http::{Method, StatusCode};
 use fastly::{Request, Response};

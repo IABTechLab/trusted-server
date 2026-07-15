@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use edgezero_core::body::Body;
-use edgezero_core::http::{header, request_builder, HeaderValue, Method};
+use edgezero_core::http::{HeaderValue, Method, header, request_builder};
 use error_stack::{Report, ResultExt as _};
 use trusted_server_core::auction::telemetry::{
     AuctionEventBatch, AuctionTelemetrySink, NoopAuctionTelemetrySink,
