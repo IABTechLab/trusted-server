@@ -4,15 +4,15 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::{
+    Engine as _,
     engine::general_purpose::{
         STANDARD as BASE64_STANDARD, STANDARD_NO_PAD as BASE64_STANDARD_NO_PAD,
     },
-    Engine as _,
 };
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::header::HeaderValue;
-use http::{header, Method, StatusCode};
+use http::{Method, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use url::{Url, Url as ParsedUrl};
@@ -24,26 +24,25 @@ use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid, MediaType,
 };
 use crate::consent_config::ConsentForwardingMode;
-use crate::cookies::{strip_cookies, CONSENT_COOKIE_NAMES};
+use crate::cookies::{CONSENT_COOKIE_NAMES, strip_cookies};
 use crate::error::TrustedServerError;
 use crate::http_util::RequestInfo;
 use crate::integrations::{
-    collect_response_bounded, ensure_integration_backend_with_timeout,
-    predict_integration_backend_name, AttributeRewriteAction, IntegrationAttributeContext,
-    IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationHeadInjector,
-    IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration,
-    UPSTREAM_RTB_MAX_RESPONSE_BYTES,
+    AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
+    IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
+    IntegrationRegistration, UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
+    ensure_integration_backend_with_timeout, predict_integration_backend_name,
 };
 use crate::openrtb::{
-    to_openrtb_i32, Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, ImpExt,
-    ImpStoredRequest, OpenRtbRequest, PrebidExt, PrebidImpExt, Publisher, Regs, RegsExt,
-    RequestExt, Site, ToExt, TrustedServerExt, User, UserExt,
+    Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, ImpExt, ImpStoredRequest,
+    OpenRtbRequest, PrebidExt, PrebidImpExt, Publisher, Regs, RegsExt, RequestExt, Site, ToExt,
+    TrustedServerExt, User, UserExt, to_openrtb_i32,
 };
 use crate::platform::{
     PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, RuntimeServices,
 };
-use crate::proxy::{is_host_allowed, proxy_request, ProxyRequestConfig};
-use crate::request_signing::{RequestSigner, SigningParams, SIGNING_VERSION};
+use crate::proxy::{ProxyRequestConfig, is_host_allowed, proxy_request};
+use crate::request_signing::{RequestSigner, SIGNING_VERSION, SigningParams};
 use crate::settings::{IntegrationConfig, Settings};
 
 const PREBID_INTEGRATION_ID: &str = "prebid";
@@ -1982,28 +1981,40 @@ impl PrebidAuctionProvider {
         .await
         .change_context(TrustedServerError::Prebid {
             message: "Failed to read Prebid response body".to_string(),
-        })?;
+        });
 
         if !status.is_success() {
             let auction_id = auction_id.unwrap_or("<unavailable>");
             log::warn!("Prebid auction {auction_id:?} returned non-success status: {status}");
 
+            let body_bytes = match body_bytes {
+                Ok(body_bytes) => Some(body_bytes),
+                Err(error) => {
+                    log::warn!(
+                        "Prebid auction {auction_id:?} failed to read non-success response body: {error:?}"
+                    );
+                    None
+                }
+            };
+
             if self.config.debug {
-                match prebid_body_preview(&body_bytes) {
-                    Some(preview) => {
-                        let truncation = if preview.truncated {
-                            " (truncated)"
-                        } else {
-                            ""
-                        };
-                        log::warn!(
-                            "Prebid auction {auction_id:?} error response body preview{truncation}: {}",
-                            preview.text
-                        );
+                if let Some(body_bytes) = body_bytes.as_deref() {
+                    match prebid_body_preview(body_bytes) {
+                        Some(preview) => {
+                            let truncation = if preview.truncated {
+                                " (truncated)"
+                            } else {
+                                ""
+                            };
+                            log::warn!(
+                                "Prebid auction {auction_id:?} error response body preview{truncation}: {}",
+                                preview.text
+                            );
+                        }
+                        None => log::warn!(
+                            "Prebid auction {auction_id:?} returned an empty error response body"
+                        ),
                     }
-                    None => log::warn!(
-                        "Prebid auction {auction_id:?} returned an empty error response body"
-                    ),
                 }
             }
 
@@ -2017,11 +2028,13 @@ impl PrebidAuctionProvider {
                         serde_json::json!(format!("Prebid Server returned HTTP {status_code}")),
                     );
 
-            let upstream_message = self
-                .config
-                .debug
-                .then(|| extract_prebid_error_message(&body_bytes, content_type.as_deref()))
-                .flatten();
+            let upstream_message = if self.config.debug {
+                body_bytes.as_deref().and_then(|body_bytes| {
+                    extract_prebid_error_message(body_bytes, content_type.as_deref())
+                })
+            } else {
+                None
+            };
             if let Some(message) = upstream_message {
                 auction_response.metadata.insert(
                     "upstream_message".to_string(),
@@ -2036,6 +2049,7 @@ impl PrebidAuctionProvider {
             return Ok(auction_response);
         }
 
+        let body_bytes = body_bytes?;
         let response_json: Json =
             serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Prebid {
                 message: "Failed to parse Prebid response".to_string(),
@@ -2411,6 +2425,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::auction::formats::convert_to_openrtb_response;
+    use crate::auction::orchestrator::OrchestrationResult;
     use crate::auction::test_support::create_test_auction_context as shared_test_auction_context;
     use crate::auction::types::{
         AdFormat, AdSlot, AuctionContext, AuctionRequest, DeviceInfo, PublisherInfo, UserInfo,
@@ -2418,13 +2434,13 @@ mod tests {
 
     use crate::consent::{ConsentContext, ConsentSource};
     use crate::geo::GeoInfo;
-    use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
+    use crate::html_processor::{HtmlProcessorConfig, create_html_processor};
     use crate::integrations::{
         AttributeRewriteAction, IntegrationDocumentState, IntegrationRegistry,
     };
     use crate::platform::test_support::{
-        build_services_with_http_client, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore,
-        StubHttpClient,
+        NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore, StubHttpClient,
+        build_services_with_http_client,
     };
     use crate::platform::{
         ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformError, RuntimeServices,
@@ -2433,6 +2449,7 @@ mod tests {
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::tests::create_test_settings;
     use base64::engine::general_purpose::STANDARD as TEST_BASE64_STANDARD;
+    use bytes::Bytes;
     use http::Method;
     use serde_json::json;
     use std::collections::HashMap;
@@ -2560,6 +2577,14 @@ mod tests {
         content_type: Option<&str>,
         body: impl Into<Vec<u8>>,
     ) -> PlatformResponse {
+        prebid_platform_response_with_body(status, content_type, EdgeBody::from(body.into()))
+    }
+
+    fn prebid_platform_response_with_body(
+        status: StatusCode,
+        content_type: Option<&str>,
+        body: EdgeBody,
+    ) -> PlatformResponse {
         let mut builder = http::Response::builder().status(status);
         if let Some(content_type) = content_type {
             builder = builder.header(header::CONTENT_TYPE, content_type);
@@ -2567,7 +2592,7 @@ mod tests {
 
         PlatformResponse::new(
             builder
-                .body(EdgeBody::from(body.into()))
+                .body(body)
                 .expect("should build Prebid platform response"),
         )
     }
@@ -2880,9 +2905,11 @@ script_patterns = ["/prebid.js", "/custom/prebid.min.js"]
 
         assert_eq!(config.script_patterns.len(), 2);
         assert!(config.script_patterns.contains(&"/prebid.js".to_string()));
-        assert!(config
-            .script_patterns
-            .contains(&"/custom/prebid.min.js".to_string()));
+        assert!(
+            config
+                .script_patterns
+                .contains(&"/custom/prebid.min.js".to_string())
+        );
     }
 
     #[test]
@@ -2897,9 +2924,11 @@ server_url = "https://prebid.example"
 
         assert!(!config.script_patterns.is_empty());
         assert!(config.script_patterns.contains(&"/prebid.js".to_string()));
-        assert!(config
-            .script_patterns
-            .contains(&"/prebid.min.js".to_string()));
+        assert!(
+            config
+                .script_patterns
+                .contains(&"/prebid.min.js".to_string())
+        );
     }
 
     #[test]
@@ -5188,6 +5217,158 @@ external_bundle_sri = "sha384-AAAA"
         );
     }
 
+    fn assert_oversized_http_error_is_classified(
+        auction_response: &AuctionResponse,
+        expected_status: u16,
+    ) {
+        assert_eq!(
+            auction_response.status,
+            crate::auction::types::BidStatus::Error
+        );
+        assert_eq!(
+            auction_response.metadata["error_type"],
+            json!(ERROR_TYPE_HTTP_STATUS)
+        );
+        assert_eq!(
+            auction_response.metadata["http_status"],
+            json!(expected_status)
+        );
+        assert_eq!(
+            auction_response.metadata["message"],
+            json!(format!("Prebid Server returned HTTP {expected_status}"))
+        );
+        assert!(
+            !auction_response.metadata.contains_key("upstream_message"),
+            "should not expose a body that could not be collected safely"
+        );
+    }
+
+    #[test]
+    fn oversized_once_non_success_prebid_response_preserves_http_classification() {
+        let mut config = base_config();
+        config.debug = true;
+        let provider = PrebidAuctionProvider::new(config);
+        let response = prebid_platform_response(
+            StatusCode::BAD_GATEWAY,
+            Some("text/plain"),
+            vec![b'x'; UPSTREAM_RTB_MAX_RESPONSE_BYTES + 1],
+        );
+
+        let auction_response = futures::executor::block_on(provider.parse_response(response, 42))
+            .expect("should preserve HTTP classification for oversized one-shot body");
+
+        assert_oversized_http_error_is_classified(
+            &auction_response,
+            StatusCode::BAD_GATEWAY.as_u16(),
+        );
+    }
+
+    #[test]
+    fn oversized_streaming_non_success_prebid_response_preserves_http_classification() {
+        let mut config = base_config();
+        config.debug = true;
+        let provider = PrebidAuctionProvider::new(config);
+        let stream = futures::stream::iter([
+            Bytes::from(vec![b'x'; UPSTREAM_RTB_MAX_RESPONSE_BYTES]),
+            Bytes::from_static(b"x"),
+        ]);
+        let response = prebid_platform_response_with_body(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some("text/plain"),
+            EdgeBody::stream(stream),
+        );
+
+        let auction_response = futures::executor::block_on(provider.parse_response(response, 42))
+            .expect("should preserve HTTP classification for oversized streaming body");
+
+        assert_oversized_http_error_is_classified(
+            &auction_response,
+            StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+        );
+    }
+
+    fn public_prebid_error_metadata(debug: bool, upstream_message: &str) -> Json {
+        let mut config = base_config();
+        config.debug = debug;
+        let provider = PrebidAuctionProvider::new(config);
+        let body = serde_json::to_vec(&json!({ "message": upstream_message }))
+            .expect("should serialize upstream error response");
+        let response =
+            prebid_platform_response(StatusCode::BAD_REQUEST, Some("application/json"), body);
+        let provider_response = futures::executor::block_on(provider.parse_response(response, 42))
+            .expect("should classify upstream HTTP error");
+        let result = OrchestrationResult {
+            provider_responses: vec![provider_response],
+            mediator_response: None,
+            winning_bids: HashMap::new(),
+            total_time_ms: 42,
+            metadata: HashMap::new(),
+        };
+        let response = convert_to_openrtb_response(
+            &result,
+            &make_settings(),
+            &create_test_auction_request(),
+            false,
+        )
+        .expect("should serialize public auction response");
+        let body = response.into_body().into_bytes().unwrap_or_default();
+        let response_json: Json =
+            serde_json::from_slice(&body).expect("should parse public auction response");
+
+        response_json["ext"]["orchestrator"]["provider_details"][0]["metadata"].clone()
+    }
+
+    #[test]
+    fn public_auction_response_gates_and_bounds_prebid_upstream_message() {
+        let trailing_marker = "trailing-private-marker";
+        let upstream_message = format!(
+            " \nprivate-details\t{}\n{trailing_marker}",
+            "x".repeat(PREBID_PUBLIC_ERROR_MESSAGE_CHARS)
+        );
+
+        let no_debug_metadata = public_prebid_error_metadata(false, &upstream_message);
+        assert_eq!(
+            no_debug_metadata["error_type"],
+            json!(ERROR_TYPE_HTTP_STATUS)
+        );
+        assert_eq!(no_debug_metadata["http_status"], json!(400));
+        assert_eq!(
+            no_debug_metadata["message"],
+            json!("Prebid Server returned HTTP 400")
+        );
+        assert!(
+            no_debug_metadata.get("upstream_message").is_none(),
+            "should hide upstream text in the public response when debug is disabled"
+        );
+        assert!(
+            !no_debug_metadata.to_string().contains("private-details"),
+            "should not serialize upstream-only text when debug is disabled"
+        );
+
+        let debug_metadata = public_prebid_error_metadata(true, &upstream_message);
+        let expected_message = format!(
+            "private-details {}",
+            "x".repeat(PREBID_PUBLIC_ERROR_MESSAGE_CHARS - "private-details ".chars().count())
+        );
+        assert_eq!(
+            debug_metadata["upstream_message"],
+            json!(expected_message),
+            "should serialize only the normalized, bounded upstream message"
+        );
+        assert_eq!(debug_metadata["upstream_message_truncated"], json!(true));
+        let serialized_debug_metadata = debug_metadata.to_string();
+        assert!(
+            !serialized_debug_metadata.contains(trailing_marker),
+            "should omit upstream text beyond the public message bound"
+        );
+        assert!(
+            !debug_metadata["upstream_message"]
+                .as_str()
+                .is_some_and(|message| message.contains(['\n', '\t'])),
+            "should normalize control characters in the public response"
+        );
+    }
+
     fn make_auction_request(slots: Vec<AdSlot>) -> AuctionRequest {
         AuctionRequest {
             id: "test-auction-1".to_string(),
@@ -6070,8 +6251,7 @@ set = { placementId = "explicit_header" }
                 let actual = engine.rules.iter().map(rule_signature).collect::<Vec<_>>();
 
                 assert_eq!(
-                    actual,
-                    expected,
+                    actual, expected,
                     "compatibility rules should compile in sorted matcher order on iteration {iteration}"
                 );
             }
