@@ -2636,11 +2636,13 @@ mod tests {
         };
         let state = Arc::new(Mutex::new(Some("BIDS_SCRIPT".to_string())));
         prepend_auction_debug_comment("stream", &result, &state);
-        state
+        let comment = state
             .lock()
             .expect("should lock state")
             .clone()
-            .expect("should have comment")
+            .expect("should have comment");
+        drop(state);
+        comment
     }
 
     #[test]

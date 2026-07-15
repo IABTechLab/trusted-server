@@ -138,7 +138,7 @@ When Prebid Server returns a non-2xx status, the provider detail always includes
 
 ```json
 {
-  "error_type": "upstream_http",
+  "error_type": "http_status",
   "http_status": 400,
   "message": "Prebid Server returned HTTP 400"
 }
@@ -148,7 +148,7 @@ With `debug = true`, Trusted Server also extracts the first error message from a
 
 ```json
 {
-  "error_type": "upstream_http",
+  "error_type": "http_status",
   "http_status": 400,
   "message": "Prebid Server returned HTTP 400",
   "upstream_message": "Invalid request: imp[0] has no valid bidders",

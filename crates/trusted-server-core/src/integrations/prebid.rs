@@ -2017,19 +2017,20 @@ impl PrebidAuctionProvider {
                         serde_json::json!(format!("Prebid Server returned HTTP {status_code}")),
                     );
 
-            if self.config.debug {
-                if let Some(message) =
-                    extract_prebid_error_message(&body_bytes, content_type.as_deref())
-                {
-                    auction_response.metadata.insert(
-                        "upstream_message".to_string(),
-                        serde_json::json!(message.text),
-                    );
-                    auction_response.metadata.insert(
-                        "upstream_message_truncated".to_string(),
-                        serde_json::json!(message.truncated),
-                    );
-                }
+            let upstream_message = self
+                .config
+                .debug
+                .then(|| extract_prebid_error_message(&body_bytes, content_type.as_deref()))
+                .flatten();
+            if let Some(message) = upstream_message {
+                auction_response.metadata.insert(
+                    "upstream_message".to_string(),
+                    serde_json::json!(message.text),
+                );
+                auction_response.metadata.insert(
+                    "upstream_message_truncated".to_string(),
+                    serde_json::json!(message.truncated),
+                );
             }
 
             return Ok(auction_response);
