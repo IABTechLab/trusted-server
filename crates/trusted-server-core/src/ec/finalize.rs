@@ -98,7 +98,9 @@ pub fn ec_finalize_response(
             if matches!(ec_context.kv_snapshot(), EcKvSnapshot::Missing { .. })
                 && ec_context.recovery_eligible()
             {
-                recover_orphaned_ec(settings, ec_context, graph, &updates, response);
+                confirm_then_recover_orphaned_ec(
+                    settings, ec_context, graph, &ec_id, &updates, response,
+                );
             }
         }
 
@@ -198,6 +200,44 @@ fn recover_orphaned_ec(
     ec_context.set_kv_snapshot(EcKvSnapshot::Failed {
         ec_id: orphan_id.clone(),
     });
+}
+
+/// Confirms an orphaned cookie is genuinely absent before rotating it.
+///
+/// The origin-overlapped preload reads the identity-graph row while the
+/// publisher origin is still in flight. Fastly edge data stores are eventually
+/// consistent, so a recently created live key can transiently read `Missing` at
+/// one POP. Before rotating a year-lived identity, this performs one more
+/// authoritative read — separated from the preload by the full origin round
+/// trip, which gives replication time to converge:
+///
+/// - a now-visible row is adopted, with any pending updates merged, and is
+///   never rotated;
+/// - a confirmed authoritative miss rotates through [`recover_orphaned_ec`];
+/// - a read failure is not a miss and never rotates.
+fn confirm_then_recover_orphaned_ec(
+    settings: &Settings,
+    ec_context: &mut EcContext,
+    graph: &KvIdentityGraph,
+    ec_id: &str,
+    updates: &[super::kv::PartnerIdUpdate],
+    response: &mut Response<EdgeBody>,
+) {
+    let confirmed = graph.load_snapshot(ec_id);
+    match confirmed {
+        EcKvSnapshot::Present { .. } => {
+            // The row became visible after the origin round trip: adopt it and
+            // merge any pending updates rather than rotating a valid identity.
+            let merged = graph.upsert_partner_ids_from_snapshot(ec_id, updates, confirmed);
+            ec_context.set_kv_snapshot(merged);
+        }
+        EcKvSnapshot::Missing { .. } => {
+            recover_orphaned_ec(settings, ec_context, graph, updates, response);
+        }
+        // A failed or not-read confirmation is not an authoritative miss: leave
+        // the existing snapshot in place and do not rotate an unconfirmed miss.
+        EcKvSnapshot::Failed { .. } | EcKvSnapshot::NotRead => {}
+    }
 }
 
 /// Sets the EC cookie on response when an EC ID is available.
@@ -687,6 +727,50 @@ mod tests {
         assert!(
             get_header(&response, "set-cookie").is_some(),
             "should emit replacement cookie after persistence"
+        );
+    }
+
+    #[test]
+    fn finalize_transient_missing_row_confirms_present_and_does_not_rotate() {
+        // The origin-overlapped preload transiently read `Missing` on an
+        // eventually-consistent store, but the row actually exists. The
+        // confirming re-read at finalize must adopt the live row instead of
+        // rotating a valid identity (transient Add -> Missing -> Present).
+        let settings = create_test_settings();
+        let orphan = sample_ec_id("trans1");
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let live = KvEntry::new(
+            &granting_consent(),
+            None,
+            current_timestamp(),
+            &settings.publisher.domain,
+        );
+        graph
+            .create(&orphan, &live)
+            .expect("should seed the live row the preload missed");
+        let mut ec_context = returning_user_context(
+            &orphan,
+            EcKvSnapshot::Missing {
+                ec_id: orphan.clone(),
+            },
+            true,
+        );
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &PartnerRegistry::empty(),
+            None,
+            None,
+            &mut response,
+        );
+
+        assert_did_not_rotate(&ec_context, &orphan, &response);
+        assert!(
+            matches!(ec_context.kv_snapshot(), EcKvSnapshot::Present { .. }),
+            "confirming read must adopt the now-visible row rather than rotating"
         );
     }
 

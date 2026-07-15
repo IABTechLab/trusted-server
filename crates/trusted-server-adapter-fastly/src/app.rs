@@ -407,7 +407,13 @@ fn build_ec_request_state(
         match EcContext::read_from_request_with_geo(settings, req, services, geo_info.as_ref()) {
             Ok(mut context) => {
                 context.set_device_signals(device_signals);
-                context.set_recovery_eligible(is_real_browser && is_navigation_request(req));
+                // Orphan-recovery eligibility is intentionally left false here.
+                // Authorizing it during generic pre-routing would let named
+                // routes and request-filter short circuits (e.g. a DataDome
+                // challenge) reach EC finalization and rotate an identity off a
+                // non-publisher response. It is granted only inside the
+                // publisher fallback, after filters pass and the origin start
+                // succeeds — see `dispatch_fallback`.
                 (context, None)
             }
             Err(report) => (EcContext::default(), Some(report)),
@@ -759,7 +765,8 @@ async fn dispatch_fallback(
         // Generate an EC ID if needed — mirrors the legacy catch-all arm.
         // Only for document navigations by recognised browsers; subresource
         // requests may lack consent signals such as Sec-GPC.
-        if ec.is_real_browser && is_navigation_request(&req) {
+        let is_publisher_navigation = ec.is_real_browser && is_navigation_request(&req);
+        if is_publisher_navigation {
             if let Err(err) = ec
                 .ec_context
                 .generate_if_needed(&state.settings, ec.kv_graph.as_ref())
@@ -799,6 +806,14 @@ async fn dispatch_fallback(
                         .await
                         {
                             Ok(pub_response) => {
+                                // Origin start succeeded on the sole publisher-
+                                // page path: authorize orphan recovery now, and
+                                // only for real-browser document navigations.
+                                // Restricting it here keeps identity rotation
+                                // within the publisher-navigation boundary —
+                                // named routes, integration proxies, and filter
+                                // short circuits never reach this point.
+                                ec.ec_context.set_recovery_eligible(is_publisher_navigation);
                                 buffer_publisher_response_async(
                                     pub_response,
                                     &method,
@@ -2322,6 +2337,82 @@ mod tests {
                 .iter()
                 .any(|m| m.name == "x-challenge"),
             "the filter's response-header effect must be threaded out"
+        );
+    }
+
+    fn recovery_eligible_of(response: &Response) -> bool {
+        response
+            .extensions()
+            .get::<super::EcFinalizeState>()
+            .expect("response should carry EcFinalizeState")
+            .ec_context
+            .recovery_eligible()
+    }
+
+    fn browser_navigation_request(path: &str) -> edgezero_core::http::Request {
+        let uri = format!("https://test-publisher.com{path}");
+        let mut req = request_builder()
+            .method(Method::GET)
+            .uri(uri)
+            .header("sec-fetch-dest", "document")
+            .body(Body::empty())
+            .expect("should build request");
+        req.extensions_mut().insert(DeviceSignals::derive(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
+            Some("1:65536;2:0;4:6291456;6:262144"),
+        ));
+        req
+    }
+
+    #[test]
+    fn named_route_response_is_not_recovery_eligible() {
+        // Orphan recovery must never be authorized on a named route: it is not a
+        // publisher-page navigation, so a missing KV row must not rotate the
+        // identity there.
+        let router = test_router();
+        let response = route(
+            &router,
+            empty_request(Method::GET, "/.well-known/trusted-server.json"),
+        );
+
+        assert!(
+            !recovery_eligible_of(&response),
+            "named-route responses must not authorize orphan recovery"
+        );
+    }
+
+    #[test]
+    fn filter_short_circuit_response_is_not_recovery_eligible() {
+        // A request-filter short circuit (e.g. a DataDome challenge/block) must
+        // not authorize orphan recovery even for a would-be publisher
+        // navigation: no publisher page was served.
+        let router = router_with_request_filters(vec![Arc::new(ChallengeRequestFilter)]);
+        let response = route(&router, browser_navigation_request("/some-page"));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "the challenge filter should short-circuit routing"
+        );
+        assert!(
+            !recovery_eligible_of(&response),
+            "a short-circuit filter response must not authorize orphan recovery"
+        );
+    }
+
+    #[test]
+    fn publisher_navigation_origin_start_failure_is_not_recovery_eligible() {
+        // Recovery is authorized only after a successful origin start. With no
+        // live backend the publisher origin fails, so even a real-browser
+        // document navigation must leave recovery unauthorized.
+        let router = test_router();
+        let response = route(&router, browser_navigation_request("/some-page"));
+
+        assert!(
+            !recovery_eligible_of(&response),
+            "an origin-start failure must not authorize orphan recovery"
         );
     }
 }

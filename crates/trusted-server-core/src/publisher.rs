@@ -1392,10 +1392,15 @@ pub async fn handle_publisher_request(
     );
 
     let consent_context = ec_context.consent().clone();
-    let ec_id_owned = ec_context
-        .ec_value()
-        .filter(|_| ec_allowed)
-        .map(str::to_owned);
+    // The active EC ID drives the internal snapshot preload and finalization —
+    // including consent-withdrawal tombstoning — so it must NOT be filtered by
+    // consent. The auction/EID identity is the consent-filtered view: under an
+    // explicit withdrawal `ec_allowed` is false, so auction dispatch forwards no
+    // EC while the origin-overlapped snapshot read still happens for the active
+    // ID, keeping the withdrawal CAS off the post-origin latency path.
+    let active_ec_id_owned = ec_context.ec_value().map(str::to_owned);
+    let active_ec_id = active_ec_id_owned.as_deref();
+    let ec_id_owned = active_ec_id_owned.clone().filter(|_| ec_allowed);
     let ec_id = ec_id_owned.as_deref();
     let cookie_jar = handle_request_cookies(&req)?;
     let geo = ec_context.geo_info().cloned();
@@ -1506,7 +1511,7 @@ pub async fn handle_publisher_request(
     let auction_client_request = request_head_snapshot(&req);
     let mut origin_request = Some(req);
     let should_preload_ec =
-        should_preload_ec_snapshot(is_navigation, is_get, ec_id.is_some(), kv.is_some());
+        should_preload_ec_snapshot(is_navigation, is_get, active_ec_id.is_some(), kv.is_some());
     let mut pending_origin = None;
     if should_preload_ec && services.http_client().supports_concurrent_fanout() {
         let mut origin_req = origin_request.take().ok_or_else(|| {
@@ -1526,8 +1531,19 @@ pub async fn handle_publisher_request(
         );
     }
     if should_preload_ec {
-        if let (Some(graph), Some(ec_id)) = (kv, ec_id) {
-            ec_context.set_kv_snapshot(graph.load_snapshot(ec_id));
+        if let (Some(graph), Some(active_ec_id)) = (kv, active_ec_id) {
+            let refreshed = graph.load_snapshot(active_ec_id);
+            // Never downgrade an in-request Add-confirmed Present snapshot: a
+            // freshly created row can read back Missing/Failed on an
+            // eventually-consistent store, and rotating or suppressing that
+            // just-generated identity would fragment it. Adopt the refresh only
+            // when it keeps or upgrades to a Present row (the intended
+            // generation-refresh) — otherwise retain the confirmed entry.
+            let keep_present = ec_context.kv_snapshot().entry_for(active_ec_id).is_some()
+                && refreshed.entry_for(active_ec_id).is_none();
+            if !keep_present {
+                ec_context.set_kv_snapshot(refreshed);
+            }
         }
     }
 
@@ -2320,10 +2336,6 @@ pub async fn handle_page_bids(
 
     let request_info = crate::http_util::RequestInfo::from_request(&req, services.client_info());
     let ec_id = ec_context.ec_value().filter(|_| ec_context.ec_allowed());
-    let page_bids_kv_snapshot = match (kv, ec_id) {
-        (Some(graph), Some(ec_id)) => graph.load_snapshot(ec_id),
-        _ => crate::ec::EcKvSnapshot::NotRead,
-    };
     let consent_context = ec_context.consent();
     let geo = ec_context.geo_info().cloned();
     let cookie_jar = handle_request_cookies(&req)?;
@@ -2378,6 +2390,15 @@ pub async fn handle_page_bids(
             let slots_ctx = MatchedSlotsContext {
                 matched_slots: &matched_slots,
                 request_path: &path_param,
+            };
+            // Load the identity-graph snapshot only now that a live auction is
+            // actually running (enabled, consent-granted, slots matched, not a
+            // bot/prefetch) and a partner registry exists to consume server-side
+            // EIDs. Kill-switch, no-slot, bot/prefetch, and no-registry requests
+            // never reach here, so they incur no billable KV read.
+            let page_bids_kv_snapshot = match (kv, ec_id, auction.registry) {
+                (Some(graph), Some(ec_id), Some(_)) => graph.load_snapshot(ec_id),
+                _ => crate::ec::EcKvSnapshot::NotRead,
             };
             let mut auction_request = build_auction_request(
                 &slots_ctx,

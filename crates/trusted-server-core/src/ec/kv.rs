@@ -506,7 +506,26 @@ impl KvIdentityGraph {
             return snapshot;
         }
 
-        let mut current = snapshot;
+        // Resolve the initial usable snapshot without spending a CAS attempt. A
+        // not-read, generation-unavailable, or foreign-ID snapshot is refreshed
+        // once; an authoritative miss or failure for this EC ID is returned
+        // as-is (the hot path never retries a failed lookup). This keeps all
+        // `MAX_CAS_RETRIES` iterations available for actual writes.
+        let mut current = match snapshot {
+            EcKvSnapshot::Present {
+                ec_id: ref snapshot_id,
+                generation: Some(_),
+                ..
+            } if snapshot_id == ec_id => snapshot,
+            EcKvSnapshot::Missing {
+                ec_id: ref snapshot_id,
+            }
+            | EcKvSnapshot::Failed {
+                ec_id: ref snapshot_id,
+            } if snapshot_id == ec_id => return snapshot,
+            _ => self.load_snapshot(ec_id),
+        };
+
         for _attempt in 0..MAX_CAS_RETRIES {
             let (mut entry, generation) = match current {
                 EcKvSnapshot::Present {
@@ -514,19 +533,15 @@ impl KvIdentityGraph {
                     ref entry,
                     generation: Some(generation),
                 } if snapshot_id == ec_id => (entry.as_ref().clone(), generation),
+                // A refreshed read that is absent or unreadable is authoritative
+                // for this write: never create or overwrite a missing root.
+                EcKvSnapshot::Missing { .. } | EcKvSnapshot::Failed { .. } => return current,
+                // `load_snapshot` never yields `NotRead` or a generation-less
+                // `Present`; fail closed if that invariant is ever violated.
                 EcKvSnapshot::Present { .. } | EcKvSnapshot::NotRead => {
-                    current = self.load_snapshot(ec_id);
-                    continue;
-                }
-                EcKvSnapshot::Missing {
-                    ec_id: ref snapshot_id,
-                }
-                | EcKvSnapshot::Failed {
-                    ec_id: ref snapshot_id,
-                } if snapshot_id == ec_id => return current,
-                EcKvSnapshot::Missing { .. } | EcKvSnapshot::Failed { .. } => {
-                    current = self.load_snapshot(ec_id);
-                    continue;
+                    return EcKvSnapshot::Failed {
+                        ec_id: ec_id.to_owned(),
+                    };
                 }
             };
 
@@ -779,7 +794,23 @@ impl KvIdentityGraph {
         ec_id: &str,
         snapshot: EcKvSnapshot,
     ) -> EcKvSnapshot {
-        let mut current = snapshot;
+        // Resolve the initial usable snapshot without spending a CAS attempt. An
+        // authoritative missing row is a no-op; any non-authoritative state — a
+        // failed read or a snapshot lacking a usable generation — is re-read once
+        // so a transient error never silently drops a withdrawal, and all
+        // `MAX_CAS_RETRIES` iterations stay available for the tombstone write.
+        let mut current = match snapshot {
+            EcKvSnapshot::Present {
+                ec_id: ref snapshot_id,
+                generation: Some(_),
+                ..
+            } if snapshot_id == ec_id => snapshot,
+            EcKvSnapshot::Missing {
+                ec_id: ref snapshot_id,
+            } if snapshot_id == ec_id => return snapshot,
+            _ => self.load_snapshot(ec_id),
+        };
+
         for _attempt in 0..MAX_CAS_RETRIES {
             let generation = match current {
                 EcKvSnapshot::Present {
@@ -787,12 +818,17 @@ impl KvIdentityGraph {
                     generation: Some(generation),
                     ..
                 } if snapshot_id == ec_id => generation,
+                // An authoritative missing row (including one that disappeared
+                // mid-retry) is a no-op.
                 EcKvSnapshot::Missing {
                     ec_id: ref snapshot_id,
                 } if snapshot_id == ec_id => return current,
+                // A refreshed read that failed (or any other unusable state)
+                // fails closed rather than silently dropping the withdrawal.
                 _ => {
-                    current = self.load_snapshot(ec_id);
-                    continue;
+                    return EcKvSnapshot::Failed {
+                        ec_id: ec_id.to_owned(),
+                    };
                 }
             };
             let tombstone = KvEntry::tombstone(current_timestamp());
@@ -1805,6 +1841,34 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_upsert_gen_unavailable_survives_four_conflicts_then_writes() {
+        // A generation-unavailable snapshot (finalize-written style) refreshes
+        // once to obtain a usable generation. That refresh must not consume a
+        // CAS attempt, so all five write attempts remain: four conflicts
+        // followed by a successful fifth write still persist the update.
+        let graph = KvIdentityGraph::new(ConflictInjectingEcKv::new(4, false));
+        let ec_id = snapshot_ec_id();
+        graph.create(&ec_id, &live_entry()).expect("should seed");
+        let snapshot = EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(live_entry()),
+            generation: None,
+        };
+        let updates = [PartnerIdUpdate::new("ssp_x", "uid-1")];
+
+        let outcome = graph.upsert_partner_ids_from_snapshot(&ec_id, &updates, snapshot);
+
+        assert_eq!(
+            outcome
+                .entry_for(&ec_id)
+                .and_then(|entry| entry.ids.get("ssp_x"))
+                .map(|id| id.uid.as_str()),
+            Some("uid-1"),
+            "the fifth CAS attempt must still succeed after a refresh and four conflicts"
+        );
+    }
+
+    #[test]
     fn snapshot_upsert_cas_conflict_remerges_concurrent_data() {
         let graph = KvIdentityGraph::new(ConflictInjectingEcKv::new(1, true));
         let ec_id = snapshot_ec_id();
@@ -1882,6 +1946,30 @@ mod tests {
                 .entry_for(&ec_id)
                 .is_some_and(|entry| !entry.consent.ok),
             "should retry the conflict and persist the tombstone"
+        );
+    }
+
+    #[test]
+    fn tombstone_gen_unavailable_survives_four_conflicts_then_writes() {
+        // A generation-unavailable snapshot refreshes once before its CAS. That
+        // refresh must not spend a CAS attempt, so a withdrawal tombstone still
+        // persists after four conflicts and a successful fifth write.
+        let graph = KvIdentityGraph::new(ConflictInjectingEcKv::new(4, false));
+        let ec_id = snapshot_ec_id();
+        graph.create(&ec_id, &live_entry()).expect("should seed");
+        let snapshot = EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(live_entry()),
+            generation: None,
+        };
+
+        let outcome = graph.tombstone_existing_from_snapshot(&ec_id, snapshot);
+
+        assert!(
+            outcome
+                .entry_for(&ec_id)
+                .is_some_and(|entry| !entry.consent.ok),
+            "the fifth CAS attempt must persist the tombstone after a refresh and four conflicts"
         );
     }
 

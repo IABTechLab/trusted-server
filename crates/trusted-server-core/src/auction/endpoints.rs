@@ -244,10 +244,12 @@ pub async fn handle_auction(
         None
     };
 
-    // Resolve partner EIDs from the KV identity graph when the user has
-    // a valid EC and both KV and partner stores are available.
-    let auction_kv_snapshot = match (kv, ec_id) {
-        (Some(graph), Some(ec_id)) => graph.load_snapshot(ec_id),
+    // Resolve partner EIDs from the KV identity graph when the user has a valid
+    // EC and both KV and partner stores are available. Gate the read on a
+    // present registry: without one, `resolve_auction_eids` yields no
+    // server-side EIDs, so the snapshot would be an unused billable KV read.
+    let auction_kv_snapshot = match (kv, ec_id, registry) {
+        (Some(graph), Some(ec_id), Some(_)) => graph.load_snapshot(ec_id),
         _ => EcKvSnapshot::NotRead,
     };
     let eids = resolve_auction_eids(&auction_kv_snapshot, registry, ec_context);
