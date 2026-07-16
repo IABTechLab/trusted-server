@@ -1,5 +1,22 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { buildAdRequest, parseAuctionResponse, sendAuction } from '../../src/core/auction';
+import envelope from '../fixtures/aps-renderer-v1.json';
+
+function apsRenderer(creativeId?: string) {
+  const bid = envelope.seatbid[0].bid[0];
+  return {
+    type: 'aps' as const,
+    version: 1 as const,
+    accountId: 'example-account-id',
+    bidId: bid.id,
+    ...(creativeId ? { creativeId } : {}),
+    tagType: 'iframe' as const,
+    creativeUrl: bid.ext.creativeurl,
+    aaxResponse: btoa(JSON.stringify(envelope)),
+    width: bid.w,
+    height: bid.h,
+  };
+}
 
 describe('auction/buildAdRequest', () => {
   it('builds from tsjs AdUnit objects', () => {
@@ -172,6 +189,83 @@ describe('auction/parseAuctionResponse', () => {
       creativeId: 'cr-123',
       adomain: ['example.com'],
     });
+  });
+
+  it('parses an APS typed renderer without requiring adm', () => {
+    const renderer = apsRenderer('fictional-creative-id');
+    const bids = parseAuctionResponse({
+      seatbid: [
+        {
+          seat: 'aps',
+          bid: [
+            {
+              id: renderer.bidId,
+              impid: 'fictional-slot',
+              price: 1.23,
+              crid: renderer.creativeId,
+              w: 300,
+              h: 250,
+              ext: { trusted_server: { renderer } },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(bids).toHaveLength(1);
+    expect(bids[0]).toEqual(
+      expect.objectContaining({
+        impid: 'fictional-slot',
+        adm: '',
+        renderer,
+        width: 300,
+        height: 250,
+        creativeId: 'fictional-creative-id',
+      })
+    );
+  });
+
+  it('parses an APS renderer with optional creativeId omitted', () => {
+    const renderer = apsRenderer();
+    const bids = parseAuctionResponse({
+      seatbid: [
+        {
+          seat: 'aps',
+          bid: [
+            {
+              impid: 'fictional-slot',
+              price: 1.23,
+              w: 300,
+              h: 250,
+              ext: { trusted_server: { renderer } },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(bids[0].renderer).toEqual(renderer);
+    expect(bids[0].creativeId).toBe('aps-fictional-slot');
+  });
+
+  it('ignores unrelated or malformed renderer extensions while retaining ordinary adm', () => {
+    const bids = parseAuctionResponse({
+      seatbid: [
+        {
+          seat: 'ordinary',
+          bid: [
+            {
+              impid: 'slot-1',
+              adm: '<div>ordinary</div>',
+              ext: { trusted_server: { renderer: { type: 'aps', version: 99 } } },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(bids[0].renderer).toBeUndefined();
+    expect(bids[0].adm).toBe('<div>ordinary</div>');
   });
 
   it('handles multiple seatbids with multiple bids', () => {

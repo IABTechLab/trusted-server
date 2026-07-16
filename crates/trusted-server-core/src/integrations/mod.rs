@@ -289,6 +289,10 @@ pub(crate) struct IntegrationBuilder {
 pub(crate) fn builders() -> &'static [IntegrationBuilder] {
     &[
         IntegrationBuilder {
+            id: "aps",
+            build: aps::register,
+        },
+        IntegrationBuilder {
             id: "prebid",
             build: prebid::register,
         },

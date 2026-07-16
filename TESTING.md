@@ -131,8 +131,9 @@ INFO: Running 2 bidders in parallel
 INFO: Requesting bids from: prebid
 INFO: Prebid returned 2 bids (time: 120ms)
 INFO: Requesting bids from: aps
-INFO: APS (MOCK): returning 2 bids in 80ms
-INFO: GAM mediation: slot 'header-banner' won by 'amazon-aps' at $2.50 CPM
+INFO: APS requests bids for 2 impressions
+INFO: APS returns 2 accepted bids in 80ms
+INFO: GAM mediation: slot 'header-banner' won by 'aps' at $2.50 CPM
 ```
 
 ### Verify Provider Registration

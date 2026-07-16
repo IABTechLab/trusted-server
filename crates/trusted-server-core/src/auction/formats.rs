@@ -10,6 +10,7 @@ use http::{HeaderValue, Request, Response, StatusCode, header};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
+use url::Url;
 use uuid::Uuid;
 
 use crate::auction::context::ContextValue;
@@ -19,7 +20,10 @@ use crate::creative;
 use crate::ec::eids::encode_eids_header;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
-use crate::openrtb::{OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid, ToExt, to_openrtb_i32};
+use crate::openrtb::{
+    BidExt, BidTrustedServerExt, OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid, ToExt,
+    to_openrtb_i32,
+};
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
@@ -82,6 +86,33 @@ pub struct MediaTypes {
 #[serde(rename_all = "camelCase")]
 pub struct BannerUnit {
     pub sizes: Vec<Vec<u32>>,
+}
+
+const MAX_PUBLISHER_PAGE_URL_BYTES: usize = 8192;
+
+fn publisher_page_url(req: &Request<EdgeBody>, publisher_domain: &str) -> String {
+    let fallback = format!("https://{publisher_domain}");
+    let Some(candidate) = req
+        .headers()
+        .get(header::REFERER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| value.len() <= MAX_PUBLISHER_PAGE_URL_BYTES)
+    else {
+        return fallback;
+    };
+    let Ok(parsed) = Url::parse(candidate) else {
+        return fallback;
+    };
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case(publisher_domain))
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return fallback;
+    }
+    parsed.to_string()
 }
 
 /// Convert tsjs/Prebid.js request format to internal [`AuctionRequest`].
@@ -194,12 +225,14 @@ pub fn convert_tsjs_to_auction_request(
         }
     }
 
+    let page_url = publisher_page_url(req, &settings.publisher.domain);
+
     Ok(AuctionRequest {
         id: Uuid::new_v4().to_string(),
         slots,
         publisher: PublisherInfo {
             domain: settings.publisher.domain.clone(),
-            page_url: Some(format!("https://{}", settings.publisher.domain)),
+            page_url: Some(page_url.clone()),
         },
         user: UserInfo {
             id: ec_id,
@@ -209,7 +242,7 @@ pub fn convert_tsjs_to_auction_request(
         device,
         site: Some(SiteInfo {
             domain: settings.publisher.domain.clone(),
-            page: format!("https://{}", settings.publisher.domain),
+            page: page_url,
         }),
         context,
     })
@@ -217,12 +250,12 @@ pub fn convert_tsjs_to_auction_request(
 
 /// Convert `OrchestrationResult` to `OpenRTB` response format.
 ///
-/// Returns rewritten creative HTML directly in the `adm` field for inline delivery.
+/// Returns rewritten ordinary creative HTML in `adm` or a typed renderer extension.
 ///
 /// # Errors
 ///
 /// Returns an error if:
-/// - A winning bid is missing a price
+/// - A winning bid is missing a price or render source
 /// - The response serialization fails
 pub fn convert_to_openrtb_response(
     result: &OrchestrationResult,
@@ -250,8 +283,9 @@ pub fn convert_to_openrtb_response(
         let width = to_openrtb_i32(bid.width, "width", &bid_context);
         let height = to_openrtb_i32(bid.height, "height", &bid_context);
 
-        // Process creative HTML if present - — sanitize dangerous markup first, then rewrite URLs.
-        let creative_html = if let Some(ref raw_creative) = bid.creative {
+        // Ordinary markup remains on the mandatory sanitize/rewrite path. A
+        // typed renderer is serialized separately and never enters the HTML sanitizer.
+        let (adm, ext) = if let Some(ref raw_creative) = bid.creative {
             let sanitized = creative::sanitize_creative_html(raw_creative);
             let rewritten = creative::rewrite_creative_html(settings, &sanitized);
 
@@ -264,26 +298,38 @@ pub fn convert_to_openrtb_response(
                 rewritten.len()
             );
 
-            rewritten
+            (Some(rewritten), None)
+        } else if let Some(renderer) = bid.renderer.as_ref() {
+            (
+                None,
+                BidExt {
+                    trusted_server: BidTrustedServerExt { renderer },
+                }
+                .to_ext(),
+            )
         } else {
-            // No creative provided (e.g., from mediation layer that returns iframe URLs)
-            log::warn!(
-                "No creative HTML for auction {} slot {} - mediation should have provided creative",
-                auction_request.id,
-                slot_id
-            );
-            String::new()
+            return Err(Report::new(TrustedServerError::Auction {
+                message: format!(
+                    "Winning bid for slot '{}' from '{}' has no render source",
+                    slot_id, bid.bidder
+                ),
+            }));
         };
 
         let openrtb_bid = OpenRtbBid {
-            id: Some(format!("{}-{}", bid.bidder, slot_id)),
+            id: bid
+                .bid_id
+                .clone()
+                .or_else(|| Some(format!("{}-{}", bid.bidder, slot_id))),
             impid: Some(slot_id.to_string()),
             price: Some(price),
-            adm: Some(creative_html),
-            crid: Some(format!("{}-creative", bid.bidder)),
+            adm,
+            adid: bid.ad_id.clone(),
+            crid: bid.creative_id.clone(),
             w: width,
             h: height,
             adomain: bid.adomain.clone().unwrap_or_default(),
+            ext,
             ..Default::default()
         };
 
@@ -365,7 +411,9 @@ pub fn convert_to_openrtb_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auction::types::{AuctionResponse, Bid, BidStatus};
+    use crate::auction::types::{
+        ApsRendererV1, ApsTagType, AuctionResponse, Bid, BidRenderer, BidStatus,
+    };
     use crate::openrtb::{Eid, Uid};
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
@@ -437,7 +485,10 @@ mod tests {
             height: 250,
             nurl: None,
             burl: None,
+            bid_id: Some(format!("{bidder}-{slot_id}")),
             ad_id: None,
+            creative_id: Some(format!("{bidder}-creative")),
+            renderer: None,
             cache_id: None,
             cache_host: None,
             cache_path: None,
@@ -603,6 +654,45 @@ mod tests {
             response.headers().get("x-ts-ec").is_none(),
             "should omit x-ts-ec when no EC ID is available"
         );
+    }
+
+    #[test]
+    fn publisher_page_url_accepts_only_same_publisher_http_urls() {
+        let request = Request::builder()
+            .uri("https://publisher.example.com/auction")
+            .header(
+                header::REFERER,
+                "https://publisher.example.com/article?id=1",
+            )
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        assert_eq!(
+            publisher_page_url(&request, "publisher.example.com"),
+            "https://publisher.example.com/article?id=1"
+        );
+        assert_eq!(
+            publisher_page_url(&request, "Publisher.Example.Com"),
+            "https://publisher.example.com/article?id=1",
+            "DNS host comparison should be case-insensitive"
+        );
+
+        for candidate in [
+            "https://other.example/article",
+            "javascript:alert(1)",
+            "https://user:password@publisher.example.com/article",
+            "not a url",
+        ] {
+            let request = Request::builder()
+                .uri("https://publisher.example.com/auction")
+                .header(header::REFERER, candidate)
+                .body(EdgeBody::empty())
+                .expect("should build request");
+            assert_eq!(
+                publisher_page_url(&request, "publisher.example.com"),
+                "https://publisher.example.com",
+                "should reject {candidate}"
+            );
+        }
     }
 
     #[test]
@@ -933,22 +1023,65 @@ mod tests {
     }
 
     #[test]
-    fn convert_to_openrtb_response_serializes_missing_creative_as_empty_adm() {
+    fn convert_to_openrtb_response_rejects_winner_without_render_source() {
         let settings = make_settings();
         let auction_request = make_auction_request();
         let mut bid = make_bid("div-gpt-top", "appnexus", Some(2.75));
         bid.creative = None;
         let result = make_result(bid);
 
-        let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
-            .expect("should convert bid without creative HTML");
+        let error = convert_to_openrtb_response(&result, &settings, &auction_request, false)
+            .expect_err("should reject bid without a render source");
 
-        assert_eq!(response.status(), StatusCode::OK, "should return OK");
+        assert!(
+            format!("{error:?}").contains("has no render source"),
+            "should explain the missing render source"
+        );
+    }
+
+    #[test]
+    fn convert_to_openrtb_response_emits_typed_aps_renderer_without_adm() {
+        let settings = make_settings();
+        let auction_request = make_auction_request();
+        let mut bid = make_bid("div-gpt-top", "aps", Some(2.75));
+        bid.creative = None;
+        bid.bid_id = Some("fictional-bid".to_string());
+        bid.ad_id = Some("fictional-ad".to_string());
+        bid.creative_id = Some("fictional-creative".to_string());
+        bid.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
+            version: 1,
+            account_id: "example-account".to_string(),
+            bid_id: "fictional-bid".to_string(),
+            creative_id: Some("fictional-creative".to_string()),
+            tag_type: ApsTagType::Iframe,
+            creative_url: "https://creative.example/render".to_string(),
+            aax_response: "fictional-base64".to_string(),
+            width: 300,
+            height: 250,
+        }));
+        let result = make_result(bid);
+
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
+            .expect("should convert APS renderer bid");
         let json = response_json(response);
+        let bid = json["seatbid"][0]["bid"][0]
+            .as_object()
+            .expect("should serialize bid object");
+
+        assert!(
+            !bid.contains_key("adm"),
+            "should omit adm for renderer bids"
+        );
+        assert_eq!(bid["id"], json!("fictional-bid"));
+        assert_eq!(bid["adid"], json!("fictional-ad"));
+        assert_eq!(bid["crid"], json!("fictional-creative"));
         assert_eq!(
-            json["seatbid"][0]["bid"][0]["adm"],
-            json!(""),
-            "should serialize missing creative as empty adm"
+            bid["ext"]["trusted_server"]["renderer"]["type"],
+            json!("aps")
+        );
+        assert_eq!(
+            bid["ext"]["trusted_server"]["renderer"]["bidId"],
+            json!("fictional-bid")
         );
     }
 
