@@ -1116,7 +1116,9 @@ impl AuctionOrchestrator {
 
         for (provider_name, start_time, _) in backend_to_provider.values() {
             let response_time_ms = start_time.elapsed().as_millis() as u64;
-            log::warn!("Provider '{provider_name}' timed out before dispatched auction collection completed");
+            log::warn!(
+                "Provider '{provider_name}' timed out before dispatched auction collection completed"
+            );
             responses.push(provider_timeout_response(provider_name, response_time_ms));
         }
         backend_to_provider.clear();
@@ -1327,7 +1329,7 @@ mod tests {
         MediaType, PublisherInfo, UserInfo,
     };
     use crate::error::TrustedServerError;
-    use crate::platform::test_support::{build_services_with_http_client, StubHttpClient};
+    use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
     use crate::platform::{
         PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, RuntimeServices,
     };

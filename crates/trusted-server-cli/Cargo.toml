@@ -1,10 +1,11 @@
 [package]
 name = "trusted-server-cli"
-version = "0.1.0"
-authors = []
-edition = "2024"
-publish = false
-license = "Apache-2.0"
+description = "Operator CLI (`ts`) for Trusted Server."
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
 
 [[bin]]
 name = "ts"
@@ -57,6 +58,7 @@ tokio-rustls = { workspace = true }
 webpki-roots = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 x509-parser = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]

@@ -64,17 +64,15 @@ pub fn detect_jurisdiction(geo: Option<&GeoInfo>, config: &ConsentConfig) -> Jur
     }
 
     // For US users, check if the region is a state with a privacy law.
-    if geo.country.eq_ignore_ascii_case("US") {
-        if let Some(region) = &geo.region {
-            if config
-                .us_states
-                .privacy_states
-                .iter()
-                .any(|state| state.eq_ignore_ascii_case(region))
-            {
-                return Jurisdiction::UsState(region.to_uppercase());
-            }
-        }
+    if geo.country.eq_ignore_ascii_case("US")
+        && let Some(region) = &geo.region
+        && config
+            .us_states
+            .privacy_states
+            .iter()
+            .any(|state| state.eq_ignore_ascii_case(region))
+    {
+        return Jurisdiction::UsState(region.to_uppercase());
     }
 
     Jurisdiction::NonRegulated
@@ -86,7 +84,7 @@ pub fn detect_jurisdiction(geo: Option<&GeoInfo>, config: &ConsentConfig) -> Jur
 
 #[cfg(test)]
 mod tests {
-    use super::{detect_jurisdiction, Jurisdiction};
+    use super::{Jurisdiction, detect_jurisdiction};
     use crate::consent_config::ConsentConfig;
     use crate::geo::GeoInfo;
 
