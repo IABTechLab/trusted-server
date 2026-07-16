@@ -80,9 +80,9 @@ pub struct Eid {
 pub struct Uid {
     /// The identifier value.
     pub id: String,
-    /// Agent type: 1 = cookie/device, 2 = person, 3 = user-provided.
+    /// `OpenRTB` agent type, including vendor-specific values such as PAIR's `571187`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub atype: Option<u8>,
+    pub atype: Option<i32>,
     /// Provider-specific extension data.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ext: Option<Value>,
@@ -410,6 +410,25 @@ mod tests {
         assert!(
             serialized["uids"][0].get("ext").is_none(),
             "ext should be omitted when None"
+        );
+    }
+
+    #[test]
+    fn eid_serializes_vendor_specific_atype() {
+        let eid = Eid {
+            source: "google.com".to_owned(),
+            uids: vec![Uid {
+                id: "pair-id".to_owned(),
+                atype: Some(571187),
+                ext: None,
+            }],
+        };
+
+        let serialized = serde_json::to_value(&eid).expect("should serialize");
+
+        assert_eq!(
+            serialized["uids"][0]["atype"], 571187,
+            "should preserve PAIR's vendor-specific atype"
         );
     }
 }

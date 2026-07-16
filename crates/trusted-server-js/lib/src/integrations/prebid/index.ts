@@ -25,16 +25,19 @@ import 'prebid.js/modules/userId.js';
 // shim leaves its bids untouched and the corresponding adapter handles them
 // natively in the browser.
 import './_adapters.generated';
-import './_user_ids.generated';
 
 import { log } from '../../core/log';
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
 import type { AuctionBid, AuctionEid } from '../../core/auction';
 import type { AuctionSlot } from '../../core/types';
 
-import { DEFAULT_PREBID_USER_ID_MODULES, PREBID_USER_ID_MODULE_REGISTRY } from './user_id_modules';
+import { INCLUDED_PREBID_USER_ID_MODULES } from './_user_ids.generated';
+import { PREBID_USER_ID_MODULE_REGISTRY } from './user_id_modules';
 
 const ADAPTER_CODE = 'trustedServer';
+// OpenRTB permits vendor-specific agent types; PAIR uses 571187.
+// Keep this range aligned with the signed 32-bit Rust/OpenRTB representation.
+const MAX_OPENRTB_ATYPE = 2_147_483_647;
 const BIDDER_PARAMS_KEY = 'bidderParams';
 const ZONE_KEY = 'zone';
 const TS_REFRESH_TARGETING_KEYS = [
@@ -140,7 +143,7 @@ function recordUserIdModuleDiagnostics(): PrebidUserIdDiagnostics {
   const configuredUserIdNames = [...new Set(readConfiguredUserIdNames())].sort();
   const coveredConfigNames = new Set(
     PREBID_USER_ID_MODULE_REGISTRY.filter((entry) =>
-      DEFAULT_PREBID_USER_ID_MODULES.includes(entry.moduleName)
+      INCLUDED_PREBID_USER_ID_MODULES.includes(entry.moduleName)
     ).flatMap((entry) => entry.configNames)
   );
   const missingConfiguredUserIdNames = configuredUserIdNames.filter(
@@ -148,15 +151,20 @@ function recordUserIdModuleDiagnostics(): PrebidUserIdDiagnostics {
   );
 
   const diagnostics: PrebidUserIdDiagnostics = {
-    includedModules: [...DEFAULT_PREBID_USER_ID_MODULES],
+    includedModules: [...INCLUDED_PREBID_USER_ID_MODULES],
     configuredUserIdNames,
     missingConfiguredUserIdNames,
   };
 
+  const previouslyMissingConfiguredUserIdNames = new Set<string>();
   if (typeof window !== 'undefined') {
     const tsjsWindow = window as typeof window & {
       __tsjs_prebid_diagnostics?: { userIdModules?: PrebidUserIdDiagnostics };
     };
+    for (const name of tsjsWindow.__tsjs_prebid_diagnostics?.userIdModules
+      ?.missingConfiguredUserIdNames ?? []) {
+      previouslyMissingConfiguredUserIdNames.add(name);
+    }
     tsjsWindow.__tsjs_prebid_diagnostics = {
       ...(tsjsWindow.__tsjs_prebid_diagnostics ?? {}),
       userIdModules: diagnostics,
@@ -164,9 +172,11 @@ function recordUserIdModuleDiagnostics(): PrebidUserIdDiagnostics {
   }
 
   for (const name of missingConfiguredUserIdNames) {
-    log.warn(
-      `[tsjs-prebid] configured User ID module "${name}" is not included in the external bundle`
-    );
+    if (!previouslyMissingConfiguredUserIdNames.has(name)) {
+      log.warn(
+        `[tsjs-prebid] configured User ID module "${name}" is not included in the external bundle`
+      );
+    }
   }
 
   return diagnostics;
@@ -291,7 +301,7 @@ function sanitizeAuctionUid(uid: {
     typeof uid.atype === 'number' &&
     Number.isInteger(uid.atype) &&
     uid.atype >= 0 &&
-    uid.atype <= 255
+    uid.atype <= MAX_OPENRTB_ATYPE
   ) {
     sanitizedUid.atype = uid.atype;
   }
@@ -755,6 +765,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   // client-side bidders are left untouched.
   pbjs.requestBids = function (requestObj?: Parameters<typeof originalRequestBids>[0]) {
     log.debug('[tsjs-prebid] requestBids called');
+    recordUserIdModuleDiagnostics();
 
     const opts = requestObj || {};
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1073,25 +1084,13 @@ export function installRefreshHandler(timeoutMs = 1500): void {
 }
 
 /**
- * Configure Prebid.js userID modules for identity warm-up.
+ * Configure identity sync behavior for the generated Prebid User ID modules.
  *
- * Runs post-window.load (called from installPrebidNpm after setup).
- * Writes identity tokens to 1P cookies so the next server-side request
- * can harvest them for EC graph enrichment.
- *
- * **Current state:** This function only configures `pbjs.userSync` settings.
- * It does NOT import or register any userID modules. Actual module imports
- * (ID5, sharedID, LiveRamp ATS, Lockr) must be added to this bundle explicitly
- * — there is currently no `_userIdModules.generated.ts` build step.
- * Track as Phase B follow-up: add `TSJS_PREBID_USER_ID_MODULES` handling to
- * `build-all.mjs` (similar to `TSJS_PREBID_ADAPTERS`) and import generated file.
+ * The external bundle generator statically imports the selected modules through
+ * `_user_ids.generated.ts`. This post-window-load configuration controls when
+ * those modules synchronize identities; it does not select or register modules.
  */
 export function installUserIdModules(): void {
-  // NOTE: No userID module imports exist yet. `_userIdModules.generated.ts` and
-  // `TSJS_PREBID_USER_ID_MODULES` handling in `build-all.mjs` are not implemented.
-  // This function only configures pbjs.userSync settings; actual module registration
-  // requires the Phase B follow-up described in the docblock above.
-  // Configure sync behavior so modules will run post-window.load when added.
   try {
     pbjs.setConfig({
       userSync: {

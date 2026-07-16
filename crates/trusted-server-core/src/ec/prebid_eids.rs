@@ -33,7 +33,7 @@ struct LegacyCookieEid {
         dead_code,
         reason = "legacy cookie field is deserialized for compatibility but not emitted"
     )]
-    atype: u8,
+    atype: i32,
 }
 
 /// OpenRTB-style `ts-eids` cookie entry.
@@ -48,7 +48,7 @@ struct StructuredCookieEid {
 struct StructuredCookieUid {
     id: String,
     #[serde(default)]
-    atype: Option<u8>,
+    atype: Option<i32>,
     #[serde(default)]
     ext: Option<JsonValue>,
 }
@@ -318,6 +318,7 @@ fn structured_cookie_uid_to_openrtb(uid: StructuredCookieUid) -> Option<Uid> {
         return None;
     }
 
+    let atype = uid.atype.filter(|atype| *atype >= 0);
     let ext = match uid.ext {
         Some(JsonValue::Object(_)) => uid.ext,
         _ => None,
@@ -325,7 +326,7 @@ fn structured_cookie_uid_to_openrtb(uid: StructuredCookieUid) -> Option<Uid> {
 
     Some(Uid {
         id: uid.id,
-        atype: uid.atype,
+        atype,
         ext,
     })
 }
@@ -338,7 +339,7 @@ fn legacy_cookie_eids_to_openrtb(entries: Vec<LegacyCookieEid>) -> Vec<Eid> {
             source: entry.source,
             uids: vec![Uid {
                 id: entry.id,
-                atype: Some(entry.atype),
+                atype: (entry.atype >= 0).then_some(entry.atype),
                 ext: None,
             }],
         })
@@ -407,15 +408,25 @@ mod tests {
         let eids = vec![
             json!({"source": "id5-sync.com", "id": "ID5_abc", "atype": 1}),
             json!({"source": "liveramp.com", "id": "LR_xyz", "atype": 3}),
+            json!({"source": "google.com", "id": "pair-id", "atype": 571187}),
         ];
         let encoded = BASE64.encode(serde_json::to_vec(&eids).expect("should serialize"));
 
         let decoded = parse_prebid_eids_cookie(&encoded).expect("should decode valid payload");
-        assert_eq!(decoded.len(), 2, "should parse both EIDs");
+        assert_eq!(decoded.len(), 3, "should parse all EIDs");
         assert_eq!(decoded[0].source, "id5-sync.com");
         assert_eq!(decoded[0].uids[0].id, "ID5_abc");
         assert_eq!(decoded[1].source, "liveramp.com");
         assert_eq!(decoded[1].uids[0].id, "LR_xyz");
+        assert_eq!(
+            decoded[2].source, "google.com",
+            "should preserve PAIR source"
+        );
+        assert_eq!(
+            decoded[2].uids[0].atype,
+            Some(571187),
+            "should preserve PAIR vendor-specific atype"
+        );
     }
 
     #[test]
@@ -424,7 +435,8 @@ mod tests {
             "source": "sharedid.org",
             "uids": [
                 {"id": "shared_123", "atype": 3},
-                {"id": "shared_456", "ext": {"provider": "example"}}
+                {"id": "shared_456", "ext": {"provider": "example"}},
+                {"id": "shared_invalid", "atype": -1}
             ]
         })];
         let encoded = BASE64.encode(serde_json::to_vec(&eids).expect("should serialize"));
@@ -432,13 +444,35 @@ mod tests {
         let decoded = parse_prebid_eids_cookie(&encoded).expect("should decode valid payload");
         assert_eq!(decoded.len(), 1, "should parse one structured EID entry");
         assert_eq!(decoded[0].source, "sharedid.org");
-        assert_eq!(decoded[0].uids.len(), 2, "should preserve multiple UIDs");
+        assert_eq!(decoded[0].uids.len(), 3, "should preserve multiple UIDs");
         assert_eq!(decoded[0].uids[0].id, "shared_123");
         assert_eq!(decoded[0].uids[0].atype, Some(3));
         assert_eq!(
             decoded[0].uids[1].ext,
             Some(json!({"provider": "example"})),
             "should preserve UID ext objects"
+        );
+        assert_eq!(
+            decoded[0].uids[2].atype, None,
+            "should drop negative atype values"
+        );
+    }
+
+    #[test]
+    fn parse_prebid_eids_cookie_preserves_pair_atype() {
+        let encoded = encode_json(&json!([
+            {
+                "source": "google.com",
+                "uids": [{ "id": "pair-id", "atype": 571187 }]
+            }
+        ]));
+
+        let decoded = parse_prebid_eids_cookie(&encoded).expect("should decode PAIR EID");
+
+        assert_eq!(
+            decoded[0].uids[0].atype,
+            Some(571187),
+            "should preserve PAIR's vendor-specific atype"
         );
     }
 

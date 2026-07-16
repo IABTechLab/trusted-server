@@ -22,6 +22,7 @@ pull_sync_concurrency = 3
 # [[ec.partners]]
 # name = "Example Partner"
 # source_domain = "partner.example.com"
+# OpenRTB agent type; vendor-specific values are supported (PAIR uses 571187).
 # openrtb_atype = 3
 # bidstream_enabled = true
 # api_token = "replace-with-partner-api-token-32-bytes-minimum"
