@@ -743,7 +743,7 @@ impl ApsAuctionProvider {
         .change_context(TrustedServerError::Auction {
             message: "Failed to read APS response body".to_string(),
         })?;
-        log::trace!("APS response body: {}", String::from_utf8_lossy(&body));
+        log::info!("APS response body: {}", String::from_utf8_lossy(&body));
         let value: Json = match serde_json::from_slice(&body) {
             Ok(value) => value,
             Err(error) => {
