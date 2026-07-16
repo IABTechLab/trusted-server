@@ -218,6 +218,13 @@ async function buildExternalBundle(outDir, generatedModules) {
               'node_modules/prebid.js/dist/src/src/adapterManager.js'
             ),
           },
+          {
+            find: 'prebid.js/src/adRendering.js',
+            replacement: path.resolve(
+              __dirname,
+              'node_modules/prebid.js/dist/src/src/adRendering.js'
+            ),
+          },
         ],
       },
       build: {

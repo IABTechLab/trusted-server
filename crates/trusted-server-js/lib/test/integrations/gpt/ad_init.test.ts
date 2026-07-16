@@ -1029,6 +1029,123 @@ describe('installTsRenderBridge', () => {
     beaconSpy.mockRestore();
   });
 
+  it('serves a registered Prebid APS renderer when its generated ad ID differs from the APS bid ID', async () => {
+    const renderer = apsRenderer();
+    const prebidAdId = 'prebid-generated-ad-id';
+    const markWinner = vi.fn();
+    const markRendered = vi.fn();
+    (window as TestWindow).tsjs.apsPrebidRenderers = {
+      [prebidAdId]: {
+        adUnitCode: 'div-header',
+        renderer,
+        registeredAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+        markWinner,
+        markRendered,
+      },
+    };
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const stopSpy = vi.fn();
+    const portMessages: string[] = [];
+    const event = Object.assign(new Event('message'), {
+      data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+      ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+      source,
+      stopImmediatePropagation: stopSpy,
+    }) as unknown as MessageEvent;
+
+    bridgeListener(event);
+    bridgeListener(event);
+
+    expect(stopSpy).toHaveBeenCalledTimes(2);
+    expect(portMessages).toHaveLength(1);
+    expect(markWinner).toHaveBeenCalledTimes(1);
+    expect(markRendered).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(portMessages[0])).toEqual(
+      expect.objectContaining({
+        message: 'Prebid Response',
+        adId: prebidAdId,
+        apsRenderer: renderer,
+        width: renderer.width,
+        height: renderer.height,
+      })
+    );
+    expect(renderer.bidId).not.toBe(prebidAdId);
+    expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeUndefined();
+    expect(fetchStub).not.toHaveBeenCalled();
+  });
+
+  it('does not expose a registered Prebid APS renderer to another slot iframe', async () => {
+    const renderer = apsRenderer();
+    const prebidAdId = 'prebid-generated-ad-id';
+    (window as TestWindow).tsjs.apsPrebidRenderers = {
+      [prebidAdId]: {
+        adUnitCode: 'div-header',
+        renderer,
+        registeredAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+        markWinner: vi.fn(),
+        markRendered: vi.fn(),
+      },
+    };
+
+    const footer = document.createElement('div');
+    footer.id = 'div-footer';
+    const foreignIframe = document.createElement('iframe');
+    footer.appendChild(foreignIframe);
+    document.body.appendChild(footer);
+
+    const bridgeListener = await captureBridgeListener();
+    const stopSpy = vi.fn();
+    const portMessages: string[] = [];
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+        source: foreignIframe.contentWindow,
+        stopImmediatePropagation: stopSpy,
+      }) as unknown as MessageEvent
+    );
+
+    expect(stopSpy).not.toHaveBeenCalled();
+    expect(portMessages).toEqual([]);
+    expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeDefined();
+    footer.remove();
+  });
+
+  it('drops an expired Prebid APS renderer without claiming the creative request', async () => {
+    const prebidAdId = 'expired-prebid-ad-id';
+    (window as TestWindow).tsjs.apsPrebidRenderers = {
+      [prebidAdId]: {
+        adUnitCode: 'div-header',
+        renderer: apsRenderer(),
+        registeredAt: Date.now() - 61_000,
+        expiresAt: Date.now() - 1_000,
+        markWinner: vi.fn(),
+        markRendered: vi.fn(),
+      },
+    };
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const stopSpy = vi.fn();
+    const portMessages: string[] = [];
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+        source,
+        stopImmediatePropagation: stopSpy,
+      }) as unknown as MessageEvent
+    );
+
+    expect(stopSpy).not.toHaveBeenCalled();
+    expect(portMessages).toEqual([]);
+    expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeUndefined();
+  });
+
   it('validates APS data before claiming the Prebid request', async () => {
     const renderer = { ...apsRenderer(), aaxResponse: 'invalid' };
     (window as TestWindow).tsjs.bids.homepage_header = {

@@ -1,4 +1,21 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import envelope from '../../fixtures/aps-renderer-v1.json';
+
+function apsRenderer() {
+  const bid = envelope.seatbid[0].bid[0];
+  return {
+    type: 'aps' as const,
+    version: 1 as const,
+    accountId: 'example-account-id',
+    bidId: bid.id,
+    creativeId: 'fictional-creative-id',
+    tagType: 'iframe' as const,
+    creativeUrl: bid.ext.creativeurl,
+    aaxResponse: btoa(JSON.stringify(envelope)),
+    width: bid.w,
+    height: bid.h,
+  };
+}
 
 // Define mocks using vi.hoisted so they're available inside vi.mock factories
 const {
@@ -7,6 +24,9 @@ const {
   mockRequestBids,
   mockRegisterBidAdapter,
   mockGetUserIdsAsEids,
+  mockMarkBidAsRendered,
+  mockMarkWinner,
+  mockOnEvent,
   mockPbjs,
   mockGetBidAdapter,
   mockAdapterManager,
@@ -16,6 +36,9 @@ const {
   const mockRequestBids = vi.fn();
   const mockRegisterBidAdapter = vi.fn();
   const mockGetBidAdapter = vi.fn();
+  const mockMarkBidAsRendered = vi.fn();
+  const mockMarkWinner = vi.fn();
+  const mockOnEvent = vi.fn();
   const mockGetUserIdsAsEids = vi.fn(
     () => [] as Array<{ source: string; uids?: Array<{ id: string; atype?: number }> }>
   );
@@ -25,6 +48,7 @@ const {
     requestBids: mockRequestBids,
     registerBidAdapter: mockRegisterBidAdapter,
     getUserIdsAsEids: mockGetUserIdsAsEids,
+    onEvent: mockOnEvent,
     adUnits: [] as any[],
   };
   const mockAdapterManager = {
@@ -36,6 +60,9 @@ const {
     mockRequestBids,
     mockRegisterBidAdapter,
     mockGetUserIdsAsEids,
+    mockMarkBidAsRendered,
+    mockMarkWinner,
+    mockOnEvent,
     mockPbjs,
     mockGetBidAdapter,
     mockAdapterManager,
@@ -46,6 +73,10 @@ const {
 // The real prebid.js cannot run in jsdom, so we provide a minimal stub.
 vi.mock('prebid.js', () => ({ default: mockPbjs }));
 vi.mock('prebid.js/src/adapterManager.js', () => ({ default: mockAdapterManager }));
+vi.mock('prebid.js/src/adRendering.js', () => ({
+  markBidAsRendered: mockMarkBidAsRendered,
+  markWinner: mockMarkWinner,
+}));
 
 // Side-effect imports are no-ops in tests
 vi.mock('prebid.js/modules/consentManagementTcf.js', () => ({}));
@@ -142,6 +173,37 @@ describe('prebid/auctionBidsToPrebidBids', () => {
     });
   });
 
+  it('preserves an APS renderer without converting it to executable markup', () => {
+    const renderer = apsRenderer();
+    const auctionBids: AuctionBid[] = [
+      {
+        impid: 'div-aps',
+        adm: '<script>must not become Prebid ad markup</script>',
+        renderer,
+        price: 1.23,
+        width: 300,
+        height: 250,
+        seat: 'aps',
+        creativeId: 'fictional-creative-id',
+        adomain: ['advertiser.example'],
+      },
+    ];
+
+    const result = auctionBidsToPrebidBids(auctionBids, [
+      { adUnitCode: 'div-aps', bidId: 'prebid-request-id' },
+    ]);
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toEqual(
+      expect.objectContaining({
+        requestId: 'prebid-request-id',
+        bidderCode: 'aps',
+        ad: '',
+        trustedServerRenderer: renderer,
+      })
+    );
+  });
+
   it('falls back to impid when no matching bidRequest found', () => {
     const auctionBids: AuctionBid[] = [
       {
@@ -209,6 +271,8 @@ describe('prebid/installPrebidNpm', () => {
     mockGetUserIdsAsEids.mockReturnValue([]);
     document.cookie = 'ts-eids=; Path=/; Max-Age=0';
     delete (window as any).__tsjs_prebid;
+    delete (window as any).tsjs;
+    delete (mockPbjs as any).__tsApsBidResponseListenerInstalled;
   });
 
   it('registers the trustedServer bid adapter', () => {
@@ -226,6 +290,73 @@ describe('prebid/installPrebidNpm', () => {
         interpretResponse: expect.any(Function),
       })
     );
+  });
+
+  it('registers accepted APS descriptors under Prebid generated ad IDs', () => {
+    installPrebidNpm();
+
+    const bidResponseListener = mockOnEvent.mock.calls.find(
+      ([eventName]) => eventName === 'bidResponse'
+    )?.[1] as ((bid: Record<string, unknown>) => void) | undefined;
+    expect(bidResponseListener).toBeTypeOf('function');
+
+    const renderer = apsRenderer();
+    bidResponseListener!({
+      adapterCode: 'trustedServer',
+      bidderCode: 'aps',
+      adId: 'prebid-generated-ad-id',
+      adUnitCode: 'div-aps',
+      ttl: 300,
+      trustedServerRenderer: renderer,
+    });
+
+    const entry = (window as any).tsjs.apsPrebidRenderers['prebid-generated-ad-id'];
+    expect(entry).toEqual(
+      expect.objectContaining({
+        adUnitCode: 'div-aps',
+        renderer,
+        expiresAt: expect.any(Number),
+        markRendered: expect.any(Function),
+        markWinner: expect.any(Function),
+      })
+    );
+
+    entry.markWinner();
+    entry.markRendered();
+    expect(mockMarkWinner).toHaveBeenCalledWith(
+      expect.objectContaining({ adId: 'prebid-generated-ad-id' })
+    );
+    expect(mockMarkBidAsRendered).toHaveBeenCalledWith(
+      expect.objectContaining({ adId: 'prebid-generated-ad-id' })
+    );
+  });
+
+  it('does not register malformed or non-trusted APS renderer capabilities', () => {
+    installPrebidNpm();
+
+    const bidResponseListener = mockOnEvent.mock.calls.find(
+      ([eventName]) => eventName === 'bidResponse'
+    )?.[1] as ((bid: Record<string, unknown>) => void) | undefined;
+    const malformedBid: Record<string, unknown> = {
+      adapterCode: 'trustedServer',
+      bidderCode: 'aps',
+      adId: 'malformed-ad-id',
+      adUnitCode: 'div-aps',
+      ttl: 300,
+      trustedServerRenderer: { ...apsRenderer(), aaxResponse: 'invalid' },
+    };
+    bidResponseListener!(malformedBid);
+    bidResponseListener!({
+      adapterCode: 'publisherAdapter',
+      bidderCode: 'aps',
+      adId: 'foreign-ad-id',
+      adUnitCode: 'div-aps',
+      trustedServerRenderer: apsRenderer(),
+    });
+
+    expect((window as any).tsjs?.apsPrebidRenderers?.['malformed-ad-id']).toBeUndefined();
+    expect((window as any).tsjs?.apsPrebidRenderers?.['foreign-ad-id']).toBeUndefined();
+    expect(malformedBid).not.toHaveProperty('trustedServerRenderer');
   });
 
   it('calls setConfig with debug=false by default', () => {
