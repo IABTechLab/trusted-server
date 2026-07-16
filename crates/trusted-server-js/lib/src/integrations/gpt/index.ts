@@ -4,6 +4,8 @@ import {
   APS_UNIVERSAL_CREATIVE_RENDERER,
   APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
   apsRendererUrl,
+  consumeApsPrebidRenderer,
+  getApsPrebidRenderer,
   validateApsRenderer,
 } from '../aps/render';
 
@@ -95,6 +97,21 @@ function slotIdForMessageSource(source: MessageEventSource | null): string | und
       Array.from(root.querySelectorAll('iframe')).some((iframe) => iframe.contentWindow === source)
     )
   )?.id;
+}
+
+function messageSourceBelongsToAdUnit(
+  source: MessageEventSource | null,
+  adUnitCode: string
+): boolean {
+  if (!source) return false;
+  const roots = [
+    document.getElementById(adUnitCode),
+    document.getElementById(`${adUnitCode}-container`),
+  ].filter((root): root is HTMLElement => root !== null);
+
+  return roots.some((root) =>
+    Array.from(root.querySelectorAll('iframe')).some((iframe) => iframe.contentWindow === source)
+  );
 }
 
 function clearTargetingKeys(slot: GoogleTagSlot, keys: Iterable<string>): void {
@@ -849,6 +866,21 @@ export function installTsRenderBridge(): void {
   // and both fire the nurl/burl beacons. Tracking in-flight adIds prevents the
   // concurrent double-fire; the entry is cleared once the fetch settles.
   const renderingAdIds = new Set<string>();
+  const consumedPrebidApsIds = new Map<string, { adUnitCode: string; expiresAt: number }>();
+  const rememberConsumedPrebidApsId = (
+    adId: string,
+    entry: { adUnitCode: string; expiresAt: number }
+  ): void => {
+    const now = Date.now();
+    for (const [consumedAdId, consumed] of consumedPrebidApsIds) {
+      if (consumed.expiresAt <= now) consumedPrebidApsIds.delete(consumedAdId);
+    }
+    if (!consumedPrebidApsIds.has(adId) && consumedPrebidApsIds.size >= 256) {
+      const oldestAdId = consumedPrebidApsIds.keys().next().value as string | undefined;
+      if (oldestAdId) consumedPrebidApsIds.delete(oldestAdId);
+    }
+    consumedPrebidApsIds.set(adId, entry);
+  };
 
   window.addEventListener('message', (e: MessageEvent) => {
     let data: Record<string, unknown>;
@@ -867,6 +899,71 @@ export function installTsRenderBridge(): void {
 
     const port = e.ports?.[0];
     if (!port) return;
+
+    const consumedPrebidAps = consumedPrebidApsIds.get(adId);
+    if (consumedPrebidAps) {
+      if (consumedPrebidAps.expiresAt <= Date.now()) {
+        consumedPrebidApsIds.delete(adId);
+      } else {
+        if (messageSourceBelongsToAdUnit(e.source, consumedPrebidAps.adUnitCode)) {
+          e.stopImmediatePropagation();
+        }
+        return;
+      }
+    }
+
+    // Client-side trustedServer adapter bids receive a new adId from Prebid. Bind
+    // that ID to the server-validated APS descriptor only after confirming the
+    // requesting Universal Creative frame belongs to the same GPT ad unit.
+    const prebidRendererEntry = getApsPrebidRenderer(adId);
+    if (prebidRendererEntry) {
+      if (!messageSourceBelongsToAdUnit(e.source, prebidRendererEntry.adUnitCode)) return;
+      const renderer = validateApsRenderer(prebidRendererEntry.renderer);
+      const rendererUrl = apsRendererUrl();
+      if (!renderer || !rendererUrl) return;
+      if (!consumeApsPrebidRenderer(adId, prebidRendererEntry)) return;
+      rememberConsumedPrebidApsId(adId, {
+        adUnitCode: prebidRendererEntry.adUnitCode,
+        expiresAt: prebidRendererEntry.expiresAt,
+      });
+
+      e.stopImmediatePropagation();
+      try {
+        prebidRendererEntry.markWinner();
+      } catch (err) {
+        log.warn('[tsjs-gpt] pbRender bridge: Prebid APS winner lifecycle failed', err);
+        return;
+      }
+
+      try {
+        port.postMessage(
+          JSON.stringify({
+            message: 'Prebid Response',
+            adId,
+            renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
+            rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+            rendererUrl,
+            apsRenderer: renderer,
+            width: renderer.width,
+            height: renderer.height,
+          })
+        );
+      } catch (err) {
+        log.warn('[tsjs-gpt] pbRender bridge: Prebid APS response failed', err);
+        return;
+      }
+
+      try {
+        prebidRendererEntry.markRendered();
+      } catch (err) {
+        log.warn('[tsjs-gpt] pbRender bridge: Prebid APS rendered lifecycle failed', err);
+      }
+      log.debug(
+        `[tsjs-gpt] pbRender bridge served Prebid APS bid for '${prebidRendererEntry.adUnitCode}'`
+      );
+      return;
+    }
+
     const sourceSlotId = slotIdForMessageSource(e.source);
     if (!sourceSlotId) return;
 
