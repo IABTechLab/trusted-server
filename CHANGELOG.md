@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking** — Replaced the legacy APS contextual integration with APS OpenRTB at `/e/pb/bid`. APS configuration now uses canonical `account_id` (`pub_id` remains a compatibility alias), no longer requires APS-specific slot IDs, and defaults script creative eligibility off. Operators must update the endpoint, disable native APS demand for Trusted Server cohorts, and prepare GAM/Universal Creative targeting for `hb_bidder=aps` before rollout.
 - **Breaking** — `bid_param_zone_overrides` inner values must now be JSON objects; previously non-object or empty values (`"header" = "x"`, `"header" = {}`) were accepted and silently produced a dead rule at runtime. They now fail at startup with a configuration error. Operators upgrading should audit their `bid_param_zone_overrides` config for non-object zone entries.
 - **Breaking** — Sourcepoint browser module inclusion now requires explicit `[integrations.sourcepoint].enabled = true`; operators relying on the previous unconditional Sourcepoint module should enable the integration before upgrading.
+- Added optional APS `inventory_domain` and `inventory_page_origin` overrides for deployments whose edge hostname differs from the APS-authorized inventory identity.
 
 ### Security
 
