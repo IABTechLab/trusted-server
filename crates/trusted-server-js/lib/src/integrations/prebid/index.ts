@@ -12,9 +12,11 @@
 // bids flow through the orchestrator.
 
 import type _pbjsDefault from 'prebid.js';
+import { markBidAsRendered, markWinner } from 'prebid.js/src/adRendering.js';
 
 import { log } from '../../core/log';
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
+import { registerApsPrebidRenderer } from '../aps/render';
 import type { AuctionBid, AuctionEid } from '../../core/auction';
 import type { AuctionSlot, TsjsApi } from '../../core/types';
 
@@ -91,6 +93,9 @@ function hasPrebidJsApi(): boolean {
 }
 
 const ADAPTER_CODE = 'trustedServer';
+const APS_BIDDER_CODE = 'aps';
+const APS_RENDERER_FIELD = 'trustedServerRenderer';
+const APS_BID_RESPONSE_LISTENER_SENTINEL = '__tsApsBidResponseListenerInstalled';
 // OpenRTB permits vendor-specific agent types; PAIR uses 571187.
 // Keep this range aligned with the signed 32-bit Rust/OpenRTB representation.
 const MAX_OPENRTB_ATYPE = 2_147_483_647;
@@ -292,7 +297,8 @@ export function auctionBidsToPrebidBids(auctionBids: AuctionBid[], bidRequests: 
       cpm: bid.price,
       width: bid.width,
       height: bid.height,
-      ad: bid.adm,
+      ad: bid.renderer ? '' : bid.adm,
+      ...(bid.renderer ? { [APS_RENDERER_FIELD]: bid.renderer } : {}),
       ttl: 300,
       creativeId: bid.creativeId,
       netRevenue: true,
@@ -958,6 +964,32 @@ function collectAuctionEids(): AuctionEid[] | undefined {
  * repeat calls (double script inclusion, a bundle that still carries a
  * baked-in shim) a no-op instead of a double adapter registration.
  */
+function installApsBidResponseRegistry(): void {
+  const prebid = pbjs as typeof pbjs & Record<string, unknown>;
+  if (prebid[APS_BID_RESPONSE_LISTENER_SENTINEL] === true) return;
+
+  pbjs.onEvent('bidResponse', (rawBid) => {
+    const bid = rawBid as unknown as Record<string, unknown>;
+    const renderer = bid[APS_RENDERER_FIELD];
+    if (
+      bid['adapterCode'] !== ADAPTER_CODE ||
+      bid['bidderCode'] !== APS_BIDDER_CODE ||
+      renderer === undefined
+    ) {
+      return;
+    }
+
+    registerApsPrebidRenderer(bid['adId'], bid['adUnitCode'], renderer, bid['ttl'], {
+      markWinner: () => markWinner(rawBid),
+      markRendered: () => markBidAsRendered(rawBid),
+    });
+    // Keep the executable capability only in the bounded, one-time registry. Prebid
+    // still owns the generated ad ID and ordinary GAM targeting on this bid object.
+    delete bid[APS_RENDERER_FIELD];
+  });
+  prebid[APS_BID_RESPONSE_LISTENER_SENTINEL] = true;
+}
+
 export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs {
   // The prebid integration requires the external Prebid.js bundle
   // (integrations.prebid.external_bundle_url). When it failed to load (network
@@ -1008,6 +1040,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   };
 
   auctionEndpoint = merged.endpoint ?? '/auction';
+  installApsBidResponseRegistry();
 
   // Register the trustedServer adapter using pbjs.registerBidAdapter(null, code, spec)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
