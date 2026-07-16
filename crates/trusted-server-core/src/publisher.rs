@@ -697,6 +697,7 @@ pub async fn stream_publisher_body_async<W: Write>(
             &result.winning_bids,
             params.price_granularity,
             &params.ad_bids_state,
+            settings,
             settings.debug.inject_adm_for_testing,
         );
         return stream_publisher_body(body, output, params, settings, integration_registry);
@@ -848,6 +849,7 @@ pub(crate) fn write_bids_to_state(
     winning_bids: &std::collections::HashMap<String, Bid>,
     price_granularity: PriceGranularity,
     ad_bids_state: &Arc<Mutex<Option<String>>>,
+    settings: &Settings,
     include_debug_bid: bool,
 ) {
     log::debug!(
@@ -855,7 +857,7 @@ pub(crate) fn write_bids_to_state(
         winning_bids.len(),
         winning_bids.keys().cloned().collect::<Vec<_>>().join(", ")
     );
-    let bid_map = build_bid_map(winning_bids, price_granularity, include_debug_bid);
+    let bid_map = build_bid_map(winning_bids, price_granularity, settings, include_debug_bid);
     let bids_script = build_bids_script(&bid_map);
     *ad_bids_state.lock().expect("should lock bid state") = Some(bids_script);
 }
@@ -1243,6 +1245,7 @@ async fn collect_stream_auction(
         &result.winning_bids,
         price_granularity,
         ad_bids_state,
+        settings,
         settings.debug.inject_adm_for_testing,
     );
 
@@ -1938,6 +1941,7 @@ fn html_escape_for_script(s: &str) -> String {
 pub(crate) fn build_bid_map(
     winning_bids: &std::collections::HashMap<String, Bid>,
     granularity: crate::price_bucket::PriceGranularity,
+    settings: &Settings,
     include_debug_bid: bool,
 ) -> serde_json::Map<String, serde_json::Value> {
     winning_bids
@@ -1987,8 +1991,19 @@ pub(crate) fn build_bid_map(
                 // render it locally when GAM serves the Prebid Universal Creative
                 // — no PBS Cache round trip. The `hb_cache_*` coordinates above
                 // remain as the fallback for an absent `adm`.
-                if let Some(ref adm) = bid.creative {
-                    obj.insert("adm".to_string(), serde_json::Value::String(adm.clone()));
+                //
+                // Run the same creative-processing boundary as the `/auction`
+                // path (see `auction::formats`): sanitize dangerous markup first,
+                // then rewrite URLs to first-party proxies. `sanitize_creative_html`
+                // also enforces the 1 MiB creative cap, returning an empty string
+                // for oversized or unparseable markup — in which case the entry is
+                // omitted and the bridge falls back to the PBS Cache coordinates.
+                if let Some(ref raw_creative) = bid.creative {
+                    let sanitized = crate::creative::sanitize_creative_html(raw_creative);
+                    let adm = crate::creative::rewrite_creative_html(settings, &sanitized);
+                    if !adm.is_empty() {
+                        obj.insert("adm".to_string(), serde_json::Value::String(adm));
+                    }
                 }
                 // Verbose per-bid debug blob only under the testing flag; also
                 // doubles as the client-side gate for the direct GAM-replace path.
@@ -2399,6 +2414,7 @@ pub async fn handle_page_bids(
     let bid_map = build_bid_map(
         &winning_bids,
         co_config.price_granularity,
+        settings,
         settings.debug.inject_adm_for_testing,
     );
 
@@ -3944,7 +3960,15 @@ mod tests {
         };
         use crate::http_util::RequestInfo;
         use crate::price_bucket::PriceGranularity;
+        use crate::settings::Settings;
         use std::collections::HashMap;
+
+        // Default settings are enough for the creative boundary: the sanitize
+        // pass needs no config, and `rewrite_creative_html` only signs URLs it
+        // actually rewrites (none of these fixtures carry proxyable URLs).
+        fn test_settings() -> Settings {
+            Settings::default()
+        }
 
         fn make_config() -> CreativeOpportunitiesConfig {
             CreativeOpportunitiesConfig {
@@ -4049,7 +4073,12 @@ mod tests {
                     "https://ssp/bill",
                 ),
             );
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                false,
+            );
             let entry = map.get("atf_sidebar_ad").expect("should have bid entry");
             let obj = entry.as_object().expect("should be object");
             assert_eq!(
@@ -4096,7 +4125,12 @@ mod tests {
             // Production path (include_debug_bid = false): the creative is always
             // included so the bridge can render it locally, but the verbose
             // debug_bid blob is not.
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                false,
+            );
             let obj = map
                 .get("atf_sidebar_ad")
                 .expect("should have bid entry")
@@ -4115,7 +4149,97 @@ mod tests {
         }
 
         #[test]
-        fn build_bids_script_escapes_hostile_adm() {
+        fn build_bid_map_sanitizes_hostile_adm() {
+            // The inline-adm path must run the same creative-processing boundary
+            // as the `/auction` path (sanitize → rewrite) before the creative
+            // reaches window.tsjs.bids, so hostile executable markup never lands
+            // in the client-facing `adm` for the Prebid Universal Creative to run.
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "kargo",
+                "abc123",
+                "https://ssp/win",
+                "https://ssp/bill",
+            );
+            bid.creative = Some(
+                "<div onclick=\"steal()\"><script>alert(1)</script>\
+                 <a href=\"javascript:evil()\">x</a></div>"
+                    .to_string(),
+            );
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                false,
+            );
+            let adm = map
+                .get("atf_sidebar_ad")
+                .and_then(|v| v.as_object())
+                .and_then(|o| o.get("adm"))
+                .and_then(|v| v.as_str())
+                .expect("should include a sanitized adm");
+
+            assert!(
+                !adm.contains("<script"),
+                "should strip <script> elements from the inline adm"
+            );
+            assert!(
+                !adm.contains("alert(1)"),
+                "should strip inline script bodies from the inline adm"
+            );
+            assert!(
+                !adm.contains("onclick"),
+                "should strip on* event-handler attributes from the inline adm"
+            );
+            assert!(
+                !adm.contains("javascript:"),
+                "should strip javascript: URIs from the inline adm"
+            );
+        }
+
+        #[test]
+        fn build_bid_map_omits_oversized_adm() {
+            // Creatives larger than the sanitize pass's 1 MiB cap are rejected
+            // (empty result), so the inline `adm` is omitted and the pbRender
+            // bridge falls back to the PBS Cache coordinates instead of shipping
+            // an unbounded creative to the client.
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "kargo",
+                "abc123",
+                "https://ssp/win",
+                "https://ssp/bill",
+            );
+            bid.creative = Some(format!("<div>{}</div>", "a".repeat(1024 * 1024 + 1)));
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                false,
+            );
+            let obj = map
+                .get("atf_sidebar_ad")
+                .and_then(|v| v.as_object())
+                .expect("should have a bid entry");
+            assert!(
+                obj.get("adm").is_none(),
+                "should omit the inline adm when the creative exceeds the 1 MiB cap"
+            );
+        }
+
+        #[test]
+        fn build_bids_script_escapes_line_separators_in_adm() {
+            // U+2028/U+2029 are valid JSON string content but terminate inline
+            // <script> statements; they survive the sanitize boundary as ordinary
+            // text, so build_bids_script must unicode-escape them.
             let mut winning_bids = HashMap::new();
             let mut bid = make_bid(
                 "s",
@@ -4125,17 +4249,16 @@ mod tests {
                 "https://ssp/win",
                 "https://ssp/bill",
             );
-            // A hostile creative that tries to break out of the <script> and
-            // includes both line/paragraph separators the spec promises to escape.
-            bid.creative = Some("</script><script>alert(1)</script>\u{2028}\u{2029}".to_string());
+            bid.creative = Some("<div>a\u{2028}b\u{2029}c</div>".to_string());
             winning_bids.insert("s".to_string(), bid);
 
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
-            let script = build_bids_script(&map);
-            assert!(
-                !script.contains("</script><script>"),
-                "should not let a hostile adm break out of the script context"
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                false,
             );
+            let script = build_bids_script(&map);
             assert!(
                 !script.contains('\u{2028}') && !script.contains('\u{2029}'),
                 "should unicode-escape both U+2028 and U+2029 in the adm"
@@ -4164,7 +4287,12 @@ mod tests {
             );
             winning_bids.insert("atf_sidebar_ad".to_string(), bid);
 
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, true);
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                true,
+            );
             let obj = map
                 .get("atf_sidebar_ad")
                 .expect("should have bid entry")
@@ -4225,7 +4353,12 @@ mod tests {
                     metadata: Default::default(),
                 },
             );
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                false,
+            );
             let obj = map
                 .get("atf_sidebar_ad")
                 .expect("should have bid entry")
@@ -4271,7 +4404,12 @@ mod tests {
                     metadata: Default::default(),
                 },
             );
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                false,
+            );
             let obj = map
                 .get("atf_sidebar_ad")
                 .expect("should have bid entry")
@@ -4315,7 +4453,12 @@ mod tests {
                     metadata: Default::default(),
                 },
             );
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                false,
+            );
             let obj = map
                 .get("atf_sidebar_ad")
                 .expect("should have bid entry")
@@ -4350,7 +4493,12 @@ mod tests {
                     metadata: Default::default(),
                 },
             );
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                false,
+            );
             assert!(
                 map.is_empty(),
                 "slot with no price should be excluded from bid map"

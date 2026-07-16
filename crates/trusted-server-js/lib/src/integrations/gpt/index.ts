@@ -281,7 +281,11 @@ export function safeAdmIframeSrc(src: string): string | undefined {
  *
  * Adapted from PR #241 (github.com/IABTechLab/trusted-server/pull/241).
  * Instead of reading from pbjs, reads adm directly from window.tsjs.bids.
- * Only active when inject_adm_for_testing injects adm server-side.
+ *
+ * This is the testing-only direct-replace path that bypasses GAM entirely. The
+ * sanitized `adm` now ships in production for the pbRender bridge, so `adm`
+ * presence no longer gates it; the caller gates on the per-bid `debug_bid`
+ * signal (present only under `inject_adm_for_testing`) instead.
  *
  * Strategy:
  * 1. If adm contains an <iframe src="..."> with a safe http(s) src, set that
@@ -823,6 +827,36 @@ const TS_DISPLAY_RENDERER =
   'w.document.body.appendChild(f);};})();';
 
 /**
+ * Extract the renderable creative markup from a PBS Cache GET response.
+ *
+ * Prebid Cache entries are JSON bid objects (`{ "adm": "<div…>", … }`); the
+ * Prebid Universal Creative's own cache path `JSON.parse`s the response and
+ * renders `bidObject.adm`, not the raw response body. This mirrors that
+ * extraction so the bridge hands PUC a creative string rather than a serialized
+ * bid document.
+ *
+ * A non-JSON body is treated as raw creative markup for backward compatibility
+ * with caches that store the creative directly. Returns `undefined` when the
+ * JSON payload carries no usable string `adm` (missing or malformed), so the
+ * caller can decline to render instead of injecting a serialized object.
+ */
+export function extractCachedAdm(body: string): string | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    // Not JSON — a cache that returned the creative markup directly.
+    return body.trim().length > 0 ? body : undefined;
+  }
+  if (parsed && typeof parsed === 'object') {
+    const adm = (parsed as { adm?: unknown }).adm;
+    return typeof adm === 'string' && adm.length > 0 ? adm : undefined;
+  }
+  // A JSON primitive (string/number/bool) is not a valid cached bid object.
+  return undefined;
+}
+
+/**
  * Install the TS → pbRender bridge.
  *
  * Must be installed synchronously at module init — before `adInit()` fires
@@ -831,7 +865,9 @@ const TS_DISPLAY_RENDERER =
  *
  * When `adId` matches a TS server-side bid in `window.tsjs.bids` AND the bid
  * has renderable markup, the bridge:
- *   1. Uses debug `adm` directly when present, otherwise fetches from PBS Cache.
+ *   1. Uses the inline `adm` directly when present (the sanitized winning
+ *      creative, now shipped in production), otherwise fetches from PBS Cache
+ *      and extracts `adm` from the cached bid JSON (see `extractCachedAdm`).
  *   2. Replies via the MessageChannel port with a `"Prebid Response"`.
  *   3. Calls `stopImmediatePropagation()` so Prebid.js does not also process
  *      the message and log spurious failures.
@@ -924,7 +960,18 @@ export function installTsRenderBridge(): void {
 
     fetch(cacheUrl, { mode: 'cors' })
       .then((res) => (res.ok ? res.text() : Promise.reject(res.status)))
-      .then((ad) => {
+      .then((body) => {
+        // PBS Cache returns the cached bid as a JSON object; extract its `adm`
+        // the same way the Prebid Universal Creative does before rendering.
+        const ad = extractCachedAdm(body);
+        if (!ad) {
+          // No renderable creative in the cache payload — decline rather than
+          // ship a serialized bid document to PUC. Beacons stay unfired.
+          log.warn(
+            `[tsjs-gpt] pbRender bridge: PBS Cache response for '${slotId}' had no renderable adm`
+          );
+          return;
+        }
         port.postMessage(
           JSON.stringify({
             message: 'Prebid Response',
