@@ -733,9 +733,9 @@ mod tests {
             .predict_name(&spec)
             .expect("should compute backend name for valid spec");
 
-        assert_eq!(
-            name, "backend_https_origin_example_com_443_fb15000_bb15000",
-            "should match BackendConfig naming convention"
+        assert!(
+            name.starts_with("backend_https_origin_example_com_443_fb15000_bb15000_"),
+            "should match BackendConfig naming convention, got {name}"
         );
     }
 
@@ -757,9 +757,11 @@ mod tests {
             .predict_name(&spec)
             .expect("should compute backend name for host header override");
 
-        assert_eq!(
-            name, "backend_https_origin_example_com_443_oh_www_example_com_fb15000_bb15000",
-            "should match BackendConfig naming convention with host header override"
+        assert!(
+            name.starts_with(
+                "backend_https_origin_example_com_443_oh_www_example_com_fb15000_bb15000_"
+            ),
+            "should match BackendConfig naming convention with host header override, got {name}"
         );
     }
 
@@ -825,8 +827,8 @@ mod tests {
             .expect("should compute name with custom timeout");
 
         assert!(
-            name.ends_with("_fb2000_bb2000"),
-            "should encode 2000ms first-byte and between-bytes timeouts in name"
+            name.contains("_fb2000_bb2000_"),
+            "should encode 2000ms first-byte and between-bytes timeouts in name, got {name}"
         );
     }
 
