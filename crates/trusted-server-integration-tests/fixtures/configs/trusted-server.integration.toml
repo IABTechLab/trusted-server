@@ -100,10 +100,11 @@ timeout_ms = 2000
 allowed_context_keys = []
 
 [integrations.aps]
-enabled = false
-pub_id = "example-aps-publisher-id"
-endpoint = "https://aps.example.com/e/dtb/bid"
+enabled = true
+account_id = "example-aps-account-id"
+endpoint = "https://web.ads.aps.amazon-adsystem.com/e/pb/bid"
 timeout_ms = 1000
+allow_script_creatives = false
 
 [integrations.google_tag_manager]
 enabled = false
