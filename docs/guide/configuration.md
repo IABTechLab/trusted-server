@@ -1220,8 +1220,9 @@ timeout_ms = 2000
 
 [integrations.aps]
 enabled = true
-pub_id = "example-publisher"
-endpoint = "https://aps.example.com/e/dtb/bid"
+account_id = "example-account"
+endpoint = "https://web.ads.aps.amazon-adsystem.com/e/pb/bid"
+allow_script_creatives = false
 
 [integrations.prebid]
 enabled = true

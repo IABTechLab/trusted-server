@@ -1,9 +1,11 @@
 // Request orchestration for tsjs: unified auction endpoint with iframe-based creative rendering.
-import { log } from './log';
+import { renderApsCreative } from '../integrations/aps/render';
+
+import { buildAdRequest, sendAuction } from './auction';
 import { collectContext } from './context';
+import { log } from './log';
 import { getAllUnits, firstSize } from './registry';
 import { createAdIframe, findSlot, buildCreativeDocument, sanitizeCreativeHtml } from './render';
-import { buildAdRequest, sendAuction } from './auction';
 
 export type RequestAdsCallback = () => void;
 export interface RequestAdsOptions {
@@ -49,6 +51,10 @@ export function requestAds(
         log.info('requestAds: got bids', { count: bids.length });
         for (const bid of bids) {
           if (!bid.impid) continue;
+          if (bid.renderer) {
+            renderApsCreative({ slotId: bid.impid, renderer: bid.renderer });
+            continue;
+          }
           if (!bid.adm) {
             log.debug('requestAds: bid has no adm, skipping', { slotId: bid.impid });
             continue;
