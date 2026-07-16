@@ -711,6 +711,14 @@ impl BodyStreamEncoder {
                     .change_context(TrustedServerError::Proxy {
                         message: "Failed to encode gzip publisher body chunk".to_string(),
                     })?;
+                // Sync-flush so the bytes written so far are byte-aligned and
+                // decodable now; `write_all` alone leaves them buffered inside
+                // the codec, withholding all output until `finish()` and
+                // defeating progressive rendering. `flush()` does not emit the
+                // gzip trailer — `finish()` still does.
+                encoder.flush().change_context(TrustedServerError::Proxy {
+                    message: "Failed to flush gzip publisher body chunk".to_string(),
+                })?;
                 Ok(std::mem::take(encoder.get_mut()))
             }
             Self::Deflate(encoder) => {
@@ -719,6 +727,11 @@ impl BodyStreamEncoder {
                     .change_context(TrustedServerError::Proxy {
                         message: "Failed to encode deflate publisher body chunk".to_string(),
                     })?;
+                // Sync-flush the deflate codec for the same reason as gzip: make
+                // the chunk decodable now without writing the stream trailer.
+                encoder.flush().change_context(TrustedServerError::Proxy {
+                    message: "Failed to flush deflate publisher body chunk".to_string(),
+                })?;
                 Ok(std::mem::take(encoder.get_mut()))
             }
             Self::Brotli(encoder) => {
@@ -727,6 +740,13 @@ impl BodyStreamEncoder {
                     .change_context(TrustedServerError::Proxy {
                         message: "Failed to encode brotli publisher body chunk".to_string(),
                     })?;
+                // `flush()` emits a brotli flush marker (`BROTLI_OPERATION_FLUSH`)
+                // so the chunk decodes now; the stream is not finished, so
+                // `finish()` (`into_inner`, `BROTLI_OPERATION_FINISH`) still
+                // writes the terminating metadata block afterwards.
+                encoder.flush().change_context(TrustedServerError::Proxy {
+                    message: "Failed to flush brotli publisher body chunk".to_string(),
+                })?;
                 Ok(std::mem::take(encoder.get_mut()))
             }
         }
@@ -752,6 +772,63 @@ impl BodyStreamEncoder {
 mod tests {
     use super::*;
     use crate::streaming_replacer::{Replacement, StreamingReplacer};
+
+    /// Decode `encoded` with a streaming decoder that is flushed but never
+    /// finished, mirroring how a browser decodes bytes received so far while
+    /// the response body is still open.
+    fn decode_without_finish(compression: Compression, encoded: &[u8]) -> Vec<u8> {
+        match compression {
+            Compression::None => encoded.to_vec(),
+            Compression::Gzip => {
+                let mut decoder = flate2::write::MultiGzDecoder::new(Vec::new());
+                decoder.write_all(encoded).expect("should write gzip bytes");
+                decoder.flush().expect("should flush gzip decoder");
+                decoder.get_ref().clone()
+            }
+            Compression::Deflate => {
+                let mut decoder = flate2::write::ZlibDecoder::new(Vec::new());
+                decoder.write_all(encoded).expect("should write deflate bytes");
+                decoder.flush().expect("should flush deflate decoder");
+                decoder.get_ref().clone()
+            }
+            Compression::Brotli => {
+                let mut decoder =
+                    brotli::DecompressorWriter::new(Vec::new(), STREAM_CHUNK_SIZE);
+                decoder.write_all(encoded).expect("should write brotli bytes");
+                decoder.flush().expect("should flush brotli decoder");
+                decoder.get_ref().clone()
+            }
+        }
+    }
+
+    #[test]
+    fn body_stream_encoder_emits_decodable_chunk_before_finish() {
+        // A single origin chunk arrives and the origin then stays pending
+        // (no EOF, so `finish()` is never called). Every compressed codec must
+        // already emit browser-decodable output for that chunk, otherwise the
+        // client stalls on an empty stream (or a bare gzip header) until the
+        // whole origin transfer completes — the FCP regression from #849.
+        let prefix = b"<html><head><title>Example</title></head><body><p>hello</p>";
+        for compression in [Compression::Gzip, Compression::Deflate, Compression::Brotli] {
+            let mut encoder = BodyStreamEncoder::new(compression);
+            let encoded = encoder
+                .encode_chunk(prefix.to_vec())
+                .expect("should encode the first chunk");
+
+            assert!(
+                !encoded.is_empty(),
+                "{compression:?}: first chunk must be emitted, not withheld until finish()"
+            );
+
+            // The pre-finish output must already decode to the document prefix.
+            let decoded = decode_without_finish(compression, &encoded);
+            assert_eq!(
+                decoded.as_slice(),
+                prefix.as_slice(),
+                "{compression:?}: flushed chunk must decode to the prefix before finish()"
+            );
+        }
+    }
 
     #[test]
     fn body_stream_decoder_enforces_cumulative_decoded_cap() {
