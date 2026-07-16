@@ -99,7 +99,7 @@ describe('installSpaAuctionHook', () => {
     const adInit = vi.fn();
     ts.adInit = adInit;
 
-    history.pushState({}, '', '/next-page');
+    history.pushState({}, '', '/next-page?edition=fictional#section');
     await flushAsync();
 
     expect(fetchStub).toHaveBeenCalledWith(

@@ -30,6 +30,9 @@ enabled = true
 account_id = "example-aps-account-id"
 endpoint = "https://web.ads.aps.amazon-adsystem.com/e/pb/bid"
 timeout_ms = 800
+# Set both when the deployment hostname differs from APS-authorized inventory.
+# inventory_domain = "publisher.example"
+# inventory_page_origin = "https://www.publisher.example"
 allow_script_creatives = false
 
 [auction]
@@ -41,6 +44,8 @@ timeout_ms = 2000
 `account_id` is the canonical field. `pub_id` remains a compatibility alias for migration, including integer values, but new configuration should not use it. Supplying both names is an error.
 
 `allow_script_creatives` defaults to `false`. While disabled, APS script bids are rejected before per-impression reduction, floors, mediation, and winner selection. Enable it only for a controlled cohort after the browser-security checks in [Rollout](#rollout) pass.
+
+Set `inventory_domain` and `inventory_page_origin` together only when the public deployment hostname differs from the inventory identity authorized by APS. The domain becomes `site.domain`. The HTTPS page origin replaces the current page's scheme and host while preserving its path and query. The origin must be the inventory domain or one of its subdomains and cannot include credentials, a port, path, query, or fragment. These values come only from operator configuration; Trusted Server never accepts APS inventory identity from the client auction payload.
 
 APS uses ordinary auction slot IDs and banner formats. Legacy creative-opportunity APS `slot_id` configuration is accepted for compatibility but ignored, and `bidders.aps.slotID` is not required. Remove both during migration.
 
@@ -184,6 +189,7 @@ Use fictional values in source-controlled configuration and fixtures. Supply con
 
 - Confirm `account_id` and account eligibility with APS.
 - Confirm the endpoint is `/e/pb/bid` and uses HTTPS without credentials.
+- If the deployment hostname differs from APS-authorized inventory, configure both `inventory_domain` and `inventory_page_origin` with the APS-approved identity.
 - Ensure `aps` appears in `auction.providers`.
 - Check aggregate APS drop reasons for currency, dimensions, render source, URL, tag type, or script-gate rejection.
 - Confirm the provider timeout fits inside the auction timeout.
