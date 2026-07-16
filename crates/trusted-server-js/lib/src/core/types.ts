@@ -68,6 +68,18 @@ export interface ApsRendererV1 {
 
 export type AuctionBidRenderer = ApsRendererV1;
 
+/** A client-side Prebid bid's generated ad ID bound to its APS render capability. */
+export interface ApsPrebidRendererEntry {
+  adUnitCode: string;
+  renderer: ApsRendererV1;
+  registeredAt: number;
+  expiresAt: number;
+  /** Notify Prebid that GAM selected this bid before replying to Universal Creative. */
+  markWinner(): void;
+  /** Mark Prebid's bid rendered after the Universal Creative response is posted. */
+  markRendered(): void;
+}
+
 /** Bid targeting data from the server-side auction, injected into `window.tsjs.bids`. */
 export interface AuctionBidData {
   hb_pb?: string;
@@ -112,6 +124,11 @@ export interface TsjsApi {
   adSlots?: AuctionSlot[];
   /** Winning bid targeting data injected before </body>. */
   bids?: Record<string, AuctionBidData>;
+  /**
+   * Bounded client-side Prebid APS renderer capabilities keyed by Prebid's generated
+   * `hb_adid`. The Universal Creative bridge consumes each entry at most once.
+   */
+  apsPrebidRenderers?: Record<string, ApsPrebidRendererEntry>;
   /** Initialises GPT slots with server-side bid targeting and calls refresh(). */
   adInit?: () => void;
   /** GPT slot objects TS defined — used to destroy stale slots on SPA navigation. */

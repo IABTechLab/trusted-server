@@ -7,7 +7,9 @@ import {
   APS_UNIVERSAL_CREATIVE_RENDERER,
   APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
   apsRendererUrl,
+  getApsPrebidRenderer,
   parseApsRendererDescriptor,
+  registerApsPrebidRenderer,
   renderApsCreative,
   validateApsRenderer,
 } from '../../../src/integrations/aps/render';
@@ -127,6 +129,46 @@ describe('APS renderer validation', () => {
       parseApsRendererDescriptor({ ...descriptor(), adm: '<div>forbidden</div>' })
     ).toBeUndefined();
     expect(parseApsRendererDescriptor({ ...descriptor(), version: 2 })).toBeUndefined();
+  });
+});
+
+describe('Prebid APS renderer registry', () => {
+  afterEach(() => {
+    delete window.tsjs;
+  });
+
+  it('bounds entries and evicts the oldest capability', () => {
+    for (let index = 0; index <= 256; index += 1) {
+      expect(
+        registerApsPrebidRenderer(`prebid-${index}`, 'fictional-slot', descriptor(), 300, {
+          markWinner: vi.fn(),
+          markRendered: vi.fn(),
+        })
+      ).toBe(true);
+    }
+
+    expect(Object.keys(window.tsjs?.apsPrebidRenderers ?? {})).toHaveLength(256);
+    expect(getApsPrebidRenderer('prebid-0')).toBeUndefined();
+    expect(getApsPrebidRenderer('prebid-256')).toEqual(
+      expect.objectContaining({ adUnitCode: 'fictional-slot', renderer: descriptor() })
+    );
+  });
+
+  it('rejects unsafe Prebid IDs and invalid descriptors', () => {
+    const lifecycle = { markWinner: vi.fn(), markRendered: vi.fn() };
+    expect(
+      registerApsPrebidRenderer('__proto__', 'fictional-slot', descriptor(), 300, lifecycle)
+    ).toBe(false);
+    expect(
+      registerApsPrebidRenderer(
+        'safe-prebid-id',
+        'fictional-slot',
+        descriptor({ aaxResponse: 'invalid' }),
+        300,
+        lifecycle
+      )
+    ).toBe(false);
+    expect(window.tsjs?.apsPrebidRenderers).toBeUndefined();
   });
 });
 
