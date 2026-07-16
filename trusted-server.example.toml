@@ -124,6 +124,9 @@ enabled = false
 account_id = "example-aps-account-id"
 endpoint = "https://web.ads.aps.amazon-adsystem.com/e/pb/bid"
 timeout_ms = 1000
+# Set both when the deployment hostname differs from APS-authorized inventory.
+# inventory_domain = "publisher.example"
+# inventory_page_origin = "https://www.publisher.example"
 # Script creatives require separate security validation before opt-in.
 allow_script_creatives = false
 
