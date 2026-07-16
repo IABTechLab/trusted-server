@@ -709,17 +709,16 @@ export function installSpaAuctionHook(): void {
   ts.spaHookInstalled = true;
 
   let inflight: AbortController | null = null;
-  // Last path an auction was run for. popstate fires for hash-only and
-  // same-pathname back/forward (scroll restoration), and pushState/replaceState
-  // can be called with the current URL, so guard every entry point against
-  // re-requesting impressions for a path we already loaded.
-  let currentPath = location.pathname;
+  // Last path and query an auction was run for. popstate fires for hash-only
+  // changes and pushState/replaceState can be called with the current URL, so
+  // guard every entry point against re-requesting impressions already loaded.
+  let currentPath = `${location.pathname}${location.search}`;
   // Last path whose slots/bids were actually applied — the initial SSR page
   // counts. A failed navigation rolls `currentPath` back to this rather than to
   // the immediately-previous committed value: on rapid A→B where A was aborted
   // mid-flight and B then fails, rolling back to A (never loaded) would strand
   // it behind the no-op guard, so we roll back to the last applied route instead.
-  let lastAppliedPath = location.pathname;
+  let lastAppliedPath = `${location.pathname}${location.search}`;
 
   async function onNavigate(path: string): Promise<void> {
     if (path === currentPath) return;
@@ -779,8 +778,9 @@ export function installSpaAuctionHook(): void {
     const original = history[method].bind(history);
     history[method] = function (state: unknown, unused: string, url?: string | URL | null): void {
       original(state, unused, url);
-      const newPath = url ? new URL(String(url), location.href).pathname : location.pathname;
-      // onNavigate no-ops when newPath equals the last loaded path.
+      const locationUrl = url ? new URL(String(url), location.href) : location;
+      const newPath = `${locationUrl.pathname}${locationUrl.search}`;
+      // onNavigate no-ops when newPath equals the last loaded path and query.
       void onNavigate(newPath);
     };
   }
@@ -789,7 +789,7 @@ export function installSpaAuctionHook(): void {
   patchHistoryMethod('replaceState');
 
   window.addEventListener('popstate', () => {
-    void onNavigate(location.pathname);
+    void onNavigate(`${location.pathname}${location.search}`);
   });
 }
 
