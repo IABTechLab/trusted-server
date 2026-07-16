@@ -22,16 +22,16 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use brotli::enc::writer::CompressorWriter;
-use brotli::enc::BrotliEncoderParams;
 use brotli::Decompressor;
+use brotli::enc::BrotliEncoderParams;
+use brotli::enc::writer::CompressorWriter;
 use cookie::CookieJar;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use flate2::read::{GzDecoder, ZlibDecoder};
 use flate2::write::{GzEncoder, ZlibEncoder};
 use futures::StreamExt as _;
-use http::{header, HeaderValue, Method, Request, Response, StatusCode, Uri};
+use http::{HeaderValue, Method, Request, Response, StatusCode, Uri, header};
 
 use crate::auction::endpoints::{
     merge_auction_eids, resolve_auction_eids, resolve_client_auction_eids,
@@ -60,8 +60,8 @@ use crate::price_bucket::{PriceGranularity, price_bucket};
 use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::Settings;
 use crate::streaming_processor::{
-    BodyStreamDecoder, BodyStreamEncoder, Compression, PipelineConfig, StreamProcessor,
-    StreamingPipeline, STREAM_CHUNK_SIZE,
+    BodyStreamDecoder, BodyStreamEncoder, Compression, PipelineConfig, STREAM_CHUNK_SIZE,
+    StreamProcessor, StreamingPipeline,
 };
 use crate::streaming_replacer::create_url_replacer;
 
@@ -4134,7 +4134,10 @@ mod tests {
             "the prefix up to </body> must be ready before collection"
         );
         assert!(
-            ad_bids_state.lock().expect("should lock bid state").is_none(),
+            ad_bids_state
+                .lock()
+                .expect("should lock bid state")
+                .is_none(),
             "auction must not be collected while the ready prefix is emitted"
         );
 
@@ -4148,7 +4151,10 @@ mod tests {
             "the held close tail must be emitted after collection"
         );
         assert!(
-            ad_bids_state.lock().expect("should lock bid state").is_some(),
+            ad_bids_state
+                .lock()
+                .expect("should lock bid state")
+                .is_some(),
             "collection must run when the held tail is emitted"
         );
     }

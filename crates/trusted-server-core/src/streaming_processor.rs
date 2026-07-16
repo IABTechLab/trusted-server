@@ -787,14 +787,17 @@ mod tests {
             }
             Compression::Deflate => {
                 let mut decoder = flate2::write::ZlibDecoder::new(Vec::new());
-                decoder.write_all(encoded).expect("should write deflate bytes");
+                decoder
+                    .write_all(encoded)
+                    .expect("should write deflate bytes");
                 decoder.flush().expect("should flush deflate decoder");
                 decoder.get_ref().clone()
             }
             Compression::Brotli => {
-                let mut decoder =
-                    brotli::DecompressorWriter::new(Vec::new(), STREAM_CHUNK_SIZE);
-                decoder.write_all(encoded).expect("should write brotli bytes");
+                let mut decoder = brotli::DecompressorWriter::new(Vec::new(), STREAM_CHUNK_SIZE);
+                decoder
+                    .write_all(encoded)
+                    .expect("should write brotli bytes");
                 decoder.flush().expect("should flush brotli decoder");
                 decoder.get_ref().clone()
             }
