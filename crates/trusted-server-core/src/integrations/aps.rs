@@ -783,7 +783,7 @@ impl AuctionProvider for ApsAuctionProvider {
             }));
         }
         log::info!("APS requests bids for {} impressions", openrtb.imp.len());
-        log::trace!("APS request body: {openrtb:?}");
+        log::info!("APS request body: {openrtb:?}");
         let body = serde_json::to_vec(&openrtb).change_context(TrustedServerError::Auction {
             message: "Failed to serialize APS OpenRTB request".to_string(),
         })?;
