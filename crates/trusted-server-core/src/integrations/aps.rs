@@ -114,6 +114,7 @@ addEventListener('message',receive);
 
 /// Configuration for the APS `OpenRTB` integration.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[validate(schema(function = "validate_inventory_identity_override"))]
 pub struct ApsConfig {
     /// Whether APS integration is enabled.
     #[serde(default = "default_enabled")]
@@ -131,6 +132,14 @@ pub struct ApsConfig {
     /// Whether APS script creatives are eligible before winner selection.
     #[serde(default)]
     pub allow_script_creatives: bool,
+    /// APS-authorized inventory domain used instead of the deployment hostname.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_inventory_domain"))]
+    pub inventory_domain: Option<String>,
+    /// Canonical HTTPS origin used for APS `site.page` while preserving path and query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_inventory_page_origin"))]
+    pub inventory_page_origin: Option<String>,
 }
 
 fn deserialize_account_id<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -197,6 +206,78 @@ fn validate_aps_endpoint(value: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
+fn validate_inventory_domain(value: &str) -> Result<(), ValidationError> {
+    if value.trim() != value
+        || value.is_empty()
+        || value.len() > 253
+        || value.starts_with('.')
+        || value.ends_with('.')
+        || value.contains(['/', ':'])
+    {
+        return Err(ValidationError::new("invalid_aps_inventory_domain"));
+    }
+    for label in value.split('.') {
+        let bytes = label.as_bytes();
+        if label.is_empty()
+            || label.len() > 63
+            || bytes.first() == Some(&b'-')
+            || bytes.last() == Some(&b'-')
+            || !bytes
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        {
+            return Err(ValidationError::new("invalid_aps_inventory_domain"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_inventory_page_origin(value: &str) -> Result<(), ValidationError> {
+    let parsed =
+        Url::parse(value).map_err(|_| ValidationError::new("invalid_aps_inventory_page_origin"))?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.port().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(ValidationError::new("invalid_aps_inventory_page_origin"));
+    }
+    Ok(())
+}
+
+fn validate_inventory_identity_override(config: &ApsConfig) -> Result<(), ValidationError> {
+    let (Some(domain), Some(origin)) = (
+        config.inventory_domain.as_deref(),
+        config.inventory_page_origin.as_deref(),
+    ) else {
+        if config.inventory_domain.is_none() && config.inventory_page_origin.is_none() {
+            return Ok(());
+        }
+        return Err(ValidationError::new(
+            "incomplete_aps_inventory_identity_override",
+        ));
+    };
+    let parsed = Url::parse(origin)
+        .map_err(|_| ValidationError::new("invalid_aps_inventory_page_origin"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| ValidationError::new("invalid_aps_inventory_page_origin"))?
+        .to_ascii_lowercase();
+    let domain = domain.to_ascii_lowercase();
+    if host != domain
+        && !host
+            .strip_suffix(&domain)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+    {
+        return Err(ValidationError::new("aps_inventory_origin_domain_mismatch"));
+    }
+    Ok(())
+}
+
 fn default_enabled() -> bool {
     false
 }
@@ -217,6 +298,8 @@ impl Default for ApsConfig {
             endpoint: default_endpoint(),
             timeout_ms: default_timeout_ms(),
             allow_script_creatives: false,
+            inventory_domain: None,
+            inventory_page_origin: None,
         }
     }
 }
@@ -324,6 +407,28 @@ impl ApsAuctionProvider {
         Some(parsed.to_string())
     }
 
+    fn inventory_site_identity(
+        &self,
+        fallback_domain: &str,
+        fallback_page: String,
+    ) -> (String, String) {
+        let (Some(domain), Some(origin)) = (
+            self.config.inventory_domain.as_ref(),
+            self.config.inventory_page_origin.as_deref(),
+        ) else {
+            return (fallback_domain.to_string(), fallback_page);
+        };
+        let (Ok(mut canonical_page), Ok(current_page)) =
+            (Url::parse(origin), Url::parse(&fallback_page))
+        else {
+            return (fallback_domain.to_string(), fallback_page);
+        };
+        canonical_page.set_path(current_page.path());
+        canonical_page.set_query(current_page.query());
+        canonical_page.set_fragment(None);
+        (domain.clone(), canonical_page.to_string())
+    }
+
     fn build_openrtb_request(
         &self,
         request: &AuctionRequest,
@@ -420,12 +525,13 @@ impl ApsAuctionProvider {
             .and_then(|value| value.to_str().ok())
             .and_then(Self::valid_http_url)
             .filter(|value| value != &page);
+        let (site_domain, page) = self.inventory_site_identity(&request.publisher.domain, page);
 
         OpenRtbRequest {
             id: Some(request.id.clone()),
             imp,
             site: Some(Site {
-                domain: Some(request.publisher.domain.clone()),
+                domain: Some(site_domain.clone()),
                 page: Some(page),
                 r#ref: referer,
                 publisher: Some(Publisher {
@@ -956,6 +1062,8 @@ mod tests {
             endpoint: default_endpoint(),
             timeout_ms: 800,
             allow_script_creatives: false,
+            inventory_domain: None,
+            inventory_page_origin: None,
         }
     }
 
@@ -1050,6 +1158,93 @@ mod tests {
             .expect("should deserialize before validation");
             assert!(parsed.validate().is_err(), "should reject {endpoint}");
         }
+    }
+
+    #[test]
+    fn config_requires_safe_inventory_identity_override_pair() {
+        for value in [
+            json!({
+                "account_id": "example-account",
+                "inventory_domain": "publisher.example"
+            }),
+            json!({
+                "account_id": "example-account",
+                "inventory_page_origin": "https://www.publisher.example"
+            }),
+            json!({
+                "account_id": "example-account",
+                "inventory_domain": "publisher.example",
+                "inventory_page_origin": "http://www.publisher.example"
+            }),
+            json!({
+                "account_id": "example-account",
+                "inventory_domain": "publisher.example",
+                "inventory_page_origin": "https://www.publisher.example/path"
+            }),
+            json!({
+                "account_id": "example-account",
+                "inventory_domain": "publisher.example/path",
+                "inventory_page_origin": "https://www.publisher.example"
+            }),
+            json!({
+                "account_id": "example-account",
+                "inventory_domain": "publisher.example",
+                "inventory_page_origin": "https://unrelated.example"
+            }),
+        ] {
+            let parsed: ApsConfig =
+                serde_json::from_value(value).expect("should deserialize before validation");
+            assert!(
+                parsed.validate().is_err(),
+                "should reject unsafe or incomplete inventory identity override"
+            );
+        }
+    }
+
+    #[test]
+    fn inventory_identity_override_rewrites_site_and_preserves_page_path() {
+        let config: ApsConfig = serde_json::from_value(json!({
+            "enabled": true,
+            "account_id": "example-account",
+            "inventory_domain": "publisher.example",
+            "inventory_page_origin": "https://www.publisher.example"
+        }))
+        .expect("should deserialize APS inventory identity override");
+        config
+            .validate()
+            .expect("should validate APS inventory identity override");
+        let provider = ApsAuctionProvider::new(config);
+        let mut auction_request = request();
+        auction_request.publisher.domain = "deployment.example".to_string();
+        auction_request.publisher.page_url =
+            Some("https://deployment.example/news/story?edition=fictional#section".to_string());
+        let settings = create_test_settings();
+        let services = noop_services();
+        let downstream = http::Request::builder()
+            .uri("https://deployment.example/auction")
+            .body(EdgeBody::empty())
+            .expect("should build downstream request");
+        let context = AuctionContext {
+            settings: &settings,
+            request: &downstream,
+            timeout_ms: 321,
+            provider_responses: None,
+            services: &services,
+        };
+
+        let serialized =
+            serde_json::to_value(provider.build_openrtb_request(&auction_request, &context))
+                .expect("should serialize APS request");
+
+        assert_eq!(serialized["site"]["domain"], "publisher.example");
+        assert_eq!(
+            serialized["site"]["page"],
+            "https://www.publisher.example/news/story?edition=fictional"
+        );
+        assert_eq!(
+            serialized["site"]["publisher"]["domain"],
+            "deployment.example"
+        );
     }
 
     #[test]

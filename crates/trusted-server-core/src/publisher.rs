@@ -2638,6 +2638,7 @@ pub async fn handle_publisher_request(
 
     log::debug!("Proxying request to configured publisher backend");
 
+    let request_path_and_query = origin_path_and_query.to_string();
     let request_path = req.uri().path().to_string();
     let is_get = req.method() == http::Method::GET;
 
@@ -2728,7 +2729,7 @@ pub async fn handle_publisher_request(
         if should_run_auction {
             let slots_ctx = MatchedSlotsContext {
                 matched_slots: &matched_slots,
-                request_path: &request_path,
+                request_path_and_query: &request_path_and_query,
             };
             let mut auction_request = build_auction_request(
                 &slots_ctx,
@@ -3092,11 +3093,11 @@ pub async fn handle_publisher_request(
 /// Bundle of the per-request creative-opportunity inputs that travel together.
 ///
 /// Extracted so `build_auction_request` stays under the project's
-/// 7-argument cap (`matched_slots` + `request_path` live for the same
+/// 7-argument cap (`matched_slots` + `request_path_and_query` live for the same
 /// request scope and are passed together everywhere).
 pub(crate) struct MatchedSlotsContext<'a> {
     pub matched_slots: &'a [crate::creative_opportunities::CreativeOpportunitySlot],
-    pub request_path: &'a str,
+    pub request_path_and_query: &'a str,
 }
 
 /// Borrowed inputs for [`apply_auction_eids_and_device`], bundled to keep the
@@ -3183,7 +3184,8 @@ pub(crate) fn build_auction_request(
     // server edge host, which must not leak into the bid request.
     let page_url = format!(
         "{}://{}{}",
-        request_info.scheme, publisher_domain, slots_ctx.request_path
+<<<<<<< HEAD
+        request_info.scheme, publisher_domain, slots_ctx.request_path_and_query
     );
     let ec_id = ec_id.filter(|id| !id.is_empty());
     let request_id = ec_id.map_or_else(
@@ -3740,8 +3742,8 @@ pub fn page_bids_preflight_denied() -> Response<EdgeBody> {
 
 /// Normalizes the client-supplied `path` query parameter before glob matching.
 ///
-/// The SPA hook sends `location.pathname`, but the parameter is
-/// client-controlled: strip any query string or fragment and force a leading
+/// The SPA hook sends `location.pathname + location.search`, but the parameter
+/// is client-controlled: strip any query string or fragment and force a leading
 /// `/` so slot `page_patterns` always match against a canonical path shape.
 fn normalize_page_bids_path(raw: &str) -> String {
     let path = raw.split(['?', '#']).next().unwrap_or("");
@@ -3847,8 +3849,8 @@ pub async fn handle_page_bids(
         .query()
         .and_then(|query| {
             url::form_urlencoded::parse(query.as_bytes())
-                .find(|(k, _)| k == "path")
-                .map(|(_, v)| normalize_page_bids_path(&v))
+                .find(|(key, _)| key == "path")
+                .map(|(_, value)| normalize_page_bids_path(&value))
         })
         .unwrap_or_else(|| "/".to_string());
 
@@ -3911,7 +3913,7 @@ pub async fn handle_page_bids(
         if ad_stack_enabled && !is_bot && !is_prefetch {
             let slots_ctx = MatchedSlotsContext {
                 matched_slots: &matched_slots,
-                request_path: &path_param,
+                request_path_and_query: &path_param,
             };
             let mut auction_request = build_auction_request(
                 &slots_ctx,
@@ -9339,7 +9341,7 @@ mod tests {
             let slots = [slot];
             let slots_ctx = MatchedSlotsContext {
                 matched_slots: &slots,
-                request_path: "/2024/01/my-article/",
+                request_path_and_query: "/2024/01/my-article/?edition=fictional",
             };
             let request_info = RequestInfo {
                 host: "publisher.example.com".to_string(),
@@ -9360,6 +9362,11 @@ mod tests {
                 request.id.starts_with("ts-req-"),
                 "should use a non-EC request id, got {}",
                 request.id
+            );
+            assert_eq!(
+                request.publisher.page_url.as_deref(),
+                Some("https://publisher.example.com/2024/01/my-article/?edition=fictional"),
+                "should preserve the page path and query for auction providers"
             );
         }
 
@@ -9415,7 +9422,7 @@ mod tests {
             let slots = [slot];
             let slots_ctx = MatchedSlotsContext {
                 matched_slots: &slots,
-                request_path: "/2024/01/my-article/",
+                request_path_and_query: "/2024/01/my-article/",
             };
             let request_info = RequestInfo {
                 host: "publisher.example.com".to_string(),
@@ -10326,6 +10333,20 @@ mod tests {
                 normalize_page_bids_path(""),
                 "/",
                 "empty path should normalize to root"
+            );
+        }
+
+        #[test]
+        fn normalize_page_bids_path_and_query_preserves_query_but_drops_fragment() {
+            assert_eq!(
+                normalize_page_bids_path_and_query("/2024/01/article/?edition=fictional#section"),
+                "/2024/01/article/?edition=fictional",
+                "query should reach auction providers without a browser-only fragment"
+            );
+            assert_eq!(
+                normalize_page_bids_path_and_query("2024/01/article/?edition=fictional"),
+                "/2024/01/article/?edition=fictional",
+                "missing leading slash should be added"
             );
         }
 

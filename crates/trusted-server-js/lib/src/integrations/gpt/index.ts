@@ -954,9 +954,7 @@ export function installSpaAuctionHook(): void {
 
   let inflight: AbortController | null = null;
   // Last path an auction was run for. popstate fires for hash-only and
-  // same-pathname back/forward (scroll restoration), and pushState/replaceState
-  // can be called with the current URL, so guard every entry point against
-  // re-requesting impressions for a path we already loaded.
+  // same-pathname changes, so guard against re-requesting loaded impressions.
   let currentPath = location.pathname;
   // Last path whose slots/bids were actually applied — the initial SSR page
   // counts. A failed navigation rolls `currentPath` back to this rather than to
@@ -1038,7 +1036,8 @@ export function installSpaAuctionHook(): void {
     const original = history[method].bind(history);
     history[method] = function (state: unknown, unused: string, url?: string | URL | null): void {
       original(state, unused, url);
-      const newPath = url ? new URL(String(url), location.href).pathname : location.pathname;
+      const locationUrl = url ? new URL(String(url), location.href) : location;
+      const newPath = locationUrl.pathname;
       // onNavigate no-ops when newPath equals the last loaded path.
       void onNavigate(newPath);
     };
