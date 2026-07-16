@@ -13,6 +13,7 @@ Before you begin, ensure you have the following installed (versions are pinned i
 **For Fastly deployment** (optional for local dev):
 
 - Fastly {{FASTLY_VERSION}} CLI installed
+- Chrome or Chromium, required for `ts audit`
 - A Fastly account and API key
 
 ## Installation
@@ -23,6 +24,20 @@ Before you begin, ensure you have the following installed (versions are pinned i
 git clone https://github.com/IABTechLab/trusted-server.git
 cd trusted-server
 ```
+
+### Install the CLI
+
+Install the `ts` operator CLI for your current platform:
+
+```bash
+cargo install-cli
+
+# If your shell cannot find `ts`, add Cargo's bin directory to PATH
+export PATH="$HOME/.cargo/bin:$PATH"
+ts --help
+```
+
+See [Trusted Server CLI](/guide/cli) for command details.
 
 ## Local Development
 
@@ -103,6 +118,21 @@ cargo test-axum
 
 ## Configuration
 
+Create a starter Trusted Server config with the `ts` CLI:
+
+```bash
+ts config init
+```
+
+To bootstrap from a public publisher page, run an audit first:
+
+```bash
+ts audit https://publisher.example
+```
+
+The audit command writes `js-assets.toml` plus a draft `trusted-server.toml`.
+Review the draft, replace placeholders/secrets, then validate it.
+
 Edit `trusted-server.toml` to configure:
 
 - Ad server integrations
@@ -110,7 +140,13 @@ Edit `trusted-server.toml` to configure:
 - EC configuration
 - GDPR settings
 
-See [Configuration](/guide/configuration) for details.
+Validate the config before pushing it to platform storage:
+
+```bash
+ts config validate
+```
+
+See [Configuration](/guide/configuration) and [Trusted Server CLI](/guide/cli) for details.
 
 ## Deploy to Fastly
 

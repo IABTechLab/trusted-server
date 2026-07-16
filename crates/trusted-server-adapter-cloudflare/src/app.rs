@@ -5,11 +5,13 @@ use std::sync::Arc;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{HeaderValue, Method, Request, Response, header};
+use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+#[cfg(target_arch = "wasm32")]
+use trusted_server_core::config_payload::settings_from_config_blob;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
@@ -19,14 +21,13 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    PublisherResponse, buffer_publisher_response, handle_publisher_request, handle_tsjs_dynamic,
+    AuctionDispatch, PublisherResponse, buffer_publisher_response_async, handle_page_bids,
+    handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
 };
 use trusted_server_core::request_signing::{
-    handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
-    handle_verify_signature,
+    handle_trusted_server_discovery, handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
-use trusted_server_core::settings_data::get_settings;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::build_runtime_services;
@@ -34,6 +35,14 @@ use crate::platform::build_runtime_services;
 // ---------------------------------------------------------------------------
 // AppState
 // ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "wasm32")]
+static CLOUDFLARE_CONFIG_JSON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+#[cfg(target_arch = "wasm32")]
+pub fn set_cloudflare_config_json(value: String) {
+    let _ = CLOUDFLARE_CONFIG_JSON.set(value);
+}
 
 /// Application state built once at startup and shared across all requests.
 pub struct AppState {
@@ -49,8 +58,43 @@ pub struct AppState {
 /// Returns an error when settings, the auction orchestrator, or the integration
 /// registry fail to initialise.
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let settings = get_settings()?;
+    let settings = load_startup_settings()?;
     build_state_with_settings(settings)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
+    settings_from_cloudflare_config_json()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
+    Settings::from_toml(include_str!("../../../trusted-server.example.toml"))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServerError>> {
+    let raw_config = CLOUDFLARE_CONFIG_JSON.get().ok_or_else(|| {
+        Report::new(TrustedServerError::Configuration {
+            message: "Cloudflare TRUSTED_SERVER_CONFIG is required".to_string(),
+        })
+        .attach("set TRUSTED_SERVER_CONFIG to JSON containing the app_config blob envelope")
+    })?;
+    let value: serde_json::Value = serde_json::from_str(raw_config).map_err(|error| {
+        Report::new(TrustedServerError::Configuration {
+            message: "invalid Cloudflare TRUSTED_SERVER_CONFIG JSON".to_string(),
+        })
+        .attach(format!("failed to parse TRUSTED_SERVER_CONFIG: {error}"))
+    })?;
+    let envelope = value
+        .get("app_config")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            Report::new(TrustedServerError::Configuration {
+                message: "Cloudflare TRUSTED_SERVER_CONFIG missing app_config".to_string(),
+            })
+        })?;
+    settings_from_config_blob(envelope)
 }
 
 /// Build the application state from explicit settings.
@@ -78,6 +122,29 @@ fn build_state_with_settings(
 
 fn build_per_request_services(ctx: &RequestContext) -> RuntimeServices {
     build_runtime_services(ctx)
+}
+
+/// Builds the geo-aware [`EcContext`] for consent-gated endpoints (`/auction`,
+/// `/__ts/page-bids`, and the publisher fallback).
+///
+/// Mirrors the Fastly entry point: `EcContext::default()` leaves jurisdiction
+/// Unknown, which fails the auction consent gate closed even for consented
+/// users. Geo comes from the Workers `cf` object when deployed. A malformed
+/// consent string is logged and falls back to the default (fail-closed) context
+/// rather than being silently swallowed.
+fn build_ec_context(settings: &Settings, services: &RuntimeServices, req: &Request) -> EcContext {
+    let geo_info = services
+        .geo()
+        .lookup(services.client_info().client_ip)
+        .unwrap_or_else(|e| {
+            log::warn!("geo lookup failed: {e}");
+            None
+        });
+    EcContext::read_from_request_with_geo(settings, req, services, geo_info.as_ref())
+        .unwrap_or_else(|e| {
+            log::warn!("EC context read failed: {e:?}");
+            EcContext::default()
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -117,16 +184,27 @@ where
 
 /// Collapse a [`PublisherResponse`] into a plain [`Response`].
 ///
-/// Delegates to the shared [`buffer_publisher_response`], which enforces
+/// Delegates to the shared [`buffer_publisher_response_async`], which collects
+/// the dispatched server-side auction and enforces
 /// `settings.publisher.max_buffered_body_bytes`, then removes any
 /// `Transfer-Encoding` header since the buffered body is no longer chunked.
-fn resolve_publisher_response(
+async fn resolve_publisher_response(
     publisher_response: PublisherResponse,
     method: &Method,
     settings: &Settings,
     registry: &IntegrationRegistry,
+    orchestrator: &AuctionOrchestrator,
+    services: &RuntimeServices,
 ) -> Result<Response, Report<TrustedServerError>> {
-    let mut response = buffer_publisher_response(publisher_response, method, settings, registry)?;
+    let mut response = buffer_publisher_response_async(
+        publisher_response,
+        method,
+        settings,
+        registry,
+        orchestrator,
+        services,
+    )
+    .await?;
     response.headers_mut().remove(header::TRANSFER_ENCODING);
     Ok(response)
 }
@@ -143,6 +221,20 @@ pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
     let body = edgezero_core::body::Body::from(format!("{}\n", root_error.user_message()));
     let mut response = Response::new(body);
     *response.status_mut() = root_error.status_code();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
+fn admin_key_management_not_supported() -> Response {
+    let body = edgezero_core::body::Body::from(
+        "Admin key management is not supported on Cloudflare Workers.\n\
+         Use the Fastly adapter (via Viceroy or deployed) to rotate or deactivate keys.\n",
+    );
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/plain; charset=utf-8"),
@@ -296,11 +388,35 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                         }))
                     })
             } else {
-                handle_publisher_request(&state.settings, &state.registry, &services, req)
-                    .await
-                    .and_then(|pr| {
-                        resolve_publisher_response(pr, &method, &state.settings, &state.registry)
-                    })
+                let mut ec_context = build_ec_context(&state.settings, &services, &req);
+                let auction = AuctionDispatch {
+                    orchestrator: &state.orchestrator,
+                    slots: state.settings.creative_opportunity_slots(),
+                    registry: None,
+                };
+                match handle_publisher_request(
+                    &state.settings,
+                    &services,
+                    None,
+                    &mut ec_context,
+                    auction,
+                    req,
+                )
+                .await
+                {
+                    Ok(pr) => {
+                        resolve_publisher_response(
+                            pr,
+                            &method,
+                            &state.settings,
+                            &state.registry,
+                            &state.orchestrator,
+                            &services,
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                }
             };
 
             Ok(result.unwrap_or_else(|e| http_error(&e)))
@@ -339,22 +455,19 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // letting them fall through would forward the caller's
             // `Authorization` header and key-management payload to the origin,
             // leaking admin credentials.
-            .post(
-                "/_ts/admin/keys/rotate",
-                make_handler(Arc::clone(&state), |s, services, req| async move {
-                    handle_rotate_key(&s.settings, &services, req)
-                }),
-            )
-            .post(
-                "/_ts/admin/keys/deactivate",
-                make_handler(Arc::clone(&state), |s, services, req| async move {
-                    handle_deactivate_key(&s.settings, &services, req)
-                }),
-            )
+            .post("/_ts/admin/keys/rotate", |_ctx: RequestContext| async {
+                Ok::<Response, EdgeError>(admin_key_management_not_supported())
+            })
+            .post("/_ts/admin/keys/deactivate", |_ctx: RequestContext| async {
+                Ok::<Response, EdgeError>(admin_key_management_not_supported())
+            })
             .post(
                 "/auction",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
-                    let ec_context = EcContext::default();
+                    // Build the geo-aware EC context so the auction consent gate
+                    // sees the caller's jurisdiction — `EcContext::default()`
+                    // fails it closed for consented users.
+                    let ec_context = build_ec_context(&s.settings, &services, &req);
                     handle_auction(
                         &s.settings,
                         &s.orchestrator,
@@ -365,6 +478,28 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                         req,
                     )
                     .await
+                }),
+            )
+            // SPA re-auction endpoint. The OPTIONS preflight for this
+            // side-effecting GET is denied so the GET handler's `X-TSJS-Page-Bids`
+            // gate stays trustworthy.
+            .route(
+                "/__ts/page-bids",
+                Method::OPTIONS,
+                make_handler(Arc::clone(&state), |_s, _services, _req| async move {
+                    Ok(page_bids_preflight_denied())
+                }),
+            )
+            .get(
+                "/__ts/page-bids",
+                make_handler(Arc::clone(&state), |s, services, req| async move {
+                    let ec_context = build_ec_context(&s.settings, &services, &req);
+                    let auction = AuctionDispatch {
+                        orchestrator: &s.orchestrator,
+                        slots: s.settings.creative_opportunity_slots(),
+                        registry: None,
+                    };
+                    handle_page_bids(&s.settings, &services, None, auction, &ec_context, req).await
                 }),
             )
             .get(

@@ -124,16 +124,15 @@ pub fn build_consent_context(input: &ConsentPipelineInput<'_>) -> ConsentContext
 
     // Read fallback: when the request carries no consent signals, fall back
     // to consent persisted in KV for this EC ID (when persistence is wired).
-    if signals.is_empty() {
-        if let (Some(ec_id), Some(store)) = (input.ec_id, input.kv_store) {
-            if let Some(mut ctx) = kv::load_consent_from_kv(store, ec_id) {
-                // Jurisdiction is request-local: derive it from the current
-                // geo rather than the value stored with the persisted entry.
-                ctx.jurisdiction = jurisdiction::detect_jurisdiction(input.geo, input.config);
-                log_consent_context(&ctx);
-                return ctx;
-            }
-        }
+    if signals.is_empty()
+        && let (Some(ec_id), Some(store)) = (input.ec_id, input.kv_store)
+        && let Some(mut ctx) = kv::load_consent_from_kv(store, ec_id)
+    {
+        // Jurisdiction is request-local: derive it from the current
+        // geo rather than the value stored with the persisted entry.
+        ctx.jurisdiction = jurisdiction::detect_jurisdiction(input.geo, input.config);
+        log_consent_context(&ctx);
+        return ctx;
     }
 
     // In proxy mode, skip decoding entirely.
@@ -328,6 +327,26 @@ fn effective_tcf(ctx: &ConsentContext) -> Option<&types::TcfConsent> {
         let g = ctx.gpp.as_ref()?;
         g.eu_tcf.as_ref()
     })
+}
+
+/// Returns whether a server-side auction may be dispatched for this request.
+///
+/// Fails closed for GDPR-relevant traffic: when an EU TCF signal is present
+/// (`gdpr_applies`) **or** the request's geo jurisdiction is GDPR or unknown,
+/// the effective TCF consent (standalone TC string or GPP EU TCF section)
+/// must grant Purpose 1 (storage/access). Only requests from a known
+/// non-GDPR jurisdiction with no EU TCF signal are freely allowed.
+#[must_use]
+pub fn consent_allows_server_side_auction(ctx: &ConsentContext) -> bool {
+    let requires_tcf_purpose1 = ctx.gdpr_applies
+        || matches!(
+            ctx.jurisdiction,
+            jurisdiction::Jurisdiction::Gdpr | jurisdiction::Jurisdiction::Unknown
+        );
+    if !requires_tcf_purpose1 {
+        return true;
+    }
+    effective_tcf(ctx).is_some_and(|tcf| tcf.has_purpose_consent(1))
 }
 
 /// Returns whether TCF consent allows EID transmission.
@@ -552,10 +571,10 @@ pub fn allows_ec_creation(ctx: &ConsentContext) -> bool {
                 return tcf.has_storage_consent();
             }
             // GPP US sale_opt_out=false is an explicit non-opt-out signal.
-            if let Some(gpp) = &ctx.gpp {
-                if let Some(opted_out) = gpp.us_sale_opt_out {
-                    return !opted_out;
-                }
+            if let Some(gpp) = &ctx.gpp
+                && let Some(opted_out) = gpp.us_sale_opt_out
+            {
+                return !opted_out;
             }
             // Check US Privacy string when no TCF decision is present.
             if let Some(usp) = &ctx.us_privacy {
@@ -682,9 +701,9 @@ mod tests {
     use http::Request;
 
     use super::{
-        allows_ec_creation, apply_expiration_check, apply_tcf_conflict_resolution,
-        build_consent_context, build_context_from_signals, has_explicit_ec_withdrawal,
-        ConsentPipelineInput,
+        ConsentPipelineInput, allows_ec_creation, apply_expiration_check,
+        apply_tcf_conflict_resolution, build_consent_context, build_context_from_signals,
+        consent_allows_server_side_auction, has_explicit_ec_withdrawal,
     };
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{
@@ -783,6 +802,95 @@ mod tests {
             }),
             ..ConsentContext::default()
         }
+    }
+
+    #[test]
+    fn auction_allowed_for_known_non_gdpr_jurisdiction_without_tcf_signal() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            ..ConsentContext::default()
+        };
+
+        assert!(
+            consent_allows_server_side_auction(&ctx),
+            "known non-GDPR jurisdiction with no EU TCF signal should allow auction"
+        );
+    }
+
+    #[test]
+    fn auction_fails_closed_for_gdpr_jurisdiction_without_consent() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::Gdpr,
+            ..ConsentContext::default()
+        };
+
+        assert!(
+            !consent_allows_server_side_auction(&ctx),
+            "GDPR jurisdiction without a TCF signal should fail closed"
+        );
+    }
+
+    #[test]
+    fn auction_fails_closed_for_unknown_jurisdiction_without_consent() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::Unknown,
+            ..ConsentContext::default()
+        };
+
+        assert!(
+            !consent_allows_server_side_auction(&ctx),
+            "unknown jurisdiction without a TCF signal should fail closed"
+        );
+    }
+
+    #[test]
+    fn auction_fails_closed_when_tcf_signal_present_without_purpose1() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            gdpr_applies: true,
+            tcf: Some(TcfBuilder::new().with_storage(false).build()),
+            ..ConsentContext::default()
+        };
+
+        assert!(
+            !consent_allows_server_side_auction(&ctx),
+            "EU TCF signal without Purpose 1 should block auction even outside GDPR geo"
+        );
+    }
+
+    #[test]
+    fn auction_allowed_for_gdpr_jurisdiction_with_purpose1_consent() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::Gdpr,
+            gdpr_applies: true,
+            tcf: Some(TcfBuilder::new().with_storage(true).build()),
+            ..ConsentContext::default()
+        };
+
+        assert!(
+            consent_allows_server_side_auction(&ctx),
+            "GDPR jurisdiction with Purpose 1 consent should allow auction"
+        );
+    }
+
+    #[test]
+    fn auction_allowed_with_purpose1_via_gpp_eu_tcf_section() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::Gdpr,
+            gdpr_applies: true,
+            gpp: Some(GppConsent {
+                version: 1,
+                section_ids: vec![2],
+                eu_tcf: Some(TcfBuilder::new().with_storage(true).build()),
+                us_sale_opt_out: None,
+            }),
+            ..ConsentContext::default()
+        };
+
+        assert!(
+            consent_allows_server_side_auction(&ctx),
+            "Purpose 1 granted via GPP EU TCF section should allow auction"
+        );
     }
 
     #[test]

@@ -18,12 +18,14 @@ crates/
   trusted-server-adapter-axum/          # Axum dev server entry point (native binary)
   trusted-server-adapter-cloudflare/    # Cloudflare Workers entry point (wasm32-unknown-unknown binary)
   trusted-server-adapter-spin/          # Fermyon Spin entry point (wasm32-wasip1 component)
+  trusted-server-cli/                   # Host-target `ts` operator CLI
   trusted-server-js/                    # TypeScript/JS build — per-integration IIFE bundles
     lib/         # TS source, Vitest tests, esbuild pipeline
 ```
 
-Supporting files: `fastly.toml`, `trusted-server.toml`, `.env.dev`,
-`rust-toolchain.toml`, `CONTRIBUTING.md`.
+Supporting files: `edgezero.toml`, `fastly.toml`,
+`trusted-server.example.toml`, `.env.dev`, `rust-toolchain.toml`,
+`CONTRIBUTING.md`. Operator-owned `trusted-server.toml` files are gitignored.
 
 ## Toolchain
 
@@ -96,6 +98,13 @@ cargo test-axum        # Axum dev server adapter (native)
 cargo test-cloudflare  # Cloudflare Workers adapter (native host)
 cargo test-spin        # Spin adapter route tests (native host)
 
+# Run host-target CLI tests (workspace default target is wasm32-wasip1)
+# Use your host triple, for example x86_64-unknown-linux-gnu on CI/Linux
+# or aarch64-apple-darwin on Apple Silicon macOS.
+# Use the local helper (recommended):
+# ./scripts/test-cli.sh
+cargo test --package trusted-server-cli --target <host-triple>
+
 # Format
 cargo fmt --all -- --check
 
@@ -106,6 +115,7 @@ cargo fmt --all -- --check
 cargo clippy-fastly
 cargo clippy-axum
 cargo clippy-cloudflare
+cargo clippy-cloudflare-wasm
 cargo clippy-spin-native
 cargo clippy-spin-wasm
 
@@ -311,10 +321,12 @@ IntegrationRegistration::builder(ID)
 
 | File                  | Purpose                                                    |
 | --------------------- | ---------------------------------------------------------- |
-| `fastly.toml`         | Fastly service configuration and build settings            |
-| `trusted-server.toml` | Application settings (ad servers, KV stores, ID templates) |
-| `rust-toolchain.toml` | Pins Rust version to 1.95.0                                |
-| `.env.dev`            | Local development environment variables                    |
+| `edgezero.toml`                 | EdgeZero app/platform manifest and logical stores               |
+| `fastly.toml`                   | Fastly service configuration and build settings                 |
+| `trusted-server.example.toml`   | Source-controlled Trusted Server app-config template            |
+| `trusted-server.toml`           | Operator-owned app config; gitignored; `ts config push` publishes it as an EdgeZero blob envelope |
+| `rust-toolchain.toml`           | Pins Rust version to 1.95.0                                     |
+| `.env.dev`                      | Local development environment variables                         |
 
 ---
 
@@ -323,7 +335,7 @@ IntegrationRegistration::builder(ID)
 Every PR must pass:
 
 1. `cargo fmt --all -- --check`
-2. `cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare && cargo clippy-spin-native && cargo clippy-spin-wasm`
+2. `cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare && cargo clippy-cloudflare-wasm && cargo clippy-spin-native && cargo clippy-spin-wasm`
 3. `cargo test-fastly && cargo test-axum && cargo test-cloudflare && cargo test-spin`
 4. `cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity`
 5. JS build and test (`cd crates/trusted-server-js/lib && npx vitest run`)

@@ -10,9 +10,12 @@ use http::Request;
 use crate::constants::{COOKIE_TS_EC, HEADER_X_TS_EC};
 use crate::cookies::handle_request_cookies;
 use crate::ec::cookies::ec_id_has_only_allowed_chars;
+#[cfg(test)]
 use crate::ec::generation::{generate_ec_id as generate_canonical_ec_id, normalize_ip};
 use crate::error::TrustedServerError;
+#[cfg(test)]
 use crate::platform::RuntimeServices;
+#[cfg(test)]
 use crate::settings::Settings;
 
 /// Generates a fresh EC ID based on client IP address.
@@ -26,6 +29,10 @@ use crate::settings::Settings;
 /// # Errors
 ///
 /// - [`TrustedServerError::EdgeCookie`] if HMAC generation fails
+///
+/// Currently exercised only by tests: the production EC lifecycle generates IDs
+/// through [`crate::ec`]/`EcContext` rather than this edge-cookie helper.
+#[cfg(test)]
 pub fn generate_ec_id(
     settings: &Settings,
     services: &RuntimeServices,
@@ -97,6 +104,7 @@ pub fn get_ec_id(req: &Request<EdgeBody>) -> Result<Option<String>, Report<Trust
 /// # Errors
 ///
 /// Returns an error if ID generation fails.
+#[cfg(test)]
 pub(crate) fn get_or_generate_ec_id_from_http_request(
     settings: &Settings,
     services: &RuntimeServices,
@@ -130,7 +138,7 @@ pub fn get_or_generate_ec_id(
 mod tests {
     use super::*;
     use edgezero_core::body::Body as EdgeBody;
-    use http::{header, HeaderName};
+    use http::{HeaderName, header};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use crate::platform::test_support::{noop_services, noop_services_with_client_ip};

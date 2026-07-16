@@ -5,7 +5,7 @@
 
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use http::{header, Request, Response, StatusCode};
+use http::{Request, Response, StatusCode, header};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{IntoHttpResponse, TrustedServerError};
@@ -22,6 +22,19 @@ fn json_response(status: StatusCode, body: String) -> Response<EdgeBody> {
         .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
         .body(EdgeBody::from(body.into_bytes()))
         .expect("should build json response")
+}
+
+fn request_body_bytes(
+    body: EdgeBody,
+    endpoint: &str,
+) -> Result<bytes::Bytes, Report<TrustedServerError>> {
+    if body.is_stream() {
+        return Err(Report::new(TrustedServerError::BadRequest {
+            message: format!("{endpoint} request body must be buffered, not streamed"),
+        }));
+    }
+
+    Ok(body.into_bytes().unwrap_or_default())
 }
 
 /// Retrieves and returns the trusted-server discovery document.
@@ -100,7 +113,7 @@ pub fn handle_verify_signature(
     services: &RuntimeServices,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    let body = req.into_body().into_bytes();
+    let body = request_body_bytes(req.into_body(), "verify-signature")?;
     enforce_max_body_size(&body, VERIFY_MAX_BODY_BYTES, "verify-signature")?;
     let verify_req: VerifySignatureRequest =
         serde_json::from_slice(&body).change_context(TrustedServerError::Configuration {
@@ -290,7 +303,7 @@ pub fn handle_rotate_key(
         secret_store_id,
     } = signing_store_ids(settings)?;
 
-    let body = req.into_body().into_bytes();
+    let body = request_body_bytes(req.into_body(), "rotate-key")?;
     enforce_max_body_size(&body, ADMIN_MAX_BODY_BYTES, "rotate-key")?;
     let rotate_req: RotateKeyRequest = if body.is_empty() {
         RotateKeyRequest { kid: None }
@@ -409,7 +422,7 @@ pub fn handle_deactivate_key(
         secret_store_id,
     } = signing_store_ids(settings)?;
 
-    let body = req.into_body().into_bytes();
+    let body = request_body_bytes(req.into_body(), "deactivate-key")?;
     enforce_max_body_size(&body, ADMIN_MAX_BODY_BYTES, "deactivate-key")?;
     let deactivate_req: DeactivateKeyRequest =
         serde_json::from_slice(&body).change_context(TrustedServerError::Configuration {
@@ -486,14 +499,15 @@ pub fn handle_deactivate_key(
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use edgezero_core::body::Body as EdgeBody;
     use error_stack::Report;
-    use http::{header, Method, Request as HttpRequest, StatusCode};
+    use http::{Method, Request as HttpRequest, StatusCode, header};
 
     use crate::error::IntoHttpResponse;
     use crate::platform::{
-        test_support::{build_request_signing_services, build_services_with_config, noop_services},
         PlatformConfigStore, PlatformError, StoreId, StoreName,
+        test_support::{build_request_signing_services, build_services_with_config, noop_services},
     };
 
     use super::*;
@@ -511,9 +525,24 @@ mod tests {
             .expect("should build request")
     }
 
+    fn build_streaming_request(method: Method, uri: &str) -> HttpRequest<EdgeBody> {
+        let stream = futures::stream::iter(vec![Bytes::from_static(b"{}")]);
+        HttpRequest::builder()
+            .method(method)
+            .uri(uri)
+            .body(EdgeBody::stream(stream))
+            .expect("should build streaming request")
+    }
+
     fn response_body_string(response: http::Response<EdgeBody>) -> String {
-        String::from_utf8(response.into_body().into_bytes().to_vec())
-            .expect("should decode response body")
+        String::from_utf8(
+            response
+                .into_body()
+                .into_bytes()
+                .unwrap_or_default()
+                .to_vec(),
+        )
+        .expect("should decode response body")
     }
 
     fn assert_json_content_type(response: &http::Response<EdgeBody>) {
@@ -969,6 +998,27 @@ mod tests {
     }
 
     #[test]
+    fn verify_signature_rejects_streaming_body() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let req = build_streaming_request(Method::POST, "https://test.com/verify-signature");
+        let err = handle_verify_signature(&settings, &noop_services(), req)
+            .expect_err("should reject streaming verify body");
+        assert_eq!(
+            err.current_context().status_code(),
+            StatusCode::BAD_REQUEST,
+            "should return 400 for streaming verify body"
+        );
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::BadRequest { message }
+                    if message == "verify-signature request body must be buffered, not streamed"
+            ),
+            "should explain that verify bodies must be buffered"
+        );
+    }
+
+    #[test]
     fn rotate_key_rejects_oversized_body() {
         let settings = crate::test_support::tests::create_test_settings();
         let oversized = "x".repeat(ADMIN_MAX_BODY_BYTES + 1);
@@ -983,6 +1033,27 @@ mod tests {
             err.current_context().status_code(),
             StatusCode::PAYLOAD_TOO_LARGE,
             "should return 413 for rotate-key body over limit"
+        );
+    }
+
+    #[test]
+    fn rotate_key_rejects_streaming_body() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let req = build_streaming_request(Method::POST, "https://test.com/admin/keys/rotate");
+        let err = handle_rotate_key(&settings, &noop_services(), req)
+            .expect_err("should reject streaming rotate body");
+        assert_eq!(
+            err.current_context().status_code(),
+            StatusCode::BAD_REQUEST,
+            "should return 400 for streaming rotate body"
+        );
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::BadRequest { message }
+                    if message == "rotate-key request body must be buffered, not streamed"
+            ),
+            "should explain that rotate bodies must be buffered"
         );
     }
 

@@ -7,7 +7,7 @@
 //! method gates assert exact status codes.
 
 use edgezero_core::app::Hooks as _;
-use edgezero_core::http::request_builder;
+use edgezero_core::http::{Request, Response, request_builder};
 use edgezero_core::router::RouterService;
 use trusted_server_adapter_spin::app::TrustedServerApp;
 use trusted_server_core::settings::Settings;
@@ -44,6 +44,10 @@ fn test_router() -> RouterService {
         .expect("should build router from test settings")
 }
 
+async fn route(router: RouterService, req: Request) -> Response {
+    router.oneshot(req).await.expect("should route request")
+}
+
 #[test]
 fn routes_build_without_panic() {
     // build_state() may fail (no real settings in CI) — startup_error_router
@@ -53,8 +57,9 @@ fn routes_build_without_panic() {
 
 #[test]
 fn edgezero_manifest_loads_and_resolves_spin_stores() {
-    let loader =
-        edgezero_core::manifest::ManifestLoader::load_from_str(include_str!("../edgezero.toml"));
+    let loader = edgezero_core::manifest::ManifestLoader::load_from_str(include_str!(
+        "../../../edgezero.toml"
+    ));
     let manifest = loader.manifest();
 
     assert!(
@@ -62,9 +67,14 @@ fn edgezero_manifest_loads_and_resolves_spin_stores() {
         "Spin EdgeZero manifest must enable config store injection"
     );
     assert_eq!(
-        manifest.kv_store_name(edgezero_core::app::SPIN_ADAPTER),
-        "default",
-        "Spin KV label must match spin.toml key_value_stores"
+        manifest
+            .stores
+            .kv
+            .as_ref()
+            .expect("should declare a KV store")
+            .default_id(),
+        "trusted_server_kv",
+        "Spin KV declaration must expose its default logical store id"
     );
     assert!(
         manifest.secret_store_enabled(edgezero_core::app::SPIN_ADAPTER),
@@ -78,6 +88,32 @@ fn edgezero_manifest_loads_and_resolves_spin_stores() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_admin_routes_return_501() {
+    for (path, body) in [
+        ("/_ts/admin/keys/rotate", "{}"),
+        (
+            "/_ts/admin/keys/deactivate",
+            r#"{"kid":"test-key","delete":false}"#,
+        ),
+    ] {
+        let req = request_builder()
+            .method("POST")
+            .uri(path)
+            .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+            .header("content-type", "application/json")
+            .body(edgezero_core::body::Body::from(body))
+            .expect("should build request");
+        let resp = route(test_router(), req).await;
+
+        assert_eq!(
+            resp.status().as_u16(),
+            501,
+            "{path} should report that Spin key management is unsupported"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn health_route_returns_ok() {
     // Parity with the Fastly/Axum adapters: GET /health is a cheap liveness probe
     // answering 200 "ok", not routed through publisher handling.
@@ -89,7 +125,7 @@ async fn health_route_returns_ok() {
         .body(edgezero_core::body::Body::empty())
         .expect("should build request");
 
-    let resp = router.oneshot(req).await;
+    let resp = route(router, req).await;
 
     assert_eq!(
         resp.status().as_u16(),
@@ -97,7 +133,7 @@ async fn health_route_returns_ok() {
         "health probe should return 200"
     );
 
-    let body = resp.into_body().into_bytes();
+    let body = resp.into_body().into_bytes().unwrap_or_default();
     assert_eq!(&body[..], b"ok", "health probe should return the body `ok`");
 }
 
@@ -113,7 +149,7 @@ async fn finalize_middleware_injects_geo_header() {
         .body(edgezero_core::body::Body::empty())
         .expect("should build request");
 
-    let resp = router.oneshot(req).await;
+    let resp = route(router, req).await;
 
     assert!(
         resp.headers().contains_key("x-geo-info-available"),
@@ -139,7 +175,7 @@ async fn auth_middleware_runs_in_chain_for_protected_routes() {
         .body(edgezero_core::body::Body::from("{}"))
         .expect("should build request");
 
-    let resp = router.oneshot(req).await;
+    let resp = route(router, req).await;
 
     assert!(
         resp.headers().contains_key("x-geo-info-available"),
@@ -166,7 +202,7 @@ async fn tsjs_route_is_routed_not_5xx() {
         .uri("/static/tsjs=0000000000000000")
         .body(edgezero_core::body::Body::empty())
         .expect("should build request");
-    let resp = router.oneshot(req).await;
+    let resp = route(router, req).await;
     let status = resp.status().as_u16();
     // The tsjs route is matched by the /{*rest} catch-all. The handler returns
     // 404 for an unknown hash; that is application behaviour, not a route miss.
@@ -182,7 +218,7 @@ async fn verify_signature_is_routed() {
         .header("content-type", "application/json")
         .body(edgezero_core::body::Body::from("{}"))
         .expect("should build request");
-    let resp = router.oneshot(req).await;
+    let resp = route(router, req).await;
     assert_ne!(
         resp.status().as_u16(),
         404,
@@ -202,7 +238,7 @@ async fn verify_signature_put_falls_through_to_publisher_fallback() {
         .uri("/verify-signature")
         .body(edgezero_core::body::Body::empty())
         .expect("should build request");
-    let resp = router.oneshot(req).await;
+    let resp = route(router, req).await;
 
     let status = resp.status().as_u16();
     assert_ne!(
@@ -224,7 +260,7 @@ async fn admin_rotate_key_is_routed() {
         .header("content-type", "application/json")
         .body(edgezero_core::body::Body::from("{}"))
         .expect("should build request");
-    let resp = router.oneshot(req).await;
+    let resp = route(router, req).await;
     assert_ne!(
         resp.status().as_u16(),
         404,
@@ -241,7 +277,7 @@ async fn admin_deactivate_key_is_routed() {
         .header("content-type", "application/json")
         .body(edgezero_core::body::Body::from("{}"))
         .expect("should build request");
-    let resp = router.oneshot(req).await;
+    let resp = route(router, req).await;
     assert_ne!(
         resp.status().as_u16(),
         404,
@@ -266,7 +302,7 @@ async fn legacy_admin_aliases_denied_locally_not_proxied_to_publisher() {
                 .body(edgezero_core::body::Body::from("{\"key_id\":\"leak-me\"}"))
                 .expect("should build authorized legacy-alias request");
 
-            let resp = router.oneshot(req).await;
+            let resp = route(router, req).await;
 
             assert_eq!(
                 resp.status().as_u16(),
@@ -290,7 +326,7 @@ async fn auction_is_routed() {
         .header("content-type", "application/json")
         .body(edgezero_core::body::Body::from(r#"{"adUnits":[]}"#))
         .expect("should build request");
-    let resp = router.oneshot(req).await;
+    let resp = route(router, req).await;
     assert_ne!(resp.status().as_u16(), 404, "/auction must be routed");
 }
 
@@ -307,7 +343,7 @@ async fn head_root_reaches_publisher_fallback() {
         .uri("/")
         .body(edgezero_core::body::Body::empty())
         .expect("should build request");
-    let resp = router.oneshot(req).await;
+    let resp = route(router, req).await;
     assert_ne!(
         resp.status().as_u16(),
         405,
@@ -323,7 +359,7 @@ async fn options_page_reaches_publisher_fallback() {
         .uri("/some/page")
         .body(edgezero_core::body::Body::empty())
         .expect("should build request");
-    let resp = router.oneshot(req).await;
+    let resp = route(router, req).await;
     assert_ne!(
         resp.status().as_u16(),
         405,
@@ -341,7 +377,7 @@ async fn head_named_get_route_reaches_publisher_fallback() {
         .uri("/first-party/proxy")
         .body(edgezero_core::body::Body::empty())
         .expect("should build request");
-    let resp = router.oneshot(req).await;
+    let resp = route(router, req).await;
     assert_ne!(
         resp.status().as_u16(),
         405,
@@ -357,7 +393,7 @@ async fn first_party_proxy_is_routed() {
         .uri("/first-party/proxy")
         .body(edgezero_core::body::Body::empty())
         .expect("should build request");
-    let resp = router.oneshot(req).await;
+    let resp = route(router, req).await;
     assert_ne!(
         resp.status().as_u16(),
         404,
@@ -373,7 +409,7 @@ async fn first_party_click_is_routed() {
         .uri("/first-party/click")
         .body(edgezero_core::body::Body::empty())
         .expect("should build request");
-    let resp = router.oneshot(req).await;
+    let resp = route(router, req).await;
     assert_ne!(
         resp.status().as_u16(),
         404,
@@ -389,7 +425,7 @@ async fn first_party_sign_get_is_routed() {
         .uri("/first-party/sign")
         .body(edgezero_core::body::Body::empty())
         .expect("should build request");
-    let resp = router.oneshot(req).await;
+    let resp = route(router, req).await;
     assert_ne!(
         resp.status().as_u16(),
         404,
@@ -406,7 +442,7 @@ async fn first_party_sign_post_is_routed() {
         .header("content-type", "application/json")
         .body(edgezero_core::body::Body::from("{}"))
         .expect("should build request");
-    let resp = router.oneshot(req).await;
+    let resp = route(router, req).await;
     assert_ne!(
         resp.status().as_u16(),
         404,
@@ -423,7 +459,7 @@ async fn first_party_proxy_rebuild_is_routed() {
         .header("content-type", "application/json")
         .body(edgezero_core::body::Body::from("{}"))
         .expect("should build request");
-    let resp = router.oneshot(req).await;
+    let resp = route(router, req).await;
     assert_ne!(
         resp.status().as_u16(),
         404,
@@ -465,13 +501,13 @@ async fn first_party_sign_get_with_path_only_uri_signs_target() {
         )
         .body(edgezero_core::body::Body::empty())
         .expect("should build request");
-    let resp = router.oneshot(req).await;
+    let resp = route(router, req).await;
     assert_eq!(
         resp.status().as_u16(),
         200,
         "GET /first-party/sign must parse its query from the reconstructed absolute URI"
     );
-    let body = String::from_utf8(resp.into_body().into_bytes().to_vec())
+    let body = String::from_utf8(resp.into_body().into_bytes().unwrap_or_default().to_vec())
         .expect("sign response body should be UTF-8");
     assert!(
         body.contains("\"href\""),
@@ -498,14 +534,20 @@ async fn first_party_proxy_round_trip_through_spin_router() {
         )
         .body(edgezero_core::body::Body::empty())
         .expect("should build request");
-    let sign_resp = router.oneshot(sign_req).await;
+    let sign_resp = route(router, sign_req).await;
     assert_eq!(
         sign_resp.status().as_u16(),
         200,
         "sign step must succeed before the proxy round-trip"
     );
-    let sign_body = String::from_utf8(sign_resp.into_body().into_bytes().to_vec())
-        .expect("sign response body should be UTF-8");
+    let sign_body = String::from_utf8(
+        sign_resp
+            .into_body()
+            .into_bytes()
+            .unwrap_or_default()
+            .to_vec(),
+    )
+    .expect("sign response body should be UTF-8");
     let href = json_string_field(&sign_body, "href")
         .expect("sign response must include a signed href path");
     assert!(
@@ -513,6 +555,7 @@ async fn first_party_proxy_round_trip_through_spin_router() {
         "signed href must target the proxy path, got: {href}"
     );
 
+    let router = test_router();
     let proxy_req = request_builder()
         .method("GET")
         .uri(href.clone())
@@ -522,7 +565,7 @@ async fn first_party_proxy_round_trip_through_spin_router() {
         )
         .body(edgezero_core::body::Body::empty())
         .expect("should build proxy request");
-    let proxy_resp = router.oneshot(proxy_req).await;
+    let proxy_resp = route(router, proxy_req).await;
     let status = proxy_resp.status().as_u16();
     assert_ne!(
         status, 400,
@@ -544,7 +587,7 @@ async fn admin_route_without_credentials_returns_401() {
         .header("content-type", "application/json")
         .body(edgezero_core::body::Body::from("{}"))
         .expect("should build request");
-    let resp = router.oneshot(req).await;
+    let resp = route(router, req).await;
     assert_eq!(
         resp.status().as_u16(),
         401,
@@ -561,7 +604,7 @@ async fn admin_route_without_credentials_includes_www_authenticate_header() {
         .header("content-type", "application/json")
         .body(edgezero_core::body::Body::from("{}"))
         .expect("should build request");
-    let resp = router.oneshot(req).await;
+    let resp = route(router, req).await;
     assert_eq!(
         resp.status().as_u16(),
         401,
@@ -595,7 +638,7 @@ async fn admin_route_with_wrong_credentials_returns_401() {
         .header("authorization", format!("Basic {creds}"))
         .body(edgezero_core::body::Body::from("{}"))
         .expect("should build request");
-    let resp = router.oneshot(req).await;
+    let resp = route(router, req).await;
     assert_eq!(
         resp.status().as_u16(),
         401,
@@ -611,7 +654,7 @@ async fn discovery_endpoint_does_not_require_auth() {
         .uri("/.well-known/trusted-server.json")
         .body(edgezero_core::body::Body::empty())
         .expect("should build request");
-    let resp = router.oneshot(req).await;
+    let resp = route(router, req).await;
     assert_ne!(
         resp.status().as_u16(),
         401,
@@ -628,7 +671,7 @@ async fn auction_endpoint_does_not_require_auth() {
         .header("content-type", "application/json")
         .body(edgezero_core::body::Body::from(r#"{"adUnits":[]}"#))
         .expect("should build request");
-    let resp = router.oneshot(req).await;
+    let resp = route(router, req).await;
     assert_ne!(
         resp.status().as_u16(),
         401,
@@ -649,7 +692,7 @@ async fn admin_rotate_key_auth_fail_returns_401() {
         .header("content-type", "application/json")
         .body(edgezero_core::body::Body::from(r#"{"keyId":"test-key"}"#))
         .expect("should build request");
-    let resp = router.oneshot(req).await;
+    let resp = route(router, req).await;
     assert_eq!(
         resp.status().as_u16(),
         401,
@@ -666,7 +709,7 @@ async fn admin_deactivate_key_auth_fail_returns_401() {
         .header("content-type", "application/json")
         .body(edgezero_core::body::Body::from(r#"{"keyId":"test-key"}"#))
         .expect("should build request");
-    let resp = router.oneshot(req).await;
+    let resp = route(router, req).await;
     assert_eq!(
         resp.status().as_u16(),
         401,

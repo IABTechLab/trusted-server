@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use edgezero_core::body::Body as EdgeBody;
-use edgezero_core::http::{request_builder, HeaderMap, HeaderName};
+use edgezero_core::http::{HeaderMap, HeaderName, request_builder};
 use error_stack::{Report, ResultExt};
-use http::{header, Method, Request, Response, StatusCode};
+use http::{Method, Request, Response, StatusCode, header};
 use url::Url;
 
 use crate::error::TrustedServerError;
@@ -13,8 +13,8 @@ use crate::integrations::{
 use crate::platform::{PlatformBackendSpec, PlatformHttpRequest, RuntimeServices, StoreName};
 use crate::redacted::Redacted;
 
-use super::protection_scope::{ProtectionRequestFacts, ProtectionScopeDecision};
 use super::DataDomeIntegration;
+use super::protection_scope::{ProtectionRequestFacts, ProtectionScopeDecision};
 
 const VALIDATE_REQUEST_PATH: &str = "/validate-request";
 const REQUEST_MODULE_NAME: &str = "Trusted-Server-Rust";
@@ -159,6 +159,7 @@ impl DataDomeIntegration {
             host_header_override: None,
             certificate_check: true,
             first_byte_timeout: Duration::from_millis(u64::from(self.config.timeout_ms)),
+            between_bytes_timeout: Duration::from_millis(u64::from(self.config.timeout_ms)),
         };
 
         services.backend().ensure(&spec).change_context(Self::error(
@@ -390,7 +391,7 @@ impl DataDomeIntegration {
                     );
                     return RequestFilterDecision::Continue(RequestFilterEffects::default());
                 }
-                let body_bytes = body.into_bytes();
+                let body_bytes = body.into_bytes().unwrap_or_default();
                 EdgeBody::from(body_bytes.as_ref().to_vec())
             };
             let challenge = Response::builder()
@@ -647,7 +648,7 @@ mod tests {
 
     use crate::integrations::datadome::DataDomeConfig;
     use crate::platform::test_support::{
-        build_services_with_config_and_secret, HashMapSecretStore, NoopConfigStore, NoopSecretStore,
+        HashMapSecretStore, NoopConfigStore, NoopSecretStore, build_services_with_config_and_secret,
     };
     use crate::settings::Settings;
 
@@ -789,7 +790,11 @@ mod tests {
             "should preserve challenge status"
         );
         assert_eq!(
-            response.into_body().into_bytes().as_ref(),
+            response
+                .into_body()
+                .into_bytes()
+                .unwrap_or_default()
+                .as_ref(),
             b"",
             "HEAD challenges should not include a response body"
         );

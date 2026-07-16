@@ -53,9 +53,15 @@ pub struct AdFormat {
 }
 
 /// Media type enumeration.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `Default` is `Banner` for programmatic construction only. Do **not** add
+/// `#[serde(default)]` to any field of this type: it would coerce an
+/// unknown/missing media type to `Banner` rather than failing, silently
+/// mis-typing video/native slots. Deserialization must stay strict.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum MediaType {
+    #[default]
     Banner,
     Video,
     Native,
@@ -83,11 +89,13 @@ pub struct UserInfo {
     /// cookies/headers, not from stored data.
     #[serde(skip)]
     pub consent: Option<crate::consent::ConsentContext>,
-    /// Consent-gated Extended User IDs resolved from the KV identity graph.
+    /// Extended User IDs parsed from the [`crate::constants::COOKIE_TS_EIDS`] cookie.
     ///
-    /// Populated by the auction handler from partner data when the user has
-    /// a valid EC and consent permits EID transmission. `None` when no EIDs
-    /// are available (no EC, consent denied, or KV read failure).
+    /// Raw (un-gated) values from the browser; consent gating via
+    /// [`crate::consent::gate_eids_by_consent`] is applied centrally in the
+    /// endpoint handlers (the auction and page-bids paths) before any EID
+    /// reaches a bid request — the provider layer just forwards already-gated
+    /// EIDs.
     #[serde(skip)]
     pub eids: Option<Vec<crate::openrtb::Eid>>,
 }
@@ -108,6 +116,29 @@ pub struct SiteInfo {
 }
 
 /// Context passed to auction providers.
+///
+/// # The `request` field is path-dependent
+///
+/// `request` carries the **real downstream client request** in the dispatch
+/// path ([`AuctionOrchestrator::run_auction`][run] and
+/// [`dispatch_auction`][dispatch]). Providers there can read client headers
+/// (DNT, User-Agent, cookies, X-* customs) directly off it.
+///
+/// In the **collect path** ([`collect_dispatched_auction`][collect]) the
+/// mediator is invoked with a synthetic placeholder request
+/// (`https://placeholder.invalid/`), because the real client request has
+/// already been consumed by `send_async` during dispatch and the host pipeline
+/// can't lend it across the `.await`. **Mediators must not depend on reading
+/// client state from `context.request`** — the placeholder has none of the
+/// real headers. If a future mediator needs that data, snapshot it into a new
+/// field on this struct at dispatch time and stash it on the
+/// [`DispatchedAuction`] token so collect can attach it to the mediator's
+/// context. See <https://github.com/IABTechLab/trusted-server/issues/680>
+/// (P2-1) for the open follow-up.
+///
+/// [run]: crate::auction::AuctionOrchestrator::run_auction
+/// [dispatch]: crate::auction::AuctionOrchestrator::dispatch_auction
+/// [collect]: crate::auction::AuctionOrchestrator::collect_dispatched_auction
 pub struct AuctionContext<'a> {
     pub settings: &'a Settings,
     pub request: &'a Request<EdgeBody>,
@@ -118,6 +149,12 @@ pub struct AuctionContext<'a> {
     /// Platform services (config store, secret store, etc.) for use by providers.
     pub services: &'a RuntimeServices,
 }
+
+/// URL used by the orchestrator when invoking a mediator from the collect
+/// path. Providers can `debug_assert` against this value to catch a mediator
+/// that has accidentally started depending on `context.request` carrying real
+/// client headers.
+pub const MEDIATOR_PLACEHOLDER_URL: &str = "https://placeholder.invalid/";
 
 /// Response from a single auction provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +196,24 @@ pub struct Bid {
     pub nurl: Option<String>,
     /// Billing notification URL
     pub burl: Option<String>,
+    /// Ad ID from the bidder
+    pub ad_id: Option<String>,
+    /// Prebid Cache UUID for this bid.
+    ///
+    /// Populated from `ext.prebid.cache.bids.cacheId` in the PBS response.
+    /// Used as `hb_adid` targeting value in `window.tsjs.bids`. `None` for
+    /// non-PBS providers (e.g., APS) and PBS bids without Prebid Cache enabled.
+    pub cache_id: Option<String>,
+    /// Prebid Cache host (e.g., `"openads.adsrvr.org"`).
+    ///
+    /// Populated from the host of `ext.prebid.cache.bids.url`. Used as
+    /// `hb_cache_host` targeting value. `None` when cache is absent.
+    pub cache_host: Option<String>,
+    /// Prebid Cache path (e.g., `"/cache"`).
+    ///
+    /// Populated from the path of `ext.prebid.cache.bids.url`. Used as
+    /// `hb_cache_path` targeting value. `None` when cache is absent.
+    pub cache_path: Option<String>,
     /// Provider-specific bid metadata
     /// For APS bids, contains encoded price in "amznbid" field
     pub metadata: HashMap<String, serde_json::Value>,
@@ -283,6 +338,10 @@ mod tests {
             height: 250,
             nurl: None,
             burl: None,
+            ad_id: None,
+            cache_id: None,
+            cache_host: None,
+            cache_path: None,
             metadata: HashMap::new(),
         }
     }
@@ -393,5 +452,74 @@ mod tests {
             json.get("metadata").is_none(),
             "should omit metadata field when empty"
         );
+    }
+
+    #[test]
+    fn bid_with_cache_fields_round_trips_through_json() {
+        let bid = Bid {
+            slot_id: "atf".to_string(),
+            price: Some(1.50),
+            currency: "USD".to_string(),
+            creative: None,
+            adomain: None,
+            bidder: "thetradedesk".to_string(),
+            width: 300,
+            height: 250,
+            nurl: None,
+            burl: None,
+            ad_id: Some("bid-id".to_string()),
+            cache_id: Some("cache-uuid".to_string()),
+            cache_host: Some("cache.example.com".to_string()),
+            cache_path: Some("/pbc/v1/cache".to_string()),
+            metadata: HashMap::new(),
+        };
+        let json = serde_json::to_string(&bid).expect("should serialize Bid");
+        let restored: Bid = serde_json::from_str(&json).expect("should deserialize Bid");
+        assert_eq!(
+            restored.cache_id.as_deref(),
+            Some("cache-uuid"),
+            "should round-trip cache_id"
+        );
+        assert_eq!(
+            restored.cache_host.as_deref(),
+            Some("cache.example.com"),
+            "should round-trip cache_host"
+        );
+        assert_eq!(
+            restored.cache_path.as_deref(),
+            Some("/pbc/v1/cache"),
+            "should round-trip cache_path"
+        );
+    }
+
+    #[test]
+    fn media_type_defaults_to_banner() {
+        assert_eq!(
+            MediaType::default(),
+            MediaType::Banner,
+            "should default to Banner for serde field defaults"
+        );
+    }
+
+    #[test]
+    fn bid_has_ad_id_field() {
+        let bid = Bid {
+            slot_id: "s".to_string(),
+            price: Some(1.0),
+            currency: "USD".to_string(),
+            creative: None,
+            adomain: None,
+            bidder: "kargo".to_string(),
+            width: 300,
+            height: 250,
+            nurl: None,
+            burl: None,
+            ad_id: Some("prebid-ad-id-abc".to_string()),
+            cache_id: None,
+            cache_host: None,
+            cache_path: None,
+            metadata: Default::default(),
+        };
+        assert_eq!(bid.ad_id.as_deref(), Some("prebid-ad-id-abc"));
     }
 }

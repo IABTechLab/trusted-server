@@ -1,7 +1,8 @@
+#[cfg(test)]
 use config::{Config, Environment, File, FileFormat};
 use error_stack::{Report, ResultExt};
 use regex::Regex;
-use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
@@ -12,12 +13,15 @@ use validator::{Validate, ValidationError};
 
 use crate::auction_config_types::AuctionConfig;
 use crate::consent_config::ConsentConfig;
+use crate::creative_opportunities::CreativeOpportunitiesConfig;
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::platform::PlatformImageOptimizerRegion;
 use crate::redacted::Redacted;
 
+#[cfg(test)]
 pub const ENVIRONMENT_VARIABLE_PREFIX: &str = "TRUSTED_SERVER";
+#[cfg(test)]
 pub const ENVIRONMENT_VARIABLE_SEPARATOR: &str = "__";
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
@@ -286,6 +290,7 @@ impl DerefMut for IntegrationSettings {
 /// registered via API. At startup, each partner's `api_token` is hashed
 /// (SHA-256) for O(1) auth lookups; the plaintext is never stored at runtime.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct EcPartner {
     /// Human-readable partner name.
     pub name: String,
@@ -437,6 +442,7 @@ impl EcPartner {
 /// Mapped from the `[ec]` TOML section. Controls EC identity generation,
 /// KV store names, and partner registry.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct Ec {
     /// Publisher passphrase used as HMAC key for EC generation.
     #[validate(custom(function = Ec::validate_passphrase))]
@@ -531,6 +537,7 @@ impl Ec {
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct Rewrite {
     /// List of domains to exclude from rewriting. Supports wildcards (e.g., "*.example.com").
     /// URLs from these domains will not be proxied through first-party endpoints.
@@ -567,6 +574,7 @@ impl Rewrite {
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct Handler {
     #[validate(length(min = 1), custom(function = validate_path))]
     pub path: String,
@@ -580,6 +588,23 @@ pub struct Handler {
 }
 
 impl Handler {
+    /// Known handler password placeholders that must not be used in deployments.
+    pub const PASSWORD_PLACEHOLDERS: &[&str] = &[
+        "replace-with-admin-password-32-bytes",
+        "replace-with-admin-password",
+        "change-me-admin-password",
+    ];
+
+    /// Returns `true` if `password` matches a known placeholder value
+    /// (case-insensitive).
+    #[must_use]
+    pub fn is_placeholder_password(password: &str) -> bool {
+        let password = password.trim();
+        Self::PASSWORD_PLACEHOLDERS
+            .iter()
+            .any(|placeholder| placeholder.eq_ignore_ascii_case(password))
+    }
+
     fn compiled_regex(&self) -> Result<&Regex, Report<TrustedServerError>> {
         match self
             .regex
@@ -615,6 +640,7 @@ impl Handler {
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RequestSigning {
     #[serde(default = "default_request_signing_enabled")]
     pub enabled: bool,
@@ -690,7 +716,7 @@ pub enum OriginQueryPolicy {
 
 /// Authentication configuration for an asset origin.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AssetOriginAuth {
     /// Sign asset origin requests with AWS Signature Version 4 for `S3`.
     #[serde(rename = "s3_sigv4", alias = "s3_sig_v4")]
@@ -801,6 +827,7 @@ impl S3SigV4AuthConfig {
 /// transformation table lives under top-level [`ImageOptimizerSettings`] so
 /// multiple routes can share one closed set of profiles.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AssetImageOptimizerConfig {
     /// Enables Image Optimizer for this route when the table is present.
     #[serde(
@@ -867,6 +894,7 @@ pub enum UnknownProfilePolicy {
 /// site-specific profile tables in private configuration overlays when those
 /// values should not be committed to the public repository.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImageOptimizerSettings {
     /// Named profile sets referenced by asset routes.
     #[serde(default)]
@@ -901,6 +929,7 @@ impl ImageOptimizerSettings {
 /// supported subset: `quality`, `resize-filter`, `format`, `width`, `height`,
 /// and `crop`. Profile-specific parameters override [`Self::base_params`].
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImageOptimizerProfileSet {
     /// Params applied to every profile before profile-specific params.
     #[serde(default)]
@@ -991,6 +1020,7 @@ impl ImageOptimizerProfileSet {
 /// profile crop is replaced with an aspect-ratio crop derived from the request
 /// query value.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImageOptimizerAspectRatioConfig {
     /// Allowed aspect ratio query values such as `1-1` or `16-9`.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
@@ -1059,6 +1089,7 @@ pub enum MissingCropOffsetMode {
 /// Offset bucketing caps output variant cardinality. Request values outside
 /// `0..=100` or values that fail to parse fall back to [`Self::default`].
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImageOptimizerCropOffsetsConfig {
     /// Enable crop offset normalization.
     #[serde(
@@ -1180,8 +1211,9 @@ fn validate_image_optimizer_format(
     value: &str,
 ) -> Result<(), Report<TrustedServerError>> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "auto" | "avif" | "gif" | "jpeg" | "jpg" | "jxl" | "jpegxl" | "mp4" | "png"
-        | "webp" => Ok(()),
+        "auto" | "avif" | "gif" | "jpeg" | "jpg" | "jxl" | "jpegxl" | "mp4" | "png" | "webp" => {
+            Ok(())
+        }
         _ => Err(Report::new(TrustedServerError::Configuration {
             message: format!(
                 "image_optimizer.profile_sets `{set_name}` profile `{profile_name}` has unsupported format `{value}`"
@@ -1310,6 +1342,7 @@ fn validate_crop_param(
 
 /// A path-prefix asset route that proxies matched first-party requests to an alternate origin.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProxyAssetRoute {
     /// Path prefix matched against the incoming request path. Must start with `/`.
     ///
@@ -1554,6 +1587,7 @@ impl ProxyAssetRoute {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Proxy {
     /// Enable TLS certificate verification when proxying to HTTPS origins.
     /// Defaults to true for secure production use.
@@ -1581,10 +1615,11 @@ fn default_certificate_check() -> bool {
 }
 
 fn is_admin_placeholder_password(password: &str) -> bool {
-    matches!(
-        password.trim().to_ascii_lowercase().as_str(),
-        "changeme" | "password" | "admin"
-    )
+    Handler::is_placeholder_password(password)
+        || matches!(
+            password.trim().to_ascii_lowercase().as_str(),
+            "changeme" | "password" | "admin"
+        )
 }
 
 impl Default for Proxy {
@@ -1623,7 +1658,7 @@ impl Proxy {
         }
 
         if self.allowed_domains.is_empty() {
-            log::info!(
+            log::debug!(
                 "proxy.allowed_domains is empty: all redirect destinations are permitted (open mode)"
             );
         }
@@ -1687,8 +1722,177 @@ impl Proxy {
     }
 }
 
+/// Direct Tinybird Events API telemetry configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TinybirdSettings {
+    /// Master enablement for auction telemetry ingestion.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Regional Tinybird API host, without scheme or path.
+    #[serde(default)]
+    pub api_host: String,
+    /// Fastly Secret Store name containing Tinybird append tokens.
+    #[serde(default = "default_tinybird_secret_store")]
+    pub secret_store: String,
+    /// Auction Events API datasource name.
+    #[serde(default = "default_tinybird_auction_dataset")]
+    pub auction_dataset: String,
+    /// Secret key containing the auction datasource APPEND token.
+    #[serde(default = "default_tinybird_auction_token_secret")]
+    pub auction_token_secret: String,
+    /// Reserved for future access-log telemetry.
+    ///
+    /// `true` is rejected until an access-log emitter is wired, so operators
+    /// cannot enable a setting that silently emits nothing.
+    #[serde(default)]
+    pub access_enabled: bool,
+    /// Future access-log Events API datasource name.
+    #[serde(default = "default_tinybird_access_dataset")]
+    pub access_dataset: String,
+    /// Future Secret Store key containing the access-log datasource APPEND token.
+    #[serde(default = "default_tinybird_access_token_secret")]
+    pub access_token_secret: String,
+    /// Future fraction of requests to emit for optional access telemetry.
+    #[serde(default)]
+    pub access_sample_rate: f64,
+    /// Defensive maximum NDJSON body size for one Events API request.
+    #[serde(default = "default_tinybird_max_body_bytes")]
+    pub max_body_bytes: usize,
+}
+
+fn default_tinybird_secret_store() -> String {
+    "ts_secrets".to_owned()
+}
+
+fn default_tinybird_auction_dataset() -> String {
+    "auction_events_raw".to_owned()
+}
+
+fn default_tinybird_auction_token_secret() -> String {
+    "tinybird_auction_append_token".to_owned()
+}
+
+fn default_tinybird_access_dataset() -> String {
+    "access_logs_raw".to_owned()
+}
+
+fn default_tinybird_access_token_secret() -> String {
+    "tinybird_access_append_token".to_owned()
+}
+
+fn default_tinybird_max_body_bytes() -> usize {
+    1024 * 1024
+}
+
+impl Default for TinybirdSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_host: String::new(),
+            secret_store: default_tinybird_secret_store(),
+            auction_dataset: default_tinybird_auction_dataset(),
+            auction_token_secret: default_tinybird_auction_token_secret(),
+            access_enabled: false,
+            access_dataset: default_tinybird_access_dataset(),
+            access_token_secret: default_tinybird_access_token_secret(),
+            access_sample_rate: 0.0,
+            max_body_bytes: default_tinybird_max_body_bytes(),
+        }
+    }
+}
+
+impl TinybirdSettings {
+    fn normalize(&mut self) {
+        self.api_host = self.api_host.trim().to_ascii_lowercase();
+        self.secret_store = self.secret_store.trim().to_owned();
+        self.auction_dataset = self.auction_dataset.trim().to_owned();
+        self.auction_token_secret = self.auction_token_secret.trim().to_owned();
+        self.access_dataset = self.access_dataset.trim().to_owned();
+        self.access_token_secret = self.access_token_secret.trim().to_owned();
+    }
+
+    fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
+        self.normalize();
+        if !(0.0..=1.0).contains(&self.access_sample_rate) {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "tinybird.access_sample_rate must be between 0.0 and 1.0".to_owned(),
+            }));
+        }
+        if self.max_body_bytes < 1024 {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "tinybird.max_body_bytes must be at least 1024".to_owned(),
+            }));
+        }
+        if self.access_enabled {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "tinybird.access_enabled is reserved for future access-log telemetry; no emitter is currently wired".to_owned(),
+            }));
+        }
+        if !self.enabled {
+            return Ok(());
+        }
+        validate_tinybird_api_host(&self.api_host)?;
+        if self.secret_store.is_empty() {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message:
+                    "tinybird.secret_store must not be empty when Tinybird telemetry is enabled"
+                        .to_owned(),
+            }));
+        }
+        if self.enabled {
+            validate_tinybird_dataset(&self.auction_dataset, "tinybird.auction_dataset")?;
+            validate_tinybird_secret(&self.auction_token_secret, "tinybird.auction_token_secret")?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_tinybird_api_host(host: &str) -> Result<(), Report<TrustedServerError>> {
+    if host.is_empty()
+        || host.contains('/')
+        || host.contains(':')
+        || host.chars().any(char::is_control)
+        || host.starts_with("http://")
+        || host.starts_with("https://")
+    {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: "tinybird.api_host must be a regional host without scheme, port, or path"
+                .to_owned(),
+        }));
+    }
+    validate_host_header_override_value(host).map_err(|reason| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!("tinybird.api_host {reason}"),
+        })
+    })
+}
+
+fn validate_tinybird_dataset(value: &str, setting: &str) -> Result<(), Report<TrustedServerError>> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: format!("{setting} must be a non-empty datasource identifier"),
+        }));
+    }
+    Ok(())
+}
+
+fn validate_tinybird_secret(value: &str, setting: &str) -> Result<(), Report<TrustedServerError>> {
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: format!("{setting} must be a non-empty Secret Store key"),
+        }));
+    }
+    Ok(())
+}
+
 /// Debug-only features. All flags default to `false` (off in production).
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DebugConfig {
     /// Expose the JA4/TLS fingerprint debug endpoint at `GET /_ts/debug/ja4`.
     ///
@@ -1697,6 +1901,21 @@ pub struct DebugConfig {
     /// Fastly-observed TLS details that browser JS cannot normally read.
     #[serde(default)]
     pub ja4_endpoint_enabled: bool,
+
+    /// Inject a `<!-- ts-debug: ... -->` HTML comment before `</body>` showing
+    /// auction pipeline stats (SSP count, mediator status, winning bid count).
+    /// Never enable in production — visible in page source.
+    #[serde(default)]
+    pub auction_html_comment: bool,
+
+    /// Include raw `adm` creative markup in `window.tsjs.bids` for GPT/GAM
+    /// debug rendering through the Prebid Universal Creative bridge.
+    ///
+    /// Use this to validate the server-side auction→GAM targeting→creative
+    /// rendering pipeline while PBS Cache is unavailable. Never enable in
+    /// production — injects raw HTML from SSPs.
+    #[serde(default)]
+    pub inject_adm_for_testing: bool,
 }
 
 /// Tester-cookie endpoint configuration.
@@ -1708,6 +1927,7 @@ pub struct TesterCookieConfig {
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct Settings {
     #[validate(nested)]
     pub publisher: Publisher,
@@ -1734,52 +1954,59 @@ pub struct Settings {
     #[serde(default)]
     pub proxy: Proxy,
     #[serde(default)]
+    pub creative_opportunities: Option<CreativeOpportunitiesConfig>,
+    #[serde(default)]
     pub image_optimizer: ImageOptimizerSettings,
+    #[serde(default)]
+    pub tinybird: TinybirdSettings,
     #[serde(default)]
     pub debug: DebugConfig,
 }
 
 impl Settings {
-    /// Creates a new [`Settings`] instance from a pre-built TOML string.
-    ///
-    /// Use this for the runtime path where the TOML has already been
-    /// fully resolved (env vars baked in by build.rs).
+    /// Creates a new [`Settings`] instance from a TOML string.
     ///
     /// # Errors
     ///
     /// - [`TrustedServerError::Configuration`] if the TOML is invalid or missing required fields
     pub fn from_toml(toml_str: &str) -> Result<Self, Report<TrustedServerError>> {
-        let mut settings: Self =
+        let settings: Self =
             toml::from_str(toml_str).change_context(TrustedServerError::Configuration {
                 message: "Failed to deserialize TOML configuration".to_string(),
             })?;
 
-        settings.proxy.normalize();
-        settings.image_optimizer.normalize();
-        settings.consent.validate();
-        settings.prepare_runtime()?;
-
-        settings.validate().map_err(|err| {
-            Report::new(TrustedServerError::Configuration {
-                message: format!("Configuration validation failed: {err}"),
-            })
-        })?;
-
-        settings.validate_admin_coverage()?;
-        settings.validate_admin_handler_passwords()?;
-
-        Ok(settings)
+        Self::finalize_deserialized(settings, "Configuration")
     }
 
-    /// Creates a new [`Settings`] instance from a TOML string, applying
-    /// environment variable overrides using the `TRUSTED_SERVER__` prefix.
+    /// Creates a new [`Settings`] instance from a JSON value.
     ///
-    /// Used by build.rs to merge the base config with env vars before
-    /// baking the result into the binary.
+    /// Runtime config-store loading uses this after verifying the `app_config`
+    /// blob envelope and extracting the same typed settings shape.
+    ///
+    /// # Errors
+    ///
+    /// - [`TrustedServerError::Configuration`] if the JSON value is invalid or missing required fields
+    pub fn from_json_value(value: JsonValue) -> Result<Self, Report<TrustedServerError>> {
+        let settings: Self =
+            serde_json::from_value(value).change_context(TrustedServerError::Configuration {
+                message: "Failed to deserialize JSON configuration".to_string(),
+            })?;
+
+        Self::finalize_deserialized(settings, "Configuration")
+    }
+
+    /// Creates a new [`Settings`] instance from a TOML string with legacy
+    /// test-only `TRUSTED_SERVER__` environment variable overrides.
+    ///
+    /// Runtime loading does not use this legacy helper; `EdgeZero` CLI app-config
+    /// overlays are applied before deserializing [`crate::config::TrustedServerAppConfig`].
+    /// This helper remains available to existing tests that exercise legacy
+    /// parsing behavior.
     ///
     /// # Errors
     ///
     /// - [`TrustedServerError::Configuration`] if the TOML is invalid or missing required fields
+    #[cfg(test)]
     pub fn from_toml_and_env(toml_str: &str) -> Result<Self, Report<TrustedServerError>> {
         let environment = Environment::default()
             .prefix(ENVIRONMENT_VARIABLE_PREFIX)
@@ -1793,25 +2020,33 @@ impl Settings {
             .change_context(TrustedServerError::Configuration {
                 message: "Failed to build configuration".to_string(),
             })?;
-        let mut settings: Self =
+        let settings: Self =
             config
                 .try_deserialize()
                 .change_context(TrustedServerError::Configuration {
                     message: "Failed to deserialize configuration".to_string(),
                 })?;
 
+        Self::finalize_deserialized(settings, "Build-time configuration")
+    }
+
+    pub(crate) fn finalize_deserialized(
+        mut settings: Self,
+        validation_label: &str,
+    ) -> Result<Self, Report<TrustedServerError>> {
         settings.integrations.normalize();
         settings.proxy.normalize();
         settings.image_optimizer.normalize();
         settings.consent.validate();
 
+        settings.prepare_runtime()?;
+
         settings.validate().map_err(|err| {
             Report::new(TrustedServerError::Configuration {
-                message: format!("Build-time configuration validation failed: {err}"),
+                message: format!("{validation_label} validation failed: {err}"),
             })
         })?;
 
-        settings.prepare_runtime()?;
         settings.validate_admin_coverage()?;
         settings.validate_admin_handler_passwords()?;
 
@@ -1822,14 +2057,29 @@ impl Settings {
     ///
     /// # Errors
     ///
-    /// Returns a configuration error if any handler path regex does not compile.
-    pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+    /// Returns a configuration error if any cached runtime artifact cannot be
+    /// prepared, if any handler path regex does not compile, or if a creative
+    /// opportunity slot is invalid.
+    pub fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
         self.image_optimizer.prepare_runtime()?;
         self.proxy.prepare_runtime()?;
+        self.tinybird.prepare_runtime()?;
         self.validate_asset_image_optimizer_profile_sets()?;
 
         for handler in &self.handlers {
             handler.prepare_runtime()?;
+        }
+
+        if let Some(co) = &mut self.creative_opportunities {
+            co.compile_slots();
+            // Slots flow into injected HTML/JS, provider payloads, and GPT
+            // calls. Env/private config can bypass static review, so validate
+            // the full runtime shape on every load path.
+            co.validate_runtime().map_err(|err| {
+                Report::new(TrustedServerError::Configuration {
+                    message: format!("Invalid creative opportunity slot config: {err}"),
+                })
+            })?;
         }
 
         for (name, value) in &self.response_headers {
@@ -1846,6 +2096,17 @@ impl Settings {
         }
 
         Ok(())
+    }
+
+    /// Returns compiled creative opportunity slots, or empty slice if feature is disabled.
+    #[must_use]
+    pub fn creative_opportunity_slots(
+        &self,
+    ) -> &[crate::creative_opportunities::CreativeOpportunitySlot] {
+        self.creative_opportunities
+            .as_ref()
+            .map(|co| co.slot.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Rejects known placeholder secret values.
@@ -1866,6 +2127,11 @@ impl Settings {
         for partner in &self.ec.partners {
             if EcPartner::is_placeholder_api_token(partner.api_token.expose()) {
                 insecure_fields.push(format!("ec.partners[{}].api_token", partner.source_domain));
+            }
+        }
+        for handler in &self.handlers {
+            if Handler::is_placeholder_password(handler.password.expose()) {
+                insecure_fields.push(format!("handlers[{}].password", handler.path));
             }
         }
 
@@ -1930,7 +2196,7 @@ impl Settings {
 
     /// Known admin endpoint paths that must be covered by a handler.
     ///
-    /// [`from_toml_and_env`](Self::from_toml_and_env) rejects configurations
+    /// [`from_toml`](Self::from_toml) rejects configurations
     /// where any of these paths lack a matching handler, ensuring admin
     /// endpoints are always protected by authentication.
     /// Update [`ADMIN_ENDPOINTS`](Self::ADMIN_ENDPOINTS) when adding new
@@ -1940,8 +2206,8 @@ impl Settings {
 
     /// Returns admin endpoint paths that no configured handler covers.
     ///
-    /// Called by [`from_toml_and_env`](Self::from_toml_and_env) at build time
-    /// to enforce that every admin endpoint has a handler. An empty return
+    /// Called during settings finalization to enforce that every admin endpoint
+    /// has a handler. An empty return
     /// value means all admin endpoints are properly covered.
     ///
     /// # Errors
@@ -2326,15 +2592,73 @@ mod tests {
 
     use crate::auction::build_orchestrator;
     use crate::integrations::{
+        IntegrationRegistry,
         datadome::{DataDomeConfig, ProtectionMatcherConfig},
         gpt::GptConfig,
         nextjs::NextJsIntegrationConfig,
         prebid::PrebidIntegrationConfig,
         testlight::TestlightConfig,
-        IntegrationRegistry,
     };
     use crate::redacted::Redacted;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
+
+    #[test]
+    fn tinybird_defaults_to_disabled_placeholders() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse settings without tinybird block");
+
+        assert!(
+            !settings.tinybird.enabled,
+            "Tinybird should default disabled"
+        );
+        assert_eq!(settings.tinybird.secret_store, "ts_secrets");
+        assert_eq!(settings.tinybird.auction_dataset, "auction_events_raw");
+        assert_eq!(
+            settings.tinybird.auction_token_secret,
+            "tinybird_auction_append_token"
+        );
+    }
+
+    #[test]
+    fn tinybird_enabled_requires_host_dataset_and_token() {
+        let toml = format!(
+            "{}\n[tinybird]\nenabled = true\napi_host = \"https://api.example.com/path\"\n",
+            crate_test_settings_str()
+        );
+
+        let err = Settings::from_toml(&toml).expect_err("should reject invalid api host");
+        assert!(
+            format!("{err:?}").contains("tinybird.api_host"),
+            "should report tinybird.api_host validation error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn tinybird_accepts_region_host_without_scheme() {
+        let toml = format!(
+            "{}\n[tinybird]\nenabled = true\napi_host = \"api.us-east.aws.tinybird.co\"\n",
+            crate_test_settings_str()
+        );
+
+        let settings = Settings::from_toml(&toml).expect("should accept Tinybird region host");
+        assert!(settings.tinybird.enabled);
+        assert_eq!(settings.tinybird.api_host, "api.us-east.aws.tinybird.co");
+    }
+
+    #[test]
+    fn tinybird_access_enabled_is_rejected_until_emitter_is_wired() {
+        let toml = format!(
+            "{}\n[tinybird]\naccess_enabled = true\n",
+            crate_test_settings_str()
+        );
+
+        let err = Settings::from_toml(&toml)
+            .expect_err("should reject access telemetry before emitter exists");
+        assert!(
+            format!("{err:?}").contains("tinybird.access_enabled"),
+            "should report unsupported tinybird.access_enabled setting: {err:?}"
+        );
+    }
 
     #[test]
     fn test_settings_from_valid_toml() {
@@ -2681,6 +3005,32 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     #[test]
+    fn is_placeholder_handler_password_rejects_known_template_value() {
+        assert!(
+            Handler::is_placeholder_password("replace-with-admin-password-32-bytes"),
+            "init-template handler password should be rejected"
+        );
+    }
+
+    #[test]
+    fn reject_placeholder_secrets_includes_handler_passwords() {
+        let mut settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        settings.publisher.proxy_secret = Redacted::new("unit-test-proxy-secret".to_owned());
+        settings.ec.passphrase = Redacted::new("test-secret-key-32-bytes-minimum".to_owned());
+        settings.handlers[0].password =
+            Redacted::new("replace-with-admin-password-32-bytes".to_owned());
+
+        let err = settings
+            .reject_placeholder_secrets()
+            .expect_err("should reject placeholder handler password");
+        assert!(
+            format!("{err:?}").contains("handlers"),
+            "error should mention handler password field"
+        );
+    }
+
+    #[test]
     fn test_settings_empty_toml() {
         let toml_str = "";
         let settings = Settings::from_toml(toml_str);
@@ -3018,10 +3368,7 @@ origin_host_header_overide = "www.example.com""#,
             [
                 (origin_key, Some("https://origin.test-publisher.com")),
                 (format!("{datadome_prefix}ENABLED"), Some("true")),
-                (
-                    format!("{datadome_prefix}ENABLE_PROTECTION"),
-                    Some("true"),
-                ),
+                (format!("{datadome_prefix}ENABLE_PROTECTION"), Some("true")),
                 (
                     format!("{datadome_prefix}PROTECTION_EXCLUDED_METHODS{separator}0"),
                     Some("OPTIONS"),
@@ -3055,19 +3402,27 @@ origin_host_header_overide = "www.example.com""#,
                     Some("legacy-static-get-head"),
                 ),
                 (
-                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}METHODS{separator}0"),
+                    format!(
+                        "{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}METHODS{separator}0"
+                    ),
                     Some("GET"),
                 ),
                 (
-                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}METHODS{separator}1"),
+                    format!(
+                        "{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}METHODS{separator}1"
+                    ),
                     Some("HEAD"),
                 ),
                 (
-                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}TYPE"),
+                    format!(
+                        "{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}TYPE"
+                    ),
                     Some("path_regex"),
                 ),
                 (
-                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}PATTERNS{separator}0"),
+                    format!(
+                        "{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}PATTERNS{separator}0"
+                    ),
                     Some(r"(?i)\.(css|js)$"),
                 ),
                 (
@@ -3075,11 +3430,15 @@ origin_host_header_overide = "www.example.com""#,
                     Some("next-rsc"),
                 ),
                 (
-                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}1{separator}TYPE"),
+                    format!(
+                        "{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}1{separator}TYPE"
+                    ),
                     Some("query_param_non_empty"),
                 ),
                 (
-                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}1{separator}NAMES{separator}0"),
+                    format!(
+                        "{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}1{separator}NAMES{separator}0"
+                    ),
                     Some("_rsc"),
                 ),
             ],
@@ -3107,8 +3466,7 @@ origin_host_header_overide = "www.example.com""#,
                     "should parse indexed IP CIDR list"
                 );
                 assert_eq!(
-                    cfg.protection_excluded_ip_cidr_sources[0].key,
-                    "googlebot_ips",
+                    cfg.protection_excluded_ip_cidr_sources[0].key, "googlebot_ips",
                     "should parse indexed CIDR source list"
                 );
                 assert!(matches!(
@@ -3394,7 +3752,10 @@ origin_host_header_overide = "www.example.com""#,
         let toml_str = crate_test_settings_str() + "\nhello = 1";
 
         let settings = Settings::from_toml(&toml_str);
-        assert!(settings.is_ok(), "Extra fields should be ignored");
+        assert!(
+            settings.is_err(),
+            "unknown top-level fields should be rejected"
+        );
     }
 
     #[test]
@@ -4369,67 +4730,99 @@ origin_host_header_overide = "www.example.com""#,
         let separator = ENVIRONMENT_VARIABLE_SEPARATOR;
         let vars = [
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}PREFIX"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}PREFIX"
+                ),
                 Some("/.image/"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}ORIGIN_URL"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}ORIGIN_URL"
+                ),
                 Some("https://bucket.s3.us-west-2.amazonaws.com"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}AUTH{separator}TYPE"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}AUTH{separator}TYPE"
+                ),
                 Some("s3_sigv4"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}AUTH{separator}REGION"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}AUTH{separator}REGION"
+                ),
                 Some("us-west-2"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}AUTH{separator}ORIGIN_QUERY"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}AUTH{separator}ORIGIN_QUERY"
+                ),
                 Some("strip"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}IMAGE_OPTIMIZER{separator}ENABLED"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}IMAGE_OPTIMIZER{separator}ENABLED"
+                ),
                 Some("true"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}IMAGE_OPTIMIZER{separator}REGION"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}IMAGE_OPTIMIZER{separator}REGION"
+                ),
                 Some("us_west"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}IMAGE_OPTIMIZER{separator}PROFILE_SET"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}IMAGE_OPTIMIZER{separator}PROFILE_SET"
+                ),
                 Some("default_images"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}BASE_PARAMS"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}BASE_PARAMS"
+                ),
                 Some("quality=70&resize-filter=bicubic"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}DEFAULT_PROFILE"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}DEFAULT_PROFILE"
+                ),
                 Some("w828"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}PROFILES{separator}W828"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}PROFILES{separator}W828"
+                ),
                 Some("format=auto&width=828"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}PROFILES{separator}W1536"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}PROFILES{separator}W1536"
+                ),
                 Some("format=auto&width=1536"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}ASPECT_RATIOS{separator}ALLOWED"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}ASPECT_RATIOS{separator}ALLOWED"
+                ),
                 Some("[\"1-1\",\"16-9\"]"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}ASPECT_RATIOS{separator}PROFILES"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}ASPECT_RATIOS{separator}PROFILES"
+                ),
                 Some("[\"w828\",\"w1536\"]"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}CROP_OFFSETS{separator}ENABLED"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}CROP_OFFSETS{separator}ENABLED"
+                ),
                 Some("true"),
             ),
             (
-                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}CROP_OFFSETS{separator}BUCKETS"),
+                format!(
+                    "{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}CROP_OFFSETS{separator}BUCKETS"
+                ),
                 Some("[10,30,50,70,90]"),
             ),
         ];
@@ -4960,33 +5353,237 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     /// Verifies that [`Settings::ADMIN_ENDPOINTS`] stays in sync with the
-    /// admin route table in `crates/trusted-server-adapter-fastly/src/main.rs`.
+    /// admin route table in `crates/trusted-server-adapter-fastly/src/app.rs`.
     ///
     /// If this test fails, a route was added or removed in the Fastly
     /// router without updating `ADMIN_ENDPOINTS` (or vice versa).
     #[test]
+    fn settings_parses_creative_opportunities_section() {
+        let toml = r#"
+[[handlers]]
+path = "^/_ts/admin"
+username = "admin"
+password = "unit-test-admin-secret"
+
+[publisher]
+domain = "example.com"
+cookie_domain = ".example.com"
+origin_url = "https://origin.example.com"
+proxy_secret = "secret"
+
+[ec]
+passphrase = "test-secret-key-32-bytes-minimum"
+
+[creative_opportunities]
+gam_network_id = "21765378893"
+auction_timeout_ms = 500
+"#;
+        let settings = Settings::from_toml(toml).expect("should parse");
+        let co = settings
+            .creative_opportunities
+            .expect("should have creative_opportunities");
+        assert_eq!(co.gam_network_id, "21765378893");
+        assert_eq!(co.auction_timeout_ms, Some(500));
+    }
+
+    #[test]
+    fn settings_rejects_invalid_creative_opportunity_slot_id() {
+        let toml = r#"
+[[handlers]]
+path = "^/_ts/admin"
+username = "admin"
+password = "unit-test-admin-secret"
+
+[publisher]
+domain = "example.com"
+cookie_domain = ".example.com"
+origin_url = "https://origin.example.com"
+proxy_secret = "secret"
+
+[ec]
+passphrase = "test-secret-key-32-bytes-minimum"
+
+[creative_opportunities]
+gam_network_id = "21765378893"
+
+[[creative_opportunities.slot]]
+id = "xss<script>"
+page_patterns = ["/"]
+formats = [{ width = 300, height = 250 }]
+"#;
+        let err = Settings::from_toml(toml).expect_err("should reject invalid slot id");
+        assert!(
+            format!("{err:?}").contains("Invalid creative opportunity slot config"),
+            "error should mention the invalid slot id, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn settings_rejects_env_injected_invalid_creative_opportunity_slot_id() {
+        // A TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__SLOT override must go through
+        // the same runtime slot validation as a TOML-defined slot, so an invalid
+        // id injected via env is rejected by from_toml_and_env (the build-time
+        // path uses the same validation against the merged config).
+        let toml = r#"
+[[handlers]]
+path = "^/_ts/admin"
+username = "admin"
+password = "unit-test-admin-secret"
+
+[publisher]
+domain = "example.com"
+cookie_domain = ".example.com"
+origin_url = "https://origin.example.com"
+proxy_secret = "secret"
+
+[ec]
+passphrase = "test-secret-key-32-bytes-minimum"
+
+[creative_opportunities]
+gam_network_id = "21765378893"
+"#;
+        let slot_key = format!(
+            "{}{}CREATIVE_OPPORTUNITIES{}SLOT",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        temp_env::with_var(
+            slot_key,
+            Some(
+                r#"[{"id":"bad id","page_patterns":["/"],"formats":[{"width":300,"height":250}]}]"#,
+            ),
+            || {
+                let err = Settings::from_toml_and_env(toml)
+                    .expect_err("should reject env-injected invalid slot id");
+                assert!(
+                    format!("{err:?}").contains("Invalid creative opportunity slot config"),
+                    "error should mention the invalid slot id, got: {err:?}"
+                );
+            },
+        );
+    }
+
+    fn creative_opportunity_settings_toml(slot_body: &str) -> String {
+        format!(
+            r#"
+[[handlers]]
+path = "^/_ts/admin"
+username = "admin"
+password = "unit-test-admin-secret"
+
+[publisher]
+domain = "example.com"
+cookie_domain = ".example.com"
+origin_url = "https://origin.example.com"
+proxy_secret = "secret"
+
+[ec]
+passphrase = "test-secret-key-32-bytes-minimum"
+
+[creative_opportunities]
+gam_network_id = "21765378893"
+
+[[creative_opportunities.slot]]
+{slot_body}
+"#
+        )
+    }
+
+    fn assert_creative_opportunity_slot_config_rejected(slot_body: &str, expected: &str) {
+        let toml = creative_opportunity_settings_toml(slot_body);
+        let err = Settings::from_toml(&toml)
+            .expect_err("should reject malformed creative opportunity slot");
+        assert!(
+            format!("{err:?}").contains(expected),
+            "error should contain {expected:?}, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn settings_rejects_creative_opportunity_slot_without_page_patterns() {
+        assert_creative_opportunity_slot_config_rejected(
+            r#"
+id = "atf"
+page_patterns = []
+formats = [{ width = 300, height = 250 }]
+"#,
+            "must include at least one page pattern",
+        );
+    }
+
+    #[test]
+    fn settings_rejects_creative_opportunity_slot_without_valid_page_patterns() {
+        assert_creative_opportunity_slot_config_rejected(
+            r#"
+id = "atf"
+page_patterns = ["["]
+formats = [{ width = 300, height = 250 }]
+"#,
+            "must include at least one valid page pattern",
+        );
+    }
+
+    #[test]
+    fn settings_rejects_creative_opportunity_slot_without_formats() {
+        assert_creative_opportunity_slot_config_rejected(
+            r#"
+id = "atf"
+page_patterns = ["/"]
+formats = []
+"#,
+            "must include at least one format",
+        );
+    }
+
+    #[test]
+    fn settings_rejects_creative_opportunity_slot_with_zero_dimensions() {
+        assert_creative_opportunity_slot_config_rejected(
+            r#"
+id = "atf"
+page_patterns = ["/"]
+formats = [{ width = 0, height = 250 }]
+"#,
+            "must have positive width and height",
+        );
+    }
+
+    #[test]
+    fn settings_rejects_creative_opportunity_slot_with_empty_gam_unit_path() {
+        assert_creative_opportunity_slot_config_rejected(
+            r#"
+id = "atf"
+gam_unit_path = ""
+page_patterns = ["/"]
+formats = [{ width = 300, height = 250 }]
+"#,
+            "resolved GAM unit path must not be empty",
+        );
+    }
+
+    #[test]
     fn admin_endpoints_match_fastly_router() {
-        let router_source = include_str!("../../trusted-server-adapter-fastly/src/main.rs");
+        let router_source = include_str!("../../trusted-server-adapter-fastly/src/app.rs");
 
         for endpoint in Settings::ADMIN_ENDPOINTS {
             assert!(
                 router_source.contains(endpoint),
                 "ADMIN_ENDPOINTS lists \"{endpoint}\" but it was not found in \
-                 crates/trusted-server-adapter-fastly/src/main.rs — remove it from ADMIN_ENDPOINTS or \
+                 crates/trusted-server-adapter-fastly/src/app.rs — remove it from ADMIN_ENDPOINTS or \
                  add the route back to the router"
             );
         }
 
         // Also verify we haven't missed any admin routes in the router.
-        // Best-effort: only detects string-literal routes in standard match-arm
-        // format. If you define admin routes differently (e.g. via constants or
-        // non-standard formatting), add them to ADMIN_ENDPOINTS manually.
+        // Best-effort: only detects string-literal routes in the NamedRoute
+        // table. If you define admin routes differently (e.g. via constants),
+        // add them to ADMIN_ENDPOINTS manually.
         let admin_routes_in_router: Vec<&str> = router_source
             .lines()
             .filter_map(|line| {
                 let trimmed = line.trim();
-                // Match arms look like: (Method::POST, "/_ts/admin/...") => ...
-                if trimmed.starts_with('(') && trimmed.contains("\"/_ts/admin/") {
+                // Route entries look like: path: "/_ts/admin/...",
+                if trimmed.starts_with("path: ") && trimmed.contains("\"/_ts/admin/") {
                     let start = trimmed.find("\"/_ts/admin/")?;
                     let rest = &trimmed[start + 1..];
                     let end = rest.find('"')?;

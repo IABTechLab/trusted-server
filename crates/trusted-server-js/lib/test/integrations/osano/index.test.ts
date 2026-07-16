@@ -171,6 +171,21 @@ describe('integrations/osano consent mirror', () => {
     expect(getCookie(MARKER_COOKIE)).toBe('osano');
   });
 
+  it('mirrors USP, GPP, and TCF consent cookies together', async () => {
+    setUspApi('1YN-');
+    setGppApi('DBABLA~BVQqAAAAAgA.QA', [7, 8]);
+    setTcfApi('CPXxRfAPXxRfAAfKABENB-CgAAAAAAAAAAYgAAAAAAAA');
+
+    const result = await mirrorOsanoConsent();
+
+    expect(result).toBe(true);
+    expect(getCookie('us_privacy')).toBe('1YN-');
+    expect(getCookie('__gpp')).toBe('DBABLA~BVQqAAAAAgA.QA');
+    expect(getCookie('__gpp_sid')).toBe('7,8');
+    expect(getCookie('euconsent-v2')).toBe('CPXxRfAPXxRfAAfKABENB-CgAAAAAAAAAAYgAAAAAAAA');
+    expect(getCookie(MARKER_COOKIE)).toBe('osano');
+  });
+
   it('preserves existing unmarked consent cookies', async () => {
     document.cookie = 'us_privacy=external; path=/';
     setUspApi('1YN-');

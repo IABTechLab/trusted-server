@@ -1,3 +1,4 @@
+use edgezero_adapter_axum::dev_server::{AxumDevServer, AxumDevServerConfig};
 use edgezero_core::app::Hooks as _;
 use trusted_server_adapter_axum::app::TrustedServerApp;
 
@@ -10,17 +11,17 @@ fn main() {
     let config = match port_from_env() {
         // When PORT is set, bind to a specific address so integration tests
         // can allocate a fresh OS port each run and avoid TIME_WAIT flakiness.
-        Some(port) => edgezero_adapter_axum::AxumDevServerConfig {
+        Some(port) => AxumDevServerConfig {
             addr: std::net::SocketAddr::from(([127, 0, 0, 1], port)),
             enable_ctrl_c: true,
         },
         // Normal development path: read bind address from axum.toml.
-        None => edgezero_adapter_axum::AxumDevServerConfig::default(),
+        None => AxumDevServerConfig::default(),
     };
 
     log::info!("Listening on http://{}", config.addr);
     let router = TrustedServerApp::routes();
-    if let Err(err) = edgezero_adapter_axum::AxumDevServer::with_config(router, config).run() {
+    if let Err(err) = AxumDevServer::with_config(router, config).run() {
         log::error!("trusted-server-adapter-axum failed: {err}");
         std::process::exit(1);
     }

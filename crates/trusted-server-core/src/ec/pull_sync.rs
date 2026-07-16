@@ -9,13 +9,13 @@
 //! the entry no longer stores per-partner sync timestamps.
 
 use edgezero_core::body::Body as EdgeBody;
-use http::{header, Method, StatusCode};
+use http::{Method, StatusCode, header};
 use serde::Deserialize;
 use url::Url;
 
 use crate::platform::{
-    PlatformBackendSpec, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
-    RuntimeServices, DEFAULT_FIRST_BYTE_TIMEOUT,
+    DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, PlatformHttpRequest, PlatformPendingRequest,
+    PlatformResponse, RuntimeServices,
 };
 use crate::settings::Settings;
 
@@ -26,8 +26,8 @@ use super::rate_limiter::RateLimiter;
 use super::registry::{PartnerConfig, PartnerRegistry};
 
 // `current_timestamp` is defined in the parent `ec` module.
-use super::current_timestamp;
 use super::EcContext;
+use super::current_timestamp;
 
 /// Inputs needed to dispatch pull sync after response flush.
 #[derive(Debug, Clone)]
@@ -173,6 +173,7 @@ pub fn dispatch_pull_sync(
             host_header_override: None,
             certificate_check: settings.proxy.certificate_check,
             first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
+            between_bytes_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
         }) {
             Ok(name) => name,
             Err(err) => {
@@ -383,7 +384,11 @@ fn extract_pull_uid(response: PlatformResponse, source_domain: &str) -> Option<S
         return None;
     }
 
-    let body = response.response.into_body().into_bytes();
+    let body = response
+        .response
+        .into_body()
+        .into_bytes()
+        .unwrap_or_default();
     if body.len() > MAX_PULL_RESPONSE_BYTES {
         log::warn!(
             "Pull sync: partner '{}' returned oversized response ({} bytes), rejecting",

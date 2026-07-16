@@ -1,8 +1,11 @@
 [package]
 name = "trusted-server-adapter-cloudflare"
-version = "0.1.0"
-edition = "2024"
-publish = false
+description = "Cloudflare Workers entry point for Trusted Server."
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
 
 [lints]
 workspace = true
@@ -23,15 +26,17 @@ bytes = { workspace = true }
 edgezero-adapter-cloudflare = { workspace = true }
 edgezero-core = { workspace = true }
 error-stack = { workspace = true }
+futures = { workspace = true }
 log = { workspace = true }
-trusted-server-core = { path = "../trusted-server-core" }
-trusted-server-js = { path = "../trusted-server-js" }
-worker = { version = "0.8", default-features = false, features = ["http"], optional = true }
+serde_json = { workspace = true }
+trusted-server-core = { workspace = true }
+trusted-server-js = { workspace = true }
+worker = { workspace = true, optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 edgezero-adapter-cloudflare = { workspace = true, features = ["cloudflare"] }
 js-sys = { workspace = true }
-worker = { version = "0.8", default-features = false, features = ["http"] }
+worker = { workspace = true }
 
 [dev-dependencies]
 base64 = { workspace = true }

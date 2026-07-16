@@ -19,18 +19,21 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    buffer_publisher_response, handle_publisher_request, handle_tsjs_dynamic,
+    AuctionDispatch, buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
+    handle_tsjs_dynamic, page_bids_preflight_denied,
 };
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
-use trusted_server_core::settings_data::get_settings;
+use trusted_server_core::settings_data::{
+    default_config_key, default_config_store_name, get_settings_from_config_store,
+};
 
 use trusted_server_core::platform::RuntimeServices;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
-use crate::platform::build_runtime_services;
+use crate::platform::{AxumPlatformConfigStore, build_runtime_services};
 
 // ---------------------------------------------------------------------------
 // AppState
@@ -50,7 +53,10 @@ pub struct AppState {
 /// Returns an error when settings, the auction orchestrator, or the integration
 /// registry fail to initialise.
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let settings = get_settings()?;
+    let store_name = default_config_store_name();
+    let config_key = default_config_key();
+    let settings =
+        get_settings_from_config_store(&AxumPlatformConfigStore, &store_name, &config_key)?;
     build_state_with_settings(settings)
 }
 
@@ -130,6 +136,34 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// EC context
+// ---------------------------------------------------------------------------
+
+/// Builds the geo-aware [`EcContext`] for consent-gated endpoints (`/auction`,
+/// `/__ts/page-bids`, and the publisher fallback).
+///
+/// Mirrors the Fastly entry point: `EcContext::default()` leaves jurisdiction
+/// Unknown, which fails the auction consent gate closed even for consented
+/// users. Geo comes from the platform (a no-op on the local Axum dev server, so
+/// jurisdiction stays Unknown there unless the request carries TCF consent). A
+/// malformed consent string is logged and falls back to the default
+/// (fail-closed) context rather than being silently swallowed.
+fn build_ec_context(state: &AppState, services: &RuntimeServices, req: &Request) -> EcContext {
+    let geo_info = services
+        .geo()
+        .lookup(services.client_info().client_ip)
+        .unwrap_or_else(|e| {
+            log::warn!("geo lookup failed: {e}");
+            None
+        });
+    EcContext::read_from_request_with_geo(&state.settings, req, services, geo_info.as_ref())
+        .unwrap_or_else(|e| {
+            log::warn!("EC context read failed: {e:?}");
+            EcContext::default()
+        })
+}
+
+// ---------------------------------------------------------------------------
 // Fallback dispatcher (tsjs / integration proxy / publisher)
 // ---------------------------------------------------------------------------
 
@@ -166,9 +200,34 @@ async fn dispatch_fallback(
             });
     }
 
-    handle_publisher_request(&state.settings, &state.registry, services, req)
-        .await
-        .and_then(|pr| buffer_publisher_response(pr, &method, &state.settings, &state.registry))
+    // Run the server-side auction with the configured creative-opportunity
+    // slots; `handle_publisher_request` matches them against the request path.
+    let mut ec_context = build_ec_context(state, services, &req);
+    let auction = AuctionDispatch {
+        orchestrator: &state.orchestrator,
+        slots: state.settings.creative_opportunity_slots(),
+        registry: None,
+    };
+    let publisher_response = handle_publisher_request(
+        &state.settings,
+        services,
+        None,
+        &mut ec_context,
+        auction,
+        req,
+    )
+    .await?;
+    // Async finalize so the dispatched auction is collected and its bids are
+    // injected before `</body>` (the sync buffer path would drop them).
+    buffer_publisher_response_async(
+        publisher_response,
+        &method,
+        &state.settings,
+        &state.registry,
+        &state.orchestrator,
+        services,
+    )
+    .await
 }
 
 fn fallback_handler(
@@ -197,6 +256,7 @@ enum NamedRouteHandler {
     /// reach the publisher fallback (which would leak admin credentials).
     LegacyAdminDenied,
     Auction,
+    PageBids,
     FirstPartyProxy,
     FirstPartyClick,
     FirstPartySign,
@@ -219,7 +279,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 11] {
+fn named_routes() -> [NamedRoute; 12] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -264,6 +324,13 @@ fn named_routes() -> [NamedRoute; 11] {
             path: "/auction",
             primary_methods: &[Method::POST],
             handler: NamedRouteHandler::Auction,
+        },
+        // GET runs the SPA re-auction; OPTIONS is denied in-handler as a CORS
+        // preflight guard for this side-effecting endpoint.
+        NamedRoute {
+            path: "/__ts/page-bids",
+            primary_methods: &[Method::GET, Method::OPTIONS],
+            handler: NamedRouteHandler::PageBids,
         },
         NamedRoute {
             path: "/first-party/proxy",
@@ -323,7 +390,10 @@ fn named_route_handler(
                     }
                     NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
                     NamedRouteHandler::Auction => {
-                        let ec_context = EcContext::default();
+                        // Build the geo-aware EC context so the auction consent
+                        // gate sees the caller's jurisdiction — `EcContext::default()`
+                        // fails it closed for consented users.
+                        let ec_context = build_ec_context(&state, &services, &req);
                         handle_auction(
                             &state.settings,
                             &state.orchestrator,
@@ -334,6 +404,30 @@ fn named_route_handler(
                             req,
                         )
                         .await
+                    }
+                    NamedRouteHandler::PageBids => {
+                        // SPA re-auction endpoint. `OPTIONS` is a CORS preflight
+                        // for this side-effecting GET and is always denied so the
+                        // GET handler's `X-TSJS-Page-Bids` gate stays trustworthy.
+                        if req.method() == Method::OPTIONS {
+                            Ok(page_bids_preflight_denied())
+                        } else {
+                            let ec_context = build_ec_context(&state, &services, &req);
+                            let auction = AuctionDispatch {
+                                orchestrator: &state.orchestrator,
+                                slots: state.settings.creative_opportunity_slots(),
+                                registry: None,
+                            };
+                            handle_page_bids(
+                                &state.settings,
+                                &services,
+                                None,
+                                auction,
+                                &ec_context,
+                                req,
+                            )
+                            .await
+                        }
                     }
                     NamedRouteHandler::FirstPartyProxy => {
                         handle_first_party_proxy(&state.settings, &services, req).await

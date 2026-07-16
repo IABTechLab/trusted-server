@@ -18,6 +18,7 @@ const OSANO_INTEGRATION_ID: &str = "osano";
 
 /// Configuration for the Osano consent mirror integration.
 #[derive(Debug, Clone, Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct OsanoConfig {
     /// Whether the Osano browser consent mirror is enabled.
     #[serde(default)]
@@ -52,7 +53,7 @@ pub fn register(
 mod tests {
     use serde_json::json;
 
-    use super::register;
+    use super::{OsanoConfig, register};
     use crate::test_support::tests::create_test_settings;
 
     #[test]
@@ -91,6 +92,25 @@ mod tests {
         assert!(
             registration.head_injectors.is_empty(),
             "Osano v1 should not inject HTML from Rust"
+        );
+    }
+
+    #[test]
+    fn config_rejects_unknown_fields() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config("osano", &json!({ "enabled": true, "typo": true }))
+            .expect("should insert osano config");
+
+        let err = settings
+            .integration_config::<OsanoConfig>("osano")
+            .expect_err("should reject unknown Osano config fields");
+        let error_text = format!("{err:?}");
+
+        assert!(
+            error_text.contains("typo") || error_text.contains("unknown field"),
+            "error should mention the unknown field: {err:?}"
         );
     }
 }

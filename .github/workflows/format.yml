@@ -25,7 +25,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
-          target: wasm32-wasip1
+          target: wasm32-wasip1,wasm32-unknown-unknown
           components: "clippy, rustfmt"
           cache-shared-key: cargo-${{ runner.os }}
 
@@ -41,11 +41,22 @@ jobs:
       - name: Run cargo clippy (Cloudflare — native)
         run: cargo clippy-cloudflare
 
+      - name: Run cargo clippy (Cloudflare — wasm32-unknown-unknown)
+        run: cargo clippy-cloudflare-wasm
+
       - name: Run cargo clippy (Spin — native)
         run: cargo clippy-spin-native
 
       - name: Run cargo clippy (Spin — wasm32-wasip1)
         run: cargo clippy-spin-wasm
+
+      - name: Run host-target CLI clippy
+        run: cargo clippy --package trusted-server-cli --target x86_64-unknown-linux-gnu --all-targets --all-features -- -D warnings
+
+      # The codegen crate is a workspace member but is not a default member and
+      # is not covered by any adapter-scoped alias, so lint it explicitly.
+      - name: Run host-target OpenRTB codegen clippy
+        run: cargo clippy --package trusted-server-openrtb-codegen --target x86_64-unknown-linux-gnu --all-targets -- -D warnings
 
   format-typescript:
     runs-on: ubuntu-latest

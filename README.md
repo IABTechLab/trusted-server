@@ -15,6 +15,7 @@ The guide in `docs/guide/` (published at the link below) is the source of truth 
 | [Getting Started](https://iabtechlab.github.io/trusted-server/guide/getting-started)    | Installation and setup                     |
 | [Architecture](https://iabtechlab.github.io/trusted-server/guide/architecture)          | System architecture overview               |
 | [Configuration](https://iabtechlab.github.io/trusted-server/guide/configuration)        | Configuration reference                    |
+| [Trusted Server CLI](https://iabtechlab.github.io/trusted-server/guide/cli)             | `ts` CLI install and command reference     |
 | [Integrations](https://iabtechlab.github.io/trusted-server/guide/integrations-overview) | Partner integrations (Prebid, Lockr, etc.) |
 
 ## Quick Start
@@ -26,6 +27,21 @@ See the [Getting Started guide](https://iabtechlab.github.io/trusted-server/guid
 cargo build-fastly       # Fastly adapter + core (wasm32-wasip1)
 cargo build-axum         # Axum dev server (native)
 cargo build-cloudflare   # Cloudflare Workers (wasm32-unknown-unknown)
+
+# Install the host-target CLI for your current platform
+cargo install-cli
+
+# If your shell cannot find `ts`, add Cargo's bin directory to PATH
+export PATH="$HOME/.cargo/bin:$PATH"
+ts --help
+
+# Create local config, then edit placeholders before validation
+ts config init
+# Edit trusted-server.toml
+ts config validate
+
+# Audit a public page with Chrome/Chromium to bootstrap a draft config
+ts audit https://publisher.example
 
 # Run tests (Fastly/WASM crates — requires Viceroy)
 cargo test-fastly

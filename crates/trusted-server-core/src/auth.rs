@@ -1,4 +1,4 @@
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
 use http::header;
@@ -17,8 +17,8 @@ const BASIC_AUTH_REALM: &str = r#"Basic realm="Trusted Server""#;
 /// when the supplied credentials are valid. Returns `Ok(Some(Response))` with
 /// the auth challenge when credentials are missing or invalid.
 ///
-/// Admin endpoints are protected by requiring a handler at build time; see
-/// [`Settings::from_toml_and_env`]. Credential checks use constant-time
+/// Admin endpoints are protected by requiring a handler during settings
+/// finalization; see [`Settings::from_toml`]. Credential checks use constant-time
 /// comparison for both username and password, and evaluate both regardless of
 /// individual match results to avoid timing oracles.
 ///
@@ -98,7 +98,7 @@ fn unauthorized_response() -> Response<EdgeBody> {
 mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD;
-    use http::{header, HeaderValue, Method};
+    use http::{HeaderValue, Method, header};
 
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
 
@@ -122,9 +122,11 @@ mod tests {
         let settings = create_test_settings();
         let req = build_request(Method::GET, "https://example.com/open");
 
-        assert!(enforce_basic_auth(&settings, &req)
-            .expect("should evaluate auth")
-            .is_none());
+        assert!(
+            enforce_basic_auth(&settings, &req)
+                .expect("should evaluate auth")
+                .is_none()
+        );
     }
 
     #[test]
@@ -150,9 +152,11 @@ mod tests {
         let token = STANDARD.encode("user:pass");
         set_authorization(&mut req, &format!("Basic {token}"));
 
-        assert!(enforce_basic_auth(&settings, &req)
-            .expect("should evaluate auth")
-            .is_none());
+        assert!(
+            enforce_basic_auth(&settings, &req)
+                .expect("should evaluate auth")
+                .is_none()
+        );
     }
 
     #[test]

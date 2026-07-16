@@ -1,5 +1,6 @@
+use crate::common::config::integration_app_config_envelope;
 use crate::common::runtime::{
-    RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult,
+    RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult, origin_port,
 };
 use error_stack::ResultExt as _;
 use std::io::{BufRead as _, BufReader};
@@ -31,8 +32,14 @@ impl RuntimeEnvironment for AxumDevServer {
         let binary = self.binary_path();
         let port = super::find_available_port().unwrap_or(AXUM_DEFAULT_PORT);
 
+        let app_config = integration_app_config_envelope(origin_port())?;
+
         let mut child = Command::new(&binary)
             .env("PORT", port.to_string())
+            .env(
+                "TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG",
+                app_config,
+            )
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()

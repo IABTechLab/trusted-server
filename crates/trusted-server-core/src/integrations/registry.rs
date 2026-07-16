@@ -9,8 +9,8 @@ use http::{Method, Request, Response};
 use matchit::Router;
 
 use crate::constants::HEADER_X_TS_EC;
-use crate::ec::kv::KvIdentityGraph;
 use crate::ec::EcContext;
+use crate::ec::kv::KvIdentityGraph;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::http_util::is_navigation_request;
@@ -159,10 +159,10 @@ impl IntegrationDocumentState {
             .lock()
             .expect("should lock integration document state");
 
-        if let Some(existing) = guard.get(integration_id) {
-            if let Ok(downcast) = Arc::clone(existing).downcast::<T>() {
-                return downcast;
-            }
+        if let Some(existing) = guard.get(integration_id)
+            && let Ok(downcast) = Arc::clone(existing).downcast::<T>()
+        {
+            return downcast;
         }
 
         let value: Arc<T> = Arc::new(init());
@@ -581,6 +581,7 @@ pub trait IntegrationHeadInjector: Send + Sync {
 pub struct IntegrationRegistration {
     pub integration_id: &'static str,
     pub js_deferred: bool,
+    pub js_disabled: bool,
     pub proxies: Vec<Arc<dyn IntegrationProxy>>,
     pub attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     pub script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
@@ -606,6 +607,7 @@ impl IntegrationRegistrationBuilder {
             registration: IntegrationRegistration {
                 integration_id,
                 js_deferred: false,
+                js_disabled: false,
                 proxies: Vec::new(),
                 attribute_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
@@ -666,6 +668,14 @@ impl IntegrationRegistrationBuilder {
         self
     }
 
+    /// Disable TSJS module inclusion for an integration that is handled by other assets.
+    #[must_use]
+    pub fn without_js(mut self) -> Self {
+        self.registration.js_disabled = true;
+        self.registration.js_deferred = false;
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> IntegrationRegistration {
         self.registration
@@ -688,6 +698,7 @@ struct IntegrationRegistryInner {
     routes: Vec<(IntegrationEndpoint, &'static str)>,
     enabled_integration_ids: Vec<&'static str>,
     deferred_js_ids: Vec<&'static str>,
+    disabled_js_ids: Vec<&'static str>,
     html_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
     html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
@@ -707,12 +718,13 @@ impl Default for IntegrationRegistryInner {
             options_router: Router::new(),
             routes: Vec::new(),
             enabled_integration_ids: Vec::new(),
+            deferred_js_ids: Vec::new(),
+            disabled_js_ids: Vec::new(),
             html_rewriters: Vec::new(),
             script_rewriters: Vec::new(),
             html_post_processors: Vec::new(),
             head_injectors: Vec::new(),
             request_filters: Vec::new(),
-            deferred_js_ids: Vec::new(),
         }
     }
 }
@@ -776,7 +788,11 @@ impl IntegrationRegistry {
         let mut inner = IntegrationRegistryInner::default();
 
         for builder in crate::integrations::builders() {
-            if let Some(registration) = builder(settings)? {
+            if let Some(registration) = (builder.build)(settings)? {
+                debug_assert_eq!(
+                    registration.integration_id, builder.id,
+                    "integration builder ID should match registration ID"
+                );
                 inner
                     .enabled_integration_ids
                     .push(registration.integration_id);
@@ -838,7 +854,9 @@ impl IntegrationRegistry {
                     .extend(registration.html_post_processors);
                 inner.head_injectors.extend(registration.head_injectors);
                 inner.request_filters.extend(registration.request_filters);
-                if registration.js_deferred {
+                if registration.js_disabled {
+                    inner.disabled_js_ids.push(registration.integration_id);
+                } else if registration.js_deferred {
                     inner.deferred_js_ids.push(registration.integration_id);
                 }
             }
@@ -1099,7 +1117,10 @@ impl IntegrationRegistry {
         let mut ids: Vec<&'static str> = JS_ALWAYS.to_vec();
 
         for id in &self.inner.enabled_integration_ids {
-            if trusted_server_js::module_bundle(id).is_some() && !ids.contains(id) {
+            if trusted_server_js::module_bundle(id).is_some()
+                && !self.inner.disabled_js_ids.contains(id)
+                && !ids.contains(id)
+            {
                 ids.push(*id);
             }
         }
@@ -1133,6 +1154,14 @@ impl IntegrationRegistry {
 
     #[cfg(test)]
     #[must_use]
+    pub fn empty_for_tests() -> Self {
+        Self {
+            inner: Arc::new(IntegrationRegistryInner::default()),
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
     pub fn from_rewriters(
         attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
         script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
@@ -1154,6 +1183,7 @@ impl IntegrationRegistry {
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
                 deferred_js_ids: Vec::new(),
+                disabled_js_ids: Vec::new(),
             }),
         }
     }
@@ -1182,6 +1212,7 @@ impl IntegrationRegistry {
                 head_injectors,
                 request_filters: Vec::new(),
                 deferred_js_ids: Vec::new(),
+                disabled_js_ids: Vec::new(),
             }),
         }
     }
@@ -1206,6 +1237,7 @@ impl IntegrationRegistry {
                 head_injectors: Vec::new(),
                 request_filters,
                 deferred_js_ids: Vec::new(),
+                disabled_js_ids: Vec::new(),
             }),
         }
     }
@@ -1270,6 +1302,7 @@ impl IntegrationRegistry {
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
                 deferred_js_ids: Vec::new(),
+                disabled_js_ids: Vec::new(),
             }),
         }
     }
@@ -1280,7 +1313,7 @@ mod tests {
     use super::*;
     use crate::constants::COOKIE_TS_EC;
     use crate::platform::test_support::noop_services;
-    use http::{header, HeaderValue, StatusCode};
+    use http::{HeaderValue, StatusCode, header};
 
     // Mock integration proxy for testing
     struct MockProxy;
@@ -1916,7 +1949,7 @@ mod tests {
     }
 
     #[test]
-    fn js_module_ids_immediate_excludes_prebid_and_includes_core_js_only_modules() {
+    fn js_module_ids_exclude_prebid_and_include_core_js_only_modules() {
         let settings = crate::test_support::tests::create_test_settings();
         let mut settings_with_prebid = settings;
         settings_with_prebid
@@ -1926,6 +1959,7 @@ mod tests {
                 &serde_json::json!({
                     "enabled": true,
                     "server_url": "https://test-prebid.com/openrtb2/auction",
+                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
                     "timeout_ms": 1000,
                     "bidders": ["mocktioneer"],
                     "debug": false
@@ -1941,8 +1975,8 @@ mod tests {
         let deferred = registry.js_module_ids_deferred();
 
         assert!(
-            all.contains(&"prebid"),
-            "should include prebid in full list"
+            !all.contains(&"prebid"),
+            "should not include prebid in embedded TSJS module IDs"
         );
         assert!(
             immediate.contains(&"creative"),
@@ -1957,8 +1991,8 @@ mod tests {
             "should not include prebid in immediate IDs"
         );
         assert!(
-            deferred.contains(&"prebid"),
-            "should include prebid in deferred IDs"
+            !deferred.contains(&"prebid"),
+            "should not include prebid in deferred IDs"
         );
     }
 
@@ -2027,7 +2061,8 @@ mod tests {
                 "prebid",
                 &serde_json::json!({
                     "enabled": false,
-                    "server_url": "https://test-prebid.com/openrtb2/auction"
+                    "server_url": "https://test-prebid.com/openrtb2/auction",
+                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
                 }),
             )
             .expect("should update prebid config");
@@ -2042,6 +2077,41 @@ mod tests {
     }
 
     #[test]
+    fn js_module_ids_exclude_prebid_when_external_bundle_is_configured() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &serde_json::json!({
+                    "enabled": true,
+                    "server_url": "https://test-prebid.com/openrtb2/auction",
+                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js"
+                }),
+            )
+            .expect("should update prebid config");
+
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+
+        assert!(
+            !registry.js_module_ids().contains(&"prebid"),
+            "external bundle mode should not include prebid in embedded TSJS modules"
+        );
+        assert!(
+            !registry.js_module_ids_immediate().contains(&"prebid"),
+            "external bundle mode should not include prebid in immediate TSJS modules"
+        );
+        assert!(
+            !registry.js_module_ids_deferred().contains(&"prebid"),
+            "external bundle mode should not include prebid in deferred TSJS modules"
+        );
+        assert!(
+            registry.has_route(&Method::GET, "/integrations/prebid/bundle.js"),
+            "external bundle mode should register the first-party bundle route"
+        );
+    }
+
+    #[test]
     fn js_module_ids_split_is_exhaustive() {
         let settings = crate::test_support::tests::create_test_settings();
         let mut settings_with_prebid = settings;
@@ -2052,6 +2122,7 @@ mod tests {
                 &serde_json::json!({
                     "enabled": true,
                     "server_url": "https://test-prebid.com/openrtb2/auction",
+                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
                     "timeout_ms": 1000,
                     "bidders": ["mocktioneer"],
                     "debug": false

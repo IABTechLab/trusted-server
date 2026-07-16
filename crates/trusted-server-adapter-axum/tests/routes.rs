@@ -6,7 +6,7 @@
 
 use axum::body::Body as AxumBody;
 use axum::http::Request;
-use edgezero_adapter_axum::EdgeZeroAxumService;
+use edgezero_adapter_axum::service::EdgeZeroAxumService;
 use tower::{Service as _, ServiceExt as _};
 use trusted_server_adapter_axum::app::TrustedServerApp;
 

@@ -1,8 +1,8 @@
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chacha20poly1305::{aead::Aead as _, aead::KeyInit as _, XChaCha20Poly1305, XNonce};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce, aead::Aead as _, aead::KeyInit as _};
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
-use http::{header, Request, Response, StatusCode};
+use http::{Request, Response, StatusCode, header};
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 
@@ -232,36 +232,31 @@ fn detect_request_scheme(
     }
 
     // 2. Try the Forwarded header (RFC 7239)
-    if let Some(forwarded) = req.headers().get("forwarded") {
-        if let Ok(forwarded_str) = forwarded.to_str() {
-            if let Some(proto) = parse_forwarded_param(forwarded_str, "proto") {
-                if let Some(scheme) = normalize_scheme(proto) {
-                    return scheme;
-                }
-            }
-        }
+    if let Some(forwarded) = req.headers().get("forwarded")
+        && let Ok(forwarded_str) = forwarded.to_str()
+        && let Some(proto) = parse_forwarded_param(forwarded_str, "proto")
+        && let Some(scheme) = normalize_scheme(proto)
+    {
+        return scheme;
     }
 
     // 3. Try X-Forwarded-Proto header
-    if let Some(proto) = req.headers().get("x-forwarded-proto") {
-        if let Ok(proto_str) = proto.to_str() {
-            if let Some(value) = parse_list_header_value(proto_str) {
-                if let Some(scheme) = normalize_scheme(value) {
-                    return scheme;
-                }
-            }
-        }
+    if let Some(proto) = req.headers().get("x-forwarded-proto")
+        && let Ok(proto_str) = proto.to_str()
+        && let Some(value) = parse_list_header_value(proto_str)
+        && let Some(scheme) = normalize_scheme(value)
+    {
+        return scheme;
     }
 
     // 4. Check Fastly-SSL header. On the `EdgeZero` path this is injected from
     //    authoritative Fastly TLS metadata after spoofable headers are stripped,
     //    so it is reliable. On direct or legacy paths it can be spoofed by clients.
-    if let Some(ssl) = req.headers().get("fastly-ssl") {
-        if let Ok(ssl_str) = ssl.to_str() {
-            if ssl_str == "1" || ssl_str.to_lowercase() == "true" {
-                return "https".to_owned();
-            }
-        }
+    if let Some(ssl) = req.headers().get("fastly-ssl")
+        && let Ok(ssl_str) = ssl.to_str()
+        && (ssl_str == "1" || ssl_str.to_lowercase() == "true")
+    {
+        return "https".to_owned();
     }
 
     // Default to HTTP
@@ -289,9 +284,9 @@ pub fn serve_static_with_etag(
         .headers()
         .get(header::IF_NONE_MATCH)
         .and_then(|h| h.to_str().ok())
+        && if_none_match == etag
     {
-        if if_none_match == etag {
-            return Response::builder()
+        return Response::builder()
                 .status(StatusCode::NOT_MODIFIED)
                 .header(header::ETAG, &etag)
                 .header(
@@ -302,7 +297,6 @@ pub fn serve_static_with_etag(
                 .header(header::VARY, "Accept-Encoding")
                 .body(EdgeBody::empty())
                 .expect("should build 304 static response");
-        }
     }
 
     Response::builder()

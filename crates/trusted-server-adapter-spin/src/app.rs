@@ -1,7 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use edgezero_adapter_spin::SpinRequestContext;
+use edgezero_adapter_spin::context::SpinRequestContext;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
@@ -14,19 +14,19 @@ use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::sanitize_forwarded_headers;
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
+use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    PublisherResponse, buffer_publisher_response, handle_publisher_request, handle_tsjs_dynamic,
+    AuctionDispatch, PublisherResponse, buffer_publisher_response_async, handle_page_bids,
+    handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
 };
 use trusted_server_core::request_signing::{
-    handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
-    handle_verify_signature,
+    handle_trusted_server_discovery, handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
-use trusted_server_core::settings_data::get_settings;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, NormalizeMiddleware};
 use crate::platform::build_runtime_services;
@@ -49,7 +49,7 @@ pub struct AppState {
 /// Returns an error when settings, the auction orchestrator, or the integration
 /// registry fail to initialise.
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let settings = get_settings()?;
+    let settings = Settings::from_toml(include_str!("../../../trusted-server.example.toml"))?;
     build_state_with_settings(settings)
 }
 
@@ -78,16 +78,27 @@ fn build_state_with_settings(
 
 /// Collapse a [`PublisherResponse`] into a plain [`Response`].
 ///
-/// Delegates to the shared [`buffer_publisher_response`], which enforces
-/// `settings.publisher.max_buffered_body_bytes` so a large processable
-/// origin response fails safely instead of exhausting the Wasm heap.
-fn resolve_publisher_response(
+/// Delegates to the shared [`buffer_publisher_response_async`], which collects
+/// the dispatched server-side auction and enforces
+/// `settings.publisher.max_buffered_body_bytes` so a large processable origin
+/// response fails safely instead of exhausting the Wasm heap.
+async fn resolve_publisher_response(
     publisher_response: PublisherResponse,
     method: &Method,
     settings: &Settings,
     registry: &IntegrationRegistry,
+    orchestrator: &AuctionOrchestrator,
+    services: &RuntimeServices,
 ) -> Result<Response, Report<TrustedServerError>> {
-    buffer_publisher_response(publisher_response, method, settings, registry)
+    buffer_publisher_response_async(
+        publisher_response,
+        method,
+        settings,
+        registry,
+        orchestrator,
+        services,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -130,7 +141,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 11] {
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 12] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
@@ -139,6 +150,7 @@ fn named_fallback_paths() -> [(&'static str, &'static [Method]); 11] {
         ("/admin/keys/rotate", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/deactivate", LEGACY_ADMIN_DENY_METHODS),
         ("/auction", &[Method::POST]),
+        ("/__ts/page-bids", &[Method::GET, Method::OPTIONS]),
         ("/first-party/proxy", &[Method::GET]),
         ("/first-party/click", &[Method::GET]),
         ("/first-party/sign", &[Method::GET, Method::POST]),
@@ -309,6 +321,44 @@ fn health_response() -> Response {
     resp
 }
 
+/// Builds the geo-aware [`EcContext`] for consent-gated endpoints (`/auction`,
+/// `/__ts/page-bids`, and the publisher fallback).
+///
+/// Mirrors the Fastly entry point: `EcContext::default()` leaves jurisdiction
+/// Unknown, which fails the auction consent gate closed even for consented
+/// users. Spin's platform geo is a no-op, so jurisdiction stays Unknown unless
+/// the request carries TCF consent. A malformed consent string is logged and
+/// falls back to the default (fail-closed) context rather than being silently
+/// swallowed.
+fn build_ec_context(settings: &Settings, services: &RuntimeServices, req: &Request) -> EcContext {
+    let geo_info = services
+        .geo()
+        .lookup(services.client_info().client_ip)
+        .unwrap_or_else(|e| {
+            log::warn!("geo lookup failed: {e}");
+            None
+        });
+    EcContext::read_from_request_with_geo(settings, req, services, geo_info.as_ref())
+        .unwrap_or_else(|e| {
+            log::warn!("EC context read failed: {e:?}");
+            EcContext::default()
+        })
+}
+
+fn admin_key_management_not_supported() -> Response {
+    let body = edgezero_core::body::Body::from(
+        "Admin key management is not supported on Fermyon Spin.\n\
+         Use the Fastly adapter (via Viceroy or deployed) to rotate or deactivate keys.\n",
+    );
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
 // ---------------------------------------------------------------------------
 // Error helper
 // ---------------------------------------------------------------------------
@@ -457,28 +507,8 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             }
         };
 
-        // /_ts/admin/keys/rotate
-        let s = Arc::clone(&state);
-        let rotate_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_runtime_services(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_rotate_key(&s.settings, &services, req)
-                    .unwrap_or_else(|e| http_error(&e)))
-            }
-        };
-
-        // /_ts/admin/keys/deactivate
-        let s = Arc::clone(&state);
-        let deactivate_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_runtime_services(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_deactivate_key(&s.settings, &services, req)
-                    .unwrap_or_else(|e| http_error(&e)))
-            }
+        let admin_not_supported_handler = |_ctx: RequestContext| async {
+            Ok::<Response, EdgeError>(admin_key_management_not_supported())
         };
 
         // /auction
@@ -493,7 +523,10 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 // OpenRTB metadata that auction signing derives from
                 // `RequestInfo::from_request` uses the trusted runtime authority.
                 let req = ctx.into_request();
-                let ec_context = EcContext::default();
+                // Build the geo-aware EC context so the auction consent gate sees
+                // the caller's jurisdiction — `EcContext::default()` fails it
+                // closed for consented users.
+                let ec_context = build_ec_context(&s.settings, &services, &req);
                 Ok(handle_auction(
                     &s.settings,
                     &s.orchestrator,
@@ -506,6 +539,33 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 .await
                 .unwrap_or_else(|e| http_error(&e)))
             }
+        };
+
+        // GET /__ts/page-bids — SPA re-auction endpoint.
+        let s = Arc::clone(&state);
+        let page_bids_handler = move |ctx: RequestContext| {
+            let s = Arc::clone(&s);
+            async move {
+                let services = build_runtime_services(&ctx);
+                let req = ctx.into_request();
+                let ec_context = build_ec_context(&s.settings, &services, &req);
+                let auction = AuctionDispatch {
+                    orchestrator: &s.orchestrator,
+                    slots: s.settings.creative_opportunity_slots(),
+                    registry: None,
+                };
+                Ok(
+                    handle_page_bids(&s.settings, &services, None, auction, &ec_context, req)
+                        .await
+                        .unwrap_or_else(|e| http_error(&e)),
+                )
+            }
+        };
+
+        // OPTIONS /__ts/page-bids — deny the CORS preflight for this
+        // side-effecting GET so the `X-TSJS-Page-Bids` gate stays trustworthy.
+        let page_bids_options_handler = |_ctx: RequestContext| async {
+            Ok::<Response, EdgeError>(page_bids_preflight_denied())
         };
 
         // GET /first-party/proxy
@@ -598,11 +658,35 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                         }))
                     })
             } else {
-                handle_publisher_request(&state.settings, &state.registry, &services, req)
-                    .await
-                    .and_then(|pr| {
-                        resolve_publisher_response(pr, &method, &state.settings, &state.registry)
-                    })
+                let mut ec_context = build_ec_context(&state.settings, &services, &req);
+                let auction = AuctionDispatch {
+                    orchestrator: &state.orchestrator,
+                    slots: state.settings.creative_opportunity_slots(),
+                    registry: None,
+                };
+                match handle_publisher_request(
+                    &state.settings,
+                    &services,
+                    None,
+                    &mut ec_context,
+                    auction,
+                    req,
+                )
+                .await
+                {
+                    Ok(pr) => {
+                        resolve_publisher_response(
+                            pr,
+                            &method,
+                            &state.settings,
+                            &state.registry,
+                            &state.orchestrator,
+                            &services,
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                }
             };
 
             Ok(result.unwrap_or_else(|e| http_error(&e)))
@@ -644,9 +728,15 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // handler regex `^/_ts/admin` does not match them, and letting them
             // fall through to the publisher fallback would forward admin
             // credentials and key-management payloads to the origin.
-            .post("/_ts/admin/keys/rotate", rotate_handler)
-            .post("/_ts/admin/keys/deactivate", deactivate_handler)
+            .post("/_ts/admin/keys/rotate", admin_not_supported_handler)
+            .post("/_ts/admin/keys/deactivate", admin_not_supported_handler)
             .post("/auction", auction_handler)
+            .get("/__ts/page-bids", page_bids_handler)
+            .route(
+                "/__ts/page-bids",
+                Method::OPTIONS,
+                page_bids_options_handler,
+            )
             .get("/first-party/proxy", fp_proxy_handler)
             .get("/first-party/click", fp_click_handler)
             .get("/first-party/sign", fp_sign_handler)
@@ -966,7 +1056,12 @@ mod tests {
                     .uri(path)
                     .body(edgezero_core::body::Body::empty())
                     .expect("should build request");
-                let status = router.oneshot(req).await.status().as_u16();
+                let status = router
+                    .oneshot(req)
+                    .await
+                    .expect("should route startup-error request")
+                    .status()
+                    .as_u16();
                 assert_eq!(
                     status, 503,
                     "{method} {path} must return 503 from the startup fallback, got {status}"
@@ -989,14 +1084,17 @@ mod tests {
             .uri("/health")
             .body(edgezero_core::body::Body::empty())
             .expect("should build request");
-        let resp = router.oneshot(req).await;
+        let resp = router
+            .oneshot(req)
+            .await
+            .expect("should route startup-error health request");
 
         assert_eq!(
             resp.status().as_u16(),
             200,
             "GET /health must return 200 from the startup fallback"
         );
-        let body = resp.into_body().into_bytes();
+        let body = resp.into_body().into_bytes().unwrap_or_default();
         assert_eq!(
             &body[..],
             b"ok",

@@ -1,6 +1,6 @@
 //! Full `EdgeZero` application wiring for Trusted Server.
 //!
-//! Registers all routes from the legacy [`crate::route_request`] into a
+//! Registers all routes for Trusted Server into a
 //! [`RouterService`]. On successful startup, attaches [`FinalizeResponseMiddleware`]
 //! (outermost) and [`AuthMiddleware`] (inner). When startup fails,
 //! [`startup_error_router`] returns a bare router without middleware.
@@ -78,31 +78,32 @@
 //! that responds to all routes with the startup error. This router does **not**
 //! attach middleware. Startup-error responses may still receive entry-point
 //! finalization (geo and TS headers) when settings can be reloaded via
-//! [`trusted_server_core::settings_data::get_settings`]; if settings loading itself
-//! fails, they are returned without geo or TS headers.
+//! [`load_settings_from_config_store`]; if settings loading itself fails, they
+//! are returned without geo or TS headers.
 
 use std::sync::Arc;
 
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
-use edgezero_adapter_fastly::FastlyRequestContext;
-use edgezero_core::app::Hooks;
+use edgezero_adapter_fastly::context::FastlyRequestContext;
+use edgezero_core::app::{App, Hooks};
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
-    header, HandlerFuture, HeaderValue, Method, Request, Response, StatusCode,
+    HandlerFuture, HeaderValue, Method, Request, Response, StatusCode, header,
 };
 use edgezero_core::router::RouterService;
 use error_stack::Report;
+use trusted_server_core::auction::AuctionTelemetrySink;
 use trusted_server_core::auction::endpoints::handle_auction;
-use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
+use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
 use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
+use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
 use trusted_server_core::ec::consent::ec_consent_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::registry::PartnerRegistry;
-use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{
@@ -111,24 +112,27 @@ use trusted_server_core::integrations::{
 };
 use trusted_server_core::platform::{ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices};
 use trusted_server_core::proxy::{
-    handle_asset_proxy_request, handle_first_party_click, handle_first_party_proxy,
-    handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, AssetProxyCachePolicy,
+    AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
+    handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    buffer_publisher_response, handle_publisher_request, handle_tsjs_dynamic,
+    AuctionDispatch, buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
+    handle_tsjs_dynamic, page_bids_preflight_denied,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
     handle_verify_signature,
 };
 use trusted_server_core::settings::{ProxyAssetRoute, Settings};
-use trusted_server_core::settings_data::get_settings;
+use trusted_server_core::settings_data::{
+    default_config_key, default_config_store_name, get_settings_from_config_store,
+};
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::{
-    open_kv_store, FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformGeo,
-    FastlyPlatformHttpClient, FastlyPlatformSecretStore, UnavailableKvStore,
+    FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformGeo, FastlyPlatformHttpClient,
+    FastlyPlatformSecretStore, UnavailableKvStore, open_kv_store,
 };
 
 // ---------------------------------------------------------------------------
@@ -144,6 +148,7 @@ pub(crate) struct AppState {
     pub(crate) orchestrator: Arc<AuctionOrchestrator>,
     pub(crate) registry: Arc<IntegrationRegistry>,
     pub(crate) default_kv_store: Arc<dyn PlatformKvStore>,
+    pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -153,15 +158,24 @@ pub(crate) struct AppState {
 /// Returns an error when settings, the auction orchestrator, or the integration
 /// registry fail to initialise.
 pub(crate) fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    build_state_from_settings(get_settings()?)
+    build_state_from_settings(load_settings_from_config_store()?)
+}
+
+pub(crate) fn load_settings_from_config_store() -> Result<Settings, Report<TrustedServerError>> {
+    let store_name = default_config_store_name();
+    let config_key = default_config_key();
+    get_settings_from_config_store(&FastlyPlatformConfigStore, &store_name, &config_key)
 }
 
 pub(crate) fn build_state_from_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    warn_if_certificate_check_disabled(&settings);
+
     let orchestrator = build_orchestrator(&settings)?;
     let registry = IntegrationRegistry::new(&settings)?;
 
+    let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
 
     Ok(Arc::new(AppState {
@@ -169,7 +183,16 @@ pub(crate) fn build_state_from_settings(
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
         default_kv_store,
+        auction_telemetry_sink,
     }))
+}
+
+fn warn_if_certificate_check_disabled(settings: &Settings) {
+    if !settings.proxy.certificate_check {
+        log::warn!(
+            "INSECURE: proxy.certificate_check is disabled; HTTPS origin certificate verification is disabled"
+        );
+    }
 }
 
 /// Resolves per-request consent KV store services for routes that read consent data.
@@ -235,6 +258,7 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         .backend(Arc::new(FastlyPlatformBackend))
         .http_client(Arc::new(FastlyPlatformHttpClient))
         .geo(Arc::new(FastlyPlatformGeo))
+        .auction_telemetry_sink(Arc::clone(&state.auction_telemetry_sink))
         .client_info(client_info)
         .build()
 }
@@ -585,6 +609,38 @@ async fn run_named_route(
             )
             .await
         }
+        NamedRouteHandler::PageBids => {
+            // SPA re-auction endpoint. `OPTIONS` is a CORS preflight for this
+            // side-effecting GET and is always denied so the GET handler's
+            // `X-TSJS-Page-Bids` gate stays trustworthy.
+            if req.method() == Method::OPTIONS {
+                return Ok(page_bids_preflight_denied());
+            }
+            // Like the auction, page-bids reads consent data, so the consent KV
+            // store must be available — fail closed with 503 when configured but
+            // unopenable, matching legacy.
+            let consent_services = runtime_services_for_consent_route(&state.settings, services)?;
+            let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
+            let registry_ref = if partner_registry.is_empty() {
+                None
+            } else {
+                Some(&partner_registry)
+            };
+            let auction = AuctionDispatch {
+                orchestrator: &state.orchestrator,
+                slots: state.settings.creative_opportunity_slots(),
+                registry: registry_ref,
+            };
+            handle_page_bids(
+                &state.settings,
+                &consent_services,
+                ec.kv_graph.as_ref(),
+                auction,
+                &ec.ec_context,
+                req,
+            )
+            .await
+        }
         NamedRouteHandler::FirstPartyProxy => {
             handle_first_party_proxy(&state.settings, services, req).await
         }
@@ -667,7 +723,7 @@ async fn dispatch_fallback(
     } else if state.registry.has_route(&method, &path) {
         // Integration-proxy responses are not bounded by publisher.max_buffered_body_bytes.
         // Only the handle_publisher_request branch below routes through
-        // buffer_publisher_response. Integration responses are small in practice
+        // buffer_publisher_response_async. Integration responses are small in practice
         // and the EdgeZero flag is off by default; extend the cap here if that changes.
         state
             .registry
@@ -702,13 +758,13 @@ async fn dispatch_fallback(
         // Generate an EC ID if needed — mirrors the legacy catch-all arm.
         // Only for document navigations by recognised browsers; subresource
         // requests may lack consent signals such as Sec-GPC.
-        if ec.is_real_browser && is_navigation_request(&req) {
-            if let Err(err) = ec
+        if ec.is_real_browser
+            && is_navigation_request(&req)
+            && let Err(err) = ec
                 .ec_context
                 .generate_if_needed(&state.settings, ec.kv_graph.as_ref())
-            {
-                log::warn!("EC generation failed for publisher proxy: {err:?}");
-            }
+        {
+            log::warn!("EC generation failed for publisher proxy: {err:?}");
         }
 
         // Publisher pages read consent data, so the consent KV store must be
@@ -716,16 +772,47 @@ async fn dispatch_fallback(
         // be opened, matching legacy behavior.
         match runtime_services_for_consent_route(&state.settings, services) {
             Ok(publisher_services) => {
-                handle_publisher_request(&state.settings, &state.registry, &publisher_services, req)
-                    .await
-                    .and_then(|pub_response| {
-                        buffer_publisher_response(
-                            pub_response,
-                            &method,
+                // Run the server-side auction with the configured creative-
+                // opportunity slots and collect the dispatched bids in the
+                // buffered finalize (`buffer_publisher_response_async`), matching
+                // the legacy streaming path. `handle_publisher_request` matches the
+                // slots against the request path. The partner registry plus the
+                // EC identity-graph KV (`ec.kv_graph`) enrich the bid request with
+                // server-side EIDs, same as the legacy auction.
+                let slots = state.settings.creative_opportunity_slots();
+                match PartnerRegistry::from_config(&state.settings.ec.partners) {
+                    Ok(partner_registry) => {
+                        let auction = AuctionDispatch {
+                            orchestrator: &state.orchestrator,
+                            slots,
+                            registry: Some(&partner_registry),
+                        };
+                        match handle_publisher_request(
                             &state.settings,
-                            &state.registry,
+                            &publisher_services,
+                            ec.kv_graph.as_ref(),
+                            &mut ec.ec_context,
+                            auction,
+                            req,
                         )
-                    })
+                        .await
+                        {
+                            Ok(pub_response) => {
+                                buffer_publisher_response_async(
+                                    pub_response,
+                                    &method,
+                                    &state.settings,
+                                    &state.registry,
+                                    &state.orchestrator,
+                                    &publisher_services,
+                                )
+                                .await
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
             }
             Err(e) => Err(e),
         }
@@ -784,10 +871,10 @@ async fn dispatch_asset_fallback(
             // client. HEAD and bodiless statuses (204, 304) advertise the origin
             // Content-Length but carry no body, so their stream is dropped to
             // preserve that header and avoid a length/body mismatch.
-            if let Some(body) = stream_body {
-                if asset_response_carries_body(&method, response.status()) {
-                    *response.body_mut() = body;
-                }
+            if let Some(body) = stream_body
+                && asset_response_carries_body(&method, response.status())
+            {
+                *response.body_mut() = body;
             }
 
             response.extensions_mut().insert(cache_policy);
@@ -908,6 +995,7 @@ enum NamedRouteHandler {
     SetTester,
     ClearTester,
     Auction,
+    PageBids,
     FirstPartyProxy,
     FirstPartyClick,
     FirstPartySign,
@@ -992,6 +1080,13 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         primary_methods: &[Method::POST],
         handler: NamedRouteHandler::Auction,
     },
+    // GET runs the SPA re-auction; OPTIONS is denied in-handler as a CORS
+    // preflight guard for this side-effecting endpoint.
+    NamedRoute {
+        path: "/__ts/page-bids",
+        primary_methods: &[Method::GET, Method::OPTIONS],
+        handler: NamedRouteHandler::PageBids,
+    },
     NamedRoute {
         path: "/first-party/proxy",
         primary_methods: &[Method::GET],
@@ -1041,6 +1136,25 @@ fn fallback_route_handler(
 pub struct TrustedServerApp;
 
 impl TrustedServerApp {
+    pub(crate) fn build_app_with_state() -> (App, Option<Arc<AppState>>) {
+        let (router, state) = Self::router_with_state();
+        let mut app = App::with_name(router, Self::name());
+        Self::configure(&mut app);
+        (app, state)
+    }
+
+    fn router_with_state() -> (RouterService, Option<Arc<AppState>>) {
+        let state = match build_state() {
+            Ok(state) => state,
+            Err(ref e) => {
+                log::error!("failed to build application state: {:?}", e);
+                return (startup_error_router(e), None);
+            }
+        };
+
+        (Self::routes_for_state(&state), Some(state))
+    }
+
     fn routes_for_state(state: &Arc<AppState>) -> RouterService {
         let mut router = RouterService::builder()
             .middleware(FinalizeResponseMiddleware::new(
@@ -1088,15 +1202,7 @@ impl Hooks for TrustedServerApp {
     }
 
     fn routes() -> RouterService {
-        let state = match build_state() {
-            Ok(s) => s,
-            Err(ref e) => {
-                log::error!("failed to build application state: {:?}", e);
-                return startup_error_router(e);
-            }
-        };
-
-        Self::routes_for_state(&state)
+        Self::router_with_state().0
     }
 }
 
@@ -1105,16 +1211,13 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        build_state_from_settings, startup_error_router, AppState, NamedRouteHandler,
-        TrustedServerApp, NAMED_ROUTES,
+        AppState, NAMED_ROUTES, NamedRouteHandler, TrustedServerApp, build_state_from_settings,
+        startup_error_router,
     };
-    use crate::route_tests::{
-        test_runtime_services_with_secret_http_client_and_geo, us_california_geo, FixedBackend,
-        FixedGeo, NoopSecretStore, StreamingRecordingHttpClient,
-    };
-
+    use bytes::Bytes;
     use edgezero_core::body::Body;
-    use edgezero_core::http::{header, request_builder, Method, StatusCode};
+    use edgezero_core::http::{Method, Response, StatusCode, header, request_builder};
+    use edgezero_core::key_value_store::NoopKvStore;
     use edgezero_core::router::RouterService;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Mutex;
@@ -1129,7 +1232,11 @@ mod tests {
         HeaderMutation, IntegrationRegistry, IntegrationRequestFilter, RequestFilterDecision,
         RequestFilterEffects, RequestFilterInput,
     };
-    use trusted_server_core::platform::{ClientInfo, PlatformHttpClient};
+    use trusted_server_core::platform::{
+        ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformError, PlatformHttpClient,
+        PlatformHttpRequest, PlatformKvStore, PlatformPendingRequest, PlatformResponse,
+        PlatformSelectResult, RuntimeServices,
+    };
     use trusted_server_core::settings::Settings;
 
     fn settings_with_missing_consent_store() -> Settings {
@@ -1146,6 +1253,9 @@ mod tests {
                 origin_url = "https://origin.test-publisher.com"
                 proxy_secret = "unit-test-proxy-secret"
 
+                [proxy]
+                allowed_domains = ["*.example", "*.example.com"]
+
                 [ec]
                 passphrase = "test-passphrase-at-least-32-bytes!!"
 
@@ -1160,6 +1270,7 @@ mod tests {
                 [integrations.prebid]
                 enabled = true
                 server_url = "https://test-prebid.com/openrtb2/auction"
+                external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
 
                 [integrations.datadome]
                 enabled = true
@@ -1188,6 +1299,10 @@ mod tests {
             .expect("should build request")
     }
 
+    fn route(router: &RouterService, request: edgezero_core::http::Request) -> Response {
+        block_on(router.oneshot(request)).expect("should route request")
+    }
+
     fn test_settings() -> Settings {
         Settings::from_toml(
             r#"
@@ -1207,6 +1322,9 @@ mod tests {
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
+            [proxy]
+            allowed_domains = ["*.example", "*.example.com"]
+
             [ec]
             passphrase = "test-secret-key-32-bytes-minimum"
 
@@ -1218,6 +1336,7 @@ mod tests {
             [integrations.prebid]
             enabled = true
             server_url = "https://test-prebid.com/openrtb2/auction"
+            external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
 
             [auction]
             enabled = true
@@ -1246,6 +1365,9 @@ mod tests {
         let default_kv_store =
             Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn super::PlatformKvStore>;
         let state = Arc::new(super::AppState {
+            auction_telemetry_sink: Arc::new(
+                trusted_server_core::auction::NoopAuctionTelemetrySink,
+            ),
             settings: Arc::new(settings),
             orchestrator: Arc::new(orchestrator),
             registry: Arc::new(registry),
@@ -1331,8 +1453,8 @@ mod tests {
         });
         let router = startup_error_router(&report);
 
-        let head_response = block_on(router.oneshot(empty_request(Method::HEAD, "/")));
-        let options_response = block_on(router.oneshot(empty_request(Method::OPTIONS, "/any")));
+        let head_response = route(&router, empty_request(Method::HEAD, "/"));
+        let options_response = route(&router, empty_request(Method::OPTIONS, "/any"));
 
         assert_eq!(
             head_response.status(),
@@ -1422,7 +1544,7 @@ mod tests {
         let router = test_router();
         let req = empty_request(Method::POST, "/_ts/admin/keys/rotate");
 
-        let response = block_on(router.oneshot(req));
+        let response = route(&router, req);
 
         assert_eq!(
             response.status(),
@@ -1542,7 +1664,7 @@ mod tests {
                     .body(Body::from("{\"key_id\":\"leak-me\"}"))
                     .expect("should build authorized legacy-alias request");
 
-                let response = block_on(router.oneshot(req));
+                let response = route(&router, req);
 
                 assert_eq!(
                     response.status(),
@@ -1560,8 +1682,10 @@ mod tests {
         // header), not the publisher fallback, which would fail with a
         // gateway error without a live backend.
         let router = test_router();
-        let response =
-            block_on(router.oneshot(empty_request(Method::OPTIONS, "/_ts/api/v1/identify")));
+        let response = route(
+            &router,
+            empty_request(Method::OPTIONS, "/_ts/api/v1/identify"),
+        );
 
         assert_eq!(
             response.status(),
@@ -1577,7 +1701,7 @@ mod tests {
         // require_identity_graph fails with a KvStore error (503) — proving
         // the request was NOT proxied to the publisher origin.
         let router = test_router();
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/api/v1/identify")));
+        let response = route(&router, empty_request(Method::GET, "/_ts/api/v1/identify"));
 
         assert_eq!(
             response.status(),
@@ -1594,8 +1718,10 @@ mod tests {
         // ec.ec_store configured, require_identity_graph fails with a KvStore
         // error (503).
         let router = test_router();
-        let response =
-            block_on(router.oneshot(empty_request(Method::POST, "/_ts/api/v1/batch-sync")));
+        let response = route(
+            &router,
+            empty_request(Method::POST, "/_ts/api/v1/batch-sync"),
+        );
 
         assert_eq!(
             response.status(),
@@ -1607,7 +1733,7 @@ mod tests {
     #[test]
     fn dispatch_set_tester_is_disabled_by_default() {
         let router = test_router();
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/set-tester")));
+        let response = route(&router, empty_request(Method::GET, "/_ts/set-tester"));
 
         assert_eq!(
             response.status(),
@@ -1626,7 +1752,7 @@ mod tests {
         settings.tester_cookie.enabled = true;
         let state = app_state_for_settings(settings);
         let router = TrustedServerApp::routes_for_state(&state);
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/set-tester")));
+        let response = route(&router, empty_request(Method::GET, "/_ts/set-tester"));
 
         assert_eq!(
             response.status(),
@@ -1648,7 +1774,7 @@ mod tests {
     #[test]
     fn dispatch_clear_tester_is_disabled_by_default() {
         let router = test_router();
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/clear-tester")));
+        let response = route(&router, empty_request(Method::GET, "/_ts/clear-tester"));
 
         assert_eq!(
             response.status(),
@@ -1667,7 +1793,7 @@ mod tests {
         settings.tester_cookie.enabled = true;
         let state = app_state_for_settings(settings);
         let router = TrustedServerApp::routes_for_state(&state);
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/clear-tester")));
+        let response = route(&router, empty_request(Method::GET, "/_ts/clear-tester"));
 
         assert_eq!(
             response.status(),
@@ -1693,10 +1819,13 @@ mod tests {
         // point via response extensions — even on error responses — so that
         // edgezero_main can run ec_finalize_response and pull sync.
         let router = test_router();
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")));
+        let response = route(&router, empty_request(Method::GET, "/some-page"));
 
         assert!(
-            response.extensions().get::<super::EcFinalizeState>().is_some(),
+            response
+                .extensions()
+                .get::<super::EcFinalizeState>()
+                .is_some(),
             "publisher fallback responses should carry EcFinalizeState for entry-point EC finalization"
         );
     }
@@ -1718,7 +1847,7 @@ mod tests {
             Some("1:65536;2:0;4:6291456;6:262144"),
         ));
 
-        let response = block_on(router.oneshot(req));
+        let response = route(&router, req);
 
         let finalize = response
             .extensions()
@@ -1737,7 +1866,7 @@ mod tests {
         // documents the regression the extension threading fixes: the same
         // request that looks like a browser above is treated as a bot here.
         let router = test_router();
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")));
+        let response = route(&router, empty_request(Method::GET, "/some-page"));
 
         let finalize = response
             .extensions()
@@ -1773,7 +1902,7 @@ mod tests {
             server_region: Some("US-East".to_string()),
         });
 
-        let _ = block_on(router.oneshot(req));
+        let _ = route(&router, req);
 
         let observed = captured
             .lock()
@@ -1817,10 +1946,10 @@ mod tests {
         // Named routes must also thread EC finalize state, mirroring how the
         // legacy path finalizes every response with the pre-routing EcContext.
         let router = test_router();
-        let response = block_on(router.oneshot(empty_request(
-            Method::GET,
-            "/.well-known/trusted-server.json",
-        )));
+        let response = route(
+            &router,
+            empty_request(Method::GET, "/.well-known/trusted-server.json"),
+        );
 
         assert!(
             response
@@ -1843,7 +1972,7 @@ mod tests {
         let router = test_router();
         let req = empty_request(Method::HEAD, "/first-party/proxy");
 
-        let response = block_on(router.oneshot(req));
+        let response = route(&router, req);
 
         assert_ne!(
             response.status(),
@@ -1864,7 +1993,7 @@ mod tests {
             .body(Body::from(body))
             .expect("should build auction request");
 
-        let response = block_on(router.oneshot(req));
+        let response = route(&router, req);
 
         assert_eq!(
             response.status(),
@@ -1888,7 +2017,7 @@ mod tests {
             "/",
         );
 
-        let response = block_on(router.oneshot(req));
+        let response = route(&router, req);
 
         assert_eq!(
             response.status(),
@@ -1909,8 +2038,10 @@ mod tests {
         let state = app_state_for_settings(settings_with_missing_consent_store());
         let router = TrustedServerApp::routes_for_state(&state);
 
-        let admin_response =
-            block_on(router.oneshot(empty_request(Method::POST, "/_ts/admin/keys/rotate")));
+        let admin_response = route(
+            &router,
+            empty_request(Method::POST, "/_ts/admin/keys/rotate"),
+        );
         assert_eq!(
             admin_response.status(),
             StatusCode::UNAUTHORIZED,
@@ -1922,15 +2053,14 @@ mod tests {
             .uri("/auction")
             .body(Body::from(r#"{"adUnits":[]}"#))
             .expect("should build auction request");
-        let auction_response = block_on(router.oneshot(auction_request));
+        let auction_response = route(&router, auction_request);
         assert_eq!(
             auction_response.status(),
             StatusCode::SERVICE_UNAVAILABLE,
             "auction should fail closed when configured consent KV cannot be opened"
         );
 
-        let publisher_response =
-            block_on(router.oneshot(empty_request(Method::GET, "/articles/example")));
+        let publisher_response = route(&router, empty_request(Method::GET, "/articles/example"));
         assert_eq!(
             publisher_response.status(),
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1940,8 +2070,10 @@ mod tests {
         // Integration routes must NOT require the consent KV — runtime_services_for_consent_route
         // is wired only into the publisher and auction branches of dispatch_fallback, not into
         // the integration proxy branch. A missing consent store must not 503 integration routes.
-        let integration_response =
-            block_on(router.oneshot(empty_request(Method::GET, "/integrations/datadome/tags.js")));
+        let integration_response = route(
+            &router,
+            empty_request(Method::GET, "/integrations/datadome/tags.js"),
+        );
         assert_ne!(
             integration_response.status(),
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1989,7 +2121,7 @@ mod tests {
         let state = build_state_from_settings(settings).expect("should build state");
         let router = TrustedServerApp::routes_for_state(&state);
 
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/.image/banner.png")));
+        let response = route(&router, empty_request(Method::GET, "/.image/banner.png"));
 
         assert!(
             response
@@ -2005,6 +2137,70 @@ mod tests {
                 .is_none(),
             "asset-route responses must skip EC finalization (no EcFinalizeState)"
         );
+    }
+
+    struct FixedBackend;
+
+    impl PlatformBackend for FixedBackend {
+        fn predict_name(
+            &self,
+            spec: &PlatformBackendSpec,
+        ) -> Result<String, Report<PlatformError>> {
+            Ok(format!("{}-{}", spec.scheme, spec.host))
+        }
+
+        fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+            self.predict_name(spec)
+        }
+    }
+
+    struct StreamingHttpClient;
+
+    #[async_trait::async_trait(?Send)]
+    impl PlatformHttpClient for StreamingHttpClient {
+        async fn send(
+            &self,
+            request: PlatformHttpRequest,
+        ) -> Result<PlatformResponse, Report<PlatformError>> {
+            assert!(
+                request.stream_response,
+                "streaming Fastly routes should request an origin response stream"
+            );
+            let response = edgezero_core::http::response_builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/html")
+                .body(Body::stream(futures::stream::iter(vec![
+                    Bytes::from_static(b"streamed-asset"),
+                ])))
+                .map_err(|_| Report::new(PlatformError::HttpClient))?;
+            Ok(PlatformResponse::new(response))
+        }
+
+        async fn send_async(
+            &self,
+            _request: PlatformHttpRequest,
+        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        async fn select(
+            &self,
+            _pending_requests: Vec<PlatformPendingRequest>,
+        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+    }
+
+    fn streaming_runtime_services() -> RuntimeServices {
+        RuntimeServices::builder()
+            .config_store(Arc::new(crate::platform::FastlyPlatformConfigStore))
+            .secret_store(Arc::new(crate::platform::FastlyPlatformSecretStore))
+            .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
+            .backend(Arc::new(FixedBackend))
+            .http_client(Arc::new(StreamingHttpClient))
+            .geo(Arc::new(crate::platform::FastlyPlatformGeo))
+            .client_info(ClientInfo::default())
+            .build()
     }
 
     #[test]
@@ -2045,16 +2241,8 @@ mod tests {
         .expect("should parse asset-route settings");
         let state = build_state_from_settings(settings).expect("should build state");
 
-        let fastly_req = fastly::Request::get("https://test-publisher.com/.images/logo.png");
-        let http_client = Arc::new(StreamingRecordingHttpClient::new());
-        let services = test_runtime_services_with_secret_http_client_and_geo(
-            &fastly_req,
-            Arc::new(FixedBackend),
-            Arc::new(NoopSecretStore),
-            Arc::clone(&http_client) as Arc<dyn PlatformHttpClient>,
-            Arc::new(FixedGeo(us_california_geo())),
-        );
-        let req = crate::compat::from_fastly_request(fastly_req);
+        let services = streaming_runtime_services();
+        let req = empty_request(Method::GET, "/.images/logo.png");
         let asset_route = state
             .settings
             .asset_route_for_path("/.images/logo.png")
@@ -2090,7 +2278,7 @@ mod tests {
         // still carry the RequestFilterEffects the filter emitted — proving the
         // filter ran on the dispatch path.
         let router = router_with_request_filters(vec![Arc::new(RecordingRequestFilter)]);
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")));
+        let response = route(&router, empty_request(Method::GET, "/some-page"));
 
         let effects = response
             .extensions()
@@ -2112,7 +2300,7 @@ mod tests {
         // fallback, return its own response, still carry EcFinalizeState (legacy
         // parity: Respond keeps EC finalization), and thread its response effects.
         let router = router_with_request_filters(vec![Arc::new(ChallengeRequestFilter)]);
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")));
+        let response = route(&router, empty_request(Method::GET, "/some-page"));
 
         assert_eq!(
             response.status(),

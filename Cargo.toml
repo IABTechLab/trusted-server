@@ -1,21 +1,17 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/trusted-server-core",
-    "crates/trusted-server-adapter-fastly",
     "crates/trusted-server-adapter-axum",
     "crates/trusted-server-adapter-cloudflare",
+    "crates/trusted-server-adapter-fastly",
     "crates/trusted-server-adapter-spin",
+    "crates/trusted-server-cli",
+    "crates/trusted-server-core",
+    "crates/trusted-server-integration-tests",
     "crates/trusted-server-js",
     "crates/trusted-server-openrtb",
-]
-# trusted-server-integration-tests is intentionally excluded from workspace members because it
-# requires a native target (testcontainers, reqwest) while the workspace default
-# is wasm32-wasip1. Run it via: ./scripts/integration-tests.sh
-# Crates excluded from workspace — must be built/tested outside the workspace:
-#   cargo test-cloudflare → trusted-server-adapter-cloudflare (wasm32-unknown-unknown)
-exclude = [
-    "crates/trusted-server-integration-tests",
+    # Manual protobuf codegen tool — a member so it shares workspace settings,
+    # but no default member or alias builds it. Run it explicitly with `-p`.
     "crates/trusted-server-openrtb-codegen",
 ]
 
@@ -32,6 +28,13 @@ default-members = [
 [profile.release]
 debug = 1
 
+[workspace.package]
+authors = []
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+version = "0.1.0"
+
 [workspace.dependencies]
 anyhow = "1"
 async-trait = "0.1"
@@ -42,52 +45,78 @@ build-print = "1.0.1"
 bytes = "1.11"
 chacha20poly1305 = "0.10"
 chrono = "0.4.44"
+chromiumoxide = "0.9.1"
+clap = { version = "4", features = ["derive"] }
 config = "0.15.19"
 cookie = "0.18.1"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 derive_more = { version = "2.0", features = ["display", "error"] }
+directories = "5"
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }
-edgezero-adapter-axum = { git = "https://github.com/stackpop/edgezero", rev = "ce6bcf74b529d9066d08ba87b2971af8379eb29e", default-features = false }
-edgezero-adapter-cloudflare = { git = "https://github.com/stackpop/edgezero", rev = "ce6bcf74b529d9066d08ba87b2971af8379eb29e", default-features = false }
-edgezero-adapter-fastly = { git = "https://github.com/stackpop/edgezero", rev = "ce6bcf74b529d9066d08ba87b2971af8379eb29e", default-features = false }
-edgezero-adapter-spin = { git = "https://github.com/stackpop/edgezero", rev = "ce6bcf74b529d9066d08ba87b2971af8379eb29e", default-features = false }
-edgezero-core = { git = "https://github.com/stackpop/edgezero", rev = "ce6bcf74b529d9066d08ba87b2971af8379eb29e", default-features = false }
+edgezero-adapter-axum = { git = "https://github.com/stackpop/edgezero", tag = "v0.0.4", default-features = false }
+edgezero-adapter-cloudflare = { git = "https://github.com/stackpop/edgezero", tag = "v0.0.4", default-features = false }
+edgezero-adapter-fastly = { git = "https://github.com/stackpop/edgezero", tag = "v0.0.4", default-features = false }
+edgezero-adapter-spin = { git = "https://github.com/stackpop/edgezero", tag = "v0.0.4", default-features = false }
+edgezero-cli = { git = "https://github.com/stackpop/edgezero", tag = "v0.0.4" }
+edgezero-core = { git = "https://github.com/stackpop/edgezero", tag = "v0.0.4", default-features = false }
+env_logger = "0.11"
 error-stack = "0.6"
 fastly = "0.12"
 fern = "0.7.1"
 flate2 = "1.1"
 futures = "0.3"
+glob = "0.3"
+getrandom = "0.2"
 hex = "0.4.3"
 hmac = "0.12.1"
 http = "1.4.0"
+http-body-util = "0.1"
+hyper = "1"
+hyper-util = "0.1"
 iab_gpp = "0.1"
 jose-jwk = "0.1.2"
 js-sys = "0.3"
+libc = "0.2"
 log = "0.4.29"
 log-fastly = "0.12"
 lol_html = "2.7.2"
 matchit = "0.9"
 mime = "0.3"
+prost-build = "0.13"
 rand = "0.8"
+rcgen = { version = "0.13", features = ["x509-parser"] }
 regex = "1.12.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rustls = "0.23"
+rustls-pemfile = "2"
+scraper = "0.24.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.149"
-simple_logger = "5"
 sha2 = "0.10.9"
-spin-sdk = { version = "5.2", default-features = false }
+simple_logger = "5"
+spin-sdk = { version = "~6.0", default-features = false, features = ["http", "key-value", "variables"] }
 subtle = "2.6"
 temp-env = "0.3.6"
+tempfile = "3.24"
+testcontainers = { version = "0.25", features = ["blocking"] }
+time = "0.3"
 tokio = { version = "1.49", features = ["sync", "macros", "io-util", "rt", "time"] }
+tokio-rustls = "0.26"
 toml = "1.1"
+toml_edit = "0.23.10"
 tower = "0.4"
 trusted-server-core = { path = "crates/trusted-server-core" }
+trusted-server-js = { path = "crates/trusted-server-js" }
+trusted-server-openrtb = { path = "crates/trusted-server-openrtb" }
 url = "2.5.8"
 urlencoding = "2.1"
 uuid = { version = "1.18", features = ["v4"] }
 validator = { version = "0.20", features = ["derive"] }
 web-time = "1"
+webpki-roots = "1"
 which = "8"
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+worker = { version = "0.8", default-features = false, features = ["http"] }
+x509-parser = "0.16"
 
 [workspace.lints.clippy]
 # Correctness - Force explicit error handling in production code
