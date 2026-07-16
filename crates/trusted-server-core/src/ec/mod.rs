@@ -74,8 +74,70 @@ use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 use device::DeviceSignals;
 
-use self::kv::KvIdentityGraph;
+use self::kv::{CreateIfAbsentOutcome, KvIdentityGraph};
 use self::kv_types::KvEntry;
+
+/// Request-scoped view of one EC identity-graph lookup.
+///
+/// The state distinguishes an authoritative miss from a store failure and
+/// binds persisted entry data to the EC ID that was actually read or written.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum EcKvSnapshot {
+    /// No identity-graph lookup has been attempted for this request.
+    #[default]
+    NotRead,
+    /// The store authoritatively reported that this EC ID does not exist.
+    Missing { ec_id: String },
+    /// Persisted entry data, optionally with a generation usable for CAS.
+    Present {
+        ec_id: String,
+        entry: Box<KvEntry>,
+        generation: Option<u64>,
+    },
+    /// The lookup failed, so absence is not authoritative.
+    Failed { ec_id: String },
+}
+
+impl EcKvSnapshot {
+    /// Returns whether this state was produced for `ec_id`.
+    #[must_use]
+    pub fn belongs_to(&self, ec_id: &str) -> bool {
+        match self {
+            Self::NotRead => false,
+            Self::Missing { ec_id: snapshot_id }
+            | Self::Present {
+                ec_id: snapshot_id, ..
+            }
+            | Self::Failed { ec_id: snapshot_id } => snapshot_id == ec_id,
+        }
+    }
+
+    /// Returns the persisted entry only when the snapshot belongs to `ec_id`.
+    #[must_use]
+    pub fn entry_for(&self, ec_id: &str) -> Option<&KvEntry> {
+        match self {
+            Self::Present {
+                ec_id: snapshot_id,
+                entry,
+                ..
+            } if snapshot_id == ec_id => Some(entry.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// Returns a usable CAS generation only when the snapshot belongs to `ec_id`.
+    #[must_use]
+    pub fn generation_for(&self, ec_id: &str) -> Option<u64> {
+        match self {
+            Self::Present {
+                ec_id: snapshot_id,
+                generation,
+                ..
+            } if snapshot_id == ec_id => *generation,
+            _ => None,
+        }
+    }
+}
 
 pub use generation::{
     ec_hash, generate_ec_id, is_valid_ec_hash, is_valid_ec_id, normalize_ec_id_for_kv,
@@ -160,6 +222,10 @@ pub struct EcContext {
     /// Set via [`EcContext::set_device_signals`] before
     /// [`EcContext::generate_if_needed`] is called.
     device_signals: Option<DeviceSignals>,
+    /// Request-scoped persisted identity-graph state for the active EC ID.
+    kv_snapshot: EcKvSnapshot,
+    /// Whether this request may rotate an orphaned EC identity.
+    recovery_eligible: bool,
 }
 
 impl EcContext {
@@ -239,6 +305,8 @@ impl EcContext {
             client_ip,
             geo_info: geo_info.cloned(),
             device_signals: None,
+            kv_snapshot: EcKvSnapshot::NotRead,
+            recovery_eligible: false,
         })
     }
 
@@ -278,12 +346,10 @@ impl EcContext {
             })
         })?;
 
-        let ec_id = generation::generate_ec_id(settings, client_ip)?;
-        log::info!("Generated new EC ID: {}", log_id(&ec_id));
-        self.ec_value = Some(ec_id);
-        self.ec_generated = true;
-
-        if let (Some(graph), Some(ec_value)) = (kv, self.ec_value.as_deref()) {
+        const MAX_CREATE_ATTEMPTS: usize = 5;
+        for attempt in 0..MAX_CREATE_ATTEMPTS {
+            let ec_id = generation::generate_ec_id(settings, client_ip)?;
+            log::info!("Generated new EC ID: {}", log_id(&ec_id));
             let now = current_timestamp();
             let mut entry = KvEntry::new(
                 &self.consent,
@@ -296,20 +362,45 @@ impl EcContext {
                 .as_ref()
                 .map(DeviceSignals::to_kv_device);
 
-            if let Err(err) = graph.create_or_revive(ec_value, &entry) {
-                log::error!(
-                    "Failed to create or revive EC entry for id '{}' after generation: {err:?}",
-                    log_id(ec_value),
-                );
-                self.ec_value = None;
-                self.ec_generated = false;
-                return Err(err.change_context(TrustedServerError::EdgeCookie {
-                    message: "Failed to persist generated EC ID to KV identity graph".to_string(),
-                }));
+            if let Some(graph) = kv {
+                match graph.create_if_absent(&ec_id, &entry) {
+                    Ok(CreateIfAbsentOutcome::Written) => {
+                        self.kv_snapshot = EcKvSnapshot::Present {
+                            ec_id: ec_id.clone(),
+                            entry: Box::new(entry),
+                            generation: None,
+                        };
+                    }
+                    Ok(CreateIfAbsentOutcome::AlreadyExists) => {
+                        log::warn!(
+                            "Generated EC ID collision on attempt {}/{MAX_CREATE_ATTEMPTS}",
+                            attempt + 1
+                        );
+                        continue;
+                    }
+                    Err(err) => {
+                        log::error!(
+                            "Failed to create EC entry for id '{}' after generation: {err:?}",
+                            log_id(&ec_id),
+                        );
+                        return Err(err.change_context(TrustedServerError::EdgeCookie {
+                            message: "Failed to persist generated EC ID to KV identity graph"
+                                .to_string(),
+                        }));
+                    }
+                }
             }
+
+            self.ec_value = Some(ec_id);
+            self.ec_generated = true;
+            return Ok(());
         }
 
-        Ok(())
+        Err(Report::new(TrustedServerError::EdgeCookie {
+            message: format!(
+                "Failed to allocate a unique EC ID after {MAX_CREATE_ATTEMPTS} attempts"
+            ),
+        }))
     }
 
     /// Returns the EC ID value, if present (either from request or generated).
@@ -382,6 +473,35 @@ impl EcContext {
         self.geo_info.as_ref()
     }
 
+    /// Returns the request-scoped identity-graph snapshot.
+    #[must_use]
+    pub fn kv_snapshot(&self) -> &EcKvSnapshot {
+        &self.kv_snapshot
+    }
+
+    /// Replaces the request-scoped identity-graph snapshot.
+    pub fn set_kv_snapshot(&mut self, snapshot: EcKvSnapshot) {
+        self.kv_snapshot = snapshot;
+    }
+
+    /// Marks a real-browser document navigation as eligible for orphan recovery.
+    pub fn set_recovery_eligible(&mut self, eligible: bool) {
+        self.recovery_eligible = eligible;
+    }
+
+    /// Returns whether orphan recovery is allowed for this request.
+    #[must_use]
+    pub fn recovery_eligible(&self) -> bool {
+        self.recovery_eligible
+    }
+
+    /// Replaces an orphaned active ID after its new backing row is persisted.
+    pub(crate) fn replace_with_generated(&mut self, ec_id: String, snapshot: EcKvSnapshot) {
+        self.ec_value = Some(ec_id);
+        self.ec_generated = true;
+        self.kv_snapshot = snapshot;
+    }
+
     /// Returns whether EC creation is permitted by consent for this request.
     #[must_use]
     pub fn ec_allowed(&self) -> bool {
@@ -427,6 +547,8 @@ impl EcContext {
             client_ip: None,
             geo_info: None,
             device_signals: None,
+            kv_snapshot: EcKvSnapshot::NotRead,
+            recovery_eligible: false,
         }
     }
 
@@ -447,6 +569,8 @@ impl EcContext {
             client_ip,
             geo_info: None,
             device_signals: None,
+            kv_snapshot: EcKvSnapshot::NotRead,
+            recovery_eligible: false,
         }
     }
 
@@ -470,6 +594,8 @@ impl EcContext {
             client_ip: None,
             geo_info: None,
             device_signals: None,
+            kv_snapshot: EcKvSnapshot::NotRead,
+            recovery_eligible: false,
         }
     }
 }
@@ -493,8 +619,145 @@ pub(crate) fn current_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consent::jurisdiction::Jurisdiction;
+    use crate::consent::types::{ConsentContext, ConsentSource};
+    use crate::ec::kv_backend::test_support::InMemoryEcKv;
+    use crate::ec::kv_backend::{
+        EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome,
+    };
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
+
+    /// [`EcKvStore`] wrapper whose first `collisions` `Add` writes report a
+    /// precondition failure, forcing generation to retry with a fresh suffix.
+    struct AddCollidingEcKv {
+        inner: InMemoryEcKv,
+        collisions_remaining: std::sync::Mutex<u32>,
+    }
+
+    impl AddCollidingEcKv {
+        fn new(collisions: u32) -> Self {
+            Self {
+                inner: InMemoryEcKv::new("add-colliding-store"),
+                collisions_remaining: std::sync::Mutex::new(collisions),
+            }
+        }
+    }
+
+    impl EcKvStore for AddCollidingEcKv {
+        fn store_name(&self) -> &str {
+            self.inner.store_name()
+        }
+        fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            self.inner.lookup(key)
+        }
+        fn insert(
+            &self,
+            key: &str,
+            write: EcKvWrite<'_>,
+        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+            if matches!(write.mode, EcKvWriteMode::Add) {
+                let mut remaining = self
+                    .collisions_remaining
+                    .lock()
+                    .expect("should lock collision counter");
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return Ok(EcKvWriteOutcome::PreconditionFailed);
+                }
+            }
+            self.inner.insert(key, write)
+        }
+        fn count_keys_with_prefix(
+            &self,
+            prefix: &str,
+            limit: u32,
+        ) -> Result<u32, Report<TrustedServerError>> {
+            self.inner.count_keys_with_prefix(prefix, limit)
+        }
+        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            self.inner.delete(key)
+        }
+    }
+
+    fn granting_consent() -> ConsentContext {
+        ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn generate_if_needed_retries_id_collision_then_persists() {
+        let settings = create_test_settings();
+        let mut ec =
+            EcContext::new_for_test_with_ip(None, granting_consent(), Some("192.0.2.5".to_owned()));
+        let graph = KvIdentityGraph::new(AddCollidingEcKv::new(2));
+
+        ec.generate_if_needed(&settings, Some(&graph))
+            .expect("should generate after bounded collisions");
+
+        assert!(ec.ec_value().is_some(), "should allocate a fresh EC ID");
+        assert!(ec.ec_generated(), "should mark the EC as generated");
+        assert!(
+            matches!(ec.kv_snapshot(), EcKvSnapshot::Present { .. }),
+            "generation should seed a present snapshot"
+        );
+    }
+
+    #[test]
+    fn generate_if_needed_errors_after_collision_exhaustion() {
+        let settings = create_test_settings();
+        let mut ec =
+            EcContext::new_for_test_with_ip(None, granting_consent(), Some("192.0.2.6".to_owned()));
+        // Collide on every attempt so the bounded retry is exhausted.
+        let graph = KvIdentityGraph::new(AddCollidingEcKv::new(u32::MAX));
+
+        let result = ec.generate_if_needed(&settings, Some(&graph));
+
+        assert!(result.is_err(), "should fail after exhausting attempts");
+        assert!(
+            ec.ec_value().is_none() && !ec.ec_generated(),
+            "must not activate an EC ID it could not persist"
+        );
+    }
+
+    #[test]
+    fn default_ec_context_is_recovery_ineligible_and_unread() {
+        let ec = EcContext::default();
+        assert!(
+            !ec.recovery_eligible(),
+            "a default context must not authorize orphan recovery"
+        );
+        assert!(
+            matches!(ec.kv_snapshot(), EcKvSnapshot::NotRead),
+            "a default context must carry no identity-graph state"
+        );
+    }
+
+    #[test]
+    fn read_from_request_does_not_authorize_recovery_from_navigation_headers() {
+        // Non-Fastly adapters build EC context through the shared read path and
+        // never call `set_recovery_eligible`. Navigation headers alone must not
+        // authorize orphan recovery or seed KV state.
+        let settings = create_test_settings();
+        let ec_id = valid_ec_id("b", "CkEc01");
+        let cookie = format!("ts-ec={ec_id}");
+        let req = create_test_request(&[("cookie", &cookie), ("sec-fetch-dest", "document")]);
+
+        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context");
+
+        assert!(
+            !ec.recovery_eligible(),
+            "the shared read path must never authorize recovery from headers"
+        );
+        assert!(
+            matches!(ec.kv_snapshot(), EcKvSnapshot::NotRead),
+            "the shared read path must leave the snapshot unread"
+        );
+    }
 
     fn create_test_request(headers: &[(&str, &str)]) -> Request<EdgeBody> {
         let mut builder = Request::builder().method("GET").uri("http://example.com");
@@ -509,6 +772,55 @@ mod tests {
     /// Creates a valid EC ID for testing: `{64hex}.{6alnum}`.
     fn valid_ec_id(prefix_char: &str, suffix: &str) -> String {
         format!("{}.{suffix}", prefix_char.repeat(64))
+    }
+
+    #[test]
+    fn kv_snapshot_distinguishes_non_present_states() {
+        assert!(EcKvSnapshot::NotRead.entry_for("ec-1").is_none());
+        assert!(
+            EcKvSnapshot::Missing {
+                ec_id: "ec-1".to_owned()
+            }
+            .entry_for("ec-1")
+            .is_none()
+        );
+        assert!(
+            EcKvSnapshot::Failed {
+                ec_id: "ec-1".to_owned()
+            }
+            .entry_for("ec-1")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn kv_snapshot_present_state_is_bound_to_ec_id() {
+        let consent = ConsentContext::default();
+        let entry = KvEntry::new(&consent, None, 1_000, "example.com");
+        let snapshot = EcKvSnapshot::Present {
+            ec_id: "ec-1".to_owned(),
+            entry: Box::new(entry.clone()),
+            generation: Some(7),
+        };
+
+        assert_eq!(snapshot.entry_for("ec-1"), Some(&entry));
+        assert_eq!(snapshot.generation_for("ec-1"), Some(7));
+        assert!(snapshot.entry_for("ec-2").is_none());
+        assert_eq!(snapshot.generation_for("ec-2"), None);
+    }
+
+    #[test]
+    fn kv_snapshot_retains_persisted_entry_without_generation() {
+        let consent = ConsentContext::default();
+        let entry = KvEntry::new(&consent, None, 1_000, "example.com");
+        let snapshot = EcKvSnapshot::Present {
+            ec_id: "ec-1".to_owned(),
+            entry: Box::new(entry.clone()),
+            generation: None,
+        };
+
+        assert_eq!(snapshot.entry_for("ec-1"), Some(&entry));
+        assert_eq!(snapshot.generation_for("ec-1"), None);
     }
 
     #[test]

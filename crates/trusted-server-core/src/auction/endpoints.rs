@@ -12,10 +12,10 @@ use crate::auction::orchestrator::OrchestrationResult;
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
 use crate::constants::COOKIE_TS_EIDS;
 use crate::ec::EcContext;
+use crate::ec::EcKvSnapshot;
 use crate::ec::eids::{resolve_partner_ids, to_eids};
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::kv_types::MAX_UID_LENGTH;
-use crate::ec::log_id;
 use crate::ec::prebid_eids::parse_prebid_eids_cookie;
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
@@ -245,9 +245,15 @@ pub async fn handle_auction(
         None
     };
 
-    // Resolve partner EIDs from the KV identity graph when the user has
-    // a valid EC and both KV and partner stores are available.
-    let eids = resolve_auction_eids(kv, registry, ec_context);
+    // Resolve partner EIDs from the KV identity graph when the user has a valid
+    // EC and both KV and partner stores are available. Gate the read on a
+    // present registry: without one, `resolve_auction_eids` yields no
+    // server-side EIDs, so the snapshot would be an unused billable KV read.
+    let auction_kv_snapshot = match (kv, ec_id, registry) {
+        (Some(graph), Some(ec_id), Some(_)) => graph.load_snapshot(ec_id),
+        _ => EcKvSnapshot::NotRead,
+    };
+    let eids = resolve_auction_eids(&auction_kv_snapshot, registry, ec_context);
 
     // Look up geo for device info.
     let geo = services
@@ -345,11 +351,10 @@ pub async fn handle_auction(
 /// store, no EC, consent denied). On KV or partner-resolution errors, logs a
 /// warning and returns empty EIDs so the auction can proceed in degraded mode.
 pub(crate) fn resolve_auction_eids(
-    kv: Option<&KvIdentityGraph>,
+    snapshot: &EcKvSnapshot,
     registry: Option<&PartnerRegistry>,
     ec_context: &EcContext,
 ) -> Option<Vec<Eid>> {
-    let kv = kv?;
     let registry = registry?;
 
     if !ec_context.ec_allowed() {
@@ -358,19 +363,15 @@ pub(crate) fn resolve_auction_eids(
 
     let ec_id = ec_context.ec_value()?;
 
-    let entry = match kv.get(ec_id) {
-        Ok(Some((entry, _generation))) => entry,
-        Ok(None) => return Some(Vec::new()),
-        Err(err) => {
-            log::warn!(
-                "Auction KV read failed for EC ID '{}': {err:?}",
-                log_id(ec_id)
-            );
-            return Some(Vec::new());
-        }
+    let Some(entry) = snapshot.entry_for(ec_id) else {
+        return Some(Vec::new());
     };
 
-    let resolved = resolve_partner_ids(registry, &entry);
+    if !entry.consent.ok {
+        return Some(Vec::new());
+    }
+
+    let resolved = resolve_partner_ids(registry, entry);
     Some(to_eids(&resolved))
 }
 
@@ -854,22 +855,24 @@ mod tests {
     }
 
     #[test]
-    fn resolve_auction_eids_returns_none_without_kv() {
+    fn resolve_auction_eids_returns_empty_without_snapshot() {
         let registry = PartnerRegistry::empty();
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
 
-        let result = resolve_auction_eids(None, Some(&registry), &ec_context);
-        assert!(result.is_none(), "should return None when KV is missing");
+        let result = resolve_auction_eids(&EcKvSnapshot::NotRead, Some(&registry), &ec_context);
+        assert!(
+            result.is_some_and(|eids| eids.is_empty()),
+            "should degrade to empty EIDs without a snapshot"
+        );
     }
 
     #[test]
     fn resolve_auction_eids_returns_none_without_registry() {
-        let kv = KvIdentityGraph::failing("test_store");
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
 
-        let result = resolve_auction_eids(Some(&kv), None, &ec_context);
+        let result = resolve_auction_eids(&EcKvSnapshot::NotRead, None, &ec_context);
         assert!(
             result.is_none(),
             "should return None when registry is missing"
@@ -878,12 +881,11 @@ mod tests {
 
     #[test]
     fn resolve_auction_eids_returns_none_when_consent_denied() {
-        let kv = KvIdentityGraph::failing("test_store");
         let registry = PartnerRegistry::empty();
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let ec_context = make_ec_context(Jurisdiction::Unknown, Some(&ec_id));
 
-        let result = resolve_auction_eids(Some(&kv), Some(&registry), &ec_context);
+        let result = resolve_auction_eids(&EcKvSnapshot::NotRead, Some(&registry), &ec_context);
         assert!(
             result.is_none(),
             "should return None when consent is denied"
@@ -892,11 +894,10 @@ mod tests {
 
     #[test]
     fn resolve_auction_eids_returns_none_when_no_ec() {
-        let kv = KvIdentityGraph::failing("test_store");
         let registry = PartnerRegistry::empty();
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
 
-        let result = resolve_auction_eids(Some(&kv), Some(&registry), &ec_context);
+        let result = resolve_auction_eids(&EcKvSnapshot::NotRead, Some(&registry), &ec_context);
         assert!(
             result.is_none(),
             "should return None when no EC value is present"
@@ -905,14 +906,14 @@ mod tests {
 
     #[test]
     fn resolve_auction_eids_returns_empty_on_kv_miss() {
-        let kv = KvIdentityGraph::failing("nonexistent_store");
         let registry = PartnerRegistry::empty();
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
 
-        // KV store doesn't exist, so the get() call will error — should return
-        // empty Vec (degraded mode), not None.
-        let result = resolve_auction_eids(Some(&kv), Some(&registry), &ec_context);
+        let snapshot = EcKvSnapshot::Failed {
+            ec_id: ec_id.clone(),
+        };
+        let result = resolve_auction_eids(&snapshot, Some(&registry), &ec_context);
         let eids = result.expect("should return Some on KV error (degraded mode)");
         assert!(
             eids.is_empty(),

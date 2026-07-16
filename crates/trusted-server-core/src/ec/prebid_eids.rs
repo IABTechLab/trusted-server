@@ -119,6 +119,28 @@ pub fn ingest_eid_cookies(
     ingest_eid_cookies_with_writer(eids_cookie, sharedid_cookie, ec_id, kv, registry);
 }
 
+/// Collects validated request-local partner updates without performing KV I/O.
+pub(crate) fn collect_eid_cookie_updates(
+    eids_cookie: Option<&str>,
+    sharedid_cookie: Option<&str>,
+    registry: &PartnerRegistry,
+) -> Vec<PartnerIdUpdate> {
+    if registry.is_empty() {
+        return Vec::new();
+    }
+
+    let mut updates = Vec::new();
+    if let Some(cookie) = eids_cookie {
+        updates.extend(collect_prebid_eid_updates(cookie, registry));
+    }
+    if let Some(cookie) = sharedid_cookie
+        && let Some(update) = collect_sharedid_update(cookie, registry)
+    {
+        updates.push(update);
+    }
+    dedupe_partner_updates(updates)
+}
+
 /// Parses a `ts-eids` cookie value and writes matched partner UIDs to KV.
 ///
 /// `cookie_value` is the raw base64-encoded cookie value, already extracted
@@ -142,21 +164,7 @@ fn ingest_eid_cookies_with_writer(
     writer: &dyn PartnerIdBulkWriter,
     registry: &PartnerRegistry,
 ) {
-    if registry.is_empty() {
-        return;
-    }
-
-    let mut updates = Vec::new();
-    if let Some(cookie) = eids_cookie {
-        updates.extend(collect_prebid_eid_updates(cookie, registry));
-    }
-    if let Some(cookie) = sharedid_cookie
-        && let Some(update) = collect_sharedid_update(cookie, registry)
-    {
-        updates.push(update);
-    }
-
-    let updates = dedupe_partner_updates(updates);
+    let updates = collect_eid_cookie_updates(eids_cookie, sharedid_cookie, registry);
     if updates.is_empty() {
         return;
     }
@@ -596,6 +604,39 @@ mod tests {
         assert_eq!(
             update,
             PartnerIdUpdate::new("sharedid.org", "shared-cookie-id")
+        );
+    }
+
+    #[test]
+    fn collect_eid_cookie_updates_merges_prebid_and_sharedid_without_kv() {
+        let registry = make_registry(vec![("id5", "id5-sync.com"), ("sharedid", "sharedid.org")]);
+        let eids_cookie = encode_json(&json!([
+            {"source": "id5-sync.com", "uids": [{"id": "ID5_abc", "atype": 1}]}
+        ]));
+
+        let updates = collect_eid_cookie_updates(Some(&eids_cookie), Some(" shared-1 "), &registry);
+
+        assert_eq!(
+            updates.len(),
+            2,
+            "should collect prebid and sharedId matches"
+        );
+        assert!(updates.contains(&PartnerIdUpdate::new("id5-sync.com", "ID5_abc")));
+        assert!(updates.contains(&PartnerIdUpdate::new("sharedid.org", "shared-1")));
+    }
+
+    #[test]
+    fn collect_eid_cookie_updates_empty_registry_returns_no_updates() {
+        let registry = PartnerRegistry::empty();
+        let eids_cookie = encode_json(&json!([
+            {"source": "id5-sync.com", "uids": [{"id": "ID5_abc", "atype": 1}]}
+        ]));
+
+        let updates = collect_eid_cookie_updates(Some(&eids_cookie), Some("shared-1"), &registry);
+
+        assert!(
+            updates.is_empty(),
+            "an empty registry matches no partners and touches no KV"
         );
     }
 

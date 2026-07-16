@@ -760,6 +760,55 @@ fn mediator_placeholder_request() -> Request<EdgeBody> {
         .expect("MEDIATOR_PLACEHOLDER_URL should be a valid URI")
 }
 
+/// Copies the downstream request head while leaving its body available to the caller.
+fn request_head_snapshot(req: &Request<EdgeBody>) -> Request<EdgeBody> {
+    let mut snapshot = Request::new(EdgeBody::empty());
+    *snapshot.method_mut() = req.method().clone();
+    *snapshot.uri_mut() = req.uri().clone();
+    *snapshot.version_mut() = req.version();
+    *snapshot.headers_mut() = req.headers().clone();
+    snapshot
+}
+
+fn should_preload_ec_snapshot(
+    is_navigation: bool,
+    is_get: bool,
+    has_ec_id: bool,
+    has_kv: bool,
+) -> bool {
+    is_navigation && is_get && has_ec_id && has_kv
+}
+
+/// Rewrites a downstream request into an outbound publisher-origin request.
+///
+/// Restricts advertised encodings to those the rewrite pipeline can handle,
+/// strips the internal `fastly-ssl` scheme signal so it never leaks to the
+/// backend, and retargets the URI and `Host` header at the origin.
+fn rewrite_origin_request(
+    req: &mut Request<EdgeBody>,
+    target_uri: Uri,
+    origin_host_header: &str,
+) -> Result<(), Report<TrustedServerError>> {
+    restrict_accept_encoding(req);
+    // Layering wart: `fastly-ssl` is a vendor-specific header name. Core only
+    // knows it because the Fastly adapter re-injects it from trusted TLS
+    // metadata and `detect_scheme` (see `http_util`) still reads it as a
+    // fallback scheme signal. The neutral signal (`ClientInfo::tls_protocol`)
+    // is already the primary path, so this strip — and the whole `fastly-ssl`
+    // coupling in core — should move behind a platform-neutral header in a
+    // separate change. Until then we strip it here so the edge signal never
+    // reaches publisher backends.
+    req.headers_mut().remove("fastly-ssl");
+    *req.uri_mut() = target_uri;
+    req.headers_mut().insert(
+        header::HOST,
+        HeaderValue::from_str(origin_host_header).change_context(TrustedServerError::Proxy {
+            message: "invalid publisher origin host header".to_string(),
+        })?,
+    );
+    Ok(())
+}
+
 /// Build a minimal [`AuctionContext`] for the collect phase.
 ///
 /// See [`AuctionContext::request`]: the orchestrator's collect path runs
@@ -1310,7 +1359,7 @@ pub async fn handle_publisher_request(
     kv: Option<&KvIdentityGraph>,
     ec_context: &mut EcContext,
     auction: AuctionDispatch<'_>,
-    mut req: Request<EdgeBody>,
+    req: Request<EdgeBody>,
 ) -> Result<PublisherResponse, Report<TrustedServerError>> {
     log::debug!("Proxying request to publisher_origin");
 
@@ -1348,7 +1397,16 @@ pub async fn handle_publisher_request(
     );
 
     let consent_context = ec_context.consent().clone();
-    let ec_id = ec_context.ec_value().filter(|_| ec_allowed);
+    // The active EC ID drives the internal snapshot preload and finalization —
+    // including consent-withdrawal tombstoning — so it must NOT be filtered by
+    // consent. The auction/EID identity is the consent-filtered view: under an
+    // explicit withdrawal `ec_allowed` is false, so auction dispatch forwards no
+    // EC while the origin-overlapped snapshot read still happens for the active
+    // ID, keeping the withdrawal CAS off the post-origin latency path.
+    let active_ec_id_owned = ec_context.ec_value().map(str::to_owned);
+    let active_ec_id = active_ec_id_owned.as_deref();
+    let ec_id_owned = active_ec_id_owned.clone().filter(|_| ec_allowed);
+    let ec_id = ec_id_owned.as_deref();
     let cookie_jar = handle_request_cookies(&req)?;
     let geo = ec_context.geo_info().cloned();
 
@@ -1455,6 +1513,43 @@ pub async fn handle_publisher_request(
         .map(|co| co.price_granularity)
         .unwrap_or_default();
 
+    let auction_client_request = request_head_snapshot(&req);
+    let mut origin_request = Some(req);
+    let should_preload_ec =
+        should_preload_ec_snapshot(is_navigation, is_get, active_ec_id.is_some(), kv.is_some());
+    let mut pending_origin = None;
+    if should_preload_ec && services.http_client().supports_concurrent_fanout() {
+        let mut origin_req = origin_request.take().ok_or_else(|| {
+            Report::new(TrustedServerError::Proxy {
+                message: "publisher origin request was already consumed".to_owned(),
+            })
+        })?;
+        rewrite_origin_request(&mut origin_req, target_uri.clone(), &origin_host_header)?;
+        pending_origin = Some(
+            services
+                .http_client()
+                .send_async(PlatformHttpRequest::new(origin_req, backend_name.clone()))
+                .await
+                .change_context(TrustedServerError::Proxy {
+                    message: "Failed to start publisher origin request".to_string(),
+                })?,
+        );
+    }
+    if should_preload_ec && let (Some(graph), Some(active_ec_id)) = (kv, active_ec_id) {
+        let refreshed = graph.load_snapshot(active_ec_id);
+        // Never downgrade an in-request Add-confirmed Present snapshot: a
+        // freshly created row can read back Missing/Failed on an
+        // eventually-consistent store, and rotating or suppressing that
+        // just-generated identity would fragment it. Adopt the refresh only
+        // when it keeps or upgrades to a Present row (the intended
+        // generation-refresh) — otherwise retain the confirmed entry.
+        let keep_present = ec_context.kv_snapshot().entry_for(active_ec_id).is_some()
+            && refreshed.entry_for(active_ec_id).is_none();
+        if !keep_present {
+            ec_context.set_kv_snapshot(refreshed);
+        }
+    }
+
     // Dispatch SSP bid requests while req still has the original client headers
     // (User-Agent, x-forwarded-for, cookies, etc.).  The borrow ends when
     // dispatch_auction returns — DispatchedAuction holds no lifetime — so req
@@ -1482,7 +1577,8 @@ pub async fn handle_publisher_request(
                 ec_id,
                 &consent_context,
                 &request_info,
-                req.headers()
+                auction_client_request
+                    .headers()
                     .get("user-agent")
                     .and_then(|v| v.to_str().ok()),
             );
@@ -1491,7 +1587,7 @@ pub async fn handle_publisher_request(
                 &AuctionEidTargeting {
                     cookie_jar: cookie_jar.as_ref(),
                     ec_id,
-                    kv,
+                    kv_snapshot: ec_context.kv_snapshot(),
                     partner_registry: auction.registry,
                     ec_context,
                     services,
@@ -1501,7 +1597,7 @@ pub async fn handle_publisher_request(
             );
             let auction_context = AuctionContext {
                 settings,
-                request: &req,
+                request: &auction_client_request,
                 timeout_ms: auction_timeout_ms,
                 provider_responses: None,
                 services,
@@ -1587,29 +1683,31 @@ pub async fn handle_publisher_request(
         }
     );
 
-    // Only advertise encodings the rewrite pipeline can decode and re-encode.
-    restrict_accept_encoding(&mut req);
-    // Strip the internal `fastly-ssl` scheme signal before forwarding to the
-    // origin. On the EdgeZero path the entry point re-injects this header from
-    // trusted Fastly TLS metadata so in-process scheme detection works; the
-    // legacy path never sets it. Either way it is an internal edge signal that
-    // must not leak to publisher backends.
-    req.headers_mut().remove("fastly-ssl");
-    *req.uri_mut() = target_uri;
-    req.headers_mut().insert(
-        header::HOST,
-        HeaderValue::from_str(&origin_host_header).change_context(TrustedServerError::Proxy {
-            message: "invalid publisher origin host header".to_string(),
-        })?,
-    );
+    // Rewrite the origin request only on the eager path where it was not already
+    // started via `send_async`. The concurrent path rewrote and dispatched it
+    // above, leaving `origin_request` empty.
+    if let Some(req) = origin_request.as_mut() {
+        rewrite_origin_request(req, target_uri, &origin_host_header)?;
+    }
 
     // SSP requests are already racing through the platform HTTP client, so
     // origin TTFB tracks origin latency rather than the auction timeout.
-    let mut response = match services
-        .http_client()
-        .send(PlatformHttpRequest::new(req, backend_name))
-        .await
-    {
+    let origin_result = if let Some(pending) = pending_origin {
+        services.http_client().wait(pending).await
+    } else {
+        services
+            .http_client()
+            .send(PlatformHttpRequest::new(
+                origin_request.take().ok_or_else(|| {
+                    Report::new(TrustedServerError::Proxy {
+                        message: "publisher origin request was already consumed".to_owned(),
+                    })
+                })?,
+                backend_name,
+            ))
+            .await
+    };
+    let mut response = match origin_result {
         Ok(platform_response) => platform_response.response,
         Err(err) => {
             if let Some(dispatched) = dispatched_auction.take() {
@@ -1797,7 +1895,7 @@ pub(crate) struct MatchedSlotsContext<'a> {
 struct AuctionEidTargeting<'a> {
     cookie_jar: Option<&'a CookieJar>,
     ec_id: Option<&'a str>,
-    kv: Option<&'a KvIdentityGraph>,
+    kv_snapshot: &'a crate::ec::EcKvSnapshot,
     partner_registry: Option<&'a PartnerRegistry>,
     ec_context: &'a EcContext,
     services: &'a RuntimeServices,
@@ -1826,7 +1924,7 @@ fn apply_auction_eids_and_device(
         None
     };
     let kv_eids = resolve_auction_eids(
-        targeting.kv,
+        targeting.kv_snapshot,
         targeting.partner_registry,
         targeting.ec_context,
     );
@@ -2296,6 +2394,15 @@ pub async fn handle_page_bids(
                 matched_slots: &matched_slots,
                 request_path: &path_param,
             };
+            // Load the identity-graph snapshot only now that a live auction is
+            // actually running (enabled, consent-granted, slots matched, not a
+            // bot/prefetch) and a partner registry exists to consume server-side
+            // EIDs. Kill-switch, no-slot, bot/prefetch, and no-registry requests
+            // never reach here, so they incur no billable KV read.
+            let page_bids_kv_snapshot = match (kv, ec_id, auction.registry) {
+                (Some(graph), Some(ec_id), Some(_)) => graph.load_snapshot(ec_id),
+                _ => crate::ec::EcKvSnapshot::NotRead,
+            };
             let mut auction_request = build_auction_request(
                 &slots_ctx,
                 ec_id,
@@ -2310,7 +2417,7 @@ pub async fn handle_page_bids(
                 &AuctionEidTargeting {
                     cookie_jar: cookie_jar.as_ref(),
                     ec_id,
-                    kv,
+                    kv_snapshot: &page_bids_kv_snapshot,
                     partner_registry: auction.registry,
                     ec_context,
                     services,
@@ -2442,7 +2549,41 @@ mod tests {
     use flate2::write::GzEncoder;
 
     use super::*;
+
+    #[test]
+    fn request_head_snapshot_preserves_downstream_shape_without_body() {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/article?x=1")
+            .header(header::HOST, "publisher.example")
+            .header("fastly-ssl", "1")
+            .header(header::USER_AGENT, "test-browser")
+            .body(EdgeBody::from("ignored-body"))
+            .expect("should build request");
+
+        let snapshot = request_head_snapshot(&request);
+
+        assert_eq!(snapshot.method(), Method::GET);
+        assert_eq!(snapshot.uri(), request.uri());
+        assert_eq!(snapshot.headers(), request.headers());
+        assert!(
+            matches!(snapshot.body(), EdgeBody::Once(bytes) if bytes.is_empty()),
+            "snapshot should never duplicate the request body"
+        );
+    }
+
+    #[test]
+    fn ec_snapshot_preload_requires_navigation_get_ec_and_kv() {
+        assert!(should_preload_ec_snapshot(true, true, true, true));
+        assert!(!should_preload_ec_snapshot(false, true, true, true));
+        assert!(!should_preload_ec_snapshot(true, false, true, true));
+        assert!(!should_preload_ec_snapshot(true, true, false, true));
+        assert!(!should_preload_ec_snapshot(true, true, true, false));
+    }
     use crate::auction::types::{AdFormat, AdSlot, MediaType};
+    use crate::consent::ConsentContext;
+    use crate::ec::kv_backend::test_support::InMemoryEcKv;
+    use crate::ec::kv_backend::{EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteOutcome};
     use crate::integrations::IntegrationRegistry;
     use crate::platform::test_support::{
         StubHttpClient, build_services_with_http_client, noop_services,
@@ -2451,6 +2592,157 @@ mod tests {
     use edgezero_core::body::Body as EdgeBody;
     use http::{Method, Request as HttpRequest, StatusCode, header};
     use std::sync::Arc;
+
+    /// [`EcKvStore`] that records how many HTTP calls the shared stub client had
+    /// made at the moment of each identity-graph lookup. This exposes the
+    /// interleaving between origin dispatch and the EC KV read so scheduling
+    /// tests can prove origin starts before the lookup only for concurrent
+    /// clients.
+    struct OrderRecordingKv {
+        inner: InMemoryEcKv,
+        http: Arc<StubHttpClient>,
+        http_calls_at_lookup: Arc<AtomicUsize>,
+        lookups: Arc<AtomicUsize>,
+    }
+
+    impl EcKvStore for OrderRecordingKv {
+        fn store_name(&self) -> &str {
+            self.inner.store_name()
+        }
+        fn lookup(&self, _key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            self.lookups.fetch_add(1, Ordering::SeqCst);
+            self.http_calls_at_lookup
+                .store(self.http.recorded_backend_names().len(), Ordering::SeqCst);
+            // Report a miss: the scheduling assertions only care about ordering.
+            Ok(None)
+        }
+        fn insert(
+            &self,
+            key: &str,
+            write: EcKvWrite<'_>,
+        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+            self.inner.insert(key, write)
+        }
+        fn count_keys_with_prefix(
+            &self,
+            prefix: &str,
+            limit: u32,
+        ) -> Result<u32, Report<TrustedServerError>> {
+            self.inner.count_keys_with_prefix(prefix, limit)
+        }
+        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            self.inner.delete(key)
+        }
+    }
+
+    fn scheduling_consent() -> ConsentContext {
+        ConsentContext {
+            jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+            ..Default::default()
+        }
+    }
+
+    fn navigation_request() -> Request<EdgeBody> {
+        HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/article")
+            .header(header::HOST, "publisher.example")
+            .header("sec-fetch-dest", "document")
+            .body(EdgeBody::empty())
+            .expect("should build navigation request")
+    }
+
+    /// Drives one EC-capable navigation and returns
+    /// `(lookups, http_calls_at_first_lookup, result_is_ok)`.
+    async fn run_scheduling_probe(
+        concurrent_fanout: bool,
+        queue_origin: bool,
+    ) -> (usize, usize, bool) {
+        let settings = create_test_settings();
+        let http = Arc::new(StubHttpClient::new());
+        http.set_concurrent_fanout(concurrent_fanout);
+        if queue_origin {
+            http.push_response(200, b"<html><body>ok</body></html>".to_vec());
+        }
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let http_calls_at_lookup = Arc::new(AtomicUsize::new(0));
+        let graph = KvIdentityGraph::new(OrderRecordingKv {
+            inner: InMemoryEcKv::new("order-store"),
+            http: Arc::clone(&http),
+            http_calls_at_lookup: Arc::clone(&http_calls_at_lookup),
+            lookups: Arc::clone(&lookups),
+        });
+        let services = build_services_with_http_client(
+            Arc::clone(&http) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let ec_id = format!("{}.CkId01", "b".repeat(64));
+        let mut ec_context = EcContext::new_for_test_with_ip(
+            Some(ec_id),
+            scheduling_consent(),
+            Some("203.0.113.7".to_owned()),
+        );
+        assert!(
+            ec_context.ec_allowed() && ec_context.ec_value().is_some(),
+            "test precondition: an active, consent-allowed EC must exist"
+        );
+        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+
+        let result = handle_publisher_request(
+            &settings,
+            &services,
+            Some(&graph),
+            &mut ec_context,
+            AuctionDispatch {
+                orchestrator: &orchestrator,
+                slots: &[],
+                registry: None,
+            },
+            navigation_request(),
+        )
+        .await;
+
+        (
+            lookups.load(Ordering::SeqCst),
+            http_calls_at_lookup.load(Ordering::SeqCst),
+            result.is_ok(),
+        )
+    }
+
+    #[tokio::test]
+    async fn concurrent_client_starts_origin_before_ec_lookup() {
+        let (lookups, http_calls_at_lookup, ok) = run_scheduling_probe(true, true).await;
+
+        assert!(ok, "should proxy the origin response");
+        assert_eq!(lookups, 1, "should perform exactly one EC lookup");
+        assert_eq!(
+            http_calls_at_lookup, 1,
+            "a concurrent client must start the origin before its EC KV lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn eager_client_reads_ec_before_starting_origin() {
+        let (lookups, http_calls_at_lookup, ok) = run_scheduling_probe(false, true).await;
+
+        assert!(ok, "should proxy the origin response");
+        assert_eq!(lookups, 1, "should perform exactly one EC lookup");
+        assert_eq!(
+            http_calls_at_lookup, 0,
+            "an eager client must not start the origin before its EC KV lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_origin_start_failure_skips_ec_and_auction_work() {
+        // No origin response is queued, so the concurrent `send_async` fails.
+        let (lookups, _http_calls, ok) = run_scheduling_probe(true, false).await;
+
+        assert!(!ok, "origin-start failure should surface as an error");
+        assert_eq!(
+            lookups, 0,
+            "origin-start failure must occur before any EC KV work"
+        );
+    }
 
     struct ChunkedReader {
         chunks: std::collections::VecDeque<Vec<u8>>,
