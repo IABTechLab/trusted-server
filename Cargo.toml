@@ -10,6 +10,9 @@ members = [
     "crates/trusted-server-integration-tests",
     "crates/trusted-server-js",
     "crates/trusted-server-openrtb",
+    # Manual protobuf codegen tool — a member so it shares workspace settings,
+    # but no default member or alias builds it. Run it explicitly with `-p`.
+    "crates/trusted-server-openrtb-codegen",
 ]
 
 # Viceroy (cargo test-fastly runner) calls `cargo run --bin trusted-server-adapter-fastly`
@@ -24,6 +27,13 @@ default-members = [
 
 [profile.release]
 debug = 1
+
+[workspace.package]
+authors = []
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+version = "0.1.0"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -72,6 +82,7 @@ log-fastly = "0.12"
 lol_html = "2.7.2"
 matchit = "0.9"
 mime = "0.3"
+prost-build = "0.13"
 rand = "0.8"
 rcgen = { version = "0.13", features = ["x509-parser"] }
 regex = "1.12.3"

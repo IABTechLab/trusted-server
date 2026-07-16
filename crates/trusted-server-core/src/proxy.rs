@@ -1,9 +1,9 @@
 use crate::http_util::{compute_encrypted_sha256_token, ct_str_eq, enforce_max_body_size};
 use edgezero_core::body::Body as EdgeBody;
-use edgezero_core::http::{request_builder as edge_request_builder, Uri as EdgeUri};
+use edgezero_core::http::{Uri as EdgeUri, request_builder as edge_request_builder};
 use error_stack::{Report, ResultExt};
 use futures::StreamExt as _;
-use http::{header, HeaderValue, Method, Request, Response, StatusCode};
+use http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
@@ -19,8 +19,8 @@ use crate::creative::{CreativeCssProcessor, CreativeHtmlProcessor};
 use crate::edge_cookie::get_ec_id;
 use crate::error::TrustedServerError;
 use crate::platform::{
-    PlatformBackendSpec, PlatformHttpRequest, PlatformResponse, RuntimeServices, StoreName,
-    DEFAULT_FIRST_BYTE_TIMEOUT,
+    DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, PlatformHttpRequest, PlatformResponse,
+    RuntimeServices, StoreName,
 };
 use crate::redacted::Redacted;
 use crate::s3_sigv4::{self, S3Credentials};
@@ -571,10 +571,9 @@ fn apply_image_passthrough_metadata(
         .get(header::CONTENT_LENGTH)
         .and_then(|h| h.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
+        && cl <= 256
     {
-        if cl <= 256 {
-            is_pixel = true;
-        }
+        is_pixel = true;
     }
     if !is_pixel {
         let lower = target_url.to_ascii_lowercase();
@@ -1113,8 +1112,8 @@ pub async fn handle_asset_proxy_request(
     }
     outbound_headers.insert(header::HOST, asset_origin_host_header(&target_url)?);
 
-    if should_preflight_s3(route, image_optimizer.is_some(), req.method()) {
-        if let Some(response) = preflight_s3_origin_for_image_optimizer(
+    if should_preflight_s3(route, image_optimizer.is_some(), req.method())
+        && let Some(response) = preflight_s3_origin_for_image_optimizer(
             services,
             route,
             &target_url,
@@ -1123,9 +1122,8 @@ pub async fn handle_asset_proxy_request(
             &backend_name,
         )
         .await?
-        {
-            return Ok(response);
-        }
+    {
+        return Ok(response);
     }
 
     if let Some(auth) = &route.auth {
@@ -2031,20 +2029,20 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        asset_origin_host_header, asset_path_skips_image_optimizer, build_asset_proxy_target_url,
-        clear_s3_credentials_cache_for_tests, handle_asset_proxy_request, handle_first_party_click,
-        handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
-        is_host_allowed, proxy_request, rebuild_response_with_body,
-        reconstruct_and_validate_signed_target, redirect_is_permitted, stream_asset_body,
-        AssetProxyCachePolicy, ProxyRequestConfig, IMAGE_FALLBACK_CONTENT_TYPE,
-        SUPPORTED_ENCODINGS,
+        AssetProxyCachePolicy, IMAGE_FALLBACK_CONTENT_TYPE, ProxyRequestConfig,
+        SUPPORTED_ENCODINGS, asset_origin_host_header, asset_path_skips_image_optimizer,
+        build_asset_proxy_target_url, clear_s3_credentials_cache_for_tests,
+        handle_asset_proxy_request, handle_first_party_click, handle_first_party_proxy,
+        handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, is_host_allowed,
+        proxy_request, rebuild_response_with_body, reconstruct_and_validate_signed_target,
+        redirect_is_permitted, stream_asset_body,
     };
     use crate::constants::{HEADER_ACCEPT, HEADER_X_FORWARDED_FOR};
     use crate::creative;
     use crate::error::{IntoHttpResponse, TrustedServerError};
     use crate::platform::test_support::{
-        build_services_with_http_client, build_services_with_secret_and_http_client, noop_services,
-        HashMapSecretStore, StubHttpClient,
+        HashMapSecretStore, StubHttpClient, build_services_with_http_client,
+        build_services_with_secret_and_http_client, noop_services,
     };
     use crate::platform::{
         PlatformError, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
@@ -2060,7 +2058,7 @@ mod tests {
     use edgezero_core::body::Body as EdgeBody;
     use edgezero_core::http::response_builder as edge_response_builder;
     use error_stack::Report;
-    use http::{header, HeaderValue, Method, Request as HttpRequest, Response, StatusCode};
+    use http::{HeaderValue, Method, Request as HttpRequest, Response, StatusCode, header};
 
     #[test]
     fn test_rebuild_response_with_body_preserves_multiple_headers() {
@@ -2784,7 +2782,7 @@ mod tests {
             let settings = create_test_settings();
             // Intentionally malformed target (host missing) but signed consistently
             let tsurl = "https://"; // invalid URL
-                                    // Manually construct first-party URL matching creative's format
+            // Manually construct first-party URL matching creative's format
             let full_for_token = tsurl.to_string();
             let sig = crate::http_util::compute_encrypted_sha256_token(&settings, &full_for_token);
             let url = format!(
@@ -2979,9 +2977,9 @@ mod tests {
 
     #[test]
     fn html_gzip_response_is_processed_with_compression_preserved() {
+        use flate2::Compression;
         use flate2::read::GzDecoder;
         use flate2::write::GzEncoder;
-        use flate2::Compression;
         use std::io::{Read, Write};
 
         let settings = create_test_settings();
@@ -3035,8 +3033,8 @@ mod tests {
 
     #[test]
     fn css_brotli_response_is_processed_with_compression_preserved() {
-        use brotli::enc::writer::CompressorWriter;
         use brotli::Decompressor;
+        use brotli::enc::writer::CompressorWriter;
         use std::io::{Read, Write};
 
         let settings = create_test_settings();

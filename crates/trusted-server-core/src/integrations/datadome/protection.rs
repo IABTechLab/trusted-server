@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use edgezero_core::body::Body as EdgeBody;
-use edgezero_core::http::{request_builder, HeaderMap, HeaderName};
+use edgezero_core::http::{HeaderMap, HeaderName, request_builder};
 use error_stack::{Report, ResultExt};
-use http::{header, Method, Request, Response, StatusCode};
+use http::{Method, Request, Response, StatusCode, header};
 use url::Url;
 
 use crate::error::TrustedServerError;
@@ -13,8 +13,8 @@ use crate::integrations::{
 use crate::platform::{PlatformBackendSpec, PlatformHttpRequest, RuntimeServices, StoreName};
 use crate::redacted::Redacted;
 
-use super::protection_scope::{ProtectionRequestFacts, ProtectionScopeDecision};
 use super::DataDomeIntegration;
+use super::protection_scope::{ProtectionRequestFacts, ProtectionScopeDecision};
 
 const VALIDATE_REQUEST_PATH: &str = "/validate-request";
 const REQUEST_MODULE_NAME: &str = "Trusted-Server-Rust";
@@ -649,7 +649,7 @@ mod tests {
 
     use crate::integrations::datadome::DataDomeConfig;
     use crate::platform::test_support::{
-        build_services_with_config_and_secret, HashMapSecretStore, NoopConfigStore, NoopSecretStore,
+        HashMapSecretStore, NoopConfigStore, NoopSecretStore, build_services_with_config_and_secret,
     };
     use crate::settings::Settings;
 

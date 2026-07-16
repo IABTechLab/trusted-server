@@ -207,7 +207,10 @@ impl<'a> BackendConfig<'a> {
             None => buf.push('n'),
         }
         push_field(&mut buf, &self.first_byte_timeout.as_millis().to_string());
-        push_field(&mut buf, &self.between_bytes_timeout.as_millis().to_string());
+        push_field(
+            &mut buf,
+            &self.between_bytes_timeout.as_millis().to_string(),
+        );
         buf
     }
 
@@ -285,7 +288,10 @@ impl<'a> BackendConfig<'a> {
             first_byte_timeout_ms,
             between_bytes_timeout_ms
         );
-        let readable: String = readable_full.chars().take(MAX_READABLE_PREFIX_LEN).collect();
+        let readable: String = readable_full
+            .chars()
+            .take(MAX_READABLE_PREFIX_LEN)
+            .collect();
 
         // Collision-resistant over the *complete* spec, so name equality implies
         // spec equality and `NameInUse` reuse is safe.
@@ -468,9 +474,7 @@ impl<'a> BackendConfig<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        compute_host_header, BackendConfig, MAX_BACKEND_NAME_LEN, SPEC_DIGEST_HEX_LEN,
-    };
+    use super::{BackendConfig, MAX_BACKEND_NAME_LEN, SPEC_DIGEST_HEX_LEN, compute_host_header};
 
     /// Assert a computed name is `backend_<body>_<hex digest>` and stays within
     /// Fastly's length limit. The digest is what makes the name injective, so

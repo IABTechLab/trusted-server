@@ -146,13 +146,13 @@ impl CreativeOpportunitySlot {
         // A negative floor silently disables minimum-price enforcement, and a
         // non-finite floor (NaN/infinity) produces surprising all-pass/all-drop
         // comparisons and an invalid OpenRTB `bidfloor`.
-        if let Some(floor_price) = self.floor_price {
-            if !floor_price.is_finite() || floor_price < 0.0 {
-                return Err(format!(
-                    "slot `{}` floor_price must be a finite value >= 0.0, got {floor_price}",
-                    self.id
-                ));
-            }
+        if let Some(floor_price) = self.floor_price
+            && (!floor_price.is_finite() || floor_price < 0.0)
+        {
+            return Err(format!(
+                "slot `{}` floor_price must be a finite value >= 0.0, got {floor_price}",
+                self.id
+            ));
         }
 
         // An explicit empty/whitespace `div_id` override is rejected: the

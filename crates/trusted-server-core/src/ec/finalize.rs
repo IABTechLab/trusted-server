@@ -11,13 +11,13 @@ use http::Response;
 use super::consent::{ec_consent_granted, ec_consent_withdrawn};
 use crate::settings::Settings;
 
+use super::EcContext;
 use super::cookies::{expire_ec_cookie, set_ec_cookie};
 use super::generation::is_valid_ec_id;
 use super::kv::KvIdentityGraph;
 use super::log_id;
 use super::prebid_eids::ingest_eid_cookies;
 use super::registry::PartnerRegistry;
-use super::EcContext;
 
 /// TS-managed response headers tied to EC identity output.
 const EC_RESPONSE_HEADERS: &[&str] = &[
@@ -155,16 +155,16 @@ pub fn clear_ec_on_response(settings: &Settings, response: &mut Response<EdgeBod
 fn withdrawal_ec_ids(ec_context: &EcContext) -> HashSet<String> {
     let mut hashes = HashSet::new();
 
-    if let Some(cookie_ec_id) = ec_context.existing_cookie_ec_id() {
-        if is_valid_ec_id(cookie_ec_id) {
-            hashes.insert(cookie_ec_id.to_owned());
-        }
+    if let Some(cookie_ec_id) = ec_context.existing_cookie_ec_id()
+        && is_valid_ec_id(cookie_ec_id)
+    {
+        hashes.insert(cookie_ec_id.to_owned());
     }
 
-    if let Some(active_ec_id) = ec_context.ec_value() {
-        if is_valid_ec_id(active_ec_id) {
-            hashes.insert(active_ec_id.to_owned());
-        }
+    if let Some(active_ec_id) = ec_context.ec_value()
+        && is_valid_ec_id(active_ec_id)
+    {
+        hashes.insert(active_ec_id.to_owned());
     }
 
     hashes
