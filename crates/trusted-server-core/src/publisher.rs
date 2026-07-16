@@ -1080,11 +1080,11 @@ pub async fn buffer_publisher_response_async(
         PublisherResponse::Buffered(mut response) => {
             // A buffered-unmodified response can carry an origin body (a stream
             // on streaming-capable adapters). A bodiless response (HEAD, 204,
-            // 205, 304) must stay bodiless, so drop the body while preserving
-            // metadata such as `Content-Length`, matching the streaming
-            // finalizer.
+            // 205, 304) must stay bodiless, so drop the body and correct its
+            // framing (204/205 Content-Length; HEAD/304 preserved), matching
+            // the streaming finalizer.
             if !response_carries_body(method, response.status()) {
-                *response.body_mut() = EdgeBody::empty();
+                make_response_bodiless(&mut response);
             }
             Ok(response)
         }
@@ -1159,10 +1159,10 @@ pub async fn publisher_response_into_streaming_response(
             // classified, so a buffered-unmodified response can still hold an
             // `EdgeBody::Stream`. A bodiless response (HEAD, 204, 205, 304) must
             // stay bodiless — `send_edgezero_response` streams any
-            // `EdgeBody::Stream` to the client — so drop the body while
-            // preserving metadata such as `Content-Length`.
+            // `EdgeBody::Stream` to the client — so drop the body and correct
+            // its framing (204/205 Content-Length; HEAD/304 preserved).
             if !response_carries_body(method, response.status()) {
-                *response.body_mut() = EdgeBody::empty();
+                make_response_bodiless(&mut response);
             }
             Ok(response)
         }
@@ -1350,6 +1350,30 @@ fn response_carries_body(method: &Method, status: StatusCode) -> bool {
         && status != StatusCode::NO_CONTENT
         && status != StatusCode::RESET_CONTENT
         && status != StatusCode::NOT_MODIFIED
+}
+
+/// Drop a bodiless response's body and correct its framing headers.
+///
+/// The response keeps no body, and its `Content-Length` is corrected where the
+/// origin's value would be invalid for the now-empty message:
+/// - **204 No Content**: RFC 9110 §8.6 forbids `Content-Length`; remove it.
+/// - **205 Reset Content**: the reset response carries nothing, so a nonzero
+///   origin length is wrong (RFC 9110 §15.4.6); normalize it to `0`.
+/// - **HEAD and 304 Not Modified**: `Content-Length` legitimately advertises
+///   the `GET` representation length, so it is preserved untouched.
+fn make_response_bodiless(response: &mut Response<EdgeBody>) {
+    *response.body_mut() = EdgeBody::empty();
+    match response.status() {
+        StatusCode::NO_CONTENT => {
+            response.headers_mut().remove(header::CONTENT_LENGTH);
+        }
+        StatusCode::RESET_CONTENT => {
+            response
+                .headers_mut()
+                .insert(header::CONTENT_LENGTH, HeaderValue::from(0_u64));
+        }
+        _ => {}
+    }
 }
 
 /// A [`Write`] sink that buffers into a `Vec<u8>` but fails once the configured
@@ -5547,26 +5571,29 @@ mod tests {
         );
     }
 
+    // (method, status, expected Content-Length after bodiless normalization).
+    // 204 forbids Content-Length (removed); 205 must advertise a zero-length
+    // body; HEAD and 304 legitimately advertise the GET representation length.
+    const BODILESS_FRAMING_CASES: [(Method, StatusCode, Option<&str>); 4] = [
+        (Method::HEAD, StatusCode::OK, Some("42")),
+        (Method::GET, StatusCode::NO_CONTENT, None),
+        (Method::GET, StatusCode::RESET_CONTENT, Some("0")),
+        (Method::GET, StatusCode::NOT_MODIFIED, Some("42")),
+    ];
+
     #[test]
-    fn publisher_response_streaming_finalize_drops_bodiless_buffered_stream_body() {
+    fn publisher_response_streaming_finalize_normalizes_bodiless_framing() {
         // Fastly requests the origin body as a stream before classification, so
         // a buffered-unmodified response can hold an `EdgeBody::Stream`. The
         // adapter streams any `EdgeBody::Stream` to the client, so bodiless
-        // responses must be normalized to carry no body while keeping metadata.
+        // responses must carry no body and correct framing per status.
         let settings = Arc::new(create_test_settings());
         let registry = Arc::new(
             IntegrationRegistry::new(&settings).expect("should create integration registry"),
         );
         let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
 
-        let cases = [
-            (Method::HEAD, StatusCode::OK),
-            (Method::GET, StatusCode::NO_CONTENT),
-            (Method::GET, StatusCode::RESET_CONTENT),
-            (Method::GET, StatusCode::NOT_MODIFIED),
-        ];
-
-        for (method, status) in cases {
+        for (method, status, expected_length) in BODILESS_FRAMING_CASES {
             let response = Response::builder()
                 .status(status)
                 .header(header::CONTENT_LENGTH, "42")
@@ -5595,8 +5622,62 @@ mod tests {
                     .headers()
                     .get(header::CONTENT_LENGTH)
                     .and_then(|v| v.to_str().ok()),
-                Some("42"),
-                "bodiless {method} {status} must preserve the origin Content-Length"
+                expected_length,
+                "bodiless {method} {status} must carry the corrected Content-Length"
+            );
+
+            let drained = futures::executor::block_on(
+                response
+                    .into_body()
+                    .into_bytes_bounded(settings.publisher.max_buffered_body_bytes),
+            )
+            .expect("body should drain")
+            .to_vec();
+            assert!(
+                drained.is_empty(),
+                "bodiless {method} {status} must deliver zero body bytes, got {} bytes",
+                drained.len()
+            );
+        }
+    }
+
+    #[test]
+    fn buffer_publisher_response_normalizes_bodiless_framing() {
+        // The buffered finalizer (Axum/Cloudflare/Spin) must correct bodiless
+        // framing identically to the streaming finalizer.
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let services = noop_services();
+
+        for (method, status, expected_length) in BODILESS_FRAMING_CASES {
+            let response = Response::builder()
+                .status(status)
+                .header(header::CONTENT_LENGTH, "42")
+                .body(EdgeBody::from(
+                    b"origin body bytes that must not reach the client".to_vec(),
+                ))
+                .expect("should build response");
+            let publisher_response = PublisherResponse::Buffered(response);
+
+            let response = futures::executor::block_on(buffer_publisher_response_async(
+                publisher_response,
+                &method,
+                &settings,
+                &registry,
+                &orchestrator,
+                &services,
+            ))
+            .expect("should finalize buffered response");
+
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok()),
+                expected_length,
+                "bodiless {method} {status} must carry the corrected Content-Length"
             );
 
             let drained = futures::executor::block_on(
