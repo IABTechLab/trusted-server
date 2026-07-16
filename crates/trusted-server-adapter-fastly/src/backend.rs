@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use error_stack::{Report, ResultExt as _};
 use fastly::backend::Backend;
+use sha2::{Digest as _, Sha256};
 use url::Url;
 
 use trusted_server_core::error::TrustedServerError;
@@ -47,6 +48,34 @@ fn sanitize_backend_name_component(value: &str) -> String {
         .collect()
 }
 
+/// Fastly's documented maximum length for a dynamic backend name.
+const MAX_BACKEND_NAME_LEN: usize = 255;
+/// Maximum length of the human-readable prefix folded into a backend name.
+///
+/// Bounds the name so that `backend_<prefix>_<digest>` can never exceed
+/// [`MAX_BACKEND_NAME_LEN`]: 8 (`backend_`) + 200 + 1 (`_`) +
+/// [`SPEC_DIGEST_HEX_LEN`] = 241 ≤ 255.
+const MAX_READABLE_PREFIX_LEN: usize = 200;
+/// Width of the hex digest suffix — the first 128 bits of a SHA-256 over the
+/// full backend spec, which is collision-resistant at the handful-of-hundreds
+/// scale of a service's dynamic backends.
+const SPEC_DIGEST_HEX_LEN: usize = 32;
+
+/// Hex-encode the first 128 bits of a SHA-256 digest of `canonical`.
+///
+/// Used to make a backend name a collision-resistant function of the complete
+/// backend spec (see [`BackendConfig::canonical_spec_string`]).
+fn spec_digest_hex(canonical: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    let digest = hasher.finalize();
+    digest
+        .iter()
+        .take(SPEC_DIGEST_HEX_LEN / 2)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// Default first-byte timeout for backends (15 seconds).
 pub(crate) const DEFAULT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Default timeout between response body bytes for backends (10 seconds).
@@ -64,6 +93,7 @@ pub struct BackendConfig<'a> {
     first_byte_timeout: Duration,
     between_bytes_timeout: Duration,
     host_header_override: Option<&'a str>,
+    discriminator: Option<&'a str>,
 }
 
 impl<'a> BackendConfig<'a> {
@@ -81,6 +111,7 @@ impl<'a> BackendConfig<'a> {
             first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
             between_bytes_timeout: DEFAULT_BETWEEN_BYTES_TIMEOUT,
             host_header_override: None,
+            discriminator: None,
         }
     }
 
@@ -128,14 +159,77 @@ impl<'a> BackendConfig<'a> {
         self
     }
 
+    /// Set an optional stable discriminator folded into the backend name.
+    ///
+    /// Two callers targeting the same origin with the same transport timeout
+    /// otherwise share a backend name. Auction response correlation keys on the
+    /// backend name, so a shared name would let one provider's response be
+    /// parsed as another's. A per-provider discriminator keeps the names
+    /// distinct while staying stable across requests.
+    #[must_use]
+    pub fn discriminator(mut self, discriminator: Option<&'a str>) -> Self {
+        self.discriminator = discriminator;
+        self
+    }
+
+    /// Build an unambiguous, length-prefixed encoding of the complete backend
+    /// spec for digesting.
+    ///
+    /// Every field is prefixed with its byte length so that no two distinct
+    /// specs can encode to the same string (a lossy substitution like
+    /// `sanitize_backend_name_component` cannot guarantee this). `Option` fields
+    /// are presence-tagged so a `None` never aliases a `Some("")`. The result is
+    /// fed to [`spec_digest_hex`]; it is never parsed, only hashed.
+    fn canonical_spec_string(&self, target_port: u16) -> String {
+        fn push_field(buf: &mut String, field: &str) {
+            buf.push_str(&field.len().to_string());
+            buf.push(':');
+            buf.push_str(field);
+        }
+
+        let mut buf = String::new();
+        push_field(&mut buf, self.scheme);
+        push_field(&mut buf, self.host);
+        push_field(&mut buf, &target_port.to_string());
+        push_field(&mut buf, if self.certificate_check { "1" } else { "0" });
+        match self.host_header_override {
+            Some(value) => {
+                buf.push('s');
+                push_field(&mut buf, value);
+            }
+            None => buf.push('n'),
+        }
+        match self.discriminator {
+            Some(value) => {
+                buf.push('s');
+                push_field(&mut buf, value);
+            }
+            None => buf.push('n'),
+        }
+        push_field(&mut buf, &self.first_byte_timeout.as_millis().to_string());
+        push_field(
+            &mut buf,
+            &self.between_bytes_timeout.as_millis().to_string(),
+        );
+        buf
+    }
+
     /// Compute the deterministic backend name and resolved port without
     /// registering anything.
     ///
-    /// The name encodes scheme, host, port, certificate setting, and
-    /// first-byte timeout so that backends with different configurations
-    /// never collide.  Including the timeout prevents "first-registration-wins"
-    /// poisoning where a later request for the same origin with a tighter
-    /// timeout would silently inherit the original registration's value.
+    /// The name is `backend_<readable>_<digest>`, where `<digest>` is a
+    /// collision-resistant SHA-256 over an unambiguous encoding of the
+    /// *complete* backend spec — scheme, host, port, certificate setting, Host
+    /// override, provider discriminator, and the first-byte/between-bytes
+    /// timeouts (see [`canonical_spec_string`](Self::canonical_spec_string)).
+    /// Because distinct specs yield distinct digests, name equality implies spec
+    /// equality: that is what makes reusing a `NameInUse` backend provably safe,
+    /// and it prevents "first-registration-wins" poisoning where a later request
+    /// with a tighter timeout would inherit an earlier registration's value. The
+    /// `<readable>` half is a lossy, bounded slug carried only for logs — any
+    /// collision there is harmless because uniqueness comes from the digest. The
+    /// whole name is bounded to [`MAX_BACKEND_NAME_LEN`] so a long host or
+    /// discriminator can never produce a name Fastly rejects at registration.
     fn compute_name(&self) -> Result<(String, u16), Report<TrustedServerError>> {
         if self.host.is_empty() {
             return Err(Report::new(TrustedServerError::Proxy {
@@ -174,16 +268,46 @@ impl<'a> BackendConfig<'a> {
         } else {
             "_nocert"
         };
+        let discriminator_suffix = self
+            .discriminator
+            .map(|d| format!("_p_{}", sanitize_backend_name_component(d)))
+            .unwrap_or_default();
         let first_byte_timeout_ms = self.first_byte_timeout.as_millis();
         let between_bytes_timeout_ms = self.between_bytes_timeout.as_millis();
-        let backend_name = format!(
-            "backend_{}{}{}_fb{}_bb{}",
+
+        // Lossy, human-readable slug for logs. Correctness does not depend on
+        // it — uniqueness comes from the digest below — so it is bounded to a
+        // fixed length. Sanitization only emits ASCII, so a char-boundary take
+        // is byte-exact.
+        let readable_full = format!(
+            "{}{}{}{}_fb{}_bb{}",
             sanitize_backend_name_component(&name_base),
             host_override_suffix,
             cert_suffix,
+            discriminator_suffix,
             first_byte_timeout_ms,
             between_bytes_timeout_ms
         );
+        let readable: String = readable_full
+            .chars()
+            .take(MAX_READABLE_PREFIX_LEN)
+            .collect();
+
+        // Collision-resistant over the *complete* spec, so name equality implies
+        // spec equality and `NameInUse` reuse is safe.
+        let digest = spec_digest_hex(&self.canonical_spec_string(target_port));
+        let backend_name = format!("backend_{readable}_{digest}");
+
+        // Bounded by construction; assert it so any future format change fails
+        // attributably during prediction rather than at Fastly registration.
+        if backend_name.len() > MAX_BACKEND_NAME_LEN {
+            return Err(Report::new(TrustedServerError::Proxy {
+                message: format!(
+                    "backend name exceeds {MAX_BACKEND_NAME_LEN}-char limit ({} chars)",
+                    backend_name.len()
+                ),
+            }));
+        }
 
         Ok((backend_name, target_port))
     }
@@ -350,7 +474,33 @@ impl<'a> BackendConfig<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendConfig, compute_host_header};
+    use super::{BackendConfig, MAX_BACKEND_NAME_LEN, SPEC_DIGEST_HEX_LEN, compute_host_header};
+
+    /// Assert a computed name is `backend_<body>_<hex digest>` and stays within
+    /// Fastly's length limit. The digest is what makes the name injective, so
+    /// checking its presence and width guards the collision-safety property.
+    fn assert_backend_name_shape(name: &str, expected_body: &str) {
+        let prefix = format!("backend_{expected_body}_");
+        assert!(
+            name.starts_with(&prefix),
+            "name should start with the readable body `{prefix}`, got {name}"
+        );
+        let digest = &name[prefix.len()..];
+        assert_eq!(
+            digest.len(),
+            SPEC_DIGEST_HEX_LEN,
+            "digest suffix should be {SPEC_DIGEST_HEX_LEN} hex chars, got {digest}"
+        );
+        assert!(
+            digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "digest suffix should be hex, got {digest}"
+        );
+        assert!(
+            name.len() <= MAX_BACKEND_NAME_LEN,
+            "name should stay within the {MAX_BACKEND_NAME_LEN}-char limit, got {}",
+            name.len()
+        );
+    }
 
     // Tests for compute_host_header - the fix for port preservation in Host header
     #[test]
@@ -399,7 +549,7 @@ mod tests {
         let name = BackendConfig::new("https", "origin.example.com")
             .ensure()
             .expect("should create backend for valid HTTPS origin");
-        assert_eq!(name, "backend_https_origin_example_com_443_fb15000_bb10000");
+        assert_backend_name_shape(&name, "https_origin_example_com_443_fb15000_bb10000");
     }
 
     #[test]
@@ -408,10 +558,7 @@ mod tests {
             .certificate_check(false)
             .ensure()
             .expect("should create backend with cert check disabled");
-        assert_eq!(
-            name,
-            "backend_https_origin_example_com_443_nocert_fb15000_bb10000"
-        );
+        assert_backend_name_shape(&name, "https_origin_example_com_443_nocert_fb15000_bb10000");
     }
 
     #[test]
@@ -420,7 +567,7 @@ mod tests {
             .port(Some(8080))
             .ensure()
             .expect("should create backend for HTTP origin with explicit port");
-        assert_eq!(name, "backend_http_api_test-site_org_8080_fb15000_bb10000");
+        assert_backend_name_shape(&name, "http_api_test-site_org_8080_fb15000_bb10000");
     }
 
     #[test]
@@ -428,7 +575,7 @@ mod tests {
         let name = BackendConfig::new("http", "example.org")
             .ensure()
             .expect("should create backend defaulting to port 80 for HTTP");
-        assert_eq!(name, "backend_http_example_org_80_fb15000_bb10000");
+        assert_backend_name_shape(&name, "http_example_org_80_fb15000_bb10000");
     }
 
     #[test]
@@ -483,13 +630,13 @@ mod tests {
             name_a, name_b,
             "backends with different host header overrides should have different names"
         );
-        assert_eq!(
-            name_a,
-            "backend_https_origin_example_com_443_oh_www_example_com_fb15000_bb10000"
+        assert_backend_name_shape(
+            &name_a,
+            "https_origin_example_com_443_oh_www_example_com_fb15000_bb10000",
         );
-        assert_eq!(
-            name_b,
-            "backend_https_origin_example_com_443_oh_m_example_com_fb15000_bb10000"
+        assert_backend_name_shape(
+            &name_b,
+            "https_origin_example_com_443_oh_m_example_com_fb15000_bb10000",
         );
     }
 
@@ -544,12 +691,12 @@ mod tests {
             "backends with different timeouts should have different names"
         );
         assert!(
-            name_a.ends_with("_fb2000_bb10000"),
-            "name should include first-byte and between-bytes timeout suffix"
+            name_a.contains("_fb2000_bb10000_"),
+            "name should include first-byte and between-bytes timeout in the readable body"
         );
         assert!(
-            name_b.ends_with("_fb500_bb10000"),
-            "name should include first-byte and between-bytes timeout suffix"
+            name_b.contains("_fb500_bb10000_"),
+            "name should include first-byte and between-bytes timeout in the readable body"
         );
     }
 
@@ -571,12 +718,89 @@ mod tests {
             "backends with different between-bytes timeouts should have different names"
         );
         assert!(
-            name_a.ends_with("_fb15000_bb2000"),
-            "name should include first-byte and between-bytes timeout suffix"
+            name_a.contains("_fb15000_bb2000_"),
+            "name should include first-byte and between-bytes timeout in the readable body"
         );
         assert!(
-            name_b.ends_with("_fb15000_bb500"),
-            "name should include first-byte and between-bytes timeout suffix"
+            name_b.contains("_fb15000_bb500_"),
+            "name should include first-byte and between-bytes timeout in the readable body"
+        );
+    }
+
+    #[test]
+    fn discriminators_that_sanitize_alike_produce_distinct_names() {
+        // `provider.a` and `provider_a` both sanitize to the same readable slug
+        // (`.` maps to `_`). Before the spec digest they collided to one backend
+        // name, so the second registration silently reused the first — routing
+        // one provider's auction traffic through another's backend. The digest
+        // over the raw spec must keep them distinct.
+        let dotted = BackendConfig::new("https", "gateway.example.com")
+            .discriminator(Some("provider.a"))
+            .predict_name()
+            .expect("should predict name for dotted discriminator");
+        let underscored = BackendConfig::new("https", "gateway.example.com")
+            .discriminator(Some("provider_a"))
+            .predict_name()
+            .expect("should predict name for underscored discriminator");
+        assert_ne!(
+            dotted, underscored,
+            "discriminators differing only by a sanitized character must not collide"
+        );
+    }
+
+    #[test]
+    fn host_overrides_that_sanitize_alike_produce_distinct_names() {
+        // `host.example.com:8443` (host+port) and `host.example.com.8443` (DNS
+        // label) are both valid overrides that sanitize to the same readable
+        // slug (`:` and `.` both map to `_`). The digest over the raw value must
+        // keep the two backends — with different Host routing — distinct.
+        let with_port = BackendConfig::new("https", "origin.example.com")
+            .host_header_override(Some("host.example.com:8443"))
+            .predict_name()
+            .expect("should predict name for host:port override");
+        let with_label = BackendConfig::new("https", "origin.example.com")
+            .host_header_override(Some("host.example.com.8443"))
+            .predict_name()
+            .expect("should predict name for dotted-label override");
+        assert_ne!(
+            with_port, with_label,
+            "host overrides differing only by a sanitized character must not collide"
+        );
+    }
+
+    #[test]
+    fn long_host_and_discriminator_stay_within_the_length_limit() {
+        // A syntactically valid maximum-length DNS host plus a discriminator
+        // previously pushed the name past Fastly's 255-char limit, so
+        // `predict_name` succeeded while `ensure` failed at registration. The
+        // bounded prefix + fixed-width digest must keep prediction, and the name
+        // it predicts, within the limit.
+        let label = "a".repeat(63);
+        let long_host = format!("{label}.{label}.{label}.{label}.example.com");
+        assert!(
+            long_host.len() > 200,
+            "should exercise a host longer than the readable-prefix bound"
+        );
+        let name = BackendConfig::new("https", &long_host)
+            .discriminator(Some("prebid"))
+            .predict_name()
+            .expect("should predict a bounded name for a long host and discriminator");
+        assert!(
+            name.len() <= MAX_BACKEND_NAME_LEN,
+            "name should stay within the {MAX_BACKEND_NAME_LEN}-char limit, got {}",
+            name.len()
+        );
+
+        // Two long hosts sharing the truncated prefix must still resolve to
+        // different backends via the digest.
+        let other_host = format!("{label}.{label}.{label}.{label}.example.net");
+        let other = BackendConfig::new("https", &other_host)
+            .discriminator(Some("prebid"))
+            .predict_name()
+            .expect("should predict a bounded name for the sibling host");
+        assert_ne!(
+            name, other,
+            "hosts sharing a truncated prefix must stay distinct via the digest"
         );
     }
 }
