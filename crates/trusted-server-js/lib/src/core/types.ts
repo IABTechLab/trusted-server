@@ -41,12 +41,32 @@ export interface AuctionDebugBidData {
   height?: number;
   nurl?: string | null;
   burl?: string | null;
+  bid_id?: string | null;
   ad_id?: string | null;
+  creative_id?: string | null;
   cache_id?: string | null;
   cache_host?: string | null;
   cache_path?: string | null;
   metadata?: Record<string, unknown>;
 }
+
+export type ApsTagType = 'iframe' | 'script';
+
+/** Version 1 Trusted Server APS renderer descriptor. */
+export interface ApsRendererV1 {
+  type: 'aps';
+  version: 1;
+  accountId: string;
+  bidId: string;
+  creativeId?: string;
+  tagType: ApsTagType;
+  creativeUrl: string;
+  aaxResponse: string;
+  width: number;
+  height: number;
+}
+
+export type AuctionBidRenderer = ApsRendererV1;
 
 /** Bid targeting data from the server-side auction, injected into `window.tsjs.bids`. */
 export interface AuctionBidData {
@@ -57,6 +77,8 @@ export interface AuctionBidData {
   hb_cache_path?: string;
   nurl?: string;
   burl?: string;
+  /** Typed winning-bid renderer capability. */
+  renderer?: AuctionBidRenderer;
   /** Raw creative markup. Only present when `[debug] inject_adm_for_testing = true`. */
   adm?: string;
   /** Debug-only bid field mirror. Only present when `[debug] inject_adm_for_testing = true`. */

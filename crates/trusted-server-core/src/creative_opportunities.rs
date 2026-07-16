@@ -275,8 +275,9 @@ impl CreativeOpportunitySlot {
 
     /// Converts this slot into an [`AdSlot`] ready for use in an auction request.
     ///
-    /// Provider-specific params (e.g., APS `slotID`, PBS bidder params) are wired
-    /// into the `bidders` map keyed by provider/bidder name.
+    /// Prebid Server bidder params are wired into the `bidders` map keyed by
+    /// bidder name. Legacy APS slot params are accepted in configuration but
+    /// intentionally ignored by the APS `OpenRTB` provider.
     ///
     /// When [`PrebidSlotParams::bidders`] is empty, a `trustedServer` entry is
     /// injected so [`PrebidAuctionProvider`] expands all `config.bidders`
@@ -285,12 +286,6 @@ impl CreativeOpportunitySlot {
     #[must_use]
     pub fn to_ad_slot(&self) -> AdSlot {
         let mut bidders: HashMap<String, serde_json::Value> = HashMap::new();
-        if let Some(ref aps) = self.providers.aps {
-            bidders.insert(
-                "aps".to_string(),
-                serde_json::json!({ "slotID": aps.slot_id }),
-            );
-        }
         if let Some(ref prebid) = self.providers.prebid {
             if prebid.bidders.is_empty() {
                 // No explicit per-bidder override: let the Prebid provider expand
@@ -364,7 +359,10 @@ impl CreativeOpportunityFormat {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SlotProviders {
-    /// Amazon Publisher Services (APS/TAM) slot parameters.
+    /// Legacy APS slot parameters, retained only for configuration compatibility.
+    ///
+    /// APS `OpenRTB` uses the canonical creative-opportunity slot ID and does not
+    /// forward this value to APS or Prebid Server.
     pub aps: Option<ApsSlotParams>,
     /// Prebid Server inline bidder parameters.
     ///
@@ -374,11 +372,11 @@ pub struct SlotProviders {
     pub prebid: Option<PrebidSlotParams>,
 }
 
-/// APS-specific parameters for a slot.
+/// Legacy APS-specific parameters retained for configuration compatibility.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApsSlotParams {
-    /// The APS slot ID string used when making TAM bid requests.
+    /// Deprecated legacy slot ID. APS `OpenRTB` ignores this value.
     pub slot_id: String,
 }
 
@@ -617,16 +615,15 @@ mod tests {
     }
 
     #[test]
-    fn to_ad_slot_wires_aps_params_into_bidders() {
+    fn to_ad_slot_ignores_legacy_aps_params() {
         let mut slot = make_slot("atf", vec!["/"]);
         slot.providers.aps = Some(ApsSlotParams {
-            slot_id: "aps-slot-atf".to_string(),
+            slot_id: "legacy-aps-slot-atf".to_string(),
         });
         let ad_slot = slot.to_ad_slot();
-        let aps_params = ad_slot.bidders.get("aps").expect("should have aps bidder");
-        assert_eq!(
-            aps_params.get("slotID").and_then(|v| v.as_str()),
-            Some("aps-slot-atf"),
+        assert!(
+            !ad_slot.bidders.contains_key("aps"),
+            "legacy APS params must not enable APS through Prebid Server"
         );
     }
 

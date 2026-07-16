@@ -1,5 +1,11 @@
 import { log } from '../../core/log';
 import type { AuctionSlot, AuctionBidData, TsjsApi } from '../../core/types';
+import {
+  APS_UNIVERSAL_CREATIVE_RENDERER,
+  APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+  apsRendererUrl,
+  validateApsRenderer,
+} from '../aps/render';
 
 import { installGptGuard } from './script_guard';
 
@@ -556,13 +562,8 @@ export function installTsAdInit(): void {
           slotsToRefresh.push(gptSlot);
         }
 
-        // APS: signal to apstag that bids are ready so Amazon's GAM creative
-        // can render.  apstag must already be initialised on the page (which it
-        // is on production publisher pages).  Safe no-op if apstag is absent.
-        if (bid.hb_bidder === 'aps' || bid.hb_bidder === 'amazon-aps') {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (window as any).apstag?.setDisplayBids?.();
-        }
+        // Trusted Server APS winners carry their own typed renderer and never
+        // enter the publisher-owned native apstag rendering path.
       });
 
       ts.prevGptSlots = newSlots as unknown[];
@@ -593,10 +594,13 @@ export function installTsAdInit(): void {
           // Read ts.bids live (not the snapshot above) so post-navigation bid data is used.
           const bid = (ts.bids ?? {})[slotId] ?? {};
 
-          // GAM interceptor (testing): when adm is present, replace the GAM creative.
-          // Adapted from PR #241 — uses window.tsjs.bids[slotId].adm instead of pbjs.
-          // Only active when inject_adm_for_testing injects adm into bids server-side.
-          if (bid.adm) {
+          // GAM interceptor (testing bypass): directly replace the GAM creative.
+          // `adm` is now always injected in production, so it can no longer gate
+          // this path. `debug_bid` is present only when inject_adm_for_testing is
+          // on, so it is the per-bid signal that the testing bypass is enabled.
+          // In production the render bridge serves the creative and GAM stays in
+          // the loop; this direct replace stays testing-only.
+          if (bid.adm && bid.debug_bid) {
             injectAdmIntoSlot(divId, bid.adm);
           }
         });
@@ -889,6 +893,38 @@ export function installTsRenderBridge(): void {
     const slot = window.tsjs?.adSlots?.find((s) => s.id === slotId);
     const [width, height] = slot?.formats?.[0] ?? [728, 90];
 
+    if (matchedBid.renderer !== undefined) {
+      const renderer = validateApsRenderer(matchedBid.renderer);
+      const rendererUrl = apsRendererUrl();
+      if (!renderer || !rendererUrl) return;
+
+      // Ownership and the complete consumed envelope are valid before this
+      // handler claims the message or suppresses another legitimate handler.
+      e.stopImmediatePropagation();
+      if (renderingAdIds.has(adId)) return;
+      renderingAdIds.add(adId);
+
+      try {
+        port.postMessage(
+          JSON.stringify({
+            message: 'Prebid Response',
+            adId,
+            renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
+            rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+            rendererUrl,
+            apsRenderer: renderer,
+            width: renderer.width,
+            height: renderer.height,
+          })
+        );
+        log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' through APS renderer`);
+      } catch (err) {
+        renderingAdIds.delete(adId);
+        log.warn('[tsjs-gpt] pbRender bridge: APS response failed', err);
+      }
+      return;
+    }
+
     if (matchedBid.adm) {
       e.stopImmediatePropagation();
       port.postMessage(
@@ -902,7 +938,7 @@ export function installTsRenderBridge(): void {
         })
       );
       fireWinBillingBeacons(slotId, matchedBid);
-      log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from debug adm`);
+      log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from inline adm`);
       return;
     }
 

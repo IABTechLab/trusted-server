@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::auction::types::OrchestratorExt;
+use crate::auction::types::{BidRenderer, OrchestratorExt};
 
 pub type OpenRtbRequest = trusted_server_openrtb::BidRequest;
 pub type OpenRtbResponse = trusted_server_openrtb::BidResponse;
@@ -169,6 +169,18 @@ pub struct PrebidImpExt {
 #[derive(Debug, Serialize)]
 pub struct ImpStoredRequest {
     pub id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BidExt<'a> {
+    pub trusted_server: BidTrustedServerExt<'a>,
+}
+
+impl ToExt for BidExt<'_> {}
+
+#[derive(Debug, Serialize)]
+pub struct BidTrustedServerExt<'a> {
+    pub renderer: &'a BidRenderer,
 }
 
 #[derive(Debug, Serialize)]

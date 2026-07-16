@@ -1902,9 +1902,11 @@ pub struct DebugConfig {
     #[serde(default)]
     pub ja4_endpoint_enabled: bool,
 
-    /// Inject a `<!-- ts-debug: ... -->` HTML comment before `</body>` showing
-    /// auction pipeline stats (SSP count, mediator status, winning bid count).
-    /// Never enable in production — visible in page source.
+    /// Inject a `<!-- ts-debug: ... -->` HTML comment before `</body>` dumping
+    /// the full per-provider auction result: pipeline stats (SSP count, mediator
+    /// status, winning bid count) plus every provider response — including each
+    /// bid's raw `adm` creative markup and provider metadata. Never enable in
+    /// production — visible in page source and injects raw HTML from SSPs.
     #[serde(default)]
     pub auction_html_comment: bool,
 
@@ -4332,6 +4334,41 @@ origin_host_header_overide = "www.example.com""#,
         // Invalid URLs should not crash and should return false
         assert!(!rewrite.is_excluded("not a url"));
         assert!(!rewrite.is_excluded(""));
+    }
+
+    #[test]
+    fn test_auction_rewrite_creatives_defaults_to_true_when_omitted() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [auction]
+            enabled = true
+            providers = []
+            "#;
+
+        let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
+
+        assert!(
+            settings.auction.rewrite_creatives,
+            "should preserve creative rewriting when the setting is omitted"
+        );
+    }
+
+    #[test]
+    fn test_auction_rewrite_creatives_accepts_explicit_false() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [auction]
+            enabled = true
+            providers = []
+            rewrite_creatives = false
+            "#;
+
+        let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
+
+        assert!(
+            !settings.auction.rewrite_creatives,
+            "should disable creative rewriting when explicitly configured"
+        );
     }
 
     #[test]

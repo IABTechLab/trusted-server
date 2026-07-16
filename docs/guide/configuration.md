@@ -1191,26 +1191,38 @@ Settings for the auction orchestrator that coordinates multiple bid providers.
 
 ### `[auction]`
 
-| Field            | Type          | Default            | Description                                                 |
-| ---------------- | ------------- | ------------------ | ----------------------------------------------------------- |
-| `enabled`        | Boolean       | `false`            | Enable the auction orchestrator                             |
-| `providers`      | Array[String] | `[]`               | Provider names that participate (e.g., `["prebid", "aps"]`) |
-| `mediator`       | String        | Optional           | Mediator provider name (runs parallel mediation when set)   |
-| `timeout_ms`     | Integer       | `2000`             | Auction timeout in milliseconds                             |
-| `creative_store` | String        | `"creative_store"` | Deprecated; creatives are now delivered inline              |
+| Field               | Type          | Default            | Description                                                       |
+| ------------------- | ------------- | ------------------ | ----------------------------------------------------------------- |
+| `enabled`           | Boolean       | `false`            | Enable the auction orchestrator                                   |
+| `rewrite_creatives` | Boolean       | `true`             | Rewrite sanitized winning-bid `adm` through first-party endpoints |
+| `providers`         | Array[String] | `[]`               | Provider names that participate (e.g., `["prebid", "aps"]`)       |
+| `mediator`          | String        | Optional           | Mediator provider name (runs parallel mediation when set)         |
+| `timeout_ms`        | Integer       | `2000`             | Auction timeout in milliseconds                                   |
+| `creative_store`    | String        | `"creative_store"` | Deprecated; creatives are now delivered inline                    |
+
+Creative markup returned by `POST /auction` is always server-sanitized. With
+`rewrite_creatives = true` (the default), eligible absolute or protocol-relative
+resource and click URLs not excluded by rewrite configuration are converted to
+signed first-party endpoints, and the creative TSJS runtime is injected when a
+`<body>` exists. Setting it to `false` returns sanitized but unre-written `adm`;
+accepted external URLs remain direct and are not host allowlisted by the
+sanitizer. The setting does not affect HTML or CSS fetched through
+`/first-party/proxy`. See [Creative Processing](/guide/creative-processing#auction-rewrite-control).
 
 **Example**:
 
 ```toml
 [auction]
 enabled = true
+rewrite_creatives = true
 providers = ["aps", "prebid"]
 timeout_ms = 2000
 
 [integrations.aps]
 enabled = true
-pub_id = "example-publisher"
-endpoint = "https://aps.example.com/e/dtb/bid"
+account_id = "example-account"
+endpoint = "https://web.ads.aps.amazon-adsystem.com/e/pb/bid"
+allow_script_creatives = false
 
 [integrations.prebid]
 enabled = true
@@ -1221,6 +1233,7 @@ server_url = "https://prebid-server.example.com/openrtb2/auction"
 
 ```bash
 TRUSTED_SERVER__AUCTION__ENABLED=true
+TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES=true
 TRUSTED_SERVER__AUCTION__PROVIDERS=aps,prebid
 TRUSTED_SERVER__AUCTION__PROVIDERS__0=aps
 TRUSTED_SERVER__AUCTION__PROVIDERS__1=prebid

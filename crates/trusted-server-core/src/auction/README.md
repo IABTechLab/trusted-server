@@ -117,7 +117,7 @@ When a request arrives at the `/auction` endpoint, it goes through the following
                               ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │  9. Each Provider Processes Request                                  │
-│     - Transform AuctionRequest → Provider format (e.g., APS TAM)     │
+│     - Transform AuctionRequest → Provider OpenRTB request           │
 │     - Send HTTP request to provider endpoint                         │
 │     - Parse provider response                                        │
 │     - Transform → AuctionResponse with Bid[]                         │
@@ -188,30 +188,21 @@ AdSlot {
 
 #### 3. Provider Execution
 Each registered provider (APS, Prebid, etc.) receives the `AuctionRequest` and:
-- Transforms it to their specific format (e.g., APS TAM, OpenRTB)
+- Transforms it to the provider's OpenRTB request format
 - Makes HTTP request to their endpoint
 - Parses the response
 - Returns `AuctionResponse` with `Bid[]`
 
 For example, APS provider:
 ```rust
-// Transform AuctionRequest → ApsBidRequest
-let aps_request = ApsBidRequest {
-    pub_id: "5128",
-    slots: vec![
-        ApsSlot {
-            slot_id: "header-banner",
-            sizes: vec![[728, 90], [970, 250]],
-            slot_name: Some("header-banner"),
-        }
-    ],
-    page_url: Some("https://example.com"),
-    ua: Some("Mozilla/5.0..."),
-    timeout: Some(800),
-};
+// Transform AuctionRequest → APS OpenRTB request
+// - ext.account = configured account_id
+// - ext.sdk = { source: "prebid", version: "2.2.0" }
+// - banner slots become secure impressions with matching formats/floors
+// - existing consent, identity, device, and geo privacy gates apply
 
-// HTTP POST to http://localhost:6767/e/dtb/bid
-// Parse response → AuctionResponse
+// HTTP POST to https://web.ads.aps.amazon-adsystem.com/e/pb/bid
+// Parse decoded-price response → AuctionResponse with a typed renderer
 ```
 
 #### 4. Response Assembly
@@ -222,17 +213,29 @@ The orchestrator collects all bids and creates an OpenRTB response:
   "id": "auction-response",
   "seatbid": [
     {
-      "seat": "amazon-aps",
+      "seat": "aps",
       "bid": [
         {
-          "id": "amazon-aps-header-banner",
+          "id": "fictional-selected-bid-id",
           "impid": "header-banner",
           "price": 2.5,
-          "adm": "<iframe src=\"/first-party/proxy?tsurl=...\">",
           "w": 728,
           "h": 90,
-          "crid": "amazon-aps-creative",
-          "adomain": ["amazon.com"]
+          "ext": {
+            "trusted_server": {
+              "renderer": {
+                "type": "aps",
+                "version": 1,
+                "accountId": "example-account",
+                "bidId": "fictional-selected-bid-id",
+                "tagType": "iframe",
+                "creativeUrl": "https://creative.example/render",
+                "aaxResponse": "<base64 minimized one-bid envelope>",
+                "width": 728,
+                "height": 90
+              }
+            }
+          }
         }
       ]
     }

@@ -1695,24 +1695,35 @@ pub(crate) fn write_bids_to_state(
     winning_bids: &std::collections::HashMap<String, Bid>,
     price_granularity: PriceGranularity,
     ad_bids_state: &Arc<Mutex<Option<String>>>,
-    inject_adm: bool,
+    include_debug_bid: bool,
 ) {
     log::debug!(
         "write_bids_to_state: {} winning bid(s): [{}]",
         winning_bids.len(),
         winning_bids.keys().cloned().collect::<Vec<_>>().join(", ")
     );
-    let bid_map = build_bid_map(winning_bids, price_granularity, inject_adm);
+    let bid_map = build_bid_map(winning_bids, price_granularity, include_debug_bid);
     let bids_script = build_bids_script(&bid_map);
     *ad_bids_state.lock().expect("should lock bid state") = Some(bids_script);
 }
 
-/// Prepend an HTML comment summarising the auction result onto the shared
-/// `ad_bids_state` so it lands directly before the injected bids `<script>`.
+/// Maximum serialized size (in bytes) of a dump embedded in the `ts-debug`
+/// comment. A PBS response with many bids can carry megabytes of creative
+/// markup; cap it so leaving
+/// [`auction_html_comment`](crate::settings::DebugConfig::auction_html_comment)
+/// enabled cannot bloat every page render without bound.
+const MAX_AUCTION_DEBUG_DUMP_BYTES: usize = 256 * 1024;
+
+/// Prepend a `<!-- ts-debug: ... -->` HTML comment carrying the full auction
+/// result — pipeline stats plus every provider response, including each bid's
+/// raw `adm` creative markup — onto the shared `ad_bids_state` so it lands
+/// directly before the injected bids `<script>`. Gated by
+/// [`auction_html_comment`](crate::settings::DebugConfig::auction_html_comment);
+/// never enable in production.
 ///
 /// `path_label` differentiates the streaming-with-auction-hold path (`stream`)
-/// from the buffered path (`buffered`) in the resulting `<!-- ts-debug: -->`
-/// marker so on-page debugging can tell which code path produced the bids.
+/// from the buffered path (`buffered`) in the marker so on-page debugging can
+/// tell which code path produced the bids.
 pub(crate) fn prepend_auction_debug_comment(
     path_label: &str,
     result: &crate::auction::orchestrator::OrchestrationResult,
@@ -1723,8 +1734,48 @@ pub(crate) fn prepend_auction_debug_comment(
         Some(r) => format!("ok({}_bids)", r.bids.len()),
         None => "none".to_string(),
     };
+    // Full per-provider dump so the operator can see exactly what each SSP
+    // returned — `status` (nobid vs error vs success), every `bids` entry, and
+    // `metadata` — without needing log access.
+    //
+    // `Bid.creative` and provider metadata are attacker/partner-influenced and
+    // may contain an HTML5 comment terminator (`-->`, or the `--!>`
+    // comment-end-bang variant), which would end the comment early and leak the
+    // remaining markup into the live DOM. Neutralise both, then cap the size so
+    // a large SSP response cannot bloat the page.
+    //
+    // NB: a single `replace("--", …)` is deliberately NOT used — because
+    // `str::replace` is non-overlapping, it re-forms a live `-->` / `--!>` at
+    // the junction of an odd dash-run (`--->` -> `- -->`, `----->` -> `- -- -->`),
+    // reintroducing exactly the terminator we are trying to remove. The two
+    // targeted replacements below cannot re-form either sequence.
+    let render_dump = |json: String| -> String {
+        let neutralised = json.replace("-->", "-- >").replace("--!>", "-- !>");
+        if neutralised.len() > MAX_AUCTION_DEBUG_DUMP_BYTES {
+            let end = neutralised.floor_char_boundary(MAX_AUCTION_DEBUG_DUMP_BYTES);
+            format!("{}…(truncated)", &neutralised[..end])
+        } else {
+            neutralised
+        }
+    };
+    let providers_dump = serde_json::to_string(&result.provider_responses)
+        .map(render_dump)
+        .unwrap_or_else(|e| format!("<provider_responses serialize error: {e}>"));
+    // Only dump the mediator response when one actually ran; otherwise the
+    // `mediator=none` on the summary line already conveys it.
+    let mediator_line = match &result.mediator_response {
+        Some(_) => {
+            let dump = serde_json::to_string(&result.mediator_response)
+                .map(render_dump)
+                .unwrap_or_else(|e| format!("<mediator_response serialize error: {e}>"));
+            format!("\nmediator_response={dump}")
+        }
+        None => String::new(),
+    };
     let debug_comment = format!(
-        "<!-- ts-debug: path={path_label} ssp={ssp_count} mediator={mediator_info} winning={} time={}ms -->",
+        "<!-- ts-debug: path={path_label} ssp={ssp_count} mediator={mediator_info} winning={} time={}ms\n\
+         provider_responses={providers_dump}{mediator_line}\n\
+         -->",
         result.winning_bids.len(),
         result.total_time_ms,
     );
@@ -2928,7 +2979,7 @@ fn html_escape_for_script(s: &str) -> String {
 pub(crate) fn build_bid_map(
     winning_bids: &std::collections::HashMap<String, Bid>,
     granularity: crate::price_bucket::PriceGranularity,
-    include_adm: bool,
+    include_debug_bid: bool,
 ) -> serde_json::Map<String, serde_json::Value> {
     winning_bids
         .iter()
@@ -2941,10 +2992,17 @@ pub(crate) fn build_bid_map(
                     "hb_bidder".to_string(),
                     serde_json::Value::String(bid.bidder.clone()),
                 );
-                // hb_adid: use PBS Cache UUID when present — the Prebid Universal Creative uses
-                // this as the cache lookup key, NOT the OpenRTB bid ID (bid.ad_id). Fall back to
-                // bid.ad_id for APS and other non-PBS providers.
-                let hb_adid = bid.cache_id.as_deref().or(bid.ad_id.as_deref());
+                // PBS Cache remains highest priority. APS uses the selected bid ID
+                // carried by its typed renderer; other providers retain the ad-ID fallback.
+                let renderer_bid_id = bid
+                    .renderer
+                    .as_ref()
+                    .map(|renderer| renderer.aps().bid_id.as_str());
+                let hb_adid = bid
+                    .cache_id
+                    .as_deref()
+                    .or(renderer_bid_id)
+                    .or(bid.ad_id.as_deref());
                 if let Some(id) = hb_adid {
                     obj.insert(
                         "hb_adid".to_string(),
@@ -2973,12 +3031,20 @@ pub(crate) fn build_bid_map(
                 if let Some(ref burl) = bid.burl {
                     obj.insert("burl".to_string(), serde_json::Value::String(burl.clone()));
                 }
-                // Include raw creative markup only for explicit debug injection.
-                // The pbRender bridge can use it while PBS Cache is unavailable.
-                if include_adm {
-                    if let Some(ref adm) = bid.creative {
-                        obj.insert("adm".to_string(), serde_json::Value::String(adm.clone()));
-                    }
+                if let Some(ref renderer) = bid.renderer {
+                    obj.insert(
+                        "renderer".to_string(),
+                        serde_json::to_value(renderer).expect("should serialize typed renderer"),
+                    );
+                }
+                // Always include an ordinary winning creative so the pbRender bridge can
+                // render it locally when GAM serves the Prebid Universal Creative. APS
+                // winners carry only their typed renderer and never expose creative markup.
+                if let Some(ref adm) = bid.creative {
+                    obj.insert("adm".to_string(), serde_json::Value::String(adm.clone()));
+                }
+                // Verbose per-bid debug blob is included only under the testing flag.
+                if include_debug_bid {
                     obj.insert(
                         "debug_bid".to_string(),
                         serde_json::json!({
@@ -2992,7 +3058,9 @@ pub(crate) fn build_bid_map(
                             "height": bid.height,
                             "nurl": bid.nurl,
                             "burl": bid.burl,
+                            "bid_id": bid.bid_id,
                             "ad_id": bid.ad_id,
+                            "creative_id": bid.creative_id,
                             "cache_id": bid.cache_id,
                             "cache_host": bid.cache_host,
                             "cache_path": bid.cache_path,
@@ -3433,6 +3501,8 @@ mod tests {
     use flate2::write::GzEncoder;
 
     use super::*;
+    use crate::auction::orchestrator::OrchestrationResult;
+    use crate::auction::types::AuctionResponse;
     use crate::auction::types::{AdFormat, AdSlot, MediaType};
     use crate::integrations::IntegrationRegistry;
     use crate::platform::test_support::{
@@ -3443,6 +3513,98 @@ mod tests {
     use edgezero_core::body::Body as EdgeBody;
     use http::{Method, Request as HttpRequest, StatusCode, header};
     use std::sync::Arc;
+
+    fn make_test_bid_with_creative(creative: &str) -> Bid {
+        Bid {
+            slot_id: "slot".to_string(),
+            price: Some(1.0),
+            currency: "USD".to_string(),
+            creative: Some(creative.to_string()),
+            adomain: None,
+            bidder: "seat".to_string(),
+            width: 300,
+            height: 250,
+            nurl: None,
+            burl: None,
+            bid_id: None,
+            ad_id: None,
+            creative_id: None,
+            renderer: None,
+            cache_id: None,
+            cache_host: None,
+            cache_path: None,
+            metadata: Default::default(),
+        }
+    }
+
+    /// Build the ts-debug comment for a one-bid auction whose creative is
+    /// `creative`, so tests can assert on the rendered dump.
+    fn dump_comment_for_creative(creative: &str) -> String {
+        let mut bid = make_test_bid_with_creative(creative);
+        bid.slot_id = "ad-header-0".to_string();
+        let result = OrchestrationResult {
+            provider_responses: vec![
+                AuctionResponse::no_bid("prebid", 665),
+                AuctionResponse::success("aps", vec![bid], 42),
+            ],
+            mediator_response: None,
+            winning_bids: std::collections::HashMap::new(),
+            total_time_ms: 665,
+            metadata: std::collections::HashMap::new(),
+        };
+        let state = Arc::new(Mutex::new(Some("BIDS_SCRIPT".to_string())));
+        prepend_auction_debug_comment("stream", &result, &state);
+        state
+            .lock()
+            .expect("should lock state")
+            .clone()
+            .expect("should have comment")
+    }
+
+    #[test]
+    fn auction_debug_comment_dumps_provider_status() {
+        let comment = dump_comment_for_creative("<div>plain</div>");
+        // Compact (non-pretty) JSON: `"status":"nobid"` with no spaces.
+        assert!(
+            comment.contains("\"status\":\"nobid\""),
+            "should surface the no-bid provider status: {comment}"
+        );
+        assert!(
+            comment.contains("provider_responses="),
+            "should dump the provider_responses payload"
+        );
+        // No mediator ran, so its line is omitted (mediator=none already says so).
+        assert!(
+            !comment.contains("mediator_response="),
+            "should omit mediator_response when no mediator ran: {comment}"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_neutralises_every_comment_terminator_vector() {
+        // Each vector reaches HTML5 comment-end state via a distinct tokenizer
+        // path. A single `replace("--", …)` would re-form a terminator on the
+        // odd-dash-run cases; the targeted two-replace must leave the comment's
+        // own trailing `-->` as the only surviving terminator and drop `--!>`.
+        for creative in [
+            "<div>evil-->break</div>",
+            "--!><img src=x onerror=alert(1)>",
+            "<!--><img src=x onerror=alert(1)>",
+            "<!--!><img src=x onerror=alert(1)>",
+            "----!><img src=x onerror=alert(1)>",
+        ] {
+            let comment = dump_comment_for_creative(creative);
+            assert_eq!(
+                comment.matches("-->").count(),
+                1,
+                "exactly one `-->` (the terminator) must survive for {creative:?}: {comment}"
+            );
+            assert!(
+                !comment.contains("--!>"),
+                "the `--!>` nested terminator must not survive for {creative:?}: {comment}"
+            );
+        }
+    }
 
     struct ChunkedReader {
         chunks: std::collections::VecDeque<Vec<u8>>,
@@ -6266,7 +6428,7 @@ mod tests {
             MatchedSlotsContext, build_ad_slots_script, build_auction_request, build_bid_map,
             build_bids_script, html_escape_for_script,
         };
-        use crate::auction::types::{Bid, MediaType};
+        use crate::auction::types::{ApsRendererV1, ApsTagType, Bid, BidRenderer, MediaType};
         use crate::consent::ConsentContext;
         use crate::creative_opportunities::{
             CreativeOpportunitiesConfig, CreativeOpportunityFormat, CreativeOpportunitySlot,
@@ -6323,7 +6485,10 @@ mod tests {
                 height: 250,
                 nurl: Some(nurl.to_string()),
                 burl: Some(burl.to_string()),
+                bid_id: None,
                 ad_id: Some(ad_id.to_string()),
+                creative_id: None,
+                renderer: None,
                 cache_id: None,
                 cache_host: None,
                 cache_path: None,
@@ -6409,38 +6574,45 @@ mod tests {
         }
 
         #[test]
-        fn client_bid_map_omits_adm_by_default() {
-            let mut winning_bids = HashMap::new();
-            let mut bid = make_bid(
-                "atf_sidebar_ad",
-                1.50,
-                "kargo",
-                "abc123",
-                "https://ssp/win",
-                "https://ssp/bill",
-            );
-            bid.creative = Some("<div>Creative</div>".to_string());
-            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+        fn bid_map_exposes_aps_renderer_and_selected_bid_id_without_debug_adm() {
+            let mut bid = make_bid("atf_sidebar_ad", 1.50, "aps", "fallback-ad", "", "");
+            bid.bid_id = Some("selected-bid".to_string());
+            bid.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
+                version: 1,
+                account_id: "example-account".to_string(),
+                bid_id: "selected-bid".to_string(),
+                creative_id: None,
+                tag_type: ApsTagType::Iframe,
+                creative_url: "https://creative.example/render".to_string(),
+                aax_response: "fictional-base64</script>".to_string(),
+                width: 300,
+                height: 250,
+            }));
+            bid.nurl = None;
+            bid.burl = None;
+            let winning_bids = HashMap::from([("atf_sidebar_ad".to_string(), bid)]);
 
             let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
-            let obj = map
-                .get("atf_sidebar_ad")
-                .expect("should have bid entry")
+            let obj = map["atf_sidebar_ad"]
                 .as_object()
-                .expect("should be object");
+                .expect("should include APS bid");
 
-            assert!(
-                obj.get("adm").is_none(),
-                "should omit adm when debug injection is disabled"
-            );
-            assert!(
-                obj.get("debug_bid").is_none(),
-                "should omit debug bid when debug injection is disabled"
-            );
+            assert_eq!(obj["hb_bidder"], "aps");
+            assert_eq!(obj["hb_adid"], "selected-bid");
+            assert_eq!(obj["renderer"]["type"], "aps");
+            assert_eq!(obj["renderer"]["bidId"], "selected-bid");
+            assert!(obj.get("adm").is_none());
+            assert!(obj.get("nurl").is_none());
+            assert!(obj.get("burl").is_none());
+            assert!(obj.get("metadata").is_none());
+
+            let script = build_bids_script(&map);
+            assert!(!script.contains("</script></script>"));
+            assert!(script.contains("\\u003C/script\\u003E"));
         }
 
         #[test]
-        fn client_bid_map_includes_adm_when_debug_injection_enabled() {
+        fn client_bid_map_includes_adm_and_omits_debug_bid_by_default() {
             let mut winning_bids = HashMap::new();
             let mut bid = make_bid(
                 "atf_sidebar_ad",
@@ -6453,7 +6625,10 @@ mod tests {
             bid.creative = Some("<div>Creative</div>".to_string());
             winning_bids.insert("atf_sidebar_ad".to_string(), bid);
 
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, true);
+            // Production path (include_debug_bid = false): the creative is always
+            // included so the bridge can render it locally, but the verbose
+            // debug_bid blob is not.
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
             let obj = map
                 .get("atf_sidebar_ad")
                 .expect("should have bid entry")
@@ -6463,7 +6638,39 @@ mod tests {
             assert_eq!(
                 obj.get("adm").and_then(|v| v.as_str()),
                 Some("<div>Creative</div>"),
-                "should include adm when debug injection is enabled"
+                "should include creative markup for local rendering by default"
+            );
+            assert!(
+                obj.get("debug_bid").is_none(),
+                "should omit the debug_bid blob when debug injection is disabled"
+            );
+        }
+
+        #[test]
+        fn build_bids_script_escapes_hostile_adm() {
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "s",
+                1.50,
+                "kargo",
+                "abc123",
+                "https://ssp/win",
+                "https://ssp/bill",
+            );
+            // A hostile creative that tries to break out of the <script> and
+            // includes both line/paragraph separators the spec promises to escape.
+            bid.creative = Some("</script><script>alert(1)</script>\u{2028}\u{2029}".to_string());
+            winning_bids.insert("s".to_string(), bid);
+
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
+            let script = build_bids_script(&map);
+            assert!(
+                !script.contains("</script><script>"),
+                "should not let a hostile adm break out of the script context"
+            );
+            assert!(
+                !script.contains('\u{2028}') && !script.contains('\u{2029}'),
+                "should unicode-escape both U+2028 and U+2029 in the adm"
             );
         }
 
@@ -6543,7 +6750,10 @@ mod tests {
                     height: 250,
                     nurl: None,
                     burl: None,
+                    bid_id: None,
                     ad_id: Some("bid-impression-id".to_string()),
+                    creative_id: None,
+                    renderer: None,
                     cache_id: Some("f47447a0-b759-4f2f-9887-af458b79b570".to_string()),
                     cache_host: Some("openads.adsrvr.org".to_string()),
                     cache_path: Some("/cache".to_string()),
@@ -6584,12 +6794,15 @@ mod tests {
                     currency: "USD".to_string(),
                     creative: None,
                     adomain: None,
-                    bidder: "amazon-aps".to_string(),
+                    bidder: "ordinary".to_string(),
                     width: 300,
                     height: 250,
                     nurl: None,
                     burl: None,
-                    ad_id: Some("aps-bid-token".to_string()),
+                    bid_id: None,
+                    ad_id: Some("ordinary-ad-id".to_string()),
+                    creative_id: None,
+                    renderer: None,
                     cache_id: None,
                     cache_host: None,
                     cache_path: None,
@@ -6604,7 +6817,7 @@ mod tests {
                 .expect("should be object");
             assert_eq!(
                 obj.get("hb_adid").and_then(|v| v.as_str()),
-                Some("aps-bid-token"),
+                Some("ordinary-ad-id"),
                 "should fall back to ad_id when cache_id absent"
             );
             assert!(
@@ -6628,12 +6841,15 @@ mod tests {
                     currency: "USD".to_string(),
                     creative: None,
                     adomain: None,
-                    bidder: "amazon-aps".to_string(),
+                    bidder: "ordinary".to_string(),
                     width: 300,
                     height: 250,
                     nurl: None,
                     burl: None,
+                    bid_id: None,
                     ad_id: None,
+                    creative_id: None,
+                    renderer: None,
                     cache_id: None,
                     cache_host: None,
                     cache_path: None,
@@ -6668,7 +6884,10 @@ mod tests {
                     height: 250,
                     nurl: None,
                     burl: None,
+                    bid_id: None,
                     ad_id: None,
+                    creative_id: None,
+                    renderer: None,
                     cache_id: None,
                     cache_host: None,
                     cache_path: None,

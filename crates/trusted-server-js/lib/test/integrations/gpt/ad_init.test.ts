@@ -1,4 +1,21 @@
 import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
+import envelope from '../../fixtures/aps-renderer-v1.json';
+
+function apsRenderer() {
+  const bid = envelope.seatbid[0].bid[0];
+  return {
+    type: 'aps' as const,
+    version: 1 as const,
+    accountId: 'example-account-id',
+    bidId: bid.id,
+    creativeId: 'fictional-creative-id',
+    tagType: 'iframe' as const,
+    creativeUrl: bid.ext.creativeurl,
+    aaxResponse: btoa(JSON.stringify(envelope)),
+    width: bid.w,
+    height: bid.h,
+  };
+}
 
 // Track every 'message' EventListener added to window across the entire test
 // file.  This lets the installTsRenderBridge suite remove all accumulated
@@ -371,7 +388,7 @@ describe('installTsAdInit', () => {
     expect(mockPubads.refresh).not.toHaveBeenCalled();
   });
 
-  it('keeps the GAM path when debug adm is present', async () => {
+  it('keeps the GAM path when a bid carries inline adm (adInit does not inject)', async () => {
     const slotEl = document.getElementById('div-atf-sidebar')!;
     const mockSlot = {
       addService: vi.fn().mockReturnThis(),
@@ -408,7 +425,7 @@ describe('installTsAdInit', () => {
           hb_pb: '0.20',
           hb_bidder: 'mocktioneer',
           hb_adid: 'debug-uuid',
-          adm: '<div>Debug creative</div>',
+          adm: '<div>Inline creative</div>',
         },
       },
     };
@@ -424,6 +441,80 @@ describe('installTsAdInit', () => {
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_adid', 'debug-uuid');
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_initial', '1');
     expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
+  });
+
+  // Helper: full adInit setup for a single slot whose bid carries an iframe adm.
+  // `debugBid` toggles the per-bid `debug_bid` field that gates the testing bypass.
+  async function fireSlotRenderWithAdm(debugBid: boolean): Promise<HTMLIFrameElement> {
+    let capturedListener: ((e: SlotRenderEvent) => void) | undefined;
+    const mockSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+      getTargeting: vi.fn().mockReturnValue(['abc']),
+    };
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([mockSlot]),
+      refresh: vi.fn(),
+      addEventListener: vi.fn((event: string, fn: (e: SlotRenderEvent) => void) => {
+        if (event === 'slotRenderEnded') capturedListener = fn;
+      }),
+    };
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(mockSlot),
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+    };
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {
+        atf_sidebar_ad: {
+          hb_pb: '1.00',
+          hb_bidder: 'kargo',
+          hb_adid: 'abc',
+          adm: '<iframe src="https://cdn.example/creative.html"></iframe>',
+          ...(debugBid ? { debug_bid: { slot_id: 'atf_sidebar_ad' } } : {}),
+        },
+      },
+    };
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    // A pre-existing GAM iframe; the bypass, if it runs, rewrites its src.
+    const slotEl = document.getElementById('div-atf-sidebar')!;
+    const gamIframe = document.createElement('iframe');
+    gamIframe.src = 'about:blank';
+    slotEl.appendChild(gamIframe);
+
+    expect(capturedListener).toBeDefined();
+    capturedListener!({ isEmpty: false, slot: mockSlot });
+    return gamIframe;
+  }
+
+  it('does not run the GAM-replace bypass without debug_bid (production)', async () => {
+    const gamIframe = await fireSlotRenderWithAdm(false);
+    // No debug_bid ⇒ testing bypass is off; the render bridge handles the creative
+    // and GAM stays in the loop, so the GAM iframe src is untouched.
+    expect(gamIframe.src).toBe('about:blank');
+  });
+
+  it('runs the GAM-replace bypass when debug_bid is present (testing)', async () => {
+    const gamIframe = await fireSlotRenderWithAdm(true);
+    // debug_bid present ⇒ inject_adm_for_testing on ⇒ direct GAM replace fires,
+    // rewriting the iframe to the creative URL from the adm.
+    expect(gamIframe.src).toBe('https://cdn.example/creative.html');
   });
 
   it('does not fire win/billing beacons from slotRenderEnded targeting alone', async () => {
@@ -654,7 +745,7 @@ describe('installTsAdInit', () => {
     beaconSpy.mockRestore();
   });
 
-  it('calls apstag.setDisplayBids when hb_bidder is aps', async () => {
+  it('does not call native apstag for a Trusted Server APS renderer winner', async () => {
     const setDisplayBidsSpy = vi.fn();
     (window as TestWindow).apstag = { setDisplayBids: setDisplayBidsSpy };
 
@@ -687,7 +778,12 @@ describe('installTsAdInit', () => {
         },
       ],
       bids: {
-        atf_sidebar_ad: { hb_pb: '1.50', hb_bidder: 'aps', nurl: '', burl: '' },
+        atf_sidebar_ad: {
+          hb_pb: '1.50',
+          hb_bidder: 'aps',
+          hb_adid: envelope.seatbid[0].bid[0].id,
+          renderer: apsRenderer(),
+        },
       },
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any;
@@ -696,7 +792,8 @@ describe('installTsAdInit', () => {
     installTsAdInit();
     (window as TestWindow).tsjs!.adInit!();
 
-    expect(setDisplayBidsSpy).toHaveBeenCalled();
+    expect(setDisplayBidsSpy).not.toHaveBeenCalled();
+    expect((window as TestWindow).apstag).toEqual({ setDisplayBids: setDisplayBidsSpy });
 
     delete (window as TestWindow).apstag;
   });
@@ -914,6 +1011,162 @@ describe('installTsRenderBridge', () => {
     return bridgeListener!;
   }
 
+  it('serves one exact APS dynamic-renderer response without cache fetches or beacons', async () => {
+    const renderer = apsRenderer();
+    (window as TestWindow).tsjs.bids.homepage_header = {
+      hb_adid: renderer.bidId,
+      hb_bidder: 'aps',
+      hb_pb: '1.23',
+      renderer,
+      // These must not be used even if unexpected legacy fields coexist.
+      nurl: 'https://notify.example/win',
+      burl: 'https://notify.example/bill',
+      hb_cache_host: 'cache.example.com',
+      hb_cache_path: '/cache',
+    };
+
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const stopSpy = vi.fn();
+    const portMessages: string[] = [];
+    const fakePort = { postMessage: (message: string) => portMessages.push(message) };
+    const event = Object.assign(new Event('message'), {
+      data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
+      ports: [fakePort],
+      source,
+      stopImmediatePropagation: stopSpy,
+    }) as unknown as MessageEvent;
+
+    bridgeListener(event);
+    bridgeListener(event);
+
+    expect(stopSpy).toHaveBeenCalledTimes(2);
+    expect(fetchStub).not.toHaveBeenCalled();
+    expect(beaconSpy).not.toHaveBeenCalled();
+    expect(portMessages).toHaveLength(1);
+    const response = JSON.parse(portMessages[0]) as Record<string, unknown>;
+    expect(Object.keys(response).sort()).toEqual(
+      [
+        'adId',
+        'apsRenderer',
+        'height',
+        'message',
+        'renderer',
+        'rendererUrl',
+        'rendererVersion',
+        'width',
+      ].sort()
+    );
+    expect(response).toEqual({
+      message: 'Prebid Response',
+      adId: renderer.bidId,
+      renderer: expect.stringContaining('window.render=function'),
+      rendererVersion: 4,
+      rendererUrl: new URL('/integrations/aps/renderer', window.location.origin).href,
+      apsRenderer: renderer,
+      width: 300,
+      height: 250,
+    });
+    expect(String(response.renderer)).not.toContain(renderer.accountId);
+    expect(String(response.renderer)).not.toContain(renderer.aaxResponse);
+
+    // Universal Creative's dynamic-renderer path evaluates the returned static
+    // source and calls window.render(response, helper, targetWindow). Consume
+    // the exact bridge response through that deployed protocol shape.
+    const dynamicWindow = window as unknown as {
+      render?: (data: Record<string, unknown>, helper: unknown, target: Window) => Promise<void>;
+    };
+    window.eval(String(response.renderer));
+    try {
+      const rendered = dynamicWindow.render!(response, undefined, window);
+      const outerFrame = document.querySelector<HTMLIFrameElement>(
+        'iframe[src*="/integrations/aps/renderer#tsaps="]'
+      )!;
+      expect(outerFrame).not.toBeNull();
+      expect(outerFrame.getAttribute('sandbox')).not.toContain('allow-same-origin');
+
+      const rendererPost = vi.spyOn(outerFrame.contentWindow!, 'postMessage');
+      outerFrame.dispatchEvent(new Event('load'));
+      const sent = rendererPost.mock.calls[0][0] as { nonce: string };
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          data: { message: 'trusted-server/aps/renderer-ready', nonce: sent.nonce },
+          source: outerFrame.contentWindow,
+        })
+      );
+      await expect(rendered).resolves.toBeUndefined();
+      outerFrame.remove();
+    } finally {
+      delete dynamicWindow.render;
+    }
+    beaconSpy.mockRestore();
+  });
+
+  it('validates APS data before claiming the Prebid request', async () => {
+    const renderer = { ...apsRenderer(), aaxResponse: 'invalid' };
+    (window as TestWindow).tsjs.bids.homepage_header = {
+      hb_adid: renderer.bidId,
+      hb_bidder: 'aps',
+      renderer,
+    };
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const stopSpy = vi.fn();
+    const portMessages: string[] = [];
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
+        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+        source,
+        stopImmediatePropagation: stopSpy,
+      }) as unknown as MessageEvent
+    );
+
+    expect(stopSpy).not.toHaveBeenCalled();
+    expect(portMessages).toEqual([]);
+    expect(fetchStub).not.toHaveBeenCalled();
+  });
+
+  it('ignores an APS ad ID requested by another configured slot', async () => {
+    const renderer = apsRenderer();
+    (window as TestWindow).tsjs.bids.homepage_header = {
+      hb_adid: renderer.bidId,
+      hb_bidder: 'aps',
+      renderer,
+    };
+    (window as TestWindow).tsjs.adSlots.push({
+      id: 'homepage_footer',
+      formats: [[300, 250]],
+      gam_unit_path: '/a/b/footer',
+      div_id: 'div-footer',
+      targeting: {},
+    });
+    const footer = document.createElement('div');
+    footer.id = 'div-footer';
+    const foreignIframe = document.createElement('iframe');
+    footer.appendChild(foreignIframe);
+    document.body.appendChild(footer);
+
+    const bridgeListener = await captureBridgeListener();
+    const stopSpy = vi.fn();
+    const portMessages: string[] = [];
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
+        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+        source: foreignIframe.contentWindow,
+        stopImmediatePropagation: stopSpy,
+      }) as unknown as MessageEvent
+    );
+
+    expect(stopSpy).not.toHaveBeenCalled();
+    expect(portMessages).toEqual([]);
+    expect(fetchStub).not.toHaveBeenCalled();
+    footer.remove();
+  });
+
   it('calls stopImmediatePropagation and fetches PBS Cache for a TS bid', async () => {
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
     const mockAd = '<div>Test Creative</div>';
@@ -1039,18 +1292,22 @@ describe('installTsRenderBridge', () => {
     beaconSpy.mockRestore();
   });
 
-  it('responds with adm without fetching PBS Cache when debug adm is available', async () => {
+  it('serves inline adm without fetching PBS Cache even when cache coords are present', async () => {
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
-    const debugAdm = '<div>Debug Creative</div>';
+    const inlineAdm = '<div>Inline Creative</div>';
     (window as TestWindow).tsjs = {
       bids: {
         homepage_header: {
           hb_adid: 'debug-adid',
           hb_bidder: 'mocktioneer',
           hb_pb: '0.20',
+          // Production shape: cache coordinates ARE present, but the bridge must
+          // prefer the local inline adm and skip the PBS Cache fetch.
+          hb_cache_host: 'cache.example.com',
+          hb_cache_path: '/pbc/v1/cache',
           nurl: 'https://debug.example/win',
           burl: 'https://debug.example/bill',
-          adm: debugAdm,
+          adm: inlineAdm,
         },
       },
       adSlots: [
@@ -1103,7 +1360,7 @@ describe('installTsRenderBridge', () => {
     const parsed = JSON.parse(portMessages[0]) as Record<string, any>;
     expect(parsed.message).toBe('Prebid Response');
     expect(parsed.adId).toBe('debug-adid');
-    expect(parsed.ad).toBe(debugAdm);
+    expect(parsed.ad).toBe(inlineAdm);
     expect(parsed.width).toBe(728);
     expect(parsed.height).toBe(90);
     expect(beaconSpy).toHaveBeenCalledWith('https://debug.example/win');
@@ -1235,7 +1492,7 @@ describe('installTsRenderBridge', () => {
     window.dispatchEvent(
       new MessageEvent('message', {
         data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
-        ports: [fakePort as MessagePort],
+        ports: [fakePort as unknown as MessagePort],
         source: foreignIframe.contentWindow,
       })
     );
@@ -1280,7 +1537,7 @@ describe('installTsRenderBridge', () => {
       new MessageEvent('message', {
         // adId belongs to slot B (homepage_footer), not slot A's iframe.
         data: JSON.stringify({ message: 'Prebid Request', adId: 'footer-uuid' }),
-        ports: [fakePort as MessagePort],
+        ports: [fakePort as unknown as MessagePort],
         source,
       })
     );
