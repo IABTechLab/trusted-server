@@ -1535,9 +1535,7 @@ pub async fn handle_publisher_request(
                 })?,
         );
     }
-    if should_preload_ec
-        && let (Some(graph), Some(active_ec_id)) = (kv, active_ec_id)
-    {
+    if should_preload_ec && let (Some(graph), Some(active_ec_id)) = (kv, active_ec_id) {
         let refreshed = graph.load_snapshot(active_ec_id);
         // Never downgrade an in-request Add-confirmed Present snapshot: a
         // freshly created row can read back Missing/Failed on an
