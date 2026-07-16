@@ -1,7 +1,7 @@
 # Amazon APS OpenRTB First-Class Integration Design
 
-**Date:** 2026-07-15  
-**Status:** Approved for implementation and test; production rollout remains subject to APS account-team validation  
+**Date:** 2026-07-15<br>
+**Status:** Approved for implementation and test; production rollout remains subject to APS account-team validation<br>
 **Issue:** [#764 — Add the Amazon APS Prebid Adapter as first class integration](https://github.com/IABTechLab/trusted-server/issues/764)
 
 ---
