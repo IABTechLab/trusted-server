@@ -777,16 +777,20 @@ mod tests {
     #[test]
     fn kv_snapshot_distinguishes_non_present_states() {
         assert!(EcKvSnapshot::NotRead.entry_for("ec-1").is_none());
-        assert!(EcKvSnapshot::Missing {
-            ec_id: "ec-1".to_owned()
-        }
-        .entry_for("ec-1")
-        .is_none());
-        assert!(EcKvSnapshot::Failed {
-            ec_id: "ec-1".to_owned()
-        }
-        .entry_for("ec-1")
-        .is_none());
+        assert!(
+            EcKvSnapshot::Missing {
+                ec_id: "ec-1".to_owned()
+            }
+            .entry_for("ec-1")
+            .is_none()
+        );
+        assert!(
+            EcKvSnapshot::Failed {
+                ec_id: "ec-1".to_owned()
+            }
+            .entry_for("ec-1")
+            .is_none()
+        );
     }
 
     #[test]

@@ -23,7 +23,7 @@ use super::current_timestamp;
 use super::generation::ec_hash;
 use super::kv_backend::{EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome};
 use super::kv_types::{KvEntry, KvMetadata, KvNetwork};
-use super::{log_id, EcKvSnapshot};
+use super::{EcKvSnapshot, log_id};
 
 /// Maximum number of CAS retry attempts before giving up.
 const MAX_CAS_RETRIES: u32 = 5;
@@ -396,12 +396,12 @@ impl KvIdentityGraph {
                     // Re-read immediately to get a fresh generation. Sleeping in
                     // the CAS loop would block the edge compute request worker.
                     match self.get(ec_id)? {
-                        Some((refreshed, gen)) => {
+                        Some((refreshed, generation)) => {
                             if refreshed.consent.ok {
                                 // Someone else revived it — done.
                                 return Ok(());
                             }
-                            current_gen = gen;
+                            current_gen = generation;
                         }
                         None => return self.create(ec_id, entry),
                     }
@@ -1102,8 +1102,8 @@ mod tests {
     // CAS-conflict injection tests
     // -----------------------------------------------------------------------
 
-    use crate::ec::kv_backend::test_support::InMemoryEcKv;
     use crate::ec::kv_backend::EcKvLookup;
+    use crate::ec::kv_backend::test_support::InMemoryEcKv;
 
     /// [`EcKvStore`] wrapper that injects generation conflicts: the first
     /// `conflicts_remaining` `IfGenerationMatch` inserts return
@@ -1835,9 +1835,11 @@ mod tests {
             1,
             "an unavailable generation refreshes exactly once before CAS"
         );
-        assert!(outcome
-            .entry_for(&ec_id)
-            .is_some_and(|e| e.ids.contains_key("ssp_x")));
+        assert!(
+            outcome
+                .entry_for(&ec_id)
+                .is_some_and(|e| e.ids.contains_key("ssp_x"))
+        );
     }
 
     #[test]

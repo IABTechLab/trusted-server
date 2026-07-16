@@ -8,7 +8,7 @@
 //! compatibility we also accept the earlier flattened payload shape
 //! (`{source, id, atype}` per entry).
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use error_stack::Report;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -133,10 +133,10 @@ pub(crate) fn collect_eid_cookie_updates(
     if let Some(cookie) = eids_cookie {
         updates.extend(collect_prebid_eid_updates(cookie, registry));
     }
-    if let Some(cookie) = sharedid_cookie {
-        if let Some(update) = collect_sharedid_update(cookie, registry) {
-            updates.push(update);
-        }
+    if let Some(cookie) = sharedid_cookie
+        && let Some(update) = collect_sharedid_update(cookie, registry)
+    {
+        updates.push(update);
     }
     dedupe_partner_updates(updates)
 }

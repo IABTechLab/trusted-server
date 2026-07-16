@@ -4,31 +4,32 @@ use std::collections::HashMap;
 
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use http::{header, Request, Response, StatusCode};
+use http::{Request, Response, StatusCode, header};
 use serde_json::Value as JsonValue;
 
 use crate::auction::formats::AdRequest;
 use crate::auction::orchestrator::OrchestrationResult;
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
 use crate::constants::COOKIE_TS_EIDS;
+use crate::ec::EcContext;
+use crate::ec::EcKvSnapshot;
 use crate::ec::eids::{resolve_partner_ids, to_eids};
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::kv_types::MAX_UID_LENGTH;
 use crate::ec::prebid_eids::parse_prebid_eids_cookie;
 use crate::ec::registry::PartnerRegistry;
-use crate::ec::{EcContext, EcKvSnapshot};
 use crate::error::TrustedServerError;
 use crate::openrtb::{Eid, Uid};
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
+use super::AuctionOrchestrator;
 use super::formats::{convert_to_openrtb_response, convert_tsjs_to_auction_request};
 use super::telemetry::{
-    build_auction_events, emit_auction_events_best_effort_lazy, AuctionObservationContext,
-    AuctionSource, AuctionTerminalOutcome,
+    AuctionObservationContext, AuctionSource, AuctionTerminalOutcome, build_auction_events,
+    emit_auction_events_best_effort_lazy,
 };
 use super::types::AuctionContext;
-use super::AuctionOrchestrator;
 
 const MAX_CLIENT_EID_SOURCES: usize = 64;
 const MAX_CLIENT_UIDS_PER_SOURCE: usize = 32;
@@ -381,10 +382,10 @@ fn extract_cookie_value(req: &Request<EdgeBody>, name: &str) -> Option<String> {
         .and_then(|v| v.to_str().ok())?;
     for pair in cookie_header.split(';') {
         let pair = pair.trim();
-        if let Some((key, value)) = pair.split_once('=') {
-            if key.trim() == name {
-                return Some(value.trim().to_owned());
-            }
+        if let Some((key, value)) = pair.split_once('=')
+            && key.trim() == name
+        {
+            return Some(value.trim().to_owned());
         }
     }
     None
@@ -454,11 +455,7 @@ fn parse_client_auction_eids(raw: Option<&JsonValue>) -> Option<Vec<Eid>> {
         eids.push(Eid { source, uids });
     }
 
-    if eids.is_empty() {
-        None
-    } else {
-        Some(eids)
-    }
+    if eids.is_empty() { None } else { Some(eids) }
 }
 
 fn parse_client_auction_uid(raw: &JsonValue) -> Option<Uid> {
@@ -557,12 +554,12 @@ mod tests {
     use crate::consent::types::ConsentContext;
     use crate::openrtb::Uid;
     use crate::platform::test_support::{
-        noop_services, NoopBackend, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore,
+        NoopBackend, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore, noop_services,
     };
     use crate::platform::{ClientInfo, PlatformPendingRequest, PlatformResponse};
     use crate::test_support::tests::create_test_settings;
-    use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 

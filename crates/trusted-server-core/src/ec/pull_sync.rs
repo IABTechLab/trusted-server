@@ -9,13 +9,13 @@
 //! the entry no longer stores per-partner sync timestamps.
 
 use edgezero_core::body::Body as EdgeBody;
-use http::{header, Method, StatusCode};
+use http::{Method, StatusCode, header};
 use serde::Deserialize;
 use url::Url;
 
 use crate::platform::{
-    PlatformBackendSpec, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
-    RuntimeServices, DEFAULT_FIRST_BYTE_TIMEOUT,
+    DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, PlatformHttpRequest, PlatformPendingRequest,
+    PlatformResponse, RuntimeServices,
 };
 use crate::settings::Settings;
 
@@ -26,9 +26,9 @@ use super::rate_limiter::RateLimiter;
 use super::registry::{PartnerConfig, PartnerRegistry};
 
 // `current_timestamp` is defined in the parent `ec` module.
-use super::current_timestamp;
 use super::EcContext;
 use super::EcKvSnapshot;
+use super::current_timestamp;
 
 /// Inputs needed to dispatch pull sync after response flush.
 #[derive(Debug, Clone)]
@@ -722,7 +722,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use crate::error::TrustedServerError;
-    use crate::platform::test_support::{build_services_with_http_client, StubHttpClient};
+    use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
     use crate::settings::EcPartner;
     use crate::test_support::tests::create_test_settings;
     use error_stack::Report;

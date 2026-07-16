@@ -89,21 +89,21 @@ use edgezero_core::app::{App, Hooks};
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
-    header, HandlerFuture, HeaderValue, Method, Request, Response, StatusCode,
+    HandlerFuture, HeaderValue, Method, Request, Response, StatusCode, header,
 };
 use edgezero_core::router::RouterService;
 use error_stack::Report;
-use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::AuctionTelemetrySink;
-use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
+use trusted_server_core::auction::endpoints::handle_auction;
+use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
 use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
+use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
 use trusted_server_core::ec::consent::ec_consent_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::registry::PartnerRegistry;
-use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{
@@ -112,12 +112,12 @@ use trusted_server_core::integrations::{
 };
 use trusted_server_core::platform::{ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices};
 use trusted_server_core::proxy::{
-    handle_asset_proxy_request, handle_first_party_click, handle_first_party_proxy,
-    handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, AssetProxyCachePolicy,
+    AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
+    handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
-    handle_tsjs_dynamic, page_bids_preflight_denied, AuctionDispatch,
+    AuctionDispatch, buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
+    handle_tsjs_dynamic, page_bids_preflight_denied,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
@@ -131,8 +131,8 @@ use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester}
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::{
-    open_kv_store, FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformGeo,
-    FastlyPlatformHttpClient, FastlyPlatformSecretStore, UnavailableKvStore,
+    FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformGeo, FastlyPlatformHttpClient,
+    FastlyPlatformSecretStore, UnavailableKvStore, open_kv_store,
 };
 
 // ---------------------------------------------------------------------------
@@ -766,13 +766,12 @@ async fn dispatch_fallback(
         // Only for document navigations by recognised browsers; subresource
         // requests may lack consent signals such as Sec-GPC.
         let is_publisher_navigation = ec.is_real_browser && is_navigation_request(&req);
-        if is_publisher_navigation {
-            if let Err(err) = ec
+        if is_publisher_navigation
+            && let Err(err) = ec
                 .ec_context
                 .generate_if_needed(&state.settings, ec.kv_graph.as_ref())
-            {
-                log::warn!("EC generation failed for publisher proxy: {err:?}");
-            }
+        {
+            log::warn!("EC generation failed for publisher proxy: {err:?}");
         }
 
         // Publisher pages read consent data, so the consent KV store must be
@@ -887,10 +886,10 @@ async fn dispatch_asset_fallback(
             // client. HEAD and bodiless statuses (204, 304) advertise the origin
             // Content-Length but carry no body, so their stream is dropped to
             // preserve that header and avoid a length/body mismatch.
-            if let Some(body) = stream_body {
-                if asset_response_carries_body(&method, response.status()) {
-                    *response.body_mut() = body;
-                }
+            if let Some(body) = stream_body
+                && asset_response_carries_body(&method, response.status())
+            {
+                *response.body_mut() = body;
             }
 
             response.extensions_mut().insert(cache_policy);
@@ -1227,12 +1226,12 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        build_state_from_settings, startup_error_router, AppState, NamedRouteHandler,
-        TrustedServerApp, NAMED_ROUTES,
+        AppState, NAMED_ROUTES, NamedRouteHandler, TrustedServerApp, build_state_from_settings,
+        startup_error_router,
     };
     use bytes::Bytes;
     use edgezero_core::body::Body;
-    use edgezero_core::http::{header, request_builder, Method, Response, StatusCode};
+    use edgezero_core::http::{Method, Response, StatusCode, header, request_builder};
     use edgezero_core::key_value_store::NoopKvStore;
     use edgezero_core::router::RouterService;
     use std::net::{IpAddr, Ipv4Addr};
@@ -1838,7 +1837,10 @@ mod tests {
         let response = route(&router, empty_request(Method::GET, "/some-page"));
 
         assert!(
-            response.extensions().get::<super::EcFinalizeState>().is_some(),
+            response
+                .extensions()
+                .get::<super::EcFinalizeState>()
+                .is_some(),
             "publisher fallback responses should carry EcFinalizeState for entry-point EC finalization"
         );
     }
