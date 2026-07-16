@@ -44,6 +44,10 @@ const MAX_ACCOUNT_ID_BYTES: usize = 1024;
 const MAX_CREATIVE_URL_BYTES: usize = 4096;
 const MAX_PAGE_URL_BYTES: usize = 8192;
 const MAX_RENDER_ENVELOPE_BYTES: usize = 256 * 1024;
+/// Cap on the raw upstream body preview surfaced in failure metadata.
+const MAX_DEBUG_BODY_SNIPPET_BYTES: usize = 256;
+/// Cap on the number of top-level response keys surfaced in failure metadata.
+const MAX_DEBUG_RESPONSE_KEYS: usize = 16;
 const APS_RENDERER_CSP: &str = "default-src 'none'; sandbox allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation; script-src 'unsafe-inline' https:; connect-src https:; frame-src https:; img-src https: data:; media-src https: blob:; style-src 'unsafe-inline' https:; font-src https: data:;";
 
 const APS_RENDERER_DOCUMENT: &str = r#"<!doctype html>
@@ -622,23 +626,65 @@ impl ApsAuctionProvider {
         })
     }
 
+    /// Identify which response-shape invariant an APS body violates.
+    ///
+    /// Returns the name of the first failing check, or `None` when the body is
+    /// a well-formed `OpenRTB` bid response. The name is surfaced in failure
+    /// metadata so operators can see *why* a response was rejected.
+    fn response_shape_error(value: &Json) -> Option<&'static str> {
+        if !value.is_object() {
+            return Some("not_object");
+        }
+        if value.get("contextual").is_some() {
+            return Some("contextual_present");
+        }
+        if value
+            .get("cur")
+            .is_some_and(|currency| !currency.is_string())
+        {
+            return Some("cur_not_string");
+        }
+        if value
+            .get("seatbid")
+            .is_some_and(|seatbids| !seatbids.is_array())
+        {
+            return Some("seatbid_not_array");
+        }
+        None
+    }
+
+    /// Bounded list of an object's top-level keys, for failure metadata.
+    ///
+    /// Returns an empty list for non-objects. Capped at
+    /// [`MAX_DEBUG_RESPONSE_KEYS`] so a pathological response cannot bloat the
+    /// debug comment.
+    fn top_level_keys(value: &Json) -> Vec<String> {
+        value.as_object().map_or_else(Vec::new, |map| {
+            map.keys().take(MAX_DEBUG_RESPONSE_KEYS).cloned().collect()
+        })
+    }
+
+    /// Bounded, lossy UTF-8 preview of an upstream body, for failure metadata.
+    ///
+    /// Truncated to [`MAX_DEBUG_BODY_SNIPPET_BYTES`]; invalid UTF-8 becomes the
+    /// replacement character. Only surfaced when the auction debug comment is
+    /// enabled by the operator.
+    fn response_body_snippet(body: &[u8]) -> String {
+        let end = body.len().min(MAX_DEBUG_BODY_SNIPPET_BYTES);
+        String::from_utf8_lossy(&body[..end]).into_owned()
+    }
+
     fn parse_aps_response(
         &self,
         value: &Json,
         response_time_ms: u64,
         request: &AuctionRequest,
     ) -> AuctionResponse {
-        if !value.is_object()
-            || value.get("contextual").is_some()
-            || value
-                .get("cur")
-                .is_some_and(|currency| !currency.is_string())
-            || value
-                .get("seatbid")
-                .is_some_and(|seatbids| !seatbids.is_array())
-        {
+        if let Some(shape_error) = Self::response_shape_error(value) {
             return AuctionResponse::error(APS_INTEGRATION_ID, response_time_ms)
-                .with_metadata("drop_reasons", json!({"unexpected_response_shape": 1}));
+                .with_metadata("drop_reasons", json!({"unexpected_response_shape": 1}))
+                .with_metadata("shape_error", json!(shape_error))
+                .with_metadata("response_keys", json!(Self::top_level_keys(value)));
         }
         if value
             .get("cur")
@@ -724,15 +770,18 @@ impl ApsAuctionProvider {
         request: Option<&AuctionRequest>,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
         let response = response.response;
-        if response.status() == StatusCode::NO_CONTENT {
+        let status = response.status();
+        if status == StatusCode::NO_CONTENT {
             return Ok(AuctionResponse::no_bid(
                 APS_INTEGRATION_ID,
                 response_time_ms,
             ));
         }
-        if !response.status().is_success() {
-            log::warn!("APS returns a non-success status");
-            return Ok(AuctionResponse::error(APS_INTEGRATION_ID, response_time_ms));
+        if !status.is_success() {
+            log::warn!("APS returns a non-success status: {}", status.as_u16());
+            return Ok(AuctionResponse::error(APS_INTEGRATION_ID, response_time_ms)
+                .with_metadata("drop_reasons", json!({"non_success_status": 1}))
+                .with_metadata("http_status", json!(status.as_u16())));
         }
         let body = collect_response_bounded(
             response.into_body(),
@@ -749,7 +798,9 @@ impl ApsAuctionProvider {
             Err(error) => {
                 log::warn!("Failed to parse APS response JSON: {error}");
                 return Ok(AuctionResponse::error(APS_INTEGRATION_ID, response_time_ms)
-                    .with_metadata("drop_reasons", json!({"unexpected_response_shape": 1})));
+                    .with_metadata("drop_reasons", json!({"unexpected_response_shape": 1}))
+                    .with_metadata("shape_error", json!("invalid_json"))
+                    .with_metadata("body_snippet", json!(Self::response_body_snippet(&body))));
             }
         };
         let Some(request) = request else {
@@ -1235,18 +1286,40 @@ mod tests {
     #[test]
     fn rejects_wrong_typed_response_level_fields() {
         let provider = ApsAuctionProvider::new(config());
-        for value in [
-            json!({"cur": ["USD"], "seatbid": []}),
-            json!({"cur": "USD", "seatbid": "invalid"}),
-            json!({"contextual": {"slots": []}}),
+        for (value, expected_shape_error) in [
+            (json!("not-an-object"), "not_object"),
+            (json!({"cur": ["USD"], "seatbid": []}), "cur_not_string"),
+            (
+                json!({"cur": "USD", "seatbid": "invalid"}),
+                "seatbid_not_array",
+            ),
+            (json!({"contextual": {"slots": []}}), "contextual_present"),
         ] {
             let response = provider.parse_aps_response(&value, 12, &request());
             assert!(response.bids.is_empty());
             assert_eq!(
-                response.metadata["drop_reasons"]["unexpected_response_shape"],
-                1
+                response.metadata["drop_reasons"]["unexpected_response_shape"], 1,
+                "should keep the umbrella drop reason for {expected_shape_error}"
+            );
+            assert_eq!(
+                response.metadata["shape_error"], expected_shape_error,
+                "should name the failing shape check"
             );
         }
+    }
+
+    #[test]
+    fn shape_error_surfaces_top_level_response_keys() {
+        let provider = ApsAuctionProvider::new(config());
+        let value = json!({"contextual": {"slots": []}, "id": "abc"});
+        let response = provider.parse_aps_response(&value, 12, &request());
+        let keys = response.metadata["response_keys"]
+            .as_array()
+            .expect("should expose response_keys as an array");
+        assert!(
+            keys.contains(&json!("contextual")),
+            "should surface the contextual key that triggered rejection"
+        );
     }
 
     #[test]
@@ -1271,6 +1344,33 @@ mod tests {
             response.metadata["drop_reasons"]["unexpected_response_shape"],
             1
         );
+        assert_eq!(response.metadata["shape_error"], "invalid_json");
+        assert_eq!(
+            response.metadata["body_snippet"], "{not-json",
+            "should surface the raw upstream body preview"
+        );
+    }
+
+    #[test]
+    fn non_success_status_surfaces_http_status() {
+        let provider = ApsAuctionProvider::new(config());
+        let platform_response = PlatformResponse::new(
+            edgezero_core::http::response_builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(EdgeBody::from(b"upstream boom".to_vec()))
+                .expect("should build non-success APS response"),
+        );
+        let auction_request = request();
+        let response = futures::executor::block_on(provider.parse_response_inner(
+            platform_response,
+            12,
+            Some(&auction_request),
+        ))
+        .expect("should convert non-success status into a safe auction response");
+
+        assert_eq!(response.status, BidStatus::Error);
+        assert_eq!(response.metadata["drop_reasons"]["non_success_status"], 1);
+        assert_eq!(response.metadata["http_status"], 502);
     }
 
     #[test]
