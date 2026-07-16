@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import envelope from '../fixtures/aps-renderer-v1.json';
 
 async function flushRequestAds(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
@@ -64,6 +65,107 @@ describe('request.requestAds', () => {
         originalLength: creativeHtml.length,
       })
     );
+  });
+
+  it('dispatches a valid APS descriptor to the opaque static renderer route', async () => {
+    const apsBid = envelope.seatbid[0].bid[0];
+    const renderer = {
+      type: 'aps',
+      version: 1,
+      accountId: 'example-account-id',
+      bidId: apsBid.id,
+      tagType: apsBid.ext.tagtype,
+      creativeUrl: apsBid.ext.creativeurl,
+      aaxResponse: btoa(JSON.stringify(envelope)),
+      width: apsBid.w,
+      height: apsBid.h,
+    };
+    (globalThis as any).fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => 'application/json' },
+      json: async () => ({
+        seatbid: [
+          {
+            seat: 'aps',
+            bid: [
+              {
+                impid: 'slot1',
+                price: 1.23,
+                w: 300,
+                h: 250,
+                ext: { trusted_server: { renderer } },
+              },
+            ],
+          },
+        ],
+      }),
+    });
+
+    const { addAdUnits } = await import('../../src/core/registry');
+    const { requestAds } = await import('../../src/core/request');
+    document.body.innerHTML = '<div id="slot1"><span>existing</span></div>';
+    addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
+
+    requestAds();
+    await flushRequestAds();
+
+    const iframe = document.querySelector('#slot1 iframe') as HTMLIFrameElement | null;
+    expect(iframe).not.toBeNull();
+    expect(iframe!.src).toContain('/integrations/aps/renderer#tsaps=');
+    expect(iframe!.srcdoc).toBe('');
+    expect(iframe!.getAttribute('sandbox')).not.toContain('allow-same-origin');
+    expect(document.querySelector('#slot1 span')).not.toBeNull();
+
+    const postMessage = vi.spyOn(iframe!.contentWindow!, 'postMessage');
+    iframe!.dispatchEvent(new Event('load'));
+    expect(document.querySelector('#slot1 span')).not.toBeNull();
+    expect(postMessage).toHaveBeenCalledWith(expect.objectContaining({ renderer }), '*');
+
+    const message = postMessage.mock.calls[0][0] as { nonce: string };
+    window.dispatchEvent(
+      new MessageEvent('message', {
+        data: { message: 'trusted-server/aps/renderer-ready', nonce: message.nonce },
+        source: iframe!.contentWindow,
+      })
+    );
+    expect(document.querySelector('#slot1 span')).toBeNull();
+  });
+
+  it('does not mutate the slot for an invalid APS descriptor', async () => {
+    (globalThis as any).fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => 'application/json' },
+      json: async () => ({
+        seatbid: [
+          {
+            seat: 'aps',
+            bid: [
+              {
+                impid: 'slot1',
+                ext: {
+                  trusted_server: {
+                    renderer: { type: 'aps', version: 1, aaxResponse: 'invalid' },
+                  },
+                },
+              },
+            ],
+          },
+        ],
+      }),
+    });
+
+    const { addAdUnits } = await import('../../src/core/registry');
+    const { requestAds } = await import('../../src/core/request');
+    document.body.innerHTML = '<div id="slot1"><span>existing</span></div>';
+    addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
+
+    requestAds();
+    await flushRequestAds();
+
+    expect(document.querySelector('#slot1 iframe')).toBeNull();
+    expect(document.querySelector('#slot1 span')).not.toBeNull();
   });
 
   it('does not render on non-JSON response', async () => {

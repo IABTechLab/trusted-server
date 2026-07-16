@@ -2096,10 +2096,17 @@ pub(crate) fn build_bid_map(
                     "hb_bidder".to_string(),
                     serde_json::Value::String(bid.bidder.clone()),
                 );
-                // hb_adid: use PBS Cache UUID when present — the Prebid Universal Creative uses
-                // this as the cache lookup key, NOT the OpenRTB bid ID (bid.ad_id). Fall back to
-                // bid.ad_id for APS and other non-PBS providers.
-                let hb_adid = bid.cache_id.as_deref().or(bid.ad_id.as_deref());
+                // PBS Cache remains highest priority. APS uses the selected bid ID
+                // carried by its typed renderer; other providers retain the ad-ID fallback.
+                let renderer_bid_id = bid
+                    .renderer
+                    .as_ref()
+                    .map(|renderer| renderer.aps().bid_id.as_str());
+                let hb_adid = bid
+                    .cache_id
+                    .as_deref()
+                    .or(renderer_bid_id)
+                    .or(bid.ad_id.as_deref());
                 if let Some(id) = hb_adid {
                     obj.insert(
                         "hb_adid".to_string(),
@@ -2128,6 +2135,12 @@ pub(crate) fn build_bid_map(
                 if let Some(ref burl) = bid.burl {
                     obj.insert("burl".to_string(), serde_json::Value::String(burl.clone()));
                 }
+                if let Some(ref renderer) = bid.renderer {
+                    obj.insert(
+                        "renderer".to_string(),
+                        serde_json::to_value(renderer).expect("should serialize typed renderer"),
+                    );
+                }
                 // Include raw creative markup only for explicit debug injection.
                 // The pbRender bridge can use it while PBS Cache is unavailable.
                 if include_adm {
@@ -2147,7 +2160,9 @@ pub(crate) fn build_bid_map(
                             "height": bid.height,
                             "nurl": bid.nurl,
                             "burl": bid.burl,
+                            "bid_id": bid.bid_id,
                             "ad_id": bid.ad_id,
+                            "creative_id": bid.creative_id,
                             "cache_id": bid.cache_id,
                             "cache_host": bid.cache_host,
                             "cache_path": bid.cache_path,
@@ -4246,7 +4261,7 @@ mod tests {
             MatchedSlotsContext, build_ad_slots_script, build_auction_request, build_bid_map,
             build_bids_script, html_escape_for_script,
         };
-        use crate::auction::types::{Bid, MediaType};
+        use crate::auction::types::{ApsRendererV1, ApsTagType, Bid, BidRenderer, MediaType};
         use crate::consent::ConsentContext;
         use crate::creative_opportunities::{
             CreativeOpportunitiesConfig, CreativeOpportunityFormat, CreativeOpportunitySlot,
@@ -4303,7 +4318,10 @@ mod tests {
                 height: 250,
                 nurl: Some(nurl.to_string()),
                 burl: Some(burl.to_string()),
+                bid_id: None,
                 ad_id: Some(ad_id.to_string()),
+                creative_id: None,
+                renderer: None,
                 cache_id: None,
                 cache_host: None,
                 cache_path: None,
@@ -4386,6 +4404,44 @@ mod tests {
                 Some("https://ssp/bill"),
                 "should include burl"
             );
+        }
+
+        #[test]
+        fn bid_map_exposes_aps_renderer_and_selected_bid_id_without_debug_adm() {
+            let mut bid = make_bid("atf_sidebar_ad", 1.50, "aps", "fallback-ad", "", "");
+            bid.bid_id = Some("selected-bid".to_string());
+            bid.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
+                version: 1,
+                account_id: "example-account".to_string(),
+                bid_id: "selected-bid".to_string(),
+                creative_id: None,
+                tag_type: ApsTagType::Iframe,
+                creative_url: "https://creative.example/render".to_string(),
+                aax_response: "fictional-base64</script>".to_string(),
+                width: 300,
+                height: 250,
+            }));
+            bid.nurl = None;
+            bid.burl = None;
+            let winning_bids = HashMap::from([("atf_sidebar_ad".to_string(), bid)]);
+
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
+            let obj = map["atf_sidebar_ad"]
+                .as_object()
+                .expect("should include APS bid");
+
+            assert_eq!(obj["hb_bidder"], "aps");
+            assert_eq!(obj["hb_adid"], "selected-bid");
+            assert_eq!(obj["renderer"]["type"], "aps");
+            assert_eq!(obj["renderer"]["bidId"], "selected-bid");
+            assert!(obj.get("adm").is_none());
+            assert!(obj.get("nurl").is_none());
+            assert!(obj.get("burl").is_none());
+            assert!(obj.get("metadata").is_none());
+
+            let script = build_bids_script(&map);
+            assert!(!script.contains("</script></script>"));
+            assert!(script.contains("\\u003C/script\\u003E"));
         }
 
         #[test]
@@ -4523,7 +4579,10 @@ mod tests {
                     height: 250,
                     nurl: None,
                     burl: None,
+                    bid_id: None,
                     ad_id: Some("bid-impression-id".to_string()),
+                    creative_id: None,
+                    renderer: None,
                     cache_id: Some("f47447a0-b759-4f2f-9887-af458b79b570".to_string()),
                     cache_host: Some("openads.adsrvr.org".to_string()),
                     cache_path: Some("/cache".to_string()),
@@ -4564,12 +4623,15 @@ mod tests {
                     currency: "USD".to_string(),
                     creative: None,
                     adomain: None,
-                    bidder: "amazon-aps".to_string(),
+                    bidder: "ordinary".to_string(),
                     width: 300,
                     height: 250,
                     nurl: None,
                     burl: None,
-                    ad_id: Some("aps-bid-token".to_string()),
+                    bid_id: None,
+                    ad_id: Some("ordinary-ad-id".to_string()),
+                    creative_id: None,
+                    renderer: None,
                     cache_id: None,
                     cache_host: None,
                     cache_path: None,
@@ -4584,7 +4646,7 @@ mod tests {
                 .expect("should be object");
             assert_eq!(
                 obj.get("hb_adid").and_then(|v| v.as_str()),
-                Some("aps-bid-token"),
+                Some("ordinary-ad-id"),
                 "should fall back to ad_id when cache_id absent"
             );
             assert!(
@@ -4608,12 +4670,15 @@ mod tests {
                     currency: "USD".to_string(),
                     creative: None,
                     adomain: None,
-                    bidder: "amazon-aps".to_string(),
+                    bidder: "ordinary".to_string(),
                     width: 300,
                     height: 250,
                     nurl: None,
                     burl: None,
+                    bid_id: None,
                     ad_id: None,
+                    creative_id: None,
+                    renderer: None,
                     cache_id: None,
                     cache_host: None,
                     cache_path: None,
@@ -4648,7 +4713,10 @@ mod tests {
                     height: 250,
                     nurl: None,
                     burl: None,
+                    bid_id: None,
                     ad_id: None,
+                    creative_id: None,
+                    renderer: None,
                     cache_id: None,
                     cache_host: None,
                     cache_path: None,
