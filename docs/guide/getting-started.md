@@ -69,14 +69,19 @@ cargo run -p trusted-server-adapter-axum
 The server will be available at `http://localhost:8787`. Set `PORT=<port>` before
 `cargo run` to bind the dev server to a different local port.
 
-**Environment variable conventions used by the Axum adapter:**
+**How the Axum adapter loads config and secrets:**
 
-| Purpose            | Pattern                               | Example                                                  |
-| ------------------ | ------------------------------------- | -------------------------------------------------------- |
-| Config store value | `TRUSTED_SERVER_CONFIG_{STORE}_{KEY}` | `TRUSTED_SERVER_CONFIG_SETTINGS_AD_SERVER_URL=https://…` |
-| Secret store value | `TRUSTED_SERVER_SECRET_{STORE}_{KEY}` | `TRUSTED_SERVER_SECRET_KEYS_SIGNING_KEY=abc123`          |
+The Axum dev server reads through the same `EdgeZero` store registry as the other
+adapters, backed by local files and environment variables:
 
-Store names and key names are uppercased with hyphens and dots replaced by underscores.
+| Purpose | Source |
+| ------- | ------ |
+| App config | The `EdgeZero` config store on disk: `.edgezero/local-config-<store-id>.json` (a JSON object of `key → value`). The default app-config store also honors `TRUSTED_SERVER_AXUM_CONFIG_PATH`, pointing it at an explicit file. |
+| Secrets | Environment variables named after the secret **key** (e.g. `signing-key` → `SIGNING_KEY`). Set them before starting the server. |
+
+> The older `TRUSTED_SERVER_CONFIG_{STORE}_{KEY}` / `TRUSTED_SERVER_SECRET_{STORE}_{KEY}`
+> env conventions no longer apply — config now comes from the config-store file and
+> secrets from key-named env vars.
 
 > **Dev server limitations:** The Axum adapter does not support KV store,
 > geo lookup, config/secret-store writes, or admin key-management routes.
