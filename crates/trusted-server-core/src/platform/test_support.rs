@@ -621,6 +621,24 @@ pub(crate) fn noop_services() -> RuntimeServices {
     build_services_with_config(NoopConfigStore)
 }
 
+/// Build a [`RuntimeServices`] carrying a caller-supplied KV registry, so tests
+/// can exercise named-store resolution via
+/// [`RuntimeServices::kv_handle_named`].
+pub(crate) fn noop_services_with_kv_registry(
+    kv_registry: edgezero_core::store_registry::KvRegistry,
+) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .kv_registry(Some(kv_registry))
+        .backend(Arc::new(NoopBackend))
+        .http_client(Arc::new(NoopHttpClient))
+        .geo(Arc::new(NoopGeo))
+        .client_info(ClientInfo::default())
+        .build()
+}
+
 /// Build a [`RuntimeServices`] with a caller-supplied HTTP client and a [`StubBackend`].
 ///
 /// Uses [`StubBackend`] (always returns `Ok("stub-backend")`) rather than

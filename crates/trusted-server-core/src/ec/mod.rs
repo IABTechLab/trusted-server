@@ -212,14 +212,30 @@ impl EcContext {
             .client_ip
             .map(generation::normalize_ip);
 
-        // Build consent context from request-local cookies, headers, and geo.
+        // Resolve the consent KV store for persistence, keyed by the existing EC
+        // id. Resolution is deliberately best-effort: this runs on every request
+        // that builds an EC context, including routes that do not depend on
+        // consent, so a configured-but-unresolvable store must not fail here.
+        // Fail-closed enforcement for a missing consent store lives at the
+        // consent-dependent routes (`consent::resolve_consent_kv`), which keeps a
+        // misconfiguration from breaking unrelated routes.
+        let consent_kv = settings
+            .consent
+            .consent_store
+            .as_deref()
+            .and_then(|store_id| services.kv_handle_named(store_id));
+
+        // Build consent context from request-local cookies, headers, and geo,
+        // falling back to (and persisting) KV-backed consent for this EC id. A
+        // request without an EC id yet cannot key persistence, so it stays
+        // request-local until the EC cookie is present on a later request.
         let consent = consent_mod::build_consent_context(&ConsentPipelineInput {
             jar: parsed.jar.as_ref(),
             req,
             config: &settings.consent,
             geo: geo_info,
-            ec_id: None,
-            kv_store: None,
+            ec_id: ec_value.as_deref(),
+            kv_store: consent_kv,
         });
 
         log::info!(
@@ -676,6 +692,177 @@ mod tests {
             ec.existing_cookie_ec_id(),
             Some(cookie_ec2.as_str()),
             "should return cookie value for revocation even when header is present"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Consent KV persistence wiring
+    // ---------------------------------------------------------------------
+
+    /// In-memory [`crate::platform::PlatformKvStore`] double for the consent
+    /// persistence wiring tests.
+    struct InMemoryKvStore {
+        entries: std::sync::Mutex<std::collections::HashMap<String, bytes::Bytes>>,
+    }
+
+    impl InMemoryKvStore {
+        fn new() -> Self {
+            Self {
+                entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl crate::platform::PlatformKvStore for InMemoryKvStore {
+        async fn get_bytes(
+            &self,
+            key: &str,
+        ) -> Result<Option<bytes::Bytes>, crate::platform::KvError> {
+            Ok(self
+                .entries
+                .lock()
+                .expect("should lock entries")
+                .get(key)
+                .cloned())
+        }
+
+        async fn put_bytes(
+            &self,
+            key: &str,
+            value: bytes::Bytes,
+        ) -> Result<(), crate::platform::KvError> {
+            self.entries
+                .lock()
+                .expect("should lock entries")
+                .insert(key.to_owned(), value);
+            Ok(())
+        }
+
+        async fn put_bytes_with_ttl(
+            &self,
+            key: &str,
+            value: bytes::Bytes,
+            _ttl: std::time::Duration,
+        ) -> Result<(), crate::platform::KvError> {
+            self.put_bytes(key, value).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), crate::platform::KvError> {
+            self.entries
+                .lock()
+                .expect("should lock entries")
+                .remove(key);
+            Ok(())
+        }
+
+        async fn list_keys_page(
+            &self,
+            _prefix: &str,
+            _cursor: Option<&str>,
+            _limit: usize,
+        ) -> Result<edgezero_core::key_value_store::KvPage, crate::platform::KvError> {
+            Ok(edgezero_core::key_value_store::KvPage::default())
+        }
+    }
+
+    /// Settings whose consent pipeline persists to the `consent_store` id.
+    fn settings_with_consent_store() -> Settings {
+        let mut settings = create_test_settings();
+        settings.consent.consent_store = Some("consent_store".to_owned());
+        settings
+    }
+
+    /// Build services whose KV registry holds a distinct default store and a
+    /// named `consent_store`, returning both handles so tests can assert which
+    /// store was written.
+    fn services_with_consent_kv() -> (
+        RuntimeServices,
+        crate::platform::KvHandle,
+        crate::platform::KvHandle,
+    ) {
+        let default_handle =
+            crate::platform::KvHandle::new(std::sync::Arc::new(InMemoryKvStore::new()));
+        let consent_handle =
+            crate::platform::KvHandle::new(std::sync::Arc::new(InMemoryKvStore::new()));
+        let by_id = std::collections::BTreeMap::from([
+            ("trusted_server_kv".to_owned(), default_handle.clone()),
+            ("consent_store".to_owned(), consent_handle.clone()),
+        ]);
+        let registry = edgezero_core::store_registry::StoreRegistry::from_parts(
+            by_id,
+            "trusted_server_kv".to_owned(),
+        )
+        .expect("should build kv registry");
+        let services = crate::platform::test_support::noop_services_with_kv_registry(registry);
+        (services, default_handle, consent_handle)
+    }
+
+    #[test]
+    fn read_from_request_persists_consent_to_the_named_consent_store() {
+        let settings = settings_with_consent_store();
+        let (services, default_handle, consent_handle) = services_with_consent_kv();
+        let ec_id = valid_ec_id("c", "Persis");
+        let cookie = format!("ts-ec={ec_id}; us_privacy=1YNN");
+        let req = create_test_request(&[("cookie", &cookie)]);
+
+        EcContext::read_from_request(&settings, &req, &services).expect("should read EC context");
+
+        let persisted = crate::consent::kv::load_consent_from_kv(&consent_handle, &ec_id)
+            .expect("should persist cookie-sourced consent under the EC id");
+        assert_eq!(
+            persisted.raw_us_privacy.as_deref(),
+            Some("1YNN"),
+            "should persist the cookie-sourced consent signal"
+        );
+        assert!(
+            crate::consent::kv::load_consent_from_kv(&default_handle, &ec_id).is_none(),
+            "should resolve the named consent store, never the default KV store"
+        );
+    }
+
+    #[test]
+    fn read_from_request_falls_back_to_persisted_consent_when_request_has_no_signals() {
+        let settings = settings_with_consent_store();
+        let (services, _default_handle, _consent_handle) = services_with_consent_kv();
+        let ec_id = valid_ec_id("d", "Fallbk");
+
+        // First request carries a consent cookie — persisted under the EC id.
+        let seeding_cookie = format!("ts-ec={ec_id}; us_privacy=1YNN");
+        let seeding_req = create_test_request(&[("cookie", &seeding_cookie)]);
+        EcContext::read_from_request(&settings, &seeding_req, &services)
+            .expect("should read EC context for the seeding request");
+
+        // Second request carries only the EC cookie — no consent signals.
+        let bare_cookie = format!("ts-ec={ec_id}");
+        let bare_req = create_test_request(&[("cookie", &bare_cookie)]);
+        let ec = EcContext::read_from_request(&settings, &bare_req, &services)
+            .expect("should read EC context for the bare request");
+
+        assert_eq!(
+            ec.consent().raw_us_privacy.as_deref(),
+            Some("1YNN"),
+            "should fall back to consent persisted under the EC id"
+        );
+    }
+
+    #[test]
+    fn read_from_request_succeeds_when_consent_store_is_configured_but_unresolved() {
+        // A configured-but-unresolvable consent store must not fail the EC
+        // context: fail-closed lives at the consent-dependent routes, so a
+        // misconfiguration must not break routes that never read consent.
+        let settings = settings_with_consent_store();
+        let ec_id = valid_ec_id("e", "NoRegs");
+        let cookie = format!("ts-ec={ec_id}; us_privacy=1YNN");
+        let req = create_test_request(&[("cookie", &cookie)]);
+
+        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context without a KV registry");
+
+        assert_eq!(
+            ec.consent().raw_us_privacy.as_deref(),
+            Some("1YNN"),
+            "should still build request-local consent with persistence disabled"
         );
     }
 }
