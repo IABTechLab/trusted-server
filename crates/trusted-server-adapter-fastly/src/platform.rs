@@ -515,6 +515,10 @@ pub struct FastlyPlatformHttpClient;
 
 #[async_trait::async_trait(?Send)]
 impl PlatformHttpClient for FastlyPlatformHttpClient {
+    fn supports_streaming_responses(&self) -> bool {
+        true
+    }
+
     async fn send(
         &self,
         request: PlatformHttpRequest,

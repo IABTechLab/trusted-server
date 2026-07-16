@@ -224,6 +224,9 @@ pub(crate) struct StubHttpClient {
     // Reported by supports_concurrent_fanout(); set false to emulate
     // platforms whose send_async executes eagerly (e.g. Cloudflare Workers).
     concurrent_fanout: std::sync::atomic::AtomicBool,
+    // Reported by supports_streaming_responses(); set true to emulate Fastly's
+    // streaming response support.
+    streaming_responses_supported: std::sync::atomic::AtomicBool,
     image_optimizer_options: Mutex<Vec<Option<PlatformImageOptimizerOptions>>>,
     stream_response_flags: Mutex<Vec<bool>>,
     request_methods: Mutex<Vec<String>>,
@@ -246,6 +249,7 @@ impl StubHttpClient {
             request_headers: Mutex::new(Vec::new()),
             select_errors: Mutex::new(VecDeque::new()),
             concurrent_fanout: std::sync::atomic::AtomicBool::new(true),
+            streaming_responses_supported: std::sync::atomic::AtomicBool::new(false),
             image_optimizer_options: Mutex::new(Vec::new()),
             stream_response_flags: Mutex::new(Vec::new()),
             request_methods: Mutex::new(Vec::new()),
@@ -257,6 +261,12 @@ impl StubHttpClient {
     /// Make `supports_concurrent_fanout()` report the given value.
     pub fn set_concurrent_fanout(&self, supported: bool) {
         self.concurrent_fanout
+            .store(supported, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Make `supports_streaming_responses()` report the given value.
+    pub fn set_streaming_responses_supported(&self, supported: bool) {
+        self.streaming_responses_supported
             .store(supported, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -360,6 +370,11 @@ impl StubHttpClient {
 impl PlatformHttpClient for StubHttpClient {
     fn supports_concurrent_fanout(&self) -> bool {
         self.concurrent_fanout
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn supports_streaming_responses(&self) -> bool {
+        self.streaming_responses_supported
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -619,6 +634,24 @@ pub(crate) fn build_services_with_config(
 
 pub(crate) fn noop_services() -> RuntimeServices {
     build_services_with_config(NoopConfigStore)
+}
+
+/// Build a [`RuntimeServices`] whose auction telemetry sink is the supplied
+/// recording (or otherwise custom) sink, so tests can assert which terminal
+/// auction events were emitted.
+pub(crate) fn noop_services_with_telemetry_sink(
+    auction_telemetry_sink: Arc<dyn crate::auction::telemetry::AuctionTelemetrySink>,
+) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(NoopBackend))
+        .http_client(Arc::new(NoopHttpClient))
+        .geo(Arc::new(NoopGeo))
+        .auction_telemetry_sink(auction_telemetry_sink)
+        .client_info(ClientInfo::default())
+        .build()
 }
 
 /// Build a [`RuntimeServices`] with a caller-supplied HTTP client and a [`StubBackend`].
