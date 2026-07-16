@@ -4,7 +4,7 @@
 //! keyed IDs from KV entries, convert them to `OpenRTB` EID structures, and
 //! build base64-encoded response headers.
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use error_stack::{Report, ResultExt as _};
 
 use crate::error::TrustedServerError;

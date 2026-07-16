@@ -23,9 +23,9 @@ use std::cell::{Cell, RefCell};
 use std::io::{self, Read, Write};
 use std::rc::Rc;
 
-use brotli::enc::writer::CompressorWriter;
-use brotli::enc::BrotliEncoderParams;
 use brotli::Decompressor;
+use brotli::enc::BrotliEncoderParams;
+use brotli::enc::writer::CompressorWriter;
 use error_stack::{Report, ResultExt as _};
 use flate2::read::{MultiGzDecoder, ZlibDecoder};
 use flate2::write::{GzEncoder, ZlibEncoder};
@@ -323,13 +323,11 @@ impl StreamProcessor for HtmlRewriterAdapter {
             _ => {}
         }
 
-        if is_last {
-            if let Some(rewriter) = self.rewriter.take() {
-                rewriter.end().map_err(|e| {
-                    log::error!("Failed to finalize HTML: {e}");
-                    io::Error::other(format!("HTML finalization failed: {e}"))
-                })?;
-            }
+        if is_last && let Some(rewriter) = self.rewriter.take() {
+            rewriter.end().map_err(|e| {
+                log::error!("Failed to finalize HTML: {e}");
+                io::Error::other(format!("HTML finalization failed: {e}"))
+            })?;
         }
 
         // Drain whatever lol_html produced since the last call
@@ -1062,7 +1060,7 @@ mod tests {
 
     #[test]
     fn test_html_rewriter_adapter_streams_incrementally() {
-        use lol_html::{element, Settings};
+        use lol_html::{Settings, element};
 
         // Create a simple HTML rewriter that replaces text
         let settings = Settings {
@@ -1323,8 +1321,8 @@ mod tests {
 
     #[test]
     fn test_brotli_round_trip_produces_valid_output() {
-        use brotli::enc::writer::CompressorWriter;
         use brotli::Decompressor;
+        use brotli::enc::writer::CompressorWriter;
         use std::io::{Read as _, Write as _};
 
         let input_data = b"<html><body>hello world</body></html>";
@@ -1418,14 +1416,14 @@ mod tests {
 
     #[test]
     fn test_streaming_pipeline_with_html_rewriter() {
-        use lol_html::{element, Settings};
+        use lol_html::{Settings, element};
 
         let settings = Settings {
             element_content_handlers: vec![element!("a[href]", |el| {
-                if let Some(href) = el.get_attribute("href") {
-                    if href.contains("example.com") {
-                        el.set_attribute("href", &href.replace("example.com", "test.com"))?;
-                    }
+                if let Some(href) = el.get_attribute("href")
+                    && href.contains("example.com")
+                {
+                    el.set_attribute("href", &href.replace("example.com", "test.com"))?;
                 }
                 Ok(())
             })],
@@ -1458,15 +1456,15 @@ mod tests {
     fn test_gzip_pipeline_with_html_rewriter() {
         use flate2::read::GzDecoder;
         use flate2::write::GzEncoder;
-        use lol_html::{element, Settings};
+        use lol_html::{Settings, element};
         use std::io::{Read as _, Write as _};
 
         let settings = Settings {
             element_content_handlers: vec![element!("a[href]", |el| {
-                if let Some(href) = el.get_attribute("href") {
-                    if href.contains("example.com") {
-                        el.set_attribute("href", &href.replace("example.com", "test.com"))?;
-                    }
+                if let Some(href) = el.get_attribute("href")
+                    && href.contains("example.com")
+                {
+                    el.set_attribute("href", &href.replace("example.com", "test.com"))?;
                 }
                 Ok(())
             })],

@@ -40,8 +40,8 @@ use crate::auction::orchestrator::{
     AuctionOrchestrator, DispatchAuctionOutcome, DispatchedAuction,
 };
 use crate::auction::telemetry::{
-    build_auction_events, emit_auction_events_best_effort_lazy, AuctionObservationContext,
-    AuctionSource, AuctionTerminalOutcome,
+    AuctionObservationContext, AuctionSource, AuctionTerminalOutcome, build_auction_events,
+    emit_auction_events_best_effort_lazy,
 };
 use crate::auction::types::{
     AuctionContext, AuctionRequest, Bid, DeviceInfo, PublisherInfo, SiteInfo, UserInfo,
@@ -49,14 +49,14 @@ use crate::auction::types::{
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
 use crate::constants::{COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
 use crate::cookies::handle_request_cookies;
+use crate::ec::EcContext;
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::registry::PartnerRegistry;
-use crate::ec::EcContext;
 use crate::error::TrustedServerError;
-use crate::http_util::{is_navigation_request, serve_static_with_etag, RequestInfo};
+use crate::http_util::{RequestInfo, is_navigation_request, serve_static_with_etag};
 use crate::integrations::IntegrationRegistry;
 use crate::platform::{GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices};
-use crate::price_bucket::{price_bucket, PriceGranularity};
+use crate::price_bucket::{PriceGranularity, price_bucket};
 use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::Settings;
 use crate::streaming_processor::{
@@ -254,10 +254,10 @@ fn accept_encoding_qvalue(header_value: &str, target: &str) -> Option<f32> {
             let Some((name, value)) = parameter.trim().split_once('=') else {
                 continue;
             };
-            if name.trim().eq_ignore_ascii_case("q") {
-                if let Ok(parsed_qvalue) = value.trim().parse::<f32>() {
-                    qvalue = parsed_qvalue;
-                }
+            if name.trim().eq_ignore_ascii_case("q")
+                && let Ok(parsed_qvalue) = value.trim().parse::<f32>()
+            {
+                qvalue = parsed_qvalue;
             }
         }
 
@@ -576,16 +576,16 @@ fn passthrough_finish_segments<P: StreamProcessor>(
 ) -> Result<Vec<bytes::Bytes>, Report<TrustedServerError>> {
     let mut segments = Vec::new();
     let decoded_tail = decoder.finish()?;
-    if !decoded_tail.is_empty() {
-        if let Some(encoded) = process_and_encode_chunk(
+    if !decoded_tail.is_empty()
+        && let Some(encoded) = process_and_encode_chunk(
             processor,
             encoder,
             &decoded_tail,
             false,
             "Failed to process decoded tail",
-        )? {
-            segments.push(encoded);
-        }
+        )?
+    {
+        segments.push(encoded);
     }
     if let Some(encoded) = process_and_encode_chunk(
         processor,
@@ -898,6 +898,11 @@ async fn hold_finish_segments<P: StreamProcessor>(
 /// [`HtmlProcessorConfig::with_ad_state`], so the canonical builder stays the
 /// single source of truth: a future field added to `from_settings` is
 /// inherited here automatically.
+///
+/// The returned processor owns its state and borrows none of the arguments.
+/// `use<>` states that explicitly: without it, Rust 2024 would have the opaque
+/// type capture every input lifetime, forcing callers to keep the settings and
+/// registry alive for as long as the processor.
 fn create_html_stream_processor(
     origin_host: &str,
     request_host: &str,
@@ -906,8 +911,8 @@ fn create_html_stream_processor(
     integration_registry: &IntegrationRegistry,
     ad_slots_script: Option<String>,
     ad_bids_state: Arc<Mutex<Option<String>>>,
-) -> Result<impl StreamProcessor, Report<TrustedServerError>> {
-    use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
+) -> Result<impl StreamProcessor + use<>, Report<TrustedServerError>> {
+    use crate::html_processor::{HtmlProcessorConfig, create_html_processor};
 
     let config = HtmlProcessorConfig::from_settings(
         settings,
@@ -3357,8 +3362,8 @@ mod tests {
     use std::io::{self, Read as _, Write as _};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use brotli::enc::writer::CompressorWriter;
     use brotli::Decompressor;
+    use brotli::enc::writer::CompressorWriter;
     use flate2::read::GzDecoder;
     use flate2::write::GzEncoder;
 
@@ -3366,11 +3371,11 @@ mod tests {
     use crate::auction::types::{AdFormat, AdSlot, MediaType};
     use crate::integrations::IntegrationRegistry;
     use crate::platform::test_support::{
-        build_services_with_http_client, noop_services, StubHttpClient,
+        StubHttpClient, build_services_with_http_client, noop_services,
     };
     use crate::test_support::tests::create_test_settings;
     use edgezero_core::body::Body as EdgeBody;
-    use http::{header, Method, Request as HttpRequest, StatusCode};
+    use http::{Method, Request as HttpRequest, StatusCode, header};
     use std::sync::Arc;
 
     struct ChunkedReader {
@@ -5932,8 +5937,8 @@ mod tests {
     #[cfg(test)]
     mod creative_opportunities_tests {
         use super::super::{
-            build_ad_slots_script, build_auction_request, build_bid_map, build_bids_script,
-            html_escape_for_script, MatchedSlotsContext,
+            MatchedSlotsContext, build_ad_slots_script, build_auction_request, build_bid_map,
+            build_bids_script, html_escape_for_script,
         };
         use crate::auction::types::{Bid, MediaType};
         use crate::consent::ConsentContext;
