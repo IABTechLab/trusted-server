@@ -698,6 +698,7 @@ pub async fn stream_publisher_body_async<W: Write>(
             params.price_granularity,
             &params.ad_bids_state,
             settings.debug.inject_adm_for_testing,
+            telemetry.auction_request.as_ref().map(|r| r.id.as_str()),
         );
         return stream_publisher_body(body, output, params, settings, integration_registry);
     }
@@ -844,18 +845,22 @@ pub(crate) fn should_run_server_side_ad_stack(
 }
 
 /// Write winning bids from an auction result into the shared `ad_bids_state` lock.
+///
+/// `auction_id` propagates into each bid entry as `hb_auction_id` so the
+/// injected `tsjs.bids` payload can be traced back to the server-side auction.
 pub(crate) fn write_bids_to_state(
     winning_bids: &std::collections::HashMap<String, Bid>,
     price_granularity: PriceGranularity,
     ad_bids_state: &Arc<Mutex<Option<String>>>,
     inject_adm: bool,
+    auction_id: Option<&str>,
 ) {
     log::debug!(
         "write_bids_to_state: {} winning bid(s): [{}]",
         winning_bids.len(),
         winning_bids.keys().cloned().collect::<Vec<_>>().join(", ")
     );
-    let bid_map = build_bid_map(winning_bids, price_granularity, inject_adm);
+    let bid_map = build_bid_map(winning_bids, price_granularity, inject_adm, auction_id);
     let bids_script = build_bids_script(&bid_map);
     *ad_bids_state.lock().expect("should lock bid state") = Some(bids_script);
 }
@@ -1244,6 +1249,7 @@ async fn collect_stream_auction(
         price_granularity,
         ad_bids_state,
         settings.debug.inject_adm_for_testing,
+        telemetry.auction_request.as_ref().map(|r| r.id.as_str()),
     );
 
     if settings.debug.auction_html_comment {
@@ -1935,10 +1941,17 @@ fn html_escape_for_script(s: &str) -> String {
 ///
 /// Returns a JSON object map of slot ID → bid metadata including the bucketed
 /// CPM (`hb_pb`), bidder (`hb_bidder`), and optional ad ID, nurl, and burl.
+///
+/// Every entry also carries the trace fields `hb_auction_id` (when
+/// `auction_id` is known), `hb_crid` (when the bidder returned a creative ID),
+/// and `hb_adm_hash` (when the bid has creative markup) so the client can
+/// stamp rendered creatives with a tuple that joins back to the server-side
+/// `auction winner:` log lines.
 pub(crate) fn build_bid_map(
     winning_bids: &std::collections::HashMap<String, Bid>,
     granularity: crate::price_bucket::PriceGranularity,
     include_adm: bool,
+    auction_id: Option<&str>,
 ) -> serde_json::Map<String, serde_json::Value> {
     winning_bids
         .iter()
@@ -1951,6 +1964,21 @@ pub(crate) fn build_bid_map(
                     "hb_bidder".to_string(),
                     serde_json::Value::String(bid.bidder.clone()),
                 );
+                if let Some(id) = auction_id {
+                    obj.insert(
+                        "hb_auction_id".to_string(),
+                        serde_json::Value::String(id.to_string()),
+                    );
+                }
+                if let Some(ref crid) = bid.crid {
+                    obj.insert(
+                        "hb_crid".to_string(),
+                        serde_json::Value::String(crid.clone()),
+                    );
+                }
+                if let Some(hash) = bid.creative_trace_hash() {
+                    obj.insert("hb_adm_hash".to_string(), serde_json::Value::String(hash));
+                }
                 // hb_adid: use PBS Cache UUID when present — the Prebid Universal Creative uses
                 // this as the cache lookup key, NOT the OpenRTB bid ID (bid.ad_id). Fall back to
                 // bid.ad_id for APS and other non-PBS providers.
@@ -2003,6 +2031,8 @@ pub(crate) fn build_bid_map(
                             "nurl": bid.nurl,
                             "burl": bid.burl,
                             "ad_id": bid.ad_id,
+                            "bid_id": bid.bid_id,
+                            "crid": bid.crid,
                             "cache_id": bid.cache_id,
                             "cache_host": bid.cache_host,
                             "cache_path": bid.cache_path,
@@ -2281,8 +2311,8 @@ pub async fn handle_page_bids(
     // skip the live auction, matching the existing bot/prefetch behaviour.
     let ad_stack_enabled = auction_enabled && consent_allows_auction;
 
-    let winning_bids = if matched_slots.is_empty() {
-        std::collections::HashMap::new()
+    let (winning_bids, page_auction_id) = if matched_slots.is_empty() {
+        (std::collections::HashMap::new(), None)
     } else {
         let observation = AuctionObservationContext::from_parts(
             AuctionSource::SpaNavigation,
@@ -2345,7 +2375,7 @@ pub async fn handle_page_bids(
                         )
                     })
                     .await;
-                    winning_bids
+                    (winning_bids, Some(auction_request.id.clone()))
                 }
                 Err(e) => {
                     log::warn!("page-bids auction failed: {e:?}");
@@ -2362,7 +2392,7 @@ pub async fn handle_page_bids(
                         )
                     })
                     .await;
-                    std::collections::HashMap::new()
+                    (std::collections::HashMap::new(), None)
                 }
             }
         } else {
@@ -2388,7 +2418,7 @@ pub async fn handle_page_bids(
                 )
             })
             .await;
-            std::collections::HashMap::new()
+            (std::collections::HashMap::new(), None)
         }
     };
 
@@ -2396,6 +2426,7 @@ pub async fn handle_page_bids(
         &winning_bids,
         co_config.price_granularity,
         settings.debug.inject_adm_for_testing,
+        page_auction_id.as_deref(),
     );
 
     // Gate slots on the ad-stack kill switch / consent: when disabled, return no
@@ -3991,6 +4022,8 @@ mod tests {
                 nurl: Some(nurl.to_string()),
                 burl: Some(burl.to_string()),
                 ad_id: Some(ad_id.to_string()),
+                bid_id: None,
+                crid: None,
                 cache_id: None,
                 cache_host: None,
                 cache_path: None,
@@ -4045,7 +4078,7 @@ mod tests {
                     "https://ssp/bill",
                 ),
             );
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false, None);
             let entry = map.get("atf_sidebar_ad").expect("should have bid entry");
             let obj = entry.as_object().expect("should be object");
             assert_eq!(
@@ -4076,6 +4109,86 @@ mod tests {
         }
 
         #[test]
+        fn bid_map_includes_trace_fields() {
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "kargo",
+                "abc123",
+                "https://ssp/win",
+                "https://ssp/bill",
+            );
+            bid.creative = Some("<div>Creative</div>".to_string());
+            bid.crid = Some("cr-98765".to_string());
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                false,
+                Some("ts-req-trace1"),
+            );
+            let obj = map
+                .get("atf_sidebar_ad")
+                .expect("should have bid entry")
+                .as_object()
+                .expect("should be object");
+
+            assert_eq!(
+                obj.get("hb_auction_id").and_then(|v| v.as_str()),
+                Some("ts-req-trace1"),
+                "should carry the auction ID"
+            );
+            assert_eq!(
+                obj.get("hb_crid").and_then(|v| v.as_str()),
+                Some("cr-98765"),
+                "should carry the upstream creative ID"
+            );
+            assert_eq!(
+                obj.get("hb_adm_hash").and_then(|v| v.as_str()),
+                Some(crate::auction::adm_trace_hash("<div>Creative</div>").as_str()),
+                "should hash the raw creative markup"
+            );
+        }
+
+        #[test]
+        fn bid_map_omits_trace_fields_without_sources() {
+            let mut winning_bids = HashMap::new();
+            winning_bids.insert(
+                "atf_sidebar_ad".to_string(),
+                make_bid(
+                    "atf_sidebar_ad",
+                    1.50,
+                    "kargo",
+                    "abc123",
+                    "https://ssp/win",
+                    "https://ssp/bill",
+                ),
+            );
+
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false, None);
+            let obj = map
+                .get("atf_sidebar_ad")
+                .expect("should have bid entry")
+                .as_object()
+                .expect("should be object");
+
+            assert!(
+                obj.get("hb_auction_id").is_none(),
+                "should omit hb_auction_id when the auction ID is unknown"
+            );
+            assert!(
+                obj.get("hb_crid").is_none(),
+                "should omit hb_crid when the bidder returned none"
+            );
+            assert!(
+                obj.get("hb_adm_hash").is_none(),
+                "should omit hb_adm_hash without creative markup"
+            );
+        }
+
+        #[test]
         fn client_bid_map_omits_adm_by_default() {
             let mut winning_bids = HashMap::new();
             let mut bid = make_bid(
@@ -4089,7 +4202,7 @@ mod tests {
             bid.creative = Some("<div>Creative</div>".to_string());
             winning_bids.insert("atf_sidebar_ad".to_string(), bid);
 
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false, None);
             let obj = map
                 .get("atf_sidebar_ad")
                 .expect("should have bid entry")
@@ -4120,7 +4233,7 @@ mod tests {
             bid.creative = Some("<div>Creative</div>".to_string());
             winning_bids.insert("atf_sidebar_ad".to_string(), bid);
 
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, true);
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, true, None);
             let obj = map
                 .get("atf_sidebar_ad")
                 .expect("should have bid entry")
@@ -4156,7 +4269,7 @@ mod tests {
             );
             winning_bids.insert("atf_sidebar_ad".to_string(), bid);
 
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, true);
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, true, None);
             let obj = map
                 .get("atf_sidebar_ad")
                 .expect("should have bid entry")
@@ -4211,13 +4324,15 @@ mod tests {
                     nurl: None,
                     burl: None,
                     ad_id: Some("bid-impression-id".to_string()),
+                    bid_id: None,
+                    crid: None,
                     cache_id: Some("f47447a0-b759-4f2f-9887-af458b79b570".to_string()),
                     cache_host: Some("openads.adsrvr.org".to_string()),
                     cache_path: Some("/cache".to_string()),
                     metadata: Default::default(),
                 },
             );
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false, None);
             let obj = map
                 .get("atf_sidebar_ad")
                 .expect("should have bid entry")
@@ -4257,13 +4372,15 @@ mod tests {
                     nurl: None,
                     burl: None,
                     ad_id: Some("aps-bid-token".to_string()),
+                    bid_id: None,
+                    crid: None,
                     cache_id: None,
                     cache_host: None,
                     cache_path: None,
                     metadata: Default::default(),
                 },
             );
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false, None);
             let obj = map
                 .get("atf_sidebar_ad")
                 .expect("should have bid entry")
@@ -4301,13 +4418,15 @@ mod tests {
                     nurl: None,
                     burl: None,
                     ad_id: None,
+                    bid_id: None,
+                    crid: None,
                     cache_id: None,
                     cache_host: None,
                     cache_path: None,
                     metadata: Default::default(),
                 },
             );
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false, None);
             let obj = map
                 .get("atf_sidebar_ad")
                 .expect("should have bid entry")
@@ -4336,13 +4455,15 @@ mod tests {
                     nurl: None,
                     burl: None,
                     ad_id: None,
+                    bid_id: None,
+                    crid: None,
                     cache_id: None,
                     cache_host: None,
                     cache_path: None,
                     metadata: Default::default(),
                 },
             );
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false, None);
             assert!(
                 map.is_empty(),
                 "slot with no price should be excluded from bid map"

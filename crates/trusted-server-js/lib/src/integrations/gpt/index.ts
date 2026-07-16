@@ -1,5 +1,6 @@
 import { log } from '../../core/log';
-import type { AuctionSlot, AuctionBidData, TsjsApi } from '../../core/types';
+import { recordRender, stampCreativeTrace } from '../../core/trace';
+import type { AuctionSlot, AuctionBidData, RenderServedFrom, TsjsApi } from '../../core/types';
 
 import { installGptGuard } from './script_guard';
 
@@ -336,6 +337,7 @@ function injectAdmIntoSlot(divId: string, adm: string): void {
       f.width = String(slotEl.offsetWidth || 728);
       f.height = String(slotEl.offsetHeight || 90);
       f.setAttribute('sandbox', ADM_IFRAME_SANDBOX);
+      f.setAttribute('data-ts-injected-adm', 'true');
       f.srcdoc = adm;
       slotEl.appendChild(f);
       log.debug(`[tsjs-gpt] gam-intercept: replaced slot content for '${divId}'`);
@@ -593,6 +595,23 @@ export function installTsAdInit(): void {
           // Read ts.bids live (not the snapshot above) so post-navigation bid data is used.
           const bid = (ts.bids ?? {})[slotId] ?? {};
 
+          // Trace: registry entry + DOM markers joining the GAM-rendered
+          // creative back to the server-side auction bid for this slot.
+          const record = recordRender({
+            slotId,
+            path: 'ssat',
+            rendered: !event.isEmpty,
+            elementId: divId,
+            auctionId: bid.hb_auction_id,
+            bidder: bid.hb_bidder,
+            adId: bid.hb_adid,
+            creativeId: bid.hb_crid,
+            admHash: bid.hb_adm_hash,
+            servedFrom: 'gam',
+          });
+          const slotEl = document.getElementById(divId);
+          if (slotEl) stampCreativeTrace(slotEl, record);
+
           // GAM interceptor (testing): when adm is present, replace the GAM creative.
           // Adapted from PR #241 — uses window.tsjs.bids[slotId].adm instead of pbjs.
           // Only active when inject_adm_for_testing injects adm into bids server-side.
@@ -836,6 +855,39 @@ const TS_DISPLAY_RENDERER =
  * Lives in gpt/index.ts (not prebid/index.ts) to avoid pulling the full
  * Prebid bundle into tsjs-gpt.js via inlineDynamicImports.
  */
+/**
+ * Trace a creative served by the pbRender bridge: registry entry + DOM markers
+ * on the slot element. `servedFrom` distinguishes debug adm injection from a
+ * PBS Cache fetch so verification tooling knows which mechanism delivered the
+ * markup into the GAM iframe.
+ *
+ * `el` must be resolved by the caller at message-receipt time: the PBS Cache
+ * path stamps only after an async fetch, and re-resolving from live
+ * `tsjs.adSlots`/DOM at that point could stamp a *new* route's slot with the
+ * previous page's trace data after an SPA navigation. The connectivity check
+ * below drops the stamp when the captured element has left the document.
+ */
+function recordBridgeRender(
+  slotId: string,
+  bid: AuctionBidData,
+  servedFrom: RenderServedFrom,
+  el: HTMLElement | null
+): void {
+  const record = recordRender({
+    slotId,
+    path: 'ssat',
+    rendered: true,
+    elementId: el?.id,
+    auctionId: bid.hb_auction_id,
+    bidder: bid.hb_bidder,
+    adId: bid.hb_adid,
+    creativeId: bid.hb_crid,
+    admHash: bid.hb_adm_hash,
+    servedFrom,
+  });
+  if (el && el.isConnected) stampCreativeTrace(el, record);
+}
+
 export function installTsRenderBridge(): void {
   if (typeof window === 'undefined') return;
 
@@ -888,6 +940,10 @@ export function installTsRenderBridge(): void {
 
     const slot = window.tsjs?.adSlots?.find((s) => s.id === slotId);
     const [width, height] = slot?.formats?.[0] ?? [728, 90];
+    // Resolve the slot element now, at message-receipt time: the PBS Cache
+    // branch stamps after an async fetch, and by then an SPA navigation may
+    // have swapped tsjs.adSlots/DOM for a new route with the same slot IDs.
+    const slotEl = slot ? findSlotElementByDivId(slot.div_id) : null;
 
     if (matchedBid.adm) {
       e.stopImmediatePropagation();
@@ -902,6 +958,7 @@ export function installTsRenderBridge(): void {
         })
       );
       fireWinBillingBeacons(slotId, matchedBid);
+      recordBridgeRender(slotId, matchedBid, 'debug-adm', slotEl);
       log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from debug adm`);
       return;
     }
@@ -933,6 +990,7 @@ export function installTsRenderBridge(): void {
           })
         );
         fireWinBillingBeacons(slotId, matchedBid);
+        recordBridgeRender(slotId, matchedBid, 'pbs-cache', slotEl);
         log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from PBS Cache`);
       })
       .catch((err) => {

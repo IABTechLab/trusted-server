@@ -55,6 +55,10 @@ export interface AuctionBid {
   creativeId: string;
   /** Advertiser domains. */
   adomain: string[];
+  /** Server-side auction ID (response top-level `id` / `ext.ts.auction_id`). */
+  auctionId?: string;
+  /** Trace hash of the delivered adm (`ext.ts.adm_hash`, 16 hex chars of SHA-256). */
+  admHash?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -126,12 +130,18 @@ export function parseAuctionResponse(body: any): AuctionBid[] {
   const seatbids = body?.seatbid;
   if (!Array.isArray(seatbids)) return bids;
 
+  // Server-side auction ID: response top-level `id`, kept per-bid so callers
+  // that only see individual bids retain the trace key.
+  const responseAuctionId: string | undefined =
+    typeof body?.id === 'string' && body.id !== '' ? body.id : undefined;
+
   for (const sb of seatbids) {
     const seat: string = sb.seat ?? 'unknown';
     const sbBids = sb.bid;
     if (!Array.isArray(sbBids)) continue;
 
     for (const b of sbBids) {
+      const tsExt = b?.ext?.ts;
       // Coerce missing/null adm to '' so AuctionBid.adm is always a string.
       // The empty-string case is filtered in renderCreativeInline via the
       // `if (!bid.adm)` guard. The client-side `typeof !== 'string'` check in
@@ -146,6 +156,12 @@ export function parseAuctionResponse(body: any): AuctionBid[] {
         seat,
         creativeId: b.crid ?? `${seat}-${b.impid ?? ''}`,
         adomain: Array.isArray(b.adomain) ? b.adomain : [],
+        auctionId:
+          typeof tsExt?.auction_id === 'string' && tsExt.auction_id !== ''
+            ? tsExt.auction_id
+            : responseAuctionId,
+        admHash:
+          typeof tsExt?.adm_hash === 'string' && tsExt.adm_hash !== '' ? tsExt.adm_hash : undefined,
       });
     }
   }

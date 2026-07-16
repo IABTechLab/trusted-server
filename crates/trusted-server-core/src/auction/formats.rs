@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::auction::context::ContextValue;
+use crate::auction::types::adm_trace_hash;
 use crate::consent::ConsentContext;
 use crate::constants::{HEADER_X_TS_EC_CONSENT, HEADER_X_TS_EIDS, HEADER_X_TS_EIDS_TRUNCATED};
 use crate::creative;
@@ -275,15 +276,57 @@ pub fn convert_to_openrtb_response(
             String::new()
         };
 
+        // Trace hash over the exact markup delivered to the client (post
+        // sanitize/rewrite) so the client can stamp the rendered creative with
+        // a value that matches this response byte-for-byte. Logged at info so
+        // server logs join against the DOM markers without debug logging.
+        let adm_hash = (!creative_html.is_empty()).then(|| adm_trace_hash(&creative_html));
+        if let Some(ref hash) = adm_hash {
+            log::info!(
+                "auction delivered creative: auction_id={} slot_id={} bidder={} crid={:?} adm_hash={}",
+                auction_request.id,
+                slot_id,
+                bid.bidder,
+                bid.crid,
+                hash,
+            );
+        }
+        let mut ts_ext = serde_json::Map::new();
+        ts_ext.insert(
+            "auction_id".to_string(),
+            serde_json::Value::String(auction_request.id.clone()),
+        );
+        if let Some(ref hash) = adm_hash {
+            ts_ext.insert(
+                "adm_hash".to_string(),
+                serde_json::Value::String(hash.clone()),
+            );
+        }
+        let mut bid_ext = serde_json::Map::new();
+        bid_ext.insert("ts".to_string(), serde_json::Value::Object(ts_ext));
+
         let openrtb_bid = OpenRtbBid {
-            id: Some(format!("{}-{}", bid.bidder, slot_id)),
+            // Prefer the bidder's real bid ID; fall back to the legacy
+            // synthetic value so consumers of the old shape keep working.
+            id: Some(
+                bid.bid_id
+                    .clone()
+                    .unwrap_or_else(|| format!("{}-{}", bid.bidder, slot_id)),
+            ),
             impid: Some(slot_id.to_string()),
             price: Some(price),
             adm: Some(creative_html),
-            crid: Some(format!("{}-creative", bid.bidder)),
+            // Prefer the bidder's real creative ID; fall back to the legacy
+            // synthetic value so consumers of the old shape keep working.
+            crid: Some(
+                bid.crid
+                    .clone()
+                    .unwrap_or_else(|| format!("{}-creative", bid.bidder)),
+            ),
             w: width,
             h: height,
             adomain: bid.adomain.clone().unwrap_or_default(),
+            ext: Some(bid_ext),
             ..Default::default()
         };
 
@@ -438,6 +481,8 @@ mod tests {
             nurl: None,
             burl: None,
             ad_id: None,
+            bid_id: None,
+            crid: None,
             cache_id: None,
             cache_host: None,
             cache_path: None,
@@ -929,6 +974,81 @@ mod tests {
             json["ext"]["orchestrator"]["provider_details"][0]["name"],
             json!("prebid"),
             "should include provider summary details"
+        );
+    }
+
+    #[test]
+    fn convert_to_openrtb_response_includes_trace_ext_with_delivered_adm_hash() {
+        let settings = make_settings();
+        let auction_request = make_auction_request();
+        let result = make_result(make_bid("div-gpt-top", "appnexus", Some(2.75)));
+
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
+            .expect("should convert auction result to OpenRTB response");
+
+        let json = response_json(response);
+        let bid = &json["seatbid"][0]["bid"][0];
+        assert_eq!(
+            bid["ext"]["ts"]["auction_id"],
+            json!("auction-1"),
+            "should carry the auction ID in the trace ext"
+        );
+        let delivered_adm = bid["adm"].as_str().expect("should serialize adm as string");
+        assert_eq!(
+            bid["ext"]["ts"]["adm_hash"],
+            json!(adm_trace_hash(delivered_adm)),
+            "should hash the exact adm delivered to the client"
+        );
+    }
+
+    #[test]
+    fn convert_to_openrtb_response_omits_adm_hash_without_creative() {
+        let settings = make_settings();
+        let auction_request = make_auction_request();
+        let mut bid = make_bid("div-gpt-top", "appnexus", Some(2.75));
+        bid.creative = None;
+        let result = make_result(bid);
+
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
+            .expect("should convert bid without creative HTML");
+
+        let json = response_json(response);
+        let ts_ext = json["seatbid"][0]["bid"][0]["ext"]["ts"]
+            .as_object()
+            .expect("should serialize trace ext as object");
+        assert_eq!(
+            ts_ext.get("auction_id"),
+            Some(&json!("auction-1")),
+            "should still carry the auction ID"
+        );
+        assert!(
+            !ts_ext.contains_key("adm_hash"),
+            "should omit adm_hash when there is no creative"
+        );
+    }
+
+    #[test]
+    fn convert_to_openrtb_response_prefers_upstream_crid_and_bid_id() {
+        let settings = make_settings();
+        let auction_request = make_auction_request();
+        let mut bid = make_bid("div-gpt-top", "appnexus", Some(2.75));
+        bid.crid = Some("cr-12345".to_string());
+        bid.bid_id = Some("bid-abc-1".to_string());
+        let result = make_result(bid);
+
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
+            .expect("should convert bid with upstream crid and bid ID");
+
+        let json = response_json(response);
+        assert_eq!(
+            json["seatbid"][0]["bid"][0]["crid"],
+            json!("cr-12345"),
+            "should pass through the bidder's creative ID instead of the synthetic fallback"
+        );
+        assert_eq!(
+            json["seatbid"][0]["bid"][0]["id"],
+            json!("bid-abc-1"),
+            "should pass through the bidder's bid ID instead of the synthetic fallback"
         );
     }
 

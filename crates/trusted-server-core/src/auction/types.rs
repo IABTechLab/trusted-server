@@ -198,6 +198,21 @@ pub struct Bid {
     pub burl: Option<String>,
     /// Ad ID from the bidder
     pub ad_id: Option<String>,
+    /// Bid ID from the bidder (`OpenRTB` `bid.id`).
+    ///
+    /// Distinct from [`Bid::ad_id`] (the `adid` creative/ad identifier):
+    /// this is the bidder's identifier for the bid itself. Carried so the
+    /// `/auction` response can echo the upstream bid ID instead of a
+    /// synthesized one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bid_id: Option<String>,
+    /// Creative ID from the bidder (`OpenRTB` `crid`).
+    ///
+    /// Carried end-to-end so a rendered creative on the page can be traced
+    /// back to the upstream creative, not just the bidder. `None` when the
+    /// provider response does not include one (e.g. APS pre-decode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crid: Option<String>,
     /// Prebid Cache UUID for this bid.
     ///
     /// Populated from `ext.prebid.cache.bids.cacheId` in the PBS response.
@@ -251,6 +266,49 @@ impl From<&AuctionResponse> for ProviderSummary {
             time_ms: response.response_time_ms,
             metadata: response.metadata.clone(),
         }
+    }
+}
+
+/// Length of the hex-encoded creative trace hash.
+///
+/// 16 hex chars (64 bits of SHA-256) — short enough for a DOM attribute and a
+/// log field, long enough that collisions across a page's creatives are not a
+/// practical concern for tracing.
+const ADM_TRACE_HASH_LEN: usize = 16;
+
+/// Compute the trace hash for a creative markup string.
+///
+/// The hash is the first [`ADM_TRACE_HASH_LEN`] hex characters of the SHA-256
+/// of the exact bytes handed to the client. It is a correlation key for
+/// tracing a winning bid to the creative rendered on the page — server logs,
+/// the injected bid payload, and DOM markers all carry the same value — not an
+/// integrity mechanism.
+///
+/// # Examples
+///
+/// ```
+/// use trusted_server_core::auction::adm_trace_hash;
+///
+/// let hash = adm_trace_hash("<div>example creative</div>");
+/// assert_eq!(hash.len(), 16);
+/// ```
+#[must_use]
+pub fn adm_trace_hash(adm: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    let digest = Sha256::digest(adm.as_bytes());
+    let mut hex = hex::encode(digest);
+    hex.truncate(ADM_TRACE_HASH_LEN);
+    hex
+}
+
+impl Bid {
+    /// Trace hash of this bid's creative markup, when present.
+    ///
+    /// See [`adm_trace_hash`] for the hash definition.
+    #[must_use]
+    pub fn creative_trace_hash(&self) -> Option<String> {
+        self.creative.as_deref().map(adm_trace_hash)
     }
 }
 
@@ -339,11 +397,49 @@ mod tests {
             nurl: None,
             burl: None,
             ad_id: None,
+            bid_id: None,
+            crid: None,
             cache_id: None,
             cache_host: None,
             cache_path: None,
             metadata: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn adm_trace_hash_is_sha256_prefix() {
+        // SHA-256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+        assert_eq!(
+            adm_trace_hash("abc"),
+            "ba7816bf8f01cfea",
+            "should be the first 16 hex chars of the SHA-256 digest"
+        );
+    }
+
+    #[test]
+    fn adm_trace_hash_distinguishes_creatives() {
+        assert_ne!(
+            adm_trace_hash("<div>creative a</div>"),
+            adm_trace_hash("<div>creative b</div>"),
+            "should produce different hashes for different markup"
+        );
+    }
+
+    #[test]
+    fn creative_trace_hash_follows_creative_presence() {
+        let mut bid = make_bid("kargo");
+        assert_eq!(
+            bid.creative_trace_hash(),
+            None,
+            "should be None without creative markup"
+        );
+
+        bid.creative = Some("<div>example creative</div>".to_owned());
+        assert_eq!(
+            bid.creative_trace_hash(),
+            Some(adm_trace_hash("<div>example creative</div>")),
+            "should hash the creative markup when present"
+        );
     }
 
     #[test]
@@ -468,6 +564,8 @@ mod tests {
             nurl: None,
             burl: None,
             ad_id: Some("bid-id".to_string()),
+            bid_id: None,
+            crid: None,
             cache_id: Some("cache-uuid".to_string()),
             cache_host: Some("cache.example.com".to_string()),
             cache_path: Some("/pbc/v1/cache".to_string()),
@@ -515,6 +613,8 @@ mod tests {
             nurl: None,
             burl: None,
             ad_id: Some("prebid-ad-id-abc".to_string()),
+            bid_id: None,
+            crid: None,
             cache_id: None,
             cache_host: None,
             cache_path: None,

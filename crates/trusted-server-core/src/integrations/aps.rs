@@ -482,6 +482,8 @@ impl ApsAuctionProvider {
             nurl: None, // Real APS uses client-side event tracking
             burl: None,
             ad_id: None,
+            bid_id: None,
+            crid: None,
             cache_id: None,
             cache_host: None,
             cache_path: None,
