@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { expect, test } from "@playwright/test";
 import { runtimeUrl } from "../../helpers/state.js";
 
@@ -6,11 +8,24 @@ const IFRAME_CREATIVE_URL = "https://creative.example/iframe";
 const SCRIPT_CREATIVE_URL = "https://creative.example/script.js";
 const SANDBOX =
     "allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation";
+const TSJS_CRATE = resolve(__dirname, "../../../../trusted-server-js");
+
+function clientAuctionBundlePaths() {
+    const manifestPath = resolve(TSJS_CRATE, "dist/prebid/manifest.json");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+        filename: string;
+    };
+    return {
+        gpt: resolve(TSJS_CRATE, "dist/tsjs-gpt.js"),
+        prebid: resolve(TSJS_CRATE, "dist/prebid", manifest.filename),
+    };
+}
 
 function descriptor(
     tagType: "iframe" | "script",
-    creativeUrl =
-        tagType === "iframe" ? IFRAME_CREATIVE_URL : SCRIPT_CREATIVE_URL,
+    creativeUrl = tagType === "iframe"
+        ? IFRAME_CREATIVE_URL
+        : SCRIPT_CREATIVE_URL,
 ) {
     const envelope = {
         seatbid: [
@@ -151,6 +166,183 @@ const SCRIPT_CREATIVE = `(function(){
 })();`;
 
 test.describe("APS opaque renderer", () => {
+    test("renders a trustedServer adapter bid using Prebid's generated GAM ad ID", async ({
+        page,
+    }) => {
+        const apsRenderer = descriptor("iframe");
+        const responseBody = {
+            id: "fictional-auction",
+            seatbid: [
+                {
+                    seat: "aps",
+                    bid: [
+                        {
+                            id: apsRenderer.bidId,
+                            impid: "div-aps",
+                            price: 1.23,
+                            crid: apsRenderer.creativeId,
+                            w: 300,
+                            h: 250,
+                            ext: {
+                                trusted_server: { renderer: apsRenderer },
+                            },
+                        },
+                    ],
+                },
+            ],
+            ext: {},
+        };
+        let auctionRequests = 0;
+        await page.route(runtimeUrl("/aps-prebid-adapter-test"), (route) =>
+            route.fulfill({
+                status: 200,
+                contentType: "text/html",
+                body: '<!doctype html><div id="div-aps"></div>',
+            }),
+        );
+        await page.route(runtimeUrl("/auction"), (route) => {
+            auctionRequests += 1;
+            return route.fulfill({
+                status: 200,
+                contentType: "application/json",
+                body: JSON.stringify(responseBody),
+            });
+        });
+
+        await page.goto(runtimeUrl("/aps-prebid-adapter-test"));
+        const bundles = clientAuctionBundlePaths();
+        await page.addScriptTag({ path: bundles.gpt });
+        await page.addScriptTag({ path: bundles.prebid });
+
+        const result = await page.evaluate(async () => {
+            type PrebidBid = {
+                ad?: string;
+                adId: string;
+                bidderCode: string;
+                status?: string;
+            };
+            type PrebidApi = {
+                getAllWinningBids(): PrebidBid[];
+                getBidResponsesForAdUnitCode(code: string): {
+                    bids: PrebidBid[];
+                };
+                onEvent(
+                    name: string,
+                    callback: (value: Record<string, unknown>) => void,
+                ): void;
+                requestBids(options: Record<string, unknown>): void;
+            };
+            const pbjs = (window as unknown as { pbjs: PrebidApi }).pbjs;
+            const bidWon: string[] = [];
+            const renderSucceeded: string[] = [];
+            pbjs.onEvent("bidWon", (bid) => bidWon.push(String(bid.adId)));
+            pbjs.onEvent("adRenderSucceeded", (event) =>
+                renderSucceeded.push(String(event.adId)),
+            );
+
+            const acceptedBid = await new Promise<PrebidBid | undefined>(
+                (resolveBid) => {
+                    pbjs.requestBids({
+                        adUnits: [
+                            {
+                                code: "div-aps",
+                                mediaTypes: { banner: { sizes: [[300, 250]] } },
+                                bids: [],
+                            },
+                        ],
+                        bidsBackHandler: () =>
+                            resolveBid(
+                                pbjs
+                                    .getBidResponsesForAdUnitCode("div-aps")
+                                    .bids.find(
+                                        (bid) => bid.bidderCode === "aps",
+                                    ),
+                            ),
+                        timeout: 1_000,
+                    });
+                },
+            );
+            if (!acceptedBid)
+                throw new Error("APS bid was not accepted by Prebid");
+
+            const universalCreativeResponse = await new Promise<
+                Record<string, unknown>
+            >((resolveResponse, rejectResponse) => {
+                const frame = document.createElement("iframe");
+                const adIdJson = JSON.stringify(acceptedBid.adId);
+                frame.srcdoc = `<script>
+const renderChannel = new MessageChannel();
+renderChannel.port1.onmessage = function(event) {
+  parent.postMessage({ type: 'captured-prebid-response', payload: event.data }, '*');
+  const eventChannel = new MessageChannel();
+  parent.postMessage(JSON.stringify({
+    message: 'Prebid Event',
+    adId: ${adIdJson},
+    event: 'adRenderSucceeded'
+  }), '*', [eventChannel.port2]);
+};
+parent.postMessage(JSON.stringify({
+  message: 'Prebid Request',
+  adId: ${adIdJson}
+}), '*', [renderChannel.port2]);
+<\/script>`;
+                const receive = (event: MessageEvent) => {
+                    if (event.data?.type !== "captured-prebid-response") return;
+                    window.removeEventListener("message", receive);
+                    resolveResponse(JSON.parse(String(event.data.payload)));
+                };
+                window.addEventListener("message", receive);
+                document.getElementById("div-aps")!.appendChild(frame);
+                window.setTimeout(
+                    () =>
+                        rejectResponse(
+                            new Error("Universal Creative response timed out"),
+                        ),
+                    3_000,
+                );
+            });
+            await new Promise((resolveTick) =>
+                window.setTimeout(resolveTick, 50),
+            );
+
+            return {
+                acceptedAd: acceptedBid.ad,
+                acceptedAdId: acceptedBid.adId,
+                acceptedStatus: acceptedBid.status,
+                bidWon,
+                renderSucceeded,
+                universalCreativeResponse,
+                winningAdIds: pbjs.getAllWinningBids().map((bid) => bid.adId),
+                registrySize: Object.keys(
+                    (
+                        window as unknown as {
+                            tsjs?: {
+                                apsPrebidRenderers?: Record<string, unknown>;
+                            };
+                        }
+                    ).tsjs?.apsPrebidRenderers ?? {},
+                ).length,
+            };
+        });
+
+        expect(auctionRequests).toBe(1);
+        expect(result.acceptedAd).toBe("");
+        expect(result.acceptedAdId).not.toBe(apsRenderer.bidId);
+        expect(result.universalCreativeResponse).toEqual(
+            expect.objectContaining({
+                message: "Prebid Response",
+                adId: result.acceptedAdId,
+                rendererVersion: 4,
+                apsRenderer,
+            }),
+        );
+        expect(result.bidWon).toEqual([result.acceptedAdId]);
+        expect(result.renderSucceeded).toEqual([result.acceptedAdId]);
+        expect(result.winningAdIds).toContain(result.acceptedAdId);
+        expect(result.acceptedStatus).toBe("rendered");
+        expect(result.registrySize).toBe(0);
+    });
+
     test("enforces nonce gating and isolates iframe and script behavior under restrictive CSP", async ({
         page,
     }) => {
@@ -201,9 +393,7 @@ test.describe("APS opaque renderer", () => {
                     "Content-Security-Policy":
                         "default-src 'none'; script-src 'unsafe-inline'; frame-src 'self'",
                 },
-                body: testPage(
-                    runtimeUrl("/integrations/aps/renderer"),
-                ),
+                body: testPage(runtimeUrl("/integrations/aps/renderer")),
             });
         });
 
@@ -609,6 +799,8 @@ test.describe("APS opaque renderer", () => {
 
         await page.waitForTimeout(100);
         expect(runnerRequests).toBe(0);
-        await expect(page.locator("#same-origin-slot .existing")).toHaveCount(1);
+        await expect(page.locator("#same-origin-slot .existing")).toHaveCount(
+            1,
+        );
     });
 });

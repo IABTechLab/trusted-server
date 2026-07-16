@@ -12,7 +12,8 @@ The integration supports:
 - banner impressions;
 - APS OpenRTB requests to `https://web.ads.aps.amazon-adsystem.com/e/pb/bid`;
 - decoded-CPM winner selection with or without a mediator;
-- direct `/auction` rendering; and
+- direct `/auction` rendering;
+- client-side `trustedServer` Prebid adapter auctions through GAM; and
 - initial-navigation and page-bids rendering through GAM/Prebid Universal Creative.
 
 The integration does not implement:
@@ -137,7 +138,9 @@ The TSJS auction client validates the typed renderer descriptor, creates the opa
 
 For initial navigation and page-bids, Trusted Server publishes the same descriptor in `window.tsjs.bids`. The source-checked Prebid Universal Creative bridge accepts requests only from the iframe that owns the matching `hb_adid`, validates the complete envelope, and returns a static dynamic-renderer program that creates the same opaque renderer iframe.
 
-This path does not fetch PBS Cache, fire generic APS win/billing beacons, or call `apstag.setDisplayBids()` for the Trusted Server winner. Publisher-owned native APS objects are otherwise left untouched.
+For client-side `trustedServer` adapter auctions, Prebid generates its own `hb_adid`. Trusted Server binds that generated ID to the validated APS descriptor in a bounded, expiring browser registry before GAM refresh. The bridge verifies that the requesting Universal Creative iframe belongs to the same ad unit, consumes the capability once, and passes the APS bid ID separately to the Amazon runner.
+
+These paths do not fetch PBS Cache, fire generic APS win/billing beacons, or call `apstag.setDisplayBids()` for the Trusted Server winner. Publisher-owned native APS objects are otherwise left untouched.
 
 ## Publisher CSP
 
@@ -199,6 +202,7 @@ Use fictional values in source-controlled configuration and fixtures. Supply con
 - Confirm `GET /integrations/aps/renderer` returns HTML with its CSP and `Referrer-Policy: no-referrer`.
 - Confirm publisher CSP permits `frame-src 'self'`.
 - Confirm the GAM creative uses the supported Prebid Universal Creative bridge and the winning `hb_adid`.
+- For client-side `trustedServer` adapter auctions, confirm Prebid's `bidResponse` contains a generated `adId` and that the corresponding capability appears briefly in `window.tsjs.apsPrebidRenderers` before rendering.
 - Ensure no native APS path is trying to handle the same cohort.
 - Keep script creatives disabled while diagnosing iframe rendering.
 
