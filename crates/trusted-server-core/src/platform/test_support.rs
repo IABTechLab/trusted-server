@@ -636,6 +636,24 @@ pub(crate) fn noop_services() -> RuntimeServices {
     build_services_with_config(NoopConfigStore)
 }
 
+/// Build a [`RuntimeServices`] whose auction telemetry sink is the supplied
+/// recording (or otherwise custom) sink, so tests can assert which terminal
+/// auction events were emitted.
+pub(crate) fn noop_services_with_telemetry_sink(
+    auction_telemetry_sink: Arc<dyn crate::auction::telemetry::AuctionTelemetrySink>,
+) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(NoopBackend))
+        .http_client(Arc::new(NoopHttpClient))
+        .geo(Arc::new(NoopGeo))
+        .auction_telemetry_sink(auction_telemetry_sink)
+        .client_info(ClientInfo::default())
+        .build()
+}
+
 /// Build a [`RuntimeServices`] with a caller-supplied HTTP client and a [`StubBackend`].
 ///
 /// Uses [`StubBackend`] (always returns `Ok("stub-backend")`) rather than

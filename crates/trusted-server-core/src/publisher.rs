@@ -1094,16 +1094,24 @@ pub async fn buffer_publisher_response_async(
             mut params,
         } => {
             if !response_carries_body(method, response.status()) {
-                if params.dispatched_auction.is_some() {
-                    // A bodiless response (HEAD navigation, 204/304) has no
+                if let Some(dispatched) = params.dispatched_auction.take() {
+                    // A bodiless response (HEAD navigation, 304) has no
                     // `</body>` to inject bids into, so the dispatched SSP
-                    // requests are wasted — surface it for quota observability,
-                    // matching the pass-through / buffered-unmodified arms.
+                    // requests are wasted. Emit a terminal abandonment event so
+                    // the SSP work and quota consumption stay observable instead
+                    // of vanishing, matching the streaming finalizer.
                     log::warn!(
                         "Server-side auction dispatched but response is bodiless (method: {}, status: {}); in-flight SSP bid requests will not be collected",
                         method,
                         response.status(),
                     );
+                    emit_abandoned_auction(
+                        services,
+                        params.auction_observation.take(),
+                        dispatched,
+                        "bodiless_response",
+                    )
+                    .await;
                 }
                 return Ok(response);
             }
@@ -1175,19 +1183,28 @@ pub async fn publisher_response_into_streaming_response(
         PublisherResponse::Stream {
             mut response,
             body,
-            params,
+            mut params,
         } => {
             if !response_carries_body(method, response.status()) {
-                if params.dispatched_auction.is_some() {
-                    // A bodiless response (HEAD navigation, 204/304) has no
+                if let Some(dispatched) = params.dispatched_auction.take() {
+                    // A bodiless response (HEAD navigation, 304) has no
                     // `</body>` to inject bids into, so the dispatched SSP
-                    // requests are wasted — surface it for quota observability,
-                    // matching the buffered finalizer.
+                    // requests are wasted. Emit a terminal abandonment event so
+                    // the SSP work and quota consumption stay observable instead
+                    // of vanishing, matching the processor-init-error path and
+                    // the buffered finalizer.
                     log::warn!(
                         "Server-side auction dispatched but response is bodiless (method: {}, status: {}); in-flight SSP bid requests will not be collected",
                         method,
                         response.status(),
                     );
+                    emit_abandoned_auction(
+                        &services,
+                        params.auction_observation.take(),
+                        dispatched,
+                        "bodiless_response",
+                    )
+                    .await;
                 }
                 return Ok(response);
             }
@@ -3420,6 +3437,7 @@ mod tests {
     use crate::integrations::IntegrationRegistry;
     use crate::platform::test_support::{
         StubHttpClient, build_services_with_http_client, noop_services,
+        noop_services_with_telemetry_sink,
     };
     use crate::test_support::tests::create_test_settings;
     use edgezero_core::body::Body as EdgeBody;
@@ -5693,6 +5711,126 @@ mod tests {
                 drained.len()
             );
         }
+    }
+
+    #[derive(Default)]
+    struct RecordingTelemetrySink {
+        batches: Mutex<Vec<crate::auction::telemetry::AuctionEventBatch>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl crate::auction::telemetry::AuctionTelemetrySink for RecordingTelemetrySink {
+        async fn emit_auction_events(
+            &self,
+            _services: &RuntimeServices,
+            batch: crate::auction::telemetry::AuctionEventBatch,
+        ) -> Result<(), Report<TrustedServerError>> {
+            self.batches
+                .lock()
+                .expect("should lock telemetry batches")
+                .push(batch);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn finalizers_emit_abandoned_auction_for_bodiless_dispatched_response() {
+        // A conditional navigation can dispatch an auction and receive a
+        // processable HTML 304 that classification routes to Stream. The
+        // bodiless response has no `</body>` to inject into, so the dispatched
+        // auction is never collected — but both finalizers must still emit a
+        // terminal abandonment event so the SSP work and quota consumption stay
+        // observable instead of vanishing silently.
+        let settings = Arc::new(create_test_settings());
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+
+        let make_params = || {
+            let ec_context =
+                EcContext::new_for_test(None, crate::consent::types::ConsentContext::default());
+            OwnedProcessResponseParams {
+                content_encoding: String::new(),
+                origin_host: "origin.example.com".to_string(),
+                origin_url: "https://origin.example.com".to_string(),
+                request_host: "proxy.example.com".to_string(),
+                request_scheme: "https".to_string(),
+                content_type: "text/html; charset=utf-8".to_string(),
+                ad_slots_script: None,
+                ad_bids_state: Arc::new(Mutex::new(None)),
+                auction_observation: Some(AuctionObservationContext::from_parts(
+                    AuctionSource::SpaNavigation,
+                    "proxy.example.com",
+                    "/article",
+                    1,
+                    &ec_context,
+                )),
+                auction_request: Some(test_auction_request()),
+                dispatched_auction: Some(DispatchedAuction::empty_for_test(
+                    test_auction_request(),
+                    10,
+                )),
+                price_granularity: PriceGranularity::default(),
+            }
+        };
+        let make_stream_response = || PublisherResponse::Stream {
+            response: Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .body(EdgeBody::empty())
+                .expect("should build 304 response"),
+            body: EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from_static(
+                b"<html></html>",
+            )])),
+            params: Box::new(make_params()),
+        };
+
+        fn assert_bodiless_abandoned(sink: &RecordingTelemetrySink) {
+            let batches = sink.batches.lock().expect("should lock telemetry batches");
+            assert_eq!(
+                batches.len(),
+                1,
+                "bodiless dispatched response should emit exactly one terminal batch"
+            );
+            let reasons: Vec<String> = batches[0]
+                .rows()
+                .iter()
+                .filter_map(|row| row.terminal_reason.clone())
+                .collect();
+            assert!(
+                reasons.iter().any(|reason| reason == "bodiless_response"),
+                "abandonment must carry the bodiless_response reason, got {reasons:?}"
+            );
+        }
+
+        // Streaming finalizer (Fastly).
+        let streaming_sink = Arc::new(RecordingTelemetrySink::default());
+        let response = futures::executor::block_on(publisher_response_into_streaming_response(
+            make_stream_response(),
+            &Method::GET,
+            Arc::clone(&settings),
+            &registry,
+            Arc::clone(&orchestrator),
+            noop_services_with_telemetry_sink(Arc::clone(&streaming_sink) as _),
+        ))
+        .expect("streaming finalize should succeed");
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_bodiless_abandoned(&streaming_sink);
+
+        // Buffered finalizer (Axum/Cloudflare/Spin).
+        let buffered_sink = Arc::new(RecordingTelemetrySink::default());
+        let buffered_services = noop_services_with_telemetry_sink(Arc::clone(&buffered_sink) as _);
+        let response = futures::executor::block_on(buffer_publisher_response_async(
+            make_stream_response(),
+            &Method::GET,
+            settings.as_ref(),
+            &registry,
+            orchestrator.as_ref(),
+            &buffered_services,
+        ))
+        .expect("buffered finalize should succeed");
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_bodiless_abandoned(&buffered_sink);
     }
 
     #[test]
