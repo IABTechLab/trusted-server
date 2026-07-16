@@ -1537,6 +1537,7 @@ pub async fn handle_publisher_request(
 
     log::debug!("Proxying request to configured publisher backend");
 
+    let request_path_and_query = origin_path_and_query.to_string();
     let request_path = req.uri().path().to_string();
     let is_get = req.method() == http::Method::GET;
 
@@ -1620,7 +1621,7 @@ pub async fn handle_publisher_request(
         if should_run_auction {
             let slots_ctx = MatchedSlotsContext {
                 matched_slots: &matched_slots,
-                request_path: &request_path,
+                request_path_and_query: &request_path_and_query,
             };
             let mut auction_request = build_auction_request(
                 &slots_ctx,
@@ -1930,11 +1931,11 @@ pub async fn handle_publisher_request(
 /// Bundle of the per-request creative-opportunity inputs that travel together.
 ///
 /// Extracted so `build_auction_request` stays under the project's
-/// 7-argument cap (`matched_slots` + `request_path` live for the same
+/// 7-argument cap (`matched_slots` + `request_path_and_query` live for the same
 /// request scope and are passed together everywhere).
 pub(crate) struct MatchedSlotsContext<'a> {
     pub matched_slots: &'a [crate::creative_opportunities::CreativeOpportunitySlot],
-    pub request_path: &'a str,
+    pub request_path_and_query: &'a str,
 }
 
 /// Borrowed inputs for [`apply_auction_eids_and_device`], bundled to keep the
@@ -2016,7 +2017,7 @@ pub(crate) fn build_auction_request(
         .collect();
     let page_url = format!(
         "{}://{}{}",
-        request_info.scheme, request_info.host, slots_ctx.request_path
+        request_info.scheme, request_info.host, slots_ctx.request_path_and_query
     );
     let ec_id = ec_id.filter(|id| !id.is_empty());
     let request_id = ec_id.map_or_else(
@@ -2331,8 +2332,8 @@ pub fn page_bids_preflight_denied() -> Response<EdgeBody> {
 
 /// Normalizes the client-supplied `path` query parameter before glob matching.
 ///
-/// The SPA hook sends `location.pathname`, but the parameter is
-/// client-controlled: strip any query string or fragment and force a leading
+/// The SPA hook sends `location.pathname + location.search`, but the parameter
+/// is client-controlled: strip any query string or fragment and force a leading
 /// `/` so slot `page_patterns` always match against a canonical path shape.
 fn normalize_page_bids_path(raw: &str) -> String {
     let path = raw.split(['?', '#']).next().unwrap_or("");
@@ -2340,6 +2341,20 @@ fn normalize_page_bids_path(raw: &str) -> String {
         path.to_string()
     } else {
         format!("/{path}")
+    }
+}
+
+/// Normalize the page path and query retained in the upstream auction context.
+///
+/// Fragments never reach an HTTP server and are discarded if a client includes
+/// one explicitly. Unlike [`normalize_page_bids_path`], the query is preserved
+/// for the `OpenRTB` `site.page` URL and is not used for slot matching.
+fn normalize_page_bids_path_and_query(raw: &str) -> String {
+    let path_and_query = raw.split('#').next().unwrap_or("");
+    if path_and_query.starts_with('/') {
+        path_and_query.to_string()
+    } else {
+        format!("/{path_and_query}")
     }
 }
 
@@ -2383,15 +2398,17 @@ pub async fn handle_page_bids(
         return Ok(page_bids_preflight_denied());
     }
 
-    let path_param = req
+    let requested_page = req
         .uri()
         .query()
         .and_then(|query| {
             url::form_urlencoded::parse(query.as_bytes())
-                .find(|(k, _)| k == "path")
-                .map(|(_, v)| normalize_page_bids_path(&v))
+                .find(|(key, _)| key == "path")
+                .map(|(_, value)| value.into_owned())
         })
         .unwrap_or_else(|| "/".to_string());
+    let path_param = normalize_page_bids_path(&requested_page);
+    let page_path_and_query = normalize_page_bids_path_and_query(&requested_page);
 
     let matched_slots: Vec<_> =
         crate::creative_opportunities::match_slots(auction.slots, &path_param)
@@ -2454,7 +2471,7 @@ pub async fn handle_page_bids(
         if ad_stack_enabled && !is_bot && !is_prefetch {
             let slots_ctx = MatchedSlotsContext {
                 matched_slots: &matched_slots,
-                request_path: &path_param,
+                request_path_and_query: &page_path_and_query,
             };
             let mut auction_request = build_auction_request(
                 &slots_ctx,
@@ -4769,7 +4786,7 @@ mod tests {
             let slots = [slot];
             let slots_ctx = MatchedSlotsContext {
                 matched_slots: &slots,
-                request_path: "/2024/01/my-article/",
+                request_path_and_query: "/2024/01/my-article/?edition=fictional",
             };
             let request_info = RequestInfo {
                 host: "publisher.example.com".to_string(),
@@ -4790,6 +4807,11 @@ mod tests {
                 "should use a non-EC request id, got {}",
                 request.id
             );
+            assert_eq!(
+                request.publisher.page_url.as_deref(),
+                Some("https://publisher.example.com/2024/01/my-article/?edition=fictional"),
+                "should preserve the page path and query for auction providers"
+            );
         }
 
         #[test]
@@ -4798,7 +4820,7 @@ mod tests {
             let slots = [slot];
             let slots_ctx = MatchedSlotsContext {
                 matched_slots: &slots,
-                request_path: "/2024/01/my-article/",
+                request_path_and_query: "/2024/01/my-article/",
             };
             let request_info = RequestInfo {
                 host: "publisher.example.com".to_string(),
@@ -5225,6 +5247,20 @@ mod tests {
                 normalize_page_bids_path(""),
                 "/",
                 "empty path should normalize to root"
+            );
+        }
+
+        #[test]
+        fn normalize_page_bids_path_and_query_preserves_query_but_drops_fragment() {
+            assert_eq!(
+                normalize_page_bids_path_and_query("/2024/01/article/?edition=fictional#section"),
+                "/2024/01/article/?edition=fictional",
+                "query should reach auction providers without a browser-only fragment"
+            );
+            assert_eq!(
+                normalize_page_bids_path_and_query("2024/01/article/?edition=fictional"),
+                "/2024/01/article/?edition=fictional",
+                "missing leading slash should be added"
             );
         }
 
