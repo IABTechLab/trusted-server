@@ -163,25 +163,60 @@ fn backend_config_from_spec(spec: &PlatformBackendSpec) -> BackendConfig<'_> {
 /// [`FastlyPlatformBackend::canonicalize_transport_timeout_ms`]).
 const TRANSPORT_TIMEOUT_QUANTUM_MS: u32 = 250;
 
+/// Upper bound of the fine-grained quantum range.
+///
+/// Budget-bound values below this ceiling are floored to a
+/// [`TRANSPORT_TIMEOUT_QUANTUM_MS`] multiple (the issue #847 behavior for the
+/// default 2000 ms auction). At or above it, values snap to the coarse
+/// [`TRANSPORT_TIMEOUT_COARSE_LADDER_MS`] instead so the total number of
+/// distinct budget-derived buckets stays globally bounded regardless of how
+/// large the configured ceiling is.
+const TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS: u32 = 2000;
+
 /// Coarse rungs for budget-bound transport timeouts below one quantum,
 /// ordered high to low.
 ///
-/// A budget-bound value at or above one quantum is floored to a
-/// [`TRANSPORT_TIMEOUT_QUANTUM_MS`] multiple. Below one quantum, passing the
-/// exact wall-clock remainder through would mint a distinct backend name for
-/// every millisecond in `1..250`, so the near-exhausted tail alone could
-/// exceed Fastly's per-service dynamic backend limit. Snapping to this finite
-/// ladder instead bounds the number of budget-derived names an origin can
-/// produce. Budgets below the smallest rung round to zero, which callers treat
-/// as "budget exhausted — skip the launch".
+/// Below one quantum, passing the exact wall-clock remainder through would mint
+/// a distinct backend name for every millisecond in `1..250`, so the
+/// near-exhausted tail alone could exceed Fastly's per-service dynamic backend
+/// limit. Snapping to this finite ladder instead bounds the number of
+/// budget-derived names an origin can produce. Budgets below the smallest rung
+/// round to zero, which callers treat as "budget exhausted — skip the launch".
 const SUB_QUANTUM_LADDER_MS: [u32; 4] = [200, 150, 100, 50];
 
-/// Round a budget-bound transport timeout down to a stable bucket.
+/// Coarse rungs for budget-bound transport timeouts at or above the quantum
+/// ceiling, ascending. Every rung is a [`TRANSPORT_TIMEOUT_QUANTUM_MS`]
+/// multiple.
 ///
-/// At or above one quantum, floors to a [`TRANSPORT_TIMEOUT_QUANTUM_MS`]
-/// multiple. Below one quantum, snaps down to the greatest
-/// [`SUB_QUANTUM_LADDER_MS`] rung no larger than `remaining_ms` (or zero).
+/// Above [`TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS`], flooring to a 250 ms multiple
+/// would let a large configured ceiling (e.g. 60,000 ms) mint hundreds of
+/// distinct backend names — recreating the per-service dynamic backend
+/// exhaustion this quantization exists to prevent. This fixed, globally finite
+/// ladder caps the number of high-budget buckets instead: values are floored to
+/// the greatest rung no larger than the remaining budget, and anything above
+/// the top rung clamps to it. Rounding down never extends a transport cap past
+/// the remaining budget.
+const TRANSPORT_TIMEOUT_COARSE_LADDER_MS: [u32; 8] =
+    [2000, 3000, 5000, 10000, 20000, 30000, 45000, 60000];
+
+/// Round a budget-bound transport timeout down to a stable, globally bounded
+/// bucket.
+///
+/// - At or above [`TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS`], floors to the
+///   greatest [`TRANSPORT_TIMEOUT_COARSE_LADDER_MS`] rung no larger than
+///   `remaining_ms` (clamping to the top rung above it).
+/// - Within the quantum range, floors to a [`TRANSPORT_TIMEOUT_QUANTUM_MS`]
+///   multiple.
+/// - Below one quantum, snaps down to the greatest [`SUB_QUANTUM_LADDER_MS`]
+///   rung no larger than `remaining_ms` (or zero).
 fn quantize_transport_timeout_ms(remaining_ms: u32) -> u32 {
+    if remaining_ms >= TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS {
+        return TRANSPORT_TIMEOUT_COARSE_LADDER_MS
+            .into_iter()
+            .rev()
+            .find(|&rung| rung <= remaining_ms)
+            .unwrap_or(TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS);
+    }
     let floored = (remaining_ms / TRANSPORT_TIMEOUT_QUANTUM_MS) * TRANSPORT_TIMEOUT_QUANTUM_MS;
     if floored > 0 {
         return floored;
@@ -1096,6 +1131,42 @@ mod tests {
             distinct.len() <= 16,
             "budget-derived transport values should stay well under the dynamic backend limit, \
              got {} distinct values: {distinct:?}",
+            distinct.len()
+        );
+    }
+
+    #[test]
+    fn canonicalize_budget_derived_names_stay_bounded_for_large_ceiling() {
+        // A large configured ceiling (e.g. a 60s mediator budget) must not let
+        // the budget-derived buckets grow with the ceiling. Without the coarse
+        // ladder a 60,000ms ceiling would mint ~240 distinct 250ms buckets and
+        // blow past Fastly's documented per-service dynamic backend limit (200).
+        let backend = FastlyPlatformBackend;
+        let configured = 60_000;
+        let mut distinct = std::collections::BTreeSet::new();
+        for remaining in 0..=configured {
+            let value = backend.canonicalize_transport_timeout_ms(remaining, configured);
+            if value > 0 {
+                distinct.insert(value);
+            }
+            assert!(
+                value == 0
+                    || value % TRANSPORT_TIMEOUT_QUANTUM_MS == 0
+                    || SUB_QUANTUM_LADDER_MS.contains(&value),
+                "canonical value {value}ms (from remaining {remaining}ms) is neither a quantum \
+                 multiple nor a ladder rung"
+            );
+        }
+        // A budget above the top coarse rung must clamp to it, not open a new
+        // bucket per 250ms step.
+        assert_eq!(
+            backend.canonicalize_transport_timeout_ms(120_000, 240_000),
+            60_000,
+            "a budget above the top coarse rung clamps to it"
+        );
+        assert!(
+            distinct.len() <= 20,
+            "large-ceiling budget-derived values must stay bounded, got {} distinct values: {distinct:?}",
             distinct.len()
         );
     }

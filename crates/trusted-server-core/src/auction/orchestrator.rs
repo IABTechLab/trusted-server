@@ -1,7 +1,7 @@
 //! Auction orchestrator for managing multi-provider auctions.
 
 use error_stack::{Report, ResultExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use web_time::Instant;
@@ -192,6 +192,21 @@ impl AuctionOrchestrator {
     ) -> Result<(), Report<TrustedServerError>> {
         if !self.config.enabled {
             return Ok(());
+        }
+
+        // A provider listed twice would launch the same auction request twice
+        // (its backend name canonicalizes identically), so the duplicate is
+        // detected only after the second outbound send has already fired. Reject
+        // it at startup instead.
+        let mut seen = HashSet::new();
+        for provider_name in &self.config.providers {
+            if !seen.insert(provider_name.as_str()) {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "Auction provider `{provider_name}` is listed more than once in [auction].providers; each provider may appear at most once"
+                    ),
+                }));
+            }
         }
 
         for provider_name in self
@@ -500,6 +515,23 @@ impl AuctionOrchestrator {
                 }
             };
 
+            // Pre-launch guard: `request_bids` fires the outbound send, and
+            // discarding the returned pending handle afterwards does not retract
+            // it. If another provider this auction already claimed the predicted
+            // backend name, skip *before* dispatching so a duplicate never hits
+            // the wire. The post-launch check below stays as a defense for a
+            // provider that resolves to an unexpected name.
+            if backend_to_provider.contains_key(&backend_name) {
+                log::warn!(
+                    "Provider '{}' predicted backend name '{}' already claimed by another provider \
+                     this auction; skipping launch before dispatch to avoid a duplicate request",
+                    provider.provider_name(),
+                    backend_name,
+                );
+                responses.push(provider_launch_failed_response(provider.provider_name(), 0));
+                continue;
+            }
+
             let provider_context = AuctionContext {
                 settings: context.settings,
                 request: context.request,
@@ -530,12 +562,11 @@ impl AuctionOrchestrator {
                             );
                             backend_name.clone()
                         });
-                    // Responses are correlated back to providers by backend
-                    // name. If another provider this auction already claimed
-                    // this name (e.g. two providers on one origin whose specs
-                    // canonicalize to the same backend), inserting here would
-                    // silently overwrite the first mapping and misattribute or
-                    // drop a response. Fail this launch attributably instead.
+                    // Post-launch defense: the resolved name differs from the
+                    // prediction and collides with another provider's. Responses
+                    // are correlated by backend name, so inserting here would
+                    // overwrite the first mapping and misattribute or drop a
+                    // response. Fail this launch attributably instead.
                     if backend_to_provider.contains_key(&request_backend_name) {
                         let response_time_ms = start_time.elapsed().as_millis() as u64;
                         log::warn!(
@@ -946,6 +977,21 @@ impl AuctionOrchestrator {
                 }
             };
 
+            // Pre-launch guard: skip before `request_bids` fires the outbound
+            // send when another provider this auction already claimed the
+            // predicted backend name (see the parallel path). Dropping the
+            // pending handle afterwards would not retract the request.
+            if backend_to_provider.contains_key(&backend_name) {
+                log::warn!(
+                    "Provider '{}' predicted backend name '{}' already claimed by another provider \
+                     this auction; skipping dispatch before send to avoid a duplicate request",
+                    provider.provider_name(),
+                    backend_name,
+                );
+                launch_responses.push(provider_launch_failed_response(provider.provider_name(), 0));
+                continue;
+            }
+
             let provider_context = AuctionContext {
                 settings: context.settings,
                 request: context.request,
@@ -957,7 +1003,7 @@ impl AuctionOrchestrator {
             let start_time = Instant::now();
             match provider.request_bids(request, &provider_context).await {
                 Ok(pending) => {
-                    // See the parallel path: a backend name already claimed by
+                    // Post-launch defense: a backend name already claimed by
                     // another provider this auction would misattribute the
                     // collected response, so fail this launch attributably
                     // rather than overwrite the mapping.
@@ -2002,6 +2048,28 @@ mod tests {
                 "should explain that no configured provider request launched"
             );
         });
+    }
+
+    #[test]
+    fn rejects_duplicate_configured_providers() {
+        // A provider listed twice canonicalizes to one backend name, so the
+        // duplicate would only be caught after its second outbound request had
+        // already fired. Startup validation must reject it up front.
+        let config = AuctionConfig {
+            enabled: true,
+            providers: vec!["prebid".to_string(), "prebid".to_string()],
+            timeout_ms: 2000,
+            ..Default::default()
+        };
+        let orchestrator = AuctionOrchestrator::new(config);
+
+        let err = orchestrator
+            .validate_configured_provider_names()
+            .expect_err("should reject a provider listed more than once");
+        assert!(
+            err.to_string().contains("listed more than once"),
+            "should explain the duplicate provider, got: {err}"
+        );
     }
 
     #[test]
