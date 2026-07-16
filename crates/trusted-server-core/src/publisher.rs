@@ -867,6 +867,74 @@ pub(crate) fn write_bids_to_state(
 /// enabled cannot bloat every page render without bound.
 const MAX_AUCTION_DEBUG_DUMP_BYTES: usize = 256 * 1024;
 
+/// Provider-metadata keys safe to surface in the on-page `ts-debug` dump.
+///
+/// Fail-closed allowlist: any key not listed — notably `debug`, which carries
+/// the resolved `OpenRTB` request (EC ID, `user.ext.eids`, the TC consent string,
+/// `device.ip`, and `device.geo`) plus per-bidder `httpcalls` — is dropped so a
+/// visitor's identity graph cannot reach the client-readable DOM even when
+/// `[integration.prebid].debug` is also enabled. Full debug detail remains
+/// available server-side via `log::trace!`.
+const DEBUG_DUMP_METADATA_ALLOWLIST: &[&str] = &[
+    "error_type",
+    "status",
+    "message",
+    "responsetimemillis",
+    "errors",
+    "warnings",
+    "bidstatus",
+];
+
+/// Per-bid creative preview length (in bytes) in the `ts-debug` dump. Mirrors
+/// the 512-byte upstream-body preview the prebid provider logs on an HTTP error
+/// (`integrations/prebid.rs`): enough to identify a creative without copying
+/// megabytes of `adm` markup into every page render. The full creative still
+/// renders via the injected bids `<script>`.
+const MAX_BID_CREATIVE_DUMP_BYTES: usize = 512;
+
+/// Truncate `value` to at most `max` bytes on a UTF-8 char boundary, appending
+/// a `…(truncated N bytes)` marker when truncation occurred.
+fn truncate_with_marker(value: &str, max: usize) -> String {
+    if value.len() <= max {
+        return value.to_string();
+    }
+    let end = value.floor_char_boundary(max);
+    format!("{}…(truncated {} bytes)", &value[..end], value.len() - end)
+}
+
+/// Build a redacted JSON view of a single provider response for the `ts-debug`
+/// dump: only [`DEBUG_DUMP_METADATA_ALLOWLIST`] metadata keys survive, and each
+/// bid's creative is previewed to [`MAX_BID_CREATIVE_DUMP_BYTES`].
+fn redact_response_for_dump(
+    response: &crate::auction::types::AuctionResponse,
+) -> serde_json::Value {
+    let metadata: serde_json::Map<String, serde_json::Value> = response
+        .metadata
+        .iter()
+        .filter(|(key, _)| DEBUG_DUMP_METADATA_ALLOWLIST.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let bids: Vec<serde_json::Value> = response.bids.iter().map(redact_bid_for_dump).collect();
+    serde_json::json!({
+        "provider": response.provider,
+        "status": response.status,
+        "response_time_ms": response.response_time_ms,
+        "bids": bids,
+        "metadata": metadata,
+    })
+}
+
+/// Build a redacted JSON view of a single bid: every field except `creative`,
+/// which is previewed to [`MAX_BID_CREATIVE_DUMP_BYTES`].
+fn redact_bid_for_dump(bid: &crate::auction::types::Bid) -> serde_json::Value {
+    let mut value = serde_json::to_value(bid).unwrap_or(serde_json::Value::Null);
+    if let Some(creative) = &bid.creative {
+        value["creative"] =
+            serde_json::Value::String(truncate_with_marker(creative, MAX_BID_CREATIVE_DUMP_BYTES));
+    }
+    value
+}
+
 /// Prepend a `<!-- ts-debug: ... -->` HTML comment carrying the full auction
 /// result — pipeline stats plus every provider response, including each bid's
 /// raw `adm` creative markup — onto the shared `ad_bids_state` so it lands
@@ -887,47 +955,67 @@ pub(crate) fn prepend_auction_debug_comment(
         Some(r) => format!("ok({}_bids)", r.bids.len()),
         None => "none".to_string(),
     };
-    // Full per-provider dump so the operator can see exactly what each SSP
-    // returned — `status` (nobid vs error vs success), every `bids` entry, and
-    // `metadata` — without needing log access.
+    // Redacted, bounded, deterministic dump so an operator can see each
+    // provider's status, bids, and safe metadata without needing log access.
     //
-    // `Bid.creative` and provider metadata are attacker/partner-influenced and
-    // may contain an HTML5 comment terminator (`-->`, or the `--!>`
-    // comment-end-bang variant), which would end the comment early and leak the
-    // remaining markup into the live DOM. Neutralise both, then cap the size so
-    // a large SSP response cannot bloat the page.
+    // SECURITY: `Bid.creative` and provider metadata are attacker/partner-
+    // influenced. Two layers protect the DOM:
+    //   1. `redact_response_for_dump` drops all non-allowlisted metadata (notably
+    //      the identity-bearing `debug` subtree) and previews each creative, so
+    //      the visitor's identity graph never enters the comment and one large
+    //      creative cannot dominate the payload.
+    //   2. `render_dump` below neutralises HTML comment terminators and caps the
+    //      total serialized size.
     //
-    // NB: a single `replace("--", …)` is deliberately NOT used — because
+    // `serde_json::Map` (no `preserve_order` feature) is `BTreeMap`-backed, so
+    // the rendered metadata keys are sorted — the dump is deterministic even
+    // though `AuctionResponse.metadata` is a `HashMap`.
+    let mut dump = serde_json::Map::new();
+    dump.insert(
+        "provider_responses".to_string(),
+        serde_json::Value::Array(
+            result
+                .provider_responses
+                .iter()
+                .map(redact_response_for_dump)
+                .collect(),
+        ),
+    );
+    // Only include the mediator response when one actually ran; otherwise the
+    // `mediator=none` on the summary line already conveys it.
+    if let Some(mediator_response) = &result.mediator_response {
+        dump.insert(
+            "mediator_response".to_string(),
+            redact_response_for_dump(mediator_response),
+        );
+    }
+    // A single `replace("--", …)` is deliberately NOT used — because
     // `str::replace` is non-overlapping, it re-forms a live `-->` / `--!>` at
     // the junction of an odd dash-run (`--->` -> `- -->`, `----->` -> `- -- -->`),
     // reintroducing exactly the terminator we are trying to remove. The two
-    // targeted replacements below cannot re-form either sequence.
+    // targeted replacements below cannot re-form either sequence. Applied to the
+    // serialize-error fallback too, so nothing reaches the DOM un-neutralised.
     let render_dump = |json: String| -> String {
         let neutralised = json.replace("-->", "-- >").replace("--!>", "-- !>");
         if neutralised.len() > MAX_AUCTION_DEBUG_DUMP_BYTES {
             let end = neutralised.floor_char_boundary(MAX_AUCTION_DEBUG_DUMP_BYTES);
-            format!("{}…(truncated)", &neutralised[..end])
+            format!(
+                "{}…(truncated {} bytes)",
+                &neutralised[..end],
+                neutralised.len() - end
+            )
         } else {
             neutralised
         }
     };
-    let providers_dump = serde_json::to_string(&result.provider_responses)
-        .map(render_dump)
-        .unwrap_or_else(|e| format!("<provider_responses serialize error: {e}>"));
-    // Only dump the mediator response when one actually ran; otherwise the
-    // `mediator=none` on the summary line already conveys it.
-    let mediator_line = match &result.mediator_response {
-        Some(_) => {
-            let dump = serde_json::to_string(&result.mediator_response)
-                .map(render_dump)
-                .unwrap_or_else(|e| format!("<mediator_response serialize error: {e}>"));
-            format!("\nmediator_response={dump}")
-        }
-        None => String::new(),
-    };
+    // Single serialize → single neutralise → single total-budget cap.
+    let dump = render_dump(
+        serde_json::to_string(&serde_json::Value::Object(dump))
+            .unwrap_or_else(|e| format!("<dump serialize error: {e}>")),
+    );
     let debug_comment = format!(
         "<!-- ts-debug: path={path_label} ssp={ssp_count} mediator={mediator_info} winning={} time={}ms\n\
-         provider_responses={providers_dump}{mediator_line}\n\
+         dump={dump}\n\
          -->",
         result.winning_bids.len(),
         result.total_time_ms,
@@ -2542,12 +2630,11 @@ mod tests {
         };
         let state = Arc::new(Mutex::new(Some("BIDS_SCRIPT".to_string())));
         prepend_auction_debug_comment("stream", &result, &state);
-        let comment = state
+        state
             .lock()
             .expect("should lock state")
             .clone()
-            .expect("should have comment");
-        comment
+            .expect("should have comment")
     }
 
     #[test]
@@ -2559,13 +2646,88 @@ mod tests {
             "should surface the no-bid provider status: {comment}"
         );
         assert!(
-            comment.contains("provider_responses="),
-            "should dump the provider_responses payload"
+            comment.contains("dump={\"provider_responses\":"),
+            "should dump the provider_responses payload: {comment}"
         );
-        // No mediator ran, so its line is omitted (mediator=none already says so).
+        // No mediator ran, so it is omitted (mediator=none already says so).
         assert!(
-            !comment.contains("mediator_response="),
+            !comment.contains("mediator_response"),
             "should omit mediator_response when no mediator ran: {comment}"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_never_leaks_provider_debug_metadata() {
+        // A provider response whose `debug` metadata mirrors the shape prebid
+        // stores verbatim when `[integration.prebid].debug` is on: the resolved
+        // OpenRTB request carrying the visitor's identity graph. The dump must
+        // drop it — only allowlisted keys may reach the DOM.
+        let response = AuctionResponse::error("prebid", 12)
+            .with_metadata(
+                "debug",
+                serde_json::json!({
+                    "resolvedrequest": {
+                        "user": {
+                            "id": "EC-ID-abc123",
+                            "consent": "CPtc-TCSTRING-xyz",
+                            "ext": { "eids": [{ "source": "example.com",
+                                                "uids": [{ "id": "EID-USER-999" }] }] }
+                        },
+                        "device": { "ip": "203.0.113.77",
+                                    "geo": { "lat": 37.7749, "lon": -122.4194 } }
+                    }
+                }),
+            )
+            // An allowlisted key must still survive.
+            .with_metadata("error_type", serde_json::json!("http_status"));
+        let result = OrchestrationResult {
+            provider_responses: vec![response],
+            mediator_response: None,
+            winning_bids: std::collections::HashMap::new(),
+            total_time_ms: 12,
+            metadata: std::collections::HashMap::new(),
+        };
+        let state = Arc::new(Mutex::new(Some("BIDS_SCRIPT".to_string())));
+        prepend_auction_debug_comment("stream", &result, &state);
+        let comment = state
+            .lock()
+            .expect("should lock state")
+            .clone()
+            .expect("should have comment");
+
+        for needle in [
+            "EC-ID-abc123",
+            "EID-USER-999",
+            "CPtc-TCSTRING-xyz",
+            "203.0.113.77",
+            "37.7749",
+            "resolvedrequest",
+        ] {
+            assert!(
+                !comment.contains(needle),
+                "identity/debug value {needle:?} must not reach the page HTML: {comment}"
+            );
+        }
+        assert!(
+            comment.contains("\"error_type\":\"http_status\""),
+            "allowlisted metadata must still surface: {comment}"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_truncates_oversized_creative() {
+        // A creative larger than the per-bid preview cap must be truncated with a
+        // marker rather than copied verbatim into the page.
+        let oversized = "x".repeat(MAX_BID_CREATIVE_DUMP_BYTES * 4);
+        let comment = dump_comment_for_creative(&oversized);
+        assert!(
+            comment.contains("(truncated"),
+            "oversized creative should carry a truncation marker: {}",
+            &comment[..comment.len().min(200)]
+        );
+        assert!(
+            !comment.contains(&oversized),
+            "the full oversized creative must not appear in the comment"
         );
     }
 

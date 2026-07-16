@@ -344,7 +344,7 @@ Provider-call fields:
 | --------------------------- | -------------------------------- | ------------------------------------------------------------------------------------ |
 | `provider`                  | LowCardinality(Nullable(String)) | prebid / aps / mediator name                                                         |
 | `provider_role`             | LowCardinality(Nullable(String)) | bidder / mediator                                                                    |
-| `status`                    | LowCardinality(Nullable(String)) | success / nobid / launch_error / parse_error / transport_error / timeout / abandoned |
+| `status`                    | LowCardinality(Nullable(String)) | success / nobid / launch_error / parse_error / transport_error / http_status_error / timeout / abandoned |
 | `provider_response_time_ms` | Nullable(UInt32)                 | provider-call latency; null if unavailable                                           |
 | `provider_bid_count`        | Nullable(UInt16)                 | number of parsed bids                                                                |
 

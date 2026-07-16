@@ -2140,6 +2140,14 @@ impl AuctionProvider for PrebidAuctionProvider {
                     "error_type",
                     serde_json::json!(crate::auction::orchestrator::ERROR_TYPE_HTTP_STATUS),
                 )
+                // Static message only (no upstream content) — mirrors the
+                // orchestrator's error constructors so every consumer of
+                // `provider_details[].metadata` sees a consistent
+                // `error_type` + `message` shape.
+                .with_metadata(
+                    "message",
+                    serde_json::json!("Prebid returned non-success status"),
+                )
                 .with_metadata("status", serde_json::json!(status.as_u16())));
         }
 
@@ -2380,6 +2388,13 @@ mod tests {
             result.metadata["status"],
             json!(403),
             "should surface the upstream HTTP status code"
+        );
+        // A static, upstream-free message keeps the error shape consistent with
+        // the orchestrator's other provider error responses.
+        assert_eq!(
+            result.metadata["message"],
+            json!("Prebid returned non-success status"),
+            "should carry a static message like every other provider error path"
         );
         // SECURITY: the upstream response body must never reach the public
         // /auction response via AuctionResponse.metadata.

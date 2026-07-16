@@ -1079,6 +1079,45 @@ mod tests {
     }
 
     #[test]
+    fn provider_call_maps_http_status_errors_to_their_own_bucket() {
+        // A non-2xx upstream status (e.g. a PBS 4xx/5xx) is tagged
+        // `error_type = "http_status"` by the prebid provider; telemetry must
+        // bucket it as `http_status_error` — distinct from a connection-level
+        // `transport_error` — so provider-health error rates count it.
+        let request = test_request("ts-ec-derived-id");
+        let provider_http_error = AuctionResponse::error("prebid", 12)
+            .with_metadata("error_type", json!("http_status"))
+            .with_metadata("status", json!(403));
+        let result = OrchestrationResult {
+            provider_responses: vec![provider_http_error],
+            mediator_response: None,
+            winning_bids: HashMap::new(),
+            total_time_ms: 12,
+            metadata: HashMap::new(),
+        };
+        let observation =
+            AuctionObservationContext::for_test(AuctionSource::AuctionApi, "/article/1", 1);
+
+        let batch = build_auction_events(
+            observation,
+            AuctionTerminalOutcome::Completed {
+                request: &request,
+                result: &result,
+            },
+        );
+
+        assert_eq!(
+            batch
+                .rows()
+                .iter()
+                .find(|row| row.provider.as_deref() == Some("prebid"))
+                .and_then(|row| row.status.as_deref()),
+            Some("http_status_error"),
+            "should bucket upstream HTTP failures as http_status_error, not transport_error"
+        );
+    }
+
+    #[test]
     fn mediated_win_marks_original_bid_once() {
         let request = test_request("req");
         let original_bid = bid("slot-1", "kargo", Some("ad-1"), None);
