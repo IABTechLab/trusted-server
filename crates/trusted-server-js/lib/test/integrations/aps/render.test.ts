@@ -147,9 +147,7 @@ describe('direct APS rendering', () => {
     const iframe = slot.querySelector('iframe')!;
     const existing = slot.querySelector('span');
     expect(existing).not.toBeNull();
-    expect(iframe.src).toMatch(
-      new RegExp(`${APS_RENDERER_PATH.replace(/\//g, '\\/')}#tsaps=[A-Za-z0-9_-]{22}$`)
-    );
+    expect(iframe.src).toMatch(/\/integrations\/aps\/renderer#tsaps=[A-Za-z0-9_-]{22}$/);
     expect(iframe.getAttribute('sandbox')).toBe(APS_RENDERER_SANDBOX);
     expect(iframe.getAttribute('sandbox')).not.toContain('allow-same-origin');
     expect(iframe.srcdoc).toBe('');
@@ -262,9 +260,7 @@ describe('Universal Creative APS source', () => {
         window
       );
       const iframe = document.body.querySelector('iframe')!;
-      expect(iframe.src).toMatch(
-        new RegExp(`${APS_RENDERER_PATH.replace(/\//g, '\\/')}#tsaps=[A-Za-z0-9_-]{22}$`)
-      );
+      expect(iframe.src).toMatch(/\/integrations\/aps\/renderer#tsaps=[A-Za-z0-9_-]{22}$/);
       expect(iframe.getAttribute('sandbox')).toBe(APS_RENDERER_SANDBOX);
       expect(iframe.getAttribute('sandbox')).not.toContain('allow-same-origin');
 
