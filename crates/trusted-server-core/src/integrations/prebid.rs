@@ -1437,7 +1437,18 @@ impl PrebidAuctionProvider {
                         {
                             explicit_bidders.extend(per_bidder.keys().cloned());
                         }
-                        bidder.extend(expand_trusted_server_bidders(&self.config.bidders, params));
+                        // Fill in trusted-server-expanded bidders without
+                        // clobbering a direct bidder entry. `slot.bidders` is a
+                        // HashMap, so this branch can run after a direct entry;
+                        // `extend` would then overwrite valid direct params with a
+                        // fabricated empty `{}`, which `explicit_bidders` would
+                        // wrongly preserve past the drop below. `or_insert` makes
+                        // direct params win regardless of iteration order.
+                        for (bidder_name, bidder_params) in
+                            expand_trusted_server_bidders(&self.config.bidders, params)
+                        {
+                            bidder.entry(bidder_name).or_insert(bidder_params);
+                        }
                     } else if self.config.bidders.iter().any(|b| b == name) {
                         explicit_bidders.insert(name.clone());
                         bidder.insert(name.clone(), params.clone());
@@ -6009,6 +6020,55 @@ bidders = ["kargo", "triplelift", "criteo"]
             !params.contains_key("criteo"),
             "should drop a fabricated empty bidder with no inline params or override"
         );
+    }
+
+    #[test]
+    fn to_openrtb_prefers_direct_bidder_params_over_fabricated_empty() {
+        // A slot can carry BOTH a direct bidder entry (valid inline params) and a
+        // `trustedServer` entry whose `bidderParams` omits that bidder. Since
+        // `slot.bidders` is a HashMap, the trustedServer expansion — which
+        // fabricates an empty `{}` for the omitted bidder — could run after the
+        // direct entry and overwrite its valid params; the direct entry marks the
+        // bidder explicit, so the empty would survive the drop and PBS would reject
+        // the imp. Direct params must win regardless of iteration order.
+        //
+        // Looped because the HashMap iteration order is randomized per map, so a
+        // single run could miss the overwrite ordering; the fix must hold every
+        // time.
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+bidders = ["kargo", "triplelift"]
+"#,
+        );
+
+        for _ in 0..64 {
+            let slot = make_slot(
+                "ad-header-0",
+                HashMap::from([
+                    ("kargo".to_string(), json!({ "placementId": "direct-1" })),
+                    (
+                        TRUSTED_SERVER_BIDDER.to_string(),
+                        json!({ BIDDER_PARAMS_KEY: { "triplelift": { "inventoryCode": "tl-1" } } }),
+                    ),
+                ]),
+            );
+            let request = make_auction_request(vec![slot]);
+
+            let ortb = call_to_openrtb(config.clone(), &request);
+            let params = bidder_params(&ortb);
+
+            assert_eq!(
+                params["kargo"]["placementId"], "direct-1",
+                "direct bidder params must win over a fabricated empty from trustedServer expansion"
+            );
+            assert_eq!(
+                params["triplelift"]["inventoryCode"], "tl-1",
+                "trustedServer-supplied bidder params must still ship"
+            );
+        }
     }
 
     #[test]
