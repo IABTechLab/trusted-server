@@ -1,8 +1,11 @@
 [package]
 name = "trusted-server-integration-tests"
-version = "0.1.0"
-edition = "2024"
-publish = false
+description = "Cross-adapter parity and integration tests for Trusted Server."
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
 
 [[test]]
 name = "integration"

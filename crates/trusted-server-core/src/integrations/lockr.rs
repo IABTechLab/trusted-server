@@ -20,10 +20,10 @@ use validator::Validate;
 use crate::constants::INTERNAL_HEADERS;
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    collect_body_bounded, collect_response_bounded, ensure_integration_backend,
-    AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration, INTEGRATION_MAX_BODY_BYTES,
-    UPSTREAM_SDK_MAX_RESPONSE_BYTES,
+    AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
+    IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+    UPSTREAM_SDK_MAX_RESPONSE_BYTES, collect_body_bounded, collect_response_bounded,
+    ensure_integration_backend,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
@@ -437,7 +437,7 @@ mod tests {
     use edgezero_core::http::Method as HttpMethod;
     use serde_json::json;
 
-    use crate::platform::test_support::{build_services_with_http_client, StubHttpClient};
+    use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
     use crate::test_support::tests::create_test_settings;
 
     fn test_config() -> LockrConfig {

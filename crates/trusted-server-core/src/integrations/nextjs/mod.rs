@@ -121,7 +121,7 @@ fn build(
 mod tests {
     use super::rsc_placeholders::RSC_PAYLOAD_PLACEHOLDER_PREFIX;
     use super::*;
-    use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
+    use crate::html_processor::{HtmlProcessorConfig, create_html_processor};
     use crate::integrations::IntegrationRegistry;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::tests::create_test_settings;

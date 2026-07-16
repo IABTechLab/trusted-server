@@ -1,5 +1,5 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use trusted_server_core::html_processor::{create_html_processor, HtmlProcessorConfig};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use trusted_server_core::html_processor::{HtmlProcessorConfig, create_html_processor};
 use trusted_server_core::integrations::IntegrationRegistry;
 use trusted_server_core::streaming_processor::StreamProcessor as _;
 

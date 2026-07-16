@@ -5,7 +5,7 @@
 
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use http::{header, Request, Response, StatusCode};
+use http::{Request, Response, StatusCode, header};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{IntoHttpResponse, TrustedServerError};
@@ -502,12 +502,12 @@ mod tests {
     use bytes::Bytes;
     use edgezero_core::body::Body as EdgeBody;
     use error_stack::Report;
-    use http::{header, Method, Request as HttpRequest, StatusCode};
+    use http::{Method, Request as HttpRequest, StatusCode, header};
 
     use crate::error::IntoHttpResponse;
     use crate::platform::{
-        test_support::{build_request_signing_services, build_services_with_config, noop_services},
         PlatformConfigStore, PlatformError, StoreId, StoreName,
+        test_support::{build_request_signing_services, build_services_with_config, noop_services},
     };
 
     use super::*;

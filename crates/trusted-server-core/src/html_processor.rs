@@ -4,13 +4,13 @@
 use std::cell::Cell;
 use std::io;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use lol_html::{
-    element,
+    EndTagHandler, Settings as RewriterSettings, element,
     html_content::{ContentType, EndTag},
-    text, EndTagHandler, Settings as RewriterSettings,
+    text,
 };
 
 use crate::integrations::{
@@ -985,9 +985,9 @@ mod tests {
 
     #[test]
     fn test_real_publisher_html_with_gzip() {
+        use flate2::Compression as GzCompression;
         use flate2::read::GzDecoder;
         use flate2::write::GzEncoder;
-        use flate2::Compression as GzCompression;
         use std::io::{Read as _, Write as _};
 
         let html = include_str!("html_processor.test.html");

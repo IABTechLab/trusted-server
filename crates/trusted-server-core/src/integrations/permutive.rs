@@ -16,10 +16,10 @@ use validator::Validate;
 use crate::constants::INTERNAL_HEADERS;
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    collect_body_bounded, collect_response_bounded, ensure_integration_backend,
-    AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration, INTEGRATION_MAX_BODY_BYTES,
-    UPSTREAM_SDK_MAX_RESPONSE_BYTES,
+    AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
+    IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+    UPSTREAM_SDK_MAX_RESPONSE_BYTES, collect_body_bounded, collect_response_bounded,
+    ensure_integration_backend,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
@@ -474,7 +474,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::platform::test_support::{build_services_with_http_client, StubHttpClient};
+    use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
     use crate::test_support::tests::create_test_settings;
 
     #[test]
@@ -512,8 +512,10 @@ mod tests {
         let integration = PermutiveIntegration::new(config);
 
         // Should match edge.permutive.app URLs
-        assert!(integration
-            .is_permutive_sdk_url("https://myorg.edge.permutive.app/workspace-123-web.js"));
+        assert!(
+            integration
+                .is_permutive_sdk_url("https://myorg.edge.permutive.app/workspace-123-web.js")
+        );
 
         // Should match cdn.permutive.com URLs
         assert!(integration.is_permutive_sdk_url("https://cdn.permutive.com/myworkspace-web.js"));
