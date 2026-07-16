@@ -4,15 +4,15 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::{
+    Engine as _,
     engine::general_purpose::{
         STANDARD as BASE64_STANDARD, STANDARD_NO_PAD as BASE64_STANDARD_NO_PAD,
     },
-    Engine as _,
 };
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::header::HeaderValue;
-use http::{header, Method, StatusCode};
+use http::{Method, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use url::{Url, Url as ParsedUrl};
@@ -23,26 +23,25 @@ use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid, MediaType,
 };
 use crate::consent_config::ConsentForwardingMode;
-use crate::cookies::{strip_cookies, CONSENT_COOKIE_NAMES};
+use crate::cookies::{CONSENT_COOKIE_NAMES, strip_cookies};
 use crate::error::TrustedServerError;
 use crate::http_util::RequestInfo;
 use crate::integrations::{
-    collect_response_bounded, ensure_integration_backend_with_timeout,
-    predict_integration_backend_name, AttributeRewriteAction, IntegrationAttributeContext,
-    IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationHeadInjector,
-    IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration,
-    UPSTREAM_RTB_MAX_RESPONSE_BYTES,
+    AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
+    IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
+    IntegrationRegistration, UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
+    ensure_integration_backend_with_timeout, predict_integration_backend_name,
 };
 use crate::openrtb::{
-    to_openrtb_i32, Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, ImpExt,
-    ImpStoredRequest, OpenRtbRequest, PrebidExt, PrebidImpExt, Publisher, Regs, RegsExt,
-    RequestExt, Site, ToExt, TrustedServerExt, User, UserExt,
+    Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, ImpExt, ImpStoredRequest,
+    OpenRtbRequest, PrebidExt, PrebidImpExt, Publisher, Regs, RegsExt, RequestExt, Site, ToExt,
+    TrustedServerExt, User, UserExt, to_openrtb_i32,
 };
 use crate::platform::{
     PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, RuntimeServices,
 };
-use crate::proxy::{is_host_allowed, proxy_request, ProxyRequestConfig};
-use crate::request_signing::{RequestSigner, SigningParams, SIGNING_VERSION};
+use crate::proxy::{ProxyRequestConfig, is_host_allowed, proxy_request};
+use crate::request_signing::{RequestSigner, SIGNING_VERSION, SigningParams};
 use crate::settings::{IntegrationConfig, Settings};
 
 const PREBID_INTEGRATION_ID: &str = "prebid";
@@ -1178,16 +1177,16 @@ impl CompiledBidParamOverrideRule {
     }
 
     fn matches(&self, facts: BidParamOverrideFacts<'_>) -> bool {
-        if let Some(expected_bidder) = self.bidder.as_deref() {
-            if expected_bidder != facts.bidder {
-                return false;
-            }
+        if let Some(expected_bidder) = self.bidder.as_deref()
+            && expected_bidder != facts.bidder
+        {
+            return false;
         }
 
-        if let Some(expected_zone) = self.zone.as_deref() {
-            if facts.zone != Some(expected_zone) {
-                return false;
-            }
+        if let Some(expected_zone) = self.zone.as_deref()
+            && facts.zone != Some(expected_zone)
+        {
+            return false;
         }
 
         true
@@ -1279,11 +1278,11 @@ fn copy_request_headers(
         }
     }
 
-    if let Some(ip) = client_ip {
-        if let Ok(value) = HeaderValue::from_str(&ip.to_string()) {
-            to.headers_mut()
-                .insert(header::HeaderName::from_static("x-forwarded-for"), value);
-        }
+    if let Some(ip) = client_ip
+        && let Ok(value) = HeaderValue::from_str(&ip.to_string())
+    {
+        to.headers_mut()
+            .insert(header::HeaderName::from_static("x-forwarded-for"), value);
     }
 
     let Some(cookie_value) = from.headers().get(header::COOKIE) else {
@@ -2271,13 +2270,13 @@ mod tests {
 
     use crate::consent::{ConsentContext, ConsentSource};
     use crate::geo::GeoInfo;
-    use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
+    use crate::html_processor::{HtmlProcessorConfig, create_html_processor};
     use crate::integrations::{
         AttributeRewriteAction, IntegrationDocumentState, IntegrationRegistry,
     };
     use crate::platform::test_support::{
-        build_services_with_http_client, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore,
-        StubHttpClient,
+        NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore, StubHttpClient,
+        build_services_with_http_client,
     };
     use crate::platform::{
         ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformError, RuntimeServices,
@@ -2716,9 +2715,11 @@ script_patterns = ["/prebid.js", "/custom/prebid.min.js"]
 
         assert_eq!(config.script_patterns.len(), 2);
         assert!(config.script_patterns.contains(&"/prebid.js".to_string()));
-        assert!(config
-            .script_patterns
-            .contains(&"/custom/prebid.min.js".to_string()));
+        assert!(
+            config
+                .script_patterns
+                .contains(&"/custom/prebid.min.js".to_string())
+        );
     }
 
     #[test]
@@ -2733,9 +2734,11 @@ server_url = "https://prebid.example"
 
         assert!(!config.script_patterns.is_empty());
         assert!(config.script_patterns.contains(&"/prebid.js".to_string()));
-        assert!(config
-            .script_patterns
-            .contains(&"/prebid.min.js".to_string()));
+        assert!(
+            config
+                .script_patterns
+                .contains(&"/prebid.min.js".to_string())
+        );
     }
 
     #[test]
@@ -5755,8 +5758,7 @@ set = { placementId = "explicit_header" }
                 let actual = engine.rules.iter().map(rule_signature).collect::<Vec<_>>();
 
                 assert_eq!(
-                    actual,
-                    expected,
+                    actual, expected,
                     "compatibility rules should compile in sorted matcher order on iteration {iteration}"
                 );
             }

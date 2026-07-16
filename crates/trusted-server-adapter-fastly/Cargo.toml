@@ -1,7 +1,11 @@
 [package]
 name = "trusted-server-adapter-fastly"
-version = "0.1.0"
-edition = "2021"
+description = "Fastly Compute entry point for Trusted Server."
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
 
 [lints]
 workspace = true

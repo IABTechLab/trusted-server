@@ -991,9 +991,12 @@ describe('installTsRenderBridge', () => {
   it('calls stopImmediatePropagation and fetches PBS Cache for a TS bid', async () => {
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
     const mockAd = '<div>Test Creative</div>';
+    // PBS Cache (returnCreative=false) returns the cached bid as a JSON object;
+    // the creative lives under `adm`, not as the raw response body. The bridge
+    // must parse it and forward `adm`, mirroring the Prebid Universal Creative.
     fetchStub.mockResolvedValue({
       ok: true,
-      text: () => Promise.resolve(mockAd),
+      text: () => Promise.resolve(JSON.stringify({ adm: mockAd, width: 728, height: 90 })),
     } as Response);
 
     // Capture the bridge's 'message' listener at module-init time.
@@ -1056,6 +1059,74 @@ describe('installTsRenderBridge', () => {
       }) as unknown as MessageEvent
     );
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    expect(beaconSpy).toHaveBeenCalledTimes(2);
+    beaconSpy.mockRestore();
+  });
+
+  it('declines to render when the PBS Cache response carries no adm', async () => {
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    // A returnCreative=false JSON entry with no `adm` (VAST-only, or malformed).
+    // The bridge must NOT forward the serialized bid document to PUC.
+    fetchStub.mockResolvedValue({
+      ok: true,
+      text: () => Promise.resolve(JSON.stringify({ width: 728, height: 90 })),
+    } as Response);
+
+    const bridgeListener = await captureBridgeListener();
+    const stopSpy = vi.fn();
+    const portMessages: string[] = [];
+    const fakePort = { postMessage: (s: string) => portMessages.push(s) };
+    const source = createTrustedSlotIframe();
+
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+        ports: [fakePort],
+        source,
+        stopImmediatePropagation: stopSpy,
+      }) as unknown as MessageEvent
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    // TS owns the adId so Prebid is still stopped, but with nothing renderable
+    // the bridge sends no Prebid Response and fires no win/billing beacons.
+    expect(fetchStub).toHaveBeenCalled();
+    expect(stopSpy).toHaveBeenCalled();
+    expect(portMessages).toHaveLength(0);
+    expect(beaconSpy).not.toHaveBeenCalled();
+    beaconSpy.mockRestore();
+  });
+
+  it('renders a non-JSON PBS Cache body as raw creative markup', async () => {
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    const rawAd = '<div>Raw Cached Creative</div>';
+    // Backward compatibility: a cache that returns the creative markup directly
+    // (not a JSON bid object) is still rendered as-is.
+    fetchStub.mockResolvedValue({
+      ok: true,
+      text: () => Promise.resolve(rawAd),
+    } as Response);
+
+    const bridgeListener = await captureBridgeListener();
+    const stopSpy = vi.fn();
+    const portMessages: string[] = [];
+    const fakePort = { postMessage: (s: string) => portMessages.push(s) };
+    const source = createTrustedSlotIframe();
+
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+        ports: [fakePort],
+        source,
+        stopImmediatePropagation: stopSpy,
+      }) as unknown as MessageEvent
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    expect(portMessages).toHaveLength(1);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const parsed = JSON.parse(portMessages[0]) as Record<string, any>;
+    expect(parsed.ad).toBe(rawAd);
     expect(beaconSpy).toHaveBeenCalledTimes(2);
     beaconSpy.mockRestore();
   });
