@@ -1,5 +1,11 @@
 import { log } from '../../core/log';
 import type { AuctionSlot, AuctionBidData, TsjsApi } from '../../core/types';
+import {
+  APS_UNIVERSAL_CREATIVE_RENDERER,
+  APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+  apsRendererUrl,
+  validateApsRenderer,
+} from '../aps/render';
 
 import { installGptGuard } from './script_guard';
 
@@ -556,13 +562,8 @@ export function installTsAdInit(): void {
           slotsToRefresh.push(gptSlot);
         }
 
-        // APS: signal to apstag that bids are ready so Amazon's GAM creative
-        // can render.  apstag must already be initialised on the page (which it
-        // is on production publisher pages).  Safe no-op if apstag is absent.
-        if (bid.hb_bidder === 'aps' || bid.hb_bidder === 'amazon-aps') {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (window as any).apstag?.setDisplayBids?.();
-        }
+        // Trusted Server APS winners carry their own typed renderer and never
+        // enter the publisher-owned native apstag rendering path.
       });
 
       ts.prevGptSlots = newSlots as unknown[];
@@ -888,6 +889,38 @@ export function installTsRenderBridge(): void {
 
     const slot = window.tsjs?.adSlots?.find((s) => s.id === slotId);
     const [width, height] = slot?.formats?.[0] ?? [728, 90];
+
+    if (matchedBid.renderer !== undefined) {
+      const renderer = validateApsRenderer(matchedBid.renderer);
+      const rendererUrl = apsRendererUrl();
+      if (!renderer || !rendererUrl) return;
+
+      // Ownership and the complete consumed envelope are valid before this
+      // handler claims the message or suppresses another legitimate handler.
+      e.stopImmediatePropagation();
+      if (renderingAdIds.has(adId)) return;
+      renderingAdIds.add(adId);
+
+      try {
+        port.postMessage(
+          JSON.stringify({
+            message: 'Prebid Response',
+            adId,
+            renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
+            rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+            rendererUrl,
+            apsRenderer: renderer,
+            width: renderer.width,
+            height: renderer.height,
+          })
+        );
+        log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' through APS renderer`);
+      } catch (err) {
+        renderingAdIds.delete(adId);
+        log.warn('[tsjs-gpt] pbRender bridge: APS response failed', err);
+      }
+      return;
+    }
 
     if (matchedBid.adm) {
       e.stopImmediatePropagation();

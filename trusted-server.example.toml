@@ -117,9 +117,11 @@ allowed_context_keys = []
 
 [integrations.aps]
 enabled = false
-pub_id = "your-aps-publisher-id"
-endpoint = "https://aps.example.com/e/dtb/bid"
+account_id = "example-aps-account-id"
+endpoint = "https://web.ads.aps.amazon-adsystem.com/e/pb/bid"
 timeout_ms = 1000
+# Script creatives require separate security validation before opt-in.
+allow_script_creatives = false
 
 [integrations.google_tag_manager]
 enabled = false

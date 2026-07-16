@@ -1424,13 +1424,18 @@ impl PrebidAuctionProvider {
                 // keys like "aps" which belong to their own separate auction provider.
                 let mut bidder: HashMap<String, Json> = HashMap::new();
                 for (name, params) in &slot.bidders {
+                    if name == "aps" {
+                        // Trusted Server APS is a separate OpenRTB provider. Never
+                        // send native APS demand through PBS for the same cohort.
+                        continue;
+                    }
                     if name == TRUSTED_SERVER_BIDDER {
                         bidder.extend(expand_trusted_server_bidders(&self.config.bidders, params));
+                        bidder.remove("aps");
                     } else if self.config.bidders.iter().any(|b| b == name) {
                         bidder.insert(name.clone(), params.clone());
-                    } else if name != "aps" {
-                        // `aps` is intentionally handled by its own provider. Any
-                        // other unrecognized key is likely a misconfiguration (a
+                    } else {
+                        // Any other unrecognized key is likely a misconfiguration (a
                         // slot bidder absent from `config.bidders`) that silently
                         // yields an empty bidder map and a stored-request no-bid —
                         // log it so the drop is diagnosable.
@@ -1905,8 +1910,13 @@ impl PrebidAuctionProvider {
         // not an ad ID, so it is not used as a fallback: surfacing it as `ad_id`
         // (which is exposed raw in the debug bid) would mislead any consumer that
         // treats `ad_id` as a creative identifier. Absent `adid`, `ad_id` is None.
+        let bid_id = bid_obj.get("id").and_then(|v| v.as_str()).map(String::from);
         let ad_id = bid_obj
             .get("adid")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let creative_id = bid_obj
+            .get("crid")
             .and_then(|v| v.as_str())
             .map(String::from);
 
@@ -1973,7 +1983,10 @@ impl PrebidAuctionProvider {
             height,
             nurl,
             burl,
+            bid_id,
             ad_id,
+            creative_id,
+            renderer: None,
             cache_id,
             cache_host,
             cache_path,
@@ -5954,19 +5967,44 @@ set = { placementId = "explicit_header" }
 
     #[test]
     fn to_openrtb_skips_aps_key_from_slot_bidders_in_pbs_request() {
+        let mut config = base_config();
+        config.bidders.push("aps".to_string());
         let slot = make_slot(
             "atf_sidebar_ad",
             HashMap::from([("aps".to_string(), json!({"slotID": "aps-slot-atf-sidebar"}))]),
         );
         let request = make_auction_request(vec![slot]);
 
-        let ortb = call_to_openrtb(base_config(), &request);
+        let ortb = call_to_openrtb(config, &request);
         let ext = ortb.imp[0].ext.as_ref().expect("should have imp ext");
         let prebid = ext.get("prebid").expect("should have prebid in ext");
 
         assert!(
             prebid.get("bidder").is_none(),
             "should not forward aps key into PBS imp.ext.prebid.bidder"
+        );
+    }
+
+    #[test]
+    fn trusted_server_expansion_never_enables_aps_through_pbs() {
+        let mut config = base_config();
+        config.bidders = vec!["kargo".to_string(), "aps".to_string()];
+        let slot = make_ts_slot(
+            "in_content_ad",
+            &json!({
+                "kargo": {"placementId": "client_123"},
+                "aps": {"slotID": "legacy-aps-slot"}
+            }),
+            None,
+        );
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(config, &request);
+        let bidder = &ortb.imp[0].ext.as_ref().expect("should have imp ext")["prebid"]["bidder"];
+        assert_eq!(bidder["kargo"]["placementId"], "client_123");
+        assert!(
+            bidder.get("aps").is_none(),
+            "Trusted Server APS cohorts must not also send APS through PBS"
         );
     }
 
@@ -6218,6 +6256,7 @@ set = { networkId = 42 }
             "id": "bid-impression-id",
             "impid": "atf_sidebar_ad",
             "adid": "bidder-ad-id-abc",
+            "crid": "bidder-creative-id-abc",
             "price": 1.0,
             "w": 300,
             "h": 250,
@@ -6237,9 +6276,19 @@ set = { networkId = 42 }
             .parse_bid(&bid_json, "appnexus")
             .expect("should parse bid");
         assert_eq!(
+            bid.bid_id.as_deref(),
+            Some("bid-impression-id"),
+            "should preserve OpenRTB id separately"
+        );
+        assert_eq!(
             bid.ad_id.as_deref(),
             Some("bidder-ad-id-abc"),
             "should keep ad_id from adid field"
+        );
+        assert_eq!(
+            bid.creative_id.as_deref(),
+            Some("bidder-creative-id-abc"),
+            "should preserve OpenRTB crid separately"
         );
         assert_eq!(
             bid.cache_id.as_deref(),
