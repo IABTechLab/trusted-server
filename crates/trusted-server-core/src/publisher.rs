@@ -3276,8 +3276,17 @@ pub(crate) fn build_bid_map(
                 }
                 // hb_adid: use PBS Cache UUID when present — the Prebid Universal Creative uses
                 // this as the cache lookup key, NOT the OpenRTB bid ID (bid.ad_id). Fall back to
-                // bid.ad_id for APS and other non-PBS providers.
-                let hb_adid = bid.cache_id.as_deref().or(bid.ad_id.as_deref());
+                // bid.ad_id for APS and other non-PBS providers. Typed APS
+                // renderers use their selected bid ID as the Prebid ad ID.
+                let renderer_bid_id = bid
+                    .renderer
+                    .as_ref()
+                    .map(|renderer| renderer.aps().bid_id.as_str());
+                let hb_adid = bid
+                    .cache_id
+                    .as_deref()
+                    .or(renderer_bid_id)
+                    .or(bid.ad_id.as_deref());
                 if let Some(id) = hb_adid {
                     obj.insert(
                         "hb_adid".to_string(),
@@ -3331,6 +3340,12 @@ pub(crate) fn build_bid_map(
                 // empty string for oversized or unparseable markup — in which case
                 // the entry is omitted and the bridge falls back to the PBS Cache
                 // coordinates.
+                if let Some(ref renderer) = bid.renderer {
+                    obj.insert(
+                        "renderer".to_string(),
+                        serde_json::to_value(renderer).expect("should serialize typed renderer"),
+                    );
+                }
                 if let Some(ref raw_creative) = bid.creative {
                     // Resolve ${AUCTION_PRICE} from the exact winning CPM BEFORE
                     // sanitizing, rewriting, and signing — URL rewriting would

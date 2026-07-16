@@ -1,239 +1,162 @@
-//! Amazon Publisher Services (APS/TAM) integration.
-//!
-//! This module provides the APS auction provider for server-side bidding.
+//! Amazon Publisher Services (APS/TAM) `OpenRTB` integration.
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use http::{Method, header};
+use http::{Method, StatusCode, header};
+use serde::de::{self, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
-use std::collections::HashMap;
-use std::time::Duration;
-use validator::Validate;
+use url::Url;
+use validator::{Validate, ValidationError};
 
 use crate::auction::provider::AuctionProvider;
-use crate::auction::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid, MediaType};
+use crate::auction::types::{
+    AdSlot, ApsRendererV1, ApsTagType, AuctionContext, AuctionRequest, AuctionResponse, Bid,
+    BidRenderer, MediaType,
+};
 use crate::error::TrustedServerError;
 use crate::integrations::{
+    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
     UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
     ensure_integration_backend_with_timeout, predict_integration_backend_name,
+};
+use crate::openrtb::{
+    Banner, Device, Format, Geo, Imp, OpenRtbRequest, Publisher, Regs, RegsExt, Site, ToExt, User,
+    UserExt, to_openrtb_i32,
 };
 use crate::platform::{
     PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, RuntimeServices,
 };
+use crate::settings::{IntegrationConfig, Settings};
 
-use crate::settings::IntegrationConfig;
+const APS_INTEGRATION_ID: &str = "aps";
+const APS_RENDERER_ROUTE: &str = "/integrations/aps/renderer";
+const DEFAULT_CURRENCY: &str = "USD";
+const APS_SDK_SOURCE: &str = "prebid";
+const APS_SDK_VERSION: &str = "2.2.0";
+const MAX_ACCOUNT_ID_BYTES: usize = 1024;
+const MAX_CREATIVE_URL_BYTES: usize = 4096;
+const MAX_PAGE_URL_BYTES: usize = 8192;
+const MAX_RENDER_ENVELOPE_BYTES: usize = 256 * 1024;
+const APS_RENDERER_CSP: &str = "default-src 'none'; sandbox allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation; script-src 'unsafe-inline' https:; connect-src https:; frame-src https:; img-src https: data:; media-src https: blob:; style-src 'unsafe-inline' https:; font-src https: data:;";
 
-// ============================================================================
-// APS TAM API Types
-// ============================================================================
-
-/// APS TAM bid request format based on /e/dtb/bid endpoint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ApsBidRequest {
-    /// Publisher ID
-    #[serde(rename = "pubId")]
-    pub_id: String,
-
-    /// Slot configurations
-    slots: Vec<ApsSlot>,
-
-    /// Page URL
-    #[serde(rename = "pageUrl", skip_serializing_if = "Option::is_none")]
-    page_url: Option<String>,
-
-    /// User agent
-    #[serde(rename = "ua", skip_serializing_if = "Option::is_none")]
-    user_agent: Option<String>,
-
-    /// Timeout in milliseconds
-    #[serde(skip_serializing_if = "Option::is_none")]
-    timeout: Option<u32>,
-
-    /// GDPR consent information.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    gdpr: Option<ApsGdprConsent>,
-
-    /// US Privacy (CCPA) string.
-    #[serde(rename = "usPrivacy", skip_serializing_if = "Option::is_none")]
-    us_privacy: Option<String>,
-
-    /// GPP consent string.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    gpp: Option<String>,
-
-    /// GPP section IDs as comma-separated string.
-    #[serde(rename = "gppSid", skip_serializing_if = "Option::is_none")]
-    gpp_sid: Option<String>,
+const APS_RENDERER_DOCUMENT: &str = r#"<!doctype html>
+<meta charset="utf-8">
+<script>
+(function(){
+'use strict';
+var match=/^#tsaps=([A-Za-z0-9_-]{22,128})$/.exec(location.hash);
+var expected=match&&match[1];
+try{history.replaceState(null,'',location.pathname+location.search);}catch(_error){}
+if(!expected)return;
+function keys(value,expectedKeys){
+ if(!value||typeof value!=='object'||Array.isArray(value))return false;
+ var actual=Object.keys(value).sort();
+ return actual.length===expectedKeys.length&&actual.every(function(key,index){return key===expectedKeys[index];});
 }
-
-/// GDPR consent information for APS requests.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ApsGdprConsent {
-    /// Whether GDPR applies to this request.
-    enabled: bool,
-    /// TCF v2 consent string.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    consent: Option<String>,
+function validRenderer(renderer){
+ if(!keys(renderer,['aaxResponse','accountId','bidId','creativeId','creativeUrl','height','tagType','type','version','width'])&&
+    !keys(renderer,['aaxResponse','accountId','bidId','creativeUrl','height','tagType','type','version','width']))return false;
+ if(renderer.type!=='aps'||renderer.version!==1||typeof renderer.accountId!=='string'||!renderer.accountId||new TextEncoder().encode(renderer.accountId).length>1024)return false;
+ if(typeof renderer.bidId!=='string'||!renderer.bidId||!Number.isInteger(renderer.width)||renderer.width<=0||!Number.isInteger(renderer.height)||renderer.height<=0)return false;
+ if(Object.prototype.hasOwnProperty.call(renderer,'creativeId')&&(typeof renderer.creativeId!=='string'||!renderer.creativeId))return false;
+ if(renderer.tagType!=='iframe'&&renderer.tagType!=='script')return false;
+ if(typeof renderer.creativeUrl!=='string'||new TextEncoder().encode(renderer.creativeUrl).length>4096)return false;
+ if(typeof renderer.aaxResponse!=='string'||!renderer.aaxResponse||renderer.aaxResponse.length>349528)return false;
+ try{
+  var url=new URL(renderer.creativeUrl);
+  if(url.protocol!=='https:'||url.username||url.password||url.origin===location.origin)return false;
+  var binary=atob(renderer.aaxResponse);
+  if(binary.length>262144||btoa(binary)!==renderer.aaxResponse)return false;
+  var bytes=Uint8Array.from(binary,function(character){return character.charCodeAt(0);});
+  var decoded=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));
+  if(!keys(decoded,['seatbid'])||!Array.isArray(decoded.seatbid)||decoded.seatbid.length!==1)return false;
+  var seat=decoded.seatbid[0];
+  if(!keys(seat,['bid'])||!Array.isArray(seat.bid)||seat.bid.length!==1)return false;
+  var bid=seat.bid[0];
+  if(!keys(bid,['ext','h','id','price','w'])||!keys(bid.ext,['creativeurl','tagtype']))return false;
+  return bid.id===renderer.bidId&&bid.w===renderer.width&&bid.h===renderer.height&&
+   bid.ext.creativeurl===renderer.creativeUrl&&bid.ext.tagtype===renderer.tagType&&
+   typeof bid.price==='number'&&Number.isFinite(bid.price)&&bid.price>=0;
+ }catch(_error){return false;}
 }
-
-/// APS slot configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ApsSlot {
-    /// Slot identifier
-    #[serde(rename = "slotID")]
-    slot_id: String,
-
-    /// Ad sizes [[width, height], ...]
-    sizes: Vec<[u32; 2]>,
-
-    /// Slot name (optional)
-    #[serde(rename = "slotName", skip_serializing_if = "Option::is_none")]
-    slot_name: Option<String>,
+function receive(event){
+ if(event.source!==parent)return;
+ var message=event.data;
+ if(!keys(message,['nonce','renderer'])||message.nonce!==expected||!validRenderer(message.renderer))return;
+ removeEventListener('message',receive);
+ var acceptedNonce=expected;
+ expected='';
+ var renderer=message.renderer;
+ window._aps=window._aps instanceof Map?window._aps:new Map();
+ var account=window._aps.get(renderer.accountId);
+ if(!account){
+  account={queue:[],store:new Map([['listeners',new Map()]])};
+  window._aps.set(renderer.accountId,account);
+ }
+ account.queue.push(new CustomEvent('prebid/creative/render',{detail:{aaxResponse:renderer.aaxResponse,seatBidId:renderer.bidId}}));
+ var script=document.createElement('script');
+ script.src='https://client.aps.amazon-adsystem.com/prebid-creative.js';
+ script.onload=function(){parent.postMessage({message:'trusted-server/aps/renderer-ready',nonce:acceptedNonce},'*');};
+ script.onerror=function(){parent.postMessage({message:'trusted-server/aps/renderer-failed',nonce:acceptedNonce},'*');};
+ document.head.appendChild(script);
 }
+addEventListener('message',receive);
+})();
+</script>
+"#;
 
-/// APS TAM bid response format matching real Amazon API.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ApsBidResponse {
-    /// Contextual wrapper containing all response data
-    contextual: ApsContextual,
-}
-
-/// APS Contextual response containing slots and metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ApsContextual {
-    /// Array of slot responses (one per requested slot)
-    #[serde(default)]
-    slots: Vec<ApsSlotResponse>,
-
-    /// Event tracking host
-    #[serde(skip_serializing_if = "Option::is_none")]
-    host: Option<String>,
-
-    /// Response status ("ok", "error", etc.)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    status: Option<String>,
-
-    /// Client-side feature enablement flag
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cfe: Option<bool>,
-
-    /// Event tracking enabled
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ev: Option<bool>,
-
-    /// Client feature name (CSM script path)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cfn: Option<String>,
-
-    /// Callback version
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cb: Option<String>,
-
-    /// Campaign tracking URL
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cmp: Option<String>,
-}
-
-/// Individual APS slot response matching real Amazon format.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ApsSlotResponse {
-    /// Slot ID this response is for
-    #[serde(rename = "slotID")]
-    slot_id: String,
-
-    /// Creative size (e.g., "300x250")
-    size: String,
-
-    /// Creative ID
-    #[serde(skip_serializing_if = "Option::is_none")]
-    crid: Option<String>,
-
-    /// Media type ("d" for display, "v" for video)
-    #[serde(rename = "mediaType", skip_serializing_if = "Option::is_none")]
-    media_type: Option<String>,
-
-    /// Fill indicator flag ("1" = filled, "0" = no fill)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    fif: Option<String>,
-
-    /// List of targeting key names that are set on this slot
-    #[serde(default)]
-    targeting: Vec<String>,
-
-    /// List of metadata field names
-    #[serde(default)]
-    meta: Vec<String>,
-
-    // Targeting key-value pairs (returned as flat fields)
-    /// Amazon impression ID (unique identifier for this bid)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    amzniid: Option<String>,
-
-    /// Amazon encoded bid price
-    #[serde(skip_serializing_if = "Option::is_none")]
-    amznbid: Option<String>,
-
-    /// Amazon encoded price (alternative encoding)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    amznp: Option<String>,
-
-    /// Amazon size in `WxH` format (e.g., "300x250")
-    #[serde(skip_serializing_if = "Option::is_none")]
-    amznsz: Option<String>,
-
-    /// Amazon auction context type ("OPEN", "PRIVATE", etc.)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    amznactt: Option<String>,
-}
-
-// ============================================================================
-// Real APS Provider
-// ============================================================================
-
-/// Configuration for APS integration.
+/// Configuration for the APS `OpenRTB` integration.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct ApsConfig {
-    /// Whether APS integration is enabled
+    /// Whether APS integration is enabled.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
-
-    /// APS publisher ID (accepts both string and integer from config)
-    #[serde(deserialize_with = "deserialize_pub_id")]
-    pub pub_id: String,
-
-    /// APS API endpoint
+    /// APS account ID. `pub_id` remains a deserialization alias only.
+    #[serde(alias = "pub_id", deserialize_with = "deserialize_account_id")]
+    pub account_id: String,
+    /// APS `OpenRTB` endpoint.
     #[serde(default = "default_endpoint")]
-    #[validate(url)]
+    #[validate(custom(function = "validate_aps_endpoint"))]
     pub endpoint: String,
-
-    /// Timeout in milliseconds
+    /// Timeout in milliseconds.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u32,
+    /// Whether APS script creatives are eligible before winner selection.
+    #[serde(default)]
+    pub allow_script_creatives: bool,
 }
 
-/// Custom deserializer for `pub_id` that accepts both string and integer
-fn deserialize_pub_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+fn deserialize_account_id<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::de::{self, Visitor};
-    use std::fmt;
+    struct AccountIdVisitor;
 
-    struct PubIdVisitor;
-
-    impl<'de> Visitor<'de> for PubIdVisitor {
+    impl Visitor<'_> for AccountIdVisitor {
         type Value = String;
 
-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-            formatter.write_str("a string or integer for pub_id")
+        fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            formatter.write_str("a non-empty string or integer for account_id")
         }
 
         fn visit_str<E>(self, value: &str) -> Result<String, E>
         where
             E: de::Error,
         {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(E::custom("account_id must not be empty"));
+            }
+            if value.len() > MAX_ACCOUNT_ID_BYTES {
+                return Err(E::custom("account_id is too large"));
+            }
             Ok(value.to_string())
         }
 
@@ -241,7 +164,7 @@ where
         where
             E: de::Error,
         {
-            Ok(value)
+            self.visit_str(&value)
         }
 
         fn visit_i64<E>(self, value: i64) -> Result<String, E>
@@ -259,7 +182,19 @@ where
         }
     }
 
-    deserializer.deserialize_any(PubIdVisitor)
+    deserializer.deserialize_any(AccountIdVisitor)
+}
+
+fn validate_aps_endpoint(value: &str) -> Result<(), ValidationError> {
+    let parsed = Url::parse(value).map_err(|_| ValidationError::new("invalid_aps_endpoint"))?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(ValidationError::new("invalid_aps_endpoint"));
+    }
+    Ok(())
 }
 
 fn default_enabled() -> bool {
@@ -267,7 +202,7 @@ fn default_enabled() -> bool {
 }
 
 fn default_endpoint() -> String {
-    "https://aax.amazon-adsystem.com/e/dtb/bid".to_string()
+    "https://web.ads.aps.amazon-adsystem.com/e/pb/bid".to_string()
 }
 
 fn default_timeout_ms() -> u32 {
@@ -277,10 +212,11 @@ fn default_timeout_ms() -> u32 {
 impl Default for ApsConfig {
     fn default() -> Self {
         Self {
-            enabled: default_enabled(),
-            pub_id: String::new(),
+            enabled: false,
+            account_id: String::new(),
             endpoint: default_endpoint(),
             timeout_ms: default_timeout_ms(),
+            allow_script_creatives: false,
         }
     }
 }
@@ -291,314 +227,548 @@ impl IntegrationConfig for ApsConfig {
     }
 }
 
-/// Amazon APS auction provider.
+#[derive(Debug, Serialize)]
+struct ApsRequestExt<'a> {
+    account: &'a str,
+    sdk: ApsSdkExt,
+}
+
+impl ToExt for ApsRequestExt<'_> {}
+
+#[derive(Debug, Serialize)]
+struct ApsSdkExt {
+    source: &'static str,
+    version: &'static str,
+}
+
+struct ApsRendererInput<'a> {
+    bid_id: &'a str,
+    creative_id: Option<String>,
+    tag_type: ApsTagType,
+    creative_url: &'a str,
+    price: f64,
+    width: u32,
+    height: u32,
+}
+
+/// APS `OpenRTB` auction provider.
 pub struct ApsAuctionProvider {
     config: ApsConfig,
 }
 
 impl ApsAuctionProvider {
-    /// Create a new APS auction provider.
+    /// Create an APS provider from validated configuration.
     #[must_use]
     pub fn new(config: ApsConfig) -> Self {
         Self { config }
     }
 
-    /// Resolve the APS-specific slot ID for a slot.
-    ///
-    /// Uses the APS slot ID from `[slot.providers.aps]` if configured; falls
-    /// back to the creative-opportunity slot ID otherwise.
-    fn aps_slot_id(slot: &crate::auction::types::AdSlot) -> String {
-        slot.bidders
-            .get("aps")
-            .and_then(|p| p.get("slotID"))
-            .and_then(|v| v.as_str())
-            .unwrap_or(&slot.id)
-            .to_string()
-    }
-
-    /// Build the APS slot ID → creative-opportunity slot ID map for `request`.
-    ///
-    /// Derived from the [`AuctionRequest`] on every call so the mapping stays
-    /// request-scoped: the provider instance is shared across concurrent
-    /// auctions on non-Fastly adapters, and instance state would let
-    /// overlapping auctions overwrite or consume each other's maps.
-    fn build_slot_id_map(request: &AuctionRequest) -> HashMap<String, String> {
-        let mut slot_id_map: HashMap<String, String> = HashMap::new();
-        for slot in &request.slots {
-            let aps_slot_id = Self::aps_slot_id(slot);
-            // Last-write-wins: two slots configuring the same
-            // `[bidders.aps].slotID` would remap one slot's bids to the
-            // wrong creative slot. Log the collision so a misconfiguration
-            // is diagnosable, mirroring the build_bid_index collision log.
-            if let Some(previous_slot_id) = slot_id_map.insert(aps_slot_id.clone(), slot.id.clone())
-            {
-                log::debug!(
-                    "APS slot ID '{aps_slot_id}' maps to multiple creative slots \
-                     ('{previous_slot_id}' overwritten by '{}'); bids for this APS \
-                     slot will resolve to the last one",
-                    slot.id,
-                );
-            }
-        }
-        slot_id_map
-    }
-
-    /// Convert unified `AuctionRequest` to APS TAM bid request format.
-    ///
-    /// Populates consent fields (GDPR, US Privacy, GPP) from the
-    /// [`ConsentContext`](crate::consent::ConsentContext) attached to the request.
-    ///
-    /// `timeout_ms` is the effective auction budget for this provider (already
-    /// capped by the orchestrator) — advertised to APS so it never expects more
-    /// time than the edge will actually wait.
-    fn to_aps_request(&self, request: &AuctionRequest, timeout_ms: u32) -> ApsBidRequest {
-        let slots: Vec<ApsSlot> = request
-            .slots
-            .iter()
-            .map(|slot| {
-                let aps_slot_id = Self::aps_slot_id(slot);
-
-                // Extract sizes from banner formats
-                let sizes: Vec<[u32; 2]> = slot
-                    .formats
-                    .iter()
-                    .filter(|f| f.media_type == MediaType::Banner)
-                    .map(|f| [f.width, f.height])
-                    .collect();
-
-                ApsSlot {
-                    slot_id: aps_slot_id,
-                    sizes,
-                    slot_name: Some(slot.id.clone()),
-                }
-            })
-            .collect();
-
-        // Build consent fields from ConsentContext
-        let consent_ctx = request.user.consent.as_ref();
-        let gdpr = consent_ctx.map(|ctx| ApsGdprConsent {
-            enabled: ctx.gdpr_applies,
-            consent: ctx.raw_tc_string.clone(),
-        });
-        let us_privacy = consent_ctx.and_then(|ctx| ctx.raw_us_privacy.clone());
-        let gpp = consent_ctx.and_then(|ctx| ctx.raw_gpp_string.clone());
-        let gpp_sid = consent_ctx.and_then(|ctx| {
-            ctx.gpp_section_ids.as_ref().map(|ids| {
-                ids.iter()
-                    .map(std::string::ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",")
-            })
-        });
-
-        ApsBidRequest {
-            pub_id: self.config.pub_id.clone(),
-            slots,
-            page_url: request.publisher.page_url.clone(),
-            user_agent: request.device.as_ref().and_then(|d| d.user_agent.clone()),
-            timeout: Some(timeout_ms),
-            gdpr,
-            us_privacy,
-            gpp,
-            gpp_sid,
-        }
-    }
-
-    /// Parse size string (e.g., "300x250") into width and height.
-    fn parse_size(size: &str) -> Option<(u32, u32)> {
-        let parts: Vec<&str> = size.split('x').collect();
-        if parts.len() == 2
-            && let (Ok(w), Ok(h)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>())
-        {
-            return Some((w, h));
-        }
-        None
-    }
-
-    /// Parse a single APS slot response into unified Bid format.
-    ///
-    /// Note: Price is NOT decoded here. The encoded price is stored in metadata
-    /// and will be decoded by the mediation layer (mocktioneer). This simulates
-    /// real-world APS where only Amazon/GAM can decode the proprietary price encoding.
-    fn parse_aps_slot(&self, slot: &ApsSlotResponse) -> Result<Bid, ()> {
-        // Only process filled slots (fif == "1")
-        if slot.fif.as_deref() != Some("1") {
-            return Err(());
-        }
-
-        // Verify we have an encoded price field
-        let encoded_price = slot.amznbid.as_ref().or(slot.amznp.as_ref());
-        if encoded_price.is_none() {
-            log::debug!(
-                "APS: slot '{}' has no encoded price, skipping",
-                slot.slot_id
-            );
-            return Err(());
-        }
-
-        // Parse size from "WxH" format
-        let (width, height) = match Self::parse_size(&slot.size) {
-            Some(dims) => dims,
-            None => {
-                log::debug!(
-                    "APS: slot '{}' has malformed size '{}', skipping",
-                    slot.slot_id,
-                    slot.size
-                );
-                return Err(());
-            }
+    fn build_regs(consent: Option<&crate::consent::ConsentContext>) -> Option<Regs> {
+        let consent = consent?;
+        let ext = RegsExt {
+            gdpr: Some(u8::from(consent.gdpr_applies)),
+            us_privacy: consent.raw_us_privacy.clone(),
+            gpp: consent.raw_gpp_string.clone(),
+            gpp_sid: consent.gpp_section_ids.clone(),
         };
-
-        // Build metadata from targeting keys - includes encoded price for mediation
-        let mut metadata = HashMap::new();
-        if let Some(ref amzniid) = slot.amzniid {
-            metadata.insert("amzniid".to_string(), json!(amzniid));
-        }
-        if let Some(ref amznbid) = slot.amznbid {
-            metadata.insert("amznbid".to_string(), json!(amznbid));
-        }
-        if let Some(ref amznp) = slot.amznp {
-            metadata.insert("amznp".to_string(), json!(amznp));
-        }
-        if let Some(ref amznsz) = slot.amznsz {
-            metadata.insert("amznsz".to_string(), json!(amznsz));
-        }
-        if let Some(ref amznactt) = slot.amznactt {
-            metadata.insert("amznactt".to_string(), json!(amznactt));
-        }
-
-        // APS doesn't return creative HTML - only targeting keys
-        // The creative will be generated by the mediation layer
-        // Price is None - will be decoded by mediation layer from amznbid metadata
-        Ok(Bid {
-            slot_id: slot.slot_id.clone(),
-            price: None, // Encoded price in metadata, decoded by mediation
-            currency: "USD".to_string(),
-            creative: None,
-            adomain: None, // APS doesn't provide adomain in response
-            bidder: "amazon-aps".to_string(),
-            width,
-            height,
-            nurl: None, // Real APS uses client-side event tracking
-            burl: None,
-            ad_id: None,
-            cache_id: None,
-            cache_host: None,
-            cache_path: None,
-            metadata,
+        Some(Regs {
+            coppa: None,
+            gdpr: Some(consent.gdpr_applies),
+            us_privacy: ext.us_privacy.clone(),
+            gpp: ext.gpp.clone(),
+            gpp_sid: ext
+                .gpp_sid
+                .as_ref()
+                .map(|ids| ids.iter().map(|id| i32::from(*id)).collect())
+                .unwrap_or_default(),
+            ext: ext.to_ext(),
         })
     }
 
-    /// Parse APS TAM response into unified `AuctionResponse`.
-    ///
-    /// `slot_map` is the request-scoped APS slot ID → creative-opportunity
-    /// slot ID mapping built by [`Self::build_slot_id_map`].
-    fn parse_aps_response(
-        &self,
-        json: &Json,
-        response_time_ms: u64,
-        slot_map: &HashMap<String, String>,
-    ) -> AuctionResponse {
-        let mut bids = Vec::new();
+    fn request_language(context: &AuctionContext<'_>) -> Option<String> {
+        context
+            .request
+            .headers()
+            .get(header::ACCEPT_LANGUAGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(',').next())
+            .and_then(|value| value.split(';').next())
+            .and_then(|value| value.split('-').next())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    }
 
-        // Try to parse as ApsBidResponse with contextual wrapper
-        if let Ok(aps_response) = serde_json::from_value::<ApsBidResponse>(json.clone()) {
-            log::debug!(
-                "APS: parsed contextual response with {} slots",
-                aps_response.contextual.slots.len()
-            );
+    fn request_dnt(context: &AuctionContext<'_>) -> Option<bool> {
+        context
+            .request
+            .headers()
+            .get("DNT")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.trim() == "1")
+            .then_some(true)
+    }
 
-            for slot in aps_response.contextual.slots {
-                match self.parse_aps_slot(&slot) {
-                    Ok(mut bid) => {
-                        // Remap APS slot ID (e.g. "aps-slot-atf-sidebar") back to the
-                        // creative-opportunity slot ID (e.g. "atf_sidebar_ad") so the
-                        // mediator and bid_map can match by creative slot ID.
-                        if let Some(creative_id) = slot_map.get(&bid.slot_id) {
-                            bid.slot_id = creative_id.clone();
-                        }
-                        let encoded_price = bid
-                            .metadata
-                            .get("amznbid")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
-                        log::debug!(
-                            "APS: parsed bid for slot '{}' with encoded price (to be decoded by mediation)",
-                            bid.slot_id,
-                        );
-                        log::trace!(
-                            "APS: slot '{}' encoded price: {}",
-                            bid.slot_id,
-                            encoded_price
-                        );
-                        bids.push(bid);
-                    }
-                    Err(_) => {
-                        log::debug!("APS: skipped slot (no fill or invalid)");
-                    }
-                }
-            }
-        } else {
-            log::warn!("APS: failed to parse response as contextual format");
+    fn valid_http_url(value: &str) -> Option<String> {
+        if value.len() > MAX_PAGE_URL_BYTES {
+            return None;
         }
+        let parsed = Url::parse(value).ok()?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            return None;
+        }
+        Some(parsed.to_string())
+    }
 
-        if bids.is_empty() {
-            AuctionResponse::no_bid("aps", response_time_ms)
-        } else {
-            AuctionResponse::success("aps", bids, response_time_ms)
+    fn build_openrtb_request(
+        &self,
+        request: &AuctionRequest,
+        context: &AuctionContext<'_>,
+    ) -> OpenRtbRequest {
+        let imp = request
+            .slots
+            .iter()
+            .filter_map(|slot| {
+                let slot_context = format!("slot '{}'", slot.id);
+                let formats: Vec<Format> = slot
+                    .formats
+                    .iter()
+                    .filter(|format| format.media_type == MediaType::Banner)
+                    .filter_map(|format| {
+                        Some(Format {
+                            w: to_openrtb_i32(format.width, "format.w", &slot_context),
+                            h: to_openrtb_i32(format.height, "format.h", &slot_context),
+                            ..Default::default()
+                        })
+                        .filter(|format| format.w.is_some() && format.h.is_some())
+                    })
+                    .collect();
+                let first = formats.first()?;
+                Some(Imp {
+                    id: Some(slot.id.clone()),
+                    banner: Some(Banner {
+                        format: formats.clone(),
+                        w: first.w,
+                        h: first.h,
+                        topframe: Some(false),
+                        ..Default::default()
+                    }),
+                    bidfloor: slot.floor_price,
+                    bidfloorcur: slot.floor_price.map(|_| DEFAULT_CURRENCY.to_string()),
+                    secure: Some(true),
+                    ..Default::default()
+                })
+            })
+            .collect();
+
+        let consent = request.user.consent.as_ref();
+        let raw_tc = consent.and_then(|value| value.raw_tc_string.clone());
+        let user = Some(User {
+            id: request.user.id.clone(),
+            consent: raw_tc.clone(),
+            ext: UserExt {
+                consent: raw_tc,
+                consented_providers_settings: None,
+                eids: request.user.eids.clone(),
+            }
+            .to_ext(),
+            ..Default::default()
+        });
+
+        let language = Self::request_language(context);
+        let dnt = Self::request_dnt(context);
+        let device = request
+            .device
+            .as_ref()
+            .map(|device| Device {
+                ua: device.user_agent.clone(),
+                ip: device.ip.clone(),
+                geo: device.geo.as_ref().map(|geo| Geo {
+                    country: Some(geo.country.clone()),
+                    region: geo.region.clone(),
+                    city: Some(geo.city.clone()),
+                    metro: (geo.metro_code > 0).then(|| geo.metro_code.to_string()),
+                    r#type: Some(2),
+                    ..Default::default()
+                }),
+                dnt,
+                language: language.clone(),
+                ..Default::default()
+            })
+            .or_else(|| {
+                (dnt.is_some() || language.is_some()).then_some(Device {
+                    dnt,
+                    language,
+                    ..Default::default()
+                })
+            });
+
+        let page = request
+            .publisher
+            .page_url
+            .as_deref()
+            .and_then(Self::valid_http_url)
+            .unwrap_or_else(|| format!("https://{}", request.publisher.domain));
+        let referer = context
+            .request
+            .headers()
+            .get(header::REFERER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(Self::valid_http_url)
+            .filter(|value| value != &page);
+
+        OpenRtbRequest {
+            id: Some(request.id.clone()),
+            imp,
+            site: Some(Site {
+                domain: Some(request.publisher.domain.clone()),
+                page: Some(page),
+                r#ref: referer,
+                publisher: Some(Publisher {
+                    domain: Some(request.publisher.domain.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            user,
+            device,
+            regs: Self::build_regs(consent),
+            tmax: to_openrtb_i32(context.timeout_ms, "tmax", "APS request"),
+            cur: vec![DEFAULT_CURRENCY.to_string()],
+            ext: ApsRequestExt {
+                account: &self.config.account_id,
+                sdk: ApsSdkExt {
+                    source: APS_SDK_SOURCE,
+                    version: APS_SDK_VERSION,
+                },
+            }
+            .to_ext(),
+            ..Default::default()
         }
     }
 
-    /// Shared parse path for both trait entry points.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the response body cannot be read or is not valid JSON.
+    fn compatible_dimensions(slot: &AdSlot, width: u32, height: u32) -> bool {
+        width > 0
+            && height > 0
+            && slot.formats.iter().any(|format| {
+                format.media_type == MediaType::Banner
+                    && format.width == width
+                    && format.height == height
+            })
+    }
+
+    fn valid_creative_url(&self, value: &str, publisher_domain: &str) -> bool {
+        if value.len() > MAX_CREATIVE_URL_BYTES {
+            return false;
+        }
+        let Ok(parsed) = Url::parse(value) else {
+            return false;
+        };
+        parsed.scheme() == "https"
+            && parsed
+                .host_str()
+                .is_some_and(|host| !host.eq_ignore_ascii_case(publisher_domain))
+            && parsed.username().is_empty()
+            && parsed.password().is_none()
+    }
+
+    fn build_renderer(&self, input: ApsRendererInput<'_>) -> Option<BidRenderer> {
+        let tag_type_value = match input.tag_type {
+            ApsTagType::Iframe => "iframe",
+            ApsTagType::Script => "script",
+        };
+        let envelope = json!({
+            "seatbid": [{
+                "bid": [{
+                    "id": input.bid_id,
+                    "price": input.price,
+                    "w": input.width,
+                    "h": input.height,
+                    "ext": {
+                        "creativeurl": input.creative_url,
+                        "tagtype": tag_type_value
+                    }
+                }]
+            }]
+        });
+        let serialized = serde_json::to_vec(&envelope).ok()?;
+        if serialized.len() > MAX_RENDER_ENVELOPE_BYTES {
+            return None;
+        }
+        Some(BidRenderer::Aps(ApsRendererV1 {
+            version: 1,
+            account_id: self.config.account_id.clone(),
+            bid_id: input.bid_id.to_string(),
+            creative_id: input.creative_id,
+            tag_type: input.tag_type,
+            creative_url: input.creative_url.to_string(),
+            aax_response: BASE64_STANDARD.encode(serialized),
+            width: input.width,
+            height: input.height,
+        }))
+    }
+
+    fn increment_reason(reasons: &mut BTreeMap<String, u64>, reason: &'static str) {
+        *reasons.entry(reason.to_string()).or_default() += 1;
+    }
+
+    fn parse_bid(
+        &self,
+        value: &Json,
+        slots: &HashMap<&str, &AdSlot>,
+        publisher_domain: &str,
+    ) -> Result<Bid, &'static str> {
+        let bid_id = value
+            .get("id")
+            .and_then(Json::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or("missing_render_source")?;
+        let slot_id = value
+            .get("impid")
+            .and_then(Json::as_str)
+            .ok_or("unknown_impid")?;
+        let slot = slots.get(slot_id).ok_or("unknown_impid")?;
+        let price = value
+            .get("price")
+            .and_then(Json::as_f64)
+            .filter(|price| price.is_finite() && *price >= 0.0)
+            .ok_or("invalid_price")?;
+        if value
+            .get("mtype")
+            .is_some_and(|mtype| mtype.as_i64() != Some(1))
+        {
+            return Err("unsupported_media_type");
+        }
+        let width = value
+            .get("w")
+            .and_then(Json::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or("invalid_dimensions")?;
+        let height = value
+            .get("h")
+            .and_then(Json::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or("invalid_dimensions")?;
+        if !Self::compatible_dimensions(slot, width, height) {
+            return Err("invalid_dimensions");
+        }
+        let ext = value
+            .get("ext")
+            .and_then(Json::as_object)
+            .ok_or("missing_render_source")?;
+        let creative_url = ext
+            .get("creativeurl")
+            .and_then(Json::as_str)
+            .ok_or("missing_render_source")?;
+        if !self.valid_creative_url(creative_url, publisher_domain) {
+            return Err("invalid_creative_url");
+        }
+        let tag_type = match ext.get("tagtype").and_then(Json::as_str) {
+            Some("iframe") => ApsTagType::Iframe,
+            Some("script") if self.config.allow_script_creatives => ApsTagType::Script,
+            Some("script") => return Err("script_rendering_disabled"),
+            _ => return Err("unsupported_tagtype"),
+        };
+        let creative_id = value
+            .get("crid")
+            .and_then(Json::as_str)
+            .filter(|creative_id| !creative_id.is_empty())
+            .map(str::to_string);
+        let renderer = self
+            .build_renderer(ApsRendererInput {
+                bid_id,
+                creative_id: creative_id.clone(),
+                tag_type,
+                creative_url,
+                price,
+                width,
+                height,
+            })
+            .ok_or("render_payload_too_large")?;
+        let adomain = value
+            .get("adomain")
+            .and_then(Json::as_array)
+            .map(|domains| {
+                domains
+                    .iter()
+                    .filter_map(Json::as_str)
+                    .map(str::to_string)
+                    .collect()
+            });
+
+        Ok(Bid {
+            slot_id: slot_id.to_string(),
+            price: Some(price),
+            currency: DEFAULT_CURRENCY.to_string(),
+            creative: None,
+            adomain,
+            bidder: APS_INTEGRATION_ID.to_string(),
+            width,
+            height,
+            nurl: None,
+            burl: None,
+            bid_id: Some(bid_id.to_string()),
+            ad_id: value.get("adid").and_then(Json::as_str).map(str::to_string),
+            creative_id,
+            renderer: Some(renderer),
+            cache_id: None,
+            cache_host: None,
+            cache_path: None,
+            metadata: HashMap::new(),
+        })
+    }
+
+    fn parse_aps_response(
+        &self,
+        value: &Json,
+        response_time_ms: u64,
+        request: &AuctionRequest,
+    ) -> AuctionResponse {
+        if !value.is_object()
+            || value.get("contextual").is_some()
+            || value
+                .get("cur")
+                .is_some_and(|currency| !currency.is_string())
+            || value
+                .get("seatbid")
+                .is_some_and(|seatbids| !seatbids.is_array())
+        {
+            return AuctionResponse::error(APS_INTEGRATION_ID, response_time_ms)
+                .with_metadata("drop_reasons", json!({"unexpected_response_shape": 1}));
+        }
+        if value
+            .get("cur")
+            .and_then(Json::as_str)
+            .is_some_and(|currency| !currency.eq_ignore_ascii_case(DEFAULT_CURRENCY))
+        {
+            return AuctionResponse::no_bid(APS_INTEGRATION_ID, response_time_ms)
+                .with_metadata("drop_reasons", json!({"unsupported_currency": 1}));
+        }
+
+        let slots: HashMap<&str, &AdSlot> = request
+            .slots
+            .iter()
+            .map(|slot| (slot.id.as_str(), slot))
+            .collect();
+        let seatbids = value.get("seatbid").and_then(Json::as_array);
+        let seatbid_count = seatbids.map_or(0, Vec::len);
+        let mut reasons = BTreeMap::new();
+        let mut selected: HashMap<String, Bid> = HashMap::new();
+        let mut dropped = 0_u64;
+
+        for seatbid in seatbids.into_iter().flatten() {
+            let Some(bids) = seatbid.get("bid").and_then(Json::as_array) else {
+                continue;
+            };
+            for value in bids {
+                match self.parse_bid(value, &slots, &request.publisher.domain) {
+                    Ok(candidate) => {
+                        let replace = selected.get(&candidate.slot_id).is_none_or(|current| {
+                            let candidate_price = candidate.price.unwrap_or_default();
+                            let current_price = current.price.unwrap_or_default();
+                            candidate_price > current_price
+                                || (candidate_price == current_price
+                                    && candidate.bid_id.as_deref().unwrap_or_default()
+                                        < current.bid_id.as_deref().unwrap_or_default())
+                        });
+                        if replace {
+                            if selected
+                                .insert(candidate.slot_id.clone(), candidate)
+                                .is_some()
+                            {
+                                dropped += 1;
+                            }
+                        } else {
+                            dropped += 1;
+                        }
+                    }
+                    Err(reason) => {
+                        dropped += 1;
+                        Self::increment_reason(&mut reasons, reason);
+                    }
+                }
+            }
+        }
+
+        if seatbid_count == 0 {
+            Self::increment_reason(&mut reasons, "empty_seatbid");
+        }
+        let accepted = selected.len();
+        let metadata = [
+            ("seatbid_count".to_string(), json!(seatbid_count)),
+            ("accepted_bid_count".to_string(), json!(accepted)),
+            ("dropped_bid_count".to_string(), json!(dropped)),
+            ("drop_reasons".to_string(), json!(reasons)),
+        ];
+        let mut response = if selected.is_empty() {
+            AuctionResponse::no_bid(APS_INTEGRATION_ID, response_time_ms)
+        } else {
+            AuctionResponse::success(
+                APS_INTEGRATION_ID,
+                selected.into_values().collect(),
+                response_time_ms,
+            )
+        };
+        response.metadata.extend(metadata);
+        response
+    }
+
     async fn parse_response_inner(
         &self,
         response: PlatformResponse,
         response_time_ms: u64,
-        slot_map: &HashMap<String, String>,
+        request: Option<&AuctionRequest>,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
         let response = response.response;
-
-        // Check status code
-        if !response.status().is_success() {
-            log::warn!("APS returned non-success status: {}", response.status());
-            return Ok(AuctionResponse::error("aps", response_time_ms));
+        if response.status() == StatusCode::NO_CONTENT {
+            return Ok(AuctionResponse::no_bid(
+                APS_INTEGRATION_ID,
+                response_time_ms,
+            ));
         }
-
-        // Parse response body — collect_response_bounded caps memory from misbehaving providers.
-        let body_bytes =
-            collect_response_bounded(response.into_body(), UPSTREAM_RTB_MAX_RESPONSE_BYTES, "aps")
-                .await
-                .change_context(TrustedServerError::Auction {
-                    message: "Failed to read APS response body".to_string(),
-                })?;
-        let response_json: Json =
-            serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Auction {
-                message: "Failed to parse APS response JSON".to_string(),
-            })?;
-
-        log::trace!("APS: received response: {:?}", response_json);
-
-        // Transform to unified format
-        let auction_response = self.parse_aps_response(&response_json, response_time_ms, slot_map);
-
+        if !response.status().is_success() {
+            log::warn!("APS returns a non-success status");
+            return Ok(AuctionResponse::error(APS_INTEGRATION_ID, response_time_ms));
+        }
+        let body = collect_response_bounded(
+            response.into_body(),
+            UPSTREAM_RTB_MAX_RESPONSE_BYTES,
+            APS_INTEGRATION_ID,
+        )
+        .await
+        .change_context(TrustedServerError::Auction {
+            message: "Failed to read APS response body".to_string(),
+        })?;
+        log::trace!("APS response body: {}", String::from_utf8_lossy(&body));
+        let value: Json = match serde_json::from_slice(&body) {
+            Ok(value) => value,
+            Err(error) => {
+                log::warn!("Failed to parse APS response JSON: {error}");
+                return Ok(AuctionResponse::error(APS_INTEGRATION_ID, response_time_ms)
+                    .with_metadata("drop_reasons", json!({"unexpected_response_shape": 1})));
+            }
+        };
+        let Some(request) = request else {
+            return Ok(AuctionResponse::error(APS_INTEGRATION_ID, response_time_ms));
+        };
+        let parsed = self.parse_aps_response(&value, response_time_ms, request);
         log::info!(
-            "APS returned {} bids in {}ms",
-            auction_response.bids.len(),
+            "APS returns {} accepted bids in {}ms",
+            parsed.bids.len(),
             response_time_ms
         );
-
-        Ok(auction_response)
+        Ok(parsed)
     }
 }
 
 #[async_trait(?Send)]
 impl AuctionProvider for ApsAuctionProvider {
     fn provider_name(&self) -> &'static str {
-        "aps"
+        APS_INTEGRATION_ID
     }
 
     async fn request_bids(
@@ -606,67 +776,42 @@ impl AuctionProvider for ApsAuctionProvider {
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
     ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
-        log::info!(
-            "APS: requesting bids for {} slots (pub_id: {})",
-            request.slots.len(),
-            self.config.pub_id
-        );
-
-        // Transform to APS format. `context.timeout_ms` is the effective budget
-        // the orchestrator granted this provider — the payload must advertise
-        // the same deadline the edge backend enforces below. The APS-slot-ID →
-        // creative-slot-ID remapping is rebuilt from the request in
-        // `parse_response_with_context`, keeping it request-scoped.
-        let aps_request = self.to_aps_request(request, context.timeout_ms);
-
-        // Serialize to JSON
-        let aps_json =
-            serde_json::to_value(&aps_request).change_context(TrustedServerError::Auction {
-                message: "Failed to serialize APS bid request".to_string(),
-            })?;
-
-        log::trace!("APS: sending bid request: {:?}", aps_json);
-
-        // Create HTTP POST request
-        let aps_body =
-            serde_json::to_vec(&aps_json).change_context(TrustedServerError::Auction {
-                message: "Failed to serialize APS request body".to_string(),
-            })?;
-        let aps_req = http::Request::builder()
+        let openrtb = self.build_openrtb_request(request, context);
+        if openrtb.imp.is_empty() {
+            return Err(Report::new(TrustedServerError::Auction {
+                message: "No valid APS impressions after filtering".to_string(),
+            }));
+        }
+        log::info!("APS requests bids for {} impressions", openrtb.imp.len());
+        log::trace!("APS request body: {openrtb:?}");
+        let body = serde_json::to_vec(&openrtb).change_context(TrustedServerError::Auction {
+            message: "Failed to serialize APS OpenRTB request".to_string(),
+        })?;
+        let request = http::Request::builder()
             .method(Method::POST)
             .uri(&self.config.endpoint)
             .header(header::CONTENT_TYPE, "application/json")
-            .body(EdgeBody::from(aps_body))
+            .body(EdgeBody::from(body))
             .change_context(TrustedServerError::Auction {
                 message: "Failed to build APS request".to_string(),
             })?;
-
-        // Uses context.timeout_ms (auction-scoped) rather than the 15 s fixed
-        // timeout in ensure_integration_backend, which is for proxy endpoints.
-        // Send request asynchronously with auction-scoped timeout
-        let backend_name = ensure_integration_backend_with_timeout(
+        let backend = ensure_integration_backend_with_timeout(
             context.services,
             &self.config.endpoint,
-            "aps",
+            APS_INTEGRATION_ID,
             Duration::from_millis(u64::from(context.timeout_ms)),
         )
         .change_context(TrustedServerError::Auction {
-            message: format!(
-                "Failed to resolve backend for APS endpoint: {}",
-                self.config.endpoint
-            ),
+            message: "Failed to resolve APS backend".to_string(),
         })?;
-
-        let pending = context
+        context
             .services
             .http_client()
-            .send_async(PlatformHttpRequest::new(aps_req, backend_name))
+            .send_async(PlatformHttpRequest::new(request, backend))
             .await
             .change_context(TrustedServerError::Auction {
-                message: "Failed to send async request to APS".to_string(),
-            })?;
-
-        Ok(pending)
+                message: "Failed to send APS request".to_string(),
+            })
     }
 
     async fn parse_response(
@@ -674,11 +819,7 @@ impl AuctionProvider for ApsAuctionProvider {
         response: PlatformResponse,
         response_time_ms: u64,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-        // No auction request available — bids keep their raw APS slot IDs. The
-        // orchestrator always calls [`Self::parse_response_with_context`], so
-        // this path only serves callers outside the orchestration flow.
-        log::debug!("APS: parsing without request context — slot ID remapping unavailable");
-        self.parse_response_inner(response, response_time_ms, &HashMap::new())
+        self.parse_response_inner(response, response_time_ms, None)
             .await
     }
 
@@ -689,17 +830,12 @@ impl AuctionProvider for ApsAuctionProvider {
         request: &AuctionRequest,
         _context: &AuctionContext<'_>,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-        // Rebuild the APS-slot-ID → creative-slot-ID map from the auction
-        // request so overlapping auctions on shared provider instances cannot
-        // overwrite or consume each other's mappings.
-        let slot_map = Self::build_slot_id_map(request);
-        self.parse_response_inner(response, response_time_ms, &slot_map)
+        self.parse_response_inner(response, response_time_ms, Some(request))
             .await
     }
 
     fn supports_media_type(&self, media_type: &MediaType) -> bool {
-        // APS supports banner and video formats
-        matches!(media_type, MediaType::Banner | MediaType::Video)
+        matches!(media_type, MediaType::Banner)
     }
 
     fn timeout_ms(&self) -> u32 {
@@ -714,717 +850,671 @@ impl AuctionProvider for ApsAuctionProvider {
         predict_integration_backend_name(
             services,
             &self.config.endpoint,
-            "aps",
+            APS_INTEGRATION_ID,
             Duration::from_millis(u64::from(timeout_ms)),
         )
-        .inspect_err(|e| {
-            log::error!(
-                "Failed to predict backend name for APS endpoint '{}': {e:?}",
-                self.config.endpoint
-            );
-        })
+        .inspect_err(|error| log::error!("Failed to predict APS backend name: {error:?}"))
         .ok()
     }
 }
 
-// ============================================================================
-// Provider Auto-Registration
-// ============================================================================
+#[derive(Debug)]
+struct ApsRendererIntegration;
 
-use crate::settings::Settings;
-use std::sync::Arc;
+#[async_trait(?Send)]
+impl IntegrationProxy for ApsRendererIntegration {
+    fn integration_name(&self) -> &'static str {
+        APS_INTEGRATION_ID
+    }
 
-/// Auto-register APS provider based on settings configuration.
-///
-/// Returns the APS provider if enabled in settings.
+    fn routes(&self) -> Vec<IntegrationEndpoint> {
+        vec![IntegrationEndpoint::get(APS_RENDERER_ROUTE)]
+    }
+
+    async fn handle(
+        &self,
+        _settings: &Settings,
+        _services: &RuntimeServices,
+        request: http::Request<EdgeBody>,
+    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+        if request.method() != Method::GET || request.uri().path() != APS_RENDERER_ROUTE {
+            return http::Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(EdgeBody::from("Not Found"))
+                .change_context(TrustedServerError::Integration {
+                    integration: APS_INTEGRATION_ID.to_string(),
+                    message: "Failed to build APS not-found response".to_string(),
+                });
+        }
+        http::Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .header("x-content-type-options", "nosniff")
+            .header("referrer-policy", "no-referrer")
+            .header(header::CONTENT_SECURITY_POLICY, APS_RENDERER_CSP)
+            .body(EdgeBody::from(APS_RENDERER_DOCUMENT))
+            .change_context(TrustedServerError::Integration {
+                integration: APS_INTEGRATION_ID.to_string(),
+                message: "Failed to build APS renderer response".to_string(),
+            })
+    }
+}
+
+/// Register the APS static renderer endpoint when APS is enabled.
 ///
 /// # Errors
 ///
-/// Returns an error when the APS provider is enabled with invalid
-/// configuration.
+/// Returns an error when enabled APS configuration is invalid.
+pub fn register(
+    settings: &Settings,
+) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+    let Some(_config) = settings.integration_config::<ApsConfig>(APS_INTEGRATION_ID)? else {
+        return Ok(None);
+    };
+    let integration = Arc::new(ApsRendererIntegration);
+    Ok(Some(
+        IntegrationRegistration::builder(APS_INTEGRATION_ID)
+            .with_proxy(integration)
+            .without_js()
+            .build(),
+    ))
+}
+
+/// Register the APS auction provider when enabled.
+///
+/// # Errors
+///
+/// Returns an error when enabled APS configuration is invalid.
 pub fn register_providers(
     settings: &Settings,
 ) -> Result<Vec<Arc<dyn AuctionProvider>>, Report<TrustedServerError>> {
-    let mut providers: Vec<Arc<dyn AuctionProvider>> = Vec::new();
-
-    // Check for real APS provider configuration
-    match settings.integration_config::<ApsConfig>("aps") {
-        Ok(Some(config)) => {
-            log::info!(
-                "Registering real APS provider (pub_id: {}, endpoint: {})",
-                config.pub_id,
-                config.endpoint
-            );
-            providers.push(Arc::new(ApsAuctionProvider::new(config)));
-        }
-        Ok(None) => {
-            log::debug!("APS integration config found but is disabled");
-        }
-        Err(e) => {
-            return Err(e);
-        }
-    }
-
-    Ok(providers)
+    let Some(config) = settings.integration_config::<ApsConfig>(APS_INTEGRATION_ID)? else {
+        return Ok(Vec::new());
+    };
+    log::info!("Registering APS OpenRTB provider");
+    Ok(vec![Arc::new(ApsAuctionProvider::new(config))])
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auction::types::*;
+    use crate::auction::types::{
+        AdFormat, AdSlot, AuctionContext, AuctionRequest, BidStatus, DeviceInfo, PublisherInfo,
+        UserInfo,
+    };
+    use crate::consent::ConsentContext;
+    use crate::openrtb::{Eid, Uid};
+    use crate::platform::GeoInfo;
+    use crate::platform::test_support::noop_services;
+    use crate::test_support::tests::create_test_settings;
+    use serde_json::json;
 
-    fn create_test_auction_request() -> AuctionRequest {
-        AuctionRequest {
-            id: "test-auction-123".to_string(),
-            slots: vec![
-                AdSlot {
-                    id: "header-banner".to_string(),
-                    formats: vec![
-                        AdFormat {
-                            media_type: MediaType::Banner,
-                            width: 728,
-                            height: 90,
-                        },
-                        AdFormat {
-                            media_type: MediaType::Banner,
-                            width: 970,
-                            height: 250,
-                        },
-                    ],
-                    floor_price: Some(1.50),
-                    targeting: HashMap::new(),
-                    bidders: HashMap::new(),
-                },
-                AdSlot {
-                    id: "sidebar".to_string(),
-                    formats: vec![AdFormat {
-                        media_type: MediaType::Banner,
-                        width: 300,
-                        height: 250,
-                    }],
-                    floor_price: Some(1.00),
-                    targeting: HashMap::new(),
-                    bidders: HashMap::new(),
-                },
-            ],
-            publisher: PublisherInfo {
-                domain: "test.com".to_string(),
-                page_url: Some("https://test.com/article".to_string()),
-            },
-            user: UserInfo {
-                id: Some("user-123".to_string()),
-                consent: None,
-                eids: None,
-            },
-            device: Some(DeviceInfo {
-                user_agent: Some("Mozilla/5.0".to_string()),
-                ip: Some("192.168.1.1".to_string()),
-                geo: None,
-            }),
-            site: None,
-            context: HashMap::new(),
+    fn config() -> ApsConfig {
+        ApsConfig {
+            enabled: true,
+            account_id: "example-account-id".to_string(),
+            endpoint: default_endpoint(),
+            timeout_ms: 800,
+            allow_script_creatives: false,
         }
     }
 
-    #[test]
-    fn test_aps_request_transformation() {
-        let config = ApsConfig {
-            enabled: true,
-            pub_id: "5128".to_string(),
-            endpoint: "https://aax.amazon-adsystem.com/e/dtb/bid".to_string(),
-            timeout_ms: 800,
-        };
-
-        let provider = ApsAuctionProvider::new(config);
-        let auction_request = create_test_auction_request();
-        let aps_request = provider.to_aps_request(&auction_request, 800);
-
-        // Verify basic fields
-        assert_eq!(aps_request.pub_id, "5128");
-        assert_eq!(aps_request.slots.len(), 2);
-        assert_eq!(
-            aps_request.page_url,
-            Some("https://test.com/article".to_string())
-        );
-        assert_eq!(aps_request.user_agent, Some("Mozilla/5.0".to_string()));
-        assert_eq!(aps_request.timeout, Some(800));
-
-        // Verify first slot
-        let slot1 = &aps_request.slots[0];
-        assert_eq!(slot1.slot_id, "header-banner");
-        assert_eq!(slot1.sizes.len(), 2);
-        assert_eq!(slot1.sizes[0], [728, 90]);
-        assert_eq!(slot1.sizes[1], [970, 250]);
-
-        // Verify second slot
-        let slot2 = &aps_request.slots[1];
-        assert_eq!(slot2.slot_id, "sidebar");
-        assert_eq!(slot2.sizes.len(), 1);
-        assert_eq!(slot2.sizes[0], [300, 250]);
-    }
-
-    #[test]
-    fn aps_slot_id_from_bidders_map_used_in_request_and_remapped_in_response() {
-        use serde_json::json;
-
-        let config = ApsConfig {
-            enabled: true,
-            pub_id: "5128".to_string(),
-            endpoint: default_endpoint(),
-            timeout_ms: 800,
-        };
-        let provider = ApsAuctionProvider::new(config);
-
-        let mut bidders = HashMap::new();
-        bidders.insert(
-            "aps".to_string(),
-            json!({ "slotID": "aps-slot-atf-sidebar" }),
-        );
-        let request = AuctionRequest {
-            id: "test".to_string(),
+    fn request() -> AuctionRequest {
+        AuctionRequest {
+            id: "fictional-auction".to_string(),
             slots: vec![AdSlot {
-                id: "atf_sidebar_ad".to_string(),
+                id: "fictional-slot".to_string(),
                 formats: vec![AdFormat {
                     media_type: MediaType::Banner,
                     width: 300,
                     height: 250,
                 }],
-                floor_price: None,
+                floor_price: Some(1.0),
                 targeting: HashMap::new(),
-                bidders,
+                bidders: HashMap::new(),
             }],
             publisher: PublisherInfo {
-                domain: "example.com".to_string(),
-                page_url: None,
+                domain: "publisher.example".to_string(),
+                page_url: Some("https://publisher.example/article".to_string()),
             },
             user: UserInfo {
-                id: Some("user-1".to_string()),
+                id: Some("fictional-user".to_string()),
                 consent: None,
                 eids: None,
             },
             device: None,
             site: None,
             context: HashMap::new(),
-        };
+        }
+    }
 
-        let aps_request = provider.to_aps_request(&request, 800);
-        assert_eq!(
-            aps_request.slots[0].slot_id, "aps-slot-atf-sidebar",
-            "should send configured APS slot ID to APS"
+    fn bid(id: &str, price: f64, tagtype: &str) -> Json {
+        json!({
+            "id": id,
+            "impid": "fictional-slot",
+            "price": price,
+            "w": 300,
+            "h": 250,
+            "crid": "fictional-creative",
+            "adomain": ["advertiser.example"],
+            "ext": {
+                "creativeurl": "https://creative.example/render",
+                "tagtype": tagtype,
+                "unknown": "discarded"
+            },
+            "adm": "<script>discarded</script>",
+            "nurl": "https://notice.example/win"
+        })
+    }
+
+    #[test]
+    fn config_accepts_canonical_alias_and_integer_ids() {
+        let canonical: ApsConfig = serde_json::from_value(json!({
+            "account_id": "  example-account  "
+        }))
+        .expect("should parse canonical account ID");
+        let alias: ApsConfig =
+            serde_json::from_value(json!({"pub_id": 1234})).expect("should parse legacy alias");
+        assert_eq!(canonical.account_id, "example-account");
+        assert_eq!(alias.account_id, "1234");
+        assert!(!canonical.enabled);
+        assert!(!canonical.allow_script_creatives);
+        assert!(canonical.endpoint.ends_with("/e/pb/bid"));
+    }
+
+    #[test]
+    fn config_rejects_blank_duplicate_and_unsafe_endpoint() {
+        assert!(serde_json::from_value::<ApsConfig>(json!({"account_id": "   "})).is_err());
+        assert!(
+            serde_json::from_value::<ApsConfig>(
+                json!({"account_id": "x".repeat(MAX_ACCOUNT_ID_BYTES + 1)})
+            )
+            .is_err()
         );
-        let slot_id_map = ApsAuctionProvider::build_slot_id_map(&request);
-        assert_eq!(
-            slot_id_map.get("aps-slot-atf-sidebar").map(String::as_str),
-            Some("atf_sidebar_ad"),
-            "should build reverse map from APS slot ID to creative slot ID"
+        assert!(
+            serde_json::from_value::<ApsConfig>(json!({
+                "account_id": "one",
+                "pub_id": "two"
+            }))
+            .is_err()
         );
-
-        let aps_response = json!({
-            "contextual": {
-                "slots": [{
-                    "slotID": "aps-slot-atf-sidebar",
-                    "size": "300x250",
-                    "fif": "1",
-                    "amznbid": "1gtm3q",
-                    "meta": ["slotID"]
-                }]
-            }
-        });
-
-        let response = provider.parse_aps_response(&aps_response, 100, &slot_id_map);
-        assert_eq!(response.bids.len(), 1, "should parse one bid");
-        assert_eq!(
-            response.bids[0].slot_id, "atf_sidebar_ad",
-            "bid slot_id should be remapped to creative slot ID"
-        );
+        for endpoint in [
+            "http://aps.example/e/pb/bid",
+            "https://",
+            "https://user:password@aps.example/e/pb/bid",
+        ] {
+            let parsed: ApsConfig = serde_json::from_value(json!({
+                "account_id": "example-account",
+                "endpoint": endpoint
+            }))
+            .expect("should deserialize before validation");
+            assert!(parsed.validate().is_err(), "should reject {endpoint}");
+        }
     }
 
     #[test]
-    fn test_aps_response_parsing_success() {
-        let config = ApsConfig {
-            enabled: true,
-            pub_id: "5128".to_string(),
-            endpoint: "https://aax.amazon-adsystem.com/e/dtb/bid".to_string(),
-            timeout_ms: 800,
-        };
-
-        let provider = ApsAuctionProvider::new(config);
-
-        // Test APS response in real contextual format
-        let aps_response = json!({
-            "contextual": {
-                "slots": [
-                    {
-                        "slotID": "header-banner",
-                        "size": "728x90",
-                        "crid": "test-crid-123",
-                        "mediaType": "d",
-                        "fif": "1",
-                        "targeting": ["amzniid", "amznbid", "amznp", "amznsz", "amznactt"],
-                        "meta": ["slotID", "mediaType", "size"],
-                        "amzniid": "test-impression-id",
-                        "amznbid": "1kt0jk0",  // Proprietary Amazon encoding (not decodable)
-                        "amznp": "1kt0jk0",
-                        "amznsz": "728x90",
-                        "amznactt": "OPEN"
-                    },
-                    {
-                        "slotID": "sidebar",
-                        "size": "300x250",
-                        "crid": "test-crid-456",
-                        "mediaType": "d",
-                        "fif": "1",
-                        "targeting": ["amzniid", "amznbid", "amznp", "amznsz", "amznactt"],
-                        "meta": ["slotID", "mediaType", "size"],
-                        "amzniid": "test-impression-id-2",
-                        "amznbid": "ewpurk",  // Proprietary Amazon encoding (not decodable)
-                        "amznp": "ewpurk",
-                        "amznsz": "300x250",
-                        "amznactt": "OPEN"
-                    }
-                ],
-                "host": "https://aax-events.amazon-adsystem.com",
-                "status": "ok",
-                "cfe": true,
-                "ev": true,
-                "cb": "6"
-            }
-        });
-
-        let auction_response = provider.parse_aps_response(&aps_response, 150, &HashMap::new());
-
-        // Verify response
-        assert_eq!(auction_response.provider, "aps");
-        assert_eq!(auction_response.status, BidStatus::Success);
-        assert_eq!(auction_response.bids.len(), 2);
-        assert_eq!(auction_response.response_time_ms, 150);
-
-        // Verify first bid - price is None (encoded, to be decoded by mediation)
-        let bid1 = &auction_response.bids[0];
-        assert_eq!(bid1.slot_id, "header-banner");
-        assert_eq!(bid1.price, None); // Price is NOT decoded - it's in metadata for mediation
-        assert_eq!(bid1.width, 728);
-        assert_eq!(bid1.height, 90);
-        assert_eq!(bid1.currency, "USD");
-        assert_eq!(bid1.bidder, "amazon-aps");
-        assert_eq!(bid1.adomain, None);
-        assert!(bid1.metadata.contains_key("amzniid"));
-        assert!(bid1.metadata.contains_key("amznbid")); // Encoded price stored here
-
-        // Verify second bid
-        let bid2 = &auction_response.bids[1];
-        assert_eq!(bid2.slot_id, "sidebar");
-        assert_eq!(bid2.price, None); // Price is NOT decoded
-        assert_eq!(bid2.width, 300);
-        assert_eq!(bid2.height, 250);
-        assert!(bid2.metadata.contains_key("amznbid")); // Encoded price in metadata
-    }
-
-    #[test]
-    fn test_aps_response_parsing_no_bid() {
-        let config = ApsConfig {
-            enabled: true,
-            pub_id: "5128".to_string(),
-            endpoint: "https://aax.amazon-adsystem.com/e/dtb/bid".to_string(),
-            timeout_ms: 800,
-        };
-
-        let provider = ApsAuctionProvider::new(config);
-
-        // Empty contextual response
-        let aps_response = json!({
-            "contextual": {
-                "slots": [],
-                "status": "ok"
-            }
-        });
-
-        let auction_response = provider.parse_aps_response(&aps_response, 100, &HashMap::new());
-
-        assert_eq!(auction_response.provider, "aps");
-        assert_eq!(auction_response.status, BidStatus::NoBid);
-        assert_eq!(auction_response.bids.len(), 0);
-    }
-
-    #[test]
-    fn test_aps_response_parsing_invalid_bids() {
-        let config = ApsConfig {
-            enabled: true,
-            pub_id: "5128".to_string(),
-            endpoint: "https://aax.amazon-adsystem.com/e/dtb/bid".to_string(),
-            timeout_ms: 800,
-        };
-
-        let provider = ApsAuctionProvider::new(config);
-
-        // Response with invalid slots (not filled, zero price)
-        let aps_response = json!({
-            "contextual": {
-                "slots": [
-                    {
-                        "slotID": "header-banner",
-                        "size": "728x90",
-                        "fif": "0",  // Not filled
-                        "targeting": [],
-                        "meta": []
-                    },
-                    {
-                        "slotID": "sidebar",
-                        "size": "300x250",
-                        "fif": "1",
-                        "targeting": [],
-                        "meta": []
-                        // Missing price encoding - will decode to 0.0
-                    }
-                ],
-                "status": "ok"
-            }
-        });
-
-        let auction_response = provider.parse_aps_response(&aps_response, 100, &HashMap::new());
-
-        // Should return no-bid since all slots are invalid
-        assert_eq!(auction_response.status, BidStatus::NoBid);
-        assert_eq!(auction_response.bids.len(), 0);
-    }
-
-    #[test]
-    fn test_aps_slot_parsing() {
-        let config = ApsConfig {
-            enabled: true,
-            pub_id: "5128".to_string(),
-            endpoint: "https://aax.amazon-adsystem.com/e/dtb/bid".to_string(),
-            timeout_ms: 800,
-        };
-
-        let provider = ApsAuctionProvider::new(config);
-
-        let aps_slot = ApsSlotResponse {
-            slot_id: "test-slot".to_string(),
-            size: "728x90".to_string(),
-            crid: Some("crid-123".to_string()),
-            media_type: Some("d".to_string()),
-            fif: Some("1".to_string()),
-            targeting: vec!["amzniid".to_string(), "amznbid".to_string()],
-            meta: vec!["slotID".to_string()],
-            amzniid: Some("impression-id-123".to_string()),
-            amznbid: Some("1c7d4ow".to_string()), // Encoded price (to be decoded by mediation)
-            amznp: Some("1c7d4ow".to_string()),
-            amznsz: Some("728x90".to_string()),
-            amznactt: Some("OPEN".to_string()),
-        };
-
-        let bid = provider
-            .parse_aps_slot(&aps_slot)
-            .expect("should parse slot");
-
-        assert_eq!(bid.slot_id, "test-slot");
-        assert_eq!(bid.price, None); // Price NOT decoded - stored in metadata for mediation
-        assert_eq!(bid.width, 728);
-        assert_eq!(bid.height, 90);
-        assert_eq!(bid.currency, "USD");
-        assert_eq!(bid.bidder, "amazon-aps");
-        assert_eq!(bid.adomain, None);
-        assert_eq!(bid.nurl, None); // Real APS uses client-side tracking
-        assert_eq!(bid.burl, None);
-        assert!(bid.metadata.contains_key("amzniid"));
-        assert!(bid.metadata.contains_key("amznbid")); // Encoded price here
-        assert!(bid.metadata.contains_key("amznsz"));
-    }
-
-    #[test]
-    fn test_provider_metadata() {
-        let config = ApsConfig::default();
-        let provider = ApsAuctionProvider::new(config);
-
-        assert_eq!(provider.provider_name(), "aps");
-        assert!(!provider.is_enabled()); // Default is disabled
-        assert_eq!(provider.timeout_ms(), 800);
-        assert!(provider.supports_media_type(&MediaType::Banner));
-        assert!(provider.supports_media_type(&MediaType::Video));
-        assert!(!provider.supports_media_type(&MediaType::Native));
-    }
-
-    #[test]
-    fn aps_payload_timeout_uses_effective_auction_budget_not_provider_config() {
-        // Provider config says 1000ms but the auction budget grants only 500ms —
-        // the payload must advertise the tighter effective deadline.
-        let config = ApsConfig {
-            enabled: true,
-            pub_id: "5128".to_string(),
-            endpoint: default_endpoint(),
-            timeout_ms: 1000,
-        };
-        let provider = ApsAuctionProvider::new(config);
-        let request = create_test_auction_request();
-
-        let aps_request = provider.to_aps_request(&request, 500);
-
-        assert_eq!(
-            aps_request.timeout,
-            Some(500),
-            "should advertise the effective auction budget, not the provider config timeout"
-        );
-    }
-
-    #[test]
-    fn test_aps_request_includes_consent_fields() {
-        use crate::consent::ConsentContext;
-
-        let config = ApsConfig {
-            enabled: true,
-            pub_id: "5128".to_string(),
-            endpoint: default_endpoint(),
-            timeout_ms: 800,
-        };
-        let provider = ApsAuctionProvider::new(config);
-
-        let mut request = create_test_auction_request();
-        request.user.consent = Some(ConsentContext {
-            raw_tc_string: Some("BOEFEAyOEFEAyAHABDENAI4AAAB9vABAASA".to_string()),
+    fn builds_aps_openrtb_request_with_explicit_privacy_policy() {
+        let provider = ApsAuctionProvider::new(config());
+        let mut auction_request = request();
+        auction_request.user.consent = Some(ConsentContext {
             gdpr_applies: true,
+            raw_tc_string: Some("fictional-tcf".to_string()),
             raw_us_privacy: Some("1YNN".to_string()),
-            raw_gpp_string: Some("DBACNYA~CPXxRfAPXxRfA".to_string()),
+            raw_gpp_string: Some("fictional-gpp".to_string()),
             gpp_section_ids: Some(vec![2, 6]),
             ..Default::default()
         });
-
-        let aps_request = provider.to_aps_request(&request, 800);
-
-        // Verify GDPR consent
-        let gdpr = aps_request.gdpr.expect("should have gdpr");
-        assert!(gdpr.enabled);
-        assert_eq!(
-            gdpr.consent.as_deref(),
-            Some("BOEFEAyOEFEAyAHABDENAI4AAAB9vABAASA")
-        );
-
-        // Verify US Privacy
-        assert_eq!(aps_request.us_privacy.as_deref(), Some("1YNN"));
-
-        // Verify GPP
-        assert_eq!(aps_request.gpp.as_deref(), Some("DBACNYA~CPXxRfAPXxRfA"));
-        assert_eq!(aps_request.gpp_sid.as_deref(), Some("2,6"));
-    }
-
-    #[test]
-    fn test_aps_request_no_consent() {
-        let config = ApsConfig {
-            enabled: true,
-            pub_id: "5128".to_string(),
-            endpoint: default_endpoint(),
-            timeout_ms: 800,
-        };
-        let provider = ApsAuctionProvider::new(config);
-        let request = create_test_auction_request(); // consent is None
-
-        let aps_request = provider.to_aps_request(&request, 800);
-
-        assert!(aps_request.gdpr.is_none());
-        assert!(aps_request.us_privacy.is_none());
-        assert!(aps_request.gpp.is_none());
-        assert!(aps_request.gpp_sid.is_none());
-    }
-
-    #[test]
-    fn test_aps_request_consent_serialization() {
-        use crate::consent::ConsentContext;
-
-        let config = ApsConfig {
-            enabled: true,
-            pub_id: "5128".to_string(),
-            endpoint: default_endpoint(),
-            timeout_ms: 800,
-        };
-        let provider = ApsAuctionProvider::new(config);
-
-        let mut request = create_test_auction_request();
-        request.user.consent = Some(ConsentContext {
-            raw_tc_string: Some("BOE".to_string()),
-            gdpr_applies: true,
-            ..Default::default()
-        });
-
-        let aps_request = provider.to_aps_request(&request, 800);
-        let json = serde_json::to_value(&aps_request).expect("should serialize");
-
-        // GDPR fields present
-        assert_eq!(json["gdpr"]["enabled"], true);
-        assert_eq!(json["gdpr"]["consent"], "BOE");
-
-        // Absent fields should not appear (skip_serializing_if)
-        assert!(json.get("usPrivacy").is_none());
-        assert!(json.get("gpp").is_none());
-        assert!(json.get("gppSid").is_none());
-    }
-
-    #[test]
-    fn test_aps_bids_have_no_creative_and_no_decoded_price() {
-        // APS doesn't provide creative HTML - it only provides targeting keys
-        // APS doesn't decode prices - only mediation layer can decode them
-        // The creative will be generated by the mediation layer (e.g., GAM or ad server)
-        let config = ApsConfig {
-            enabled: true,
-            pub_id: "5128".to_string(),
-            endpoint: "https://aax.amazon-adsystem.com/e/dtb/bid".to_string(),
-            timeout_ms: 800,
-        };
-
-        let provider = ApsAuctionProvider::new(config);
-
-        let aps_slot = ApsSlotResponse {
-            slot_id: "test-slot".to_string(),
-            size: "300x250".to_string(),
-            crid: Some("test-creative".to_string()),
-            media_type: Some("d".to_string()),
-            fif: Some("1".to_string()),
-            targeting: vec!["amzniid".to_string(), "amznbid".to_string()],
-            meta: vec!["slotID".to_string()],
-            amzniid: Some("imp-123".to_string()),
-            amznbid: Some("encoded-price".to_string()),
-            amznp: Some("encoded-price-alt".to_string()),
-            amznsz: Some("300x250".to_string()),
-            amznactt: Some("OPEN".to_string()),
-        };
-
-        let bid = provider.parse_aps_slot(&aps_slot).expect("should parse");
-
-        // Key assertions:
-        // 1. creative should be None for APS bids
-        assert_eq!(bid.creative, None, "APS bids should not have creative HTML");
-        // 2. price should be None (encoded price in metadata, decoded by mediation)
-        assert_eq!(bid.price, None, "APS bids should not have decoded price");
-
-        // Verify targeting keys are in metadata (includes encoded price)
-        assert!(bid.metadata.contains_key("amzniid"));
-        assert!(bid.metadata.contains_key("amznbid")); // Encoded price
-        assert_eq!(
-            bid.metadata.get("amzniid").and_then(|v| v.as_str()),
-            Some("imp-123")
-        );
-        assert_eq!(
-            bid.metadata.get("amznbid").and_then(|v| v.as_str()),
-            Some("encoded-price")
-        );
-    }
-
-    fn single_slot_request(
-        auction_id: &str,
-        aps_slot_id: &str,
-        creative_id: &str,
-    ) -> AuctionRequest {
-        let mut bidders = HashMap::new();
-        bidders.insert("aps".to_string(), json!({ "slotID": aps_slot_id }));
-        AuctionRequest {
-            id: auction_id.to_string(),
-            slots: vec![AdSlot {
-                id: creative_id.to_string(),
-                formats: vec![AdFormat {
-                    media_type: MediaType::Banner,
-                    width: 300,
-                    height: 250,
-                }],
-                floor_price: None,
-                targeting: HashMap::new(),
-                bidders,
+        auction_request.user.eids = Some(vec![Eid {
+            source: "identity.example".to_string(),
+            uids: vec![Uid {
+                id: "fictional-uid".to_string(),
+                atype: Some(1),
+                ext: None,
             }],
-            publisher: PublisherInfo {
-                domain: "example.com".to_string(),
-                page_url: None,
+        }]);
+        auction_request.slots[0].formats.extend([
+            AdFormat {
+                media_type: MediaType::Video,
+                width: 640,
+                height: 480,
             },
-            user: UserInfo {
-                id: None,
-                consent: None,
-                eids: None,
+            AdFormat {
+                media_type: MediaType::Banner,
+                width: u32::MAX,
+                height: 90,
             },
-            device: None,
-            site: None,
-            context: HashMap::new(),
+            AdFormat {
+                media_type: MediaType::Banner,
+                width: 728,
+                height: 90,
+            },
+        ]);
+        auction_request.device = Some(DeviceInfo {
+            user_agent: Some("Fictional Browser".to_string()),
+            ip: Some("192.0.2.10".to_string()),
+            geo: Some(GeoInfo {
+                city: "Example City".to_string(),
+                country: "US".to_string(),
+                continent: "NA".to_string(),
+                latitude: 12.34,
+                longitude: 56.78,
+                metro_code: 501,
+                region: Some("CA".to_string()),
+                asn: None,
+            }),
+        });
+        let settings = create_test_settings();
+        let services = noop_services();
+        let downstream = http::Request::builder()
+            .uri("https://publisher.example/auction")
+            .header("DNT", "1")
+            .header(header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+            .header(header::REFERER, "https://referrer.example/article")
+            .body(EdgeBody::empty())
+            .expect("should build downstream request");
+        let context = AuctionContext {
+            settings: &settings,
+            request: &downstream,
+            timeout_ms: 321,
+            provider_responses: None,
+            services: &services,
+        };
+
+        let openrtb = provider.build_openrtb_request(&auction_request, &context);
+        let serialized = serde_json::to_value(openrtb).expect("should serialize request");
+
+        assert_eq!(serialized["id"], "fictional-auction");
+        assert_eq!(serialized["tmax"], 321);
+        assert_eq!(serialized["cur"], json!(["USD"]));
+        assert_eq!(serialized["ext"]["account"], "example-account-id");
+        assert_eq!(
+            serialized["ext"]["sdk"],
+            json!({"source": "prebid", "version": "2.2.0"})
+        );
+        assert_eq!(serialized["imp"][0]["id"], "fictional-slot");
+        assert_eq!(serialized["imp"][0]["banner"]["w"], 300);
+        assert_eq!(serialized["imp"][0]["banner"]["h"], 250);
+        assert_eq!(serialized["imp"][0]["banner"]["topframe"], 0);
+        assert_eq!(
+            serialized["imp"][0]["banner"]["format"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(serialized["imp"][0]["banner"]["format"][1]["w"], 728);
+        assert_eq!(serialized["imp"][0]["bidfloor"], 1.0);
+        assert_eq!(serialized["imp"][0]["bidfloorcur"], "USD");
+        assert_eq!(serialized["imp"][0]["secure"], 1);
+        assert_eq!(serialized["site"]["domain"], "publisher.example");
+        assert_eq!(
+            serialized["site"]["page"],
+            "https://publisher.example/article"
+        );
+        assert_eq!(
+            serialized["site"]["ref"],
+            "https://referrer.example/article"
+        );
+        assert_eq!(
+            serialized["site"]["publisher"]["domain"],
+            "publisher.example"
+        );
+        assert_eq!(serialized["device"]["ua"], "Fictional Browser");
+        assert_eq!(serialized["device"]["ip"], "192.0.2.10");
+        assert_eq!(serialized["device"]["dnt"], 1);
+        assert_eq!(serialized["device"]["language"], "en");
+        assert_eq!(serialized["device"]["geo"]["country"], "US");
+        assert!(serialized["device"]["geo"].get("lat").is_none());
+        assert!(serialized["device"]["geo"].get("lon").is_none());
+        assert_eq!(serialized["user"]["id"], "fictional-user");
+        assert_eq!(serialized["user"]["consent"], "fictional-tcf");
+        assert_eq!(serialized["user"]["ext"]["consent"], "fictional-tcf");
+        assert_eq!(
+            serialized["user"]["ext"]["eids"][0]["source"],
+            "identity.example"
+        );
+        assert_eq!(serialized["regs"]["gdpr"], 1);
+        assert_eq!(serialized["regs"]["us_privacy"], "1YNN");
+        assert_eq!(serialized["regs"]["gpp"], "fictional-gpp");
+        assert_eq!(serialized["regs"]["gpp_sid"], json!([2, 6]));
+        assert!(serialized["regs"].get("coppa").is_none());
+        assert!(serialized["ext"].get("prebid").is_none());
+        assert!(serialized["ext"].get("trusted_server").is_none());
+        assert!(serialized["imp"][0].get("ext").is_none());
+    }
+
+    #[test]
+    fn parses_bid_and_builds_exact_minimized_envelope() {
+        let provider = ApsAuctionProvider::new(config());
+        let response = provider.parse_aps_response(
+            &json!({"cur": "USD", "seatbid": [{"seat": 42, "bid": [bid("fictional-selected-bid-id", 1.23, "iframe")]}], "ext": {"userSyncs": []}}),
+            12,
+            &request(),
+        );
+        assert_eq!(response.bids.len(), 1);
+        let parsed = &response.bids[0];
+        assert_eq!(parsed.bidder, "aps");
+        assert_eq!(parsed.price, Some(1.23));
+        assert!(parsed.creative.is_none());
+        assert!(parsed.nurl.is_none());
+        let renderer = parsed
+            .renderer
+            .as_ref()
+            .expect("should include renderer")
+            .aps();
+        let decoded = BASE64_STANDARD
+            .decode(&renderer.aax_response)
+            .expect("should decode renderer response");
+        let decoded: Json =
+            serde_json::from_slice(&decoded).expect("should parse renderer response");
+        let fixture: Json = serde_json::from_str(include_str!(
+            "../../../trusted-server-js/lib/test/fixtures/aps-renderer-v1.json"
+        ))
+        .expect("should parse shared APS renderer fixture");
+        assert_eq!(decoded, fixture);
+    }
+
+    #[test]
+    fn empty_creative_id_is_omitted_from_renderer() {
+        let provider = ApsAuctionProvider::new(config());
+        let mut input = bid("bid-with-empty-crid", 1.23, "iframe");
+        input["crid"] = json!("");
+        let response =
+            provider.parse_aps_response(&json!({"seatbid": [{"bid": [input]}]}), 12, &request());
+        let bid = response.bids.first().expect("should accept renderer bid");
+        assert!(bid.creative_id.is_none());
+        assert!(
+            bid.renderer
+                .as_ref()
+                .expect("should retain renderer")
+                .aps()
+                .creative_id
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_typed_response_level_fields() {
+        let provider = ApsAuctionProvider::new(config());
+        for value in [
+            json!({"cur": ["USD"], "seatbid": []}),
+            json!({"cur": "USD", "seatbid": "invalid"}),
+            json!({"contextual": {"slots": []}}),
+        ] {
+            let response = provider.parse_aps_response(&value, 12, &request());
+            assert!(response.bids.is_empty());
+            assert_eq!(
+                response.metadata["drop_reasons"]["unexpected_response_shape"],
+                1
+            );
         }
     }
 
-    fn aps_platform_response(aps_slot_id: &str) -> PlatformResponse {
-        let body = json!({
-            "contextual": {
-                "slots": [{
-                    "slotID": aps_slot_id,
-                    "size": "300x250",
-                    "fif": "1",
-                    "amznbid": "1gtm3q",
-                    "meta": ["slotID"]
-                }]
-            }
-        });
-        let response = http::Response::builder()
-            .status(200)
-            .body(EdgeBody::from(
-                serde_json::to_vec(&body).expect("should serialize APS response body"),
-            ))
-            .expect("should build APS platform response");
-        PlatformResponse::new(response)
+    #[test]
+    fn malformed_json_is_a_safe_shape_error() {
+        let provider = ApsAuctionProvider::new(config());
+        let platform_response = PlatformResponse::new(
+            edgezero_core::http::response_builder()
+                .status(StatusCode::OK)
+                .body(EdgeBody::from(b"{not-json".to_vec()))
+                .expect("should build malformed APS response"),
+        );
+        let auction_request = request();
+        let response = futures::executor::block_on(provider.parse_response_inner(
+            platform_response,
+            12,
+            Some(&auction_request),
+        ))
+        .expect("should convert malformed JSON into a safe auction response");
+
+        assert!(response.bids.is_empty());
+        assert_eq!(
+            response.metadata["drop_reasons"]["unexpected_response_shape"],
+            1
+        );
     }
 
     #[test]
-    fn concurrent_auctions_parse_out_of_order_with_correct_slot_remapping() {
-        // Regression: the reverse slot map used to live on the shared provider
-        // instance, so a second auction's request_bids overwrote the first
-        // auction's map and out-of-order parses remapped bids to the wrong
-        // creative slot. The map is now derived from each parse's own request.
-        let provider = ApsAuctionProvider::new(ApsConfig {
-            enabled: true,
-            pub_id: "5128".to_string(),
-            endpoint: default_endpoint(),
-            timeout_ms: 800,
-        });
+    fn no_content_and_empty_responses_are_no_bids() {
+        let provider = ApsAuctionProvider::new(config());
+        let platform_response = PlatformResponse::new(
+            edgezero_core::http::response_builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(EdgeBody::empty())
+                .expect("should build empty APS response"),
+        );
+        let auction_request = request();
+        let no_content = futures::executor::block_on(provider.parse_response_inner(
+            platform_response,
+            12,
+            Some(&auction_request),
+        ))
+        .expect("should parse 204 as no bid");
+        assert_eq!(no_content.status, BidStatus::NoBid);
 
-        let request_a = single_slot_request("auction-a", "aps-slot-a", "creative_a");
-        let request_b = single_slot_request("auction-b", "aps-slot-b", "creative_b");
+        for value in [json!({}), json!({"seatbid": []})] {
+            let empty = provider.parse_aps_response(&value, 12, &auction_request);
+            assert_eq!(empty.status, BidStatus::NoBid);
+            assert_eq!(empty.metadata["drop_reasons"]["empty_seatbid"], 1);
+        }
+    }
 
-        let settings = crate::test_support::tests::create_test_settings();
-        let http_request = http::Request::builder()
-            .uri("https://example.com/")
+    #[test]
+    fn unsupported_currency_is_a_no_bid() {
+        let provider = ApsAuctionProvider::new(config());
+        let response = provider.parse_aps_response(
+            &json!({"cur": "EUR", "seatbid": [{"bid": [bid("eur-bid", 1.0, "iframe")]}]}),
+            12,
+            &request(),
+        );
+        assert_eq!(response.status, BidStatus::NoBid);
+        assert_eq!(response.metadata["drop_reasons"]["unsupported_currency"], 1);
+    }
+
+    #[test]
+    fn malformed_sibling_does_not_suppress_valid_bid() {
+        let provider = ApsAuctionProvider::new(config());
+        let response = provider.parse_aps_response(
+            &json!({"seatbid": [{"bid": ["malformed", bid("valid", 1.0, "iframe")]}]}),
+            12,
+            &request(),
+        );
+        assert_eq!(response.bids.len(), 1);
+        assert_eq!(response.bids[0].bid_id.as_deref(), Some("valid"));
+        assert_eq!(
+            response.metadata["drop_reasons"]["missing_render_source"],
+            1
+        );
+    }
+
+    #[test]
+    fn enabled_script_bid_keeps_typed_renderer() {
+        let mut enabled = config();
+        enabled.allow_script_creatives = true;
+        let provider = ApsAuctionProvider::new(enabled);
+        let response = provider.parse_aps_response(
+            &json!({"seatbid": [{"bid": [bid("script", 1.0, "script")]}]}),
+            12,
+            &request(),
+        );
+        let renderer = response.bids[0]
+            .renderer
+            .as_ref()
+            .expect("should keep script renderer")
+            .aps();
+        assert_eq!(renderer.tag_type, ApsTagType::Script);
+    }
+
+    #[test]
+    fn disabled_script_cannot_suppress_lower_iframe_bid() {
+        let provider = ApsAuctionProvider::new(config());
+        let response = provider.parse_aps_response(
+            &json!({"seatbid": [{"bid": [bid("script-high", 4.0, "script"), bid("iframe-low", 1.0, "iframe")]}]}),
+            12,
+            &request(),
+        );
+        assert_eq!(response.bids.len(), 1);
+        assert_eq!(response.bids[0].bid_id.as_deref(), Some("iframe-low"));
+        assert_eq!(
+            response.metadata["drop_reasons"]["script_rendering_disabled"],
+            1
+        );
+    }
+
+    #[test]
+    fn reduces_candidates_by_price_then_bid_id() {
+        let provider = ApsAuctionProvider::new(config());
+        let response = provider.parse_aps_response(
+            &json!({"seatbid": [{"bid": [bid("bid-z", 2.0, "iframe"), bid("bid-a", 2.0, "iframe")]}]}),
+            12,
+            &request(),
+        );
+        assert_eq!(response.bids.len(), 1);
+        assert_eq!(response.bids[0].bid_id.as_deref(), Some("bid-a"));
+    }
+
+    #[test]
+    fn safe_drops_missing_renderer_and_invalid_dimensions() {
+        let provider = ApsAuctionProvider::new(config());
+        let mut invalid = bid("invalid", 1.0, "iframe");
+        invalid
+            .as_object_mut()
+            .expect("should be object")
+            .remove("w");
+        let response = provider.parse_aps_response(
+            &json!({"seatbid": [{"bid": [
+                {"id": "fixture", "impid": "fictional-slot", "price": 1.0, "w": 300, "h": 250, "ext": {"bidder": "aps"}},
+                invalid
+            ]}]}),
+            12,
+            &request(),
+        );
+        assert!(response.bids.is_empty());
+        assert_eq!(
+            response.metadata["drop_reasons"]["missing_render_source"],
+            1
+        );
+        assert_eq!(response.metadata["drop_reasons"]["invalid_dimensions"], 1);
+    }
+
+    #[test]
+    fn rejects_publisher_origin_and_non_https_creative_urls() {
+        let provider = ApsAuctionProvider::new(config());
+        for creative_url in [
+            "https://publisher.example/render",
+            "http://creative.example/render",
+            "https://user:password@creative.example/render",
+        ] {
+            let mut invalid = bid("invalid-url", 1.0, "iframe");
+            invalid["ext"]["creativeurl"] = json!(creative_url);
+            let response = provider.parse_aps_response(
+                &json!({"seatbid": [{"bid": [invalid]}]}),
+                12,
+                &request(),
+            );
+            assert!(response.bids.is_empty(), "should reject {creative_url}");
+            assert_eq!(response.metadata["drop_reasons"]["invalid_creative_url"], 1);
+        }
+
+        let mut uppercase_publisher = request();
+        uppercase_publisher.publisher.domain = "Creative.Example".to_string();
+        let response = provider.parse_aps_response(
+            &json!({"seatbid": [{"bid": [bid("same-origin", 1.0, "iframe")]}]}),
+            12,
+            &uppercase_publisher,
+        );
+        assert!(response.bids.is_empty());
+        assert_eq!(response.metadata["drop_reasons"]["invalid_creative_url"], 1);
+    }
+
+    #[test]
+    fn registers_and_serves_only_static_renderer_route() {
+        let integration = ApsRendererIntegration;
+        let routes = integration.routes();
+        assert_eq!(routes.len(), 1, "should register one route");
+        assert_eq!(routes[0].method, Method::GET);
+        assert_eq!(routes[0].path, APS_RENDERER_ROUTE);
+
+        let settings = create_test_settings();
+        let services = noop_services();
+        let request = http::Request::builder()
+            .method(Method::GET)
+            .uri(APS_RENDERER_ROUTE)
             .body(EdgeBody::empty())
-            .expect("should build test request");
-        let context = crate::auction::test_support::create_test_auction_context(
-            &settings,
-            &http_request,
-            800,
+            .expect("should build renderer request");
+        let response =
+            futures::executor::block_on(integration.handle(&settings, &services, request))
+                .expect("should serve renderer");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+        assert_eq!(
+            response.headers()[header::CONTENT_SECURITY_POLICY],
+            APS_RENDERER_CSP
         );
 
-        futures::executor::block_on(async {
-            // Parse auction B's response first, then auction A's — the reverse
-            // of dispatch order — each against its own request.
-            let response_b = provider
-                .parse_response_with_context(
-                    aps_platform_response("aps-slot-b"),
-                    100,
-                    &request_b,
-                    &context,
-                )
-                .await
-                .expect("should parse auction B response");
-            let response_a = provider
-                .parse_response_with_context(
-                    aps_platform_response("aps-slot-a"),
-                    100,
-                    &request_a,
-                    &context,
-                )
-                .await
-                .expect("should parse auction A response");
+        let post = http::Request::builder()
+            .method(Method::POST)
+            .uri(APS_RENDERER_ROUTE)
+            .body(EdgeBody::empty())
+            .expect("should build method rejection request");
+        let response = futures::executor::block_on(integration.handle(&settings, &services, post))
+            .expect("should reject unsupported method");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
 
-            assert_eq!(
-                response_b.bids[0].slot_id, "creative_b",
-                "auction B bid should remap to auction B's creative slot"
-            );
-            assert_eq!(
-                response_a.bids[0].slot_id, "creative_a",
-                "auction A bid should remap to auction A's creative slot despite parsing last"
-            );
-        });
+    #[test]
+    fn enabled_config_registers_renderer_proxy() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                APS_INTEGRATION_ID,
+                &json!({"enabled": true, "account_id": "example-account"}),
+            )
+            .expect("should insert APS config");
+
+        let registration = register(&settings)
+            .expect("should register APS")
+            .expect("should return enabled registration");
+
+        assert_eq!(registration.integration_id, APS_INTEGRATION_ID);
+        assert_eq!(registration.proxies.len(), 1);
+        assert!(registration.js_disabled);
+    }
+
+    #[test]
+    fn renderer_document_is_static_and_nonce_bound() {
+        assert!(APS_RENDERER_DOCUMENT.contains("^#tsaps="));
+        assert!(APS_RENDERER_DOCUMENT.contains("event.source!==parent"));
+        assert!(APS_RENDERER_DOCUMENT.contains("message.nonce!==expected"));
+        assert!(APS_RENDERER_DOCUMENT.contains("prebid/creative/render"));
+        assert!(APS_RENDERER_DOCUMENT.contains("window._aps instanceof Map"));
+        assert!(APS_RENDERER_DOCUMENT.contains("store:new Map([['listeners',new Map()]])"));
+        assert!(APS_RENDERER_DOCUMENT.contains("account.queue.push(new CustomEvent"));
+        assert!(
+            APS_RENDERER_DOCUMENT.contains("trusted-server/aps/renderer-ready")
+                && APS_RENDERER_DOCUMENT.contains("trusted-server/aps/renderer-failed")
+        );
+        assert!(!APS_RENDERER_DOCUMENT.contains("window.apstag"));
+        assert!(
+            APS_RENDERER_DOCUMENT
+                .contains("https://client.aps.amazon-adsystem.com/prebid-creative.js")
+        );
+        assert!(!APS_RENDERER_DOCUMENT.contains("<script src="));
+        let queue_index = APS_RENDERER_DOCUMENT
+            .find("account.queue.push(new CustomEvent")
+            .expect("should queue render event");
+        let runner_index = APS_RENDERER_DOCUMENT
+            .find("document.head.appendChild(script)")
+            .expect("should dynamically load the APS runner");
+        assert!(queue_index < runner_index);
+        assert!(!APS_RENDERER_DOCUMENT.contains("allow-same-origin"));
+        assert!(APS_RENDERER_CSP.contains("default-src 'none'"));
+        assert!(APS_RENDERER_CSP.contains("sandbox allow-forms"));
+        assert!(!APS_RENDERER_CSP.contains("allow-same-origin"));
     }
 }
