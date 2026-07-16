@@ -692,85 +692,105 @@ async fn abandon_hold_auction(
     }
 }
 
+/// Output of a single close-body hold step, split at the auction-collection
+/// barrier.
+///
+/// `ready` is the prefix the caller must emit *before* collecting the auction,
+/// so a small page whose `</body>` lands in the first source chunk still
+/// streams its document prefix immediately instead of stalling behind the
+/// auction. `close_found` signals that `</body` was seen: the caller emits
+/// `ready`, then awaits [`hold_collect_close_tail`] to collect the auction and
+/// emit the held closing tail.
+struct HoldStepSegments {
+    ready: Vec<bytes::Bytes>,
+    close_found: bool,
+}
+
 /// Feed one decoded chunk through the close-body hold and processor.
 ///
-/// Returns the encoded output segments for the caller to emit — written to a
-/// client stream by [`body_close_hold_loop_stream`], yielded from the lazy
-/// body by [`publisher_response_into_streaming_response`]. Both async hold
-/// paths share this function so their behavior cannot drift apart.
+/// Returns the ready prefix for the caller to emit — written to a client stream
+/// by [`body_close_hold_loop_stream`], yielded from the lazy body by
+/// [`publisher_response_into_streaming_response`]. Both async hold paths share
+/// this function so their behavior cannot drift apart.
 ///
-/// When the raw `</body` prefix is found the dispatched auction is collected
-/// before the held tail is processed, so `lol_html` sees live bids. On
-/// processing failure the pending auction is abandoned before the error is
-/// returned.
+/// This step never awaits auction collection: it processes only the bytes the
+/// hold buffer releases as ready and reports whether `</body` was seen. Holding
+/// the collection out of this step is what lets callers emit the prefix before
+/// the auction resolves. On processing failure the pending auction is abandoned
+/// before the error is returned.
 async fn hold_step_decoded_chunk<P: StreamProcessor>(
     processor: &mut P,
     encoder: &mut BodyStreamEncoder,
     chunk: &[u8],
     state: &mut AuctionHoldState,
     collect_refs: &AuctionHoldCollectRefs<'_>,
+) -> Result<HoldStepSegments, Report<TrustedServerError>> {
+    let mut ready = Vec::new();
+    let bytes = match state.hold.as_mut() {
+        // Once the hold has been released the chunk streams straight through.
+        None => chunk.to_vec(),
+        Some(hold_buffer) => hold_buffer.push(chunk),
+    };
+    match process_and_encode_chunk(processor, encoder, &bytes, false, "Failed to process chunk") {
+        Ok(Some(encoded)) => ready.push(encoded),
+        Ok(None) => {}
+        Err(err) => {
+            abandon_hold_auction(state, collect_refs.services, "stream_process_error").await;
+            return Err(err);
+        }
+    }
+    let close_found = state
+        .hold
+        .as_ref()
+        .is_some_and(BodyCloseHoldBuffer::found_close);
+    Ok(HoldStepSegments { ready, close_found })
+}
+
+/// Collect the dispatched auction and process the held `</body>` tail.
+///
+/// Call only after [`hold_step_decoded_chunk`] (or [`hold_finish_segments`])
+/// reports `close_found` and the ready prefix has already been emitted:
+/// collecting here — after the prefix streams — is what keeps the auction
+/// riding alongside transfer instead of blocking it. Collection runs before the
+/// tail is processed so `lol_html` sees live bids at the injection point.
+async fn hold_collect_close_tail<P: StreamProcessor>(
+    processor: &mut P,
+    encoder: &mut BodyStreamEncoder,
+    state: &mut AuctionHoldState,
+    collect_refs: &AuctionHoldCollectRefs<'_>,
 ) -> Result<Vec<bytes::Bytes>, Report<TrustedServerError>> {
     let mut segments = Vec::new();
-    if let Some(hold_buffer) = state.hold.as_mut() {
-        let ready = hold_buffer.push(chunk);
-        match process_and_encode_chunk(processor, encoder, &ready, false, "Failed to process chunk")
-        {
-            Ok(Some(encoded)) => segments.push(encoded),
-            Ok(None) => {}
-            Err(err) => {
-                abandon_hold_auction(state, collect_refs.services, "stream_process_error").await;
-                return Err(err);
-            }
-        }
+    let dispatched = state
+        .dispatched
+        .take()
+        .expect("should have dispatched auction to collect");
+    collect_stream_auction(
+        dispatched,
+        state.telemetry.take(),
+        collect_refs.price_granularity,
+        collect_refs.ad_bids_state,
+        collect_refs.orchestrator,
+        collect_refs.services,
+        collect_refs.settings,
+    )
+    .await;
+    // Collection reached a terminal result; disarm only now so a drop while the
+    // collect await above was still pending is reported.
+    state.dispatched.disarm();
 
-        if state
-            .hold
-            .as_ref()
-            .is_some_and(BodyCloseHoldBuffer::found_close)
-        {
-            let dispatched = state
-                .dispatched
-                .take()
-                .expect("should have dispatched auction to collect");
-            collect_stream_auction(
-                dispatched,
-                state.telemetry.take(),
-                collect_refs.price_granularity,
-                collect_refs.ad_bids_state,
-                collect_refs.orchestrator,
-                collect_refs.services,
-                collect_refs.settings,
-            )
-            .await;
-            // Collection reached a terminal result; disarm only now so a drop
-            // while the collect await above was still pending is reported.
-            state.dispatched.disarm();
-
-            let held = state
-                .hold
-                .take()
-                .expect("should have close-body hold buffer")
-                .finish();
-            if let Some(encoded) = process_and_encode_chunk(
-                processor,
-                encoder,
-                &held,
-                false,
-                "Failed to process held body close",
-            )? {
-                segments.push(encoded);
-            }
-        }
-    } else {
-        match process_and_encode_chunk(processor, encoder, chunk, false, "Failed to process chunk")
-        {
-            Ok(Some(encoded)) => segments.push(encoded),
-            Ok(None) => {}
-            Err(err) => {
-                abandon_hold_auction(state, collect_refs.services, "stream_process_error").await;
-                return Err(err);
-            }
-        }
+    let held = state
+        .hold
+        .take()
+        .expect("should have close-body hold buffer")
+        .finish();
+    if let Some(encoded) = process_and_encode_chunk(
+        processor,
+        encoder,
+        &held,
+        false,
+        "Failed to process held body close",
+    )? {
+        segments.push(encoded);
     }
     Ok(segments)
 }
@@ -790,7 +810,7 @@ async fn hold_step_next_chunk<P: StreamProcessor>(
     processor: &mut P,
     state: &mut AuctionHoldState,
     collect_refs: &AuctionHoldCollectRefs<'_>,
-) -> Result<Option<Vec<bytes::Bytes>>, Report<TrustedServerError>> {
+) -> Result<Option<HoldStepSegments>, Report<TrustedServerError>> {
     let raw_chunk = match source.next_chunk().await {
         Ok(Some(chunk)) => chunk,
         Ok(None) => return Ok(None),
@@ -807,7 +827,10 @@ async fn hold_step_next_chunk<P: StreamProcessor>(
         }
     };
     if decoded.is_empty() {
-        return Ok(Some(Vec::new()));
+        return Ok(Some(HoldStepSegments {
+            ready: Vec::new(),
+            close_found: false,
+        }));
     }
     hold_step_decoded_chunk(processor, encoder, &decoded, state, collect_refs)
         .await
@@ -839,40 +862,16 @@ async fn hold_finish_segments<P: StreamProcessor>(
         }
     };
     if !decoded_tail.is_empty() {
-        segments.extend(
-            hold_step_decoded_chunk(processor, encoder, &decoded_tail, state, collect_refs).await?,
-        );
+        let step =
+            hold_step_decoded_chunk(processor, encoder, &decoded_tail, state, collect_refs).await?;
+        segments.extend(step.ready);
     }
 
-    if let Some(hold) = state.hold.take() {
-        let dispatched = state
-            .dispatched
-            .take()
-            .expect("should have dispatched auction to collect");
-        collect_stream_auction(
-            dispatched,
-            state.telemetry.take(),
-            collect_refs.price_granularity,
-            collect_refs.ad_bids_state,
-            collect_refs.orchestrator,
-            collect_refs.services,
-            collect_refs.settings,
-        )
-        .await;
-        // Collection reached a terminal result; disarm only now so a drop while
-        // the collect await above was still pending is reported.
-        state.dispatched.disarm();
-
-        let held = hold.finish();
-        if let Some(encoded) = process_and_encode_chunk(
-            processor,
-            encoder,
-            &held,
-            false,
-            "Failed to process held body close",
-        )? {
-            segments.push(encoded);
-        }
+    // If the hold is still armed the auction was never collected mid-stream:
+    // `</body>` arrived only in this tail, or the document had none at all.
+    // Collect now and flush the held remainder before finalizing.
+    if state.hold.is_some() {
+        segments.extend(hold_collect_close_tail(processor, encoder, state, collect_refs).await?);
     }
 
     if let Some(encoded) = process_and_encode_chunk(
@@ -1266,7 +1265,7 @@ pub async fn publisher_response_into_streaming_response(
                         settings: &settings,
                     };
 
-                    while let Some(segments) = hold_step_next_chunk(
+                    while let Some(step) = hold_step_next_chunk(
                         &mut source,
                         &mut decoder,
                         &mut encoder,
@@ -1277,8 +1276,24 @@ pub async fn publisher_response_into_streaming_response(
                     .await
                     .map_err(publisher_stream_error)?
                     {
-                        for encoded in segments {
+                        // Emit the ready prefix before collecting the auction so
+                        // the client receives the document up to `</body>` while
+                        // the auction rides alongside transfer.
+                        for encoded in step.ready {
                             yield encoded;
+                        }
+                        if step.close_found {
+                            for encoded in hold_collect_close_tail(
+                                &mut processor,
+                                &mut encoder,
+                                &mut state,
+                                &collect_refs,
+                            )
+                            .await
+                            .map_err(publisher_stream_error)?
+                            {
+                                yield encoded;
+                            }
                         }
                     }
 
@@ -1820,7 +1835,7 @@ async fn body_close_hold_loop_stream<W: Write, P: StreamProcessor>(
         settings,
     };
 
-    while let Some(segments) = hold_step_next_chunk(
+    while let Some(step) = hold_step_next_chunk(
         &mut source,
         &mut decoder,
         &mut encoder,
@@ -1830,8 +1845,17 @@ async fn body_close_hold_loop_stream<W: Write, P: StreamProcessor>(
     )
     .await?
     {
-        for encoded in segments {
+        // Write the ready prefix before collecting the auction, matching the
+        // lazy Fastly stream: only the held `</body>` tail waits on collection.
+        for encoded in step.ready {
             write_encoded_segment(writer, &encoded)?;
+        }
+        if step.close_found {
+            for encoded in
+                hold_collect_close_tail(processor, &mut encoder, &mut state, &collect_refs).await?
+            {
+                write_encoded_segment(writer, &encoded)?;
+            }
         }
     }
 
@@ -4007,6 +4031,83 @@ mod tests {
             std::str::from_utf8(&output).expect("should be utf8"),
             "<html><body>painted</body><script>late()</script></html>",
             "post-body chunks should still stream in order"
+        );
+    }
+
+    #[tokio::test]
+    async fn hold_step_yields_ready_prefix_before_collecting_auction() {
+        // A small page whose `</body>` lands in the first source chunk must
+        // still stream its document prefix immediately. `hold_step_decoded_chunk`
+        // reports the ready prefix and `close_found` without collecting; only
+        // `hold_collect_close_tail` awaits collection. Regression guard for the
+        // #849 FCP objective: the prefix must become ready while collection
+        // remains pending.
+        let settings = create_test_settings();
+        let services = noop_services();
+        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let ad_bids_state = Arc::new(Mutex::new(None));
+        let mut state = AuctionHoldState::new(
+            DispatchedAuctionGuard::new(DispatchedAuction::empty_for_test(
+                test_auction_request(),
+                500,
+            )),
+            AuctionTelemetryCarry {
+                observation: None,
+                auction_request: None,
+            },
+        );
+        let collect_refs = AuctionHoldCollectRefs {
+            price_granularity: PriceGranularity::default(),
+            ad_bids_state: &ad_bids_state,
+            orchestrator: &orchestrator,
+            services: &services,
+            settings: &settings,
+        };
+        // Passthrough processor: the ordering contract is about collection, not
+        // HTML rewriting, so keep the emitted bytes verbatim.
+        let mut processor = RecordingProcessor {
+            read_count: Arc::new(AtomicUsize::new(0)),
+            body_close_processed_at: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut encoder = BodyStreamEncoder::new(Compression::None);
+
+        let step = hold_step_decoded_chunk(
+            &mut processor,
+            &mut encoder,
+            b"<html><body>painted</body></html>",
+            &mut state,
+            &collect_refs,
+        )
+        .await
+        .expect("hold step should succeed");
+
+        assert!(
+            step.close_found,
+            "</body> in the first chunk must be detected"
+        );
+        let ready: Vec<u8> = step.ready.iter().flat_map(|b| b.to_vec()).collect();
+        assert_eq!(
+            std::str::from_utf8(&ready).expect("ready prefix should be utf8"),
+            "<html><body>painted",
+            "the prefix up to </body> must be ready before collection"
+        );
+        assert!(
+            ad_bids_state.lock().expect("should lock bid state").is_none(),
+            "auction must not be collected while the ready prefix is emitted"
+        );
+
+        let tail = hold_collect_close_tail(&mut processor, &mut encoder, &mut state, &collect_refs)
+            .await
+            .expect("collect should succeed");
+        let tail_bytes: Vec<u8> = tail.iter().flat_map(|b| b.to_vec()).collect();
+        assert_eq!(
+            std::str::from_utf8(&tail_bytes).expect("held tail should be utf8"),
+            "</body></html>",
+            "the held close tail must be emitted after collection"
+        );
+        assert!(
+            ad_bids_state.lock().expect("should lock bid state").is_some(),
+            "collection must run when the held tail is emitted"
         );
     }
 
