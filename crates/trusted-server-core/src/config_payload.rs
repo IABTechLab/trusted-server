@@ -46,6 +46,24 @@ mod tests {
     use super::*;
     use crate::redacted::Redacted;
     use crate::test_support::tests::crate_test_settings_str;
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LegacyAuctionConfig {
+        #[serde(rename = "enabled")]
+        _enabled: bool,
+        #[serde(rename = "providers")]
+        _providers: Vec<String>,
+        #[serde(rename = "mediator")]
+        _mediator: Option<String>,
+        #[serde(rename = "timeout_ms")]
+        _timeout_ms: u32,
+        #[serde(rename = "creative_store")]
+        _creative_store: String,
+        #[serde(rename = "allowed_context_keys")]
+        _allowed_context_keys: std::collections::HashSet<String>,
+    }
 
     fn test_settings() -> Settings {
         Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings")
@@ -80,15 +98,15 @@ mod tests {
 
     #[test]
     fn legacy_blob_without_rewrite_creatives_preserves_rewriting() {
-        let mut data =
+        let data =
             serde_json::to_value(test_settings()).expect("should serialize settings to JSON");
         let auction = data
-            .get_mut("auction")
-            .and_then(serde_json::Value::as_object_mut)
+            .get("auction")
+            .and_then(serde_json::Value::as_object)
             .expect("should serialize auction settings as an object");
         assert!(
-            auction.remove("rewrite_creatives").is_some(),
-            "should remove the newly serialized setting"
+            !auction.contains_key("rewrite_creatives"),
+            "should omit the default rewrite setting from the payload"
         );
         let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_string());
         let envelope_json = serde_json::to_string(&envelope).expect("should serialize envelope");
@@ -99,6 +117,33 @@ mod tests {
         assert!(
             reconstructed.auction.rewrite_creatives,
             "should enable creative rewriting for legacy blobs"
+        );
+    }
+
+    #[test]
+    fn default_auction_payload_is_accepted_by_legacy_schema() {
+        let data =
+            serde_json::to_value(test_settings()).expect("should serialize settings to JSON");
+        let auction = data
+            .get("auction")
+            .cloned()
+            .expect("should serialize auction settings");
+
+        serde_json::from_value::<LegacyAuctionConfig>(auction)
+            .expect("should deserialize the default payload with the legacy schema");
+    }
+
+    #[test]
+    fn disabled_rewrite_creatives_survives_blob_round_trip() {
+        let mut original = test_settings();
+        original.auction.rewrite_creatives = false;
+
+        let reconstructed = settings_from_config_blob(&envelope_json(&original))
+            .expect("should reconstruct disabled rewriting");
+
+        assert!(
+            !reconstructed.auction.rewrite_creatives,
+            "should preserve the explicit rewrite opt-out"
         );
     }
 

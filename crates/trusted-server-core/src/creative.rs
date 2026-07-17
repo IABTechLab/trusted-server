@@ -56,30 +56,21 @@ pub(super) fn to_abs(settings: &Settings, u: &str) -> Option<String> {
         return None;
     }
 
-    // Skip if excluded from rewrites in settings
-    if settings.rewrite.is_excluded(t) {
-        return None;
-    }
-
-    // Skip non-network schemes commonly found in creatives
     let lower = t.to_ascii_lowercase();
-    if lower.starts_with("data:")
-        || lower.starts_with("javascript:")
-        || lower.starts_with("mailto:")
-        || lower.starts_with("tel:")
-        || lower.starts_with("blob:")
-        || lower.starts_with("about:")
-    {
+    let absolute = if t.starts_with("//") {
+        format!("https:{t}")
+    } else if lower.starts_with("http://") || lower.starts_with("https://") {
+        t.to_owned()
+    } else {
+        return None;
+    };
+
+    // Match exclusions against the same absolute URL used for rewriting.
+    if settings.rewrite.is_excluded(&absolute) {
         return None;
     }
 
-    if t.starts_with("//") {
-        Some(format!("https:{t}"))
-    } else if lower.starts_with("http://") || lower.starts_with("https://") {
-        Some(t.to_owned())
-    } else {
-        None
-    }
+    Some(absolute)
 }
 
 // Helper: rewrite url(...) occurrences inside a CSS style string to first-party proxy.
@@ -1323,10 +1314,21 @@ mod tests {
             None
         );
 
+        assert_eq!(
+            to_abs(&settings, "//trusted-cdn.example.com/lib.js"),
+            None,
+            "should exclude a protocol-relative URL by exact domain"
+        );
+
         // Non-excluded domain should return Some
         assert_eq!(
             to_abs(&settings, "https://other-cdn.example.com/lib.js"),
             Some("https://other-cdn.example.com/lib.js".to_owned())
+        );
+        assert_eq!(
+            to_abs(&settings, "//other-cdn.example.com/lib.js"),
+            Some("https://other-cdn.example.com/lib.js".to_owned()),
+            "should normalize a non-excluded protocol-relative URL"
         );
     }
 
@@ -1343,6 +1345,16 @@ mod tests {
             to_abs(&settings, "https://cdnjs.cloudflare.com/lib.js"),
             None
         );
+        assert_eq!(
+            to_abs(&settings, "//cloudflare.com/cdn.js"),
+            None,
+            "should exclude a protocol-relative wildcard base domain"
+        );
+        assert_eq!(
+            to_abs(&settings, "//cdnjs.cloudflare.com/lib.js"),
+            None,
+            "should exclude a protocol-relative wildcard subdomain"
+        );
 
         // Should not exclude different domain
         assert_eq!(
@@ -1358,6 +1370,7 @@ mod tests {
 
         let html = r#"
             <img src="https://trusted-cdn.example.com/logo.png">
+            <img src="//trusted-cdn.example.com/protocol-relative.png">
             <img src="https://other-cdn.example.com/banner.jpg">
         "#;
 
@@ -1365,6 +1378,11 @@ mod tests {
 
         // Excluded domain should NOT be rewritten
         assert!(out.contains(r#"src="https://trusted-cdn.example.com/logo.png"#));
+
+        assert!(
+            out.contains(r#"src="//trusted-cdn.example.com/protocol-relative.png""#),
+            "excluded protocol-relative URL should remain direct: {out}"
+        );
 
         // Non-excluded domain SHOULD be rewritten
         assert!(out.contains("/first-party/proxy?tsurl="));

@@ -7,7 +7,7 @@ Learn how to configure Trusted Server for your deployment.
 Trusted Server uses a flexible configuration system based on:
 
 1. **TOML Files** - `trusted-server.toml` for base configuration
-2. **Environment Variables** - Build-time overrides with `TRUSTED_SERVER__` prefix (baked into the binary by `build.rs`)
+2. **Environment Variables** - Typed CLI overrides with the `TRUSTED_SERVER__` prefix
 3. **Fastly Stores** - KV/Config/Secret stores for runtime data
 
 ## Quick Start
@@ -29,15 +29,18 @@ passphrase = "replace-with-32-plus-byte-random-secret"
 
 ### Environment Variable Overrides
 
-Override any setting at build time. Environment variables are merged into the
-config by `build.rs` and baked into the compiled binary — they are **not** read
-at runtime.
+Environment variables are merged into existing TOML values by the typed
+`ts config validate`, `ts config diff`, and `ts config push` flows. They are not
+read by the deployed application at request time.
 
 ```bash
 # Format: TRUSTED_SERVER__SECTION__FIELD
 export TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
 export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
 export TRUSTED_SERVER__EC__PASSPHRASE=replace-with-32-plus-byte-random-secret
+
+ts config validate
+ts config push --adapter fastly
 ```
 
 ### Generate Secure Secrets
@@ -103,11 +106,18 @@ client_side_bidders = ["rubicon"]
 
 The sections below consolidate the full configuration reference on this page.
 
-## Environment Variable Overrides (Build-Time)
+## Environment Variable Overrides (Typed CLI)
 
 Environment variables with the `TRUSTED_SERVER__` prefix are merged into the
-base TOML configuration by `build.rs` at compile time. The resulting config is
-embedded in the binary. Changing an environment variable requires a rebuild.
+base TOML configuration by `ts config validate`, `ts config diff`, and
+`ts config push`. The resolved values are validated and, for `config push`,
+stored in the app-config blob. Changing an environment variable requires
+rerunning validation and pushing the resolved config, not rebuilding the binary.
+
+EdgeZero v0.0.4 only overrides leaves that already exist in the parsed TOML; it
+does not create missing fields. Add newly introduced defaulted fields to an
+existing config before relying on their environment overrides. Pass `--no-env`
+to use file values without the overlay.
 
 ### Format
 
@@ -1209,6 +1219,19 @@ accepted external URLs remain direct and are not host allowlisted by the
 sanitizer. The setting does not affect HTML or CSS fetched through
 `/first-party/proxy`. See [Creative Processing](/guide/creative-processing#auction-rewrite-control).
 
+::: warning Existing configs and rollback
+Configs created before `rewrite_creatives` was introduced must first add
+`rewrite_creatives = true` under `[auction]`. After adding the leaf, set
+`TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES`, run `ts config validate`, and push
+the resolved config.
+
+The default `true` is omitted from stored JSON so older binaries can read the
+blob during rollback. An explicit `false` must remain serialized. Before rolling
+back to a binary without this field, remove the `false` environment override (or
+set the file value to `true`), push the resulting default-compatible blob, and
+only then roll back the binary.
+:::
+
 **Example**:
 
 ```toml
@@ -1416,10 +1439,12 @@ trusted-server.dev.toml      # Development overrides
 
 **Environment Variables Not Applied**:
 
-- Env vars are applied at **build time** only — rebuild after changing them
+- Run the override through `ts config validate`, `ts config diff`, or `ts config push`
+- Verify the target leaf already exists in `trusted-server.toml`; EdgeZero v0.0.4 does not create missing fields
 - Verify prefix: `TRUSTED_SERVER__`
 - Check separator: `__` (double underscore)
-- Confirm variable is exported: `echo $VARIABLE_NAME`
+- Confirm the variable is exported: `echo $VARIABLE_NAME`
+- Rerun `ts config push` after changing a deploy-time override
 - Try explicit string: `VARIABLE='value'` not `VARIABLE=value`
 
 ### Debug Configuration
