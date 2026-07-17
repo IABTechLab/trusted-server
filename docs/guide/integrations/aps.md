@@ -31,6 +31,8 @@ enabled = true
 account_id = "example-aps-account-id"
 endpoint = "https://web.ads.aps.amazon-adsystem.com/e/pb/bid"
 timeout_ms = 800
+# Include raw APS request/response data in /auction metadata on test sites only.
+debug = false
 # Set both when the deployment hostname differs from APS-authorized inventory.
 # inventory_domain = "publisher.example"
 # inventory_page_origin = "https://www.publisher.example"
@@ -43,6 +45,8 @@ timeout_ms = 2000
 ```
 
 `account_id` is the canonical field. `pub_id` remains a compatibility alias for migration, including integer values, but new configuration should not use it. Supplying both names is an error.
+
+`debug` defaults to `false`. Enable it only on controlled test sites because it includes the raw APS request and response, including identity, consent, device, page, account, bid, and creative data, in the client-visible `/auction` response.
 
 `allow_script_creatives` defaults to `false`. While disabled, APS script bids are rejected before per-impression reduction, floors, mediation, and winner selection. Enable it only for a controlled cohort after the browser-security checks in [Rollout](#rollout) pass.
 
@@ -72,7 +76,39 @@ Trusted Server builds the APS request independently from its Prebid Server reque
 
 Precise latitude/longitude, disallowed identifiers, unsupported media types, and Trusted Server/Prebid-only extensions are not forwarded. Unsafe or oversized page URLs are omitted or replaced by the validated publisher fallback.
 
-Raw outbound and inbound payloads are logged only at TRACE level. Normal logs and auction metadata contain aggregate counts and drop reasons.
+Raw outbound and inbound payloads are logged only at TRACE level. With debug disabled, auction metadata contains only aggregate counts and drop reasons.
+
+## Debug mode
+
+Set `debug = true` under `[integrations.aps]` to include the direct APS HTTP exchange in the APS provider summary returned by `POST /auction`:
+
+```json
+{
+  "metadata": {
+    "debug": {
+      "httpcalls": {
+        "aps": [
+          {
+            "requestbody": "{...}",
+            "requestheaders": { "content-type": ["application/json"] },
+            "responsebody": "{...}",
+            "responseheaders": { "content-type": ["application/json"] },
+            "status": 200,
+            "uri": "https://web.ads.aps.amazon-adsystem.com/e/pb/bid"
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+This follows the Prebid Server `metadata.debug.httpcalls` representation. APS makes one direct HTTP call per auction, so the map uses the provider key `aps` with one entry. Request and captured response bodies are strings, and header values are arrays so repeated headers are preserved. If a non-success response body cannot be read within the existing 2 MiB upstream limit, `responsebody` is omitted rather than reported as an empty body. APS does not add PBS-only `resolvedrequest` or `bidstatus` fields.
+
+The debug exchange is emitted for successful responses, `204 No Content`, malformed response bodies, and non-success HTTP statuses. Transport failures and auction timeouts happen before an HTTP response reaches the parser and continue to use the orchestrator's normal error metadata.
+
+> [!WARNING]
+> APS debug metadata is unredacted and client-visible. Use it only on controlled test sites, and disable it before production rollout.
 
 ## Bid eligibility and selection
 
@@ -196,6 +232,7 @@ Use fictional values in source-controlled configuration and fixtures. Supply con
 - Ensure `aps` appears in `auction.providers`.
 - Check aggregate APS drop reasons for currency, dimensions, render source, URL, tag type, or script-gate rejection.
 - Confirm the provider timeout fits inside the auction timeout.
+- On a controlled test site, set `debug = true` and inspect `ext.orchestrator.provider_details[].metadata.debug.httpcalls.aps` in the `/auction` response.
 
 ### Winner targets but does not render
 
