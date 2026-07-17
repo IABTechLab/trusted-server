@@ -18,6 +18,7 @@ use serde_json::Value as Json;
 use url::{Url, Url as ParsedUrl};
 use validator::{Validate, ValidationError};
 
+use crate::auction::orchestrator::ERROR_TYPE_HTTP_STATUS;
 use crate::auction::provider::AuctionProvider;
 use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid, MediaType,
@@ -61,20 +62,133 @@ const ZONE_KEY: &str = "zone";
 /// Default currency for `OpenRTB` bid floors and responses.
 const DEFAULT_CURRENCY: &str = "USD";
 
-#[cfg(test)]
+const PREBID_PUBLIC_ERROR_MESSAGE_CHARS: usize = 500;
 const PREBID_ERROR_BODY_PREVIEW_CHARS: usize = 1000;
-
-#[cfg(test)]
 const PREBID_ERROR_BODY_PREVIEW_BYTES: usize = PREBID_ERROR_BODY_PREVIEW_CHARS * 4;
+const PREBID_ERROR_JSON_MAX_DEPTH: usize = 6;
+const PREBID_ERROR_JSON_KEYS: [&str; 6] =
+    ["message", "error", "errors", "detail", "title", "reason"];
 
-#[cfg(test)]
-fn prebid_body_preview(body: &[u8]) -> String {
+#[derive(Debug, Eq, PartialEq)]
+struct BoundedPrebidErrorText {
+    text: String,
+    truncated: bool,
+}
+
+fn bounded_prebid_error_text(value: &str, max_chars: usize) -> Option<BoundedPrebidErrorText> {
+    let mut text = String::new();
+    let mut char_count = 0;
+    let mut pending_space = false;
+    let mut truncated = false;
+
+    for character in value.chars() {
+        if character.is_whitespace() || character.is_control() {
+            pending_space = !text.is_empty();
+            continue;
+        }
+
+        if pending_space {
+            if char_count == max_chars {
+                truncated = true;
+                break;
+            }
+            text.push(' ');
+            char_count += 1;
+            pending_space = false;
+        }
+
+        if char_count == max_chars {
+            truncated = true;
+            break;
+        }
+        text.push(character);
+        char_count += 1;
+    }
+
+    (!text.is_empty()).then_some(BoundedPrebidErrorText { text, truncated })
+}
+
+fn prebid_body_preview(body: &[u8]) -> Option<BoundedPrebidErrorText> {
     let bounded_body = &body[..body.len().min(PREBID_ERROR_BODY_PREVIEW_BYTES)];
+    let mut preview = bounded_prebid_error_text(
+        &String::from_utf8_lossy(bounded_body),
+        PREBID_ERROR_BODY_PREVIEW_CHARS,
+    )?;
+    preview.truncated |= body.len() > bounded_body.len();
+    Some(preview)
+}
 
-    String::from_utf8_lossy(bounded_body)
-        .chars()
-        .take(PREBID_ERROR_BODY_PREVIEW_CHARS)
-        .collect()
+fn nested_prebid_json_error_message(
+    value: &Json,
+    depth: usize,
+    allow_direct_string: bool,
+) -> Option<&str> {
+    if depth > PREBID_ERROR_JSON_MAX_DEPTH {
+        return None;
+    }
+
+    match value {
+        Json::String(message) if allow_direct_string => {
+            (!message.trim().is_empty()).then_some(message.as_str())
+        }
+        Json::Array(values) => values.iter().find_map(|value| {
+            nested_prebid_json_error_message(value, depth + 1, allow_direct_string)
+        }),
+        Json::Object(values) => PREBID_ERROR_JSON_KEYS
+            .iter()
+            .find_map(|key| {
+                values
+                    .get(*key)
+                    .and_then(|value| nested_prebid_json_error_message(value, depth + 1, true))
+            })
+            .or_else(|| {
+                values
+                    .values()
+                    .find_map(|value| nested_prebid_json_error_message(value, depth + 1, false))
+            }),
+        _ => None,
+    }
+}
+
+fn prebid_json_error_message(value: &Json) -> Option<&str> {
+    let Json::Object(values) = value else {
+        return None;
+    };
+
+    PREBID_ERROR_JSON_KEYS.iter().find_map(|key| {
+        values
+            .get(*key)
+            .and_then(|value| nested_prebid_json_error_message(value, 0, true))
+    })
+}
+
+fn is_plain_text_content_type(content_type: Option<&str>) -> bool {
+    content_type.is_some_and(|value| {
+        value
+            .split(';')
+            .next()
+            .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/plain"))
+    })
+}
+
+fn extract_prebid_error_message(
+    body: &[u8],
+    content_type: Option<&str>,
+) -> Option<BoundedPrebidErrorText> {
+    let candidate = match serde_json::from_slice::<Json>(body) {
+        Ok(value) => prebid_json_error_message(&value)?.to_owned(),
+        Err(_) if is_plain_text_content_type(content_type) => {
+            std::str::from_utf8(body).ok()?.to_owned()
+        }
+        Err(_) => return None,
+    };
+
+    // Do not expose an HTML error page even if an intermediary labels it as text/plain.
+    if candidate.trim_start().starts_with('<') {
+        return None;
+    }
+
+    bounded_prebid_error_text(&candidate, PREBID_PUBLIC_ERROR_MESSAGE_CHARS)
 }
 
 /// CCPA/US-privacy string sent when the `Sec-GPC` header signals opt-out.
@@ -1844,6 +1958,126 @@ impl PrebidAuctionProvider {
         }
     }
 
+    async fn parse_response_inner(
+        &self,
+        response: PlatformResponse,
+        response_time_ms: u64,
+        auction_id: Option<&str>,
+    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+        let response = response.response;
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+
+        // Parse response — collect_response_bounded caps memory from misbehaving providers.
+        let body_bytes = collect_response_bounded(
+            response.into_body(),
+            UPSTREAM_RTB_MAX_RESPONSE_BYTES,
+            "prebid",
+        )
+        .await
+        .change_context(TrustedServerError::Prebid {
+            message: "Failed to read Prebid response body".to_string(),
+        });
+
+        if !status.is_success() {
+            let auction_id = auction_id.unwrap_or("<unavailable>");
+            log::warn!("Prebid auction {auction_id:?} returned non-success status: {status}");
+
+            let body_bytes = match body_bytes {
+                Ok(body_bytes) => Some(body_bytes),
+                Err(error) => {
+                    log::warn!(
+                        "Prebid auction {auction_id:?} failed to read non-success response body: {error:?}"
+                    );
+                    None
+                }
+            };
+
+            if self.config.debug
+                && let Some(body_bytes) = body_bytes.as_deref()
+            {
+                match prebid_body_preview(body_bytes) {
+                    Some(preview) => {
+                        let truncation = if preview.truncated {
+                            " (truncated)"
+                        } else {
+                            ""
+                        };
+                        log::warn!(
+                            "Prebid auction {auction_id:?} error response body preview{truncation}: {}",
+                            preview.text
+                        );
+                    }
+                    None => log::warn!(
+                        "Prebid auction {auction_id:?} returned an empty error response body"
+                    ),
+                }
+            }
+
+            let status_code = status.as_u16();
+            let mut auction_response =
+                AuctionResponse::error(PREBID_INTEGRATION_ID, response_time_ms)
+                    .with_metadata("error_type", serde_json::json!(ERROR_TYPE_HTTP_STATUS))
+                    .with_metadata("http_status", serde_json::json!(status_code))
+                    .with_metadata(
+                        "message",
+                        serde_json::json!(format!("Prebid Server returned HTTP {status_code}")),
+                    );
+
+            let upstream_message = if self.config.debug {
+                body_bytes.as_deref().and_then(|body_bytes| {
+                    extract_prebid_error_message(body_bytes, content_type.as_deref())
+                })
+            } else {
+                None
+            };
+            if let Some(message) = upstream_message {
+                auction_response.metadata.insert(
+                    "upstream_message".to_string(),
+                    serde_json::json!(message.text),
+                );
+                auction_response.metadata.insert(
+                    "upstream_message_truncated".to_string(),
+                    serde_json::json!(message.truncated),
+                );
+            }
+
+            return Ok(auction_response);
+        }
+
+        let body_bytes = body_bytes?;
+        let response_json: Json =
+            serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Prebid {
+                message: "Failed to parse Prebid response".to_string(),
+            })?;
+
+        // Log the full response body when debug is enabled to surface
+        // ext.debug.httpcalls, resolvedrequest, bidstatus, errors, etc.
+        if self.config.debug && log::log_enabled!(log::Level::Trace) {
+            match serde_json::to_string_pretty(&response_json) {
+                Ok(json) => log::trace!("Prebid OpenRTB response:\n{json}"),
+                Err(e) => {
+                    log::warn!("Prebid: failed to serialize response for logging: {e}");
+                }
+            }
+        }
+
+        let mut auction_response = self.parse_openrtb_response(&response_json, response_time_ms);
+        self.enrich_response_metadata(&response_json, &mut auction_response);
+
+        log::info!(
+            "Prebid returned {} bids in {}ms",
+            auction_response.bids.len(),
+            response_time_ms
+        );
+
+        Ok(auction_response)
+    }
+
     fn should_suppress_bid_notifications(&self, bidder: &str) -> bool {
         self.config.suppress_nurl
             || self
@@ -2107,58 +2341,19 @@ impl AuctionProvider for PrebidAuctionProvider {
         response: PlatformResponse,
         response_time_ms: u64,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-        let response = response.response;
-        let status = response.status();
+        self.parse_response_inner(response, response_time_ms, None)
+            .await
+    }
 
-        // Parse response — collect_response_bounded caps memory from misbehaving providers.
-        let body_bytes = collect_response_bounded(
-            response.into_body(),
-            UPSTREAM_RTB_MAX_RESPONSE_BYTES,
-            "prebid",
-        )
-        .await
-        .change_context(TrustedServerError::Prebid {
-            message: "Failed to read Prebid response body".to_string(),
-        })?;
-
-        if !status.is_success() {
-            log::warn!("Prebid returned non-success status: {}", status,);
-            if log::log_enabled!(log::Level::Trace) {
-                let body_preview = String::from_utf8_lossy(&body_bytes);
-                log::trace!(
-                    "Prebid error response body: {}",
-                    &body_preview[..body_preview.floor_char_boundary(1000)]
-                );
-            }
-            return Ok(AuctionResponse::error("prebid", response_time_ms));
-        }
-
-        let response_json: Json =
-            serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Prebid {
-                message: "Failed to parse Prebid response".to_string(),
-            })?;
-
-        // Log the full response body when debug is enabled to surface
-        // ext.debug.httpcalls, resolvedrequest, bidstatus, errors, etc.
-        if self.config.debug && log::log_enabled!(log::Level::Trace) {
-            match serde_json::to_string_pretty(&response_json) {
-                Ok(json) => log::trace!("Prebid OpenRTB response:\n{json}"),
-                Err(e) => {
-                    log::warn!("Prebid: failed to serialize response for logging: {e}");
-                }
-            }
-        }
-
-        let mut auction_response = self.parse_openrtb_response(&response_json, response_time_ms);
-        self.enrich_response_metadata(&response_json, &mut auction_response);
-
-        log::info!(
-            "Prebid returned {} bids in {}ms",
-            auction_response.bids.len(),
-            response_time_ms
-        );
-
-        Ok(auction_response)
+    async fn parse_response_with_context(
+        &self,
+        response: PlatformResponse,
+        response_time_ms: u64,
+        request: &AuctionRequest,
+        _context: &AuctionContext<'_>,
+    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+        self.parse_response_inner(response, response_time_ms, Some(request.id.as_str()))
+            .await
     }
 
     fn supports_media_type(&self, media_type: &MediaType) -> bool {
@@ -2230,6 +2425,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::auction::formats::convert_to_openrtb_response;
+    use crate::auction::orchestrator::OrchestrationResult;
     use crate::auction::test_support::create_test_auction_context as shared_test_auction_context;
     use crate::auction::types::{
         AdFormat, AdSlot, AuctionContext, AuctionRequest, DeviceInfo, PublisherInfo, UserInfo,
@@ -2252,6 +2449,7 @@ mod tests {
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::tests::create_test_settings;
     use base64::engine::general_purpose::STANDARD as TEST_BASE64_STANDARD;
+    use bytes::Bytes;
     use http::Method;
     use serde_json::json;
     use std::collections::HashMap;
@@ -2372,6 +2570,31 @@ mod tests {
                 .to_vec(),
         )
         .expect("should parse response body as utf-8")
+    }
+
+    fn prebid_platform_response(
+        status: StatusCode,
+        content_type: Option<&str>,
+        body: impl Into<Vec<u8>>,
+    ) -> PlatformResponse {
+        prebid_platform_response_with_body(status, content_type, EdgeBody::from(body.into()))
+    }
+
+    fn prebid_platform_response_with_body(
+        status: StatusCode,
+        content_type: Option<&str>,
+        body: EdgeBody,
+    ) -> PlatformResponse {
+        let mut builder = http::Response::builder().status(status);
+        if let Some(content_type) = content_type {
+            builder = builder.header(header::CONTENT_TYPE, content_type);
+        }
+
+        PlatformResponse::new(
+            builder
+                .body(body)
+                .expect("should build Prebid platform response"),
+        )
     }
 
     fn create_test_auction_request() -> AuctionRequest {
@@ -4800,26 +5023,41 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
+    fn bounded_prebid_error_text_normalizes_control_characters_and_whitespace() {
+        let message = bounded_prebid_error_text("\n invalid\trequest\0  payload \r\n", 100)
+            .expect("should extract bounded text");
+
+        assert_eq!(
+            message.text, "invalid request payload",
+            "should make upstream text safe for one-line responses and logs"
+        );
+        assert!(!message.truncated, "should retain the complete message");
+    }
+
+    #[test]
     fn prebid_body_preview_truncates_to_character_limit() {
         let body = "x".repeat(PREBID_ERROR_BODY_PREVIEW_CHARS + 100);
 
-        let preview = prebid_body_preview(body.as_bytes());
+        let preview = prebid_body_preview(body.as_bytes()).expect("should build body preview");
 
         assert_eq!(
-            preview.chars().count(),
+            preview.text.chars().count(),
             PREBID_ERROR_BODY_PREVIEW_CHARS,
             "should cap the upstream body preview"
         );
+        assert!(preview.truncated, "should report body preview truncation");
     }
 
     #[test]
     fn prebid_body_preview_handles_non_utf8_lossily() {
-        let preview = prebid_body_preview(&[b'o', b'k', 0xff, b'!']);
+        let preview =
+            prebid_body_preview(&[b'o', b'k', 0xff, b'!']).expect("should build body preview");
 
         assert_eq!(
-            preview, "ok\u{fffd}!",
+            preview.text, "ok\u{fffd}!",
             "should replace invalid UTF-8 bytes without panicking"
         );
+        assert!(!preview.truncated, "should retain the complete preview");
     }
 
     #[test]
@@ -4827,17 +5065,18 @@ external_bundle_sri = "sha384-AAAA"
         let mut body = vec![b'x'; PREBID_ERROR_BODY_PREVIEW_BYTES];
         body.extend_from_slice(&[0xff, b't', b'a', b'i', b'l']);
 
-        let preview = prebid_body_preview(&body);
+        let preview = prebid_body_preview(&body).expect("should build body preview");
 
         assert_eq!(
-            preview.chars().count(),
+            preview.text.chars().count(),
             PREBID_ERROR_BODY_PREVIEW_CHARS,
-            "should keep the public preview capped"
+            "should keep the log preview capped"
         );
         assert!(
-            !preview.contains('\u{fffd}') && !preview.contains("tail"),
+            !preview.text.contains('\u{fffd}') && !preview.text.contains("tail"),
             "should not process bytes beyond the bounded preview slice"
         );
+        assert!(preview.truncated, "should report bounded-slice truncation");
     }
 
     #[test]
@@ -4846,16 +5085,303 @@ external_bundle_sri = "sha384-AAAA"
         body.extend_from_slice("\u{2603}".as_bytes());
         body.extend_from_slice(b"tail");
 
-        let preview = prebid_body_preview(&body);
+        let preview = prebid_body_preview(&body).expect("should build body preview");
 
         assert_eq!(
-            preview.chars().count(),
+            preview.text.chars().count(),
             PREBID_ERROR_BODY_PREVIEW_CHARS,
-            "should keep the public preview capped"
+            "should keep the log preview capped"
         );
         assert!(
-            !preview.contains("tail"),
+            !preview.text.contains("tail"),
             "should not include bytes beyond the bounded preview slice"
+        );
+        assert!(preview.truncated, "should report partial-body truncation");
+    }
+
+    #[test]
+    fn extract_prebid_error_message_reads_nested_json_message() {
+        let body = br#"{
+            "errors": {
+                "exampleBidder": [{"code": 1, "message": " invalid\nrequest "}]
+            }
+        }"#;
+
+        let message = extract_prebid_error_message(body, Some("application/json"))
+            .expect("should extract nested JSON error message");
+
+        assert_eq!(message.text, "invalid request");
+        assert!(!message.truncated, "should retain the complete message");
+    }
+
+    #[test]
+    fn extract_prebid_error_message_reads_plain_text() {
+        let message = extract_prebid_error_message(
+            b" request rejected\r\nby Prebid Server ",
+            Some("Text/Plain; charset=utf-8"),
+        )
+        .expect("should extract plain-text error message");
+
+        assert_eq!(message.text, "request rejected by Prebid Server");
+        assert!(!message.truncated, "should retain the complete message");
+    }
+
+    #[test]
+    fn extract_prebid_error_message_rejects_html_and_unknown_json_fields() {
+        assert!(
+            extract_prebid_error_message(
+                b"<html><body>internal proxy error</body></html>",
+                Some("text/plain"),
+            )
+            .is_none(),
+            "should not expose HTML error pages"
+        );
+
+        for body in [
+            br#"{"resolvedrequest":{"account":"internal"}}"#.as_slice(),
+            br#"{"errors":{"resolvedrequest":{"account":"internal"}}}"#.as_slice(),
+            br#""internal""#.as_slice(),
+            br#"["internal"]"#.as_slice(),
+        ] {
+            assert!(
+                extract_prebid_error_message(body, Some("application/json")).is_none(),
+                "should only expose strings associated with allowlisted JSON error fields"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_prebid_error_message_truncates_public_message() {
+        let body = serde_json::to_vec(&json!({
+            "message": "x".repeat(PREBID_PUBLIC_ERROR_MESSAGE_CHARS + 100),
+        }))
+        .expect("should serialize test error response");
+
+        let message = extract_prebid_error_message(&body, Some("application/json"))
+            .expect("should extract JSON error message");
+
+        assert_eq!(
+            message.text.chars().count(),
+            PREBID_PUBLIC_ERROR_MESSAGE_CHARS,
+            "should cap the browser-visible upstream message"
+        );
+        assert!(message.truncated, "should report public message truncation");
+    }
+
+    #[test]
+    fn non_success_prebid_response_always_includes_safe_http_metadata() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let response = prebid_platform_response(
+            StatusCode::BAD_REQUEST,
+            Some("application/json"),
+            br#"{"message":"request details should remain hidden"}"#.to_vec(),
+        );
+
+        let auction_response = futures::executor::block_on(provider.parse_response(response, 42))
+            .expect("should convert upstream HTTP failure to auction response");
+
+        assert_eq!(
+            auction_response.status,
+            crate::auction::types::BidStatus::Error
+        );
+        assert_eq!(
+            auction_response.metadata["error_type"],
+            json!(ERROR_TYPE_HTTP_STATUS)
+        );
+        assert_eq!(auction_response.metadata["http_status"], json!(400));
+        assert_eq!(
+            auction_response.metadata["message"],
+            json!("Prebid Server returned HTTP 400")
+        );
+        assert!(
+            !auction_response.metadata.contains_key("upstream_message"),
+            "should hide upstream text when Prebid debug is disabled"
+        );
+    }
+
+    #[test]
+    fn debug_non_success_prebid_response_includes_bounded_upstream_message() {
+        let mut config = base_config();
+        config.debug = true;
+        let provider = PrebidAuctionProvider::new(config);
+        let response = prebid_platform_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Some("application/json; charset=utf-8"),
+            br#"{"error":{"message":"imp[0] has no valid bidders"}}"#.to_vec(),
+        );
+        let settings = make_settings();
+        let http_request = build_test_request();
+        let context = create_test_auction_context(&settings, &http_request);
+        let auction_request = create_test_auction_request();
+
+        let auction_response = futures::executor::block_on(provider.parse_response_with_context(
+            response,
+            66,
+            &auction_request,
+            &context,
+        ))
+        .expect("should convert upstream HTTP failure to debug auction response");
+
+        assert_eq!(auction_response.metadata["http_status"], json!(422));
+        assert_eq!(
+            auction_response.metadata["upstream_message"],
+            json!("imp[0] has no valid bidders")
+        );
+        assert_eq!(
+            auction_response.metadata["upstream_message_truncated"],
+            json!(false)
+        );
+    }
+
+    fn assert_oversized_http_error_is_classified(
+        auction_response: &AuctionResponse,
+        expected_status: u16,
+    ) {
+        assert_eq!(
+            auction_response.status,
+            crate::auction::types::BidStatus::Error
+        );
+        assert_eq!(
+            auction_response.metadata["error_type"],
+            json!(ERROR_TYPE_HTTP_STATUS)
+        );
+        assert_eq!(
+            auction_response.metadata["http_status"],
+            json!(expected_status)
+        );
+        assert_eq!(
+            auction_response.metadata["message"],
+            json!(format!("Prebid Server returned HTTP {expected_status}"))
+        );
+        assert!(
+            !auction_response.metadata.contains_key("upstream_message"),
+            "should not expose a body that could not be collected safely"
+        );
+    }
+
+    #[test]
+    fn oversized_once_non_success_prebid_response_preserves_http_classification() {
+        let mut config = base_config();
+        config.debug = true;
+        let provider = PrebidAuctionProvider::new(config);
+        let response = prebid_platform_response(
+            StatusCode::BAD_GATEWAY,
+            Some("text/plain"),
+            vec![b'x'; UPSTREAM_RTB_MAX_RESPONSE_BYTES + 1],
+        );
+
+        let auction_response = futures::executor::block_on(provider.parse_response(response, 42))
+            .expect("should preserve HTTP classification for oversized one-shot body");
+
+        assert_oversized_http_error_is_classified(
+            &auction_response,
+            StatusCode::BAD_GATEWAY.as_u16(),
+        );
+    }
+
+    #[test]
+    fn oversized_streaming_non_success_prebid_response_preserves_http_classification() {
+        let mut config = base_config();
+        config.debug = true;
+        let provider = PrebidAuctionProvider::new(config);
+        let stream = futures::stream::iter([
+            Bytes::from(vec![b'x'; UPSTREAM_RTB_MAX_RESPONSE_BYTES]),
+            Bytes::from_static(b"x"),
+        ]);
+        let response = prebid_platform_response_with_body(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some("text/plain"),
+            EdgeBody::stream(stream),
+        );
+
+        let auction_response = futures::executor::block_on(provider.parse_response(response, 42))
+            .expect("should preserve HTTP classification for oversized streaming body");
+
+        assert_oversized_http_error_is_classified(
+            &auction_response,
+            StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+        );
+    }
+
+    fn public_prebid_error_metadata(debug: bool, upstream_message: &str) -> Json {
+        let mut config = base_config();
+        config.debug = debug;
+        let provider = PrebidAuctionProvider::new(config);
+        let body = serde_json::to_vec(&json!({ "message": upstream_message }))
+            .expect("should serialize upstream error response");
+        let response =
+            prebid_platform_response(StatusCode::BAD_REQUEST, Some("application/json"), body);
+        let provider_response = futures::executor::block_on(provider.parse_response(response, 42))
+            .expect("should classify upstream HTTP error");
+        let result = OrchestrationResult {
+            provider_responses: vec![provider_response],
+            mediator_response: None,
+            winning_bids: HashMap::new(),
+            total_time_ms: 42,
+            metadata: HashMap::new(),
+        };
+        let response = convert_to_openrtb_response(
+            &result,
+            &make_settings(),
+            &create_test_auction_request(),
+            false,
+        )
+        .expect("should serialize public auction response");
+        let body = response.into_body().into_bytes().unwrap_or_default();
+        let response_json: Json =
+            serde_json::from_slice(&body).expect("should parse public auction response");
+
+        response_json["ext"]["orchestrator"]["provider_details"][0]["metadata"].clone()
+    }
+
+    #[test]
+    fn public_auction_response_gates_and_bounds_prebid_upstream_message() {
+        let trailing_marker = "trailing-private-marker";
+        let upstream_message = format!(
+            " \nprivate-details\t{}\n{trailing_marker}",
+            "x".repeat(PREBID_PUBLIC_ERROR_MESSAGE_CHARS)
+        );
+
+        let no_debug_metadata = public_prebid_error_metadata(false, &upstream_message);
+        assert_eq!(
+            no_debug_metadata["error_type"],
+            json!(ERROR_TYPE_HTTP_STATUS)
+        );
+        assert_eq!(no_debug_metadata["http_status"], json!(400));
+        assert_eq!(
+            no_debug_metadata["message"],
+            json!("Prebid Server returned HTTP 400")
+        );
+        assert!(
+            no_debug_metadata.get("upstream_message").is_none(),
+            "should hide upstream text in the public response when debug is disabled"
+        );
+        assert!(
+            !no_debug_metadata.to_string().contains("private-details"),
+            "should not serialize upstream-only text when debug is disabled"
+        );
+
+        let debug_metadata = public_prebid_error_metadata(true, &upstream_message);
+        let expected_message = format!(
+            "private-details {}",
+            "x".repeat(PREBID_PUBLIC_ERROR_MESSAGE_CHARS - "private-details ".chars().count())
+        );
+        assert_eq!(
+            debug_metadata["upstream_message"],
+            json!(expected_message),
+            "should serialize only the normalized, bounded upstream message"
+        );
+        assert_eq!(debug_metadata["upstream_message_truncated"], json!(true));
+        let serialized_debug_metadata = debug_metadata.to_string();
+        assert!(
+            !serialized_debug_metadata.contains(trailing_marker),
+            "should omit upstream text beyond the public message bound"
+        );
+        assert!(
+            !debug_metadata["upstream_message"]
+                .as_str()
+                .is_some_and(|message| message.contains(['\n', '\t'])),
+            "should normalize control characters in the public response"
         );
     }
 

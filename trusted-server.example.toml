@@ -138,6 +138,14 @@ example_segments = "segments"
 [debug]
 ja4_endpoint_enabled = false
 
+# Inject a `<!-- ts-debug: ... -->` HTML comment before `</body>` dumping a
+# redacted per-provider auction result: pipeline stats plus every provider
+# response, with each bid's creative previewed (not the full markup) and
+# provider metadata filtered to a fail-closed allowlist.
+# Visible in page source and injects (bounded) raw HTML from SSPs. NEVER enable
+# in production.
+auction_html_comment = false
+
 [creative_opportunities]
 gam_network_id = "123456789"
 # FCP is not affected by this value — body content above </body> has already
