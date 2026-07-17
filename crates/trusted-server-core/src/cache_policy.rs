@@ -159,13 +159,12 @@ impl CachePolicy {
             directives.push(format!("max-age={}", ttl.as_secs()));
         }
 
-        if edge_header == EdgeCacheHeader::SMaxageFallback {
-            if let Some(ttl) = self
+        if edge_header == EdgeCacheHeader::SMaxageFallback
+            && let Some(ttl) = self
                 .edge_ttl
                 .filter(|_| self.visibility == CacheVisibility::Public)
-            {
-                directives.push(format!("s-maxage={}", ttl.as_secs()));
-            }
+        {
+            directives.push(format!("s-maxage={}", ttl.as_secs()));
         }
 
         if let Some(ttl) = self.stale_while_revalidate {
@@ -226,14 +225,14 @@ impl CachePolicy {
         );
 
         remove_edge_cache_headers(headers);
-        if let Some(header_name) = edge_header.header_name() {
-            if let Some(value) = self.edge_header_value(edge_header) {
-                headers.insert(
-                    header_name,
-                    HeaderValue::from_str(&value)
-                        .expect("should render a valid edge cache-control header"),
-                );
-            }
+        if let Some(header_name) = edge_header.header_name()
+            && let Some(value) = self.edge_header_value(edge_header)
+        {
+            headers.insert(
+                header_name,
+                HeaderValue::from_str(&value)
+                    .expect("should render a valid edge cache-control header"),
+            );
         }
     }
 }
