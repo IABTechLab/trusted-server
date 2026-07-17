@@ -6651,7 +6651,7 @@ mod tests {
             bid.burl = None;
             let winning_bids = HashMap::from([("atf_sidebar_ad".to_string(), bid)]);
 
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false, None);
             let obj = map["atf_sidebar_ad"]
                 .as_object()
                 .expect("should include APS bid");
@@ -6687,7 +6687,7 @@ mod tests {
             // Production path (include_debug_bid = false): the creative is always
             // included so the bridge can render it locally, but the verbose
             // debug_bid blob is not.
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false, None);
             let obj = map
                 .get("atf_sidebar_ad")
                 .expect("should have bid entry")
@@ -6721,7 +6721,7 @@ mod tests {
             bid.creative = Some("</script><script>alert(1)</script>\u{2028}\u{2029}".to_string());
             winning_bids.insert("s".to_string(), bid);
 
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false, None);
             let script = build_bids_script(&map);
             assert!(
                 !script.contains("</script><script>"),

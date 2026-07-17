@@ -8,7 +8,6 @@ import { log } from './log';
 import { getAllUnits, firstSize } from './registry';
 import { createAdIframe, findSlot, buildCreativeDocument, sanitizeCreativeHtml } from './render';
 
-
 export type RequestAdsCallback = () => void;
 export interface RequestAdsOptions {
   bidsBackHandler?: RequestAdsCallback;
