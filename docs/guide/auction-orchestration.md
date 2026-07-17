@@ -368,6 +368,7 @@ enabled = true
 account_id = "example-account"
 endpoint = "https://web.ads.aps.amazon-adsystem.com/e/pb/bid"
 timeout_ms = 800
+debug = false
 allow_script_creatives = false
 ```
 
@@ -624,6 +625,7 @@ enabled = true
 account_id = "example-account"
 endpoint = "https://web.ads.aps.amazon-adsystem.com/e/pb/bid"
 timeout_ms = 800
+debug = false
 allow_script_creatives = false
 
 [integrations.adserver_mock]
@@ -659,13 +661,14 @@ price_floor = 0.50
 
 #### `[integrations.aps]`
 
-| Field                    | Type   | Default                                            | Description                                      |
-| ------------------------ | ------ | -------------------------------------------------- | ------------------------------------------------ |
-| `enabled`                | bool   | `false`                                            | Enable APS provider                              |
-| `account_id`             | string | —                                                  | APS account ID (required; `pub_id` is an alias)  |
-| `endpoint`               | string | `https://web.ads.aps.amazon-adsystem.com/e/pb/bid` | APS OpenRTB endpoint                             |
-| `timeout_ms`             | u32    | `800`                                              | Request timeout                                  |
-| `allow_script_creatives` | bool   | `false`                                            | Admit script bids before APS candidate reduction |
+| Field                    | Type   | Default                                            | Description                                                       |
+| ------------------------ | ------ | -------------------------------------------------- | ----------------------------------------------------------------- |
+| `enabled`                | bool   | `false`                                            | Enable APS provider                                               |
+| `account_id`             | string | —                                                  | APS account ID (required; `pub_id` is an alias)                   |
+| `endpoint`               | string | `https://web.ads.aps.amazon-adsystem.com/e/pb/bid` | APS OpenRTB endpoint                                              |
+| `timeout_ms`             | u32    | `800`                                              | Request timeout                                                   |
+| `debug`                  | bool   | `false`                                            | Include the raw APS HTTP exchange in `/auction` provider metadata |
+| `allow_script_creatives` | bool   | `false`                                            | Admit script bids before APS candidate reduction                  |
 
 #### `[integrations.adserver_mock]`
 
@@ -706,6 +709,7 @@ TRUSTED_SERVER__AUCTION__MEDIATOR=adserver_mock
 TRUSTED_SERVER__AUCTION__TIMEOUT_MS=2000
 TRUSTED_SERVER__INTEGRATIONS__PREBID__SERVER_URL=https://pbs.example.com
 TRUSTED_SERVER__INTEGRATIONS__APS__ACCOUNT_ID=example-account
+TRUSTED_SERVER__INTEGRATIONS__APS__DEBUG=false
 ```
 
 ## Floor Prices

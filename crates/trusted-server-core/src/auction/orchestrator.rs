@@ -1,6 +1,8 @@
 //! Auction orchestrator for managing multi-provider auctions.
 
+use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
+use http::Request;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,11 +25,12 @@ use super::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStat
 /// TTFB ≈ auction timeout.
 pub struct DispatchedAuction {
     pending_requests: Vec<PlatformPendingRequest>,
-    backend_to_provider: HashMap<String, (String, Instant, Arc<dyn AuctionProvider>)>,
+    backend_to_provider: HashMap<String, (String, Instant, Arc<dyn AuctionProvider>, u32)>,
     launch_responses: Vec<AuctionResponse>,
     auction_start: Instant,
     timeout_ms: u32,
     floor_prices: HashMap<String, f64>,
+    provider_request_context: Box<Request<EdgeBody>>,
     /// Carried so the mediator call in collect can pass it as the auction request.
     request: AuctionRequest,
 }
@@ -64,7 +67,7 @@ impl DispatchedAuction {
         let abandoned = self
             .backend_to_provider
             .into_values()
-            .map(|(provider_name, start_time, _)| {
+            .map(|(provider_name, start_time, _, _)| {
                 AbandonedProviderCall::bidder(
                     provider_name,
                     Some(u32::try_from(start_time.elapsed().as_millis()).unwrap_or(u32::MAX)),
@@ -85,6 +88,7 @@ impl DispatchedAuction {
             auction_start: Instant::now(),
             timeout_ms,
             floor_prices: HashMap::new(),
+            provider_request_context: Box::new(Request::new(EdgeBody::empty())),
             request,
         }
     }
@@ -183,6 +187,15 @@ fn log_winning_bids(auction_id: &str, winning_bids: &HashMap<String, Bid>) {
             bid.creative_trace_hash(),
         );
     }
+}
+
+fn snapshot_context_request(request: &Request<EdgeBody>) -> Request<EdgeBody> {
+    let mut snapshot = Request::new(EdgeBody::empty());
+    *snapshot.method_mut() = request.method().clone();
+    *snapshot.uri_mut() = request.uri().clone();
+    *snapshot.version_mut() = request.version();
+    *snapshot.headers_mut() = request.headers().clone();
+    snapshot
 }
 
 /// Manages auction execution across multiple providers.
@@ -490,8 +503,8 @@ impl AuctionOrchestrator {
         let auction_start = Instant::now();
 
         // Phase 1: Launch all requests concurrently and build mapping
-        // Maps backend_name -> (provider_name, start_time, provider)
-        let mut backend_to_provider: HashMap<String, (&str, Instant, &dyn AuctionProvider)> =
+        // Maps backend_name to provider state retained for response parsing.
+        let mut backend_to_provider: HashMap<String, (&str, Instant, &dyn AuctionProvider, u32)> =
             HashMap::new();
         let mut pending_requests: Vec<crate::platform::PlatformPendingRequest> = Vec::new();
         let mut responses = Vec::new();
@@ -610,7 +623,12 @@ impl AuctionOrchestrator {
                     } else {
                         backend_to_provider.insert(
                             request_backend_name.clone(),
-                            (provider.provider_name(), start_time, provider.as_ref()),
+                            (
+                                provider.provider_name(),
+                                start_time,
+                                provider.as_ref(),
+                                effective_timeout,
+                            ),
                         );
                         pending_requests.push(pending);
                         log::debug!(
@@ -695,10 +713,17 @@ impl AuctionOrchestrator {
                         .unwrap_or_default()
                         .to_string();
 
-                    if let Some((provider_name, start_time, provider)) =
+                    if let Some((provider_name, start_time, provider, effective_timeout)) =
                         backend_to_provider.remove(&backend_name)
                     {
                         let response_time_ms = start_time.elapsed().as_millis() as u64;
+                        let provider_context = AuctionContext {
+                            settings: context.settings,
+                            request: context.request,
+                            timeout_ms: effective_timeout,
+                            provider_responses: context.provider_responses,
+                            services: context.services,
+                        };
 
                         // Use the context-aware parse so a provider overriding
                         // `parse_response_with_context` behaves identically on the
@@ -709,7 +734,7 @@ impl AuctionOrchestrator {
                                 response,
                                 response_time_ms,
                                 request,
-                                context,
+                                &provider_context,
                             )
                             .await
                         {
@@ -748,7 +773,7 @@ impl AuctionOrchestrator {
                 }
                 Err(e) => {
                     if let Some(ref backend_name) = failed_backend_name {
-                        if let Some((provider_name, start_time, _)) =
+                        if let Some((provider_name, start_time, _, _)) =
                             backend_to_provider.remove(backend_name)
                         {
                             let response_time_ms = start_time.elapsed().as_millis() as u64;
@@ -785,7 +810,7 @@ impl AuctionOrchestrator {
             }
         }
 
-        for (provider_name, start_time, _) in backend_to_provider.into_values() {
+        for (provider_name, start_time, _, _) in backend_to_provider.into_values() {
             let response_time_ms = start_time.elapsed().as_millis() as u64;
             log::warn!("Provider '{provider_name}' timed out before auction collection completed");
             responses.push(provider_timeout_response(provider_name, response_time_ms));
@@ -947,8 +972,10 @@ impl AuctionOrchestrator {
         }
 
         let auction_start = Instant::now();
-        let mut backend_to_provider: HashMap<String, (String, Instant, Arc<dyn AuctionProvider>)> =
-            HashMap::new();
+        let mut backend_to_provider: HashMap<
+            String,
+            (String, Instant, Arc<dyn AuctionProvider>, u32),
+        > = HashMap::new();
         let mut pending_requests: Vec<PlatformPendingRequest> = Vec::new();
         let mut launch_responses: Vec<AuctionResponse> = Vec::new();
 
@@ -1054,6 +1081,7 @@ impl AuctionOrchestrator {
                                 provider.provider_name().to_string(),
                                 start_time,
                                 Arc::clone(provider),
+                                effective_timeout,
                             ),
                         );
                         pending_requests.push(pending.with_backend_name(backend_name));
@@ -1099,6 +1127,7 @@ impl AuctionOrchestrator {
             auction_start,
             timeout_ms: context.timeout_ms,
             floor_prices: self.floor_prices_by_slot(request),
+            provider_request_context: Box::new(snapshot_context_request(context.request)),
             request: request.clone(),
         })
     }
@@ -1126,6 +1155,7 @@ impl AuctionOrchestrator {
             auction_start,
             timeout_ms,
             floor_prices,
+            provider_request_context,
             request,
         } = dispatched;
 
@@ -1165,10 +1195,17 @@ impl AuctionOrchestrator {
             match ready {
                 Ok(platform_response) => {
                     let backend_name = platform_response.backend_name.clone().unwrap_or_default();
-                    if let Some((provider_name, start_time, provider)) =
+                    if let Some((provider_name, start_time, provider, effective_timeout)) =
                         backend_to_provider.remove(&backend_name)
                     {
                         let response_time_ms = start_time.elapsed().as_millis() as u64;
+                        let provider_context = AuctionContext {
+                            settings: context.settings,
+                            request: &provider_request_context,
+                            timeout_ms: effective_timeout,
+                            provider_responses: context.provider_responses,
+                            services: context.services,
+                        };
                         // Mirror run_providers_parallel: use the context-aware
                         // parse so providers behave identically on both paths.
                         match provider
@@ -1176,7 +1213,7 @@ impl AuctionOrchestrator {
                                 platform_response,
                                 response_time_ms,
                                 &request,
-                                context,
+                                &provider_context,
                             )
                             .await
                         {
@@ -1213,7 +1250,7 @@ impl AuctionOrchestrator {
                     // the provider behind `failed_backend_name` so it appears in
                     // provider_details instead of vanishing.
                     if let Some(ref backend_name) = failed_backend_name {
-                        if let Some((provider_name, start_time, _)) =
+                        if let Some((provider_name, start_time, _, _)) =
                             backend_to_provider.remove(backend_name)
                         {
                             let response_time_ms = start_time.elapsed().as_millis() as u64;
@@ -1247,7 +1284,7 @@ impl AuctionOrchestrator {
             // `remaining_budget_ms`.
         }
 
-        for (provider_name, start_time, _) in backend_to_provider.values() {
+        for (provider_name, start_time, _, _) in backend_to_provider.values() {
             let response_time_ms = start_time.elapsed().as_millis() as u64;
             log::warn!(
                 "Provider '{provider_name}' timed out before dispatched auction collection completed"
@@ -1588,6 +1625,25 @@ mod tests {
                 vec![],
                 response_time_ms,
             ))
+        }
+
+        async fn parse_response_with_context(
+            &self,
+            response: PlatformResponse,
+            response_time_ms: u64,
+            _request: &AuctionRequest,
+            context: &AuctionContext<'_>,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            let referer = context
+                .request
+                .headers()
+                .get(http::header::REFERER)
+                .and_then(|value| value.to_str().ok());
+            Ok(self
+                .parse_response(response, response_time_ms)
+                .await?
+                .with_metadata("context_referer", serde_json::json!(referer))
+                .with_metadata("context_timeout_ms", serde_json::json!(context.timeout_ms)))
         }
 
         fn timeout_ms(&self) -> u32 {
@@ -2792,6 +2848,75 @@ mod tests {
                 provider_b.status,
                 BidStatus::Success,
                 "provider-b should succeed — error was correctly isolated to provider-a"
+            );
+        });
+    }
+
+    #[test]
+    fn dispatched_collection_reuses_provider_launch_context() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"{}".to_vec());
+            let services = build_services_with_http_client(stub);
+            let config = AuctionConfig {
+                enabled: true,
+                providers: vec!["provider-a".to_string()],
+                timeout_ms: 750,
+                mediator: None,
+                ..Default::default()
+            };
+            let mut orchestrator = AuctionOrchestrator::new(config);
+            let mut provider = StubAuctionProvider::new("provider-a", "backend-a");
+            provider.configured_timeout_ms = 125;
+            orchestrator.register_provider(Arc::new(provider));
+            let request = create_test_auction_request();
+            let settings = create_test_settings();
+            let downstream = http::Request::builder()
+                .uri("https://publisher.example/article")
+                .header(http::header::REFERER, "https://referrer.example/source")
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build downstream request");
+            let dispatch_context = AuctionContext {
+                settings: &settings,
+                request: &downstream,
+                timeout_ms: 750,
+                provider_responses: None,
+                services: &services,
+            };
+            let dispatched = match orchestrator
+                .dispatch_auction(&request, &dispatch_context)
+                .await
+            {
+                DispatchAuctionOutcome::Dispatched(dispatched) => dispatched,
+                _ => panic!("should dispatch provider request"),
+            };
+            let placeholder = http::Request::builder()
+                .uri("https://placeholder.invalid/")
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build placeholder request");
+            let collect_context = AuctionContext {
+                settings: &settings,
+                request: &placeholder,
+                timeout_ms: 750,
+                provider_responses: None,
+                services: &services,
+            };
+
+            let result = orchestrator
+                .collect_dispatched_auction(dispatched, &services, &collect_context)
+                .await;
+
+            let response = result
+                .provider_responses
+                .first()
+                .expect("should collect provider response");
+            assert_eq!(
+                response.metadata["context_referer"], "https://referrer.example/source",
+                "should parse with the downstream request used at launch"
+            );
+            assert_eq!(
+                response.metadata["context_timeout_ms"], 125,
+                "should parse with the provider-capped launch timeout"
             );
         });
     }

@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use http::{Method, StatusCode, header};
+use http::{HeaderMap, Method, StatusCode, header};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
@@ -129,6 +129,9 @@ pub struct ApsConfig {
     /// Timeout in milliseconds.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u32,
+    /// Whether to include the APS HTTP exchange in auction response metadata.
+    #[serde(default)]
+    pub debug: bool,
     /// Whether APS script creatives are eligible before winner selection.
     #[serde(default)]
     pub allow_script_creatives: bool,
@@ -297,6 +300,7 @@ impl Default for ApsConfig {
             account_id: String::new(),
             endpoint: default_endpoint(),
             timeout_ms: default_timeout_ms(),
+            debug: false,
             allow_script_creatives: false,
             inventory_domain: None,
             inventory_page_origin: None,
@@ -332,6 +336,11 @@ struct ApsRendererInput<'a> {
     price: f64,
     width: u32,
     height: u32,
+}
+
+struct ApsDebugRequest {
+    body: String,
+    headers: BTreeMap<String, Vec<String>>,
 }
 
 /// APS `OpenRTB` auction provider.
@@ -555,6 +564,78 @@ impl ApsAuctionProvider {
             .to_ext(),
             ..Default::default()
         }
+    }
+
+    fn serialize_openrtb_request(
+        request: &OpenRtbRequest,
+    ) -> Result<Vec<u8>, Report<TrustedServerError>> {
+        serde_json::to_vec(request).change_context(TrustedServerError::Auction {
+            message: "Failed to serialize APS OpenRTB request".to_string(),
+        })
+    }
+
+    fn debug_headers(headers: &HeaderMap) -> BTreeMap<String, Vec<String>> {
+        let mut values = BTreeMap::<String, Vec<String>>::new();
+        for (name, value) in headers {
+            let Ok(value) = value.to_str() else {
+                continue;
+            };
+            values
+                .entry(name.as_str().to_string())
+                .or_default()
+                .push(value.to_string());
+        }
+        values
+    }
+
+    fn debug_request(
+        &self,
+        request: &AuctionRequest,
+        context: &AuctionContext<'_>,
+    ) -> Result<ApsDebugRequest, Report<TrustedServerError>> {
+        let openrtb = self.build_openrtb_request(request, context);
+        let body = Self::serialize_openrtb_request(&openrtb)?;
+        Ok(ApsDebugRequest {
+            body: String::from_utf8_lossy(&body).into_owned(),
+            headers: BTreeMap::from([(
+                header::CONTENT_TYPE.as_str().to_string(),
+                vec!["application/json".to_string()],
+            )]),
+        })
+    }
+
+    fn attach_debug_metadata(
+        &self,
+        response: AuctionResponse,
+        request: Option<ApsDebugRequest>,
+        response_body: Option<&[u8]>,
+        response_headers: &BTreeMap<String, Vec<String>>,
+        status: StatusCode,
+    ) -> AuctionResponse {
+        let Some(request) = request else {
+            return response;
+        };
+        let mut http_call = json!({
+            "requestbody": request.body,
+            "requestheaders": request.headers,
+            "responseheaders": response_headers,
+            "status": status.as_u16(),
+            "uri": self.config.endpoint.clone(),
+        });
+        if let (Some(response_body), Some(http_call)) = (response_body, http_call.as_object_mut()) {
+            http_call.insert(
+                "responsebody".to_string(),
+                json!(String::from_utf8_lossy(response_body)),
+            );
+        }
+        response.with_metadata(
+            "debug",
+            json!({
+                "httpcalls": {
+                    (APS_INTEGRATION_ID): [http_call]
+                }
+            }),
+        )
     }
 
     fn compatible_dimensions(slot: &AdSlot, width: u32, height: u32) -> bool {
@@ -828,17 +909,49 @@ impl ApsAuctionProvider {
         response: PlatformResponse,
         response_time_ms: u64,
         request: Option<&AuctionRequest>,
+        debug_request: Option<ApsDebugRequest>,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
         let response = response.response;
-        if response.status() == StatusCode::NO_CONTENT {
-            return Ok(AuctionResponse::no_bid(
-                APS_INTEGRATION_ID,
-                response_time_ms,
+        let status = response.status();
+        let response_headers = debug_request
+            .as_ref()
+            .map_or_else(BTreeMap::new, |_| Self::debug_headers(response.headers()));
+
+        if status == StatusCode::NO_CONTENT {
+            return Ok(self.attach_debug_metadata(
+                AuctionResponse::no_bid(APS_INTEGRATION_ID, response_time_ms),
+                debug_request,
+                Some(&[]),
+                &response_headers,
+                status,
             ));
         }
-        if !response.status().is_success() {
+        if !status.is_success() {
             log::warn!("APS returns a non-success status");
-            return Ok(AuctionResponse::error(APS_INTEGRATION_ID, response_time_ms));
+            let body = if debug_request.is_some() {
+                match collect_response_bounded(
+                    response.into_body(),
+                    UPSTREAM_RTB_MAX_RESPONSE_BYTES,
+                    APS_INTEGRATION_ID,
+                )
+                .await
+                {
+                    Ok(body) => Some(body),
+                    Err(error) => {
+                        log::warn!("Failed to read APS debug response body: {error:?}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            return Ok(self.attach_debug_metadata(
+                AuctionResponse::error(APS_INTEGRATION_ID, response_time_ms),
+                debug_request,
+                body.as_deref(),
+                &response_headers,
+                status,
+            ));
         }
         let body = collect_response_bounded(
             response.into_body(),
@@ -854,8 +967,15 @@ impl ApsAuctionProvider {
             Ok(value) => value,
             Err(error) => {
                 log::warn!("Failed to parse APS response JSON: {error}");
-                return Ok(AuctionResponse::error(APS_INTEGRATION_ID, response_time_ms)
-                    .with_metadata("drop_reasons", json!({"unexpected_response_shape": 1})));
+                let parsed = AuctionResponse::error(APS_INTEGRATION_ID, response_time_ms)
+                    .with_metadata("drop_reasons", json!({"unexpected_response_shape": 1}));
+                return Ok(self.attach_debug_metadata(
+                    parsed,
+                    debug_request,
+                    Some(&body),
+                    &response_headers,
+                    status,
+                ));
             }
         };
         let Some(request) = request else {
@@ -867,7 +987,13 @@ impl ApsAuctionProvider {
             parsed.bids.len(),
             response_time_ms
         );
-        Ok(parsed)
+        Ok(self.attach_debug_metadata(
+            parsed,
+            debug_request,
+            Some(&body),
+            &response_headers,
+            status,
+        ))
     }
 }
 
@@ -889,10 +1015,8 @@ impl AuctionProvider for ApsAuctionProvider {
             }));
         }
         log::info!("APS requests bids for {} impressions", openrtb.imp.len());
-        log::info!("APS request body: {openrtb:?}");
-        let body = serde_json::to_vec(&openrtb).change_context(TrustedServerError::Auction {
-            message: "Failed to serialize APS OpenRTB request".to_string(),
-        })?;
+        log::trace!("APS request body: {openrtb:?}");
+        let body = Self::serialize_openrtb_request(&openrtb)?;
         let request = http::Request::builder()
             .method(Method::POST)
             .uri(&self.config.endpoint)
@@ -925,7 +1049,7 @@ impl AuctionProvider for ApsAuctionProvider {
         response: PlatformResponse,
         response_time_ms: u64,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-        self.parse_response_inner(response, response_time_ms, None)
+        self.parse_response_inner(response, response_time_ms, None, None)
             .await
     }
 
@@ -934,9 +1058,20 @@ impl AuctionProvider for ApsAuctionProvider {
         response: PlatformResponse,
         response_time_ms: u64,
         request: &AuctionRequest,
-        _context: &AuctionContext<'_>,
+        context: &AuctionContext<'_>,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-        self.parse_response_inner(response, response_time_ms, Some(request))
+        let debug_request = if self.config.debug {
+            match self.debug_request(request, context) {
+                Ok(debug_request) => Some(debug_request),
+                Err(error) => {
+                    log::warn!("Failed to build APS debug request metadata: {error:?}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        self.parse_response_inner(response, response_time_ms, Some(request), debug_request)
             .await
     }
 
@@ -1061,6 +1196,7 @@ mod tests {
             account_id: "example-account-id".to_string(),
             endpoint: default_endpoint(),
             timeout_ms: 800,
+            debug: false,
             allow_script_creatives: false,
             inventory_domain: None,
             inventory_page_origin: None,
@@ -1115,6 +1251,32 @@ mod tests {
         })
     }
 
+    fn parse_with_context(
+        provider: &ApsAuctionProvider,
+        response: PlatformResponse,
+    ) -> AuctionResponse {
+        let settings = create_test_settings();
+        let services = noop_services();
+        let downstream = http::Request::builder()
+            .uri("https://publisher.example/auction")
+            .body(EdgeBody::empty())
+            .expect("should build downstream request");
+        let context = AuctionContext {
+            settings: &settings,
+            request: &downstream,
+            timeout_ms: 321,
+            provider_responses: None,
+            services: &services,
+        };
+        futures::executor::block_on(provider.parse_response_with_context(
+            response,
+            12,
+            &request(),
+            &context,
+        ))
+        .expect("should parse APS response with context")
+    }
+
     #[test]
     fn config_accepts_canonical_alias_and_integer_ids() {
         let canonical: ApsConfig = serde_json::from_value(json!({
@@ -1123,9 +1285,16 @@ mod tests {
         .expect("should parse canonical account ID");
         let alias: ApsConfig =
             serde_json::from_value(json!({"pub_id": 1234})).expect("should parse legacy alias");
+        let debug: ApsConfig = serde_json::from_value(json!({
+            "account_id": "example-account",
+            "debug": true
+        }))
+        .expect("should parse debug flag");
         assert_eq!(canonical.account_id, "example-account");
         assert_eq!(alias.account_id, "1234");
         assert!(!canonical.enabled);
+        assert!(!canonical.debug);
+        assert!(debug.debug);
         assert!(!canonical.allow_script_creatives);
         assert!(canonical.endpoint.ends_with("/e/pb/bid"));
     }
@@ -1445,6 +1614,157 @@ mod tests {
     }
 
     #[test]
+    fn debug_metadata_matches_pbs_httpcalls_shape() {
+        let mut provider_config = config();
+        provider_config.debug = true;
+        provider_config.endpoint = "https://aps.example/openrtb".to_string();
+        let provider = ApsAuctionProvider::new(provider_config);
+        let response_body = serde_json::to_vec(&json!({
+            "cur": "USD",
+            "seatbid": [{"bid": [bid("fictional-debug-bid", 1.23, "iframe")]}]
+        }))
+        .expect("should serialize APS response fixture");
+        let platform_response = PlatformResponse::new(
+            edgezero_core::http::response_builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-example-debug", "first")
+                .header("x-example-debug", "second")
+                .body(EdgeBody::from(response_body.clone()))
+                .expect("should build APS response"),
+        );
+
+        let response = parse_with_context(&provider, platform_response);
+
+        assert_eq!(response.metadata["accepted_bid_count"], 1);
+        let call = &response.metadata["debug"]["httpcalls"]["aps"][0];
+        let request_body: Json = serde_json::from_str(
+            call["requestbody"]
+                .as_str()
+                .expect("should include request body as a string"),
+        )
+        .expect("should parse captured request body");
+        assert_eq!(request_body["id"], "fictional-auction");
+        assert_eq!(request_body["tmax"], 321);
+        assert_eq!(
+            call["requestheaders"]["content-type"],
+            json!(["application/json"])
+        );
+        assert_eq!(
+            call["responsebody"],
+            String::from_utf8_lossy(&response_body).as_ref()
+        );
+        assert_eq!(
+            call["responseheaders"]["content-type"],
+            json!(["application/json"])
+        );
+        assert_eq!(
+            call["responseheaders"]["x-example-debug"],
+            json!(["first", "second"])
+        );
+        assert_eq!(call["status"], 200);
+        assert_eq!(call["uri"], "https://aps.example/openrtb");
+    }
+
+    #[test]
+    fn disabled_debug_omits_httpcall_metadata() {
+        let provider = ApsAuctionProvider::new(config());
+        let platform_response = PlatformResponse::new(
+            edgezero_core::http::response_builder()
+                .status(StatusCode::OK)
+                .body(EdgeBody::from(
+                    serde_json::to_vec(&json!({"seatbid": []}))
+                        .expect("should serialize APS no-bid response"),
+                ))
+                .expect("should build APS response"),
+        );
+
+        let response = parse_with_context(&provider, platform_response);
+
+        assert!(!response.metadata.contains_key("debug"));
+        assert_eq!(response.metadata["drop_reasons"]["empty_seatbid"], 1);
+    }
+
+    #[test]
+    fn debug_metadata_preserves_malformed_and_error_responses() {
+        let mut provider_config = config();
+        provider_config.debug = true;
+        let provider = ApsAuctionProvider::new(provider_config);
+        let malformed = PlatformResponse::new(
+            edgezero_core::http::response_builder()
+                .status(StatusCode::OK)
+                .body(EdgeBody::from(b"{not-json".to_vec()))
+                .expect("should build malformed APS response"),
+        );
+        let unavailable = PlatformResponse::new(
+            edgezero_core::http::response_builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header("retry-after", "5")
+                .body(EdgeBody::from(b"temporarily unavailable".to_vec()))
+                .expect("should build unavailable APS response"),
+        );
+        let oversized = PlatformResponse::new(
+            edgezero_core::http::response_builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(EdgeBody::from(vec![
+                    b'x';
+                    UPSTREAM_RTB_MAX_RESPONSE_BYTES + 1
+                ]))
+                .expect("should build oversized APS response"),
+        );
+
+        let malformed = parse_with_context(&provider, malformed);
+        let unavailable = parse_with_context(&provider, unavailable);
+        let oversized = parse_with_context(&provider, oversized);
+
+        assert_eq!(
+            malformed.metadata["drop_reasons"]["unexpected_response_shape"],
+            1
+        );
+        assert_eq!(
+            malformed.metadata["debug"]["httpcalls"]["aps"][0]["responsebody"],
+            "{not-json"
+        );
+        let unavailable_call = &unavailable.metadata["debug"]["httpcalls"]["aps"][0];
+        assert_eq!(unavailable.status, BidStatus::Error);
+        assert_eq!(unavailable_call["status"], 503);
+        assert_eq!(unavailable_call["responsebody"], "temporarily unavailable");
+        assert_eq!(
+            unavailable_call["responseheaders"]["retry-after"],
+            json!(["5"])
+        );
+        let oversized_call = oversized.metadata["debug"]["httpcalls"]["aps"][0]
+            .as_object()
+            .expect("should include oversized HTTP call metadata");
+        assert_eq!(oversized.status, BidStatus::Error);
+        assert_eq!(oversized_call["status"], 502);
+        assert!(
+            !oversized_call.contains_key("responsebody"),
+            "should omit response body when bounded capture fails"
+        );
+    }
+
+    #[test]
+    fn debug_metadata_includes_no_content_response() {
+        let mut provider_config = config();
+        provider_config.debug = true;
+        let provider = ApsAuctionProvider::new(provider_config);
+        let platform_response = PlatformResponse::new(
+            edgezero_core::http::response_builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(EdgeBody::empty())
+                .expect("should build empty APS response"),
+        );
+
+        let response = parse_with_context(&provider, platform_response);
+
+        assert_eq!(response.status, BidStatus::NoBid);
+        let call = &response.metadata["debug"]["httpcalls"]["aps"][0];
+        assert_eq!(call["status"], 204);
+        assert_eq!(call["responsebody"], "");
+    }
+
+    #[test]
     fn malformed_json_is_a_safe_shape_error() {
         let provider = ApsAuctionProvider::new(config());
         let platform_response = PlatformResponse::new(
@@ -1458,6 +1778,7 @@ mod tests {
             platform_response,
             12,
             Some(&auction_request),
+            None,
         ))
         .expect("should convert malformed JSON into a safe auction response");
 
@@ -1482,6 +1803,7 @@ mod tests {
             platform_response,
             12,
             Some(&auction_request),
+            None,
         ))
         .expect("should parse 204 as no bid");
         assert_eq!(no_content.status, BidStatus::NoBid);
