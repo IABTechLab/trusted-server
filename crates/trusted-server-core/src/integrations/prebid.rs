@@ -1291,16 +1291,16 @@ impl CompiledBidParamOverrideRule {
     }
 
     fn matches(&self, facts: BidParamOverrideFacts<'_>) -> bool {
-        if let Some(expected_bidder) = self.bidder.as_deref() {
-            if expected_bidder != facts.bidder {
-                return false;
-            }
+        if let Some(expected_bidder) = self.bidder.as_deref()
+            && expected_bidder != facts.bidder
+        {
+            return false;
         }
 
-        if let Some(expected_zone) = self.zone.as_deref() {
-            if facts.zone != Some(expected_zone) {
-                return false;
-            }
+        if let Some(expected_zone) = self.zone.as_deref()
+            && facts.zone != Some(expected_zone)
+        {
+            return false;
         }
 
         true
@@ -1392,11 +1392,11 @@ fn copy_request_headers(
         }
     }
 
-    if let Some(ip) = client_ip {
-        if let Ok(value) = HeaderValue::from_str(&ip.to_string()) {
-            to.headers_mut()
-                .insert(header::HeaderName::from_static("x-forwarded-for"), value);
-        }
+    if let Some(ip) = client_ip
+        && let Ok(value) = HeaderValue::from_str(&ip.to_string())
+    {
+        to.headers_mut()
+            .insert(header::HeaderName::from_static("x-forwarded-for"), value);
     }
 
     let Some(cookie_value) = from.headers().get(header::COOKIE) else {
@@ -1997,24 +1997,24 @@ impl PrebidAuctionProvider {
                 }
             };
 
-            if self.config.debug {
-                if let Some(body_bytes) = body_bytes.as_deref() {
-                    match prebid_body_preview(body_bytes) {
-                        Some(preview) => {
-                            let truncation = if preview.truncated {
-                                " (truncated)"
-                            } else {
-                                ""
-                            };
-                            log::warn!(
-                                "Prebid auction {auction_id:?} error response body preview{truncation}: {}",
-                                preview.text
-                            );
-                        }
-                        None => log::warn!(
-                            "Prebid auction {auction_id:?} returned an empty error response body"
-                        ),
+            if self.config.debug
+                && let Some(body_bytes) = body_bytes.as_deref()
+            {
+                match prebid_body_preview(body_bytes) {
+                    Some(preview) => {
+                        let truncation = if preview.truncated {
+                            " (truncated)"
+                        } else {
+                            ""
+                        };
+                        log::warn!(
+                            "Prebid auction {auction_id:?} error response body preview{truncation}: {}",
+                            preview.text
+                        );
                     }
+                    None => log::warn!(
+                        "Prebid auction {auction_id:?} returned an empty error response body"
+                    ),
                 }
             }
 
