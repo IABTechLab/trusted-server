@@ -2122,15 +2122,33 @@ impl AuctionProvider for PrebidAuctionProvider {
         })?;
 
         if !status.is_success() {
-            log::warn!("Prebid returned non-success status: {}", status,);
-            if log::log_enabled!(log::Level::Trace) {
-                let body_preview = String::from_utf8_lossy(&body_bytes);
-                log::trace!(
-                    "Prebid error response body: {}",
-                    &body_preview[..body_preview.floor_char_boundary(1000)]
-                );
-            }
-            return Ok(AuctionResponse::error("prebid", response_time_ms));
+            let body_preview = String::from_utf8_lossy(&body_bytes);
+            // SECURITY: the PBS response body is upstream-controlled and may leak
+            // internal detail (hostnames, stack traces, auth hints). Per the
+            // invariant documented in `auction/orchestrator.rs`, it MUST NOT reach
+            // the public `/auction` response, which happens if it lands in
+            // `AuctionResponse.metadata` (cloned verbatim into
+            // `ext.orchestrator.provider_details[].metadata`). Log the snippet
+            // server-side and surface only the numeric HTTP status — enough for an
+            // operator to tell an error from a no-bid without publishing the body.
+            log::warn!(
+                "Prebid returned non-success status {status}: {}",
+                &body_preview[..body_preview.floor_char_boundary(512)]
+            );
+            return Ok(AuctionResponse::error("prebid", response_time_ms)
+                .with_metadata(
+                    "error_type",
+                    serde_json::json!(crate::auction::orchestrator::ERROR_TYPE_HTTP_STATUS),
+                )
+                // Static message only (no upstream content) — mirrors the
+                // orchestrator's error constructors so every consumer of
+                // `provider_details[].metadata` sees a consistent
+                // `error_type` + `message` shape.
+                .with_metadata(
+                    "message",
+                    serde_json::json!("Prebid returned non-success status"),
+                )
+                .with_metadata("status", serde_json::json!(status.as_u16())));
         }
 
         let response_json: Json =
@@ -2232,7 +2250,8 @@ mod tests {
     use super::*;
     use crate::auction::test_support::create_test_auction_context as shared_test_auction_context;
     use crate::auction::types::{
-        AdFormat, AdSlot, AuctionContext, AuctionRequest, DeviceInfo, PublisherInfo, UserInfo,
+        AdFormat, AdSlot, AuctionContext, AuctionRequest, BidStatus, DeviceInfo, PublisherInfo,
+        UserInfo,
     };
 
     use crate::consent::{ConsentContext, ConsentSource};
@@ -2337,6 +2356,57 @@ mod tests {
         assert_eq!(
             backend_name, "predicted_https_prebid.example_123_123",
             "should cap both first-byte and between-bytes timeouts to the auction budget"
+        );
+    }
+
+    #[test]
+    fn parse_response_attaches_status_metadata_without_leaking_body_on_http_error() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let response = PlatformResponse::new(
+            edgezero_core::http::response_builder()
+                .status(403)
+                .body(EdgeBody::from(
+                    br#"{"error":"upstream-secret-detail"}"#.to_vec(),
+                ))
+                .expect("should build test response"),
+        );
+
+        let result = futures::executor::block_on(provider.parse_response(response, 643))
+            .expect("should return Ok(error response) for non-success status");
+
+        assert_eq!(
+            result.status,
+            BidStatus::Error,
+            "non-success HTTP status should map to an error response"
+        );
+        assert_eq!(
+            result.metadata["error_type"],
+            json!("http_status"),
+            "should tag the error path so telemetry buckets it as an http status error"
+        );
+        assert_eq!(
+            result.metadata["status"],
+            json!(403),
+            "should surface the upstream HTTP status code"
+        );
+        // A static, upstream-free message keeps the error shape consistent with
+        // the orchestrator's other provider error responses.
+        assert_eq!(
+            result.metadata["message"],
+            json!("Prebid returned non-success status"),
+            "should carry a static message like every other provider error path"
+        );
+        // SECURITY: the upstream response body must never reach the public
+        // /auction response via AuctionResponse.metadata.
+        assert!(
+            !result.metadata.contains_key("body"),
+            "upstream response body must not be surfaced on the response metadata"
+        );
+        assert!(
+            !result.metadata.values().any(|v| v
+                .as_str()
+                .is_some_and(|s| s.contains("upstream-secret-detail"))),
+            "no metadata value may contain the upstream body"
         );
     }
 
