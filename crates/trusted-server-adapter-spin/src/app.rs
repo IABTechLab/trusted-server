@@ -11,6 +11,8 @@ use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
 use trusted_server_core::ec::EcContext;
+use trusted_server_core::ec::admin::handle_admin_eids_lookup;
+use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::sanitize_forwarded_headers;
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
@@ -141,12 +143,15 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 12] {
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 15] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
         ("/_ts/admin/keys/rotate", &[Method::POST]),
         ("/_ts/admin/keys/deactivate", &[Method::POST]),
+        ("/_ts/admin/ec", &[Method::GET]),
+        ("/_ts/admin/ec/{id}", &[Method::GET]),
+        ("/_ts/admin/eids", &[Method::GET]),
         ("/admin/keys/rotate", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/deactivate", LEGACY_ADMIN_DENY_METHODS),
         ("/auction", &[Method::POST]),
@@ -359,6 +364,20 @@ fn admin_key_management_not_supported() -> Response {
     response
 }
 
+fn admin_ec_lookup_not_supported() -> Response {
+    let body = edgezero_core::body::Body::from(
+        "Admin EC lookup is not supported on Fermyon Spin.\n\
+         Use the Fastly adapter (via Viceroy or deployed) to inspect EC entries.\n",
+    );
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
 // ---------------------------------------------------------------------------
 // Error helper
 // ---------------------------------------------------------------------------
@@ -509,6 +528,23 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
 
         let admin_not_supported_handler = |_ctx: RequestContext| async {
             Ok::<Response, EdgeError>(admin_key_management_not_supported())
+        };
+
+        let admin_ec_not_supported_handler = |_ctx: RequestContext| async {
+            Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
+        };
+
+        // Admin EIDs echo: pure request inspection (no KV), so this adapter
+        // serves the real handler.
+        let s = Arc::clone(&state);
+        let admin_eids_handler = move |ctx: RequestContext| {
+            let s = Arc::clone(&s);
+            async move {
+                let req = ctx.into_request();
+                let result = PartnerRegistry::from_config(&s.settings.ec.partners)
+                    .and_then(|registry| handle_admin_eids_lookup(&registry, &req));
+                Ok::<Response, EdgeError>(result.unwrap_or_else(|e| http_error(&e)))
+            }
         };
 
         // /auction
@@ -730,6 +766,14 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // credentials and key-management payloads to the origin.
             .post("/_ts/admin/keys/rotate", admin_not_supported_handler)
             .post("/_ts/admin/keys/deactivate", admin_not_supported_handler)
+            // Admin EC lookup routes. Registered explicitly (like the key
+            // routes above) so they never fall through to the publisher
+            // fallback, and they match `Settings::ADMIN_ENDPOINTS` for auth
+            // coverage. The EC identity graph is Fastly KV backed, so this
+            // adapter has no store to read.
+            .get("/_ts/admin/ec", admin_ec_not_supported_handler)
+            .get("/_ts/admin/ec/{id}", admin_ec_not_supported_handler)
+            .get("/_ts/admin/eids", admin_eids_handler)
             .post("/auction", auction_handler)
             .get("/__ts/page-bids", page_bids_handler)
             .route(
