@@ -141,12 +141,14 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 12] {
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 14] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
         ("/_ts/admin/keys/rotate", &[Method::POST]),
         ("/_ts/admin/keys/deactivate", &[Method::POST]),
+        ("/_ts/admin/ec", &[Method::GET]),
+        ("/_ts/admin/ec/{id}", &[Method::GET]),
         ("/admin/keys/rotate", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/deactivate", LEGACY_ADMIN_DENY_METHODS),
         ("/auction", &[Method::POST]),
@@ -359,6 +361,20 @@ fn admin_key_management_not_supported() -> Response {
     response
 }
 
+fn admin_ec_lookup_not_supported() -> Response {
+    let body = edgezero_core::body::Body::from(
+        "Admin EC lookup is not supported on Fermyon Spin.\n\
+         Use the Fastly adapter (via Viceroy or deployed) to inspect EC entries.\n",
+    );
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
 // ---------------------------------------------------------------------------
 // Error helper
 // ---------------------------------------------------------------------------
@@ -509,6 +525,10 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
 
         let admin_not_supported_handler = |_ctx: RequestContext| async {
             Ok::<Response, EdgeError>(admin_key_management_not_supported())
+        };
+
+        let admin_ec_not_supported_handler = |_ctx: RequestContext| async {
+            Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
         };
 
         // /auction
@@ -730,6 +750,13 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // credentials and key-management payloads to the origin.
             .post("/_ts/admin/keys/rotate", admin_not_supported_handler)
             .post("/_ts/admin/keys/deactivate", admin_not_supported_handler)
+            // Admin EC lookup routes. Registered explicitly (like the key
+            // routes above) so they never fall through to the publisher
+            // fallback, and they match `Settings::ADMIN_ENDPOINTS` for auth
+            // coverage. The EC identity graph is Fastly KV backed, so this
+            // adapter has no store to read.
+            .get("/_ts/admin/ec", admin_ec_not_supported_handler)
+            .get("/_ts/admin/ec/{id}", admin_ec_not_supported_handler)
             .post("/auction", auction_handler)
             .get("/__ts/page-bids", page_bids_handler)
             .route(

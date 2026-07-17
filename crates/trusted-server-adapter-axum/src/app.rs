@@ -252,6 +252,7 @@ enum NamedRouteHandler {
     TrustedServerDiscovery,
     VerifySignature,
     AdminNotSupported,
+    AdminEcNotSupported,
     /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
     /// reach the publisher fallback (which would leak admin credentials).
     LegacyAdminDenied,
@@ -279,7 +280,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 12] {
+fn named_routes() -> [NamedRoute; 14] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -303,6 +304,19 @@ fn named_routes() -> [NamedRoute; 12] {
             path: "/_ts/admin/keys/deactivate",
             primary_methods: &[Method::POST],
             handler: NamedRouteHandler::AdminNotSupported,
+        },
+        // Admin EC lookup routes. Registered explicitly (like the key routes
+        // above) so they never fall through to the publisher fallback, and
+        // they match `Settings::ADMIN_ENDPOINTS` for auth coverage.
+        NamedRoute {
+            path: "/_ts/admin/ec",
+            primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::AdminEcNotSupported,
+        },
+        NamedRoute {
+            path: "/_ts/admin/ec/{id}",
+            primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::AdminEcNotSupported,
         },
         // The legacy non-`/_ts` aliases (`/admin/keys/*`) are denied locally with
         // a 404, matching the Fastly and Cloudflare adapters: the production
@@ -379,6 +393,21 @@ fn named_route_handler(
                         let body = edgezero_core::body::Body::from(
                             "Admin key management is not supported on the Axum dev server.\n\
                              Use the Fastly adapter (via Viceroy or deployed) to rotate or deactivate keys.\n",
+                        );
+                        let mut resp = Response::new(body);
+                        *resp.status_mut() = StatusCode::NOT_IMPLEMENTED;
+                        resp.headers_mut().insert(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static("text/plain; charset=utf-8"),
+                        );
+                        Ok(resp)
+                    }
+                    NamedRouteHandler::AdminEcNotSupported => {
+                        // The EC identity graph is Fastly KV backed; the Axum
+                        // dev server has no store to read.
+                        let body = edgezero_core::body::Body::from(
+                            "Admin EC lookup is not supported on the Axum dev server.\n\
+                             Use the Fastly adapter (via Viceroy or deployed) to inspect EC entries.\n",
                         );
                         let mut resp = Response::new(body);
                         *resp.status_mut() = StatusCode::NOT_IMPLEMENTED;

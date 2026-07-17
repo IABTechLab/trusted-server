@@ -2200,9 +2200,18 @@ impl Settings {
     /// where any of these paths lack a matching handler, ensuring admin
     /// endpoints are always protected by authentication.
     /// Update [`ADMIN_ENDPOINTS`](Self::ADMIN_ENDPOINTS) when adding new
-    /// admin routes to `crates/trusted-server-adapter-fastly/src/main.rs`.
-    pub(crate) const ADMIN_ENDPOINTS: &[&str] =
-        &["/_ts/admin/keys/rotate", "/_ts/admin/keys/deactivate"];
+    /// admin routes to `crates/trusted-server-adapter-fastly/src/app.rs`.
+    ///
+    /// The `/_ts/admin/ec/{id}` entry is the literal router pattern; handler
+    /// path regexes are matched against it verbatim, so prefix-style admin
+    /// regexes (e.g. `^/_ts/admin`) cover it while regexes too narrow to
+    /// cover the parameterized route are rejected fail-closed.
+    pub(crate) const ADMIN_ENDPOINTS: &[&str] = &[
+        "/_ts/admin/keys/rotate",
+        "/_ts/admin/keys/deactivate",
+        "/_ts/admin/ec",
+        "/_ts/admin/ec/{id}",
+    ];
 
     /// Returns admin endpoint paths that no configured handler covers.
     ///
@@ -5249,7 +5258,12 @@ origin_host_header_overide = "www.example.com""#,
             .expect("should check admin coverage");
         assert_eq!(
             uncovered,
-            vec!["/_ts/admin/keys/rotate", "/_ts/admin/keys/deactivate"],
+            vec![
+                "/_ts/admin/keys/rotate",
+                "/_ts/admin/keys/deactivate",
+                "/_ts/admin/ec",
+                "/_ts/admin/ec/{id}",
+            ],
             "should report every admin endpoint as uncovered"
         );
     }
@@ -5283,7 +5297,11 @@ origin_host_header_overide = "www.example.com""#,
             .expect("should check admin coverage");
         assert_eq!(
             uncovered,
-            vec!["/_ts/admin/keys/deactivate"],
+            vec![
+                "/_ts/admin/keys/deactivate",
+                "/_ts/admin/ec",
+                "/_ts/admin/ec/{id}",
+            ],
             "should detect the admin endpoints not covered by the narrow handler"
         );
     }
