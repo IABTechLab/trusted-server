@@ -326,7 +326,7 @@ A two-bids/same-slot/same-seat test is mandatory.
 
 ### 8.4 Diagnostics
 
-`AuctionResponse.metadata` may contain only bounded aggregate fields, for example:
+With APS debug mode disabled, `AuctionResponse.metadata` may contain only bounded aggregate fields, for example:
 
 ```json
 {
@@ -353,7 +353,16 @@ Allowed reason keys are fixed enums such as:
 - `unexpected_response_shape`.
 
 Do not include account IDs, bid IDs, URLs, tokens, consent strings, raw extensions, or
-raw bodies in INFO/WARN diagnostics or client-facing provider summaries.
+raw bodies in INFO/WARN diagnostics. Client-facing provider summaries follow the same
+rule by default.
+
+An explicit `[integrations.aps].debug = true` exception is available for controlled test
+sites. It includes the unredacted direct APS request and response under
+`metadata.debug.httpcalls.aps`, using the same request body, request headers, response
+body, response headers, status, and URI fields exposed by Prebid Server debug output.
+If a non-success response body cannot be captured within the existing 2 MiB upstream
+limit, omit `responsebody` rather than misreporting it as empty. The flag defaults to
+`false` and must not change parsing, eligibility, or selection.
 
 ---
 
