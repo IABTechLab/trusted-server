@@ -30,8 +30,18 @@ fn test_signature() -> gix::actor::Signature {
 }
 
 /// Initialise a fresh repository at `path`.
+///
+/// [`create_and_checkout_branch`] calls `repo.reference(...)`, whose reflog
+/// write needs a committer identity. Clean CI machines have no ambient
+/// `user.name` / `user.email`, so pin a fixed identity in the repo-local
+/// config (no subprocess), then reopen so the returned handle picks it up.
 pub(crate) fn init_repo(path: &Path) -> gix::Repository {
-    gix::init(path).expect("should init gix repo")
+    let repo = gix::init(path).expect("should init gix repo");
+    let config_path = repo.git_dir().join("config");
+    let mut config = fs::read_to_string(&config_path).expect("should read fresh repo config");
+    config.push_str("\n[user]\n\tname = ts dev lint tests\n\temail = tests@example.com\n");
+    fs::write(&config_path, config).expect("should write repo config");
+    gix::open(repo.git_dir()).expect("should reopen gix repo")
 }
 
 /// Stage every file currently in the working tree: write a blob per
