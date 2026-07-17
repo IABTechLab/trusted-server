@@ -18,6 +18,7 @@
 //! into any [`Write`] (a `Vec<u8>` for buffered routes, a streaming writer for
 //! the streaming route). It is not a content-rewriting concern.
 
+use std::borrow::Cow;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -726,10 +727,11 @@ async fn hold_step_decoded_chunk<P: StreamProcessor>(
     collect_refs: &AuctionHoldCollectRefs<'_>,
 ) -> Result<HoldStepSegments, Report<TrustedServerError>> {
     let mut ready = Vec::new();
-    let bytes = match state.hold.as_mut() {
-        // Once the hold has been released the chunk streams straight through.
-        None => chunk.to_vec(),
-        Some(hold_buffer) => hold_buffer.push(chunk),
+    let bytes: Cow<'_, [u8]> = match state.hold.as_mut() {
+        // Once the hold has been released the chunk streams straight through,
+        // borrowed rather than copied.
+        None => Cow::Borrowed(chunk),
+        Some(hold_buffer) => Cow::Owned(hold_buffer.push(chunk)),
     };
     match process_and_encode_chunk(processor, encoder, &bytes, false, "Failed to process chunk") {
         Ok(Some(encoded)) => ready.push(encoded),
