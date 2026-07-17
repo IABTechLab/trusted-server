@@ -935,10 +935,12 @@ fn redact_bid_for_dump(bid: &crate::auction::types::Bid) -> serde_json::Value {
     value
 }
 
-/// Prepend a `<!-- ts-debug: ... -->` HTML comment carrying the full auction
-/// result — pipeline stats plus every provider response, including each bid's
-/// raw `adm` creative markup — onto the shared `ad_bids_state` so it lands
-/// directly before the injected bids `<script>`. Gated by
+/// Prepend a `<!-- ts-debug: ... -->` HTML comment carrying a redacted view of
+/// the auction result — pipeline stats plus, per provider, its status, bids
+/// (each creative previewed to [`MAX_BID_CREATIVE_DUMP_BYTES`]), and allowlisted
+/// metadata — onto the shared `ad_bids_state` so it lands directly before the
+/// injected bids `<script>`. Identity-bearing metadata (notably prebid's `debug`
+/// subtree) is dropped; see [`DEBUG_DUMP_METADATA_ALLOWLIST`]. Gated by
 /// [`auction_html_comment`](crate::settings::DebugConfig::auction_html_comment);
 /// never enable in production.
 ///
@@ -960,10 +962,14 @@ pub(crate) fn prepend_auction_debug_comment(
     //
     // SECURITY: `Bid.creative` and provider metadata are attacker/partner-
     // influenced. Two layers protect the DOM:
-    //   1. `redact_response_for_dump` drops all non-allowlisted metadata (notably
-    //      the identity-bearing `debug` subtree) and previews each creative, so
-    //      the visitor's identity graph never enters the comment and one large
-    //      creative cannot dominate the payload.
+    //   1. `redact_response_for_dump` drops all non-allowlisted *response-level*
+    //      metadata (notably the identity-bearing `debug` subtree) and previews
+    //      each creative, so the visitor's identity graph never enters the
+    //      comment and one large creative cannot dominate the payload. Bid-level
+    //      fields (`Bid.metadata`, `nurl`, `burl`) are NOT yet allowlisted; they
+    //      pass through today because the only writer (`integrations/aps.rs`)
+    //      emits opaque targeting keys. Tightening this to a fail-closed bid
+    //      allowlist is tracked in #925.
     //   2. `render_dump` below neutralises HTML comment terminators and caps the
     //      total serialized size.
     //
