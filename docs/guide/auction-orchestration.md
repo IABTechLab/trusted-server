@@ -699,7 +699,10 @@ timeout_ms = 500               # Mediator budget (called after providers)
 
 ### Environment Variable Overrides
 
-All auction configuration can be overridden via environment variables:
+The typed `ts config validate`, `ts config diff`, and `ts config push` flows can
+override auction values that already exist in the TOML. EdgeZero v0.0.4 does
+not create missing leaves, so existing configs must add
+`rewrite_creatives = true` before relying on its environment override.
 
 ```bash
 TRUSTED_SERVER__AUCTION__ENABLED=true
@@ -710,6 +713,11 @@ TRUSTED_SERVER__AUCTION__TIMEOUT_MS=2000
 TRUSTED_SERVER__INTEGRATIONS__PREBID__SERVER_URL=https://pbs.example.com
 TRUSTED_SERVER__INTEGRATIONS__APS__PUB_ID=5128
 ```
+
+Before rolling back to a binary without `rewrite_creatives`, restore the value
+to `true`, push the default-compatible blob, and then roll back. See
+[Configuration](/guide/configuration#auction-configuration) for the complete
+migration and rollback sequence.
 
 ## Floor Prices
 

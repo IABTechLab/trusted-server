@@ -6,7 +6,7 @@ Learn how Trusted Server rewrites ad creative HTML and CSS to route resources th
 
 Creative processing has separate auction-response and proxied-response paths. When rewriting is enabled for a path, it transforms third-party ad creatives by rewriting URLs to go through your first-party domain. This provides:
 
-- **Privacy Control** - All resources load through your domain
+- **Privacy Control** - Eligible, non-excluded external resources load through your domain
 - **First-Party Context** - Cookies and storage use your domain
 - **EC ID Integration** - Automatic ID forwarding to trackers
 - **Security** - Validated, signed URLs prevent tampering
