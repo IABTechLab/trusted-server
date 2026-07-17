@@ -73,7 +73,7 @@ For each changed file, evaluate:
 - No Tokio or runtime-specific deps in `crates/trusted-server-core`
 - Fastly-specific APIs only in `crates/trusted-server-adapter-fastly`
 
-#### Convention compliance (from CLAUDE.md)
+#### Convention compliance (from AGENTS.md)
 
 - `expect("should ...")` instead of `unwrap()` in production code
 - `error-stack` (`Report<E>`) with `derive_more::Display` for errors (not thiserror/anyhow)
