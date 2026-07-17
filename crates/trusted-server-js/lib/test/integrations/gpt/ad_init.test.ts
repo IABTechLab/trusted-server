@@ -579,6 +579,92 @@ describe('installTsAdInit', () => {
     beaconSpy.mockRestore();
   });
 
+  it('stamps trace markers and records the render on slotRenderEnded', async () => {
+    let capturedListener: ((e: SlotRenderEvent) => void) | undefined;
+
+    const mockSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([mockSlot]),
+      refresh: vi.fn(),
+      addEventListener: vi.fn((event: string, fn: (e: SlotRenderEvent) => void) => {
+        if (event === 'slotRenderEnded') capturedListener = fn;
+      }),
+    };
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(mockSlot),
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+    };
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {
+        atf_sidebar_ad: {
+          hb_pb: '1.00',
+          hb_bidder: 'kargo',
+          hb_adid: 'cache-uuid-9',
+          hb_auction_id: 'ts-req-trace9',
+          hb_crid: 'cr-98765',
+          hb_adm_hash: 'a1b2c3d4e5f60718',
+        },
+      },
+    };
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(capturedListener).toBeDefined();
+    capturedListener!({ isEmpty: false, slot: mockSlot });
+
+    const el = document.getElementById('div-atf-sidebar')!;
+    expect(el.getAttribute('data-ts-slot-id')).toBe('atf_sidebar_ad');
+    expect(el.getAttribute('data-ts-render-path')).toBe('ssat');
+    expect(el.getAttribute('data-ts-rendered')).toBe('true');
+    expect(el.getAttribute('data-ts-auction-id')).toBe('ts-req-trace9');
+    expect(el.getAttribute('data-ts-bidder')).toBe('kargo');
+    expect(el.getAttribute('data-ts-ad-id')).toBe('cache-uuid-9');
+    expect(el.getAttribute('data-ts-creative-id')).toBe('cr-98765');
+    expect(el.getAttribute('data-ts-adm-hash')).toBe('a1b2c3d4e5f60718');
+
+    const record = (window as TestWindow).tsjs!.renders?.['atf_sidebar_ad'];
+    expect(record).toEqual(
+      expect.objectContaining({
+        slotId: 'atf_sidebar_ad',
+        path: 'ssat',
+        rendered: true,
+        elementId: 'div-atf-sidebar',
+        auctionId: 'ts-req-trace9',
+        bidder: 'kargo',
+        adId: 'cache-uuid-9',
+        creativeId: 'cr-98765',
+        admHash: 'a1b2c3d4e5f60718',
+        servedFrom: 'gam',
+      })
+    );
+
+    // An empty render must record rendered:false and bump the count.
+    capturedListener!({ isEmpty: true, slot: mockSlot });
+    const second = (window as TestWindow).tsjs!.renders?.['atf_sidebar_ad'];
+    expect(second?.rendered).toBe(false);
+    expect(second?.count).toBe(2);
+    expect(el.getAttribute('data-ts-rendered')).toBe('false');
+  });
+
   it('does not fire beacons for an APS-style bid that carries no hb_adid', async () => {
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
     let capturedListener: ((e: SlotRenderEvent) => void) | undefined;

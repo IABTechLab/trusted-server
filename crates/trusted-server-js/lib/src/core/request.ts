@@ -2,10 +2,12 @@
 import { renderApsCreative } from '../integrations/aps/render';
 
 import { buildAdRequest, sendAuction } from './auction';
+import { recordRender, stampCreativeTrace } from './trace';
 import { collectContext } from './context';
 import { log } from './log';
 import { getAllUnits, firstSize } from './registry';
 import { createAdIframe, findSlot, buildCreativeDocument, sanitizeCreativeHtml } from './render';
+
 
 export type RequestAdsCallback = () => void;
 export interface RequestAdsOptions {
@@ -21,6 +23,8 @@ type RenderCreativeInlineOptions = {
   creativeHeight?: number;
   seat: string;
   creativeId: string;
+  auctionId?: string;
+  admHash?: string;
 };
 
 // Entry point matching Prebid's requestBids signature; uses unified /auction endpoint.
@@ -66,6 +70,8 @@ export function requestAds(
             creativeHeight: bid.height,
             seat: bid.seat,
             creativeId: bid.creativeId,
+            auctionId: bid.auctionId,
+            admHash: bid.admHash,
           });
         }
         log.info('requestAds: rendered creatives from response');
@@ -93,10 +99,22 @@ function renderCreativeInline({
   creativeHeight,
   seat,
   creativeId,
+  auctionId,
+  admHash,
 }: RenderCreativeInlineOptions): void {
+  const trace = {
+    slotId,
+    path: 'auction' as const,
+    auctionId,
+    bidder: seat,
+    creativeId,
+    admHash,
+    servedFrom: 'inline' as const,
+  };
   const container = findSlot(slotId) as HTMLElement | null;
   if (!container) {
     log.warn('renderCreativeInline: slot not found; skipping render', { slotId, seat, creativeId });
+    recordRender({ ...trace, rendered: false });
     return;
   }
 
@@ -110,6 +128,14 @@ function renderCreativeInline({
         originalLength: sanitization.originalLength,
         rejectionReason: sanitization.rejectionReason,
       });
+      // Stamp rendered:false so the DOM marker semantics match the SSAT path
+      // (explicit false on a failed render, not just an absent attribute).
+      const rejectedRecord = recordRender({
+        ...trace,
+        rendered: false,
+        elementId: container.id || undefined,
+      });
+      stampCreativeTrace(container, rejectedRecord);
       return;
     }
 
@@ -141,10 +167,22 @@ function renderCreativeInline({
 
     iframe.srcdoc = buildCreativeDocument(sanitization.sanitizedHtml);
 
+    // Trace: registry entry + DOM markers joining this creative back to the
+    // server-side auction (matches the `auction delivered creative:` log line).
+    const record = recordRender({
+      ...trace,
+      rendered: true,
+      elementId: container.id || undefined,
+    });
+    stampCreativeTrace(container, record);
+    stampCreativeTrace(iframe, record);
+
     log.info('renderCreativeInline: rendered', {
       slotId,
       seat,
       creativeId,
+      auctionId,
+      admHash,
       width,
       height,
       originalLength: sanitization.originalLength,

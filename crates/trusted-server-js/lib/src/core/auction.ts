@@ -60,6 +60,10 @@ export interface AuctionBid {
   creativeId: string;
   /** Advertiser domains. */
   adomain: string[];
+  /** Server-side auction ID (response top-level `id` / `ext.ts.auction_id`). */
+  auctionId?: string;
+  /** Trace hash of the delivered adm (`ext.ts.adm_hash`, 16 hex chars of SHA-256). */
+  admHash?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -128,6 +132,7 @@ export function parseAuctionResponse(body: any): AuctionBid[] {
   const bids: AuctionBid[] = [];
   const seatbids = body?.seatbid;
   if (!Array.isArray(seatbids)) return bids;
+  const responseAuctionId = typeof body?.id === 'string' && body.id !== '' ? body.id : undefined;
 
   for (const seatbid of seatbids) {
     const seat: string = typeof seatbid?.seat === 'string' ? seatbid.seat : 'unknown';
@@ -135,6 +140,7 @@ export function parseAuctionResponse(body: any): AuctionBid[] {
     if (!Array.isArray(seatBids)) continue;
 
     for (const bid of seatBids) {
+      const trace = bid?.ext?.ts;
       const impid = typeof bid?.impid === 'string' ? bid.impid : '';
       const renderer = parseApsRendererDescriptor(bid?.ext?.trusted_server?.renderer);
       const width = typeof bid?.w === 'number' ? bid.w : (renderer?.width ?? 300);
@@ -154,6 +160,12 @@ export function parseAuctionResponse(body: any): AuctionBid[] {
         height,
         seat,
         creativeId,
+        auctionId:
+          typeof trace?.auction_id === 'string' && trace.auction_id !== ''
+            ? trace.auction_id
+            : responseAuctionId,
+        admHash:
+          typeof trace?.adm_hash === 'string' && trace.adm_hash !== '' ? trace.adm_hash : undefined,
         adomain: Array.isArray(bid?.adomain)
           ? bid.adomain.filter((domain: unknown): domain is string => typeof domain === 'string')
           : [],

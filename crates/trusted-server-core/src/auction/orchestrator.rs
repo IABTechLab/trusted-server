@@ -162,6 +162,29 @@ fn remaining_budget_ms(start: Instant, timeout_ms: u32) -> u32 {
     timeout_ms.saturating_sub(elapsed)
 }
 
+/// Log one structured trace line per winning bid.
+///
+/// Emits the full trace tuple — auction ID, slot, bidder, ad/cache/creative
+/// IDs, and the creative trace hash — so a rendered creative on the page
+/// (carrying the same tuple in its DOM markers) can be joined back to this
+/// auction in server logs.
+fn log_winning_bids(auction_id: &str, winning_bids: &HashMap<String, Bid>) {
+    for (slot_id, bid) in winning_bids {
+        log::info!(
+            "auction winner: auction_id={} slot_id={} bidder={} price={:?} bid_id={:?} ad_id={:?} cache_id={:?} crid={:?} adm_hash={:?}",
+            auction_id,
+            slot_id,
+            bid.bidder,
+            bid.price,
+            bid.bid_id,
+            bid.ad_id,
+            bid.cache_id,
+            bid.creative_id,
+            bid.creative_trace_hash(),
+        );
+    }
+}
+
 /// Manages auction execution across multiple providers.
 pub struct AuctionOrchestrator {
     config: AuctionConfig,
@@ -266,6 +289,8 @@ impl AuctionOrchestrator {
             "Running auction with strategy: {} (auto-detected from mediator config)",
             strategy_name
         );
+
+        log_winning_bids(&request.id, &result.winning_bids);
 
         Ok(OrchestrationResult {
             total_time_ms: start_time.elapsed().as_millis() as u64,
@@ -1263,6 +1288,7 @@ impl AuctionOrchestrator {
                             responses.len(),
                         );
                         let winning = self.select_winning_bids(&responses, &floor_prices);
+                        log_winning_bids(&request.id, &winning);
                         return OrchestrationResult {
                             provider_responses: responses,
                             mediator_response: None,
@@ -1379,6 +1405,8 @@ impl AuctionOrchestrator {
         } else {
             (None, self.select_winning_bids(&responses, &floor_prices))
         };
+
+        log_winning_bids(&request.id, &winning_bids);
 
         OrchestrationResult {
             provider_responses: responses,
