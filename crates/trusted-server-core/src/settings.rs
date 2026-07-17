@@ -299,12 +299,13 @@ pub struct EcPartner {
     /// This normalized domain is also the canonical EC KV `ids` map key.
     #[validate(custom(function = EcPartner::validate_source_domain))]
     pub source_domain: String,
-    /// `OpenRTB` `atype` value (typically 3).
+    /// `OpenRTB` `atype` value, including vendor-specific values such as PAIR's `571187`.
     #[serde(
         default = "EcPartner::default_openrtb_atype",
         deserialize_with = "from_value_or_str"
     )]
-    pub openrtb_atype: u8,
+    #[validate(range(min = 0, message = "must be a non-negative OpenRTB agent type"))]
+    pub openrtb_atype: i32,
     /// Whether this partner's UIDs appear in auction `user.eids`.
     #[serde(default, deserialize_with = "from_value_or_str")]
     pub bidstream_enabled: bool,
@@ -417,7 +418,7 @@ impl EcPartner {
     }
 
     #[must_use]
-    pub const fn default_openrtb_atype() -> u8 {
+    pub const fn default_openrtb_atype() -> i32 {
         3
     }
 
@@ -2814,6 +2815,46 @@ mod tests {
     }
 
     #[test]
+    fn validate_accepts_vendor_specific_ec_partner_atype() {
+        let toml_str = format!(
+            r#"{}
+            [[ec.partners]]
+            name = "PAIR Partner"
+            source_domain = "google.com"
+            openrtb_atype = 571187
+            api_token = "test-vendor-token-32-bytes-minimum"
+            "#,
+            crate_test_settings_str(),
+        );
+
+        let settings = Settings::from_toml(&toml_str)
+            .expect("should accept vendor-specific OpenRTB agent type");
+
+        assert_eq!(
+            settings.ec.partners[0].openrtb_atype, 571187,
+            "should preserve PAIR's vendor-specific atype"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_negative_ec_partner_atype() {
+        let toml_str = format!(
+            r#"{}
+            [[ec.partners]]
+            name = "Invalid Partner"
+            source_domain = "partner.example.com"
+            openrtb_atype = -1
+            api_token = "test-vendor-token-32-bytes-minimum"
+            "#,
+            crate_test_settings_str(),
+        );
+
+        let result = Settings::from_toml(&toml_str);
+
+        assert!(result.is_err(), "should reject negative OpenRTB agent type");
+    }
+
+    #[test]
     fn validate_accepts_origin_host_header_override() {
         let toml_str = crate_test_settings_str().replace(
             r#"origin_url = "https://origin.test-publisher.com""#,
@@ -3660,7 +3701,7 @@ origin_host_header_overide = "www.example.com""#,
                 (origin_key, Some("https://origin.test-publisher.com")),
                 (partner_0_name_key, Some("Env Partner 0")),
                 (partner_0_source_domain_key, Some("envpartner0.example.com")),
-                (partner_0_openrtb_atype_key, Some("1")),
+                (partner_0_openrtb_atype_key, Some("571187")),
                 (partner_0_bidstream_enabled_key, Some("true")),
                 (partner_0_api_token_key, Some("env-token-0")),
                 (partner_1_name_key, Some("Env Partner 1")),
@@ -3679,7 +3720,7 @@ origin_host_header_overide = "www.example.com""#,
                     settings.ec.partners[0].source_domain,
                     "envpartner0.example.com"
                 );
-                assert_eq!(settings.ec.partners[0].openrtb_atype, 1);
+                assert_eq!(settings.ec.partners[0].openrtb_atype, 571187);
                 assert!(settings.ec.partners[0].bidstream_enabled);
                 assert_eq!(settings.ec.partners[0].api_token.expose(), "env-token-0");
                 assert_eq!(settings.ec.partners[1].name, "Env Partner 1");

@@ -4880,6 +4880,14 @@ external_bundle_sri = "sha384-AAAA"
                     ext: None,
                 }],
             },
+            crate::openrtb::Eid {
+                source: "google.com".to_owned(),
+                uids: vec![crate::openrtb::Uid {
+                    id: "pair-id".to_owned(),
+                    atype: Some(571187),
+                    ext: None,
+                }],
+            },
         ]);
 
         let settings = make_settings();
@@ -4896,7 +4904,7 @@ external_bundle_sri = "sha384-AAAA"
         let serialized = serde_json::to_value(&openrtb).expect("should serialize OpenRTB request");
         let ext_eids = &serialized["user"]["ext"]["eids"];
         assert!(ext_eids.is_array(), "should populate user.ext.eids");
-        assert_eq!(ext_eids.as_array().unwrap().len(), 2, "should have 2 EIDs");
+        assert_eq!(ext_eids.as_array().unwrap().len(), 3, "should have 3 EIDs");
         assert_eq!(
             ext_eids[0]["source"], "liveramp.com",
             "should include liveramp EID"
@@ -4904,6 +4912,14 @@ external_bundle_sri = "sha384-AAAA"
         assert_eq!(
             ext_eids[1]["source"], "id5-sync.com",
             "should include id5 EID"
+        );
+        assert_eq!(
+            ext_eids[2]["source"], "google.com",
+            "should include PAIR EID"
+        );
+        assert_eq!(
+            ext_eids[2]["uids"][0]["atype"], 571187,
+            "should preserve PAIR's vendor-specific atype"
         );
     }
 
