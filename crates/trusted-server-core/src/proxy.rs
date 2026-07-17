@@ -2730,7 +2730,7 @@ mod tests {
         let settings = create_test_settings();
         let clear = "https://cdn.example/asset.js?c=3&b=2&a=1";
         // Simulate creative-generated first-party URL
-        let first_party = creative::build_proxy_url(&settings, clear);
+        let first_party = creative::build_proxy_url(&settings, clear, "");
         // Reconstruct and validate (need absolute URL for parsing)
         let st = reconstruct_and_validate_signed_target(
             &settings,
@@ -2746,7 +2746,7 @@ mod tests {
     fn reconstruct_valid_without_params() {
         let settings = create_test_settings();
         let clear = "https://cdn.example/asset.js";
-        let first_party = creative::build_proxy_url(&settings, clear);
+        let first_party = creative::build_proxy_url(&settings, clear, "");
         let st = reconstruct_and_validate_signed_target(
             &settings,
             &format!("https://edge.example{}", first_party),
@@ -2763,7 +2763,7 @@ mod tests {
             let settings = create_test_settings();
             let clear = "ftp://cdn.example/file.gif";
             // Build a first-party proxy URL with a token for the unsupported scheme
-            let first_party = creative::build_proxy_url(&settings, clear);
+            let first_party = creative::build_proxy_url(&settings, clear, "");
             let req =
                 build_http_request(Method::GET, format!("https://edge.example{}", first_party));
             let err: Report<TrustedServerError> =
@@ -2802,7 +2802,7 @@ mod tests {
         futures::executor::block_on(async {
             let settings = create_test_settings();
             let clear = "https://cdn.example/landing.html?x=1";
-            let first_party = creative::build_click_url(&settings, clear);
+            let first_party = creative::build_click_url(&settings, clear, "");
             let req =
                 build_http_request(Method::GET, format!("https://edge.example{}", first_party));
             let resp = handle_first_party_click(&settings, &noop_services(), req)

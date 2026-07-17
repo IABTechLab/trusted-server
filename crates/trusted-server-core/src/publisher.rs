@@ -1992,15 +1992,21 @@ pub(crate) fn build_bid_map(
                 // — no PBS Cache round trip. The `hb_cache_*` coordinates above
                 // remain as the fallback for an absent `adm`.
                 //
-                // Run the same creative-processing boundary as the `/auction`
-                // path (see `auction::formats`): sanitize dangerous markup first,
-                // then rewrite URLs to first-party proxies. `sanitize_creative_html`
-                // also enforces the 1 MiB creative cap, returning an empty string
-                // for oversized or unparseable markup — in which case the entry is
-                // omitted and the bridge falls back to the PBS Cache coordinates.
+                // Sanitize dangerous markup first, then rewrite URLs to
+                // first-party proxies — the same creative-processing boundary as
+                // the `/auction` path (see `auction::formats`), except the inline
+                // variant. Unlike `/auction`, this `adm` is rendered by the Prebid
+                // Universal Creative inside GAM's iframe (`f.srcdoc = d.ad`), a
+                // foreign origin where root-relative `/first-party/…` URLs resolve
+                // against GAM and 404. `rewrite_inline_creative_html` emits
+                // absolute first-party URLs and omits the tsjs bundle injection.
+                // `sanitize_creative_html` also enforces the 1 MiB creative cap,
+                // returning an empty string for oversized or unparseable markup —
+                // in which case the entry is omitted and the bridge falls back to
+                // the PBS Cache coordinates.
                 if let Some(ref raw_creative) = bid.creative {
                     let sanitized = crate::creative::sanitize_creative_html(raw_creative);
-                    let adm = crate::creative::rewrite_creative_html(settings, &sanitized);
+                    let adm = crate::creative::rewrite_inline_creative_html(settings, &sanitized);
                     if !adm.is_empty() {
                         obj.insert("adm".to_string(), serde_json::Value::String(adm));
                     }
@@ -4232,6 +4238,57 @@ mod tests {
             assert!(
                 obj.get("adm").is_none(),
                 "should omit the inline adm when the creative exceeds the 1 MiB cap"
+            );
+        }
+
+        #[test]
+        fn build_bid_map_rewrites_inline_adm_to_absolute_first_party_urls() {
+            // The inline `adm` is rendered by the Prebid Universal Creative inside
+            // GAM's iframe (`f.srcdoc = d.ad`), a foreign origin. Proxied URLs must
+            // therefore be emitted **absolute** against the publisher domain — a
+            // root-relative `/first-party/proxy` would resolve against GAM and 404.
+            // The tsjs bundle must NOT be injected into that foreign-origin iframe.
+            let mut settings = test_settings();
+            settings.publisher.domain = "example.com".to_string();
+
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "examplessp",
+                "abc123",
+                "https://ssp.example.com/win",
+                "https://ssp.example.com/bill",
+            );
+            bid.creative = Some(
+                "<html><body><img src=\"https://cdn.example.com/pixel.png\"></body></html>"
+                    .to_string(),
+            );
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, &settings, false);
+            let adm = map
+                .get("atf_sidebar_ad")
+                .and_then(|v| v.as_object())
+                .and_then(|o| o.get("adm"))
+                .and_then(|v| v.as_str())
+                .expect("should include a rewritten adm");
+
+            assert!(
+                adm.contains("https://example.com/first-party/proxy?tsurl="),
+                "should emit an absolute first-party proxy URL for the foreign-origin render context, got: {adm}"
+            );
+            assert!(
+                !adm.contains("src=\"/first-party/proxy"),
+                "should not emit a root-relative proxy URL that 404s under GAM's origin, got: {adm}"
+            );
+            assert!(
+                !adm.contains("https://cdn.example.com/pixel.png"),
+                "should proxy the original absolute CDN URL, got: {adm}"
+            );
+            assert!(
+                !adm.contains("/static/tsjs="),
+                "should not inject the tsjs bundle into a foreign-origin creative iframe, got: {adm}"
             );
         }
 
