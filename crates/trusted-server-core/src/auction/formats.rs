@@ -1023,6 +1023,47 @@ mod tests {
     }
 
     #[test]
+    fn convert_to_openrtb_response_preserves_aps_debug_metadata() {
+        let settings = make_settings();
+        let auction_request = make_auction_request();
+        let bid = make_bid("div-gpt-top", "aps", Some(2.75));
+        let debug = json!({
+            "httpcalls": {
+                "aps": [{
+                    "requestbody": "{\"id\":\"fictional-auction\"}",
+                    "requestheaders": {"content-type": ["application/json"]},
+                    "responsebody": "{\"seatbid\":[]}",
+                    "responseheaders": {"content-type": ["application/json"]},
+                    "status": 200,
+                    "uri": "https://aps.example/openrtb"
+                }]
+            }
+        });
+        let result = OrchestrationResult {
+            provider_responses: vec![AuctionResponse {
+                provider: "aps".to_string(),
+                bids: vec![bid.clone()],
+                status: BidStatus::Success,
+                response_time_ms: 42,
+                metadata: HashMap::from([("debug".to_string(), debug.clone())]),
+            }],
+            mediator_response: None,
+            winning_bids: HashMap::from([(bid.slot_id.clone(), bid)]),
+            total_time_ms: 50,
+            metadata: HashMap::new(),
+        };
+
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
+            .expect("should convert APS response with debug metadata");
+        let json = response_json(response);
+
+        assert_eq!(
+            json["ext"]["orchestrator"]["provider_details"][0]["metadata"]["debug"], debug,
+            "should preserve APS debug metadata in the auction response"
+        );
+    }
+
+    #[test]
     fn convert_to_openrtb_response_rejects_winner_without_render_source() {
         let settings = make_settings();
         let auction_request = make_auction_request();

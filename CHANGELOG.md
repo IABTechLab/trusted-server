@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added opt-in APS HTTP debug metadata for controlled test sites, exposing the direct request and response under `/auction` provider metadata using the Prebid Server `debug.httpcalls` shape.
 - Added typed APS renderer transport for direct auctions and GAM/Prebid Universal Creative, using a minimized one-bid envelope, a fragment-bound nonce, and an opaque sandboxed renderer endpoint.
 - Added Osano consent mirror integration docs and public enablement guidance.
 - Implemented basic authentication for configurable endpoint paths (#73)
