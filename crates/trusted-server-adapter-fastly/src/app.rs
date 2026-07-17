@@ -569,8 +569,12 @@ async fn run_named_route(
         NamedRouteHandler::RotateKey => handle_rotate_key(&state.settings, services, req),
         NamedRouteHandler::DeactivateKey => handle_deactivate_key(&state.settings, services, req),
         NamedRouteHandler::AdminEcLookup => {
+            // Deliberately NOT `ec.kv_graph`: that copy is bot-gated (None for
+            // non-browser clients), and operators hit this auth-gated endpoint
+            // with curl. Build the graph directly from settings instead.
+            let kv = crate::maybe_identity_graph(&state.settings);
             let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
-            handle_admin_ec_lookup(ec.kv_graph.as_ref(), &partner_registry, &req)
+            handle_admin_ec_lookup(kv.as_ref(), &partner_registry, &req)
         }
         NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
         NamedRouteHandler::BatchSync => {

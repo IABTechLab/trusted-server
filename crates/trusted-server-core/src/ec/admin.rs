@@ -164,7 +164,8 @@ fn requested_ec_id(req: &Request<EdgeBody>) -> Result<String, Box<Response<EdgeB
             None => {
                 return Err(Box::new(json_error(
                     StatusCode::NOT_FOUND,
-                    "no EC ID in path and no ts-ec cookie on the request",
+                    "no EC ID in path and no ts-ec cookie on the request — pass \
+                     an explicit id: /_ts/admin/ec/{id}",
                 )));
             }
         }
