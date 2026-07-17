@@ -209,6 +209,20 @@ impl AuctionOrchestrator {
             }
         }
 
+        // A provider that is also the mediator would be called twice per
+        // auction — once in the bidding phase and again as the mediator. The
+        // mediator's own demand already flows through its mediation response,
+        // so the overlap is never a legitimate configuration.
+        if let Some(mediator_name) = &self.config.mediator
+            && seen.contains(mediator_name.as_str())
+        {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "Auction mediator `{mediator_name}` is also listed in [auction].providers; a provider may not mediate its own auction"
+                ),
+            }));
+        }
+
         for provider_name in self
             .config
             .providers
@@ -2071,6 +2085,29 @@ mod tests {
         assert!(
             err.to_string().contains("listed more than once"),
             "should explain the duplicate provider, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_mediator_also_listed_as_provider() {
+        // A provider acting as its own mediator would be called twice per
+        // auction (bidding phase, then mediation); its demand already flows
+        // through the mediation response, so reject the overlap at startup.
+        let config = AuctionConfig {
+            enabled: true,
+            providers: vec!["prebid".to_string()],
+            mediator: Some("prebid".to_string()),
+            timeout_ms: 2000,
+            ..Default::default()
+        };
+        let orchestrator = AuctionOrchestrator::new(config);
+
+        let err = orchestrator
+            .validate_configured_provider_names()
+            .expect_err("should reject a mediator that is also a provider");
+        assert!(
+            err.to_string().contains("may not mediate its own auction"),
+            "should explain the mediator/provider overlap, got: {err}"
         );
     }
 
