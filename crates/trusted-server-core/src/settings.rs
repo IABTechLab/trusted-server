@@ -2211,6 +2211,7 @@ impl Settings {
         "/_ts/admin/keys/deactivate",
         "/_ts/admin/ec",
         "/_ts/admin/ec/{id}",
+        "/_ts/admin/eids",
     ];
 
     /// Returns admin endpoint paths that no configured handler covers.
@@ -5263,6 +5264,7 @@ origin_host_header_overide = "www.example.com""#,
                 "/_ts/admin/keys/deactivate",
                 "/_ts/admin/ec",
                 "/_ts/admin/ec/{id}",
+                "/_ts/admin/eids",
             ],
             "should report every admin endpoint as uncovered"
         );
@@ -5301,6 +5303,7 @@ origin_host_header_overide = "www.example.com""#,
                 "/_ts/admin/keys/deactivate",
                 "/_ts/admin/ec",
                 "/_ts/admin/ec/{id}",
+                "/_ts/admin/eids",
             ],
             "should detect the admin endpoints not covered by the narrow handler"
         );

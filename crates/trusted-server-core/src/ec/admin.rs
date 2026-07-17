@@ -1,4 +1,4 @@
-//! Admin endpoint for inspecting EC identity graph entries.
+//! Admin endpoints for inspecting EC identity state.
 //!
 //! Serves `GET /_ts/admin/ec` (EC ID taken from the request's `ts-ec`
 //! cookie) and `GET /_ts/admin/ec/{id}` (explicit EC ID). Returns the raw
@@ -6,9 +6,13 @@
 //! attach, so operators can debug KV-to-auction propagation without KV
 //! console access.
 //!
+//! Also serves `GET /_ts/admin/eids`, which echoes the request's `ts-eids`
+//! and `sharedId` cookies with an ingestion preview — the client-side half
+//! of EID propagation that is never stored server-side.
+//!
 //! Authentication is enforced by the `^/_ts/admin` basic-auth handler
 //! configuration; startup validation rejects configs that leave these paths
-//! uncovered (see `Settings::ADMIN_ENDPOINTS`). Because the endpoint is
+//! uncovered (see `Settings::ADMIN_ENDPOINTS`). Because the endpoints are
 //! auth-gated and operator-facing, responses intentionally include full
 //! internal detail (raw consent strings, partner UIDs, parse errors).
 
@@ -19,7 +23,7 @@ use serde_json::Value as JsonValue;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt as _};
 
-use crate::constants::COOKIE_TS_EC;
+use crate::constants::{COOKIE_SHAREDID, COOKIE_TS_EC, COOKIE_TS_EIDS};
 use crate::error::TrustedServerError;
 use crate::openrtb::Eid;
 
@@ -29,6 +33,10 @@ use super::kv::KvIdentityGraph;
 use super::kv_backend::EcKvLookup;
 use super::kv_types::{KvEntry, KvMetadata};
 use super::log_id;
+use super::prebid_eids::{
+    collect_prebid_eid_updates, collect_sharedid_update, dedupe_partner_updates,
+    parse_prebid_eids_cookie,
+};
 use super::registry::PartnerRegistry;
 
 /// Route prefix shared by the cookie-based and explicit-ID lookup routes.
@@ -271,6 +279,125 @@ fn build_auction_view(registry: &PartnerRegistry, entry: &KvEntry) -> AuctionEid
     AuctionEidsView { eids, skipped }
 }
 
+/// Admin EIDs echo payload.
+#[derive(Debug, Serialize)]
+struct AdminEidsResponse {
+    /// Whether a `ts-eids` cookie was present on the request.
+    cookie_present: bool,
+    /// EIDs parsed from the `ts-eids` cookie. Absent when the cookie is
+    /// missing or failed to parse.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eids: Option<Vec<Eid>>,
+    /// Parse failure detail when the `ts-eids` cookie could not be decoded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parse_error: Option<String>,
+    /// Whether a `sharedId` cookie was present on the request.
+    sharedid_present: bool,
+    /// Number of partners configured in the registry.
+    partners_configured: usize,
+    /// Preview of what cookie ingestion would write into the EC entry's
+    /// `ids` map on a navigation carrying these cookies.
+    ingest: IngestPreview,
+}
+
+/// What cookie ingestion would store, and what it would drop.
+#[derive(Debug, Serialize)]
+struct IngestPreview {
+    /// Cookie sources matched to a configured partner, with the UID that
+    /// would be stored (deduplicated exactly like the ingestion path).
+    matched: Vec<MatchedPartnerId>,
+    /// `ts-eids` sources with no configured partner; dropped on ingestion.
+    unmatched: Vec<String>,
+}
+
+/// A cookie-derived partner UID that ingestion would store.
+#[derive(Debug, Serialize)]
+struct MatchedPartnerId {
+    /// Partner namespace key in the EC entry's `ids` map.
+    source_domain: String,
+    /// The UID that would be stored.
+    uid: String,
+}
+
+/// Handles `GET /_ts/admin/eids`.
+///
+/// Echoes the request's `ts-eids` and `sharedId` cookies: the parsed EID
+/// list plus a preview of what cookie ingestion would write into the EC
+/// entry's `ids` map given the configured partner registry. Pure request
+/// inspection — no KV access — so it works on every adapter.
+///
+/// Always responds `200 OK`; missing or malformed cookies are reported in
+/// the payload instead of as errors.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] only when the response
+/// payload fails JSON serialization.
+pub fn handle_admin_eids_lookup(
+    registry: &PartnerRegistry,
+    req: &Request<EdgeBody>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    let eids_cookie = extract_cookie_value(req, COOKIE_TS_EIDS);
+    let sharedid_cookie = extract_cookie_value(req, COOKIE_SHAREDID);
+
+    let (eids, parse_error) = match &eids_cookie {
+        None => (None, None),
+        Some(value) => match parse_prebid_eids_cookie(value) {
+            Ok(parsed) => (Some(parsed), None),
+            Err(error) => (
+                None,
+                Some(format!("failed to parse ts-eids cookie: {error}")),
+            ),
+        },
+    };
+
+    // Mirror the ingestion path (`ingest_eid_cookies`): collect matches from
+    // both cookies, then dedupe the same way so the preview reports exactly
+    // what a navigation would store.
+    let mut updates = Vec::new();
+    if let Some(value) = &eids_cookie {
+        updates.extend(collect_prebid_eid_updates(value, registry));
+    }
+    if let Some(value) = &sharedid_cookie
+        && let Some(update) = collect_sharedid_update(value, registry)
+    {
+        updates.push(update);
+    }
+    let matched = dedupe_partner_updates(updates)
+        .into_iter()
+        .map(|update| MatchedPartnerId {
+            source_domain: update.partner_id,
+            uid: update.uid,
+        })
+        .collect();
+
+    let unmatched = eids
+        .as_ref()
+        .map(|parsed| {
+            parsed
+                .iter()
+                .filter(|eid| registry.find_by_source_domain(&eid.source).is_none())
+                .map(|eid| eid.source.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let payload = AdminEidsResponse {
+        cookie_present: eids_cookie.is_some(),
+        eids,
+        parse_error,
+        sharedid_present: sharedid_cookie.is_some(),
+        partners_configured: registry.len(),
+        ingest: IngestPreview { matched, unmatched },
+    };
+
+    let body =
+        serde_json::to_string(&payload).change_context(TrustedServerError::Configuration {
+            message: "failed to serialize admin EIDs response".to_owned(),
+        })?;
+    Ok(json_response(StatusCode::OK, body))
+}
+
 fn extract_cookie_value(req: &Request<EdgeBody>, name: &str) -> Option<String> {
     let cookie_header = req
         .headers()
@@ -304,6 +431,8 @@ fn json_response(status: StatusCode, body: String) -> Response<EdgeBody> {
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
     use super::*;
     use crate::ec::kv_backend::test_support::InMemoryEcKv;
@@ -623,5 +752,129 @@ mod tests {
         let result = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req);
 
         assert!(result.is_err(), "should propagate KV read failures");
+    }
+
+    fn eids_cookie_for(entries: &serde_json::Value) -> String {
+        BASE64.encode(entries.to_string())
+    }
+
+    #[test]
+    fn eids_lookup_without_cookies_returns_empty_payload() {
+        let req = get_request("/_ts/admin/eids");
+
+        let response =
+            handle_admin_eids_lookup(&test_registry(), &req).expect("should handle eids lookup");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response);
+        assert_eq!(json["cookie_present"], false);
+        assert_eq!(json["sharedid_present"], false);
+        assert_eq!(json["partners_configured"], 2);
+        assert!(
+            json["ingest"]["matched"]
+                .as_array()
+                .expect("should have matched list")
+                .is_empty(),
+            "should preview no matches without cookies"
+        );
+    }
+
+    #[test]
+    fn eids_lookup_parses_cookie_and_previews_ingestion() {
+        let cookie = eids_cookie_for(&serde_json::json!([
+            {
+                "source": "bidstream.example",
+                "uids": [{ "id": "uid-configured", "atype": 1 }]
+            },
+            {
+                "source": "unknown.example",
+                "uids": [{ "id": "uid-unknown", "atype": 1 }]
+            }
+        ]));
+        let req = get_request_with_cookie("/_ts/admin/eids", &format!("ts-eids={cookie}"));
+
+        let response =
+            handle_admin_eids_lookup(&test_registry(), &req).expect("should handle eids lookup");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response);
+        assert_eq!(json["cookie_present"], true);
+        assert_eq!(
+            json["eids"]
+                .as_array()
+                .expect("should have parsed eids")
+                .len(),
+            2,
+            "should echo both parsed EID sources"
+        );
+
+        let matched = json["ingest"]["matched"]
+            .as_array()
+            .expect("should have matched list");
+        assert_eq!(matched.len(), 1, "should match only the configured partner");
+        assert_eq!(matched[0]["source_domain"], "bidstream.example");
+        assert_eq!(matched[0]["uid"], "uid-configured");
+
+        let unmatched = json["ingest"]["unmatched"]
+            .as_array()
+            .expect("should have unmatched list");
+        assert_eq!(unmatched.len(), 1, "should report the unregistered source");
+        assert_eq!(unmatched[0], "unknown.example");
+    }
+
+    #[test]
+    fn eids_lookup_reports_parse_error() {
+        let req = get_request_with_cookie("/_ts/admin/eids", "ts-eids=!!!not-base64!!!");
+
+        let response =
+            handle_admin_eids_lookup(&test_registry(), &req).expect("should handle eids lookup");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "malformed cookies should be reported, not errored"
+        );
+        let json = response_json(response);
+        assert_eq!(json["cookie_present"], true);
+        assert!(
+            json["parse_error"]
+                .as_str()
+                .expect("should have parse_error")
+                .contains("ts-eids"),
+            "should describe the parse failure"
+        );
+        assert!(json.get("eids").is_none(), "should omit unparsed eids");
+        assert!(
+            json["ingest"]["matched"]
+                .as_array()
+                .expect("should have matched list")
+                .is_empty(),
+            "unparseable cookie should preview no matches"
+        );
+    }
+
+    #[test]
+    fn eids_lookup_includes_sharedid_match() {
+        let registry = PartnerRegistry::from_config(&[
+            make_test_partner("bidstream.example", true),
+            make_test_partner("sharedid.org", true),
+        ])
+        .expect("should build sharedid test registry");
+        let req = get_request_with_cookie("/_ts/admin/eids", "sharedId=shared-uid-123");
+
+        let response =
+            handle_admin_eids_lookup(&registry, &req).expect("should handle eids lookup");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response);
+        assert_eq!(json["cookie_present"], false);
+        assert_eq!(json["sharedid_present"], true);
+
+        let matched = json["ingest"]["matched"]
+            .as_array()
+            .expect("should have matched list");
+        assert_eq!(matched.len(), 1, "should match the sharedid partner");
+        assert_eq!(matched[0]["source_domain"], "sharedid.org");
+        assert_eq!(matched[0]["uid"], "shared-uid-123");
     }
 }

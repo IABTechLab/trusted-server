@@ -24,6 +24,7 @@
 //! | POST | `/_ts/admin/keys/deactivate` | [`handle_deactivate_key`] |
 //! | GET | `/_ts/admin/ec` | [`handle_admin_ec_lookup`] |
 //! | GET | `/_ts/admin/ec/{id}` | [`handle_admin_ec_lookup`] |
+//! | GET | `/_ts/admin/eids` | [`handle_admin_eids_lookup`] |
 //! | POST | `/_ts/api/v1/batch-sync` | [`handle_batch_sync`] |
 //! | GET | `/_ts/api/v1/identify` | [`handle_identify`] |
 //! | GET | `/_ts/set-tester` | [`handle_set_tester`] |
@@ -100,7 +101,7 @@ use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
 use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use trusted_server_core::ec::EcContext;
-use trusted_server_core::ec::admin::handle_admin_ec_lookup;
+use trusted_server_core::ec::admin::{handle_admin_ec_lookup, handle_admin_eids_lookup};
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
 use trusted_server_core::ec::consent::ec_consent_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
@@ -576,6 +577,10 @@ async fn run_named_route(
             let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
             handle_admin_ec_lookup(kv.as_ref(), &partner_registry, &req)
         }
+        NamedRouteHandler::AdminEidsLookup => {
+            let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
+            handle_admin_eids_lookup(&partner_registry, &req)
+        }
         NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
         NamedRouteHandler::BatchSync => {
             // Dispatched by execute_named before EC state is built.
@@ -999,6 +1004,7 @@ enum NamedRouteHandler {
     RotateKey,
     DeactivateKey,
     AdminEcLookup,
+    AdminEidsLookup,
     /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
     /// reach the publisher fallback (which would leak admin credentials).
     LegacyAdminDenied,
@@ -1062,6 +1068,13 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: "/_ts/admin/ec/{id}",
         primary_methods: &[Method::GET],
         handler: NamedRouteHandler::AdminEcLookup,
+    },
+    // Admin EIDs echo: decodes the request's ts-eids/sharedId cookies with
+    // an ingestion preview. Pure request inspection — no KV access.
+    NamedRoute {
+        path: "/_ts/admin/eids",
+        primary_methods: &[Method::GET],
+        handler: NamedRouteHandler::AdminEidsLookup,
     },
     // The legacy non-`/_ts` aliases (`/admin/keys/*`) are denied locally with a
     // 404 instead of executing key operations: the production basic-auth handler
@@ -1670,6 +1683,20 @@ mod tests {
                 "{path} must have GET as its only primary method"
             );
         }
+
+        let eids_route = NAMED_ROUTES
+            .iter()
+            .find(|route| route.path == "/_ts/admin/eids")
+            .expect("should register /_ts/admin/eids as a named route");
+        assert!(
+            matches!(eids_route.handler, NamedRouteHandler::AdminEidsLookup),
+            "/_ts/admin/eids must map to the admin EIDs lookup handler"
+        );
+        assert_eq!(
+            eids_route.primary_methods,
+            &[Method::GET],
+            "/_ts/admin/eids must have GET as its only primary method"
+        );
     }
 
     #[test]

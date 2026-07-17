@@ -76,6 +76,7 @@ fn all_explicit_routes_are_registered() {
         ("POST", "/_ts/admin/keys/deactivate"),
         ("GET", "/_ts/admin/ec"),
         ("GET", "/_ts/admin/ec/{id}"),
+        ("GET", "/_ts/admin/eids"),
         ("POST", "/admin/keys/rotate"),
         ("POST", "/admin/keys/deactivate"),
         ("POST", "/auction"),
@@ -288,6 +289,31 @@ async fn authenticated_admin_ec_routes_return_501() {
             "{path} should report that Axum EC lookup is unsupported"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_admin_eids_route_returns_200() {
+    // The EIDs echo is pure request inspection (no KV), so the dev server
+    // serves the real handler.
+    let mut svc = make_service();
+    let req = Request::builder()
+        .method("GET")
+        .uri("/_ts/admin/eids")
+        .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+        .body(AxumBody::empty())
+        .expect("should build request");
+    let resp = svc
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "/_ts/admin/eids should serve the real EIDs echo handler"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

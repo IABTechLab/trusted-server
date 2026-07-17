@@ -13,6 +13,8 @@ use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
 #[cfg(target_arch = "wasm32")]
 use trusted_server_core::config_payload::settings_from_config_blob;
 use trusted_server_core::ec::EcContext;
+use trusted_server_core::ec::admin::handle_admin_eids_lookup;
+use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::platform::RuntimeServices;
@@ -486,6 +488,15 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .get("/_ts/admin/ec/{id}", |_ctx: RequestContext| async {
                 Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
             })
+            // Admin EIDs echo: pure request inspection (no KV), so this
+            // adapter serves the real handler.
+            .get(
+                "/_ts/admin/eids",
+                make_handler(Arc::clone(&state), |s, _services, req| async move {
+                    let partner_registry = PartnerRegistry::from_config(&s.settings.ec.partners)?;
+                    handle_admin_eids_lookup(&partner_registry, &req)
+                }),
+            )
             .post(
                 "/auction",
                 make_handler(Arc::clone(&state), |s, services, req| async move {

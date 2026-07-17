@@ -12,6 +12,8 @@ use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
 use trusted_server_core::ec::EcContext;
+use trusted_server_core::ec::admin::handle_admin_eids_lookup;
+use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::proxy::{
@@ -253,6 +255,7 @@ enum NamedRouteHandler {
     VerifySignature,
     AdminNotSupported,
     AdminEcNotSupported,
+    AdminEidsLookup,
     /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
     /// reach the publisher fallback (which would leak admin credentials).
     LegacyAdminDenied,
@@ -280,7 +283,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 14] {
+fn named_routes() -> [NamedRoute; 15] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -317,6 +320,13 @@ fn named_routes() -> [NamedRoute; 14] {
             path: "/_ts/admin/ec/{id}",
             primary_methods: &[Method::GET],
             handler: NamedRouteHandler::AdminEcNotSupported,
+        },
+        // Admin EIDs echo: pure request inspection (no KV), so the dev
+        // server serves the real handler.
+        NamedRoute {
+            path: "/_ts/admin/eids",
+            primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::AdminEidsLookup,
         },
         // The legacy non-`/_ts` aliases (`/admin/keys/*`) are denied locally with
         // a 404, matching the Fastly and Cloudflare adapters: the production
@@ -416,6 +426,11 @@ fn named_route_handler(
                             HeaderValue::from_static("text/plain; charset=utf-8"),
                         );
                         Ok(resp)
+                    }
+                    NamedRouteHandler::AdminEidsLookup => {
+                        let partner_registry =
+                            PartnerRegistry::from_config(&state.settings.ec.partners)?;
+                        handle_admin_eids_lookup(&partner_registry, &req)
                     }
                     NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
                     NamedRouteHandler::Auction => {
