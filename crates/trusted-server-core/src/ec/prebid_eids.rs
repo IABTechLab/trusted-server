@@ -29,10 +29,6 @@ const MAX_EIDS_COOKIE_BYTES: usize = 8 * 1024;
 struct LegacyCookieEid {
     source: String,
     id: String,
-    #[allow(
-        dead_code,
-        reason = "legacy cookie field is deserialized for compatibility but not emitted"
-    )]
     atype: i32,
 }
 
