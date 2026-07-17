@@ -1175,10 +1175,10 @@ pub async fn handle_asset_proxy_request(
     strip_asset_proxy_response_headers(response.response_mut());
 
     let status = response.response().status();
-    if status.is_success() || status == StatusCode::NOT_MODIFIED {
-        if let Some(policy) = settings.asset_cache_policy_for_path(incoming_path)? {
-            response.apply_normalized_cache_policy(policy);
-        }
+    if (status.is_success() || status == StatusCode::NOT_MODIFIED)
+        && let Some(policy) = settings.asset_cache_policy_for_path(incoming_path)?
+    {
+        response.apply_normalized_cache_policy(policy);
     }
 
     Ok(response)
