@@ -312,6 +312,40 @@ describe('auction/parseAuctionResponse', () => {
     expect(bids[0].height).toBe(250);
     expect(bids[0].adomain).toEqual([]);
   });
+
+  it('retains the auction id from the response top-level id', () => {
+    const body = {
+      id: 'auction-uuid-1',
+      seatbid: [{ seat: 'kargo', bid: [{ impid: 'slot-1', price: 1.0, adm: '<div>A</div>' }] }],
+    };
+
+    const bids = parseAuctionResponse(body);
+    expect(bids[0].auctionId).toBe('auction-uuid-1');
+    expect(bids[0].admHash).toBeUndefined();
+  });
+
+  it('prefers bid-level ext.ts trace fields over the top-level id', () => {
+    const body = {
+      id: 'auction-uuid-1',
+      seatbid: [
+        {
+          seat: 'kargo',
+          bid: [
+            {
+              impid: 'slot-1',
+              price: 1.0,
+              adm: '<div>A</div>',
+              ext: { ts: { auction_id: 'auction-uuid-2', adm_hash: 'a1b2c3d4e5f60718' } },
+            },
+          ],
+        },
+      ],
+    };
+
+    const bids = parseAuctionResponse(body);
+    expect(bids[0].auctionId).toBe('auction-uuid-2');
+    expect(bids[0].admHash).toBe('a1b2c3d4e5f60718');
+  });
 });
 
 describe('auction/sendAuction', () => {

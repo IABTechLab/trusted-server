@@ -1222,6 +1222,7 @@ timeout_ms = 2000
 enabled = true
 account_id = "example-account"
 endpoint = "https://web.ads.aps.amazon-adsystem.com/e/pb/bid"
+debug = false
 # Optional pair for deployments hosted away from APS-authorized inventory.
 # inventory_domain = "publisher.example"
 # inventory_page_origin = "https://www.publisher.example"
@@ -1243,6 +1244,7 @@ TRUSTED_SERVER__AUCTION__PROVIDERS__1=prebid
 TRUSTED_SERVER__AUCTION__MEDIATOR=adserver_mock
 TRUSTED_SERVER__AUCTION__TIMEOUT_MS=2000
 TRUSTED_SERVER__AUCTION__CREATIVE_STORE=creative_store
+TRUSTED_SERVER__INTEGRATIONS__APS__DEBUG=false
 ```
 
 ## Fastly Runtime Config Store

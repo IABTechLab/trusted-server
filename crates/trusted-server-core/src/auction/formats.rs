@@ -14,6 +14,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::auction::context::ContextValue;
+use crate::auction::types::adm_trace_hash;
 use crate::consent::ConsentContext;
 use crate::constants::{HEADER_X_TS_EC_CONSENT, HEADER_X_TS_EIDS, HEADER_X_TS_EIDS_TRUNCATED};
 use crate::creative;
@@ -329,6 +330,39 @@ pub fn convert_to_openrtb_response(
                 ),
             }));
         };
+
+        // Trace hash over the exact markup delivered to the client (post
+        // sanitize/rewrite) so the client can stamp the rendered creative with
+        // a value that matches this response byte-for-byte. Logged at info so
+        // server logs join against the DOM markers without debug logging.
+        let adm_hash = adm
+            .as_deref()
+            .filter(|markup| !markup.is_empty())
+            .map(adm_trace_hash);
+        if let Some(ref hash) = adm_hash {
+            log::info!(
+                "auction delivered creative: auction_id={} slot_id={} bidder={} crid={:?} adm_hash={}",
+                auction_request.id,
+                slot_id,
+                bid.bidder,
+                bid.creative_id,
+                hash,
+            );
+        }
+        let mut ts_ext = serde_json::Map::new();
+        ts_ext.insert(
+            "auction_id".to_string(),
+            serde_json::Value::String(auction_request.id.clone()),
+        );
+        if let Some(ref hash) = adm_hash {
+            ts_ext.insert(
+                "adm_hash".to_string(),
+                serde_json::Value::String(hash.clone()),
+            );
+        }
+        let mut ext = ext.unwrap_or_default();
+        ext.insert("ts".to_string(), JsonValue::Object(ts_ext));
+        let ext = Some(ext);
 
         let openrtb_bid = OpenRtbBid {
             id: bid
@@ -1146,6 +1180,47 @@ mod tests {
         assert!(
             !adm.contains("auction-handler-marker") && !adm.contains("onerror"),
             "should still remove event handlers: {adm}"
+        );
+    }
+
+    #[test]
+    fn convert_to_openrtb_response_preserves_aps_debug_metadata() {
+        let settings = make_settings();
+        let auction_request = make_auction_request();
+        let bid = make_bid("div-gpt-top", "aps", Some(2.75));
+        let debug = json!({
+            "httpcalls": {
+                "aps": [{
+                    "requestbody": "{\"id\":\"fictional-auction\"}",
+                    "requestheaders": {"content-type": ["application/json"]},
+                    "responsebody": "{\"seatbid\":[]}",
+                    "responseheaders": {"content-type": ["application/json"]},
+                    "status": 200,
+                    "uri": "https://aps.example/openrtb"
+                }]
+            }
+        });
+        let result = OrchestrationResult {
+            provider_responses: vec![AuctionResponse {
+                provider: "aps".to_string(),
+                bids: vec![bid.clone()],
+                status: BidStatus::Success,
+                response_time_ms: 42,
+                metadata: HashMap::from([("debug".to_string(), debug.clone())]),
+            }],
+            mediator_response: None,
+            winning_bids: HashMap::from([(bid.slot_id.clone(), bid)]),
+            total_time_ms: 50,
+            metadata: HashMap::new(),
+        };
+
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
+            .expect("should convert APS response with debug metadata");
+        let json = response_json(response);
+
+        assert_eq!(
+            json["ext"]["orchestrator"]["provider_details"][0]["metadata"]["debug"], debug,
+            "should preserve APS debug metadata in the auction response"
         );
     }
 
