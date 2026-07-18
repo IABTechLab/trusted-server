@@ -208,6 +208,18 @@ describe('trace/floating panel', () => {
     expect(panel!.textContent).toContain('◐ slot-1 · gam-only');
   });
 
+  it('never claims ok when a render path did not report placement', () => {
+    document.cookie = 'ts-trace=1; Path=/';
+    // Regression: an unset `injected` must not fall through to ok — that would
+    // claim a confirmed TS render for a slot TS only targeted.
+    const { injected: _omitted, ...withoutInjected } = record;
+    recordRender({ ...withoutInjected, gamEmpty: false, visible: true });
+
+    const panel = document.getElementById(TRACE_PANEL_ID);
+    expect(panel!.textContent).toContain('0/1 ok');
+    expect(panel!.textContent).toContain('◐ slot-1 · gam-only');
+  });
+
   it('reuses a single panel across renders and reflects the latest count', () => {
     document.cookie = 'ts-trace=1; Path=/';
     recordRender(record);

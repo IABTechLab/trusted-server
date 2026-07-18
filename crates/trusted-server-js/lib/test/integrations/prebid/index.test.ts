@@ -63,8 +63,10 @@ import {
   auctionBidsToPrebidBids,
   installPrebidNpm,
   installRefreshHandler,
+  recordPrebidBidWon,
 } from '../../../src/integrations/prebid/index';
 import type { AuctionBid } from '../../../src/core/auction';
+import type { TsjsApi } from '../../../src/core/types';
 
 describe('prebid/collectBidders', () => {
   it('returns empty array for empty ad units', () => {
@@ -196,6 +198,82 @@ describe('prebid/auctionBidsToPrebidBids', () => {
     expect(result).toHaveLength(2);
     expect(result[0].requestId).toBe('req-a');
     expect(result[1].requestId).toBe('req-b');
+  });
+
+  it('forwards the server-side trace tuple into Prebid meta', () => {
+    const auctionBids: AuctionBid[] = [
+      {
+        impid: 'div-gpt-1',
+        adm: '<div>Ad</div>',
+        price: 1.0,
+        width: 300,
+        height: 250,
+        seat: 'kargo',
+        creativeId: 'KM-CREA-1',
+        adomain: ['kargo.com'],
+        auctionId: 'ts-auction-xyz',
+        admHash: 'a1b2c3d4e5f60718',
+      },
+    ];
+
+    const result = auctionBidsToPrebidBids(auctionBids, []);
+
+    expect(result[0].meta.tsAuctionId).toBe('ts-auction-xyz');
+    expect(result[0].meta.tsAdmHash).toBe('a1b2c3d4e5f60718');
+  });
+});
+
+describe('prebid/recordPrebidBidWon', () => {
+  beforeEach(() => {
+    delete (window as { tsjs?: TsjsApi }).tsjs;
+    document.body.innerHTML = '';
+  });
+  afterEach(() => {
+    delete (window as { tsjs?: TsjsApi }).tsjs;
+    document.body.innerHTML = '';
+  });
+
+  it('records an auction-path render for a server-side bid', () => {
+    document.body.innerHTML = '<div id="ad-header-0-_R_x_"></div>';
+    const record = recordPrebidBidWon({
+      adUnitCode: 'ad-header-0-_R_x_',
+      bidderCode: 'kargo',
+      creativeId: 'KM-CREA-1',
+      meta: { tsAuctionId: '265dcedd-aa0a', tsAdmHash: 'f68044ca9f68c88c' },
+    });
+
+    expect(record).toBeDefined();
+    expect(record).toEqual(
+      expect.objectContaining({
+        slotId: 'ad-header-0-_R_x_',
+        path: 'auction',
+        rendered: true,
+        injected: true,
+        auctionId: '265dcedd-aa0a',
+        admHash: 'f68044ca9f68c88c',
+        bidder: 'kargo',
+        creativeId: 'KM-CREA-1',
+        servedFrom: 'prebid',
+        elementId: 'ad-header-0-_R_x_',
+      })
+    );
+    // Written into the shared registry the panel reads.
+    expect((window as { tsjs?: TsjsApi }).tsjs?.renders?.['ad-header-0-_R_x_']).toBeDefined();
+  });
+
+  it('skips a bid without the server-side trace tuple (client-side bidder)', () => {
+    const record = recordPrebidBidWon({
+      adUnitCode: 'ad-header-0',
+      bidderCode: 'appnexus',
+      meta: { advertiserDomains: ['x.com'] },
+    });
+    expect(record).toBeUndefined();
+    expect((window as { tsjs?: TsjsApi }).tsjs?.renders).toBeUndefined();
+  });
+
+  it('skips a bid with no adUnitCode', () => {
+    expect(recordPrebidBidWon({ meta: { tsAuctionId: 'x' } })).toBeUndefined();
+    expect(recordPrebidBidWon(undefined)).toBeUndefined();
   });
 });
 

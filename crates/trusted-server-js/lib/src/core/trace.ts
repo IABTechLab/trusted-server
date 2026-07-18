@@ -89,9 +89,12 @@ type PanelStatus = 'ok' | 'hidden' | 'gam-only' | 'empty';
 function panelStatus(record: RenderRecord): PanelStatus {
   if (!record.rendered || record.gamEmpty === true) return 'empty';
   if (record.visible === false) return 'hidden';
-  // injected===false means TS applied targeting only; the creative is GAM's and
-  // unreadable, so we must not claim it as a confirmed TS render.
-  if (record.injected === false) return 'gam-only';
+  // `ok` requires a *confirmed* TS placement. Anything else — TS applied
+  // targeting only (injected false, creative is GAM's and cross-origin
+  // unreadable), or a path that never reported placement (undefined) — must not
+  // be claimed as a TS render. Defaulting to gam-only keeps the panel honest
+  // even if a future render path forgets to set `injected`.
+  if (record.injected !== true) return 'gam-only';
   return 'ok';
 }
 

@@ -611,7 +611,10 @@ export function installTsAdInit(): void {
           // Adapted from PR #241 — uses window.tsjs.bids[slotId].adm instead of pbjs.
           // Only active when inject_adm_for_testing injects adm into bids server-side.
           // Run before recording so the trace reflects the post-injection state.
-          const injected = bid.adm ? injectAdmIntoSlot(divId, bid.adm) : undefined;
+          // No adm to inject means TS only applied GAM targeting: whatever GAM
+          // rendered lives in a cross-origin iframe TS cannot read, so this is
+          // explicitly *not* a confirmed TS placement (status: gam-only).
+          const injected = bid.adm ? injectAdmIntoSlot(divId, bid.adm) : false;
 
           // Trace: registry entry + DOM markers joining the GAM render to the
           // server-side auction bid. `rendered` is GAM's own non-empty signal;
