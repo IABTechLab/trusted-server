@@ -29,6 +29,7 @@
 //! | GET | `/_ts/api/v1/identify` | [`handle_identify`] |
 //! | GET | `/_ts/set-tester` | [`handle_set_tester`] |
 //! | GET | `/_ts/clear-tester` | [`handle_clear_tester`] |
+//! | GET | `/_ts/trace` | [`handle_trace_mode`] |
 //! | OPTIONS | `/_ts/api/v1/identify` | [`cors_preflight_identify`] |
 //! | POST | `/auction` | [`handle_auction`] |
 //! | GET | `/first-party/proxy` | [`handle_first_party_proxy`] |
@@ -132,6 +133,7 @@ use trusted_server_core::settings_data::{
     default_config_key, default_config_store_name, get_settings_from_config_store,
 };
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
+use trusted_server_core::trace_cookie::handle_trace_mode;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::{
@@ -603,6 +605,7 @@ async fn run_named_route(
         }
         NamedRouteHandler::SetTester => handle_set_tester(&state.settings),
         NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
+        NamedRouteHandler::TraceMode => handle_trace_mode(&state.settings, req.uri().query()),
         NamedRouteHandler::Auction => {
             // The auction reads consent data, so the consent KV store must be
             // available — fail closed with 503 when it is configured but
@@ -1010,6 +1013,7 @@ enum NamedRouteHandler {
     Identify,
     SetTester,
     ClearTester,
+    TraceMode,
     Auction,
     PageBids,
     FirstPartyProxy,
@@ -1109,6 +1113,11 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: "/_ts/clear-tester",
         primary_methods: &[Method::GET],
         handler: NamedRouteHandler::ClearTester,
+    },
+    NamedRoute {
+        path: "/_ts/trace",
+        primary_methods: &[Method::GET],
+        handler: NamedRouteHandler::TraceMode,
     },
     NamedRoute {
         path: "/auction",
@@ -1816,6 +1825,55 @@ mod tests {
         assert!(
             response.headers().get(header::SET_COOKIE).is_none(),
             "disabled tester-cookie route should not set a cookie"
+        );
+    }
+
+    #[test]
+    fn dispatch_trace_route_is_disabled_by_default() {
+        let router = test_router();
+        let response = route(&router, empty_request(Method::GET, "/_ts/trace"));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "disabled trace route should return 404"
+        );
+        assert!(
+            response.headers().get(header::SET_COOKIE).is_none(),
+            "disabled trace route should not set a cookie"
+        );
+    }
+
+    #[test]
+    fn dispatch_trace_route_arms_cookie_and_redirects() {
+        let mut settings = test_settings();
+        settings.debug.trace_route_enabled = true;
+        let state = app_state_for_settings(settings);
+        let router = TrustedServerApp::routes_for_state(&state);
+        let response = route(&router, empty_request(Method::GET, "/_ts/trace"));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::FOUND,
+            "enabled trace route should redirect to root"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("/"),
+            "trace route should redirect to /"
+        );
+        let set_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("should set trace cookie")
+            .to_str()
+            .expect("should render set-cookie as utf-8");
+        assert!(
+            set_cookie.starts_with("ts-trace=1;"),
+            "trace route should arm the ts-trace cookie"
         );
     }
 

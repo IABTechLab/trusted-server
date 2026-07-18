@@ -2,7 +2,7 @@
 import { renderApsCreative } from '../integrations/aps/render';
 
 import { buildAdRequest, sendAuction } from './auction';
-import { recordRender, stampCreativeTrace } from './trace';
+import { recordRender, stampCreativeTrace, isEffectivelyVisible } from './trace';
 import { collectContext } from './context';
 import { log } from './log';
 import { getAllUnits, firstSize } from './registry';
@@ -113,7 +113,7 @@ function renderCreativeInline({
   const container = findSlot(slotId) as HTMLElement | null;
   if (!container) {
     log.warn('renderCreativeInline: slot not found; skipping render', { slotId, seat, creativeId });
-    recordRender({ ...trace, rendered: false });
+    recordRender({ ...trace, rendered: false, injected: false, visible: false });
     return;
   }
 
@@ -132,6 +132,8 @@ function renderCreativeInline({
       const rejectedRecord = recordRender({
         ...trace,
         rendered: false,
+        injected: false,
+        visible: false,
         elementId: container.id || undefined,
       });
       stampCreativeTrace(container, rejectedRecord);
@@ -168,9 +170,13 @@ function renderCreativeInline({
 
     // Trace: registry entry + DOM markers joining this creative back to the
     // server-side auction (matches the `auction delivered creative:` log line).
+    // The /auction path writes the srcdoc itself, so this is a confirmed TS
+    // placement (injected: true).
     const record = recordRender({
       ...trace,
       rendered: true,
+      injected: true,
+      visible: isEffectivelyVisible(container),
       elementId: container.id || undefined,
     });
     stampCreativeTrace(container, record);
