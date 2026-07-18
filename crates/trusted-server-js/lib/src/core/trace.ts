@@ -23,6 +23,13 @@ const TRACE_COOKIE_NAME = 'ts-trace';
 /** DOM id of the floating trace panel (body-level overlay). */
 export const TRACE_PANEL_ID = 'ts-render-trace-panel';
 
+/**
+ * Upper bound on `window.tsjs.renderLog`. A publisher page that refreshes its
+ * slots on every render can produce hundreds of entries in a session, so the
+ * history is trimmed from the front rather than growing without limit.
+ */
+const MAX_RENDER_LOG_ENTRIES = 200;
+
 /** CSS class of the per-slot confirmation badge (only on honestly-ok slots). */
 export const TRACE_BADGE_CLASS = 'ts-render-badge';
 
@@ -116,6 +123,7 @@ const STATUS_STYLE: Record<PanelStatus, { color: string; mark: string; label: st
  * `pointer-events: none` keeps the badge from intercepting clicks on the ad.
  */
 function attachTraceBadge(el: HTMLElement, record: RenderRecord): void {
+  const style = STATUS_STYLE[panelStatus(record)];
   el.querySelectorAll(`:scope > .${TRACE_BADGE_CLASS}`).forEach((n) => n.remove());
 
   const position = getComputedStyle(el).position;
@@ -125,7 +133,7 @@ function attachTraceBadge(el: HTMLElement, record: RenderRecord): void {
 
   const badge = document.createElement('div');
   badge.className = TRACE_BADGE_CLASS;
-  badge.textContent = `TS ✓ ${record.bidder ?? '?'}`;
+  badge.textContent = `TS ${style.mark} ${record.bidder ?? '?'}${style.label === 'ok' ? '' : ` · ${style.label}`}`;
   badge.title = [
     `slot: ${record.slotId}`,
     `auction: ${record.auctionId ?? '?'}`,
@@ -143,7 +151,7 @@ function attachTraceBadge(el: HTMLElement, record: RenderRecord): void {
   s.setProperty('font', '10px/1.5 ui-monospace, Menlo, Consolas, monospace');
   s.setProperty('padding', '1px 5px');
   s.setProperty('color', '#fff');
-  s.setProperty('background', 'rgba(0,128,0,0.9)');
+  s.setProperty('background', style.color);
   s.setProperty('border-radius', '3px');
   el.appendChild(badge);
 }
@@ -250,7 +258,8 @@ function buildPanelRow(record: RenderRecord): HTMLElement {
   ].join('\n');
 
   const line1 = document.createElement('div');
-  line1.textContent = `${style.mark} ${record.slotId} · ${style.label}`;
+  const clock = new Date(record.at).toLocaleTimeString('en-GB', { hour12: false });
+  line1.textContent = `${clock} ${style.mark} ${record.slotId} · ${style.label}`;
   line1.style.setProperty('font-weight', '600');
   line1.style.setProperty('color', style.color);
 
@@ -260,7 +269,7 @@ function buildPanelRow(record: RenderRecord): HTMLElement {
 
   const line3 = document.createElement('div');
   line3.style.setProperty('color', '#777');
-  line3.textContent = `${stateSummary(record)} · auction ${short(record.auctionId)}${record.count > 1 ? ` · ×${record.count}` : ''}`;
+  line3.textContent = `${stateSummary(record)} · auction ${short(record.auctionId)} · #${record.count}`;
 
   row.append(line1, line2, line3);
   return row;
@@ -279,10 +288,13 @@ export function renderTracePanel(): void {
     if (!panel) return;
 
     const renders = window.tsjs?.renders ?? {};
-    const records = Object.values(renders).sort((a, b) => a.slotId.localeCompare(b.slotId));
+    const slots = Object.values(renders);
     // Count only slots that are honestly OK (TS creative placed and visible),
     // not merely "GAM said something rendered" — the whole point of the fix.
-    const ok = records.filter((r) => panelStatus(r) === 'ok').length;
+    const ok = slots.filter((r) => panelStatus(r) === 'ok').length;
+    // Newest render first: on a page that refreshes its slots this reads as a
+    // timeline rather than a set of counters.
+    const history = [...(window.tsjs?.renderLog ?? [])].reverse();
 
     panel.replaceChildren();
 
@@ -299,7 +311,7 @@ export function renderTracePanel(): void {
     hs.setProperty('font-weight', '700');
 
     const title = document.createElement('span');
-    title.textContent = `TS Render Trace · ${ok}/${records.length} ok`;
+    title.textContent = `TS Render Trace · ${ok}/${slots.length} slots ok · ${history.length} renders`;
 
     const close = document.createElement('button');
     close.textContent = '×';
@@ -320,10 +332,10 @@ export function renderTracePanel(): void {
     hint.style.setProperty('padding', '2px 10px 4px');
     hint.style.setProperty('color', '#777');
     hint.style.setProperty('font-size', '9px');
-    hint.textContent = 'click a row to copy its full record · hover for detail';
+    hint.textContent = 'newest first · click a row to copy its full record · hover for detail';
     panel.appendChild(hint);
 
-    if (records.length === 0) {
+    if (history.length === 0) {
       const empty = document.createElement('div');
       empty.style.setProperty('padding', '6px 10px');
       empty.style.setProperty('color', '#bbb');
@@ -332,7 +344,7 @@ export function renderTracePanel(): void {
       return;
     }
 
-    for (const record of records) {
+    for (const record of history) {
       panel.appendChild(buildPanelRow(record));
     }
   } catch (err) {
@@ -357,6 +369,13 @@ export function recordRender(record: Omit<RenderRecord, 'count' | 'at'>): Render
     const prev = renders[record.slotId];
     if (prev) full.count = prev.count + 1;
     renders[record.slotId] = full;
+
+    // Keep each render as its own history entry, trimmed from the front.
+    const history = (ts.renderLog ??= []);
+    history.push(full);
+    if (history.length > MAX_RENDER_LOG_ENTRIES) {
+      history.splice(0, history.length - MAX_RENDER_LOG_ENTRIES);
+    }
   } catch (err) {
     log.warn('trace: failed to write render record', { slotId: record.slotId, err });
   }
@@ -404,14 +423,17 @@ export function stampCreativeTrace(el: Element, record: RenderRecord): void {
         el.removeAttribute(name);
       }
     }
-    // Confirmation badge only on an honestly-ok slot (TS creative placed and
-    // visible), never on the iframe itself — ties a physical banner to its
-    // panel row. Hidden / gam-only / empty slots stay unbadged on purpose.
+    // Badge any slot that actually shows something, carrying its honest status
+    // colour: green ✓ for a confirmed TS render, blue ◐ for `gam-only` (GAM
+    // rendered, TS cannot confirm it as its own). Slots with nothing on screen
+    // (`empty`) or nothing visible (`hidden`) stay unbadged — there is no
+    // creative there to label. Never badge the iframe itself.
+    const status = panelStatus(record);
     if (
       el instanceof HTMLElement &&
       el.tagName !== 'IFRAME' &&
       traceOverlayEnabled() &&
-      panelStatus(record) === 'ok'
+      (status === 'ok' || status === 'gam-only')
     ) {
       attachTraceBadge(el, record);
     }

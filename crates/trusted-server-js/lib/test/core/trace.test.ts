@@ -181,7 +181,7 @@ describe('trace/floating panel', () => {
     const panel = document.getElementById(TRACE_PANEL_ID);
     expect(panel).toBeTruthy();
     // Only slot-1 is honestly ok; slot-2 rendered nothing.
-    expect(panel!.textContent).toContain('TS Render Trace · 1/2 ok');
+    expect(panel!.textContent).toContain('TS Render Trace · 1/2 slots ok');
     expect(panel!.textContent).toContain('✓ slot-1 · ok');
     expect(panel!.textContent).toContain('✗ slot-2 · empty');
     expect(panel!.textContent).toContain('ssat · kargo');
@@ -194,7 +194,7 @@ describe('trace/floating panel', () => {
     recordRender({ ...record, visible: false });
 
     const panel = document.getElementById(TRACE_PANEL_ID);
-    expect(panel!.textContent).toContain('0/1 ok');
+    expect(panel!.textContent).toContain('0/1 slots ok');
     expect(panel!.textContent).toContain('⚠ slot-1 · hidden');
   });
 
@@ -204,7 +204,7 @@ describe('trace/floating panel', () => {
     recordRender({ ...record, injected: false, gamEmpty: false, visible: true });
 
     const panel = document.getElementById(TRACE_PANEL_ID);
-    expect(panel!.textContent).toContain('0/1 ok');
+    expect(panel!.textContent).toContain('0/1 slots ok');
     expect(panel!.textContent).toContain('◐ slot-1 · gam-only');
   });
 
@@ -216,7 +216,7 @@ describe('trace/floating panel', () => {
     recordRender({ ...withoutInjected, gamEmpty: false, visible: true });
 
     const panel = document.getElementById(TRACE_PANEL_ID);
-    expect(panel!.textContent).toContain('0/1 ok');
+    expect(panel!.textContent).toContain('0/1 slots ok');
     expect(panel!.textContent).toContain('◐ slot-1 · gam-only');
   });
 
@@ -227,9 +227,9 @@ describe('trace/floating panel', () => {
 
     const panels = document.querySelectorAll(`#${TRACE_PANEL_ID}`);
     expect(panels).toHaveLength(1);
-    // Second render of the same slot bumps the count, still one row.
-    expect(panels[0].textContent).toContain('TS Render Trace · 1/1 ok');
-    expect(panels[0].textContent).toContain('×2');
+    // Second render of the same slot bumps the count and appends a history row.
+    expect(panels[0].textContent).toContain('TS Render Trace · 1/1 slots ok');
+    expect(panels[0].textContent).toContain('#2');
   });
 
   it('close button removes the panel', () => {
