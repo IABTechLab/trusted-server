@@ -223,7 +223,7 @@ impl IntegrationSettings {
     fn normalize_opaque_json_value(value: JsonValue) -> JsonValue {
         match value {
             JsonValue::String(raw) => {
-                serde_json::from_str::<JsonValue>(&raw).unwrap_or_else(|_| JsonValue::String(raw))
+                serde_json::from_str::<JsonValue>(&raw).unwrap_or(JsonValue::String(raw))
             }
             other => other,
         }
