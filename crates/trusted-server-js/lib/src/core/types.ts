@@ -160,6 +160,13 @@ export interface TsjsApi {
   adInit?: () => void;
   /** Render-trace registry: latest render per slot (see [`RenderRecord`]). */
   renders?: Record<string, RenderRecord>;
+  /**
+   * Append-only history of every render, oldest first, bounded to the most
+   * recent entries. `renders` collapses to one row per slot (useful for
+   * "did this slot ever render" checks); this keeps each individual render so
+   * a refreshing page shows a timeline instead of a climbing counter.
+   */
+  renderLog?: RenderRecord[];
   /** GPT slot objects TS defined — used to destroy stale slots on SPA navigation. */
   prevGptSlots?: unknown[];
   /** Guards one-time-per-page enableSingleRequest/enableServices calls. */
