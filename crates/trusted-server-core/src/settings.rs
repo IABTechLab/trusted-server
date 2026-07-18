@@ -191,7 +191,19 @@ impl IntegrationSettings {
         match value {
             JsonValue::Object(map) => JsonValue::Object(
                 map.into_iter()
-                    .map(|(key, val)| (key, Self::normalize_env_value(val)))
+                    .map(|(key, value)| {
+                        let value = if matches!(
+                            key.as_str(),
+                            "bid_param_overrides"
+                                | "bid_param_zone_overrides"
+                                | "bid_param_override_rules"
+                        ) {
+                            Self::normalize_opaque_json_value(value)
+                        } else {
+                            Self::normalize_env_value(value)
+                        };
+                        (key, value)
+                    })
                     .collect(),
             ),
             JsonValue::Array(items) => {
@@ -203,6 +215,15 @@ impl IntegrationSettings {
                 } else {
                     JsonValue::String(raw)
                 }
+            }
+            other => other,
+        }
+    }
+
+    fn normalize_opaque_json_value(value: JsonValue) -> JsonValue {
+        match value {
+            JsonValue::String(raw) => {
+                serde_json::from_str::<JsonValue>(&raw).unwrap_or_else(|_| JsonValue::String(raw))
             }
             other => other,
         }
@@ -3199,6 +3220,38 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     #[test]
+    fn prebid_numeric_string_bid_param_overrides_survive_config_roundtrip() {
+        let toml_str = format!(
+            r#"{}
+
+[integrations.prebid.bid_param_overrides.pubmatic]
+publisherId = "12345"
+adSlot = "67890"
+"#,
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml_str).expect("should parse TOML settings");
+        let serialized = serde_json::to_value(&settings).expect("should serialize settings");
+        let runtime_settings =
+            Settings::from_json_value(serialized).expect("should parse runtime JSON settings");
+        let raw = runtime_settings
+            .integrations
+            .get("prebid")
+            .expect("should contain Prebid settings");
+
+        assert_eq!(
+            raw["bid_param_overrides"]["pubmatic"]["publisherId"],
+            json!("12345"),
+            "should preserve numeric-looking publisherId as a string"
+        );
+        assert_eq!(
+            raw["bid_param_overrides"]["pubmatic"]["adSlot"],
+            json!("67890"),
+            "should preserve numeric-looking adSlot as a string"
+        );
+    }
+
+    #[test]
     fn test_prebid_bid_param_overrides_override_with_json_env() {
         let toml_str = crate_test_settings_str();
         let env_key = format!(
@@ -3221,7 +3274,7 @@ origin_host_header_overide = "www.example.com""#,
             || {
                 temp_env::with_var(
                     env_key,
-                    Some(r#"{"criteo":{"networkId":99999,"pubid":"server-pub"}}"#),
+                    Some(r#"{"criteo":{"networkId":99999,"pubid":"24680"}}"#),
                     || {
                         let settings = Settings::from_toml_and_env(&toml_str)
                             .expect("Settings should parse with bidder param override env");
@@ -3239,8 +3292,8 @@ origin_host_header_overide = "www.example.com""#,
                         );
                         assert_eq!(
                             cfg_json["bid_param_overrides"]["criteo"]["pubid"],
-                            json!("server-pub"),
-                            "should deserialize pubid override from env JSON"
+                            json!("24680"),
+                            "should preserve numeric-looking pubid override from env JSON as a string"
                         );
                     },
                 );
