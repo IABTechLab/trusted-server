@@ -1387,3 +1387,106 @@ describe('installTsRenderBridge', () => {
     expect(fetchStub).not.toHaveBeenCalled();
   });
 });
+
+describe('orphaned TS slot recovery', () => {
+  type TestWin = Window & {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    tsjs?: any;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    googletag?: any;
+  };
+
+  beforeEach(() => {
+    vi.resetModules();
+    const tw = window as TestWin;
+    delete tw.tsjs;
+    delete tw.googletag;
+    document.body.innerHTML = '';
+  });
+
+  afterEach(() => {
+    document.body.innerHTML = '';
+  });
+
+  function slotStub(elementId: string) {
+    return {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      clearTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue(elementId),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
+  }
+
+  it('reports slots whose bound element left the document', async () => {
+    const { orphanedTsSlots } = await import('../../../src/integrations/gpt/index');
+    document.body.innerHTML = '<div id="live-div"></div>';
+
+    const live = slotStub('live-div');
+    const orphan = slotStub('ad-header-0-_R_ssr_');
+    const ts = { prevGptSlots: [live, orphan] };
+
+    const orphans = orphanedTsSlots(ts as never);
+    expect(orphans).toHaveLength(1);
+    expect(orphans[0].getSlotElementId()).toBe('ad-header-0-_R_ssr_');
+  });
+
+  it('returns nothing when every TS slot still has its element', async () => {
+    const { orphanedTsSlots } = await import('../../../src/integrations/gpt/index');
+    document.body.innerHTML = '<div id="a"></div><div id="b"></div>';
+    const ts = { prevGptSlots: [slotStub('a'), slotStub('b')] };
+    expect(orphanedTsSlots(ts as never)).toHaveLength(0);
+  });
+
+  it('re-runs adInit after a re-render swaps the ad div', async () => {
+    // SSR div that hydration will replace.
+    document.body.innerHTML = '<div id="ad-header-0-_R_ssr_"></div>';
+
+    const definedSlots: string[] = [];
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([]),
+      refresh: vi.fn(),
+      addEventListener: vi.fn(),
+    };
+    const tw = window as TestWin;
+    tw.googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn((_path: string, _sizes: unknown, divId: string) => {
+        definedSlots.push(divId);
+        return slotStub(divId);
+      }),
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+      display: vi.fn(),
+      destroySlots: vi.fn(),
+    };
+    tw.tsjs = {
+      adSlots: [
+        {
+          id: 'ad-header-0',
+          gam_unit_path: '/123/header',
+          div_id: 'ad-header-0',
+          formats: [[728, 90]],
+          targeting: {},
+        },
+      ],
+      bids: {},
+    };
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    tw.tsjs.adInit();
+
+    expect(definedSlots).toEqual(['ad-header-0-_R_ssr_']);
+
+    // Hydration: React replaces the SSR div with a client-id div.
+    document.body.innerHTML = '<div id="ad-header-0-_r_1_"></div>';
+
+    // The MutationObserver is debounced; give it room to fire.
+    await new Promise<void>((r) => setTimeout(r, 600));
+
+    // adInit re-ran and bound to the live div instead of the dead one.
+    expect(definedSlots).toContain('ad-header-0-_r_1_');
+  });
+});

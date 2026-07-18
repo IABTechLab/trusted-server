@@ -35,6 +35,24 @@ const TS_BID_TARGETING_KEYS = [
 ] as const;
 const TS_BASE_TARGETING_KEYS = [...TS_BID_TARGETING_KEYS, TS_INITIAL_TARGETING_KEY] as const;
 
+// ---- Orphaned-slot recovery (client re-render / hydration race) ------------
+// A client framework can replace the ad divs *after* GPT slots were bound to
+// them: server-rendered React ids (`…-_R_abc_`) are swapped for client ids
+// (`…-_r_1_`) during hydration, leaving GPT holding slots whose element no
+// longer exists ("defineSlot was called without a corresponding DIV"). GAM
+// still fetches a creative for those slots, but it has nowhere to render, so
+// the bid is silently wasted. These bound the recovery re-bind.
+/** Quiet period after DOM mutations before checking for orphaned slots. */
+const ORPHAN_RECONCILE_DEBOUNCE_MS = 250;
+/** How long after an adInit() to keep watching for a re-render. */
+const ORPHAN_RECONCILE_WINDOW_MS = 5000;
+/**
+ * Maximum re-binds per page load. Each re-bind re-requests the affected slots,
+ * so this is deliberately small: it recovers a hydration swap without letting a
+ * continuously-mutating page loop on ad requests.
+ */
+const MAX_ORPHAN_RECONCILE_ATTEMPTS = 2;
+
 // ------------------------------------------------------------------
 // googletag type stubs (minimal surface needed by the shim)
 // ------------------------------------------------------------------
@@ -459,6 +477,73 @@ function installInitialLoadDetector(ts: TsjsApi): void {
   });
 }
 
+// Orphan-watch state. Module-scoped so a re-bind cannot stack observers, and
+// so the attempt budget is shared across the page load rather than reset by the
+// adInit() the watcher itself triggers.
+let orphanObserver: MutationObserver | null = null;
+let orphanDebounceTimer: ReturnType<typeof setTimeout> | undefined;
+let orphanWindowTimer: ReturnType<typeof setTimeout> | undefined;
+let orphanReconcileAttempts = 0;
+
+function stopOrphanWatch(): void {
+  orphanObserver?.disconnect();
+  orphanObserver = null;
+  clearTimeout(orphanDebounceTimer);
+  clearTimeout(orphanWindowTimer);
+}
+
+/**
+ * TS-defined GPT slots whose bound element is no longer in the document.
+ *
+ * Exported for testing.
+ */
+export function orphanedTsSlots(ts: TsjsApi): GoogleTagSlot[] {
+  return ((ts.prevGptSlots ?? []) as GoogleTagSlot[]).filter((slot) => {
+    const elementId = slot?.getSlotElementId?.();
+    return !!elementId && !document.getElementById(elementId);
+  });
+}
+
+/**
+ * Watch for a client re-render that orphans TS's GPT slots and re-bind once it
+ * happens.
+ *
+ * Waiting for the divs to merely *exist* (as the SPA hook does) cannot help
+ * here: at `adInit()` time the server-rendered divs are present — they are
+ * later *replaced*. So instead of delaying the initial ad request, this detects
+ * the swap after the fact and re-runs `adInit()`, which destroys the orphaned
+ * slots and re-binds against the live DOM (reusing the publisher's own slot for
+ * that div when they have since defined one).
+ *
+ * Bounded by {@link MAX_ORPHAN_RECONCILE_ATTEMPTS} and
+ * {@link ORPHAN_RECONCILE_WINDOW_MS} so a page whose DOM never settles cannot
+ * spin on ad requests.
+ */
+function watchForOrphanedSlots(ts: TsjsApi): void {
+  if (typeof MutationObserver === 'undefined' || typeof document === 'undefined') return;
+  // Re-arm: a previous window may still be open from an earlier adInit().
+  stopOrphanWatch();
+  if (orphanReconcileAttempts >= MAX_ORPHAN_RECONCILE_ATTEMPTS) return;
+
+  orphanObserver = new MutationObserver(() => {
+    clearTimeout(orphanDebounceTimer);
+    orphanDebounceTimer = setTimeout(() => {
+      const orphans = orphanedTsSlots(ts);
+      if (orphans.length === 0) return;
+      orphanReconcileAttempts += 1;
+      log.warn(
+        `[tsjs-gpt] ${orphans.length} TS slot(s) orphaned by a DOM re-render; re-binding`,
+        orphans.map((slot) => slot.getSlotElementId?.())
+      );
+      // Stop before re-running: adInit() re-arms the watch itself.
+      stopOrphanWatch();
+      ts.adInit?.();
+    }, ORPHAN_RECONCILE_DEBOUNCE_MS);
+  });
+  orphanObserver.observe(document.documentElement, { childList: true, subtree: true });
+  orphanWindowTimer = setTimeout(stopOrphanWatch, ORPHAN_RECONCILE_WINDOW_MS);
+}
+
 export function installTsAdInit(): void {
   const ts = (window.tsjs ??= {} as TsjsApi);
   installInitialLoadDetector(ts);
@@ -673,6 +758,12 @@ export function installTsAdInit(): void {
         } finally {
           ts.adInitRefreshInProgress = false;
         }
+      }
+
+      // Only TS-defined slots can be orphaned by a re-render — publisher-owned
+      // slots are theirs to manage, and TS never destroys them.
+      if (newSlots.length > 0) {
+        watchForOrphanedSlots(ts);
       }
     });
   };
