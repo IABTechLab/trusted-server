@@ -31,7 +31,8 @@ import { log } from '../../core/log';
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
 import { registerApsPrebidRenderer } from '../aps/render';
 import type { AuctionBid, AuctionEid } from '../../core/auction';
-import type { AuctionSlot } from '../../core/types';
+import type { AuctionSlot, RenderRecord } from '../../core/types';
+import { recordRender, stampCreativeTrace, isEffectivelyVisible } from '../../core/trace';
 
 import { INCLUDED_PREBID_USER_ID_MODULES } from './_user_ids.generated';
 import { PREBID_USER_ID_MODULE_REGISTRY } from './user_id_modules';
@@ -226,6 +227,11 @@ export function auctionBidsToPrebidBids(auctionBids: AuctionBid[], bidRequests: 
       bidderCode: bid.seat,
       meta: {
         advertiserDomains: bid.adomain,
+        // Carry the server-side trace tuple through Prebid so the bidWon
+        // render-trace hook can attribute the render to its /auction (see
+        // installPrebidRenderTrace). Prebid passes `meta` through unchanged.
+        tsAuctionId: bid.auctionId,
+        tsAdmHash: bid.admHash,
       },
     };
   });
@@ -1215,10 +1221,97 @@ function syncPrebidEidsCookie(): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Render trace (client-side /auction path)
+// ---------------------------------------------------------------------------
+
+/** Minimal shape of the bid object Prebid.js passes to a `bidWon` handler. */
+interface PrebidWonBid {
+  adUnitCode?: string;
+  bidderCode?: string;
+  bidder?: string;
+  creativeId?: string;
+  meta?: { tsAuctionId?: unknown; tsAdmHash?: unknown; [key: string]: unknown };
+}
+
+/**
+ * Resolve the on-page element for a `bidWon` ad-unit code. Prebid renders into
+ * the ad unit's own div; fall back to the `-container` wrapper used by the GPT
+ * integration when the inner div is not directly addressable.
+ */
+function findAuctionSlotElement(adUnitCode: string): HTMLElement | null {
+  if (typeof document === 'undefined') return null;
+  return (document.getElementById(adUnitCode) ??
+    document.getElementById(`${adUnitCode}-container`)) as HTMLElement | null;
+}
+
+/**
+ * Record a render-trace entry for a Prebid `bidWon` — the authoritative signal
+ * that the client-side `/auction` creative actually rendered, distinct from the
+ * SSAT/GAM path. Only server-side (`trustedServer`) bids carry `meta.tsAuctionId`
+ * (set in {@link auctionBidsToPrebidBids}); client-side bidders lack it and are
+ * skipped so the panel never attributes a non-TS render to Trusted Server.
+ *
+ * Exported for unit testing; the render path itself is unaffected (this only
+ * observes and stamps the DOM).
+ */
+export function recordPrebidBidWon(bid: PrebidWonBid | undefined): RenderRecord | undefined {
+  if (!bid || typeof bid.adUnitCode !== 'string' || bid.adUnitCode === '') return undefined;
+  const meta = bid.meta ?? {};
+  // Only trace our server-side bids: the trustedServer adapter is the only
+  // source of meta.tsAuctionId.
+  if (typeof meta.tsAuctionId !== 'string') return undefined;
+
+  const el = findAuctionSlotElement(bid.adUnitCode);
+  const record = recordRender({
+    slotId: bid.adUnitCode,
+    path: 'auction',
+    rendered: true,
+    // Prebid rendered the `ad` markup our adapter returned — a confirmed TS
+    // placement for this path.
+    injected: true,
+    visible: isEffectivelyVisible(el),
+    elementId: el?.id,
+    auctionId: meta.tsAuctionId,
+    admHash: typeof meta.tsAdmHash === 'string' ? meta.tsAdmHash : undefined,
+    bidder: bid.bidderCode ?? bid.bidder,
+    creativeId: bid.creativeId,
+    servedFrom: 'prebid',
+  });
+  if (el) stampCreativeTrace(el, record);
+  return record;
+}
+
+/**
+ * Install the Prebid `bidWon` render-trace hook (idempotent).
+ *
+ * `bidWon` is the render-confirmation event for the client-side `/auction`
+ * path; without this hook only the one-time SSAT auction is traced and the
+ * ongoing Prebid renders are invisible to the panel. Read-only: the listener
+ * records and stamps but never alters Prebid's rendering.
+ */
+export function installPrebidRenderTrace(): void {
+  if (typeof window === 'undefined') return;
+  const p = pbjs as unknown as {
+    onEvent?: (event: string, handler: (bid: PrebidWonBid) => void) => void;
+    __tsRenderTraceInstalled?: boolean;
+  };
+  if (typeof p.onEvent !== 'function' || p.__tsRenderTraceInstalled) return;
+  p.__tsRenderTraceInstalled = true;
+  p.onEvent('bidWon', (bid) => {
+    try {
+      recordPrebidBidWon(bid);
+    } catch (err) {
+      log.warn('[tsjs-prebid] render-trace bidWon failed', err);
+    }
+  });
+}
+
 // Self-initialize when loaded in a browser (same pattern as other integrations).
 if (typeof window !== 'undefined') {
   installPrebidNpm();
   installRefreshHandler();
+  installPrebidRenderTrace();
   // The slim-Prebid lazy loader appends this bundle from a window.load
   // handler, so `load` may already have fired by the time this code runs —
   // waiting for it again would skip user ID setup entirely on that path.

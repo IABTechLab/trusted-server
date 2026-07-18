@@ -632,7 +632,11 @@ export function installTsAdInit(): void {
           // In production the render bridge serves the creative and GAM stays in
           // the loop; this direct replace stays testing-only. Run before
           // recording so the trace reflects the post-injection state.
-          const injected = bid.adm && bid.debug_bid ? injectAdmIntoSlot(divId, bid.adm) : undefined;
+          //
+          // Not injecting means TS only applied GAM targeting: whatever GAM
+          // rendered lives in a cross-origin iframe TS cannot read, so report an
+          // explicit `false` — not a confirmed TS placement (status: gam-only).
+          const injected = bid.adm && bid.debug_bid ? injectAdmIntoSlot(divId, bid.adm) : false;
 
           // Trace: registry entry + DOM markers joining the GAM render to the
           // server-side auction bid. `rendered` is GAM's own non-empty signal;

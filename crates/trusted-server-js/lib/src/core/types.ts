@@ -104,7 +104,7 @@ export interface AuctionBidData {
 }
 
 /** How a creative reached the page for a [`RenderRecord`]. */
-export type RenderServedFrom = 'inline' | 'gam' | 'debug-adm' | 'pbs-cache';
+export type RenderServedFrom = 'inline' | 'gam' | 'debug-adm' | 'pbs-cache' | 'prebid';
 
 /**
  * One entry in `window.tsjs.renders` — the client-side half of the render
