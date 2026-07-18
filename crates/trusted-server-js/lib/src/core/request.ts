@@ -4,7 +4,7 @@ import { collectContext } from './context';
 import { getAllUnits, firstSize } from './registry';
 import { createAdIframe, findSlot, buildCreativeDocument, sanitizeCreativeHtml } from './render';
 import { buildAdRequest, sendAuction } from './auction';
-import { recordRender, stampCreativeTrace } from './trace';
+import { recordRender, stampCreativeTrace, isEffectivelyVisible } from './trace';
 
 export type RequestAdsCallback = () => void;
 export interface RequestAdsOptions {
@@ -107,7 +107,7 @@ function renderCreativeInline({
   const container = findSlot(slotId) as HTMLElement | null;
   if (!container) {
     log.warn('renderCreativeInline: slot not found; skipping render', { slotId, seat, creativeId });
-    recordRender({ ...trace, rendered: false });
+    recordRender({ ...trace, rendered: false, injected: false, visible: false });
     return;
   }
 
@@ -126,6 +126,8 @@ function renderCreativeInline({
       const rejectedRecord = recordRender({
         ...trace,
         rendered: false,
+        injected: false,
+        visible: false,
         elementId: container.id || undefined,
       });
       stampCreativeTrace(container, rejectedRecord);
@@ -162,9 +164,13 @@ function renderCreativeInline({
 
     // Trace: registry entry + DOM markers joining this creative back to the
     // server-side auction (matches the `auction delivered creative:` log line).
+    // The /auction path writes the srcdoc itself, so this is a confirmed TS
+    // placement (injected: true).
     const record = recordRender({
       ...trace,
       rendered: true,
+      injected: true,
+      visible: isEffectivelyVisible(container),
       elementId: container.id || undefined,
     });
     stampCreativeTrace(container, record);

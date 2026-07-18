@@ -1,5 +1,5 @@
 import { log } from '../../core/log';
-import { recordRender, stampCreativeTrace } from '../../core/trace';
+import { recordRender, stampCreativeTrace, isEffectivelyVisible } from '../../core/trace';
 import type { AuctionSlot, AuctionBidData, RenderServedFrom, TsjsApi } from '../../core/types';
 
 import { installGptGuard } from './script_guard';
@@ -290,13 +290,19 @@ export function safeAdmIframeSrc(src: string): string | undefined {
  * 2. Otherwise replace the slot element's content with a sandboxed srcdoc
  *    iframe (no `allow-same-origin` — see [ADM_IFRAME_SANDBOX]).
  */
-function injectAdmIntoSlot(divId: string, adm: string): void {
+/**
+ * Returns whether the TS creative was placed **synchronously**. The
+ * animation-frame retry branch resolves after this returns, so it reports
+ * `false` (placement deferred/unconfirmed) — the render trace must not claim a
+ * placement that has not happened yet.
+ */
+function injectAdmIntoSlot(divId: string, adm: string): boolean {
   try {
     // divId may be the container div (used by GPT slot) or the inner div.
     // Resolve it the same way the rest of adInit does (exact then prefix) so
     // a config div_id prefix with a render-time suffix still finds the element.
     const slotEl = findSlotElementByDivId(divId);
-    if (!slotEl) return;
+    if (!slotEl) return false;
 
     // Extract the first iframe src from the adm (e.g. mocktioneer creative
     // wraps a first-party proxy iframe in a div). Reject non-http(s) schemes.
@@ -308,6 +314,7 @@ function injectAdmIntoSlot(divId: string, adm: string): void {
       // Set the GAM iframe src — works even cross-origin (no document access needed).
       gamIframe.src = innerSrc;
       log.debug(`[tsjs-gpt] gam-intercept: set iframe src for '${divId}'`);
+      return true;
     } else if (innerSrc) {
       // GAM iframe not yet in DOM (APS renders async after slotRenderEnded).
       // Retry on next animation frame so APS has a tick to insert its iframe;
@@ -324,11 +331,14 @@ function injectAdmIntoSlot(divId: string, adm: string): void {
           f.width = String(slotEl!.offsetWidth || 728);
           f.height = String(slotEl!.offsetHeight || 90);
           f.setAttribute('sandbox', ADM_IFRAME_SANDBOX);
+          f.setAttribute('data-ts-injected-adm', 'true');
           f.src = innerSrc;
           slotEl!.appendChild(f);
           log.debug(`[tsjs-gpt] gam-intercept: inserted src iframe for '${divId}'`);
         }
       });
+      // Placement deferred to the animation frame — not confirmed yet.
+      return false;
     } else {
       // No extractable safe src — replace slot content with a sandboxed srcdoc iframe.
       slotEl.innerHTML = '';
@@ -341,9 +351,11 @@ function injectAdmIntoSlot(divId: string, adm: string): void {
       f.srcdoc = adm;
       slotEl.appendChild(f);
       log.debug(`[tsjs-gpt] gam-intercept: replaced slot content for '${divId}'`);
+      return true;
     }
   } catch (err) {
     log.warn('[tsjs-gpt] gam-intercept: error injecting adm', err);
+    return false;
   }
 }
 
@@ -595,12 +607,25 @@ export function installTsAdInit(): void {
           // Read ts.bids live (not the snapshot above) so post-navigation bid data is used.
           const bid = (ts.bids ?? {})[slotId] ?? {};
 
-          // Trace: registry entry + DOM markers joining the GAM-rendered
-          // creative back to the server-side auction bid for this slot.
+          // GAM interceptor (testing): when adm is present, replace the GAM creative.
+          // Adapted from PR #241 — uses window.tsjs.bids[slotId].adm instead of pbjs.
+          // Only active when inject_adm_for_testing injects adm into bids server-side.
+          // Run before recording so the trace reflects the post-injection state.
+          const injected = bid.adm ? injectAdmIntoSlot(divId, bid.adm) : undefined;
+
+          // Trace: registry entry + DOM markers joining the GAM render to the
+          // server-side auction bid. `rendered` is GAM's own non-empty signal;
+          // `injected`/`visible` carry the honest "is the TS creative actually
+          // on screen" state so the panel does not overclaim (a non-empty GAM
+          // slot is not proof the TS creative rendered).
+          const slotEl = document.getElementById(divId);
           const record = recordRender({
             slotId,
             path: 'ssat',
             rendered: !event.isEmpty,
+            gamEmpty: event.isEmpty,
+            injected,
+            visible: isEffectivelyVisible(slotEl),
             elementId: divId,
             auctionId: bid.hb_auction_id,
             bidder: bid.hb_bidder,
@@ -609,15 +634,7 @@ export function installTsAdInit(): void {
             admHash: bid.hb_adm_hash,
             servedFrom: 'gam',
           });
-          const slotEl = document.getElementById(divId);
           if (slotEl) stampCreativeTrace(slotEl, record);
-
-          // GAM interceptor (testing): when adm is present, replace the GAM creative.
-          // Adapted from PR #241 — uses window.tsjs.bids[slotId].adm instead of pbjs.
-          // Only active when inject_adm_for_testing injects adm into bids server-side.
-          if (bid.adm) {
-            injectAdmIntoSlot(divId, bid.adm);
-          }
         });
       }
 
@@ -873,10 +890,14 @@ function recordBridgeRender(
   servedFrom: RenderServedFrom,
   el: HTMLElement | null
 ): void {
+  // The bridge serves TS's own markup into the Prebid Universal Creative, so
+  // this is a confirmed TS placement (injected: true).
   const record = recordRender({
     slotId,
     path: 'ssat',
     rendered: true,
+    injected: true,
+    visible: isEffectivelyVisible(el),
     elementId: el?.id,
     auctionId: bid.hb_auction_id,
     bidder: bid.hb_bidder,

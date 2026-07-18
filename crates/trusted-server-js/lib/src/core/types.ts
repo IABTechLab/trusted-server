@@ -100,6 +100,29 @@ export interface RenderRecord {
   admHash?: string;
   /** Mechanism that delivered the creative. */
   servedFrom?: RenderServedFrom;
+  /**
+   * GAM's own `slotRenderEnded.isEmpty` (SSAT/GAM path only). `true` means GAM
+   * itself reported the slot empty. Undefined on the `/auction` path, which
+   * never involves GAM.
+   */
+  gamEmpty?: boolean;
+  /**
+   * Whether Trusted Server actually placed the creative markup itself:
+   * `true` for the `/auction` iframe render and for a synchronous
+   * `injectAdmIntoSlot` placement; `false` when TS only applied GAM targeting
+   * (prod GAM path — the creative, if any, is GAM's and lives in a cross-origin
+   * iframe TS cannot read); `undefined` when placement was deferred/unknown.
+   *
+   * This is the honest "is it TS's creative" signal — distinct from `rendered`
+   * (GAM said something rendered) and `visible` (the slot box is on-screen).
+   */
+  injected?: boolean;
+  /**
+   * Whether the slot element was effectively visible at record time — non-zero
+   * box and no ancestor `display:none` / `visibility:hidden` / `opacity:0`.
+   * Catches slots that "rendered" but are hidden behind a publisher reveal gate.
+   */
+  visible?: boolean;
   /** How many renders this slot has seen (SPA navigations, refreshes). */
   count: number;
   /** Epoch ms when the record was written. */
