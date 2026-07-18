@@ -55,7 +55,9 @@ struct AdminEcLookupResponse {
     /// (`consent.ok = false`). Absent when the body failed to parse.
     #[serde(skip_serializing_if = "Option::is_none")]
     tombstone: Option<bool>,
-    /// The stored entry, re-serialized verbatim. Absent when the body
+    /// The stored entry, re-serialized verbatim except for derived
+    /// `created_iso` / `updated_iso` companions added next to the stored
+    /// unix-seconds timestamps for readability. Absent when the body
     /// failed to deserialize (see `entry_error` / `raw_body`).
     #[serde(skip_serializing_if = "Option::is_none")]
     entry: Option<JsonValue>,
@@ -226,7 +228,7 @@ fn build_lookup_response(
                     ));
                 }
             }
-            payload.entry = Some(serde_json::to_value(&entry).expect("should serialize KvEntry"));
+            payload.entry = Some(entry_json_with_iso_timestamps(&entry));
         }
         Err(error) => {
             payload.entry_error = Some(format!("failed to deserialize entry: {error}"));
@@ -251,6 +253,37 @@ fn build_lookup_response(
     }
 
     payload
+}
+
+/// Serializes an entry, adding derived ISO 8601 companions next to the
+/// stored unix-seconds timestamps (`created_iso`, `consent.updated_iso`).
+///
+/// The stored numeric values stay untouched so the echo remains faithful to
+/// what is in KV; the ISO fields exist purely for operator readability.
+fn entry_json_with_iso_timestamps(entry: &KvEntry) -> JsonValue {
+    let mut entry_json = serde_json::to_value(entry).expect("should serialize KvEntry");
+
+    if let Some(object) = entry_json.as_object_mut() {
+        if let Some(iso) = iso_timestamp(entry.created) {
+            object.insert("created_iso".to_owned(), JsonValue::String(iso));
+        }
+        if let Some(consent) = object.get_mut("consent").and_then(JsonValue::as_object_mut)
+            && let Some(iso) = iso_timestamp(entry.consent.updated)
+        {
+            consent.insert("updated_iso".to_owned(), JsonValue::String(iso));
+        }
+    }
+
+    entry_json
+}
+
+/// Formats a unix-seconds timestamp as ISO 8601 (`yyyy-MM-ddTHH:mm:ss.SSSZ`).
+///
+/// Returns `None` for values outside the representable date range.
+fn iso_timestamp(unix_seconds: u64) -> Option<String> {
+    let unix_seconds = i64::try_from(unix_seconds).ok()?;
+    chrono::DateTime::from_timestamp(unix_seconds, 0)
+        .map(|datetime| datetime.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
 }
 
 /// Derives the auction EID view for a valid entry, mirroring the filters in
@@ -558,6 +591,18 @@ mod tests {
         assert_eq!(
             json["entry"]["ids"]["bidstream.example"]["uid"], "uid-live",
             "should echo the stored entry verbatim"
+        );
+        assert_eq!(
+            json["entry"]["created"], 1_741_824_000_u64,
+            "should keep the stored unix-seconds timestamp"
+        );
+        assert_eq!(
+            json["entry"]["created_iso"], "2025-03-13T00:00:00.000Z",
+            "should add an ISO 8601 companion for created"
+        );
+        assert_eq!(
+            json["entry"]["consent"]["updated_iso"], "2025-03-13T00:00:00.000Z",
+            "should add an ISO 8601 companion for consent.updated"
         );
 
         let eids = json["auction"]["eids"]
