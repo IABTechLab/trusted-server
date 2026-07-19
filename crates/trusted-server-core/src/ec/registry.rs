@@ -25,7 +25,7 @@ pub struct PartnerConfig {
     /// Canonical `OpenRTB` EID source domain and EC KV `ids` key.
     pub source_domain: String,
     /// `OpenRTB` `atype` value.
-    pub openrtb_atype: u8,
+    pub openrtb_atype: i32,
     /// Whether this partner's UIDs appear in auction `user.eids`.
     pub bidstream_enabled: bool,
     /// SHA-256 hex of the partner's API token (precomputed at startup).

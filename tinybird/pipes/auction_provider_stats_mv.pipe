@@ -12,7 +12,7 @@ SQL >
     countState() AS requests,
     sumState(toUInt64(status = 'success')) AS successes,
     sumState(toUInt64(status = 'nobid')) AS nobids,
-    sumState(toUInt64(status IN ('launch_error', 'parse_error', 'transport_error'))) AS errors,
+    sumState(toUInt64(status IN ('launch_error', 'parse_error', 'transport_error', 'http_status_error'))) AS errors,
     sumState(toUInt64(status = 'timeout')) AS timeouts,
     sumState(toUInt64(status = 'abandoned')) AS abandonments,
     sumState(toUInt64(coalesce(provider_bid_count, 0))) AS parsed_bids,

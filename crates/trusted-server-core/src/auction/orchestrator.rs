@@ -96,6 +96,11 @@ const ERROR_TYPE_PARSE_RESPONSE: &str = "parse_response";
 const ERROR_TYPE_LAUNCH_FAILED: &str = "launch_failed";
 const ERROR_TYPE_TRANSPORT: &str = "transport";
 const ERROR_TYPE_TIMEOUT: &str = "timeout";
+/// A non-2xx HTTP status from an upstream SSP (e.g. a PBS 4xx/5xx). Distinct
+/// from [`ERROR_TYPE_TRANSPORT`] (a connection-level failure) so telemetry can
+/// bucket it separately. `pub(crate)` so producers such as the prebid provider
+/// tag errors with the exact value the telemetry layer recognises.
+pub(crate) const ERROR_TYPE_HTTP_STATUS: &str = "http_status";
 
 // SECURITY: the returned string is included verbatim (truncated to
 // PROVIDER_ERROR_MESSAGE_CHARS) in the public /auction response via

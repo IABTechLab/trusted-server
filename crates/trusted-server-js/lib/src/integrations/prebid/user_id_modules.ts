@@ -25,7 +25,7 @@ export interface PrebidUserIdModuleResolution {
 
 const registry = registryJson as PrebidUserIdModuleRegistryFile;
 
-export const DEFAULT_PREBID_USER_ID_MODULES = [...registry.defaultPreset];
+const DEFAULT_PREBID_USER_ID_MODULES = [...registry.defaultPreset];
 export const PREBID_USER_ID_MODULE_REGISTRY = [...registry.modules];
 
 const MODULE_SORT_ORDER = new Map(
