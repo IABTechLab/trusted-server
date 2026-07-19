@@ -862,12 +862,93 @@ pub(crate) fn write_bids_to_state(
     *ad_bids_state.lock().expect("should lock bid state") = Some(bids_script);
 }
 
-/// Prepend an HTML comment summarising the auction result onto the shared
-/// `ad_bids_state` so it lands directly before the injected bids `<script>`.
+/// Maximum serialized size (in bytes) of a dump embedded in the `ts-debug`
+/// comment. A PBS response with many bids can carry megabytes of creative
+/// markup; cap it so leaving
+/// [`auction_html_comment`](crate::settings::DebugConfig::auction_html_comment)
+/// enabled cannot bloat every page render without bound.
+const MAX_AUCTION_DEBUG_DUMP_BYTES: usize = 256 * 1024;
+
+/// Provider-metadata keys safe to surface in the on-page `ts-debug` dump.
+///
+/// Fail-closed allowlist: any key not listed — notably `debug`, which carries
+/// the resolved `OpenRTB` request (EC ID, `user.ext.eids`, the TC consent string,
+/// `device.ip`, and `device.geo`) plus per-bidder `httpcalls` — is dropped so a
+/// visitor's identity graph cannot reach the client-readable DOM even when
+/// `[integration.prebid].debug` is also enabled. Full debug detail remains
+/// available server-side via `log::trace!`.
+const DEBUG_DUMP_METADATA_ALLOWLIST: &[&str] = &[
+    "error_type",
+    "status",
+    "message",
+    "responsetimemillis",
+    "errors",
+    "warnings",
+    "bidstatus",
+];
+
+/// Per-bid creative preview length (in bytes) in the `ts-debug` dump. Mirrors
+/// the 512-byte upstream-body preview the prebid provider logs on an HTTP error
+/// (`integrations/prebid.rs`): enough to identify a creative without copying
+/// megabytes of `adm` markup into every page render. The full creative still
+/// renders via the injected bids `<script>`.
+const MAX_BID_CREATIVE_DUMP_BYTES: usize = 512;
+
+/// Truncate `value` to at most `max` bytes on a UTF-8 char boundary, appending
+/// a `…(truncated N bytes)` marker when truncation occurred.
+fn truncate_with_marker(value: &str, max: usize) -> String {
+    if value.len() <= max {
+        return value.to_string();
+    }
+    let end = value.floor_char_boundary(max);
+    format!("{}…(truncated {} bytes)", &value[..end], value.len() - end)
+}
+
+/// Build a redacted JSON view of a single provider response for the `ts-debug`
+/// dump: only [`DEBUG_DUMP_METADATA_ALLOWLIST`] metadata keys survive, and each
+/// bid's creative is previewed to [`MAX_BID_CREATIVE_DUMP_BYTES`].
+fn redact_response_for_dump(
+    response: &crate::auction::types::AuctionResponse,
+) -> serde_json::Value {
+    let metadata: serde_json::Map<String, serde_json::Value> = response
+        .metadata
+        .iter()
+        .filter(|(key, _)| DEBUG_DUMP_METADATA_ALLOWLIST.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let bids: Vec<serde_json::Value> = response.bids.iter().map(redact_bid_for_dump).collect();
+    serde_json::json!({
+        "provider": response.provider,
+        "status": response.status,
+        "response_time_ms": response.response_time_ms,
+        "bids": bids,
+        "metadata": metadata,
+    })
+}
+
+/// Build a redacted JSON view of a single bid: every field except `creative`,
+/// which is previewed to [`MAX_BID_CREATIVE_DUMP_BYTES`].
+fn redact_bid_for_dump(bid: &crate::auction::types::Bid) -> serde_json::Value {
+    let mut value = serde_json::to_value(bid).unwrap_or(serde_json::Value::Null);
+    if let Some(creative) = &bid.creative {
+        value["creative"] =
+            serde_json::Value::String(truncate_with_marker(creative, MAX_BID_CREATIVE_DUMP_BYTES));
+    }
+    value
+}
+
+/// Prepend a `<!-- ts-debug: ... -->` HTML comment carrying a redacted view of
+/// the auction result — pipeline stats plus, per provider, its status, bids
+/// (each creative previewed to [`MAX_BID_CREATIVE_DUMP_BYTES`]), and allowlisted
+/// metadata — onto the shared `ad_bids_state` so it lands directly before the
+/// injected bids `<script>`. Identity-bearing metadata (notably prebid's `debug`
+/// subtree) is dropped; see [`DEBUG_DUMP_METADATA_ALLOWLIST`]. Gated by
+/// [`auction_html_comment`](crate::settings::DebugConfig::auction_html_comment);
+/// never enable in production.
 ///
 /// `path_label` differentiates the streaming-with-auction-hold path (`stream`)
-/// from the buffered path (`buffered`) in the resulting `<!-- ts-debug: -->`
-/// marker so on-page debugging can tell which code path produced the bids.
+/// from the buffered path (`buffered`) in the marker so on-page debugging can
+/// tell which code path produced the bids.
 pub(crate) fn prepend_auction_debug_comment(
     path_label: &str,
     result: &crate::auction::orchestrator::OrchestrationResult,
@@ -878,8 +959,72 @@ pub(crate) fn prepend_auction_debug_comment(
         Some(r) => format!("ok({}_bids)", r.bids.len()),
         None => "none".to_string(),
     };
+    // Redacted, bounded, deterministic dump so an operator can see each
+    // provider's status, bids, and safe metadata without needing log access.
+    //
+    // SECURITY: `Bid.creative` and provider metadata are attacker/partner-
+    // influenced. Two layers protect the DOM:
+    //   1. `redact_response_for_dump` drops all non-allowlisted *response-level*
+    //      metadata (notably the identity-bearing `debug` subtree) and previews
+    //      each creative, so the visitor's identity graph never enters the
+    //      comment and one large creative cannot dominate the payload. Bid-level
+    //      fields (`Bid.metadata`, `nurl`, `burl`) are NOT yet allowlisted; they
+    //      pass through today because the only writer (`integrations/aps.rs`)
+    //      emits opaque targeting keys. Tightening this to a fail-closed bid
+    //      allowlist is tracked in #925.
+    //   2. `render_dump` below neutralises HTML comment terminators and caps the
+    //      total serialized size.
+    //
+    // `serde_json::Map` (no `preserve_order` feature) is `BTreeMap`-backed, so
+    // the rendered metadata keys are sorted — the dump is deterministic even
+    // though `AuctionResponse.metadata` is a `HashMap`.
+    let mut dump = serde_json::Map::new();
+    dump.insert(
+        "provider_responses".to_string(),
+        serde_json::Value::Array(
+            result
+                .provider_responses
+                .iter()
+                .map(redact_response_for_dump)
+                .collect(),
+        ),
+    );
+    // Only include the mediator response when one actually ran; otherwise the
+    // `mediator=none` on the summary line already conveys it.
+    if let Some(mediator_response) = &result.mediator_response {
+        dump.insert(
+            "mediator_response".to_string(),
+            redact_response_for_dump(mediator_response),
+        );
+    }
+    // A single `replace("--", …)` is deliberately NOT used — because
+    // `str::replace` is non-overlapping, it re-forms a live `-->` / `--!>` at
+    // the junction of an odd dash-run (`--->` -> `- -->`, `----->` -> `- -- -->`),
+    // reintroducing exactly the terminator we are trying to remove. The two
+    // targeted replacements below cannot re-form either sequence. Applied to the
+    // serialize-error fallback too, so nothing reaches the DOM un-neutralised.
+    let render_dump = |json: String| -> String {
+        let neutralised = json.replace("-->", "-- >").replace("--!>", "-- !>");
+        if neutralised.len() > MAX_AUCTION_DEBUG_DUMP_BYTES {
+            let end = neutralised.floor_char_boundary(MAX_AUCTION_DEBUG_DUMP_BYTES);
+            format!(
+                "{}…(truncated {} bytes)",
+                &neutralised[..end],
+                neutralised.len() - end
+            )
+        } else {
+            neutralised
+        }
+    };
+    // Single serialize → single neutralise → single total-budget cap.
+    let dump = render_dump(
+        serde_json::to_string(&serde_json::Value::Object(dump))
+            .unwrap_or_else(|e| format!("<dump serialize error: {e}>")),
+    );
     let debug_comment = format!(
-        "<!-- ts-debug: path={path_label} ssp={ssp_count} mediator={mediator_info} winning={} time={}ms -->",
+        "<!-- ts-debug: path={path_label} ssp={ssp_count} mediator={mediator_info} winning={} time={}ms\n\
+         dump={dump}\n\
+         -->",
         result.winning_bids.len(),
         result.total_time_ms,
     );
@@ -2468,6 +2613,8 @@ mod tests {
     use flate2::write::GzEncoder;
 
     use super::*;
+    use crate::auction::orchestrator::OrchestrationResult;
+    use crate::auction::types::AuctionResponse;
     use crate::auction::types::{AdFormat, AdSlot, MediaType};
     use crate::integrations::IntegrationRegistry;
     use crate::platform::test_support::{
@@ -2477,6 +2624,172 @@ mod tests {
     use edgezero_core::body::Body as EdgeBody;
     use http::{Method, Request as HttpRequest, StatusCode, header};
     use std::sync::Arc;
+
+    fn make_test_bid_with_creative(creative: &str) -> Bid {
+        Bid {
+            slot_id: "slot".to_string(),
+            price: Some(1.0),
+            currency: "USD".to_string(),
+            creative: Some(creative.to_string()),
+            adomain: None,
+            bidder: "seat".to_string(),
+            width: 300,
+            height: 250,
+            nurl: None,
+            burl: None,
+            ad_id: None,
+            cache_id: None,
+            cache_host: None,
+            cache_path: None,
+            metadata: Default::default(),
+        }
+    }
+
+    /// Build the ts-debug comment for a one-bid auction whose creative is
+    /// `creative`, so tests can assert on the rendered dump.
+    fn dump_comment_for_creative(creative: &str) -> String {
+        let mut bid = make_test_bid_with_creative(creative);
+        bid.slot_id = "ad-header-0".to_string();
+        let result = OrchestrationResult {
+            provider_responses: vec![
+                AuctionResponse::no_bid("prebid", 665),
+                AuctionResponse::success("aps", vec![bid], 42),
+            ],
+            mediator_response: None,
+            winning_bids: std::collections::HashMap::new(),
+            total_time_ms: 665,
+            metadata: std::collections::HashMap::new(),
+        };
+        let state = Arc::new(Mutex::new(Some("BIDS_SCRIPT".to_string())));
+        prepend_auction_debug_comment("stream", &result, &state);
+        let comment = state
+            .lock()
+            .expect("should lock state")
+            .clone()
+            .expect("should have comment");
+        drop(state);
+        comment
+    }
+
+    #[test]
+    fn auction_debug_comment_dumps_provider_status() {
+        let comment = dump_comment_for_creative("<div>plain</div>");
+        // Compact (non-pretty) JSON: `"status":"nobid"` with no spaces.
+        assert!(
+            comment.contains("\"status\":\"nobid\""),
+            "should surface the no-bid provider status: {comment}"
+        );
+        assert!(
+            comment.contains("dump={\"provider_responses\":"),
+            "should dump the provider_responses payload: {comment}"
+        );
+        // No mediator ran, so it is omitted (mediator=none already says so).
+        assert!(
+            !comment.contains("mediator_response"),
+            "should omit mediator_response when no mediator ran: {comment}"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_never_leaks_provider_debug_metadata() {
+        // A provider response whose `debug` metadata mirrors the shape prebid
+        // stores verbatim when `[integration.prebid].debug` is on: the resolved
+        // OpenRTB request carrying the visitor's identity graph. The dump must
+        // drop it — only allowlisted keys may reach the DOM.
+        let response = AuctionResponse::error("prebid", 12)
+            .with_metadata(
+                "debug",
+                serde_json::json!({
+                    "resolvedrequest": {
+                        "user": {
+                            "id": "EC-ID-abc123",
+                            "consent": "CPtc-TCSTRING-xyz",
+                            "ext": { "eids": [{ "source": "example.com",
+                                                "uids": [{ "id": "EID-USER-999" }] }] }
+                        },
+                        "device": { "ip": "203.0.113.77",
+                                    "geo": { "lat": 37.7749, "lon": -122.4194 } }
+                    }
+                }),
+            )
+            // An allowlisted key must still survive.
+            .with_metadata("error_type", serde_json::json!("http_status"));
+        let result = OrchestrationResult {
+            provider_responses: vec![response],
+            mediator_response: None,
+            winning_bids: std::collections::HashMap::new(),
+            total_time_ms: 12,
+            metadata: std::collections::HashMap::new(),
+        };
+        let state = Arc::new(Mutex::new(Some("BIDS_SCRIPT".to_string())));
+        prepend_auction_debug_comment("stream", &result, &state);
+        let comment = state
+            .lock()
+            .expect("should lock state")
+            .clone()
+            .expect("should have comment");
+
+        for needle in [
+            "EC-ID-abc123",
+            "EID-USER-999",
+            "CPtc-TCSTRING-xyz",
+            "203.0.113.77",
+            "37.7749",
+            "resolvedrequest",
+        ] {
+            assert!(
+                !comment.contains(needle),
+                "identity/debug value {needle:?} must not reach the page HTML: {comment}"
+            );
+        }
+        assert!(
+            comment.contains("\"error_type\":\"http_status\""),
+            "allowlisted metadata must still surface: {comment}"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_truncates_oversized_creative() {
+        // A creative larger than the per-bid preview cap must be truncated with a
+        // marker rather than copied verbatim into the page.
+        let oversized = "x".repeat(MAX_BID_CREATIVE_DUMP_BYTES * 4);
+        let comment = dump_comment_for_creative(&oversized);
+        assert!(
+            comment.contains("(truncated"),
+            "oversized creative should carry a truncation marker: {}",
+            &comment[..comment.len().min(200)]
+        );
+        assert!(
+            !comment.contains(&oversized),
+            "the full oversized creative must not appear in the comment"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_neutralises_every_comment_terminator_vector() {
+        // Each vector reaches HTML5 comment-end state via a distinct tokenizer
+        // path. A single `replace("--", …)` would re-form a terminator on the
+        // odd-dash-run cases; the targeted two-replace must leave the comment's
+        // own trailing `-->` as the only surviving terminator and drop `--!>`.
+        for creative in [
+            "<div>evil-->break</div>",
+            "--!><img src=x onerror=alert(1)>",
+            "<!--><img src=x onerror=alert(1)>",
+            "<!--!><img src=x onerror=alert(1)>",
+            "----!><img src=x onerror=alert(1)>",
+        ] {
+            let comment = dump_comment_for_creative(creative);
+            assert_eq!(
+                comment.matches("-->").count(),
+                1,
+                "exactly one `-->` (the terminator) must survive for {creative:?}: {comment}"
+            );
+            assert!(
+                !comment.contains("--!>"),
+                "the `--!>` nested terminator must not survive for {creative:?}: {comment}"
+            );
+        }
+    }
 
     struct ChunkedReader {
         chunks: std::collections::VecDeque<Vec<u8>>,
