@@ -2264,8 +2264,17 @@ impl AuctionProvider for PrebidAuctionProvider {
     ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
         log::info!("Prebid: requesting bids for {} slots", request.slots.len());
 
-        let request_info =
-            RequestInfo::from_request(context.request, context.services.client_info());
+        // `ext.trusted_server.request_host` must be the publisher's own domain
+        // (matching `site.domain`/`publisher.domain` below), not the raw edge
+        // `Host` header of the incoming `/auction` request. On the SSAT proxy
+        // path the browser calls `/auction` against the trusted-server edge
+        // domain (e.g. `ts.example.com`), which is not what PBS's
+        // `trusted_server` verification module expects — see the "Host header
+        // value expected by the receiving service" doc on `SigningParams`.
+        let request_info = RequestInfo {
+            host: request.publisher.domain.clone(),
+            scheme: "https".to_owned(),
+        };
 
         // Create signer and compute signature if request signing is enabled
         let signer_with_signature =
@@ -2704,6 +2713,50 @@ mod tests {
             stub.recorded_backend_names().len(),
             1,
             "should launch one upstream request through PlatformHttpClient"
+        );
+    }
+
+    #[test]
+    fn request_bids_sets_trusted_server_request_host_to_publisher_domain_not_edge_host() {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, br#"{"seatbid":[]}"#.to_vec());
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let settings = make_settings();
+        let provider = PrebidAuctionProvider::new(base_config());
+        let auction_request = create_test_auction_request();
+        // The incoming `/auction` call arrives on the trusted-server edge
+        // domain (SSAT proxy pattern), which must NOT leak into
+        // `ext.trusted_server.request_host` — that field must track the
+        // publisher's own domain instead.
+        let http_req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://ts.pub.example/auction")
+            .header(header::HOST, "ts.pub.example")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        let context = AuctionContext {
+            settings: &settings,
+            request: &http_req,
+            timeout_ms: 500,
+            provider_responses: None,
+            services: &services,
+        };
+
+        futures::executor::block_on(provider.request_bids(&auction_request, &context))
+            .expect("should start request");
+
+        let bodies = stub.recorded_request_bodies();
+        assert_eq!(bodies.len(), 1, "should send one upstream PBS request");
+        let sent: Json =
+            serde_json::from_slice(&bodies[0]).expect("should parse sent OpenRTB request body");
+        let request_host = sent["ext"]["trusted_server"]["request_host"]
+            .as_str()
+            .expect("should set ext.trusted_server.request_host");
+        assert_eq!(
+            request_host, auction_request.publisher.domain,
+            "request_host should be the publisher domain, not the edge Host header"
         );
     }
 
