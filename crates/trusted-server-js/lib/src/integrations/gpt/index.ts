@@ -1226,6 +1226,7 @@ export function installTsRenderBridge(): void {
         })
       );
       fireWinBillingBeacons(slotId, matchedBid);
+      recordBridgeRender(slotId, matchedBid, 'inline', slotEl);
       log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from inline adm`);
       return;
     }
