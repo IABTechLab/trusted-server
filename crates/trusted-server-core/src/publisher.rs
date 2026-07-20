@@ -1627,6 +1627,7 @@ pub async fn handle_publisher_request(
                 ec_id,
                 &consent_context,
                 &request_info,
+                &settings.publisher.domain,
                 req.headers()
                     .get("user-agent")
                     .and_then(|v| v.to_str().ok()),
@@ -2007,6 +2008,7 @@ pub(crate) fn build_auction_request(
     ec_id: Option<&str>,
     consent_context: &crate::consent::ConsentContext,
     request_info: &crate::http_util::RequestInfo,
+    publisher_domain: &str,
     user_agent: Option<&str>,
 ) -> AuctionRequest {
     let slots = slots_ctx
@@ -2014,9 +2016,13 @@ pub(crate) fn build_auction_request(
         .iter()
         .map(crate::creative_opportunities::CreativeOpportunitySlot::to_ad_slot)
         .collect();
+    // Advertise the configured publisher domain (not the incoming edge `Host`)
+    // so SSPs, injected creatives, and brand-safety pixels see the publisher's
+    // own origin. On the SSAT proxy path `request_info.host` is the trusted
+    // server edge host, which must not leak into the bid request.
     let page_url = format!(
         "{}://{}{}",
-        request_info.scheme, request_info.host, slots_ctx.request_path
+        request_info.scheme, publisher_domain, slots_ctx.request_path
     );
     let ec_id = ec_id.filter(|id| !id.is_empty());
     let request_id = ec_id.map_or_else(
@@ -2027,7 +2033,7 @@ pub(crate) fn build_auction_request(
         id: request_id,
         slots,
         publisher: PublisherInfo {
-            domain: request_info.host.clone(),
+            domain: publisher_domain.to_owned(),
             page_url: Some(page_url.clone()),
         },
         user: UserInfo {
@@ -2041,7 +2047,7 @@ pub(crate) fn build_auction_request(
             geo: None,
         }),
         site: Some(SiteInfo {
-            domain: request_info.host.clone(),
+            domain: publisher_domain.to_owned(),
             page: page_url,
         }),
         context: std::collections::HashMap::new(),
@@ -2446,6 +2452,7 @@ pub async fn handle_page_bids(
                 ec_id,
                 consent_context,
                 &request_info,
+                &settings.publisher.domain,
                 req.headers()
                     .get("user-agent")
                     .and_then(|v| v.to_str().ok()),
@@ -4713,6 +4720,7 @@ mod tests {
                 None,
                 &ConsentContext::default(),
                 &request_info,
+                "publisher.example.com",
                 Some("Mozilla/5.0"),
             );
 
@@ -4721,6 +4729,52 @@ mod tests {
                 request.id.starts_with("ts-req-"),
                 "should use a non-EC request id, got {}",
                 request.id
+            );
+        }
+
+        #[test]
+        fn auction_request_uses_configured_publisher_domain_not_edge_host() {
+            // On the SSAT proxy path the browser addresses the trusted-server
+            // edge host, but the auction must advertise the configured
+            // publisher domain to SSPs — otherwise injected creatives and the
+            // brand-safety pixel leak the edge/staging host.
+            let slot = make_slot();
+            let slots = [slot];
+            let slots_ctx = MatchedSlotsContext {
+                matched_slots: &slots,
+                request_path: "/2024/01/my-article/?edition=fictional",
+            };
+            let request_info = RequestInfo {
+                host: "ts.example.com".to_string(),
+                scheme: "https".to_string(),
+            };
+
+            let request = build_auction_request(
+                &slots_ctx,
+                None,
+                &ConsentContext::default(),
+                &request_info,
+                "www.example.com",
+                Some("Mozilla/5.0"),
+            );
+
+            assert_eq!(
+                request.publisher.domain, "www.example.com",
+                "publisher.domain should be the configured publisher domain, not the edge host"
+            );
+            let site = request.site.expect("should populate site metadata");
+            assert_eq!(
+                site.domain, "www.example.com",
+                "site.domain should be the configured publisher domain, not the edge host"
+            );
+            assert_eq!(
+                request.publisher.page_url.as_deref(),
+                Some("https://www.example.com/2024/01/my-article/?edition=fictional"),
+                "page_url host should be the configured publisher domain, not the edge host"
+            );
+            assert_eq!(
+                site.page, "https://www.example.com/2024/01/my-article/?edition=fictional",
+                "site.page host should be the configured publisher domain, not the edge host"
             );
         }
 
@@ -4742,6 +4796,7 @@ mod tests {
                 Some("ec-abc"),
                 &ConsentContext::default(),
                 &request_info,
+                "publisher.example.com",
                 Some("Mozilla/5.0"),
             );
 
