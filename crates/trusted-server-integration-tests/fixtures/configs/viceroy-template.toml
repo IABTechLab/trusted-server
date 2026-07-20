@@ -93,8 +93,9 @@
             data = "test-api-key"
 
     [local_server.config_stores]
-        # Generated integration configs inject the app_config blob and the
-        # empty trusted_server_config store required by the Fastly entry point.
+        # Generated integration configs inject the app-config blob into the
+        # trusted_server_config store, under the trusted_server_config key —
+        # the same store/key the entry point reads at boot.
         # GENERATED_TRUSTED_SERVER_CONFIG_STORES
 
         [local_server.config_stores.jwks_store]

@@ -11,8 +11,16 @@ use error_stack::Report;
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
 
-/// Default config-store key containing the Trusted Server app-config blob.
-pub const CONFIG_BLOB_KEY: &str = "app_config";
+/// Config-store key containing the Trusted Server app-config blob.
+///
+/// This is deliberately identical to the app-config **store id**
+/// (`trusted_server_config`, the `[stores.config]` default in `edgezero.toml`).
+/// `ts config push` writes the blob under the logical store id unless `--key` is
+/// given, and the `EdgeZero` config registry binds each store with
+/// `default_key` = its logical id, so keeping key == store id makes the push
+/// path and the boot read agree with no flags and no env overrides. The
+/// `config_blob_key_matches_declared_config_store` test pins that invariant.
+pub const CONFIG_BLOB_KEY: &str = "trusted_server_config";
 
 /// Reconstruct validated [`Settings`] from a serialized config blob envelope.
 ///

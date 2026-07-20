@@ -112,4 +112,32 @@ mod tests {
                 .expect("should declare secrets stores"),
         );
     }
+
+    /// Pins the push-to-boot contract: the key `ts config push` writes must be
+    /// the key the runtime boot read looks up.
+    ///
+    /// `ts config push` defaults the blob key to the logical store id (only an
+    /// explicit `--key` overrides it), and the `EdgeZero` config registry binds
+    /// each store with `default_key` = its logical id. So the app-config blob
+    /// key must equal the declared `[stores.config]` default. If these drift,
+    /// `ts config push` writes one key while boot reads another and startup
+    /// fails with "config key not found" — the exact end-to-end break this test
+    /// exists to prevent.
+    #[test]
+    fn config_blob_key_matches_declared_config_store() {
+        let config = STORES_METADATA
+            .config
+            .expect("should declare config stores");
+
+        assert_eq!(
+            crate::config_payload::CONFIG_BLOB_KEY,
+            config.default,
+            "app-config blob key must equal the declared config store id so `ts config push` \
+             (which defaults the key to the logical store id) writes what boot reads"
+        );
+        assert!(
+            config.ids.contains(&crate::config_payload::CONFIG_BLOB_KEY),
+            "the app-config blob key must be a declared config store id"
+        );
+    }
 }

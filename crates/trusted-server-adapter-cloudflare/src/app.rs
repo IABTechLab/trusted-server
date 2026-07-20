@@ -78,7 +78,9 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
         Report::new(TrustedServerError::Configuration {
             message: "Cloudflare TRUSTED_SERVER_CONFIG is required".to_string(),
         })
-        .attach("set TRUSTED_SERVER_CONFIG to JSON containing the app_config blob envelope")
+        .attach(
+            "set TRUSTED_SERVER_CONFIG to JSON containing the trusted_server_config blob envelope",
+        )
     })?;
     let value: serde_json::Value = serde_json::from_str(raw_config).map_err(|error| {
         Report::new(TrustedServerError::Configuration {
@@ -87,11 +89,12 @@ fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServ
         .attach(format!("failed to parse TRUSTED_SERVER_CONFIG: {error}"))
     })?;
     let envelope = value
-        .get("app_config")
+        .get(trusted_server_core::config_payload::CONFIG_BLOB_KEY)
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| {
             Report::new(TrustedServerError::Configuration {
-                message: "Cloudflare TRUSTED_SERVER_CONFIG missing app_config".to_string(),
+                message: "Cloudflare TRUSTED_SERVER_CONFIG missing trusted_server_config"
+                    .to_string(),
             })
         })?;
     settings_from_config_blob(envelope)

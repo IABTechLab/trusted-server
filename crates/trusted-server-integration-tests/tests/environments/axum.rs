@@ -37,13 +37,13 @@ impl RuntimeEnvironment for AxumDevServer {
         // Seed the app-config blob into a JSON file and point the Axum config
         // store at it via TRUSTED_SERVER_AXUM_CONFIG_PATH — a file-location
         // pointer, not a config-value override. The file holds a flat
-        // `{ "app_config": "<blob envelope>" }` object, matching the shape the
+        // `{ "trusted_server_config": "<blob envelope>" }` object, matching the shape the
         // EdgeZero Axum config store reads.
         let config_path = std::env::temp_dir().join(format!(
             "trusted-server-axum-config-{}-{port}.json",
             std::process::id()
         ));
-        let config_file = serde_json::json!({ "app_config": app_config }).to_string();
+        let config_file = serde_json::json!({ "trusted_server_config": app_config }).to_string();
         std::fs::write(&config_path, config_file)
             .change_context(TestError::RuntimeSpawn)
             .attach(format!(
