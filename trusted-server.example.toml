@@ -22,6 +22,7 @@ pull_sync_concurrency = 3
 # [[ec.partners]]
 # name = "Example Partner"
 # source_domain = "partner.example.com"
+# OpenRTB agent type; vendor-specific values are supported (PAIR uses 571187).
 # openrtb_atype = 3
 # bidstream_enabled = true
 # api_token = "replace-with-partner-api-token-32-bytes-minimum"
@@ -141,6 +142,14 @@ example_segments = "segments"
 
 [debug]
 ja4_endpoint_enabled = false
+
+# Inject a `<!-- ts-debug: ... -->` HTML comment before `</body>` dumping a
+# redacted per-provider auction result: pipeline stats plus every provider
+# response, with each bid's creative previewed (not the full markup) and
+# provider metadata filtered to a fail-closed allowlist.
+# Visible in page source and injects (bounded) raw HTML from SSPs. NEVER enable
+# in production.
+auction_html_comment = false
 
 [creative_opportunities]
 gam_network_id = "123456789"
