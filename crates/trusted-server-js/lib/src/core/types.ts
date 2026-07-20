@@ -134,6 +134,12 @@ export interface RenderRecord {
   visible?: boolean;
   /** How many renders this slot has seen (SPA navigations, refreshes). */
   count: number;
+  /**
+   * Page-global render sequence, starting at 1 and shared by the trace panel
+   * row and the on-creative badge. Unlike `count` (per-slot) this is unique
+   * across the page, so a badge reading `#12` identifies exactly one row.
+   */
+  seq: number;
   /** Epoch ms when the record was written. */
   at: number;
 }
