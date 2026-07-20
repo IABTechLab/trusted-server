@@ -1130,6 +1130,20 @@ describe('installTsRenderBridge', () => {
     expect(beaconSpy).toHaveBeenCalledWith('https://ssp.example/bill');
     expect(beaconSpy).toHaveBeenCalledTimes(2);
 
+    // The PBS Cache branch must trace the same as the debug-adm branch —
+    // regression coverage for the two recordBridgeRender call sites staying
+    // in sync (this branch's stamp only lands after the async fetch settles).
+    const record = (window as TestWindow).tsjs!.renders?.['homepage_header'];
+    expect(record).toEqual(
+      expect.objectContaining({
+        slotId: 'homepage_header',
+        path: 'ssat',
+        rendered: true,
+        injected: true,
+        servedFrom: 'pbs-cache',
+      })
+    );
+
     bridgeListener!(
       Object.assign(new Event('message'), {
         data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
@@ -1267,6 +1281,21 @@ describe('installTsRenderBridge', () => {
     expect(beaconSpy).toHaveBeenCalledWith('https://debug.example/bill');
     expect(beaconSpy).toHaveBeenCalledTimes(2);
     beaconSpy.mockRestore();
+
+    // Serving debug adm through the Universal Creative bridge is a confirmed
+    // TS placement — same as the PBS Cache branch — and must not be silently
+    // untraced just because no cache fetch was involved.
+    const record = (window as TestWindow).tsjs!.renders?.['homepage_header'];
+    expect(record).toEqual(
+      expect.objectContaining({
+        slotId: 'homepage_header',
+        path: 'ssat',
+        rendered: true,
+        injected: true,
+        bidder: 'mocktioneer',
+        servedFrom: 'debug-adm',
+      })
+    );
   });
 
   it('falls back to keepalive fetch when sendBeacon is unavailable', async () => {
