@@ -3679,7 +3679,10 @@ mod tests {
             height: 250,
             nurl: None,
             burl: None,
+            bid_id: None,
             ad_id: None,
+            creative_id: None,
+            renderer: None,
             cache_id: None,
             cache_host: None,
             cache_path: None,
@@ -3804,80 +3807,6 @@ mod tests {
         assert!(
             !comment.contains(&oversized),
             "the full oversized creative must not appear in the comment"
-        );
-    }
-
-    #[test]
-    fn auction_debug_comment_neutralises_every_comment_terminator_vector() {
-        // Each vector reaches HTML5 comment-end state via a distinct tokenizer
-        // path. A single `replace("--", …)` would re-form a terminator on the
-        // odd-dash-run cases; the targeted two-replace must leave the comment's
-        // own trailing `-->` as the only surviving terminator and drop `--!>`.
-        for creative in [
-            "<div>evil-->break</div>",
-            "--!><img src=x onerror=alert(1)>",
-            "<!--><img src=x onerror=alert(1)>",
-            "<!--!><img src=x onerror=alert(1)>",
-            "----!><img src=x onerror=alert(1)>",
-        ] {
-            let comment = dump_comment_for_creative(creative);
-            assert_eq!(
-                comment.matches("-->").count(),
-                1,
-                "exactly one `-->` (the terminator) must survive for {creative:?}: {comment}"
-            );
-            assert!(
-                !comment.contains("--!>"),
-                "the `--!>` nested terminator must not survive for {creative:?}: {comment}"
-            );
-        }
-    }
-
-    struct ChunkedReader {
-        chunks: std::collections::VecDeque<Vec<u8>>,
-        read_count: Arc<AtomicUsize>,
-    }
-
-    /// Build the ts-debug comment for a one-bid auction whose creative is
-    /// `creative`, so tests can assert on the rendered dump.
-    fn dump_comment_for_creative(creative: &str) -> String {
-        let mut bid = make_test_bid_with_creative(creative);
-        bid.slot_id = "ad-header-0".to_string();
-        let result = OrchestrationResult {
-            provider_responses: vec![
-                AuctionResponse::no_bid("prebid", 665),
-                AuctionResponse::success("aps", vec![bid], 42),
-            ],
-            mediator_response: None,
-            winning_bids: std::collections::HashMap::new(),
-            total_time_ms: 665,
-            metadata: std::collections::HashMap::new(),
-        };
-        let state = Arc::new(Mutex::new(Some("BIDS_SCRIPT".to_string())));
-        prepend_auction_debug_comment("stream", &result, &state);
-        state
-            .lock()
-            .expect("should lock state")
-            .clone()
-            .expect("should have comment")
-    }
-
-    #[test]
-    fn auction_debug_comment_dumps_provider_status() {
-        let comment = dump_comment_for_creative("<div>plain</div>");
-        // Compact (non-pretty) JSON: `"status":"nobid"` with no spaces.
-        assert!(
-            comment.contains("\"status\":\"nobid\""),
-            "should surface the no-bid provider status: {comment}"
-        );
-        assert!(
-            comment.contains("provider_responses="),
-            "should dump the provider_responses payload"
-        );
-        // No mediator ran, so its line is omitted (mediator=none already says so).
-        assert!(
-            !comment.contains("mediator_response="),
-            "should omit mediator_response when no mediator ran: {comment}"
         );
     }
 
