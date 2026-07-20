@@ -89,8 +89,11 @@ pull_sync_concurrency = 3
 # [[ec.partners]]
 # name = "Example Partner"
 # source_domain = "partner.example.com"
-# openrtb_atype = 3          # OpenRTB source.atype (default 3)
-# bidstream_enabled = true   # include this partner's UIDs in auction user.eids
+# OpenRTB source.atype (default 3); vendor-specific values are supported
+# (PAIR uses 571187).
+# openrtb_atype = 3
+# include this partner's UIDs in auction user.eids
+# bidstream_enabled = true
 # api_token = "replace-with-partner-api-token-32-bytes-minimum"
 # batch_rate_limit = 60      # max batch-sync requests/min (default 60)
 # pull_sync_enabled = false  # default false
@@ -230,6 +233,11 @@ pull_sync_concurrency = 3
 # Exposes GET /_ts/debug/ja4 returning TLS/JA4 fingerprint details. Disable
 # after investigation; it reflects data browser JS cannot normally read.
 # ja4_endpoint_enabled = false
+# Injects a `<!-- ts-debug: ... -->` HTML comment before `</body>` dumping a
+# redacted per-provider auction result (pipeline stats plus every provider
+# response, each bid's creative previewed). Visible in page source and injects
+# bounded raw SSP HTML — never enable in production.
+# auction_html_comment = false
 
 
 # =============================================================================
