@@ -574,6 +574,77 @@ describe('installTsAdInit', () => {
     expect(el.getAttribute('data-ts-rendered')).toBe('false');
   });
 
+  it('does not attribute a later GAM refresh to the finished server-side auction', async () => {
+    let capturedListener: ((e: SlotRenderEvent) => void) | undefined;
+
+    const mockSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([mockSlot]),
+      refresh: vi.fn(),
+      addEventListener: vi.fn((event: string, fn: (e: SlotRenderEvent) => void) => {
+        if (event === 'slotRenderEnded') capturedListener = fn;
+      }),
+    };
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(mockSlot),
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+    };
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {
+        atf_sidebar_ad: {
+          hb_bidder: 'kargo',
+          hb_adid: 'cache-uuid-9',
+          hb_auction_id: 'ts-req-trace9',
+          hb_adm_hash: 'a1b2c3d4e5f60718',
+        },
+      },
+    };
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    // First render consumes the targeting adInit applied → attributable.
+    capturedListener!({ isEmpty: false, slot: mockSlot });
+    expect((window as TestWindow).tsjs!.renders?.['atf_sidebar_ad']?.path).toBe('ssat');
+
+    // A publisher-driven refresh fills the slot again, but the server-side
+    // auction ran once and is long finished. ts.bids still holds its data —
+    // re-stamping it would claim a render that auction never produced.
+    capturedListener!({ isEmpty: false, slot: mockSlot });
+
+    const refreshed = (window as TestWindow).tsjs!.renders?.['atf_sidebar_ad'];
+    expect(refreshed?.path).toBe('gam-refresh');
+    expect(refreshed?.rendered).toBe(true);
+    expect(refreshed?.count).toBe(2);
+    expect(refreshed?.auctionId).toBeUndefined();
+    expect(refreshed?.bidder).toBeUndefined();
+    expect(refreshed?.admHash).toBeUndefined();
+
+    // Stale attribution must not survive on the DOM either.
+    const el = document.getElementById('div-atf-sidebar')!;
+    expect(el.getAttribute('data-ts-render-path')).toBe('gam-refresh');
+    expect(el.hasAttribute('data-ts-auction-id')).toBe(false);
+    expect(el.hasAttribute('data-ts-adm-hash')).toBe(false);
+  });
+
   it('does not fire beacons for an APS-style bid that carries no hb_adid', async () => {
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
     let capturedListener: ((e: SlotRenderEvent) => void) | undefined;
