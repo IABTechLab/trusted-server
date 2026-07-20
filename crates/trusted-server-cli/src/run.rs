@@ -2,8 +2,8 @@ use std::process;
 
 use clap::{Parser, Subcommand};
 use edgezero_cli::args::{
-    AuthArgs, BuildArgs, ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs, DeployArgs,
-    ProvisionArgs, ServeArgs,
+    ActiveVersionArgs, AuthArgs, BuildArgs, ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs,
+    DeployArgs, HealthcheckArgs, ProvisionArgs, RollbackArgs, ServeArgs,
 };
 use trusted_server_core::config::TrustedServerAppConfig;
 
@@ -13,7 +13,7 @@ use crate::commands::config::init::{ConfigInitArgs, run_config_init};
 use crate::prebid_bundle::{NpmPrebidBundleGenerator, PrebidBundleArgs, run_bundle};
 
 #[derive(Debug, Parser)]
-#[command(name = "ts", about = "Trusted Server CLI")]
+#[command(name = "ts", version, about = "Trusted Server CLI")]
 struct Args {
     #[command(subcommand)]
     command: Command,
@@ -21,6 +21,8 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Print the currently active deployment version for a target adapter.
+    ActiveVersion(ActiveVersionArgs),
     /// Audit a public page and write draft Trusted Server artifacts.
     Audit(AuditArgs),
     /// Sign in / out / status against an `EdgeZero` adapter.
@@ -32,10 +34,14 @@ enum Command {
     Config(ConfigCommand),
     /// Deploy the project through a target adapter.
     Deploy(DeployArgs),
+    /// Probe a deployed version until it reports healthy.
+    Healthcheck(HealthcheckArgs),
     /// Trusted Server Prebid commands.
     Prebid(PrebidArgs),
     /// Provision platform resources through a target adapter.
     Provision(ProvisionArgs),
+    /// Roll a service back to a previously active deployment version.
+    Rollback(RollbackArgs),
     /// Serve the project locally through a target adapter.
     Serve(ServeArgs),
     /// Local developer tools (e.g. the macOS-only production-hostname proxy).
@@ -79,6 +85,7 @@ pub fn run_from_env() -> Result<(), String> {
 
 fn dispatch(args: Args) -> Result<(), String> {
     match args.command {
+        Command::ActiveVersion(args) => edgezero_cli::run_active_version(&args),
         Command::Audit(args) => {
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
@@ -102,6 +109,7 @@ fn dispatch(args: Args) -> Result<(), String> {
             edgezero_cli::run_config_validate_typed::<TrustedServerAppConfig>(&args)
         }
         Command::Deploy(args) => edgezero_cli::run_deploy(&args),
+        Command::Healthcheck(args) => edgezero_cli::run_healthcheck(&args),
         Command::Prebid(prebid) => {
             let mut generator = NpmPrebidBundleGenerator;
             let mut stdout = std::io::stdout();
@@ -113,6 +121,7 @@ fn dispatch(args: Args) -> Result<(), String> {
             }
         }
         Command::Provision(args) => edgezero_cli::run_provision(&args),
+        Command::Rollback(args) => edgezero_cli::run_rollback(&args),
         Command::Serve(args) => edgezero_cli::run_serve(&args),
         Command::Dev(command) => crate::commands::dev::run(command),
     }
@@ -129,6 +138,165 @@ mod tests {
 
     fn parse(args: &[&str]) -> Args {
         Args::try_parse_from(args).expect("should parse args")
+    }
+
+    #[test]
+    fn parses_active_version() {
+        let args = parse(&[
+            "ts",
+            "active-version",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "service-123",
+        ]);
+        let Command::ActiveVersion(active_version) = args.command else {
+            panic!("expected active-version command");
+        };
+        assert_eq!(active_version.adapter, "fastly");
+        assert_eq!(active_version.service_id, "service-123");
+    }
+
+    #[test]
+    fn parses_healthcheck_with_retry_defaults() {
+        let args = parse(&[
+            "ts",
+            "healthcheck",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "service-123",
+            "--version",
+            "7",
+            "--domain",
+            "edge.example",
+        ]);
+        let Command::Healthcheck(healthcheck) = args.command else {
+            panic!("expected healthcheck command");
+        };
+        assert_eq!(healthcheck.domain, "edge.example");
+        assert_eq!(healthcheck.version, "7");
+        assert_eq!(healthcheck.retry, 3, "should default to 3 retries");
+        assert_eq!(
+            healthcheck.retry_delay, 5,
+            "should default to a 5s retry delay"
+        );
+        assert_eq!(healthcheck.timeout, 10, "should default to a 10s timeout");
+        assert!(!healthcheck.staging, "should probe production by default");
+    }
+
+    #[test]
+    fn parses_healthcheck_with_staging_overrides() {
+        let args = parse(&[
+            "ts",
+            "healthcheck",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "service-123",
+            "--version",
+            "7",
+            "--domain",
+            "edge.example",
+            "--staging",
+            "--retry",
+            "9",
+            "--retry-delay",
+            "2",
+            "--timeout",
+            "30",
+        ]);
+        let Command::Healthcheck(healthcheck) = args.command else {
+            panic!("expected healthcheck command");
+        };
+        assert!(healthcheck.staging);
+        assert_eq!(healthcheck.retry, 9);
+        assert_eq!(healthcheck.retry_delay, 2);
+        assert_eq!(healthcheck.timeout, 30);
+    }
+
+    #[test]
+    fn healthcheck_requires_domain() {
+        Args::try_parse_from([
+            "ts",
+            "healthcheck",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "service-123",
+            "--version",
+            "7",
+        ])
+        .expect_err("should reject healthcheck without a domain");
+    }
+
+    #[test]
+    fn parses_rollback_with_explicit_target() {
+        let args = parse(&[
+            "ts",
+            "rollback",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "service-123",
+            "--version",
+            "8",
+            "--rollback-to",
+            "7",
+        ]);
+        let Command::Rollback(rollback) = args.command else {
+            panic!("expected rollback command");
+        };
+        assert_eq!(rollback.version, "8");
+        assert_eq!(rollback.rollback_to, Some("7".to_owned()));
+        assert!(!rollback.staging);
+    }
+
+    #[test]
+    fn parses_staging_rollback_without_target() {
+        let args = parse(&[
+            "ts",
+            "rollback",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "service-123",
+            "--version",
+            "8",
+            "--staging",
+        ]);
+        let Command::Rollback(rollback) = args.command else {
+            panic!("expected rollback command");
+        };
+        assert!(rollback.staging);
+        assert_eq!(
+            rollback.rollback_to, None,
+            "staging rollback should not need an explicit target"
+        );
+    }
+
+    #[test]
+    fn rollback_requires_service_id() {
+        Args::try_parse_from(["ts", "rollback", "--adapter", "fastly", "--version", "8"])
+            .expect_err("should reject rollback without a service id");
+    }
+
+    #[test]
+    fn parses_deploy_with_staging_flags() {
+        let args = parse(&[
+            "ts",
+            "deploy",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "service-123",
+            "--stage",
+        ]);
+        let Command::Deploy(deploy) = args.command else {
+            panic!("expected deploy command");
+        };
+        assert_eq!(deploy.service_id, Some("service-123".to_owned()));
+        assert!(deploy.stage);
     }
 
     #[test]
