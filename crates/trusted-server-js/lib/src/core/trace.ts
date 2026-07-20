@@ -30,6 +30,13 @@ export const TRACE_PANEL_ID = 'ts-render-trace-panel';
  */
 const MAX_RENDER_LOG_ENTRIES = 200;
 
+/**
+ * Page-global render counter backing [`RenderRecord.seq`]. Module-scoped
+ * rather than stored on `window.tsjs` so a re-executed bundle cannot resume
+ * mid-sequence and hand two different renders the same number.
+ */
+let renderSeq = 0;
+
 /** CSS class of the per-slot confirmation badge (only on honestly-ok slots). */
 export const TRACE_BADGE_CLASS = 'ts-render-badge';
 
@@ -133,8 +140,13 @@ function attachTraceBadge(el: HTMLElement, record: RenderRecord): void {
 
   const badge = document.createElement('div');
   badge.className = TRACE_BADGE_CLASS;
-  badge.textContent = `TS ${style.mark} ${record.bidder ?? '?'}${style.label === 'ok' ? '' : ` · ${style.label}`}`;
+  // Lead with the sequence number: it is what ties this badge to a panel row.
+  badge.textContent =
+    `TS ${style.mark} #${record.seq}` +
+    `${record.bidder ? ` · ${record.bidder}` : ''}` +
+    `${style.label === 'ok' ? '' : ` · ${style.label}`}`;
   badge.title = [
+    `render: #${record.seq}`,
     `slot: ${record.slotId}`,
     `auction: ${record.auctionId ?? '?'}`,
     `bidder: ${record.bidder ?? '?'}`,
@@ -197,10 +209,26 @@ function ensureTracePanel(): HTMLElement | null {
   return panel;
 }
 
+/**
+ * Whether this record is still the live render for its slot — i.e. the entry
+ * `window.tsjs.renders` currently holds. Every other row in the log has been
+ * superseded by a later render of the same slot.
+ */
+function isCurrentRender(record: RenderRecord): boolean {
+  try {
+    return window.tsjs?.renders?.[record.slotId]?.seq === record.seq;
+  } catch {
+    return false;
+  }
+}
+
 /** GAM/injection state summary for the panel's detail line. */
 function stateSummary(record: RenderRecord): string {
   const parts: string[] = [];
-  if (record.path === 'ssat') {
+  // GAM's own fill signal, on every render path that has one. Gating this on
+  // `ssat` would hide it for `gam-refresh`, where "did GAM fill it this time"
+  // is the whole question.
+  if (record.gamEmpty !== undefined) {
     parts.push(`gam:${record.gamEmpty ? 'empty' : 'filled'}`);
   }
   if (record.injected !== undefined) {
@@ -240,6 +268,7 @@ function buildPanelRow(record: RenderRecord): HTMLElement {
   // Click a row to copy its full record (untruncated IDs/hash) + log it.
   row.addEventListener('click', () => copyRecord(record));
   row.title = [
+    `render: #${record.seq}`,
     `slot: ${record.slotId}`,
     `status: ${style.label}`,
     `path: ${record.path}`,
@@ -259,17 +288,30 @@ function buildPanelRow(record: RenderRecord): HTMLElement {
 
   const line1 = document.createElement('div');
   const clock = new Date(record.at).toLocaleTimeString('en-GB', { hour12: false });
-  line1.textContent = `${clock} ${style.mark} ${record.slotId} · ${style.label}`;
+  // `current` marks the row still on screen for its slot — the one whose badge,
+  // if any, is the badge you are looking at. Older rows are history.
+  const current = isCurrentRender(record) ? ' ◂ current' : '';
+  line1.textContent = `#${record.seq} ${clock} ${style.mark} ${record.slotId} · ${style.label}${current}`;
   line1.style.setProperty('font-weight', '600');
   line1.style.setProperty('color', style.color);
 
   const line2 = document.createElement('div');
   line2.style.setProperty('color', '#bbb');
-  line2.textContent = `${record.path}${mechanismSuffix(record)} · ${record.bidder ?? '?'} · ${short(record.admHash)}`;
+  // An unattributed render (a GAM refresh TS ran no auction for) carries no
+  // bidder or hash by design. Say that, rather than rendering `? · ?` as if a
+  // lookup had failed.
+  const attribution =
+    record.bidder || record.admHash
+      ? `${record.bidder ?? '?'} · ${short(record.admHash)}`
+      : 'no TS attribution';
+  line2.textContent = `${record.path}${mechanismSuffix(record)} · ${attribution}`;
 
   const line3 = document.createElement('div');
   line3.style.setProperty('color', '#777');
-  line3.textContent = `${stateSummary(record)} · auction ${short(record.auctionId)} · #${record.count}`;
+  const auction = record.auctionId ? ` · auction ${short(record.auctionId)}` : '';
+  // `×N` is this slot's own render count — distinct from the page-global `#seq`
+  // on line 1, which is what the on-creative badge shows.
+  line3.textContent = `${stateSummary(record)}${auction} · ×${record.count}`;
 
   row.append(line1, line2, line3);
   return row;
@@ -361,8 +403,8 @@ export function renderTracePanel(): void {
  * When the trace overlay is armed, the floating panel is refreshed here — the
  * single choke point every render passes through.
  */
-export function recordRender(record: Omit<RenderRecord, 'count' | 'at'>): RenderRecord {
-  const full: RenderRecord = { ...record, count: 1, at: Date.now() };
+export function recordRender(record: Omit<RenderRecord, 'count' | 'at' | 'seq'>): RenderRecord {
+  const full: RenderRecord = { ...record, count: 1, seq: ++renderSeq, at: Date.now() };
   try {
     const ts = (window.tsjs ??= {} as TsjsApi);
     const renders = (ts.renders ??= {});

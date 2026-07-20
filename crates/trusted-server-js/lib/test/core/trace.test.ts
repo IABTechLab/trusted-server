@@ -84,6 +84,7 @@ describe('trace/stampCreativeTrace', () => {
       adId: 'cache-uuid-1',
       admHash: 'a1b2c3d4e5f60718',
       count: 1,
+      seq: 1,
       at: 1,
     };
 
@@ -110,6 +111,7 @@ describe('trace/stampCreativeTrace', () => {
       admHash: 'a1b2c3d4e5f60718',
       servedFrom: 'gam',
       count: 1,
+      seq: 1,
       at: 1,
     };
     stampCreativeTrace(el, first);
@@ -120,6 +122,7 @@ describe('trace/stampCreativeTrace', () => {
       rendered: true,
       auctionId: 'auction-new',
       count: 2,
+      seq: 2,
       at: 2,
     };
     stampCreativeTrace(el, second);
@@ -132,7 +135,7 @@ describe('trace/stampCreativeTrace', () => {
 });
 
 describe('trace/floating panel', () => {
-  const record: Omit<RenderRecord, 'count' | 'at'> = {
+  const record: Omit<RenderRecord, 'count' | 'at' | 'seq'> = {
     slotId: 'slot-1',
     path: 'ssat',
     rendered: true,
@@ -229,7 +232,79 @@ describe('trace/floating panel', () => {
     expect(panels).toHaveLength(1);
     // Second render of the same slot bumps the count and appends a history row.
     expect(panels[0].textContent).toContain('TS Render Trace · 1/1 slots ok');
-    expect(panels[0].textContent).toContain('#2');
+    expect(panels[0].textContent).toContain('×2');
+  });
+
+  it("keeps GAM's fill signal and drops ? placeholders on an unattributed refresh", () => {
+    document.cookie = 'ts-trace=1; Path=/';
+    // A publisher-driven GAM refresh: TS ran no auction for it, so there is no
+    // bidder/hash/auction id — but GAM still reported whether it filled, and
+    // that is the most useful field on the row.
+    recordRender({
+      slotId: 'slot-1',
+      path: 'gam-refresh',
+      rendered: true,
+      gamEmpty: false,
+      injected: false,
+      visible: true,
+      servedFrom: 'gam',
+    });
+
+    const panel = document.getElementById(TRACE_PANEL_ID)!;
+    expect(panel.textContent).toContain('gam:filled');
+    expect(panel.textContent).toContain('no TS attribution');
+    // Absent attribution must not render as a failed lookup, and an auction
+    // segment must not appear at all when there is no auction to name.
+    expect(panel.textContent).not.toContain('· ? ·');
+    expect(panel.textContent).not.toContain('auction ?');
+  });
+
+  it('still reports gam:empty for a refresh GAM declined to fill', () => {
+    document.cookie = 'ts-trace=1; Path=/';
+    recordRender({
+      slotId: 'slot-1',
+      path: 'gam-refresh',
+      rendered: false,
+      gamEmpty: true,
+      injected: false,
+      visible: true,
+    });
+
+    const panel = document.getElementById(TRACE_PANEL_ID)!;
+    expect(panel.textContent).toContain('gam:empty');
+    expect(panel.textContent).toContain('✗ slot-1 · empty');
+  });
+
+  it('gives each render a page-global seq the badge and its panel row share', () => {
+    document.cookie = 'ts-trace=1; Path=/';
+    const el = document.createElement('div');
+    el.id = 'slot-el';
+    document.body.appendChild(el);
+
+    // Two slots interleaved: seq must be unique page-wide, not per-slot, so a
+    // badge reading #N identifies exactly one row.
+    const first = recordRender(record);
+    const other = recordRender({ ...record, slotId: 'slot-2' });
+    expect(other.seq).toBe(first.seq + 1);
+
+    stampCreativeTrace(el, other);
+    const badge = el.querySelector(`.${TRACE_BADGE_CLASS}`) as HTMLElement;
+    expect(badge.textContent).toContain(`#${other.seq}`);
+    // The same number appears on that render's row in the panel.
+    expect(document.getElementById(TRACE_PANEL_ID)!.textContent).toContain(`#${other.seq}`);
+
+    el.remove();
+  });
+
+  it('marks only the live render for a slot as current', () => {
+    document.cookie = 'ts-trace=1; Path=/';
+    recordRender(record);
+    const latest = recordRender(record);
+
+    const panel = document.getElementById(TRACE_PANEL_ID)!;
+    // Both renders are in the log, but only the newest is still on screen.
+    expect(panel.textContent).toContain(`#${latest.seq}`);
+    expect(panel.textContent!.match(/◂ current/g)).toHaveLength(1);
   });
 
   it('close button removes the panel', () => {
@@ -243,7 +318,7 @@ describe('trace/floating panel', () => {
 
   it('renderTracePanel is a no-op while disarmed even if renders exist', () => {
     (window as { tsjs?: TsjsApi }).tsjs = {
-      renders: { 'slot-1': { ...record, count: 1, at: 1 } },
+      renders: { 'slot-1': { ...record, count: 1, seq: 1, at: 1 } },
     } as unknown as TsjsApi;
     renderTracePanel();
     expect(document.getElementById(TRACE_PANEL_ID)).toBeNull();
@@ -288,6 +363,7 @@ describe('trace/confirmation badge', () => {
     admHash: 'a1b2c3d4e5f60718',
     servedFrom: 'gam',
     count: 1,
+    seq: 1,
     at: 1,
   };
 
@@ -298,7 +374,7 @@ describe('trace/confirmation badge', () => {
     stampCreativeTrace(el, okRecord);
     const badge = el.querySelector(`.${TRACE_BADGE_CLASS}`) as HTMLElement;
     expect(badge).toBeTruthy();
-    expect(badge.textContent).toBe('TS ✓ mocktioneer');
+    expect(badge.textContent).toBe('TS ✓ #1 · mocktioneer');
   });
 
   it('does not badge a hidden slot', () => {
