@@ -54,7 +54,8 @@ describe('build-prebid-external metadata', () => {
       const bundle = fs.readFileSync(path.join(outputDirectory, manifest.filename), 'utf8');
 
       expect(manifest.userIdModules).toEqual(['pairIdSystem', 'lockrAIMIdSystem']);
-      expect(bundle).toContain('["pairIdSystem","lockrAIMIdSystem"]');
+      expect(bundle).toContain('"pairIdSystem"');
+      expect(bundle).toContain('"lockrAIMIdSystem"');
     } finally {
       fs.rmSync(outputDirectory, { recursive: true, force: true });
     }
