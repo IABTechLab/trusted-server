@@ -210,8 +210,8 @@ fn parse_jurisdiction(s: &str) -> Jurisdiction {
 /// Entries written before PR5 have an empty `fp` (via `#[serde(default)]`),
 /// which never matches a computed fingerprint and triggers a self-healing
 /// re-write.
-fn fingerprint_unchanged(store: &KvHandle, key: &str, new_fp: &str) -> bool {
-    let bytes = match futures::executor::block_on(store.get_bytes(key)) {
+async fn fingerprint_unchanged(store: &KvHandle, key: &str, new_fp: &str) -> bool {
+    let bytes = match store.get_bytes(key).await {
         Ok(Some(bytes)) => bytes,
         _ => return false,
     };
@@ -232,8 +232,8 @@ fn fingerprint_unchanged(store: &KvHandle, key: &str, new_fp: &str) -> bool {
 /// * `store` — KV store opened by the adapter.
 /// * `ec_id` — Edge Cookie ID used as the KV key.
 #[must_use]
-pub fn load_consent_from_kv(store: &KvHandle, ec_id: &str) -> Option<ConsentContext> {
-    let bytes = match futures::executor::block_on(store.get_bytes(ec_id)) {
+pub async fn load_consent_from_kv(store: &KvHandle, ec_id: &str) -> Option<ConsentContext> {
+    let bytes = match store.get_bytes(ec_id).await {
         Ok(Some(bytes)) => bytes,
         Ok(None) => {
             log::debug!("Consent KV lookup miss");
@@ -274,7 +274,12 @@ pub fn load_consent_from_kv(store: &KvHandle, ec_id: &str) -> Option<ConsentCont
 /// * `max_age_days` — TTL for the entry, matching `max_consent_age_days`.
 ///
 /// The TTL is clamped to [`KvHandle::MAX_TTL`] — see [`consent_kv_ttl`].
-pub fn save_consent_to_kv(store: &KvHandle, ec_id: &str, ctx: &ConsentContext, max_age_days: u32) {
+pub async fn save_consent_to_kv(
+    store: &KvHandle,
+    ec_id: &str,
+    ctx: &ConsentContext,
+    max_age_days: u32,
+) {
     if ctx.is_empty() {
         log::debug!("Skipping consent KV write: consent is empty");
         return;
@@ -282,7 +287,7 @@ pub fn save_consent_to_kv(store: &KvHandle, ec_id: &str, ctx: &ConsentContext, m
 
     let fp = consent_fingerprint(ctx);
 
-    if fingerprint_unchanged(store, ec_id, &fp) {
+    if fingerprint_unchanged(store, ec_id, &fp).await {
         log::debug!("Consent unchanged; skipping write");
         return;
     }
@@ -300,7 +305,7 @@ pub fn save_consent_to_kv(store: &KvHandle, ec_id: &str, ctx: &ConsentContext, m
 
     let ttl = consent_kv_ttl(max_age_days);
 
-    match futures::executor::block_on(store.put_bytes_with_ttl(ec_id, body, ttl)) {
+    match store.put_bytes_with_ttl(ec_id, body, ttl).await {
         Ok(()) => {
             log::info!("Saved consent to KV store (ttl={ttl:?})");
         }
@@ -350,8 +355,8 @@ fn consent_kv_ttl(max_age_days: u32) -> std::time::Duration {
 ///
 /// Errors are logged but never propagated — KV failures must not
 /// break the request pipeline.
-pub fn delete_consent_from_kv(store: &KvHandle, ec_id: &str) {
-    match futures::executor::block_on(store.delete(ec_id)) {
+pub async fn delete_consent_from_kv(store: &KvHandle, ec_id: &str) {
+    match store.delete(ec_id).await {
         Ok(()) => {
             log::info!("Deleted consent KV entry (consent revoked)");
         }
@@ -573,19 +578,19 @@ mod new_api_tests {
 
     #[test]
     fn load_returns_none_when_key_absent() {
-        let result = load_consent_from_kv(&noop(), "some-ec-id");
+        let result = futures::executor::block_on(load_consent_from_kv(&noop(), "some-ec-id"));
         assert!(result.is_none(), "should return None when key is absent");
     }
 
     #[test]
     fn save_does_not_panic_with_noop_store() {
         let ctx = make_test_context();
-        save_consent_to_kv(&noop(), "some-ec-id", &ctx, 30);
+        futures::executor::block_on(save_consent_to_kv(&noop(), "some-ec-id", &ctx, 30));
     }
 
     #[test]
     fn delete_does_not_panic_with_noop_store() {
-        delete_consent_from_kv(&noop(), "some-ec-id");
+        futures::executor::block_on(delete_consent_from_kv(&noop(), "some-ec-id"));
     }
 
     /// In-memory KV double that records the TTL each write was issued with, so
@@ -688,10 +693,15 @@ mod new_api_tests {
         let handle = KvHandle::new(Arc::clone(&store) as Arc<dyn crate::platform::PlatformKvStore>);
         let ctx = make_test_context();
 
-        save_consent_to_kv(&handle, "test-ec-id", &ctx, MAX_CONSENT_AGE_DAYS_FOR_TEST);
+        futures::executor::block_on(save_consent_to_kv(
+            &handle,
+            "test-ec-id",
+            &ctx,
+            MAX_CONSENT_AGE_DAYS_FOR_TEST,
+        ));
 
         // The entry actually landed and round-trips.
-        let loaded = load_consent_from_kv(&handle, "test-ec-id")
+        let loaded = futures::executor::block_on(load_consent_from_kv(&handle, "test-ec-id"))
             .expect("should persist consent at the default 395-day consent age");
         assert_eq!(
             loaded.raw_us_privacy, ctx.raw_us_privacy,

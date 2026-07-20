@@ -17,12 +17,13 @@ use crate::request_signing::{JWKS_STORE_NAME, SIGNING_STORE_NAME};
 /// # Errors
 ///
 /// Returns an error if the config store cannot be accessed or the current-kid key is not found.
-pub fn get_current_key_id(
+pub async fn get_current_key_id(
     services: &RuntimeServices,
 ) -> Result<String, Report<TrustedServerError>> {
     services
         .config_store()
         .get(&JWKS_STORE_NAME, "current-kid")
+        .await
         .change_context(TrustedServerError::Configuration {
             message: "failed to read current-kid from config store".into(),
         })
@@ -135,15 +136,19 @@ impl RequestSigner {
     /// # Errors
     ///
     /// Returns an error if the key ID cannot be retrieved or the key cannot be parsed.
-    pub fn from_services(services: &RuntimeServices) -> Result<Self, Report<TrustedServerError>> {
-        let key_id =
-            get_current_key_id(services).change_context(TrustedServerError::Configuration {
+    pub async fn from_services(
+        services: &RuntimeServices,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        let key_id = get_current_key_id(services).await.change_context(
+            TrustedServerError::Configuration {
                 message: "failed to get current-kid".into(),
-            })?;
+            },
+        )?;
 
         let key_bytes = services
             .secret_store()
             .get_bytes(&SIGNING_STORE_NAME, &key_id)
+            .await
             .change_context(TrustedServerError::Configuration {
                 message: format!("failed to get signing key for kid: {key_id}"),
             })?;
@@ -189,7 +194,7 @@ impl RequestSigner {
 /// # Errors
 ///
 /// Returns an error if the JWK cannot be retrieved, parsed, or if signature verification fails.
-pub fn verify_signature(
+pub async fn verify_signature(
     payload: &[u8],
     signature_b64: &str,
     kid: &str,
@@ -198,6 +203,7 @@ pub fn verify_signature(
     let jwk_json = services
         .config_store()
         .get(&JWKS_STORE_NAME, kid)
+        .await
         .change_context(TrustedServerError::Configuration {
             message: format!("failed to get JWK for kid: {kid}"),
         })?;
@@ -263,8 +269,8 @@ mod tests {
     #[test]
     fn from_services_loads_kid_from_config_store() {
         let services = build_request_signing_services();
-        let signer =
-            RequestSigner::from_services(&services).expect("should create signer from services");
+        let signer = futures::executor::block_on(RequestSigner::from_services(&services))
+            .expect("should create signer from services");
 
         assert_eq!(signer.kid, "test-kid", "should load kid from config store");
     }
@@ -272,8 +278,8 @@ mod tests {
     #[test]
     fn sign_produces_non_empty_url_safe_base64_signature() {
         let services = build_request_signing_services();
-        let signer =
-            RequestSigner::from_services(&services).expect("should create signer from services");
+        let signer = futures::executor::block_on(RequestSigner::from_services(&services))
+            .expect("should create signer from services");
 
         let signature = signer
             .sign(b"these pretzels are making me thirsty")
@@ -289,13 +295,18 @@ mod tests {
     #[test]
     fn sign_and_verify_roundtrip_succeeds() {
         let services = build_request_signing_services();
-        let signer =
-            RequestSigner::from_services(&services).expect("should create signer from services");
+        let signer = futures::executor::block_on(RequestSigner::from_services(&services))
+            .expect("should create signer from services");
         let payload = b"test payload for verification";
 
         let signature = signer.sign(payload).expect("should sign payload");
-        let verified = verify_signature(payload, &signature, &signer.kid, &services)
-            .expect("should attempt verification");
+        let verified = futures::executor::block_on(verify_signature(
+            payload,
+            &signature,
+            &signer.kid,
+            &services,
+        ))
+        .expect("should attempt verification");
 
         assert!(verified, "should verify a valid signature");
     }
@@ -303,12 +314,17 @@ mod tests {
     #[test]
     fn verify_returns_false_for_wrong_payload() {
         let services = build_request_signing_services();
-        let signer =
-            RequestSigner::from_services(&services).expect("should create signer from services");
+        let signer = futures::executor::block_on(RequestSigner::from_services(&services))
+            .expect("should create signer from services");
         let signature = signer.sign(b"original").expect("should sign");
 
-        let verified = verify_signature(b"wrong payload", &signature, &signer.kid, &services)
-            .expect("should attempt verification");
+        let verified = futures::executor::block_on(verify_signature(
+            b"wrong payload",
+            &signature,
+            &signer.kid,
+            &services,
+        ))
+        .expect("should attempt verification");
 
         assert!(!verified, "should not verify signature for wrong payload");
     }
@@ -316,11 +332,16 @@ mod tests {
     #[test]
     fn verify_errors_for_unknown_kid() {
         let services = build_request_signing_services();
-        let signer =
-            RequestSigner::from_services(&services).expect("should create signer from services");
+        let signer = futures::executor::block_on(RequestSigner::from_services(&services))
+            .expect("should create signer from services");
         let signature = signer.sign(b"payload").expect("should sign");
 
-        let result = verify_signature(b"payload", &signature, "nonexistent-kid", &services);
+        let result = futures::executor::block_on(verify_signature(
+            b"payload",
+            &signature,
+            "nonexistent-kid",
+            &services,
+        ));
 
         assert!(result.is_err(), "should error for unknown kid");
     }
@@ -328,10 +349,15 @@ mod tests {
     #[test]
     fn verify_errors_for_malformed_signature() {
         let services = build_request_signing_services();
-        let signer =
-            RequestSigner::from_services(&services).expect("should create signer from services");
+        let signer = futures::executor::block_on(RequestSigner::from_services(&services))
+            .expect("should create signer from services");
 
-        let result = verify_signature(b"payload", "not-valid-base64!!!", &signer.kid, &services);
+        let result = futures::executor::block_on(verify_signature(
+            b"payload",
+            "not-valid-base64!!!",
+            &signer.kid,
+            &services,
+        ));
 
         assert!(result.is_err(), "should error for malformed signature");
     }
@@ -385,8 +411,8 @@ mod tests {
     #[test]
     fn sign_request_enhanced_produces_verifiable_signature() {
         let services = build_request_signing_services();
-        let signer =
-            RequestSigner::from_services(&services).expect("should create signer from services");
+        let signer = futures::executor::block_on(RequestSigner::from_services(&services))
+            .expect("should create signer from services");
         let params = SigningParams::new(
             "auction-123".to_owned(),
             "publisher.com".to_owned(),
@@ -398,8 +424,13 @@ mod tests {
             .build_payload(&signer.kid)
             .expect("should build payload");
 
-        let verified = verify_signature(payload.as_bytes(), &signature, &signer.kid, &services)
-            .expect("should verify");
+        let verified = futures::executor::block_on(verify_signature(
+            payload.as_bytes(),
+            &signature,
+            &signer.kid,
+            &services,
+        ))
+        .expect("should verify");
 
         assert!(verified, "enhanced request signature should be verifiable");
     }
@@ -407,8 +438,8 @@ mod tests {
     #[test]
     fn sign_request_different_hosts_produce_different_signatures() {
         let services = build_request_signing_services();
-        let signer =
-            RequestSigner::from_services(&services).expect("should create signer from services");
+        let signer = futures::executor::block_on(RequestSigner::from_services(&services))
+            .expect("should create signer from services");
 
         let params1 = SigningParams {
             request_id: "req-1".to_owned(),

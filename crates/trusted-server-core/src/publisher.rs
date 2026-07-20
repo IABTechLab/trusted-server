@@ -2667,8 +2667,12 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build test request");
 
-        let ec_context = EcContext::read_from_request(&settings, &req, &noop_services())
-            .expect("should read EC context");
+        let ec_context = futures::executor::block_on(EcContext::read_from_request(
+            &settings,
+            &req,
+            &noop_services(),
+        ))
+        .expect("should read EC context");
 
         assert_eq!(
             ec_context.ec_value(),
@@ -2695,8 +2699,9 @@ mod tests {
         req: Request<EdgeBody>,
     ) -> PublisherResponse {
         let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-        let mut ec_context =
-            EcContext::read_from_request(settings, &req, services).expect("should read EC context");
+        let mut ec_context = EcContext::read_from_request(settings, &req, services)
+            .await
+            .expect("should read EC context");
         handle_publisher_request(
             settings,
             services,
@@ -4606,6 +4611,7 @@ mod tests {
             req: Request<EdgeBody>,
         ) -> Response<EdgeBody> {
             let ec_context = EcContext::read_from_request(settings, &req, &noop_services())
+                .await
                 .expect("should read EC context");
             run_page_bids_response_with_ec(settings, orchestrator, slots, &ec_context, req).await
         }

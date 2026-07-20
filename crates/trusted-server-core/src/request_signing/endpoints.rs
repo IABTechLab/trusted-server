@@ -46,16 +46,16 @@ fn request_body_bytes(
 /// # Errors
 ///
 /// Returns an error if JWKS cannot be retrieved, parsed, or serialized.
-pub fn handle_trusted_server_discovery(
+pub async fn handle_trusted_server_discovery(
     _settings: &Settings,
     services: &RuntimeServices,
     _req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    let jwks_json = crate::request_signing::jwks::get_active_jwks(services).change_context(
-        TrustedServerError::Configuration {
+    let jwks_json = crate::request_signing::jwks::get_active_jwks(services)
+        .await
+        .change_context(TrustedServerError::Configuration {
             message: "failed to retrieve JWKS".into(),
-        },
-    )?;
+        })?;
 
     let jwks_value: serde_json::Value =
         serde_json::from_str(&jwks_json).change_context(TrustedServerError::Configuration {
@@ -108,7 +108,7 @@ const ADMIN_MAX_BODY_BYTES: usize = 4096;
 ///
 /// Returns an error if the request body cannot be parsed as JSON or if the
 /// response body cannot be serialized.
-pub fn handle_verify_signature(
+pub async fn handle_verify_signature(
     _settings: &Settings,
     services: &RuntimeServices,
     req: Request<EdgeBody>,
@@ -125,7 +125,8 @@ pub fn handle_verify_signature(
         &verify_req.signature,
         &verify_req.kid,
         services,
-    );
+    )
+    .await;
 
     let response = match verification_result {
         Ok(true) => VerifySignatureResponse {
@@ -293,7 +294,7 @@ pub fn kid_is_creatable(kid: &str) -> bool {
 /// # Errors
 ///
 /// Returns an error if the request signing settings are missing or JSON parsing fails.
-pub fn handle_rotate_key(
+pub async fn handle_rotate_key(
     settings: &Settings,
     services: &RuntimeServices,
     req: Request<EdgeBody>,
@@ -319,7 +320,10 @@ pub fn handle_rotate_key(
     } else {
         Ok(())
     };
-    let result = validation_result.and_then(|()| manager.rotate_key(services, rotate_req.kid));
+    let result = match validation_result {
+        Ok(()) => manager.rotate_key(services, rotate_req.kid).await,
+        Err(error) => Err(error),
+    };
 
     match result {
         Ok(result) => {
@@ -412,7 +416,7 @@ pub struct DeactivateKeyResponse {
 /// # Errors
 ///
 /// Returns an error if the request signing settings are missing or JSON parsing fails.
-pub fn handle_deactivate_key(
+pub async fn handle_deactivate_key(
     settings: &Settings,
     services: &RuntimeServices,
     req: Request<EdgeBody>,
@@ -435,20 +439,26 @@ pub fn handle_deactivate_key(
     // validation rules (e.g. digit- or uppercase-leading) can still be
     // deactivated or deleted. The stricter validate_kid only gates new key
     // creation/rotation.
-    let result = validate_kid_format(&deactivate_req.kid).and_then(|()| {
-        if deactivate_req.delete {
-            manager.delete_key(services, &deactivate_req.kid)
-        } else {
-            manager.deactivate_key(services, &deactivate_req.kid)
+    let result = match validate_kid_format(&deactivate_req.kid) {
+        Ok(()) => {
+            if deactivate_req.delete {
+                manager.delete_key(services, &deactivate_req.kid).await
+            } else {
+                manager.deactivate_key(services, &deactivate_req.kid).await
+            }
         }
-    });
+        Err(error) => Err(error),
+    };
 
     match result {
         Ok(()) => {
-            let remaining_keys = manager.list_active_keys(services).unwrap_or_else(|e| {
-                log::warn!("failed to list active keys after deactivation: {}", e);
-                vec![]
-            });
+            let remaining_keys = manager
+                .list_active_keys(services)
+                .await
+                .unwrap_or_else(|e| {
+                    log::warn!("failed to list active keys after deactivation: {}", e);
+                    vec![]
+                });
 
             let response = DeactivateKeyResponse {
                 success: true,
@@ -559,8 +569,13 @@ mod tests {
     /// Config store stub that returns a minimal JWKS with one Ed25519 key.
     struct StubJwksConfigStore;
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformConfigStore for StubJwksConfigStore {
-        fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
+        async fn get(
+            &self,
+            _store_name: &StoreName,
+            key: &str,
+        ) -> Result<String, Report<PlatformError>> {
             match key {
                 "active-kids" => Ok("test-kid-1".to_string()),
                 "test-kid-1" => Ok(
@@ -586,8 +601,10 @@ mod tests {
         let services = build_request_signing_services();
 
         let payload = "test message";
-        let signer = crate::request_signing::RequestSigner::from_services(&services)
-            .expect("should create signer from services");
+        let signer = futures::executor::block_on(
+            crate::request_signing::RequestSigner::from_services(&services),
+        )
+        .expect("should create signer from services");
         let signature = signer
             .sign(payload.as_bytes())
             .expect("should sign payload");
@@ -605,7 +622,7 @@ mod tests {
             Some(&body),
         );
 
-        let resp = handle_verify_signature(&settings, &services, req)
+        let resp = futures::executor::block_on(handle_verify_signature(&settings, &services, req))
             .expect("should handle verification request");
         assert_eq!(resp.status(), StatusCode::OK);
         assert_json_content_type(&resp);
@@ -624,8 +641,10 @@ mod tests {
         let settings = crate::test_support::tests::create_test_settings();
         let services = build_request_signing_services();
 
-        let signer = crate::request_signing::RequestSigner::from_services(&services)
-            .expect("should create signer from services");
+        let signer = futures::executor::block_on(
+            crate::request_signing::RequestSigner::from_services(&services),
+        )
+        .expect("should create signer from services");
 
         let wrong_signature = signer
             .sign(b"different payload")
@@ -644,7 +663,7 @@ mod tests {
             Some(&body),
         );
 
-        let resp = handle_verify_signature(&settings, &services, req)
+        let resp = futures::executor::block_on(handle_verify_signature(&settings, &services, req))
             .expect("should handle verification request");
         assert_eq!(resp.status(), StatusCode::OK);
         assert_json_content_type(&resp);
@@ -679,7 +698,7 @@ mod tests {
         );
 
         let services = noop_services();
-        let resp = handle_verify_signature(&settings, &services, req)
+        let resp = futures::executor::block_on(handle_verify_signature(&settings, &services, req))
             .expect("should return a verification response for internal errors");
 
         assert_eq!(resp.status(), StatusCode::OK, "should return 200 OK");
@@ -715,7 +734,8 @@ mod tests {
             Some("not valid json"),
         );
 
-        let result = handle_verify_signature(&settings, &noop_services(), req);
+        let result =
+            futures::executor::block_on(handle_verify_signature(&settings, &noop_services(), req));
         assert!(result.is_err(), "Malformed JSON should error");
     }
 
@@ -724,7 +744,7 @@ mod tests {
         let settings = crate::test_support::tests::create_test_settings();
         let req = build_request(Method::POST, "https://test.com/admin/keys/rotate", None);
 
-        let resp = handle_rotate_key(&settings, &noop_services(), req)
+        let resp = futures::executor::block_on(handle_rotate_key(&settings, &noop_services(), req))
             .expect("should return a response even when stores are unavailable");
 
         assert_eq!(
@@ -762,7 +782,7 @@ mod tests {
             Some(&body_json),
         );
 
-        let resp = handle_rotate_key(&settings, &noop_services(), req)
+        let resp = futures::executor::block_on(handle_rotate_key(&settings, &noop_services(), req))
             .expect("should return a response even when stores are unavailable");
 
         assert_eq!(
@@ -794,7 +814,8 @@ mod tests {
             Some("invalid json"),
         );
 
-        let result = handle_rotate_key(&settings, &noop_services(), req);
+        let result =
+            futures::executor::block_on(handle_rotate_key(&settings, &noop_services(), req));
         assert!(result.is_err(), "Invalid JSON should return error");
     }
 
@@ -813,7 +834,7 @@ mod tests {
             Some(&body_json),
         );
 
-        let resp = handle_rotate_key(&settings, &noop_services(), req)
+        let resp = futures::executor::block_on(handle_rotate_key(&settings, &noop_services(), req))
             .expect("should return a response for invalid kid");
 
         assert_eq!(
@@ -856,8 +877,9 @@ mod tests {
             Some(&body_json),
         );
 
-        let resp = handle_deactivate_key(&settings, &noop_services(), req)
-            .expect("should return a response even when stores are unavailable");
+        let resp =
+            futures::executor::block_on(handle_deactivate_key(&settings, &noop_services(), req))
+                .expect("should return a response even when stores are unavailable");
 
         assert_eq!(
             resp.status(),
@@ -896,8 +918,9 @@ mod tests {
             Some(&body_json),
         );
 
-        let resp = handle_deactivate_key(&settings, &noop_services(), req)
-            .expect("should return a response even when stores are unavailable");
+        let resp =
+            futures::executor::block_on(handle_deactivate_key(&settings, &noop_services(), req))
+                .expect("should return a response even when stores are unavailable");
 
         assert_eq!(
             resp.status(),
@@ -932,7 +955,8 @@ mod tests {
             Some("invalid json"),
         );
 
-        let result = handle_deactivate_key(&settings, &noop_services(), req);
+        let result =
+            futures::executor::block_on(handle_deactivate_key(&settings, &noop_services(), req));
         assert!(result.is_err(), "Invalid JSON should return error");
     }
 
@@ -953,8 +977,9 @@ mod tests {
             Some(&body_json),
         );
 
-        let resp = handle_deactivate_key(&settings, &noop_services(), req)
-            .expect("should return a response for invalid kid");
+        let resp =
+            futures::executor::block_on(handle_deactivate_key(&settings, &noop_services(), req))
+                .expect("should return a response for invalid kid");
 
         assert_eq!(
             resp.status(),
@@ -988,8 +1013,9 @@ mod tests {
             "https://test.com/verify-signature",
             Some(&oversized),
         );
-        let err = handle_verify_signature(&settings, &noop_services(), req)
-            .expect_err("should reject oversized body");
+        let err =
+            futures::executor::block_on(handle_verify_signature(&settings, &noop_services(), req))
+                .expect_err("should reject oversized body");
         assert_eq!(
             err.current_context().status_code(),
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -1001,8 +1027,9 @@ mod tests {
     fn verify_signature_rejects_streaming_body() {
         let settings = crate::test_support::tests::create_test_settings();
         let req = build_streaming_request(Method::POST, "https://test.com/verify-signature");
-        let err = handle_verify_signature(&settings, &noop_services(), req)
-            .expect_err("should reject streaming verify body");
+        let err =
+            futures::executor::block_on(handle_verify_signature(&settings, &noop_services(), req))
+                .expect_err("should reject streaming verify body");
         assert_eq!(
             err.current_context().status_code(),
             StatusCode::BAD_REQUEST,
@@ -1027,7 +1054,7 @@ mod tests {
             "https://test.com/admin/keys/rotate",
             Some(&oversized),
         );
-        let err = handle_rotate_key(&settings, &noop_services(), req)
+        let err = futures::executor::block_on(handle_rotate_key(&settings, &noop_services(), req))
             .expect_err("should reject oversized body");
         assert_eq!(
             err.current_context().status_code(),
@@ -1040,7 +1067,7 @@ mod tests {
     fn rotate_key_rejects_streaming_body() {
         let settings = crate::test_support::tests::create_test_settings();
         let req = build_streaming_request(Method::POST, "https://test.com/admin/keys/rotate");
-        let err = handle_rotate_key(&settings, &noop_services(), req)
+        let err = futures::executor::block_on(handle_rotate_key(&settings, &noop_services(), req))
             .expect_err("should reject streaming rotate body");
         assert_eq!(
             err.current_context().status_code(),
@@ -1066,8 +1093,9 @@ mod tests {
             "https://test.com/admin/keys/deactivate",
             Some(&oversized),
         );
-        let err = handle_deactivate_key(&settings, &noop_services(), req)
-            .expect_err("should reject oversized body");
+        let err =
+            futures::executor::block_on(handle_deactivate_key(&settings, &noop_services(), req))
+                .expect_err("should reject oversized body");
         assert_eq!(
             err.current_context().status_code(),
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -1159,8 +1187,9 @@ mod tests {
             Some(&body_json),
         );
 
-        let resp = handle_deactivate_key(&settings, &noop_services(), req)
-            .expect("should return a response for a legacy digit-leading kid");
+        let resp =
+            futures::executor::block_on(handle_deactivate_key(&settings, &noop_services(), req))
+                .expect("should return a response for a legacy digit-leading kid");
 
         assert_ne!(
             resp.status(),
@@ -1197,7 +1226,11 @@ mod tests {
 
         // noop_services() config store always returns Err, so the discovery
         // handler propagates the error rather than absorbing it into a 500.
-        let result = handle_trusted_server_discovery(&settings, &noop_services(), req);
+        let result = futures::executor::block_on(handle_trusted_server_discovery(
+            &settings,
+            &noop_services(),
+            req,
+        ));
 
         assert!(
             result.is_err(),
@@ -1215,8 +1248,9 @@ mod tests {
         );
 
         let services = build_services_with_config(StubJwksConfigStore);
-        let resp = handle_trusted_server_discovery(&settings, &services, req)
-            .expect("should return discovery document when config store is populated");
+        let resp =
+            futures::executor::block_on(handle_trusted_server_discovery(&settings, &services, req))
+                .expect("should return discovery document when config store is populated");
 
         assert_eq!(resp.status(), StatusCode::OK, "should return 200 OK");
 

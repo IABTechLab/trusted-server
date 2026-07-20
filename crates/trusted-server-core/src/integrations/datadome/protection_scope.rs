@@ -205,7 +205,7 @@ impl ProtectionScope {
         })
     }
 
-    pub(super) fn evaluate(
+    pub(super) async fn evaluate(
         &self,
         facts: &ProtectionRequestFacts<'_>,
         services: &RuntimeServices,
@@ -226,7 +226,10 @@ impl ProtectionScope {
             }
 
             for source in &self.excluded_ip_cidr_sources {
-                if source.matches(client_ip, services, self.ip_list_cache_ttl) {
+                if source
+                    .matches(client_ip, services, self.ip_list_cache_ttl)
+                    .await
+                {
                     return ProtectionScopeDecision::Skip {
                         rule_id: source.rule_id(),
                         reason: "client_ip_source",
@@ -246,7 +249,7 @@ impl ProtectionScope {
         }
 
         for rule in &self.exclusion_rules {
-            if rule.matches(facts, services, self.ip_list_cache_ttl) {
+            if rule.matches(facts, services, self.ip_list_cache_ttl).await {
                 return ProtectionScopeDecision::Skip {
                     rule_id: rule.id.clone(),
                     reason: rule.matcher.reason(),
@@ -311,8 +314,13 @@ impl ProtectionIpCidrSource {
         format!("ip-cidr-source:{}:{}", self.config_store, self.key)
     }
 
-    fn matches(&self, client_ip: IpAddr, services: &RuntimeServices, cache_ttl: Duration) -> bool {
-        match self.load_cidrs(services, cache_ttl) {
+    async fn matches(
+        &self,
+        client_ip: IpAddr,
+        services: &RuntimeServices,
+        cache_ttl: Duration,
+    ) -> bool {
+        match self.load_cidrs(services, cache_ttl).await {
             Ok(cidrs) => cidrs_match(&cidrs, client_ip),
             Err(err) => {
                 log::warn!(
@@ -325,7 +333,7 @@ impl ProtectionIpCidrSource {
         }
     }
 
-    fn load_cidrs(
+    async fn load_cidrs(
         &self,
         services: &RuntimeServices,
         cache_ttl: Duration,
@@ -348,6 +356,7 @@ impl ProtectionIpCidrSource {
         let raw = services
             .config_store()
             .get(&store_name, &self.key)
+            .await
             .map_err(|err| {
                 err.change_context(datadome_error(
                     "Failed to read DataDome IP CIDR bypass list from Config Store",
@@ -392,7 +401,7 @@ impl ProtectionExclusionRule {
         })
     }
 
-    fn matches(
+    async fn matches(
         &self,
         facts: &ProtectionRequestFacts<'_>,
         services: &RuntimeServices,
@@ -404,7 +413,7 @@ impl ProtectionExclusionRule {
             }
         }
 
-        self.matcher.matches(facts, services, cache_ttl)
+        self.matcher.matches(facts, services, cache_ttl).await
     }
 }
 
@@ -462,7 +471,7 @@ impl ProtectionMatcher {
         }
     }
 
-    fn matches(
+    async fn matches(
         &self,
         facts: &ProtectionRequestFacts<'_>,
         services: &RuntimeServices,
@@ -483,9 +492,10 @@ impl ProtectionMatcher {
             ProtectionMatcher::IpCidr(cidrs) => facts
                 .client_ip
                 .is_some_and(|client_ip| cidrs_match(cidrs, client_ip)),
-            ProtectionMatcher::IpCidrSource(source) => facts
-                .client_ip
-                .is_some_and(|client_ip| source.matches(client_ip, services, cache_ttl)),
+            ProtectionMatcher::IpCidrSource(source) => match facts.client_ip {
+                Some(client_ip) => source.matches(client_ip, services, cache_ttl).await,
+                None => false,
+            },
         }
     }
 
@@ -732,7 +742,9 @@ mod tests {
         let scope = ProtectionScope::compile(&config).expect("should compile scope");
         let services = crate::platform::test_support::noop_services();
 
-        let decision = scope.evaluate(&facts("FASTLYPURGE", "/page", None, None, None), &services);
+        let decision = futures::executor::block_on(
+            scope.evaluate(&facts("FASTLYPURGE", "/page", None, None, None), &services),
+        );
 
         assert!(matches!(
             decision,
@@ -750,7 +762,9 @@ mod tests {
         let scope = ProtectionScope::compile(&config).expect("should compile scope");
         let services = crate::platform::test_support::noop_services();
 
-        let decision = scope.evaluate(&facts("GET", "/page", None, None, Some(19750)), &services);
+        let decision = futures::executor::block_on(
+            scope.evaluate(&facts("GET", "/page", None, None, Some(19750)), &services),
+        );
 
         assert!(matches!(
             decision,
@@ -765,7 +779,7 @@ mod tests {
         let scope = ProtectionScope::compile(&config).expect("should compile scope");
         let services = crate::platform::test_support::noop_services();
 
-        let decision = scope.evaluate(
+        let decision = futures::executor::block_on(scope.evaluate(
             &facts(
                 "GET",
                 "/page",
@@ -774,7 +788,7 @@ mod tests {
                 None,
             ),
             &services,
-        );
+        ));
 
         assert!(matches!(
             decision,
@@ -799,7 +813,7 @@ mod tests {
         let services =
             build_services_with_config_and_secret(HashMapConfigStore::new(data), NoopSecretStore);
 
-        let decision = scope.evaluate(
+        let decision = futures::executor::block_on(scope.evaluate(
             &facts(
                 "GET",
                 "/page",
@@ -808,7 +822,7 @@ mod tests {
                 None,
             ),
             &services,
-        );
+        ));
 
         assert!(matches!(
             decision,
@@ -834,14 +848,18 @@ mod tests {
         let services = crate::platform::test_support::noop_services();
 
         assert!(matches!(
-            scope.evaluate(&facts("GET", "/app.JSON", None, None, None), &services),
+            futures::executor::block_on(
+                scope.evaluate(&facts("GET", "/app.JSON", None, None, None), &services)
+            ),
             ProtectionScopeDecision::Skip {
                 reason: "path_regex",
                 ..
             }
         ));
         assert!(matches!(
-            scope.evaluate(&facts("POST", "/app.JSON", None, None, None), &services),
+            futures::executor::block_on(
+                scope.evaluate(&facts("POST", "/app.JSON", None, None, None), &services)
+            ),
             ProtectionScopeDecision::Protect
         ));
     }
@@ -861,20 +879,20 @@ mod tests {
         let services = crate::platform::test_support::noop_services();
 
         assert!(matches!(
-            scope.evaluate(
+            futures::executor::block_on(scope.evaluate(
                 &facts("GET", "/page", Some("_rsc=abc&x=1"), None, None),
                 &services
-            ),
+            )),
             ProtectionScopeDecision::Skip {
                 reason: "query_param_non_empty",
                 ..
             }
         ));
         assert!(matches!(
-            scope.evaluate(
+            futures::executor::block_on(scope.evaluate(
                 &facts("GET", "/page", Some("_rsc=&x=1"), None, None),
                 &services
-            ),
+            )),
             ProtectionScopeDecision::Protect
         ));
     }

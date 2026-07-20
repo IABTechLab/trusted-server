@@ -175,12 +175,12 @@ impl EcContext {
     /// # Errors
     ///
     /// Returns an error if cookie parsing fails.
-    pub fn read_from_request(
+    pub async fn read_from_request(
         settings: &Settings,
         req: &Request<EdgeBody>,
         services: &RuntimeServices,
     ) -> Result<Self, Report<TrustedServerError>> {
-        Self::read_from_request_with_geo(settings, req, services, None)
+        Self::read_from_request_with_geo(settings, req, services, None).await
     }
 
     /// Reads EC state from an incoming request using pre-extracted geo data.
@@ -191,7 +191,7 @@ impl EcContext {
     /// # Errors
     ///
     /// Returns an error if cookie parsing fails.
-    pub fn read_from_request_with_geo(
+    pub async fn read_from_request_with_geo(
         settings: &Settings,
         req: &Request<EdgeBody>,
         services: &RuntimeServices,
@@ -236,7 +236,8 @@ impl EcContext {
             geo: geo_info,
             ec_id: ec_value.as_deref(),
             kv_store: consent_kv,
-        });
+        })
+        .await;
 
         log::info!(
             "EC context: present={}, cookie_present={}, consent_allowed={}, jurisdiction={}",
@@ -533,8 +534,12 @@ mod tests {
         let ec_id = valid_ec_id("a", "HdrEc1");
         let req = create_test_request(&[("x-ts-ec", &ec_id)]);
 
-        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
-            .expect("should read EC context");
+        let ec = futures::executor::block_on(EcContext::read_from_request(
+            &settings,
+            &req,
+            &noop_services(),
+        ))
+        .expect("should read EC context");
 
         assert!(ec.ec_value().is_none(), "should ignore EC from header");
         assert!(!ec.ec_was_present(), "should not detect EC from header");
@@ -549,8 +554,12 @@ mod tests {
         let cookie = format!("ts-ec={ec_id}");
         let req = create_test_request(&[("cookie", &cookie)]);
 
-        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
-            .expect("should read EC context");
+        let ec = futures::executor::block_on(EcContext::read_from_request(
+            &settings,
+            &req,
+            &noop_services(),
+        ))
+        .expect("should read EC context");
 
         assert_eq!(ec.ec_value(), Some(ec_id.as_str()));
         assert!(ec.ec_was_present(), "should detect EC from cookie");
@@ -566,8 +575,12 @@ mod tests {
         let cookie = format!("ts-ec={cookie_id}");
         let req = create_test_request(&[("x-ts-ec", &header_id), ("cookie", &cookie)]);
 
-        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
-            .expect("should read EC context");
+        let ec = futures::executor::block_on(EcContext::read_from_request(
+            &settings,
+            &req,
+            &noop_services(),
+        ))
+        .expect("should read EC context");
 
         assert_eq!(
             ec.ec_value(),
@@ -582,8 +595,12 @@ mod tests {
         let settings = create_test_settings();
         let req = create_test_request(&[]);
 
-        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
-            .expect("should read EC context");
+        let ec = futures::executor::block_on(EcContext::read_from_request(
+            &settings,
+            &req,
+            &noop_services(),
+        ))
+        .expect("should read EC context");
 
         assert!(ec.ec_value().is_none(), "should have no EC value");
         assert!(!ec.ec_was_present(), "should not detect EC");
@@ -597,8 +614,12 @@ mod tests {
         let cookie = format!("ts-ec={cookie_id}");
         let req = create_test_request(&[("x-ts-ec", "malformed-header"), ("cookie", &cookie)]);
 
-        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
-            .expect("should read EC context");
+        let ec = futures::executor::block_on(EcContext::read_from_request(
+            &settings,
+            &req,
+            &noop_services(),
+        ))
+        .expect("should read EC context");
 
         assert_eq!(
             ec.ec_value(),
@@ -613,8 +634,12 @@ mod tests {
         let settings = create_test_settings();
         let req = create_test_request(&[("x-ts-ec", "bad-header"), ("cookie", "ts-ec=bad-cookie")]);
 
-        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
-            .expect("should read EC context");
+        let ec = futures::executor::block_on(EcContext::read_from_request(
+            &settings,
+            &req,
+            &noop_services(),
+        ))
+        .expect("should read EC context");
 
         assert!(
             ec.ec_value().is_none(),
@@ -637,8 +662,12 @@ mod tests {
         let cookie = format!("ts-ec={ec_id}");
         let req = create_test_request(&[("cookie", &cookie)]);
 
-        let mut ec = EcContext::read_from_request(&settings, &req, &noop_services())
-            .expect("should read EC context");
+        let mut ec = futures::executor::block_on(EcContext::read_from_request(
+            &settings,
+            &req,
+            &noop_services(),
+        ))
+        .expect("should read EC context");
         ec.generate_if_needed(&settings, None)
             .expect("should not error when EC already exists");
 
@@ -658,8 +687,12 @@ mod tests {
         let cookie_ec = valid_ec_id("e", "CkVal1");
         let cookie = format!("ts-ec={cookie_ec}");
         let req = create_test_request(&[("cookie", &cookie)]);
-        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
-            .expect("should read EC context");
+        let ec = futures::executor::block_on(EcContext::read_from_request(
+            &settings,
+            &req,
+            &noop_services(),
+        ))
+        .expect("should read EC context");
         assert_eq!(
             ec.existing_cookie_ec_id(),
             Some(cookie_ec.as_str()),
@@ -669,8 +702,12 @@ mod tests {
         // With only header (no cookie)
         let header_ec = valid_ec_id("f", "HdrVl1");
         let req = create_test_request(&[("x-ts-ec", &header_ec)]);
-        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
-            .expect("should read EC context");
+        let ec = futures::executor::block_on(EcContext::read_from_request(
+            &settings,
+            &req,
+            &noop_services(),
+        ))
+        .expect("should read EC context");
         assert!(
             ec.existing_cookie_ec_id().is_none(),
             "should return None when only header is present"
@@ -681,8 +718,12 @@ mod tests {
         let cookie_ec2 = valid_ec_id("b", "Ck0002");
         let cookie2 = format!("ts-ec={cookie_ec2}");
         let req = create_test_request(&[("x-ts-ec", &header_ec2), ("cookie", &cookie2)]);
-        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
-            .expect("should read EC context");
+        let ec = futures::executor::block_on(EcContext::read_from_request(
+            &settings,
+            &req,
+            &noop_services(),
+        ))
+        .expect("should read EC context");
         assert_eq!(
             ec.ec_value(),
             Some(cookie_ec2.as_str()),
@@ -806,17 +847,25 @@ mod tests {
         let cookie = format!("ts-ec={ec_id}; us_privacy=1YNN");
         let req = create_test_request(&[("cookie", &cookie)]);
 
-        EcContext::read_from_request(&settings, &req, &services).expect("should read EC context");
+        futures::executor::block_on(EcContext::read_from_request(&settings, &req, &services))
+            .expect("should read EC context");
 
-        let persisted = crate::consent::kv::load_consent_from_kv(&consent_handle, &ec_id)
-            .expect("should persist cookie-sourced consent under the EC id");
+        let persisted = futures::executor::block_on(crate::consent::kv::load_consent_from_kv(
+            &consent_handle,
+            &ec_id,
+        ))
+        .expect("should persist cookie-sourced consent under the EC id");
         assert_eq!(
             persisted.raw_us_privacy.as_deref(),
             Some("1YNN"),
             "should persist the cookie-sourced consent signal"
         );
         assert!(
-            crate::consent::kv::load_consent_from_kv(&default_handle, &ec_id).is_none(),
+            futures::executor::block_on(crate::consent::kv::load_consent_from_kv(
+                &default_handle,
+                &ec_id
+            ))
+            .is_none(),
             "should resolve the named consent store, never the default KV store"
         );
     }
@@ -830,14 +879,20 @@ mod tests {
         // First request carries a consent cookie — persisted under the EC id.
         let seeding_cookie = format!("ts-ec={ec_id}; us_privacy=1YNN");
         let seeding_req = create_test_request(&[("cookie", &seeding_cookie)]);
-        EcContext::read_from_request(&settings, &seeding_req, &services)
-            .expect("should read EC context for the seeding request");
+        futures::executor::block_on(EcContext::read_from_request(
+            &settings,
+            &seeding_req,
+            &services,
+        ))
+        .expect("should read EC context for the seeding request");
 
         // Second request carries only the EC cookie — no consent signals.
         let bare_cookie = format!("ts-ec={ec_id}");
         let bare_req = create_test_request(&[("cookie", &bare_cookie)]);
-        let ec = EcContext::read_from_request(&settings, &bare_req, &services)
-            .expect("should read EC context for the bare request");
+        let ec = futures::executor::block_on(EcContext::read_from_request(
+            &settings, &bare_req, &services,
+        ))
+        .expect("should read EC context for the bare request");
 
         assert_eq!(
             ec.consent().raw_us_privacy.as_deref(),
@@ -856,13 +911,50 @@ mod tests {
         let cookie = format!("ts-ec={ec_id}; us_privacy=1YNN");
         let req = create_test_request(&[("cookie", &cookie)]);
 
-        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
-            .expect("should read EC context without a KV registry");
+        let ec = futures::executor::block_on(EcContext::read_from_request(
+            &settings,
+            &req,
+            &noop_services(),
+        ))
+        .expect("should read EC context without a KV registry");
 
         assert_eq!(
             ec.consent().raw_us_privacy.as_deref(),
             Some("1YNN"),
             "should still build request-local consent with persistence disabled"
+        );
+    }
+
+    #[test]
+    fn read_from_request_persists_consent_from_within_an_outer_executor() {
+        // Regression: before the end-to-end async refactor, the consent
+        // persistence path bridged the async KV write with an inner
+        // `futures::executor::block_on`. Driving a consent-persisting read from
+        // within an outer executor then panicked on Fastly-shaped runtimes with
+        // `cannot execute LocalPool executor from within another executor:
+        // EnterError`. With the reads async end to end there is no inner bridge,
+        // so the nested-executor path must now complete cleanly.
+        let settings = settings_with_consent_store();
+        let (services, _default_handle, consent_handle) = services_with_consent_kv();
+        let ec_id = valid_ec_id("f", "Nested");
+        let cookie = format!("ts-ec={ec_id}; us_privacy=1YNN");
+        let req = create_test_request(&[("cookie", &cookie)]);
+
+        // Outer executor wraps the entire consent-persisting read plus the
+        // follow-up KV read. If any request-path `block_on` bridge remained,
+        // this would panic with `EnterError` instead of returning.
+        let persisted = futures::executor::block_on(async {
+            EcContext::read_from_request(&settings, &req, &services)
+                .await
+                .expect("should read EC context from within an outer executor");
+            crate::consent::kv::load_consent_from_kv(&consent_handle, &ec_id).await
+        })
+        .expect("should persist consent under the EC id without an EnterError panic");
+
+        assert_eq!(
+            persisted.raw_us_privacy.as_deref(),
+            Some("1YNN"),
+            "should persist the cookie-sourced consent from within a nested executor"
         );
     }
 }

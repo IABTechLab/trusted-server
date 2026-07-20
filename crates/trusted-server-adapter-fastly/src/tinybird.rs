@@ -95,13 +95,14 @@ impl FastlyTinybirdAuctionTelemetrySink {
         batch.to_ndjson(self.target.max_body_bytes)
     }
 
-    fn load_append_token(
+    async fn load_append_token(
         &self,
         services: &RuntimeServices,
     ) -> Result<String, Report<TrustedServerError>> {
         let token = services
             .secret_store()
             .get_string(&self.target.secret_store, &self.target.token_secret)
+            .await
             .change_context(TrustedServerError::Proxy {
                 message: "Tinybird auction append token unavailable".to_owned(),
             })?;
@@ -185,7 +186,7 @@ impl AuctionTelemetrySink for FastlyTinybirdAuctionTelemetrySink {
         Self::validate_batch(&batch)?;
         let body = self.serialize_batch(&batch)?;
         let body_len = body.len();
-        let token = self.load_append_token(services)?;
+        let token = self.load_append_token(services).await?;
         let auth_header = Self::authorization_header(&token)?;
         let backend_name = self.ensure_backend(services)?;
         let request = self.build_events_request(body, auth_header)?;
@@ -239,8 +240,9 @@ mod tests {
 
     struct NoopConfigStore;
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformConfigStore for NoopConfigStore {
-        fn get(
+        async fn get(
             &self,
             _store_name: &StoreName,
             _key: &str,
@@ -264,8 +266,9 @@ mod tests {
 
     struct MapSecretStore(HashMap<String, Vec<u8>>);
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformSecretStore for MapSecretStore {
-        fn get_bytes(
+        async fn get_bytes(
             &self,
             _store_name: &StoreName,
             key: &str,

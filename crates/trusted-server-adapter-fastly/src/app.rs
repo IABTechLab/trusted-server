@@ -170,7 +170,13 @@ pub(crate) fn load_settings_from_config_store() -> Result<Settings, Report<Trust
             message: format!("failed to open Trusted Server config store: {error}"),
         })
     })?;
-    get_settings_from_config_store(&config_store, CONFIG_BLOB_KEY)
+    // Startup-only read: this runs at process/app construction (and post-dispatch
+    // response finalize), never inside the request router executor, so driving the
+    // async boot read with a top-level `block_on` here cannot nest executors.
+    futures::executor::block_on(get_settings_from_config_store(
+        &config_store,
+        CONFIG_BLOB_KEY,
+    ))
 }
 
 pub(crate) fn build_state_from_settings(
@@ -373,7 +379,7 @@ fn device_signals_for(req: &Request) -> DeviceSignals {
 
 /// Builds the per-request EC state, mirroring the pre-routing prelude of the
 /// legacy `route_request` step by step.
-fn build_ec_request_state(
+async fn build_ec_request_state(
     settings: &Settings,
     services: &RuntimeServices,
     req: &Request,
@@ -401,7 +407,9 @@ fn build_ec_request_state(
         });
 
     let (ec_context, setup_error) =
-        match EcContext::read_from_request_with_geo(settings, req, services, geo_info.as_ref()) {
+        match EcContext::read_from_request_with_geo(settings, req, services, geo_info.as_ref())
+            .await
+        {
             Ok(mut context) => {
                 context.set_device_signals(device_signals);
                 (context, None)
@@ -520,7 +528,7 @@ async fn execute_named(
         return Ok(run_batch_sync(&state, &services, req));
     }
 
-    let mut ec = build_ec_request_state(&state.settings, &services, &req);
+    let mut ec = build_ec_request_state(&state.settings, &services, &req).await;
     // EcContext creation errors short-circuit before filters, mirroring legacy:
     // the legacy path returns its error response before running filter_request.
     if let Some(report) = ec.setup_error.take() {
@@ -555,13 +563,15 @@ async fn run_named_route(
 ) -> Result<Response, Report<TrustedServerError>> {
     match handler {
         NamedRouteHandler::TrustedServerDiscovery => {
-            handle_trusted_server_discovery(&state.settings, services, req)
+            handle_trusted_server_discovery(&state.settings, services, req).await
         }
         NamedRouteHandler::VerifySignature => {
-            handle_verify_signature(&state.settings, services, req)
+            handle_verify_signature(&state.settings, services, req).await
         }
-        NamedRouteHandler::RotateKey => handle_rotate_key(&state.settings, services, req),
-        NamedRouteHandler::DeactivateKey => handle_deactivate_key(&state.settings, services, req),
+        NamedRouteHandler::RotateKey => handle_rotate_key(&state.settings, services, req).await,
+        NamedRouteHandler::DeactivateKey => {
+            handle_deactivate_key(&state.settings, services, req).await
+        }
         NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
         NamedRouteHandler::BatchSync => {
             // Dispatched by execute_named before EC state is built.
@@ -697,7 +707,7 @@ async fn dispatch_fallback(
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
-    let mut ec = build_ec_request_state(&state.settings, services, &req);
+    let mut ec = build_ec_request_state(&state.settings, services, &req).await;
     if let Some(report) = ec.setup_error.take() {
         let response = http_error(&report);
         return attach_dispatch_extensions(response, ec, RequestFilterEffects::default());

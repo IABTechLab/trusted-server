@@ -1,7 +1,6 @@
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::env_config::EnvConfig;
 use error_stack::Report;
-use futures::executor::block_on;
 
 use crate::config_payload::{settings_from_config_blob, CONFIG_BLOB_KEY};
 use crate::error::TrustedServerError;
@@ -17,29 +16,31 @@ pub fn default_config_key() -> String {
 ///
 /// The handle is already bound to a specific config store, so only the blob
 /// `key` is supplied. Reads resolve through the handle's async
-/// [`ConfigStoreHandle::get`], driven to completion with [`block_on`]. The
-/// handle returns a fully resolved envelope: platform-specific storage details
-/// such as Fastly's config-entry chunking are reassembled by `EdgeZero`'s
-/// config store, not here.
+/// [`ConfigStoreHandle::get`]. The handle returns a fully resolved envelope:
+/// platform-specific storage details such as Fastly's config-entry chunking are
+/// reassembled by `EdgeZero`'s config store, not here.
+///
+/// This is an async startup read: adapters drive it to completion at process
+/// boot (outside any request executor).
 ///
 /// # Errors
 ///
 /// Returns [`TrustedServerError::Configuration`] when the config blob is
 /// missing, cannot be read, fails envelope verification, or fails Trusted
 /// Server settings validation.
-pub fn get_settings_from_config_store(
+pub async fn get_settings_from_config_store(
     config_store: &ConfigStoreHandle,
     key: &str,
 ) -> Result<Settings, Report<TrustedServerError>> {
-    let envelope_json = read_config_entry(config_store, key)?;
+    let envelope_json = read_config_entry(config_store, key).await?;
     settings_from_config_blob(&envelope_json)
 }
 
-fn read_config_entry(
+async fn read_config_entry(
     config_store: &ConfigStoreHandle,
     key: &str,
 ) -> Result<String, Report<TrustedServerError>> {
-    match block_on(config_store.get(key)) {
+    match config_store.get(key).await {
         Ok(Some(value)) => Ok(value),
         Ok(None) => configuration_error(format!(
             "Trusted Server app config key `{key}` was not found in the config store"
@@ -108,8 +109,9 @@ mod tests {
         let blob = blob_envelope_json(&crate_test_settings_str());
         let handle = handle_with(&[(CONFIG_BLOB_KEY, &blob)]);
 
-        let settings = get_settings_from_config_store(&handle, CONFIG_BLOB_KEY)
-            .expect("should parse settings from the EdgeZero-read blob");
+        let settings =
+            futures::executor::block_on(get_settings_from_config_store(&handle, CONFIG_BLOB_KEY))
+                .expect("should parse settings from the EdgeZero-read blob");
 
         assert!(
             !settings.publisher.domain.is_empty(),
@@ -125,7 +127,8 @@ mod tests {
         let handle = handle_with(&[(CONFIG_BLOB_KEY, &envelope_json)]);
 
         let loaded =
-            get_settings_from_config_store(&handle, CONFIG_BLOB_KEY).expect("should load settings");
+            futures::executor::block_on(get_settings_from_config_store(&handle, CONFIG_BLOB_KEY))
+                .expect("should load settings");
 
         assert_eq!(
             loaded.publisher.domain, settings.publisher.domain,
@@ -137,8 +140,9 @@ mod tests {
     fn fails_when_blob_value_is_not_an_envelope() {
         let handle = handle_with(&[(CONFIG_BLOB_KEY, "not-an-envelope")]);
 
-        let err = get_settings_from_config_store(&handle, CONFIG_BLOB_KEY)
-            .expect_err("should reject a value that is not a blob envelope");
+        let err =
+            futures::executor::block_on(get_settings_from_config_store(&handle, CONFIG_BLOB_KEY))
+                .expect_err("should reject a value that is not a blob envelope");
 
         assert!(
             !err.to_string().is_empty(),
@@ -150,8 +154,9 @@ mod tests {
     fn fails_when_blob_key_is_missing() {
         let handle = handle_with(&[]);
 
-        let err = get_settings_from_config_store(&handle, CONFIG_BLOB_KEY)
-            .expect_err("should fail when blob is missing");
+        let err =
+            futures::executor::block_on(get_settings_from_config_store(&handle, CONFIG_BLOB_KEY))
+                .expect_err("should fail when blob is missing");
 
         assert!(
             err.to_string().contains(CONFIG_BLOB_KEY),

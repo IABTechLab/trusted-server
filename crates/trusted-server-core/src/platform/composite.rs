@@ -7,48 +7,16 @@
 //! [`PlatformConfigWriter`](super::PlatformConfigWriter) /
 //! [`PlatformSecretWriter`](super::PlatformSecretWriter).
 
-use std::future::Future;
 use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
 
+use async_trait::async_trait;
 use edgezero_core::store_registry::{ConfigRegistry, SecretRegistry};
 use error_stack::Report;
-use futures::executor::block_on;
 
 use super::{
     PlatformConfigStore, PlatformConfigWriter, PlatformError, PlatformSecretStore,
     PlatformSecretWriter, StoreId, StoreName,
 };
-
-/// Drives a store future to completion from a synchronous trait method.
-///
-/// The `EdgeZero` store traits are async while
-/// [`PlatformConfigStore`]/[`PlatformSecretStore`] are sync, so the future must
-/// be driven here. It is polled **once** first, because on Fastly the whole
-/// request already runs inside a `futures::executor::block_on` (the entry point
-/// drives `router().oneshot()` that way, as `EdgeZero`'s own Fastly dispatch
-/// does) and starting a second `futures` executor on that thread panics with
-/// `EnterError`. The Fastly config/secret stores are synchronous underneath
-/// their async signature, so the first poll is always `Ready` and no nested
-/// executor is created.
-///
-/// **Load-bearing assumption:** the Fastly config and secret stores are
-/// synchronous underneath their async signature (the Fastly SDK lookups are
-/// blocking calls inside an `async fn`), so on Fastly the first poll is always
-/// `Ready`. A store that *genuinely* yields still completes through
-/// [`block_on`] — which is correct on adapters whose runtime allows a nested
-/// `futures` executor, but would reintroduce the `EnterError` panic on Fastly.
-/// Any future Fastly store that really awaits must therefore be driven
-/// differently (or the sync trait surface pushed async).
-fn resolve_store_future<F: Future>(future: F) -> F::Output {
-    let mut future = Box::pin(future);
-    let waker = Waker::noop();
-    let mut context = Context::from_waker(waker);
-    match future.as_mut().poll(&mut context) {
-        Poll::Ready(output) => output,
-        Poll::Pending => block_on(future),
-    }
-}
 
 /// Config store whose reads resolve through an `EdgeZero` [`ConfigRegistry`] and
 /// whose writes delegate to a management-path [`PlatformConfigWriter`].
@@ -74,8 +42,13 @@ impl CompositeConfigStore {
     }
 }
 
+#[async_trait(?Send)]
 impl PlatformConfigStore for CompositeConfigStore {
-    fn get(&self, store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
+    async fn get(
+        &self,
+        store_name: &StoreName,
+        key: &str,
+    ) -> Result<String, Report<PlatformError>> {
         let registry = self
             .reader
             .as_ref()
@@ -83,7 +56,7 @@ impl PlatformConfigStore for CompositeConfigStore {
         let binding = registry
             .named(store_name.as_ref())
             .ok_or_else(|| Report::new(PlatformError::ConfigStore))?;
-        match resolve_store_future(binding.handle.get(key)) {
+        match binding.handle.get(key).await {
             Ok(Some(value)) => Ok(value),
             Ok(None) => Err(Report::new(PlatformError::ConfigStore)
                 .attach(format!("config key `{key}` not found"))),
@@ -125,8 +98,9 @@ impl CompositeSecretStore {
     }
 }
 
+#[async_trait(?Send)]
 impl PlatformSecretStore for CompositeSecretStore {
-    fn get_bytes(
+    async fn get_bytes(
         &self,
         store_name: &StoreName,
         key: &str,
@@ -138,7 +112,7 @@ impl PlatformSecretStore for CompositeSecretStore {
         let bound = registry
             .named(store_name.as_ref())
             .ok_or_else(|| Report::new(PlatformError::SecretStore))?;
-        match resolve_store_future(bound.get_bytes(key)) {
+        match bound.get_bytes(key).await {
             Ok(Some(bytes)) => Ok(bytes.to_vec()),
             Ok(None) => Err(Report::new(PlatformError::SecretStore)
                 .attach(format!("secret key `{key}` not found"))),
@@ -334,17 +308,16 @@ mod tests {
         let composite = CompositeConfigStore::new(Some(reader), writer.clone());
 
         // Act + Assert: the non-default store resolves.
-        let jwk = composite
-            .get(&StoreName::from("jwks_store"), "kid-1")
-            .expect("should read from the non-default jwks_store");
+        let jwk =
+            futures::executor::block_on(composite.get(&StoreName::from("jwks_store"), "kid-1"))
+                .expect("should read from the non-default jwks_store");
         assert_eq!(
             jwk, "{\"kty\":\"OKP\"}",
             "should resolve the non-default config store by logical id"
         );
 
         // Unknown store id is a strict error, not a fallback to default.
-        let err = composite
-            .get(&StoreName::from("nope"), "kid-1")
+        let err = futures::executor::block_on(composite.get(&StoreName::from("nope"), "kid-1"))
             .expect_err("should error on unknown store id");
         assert!(
             matches!(err.current_context(), PlatformError::ConfigStore),
@@ -389,9 +362,10 @@ mod tests {
         // A None reader is a hard error, never a silent fallback.
         let writer = Arc::new(RecordingConfigWriter::default());
         let composite = CompositeConfigStore::new(None, writer);
-        let err = composite
-            .get(&StoreName::from("trusted_server_config"), "current-kid")
-            .expect_err("should error when no registry is wired");
+        let err = futures::executor::block_on(
+            composite.get(&StoreName::from("trusted_server_config"), "current-kid"),
+        )
+        .expect_err("should error when no registry is wired");
         assert!(
             matches!(err.current_context(), PlatformError::ConfigStore),
             "absent config registry should map to a ConfigStore error"
@@ -416,17 +390,17 @@ mod tests {
         let composite = CompositeSecretStore::new(Some(reader), writer.clone());
 
         // The non-default store resolves.
-        let value = composite
-            .get_bytes(&StoreName::from("ts_secrets"), "server-side-key")
-            .expect("should read from the non-default ts_secrets store");
+        let value = futures::executor::block_on(
+            composite.get_bytes(&StoreName::from("ts_secrets"), "server-side-key"),
+        )
+        .expect("should read from the non-default ts_secrets store");
         assert_eq!(
             value, b"dd-secret",
             "should resolve the non-default secret store by logical id"
         );
 
         // Unknown store id is a strict error.
-        let err = composite
-            .get_bytes(&StoreName::from("nope"), "x")
+        let err = futures::executor::block_on(composite.get_bytes(&StoreName::from("nope"), "x"))
             .expect_err("should error on unknown secret store");
         assert!(
             matches!(err.current_context(), PlatformError::SecretStore),
@@ -466,9 +440,10 @@ mod tests {
         // A None reader is a hard error, never a silent fallback.
         let writer = Arc::new(RecordingSecretWriter::default());
         let composite = CompositeSecretStore::new(None, writer);
-        let err = composite
-            .get_bytes(&StoreName::from("trusted_server_secrets"), "API_KEY")
-            .expect_err("should error when no registry is wired");
+        let err = futures::executor::block_on(
+            composite.get_bytes(&StoreName::from("trusted_server_secrets"), "API_KEY"),
+        )
+        .expect_err("should error when no registry is wired");
         assert!(
             matches!(err.current_context(), PlatformError::SecretStore),
             "absent secret registry should map to a SecretStore error"

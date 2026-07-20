@@ -61,10 +61,13 @@ fn parse_active_kids(active_kids: &str) -> Vec<String> {
         .collect()
 }
 
-fn read_active_kids(services: &RuntimeServices) -> Result<Vec<String>, Report<TrustedServerError>> {
+async fn read_active_kids(
+    services: &RuntimeServices,
+) -> Result<Vec<String>, Report<TrustedServerError>> {
     services
         .config_store()
         .get(&JWKS_STORE_NAME, "active-kids")
+        .await
         .change_context(TrustedServerError::Configuration {
             message: "failed to read active-kids from config store".into(),
         })

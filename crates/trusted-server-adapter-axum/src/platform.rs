@@ -784,10 +784,12 @@ mod tests {
         let services = build_runtime_services(&ctx);
 
         // Act + Assert: the non-default config id resolves through the composite.
-        let jwk = services
-            .config_store()
-            .get(&StoreName::from("jwks_store"), "kid-1")
-            .expect("should resolve the non-default jwks_store through the composite");
+        let jwk = futures::executor::block_on(
+            services
+                .config_store()
+                .get(&StoreName::from("jwks_store"), "kid-1"),
+        )
+        .expect("should resolve the non-default jwks_store through the composite");
         assert_eq!(
             jwk, "{\"kty\":\"OKP\"}",
             "should read the seeded value from the non-default config store"
@@ -795,10 +797,12 @@ mod tests {
 
         // Unknown id is a strict error, never a silent fallback.
         assert!(
-            services
-                .config_store()
-                .get(&StoreName::from("no_such_store"), "kid-1")
-                .is_err(),
+            futures::executor::block_on(
+                services
+                    .config_store()
+                    .get(&StoreName::from("no_such_store"), "kid-1")
+            )
+            .is_err(),
             "unknown config id should error, not fall back to the default store"
         );
     }
@@ -818,23 +822,29 @@ mod tests {
         let ctx = test_context_with_registries(None, None, Some(secrets));
         let services = build_runtime_services(&ctx);
 
-        let dd = services
-            .secret_store()
-            .get_bytes(&StoreName::from("ts_secrets"), "server-side-key")
-            .expect("should resolve ts_secrets through the composite");
+        let dd = futures::executor::block_on(
+            services
+                .secret_store()
+                .get_bytes(&StoreName::from("ts_secrets"), "server-side-key"),
+        )
+        .expect("should resolve ts_secrets through the composite");
         assert_eq!(dd, b"dd-secret", "should read the seeded DataDome secret");
 
-        let s3 = services
-            .secret_store()
-            .get_bytes(&StoreName::from("s3_auth"), "aws-secret-access-key")
-            .expect("should resolve s3_auth through the composite");
+        let s3 = futures::executor::block_on(
+            services
+                .secret_store()
+                .get_bytes(&StoreName::from("s3_auth"), "aws-secret-access-key"),
+        )
+        .expect("should resolve s3_auth through the composite");
         assert_eq!(s3, b"s3-secret", "should read the seeded S3 secret");
 
         assert!(
-            services
-                .secret_store()
-                .get_bytes(&StoreName::from("no_such_store"), "x")
-                .is_err(),
+            futures::executor::block_on(
+                services
+                    .secret_store()
+                    .get_bytes(&StoreName::from("no_such_store"), "x")
+            )
+            .is_err(),
             "unknown secret id should error, not fall back to the default store"
         );
     }

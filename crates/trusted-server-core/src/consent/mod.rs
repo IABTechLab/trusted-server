@@ -118,7 +118,7 @@ pub struct ConsentPipelineInput<'a> {
 ///
 /// Decoding failures are logged and the corresponding decoded field is set to
 /// `None` — the raw string is still preserved for proxy-mode forwarding.
-pub fn build_consent_context(input: &ConsentPipelineInput<'_>) -> ConsentContext {
+pub async fn build_consent_context(input: &ConsentPipelineInput<'_>) -> ConsentContext {
     let signals = extract_consent_signals(input.jar, input.req);
     log_consent_signals(&signals);
 
@@ -130,7 +130,7 @@ pub fn build_consent_context(input: &ConsentPipelineInput<'_>) -> ConsentContext
     // to consent persisted in KV for this EC ID (when persistence is wired).
     if signals.is_empty() {
         if let (Some(ec_id), Some(store)) = (input.ec_id, input.kv_store.as_ref()) {
-            if let Some(mut ctx) = kv::load_consent_from_kv(store, ec_id) {
+            if let Some(mut ctx) = kv::load_consent_from_kv(store, ec_id).await {
                 // Jurisdiction is request-local: derive it from the current
                 // geo rather than the value stored with the persisted entry.
                 ctx.jurisdiction = jurisdiction::detect_jurisdiction(input.geo, input.config);
@@ -177,7 +177,7 @@ pub fn build_consent_context(input: &ConsentPipelineInput<'_>) -> ConsentContext
     // persistence is wired). The helper skips empty contexts and unchanged
     // fingerprints internally.
     if let (Some(ec_id), Some(store)) = (input.ec_id, input.kv_store.as_ref()) {
-        kv::save_consent_to_kv(store, ec_id, &ctx, input.config.max_consent_age_days);
+        kv::save_consent_to_kv(store, ec_id, &ctx, input.config.max_consent_age_days).await;
     }
 
     log_consent_context(&ctx);
@@ -939,14 +939,14 @@ mod tests {
         let req = build_request();
         let config = ConsentConfig::default();
 
-        let ctx = build_consent_context(&ConsentPipelineInput {
+        let ctx = futures::executor::block_on(build_consent_context(&ConsentPipelineInput {
             jar: None,
             req: &req,
             config: &config,
             geo: None,
             ec_id: None,
             kv_store: None,
-        });
+        }));
 
         assert_eq!(
             ctx.jurisdiction,
@@ -968,14 +968,14 @@ mod tests {
             ..ConsentConfig::default()
         };
 
-        let ctx = build_consent_context(&ConsentPipelineInput {
+        let ctx = futures::executor::block_on(build_consent_context(&ConsentPipelineInput {
             jar: Some(&jar),
             req: &req,
             config: &config,
             geo: None,
             ec_id: None,
             kv_store: None,
-        });
+        }));
 
         assert!(
             ctx.gdpr_applies,
@@ -998,14 +998,14 @@ mod tests {
             ..ConsentConfig::default()
         };
 
-        let ctx = build_consent_context(&ConsentPipelineInput {
+        let ctx = futures::executor::block_on(build_consent_context(&ConsentPipelineInput {
             jar: Some(&jar),
             req: &req,
             config: &config,
             geo: None,
             ec_id: None,
             kv_store: None,
-        });
+        }));
 
         assert!(
             ctx.gdpr_applies,
@@ -1596,22 +1596,25 @@ mod tests {
         let config = ConsentConfig::default();
         let store = kv_handle();
 
-        let ctx = build_consent_context(&ConsentPipelineInput {
+        let ctx = futures::executor::block_on(build_consent_context(&ConsentPipelineInput {
             jar: Some(&jar),
             req: &req,
             config: &config,
             geo: None,
             ec_id: Some("test-ec-id"),
             kv_store: Some(store.clone()),
-        });
+        }));
 
         assert_eq!(
             ctx.raw_us_privacy.as_deref(),
             Some("1YNN"),
             "should build cookie-sourced consent"
         );
-        let persisted = crate::consent::kv::load_consent_from_kv(&store, "test-ec-id")
-            .expect("should persist cookie-sourced consent to KV");
+        let persisted = futures::executor::block_on(crate::consent::kv::load_consent_from_kv(
+            &store,
+            "test-ec-id",
+        ))
+        .expect("should persist cookie-sourced consent to KV");
         assert_eq!(
             persisted.raw_us_privacy.as_deref(),
             Some("1YNN"),
@@ -1627,25 +1630,25 @@ mod tests {
         // First request carries a consent cookie — persisted to KV.
         let jar = parse_cookies_to_jar("us_privacy=1YNN");
         let req = build_request();
-        build_consent_context(&ConsentPipelineInput {
+        futures::executor::block_on(build_consent_context(&ConsentPipelineInput {
             jar: Some(&jar),
             req: &req,
             config: &config,
             geo: None,
             ec_id: Some("test-ec-id"),
             kv_store: Some(store.clone()),
-        });
+        }));
 
         // Second request has no consent signals — must fall back to KV.
         let bare_req = build_request();
-        let ctx = build_consent_context(&ConsentPipelineInput {
+        let ctx = futures::executor::block_on(build_consent_context(&ConsentPipelineInput {
             jar: None,
             req: &bare_req,
             config: &config,
             geo: None,
             ec_id: Some("test-ec-id"),
             kv_store: Some(store.clone()),
-        });
+        }));
 
         assert_eq!(
             ctx.raw_us_privacy.as_deref(),
@@ -1662,17 +1665,21 @@ mod tests {
         let store = kv_handle();
 
         // ec_id is absent, so the pipeline must not touch the KV store.
-        build_consent_context(&ConsentPipelineInput {
+        futures::executor::block_on(build_consent_context(&ConsentPipelineInput {
             jar: Some(&jar),
             req: &req,
             config: &config,
             geo: None,
             ec_id: None,
             kv_store: Some(store.clone()),
-        });
+        }));
 
         assert!(
-            crate::consent::kv::load_consent_from_kv(&store, "test-ec-id").is_none(),
+            futures::executor::block_on(crate::consent::kv::load_consent_from_kv(
+                &store,
+                "test-ec-id"
+            ))
+            .is_none(),
             "should not persist consent without an EC ID"
         );
     }

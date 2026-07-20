@@ -2003,7 +2003,7 @@ impl AuctionProvider for PrebidAuctionProvider {
         let signer_with_signature =
             if let Some(request_signing_config) = &context.settings.request_signing {
                 if request_signing_config.enabled {
-                    let signer = RequestSigner::from_services(context.services)?;
+                    let signer = RequestSigner::from_services(context.services).await?;
                     let params = SigningParams::new(
                         request.id.clone(),
                         request_info.host.clone(),

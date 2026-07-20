@@ -64,7 +64,13 @@ pub struct AppState {
 /// registry fail to initialise.
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let config_store = open_config_store()?;
-    let settings = get_settings_from_config_store(&config_store, CONFIG_BLOB_KEY)?;
+    // Startup-only read: `routes()` runs during dev-server setup, outside any
+    // request handler, so driving the async boot read with a top-level
+    // `block_on` here never nests inside a request executor.
+    let settings = futures::executor::block_on(get_settings_from_config_store(
+        &config_store,
+        CONFIG_BLOB_KEY,
+    ))?;
     build_state_with_settings(settings)
 }
 
@@ -180,7 +186,11 @@ where
 /// jurisdiction stays Unknown there unless the request carries TCF consent). A
 /// malformed consent string is logged and falls back to the default
 /// (fail-closed) context rather than being silently swallowed.
-fn build_ec_context(state: &AppState, services: &RuntimeServices, req: &Request) -> EcContext {
+async fn build_ec_context(
+    state: &AppState,
+    services: &RuntimeServices,
+    req: &Request,
+) -> EcContext {
     let geo_info = services
         .geo()
         .lookup(services.client_info().client_ip)
@@ -189,6 +199,7 @@ fn build_ec_context(state: &AppState, services: &RuntimeServices, req: &Request)
             None
         });
     EcContext::read_from_request_with_geo(&state.settings, req, services, geo_info.as_ref())
+        .await
         .unwrap_or_else(|e| {
             log::warn!("EC context read failed: {e:?}");
             EcContext::default()
@@ -234,7 +245,7 @@ async fn dispatch_fallback(
 
     // Run the server-side auction with the configured creative-opportunity
     // slots; `handle_publisher_request` matches them against the request path.
-    let mut ec_context = build_ec_context(state, services, &req);
+    let mut ec_context = build_ec_context(state, services, &req).await;
     let auction = AuctionDispatch {
         orchestrator: &state.orchestrator,
         slots: state.settings.creative_opportunity_slots(),
@@ -399,10 +410,10 @@ fn named_route_handler(
             move |state, services, req| async move {
                 match handler {
                     NamedRouteHandler::TrustedServerDiscovery => {
-                        handle_trusted_server_discovery(&state.settings, &services, req)
+                        handle_trusted_server_discovery(&state.settings, &services, req).await
                     }
                     NamedRouteHandler::VerifySignature => {
-                        handle_verify_signature(&state.settings, &services, req)
+                        handle_verify_signature(&state.settings, &services, req).await
                     }
                     NamedRouteHandler::AdminNotSupported => {
                         // Config/secret-store writes are backed by read-only env vars on the
@@ -425,7 +436,7 @@ fn named_route_handler(
                         // Build the geo-aware EC context so the auction consent
                         // gate sees the caller's jurisdiction — `EcContext::default()`
                         // fails it closed for consented users.
-                        let ec_context = build_ec_context(&state, &services, &req);
+                        let ec_context = build_ec_context(&state, &services, &req).await;
                         handle_auction(
                             &state.settings,
                             &state.orchestrator,
@@ -444,7 +455,7 @@ fn named_route_handler(
                         if req.method() == Method::OPTIONS {
                             Ok(page_bids_preflight_denied())
                         } else {
-                            let ec_context = build_ec_context(&state, &services, &req);
+                            let ec_context = build_ec_context(&state, &services, &req).await;
                             let auction = AuctionDispatch {
                                 orchestrator: &state.orchestrator,
                                 slots: state.settings.creative_opportunity_slots(),

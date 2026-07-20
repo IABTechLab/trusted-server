@@ -812,7 +812,7 @@ fn s3_credentials_cache_key(config: &S3SigV4AuthConfig) -> S3CredentialsCacheKey
     }
 }
 
-fn load_s3_credentials(
+async fn load_s3_credentials(
     services: &RuntimeServices,
     config: &S3SigV4AuthConfig,
 ) -> Result<Arc<S3Credentials>, Report<TrustedServerError>> {
@@ -830,27 +830,29 @@ fn load_s3_credentials(
     let access_key_id = services
         .secret_store()
         .get_string(&store_name, &config.access_key_id)
+        .await
         .change_context(TrustedServerError::Proxy {
             message: "failed to read S3 access key ID from secret store".to_string(),
         })?;
     let secret_access_key = services
         .secret_store()
         .get_string(&store_name, &config.secret_access_key)
+        .await
         .change_context(TrustedServerError::Proxy {
             message: "failed to read S3 secret access key from secret store".to_string(),
         })?;
-    let session_token = config
-        .session_token
-        .as_deref()
-        .map(|key| {
+    let session_token = match config.session_token.as_deref() {
+        Some(key) => Some(
             services
                 .secret_store()
                 .get_string(&store_name, key)
+                .await
                 .change_context(TrustedServerError::Proxy {
                     message: "failed to read S3 session token from secret store".to_string(),
-                })
-        })
-        .transpose()?;
+                })?,
+        ),
+        None => None,
+    };
     let credentials = Arc::new(S3Credentials {
         access_key_id,
         secret_access_key: Redacted::new(secret_access_key),
@@ -871,7 +873,7 @@ fn clear_s3_credentials_cache_for_tests() {
         .clear();
 }
 
-fn apply_asset_origin_auth(
+async fn apply_asset_origin_auth(
     services: &RuntimeServices,
     method: &Method,
     target_url: &url::Url,
@@ -880,7 +882,7 @@ fn apply_asset_origin_auth(
 ) -> Result<(), Report<TrustedServerError>> {
     match auth {
         AssetOriginAuth::S3SigV4(config) => {
-            let credentials = load_s3_credentials(services, config)?;
+            let credentials = load_s3_credentials(services, config).await?;
             s3_sigv4::sign_headers(
                 method,
                 target_url,
@@ -1001,7 +1003,7 @@ async fn preflight_s3_origin_for_image_optimizer(
     // HEAD preflight lets missing or unauthorized objects return raw S3 errors
     // without invoking IO on the failure path.
     let mut head_headers = unsigned_headers.clone();
-    apply_asset_origin_auth(services, &Method::HEAD, target_url, &mut head_headers, auth)?;
+    apply_asset_origin_auth(services, &Method::HEAD, target_url, &mut head_headers, auth).await?;
     let head_response = send_asset_origin_request(
         services,
         backend_name,
@@ -1024,7 +1026,7 @@ async fn preflight_s3_origin_for_image_optimizer(
     }
 
     let mut get_headers = unsigned_headers.clone();
-    apply_asset_origin_auth(services, &Method::GET, target_url, &mut get_headers, auth)?;
+    apply_asset_origin_auth(services, &Method::GET, target_url, &mut get_headers, auth).await?;
     let mut response = send_asset_origin_request(
         services,
         backend_name,
@@ -1134,7 +1136,8 @@ pub async fn handle_asset_proxy_request(
             &target_url,
             &mut outbound_headers,
             auth,
-        )?;
+        )
+        .await?;
     }
 
     let mut platform_req =
@@ -2292,8 +2295,9 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformSecretStore for CountingSecretStore {
-        fn get_bytes(
+        async fn get_bytes(
             &self,
             _store_name: &StoreName,
             key: &str,

@@ -330,7 +330,11 @@ fn health_response() -> Response {
 /// the request carries TCF consent. A malformed consent string is logged and
 /// falls back to the default (fail-closed) context rather than being silently
 /// swallowed.
-fn build_ec_context(settings: &Settings, services: &RuntimeServices, req: &Request) -> EcContext {
+async fn build_ec_context(
+    settings: &Settings,
+    services: &RuntimeServices,
+    req: &Request,
+) -> EcContext {
     let geo_info = services
         .geo()
         .lookup(services.client_info().client_ip)
@@ -339,6 +343,7 @@ fn build_ec_context(settings: &Settings, services: &RuntimeServices, req: &Reque
             None
         });
     EcContext::read_from_request_with_geo(settings, req, services, geo_info.as_ref())
+        .await
         .unwrap_or_else(|e| {
             log::warn!("EC context read failed: {e:?}");
             EcContext::default()
@@ -495,6 +500,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 let services = build_runtime_services(&ctx);
                 let req = ctx.into_request();
                 Ok(handle_trusted_server_discovery(&s.settings, &services, req)
+                    .await
                     .unwrap_or_else(|e| http_error(&e)))
             }
         };
@@ -507,6 +513,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 let services = build_runtime_services(&ctx);
                 let req = ctx.into_request();
                 Ok(handle_verify_signature(&s.settings, &services, req)
+                    .await
                     .unwrap_or_else(|e| http_error(&e)))
             }
         };
@@ -530,7 +537,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 // Build the geo-aware EC context so the auction consent gate sees
                 // the caller's jurisdiction — `EcContext::default()` fails it
                 // closed for consented users.
-                let ec_context = build_ec_context(&s.settings, &services, &req);
+                let ec_context = build_ec_context(&s.settings, &services, &req).await;
                 Ok(handle_auction(
                     &s.settings,
                     &s.orchestrator,
@@ -552,7 +559,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             async move {
                 let services = build_runtime_services(&ctx);
                 let req = ctx.into_request();
-                let ec_context = build_ec_context(&s.settings, &services, &req);
+                let ec_context = build_ec_context(&s.settings, &services, &req).await;
                 let auction = AuctionDispatch {
                     orchestrator: &s.orchestrator,
                     slots: s.settings.creative_opportunity_slots(),
@@ -662,7 +669,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                         }))
                     })
             } else {
-                let mut ec_context = build_ec_context(&state.settings, &services, &req);
+                let mut ec_context = build_ec_context(&state.settings, &services, &req).await;
                 let auction = AuctionDispatch {
                     orchestrator: &state.orchestrator,
                     slots: state.settings.creative_opportunity_slots(),

@@ -36,7 +36,7 @@ impl DataDomeIntegration {
         &self,
         input: RequestFilterInput<'_>,
     ) -> RequestFilterDecision {
-        if !self.config.enable_protection || !self.is_request_protected(&input) {
+        if !self.config.enable_protection || !self.is_request_protected(&input).await {
             return RequestFilterDecision::Continue(RequestFilterEffects::default());
         }
 
@@ -63,6 +63,7 @@ impl DataDomeIntegration {
             .map_err(ProtectionRequestError::Setup)?;
         let server_side_key = self
             .load_server_side_key(input.services)
+            .await
             .map_err(ProtectionRequestError::Setup)?;
         let payload = self.build_protection_payload(&input, &server_side_key);
         let encoded_body = form_encode(&payload.fields);
@@ -101,7 +102,7 @@ impl DataDomeIntegration {
         Ok(self.classify_protection_response(platform_response.response, input.request.method()))
     }
 
-    fn is_request_protected(&self, input: &RequestFilterInput<'_>) -> bool {
+    async fn is_request_protected(&self, input: &RequestFilterInput<'_>) -> bool {
         let req = input.request;
         if req.method() == Method::OPTIONS {
             return false;
@@ -123,7 +124,7 @@ impl DataDomeIntegration {
             client_ip: input.services.client_info().client_ip,
             asn: input.geo_info.and_then(|geo| geo.asn),
         };
-        match self.protection_scope.evaluate(&facts, input.services) {
+        match self.protection_scope.evaluate(&facts, input.services).await {
             ProtectionScopeDecision::Protect => {}
             ProtectionScopeDecision::Skip { rule_id, reason } => {
                 log::debug!("[datadome] Skipping Protection API for rule {rule_id} ({reason})");
@@ -167,7 +168,7 @@ impl DataDomeIntegration {
         ))
     }
 
-    fn load_server_side_key(
+    async fn load_server_side_key(
         &self,
         services: &RuntimeServices,
     ) -> Result<Redacted<String>, Report<TrustedServerError>> {
@@ -175,6 +176,7 @@ impl DataDomeIntegration {
         let key = services
             .secret_store()
             .get_string(&store_name, &self.config.server_side_key_secret_name)
+            .await
             .change_context(Self::error(
                 "Failed to read DataDome server-side key from secret store",
             ))?;
@@ -676,8 +678,7 @@ mod tests {
         );
         let integration = protection_integration();
 
-        let key = integration
-            .load_server_side_key(&services)
+        let key = futures::executor::block_on(integration.load_server_side_key(&services))
             .expect("should load server-side key");
 
         assert_eq!(key.expose(), "secret-from-store");
@@ -694,7 +695,7 @@ mod tests {
         };
         let integration = DataDomeIntegration::try_new(config).expect("should create integration");
 
-        let result = integration.load_server_side_key(&services);
+        let result = futures::executor::block_on(integration.load_server_side_key(&services));
 
         assert!(result.is_err(), "should error when secret is missing");
     }
