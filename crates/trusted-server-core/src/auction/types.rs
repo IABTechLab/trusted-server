@@ -249,7 +249,11 @@ pub struct Bid {
     pub nurl: Option<String>,
     /// Billing notification URL
     pub burl: Option<String>,
-    /// `OpenRTB` bid identifier.
+    /// `OpenRTB` bid identifier (`seatbid.bid.id`).
+    ///
+    /// Unique per bid instance, not a creative identifier — always present per
+    /// spec. Used as the last-resort `hb_adid` fallback in `build_bid_map` for
+    /// bidders that return neither a Prebid Cache UUID nor `adid`.
     pub bid_id: Option<String>,
     /// Ad ID from the bidder.
     pub ad_id: Option<String>,
