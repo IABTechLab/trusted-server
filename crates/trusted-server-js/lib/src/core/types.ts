@@ -114,8 +114,17 @@ export type RenderServedFrom = 'inline' | 'gam' | 'debug-adm' | 'pbs-cache' | 'p
 export interface RenderRecord {
   /** Slot the creative was rendered for. */
   slotId: string;
-  /** Which render path produced this record. */
-  path: 'auction' | 'ssat';
+  /**
+   * Which render path produced this record.
+   *
+   * `ssat` is claimed only for the render that consumes the server-side
+   * targeting TS just applied — the server-side auction runs once per
+   * navigation, so a later GAM refresh of the same slot is NOT an SSAT render
+   * even though `window.tsjs.bids` still holds that auction's data.
+   * `gam-refresh` is that later render: GAM re-requested the slot and TS cannot
+   * attribute the returned creative to any TS auction.
+   */
+  path: 'auction' | 'ssat' | 'gam-refresh';
   /** Whether a creative actually rendered (false for empty/rejected). */
   rendered: boolean;
   /** Actual DOM element ID the slot resolved to (div_id may be a prefix). */
@@ -210,6 +219,14 @@ export interface TsjsApi {
   servicesEnabled?: boolean;
   /** Maps actualDivId → slotId for slotRenderEnded billing lookup. */
   divToSlotId?: Record<string, string>;
+  /**
+   * Per-slot flag: TS applied server-side bid targeting and no GAM render has
+   * consumed it yet. Set by `adInit()`, cleared by the first `slotRenderEnded`
+   * for that slot, so only that render is attributed to the SSAT auction (see
+   * [`RenderRecord.path`]). Publisher-driven refreshes afterwards find it false
+   * and are recorded as `gam-refresh` without the stale auction tuple.
+   */
+  ssatTargetingFresh?: Record<string, boolean>;
   /**
    * Win/billing beacons already fired, keyed by `slotId|bidIdentity|kind|url`.
    * Used by the GPT render bridge so a bid's nurl/burl fire at most once even

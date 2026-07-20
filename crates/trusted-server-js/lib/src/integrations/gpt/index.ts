@@ -663,6 +663,13 @@ export function installTsAdInit(): void {
           if (bid[key]) gptSlot.setTargeting(key, String(bid[key]!));
         });
         gptSlot.setTargeting(TS_INITIAL_TARGETING_KEY, '1');
+        // Arm SSAT attribution for the next render of this slot only. Without
+        // this, every later publisher refresh would still read the page-load
+        // bid out of ts.bids and claim the (long finished) server-side auction
+        // rendered it.
+        (ts.ssatTargetingFresh ??= {})[slot.id] = TS_BID_TARGETING_KEYS.some((key) =>
+          Boolean(bid[key])
+        );
         // Map both inner div and container div → slot ID so slotRenderEnded
         // (which reports the GPT slot's div, i.e. slotDivId/container) can look up
         // the slot, while adm injection (which targets the inner div) also works.
@@ -729,20 +736,32 @@ export function installTsAdInit(): void {
           // on screen" state so the panel does not overclaim (a non-empty GAM
           // slot is not proof the TS creative rendered).
           const slotEl = document.getElementById(divId);
+          // The server-side auction runs once per navigation. Only the render
+          // that consumes the targeting adInit just applied may be attributed
+          // to it; a later publisher refresh re-requests GAM on its own and the
+          // creative it returns has no traceable link to any TS auction, so the
+          // stale bid tuple is dropped rather than re-stamped.
+          const fresh = (ts.ssatTargetingFresh ??= {})[slotId] === true;
+          ts.ssatTargetingFresh[slotId] = false;
+          const attributed = fresh
+            ? {
+                path: 'ssat' as const,
+                auctionId: bid.hb_auction_id,
+                bidder: bid.hb_bidder,
+                adId: bid.hb_adid,
+                creativeId: bid.hb_crid,
+                admHash: bid.hb_adm_hash,
+              }
+            : { path: 'gam-refresh' as const };
           const record = recordRender({
             slotId,
-            path: 'ssat',
             rendered: !event.isEmpty,
             gamEmpty: event.isEmpty,
             injected,
             visible: isEffectivelyVisible(slotEl),
             elementId: divId,
-            auctionId: bid.hb_auction_id,
-            bidder: bid.hb_bidder,
-            adId: bid.hb_adid,
-            creativeId: bid.hb_crid,
-            admHash: bid.hb_adm_hash,
             servedFrom: 'gam',
+            ...attributed,
           });
           if (slotEl) stampCreativeTrace(slotEl, record);
         });
