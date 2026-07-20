@@ -148,11 +148,11 @@ function attachTraceBadge(el: HTMLElement, record: RenderRecord): void {
   badge.title = [
     `render: #${record.seq}`,
     `slot: ${record.slotId}`,
-    `auction: ${record.auctionId ?? '?'}`,
-    `bidder: ${record.bidder ?? '?'}`,
-    `creative: ${record.creativeId ?? '?'}`,
-    `adm_hash: ${record.admHash ?? '?'}`,
-    `served: ${record.servedFrom ?? '?'}`,
+    `auction: ${record.auctionId ?? '—'}`,
+    `bidder: ${record.bidder ?? '—'}`,
+    `creative: ${record.creativeId ?? '—'}`,
+    `adm_hash: ${record.admHash ?? '—'}`,
+    `served: ${record.servedFrom ?? '—'}`,
   ].join('\n');
   const s = badge.style;
   s.setProperty('position', 'absolute');
@@ -276,13 +276,13 @@ function buildPanelRow(record: RenderRecord): HTMLElement {
     `gam_empty: ${record.gamEmpty ?? '—'}`,
     `injected (ts placed): ${record.injected ?? '—'}`,
     `visible: ${record.visible ?? '—'}`,
-    `auction: ${record.auctionId ?? '?'}`,
-    `bidder: ${record.bidder ?? '?'}`,
-    `creative: ${record.creativeId ?? '?'}`,
-    `ad_id: ${record.adId ?? '?'}`,
-    `adm_hash: ${record.admHash ?? '?'}`,
-    `served: ${record.servedFrom ?? '?'}`,
-    `element: ${record.elementId ?? '?'}`,
+    `auction: ${record.auctionId ?? '—'}`,
+    `bidder: ${record.bidder ?? '—'}`,
+    `creative: ${record.creativeId ?? '—'}`,
+    `ad_id: ${record.adId ?? '—'}`,
+    `adm_hash: ${record.admHash ?? '—'}`,
+    `served: ${record.servedFrom ?? '—'}`,
+    `element: ${record.elementId ?? '—'}`,
     `renders: ${record.count}`,
   ].join('\n');
 
