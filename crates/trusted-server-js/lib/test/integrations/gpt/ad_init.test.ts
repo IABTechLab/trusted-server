@@ -1290,6 +1290,82 @@ describe('installTsRenderBridge', () => {
     beaconSpy.mockRestore();
   });
 
+  it('does not let one slot block a PBS Cache render for another slot sharing an adId', async () => {
+    // The in-flight guard must be scoped to the requesting slot, not the shared
+    // adId: two distinct slots sharing one hb_adid must each fetch and render.
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    // Deferred fetch that stays pending, so both messages are in flight when we
+    // assert the launched-fetch count.
+    fetchStub.mockReturnValue(new Promise<Response>(() => {}));
+    (window as TestWindow).tsjs = {
+      bids: {
+        slot_a: {
+          hb_adid: 'shared-uuid',
+          hb_bidder: 'ix',
+          hb_pb: '1.00',
+          hb_cache_host: 'cache.example.com',
+          hb_cache_path: '/cache',
+        },
+        slot_b: {
+          hb_adid: 'shared-uuid',
+          hb_bidder: 'ix',
+          hb_pb: '1.00',
+          hb_cache_host: 'cache.example.com',
+          hb_cache_path: '/cache',
+        },
+      },
+      adSlots: [
+        {
+          id: 'slot_a',
+          formats: [[728, 90]] as [number, number][],
+          gam_unit_path: '/a',
+          div_id: 'div-a',
+          targeting: {},
+        },
+        {
+          id: 'slot_b',
+          formats: [[300, 250]] as [number, number][],
+          gam_unit_path: '/a',
+          div_id: 'div-b',
+          targeting: {},
+        },
+      ],
+    };
+
+    const bridgeListener = await captureBridgeListener();
+
+    const mkIframe = (divId: string): Window => {
+      const slot = document.createElement('div');
+      slot.id = divId;
+      const iframe = document.createElement('iframe');
+      slot.appendChild(iframe);
+      document.body.appendChild(slot);
+      return iframe.contentWindow!;
+    };
+    const sourceA = mkIframe('div-a');
+    const sourceB = mkIframe('div-b');
+
+    try {
+      for (const source of [sourceA, sourceB]) {
+        bridgeListener(
+          Object.assign(new Event('message'), {
+            data: JSON.stringify({ message: 'Prebid Request', adId: 'shared-uuid' }),
+            ports: [{ postMessage: () => {} }],
+            source,
+            stopImmediatePropagation: vi.fn(),
+          }) as unknown as MessageEvent
+        );
+      }
+
+      // Each slot launches its own fetch — the shared adId does not cross-block.
+      expect(fetchStub).toHaveBeenCalledTimes(2);
+    } finally {
+      document.getElementById('div-a')?.remove();
+      document.getElementById('div-b')?.remove();
+      beaconSpy.mockRestore();
+    }
+  });
+
   it('serves inline adm without fetching PBS Cache even when cache coords are present', async () => {
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
     const inlineAdm = '<div>Inline Creative</div>';
