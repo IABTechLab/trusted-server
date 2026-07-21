@@ -902,7 +902,10 @@ fn redact_response_for_dump(
             .metadata
             .iter()
             .filter(|(key, _)| {
-                options.metadata_keys.iter().any(|configured| configured == *key)
+                options
+                    .metadata_keys
+                    .iter()
+                    .any(|configured| configured == *key)
                     && AUCTION_DEBUG_METADATA_ALLOWLIST.contains(&key.as_str())
             })
             .map(|(key, value)| (key.clone(), value.clone()))
@@ -2927,7 +2930,10 @@ mod tests {
             verbosity: AuctionDebugCommentVerbosity::Full,
             ..AuctionDebugCommentOptions::default()
         };
-        for creative in ["<div>evil-->break</div>", "--!><img src=x onerror=alert(1)>"] {
+        for creative in [
+            "<div>evil-->break</div>",
+            "--!><img src=x onerror=alert(1)>",
+        ] {
             let comment = dump_comment_for_creative_with_options(creative, &options);
             assert_eq!(comment.matches("-->").count(), 1);
             assert!(!comment.contains("--!>"));

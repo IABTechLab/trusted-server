@@ -1931,7 +1931,7 @@ pub struct DebugConfig {
 /// Metadata keys safe to surface in the `ts-debug` auction comment.
 ///
 /// Fail-closed superset: any key not listed here — notably `debug`, which
-/// carries the resolved OpenRTB request (EC ID, `user.ext.eids`, the TC
+/// carries the resolved `OpenRTB` request (EC ID, `user.ext.eids`, the TC
 /// consent string, `device.ip`, `device.geo`) plus per-bidder `httpcalls` —
 /// is dropped in [`AuctionDebugCommentVerbosity::Redacted`] mode regardless
 /// of what an operator lists in [`AuctionDebugCommentOptions::metadata_keys`].
@@ -1956,7 +1956,7 @@ fn default_true() -> bool {
 fn default_auction_debug_metadata_keys() -> Vec<String> {
     AUCTION_DEBUG_METADATA_ALLOWLIST
         .iter()
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .collect()
 }
 
@@ -2730,7 +2730,7 @@ mod tests {
             opts.metadata_keys,
             AUCTION_DEBUG_METADATA_ALLOWLIST
                 .iter()
-                .map(|s| s.to_string())
+                .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>(),
             "should default metadata_keys to the full allowlist"
         );
@@ -2744,7 +2744,11 @@ mod tests {
     #[test]
     fn auction_debug_comment_options_normalize_trims_and_drops_empty_keys() {
         let mut opts = AuctionDebugCommentOptions {
-            metadata_keys: vec![" status ".to_string(), "".to_string(), "warnings".to_string()],
+            metadata_keys: vec![
+                " status ".to_string(),
+                "".to_string(),
+                "warnings".to_string(),
+            ],
             ..AuctionDebugCommentOptions::default()
         };
         opts.normalize();
