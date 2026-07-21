@@ -55,6 +55,10 @@ export interface AuctionBidData {
   hb_adid?: string;
   hb_cache_host?: string;
   hb_cache_path?: string;
+  /** Winning creative width; the bridge sizes the inline render from this. */
+  w?: number;
+  /** Winning creative height; the bridge sizes the inline render from this. */
+  h?: number;
   nurl?: string;
   burl?: string;
   /**

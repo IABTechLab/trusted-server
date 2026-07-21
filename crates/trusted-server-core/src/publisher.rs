@@ -2100,6 +2100,11 @@ pub(crate) fn build_bid_map(
                     "hb_bidder".to_string(),
                     serde_json::Value::String(bid.bidder.clone()),
                 );
+                // Winning creative dimensions — the bridge sizes the inline
+                // render from these, falling back to the first configured slot
+                // format only when absent, which mis-sizes a multi-size slot.
+                obj.insert("w".to_string(), serde_json::Value::from(bid.width));
+                obj.insert("h".to_string(), serde_json::Value::from(bid.height));
                 // hb_adid: use PBS Cache UUID when present — the Prebid Universal Creative uses
                 // this as the cache lookup key, NOT the OpenRTB bid ID (bid.ad_id). Fall back to
                 // bid.ad_id for APS and other non-PBS providers.
@@ -4424,6 +4429,46 @@ mod tests {
                 obj.get("burl").and_then(|v| v.as_str()),
                 Some("https://ssp/bill"),
                 "should include burl"
+            );
+        }
+
+        #[test]
+        fn bid_map_includes_winning_creative_dimensions() {
+            // The bridge sizes the inline render from these dimensions; without
+            // them it falls back to the first configured slot format, which
+            // mis-sizes a multi-size slot whose winner is not the first format.
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "kargo",
+                "abc123",
+                "https://ssp/win",
+                "https://ssp/bill",
+            );
+            bid.width = 300;
+            bid.height = 600;
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                false,
+            );
+            let obj = map
+                .get("atf_sidebar_ad")
+                .expect("should have bid entry")
+                .as_object()
+                .expect("should be object");
+            assert_eq!(
+                obj.get("w").and_then(serde_json::Value::as_u64),
+                Some(300),
+                "should include winning creative width"
+            );
+            assert_eq!(
+                obj.get("h").and_then(serde_json::Value::as_u64),
+                Some(600),
+                "should include winning creative height"
             );
         }
 

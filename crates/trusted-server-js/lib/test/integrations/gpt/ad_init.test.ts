@@ -1261,6 +1261,63 @@ describe('installTsRenderBridge', () => {
     beaconSpy.mockRestore();
   });
 
+  it('sizes the inline response from the winning bid, not the first slot format', async () => {
+    // Multi-size slot whose winner is the SECOND configured format. Sizing from
+    // slot.formats[0] would render the 300x250 winner in a 728x90 box.
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    const winnerAdm = '<div>Winner 300x250</div>';
+    (window as TestWindow).tsjs = {
+      bids: {
+        homepage_header: {
+          hb_adid: 'winner-adid',
+          hb_bidder: 'ix',
+          hb_pb: '2.00',
+          w: 300,
+          h: 250,
+          adm: winnerAdm,
+        },
+      },
+      adSlots: [
+        {
+          id: 'homepage_header',
+          formats: [
+            [728, 90],
+            [300, 250],
+          ] as [number, number][],
+          gam_unit_path: '/a/b/c',
+          div_id: 'div-header',
+          targeting: {},
+        },
+      ],
+    };
+
+    const bridgeListener = await captureBridgeListener();
+    const stopSpy = vi.fn();
+    const portMessages: string[] = [];
+    const fakePort = { postMessage: (s: string) => portMessages.push(s) };
+    const source = createTrustedSlotIframe();
+
+    try {
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: 'winner-adid' }),
+          ports: [fakePort],
+          source,
+          stopImmediatePropagation: stopSpy,
+        }) as unknown as MessageEvent
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+      expect(portMessages).toHaveLength(1);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const parsed = JSON.parse(portMessages[0]) as Record<string, any>;
+      expect(parsed.width).toBe(300);
+      expect(parsed.height).toBe(250);
+    } finally {
+      beaconSpy.mockRestore();
+    }
+  });
+
   it('resolves the requesting slot bid when two slots share one hb_adid', async () => {
     // Duplicate hb_adid across slots: PBS Cache is absent, so hb_adid falls back
     // to a creative id that a bidder reuses across slots. The bridge must resolve

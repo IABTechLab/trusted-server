@@ -919,7 +919,12 @@ export function installTsRenderBridge(): void {
     if (!matchedBid || matchedBid.hb_adid !== adId) return;
 
     const slot = window.tsjs?.adSlots?.find((s) => s.id === slotId);
-    const [width, height] = slot?.formats?.[0] ?? [728, 90];
+    // Prefer the winning creative's own dimensions; the first configured slot
+    // format is only a fallback and mis-sizes a multi-size slot whose winner is
+    // not the first format.
+    const [fallbackWidth, fallbackHeight] = slot?.formats?.[0] ?? [728, 90];
+    const width = matchedBid.w ?? fallbackWidth;
+    const height = matchedBid.h ?? fallbackHeight;
 
     if (matchedBid.adm) {
       e.stopImmediatePropagation();
