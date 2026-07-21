@@ -14,11 +14,11 @@
 
 ## File Structure
 
-| File | Responsibility |
-|---|---|
-| `crates/trusted-server-core/src/settings.rs` | `AuctionDebugCommentOptions`, `AuctionDebugCommentVerbosity`, `AUCTION_DEBUG_METADATA_ALLOWLIST`, wiring into `DebugConfig` and `finalize_deserialized` |
+| File                                          | Responsibility                                                                                                                                                              |
+| --------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `crates/trusted-server-core/src/settings.rs`  | `AuctionDebugCommentOptions`, `AuctionDebugCommentVerbosity`, `AUCTION_DEBUG_METADATA_ALLOWLIST`, wiring into `DebugConfig` and `finalize_deserialized`                     |
 | `crates/trusted-server-core/src/publisher.rs` | `redact_response_for_dump`, `redact_bid_for_dump`, `prepend_auction_debug_comment` — all three gain an `options` parameter; production + test call sites updated; new tests |
-| `trusted-server.example.toml` | Document the new `[debug.auction_html_comment_options]` table |
+| `trusted-server.example.toml`                 | Document the new `[debug.auction_html_comment_options]` table                                                                                                               |
 
 No file split needed — both touched files stay well under the codebase's existing size (settings.rs and publisher.rs are already large multi-struct files; this adds one cohesive struct + enum to each, following the file's existing pattern of many sibling config structs).
 
@@ -27,6 +27,7 @@ No file split needed — both touched files stay well under the codebase's exist
 ### Task 1: Config struct in settings.rs
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/settings.rs:1894-1924` (the `DebugConfig` block)
 - Modify: `crates/trusted-server-core/src/settings.rs:2038-2059` (`finalize_deserialized`)
 - Test: same file, `#[cfg(test)] mod tests` block (search for an existing `mod tests` near the bottom of settings.rs to append into)
@@ -243,6 +244,7 @@ git commit -m "Add configurable options struct for the SSAT debug comment"
 ### Task 2: Thread options through publisher.rs redaction functions
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/publisher.rs:870-936` (allowlist const removal, `redact_response_for_dump`, `redact_bid_for_dump`)
 - Modify: `crates/trusted-server-core/src/publisher.rs:950-1036` (`prepend_auction_debug_comment`)
 - Modify: `crates/trusted-server-core/src/publisher.rs:1394-1396` (production call site)
@@ -617,6 +619,7 @@ git commit -m "Make the SSAT ts-debug comment's sections, metadata, and verbosit
 ### Task 3: Document the new config in trusted-server.example.toml
 
 **Files:**
+
 - Modify: `trusted-server.example.toml:144-147` (the `[debug]` section)
 
 - [ ] **Step 1: Add the new table**

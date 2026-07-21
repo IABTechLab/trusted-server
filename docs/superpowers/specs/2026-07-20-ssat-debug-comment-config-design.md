@@ -19,6 +19,7 @@ recompiling or patching the redaction logic.
 
 This design adds a config table, `[debug.auction_html_comment_options]`,
 alongside the existing bool, with:
+
 1. Section toggles (provider responses / mediator response / bids array).
 2. A configurable subset of an expanded, still-hardcoded metadata allowlist.
 3. A `verbosity` switch (`redacted` default, `full` opt-in) that bypasses the
@@ -79,6 +80,7 @@ alongside the existing bool, with:
 `prepend_auction_debug_comment`
 ([publisher.rs:950](../../../crates/trusted-server-core/src/publisher.rs#L950))
 unconditionally:
+
 - Includes `provider_responses` and `mediator_response` (when present).
 - Includes every provider's `bids` array.
 - Filters each response's metadata to a fixed 7-key allowlist:
@@ -91,6 +93,7 @@ unconditionally:
 
 Notably absent from the allowlist today despite already being captured
 server-side by the prebid integration:
+
 - `http_status` — numeric HTTP status from a non-2xx PBS response
   ([prebid.rs:2025](../../../crates/trusted-server-core/src/integrations/prebid.rs#L2025)).
 - `upstream_message` / `upstream_message_truncated` — the actual PBS error
@@ -260,6 +263,7 @@ if options.include_mediator_response
 ```
 
 `redact_response_for_dump(response, options)`:
+
 - `Redacted`: `metadata` = `response.metadata` filtered to
   `options.metadata_keys ∩ AUCTION_DEBUG_METADATA_ALLOWLIST`. The intersection
   is computed here, at the render call — this is the actual security
@@ -269,11 +273,13 @@ if options.include_mediator_response
   `redact_bid_for_dump(bid, options)`.
 
 `redact_bid_for_dump(bid, options)`:
+
 - `Redacted`: `creative` truncated to `MAX_BID_CREATIVE_DUMP_BYTES` (512),
   as today.
 - `Full`: `creative` passed through untruncated.
 
 Unconditional regardless of `options` (safety nets, not redaction controls):
+
 - comment-terminator neutralization (`-->` → `-- >`, `--!>` → `-- !>`)
 - `MAX_AUCTION_DEBUG_DUMP_BYTES` (256KB) final cap on the serialized dump
 
