@@ -289,11 +289,6 @@ pub struct PrebidIntegrationConfig {
     /// param1 = 12345
     /// param2 = "value"
     /// ```
-    ///
-    /// Example via environment variable:
-    /// ```text
-    /// TRUSTED_SERVER__INTEGRATIONS__PREBID__BID_PARAM_OVERRIDES='{"bidder-name":{"param1":12345,"param2":"value"}}'
-    /// ```
     #[serde(default)]
     pub bid_param_overrides: HashMap<String, serde_json::Map<String, Json>>,
     /// Canonical ordered bidder-param override rules.
@@ -310,11 +305,6 @@ pub struct PrebidIntegrationConfig {
     /// when.bidder = "kargo"
     /// when.zone = "header"
     /// set = { placementId = "_abc" }
-    /// ```
-    ///
-    /// Example via environment variable:
-    /// ```text
-    /// TRUSTED_SERVER__INTEGRATIONS__PREBID__BID_PARAM_OVERRIDE_RULES='[{"when":{"bidder":"kargo","zone":"header"},"set":{"placementId":"_abc"}}]'
     /// ```
     #[serde(default)]
     pub bid_param_override_rules: Vec<BidParamOverrideRule>,
