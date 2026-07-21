@@ -2271,6 +2271,11 @@ impl AuctionProvider for PrebidAuctionProvider {
         // domain (e.g. `ts.example.com`), which is not what PBS's
         // `trusted_server` verification module expects — see the "Host header
         // value expected by the receiving service" doc on `SigningParams`.
+        // `scheme` is canonical `"https"` rather than detected from the
+        // incoming request: the publisher origin is always https in
+        // production, and PBS verification is expected to match on that,
+        // not on the edge's local scheme (e.g. http under `fastly compute
+        // serve`).
         let request_info = RequestInfo {
             host: request.publisher.domain.clone(),
             scheme: "https".to_owned(),
