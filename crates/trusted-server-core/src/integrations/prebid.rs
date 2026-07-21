@@ -1617,13 +1617,26 @@ impl PrebidAuctionProvider {
                 // a non-object) must not clobber real params from the expansion.
                 let mut expanded: HashMap<String, Json> = HashMap::new();
                 let mut direct: Vec<(String, Json)> = Vec::new();
+                let mut excluded_aps = false;
                 for (name, params) in &slot.bidders {
-                    if name == TRUSTED_SERVER_BIDDER {
-                        expanded.extend(expand_trusted_server_bidders(&self.config.bidders, params));
-                    } else if self.config.bidders.iter().any(|b| b == name) {
+                    if name.eq_ignore_ascii_case("aps") {
+                        // APS is a separate OpenRTB provider. Never send native
+                        // APS demand through PBS for the same cohort.
+                        excluded_aps = true;
+                    } else if name == TRUSTED_SERVER_BIDDER {
+                        for (bidder, params) in
+                            expand_trusted_server_bidders(&self.config.bidders, params)
+                        {
+                            if bidder.eq_ignore_ascii_case("aps") {
+                                excluded_aps = true;
+                            } else {
+                                expanded.insert(bidder, params);
+                            }
+                        }
+                    } else if self.config.bidders.iter().any(|bidder| bidder == name) {
                         direct.push((name.clone(), params.clone()));
-                    } else if name != "aps" {
-                        // `aps` is intentionally handled by its own provider. Any
+                    } else {
+                        // Any unrecognized key is likely a misconfiguration (a
                         // other unrecognized key is likely a misconfiguration (a
                         // slot bidder absent from `config.bidders`) that silently
                         // yields an empty bidder map and a stored-request no-bid —
@@ -1710,6 +1723,14 @@ impl PrebidAuctionProvider {
                         slot.id,
                         dropped_fabricated.join(", ")
                     );
+                }
+
+                if excluded_aps && bidder.is_empty() {
+                    log::warn!(
+                        "prebid: dropping imp '{}' because it contains only APS demand; refusing PBS stored-request fallback",
+                        slot.id
+                    );
+                    return None;
                 }
 
                 // When no eligible PBS bidder params remain, tell PBS to resolve

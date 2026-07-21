@@ -3184,7 +3184,6 @@ pub(crate) fn build_auction_request(
     // server edge host, which must not leak into the bid request.
     let page_url = format!(
         "{}://{}{}",
-<<<<<<< HEAD
         request_info.scheme, publisher_domain, slots_ctx.request_path_and_query
     );
     let ec_id = ec_id.filter(|id| !id.is_empty());

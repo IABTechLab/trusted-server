@@ -332,7 +332,7 @@ impl CreativeOpportunitiesConfig {
         }
 
         for slot in &self.slot {
-            slot.validate_runtime()?;
+            slot.validate_runtime()?
         }
 
         if self
@@ -362,6 +362,12 @@ impl CreativeOpportunitiesConfig {
                      {MAX_DYNAMIC_GAM_UNIT_PATH_BYTES} UTF-8 bytes using configured values",
                     slot.id
                 ));
+            }
+            if slot.providers.aps.is_some() {
+                log::warn!(
+                    "creative opportunity slot '{}': providers.aps is retained only for configuration compatibility and is ignored by APS OpenRTB",
+                    slot.id
+                );
             }
         }
 

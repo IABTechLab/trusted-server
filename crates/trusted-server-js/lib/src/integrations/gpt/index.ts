@@ -118,6 +118,16 @@ function slotIdForMessageSource(source: MessageEventSource | null): string | und
   )?.id;
 }
 
+function messageSourceBelongsToAdUnit(
+  source: MessageEventSource | null,
+  adUnitCode: string
+): boolean {
+  if (!source) return false;
+  return candidateSlotRoots(adUnitCode).some((root) =>
+    Array.from(root.querySelectorAll('iframe')).some((iframe) => iframe.contentWindow === source)
+  );
+}
+
 function clearTargetingKeys(slot: GoogleTagSlot, keys: Iterable<string>): void {
   if (typeof slot.clearTargeting !== 'function') return;
 

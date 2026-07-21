@@ -215,11 +215,11 @@ pub enum BidRenderer {
 }
 
 impl BidRenderer {
-    /// Return the APS renderer descriptor.
+    /// Return the APS renderer descriptor when this is an APS renderer.
     #[must_use]
-    pub fn aps(&self) -> &ApsRendererV1 {
+    pub fn as_aps(&self) -> Option<&ApsRendererV1> {
         match self {
-            Self::Aps(renderer) => renderer,
+            Self::Aps(renderer) => Some(renderer),
         }
     }
 }
