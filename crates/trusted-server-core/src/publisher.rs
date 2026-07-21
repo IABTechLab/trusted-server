@@ -2155,7 +2155,12 @@ pub(crate) fn build_bid_map(
                 // in which case the entry is omitted and the bridge falls back to
                 // the PBS Cache coordinates.
                 if let Some(ref raw_creative) = bid.creative {
-                    let sanitized = crate::creative::sanitize_creative_html(raw_creative);
+                    // Resolve ${AUCTION_PRICE} from the exact winning CPM BEFORE
+                    // sanitizing, rewriting, and signing — URL rewriting would
+                    // otherwise encode the literal macro into the signed proxy/click
+                    // URL, and signing would lock that wrong value.
+                    let priced = crate::creative::expand_auction_price_macro(raw_creative, cpm);
+                    let sanitized = crate::creative::sanitize_creative_html(&priced);
                     let adm = crate::creative::rewrite_inline_creative_html(settings, &sanitized);
                     if !adm.is_empty() {
                         obj.insert("adm".to_string(), serde_json::Value::String(adm));
@@ -4647,6 +4652,51 @@ mod tests {
             assert!(
                 !adm.contains("/static/tsjs="),
                 "should not inject the tsjs bundle into a foreign-origin creative iframe, got: {adm}"
+            );
+        }
+
+        #[test]
+        fn build_bid_map_expands_auction_price_macro_before_rewrite() {
+            // ${AUCTION_PRICE} must be resolved to the clearing price before the
+            // creative is rewritten and signed. Otherwise URL rewriting encodes the
+            // literal macro (`%24%7BAUCTION_PRICE%7D`) into the signed proxy/click
+            // URL, so trackers receive an encoded macro instead of the price and the
+            // signature locks the wrong value.
+            let mut settings = test_settings();
+            settings.publisher.domain = "example.com".to_string();
+
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "examplessp",
+                "abc123",
+                "https://ssp.example.com/win",
+                "https://ssp.example.com/bill",
+            );
+            bid.creative = Some(
+                "<html><body>\
+                 <a href=\"https://ads.example.com/click?p=${AUCTION_PRICE}\">go</a>\
+                 </body></html>"
+                    .to_string(),
+            );
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, &settings, false);
+            let adm = map
+                .get("atf_sidebar_ad")
+                .and_then(|v| v.as_object())
+                .and_then(|o| o.get("adm"))
+                .and_then(|v| v.as_str())
+                .expect("should include a rewritten adm");
+
+            assert!(
+                !adm.to_uppercase().contains("AUCTION_PRICE"),
+                "no literal or encoded ${{AUCTION_PRICE}} macro should survive: {adm}"
+            );
+            assert!(
+                adm.contains("p=1.5"),
+                "the exact winning CPM should be substituted into the signed URL: {adm}"
             );
         }
 

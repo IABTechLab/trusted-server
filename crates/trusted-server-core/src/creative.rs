@@ -545,6 +545,32 @@ pub fn rewrite_creative_html(settings: &Settings, markup: &str) -> String {
 /// - The `tsjs` bundle is **not** injected into `<body>`: its only job is to
 ///   safeguard click URLs, which are already absolute here, and shipping the full
 ///   core-plus-integrations bundle into every creative iframe is pure weight.
+/// The clear-price auction macro DSPs embed in creative markup and tracking URLs.
+const AUCTION_PRICE_MACRO: &str = "${AUCTION_PRICE}";
+
+/// Substitute the `${AUCTION_PRICE}` macro with the winning CPM.
+///
+/// DSP creatives and their tracking/billing URLs carry `${AUCTION_PRICE}`, which
+/// the renderer is expected to replace with the clearing price before the markup
+/// is used. On the inline render path this must happen **before** sanitizing,
+/// rewriting, and signing: URL rewriting serializes query pairs (turning the
+/// literal macro into `%24%7BAUCTION_PRICE%7D`), and signing then locks whatever
+/// value is present — so an unexpanded macro would be signed into the proxy/click
+/// URL and never resolve to a price.
+///
+/// Only the exact `${AUCTION_PRICE}` token is expanded. The encrypted
+/// `${AUCTION_PRICE:B64}` variant requires the DSP's key and is left intact; the
+/// full-token match cannot corrupt it because it lacks the closing brace the
+/// clear token ends with. `cpm` is formatted with its shortest round-trip
+/// representation, preserving the exact value without inventing precision.
+#[must_use]
+pub fn expand_auction_price_macro(markup: &str, cpm: f64) -> String {
+    if !markup.contains(AUCTION_PRICE_MACRO) {
+        return markup.to_owned();
+    }
+    markup.replace(AUCTION_PRICE_MACRO, &cpm.to_string())
+}
+
 #[must_use]
 pub fn rewrite_inline_creative_html(settings: &Settings, markup: &str) -> String {
     let base_origin = format!("https://{}", settings.publisher.domain);
@@ -929,6 +955,34 @@ mod tests {
         let html = "<html><body>one</body><body>two</body></html>";
         let out = rewrite_creative_html(&settings, html);
         assert_eq!(out.matches("/static/tsjs=tsjs-unified.min.js").count(), 1);
+    }
+
+    #[test]
+    fn expand_auction_price_replaces_literal_macro() {
+        use super::expand_auction_price_macro;
+        let out = expand_auction_price_macro(
+            "<img src=\"https://t.example/win?p=${AUCTION_PRICE}&x=1\">",
+            0.53,
+        );
+        assert!(
+            out.contains("p=0.53&"),
+            "should substitute the exact CPM for the macro: {out}"
+        );
+        assert!(
+            !out.contains("${AUCTION_PRICE}"),
+            "no literal macro should survive: {out}"
+        );
+    }
+
+    #[test]
+    fn expand_auction_price_leaves_encrypted_variant_untouched() {
+        use super::expand_auction_price_macro;
+        // The `:B64` encrypted variant requires the DSP key we do not hold; only
+        // the clear-price token is expanded, and the full-token match must not
+        // corrupt the encrypted one.
+        let out = expand_auction_price_macro("a=${AUCTION_PRICE}&b=${AUCTION_PRICE:B64}", 1.25);
+        assert!(out.contains("a=1.25&"), "{out}");
+        assert!(out.contains("b=${AUCTION_PRICE:B64}"), "{out}");
     }
 
     #[test]
