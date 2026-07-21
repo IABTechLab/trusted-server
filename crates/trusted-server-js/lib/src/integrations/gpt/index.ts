@@ -64,10 +64,22 @@ function findSlotElementByDivId(divId: string): HTMLElement | null {
   const exact = document.getElementById(divId);
   if (exact) return exact;
 
+  const configuredDivIds = (window.tsjs?.adSlots ?? [])
+    .map((slot) => slot.div_id)
+    .filter((configured) => configured.length > 0);
+
   return (
-    Array.from(document.querySelectorAll<HTMLElement>('[id]')).find(
-      (el) => el.id.startsWith(divId) && !el.id.endsWith('-container')
-    ) ?? null
+    Array.from(document.querySelectorAll<HTMLElement>('[id]')).find((element) => {
+      if (!element.id.startsWith(divId) || element.id.endsWith('-container')) return false;
+
+      // Generated slot IDs can extend a configured prefix. When configured
+      // prefixes overlap, assign the element to the longest matching prefix so
+      // `div-header` cannot claim an iframe owned by `div-header-mobile`.
+      const owner = configuredDivIds
+        .filter((configured) => element.id.startsWith(configured))
+        .sort((left, right) => right.length - left.length)[0];
+      return owner === undefined || owner === divId;
+    }) ?? null
   );
 }
 
@@ -104,12 +116,7 @@ function messageSourceBelongsToAdUnit(
   adUnitCode: string
 ): boolean {
   if (!source) return false;
-  const roots = [
-    document.getElementById(adUnitCode),
-    document.getElementById(`${adUnitCode}-container`),
-  ].filter((root): root is HTMLElement => root !== null);
-
-  return roots.some((root) =>
+  return candidateSlotRoots(adUnitCode).some((root) =>
     Array.from(root.querySelectorAll('iframe')).some((iframe) => iframe.contentWindow === source)
   );
 }
@@ -992,12 +999,10 @@ export function installTsRenderBridge(): void {
       const rendererUrl = apsRendererUrl();
       if (!renderer || !rendererUrl) return;
 
-      // Ownership and the complete consumed envelope are valid before this
-      // handler claims the message or suppresses another legitimate handler.
+      // Ownership and the complete envelope are valid before this handler
+      // claims the message. APS responses are intentionally repeatable: GAM can
+      // request the same server-rendered Universal Creative more than once.
       e.stopImmediatePropagation();
-      if (renderingAdIds.has(adId)) return;
-      renderingAdIds.add(adId);
-
       try {
         port.postMessage(
           JSON.stringify({
@@ -1013,7 +1018,6 @@ export function installTsRenderBridge(): void {
         );
         log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' through APS renderer`);
       } catch (err) {
-        renderingAdIds.delete(adId);
         log.warn('[tsjs-gpt] pbRender bridge: APS response failed', err);
       }
       return;

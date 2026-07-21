@@ -2097,12 +2097,9 @@ pub(crate) fn build_bid_map(
                     "hb_bidder".to_string(),
                     serde_json::Value::String(bid.bidder.clone()),
                 );
-                // PBS Cache remains highest priority. APS uses the selected bid ID
-                // carried by its typed renderer; other providers retain the ad-ID fallback.
-                let renderer_bid_id = bid
-                    .renderer
-                    .as_ref()
-                    .map(|renderer| renderer.aps().bid_id.as_str());
+                // PBS Cache remains highest priority. Renderer bids use the generic
+                // upstream bid ID; ordinary providers retain the ad-ID fallback.
+                let renderer_bid_id = bid.renderer.as_ref().and(bid.bid_id.as_deref());
                 let hb_adid = bid
                     .cache_id
                     .as_deref()
@@ -2643,7 +2640,10 @@ mod tests {
             height: 250,
             nurl: None,
             burl: None,
+            bid_id: None,
             ad_id: None,
+            creative_id: None,
+            renderer: None,
             cache_id: None,
             cache_host: None,
             cache_path: None,

@@ -211,6 +211,27 @@ describe('prebid/auctionBidsToPrebidBids', () => {
     );
   });
 
+  it('drops an APS bid whose renderer fails admission validation', () => {
+    const result = auctionBidsToPrebidBids(
+      [
+        {
+          impid: 'div-aps',
+          adm: '',
+          renderer: { ...apsRenderer(), aaxResponse: 'invalid' },
+          price: 1.23,
+          width: 300,
+          height: 250,
+          seat: 'aps',
+          creativeId: 'fictional-creative-id',
+          adomain: [],
+        },
+      ],
+      [{ adUnitCode: 'div-aps', bidId: 'prebid-request-id' }]
+    );
+
+    expect(result).toEqual([]);
+  });
+
   it('falls back to impid when no matching bidRequest found', () => {
     const auctionBids: AuctionBid[] = [
       {
@@ -345,6 +366,7 @@ describe('prebid/installPrebidNpm', () => {
   });
 
   it('does not register malformed or non-trusted APS renderer capabilities', () => {
+    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
     installPrebidNpm();
 
     const bidResponseListener = mockOnEvent.mock.calls.find(
@@ -369,7 +391,10 @@ describe('prebid/installPrebidNpm', () => {
 
     expect((window as any).tsjs?.apsPrebidRenderers?.['malformed-ad-id']).toBeUndefined();
     expect((window as any).tsjs?.apsPrebidRenderers?.['foreign-ad-id']).toBeUndefined();
-    expect(malformedBid).not.toHaveProperty('trustedServerRenderer');
+    expect(malformedBid).toHaveProperty('trustedServerRenderer');
+    expect(warnSpy).toHaveBeenCalledWith(
+      '[tsjs-prebid] rejected APS renderer capability that failed registration'
+    );
   });
 
   it('calls setConfig with debug=false by default', () => {

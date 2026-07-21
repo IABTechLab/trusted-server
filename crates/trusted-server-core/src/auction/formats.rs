@@ -98,20 +98,36 @@ fn publisher_page_url(req: &Request<EdgeBody>, publisher_domain: &str) -> String
         .and_then(|value| value.to_str().ok())
         .filter(|value| value.len() <= MAX_PUBLISHER_PAGE_URL_BYTES)
     else {
+        log::debug!(
+            "Auction page URL: using publisher origin because Referer is absent or invalid"
+        );
         return fallback;
     };
-    let Ok(parsed) = Url::parse(candidate) else {
+    let Ok(mut parsed) = Url::parse(candidate) else {
+        log::debug!("Auction page URL: using publisher origin because Referer is not a URL");
         return fallback;
     };
+    let publisher_domain = publisher_domain.trim_end_matches('.').to_ascii_lowercase();
+    let host_matches = !publisher_domain.is_empty()
+        && parsed.host_str().is_some_and(|host| {
+            let host = host.trim_end_matches('.').to_ascii_lowercase();
+            host == publisher_domain
+                || host
+                    .strip_suffix(&publisher_domain)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        });
     if !matches!(parsed.scheme(), "http" | "https")
-        || !parsed
-            .host_str()
-            .is_some_and(|host| host.eq_ignore_ascii_case(publisher_domain))
+        || !host_matches
         || !parsed.username().is_empty()
         || parsed.password().is_some()
     {
+        log::debug!(
+            "Auction page URL: using publisher origin because Referer is not publisher-owned HTTP(S)"
+        );
         return fallback;
     }
+    parsed.set_query(None);
+    parsed.set_fragment(None);
     parsed.to_string()
 }
 
@@ -255,7 +271,7 @@ pub fn convert_tsjs_to_auction_request(
 /// # Errors
 ///
 /// Returns an error if:
-/// - A winning bid is missing a price or render source
+/// - A winning bid is missing a price
 /// - The response serialization fails
 pub fn convert_to_openrtb_response(
     result: &OrchestrationResult,
@@ -285,7 +301,19 @@ pub fn convert_to_openrtb_response(
 
         // Ordinary markup remains on the mandatory sanitize/rewrite path. A
         // typed renderer is serialized separately and never enters the HTML sanitizer.
-        let (adm, ext) = if let Some(ref raw_creative) = bid.creative {
+        let (adm, ext) = if let Some(raw_creative) = bid
+            .creative
+            .as_deref()
+            .filter(|creative| !creative.trim().is_empty())
+        {
+            if bid.renderer.is_some() {
+                log::warn!(
+                    "Auction {}: winning bid for slot '{}' from '{}' has both creative markup and a renderer; using creative markup",
+                    auction_request.id,
+                    slot_id,
+                    bid.bidder
+                );
+            }
             let sanitized = creative::sanitize_creative_html(raw_creative);
             let rewritten = creative::rewrite_creative_html(settings, &sanitized);
 
@@ -300,20 +328,27 @@ pub fn convert_to_openrtb_response(
 
             (Some(rewritten), None)
         } else if let Some(renderer) = bid.renderer.as_ref() {
-            (
-                None,
-                BidExt {
-                    trusted_server: BidTrustedServerExt { renderer },
-                }
-                .to_ext(),
-            )
+            let Some(ext) = (BidExt {
+                trusted_server: BidTrustedServerExt { renderer },
+            })
+            .to_ext() else {
+                log::warn!(
+                    "Auction {}: skipping winning bid for slot '{}' from '{}' because its renderer extension could not be serialized",
+                    auction_request.id,
+                    slot_id,
+                    bid.bidder
+                );
+                continue;
+            };
+            (None, Some(ext))
         } else {
-            return Err(Report::new(TrustedServerError::Auction {
-                message: format!(
-                    "Winning bid for slot '{}' from '{}' has no render source",
-                    slot_id, bid.bidder
-                ),
-            }));
+            log::warn!(
+                "Auction {}: skipping winning bid for slot '{}' from '{}' because it has no render source",
+                auction_request.id,
+                slot_id,
+                bid.bidder
+            );
+            continue;
         };
 
         let openrtb_bid = OpenRtbBid {
@@ -657,30 +692,48 @@ mod tests {
     }
 
     #[test]
-    fn publisher_page_url_accepts_only_same_publisher_http_urls() {
-        let request = Request::builder()
-            .uri("https://publisher.example.com/auction")
-            .header(
-                header::REFERER,
-                "https://publisher.example.com/article?id=1",
-            )
-            .body(EdgeBody::empty())
-            .expect("should build request");
-        assert_eq!(
-            publisher_page_url(&request, "publisher.example.com"),
-            "https://publisher.example.com/article?id=1"
-        );
-        assert_eq!(
-            publisher_page_url(&request, "Publisher.Example.Com"),
-            "https://publisher.example.com/article?id=1",
-            "DNS host comparison should be case-insensitive"
-        );
+    fn publisher_page_url_accepts_publisher_hosts_and_strips_private_components() {
+        for (candidate, expected) in [
+            (
+                "https://publisher.example.com/article?id=1#comments",
+                "https://publisher.example.com/article",
+            ),
+            (
+                "http://news.publisher.example.com/nested/story?token=secret",
+                "http://news.publisher.example.com/nested/story",
+            ),
+            (
+                "https://www.publisher.example.com/",
+                "https://www.publisher.example.com/",
+            ),
+        ] {
+            let request = Request::builder()
+                .uri("https://publisher.example.com/auction")
+                .header(header::REFERER, candidate)
+                .body(EdgeBody::empty())
+                .expect("should build request");
+            assert_eq!(
+                publisher_page_url(&request, "Publisher.Example.Com"),
+                expected,
+                "should sanitize publisher-owned Referer"
+            );
+        }
+    }
 
+    #[test]
+    fn publisher_page_url_rejects_untrusted_or_oversized_referers() {
+        let oversized = format!(
+            "https://publisher.example.com/{}",
+            "x".repeat(MAX_PUBLISHER_PAGE_URL_BYTES)
+        );
         for candidate in [
             "https://other.example/article",
+            "https://publisher.example.com.evil.example/article",
+            "https://evilpublisher.example.com/article",
             "javascript:alert(1)",
             "https://user:password@publisher.example.com/article",
             "not a url",
+            &oversized,
         ] {
             let request = Request::builder()
                 .uri("https://publisher.example.com/auction")
@@ -1064,19 +1117,98 @@ mod tests {
     }
 
     #[test]
-    fn convert_to_openrtb_response_rejects_winner_without_render_source() {
+    fn convert_to_openrtb_response_skips_invalid_winners_without_dropping_valid_slots() {
         let settings = make_settings();
         let auction_request = make_auction_request();
-        let mut bid = make_bid("div-gpt-top", "appnexus", Some(2.75));
-        bid.creative = None;
+        let mut missing = make_bid("missing", "invalid", Some(3.0));
+        missing.creative = None;
+        let mut whitespace = make_bid("whitespace", "invalid", Some(2.9));
+        whitespace.creative = Some(" \n\t ".to_string());
+        let ordinary = make_bid("ordinary", "appnexus", Some(2.75));
+        let mut renderer = make_bid("renderer", "aps", Some(2.5));
+        renderer.creative = Some("  ".to_string());
+        renderer.bid_id = Some("upstream-renderer-bid".to_string());
+        renderer.creative_id = None;
+        renderer.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
+            version: 1,
+            account_id: "example-account".to_string(),
+            bid_id: "upstream-renderer-bid".to_string(),
+            creative_id: None,
+            tag_type: ApsTagType::Iframe,
+            creative_url: "https://creative.example/render".to_string(),
+            aax_response: "fictional-base64".to_string(),
+            width: 300,
+            height: 250,
+        }));
+        let result = OrchestrationResult {
+            provider_responses: vec![],
+            mediator_response: None,
+            winning_bids: HashMap::from([
+                (missing.slot_id.clone(), missing),
+                (whitespace.slot_id.clone(), whitespace),
+                (ordinary.slot_id.clone(), ordinary),
+                (renderer.slot_id.clone(), renderer),
+            ]),
+            total_time_ms: 50,
+            metadata: HashMap::new(),
+        };
+
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
+            .expect("should omit invalid winners and preserve valid slots");
+        let json = response_json(response);
+        let bids: Vec<&JsonValue> = json["seatbid"]
+            .as_array()
+            .expect("should include valid seatbids")
+            .iter()
+            .map(|seatbid| &seatbid["bid"][0])
+            .collect();
+
+        assert_eq!(bids.len(), 2, "should omit only invalid winners");
+        let ordinary = bids
+            .iter()
+            .find(|bid| bid["impid"] == "ordinary")
+            .expect("should preserve ordinary winner");
+        assert_eq!(ordinary["adm"], "<div>Ad</div>");
+        let renderer = bids
+            .iter()
+            .find(|bid| bid["impid"] == "renderer")
+            .expect("should preserve renderer winner");
+        assert!(renderer.get("adm").is_none(), "should omit renderer adm");
+        assert!(
+            renderer.get("crid").is_none(),
+            "should omit absent upstream crid"
+        );
+        assert_eq!(renderer["id"], "upstream-renderer-bid");
+        assert!(renderer.get("ext").is_some(), "should include renderer ext");
+    }
+
+    #[test]
+    fn convert_to_openrtb_response_prefers_creative_when_both_render_sources_exist() {
+        let settings = make_settings();
+        let auction_request = make_auction_request();
+        let mut bid = make_bid("div-gpt-top", "aps", Some(2.75));
+        bid.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
+            version: 1,
+            account_id: "example-account".to_string(),
+            bid_id: "fictional-bid".to_string(),
+            creative_id: None,
+            tag_type: ApsTagType::Iframe,
+            creative_url: "https://creative.example/render".to_string(),
+            aax_response: "fictional-base64".to_string(),
+            width: 300,
+            height: 250,
+        }));
         let result = make_result(bid);
 
-        let error = convert_to_openrtb_response(&result, &settings, &auction_request, false)
-            .expect_err("should reject bid without a render source");
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
+            .expect("should prefer ordinary creative markup");
+        let json = response_json(response);
+        let bid = &json["seatbid"][0]["bid"][0];
 
+        assert_eq!(bid["adm"], "<div>Ad</div>");
         assert!(
-            format!("{error:?}").contains("has no render source"),
-            "should explain the missing render source"
+            bid.get("ext").is_none(),
+            "should omit renderer extension when creative markup wins precedence"
         );
     }
 
