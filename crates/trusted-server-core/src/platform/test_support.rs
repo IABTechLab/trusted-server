@@ -488,6 +488,21 @@ impl PlatformHttpClient for StubHttpClient {
             .expect("should lock request_headers")
             .push(headers);
 
+        // Capture the outgoing request body, mirroring `send()`, so tests
+        // exercising the async fan-out path (`request_bids` providers) can
+        // assert on it via `recorded_request_bodies()` too.
+        let (_, body) = request.request.into_parts();
+        let body_bytes = body
+            .into_bytes_bounded(MAX_RECORDED_BODY_BYTES)
+            .await
+            .change_context(PlatformError::HttpClient)
+            .attach("failed to capture StubHttpClient request body")?
+            .to_vec();
+        self.request_bodies
+            .lock()
+            .expect("should lock request bodies")
+            .push(body_bytes);
+
         let response = self
             .responses
             .lock()
