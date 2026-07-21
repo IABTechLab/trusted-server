@@ -1379,6 +1379,10 @@ async fn emit_abandoned_auction(
     .await;
 }
 
+// Private orchestration helper called only from `body_close_hold_loop`, whose
+// arguments mirror the fields of `AuctionCollectCtx` it destructures; a separate
+// parameter struct would just duplicate that context.
+#[allow(clippy::too_many_arguments)]
 async fn collect_stream_auction(
     dispatched: DispatchedAuction,
     telemetry: AuctionTelemetryCarry,
