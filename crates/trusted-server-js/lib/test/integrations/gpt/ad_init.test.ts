@@ -929,6 +929,12 @@ describe('parseCachedBid', () => {
     expect(bid?.height).toBe(90);
   });
 
+  it('treats zero dimensions as absent so the caller falls back', async () => {
+    const bid = await parseCachedBid(JSON.stringify({ adm: '<div>cached</div>', w: 0, h: 0 }));
+    expect(bid?.width).toBeUndefined();
+    expect(bid?.height).toBeUndefined();
+  });
+
   it('treats a non-JSON body as raw creative markup with no metadata', async () => {
     const bid = await parseCachedBid('<div>raw</div>');
     expect(bid).toEqual({ adm: '<div>raw</div>' });

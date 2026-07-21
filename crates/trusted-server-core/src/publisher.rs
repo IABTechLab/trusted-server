@@ -2146,8 +2146,14 @@ pub(crate) fn build_bid_map(
                 // Winning creative dimensions — the bridge sizes the inline
                 // render from these, falling back to the first configured slot
                 // format only when absent, which mis-sizes a multi-size slot.
-                obj.insert("w".to_string(), serde_json::Value::from(bid.width));
-                obj.insert("h".to_string(), serde_json::Value::from(bid.height));
+                // Omit a zero dimension (missing OpenRTB w/h parse to 0) so the
+                // bridge falls back rather than sizing the frame to 0.
+                if bid.width > 0 {
+                    obj.insert("w".to_string(), serde_json::Value::from(bid.width));
+                }
+                if bid.height > 0 {
+                    obj.insert("h".to_string(), serde_json::Value::from(bid.height));
+                }
                 // hb_adid: use PBS Cache UUID when present — the Prebid Universal Creative uses
                 // this as the cache lookup key, NOT the OpenRTB bid ID (bid.ad_id). Fall back to
                 // bid.ad_id for APS and other non-PBS providers.
@@ -4491,6 +4497,39 @@ mod tests {
                 Some("https://ssp/bill"),
                 "should include burl"
             );
+        }
+
+        #[test]
+        fn bid_map_omits_zero_creative_dimensions() {
+            // Missing OpenRTB w/h parse to 0. Emitting w:0/h:0 would make the
+            // bridge (which nullish-coalesces) size the frame to 0 instead of
+            // falling back to the slot format, so a zero dimension must be omitted.
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "kargo",
+                "abc123",
+                "https://ssp/win",
+                "https://ssp/bill",
+            );
+            bid.width = 0;
+            bid.height = 0;
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                "",
+                false,
+            );
+            let obj = map
+                .get("atf_sidebar_ad")
+                .expect("should have bid entry")
+                .as_object()
+                .expect("should be object");
+            assert!(obj.get("w").is_none(), "should omit zero width");
+            assert!(obj.get("h").is_none(), "should omit zero height");
         }
 
         #[test]

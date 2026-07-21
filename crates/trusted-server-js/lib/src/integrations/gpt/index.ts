@@ -883,12 +883,18 @@ export function parseCachedBid(body: string): CachedBid | undefined {
 
   const num = (v: unknown): number | undefined =>
     typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+  // A zero (or missing) dimension is not usable render metadata; treat it as
+  // absent so the caller falls back to the slot format rather than sizing to 0.
+  const dim = (v: unknown): number | undefined => {
+    const n = num(v);
+    return n !== undefined && n > 0 ? n : undefined;
+  };
 
   return {
     adm,
     // PBS OpenRTB bids carry w/h; the Prebid.js cache format uses width/height.
-    width: num(obj.w) ?? num(obj.width),
-    height: num(obj.h) ?? num(obj.height),
+    width: dim(obj.w) ?? dim(obj.width),
+    height: dim(obj.h) ?? dim(obj.height),
     price: num(obj.price),
   };
 }
