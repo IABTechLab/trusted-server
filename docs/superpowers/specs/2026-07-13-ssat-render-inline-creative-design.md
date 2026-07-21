@@ -1,8 +1,43 @@
 # SSAT: render the winning creative inline (no PBS Cache round trip)
 
 **Date:** 2026-07-13
-**Status:** Design revised after review, pending final approval
+**Status:** Implemented — see "Implementation reconciliation" below for how the
+shipped code diverged from the original design.
 **Branch:** `feat/ssat-render-inline-creative`
+
+## Implementation reconciliation (final)
+
+The core design below is accurate; the shipped implementation refined it in four
+ways. Where the sections that follow still say `rewrite_creative_html`, the
+foreign-origin render context (see below) means the code uses
+`rewrite_inline_creative_html`.
+
+1. **Dedicated inline rewriter — `rewrite_inline_creative_html`.** The inline
+   `adm` is rendered by the Prebid Universal Creative inside GAM's iframe
+   (`f.srcdoc = d.ad`), a **foreign origin**. Root-relative `/first-party/…`
+   URLs would resolve against GAM and 404, so the inline rewriter emits
+   **absolute** first-party URLs and does **not** inject the `tsjs` bundle (its
+   only job — safeguarding click URLs — is moot once URLs are absolute, and the
+   bundle is pure weight in a creative iframe). `rewrite_creative_html` (root-
+   relative, tsjs-injecting) remains the `/auction` same-origin path.
+2. **Absolute URLs use the request origin, not `publisher.domain`.**
+   `rewrite_inline_creative_html` takes a `base_origin` derived from the trusted
+   request (`scheme://host`, host including any port). `publisher.domain` cannot
+   carry a port and may differ from the subdomain serving the request; it is only
+   the fallback when the request origin is unknown. Threaded through
+   `write_bids_to_state`/`build_bid_map`; SPA page-bids derives it from
+   `RequestInfo`.
+3. **Render metadata in the bid map.** `build_bid_map` emits the winning
+   creative's `w`/`h`; the bridge sizes the inline (and cache-fallback) render
+   from those, falling back to the first configured slot format only when absent.
+   `${AUCTION_PRICE}` is expanded from the exact winning CPM **before**
+   sanitize/rewrite/sign, so the clearing price — not an encoded macro — is what
+   gets signed into proxy/click URLs.
+4. **Cache fallback decodes a structured bid.** `parseCachedBid` (replacing the
+   adm-only `extractCachedAdm`) retains the cached creative's dimensions and
+   price, so the fallback sizes correctly and expands `${AUCTION_PRICE}` from the
+   cached price. Firing a cached win-notification URL is deferred pending a real
+   PBS Cache payload to verify the field and dedup contract.
 
 ## Problem
 
@@ -56,10 +91,18 @@ the round trip that happens _after_ GAM has already picked the TS line item.
 
 `build_bid_map`:
 
-- **Always** insert `adm` (from `bid.creative`) for a winner when present —
-  there is no runtime reason to withhold it, so it is not parameterized.
+- **Always** insert `adm` for a winner when present — there is no runtime reason
+  to withhold it, so it is not parameterized. The creative is first run through
+  the **same sanitize/rewrite boundary as the `/auction` path** (`auction::formats`):
+  `creative::sanitize_creative_html` then `creative::rewrite_creative_html`.
+  `sanitize_creative_html` also enforces the 1 MiB `MAX_CREATIVE_SIZE` cap,
+  returning empty for oversized or unparseable markup — in which case `adm` is
+  omitted and the bridge falls back to the PBS Cache coordinates. `build_bid_map`
+  therefore takes `&Settings` (needed by `rewrite_creative_html`).
 - Insert the verbose `debug_bid` blob **only** when the testing flag is set. The
-  single `include_adm` param becomes `include_debug_bid`.
+  single `include_adm` param becomes `include_debug_bid`. (The `debug_bid` blob
+  still carries the raw, un-sanitized creative for diagnostics; only the
+  client-facing `adm` is sanitized.)
 
 `hb_cache_host`/`hb_cache_path` remain inserted unconditionally.
 
@@ -69,11 +112,20 @@ the round trip that happens _after_ GAM has already picked the TS line item.
 Cache. Once `adm` is present in production, the local render becomes the default
 and the round trip disappears.
 
+**Cache payload decode:** PBS Cache (`returnCreative=false`) returns the cached
+bid as a **JSON object**, and the Prebid Universal Creative's own cache path
+`JSON.parse`s it and renders `bidObject.adm` — not the raw response body. The
+fallback therefore parses the cache response and extracts the string `adm`
+(`extractCachedAdm`), with raw-markup compatibility for caches that return the
+creative directly, and declines to render (no `"Prebid Response"`, no beacons)
+when the payload has no usable `adm`. It does **not** forward a serialized bid
+document to the PUC.
+
 **Fallback scope (corrected):** the bridge posts the markup to the PUC and
 returns; it receives **no render-success signal**. So the PBS Cache fallback
-fires only when `adm` is **absent or empty** — _not_ when `adm` is present but
-fails to render. Render failures after `adm` is supplied are not currently
-detectable and do not trigger fallback.
+fires only when the inline `adm` is **absent or empty** — _not_ when `adm` is
+present but fails to render. Render failures after `adm` is supplied are not
+currently detectable and do not trigger fallback.
 
 ### 3. Gate the GAM-bypass on `bid.debug_bid` (no new global flag)
 
@@ -94,10 +146,19 @@ change, and keeps production `adm` on the bridge-only (keep-GAM) path.
 
 ### 4. Security
 
-No new escaping code. The `adm` string is part of the bid-map JSON that already
-passes through `html_escape_for_script` + `JSON.parse("…")`, which neutralizes
-`</script>` breakout and `U+2028/2029`. **This is the guarantee trusted-server
-directly provides**, pinned by a hostile-`adm` regression test.
+Two layers, both provided directly by trusted-server:
+
+1. **Creative-processing boundary (server-side).** The inline `adm` runs through
+   the same `sanitize_creative_html` → `rewrite_creative_html` pass as the
+   `/auction` path before it enters the bid map. Sanitization strips executable
+   markup (`<script>`, `on*` handlers, `javascript:`/dangerous `data:` URIs) and
+   enforces the 1 MiB `MAX_CREATIVE_SIZE` cap; rewriting proxies creative URLs to
+   first-party endpoints. Pinned by a hostile-`adm` (script/handler/`javascript:`
+   stripped) and an oversized-`adm` (omitted) regression test.
+2. **Script-context escaping.** The (now sanitized) `adm` is part of the bid-map
+   JSON that passes through `html_escape_for_script` + `JSON.parse("…")`, which
+   neutralizes any residual `</script>` breakout and `U+2028/2029`. Pinned by a
+   line-separator escaping test.
 
 Frame isolation of the rendered creative is **not** guaranteed by TS on the
 bridge path: `injectAdmIntoSlot` sets `sandbox=ADM_IFRAME_SANDBOX`, but the
@@ -107,24 +168,27 @@ Universal Creative implementation, not on TS.
 
 ## Components changed
 
-| Unit                                         | Change                                                                                                                           |
-| -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| `build_bid_map` (Rust)                       | Always insert `adm` when `bid.creative` is `Some`. Rename `include_adm` → `include_debug_bid`, gating only the `debug_bid` blob. |
-| `build_bid_map` callers                      | Pass `include_debug_bid = inject_adm_for_testing`.                                                                               |
-| `gpt/index.ts` `injectAdmIntoSlot` call site | Gate on `bid.adm && bid.debug_bid`.                                                                                              |
-| bridge/`ad_init` tests (JS)                  | Rename "debug adm" → "inline/local adm"; confirm existing coverage.                                                              |
+| Unit                                            | Change                                                                                                                                                                                                                                                                                     |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `build_bid_map` (Rust)                          | Expand `${AUCTION_PRICE}`, then sanitize + `rewrite_inline_creative_html` `bid.creative` (1 MiB cap) before inserting `adm`; omit when rejected. Emit winning `w`/`h`. Takes `&Settings` + `request_origin`. Rename `include_adm` → `include_debug_bid`, gating only the `debug_bid` blob. |
+| `creative.rs`                                   | `rewrite_inline_creative_html(&Settings, base_origin, markup)` (absolute URLs, no tsjs); `expand_auction_price_macro`.                                                                                                                                                                     |
+| `build_bid_map` / `write_bids_to_state` callers | Thread `&Settings` + the request origin (`scheme://host`); pass `include_debug_bid = inject_adm_for_testing`.                                                                                                                                                                              |
+| `gpt/index.ts` `installTsRenderBridge`          | Resolve the bid by requesting slot; size from `matchedBid.w`/`h`; decode PBS Cache JSON into a structured bid (`parseCachedBid`) preserving dims + price, expanding `${AUCTION_PRICE}`; decline when absent.                                                                               |
+| `gpt/index.ts` `injectAdmIntoSlot` call site    | Gate on `bid.adm && bid.debug_bid`.                                                                                                                                                                                                                                                        |
+| `core/types.ts` `AuctionBidData`                | Add `w`/`h` render dimensions.                                                                                                                                                                                                                                                             |
+| bridge/`ad_init` tests (JS)                     | Rename "debug adm" → "inline/local adm"; realistic `returnCreative=false` cache payload + malformed/raw-markup coverage; slot/dimension/origin/macro cases.                                                                                                                                |
 
 No `build_bids_script` change, no `window.tsjs` flag, no `TsjsApi` change.
 
 ## Data flow (after)
 
 ```
-SSAT auction → winner (bid.creative held) → build_bid_map inserts adm
+SSAT auction → winner (bid.creative held) → build_bid_map sanitizes+rewrites → inserts adm
   → build_bids_script (html_escape_for_script) → window.tsjs.bids
   → hb_pb targeting → GAM competes
       ├ GAM picks TS line item → PUC "Prebid Request"
-      │     → bridge replies with local adm  → RENDER (no round trip) + beacons
-      │     → (adm absent) → PBS Cache fetch  → RENDER (fallback)
+      │     → bridge replies with inline adm  → RENDER (no round trip) + beacons
+      │     → (adm absent) → PBS Cache fetch → decode JSON → extract adm → RENDER (fallback)
       └ GAM has higher demand → GAM serves its own creative
 ```
 
@@ -137,13 +201,17 @@ line items in GAM sees no behavioral change.
 
 ## Testing
 
-- **Rust**: `build_bid_map` includes `adm` for winners on every path; `debug_bid`
-  present only under the testing flag; a hostile `</script>` / `U+2028/2029`
-  `adm` is escaped so `build_bids_script` output stays inside the `<script>`.
+- **Rust**: `build_bid_map` includes a sanitized `adm` for winners on every path;
+  a hostile `adm` has its `<script>`/`on*`/`javascript:` stripped; an oversized
+  (> 1 MiB) `adm` is omitted (bridge falls back to cache); `debug_bid` present
+  only under the testing flag; `U+2028/2029` in `adm` is escaped so
+  `build_bids_script` output stays inside the `<script>`.
 - **JS (vitest)**: `injectAdmIntoSlot` fires only when `bid.debug_bid` is present;
-  existing `ad_init.test.ts` bridge coverage (local-adm-without-cache-fetch,
-  cache-fetch-when-adm-absent, `nurl`/`burl` beacons, dedup) is retained with
-  terminology updated to "inline/local adm" — no duplicate tests.
+  the PBS Cache fallback decodes a realistic `returnCreative=false` JSON payload
+  and forwards its `adm`, renders a non-JSON body as raw markup, and declines a
+  payload with no `adm`; existing bridge coverage (local-adm-without-cache-fetch,
+  `nurl`/`burl` beacons, dedup) is retained with terminology updated to
+  "inline/local adm".
 
 ## Risks / accepted costs
 
@@ -158,7 +226,8 @@ line items in GAM sees no behavioral change.
 
 ## Out of scope
 
-- Size-capping / conditional inline vs cache.
+- A tunable inline-size threshold below the 1 MiB sanitize cap (the cap already
+  omits oversized creatives and defers them to the cache path).
 - Detecting render failure to trigger cache fallback.
 - Bypassing GAM for SSAT winners.
 - Changing the client-side `/auction` render path.

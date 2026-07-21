@@ -772,6 +772,7 @@ async fn hold_collect_close_tail<P: StreamProcessor>(
         collect_refs.orchestrator,
         collect_refs.services,
         collect_refs.settings,
+        collect_refs.request_origin,
     )
     .await;
     // Collection reached a terminal result; disarm only now so a drop while the
@@ -1274,12 +1275,15 @@ pub async fn publisher_response_into_streaming_response(
 
                 if let Some((guard, telemetry)) = hold_auction {
                     let mut state = AuctionHoldState::new(guard, telemetry);
+                    let request_origin =
+                        request_origin(&params.request_scheme, &params.request_host);
                     let collect_refs = AuctionHoldCollectRefs {
                         price_granularity: params.price_granularity,
                         ad_bids_state: &params.ad_bids_state,
                         orchestrator: &orchestrator,
                         services: &services,
                         settings: &settings,
+                        request_origin: &request_origin,
                     };
 
                     while let Some(step) = hold_step_next_chunk(
@@ -1589,6 +1593,7 @@ pub async fn stream_publisher_body_async<W: Write>(
             orchestrator,
             services,
             settings,
+            request_origin: request_origin(&params.request_scheme, &params.request_host),
         },
     )
     .await
@@ -1691,6 +1696,18 @@ pub(crate) fn should_run_server_side_ad_stack(
         && auction_enabled
 }
 
+/// Build the request origin (`scheme://host`, where `host` includes any port)
+/// used to emit absolute first-party URLs in inline creatives. Returns an empty
+/// string when the scheme or host is unknown, so callers fall back to the
+/// configured publisher domain.
+fn request_origin(scheme: &str, host: &str) -> String {
+    if scheme.is_empty() || host.is_empty() {
+        String::new()
+    } else {
+        format!("{scheme}://{host}")
+    }
+}
+
 /// Write winning bids from an auction result into the shared `ad_bids_state` lock.
 ///
 /// `auction_id` propagates into each bid entry as `hb_auction_id` so the
@@ -1699,6 +1716,8 @@ pub(crate) fn write_bids_to_state(
     winning_bids: &std::collections::HashMap<String, Bid>,
     price_granularity: PriceGranularity,
     ad_bids_state: &Arc<Mutex<Option<String>>>,
+    settings: &Settings,
+    request_origin: &str,
     include_debug_bid: bool,
     auction_id: Option<&str>,
 ) {
@@ -1710,6 +1729,8 @@ pub(crate) fn write_bids_to_state(
     let bid_map = build_bid_map(
         winning_bids,
         price_granularity,
+        settings,
+        request_origin,
         include_debug_bid,
         auction_id,
     );
@@ -1922,6 +1943,8 @@ struct AuctionCollectCtx<'a> {
     orchestrator: &'a AuctionOrchestrator,
     services: &'a RuntimeServices,
     settings: &'a Settings,
+    /// Trusted request origin (`scheme://host`) for absolute inline creative URLs.
+    request_origin: String,
 }
 
 struct AuctionHoldCollectRefs<'a> {
@@ -1930,6 +1953,8 @@ struct AuctionHoldCollectRefs<'a> {
     orchestrator: &'a AuctionOrchestrator,
     services: &'a RuntimeServices,
     settings: &'a Settings,
+    /// Trusted request origin (`scheme://host`) for absolute inline creative URLs.
+    request_origin: &'a str,
 }
 
 /// Run the close-body hold loop for HTML bodies, collecting the auction before
@@ -2018,6 +2043,7 @@ async fn body_close_hold_loop_stream<W: Write, P: StreamProcessor>(
         orchestrator,
         services,
         settings,
+        request_origin,
     } = ctx;
     let mut decoder = BodyStreamDecoder::new(compression, max_body_bytes);
     let mut encoder = BodyStreamEncoder::new(compression);
@@ -2029,6 +2055,7 @@ async fn body_close_hold_loop_stream<W: Write, P: StreamProcessor>(
         orchestrator,
         services,
         settings,
+        request_origin: &request_origin,
     };
 
     while let Some(step) = hold_step_next_chunk(
@@ -2146,6 +2173,7 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
         orchestrator,
         services,
         settings,
+        request_origin,
     } = ctx;
     let mut buffer = vec![0u8; STREAM_CHUNK_SIZE];
     let mut hold = Some(BodyCloseHoldBuffer::new());
@@ -2166,6 +2194,7 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
                         orchestrator,
                         services,
                         settings,
+                        &request_origin,
                     )
                     .await;
 
@@ -2229,6 +2258,7 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
                             orchestrator,
                             services,
                             settings,
+                            &request_origin,
                         )
                         .await;
 
@@ -2341,6 +2371,8 @@ async fn collect_non_html_auction(
         &result.winning_bids,
         params.price_granularity,
         &params.ad_bids_state,
+        settings,
+        &request_origin(&params.request_scheme, &params.request_host),
         settings.debug.inject_adm_for_testing,
         telemetry
             .auction_request
@@ -2349,6 +2381,10 @@ async fn collect_non_html_auction(
     );
 }
 
+// Private orchestration helper called only from `body_close_hold_loop`, whose
+// arguments mirror the fields of `AuctionCollectCtx` it destructures; a separate
+// parameter struct would just duplicate that context.
+#[allow(clippy::too_many_arguments)]
 async fn collect_stream_auction(
     dispatched: DispatchedAuction,
     telemetry: AuctionTelemetryCarry,
@@ -2357,6 +2393,7 @@ async fn collect_stream_auction(
     orchestrator: &AuctionOrchestrator,
     services: &RuntimeServices,
     settings: &Settings,
+    request_origin: &str,
 ) {
     log::info!("body_close_hold_loop: collecting dispatched auction before held body tail");
     let placeholder = mediator_placeholder_request();
@@ -2386,6 +2423,8 @@ async fn collect_stream_auction(
         &result.winning_bids,
         price_granularity,
         ad_bids_state,
+        settings,
+        request_origin,
         settings.debug.inject_adm_for_testing,
         telemetry.auction_request.as_ref().map(|r| r.id.as_str()),
     );
@@ -3102,9 +3141,21 @@ fn html_escape_for_script(s: &str) -> String {
 pub(crate) fn build_bid_map(
     winning_bids: &std::collections::HashMap<String, Bid>,
     granularity: crate::price_bucket::PriceGranularity,
+    settings: &Settings,
+    request_origin: &str,
     include_debug_bid: bool,
     auction_id: Option<&str>,
 ) -> serde_json::Map<String, serde_json::Value> {
+    // Inline creatives render in a foreign origin (PUC's srcdoc under GAM), so
+    // their proxy/click URLs must be absolute against the origin the visitor is
+    // actually on — scheme, host, and port. Fall back to the configured publisher
+    // domain only when the request origin is unknown (e.g. an empty host on a
+    // non-navigation path), where no inline render is expected anyway.
+    let base_origin = if request_origin.is_empty() {
+        format!("https://{}", settings.publisher.domain)
+    } else {
+        request_origin.to_owned()
+    };
     winning_bids
         .iter()
         .filter_map(|(slot_id, bid)| {
@@ -3133,6 +3184,17 @@ pub(crate) fn build_bid_map(
                         "hb_adm_hash".to_string(),
                         serde_json::Value::String(adm_hash),
                     );
+                }
+                // Winning creative dimensions — the bridge sizes the inline
+                // render from these, falling back to the first configured slot
+                // format only when absent, which mis-sizes a multi-size slot.
+                // Omit a zero dimension (missing OpenRTB w/h parse to 0) so the
+                // bridge falls back rather than sizing the frame to 0.
+                if bid.width > 0 {
+                    obj.insert("w".to_string(), serde_json::Value::from(bid.width));
+                }
+                if bid.height > 0 {
+                    obj.insert("h".to_string(), serde_json::Value::from(bid.height));
                 }
                 // PBS Cache remains highest priority. APS uses the selected bid ID
                 // carried by its typed renderer; other providers retain the ad-ID fallback.
@@ -3179,11 +3241,38 @@ pub(crate) fn build_bid_map(
                         serde_json::to_value(renderer).expect("should serialize typed renderer"),
                     );
                 }
-                // Always include an ordinary winning creative so the pbRender bridge can
-                // render it locally when GAM serves the Prebid Universal Creative. APS
-                // winners carry only their typed renderer and never expose creative markup.
-                if let Some(ref adm) = bid.creative {
-                    obj.insert("adm".to_string(), serde_json::Value::String(adm.clone()));
+                // Always include the winning creative so the pbRender bridge can
+                // render it locally when GAM serves the Prebid Universal Creative
+                // — no PBS Cache round trip. The `hb_cache_*` coordinates above
+                // remain as the fallback for an absent `adm`.
+                //
+                // Sanitize dangerous markup first, then rewrite URLs to
+                // first-party proxies — the same creative-processing boundary as
+                // the `/auction` path (see `auction::formats`), except the inline
+                // variant. Unlike `/auction`, this `adm` is rendered by the Prebid
+                // Universal Creative inside GAM's iframe (`f.srcdoc = d.ad`), a
+                // foreign origin where root-relative `/first-party/…` URLs resolve
+                // against GAM and 404. `rewrite_inline_creative_html` emits
+                // absolute first-party URLs and omits the tsjs bundle injection.
+                // `sanitize_creative_html` also enforces the 1 MiB creative cap,
+                // returning an empty string for oversized or unparseable markup —
+                // in which case the entry is omitted and the bridge falls back to
+                // the PBS Cache coordinates.
+                if let Some(ref raw_creative) = bid.creative {
+                    // Resolve ${AUCTION_PRICE} from the exact winning CPM BEFORE
+                    // sanitizing, rewriting, and signing — URL rewriting would
+                    // otherwise encode the literal macro into the signed proxy/click
+                    // URL, and signing would lock that wrong value.
+                    let priced = crate::creative::expand_auction_price_macro(raw_creative, cpm);
+                    let sanitized = crate::creative::sanitize_creative_html(&priced);
+                    let adm = crate::creative::rewrite_inline_creative_html(
+                        settings,
+                        &base_origin,
+                        &sanitized,
+                    );
+                    if !adm.is_empty() {
+                        obj.insert("adm".to_string(), serde_json::Value::String(adm));
+                    }
                 }
                 // Verbose per-bid debug blob is included only under the testing flag.
                 if include_debug_bid {
@@ -3437,6 +3526,12 @@ pub async fn handle_page_bids(
         return Ok(response);
     };
 
+    // Trusted request origin for absolute inline creative URLs — derived from the
+    // origin the visitor is actually on (scheme, host, port), not the configured
+    // publisher domain, which cannot carry a port and may differ by subdomain.
+    let request_info = RequestInfo::from_request(&req, services.client_info());
+    let page_bids_request_origin = request_origin(&request_info.scheme, &request_info.host);
+
     // CSRF-style gate: refuse cross-site invocations before any auction work.
     if !page_bids_request_allowed(&req) {
         log::debug!(
@@ -3624,6 +3719,8 @@ pub async fn handle_page_bids(
     let bid_map = build_bid_map(
         &winning_bids,
         co_config.price_granularity,
+        settings,
+        &page_bids_request_origin,
         settings.debug.inject_adm_for_testing,
         page_auction_id.as_deref(),
     );
@@ -4468,6 +4565,7 @@ mod tests {
             orchestrator: &orchestrator,
             services: &services,
             settings: &settings,
+            request_origin: String::new(),
         };
         let mut output = Vec::new();
 
@@ -4515,6 +4613,7 @@ mod tests {
             orchestrator: &orchestrator,
             services: &services,
             settings: &settings,
+            request_origin: "",
         };
         // Passthrough processor: the ordering contract is about collection, not
         // HTML rewriting, so keep the emitted bytes verbatim.
@@ -6684,7 +6783,15 @@ mod tests {
         };
         use crate::http_util::RequestInfo;
         use crate::price_bucket::PriceGranularity;
+        use crate::settings::Settings;
         use std::collections::HashMap;
+
+        // Default settings are enough for the creative boundary: the sanitize
+        // pass needs no config, and `rewrite_creative_html` only signs URLs it
+        // actually rewrites (none of these fixtures carry proxyable URLs).
+        fn test_settings() -> Settings {
+            Settings::default()
+        }
 
         fn make_config() -> CreativeOpportunitiesConfig {
             CreativeOpportunitiesConfig {
@@ -6792,7 +6899,14 @@ mod tests {
                     "https://ssp/bill",
                 ),
             );
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false, None);
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                "",
+                false,
+                None,
+            );
             let entry = map.get("atf_sidebar_ad").expect("should have bid entry");
             let obj = entry.as_object().expect("should be object");
             assert_eq!(
@@ -6841,7 +6955,14 @@ mod tests {
             bid.burl = None;
             let winning_bids = HashMap::from([("atf_sidebar_ad".to_string(), bid)]);
 
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false, None);
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                "",
+                false,
+                None,
+            );
             let obj = map["atf_sidebar_ad"]
                 .as_object()
                 .expect("should include APS bid");
@@ -6861,6 +6982,82 @@ mod tests {
         }
 
         #[test]
+        fn bid_map_omits_zero_creative_dimensions() {
+            // Missing OpenRTB w/h parse to 0. Emitting w:0/h:0 would make the
+            // bridge (which nullish-coalesces) size the frame to 0 instead of
+            // falling back to the slot format, so a zero dimension must be omitted.
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "kargo",
+                "abc123",
+                "https://ssp/win",
+                "https://ssp/bill",
+            );
+            bid.width = 0;
+            bid.height = 0;
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                "",
+                false,
+                None,
+            );
+            let obj = map
+                .get("atf_sidebar_ad")
+                .expect("should have bid entry")
+                .as_object()
+                .expect("should be object");
+            assert!(obj.get("w").is_none(), "should omit zero width");
+            assert!(obj.get("h").is_none(), "should omit zero height");
+        }
+
+        #[test]
+        fn bid_map_includes_winning_creative_dimensions() {
+            // The bridge sizes the inline render from these dimensions; without
+            // them it falls back to the first configured slot format, which
+            // mis-sizes a multi-size slot whose winner is not the first format.
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "kargo",
+                "abc123",
+                "https://ssp/win",
+                "https://ssp/bill",
+            );
+            bid.width = 300;
+            bid.height = 600;
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                "",
+                false,
+                None,
+            );
+            let obj = map
+                .get("atf_sidebar_ad")
+                .expect("should have bid entry")
+                .as_object()
+                .expect("should be object");
+            assert_eq!(
+                obj.get("w").and_then(serde_json::Value::as_u64),
+                Some(300),
+                "should include winning creative width"
+            );
+            assert_eq!(
+                obj.get("h").and_then(serde_json::Value::as_u64),
+                Some(600),
+                "should include winning creative height"
+            );
+        }
+
+        #[test]
         fn client_bid_map_includes_adm_and_omits_debug_bid_by_default() {
             let mut winning_bids = HashMap::new();
             let mut bid = make_bid(
@@ -6877,7 +7074,14 @@ mod tests {
             // Production path (include_debug_bid = false): the creative is always
             // included so the bridge can render it locally, but the verbose
             // debug_bid blob is not.
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false, None);
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                "",
+                false,
+                None,
+            );
             let obj = map
                 .get("atf_sidebar_ad")
                 .expect("should have bid entry")
@@ -6896,7 +7100,259 @@ mod tests {
         }
 
         #[test]
-        fn build_bids_script_escapes_hostile_adm() {
+        fn build_bid_map_sanitizes_hostile_adm() {
+            // The inline-adm path must run the same creative-processing boundary
+            // as the `/auction` path (sanitize → rewrite) before the creative
+            // reaches window.tsjs.bids, so hostile executable markup never lands
+            // in the client-facing `adm` for the Prebid Universal Creative to run.
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "kargo",
+                "abc123",
+                "https://ssp/win",
+                "https://ssp/bill",
+            );
+            bid.creative = Some(
+                "<div onclick=\"steal()\"><script>alert(1)</script>\
+                 <a href=\"javascript:evil()\">x</a></div>"
+                    .to_string(),
+            );
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                "",
+                false,
+                None,
+            );
+            let adm = map
+                .get("atf_sidebar_ad")
+                .and_then(|v| v.as_object())
+                .and_then(|o| o.get("adm"))
+                .and_then(|v| v.as_str())
+                .expect("should include a sanitized adm");
+
+            assert!(
+                !adm.contains("<script"),
+                "should strip <script> elements from the inline adm"
+            );
+            assert!(
+                !adm.contains("alert(1)"),
+                "should strip inline script bodies from the inline adm"
+            );
+            assert!(
+                !adm.contains("onclick"),
+                "should strip on* event-handler attributes from the inline adm"
+            );
+            assert!(
+                !adm.contains("javascript:"),
+                "should strip javascript: URIs from the inline adm"
+            );
+        }
+
+        #[test]
+        fn build_bid_map_omits_oversized_adm() {
+            // Creatives larger than the sanitize pass's 1 MiB cap are rejected
+            // (empty result), so the inline `adm` is omitted and the pbRender
+            // bridge falls back to the PBS Cache coordinates instead of shipping
+            // an unbounded creative to the client.
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "kargo",
+                "abc123",
+                "https://ssp/win",
+                "https://ssp/bill",
+            );
+            bid.creative = Some(format!("<div>{}</div>", "a".repeat(1024 * 1024 + 1)));
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                "",
+                false,
+                None,
+            );
+            let obj = map
+                .get("atf_sidebar_ad")
+                .and_then(|v| v.as_object())
+                .expect("should have a bid entry");
+            assert!(
+                obj.get("adm").is_none(),
+                "should omit the inline adm when the creative exceeds the 1 MiB cap"
+            );
+        }
+
+        #[test]
+        fn build_bid_map_rewrites_inline_adm_to_absolute_first_party_urls() {
+            // The inline `adm` is rendered by the Prebid Universal Creative inside
+            // GAM's iframe (`f.srcdoc = d.ad`), a foreign origin. Proxied URLs must
+            // therefore be emitted **absolute** against the publisher domain — a
+            // root-relative `/first-party/proxy` would resolve against GAM and 404.
+            // The tsjs bundle must NOT be injected into that foreign-origin iframe.
+            let mut settings = test_settings();
+            settings.publisher.domain = "example.com".to_string();
+
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "examplessp",
+                "abc123",
+                "https://ssp.example.com/win",
+                "https://ssp.example.com/bill",
+            );
+            bid.creative = Some(
+                "<html><body><img src=\"https://cdn.example.com/pixel.png\"></body></html>"
+                    .to_string(),
+            );
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &settings,
+                "",
+                false,
+                None,
+            );
+            let adm = map
+                .get("atf_sidebar_ad")
+                .and_then(|v| v.as_object())
+                .and_then(|o| o.get("adm"))
+                .and_then(|v| v.as_str())
+                .expect("should include a rewritten adm");
+
+            assert!(
+                adm.contains("https://example.com/first-party/proxy?tsurl="),
+                "should emit an absolute first-party proxy URL for the foreign-origin render context, got: {adm}"
+            );
+            assert!(
+                !adm.contains("src=\"/first-party/proxy"),
+                "should not emit a root-relative proxy URL that 404s under GAM's origin, got: {adm}"
+            );
+            assert!(
+                !adm.contains("https://cdn.example.com/pixel.png"),
+                "should proxy the original absolute CDN URL, got: {adm}"
+            );
+            assert!(
+                !adm.contains("/static/tsjs="),
+                "should not inject the tsjs bundle into a foreign-origin creative iframe, got: {adm}"
+            );
+        }
+
+        #[test]
+        fn build_bid_map_uses_request_origin_for_inline_urls() {
+            // The inline adm's absolute first-party URLs must resolve against the
+            // origin the visitor is on (here an HTTP dev host with a port), not the
+            // configured publisher domain.
+            let mut settings = test_settings();
+            settings.publisher.domain = "example.com".to_string();
+
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "examplessp",
+                "abc123",
+                "https://ssp.example.com/win",
+                "https://ssp.example.com/bill",
+            );
+            bid.creative = Some(
+                "<html><body><img src=\"https://cdn.example.com/pixel.png\"></body></html>"
+                    .to_string(),
+            );
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &settings,
+                "http://localhost:7676",
+                false,
+                None,
+            );
+            let adm = map
+                .get("atf_sidebar_ad")
+                .and_then(|v| v.as_object())
+                .and_then(|o| o.get("adm"))
+                .and_then(|v| v.as_str())
+                .expect("should include a rewritten adm");
+
+            assert!(
+                adm.contains("http://localhost:7676/first-party/proxy?tsurl="),
+                "should emit URLs against the request origin, got: {adm}"
+            );
+            assert!(
+                !adm.contains("https://example.com/first-party/proxy"),
+                "must not fall back to the configured publisher domain, got: {adm}"
+            );
+        }
+
+        #[test]
+        fn build_bid_map_expands_auction_price_macro_before_rewrite() {
+            // ${AUCTION_PRICE} must be resolved to the clearing price before the
+            // creative is rewritten and signed. Otherwise URL rewriting encodes the
+            // literal macro (`%24%7BAUCTION_PRICE%7D`) into the signed proxy/click
+            // URL, so trackers receive an encoded macro instead of the price and the
+            // signature locks the wrong value.
+            let mut settings = test_settings();
+            settings.publisher.domain = "example.com".to_string();
+
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "examplessp",
+                "abc123",
+                "https://ssp.example.com/win",
+                "https://ssp.example.com/bill",
+            );
+            bid.creative = Some(
+                "<html><body>\
+                 <a href=\"https://ads.example.com/click?p=${AUCTION_PRICE}\">go</a>\
+                 </body></html>"
+                    .to_string(),
+            );
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &settings,
+                "",
+                false,
+                None,
+            );
+            let adm = map
+                .get("atf_sidebar_ad")
+                .and_then(|v| v.as_object())
+                .and_then(|o| o.get("adm"))
+                .and_then(|v| v.as_str())
+                .expect("should include a rewritten adm");
+
+            assert!(
+                !adm.to_uppercase().contains("AUCTION_PRICE"),
+                "no literal or encoded ${{AUCTION_PRICE}} macro should survive: {adm}"
+            );
+            assert!(
+                adm.contains("p=1.5"),
+                "the exact winning CPM should be substituted into the signed URL: {adm}"
+            );
+        }
+
+        #[test]
+        fn build_bids_script_escapes_line_separators_in_adm() {
+            // U+2028/U+2029 are valid JSON string content but terminate inline
+            // <script> statements; they survive the sanitize boundary as ordinary
+            // text, so build_bids_script must unicode-escape them.
             let mut winning_bids = HashMap::new();
             let mut bid = make_bid(
                 "s",
@@ -6906,12 +7362,17 @@ mod tests {
                 "https://ssp/win",
                 "https://ssp/bill",
             );
-            // A hostile creative that tries to break out of the <script> and
-            // includes both line/paragraph separators the spec promises to escape.
-            bid.creative = Some("</script><script>alert(1)</script>\u{2028}\u{2029}".to_string());
+            bid.creative = Some("<div>a\u{2028}b\u{2029}c</div>".to_string());
             winning_bids.insert("s".to_string(), bid);
 
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false, None);
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                "",
+                false,
+                None,
+            );
             let script = build_bids_script(&map);
             assert!(
                 !script.contains("</script><script>"),
@@ -6945,7 +7406,14 @@ mod tests {
             );
             winning_bids.insert("atf_sidebar_ad".to_string(), bid);
 
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, true, None);
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                "",
+                true,
+                None,
+            );
             let obj = map
                 .get("atf_sidebar_ad")
                 .expect("should have bid entry")
@@ -7009,7 +7477,14 @@ mod tests {
                     metadata: Default::default(),
                 },
             );
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false, None);
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                "",
+                false,
+                None,
+            );
             let obj = map
                 .get("atf_sidebar_ad")
                 .expect("should have bid entry")
@@ -7058,7 +7533,14 @@ mod tests {
                     metadata: Default::default(),
                 },
             );
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false, None);
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                "",
+                false,
+                None,
+            );
             let obj = map
                 .get("atf_sidebar_ad")
                 .expect("should have bid entry")
@@ -7105,7 +7587,14 @@ mod tests {
                     metadata: Default::default(),
                 },
             );
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false, None);
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                "",
+                false,
+                None,
+            );
             let obj = map
                 .get("atf_sidebar_ad")
                 .expect("should have bid entry")
@@ -7143,7 +7632,14 @@ mod tests {
                     metadata: Default::default(),
                 },
             );
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false, None);
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                "",
+                false,
+                None,
+            );
             assert!(
                 map.is_empty(),
                 "slot with no price should be excluded from bid map"

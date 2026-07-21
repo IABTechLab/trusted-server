@@ -93,13 +93,29 @@ export interface AuctionBidData {
   hb_crid?: string;
   /** Trace hash of the bid's raw creative markup (16 hex chars of SHA-256). */
   hb_adm_hash?: string;
+  /** Winning creative width; the bridge sizes the inline render from this. */
+  w?: number;
+  /** Winning creative height; the bridge sizes the inline render from this. */
+  h?: number;
   nurl?: string;
   burl?: string;
   /** Typed winning-bid renderer capability. */
   renderer?: AuctionBidRenderer;
-  /** Raw creative markup. Only present when `[debug] inject_adm_for_testing = true`. */
+  /**
+   * Sanitized winning creative markup for local rendering through the pbRender
+   * bridge. Present whenever the winning bid carried a creative that passed the
+   * server-side sanitize/rewrite boundary; absent when there was no creative or
+   * it was rejected (e.g. over the 1 MiB cap), in which case the bridge falls
+   * back to the PBS Cache coordinates. This is NOT gated by
+   * `inject_adm_for_testing`.
+   */
   adm?: string;
-  /** Debug-only bid field mirror. Only present when `[debug] inject_adm_for_testing = true`. */
+  /**
+   * Verbose per-bid debug blob (carries the raw, un-sanitized creative among
+   * other fields). Only present when `[debug] inject_adm_for_testing = true`;
+   * its presence is also the client-side gate for the testing-only direct
+   * GAM-replace path.
+   */
   debug_bid?: AuctionDebugBidData;
 }
 
