@@ -146,6 +146,20 @@ ja4_endpoint_enabled = false
 # in production.
 auction_html_comment = false
 
+[debug.auction_html_comment_options]
+include_provider_responses = true
+include_mediator_response = true
+include_bids = true
+metadata_keys = [
+    "error_type", "http_status", "message",
+    "upstream_message", "upstream_message_truncated",
+    "responsetimemillis", "errors", "warnings", "bidstatus",
+]
+# "redacted" (default) or "full". NEVER "full" in production — exposes
+# device IP, geo, consent string, and eids via view-source when
+# integrations.prebid.debug is also enabled.
+verbosity = "redacted"
+
 [creative_opportunities]
 gam_network_id = "123456789"
 # FCP is not affected by this value — body content above </body> has already
