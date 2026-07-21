@@ -279,6 +279,25 @@ pub(crate) fn rewrite_rsc_tchunks_with_rewriter(
     request_host: &str,
     request_scheme: &str,
 ) -> String {
+    rewrite_rsc_tchunks_with(content, &|segment: &str| {
+        rewriter.rewrite(segment, origin_host, request_host, request_scheme)
+    })
+}
+
+/// Rewrite RSC T-chunks with a pluggable per-segment rewriter, recomputing each
+/// T-chunk's length prefix from the rewritten content so the RSC parser stays in
+/// sync when a rewrite changes byte length.
+///
+/// The `rewrite` closure is applied to the text between T-chunks and to each
+/// T-chunk's content, returning the rewritten segment (borrowed unchanged when
+/// there is nothing to do). Used by the origin-host RSC rewrite (via
+/// [`rewrite_rsc_tchunks_with_rewriter`]) and by the streaming integration-host
+/// flight rewrite in the HTML processor, so both share identical T-chunk framing
+/// and length recomputation.
+pub(crate) fn rewrite_rsc_tchunks_with<F>(content: &str, rewrite: &F) -> String
+where
+    F: for<'a> Fn(&'a str) -> std::borrow::Cow<'a, str>,
+{
     let Some(chunks) = find_tchunks(content) else {
         log::warn!(
             "RSC payload contains invalid or incomplete T-chunks; skipping rewriting to avoid breaking hydration"
@@ -287,7 +306,7 @@ pub(crate) fn rewrite_rsc_tchunks_with_rewriter(
     };
 
     if chunks.is_empty() {
-        return rewriter.rewrite_to_string(content, origin_host, request_host, request_scheme);
+        return rewrite(content).into_owned();
     }
 
     let mut result = String::with_capacity(content.len());
@@ -295,34 +314,25 @@ pub(crate) fn rewrite_rsc_tchunks_with_rewriter(
 
     for chunk in &chunks {
         let before = &content[last_end..chunk.match_start];
-        result.push_str(
-            rewriter
-                .rewrite(before, origin_host, request_host, request_scheme)
-                .as_ref(),
-        );
+        result.push_str(rewrite(before).as_ref());
 
         let chunk_content = &content[chunk.header_end..chunk.content_end];
-        let rewritten_content =
-            rewriter.rewrite_to_string(chunk_content, origin_host, request_host, request_scheme);
+        let rewritten_content = rewrite(chunk_content);
 
-        let new_length = calculate_unescaped_byte_length(&rewritten_content);
+        let new_length = calculate_unescaped_byte_length(rewritten_content.as_ref());
         let new_length_hex = format!("{new_length:x}");
 
         result.push_str(&content[chunk.match_start..chunk.id_end]);
         result.push_str(":T");
         result.push_str(&new_length_hex);
         result.push(',');
-        result.push_str(&rewritten_content);
+        result.push_str(rewritten_content.as_ref());
 
         last_end = chunk.content_end;
     }
 
     let remaining = &content[last_end..];
-    result.push_str(
-        rewriter
-            .rewrite(remaining, origin_host, request_host, request_scheme)
-            .as_ref(),
-    );
+    result.push_str(rewrite(remaining).as_ref());
 
     result
 }
