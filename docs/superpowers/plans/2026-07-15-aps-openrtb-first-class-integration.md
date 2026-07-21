@@ -192,11 +192,7 @@ replacing request/response behavior.
       rename the custom deserializer/error text accordingly.
 - [ ] Add `allow_script_creatives: bool` with a serde default of `false`. Treat it as a
       server-side bid-eligibility capability, not a browser-only rendering preference.
-- [ ] Change `default_endpoint()` to:
-
-  ```text
-  https://web.ads.aps.amazon-adsystem.com/e/pb/bid
-  ```
+- [ ] Change `default_endpoint()` to the built-in production APS `/e/pb/bid` endpoint. Use `https://aps.example.com/e/pb/bid` only for documentation and test overrides.
 
 - [ ] Replace generic URL-only endpoint validation with a custom check requiring HTTPS,
       a non-empty host, and no username/password. Do not add a plaintext test exception:
