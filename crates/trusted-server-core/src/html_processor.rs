@@ -1,10 +1,12 @@
 //! Simplified HTML processor that combines URL replacement and integration injection
 //!
 //! This module provides a `StreamProcessor` implementation for HTML content.
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use lol_html::{
@@ -12,7 +14,9 @@ use lol_html::{
     html_content::{ContentType, EndTag},
     text,
 };
+use regex::Regex;
 
+use crate::integrations::nextjs::rewrite_rsc_tchunks_with;
 use crate::integrations::{
     AttributeRewriteOutcome, IntegrationAttributeContext, IntegrationDocumentState,
     IntegrationHtmlContext, IntegrationHtmlPostProcessor, IntegrationRegistry,
@@ -214,6 +218,59 @@ impl HtmlProcessorConfig {
     }
 }
 
+/// Absolute `http(s)` URL as it appears unescaped inside an RSC element row or a
+/// `__next_s` push (i.e. up to the first character that cannot be part of an
+/// unescaped JSON/RSC string URL: quote, backslash, whitespace, or a bracket).
+static FLIGHT_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"https?://[^\s"'\\<>(){}\[\]]+"#).expect("should compile flight URL regex")
+});
+
+/// Rewrite third-party integration URLs inside a Next.js flight (`__next_f`) /
+/// script-loader (`__next_s`) payload segment using the **same**
+/// [`IntegrationRegistry::rewrite_attribute`] mapping the DOM `src`/`href`
+/// handlers apply.
+///
+/// React App Router hydrates the DOM against the tree it reconstructs from the
+/// flight. When TS rewrites a script tag's URL to `/integrations/…` in the DOM
+/// but the flight still carries the origin host, the two disagree and React
+/// throws a hydration error (#418). Rewriting the flight with the identical
+/// registry mapping keeps DOM and flight in sync by construction.
+///
+/// Only URLs an integration actually claims are changed; origin/CDN URLs are left
+/// untouched (`rewrite_attribute` returns `Unchanged` for them). Integration
+/// script `src`s appear as plain (unescaped) URLs in RSC element rows, which this
+/// matches; a URL with JSON-escaped slashes inside a T-chunk is left as-is (that
+/// form does not occur for integration script srcs in practice).
+fn rewrite_flight_integration_urls<'a>(
+    segment: &'a str,
+    integrations: &IntegrationRegistry,
+    request_host: &str,
+    request_scheme: &str,
+    origin_host: &str,
+) -> Cow<'a, str> {
+    if !segment.contains("://") {
+        return Cow::Borrowed(segment);
+    }
+    FLIGHT_URL_PATTERN.replace_all(segment, |caps: &regex::Captures<'_>| {
+        let url = &caps[0];
+        match integrations.rewrite_attribute(
+            "src",
+            url,
+            &IntegrationAttributeContext {
+                attribute_name: "src",
+                request_host,
+                request_scheme,
+                origin_host,
+            },
+        ) {
+            AttributeRewriteOutcome::Replaced(rewritten) => rewritten,
+            AttributeRewriteOutcome::Unchanged | AttributeRewriteOutcome::RemoveElement => {
+                url.to_string()
+            }
+        }
+    })
+}
+
 /// Create an HTML processor with URL replacement and integration hooks.
 ///
 /// # Panics
@@ -328,7 +385,13 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     // HTML parsing completes. Empty when none are enabled.
                     let deferred_ids = integrations.js_module_ids_deferred();
                     snippet.push_str(&tsjs::tsjs_deferred_script_tags(&deferred_ids));
-                    el.prepend(&snippet, ContentType::Html);
+                    // Fix #1: append at the END of <head> (before `</head>`) instead
+                    // of prepend. On Next.js App Router, React hydrates <head> children
+                    // in order; prepending our scripts shifts the first child from the
+                    // origin's <meta charset> to a <script>, causing hydration mismatch
+                    // (React #418). Appending leaves the origin head leading children
+                    // unchanged; React tolerates the extra trailing nodes.
+                    el.append(&snippet, ContentType::Html);
                     injected_tsjs.set(true);
                 }
                 Ok(())
@@ -585,6 +648,54 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         }),
     ];
 
+    // Streaming Next.js flight rewriter: keep the RSC flight (`self.__next_f`)
+    // and script-loader (`self.__next_s`) URLs in sync with the DOM attribute
+    // rewrites so React App Router hydration does not mismatch (#418). This runs
+    // in the streaming path — it buffers only the current `<script>` text node
+    // (bounded), never the whole document — so it works with the nextjs
+    // *integration* disabled and does not defeat end-to-end streaming. It reuses
+    // the nextjs module's T-chunk framing (`rewrite_rsc_tchunks_with`) so a URL
+    // inside a length-prefixed T-chunk still gets its length recomputed.
+    {
+        let patterns = patterns.clone();
+        let integrations = integration_registry.clone();
+        element_content_handlers.push(text!("script", {
+            let patterns = patterns.clone();
+            let integrations = integrations.clone();
+            move |chunk| {
+                let current = chunk.as_str();
+                // Only touch Next.js flight (`self.__next_f`) / script-loader
+                // (`self.__next_s`) payloads — the sources React App Router
+                // hydrates against. Non-Next.js sites and ordinary scripts carry
+                // neither marker and are skipped entirely, so this changes nothing
+                // outside the hydration-mismatch case it targets. Non-destructive
+                // (replaces only when the rewrite changed something), so it
+                // coexists with the per-integration script rewriters below.
+                //
+                // Gate is per-chunk: a flight script split across text chunks such
+                // that a URL lands in a chunk carrying neither marker is left
+                // unrewritten (rare — flight pushes arrive as a single text node in
+                // practice).
+                let is_flight = current.contains("__next_f") || current.contains("__next_s");
+                if is_flight && current.contains("://") {
+                    let rewritten = rewrite_rsc_tchunks_with(current, &|segment: &str| {
+                        rewrite_flight_integration_urls(
+                            segment,
+                            &integrations,
+                            &patterns.request_host,
+                            &patterns.request_scheme,
+                            &patterns.origin_host,
+                        )
+                    });
+                    if rewritten != current {
+                        chunk.replace(&rewritten, ContentType::Text);
+                    }
+                }
+                Ok(())
+            }
+        }));
+    }
+
     for script_rewriter in script_rewriters {
         let selector = script_rewriter.selector();
         let rewriter = script_rewriter.clone();
@@ -722,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn integration_head_injector_prepends_after_tsjs_once() {
+    fn integration_head_injector_appends_after_tsjs_once() {
         struct TestHeadInjector;
 
         impl IntegrationHeadInjector for TestHeadInjector {
@@ -787,8 +898,8 @@ mod tests {
             "should inject config before tsjs bundle so auto-init can read it"
         );
         assert!(
-            tsjs_index < title_index,
-            "should prepend all injected content before existing head content"
+            title_index < head_index,
+            "should append all injected content after existing head content (head-end injection is hydration-safe)"
         );
     }
 
@@ -1460,9 +1571,13 @@ mod tests {
     }
 
     #[test]
-    fn golden_script_tag_injected_at_head_start() {
-        // The trusted-server script tag must be the FIRST child of <head>.
-        // Any drift in injection position breaks the page initialization order.
+    fn golden_script_tag_injected_at_head_end() {
+        // The trusted-server script tag must be injected at the END of <head>,
+        // after the origin's own head children. On Next.js App Router <head> is
+        // React-owned and hydrated child-by-child in order; prepending a script
+        // shifts the first child (origin's `<meta>`) and trips a #418 hydration
+        // mismatch. Appending keeps the origin's head children in their original
+        // positions, so React hydrates them unchanged.
         let html = r#"<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>Test</title></head>
@@ -1476,22 +1591,32 @@ mod tests {
             .expect("should process HTML");
         let output_str = std::str::from_utf8(&output).expect("should be valid UTF-8");
 
-        let head_pos = output_str.find("<head>").expect("should contain <head>");
+        let head_close = output_str.find("</head>").expect("should contain </head>");
+        let title_close = output_str
+            .find("</title>")
+            .expect("should keep existing head content");
         let script_pos = output_str
             .find("<script")
             .expect("should inject script tag");
 
+        // The injected script comes after the origin's head content (append),
+        // not before it (prepend), and still inside <head>.
         assert!(
-            script_pos > head_pos,
-            "script tag must appear after <head> opening: head_pos={head_pos}, script_pos={script_pos}"
+            title_close < script_pos,
+            "origin head content must precede the injected script: title_close={title_close}, script_pos={script_pos}"
+        );
+        assert!(
+            script_pos < head_close,
+            "injected script must stay inside <head>: script_pos={script_pos}, head_close={head_close}"
         );
 
-        // No other elements between <head> and the script tag
-        let between = &output_str[head_pos + "<head>".len()..script_pos];
+        // No origin element between the origin head content and the injected
+        // script — it is appended directly at the end of <head>.
+        let between = &output_str[title_close + "</title>".len()..script_pos];
         let trimmed = between.trim();
         assert!(
             trimmed.is_empty(),
-            "script tag must be first child of <head>, found content before it: {trimmed:?}"
+            "injected script must be the last head child, found content before it: {trimmed:?}"
         );
     }
 

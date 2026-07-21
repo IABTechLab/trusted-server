@@ -2169,8 +2169,20 @@ pub(crate) fn build_bids_script(bid_map: &serde_json::Map<String, serde_json::Va
     let json = serde_json::to_string(bid_map)
         .expect("serde_json::to_string of Map<String,Value> should be infallible");
     let escaped = html_escape_for_script(&json);
+    // adInit() defines GPT slots on the publisher's `-container` wrappers, which
+    // mutates those ad-slot subtrees. Calling it synchronously here (this script
+    // runs at body-parse time) lands those mutations inside React's hydration
+    // window and trips a #418 hydration mismatch. Defer adInit until after the
+    // page has hydrated: gate on window `load` (client bundles that hydrate the
+    // tree have executed by then), then a double `requestAnimationFrame` so it
+    // runs after React has committed. Not a retry timer — a single deferred call.
     format!(
-        "<script>(window.tsjs=window.tsjs||{{}}).bids=JSON.parse(\"{}\");(function(){{var f=window.tsjs.adInit;if(typeof f===\"function\")f();}})();</script>",
+        "<script>(window.tsjs=window.tsjs||{{}}).bids=JSON.parse(\"{}\");\
+(function(){{\
+var f=function(){{var a=window.tsjs.adInit;if(typeof a===\"function\")a();}};\
+var d=function(){{requestAnimationFrame(function(){{requestAnimationFrame(f);}});}};\
+if(document.readyState===\"complete\")d();else addEventListener(\"load\",d,{{once:true}});\
+}})();</script>",
         escaped
     )
 }
@@ -4692,6 +4704,37 @@ mod tests {
             assert!(
                 !script.contains("prevGptSlots"),
                 "should not use TS-owned slots as adInit success signal"
+            );
+        }
+
+        #[test]
+        fn bids_script_defers_ad_init_until_after_hydration() {
+            let mut map = serde_json::Map::new();
+            map.insert("atf".to_string(), serde_json::json!({"hb_pb": "1.00"}));
+
+            let script = build_bids_script(&map);
+
+            // adInit() mutates ad-slot subtrees (GPT defineSlot on the
+            // `-container` wrapper). Running it synchronously at body-parse time
+            // lands those mutations inside React's hydration window and trips a
+            // #418 hydration mismatch. The bootstrap must defer adInit until
+            // after hydration: gate on window `load`, then a `requestAnimationFrame`.
+            assert!(
+                script.contains("requestAnimationFrame"),
+                "should defer adInit to a post-hydration animation frame"
+            );
+            assert!(
+                script.contains("\"load\""),
+                "should gate adInit on the window load event"
+            );
+            // Deferral must not regress into a retry timer.
+            assert!(
+                !script.contains("setTimeout"),
+                "should not retry adInit on a timer"
+            );
+            assert!(
+                script.contains("window.tsjs.adInit"),
+                "should still hand off bids to adInit"
             );
         }
 
