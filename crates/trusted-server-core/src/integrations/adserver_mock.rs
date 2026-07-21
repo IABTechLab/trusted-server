@@ -119,7 +119,7 @@ fn build_bid_index(bidder_responses: &[AuctionResponse]) -> BidIndex {
             // be mis-attributed during mediation. Low severity for the mock
             // mediator, but log it so the collision is visible.
             if index.insert(key, bid.clone()).is_some() {
-                log::debug!(
+                log::warn!(
                     "adserver_mock: duplicate bid for (provider '{}', slot '{}', bidder '{}'); keeping the last — win/billing URL restoration may be mis-attributed",
                     response.provider,
                     bid.slot_id,
@@ -961,7 +961,8 @@ mod tests {
                 .renderer
                 .as_ref()
                 .expect("should restore APS renderer")
-                .aps()
+                .as_aps()
+                .expect("should be APS renderer")
                 .bid_id,
             "selected"
         );

@@ -3172,7 +3172,6 @@ pub(crate) fn build_auction_request(
     // server edge host, which must not leak into the bid request.
     let page_url = format!(
         "{}://{}{}",
-<<<<<<< HEAD
         request_info.scheme, publisher_domain, slots_ctx.request_path_and_query
     );
     let ec_id = ec_id.filter(|id| !id.is_empty());
@@ -3276,14 +3275,9 @@ pub(crate) fn build_bid_map(
                 if bid.height > 0 {
                     obj.insert("h".to_string(), serde_json::Value::from(bid.height));
                 }
-                // hb_adid: use PBS Cache UUID when present — the Prebid Universal Creative uses
-                // this as the cache lookup key, NOT the OpenRTB bid ID (bid.ad_id). Fall back to
-                // bid.ad_id for APS and other non-PBS providers. Typed APS
-                // renderers use their selected bid ID as the Prebid ad ID.
-                let renderer_bid_id = bid
-                    .renderer
-                    .as_ref()
-                    .map(|renderer| renderer.aps().bid_id.as_str());
+                // PBS Cache remains highest priority. Renderer bids use the generic
+                // upstream bid ID; ordinary providers retain the ad-ID fallback.
+                let renderer_bid_id = bid.renderer.as_ref().and(bid.bid_id.as_deref());
                 let hb_adid = bid
                     .cache_id
                     .as_deref()
@@ -4034,7 +4028,10 @@ mod tests {
             height: 250,
             nurl: None,
             burl: None,
+            bid_id: None,
             ad_id: None,
+            creative_id: None,
+            renderer: None,
             cache_id: None,
             cache_host: None,
             cache_path: None,
