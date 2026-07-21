@@ -826,34 +826,71 @@ const TS_DISPLAY_RENDERER =
   'if(d.adUrl&&!d.ad){f.src=d.adUrl;}else{f.srcdoc=d.ad;}' +
   'w.document.body.appendChild(f);};})();';
 
+/** The clear-price auction macro DSPs embed in creative markup and tracking URLs. */
+const AUCTION_PRICE_MACRO = '${AUCTION_PRICE}';
+
 /**
- * Extract the renderable creative markup from a PBS Cache GET response.
- *
- * Prebid Cache entries are JSON bid objects (`{ "adm": "<div…>", … }`); the
- * Prebid Universal Creative's own cache path `JSON.parse`s the response and
- * renders `bidObject.adm`, not the raw response body. This mirrors that
- * extraction so the bridge hands PUC a creative string rather than a serialized
- * bid document.
- *
- * A non-JSON body is treated as raw creative markup for backward compatibility
- * with caches that store the creative directly. Returns `undefined` when the
- * JSON payload carries no usable string `adm` (missing or malformed), so the
- * caller can decline to render instead of injecting a serialized object.
+ * Substitute the `${AUCTION_PRICE}` macro with a clearing price. Mirrors the
+ * server-side `expand_auction_price_macro`: only the exact clear-price token is
+ * replaced, so the encrypted `${AUCTION_PRICE:B64}` variant is left intact.
  */
-export function extractCachedAdm(body: string): string | undefined {
+function expandAuctionPriceMacro(markup: string, cpm: number): string {
+  return markup.includes(AUCTION_PRICE_MACRO)
+    ? markup.split(AUCTION_PRICE_MACRO).join(String(cpm))
+    : markup;
+}
+
+/** A decoded PBS Cache bid: the renderable creative plus its render metadata. */
+export interface CachedBid {
+  adm: string;
+  width?: number;
+  height?: number;
+  price?: number;
+}
+
+/**
+ * Decode a PBS Cache GET response into a renderable bid.
+ *
+ * Prebid Cache entries are JSON bid objects (`{ "adm": "<div…>", "w": …, … }`);
+ * the Prebid Universal Creative's own cache path `JSON.parse`s the response and
+ * renders `bidObject.adm`, sizing from the cached dimensions. This mirrors that,
+ * retaining the fields the fallback render needs — creative dimensions (`w`/`h`
+ * or `width`/`height`) and clearing `price` for macro expansion — rather than
+ * reducing the payload to a bare `adm` string that forces the first slot format
+ * and leaves price macros unresolved.
+ *
+ * A non-JSON body is treated as raw creative markup (the `{ adm }`-only variant)
+ * for backward compatibility with caches that store the creative directly.
+ * Returns `undefined` when the JSON payload carries no usable string `adm`, so
+ * the caller can decline to render instead of injecting a serialized object.
+ */
+export function parseCachedBid(body: string): CachedBid | undefined {
   let parsed: unknown;
   try {
     parsed = JSON.parse(body);
   } catch {
-    // Not JSON — a cache that returned the creative markup directly.
-    return body.trim().length > 0 ? body : undefined;
+    // Not JSON — a cache that returned the creative markup directly. No render
+    // metadata is available, so only the raw markup variant is returned.
+    return body.trim().length > 0 ? { adm: body } : undefined;
   }
-  if (parsed && typeof parsed === 'object') {
-    const adm = (parsed as { adm?: unknown }).adm;
-    return typeof adm === 'string' && adm.length > 0 ? adm : undefined;
+  if (!parsed || typeof parsed !== 'object') {
+    // A JSON primitive (string/number/bool) is not a valid cached bid object.
+    return undefined;
   }
-  // A JSON primitive (string/number/bool) is not a valid cached bid object.
-  return undefined;
+  const obj = parsed as Record<string, unknown>;
+  const adm = obj.adm;
+  if (typeof adm !== 'string' || adm.length === 0) return undefined;
+
+  const num = (v: unknown): number | undefined =>
+    typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+
+  return {
+    adm,
+    // PBS OpenRTB bids carry w/h; the Prebid.js cache format uses width/height.
+    width: num(obj.w) ?? num(obj.width),
+    height: num(obj.h) ?? num(obj.height),
+    price: num(obj.price),
+  };
 }
 
 /**
@@ -959,10 +996,10 @@ export function installTsRenderBridge(): void {
     fetch(cacheUrl, { mode: 'cors' })
       .then((res) => (res.ok ? res.text() : Promise.reject(res.status)))
       .then((body) => {
-        // PBS Cache returns the cached bid as a JSON object; extract its `adm`
-        // the same way the Prebid Universal Creative does before rendering.
-        const ad = extractCachedAdm(body);
-        if (!ad) {
+        // PBS Cache returns the cached bid as a JSON object; decode its creative
+        // and render metadata the same way the Prebid Universal Creative does.
+        const cached = parseCachedBid(body);
+        if (!cached) {
           // No renderable creative in the cache payload — decline rather than
           // ship a serialized bid document to PUC. Beacons stay unfired.
           log.warn(
@@ -970,14 +1007,21 @@ export function installTsRenderBridge(): void {
           );
           return;
         }
+        // Resolve the auction-price macro from the cached clearing price, and
+        // size from the cached bid's own dimensions, falling back to the slot
+        // format only when the cache omits them.
+        const ad =
+          cached.price !== undefined
+            ? expandAuctionPriceMacro(cached.adm, cached.price)
+            : cached.adm;
         port.postMessage(
           JSON.stringify({
             message: 'Prebid Response',
             adId,
             ad,
             renderer: TS_DISPLAY_RENDERER,
-            width,
-            height,
+            width: cached.width ?? width,
+            height: cached.height ?? height,
           })
         );
         fireWinBillingBeacons(slotId, matchedBid);

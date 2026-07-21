@@ -908,6 +908,38 @@ describe('installTsAdInit', () => {
   });
 });
 
+describe('parseCachedBid', () => {
+  async function parseCachedBid(body: string) {
+    const mod = await import('../../../src/integrations/gpt/index');
+    return mod.parseCachedBid(body);
+  }
+
+  it('decodes adm, dimensions, and price from a PBS Cache bid object', async () => {
+    const bid = await parseCachedBid(
+      JSON.stringify({ adm: '<div>cached</div>', w: 300, h: 250, price: 1.23 })
+    );
+    expect(bid).toEqual({ adm: '<div>cached</div>', width: 300, height: 250, price: 1.23 });
+  });
+
+  it('accepts width/height as an alternate dimension spelling', async () => {
+    const bid = await parseCachedBid(
+      JSON.stringify({ adm: '<div>cached</div>', width: 728, height: 90 })
+    );
+    expect(bid?.width).toBe(728);
+    expect(bid?.height).toBe(90);
+  });
+
+  it('treats a non-JSON body as raw creative markup with no metadata', async () => {
+    const bid = await parseCachedBid('<div>raw</div>');
+    expect(bid).toEqual({ adm: '<div>raw</div>' });
+  });
+
+  it('returns undefined when the JSON payload carries no usable adm', async () => {
+    expect(await parseCachedBid(JSON.stringify({ w: 300, h: 250 }))).toBeUndefined();
+    expect(await parseCachedBid('   ')).toBeUndefined();
+  });
+});
+
 describe('installTsRenderBridge', () => {
   let fetchStub: ReturnType<typeof vi.fn>;
 
@@ -1128,6 +1160,74 @@ describe('installTsRenderBridge', () => {
     const parsed = JSON.parse(portMessages[0]) as Record<string, any>;
     expect(parsed.ad).toBe(rawAd);
     expect(beaconSpy).toHaveBeenCalledTimes(2);
+    beaconSpy.mockRestore();
+  });
+
+  it('sizes a PBS Cache render from the cached bid dimensions', async () => {
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    // Cached bid is 300x250 while the slot's first format is 728x90 (from the
+    // default setup). The response must use the cached dimensions.
+    fetchStub.mockResolvedValue({
+      ok: true,
+      text: () => Promise.resolve(JSON.stringify({ adm: '<div>cached</div>', w: 300, h: 250 })),
+    } as Response);
+
+    const bridgeListener = await captureBridgeListener();
+    const portMessages: string[] = [];
+    const fakePort = { postMessage: (s: string) => portMessages.push(s) };
+    const source = createTrustedSlotIframe();
+
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+        ports: [fakePort],
+        source,
+        stopImmediatePropagation: vi.fn(),
+      }) as unknown as MessageEvent
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    expect(portMessages).toHaveLength(1);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const parsed = JSON.parse(portMessages[0]) as Record<string, any>;
+    expect(parsed.width).toBe(300);
+    expect(parsed.height).toBe(250);
+    beaconSpy.mockRestore();
+  });
+
+  it('expands ${AUCTION_PRICE} from the cached bid price before responding', async () => {
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    fetchStub.mockResolvedValue({
+      ok: true,
+      text: () =>
+        Promise.resolve(
+          JSON.stringify({
+            adm: '<a href="https://t.example/win?p=${AUCTION_PRICE}">go</a>',
+            price: 2.5,
+          })
+        ),
+    } as Response);
+
+    const bridgeListener = await captureBridgeListener();
+    const portMessages: string[] = [];
+    const fakePort = { postMessage: (s: string) => portMessages.push(s) };
+    const source = createTrustedSlotIframe();
+
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+        ports: [fakePort],
+        source,
+        stopImmediatePropagation: vi.fn(),
+      }) as unknown as MessageEvent
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    expect(portMessages).toHaveLength(1);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const parsed = JSON.parse(portMessages[0]) as Record<string, any>;
+    expect(parsed.ad).toContain('p=2.5');
+    expect(parsed.ad).not.toContain('${AUCTION_PRICE}');
     beaconSpy.mockRestore();
   });
 
