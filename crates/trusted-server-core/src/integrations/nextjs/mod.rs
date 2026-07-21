@@ -24,10 +24,6 @@ mod shared;
 )]
 pub use html_post_process::{post_process_rsc_html, post_process_rsc_html_in_place};
 pub use rsc::rewrite_rsc_scripts_combined;
-// T-chunk-aware RSC rewrite with a pluggable per-segment rewriter. Used by the
-// streaming integration-host flight rewrite in the HTML processor so it shares
-// this module's T-chunk length recomputation instead of duplicating it.
-pub(crate) use rsc::rewrite_rsc_tchunks_with;
 
 use html_post_process::NextJsHtmlPostProcessor;
 use rsc_placeholders::NextJsRscPlaceholderRewriter;
