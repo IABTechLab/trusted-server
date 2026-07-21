@@ -16,6 +16,7 @@ function clientAuctionBundlePaths() {
         filename: string;
     };
     return {
+        core: resolve(TSJS_CRATE, "dist/tsjs-core.js"),
         gpt: resolve(TSJS_CRATE, "dist/tsjs-gpt.js"),
         prebid: resolve(TSJS_CRATE, "dist/prebid", manifest.filename),
     };
@@ -197,7 +198,7 @@ test.describe("APS opaque renderer", () => {
             route.fulfill({
                 status: 200,
                 contentType: "text/html",
-                body: '<!doctype html><div id="div-aps"></div>',
+                body: '<!doctype html><div id="div-aps"></div><div id="div-other"></div>',
             }),
         );
         await page.route(runtimeUrl("/auction"), (route) => {
@@ -265,6 +266,37 @@ test.describe("APS opaque renderer", () => {
             if (!acceptedBid)
                 throw new Error("APS bid was not accepted by Prebid");
 
+            const foreignUniversalCreativeResponse = await new Promise<
+                Record<string, unknown> | undefined
+            >((resolveResponse) => {
+                const frame = document.createElement("iframe");
+                const adIdJson = JSON.stringify(acceptedBid.adId);
+                frame.srcdoc = `<script>
+const renderChannel = new MessageChannel();
+renderChannel.port1.onmessage = function(event) {
+  parent.postMessage({ type: 'captured-foreign-prebid-response', payload: event.data }, '*');
+};
+parent.postMessage(JSON.stringify({
+  message: 'Prebid Request',
+  adId: ${adIdJson}
+}), '*', [renderChannel.port2]);
+<\/script>`;
+                let timeout = 0;
+                const receive = (event: MessageEvent) => {
+                    if (event.data?.type !== "captured-foreign-prebid-response")
+                        return;
+                    window.removeEventListener("message", receive);
+                    window.clearTimeout(timeout);
+                    resolveResponse(JSON.parse(String(event.data.payload)));
+                };
+                window.addEventListener("message", receive);
+                document.getElementById("div-other")!.appendChild(frame);
+                timeout = window.setTimeout(() => {
+                    window.removeEventListener("message", receive);
+                    resolveResponse(undefined);
+                }, 200);
+            });
+
             const universalCreativeResponse = await new Promise<
                 Record<string, unknown>
             >((resolveResponse, rejectResponse) => {
@@ -310,6 +342,7 @@ parent.postMessage(JSON.stringify({
                 acceptedAdId: acceptedBid.adId,
                 acceptedStatus: acceptedBid.status,
                 bidWon,
+                foreignUniversalCreativeResponse,
                 renderSucceeded,
                 universalCreativeResponse,
                 winningAdIds: pbjs.getAllWinningBids().map((bid) => bid.adId),
@@ -328,6 +361,9 @@ parent.postMessage(JSON.stringify({
         expect(auctionRequests).toBe(1);
         expect(result.acceptedAd).toBe("");
         expect(result.acceptedAdId).not.toBe(apsRenderer.bidId);
+        expect(result.foreignUniversalCreativeResponse).not.toEqual(
+            expect.objectContaining({ apsRenderer }),
+        );
         expect(result.universalCreativeResponse).toEqual(
             expect.objectContaining({
                 message: "Prebid Response",
@@ -728,16 +764,18 @@ parent.postMessage(JSON.stringify({
         );
     });
 
-    test("rejects same-origin creative URLs during static validation", async ({
+    test("rejects same-origin creative URLs through the TSJS rendering path", async ({
         page,
     }) => {
         const publisherOrigin = "https://publisher.example";
         const rendererUrl = `${publisherOrigin}/integrations/aps/renderer`;
+        const auctionUrl = `${publisherOrigin}/auction`;
         const testUrl = `${publisherOrigin}/aps-same-origin-test`;
         const runtimeRenderer = await page.request.get(
             runtimeUrl("/integrations/aps/renderer"),
         );
         const rendererDocument = await runtimeRenderer.text();
+        let creativeUrl = SCRIPT_CREATIVE_URL;
         let runnerRequests = 0;
 
         await page.route(RUNNER_URL, async (route) => {
@@ -760,45 +798,138 @@ parent.postMessage(JSON.stringify({
                 body: rendererDocument,
             });
         });
+        await page.route(auctionUrl, async (route) => {
+            const renderer = descriptor("script", creativeUrl);
+            await route.fulfill({
+                status: 200,
+                contentType: "application/json",
+                body: JSON.stringify({
+                    id: "fictional-auction",
+                    seatbid: [
+                        {
+                            seat: "aps",
+                            bid: [
+                                {
+                                    id: renderer.bidId,
+                                    impid: "same-origin-slot",
+                                    price: 1.23,
+                                    w: 300,
+                                    h: 250,
+                                    ext: {
+                                        trusted_server: { renderer },
+                                    },
+                                },
+                            ],
+                        },
+                    ],
+                    ext: {},
+                }),
+            });
+        });
         await page.route(testUrl, async (route) => {
             await route.fulfill({
                 status: 200,
                 contentType: "text/html",
                 headers: {
                     "Content-Security-Policy":
-                        "default-src 'none'; script-src 'unsafe-inline'; frame-src 'self'",
+                        "default-src 'none'; script-src 'unsafe-inline'; connect-src 'self'; frame-src 'self'",
                 },
-                body: testPage(rendererUrl),
+                body: '<!doctype html><div id="same-origin-slot"><span class="existing">existing publisher content</span></div>',
             });
         });
 
         await page.goto(testUrl);
-        const nonce = "same-origin-0123456789";
-        await page.evaluate(
-            ({ renderer, nonce }) => {
-                (
-                    window as unknown as {
-                        startApsFrame(options: Record<string, unknown>): void;
-                    }
-                ).startApsFrame({
-                    slotId: "same-origin-slot",
-                    fragmentNonce: nonce,
-                    messageNonce: nonce,
-                    omitSandbox: true,
-                    renderer,
-                });
-            },
-            {
-                renderer: descriptor(
-                    "script",
-                    `${publisherOrigin}/fictional-same-origin.js`,
-                ),
-                nonce,
-            },
-        );
+        await page.addScriptTag({ path: clientAuctionBundlePaths().core });
+        await page.evaluate(() => {
+            const tsjs = (
+                window as unknown as {
+                    tsjs: {
+                        addAdUnits(units: Array<Record<string, unknown>>): void;
+                        log: {
+                            info(message: string, ...args: unknown[]): void;
+                        };
+                        requestAds(): void;
+                    };
+                    auctionRenderCompletions?: number;
+                }
+            ).tsjs;
+            tsjs.addAdUnits([
+                {
+                    code: "same-origin-slot",
+                    mediaTypes: { banner: { sizes: [[300, 250]] } },
+                    bids: [],
+                },
+            ]);
+            const originalInfo = tsjs.log.info.bind(tsjs.log);
+            tsjs.log.info = (message: string, ...args: unknown[]) => {
+                if (
+                    message === "requestAds: rendered creatives from response"
+                ) {
+                    (
+                        window as unknown as {
+                            auctionRenderCompletions: number;
+                        }
+                    ).auctionRenderCompletions += 1;
+                }
+                originalInfo(message, ...args);
+            };
+            (
+                window as unknown as {
+                    auctionRenderCompletions: number;
+                }
+            ).auctionRenderCompletions = 0;
+            tsjs.requestAds();
+        });
 
-        await page.waitForTimeout(100);
-        expect(runnerRequests).toBe(0);
+        await expect.poll(() => runnerRequests).toBe(1);
+        await expect
+            .poll(() =>
+                page.evaluate(
+                    () =>
+                        (
+                            window as unknown as {
+                                auctionRenderCompletions: number;
+                            }
+                        ).auctionRenderCompletions,
+                ),
+            )
+            .toBe(1);
+        await expect(page.locator("#same-origin-slot .existing")).toHaveCount(
+            0,
+        );
+        const productSandbox = await page
+            .locator("#same-origin-slot > iframe")
+            .getAttribute("sandbox");
+        expect(productSandbox).toBe(SANDBOX);
+        expect(productSandbox).not.toContain("allow-same-origin");
+
+        creativeUrl = `${publisherOrigin}/fictional-same-origin.js`;
+        await page.locator("#same-origin-slot").evaluate((slot) => {
+            slot.innerHTML =
+                '<span class="existing">existing publisher content</span>';
+        });
+        await page.evaluate(() => {
+            (
+                window as unknown as {
+                    tsjs: { requestAds(): void };
+                }
+            ).tsjs.requestAds();
+        });
+
+        await expect
+            .poll(() =>
+                page.evaluate(
+                    () =>
+                        (
+                            window as unknown as {
+                                auctionRenderCompletions: number;
+                            }
+                        ).auctionRenderCompletions,
+                ),
+            )
+            .toBe(2);
+        expect(runnerRequests).toBe(1);
+        await expect(page.locator("#same-origin-slot iframe")).toHaveCount(0);
         await expect(page.locator("#same-origin-slot .existing")).toHaveCount(
             1,
         );

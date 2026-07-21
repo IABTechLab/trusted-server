@@ -10,7 +10,7 @@ Trusted Server can request banner bids from Amazon Publisher Services (APS) thro
 The integration supports:
 
 - banner impressions;
-- APS OpenRTB requests to `https://web.ads.aps.amazon-adsystem.com/e/pb/bid`;
+- APS OpenRTB requests to the integration's built-in production endpoint;
 - decoded-CPM winner selection with or without a mediator;
 - direct `/auction` rendering;
 - client-side `trustedServer` Prebid adapter auctions through GAM; and
@@ -29,7 +29,6 @@ The integration does not implement:
 [integrations.aps]
 enabled = true
 account_id = "example-aps-account-id"
-endpoint = "https://web.ads.aps.amazon-adsystem.com/e/pb/bid"
 timeout_ms = 800
 # Include raw APS request/response data in /auction metadata on test sites only.
 debug = false
@@ -94,7 +93,7 @@ Set `debug = true` under `[integrations.aps]` to include the direct APS HTTP exc
             "responsebody": "{...}",
             "responseheaders": { "content-type": ["application/json"] },
             "status": 200,
-            "uri": "https://web.ads.aps.amazon-adsystem.com/e/pb/bid"
+            "uri": "https://aps.example.com/e/pb/bid"
           }
         ]
       }

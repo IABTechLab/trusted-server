@@ -7,6 +7,7 @@ export const APS_RENDERER_SANDBOX =
 export const APS_UNIVERSAL_CREATIVE_RENDERER_VERSION = 4;
 
 const MAX_ACCOUNT_ID_BYTES = 1024;
+const MAX_CREATIVE_ID_BYTES = 1024;
 const MAX_CREATIVE_URL_BYTES = 4096;
 const MAX_RENDER_ENVELOPE_BYTES = 256 * 1024;
 const MAX_RENDER_ENVELOPE_BASE64_BYTES = 4 * Math.ceil(MAX_RENDER_ENVELOPE_BYTES / 3);
@@ -23,6 +24,7 @@ const DESCRIPTOR_KEYS = [
 ] as const;
 const DESCRIPTOR_KEYS_WITH_CREATIVE_ID = [...DESCRIPTOR_KEYS, 'creativeId'].sort();
 const activeFrames = new WeakMap<HTMLElement, HTMLIFrameElement>();
+const pendingFrameCancels = new WeakMap<HTMLElement, () => void>();
 const RENDERER_READY_MESSAGE = 'trusted-server/aps/renderer-ready';
 const RENDERER_FAILED_MESSAGE = 'trusted-server/aps/renderer-failed';
 const RENDERER_READY_TIMEOUT_MS = 10_000;
@@ -66,7 +68,9 @@ export function parseApsRendererDescriptor(value: unknown): ApsRendererV1 | unde
     typeof value.bidId !== 'string' ||
     value.bidId.length === 0 ||
     (Object.prototype.hasOwnProperty.call(value, 'creativeId') &&
-      (typeof value.creativeId !== 'string' || value.creativeId.length === 0)) ||
+      (typeof value.creativeId !== 'string' ||
+        value.creativeId.length === 0 ||
+        new TextEncoder().encode(value.creativeId).length > MAX_CREATIVE_ID_BYTES)) ||
     (value.tagType !== 'iframe' && value.tagType !== 'script') ||
     typeof value.creativeUrl !== 'string' ||
     typeof value.aaxResponse !== 'string' ||
@@ -93,7 +97,7 @@ function decodeStandardBase64(value: string): Uint8Array | undefined {
 
   try {
     const binary = atob(value);
-    if (binary.length > MAX_RENDER_ENVELOPE_BYTES) return undefined;
+    if (binary.length > MAX_RENDER_ENVELOPE_BYTES || btoa(binary) !== value) return undefined;
     return Uint8Array.from(binary, (character) => character.charCodeAt(0));
   } catch {
     return undefined;
@@ -321,8 +325,9 @@ export function renderApsCreative({ slotId, renderer: input }: RenderApsCreative
   iframe.setAttribute('sandbox', APS_RENDERER_SANDBOX);
   iframe.src = `${rendererUrl}#tsaps=${nonce}`;
 
-  const priorFrame = activeFrames.get(container);
-  if (priorFrame?.style.display === 'none') priorFrame.remove();
+  // A replacement must cancel a pending frame, not merely detach it: its
+  // message listener and ready timeout would otherwise remain live until expiry.
+  pendingFrameCancels.get(container)?.();
   activeFrames.set(container, iframe);
 
   let settled = false;
@@ -330,18 +335,24 @@ export function renderApsCreative({ slotId, renderer: input }: RenderApsCreative
     window.removeEventListener('message', receive);
     window.clearTimeout(timeoutId);
   };
-  const fail = (): void => {
+  const cancel = (): void => {
     if (settled) return;
     settled = true;
     cleanup();
+    if (pendingFrameCancels.get(container) === cancel) pendingFrameCancels.delete(container);
     if (activeFrames.get(container) === iframe) activeFrames.delete(container);
     iframe.remove();
+  };
+  const fail = (): void => {
+    if (settled) return;
+    cancel();
     log.warn('APS renderer: frame load failed');
   };
   const commit = (): void => {
     if (settled || activeFrames.get(container) !== iframe || !iframe.isConnected) return;
     settled = true;
     cleanup();
+    if (pendingFrameCancels.get(container) === cancel) pendingFrameCancels.delete(container);
     for (const child of Array.from(container.children)) {
       if (child !== iframe) child.remove();
     }
@@ -377,6 +388,7 @@ export function renderApsCreative({ slotId, renderer: input }: RenderApsCreative
   iframe.addEventListener('error', fail, { once: true });
 
   const timeoutId = window.setTimeout(fail, RENDERER_READY_TIMEOUT_MS);
+  pendingFrameCancels.set(container, cancel);
   container.appendChild(iframe);
   return true;
 }
@@ -385,21 +397,20 @@ export function renderApsCreative({ slotId, renderer: input }: RenderApsCreative
  * Static source executed by Prebid Universal Creative's dynamic-renderer frame.
  * It reads only the validated descriptor and trusted absolute endpoint URL from data.
  */
-export const APS_UNIVERSAL_CREATIVE_RENDERER =
-  '(function(){window.render=function(d,_h,w){return new Promise(function(resolve,reject){' +
-  'try{var r=d&&d.apsRenderer,u=d&&d.rendererUrl;if(!r||typeof u!=="string")throw new Error("invalid APS renderer data");' +
-  'var p=new URL(u);if((p.protocol!=="https:"&&p.protocol!=="http:")||p.username||p.password||p.pathname!=="/integrations/aps/renderer"||p.search||p.hash)throw new Error("invalid APS renderer URL");' +
-  'var c=w.crypto;if(!c||typeof c.getRandomValues!=="function")throw new Error("APS renderer randomness unavailable");' +
-  'var b=new Uint8Array(16);c.getRandomValues(b);var s="";for(var i=0;i<b.length;i++)s+=String.fromCharCode(b[i]);' +
-  'var n=w.btoa(s).replace(/\\+/g,"-").replace(/\\//g,"_").replace(/=+$/g,"");' +
-  'var f=w.document.createElement("iframe"),done=false,t;' +
-  'function clean(){w.removeEventListener("message",receive);if(t)w.clearTimeout(t);}' +
-  'function fail(){if(done)return;done=true;clean();f.remove();reject(new Error("APS renderer frame failed"));}' +
-  'function receive(e){var m=e.data;if(e.source!==f.contentWindow||!m||m.nonce!==n)return;' +
-  'if(m.message==="trusted-server/aps/renderer-ready"){done=true;clean();resolve();}' +
-  'else if(m.message==="trusted-server/aps/renderer-failed")fail();}' +
-  'f.width=String(r.width);f.height=String(r.height);f.style.border="0";' +
-  'f.setAttribute("sandbox","allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation");' +
-  'f.src=p.href+"#tsaps="+n;f.onload=function(){if(!done&&f.contentWindow)f.contentWindow.postMessage({nonce:n,renderer:r},"*");};' +
-  'f.onerror=fail;w.addEventListener("message",receive);t=w.setTimeout(fail,10000);w.document.body.appendChild(f);' +
-  '}catch(e){reject(e);}});};})();';
+export const APS_UNIVERSAL_CREATIVE_RENDERER = String.raw`(function(){window.render=function(d,_h,w){return new Promise(function(resolve,reject){
+try{var r=d&&d.apsRenderer,u=d&&d.rendererUrl;if(!r||typeof u!=="string")throw new Error("invalid APS renderer data");
+var p=new URL(u);if((p.protocol!=="https:"&&p.protocol!=="http:")||p.username||p.password||p.pathname!=="${APS_RENDERER_PATH}"||p.search||p.hash)throw new Error("invalid APS renderer URL");
+var c=w.crypto;if(!c||typeof c.getRandomValues!=="function")throw new Error("APS renderer randomness unavailable");
+var b=new Uint8Array(16);c.getRandomValues(b);var s="";for(var i=0;i<b.length;i++)s+=String.fromCharCode(b[i]);
+var n=w.btoa(s).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/g,"");
+var f=w.document.createElement("iframe"),done=false,t;
+function clean(){w.removeEventListener("message",receive);if(t)w.clearTimeout(t);}
+function fail(){if(done)return;done=true;clean();f.remove();reject(new Error("APS renderer frame failed"));}
+function receive(e){var m=e.data;if(e.source!==f.contentWindow||!m||m.nonce!==n)return;
+if(m.message==="${RENDERER_READY_MESSAGE}"){done=true;clean();resolve();}
+else if(m.message==="${RENDERER_FAILED_MESSAGE}")fail();}
+f.width=String(r.width);f.height=String(r.height);f.style.border="0";
+f.setAttribute("sandbox","${APS_RENDERER_SANDBOX}");
+f.src=p.href+"#tsaps="+n;f.onload=function(){if(!done&&f.contentWindow)f.contentWindow.postMessage({nonce:n,renderer:r},"*");};
+f.onerror=fail;w.addEventListener("message",receive);t=w.setTimeout(fail,${RENDERER_READY_TIMEOUT_MS});w.document.body.appendChild(f);
+}catch(e){reject(e);}});};})();`;

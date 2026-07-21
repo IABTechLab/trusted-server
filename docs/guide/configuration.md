@@ -1210,7 +1210,6 @@ timeout_ms = 2000
 [integrations.aps]
 enabled = true
 account_id = "example-account"
-endpoint = "https://web.ads.aps.amazon-adsystem.com/e/pb/bid"
 debug = false
 # Optional pair for deployments hosted away from APS-authorized inventory.
 # inventory_domain = "publisher.example"

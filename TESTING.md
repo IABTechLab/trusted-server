@@ -46,8 +46,8 @@ curl -X POST http://localhost:7676/auction \
 
 **With Orchestrator Enabled** (`auction.enabled = true`):
 - Logs showing: `"Using auction orchestrator"`
-- Parallel execution of APS (mocked) and Prebid (real)
-- GAM mediation (mocked) selecting winning bids
+- Parallel execution of APS OpenRTB and Prebid Server
+- Optional mock-adserver mediation selecting winning bids
 - Final response with winning creatives
 
 **With Orchestrator Disabled** (`auction.enabled = false`):
@@ -66,11 +66,13 @@ providers = ["prebid", "aps"]
 mediator = "adserver_mock"  # If set: mediation, if omitted: highest bid wins
 timeout_ms = 2000
 
-# Mock provider configs
+# APS OpenRTB provider. The built-in production endpoint is used when
+# endpoint is omitted; use only an account authorized for test traffic.
 [integrations.aps]
 enabled = true
-mock = true
-mock_price = 2.50
+account_id = "example-account"
+timeout_ms = 800
+debug = false
 
 [integrations.adserver_mock]
 enabled = true
@@ -90,10 +92,10 @@ mediator = "adserver_mock"  # Mediator configured = parallel mediation strategy
 ```
 
 **Expected Flow:**
-1. Prebid queries real SSPs
-2. APS returns mock bids ($2.50 CPM)
-3. AdServer Mock mediates between all bids
-4. Winning creative returned
+1. Prebid queries its configured bidders through Prebid Server
+2. APS sends an OpenRTB request for eligible banner impressions
+3. AdServer Mock mediates the provider responses
+4. The winning creative or typed APS renderer is returned
 
 ### Scenario 2: Parallel Only (No Mediation)
 **Config:**
@@ -157,18 +159,19 @@ INFO: Registering auction provider: adserver_mock
 
 ## Next Steps
 
-1. **Test with real Prebid Server** - Verify Prebid bids work correctly
-2. **Implement real APS** - Replace mock with actual Amazon TAM API calls
-3. **Implement real GAM** - Add Google Ad Manager API integration
-4. **Add metrics** - Track bid rates, win rates, latency per provider
+1. **Verify Prebid Server demand** - Confirm configured bidders return expected test bids
+2. **Verify APS eligibility** - Confirm the test account, inventory identity, and `/e/pb/bid` endpoint are authorized
+3. **Exercise renderer security** - Run the APS browser integration suite for iframe and script creatives
+4. **Add metrics** - Track bid rates, win rates, latency, and aggregate drop reasons per provider
 
-## Mock Provider Behavior
+## Provider Behavior
 
 ### APS (Amazon)
-- Returns bids for all slots
-- Default mock price: $2.50 CPM
-- Always returns 2 bids
-- Response time: ~80ms (simulated)
+- Sends real OpenRTB requests for eligible banner slots
+- Safely drops malformed, unsupported, or unrenderable bids and reports aggregate reasons
+- Reduces multiple APS candidates to one winner per impression
+- Returns typed renderer descriptors rather than exposing `adm` outside the sandbox
+- Automated tests intercept upstream traffic and use fictional response fixtures
 
 ### AdServer Mock
 - Acts as mediator by calling mocktioneer's mediation endpoint

@@ -41,7 +41,9 @@ const DEFAULT_CURRENCY: &str = "USD";
 const APS_SDK_SOURCE: &str = "prebid";
 const APS_SDK_VERSION: &str = "2.2.0";
 const MAX_ACCOUNT_ID_BYTES: usize = 1024;
+const MAX_CREATIVE_ID_BYTES: usize = 1024;
 const MAX_CREATIVE_URL_BYTES: usize = 4096;
+const MAX_LANGUAGE_BYTES: usize = 8;
 const MAX_PAGE_URL_BYTES: usize = 8192;
 const MAX_RENDER_ENVELOPE_BYTES: usize = 256 * 1024;
 const APS_RENDERER_CSP: &str = "default-src 'none'; sandbox allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation; script-src 'unsafe-inline' https:; connect-src https:; frame-src https:; img-src https: data:; media-src https: blob:; style-src 'unsafe-inline' https:; font-src https: data:;";
@@ -65,7 +67,7 @@ function validRenderer(renderer){
     !keys(renderer,['aaxResponse','accountId','bidId','creativeUrl','height','tagType','type','version','width']))return false;
  if(renderer.type!=='aps'||renderer.version!==1||typeof renderer.accountId!=='string'||!renderer.accountId||new TextEncoder().encode(renderer.accountId).length>1024)return false;
  if(typeof renderer.bidId!=='string'||!renderer.bidId||!Number.isInteger(renderer.width)||renderer.width<=0||!Number.isInteger(renderer.height)||renderer.height<=0)return false;
- if(Object.prototype.hasOwnProperty.call(renderer,'creativeId')&&(typeof renderer.creativeId!=='string'||!renderer.creativeId))return false;
+ if(Object.prototype.hasOwnProperty.call(renderer,'creativeId')&&(typeof renderer.creativeId!=='string'||!renderer.creativeId||new TextEncoder().encode(renderer.creativeId).length>1024))return false;
  if(renderer.tagType!=='iframe'&&renderer.tagType!=='script')return false;
  if(typeof renderer.creativeUrl!=='string'||new TextEncoder().encode(renderer.creativeUrl).length>4096)return false;
  if(typeof renderer.aaxResponse!=='string'||!renderer.aaxResponse||renderer.aaxResponse.length>349528)return false;
@@ -205,6 +207,12 @@ fn validate_aps_endpoint(value: &str) -> Result<(), ValidationError> {
         || parsed.password().is_some()
     {
         return Err(ValidationError::new("invalid_aps_endpoint"));
+    }
+    if parsed.path().trim_end_matches('/').ends_with("/e/dtb/bid") {
+        let mut error = ValidationError::new("legacy_aps_endpoint");
+        error.message =
+            Some("legacy APS endpoint /e/dtb/bid is unsupported; migrate to /e/pb/bid".into());
+        return Err(error);
     }
     Ok(())
 }
@@ -387,7 +395,7 @@ impl ApsAuctionProvider {
             .and_then(|value| value.split(';').next())
             .and_then(|value| value.split('-').next())
             .map(str::trim)
-            .filter(|value| !value.is_empty())
+            .filter(|value| !value.is_empty() && value.len() <= MAX_LANGUAGE_BYTES)
             .map(str::to_string)
     }
 
@@ -527,13 +535,10 @@ impl ApsAuctionProvider {
             .as_deref()
             .and_then(Self::valid_http_url)
             .unwrap_or_else(|| format!("https://{}", request.publisher.domain));
-        let referer = context
-            .request
-            .headers()
-            .get(header::REFERER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(Self::valid_http_url)
-            .filter(|value| value != &page);
+        // For the same-origin `/auction` request, the browser Referer is the
+        // current publisher page already carried in sanitized form as
+        // `site.page`; forwarding the raw header as `site.ref` would reintroduce
+        // query-string identifiers and can leak the deployment host.
         let (site_domain, page) = self.inventory_site_identity(&request.publisher.domain, page);
 
         OpenRtbRequest {
@@ -542,9 +547,9 @@ impl ApsAuctionProvider {
             site: Some(Site {
                 domain: Some(site_domain.clone()),
                 page: Some(page),
-                r#ref: referer,
+                r#ref: None,
                 publisher: Some(Publisher {
-                    domain: Some(request.publisher.domain.clone()),
+                    domain: Some(site_domain),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -765,6 +770,12 @@ impl ApsAuctionProvider {
             .and_then(Json::as_str)
             .filter(|creative_id| !creative_id.is_empty())
             .map(str::to_string);
+        if creative_id
+            .as_ref()
+            .is_some_and(|creative_id| creative_id.len() > MAX_CREATIVE_ID_BYTES)
+        {
+            return Err("creative_id_too_large");
+        }
         let renderer = self
             .build_renderer(ApsRendererInput {
                 bid_id,
@@ -849,6 +860,8 @@ impl ApsAuctionProvider {
 
         for seatbid in seatbids.into_iter().flatten() {
             let Some(bids) = seatbid.get("bid").and_then(Json::as_array) else {
+                dropped += 1;
+                Self::increment_reason(&mut reasons, "empty_seatbid_bids");
                 continue;
             };
             for value in bids {
@@ -868,9 +881,11 @@ impl ApsAuctionProvider {
                                 .is_some()
                             {
                                 dropped += 1;
+                                Self::increment_reason(&mut reasons, "lost_to_higher_bid");
                             }
                         } else {
                             dropped += 1;
+                            Self::increment_reason(&mut reasons, "lost_to_higher_bid");
                         }
                     }
                     Err(reason) => {
@@ -979,7 +994,11 @@ impl ApsAuctionProvider {
             }
         };
         let Some(request) = request else {
-            return Ok(AuctionResponse::error(APS_INTEGRATION_ID, response_time_ms));
+            log::error!(
+                "APS cannot parse a successful bid response without the original auction request context"
+            );
+            return Ok(AuctionResponse::error(APS_INTEGRATION_ID, response_time_ms)
+                .with_metadata("drop_reasons", json!({"missing_request_context": 1})));
         };
         let parsed = self.parse_aps_response(&value, response_time_ms, request);
         log::info!(
@@ -1173,6 +1192,11 @@ pub fn register_providers(
         return Ok(Vec::new());
     };
     log::info!("Registering APS OpenRTB provider");
+    if config.debug {
+        log::warn!(
+            "APS debug mode is ON — raw request and response data, including creative markup, will be included in client-visible /auction responses"
+        );
+    }
     Ok(vec![Arc::new(ApsAuctionProvider::new(config))])
 }
 
@@ -1300,6 +1324,48 @@ mod tests {
     }
 
     #[test]
+    fn config_accepts_default_and_custom_openrtb_endpoints() {
+        let default = ApsConfig {
+            account_id: "example-account".to_string(),
+            ..Default::default()
+        };
+        let custom: ApsConfig = serde_json::from_value(json!({
+            "account_id": "example-account",
+            "endpoint": "https://aps.example.com/custom/openrtb"
+        }))
+        .expect("should deserialize custom endpoint");
+
+        default
+            .validate()
+            .expect("should accept production default endpoint");
+        custom
+            .validate()
+            .expect("should accept fictional custom HTTPS endpoint");
+    }
+
+    #[test]
+    fn config_rejects_legacy_aps_endpoint_with_migration_error() {
+        for endpoint in [
+            "https://aps.example.com/e/dtb/bid",
+            "https://aps.example.com/e/dtb/bid/",
+            "https://aps.example.com/custom/e/dtb/bid",
+        ] {
+            let parsed: ApsConfig = serde_json::from_value(json!({
+                "account_id": "example-account",
+                "endpoint": endpoint
+            }))
+            .expect("should deserialize legacy endpoint before validation");
+            let error = parsed
+                .validate()
+                .expect_err("should reject legacy endpoint");
+            assert!(
+                error.to_string().contains("migrate to /e/pb/bid"),
+                "should provide endpoint migration guidance: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn config_rejects_blank_duplicate_and_unsafe_endpoint() {
         assert!(serde_json::from_value::<ApsConfig>(json!({"account_id": "   "})).is_err());
         assert!(
@@ -1391,6 +1457,10 @@ mod tests {
         let services = noop_services();
         let downstream = http::Request::builder()
             .uri("https://deployment.example/auction")
+            .header(
+                header::REFERER,
+                "https://deployment.example/private?token=fictional#section",
+            )
             .body(EdgeBody::empty())
             .expect("should build downstream request");
         let context = AuctionContext {
@@ -1412,7 +1482,14 @@ mod tests {
         );
         assert_eq!(
             serialized["site"]["publisher"]["domain"],
-            "deployment.example"
+            "publisher.example"
+        );
+        assert!(serialized["site"].get("ref").is_none());
+        assert!(
+            !serialized["site"]
+                .to_string()
+                .contains("deployment.example"),
+            "should not leak the deployment host in any Site field"
         );
     }
 
@@ -1514,9 +1591,9 @@ mod tests {
             serialized["site"]["page"],
             "https://publisher.example/article"
         );
-        assert_eq!(
-            serialized["site"]["ref"],
-            "https://referrer.example/article"
+        assert!(
+            serialized["site"].get("ref").is_none(),
+            "should not forward the raw browser Referer"
         );
         assert_eq!(
             serialized["site"]["publisher"]["domain"],
@@ -1547,6 +1624,36 @@ mod tests {
     }
 
     #[test]
+    fn request_language_enforces_byte_limit() {
+        let settings = create_test_settings();
+        let services = noop_services();
+
+        for (header_value, expected) in [
+            ("abcdefgh-US,xy;q=0.9", Some("abcdefgh")),
+            ("abcdefghi", None),
+        ] {
+            let downstream = http::Request::builder()
+                .uri("https://publisher.example/auction")
+                .header(header::ACCEPT_LANGUAGE, header_value)
+                .body(EdgeBody::empty())
+                .expect("should build downstream request");
+            let context = AuctionContext {
+                settings: &settings,
+                request: &downstream,
+                timeout_ms: 321,
+                provider_responses: None,
+                services: &services,
+            };
+
+            assert_eq!(
+                ApsAuctionProvider::request_language(&context).as_deref(),
+                expected,
+                "should enforce primary language byte limit for {header_value}"
+            );
+        }
+    }
+
+    #[test]
     fn parses_bid_and_builds_exact_minimized_envelope() {
         let provider = ApsAuctionProvider::new(config());
         let response = provider.parse_aps_response(
@@ -1564,7 +1671,8 @@ mod tests {
             .renderer
             .as_ref()
             .expect("should include renderer")
-            .aps();
+            .as_aps()
+            .expect("should be APS renderer");
         let decoded = BASE64_STANDARD
             .decode(&renderer.aax_response)
             .expect("should decode renderer response");
@@ -1575,6 +1683,33 @@ mod tests {
         ))
         .expect("should parse shared APS renderer fixture");
         assert_eq!(decoded, fixture);
+    }
+
+    #[test]
+    fn creative_id_enforces_utf8_byte_boundary() {
+        let provider = ApsAuctionProvider::new(config());
+        let mut at_limit = bid("creative-id-limit", 1.23, "iframe");
+        at_limit["crid"] = json!("é".repeat(MAX_CREATIVE_ID_BYTES / 2));
+        let accepted =
+            provider.parse_aps_response(&json!({"seatbid": [{"bid": [at_limit]}]}), 12, &request());
+        assert_eq!(
+            accepted.bids.len(),
+            1,
+            "should accept creative ID at byte limit"
+        );
+
+        let mut over_limit = bid("creative-id-over-limit", 1.23, "iframe");
+        over_limit["crid"] = json!(format!("{}x", "é".repeat(MAX_CREATIVE_ID_BYTES / 2)));
+        let rejected = provider.parse_aps_response(
+            &json!({"seatbid": [{"bid": [over_limit]}]}),
+            12,
+            &request(),
+        );
+        assert!(rejected.bids.is_empty());
+        assert_eq!(
+            rejected.metadata["drop_reasons"]["creative_id_too_large"],
+            1
+        );
     }
 
     #[test]
@@ -1590,7 +1725,8 @@ mod tests {
             bid.renderer
                 .as_ref()
                 .expect("should retain renderer")
-                .aps()
+                .as_aps()
+                .expect("should be APS renderer")
                 .creative_id
                 .is_none()
         );
@@ -1790,6 +1926,32 @@ mod tests {
     }
 
     #[test]
+    fn context_free_parse_response_reports_missing_request_context() {
+        let provider = ApsAuctionProvider::new(config());
+        let platform_response = PlatformResponse::new(
+            edgezero_core::http::response_builder()
+                .status(StatusCode::OK)
+                .body(EdgeBody::from(
+                    serde_json::to_vec(
+                        &json!({"seatbid": [{"bid": [bid("valid", 1.0, "iframe")]}]}),
+                    )
+                    .expect("should serialize APS response"),
+                ))
+                .expect("should build APS response"),
+        );
+
+        let response = futures::executor::block_on(provider.parse_response(platform_response, 12))
+            .expect("should return an explicit context error response");
+
+        assert_eq!(response.status, BidStatus::Error);
+        assert!(response.bids.is_empty());
+        assert_eq!(
+            response.metadata["drop_reasons"]["missing_request_context"],
+            1
+        );
+    }
+
+    #[test]
     fn no_content_and_empty_responses_are_no_bids() {
         let provider = ApsAuctionProvider::new(config());
         let platform_response = PlatformResponse::new(
@@ -1813,6 +1975,18 @@ mod tests {
             assert_eq!(empty.status, BidStatus::NoBid);
             assert_eq!(empty.metadata["drop_reasons"]["empty_seatbid"], 1);
         }
+    }
+
+    #[test]
+    fn missing_seatbid_bid_array_is_counted_as_a_drop() {
+        let provider = ApsAuctionProvider::new(config());
+        let response =
+            provider.parse_aps_response(&json!({"seatbid": [{"seat": "aps"}]}), 12, &request());
+
+        assert_eq!(response.status, BidStatus::NoBid);
+        assert_eq!(response.metadata["seatbid_count"], 1);
+        assert_eq!(response.metadata["dropped_bid_count"], 1);
+        assert_eq!(response.metadata["drop_reasons"]["empty_seatbid_bids"], 1);
     }
 
     #[test]
@@ -1857,7 +2031,8 @@ mod tests {
             .renderer
             .as_ref()
             .expect("should keep script renderer")
-            .aps();
+            .as_aps()
+            .expect("should be APS renderer");
         assert_eq!(renderer.tag_type, ApsTagType::Script);
     }
 
@@ -1878,15 +2053,23 @@ mod tests {
     }
 
     #[test]
-    fn reduces_candidates_by_price_then_bid_id() {
+    fn reduces_candidates_by_price_then_bid_id_and_reconciles_drops() {
         let provider = ApsAuctionProvider::new(config());
         let response = provider.parse_aps_response(
-            &json!({"seatbid": [{"bid": [bid("bid-z", 2.0, "iframe"), bid("bid-a", 2.0, "iframe")]}]}),
+            &json!({"seatbid": [{"bid": [
+                bid("low-incumbent", 1.0, "iframe"),
+                bid("bid-z", 2.0, "iframe"),
+                bid("bid-a", 2.0, "iframe"),
+                bid("lower-candidate", 1.5, "iframe")
+            ]}]}),
             12,
             &request(),
         );
         assert_eq!(response.bids.len(), 1);
         assert_eq!(response.bids[0].bid_id.as_deref(), Some("bid-a"));
+        assert_eq!(response.metadata["accepted_bid_count"], 1);
+        assert_eq!(response.metadata["dropped_bid_count"], 3);
+        assert_eq!(response.metadata["drop_reasons"]["lost_to_higher_bid"], 3);
     }
 
     #[test]
@@ -2001,6 +2184,26 @@ mod tests {
         assert_eq!(registration.integration_id, APS_INTEGRATION_ID);
         assert_eq!(registration.proxies.len(), 1);
         assert!(registration.js_disabled);
+    }
+
+    #[test]
+    fn enabled_invalid_config_fails_provider_registration() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                APS_INTEGRATION_ID,
+                &json!({
+                    "enabled": true,
+                    "account_id": "example-account",
+                    "endpoint": "http://insecure.example/openrtb"
+                }),
+            )
+            .expect("should insert invalid APS config for startup validation");
+
+        let _error = register_providers(&settings)
+            .err()
+            .expect("should reject invalid enabled APS configuration");
     }
 
     #[test]
