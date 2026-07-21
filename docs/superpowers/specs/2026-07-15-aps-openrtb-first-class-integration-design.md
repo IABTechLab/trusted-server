@@ -18,11 +18,7 @@ with the OpenRTB contract used by the official APS Prebid.js adapter, so APS can
 4. preserve Trusted Server's existing privacy, sanitization, bounded-I/O, and
    observability invariants.
 
-The new default endpoint is:
-
-```text
-https://web.ads.aps.amazon-adsystem.com/e/pb/bid
-```
+The integration uses its built-in production OpenRTB endpoint by default. Examples use a fictional override endpoint.
 
 The implementation may proceed against fictional fixtures and a controlled APS test
 account before APS confirms Fastly/edge-originated production support. Lack of that
@@ -130,7 +126,6 @@ The canonical configuration becomes:
 [integrations.aps]
 enabled = false
 account_id = "example-account-id"
-endpoint = "https://web.ads.aps.amazon-adsystem.com/e/pb/bid"
 timeout_ms = 800
 allow_script_creatives = false
 ```
