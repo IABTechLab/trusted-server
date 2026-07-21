@@ -117,7 +117,7 @@ When a request arrives at the `/auction` endpoint, it goes through the following
                               ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │  9. Each Provider Processes Request                                  │
-│     - Transform AuctionRequest → Provider OpenRTB request           │
+│     - Transform AuctionRequest → Provider OpenRTB request            │
 │     - Send HTTP request to provider endpoint                         │
 │     - Parse provider response                                        │
 │     - Transform → AuctionResponse with Bid[]                         │
@@ -201,7 +201,7 @@ For example, APS provider:
 // - banner slots become secure impressions with matching formats/floors
 // - existing consent, identity, device, and geo privacy gates apply
 
-// HTTP POST to https://web.ads.aps.amazon-adsystem.com/e/pb/bid
+// HTTP POST to https://aps.example.com/e/pb/bid
 // Parse decoded-price response → AuctionResponse with a typed renderer
 ```
 

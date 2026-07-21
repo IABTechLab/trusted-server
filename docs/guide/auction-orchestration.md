@@ -360,7 +360,6 @@ Builds an independent banner OpenRTB request for Amazon Publisher Services.
 [integrations.aps]
 enabled = true
 account_id = "example-account"
-endpoint = "https://web.ads.aps.amazon-adsystem.com/e/pb/bid"
 timeout_ms = 800
 debug = false
 allow_script_creatives = false
@@ -540,6 +539,45 @@ Auction results are returned in standard OpenRTB format with an `ext.orchestrato
 }
 ```
 
+APS renderer winners use the same OpenRTB response with a typed renderer extension instead of `adm`:
+
+```json
+{
+  "id": "auction-abc123",
+  "seatbid": [
+    {
+      "seat": "aps",
+      "bid": [
+        {
+          "id": "upstream-aps-bid-id",
+          "impid": "header-banner",
+          "price": 2.5,
+          "w": 728,
+          "h": 90,
+          "ext": {
+            "trusted_server": {
+              "renderer": {
+                "type": "aps",
+                "version": 1,
+                "accountId": "example-account",
+                "bidId": "upstream-aps-bid-id",
+                "tagType": "iframe",
+                "creativeUrl": "https://creative.example/render",
+                "aaxResponse": "fictional-base64-envelope",
+                "width": 728,
+                "height": 90
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+For these bids, `id` preserves APS's upstream bid ID, `crid` is present only when APS supplies one, and `adm` is absent. TSJS understands this contract; other `/auction` consumers must render `ext.trusted_server.renderer` explicitly.
+
 EC identity is maintained with the `ts-ec` cookie; auction responses do not emit EC ID headers.
 
 ## Creative Processing
@@ -585,7 +623,6 @@ debug = false
 [integrations.aps]
 enabled = true
 account_id = "example-account"
-endpoint = "https://web.ads.aps.amazon-adsystem.com/e/pb/bid"
 timeout_ms = 800
 debug = false
 allow_script_creatives = false
@@ -622,14 +659,16 @@ price_floor = 0.50
 
 #### `[integrations.aps]`
 
-| Field                    | Type   | Default                                            | Description                                                       |
-| ------------------------ | ------ | -------------------------------------------------- | ----------------------------------------------------------------- |
-| `enabled`                | bool   | `false`                                            | Enable APS provider                                               |
-| `account_id`             | string | —                                                  | APS account ID (required; `pub_id` is an alias)                   |
-| `endpoint`               | string | `https://web.ads.aps.amazon-adsystem.com/e/pb/bid` | APS OpenRTB endpoint                                              |
-| `timeout_ms`             | u32    | `800`                                              | Request timeout                                                   |
-| `debug`                  | bool   | `false`                                            | Include the raw APS HTTP exchange in `/auction` provider metadata |
-| `allow_script_creatives` | bool   | `false`                                            | Admit script bids before APS candidate reduction                  |
+| Field                    | Type   | Default                       | Description                                                       |
+| ------------------------ | ------ | ----------------------------- | ----------------------------------------------------------------- |
+| `enabled`                | bool   | `false`                       | Enable APS provider                                               |
+| `account_id`             | string | —                             | APS account ID (required; `pub_id` is an alias)                   |
+| `endpoint`               | string | Built-in APS OpenRTB endpoint | Optional APS OpenRTB endpoint override                            |
+| `timeout_ms`             | u32    | `800`                         | Request timeout                                                   |
+| `debug`                  | bool   | `false`                       | Include the raw APS HTTP exchange in `/auction` provider metadata |
+| `inventory_domain`       | string | —                             | Override `site.domain` for APS-authorized inventory               |
+| `inventory_page_origin`  | string | —                             | HTTPS origin paired with `inventory_domain` for `site.page`       |
+| `allow_script_creatives` | bool   | `false`                       | Admit script bids before APS candidate reduction                  |
 
 #### `[integrations.adserver_mock]`
 

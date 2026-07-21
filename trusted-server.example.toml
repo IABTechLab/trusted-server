@@ -119,7 +119,6 @@ allowed_context_keys = []
 [integrations.aps]
 enabled = false
 account_id = "example-aps-account-id"
-endpoint = "https://web.ads.aps.amazon-adsystem.com/e/pb/bid"
 timeout_ms = 1000
 # Include raw APS request/response data in /auction metadata on test sites only.
 debug = false
