@@ -539,12 +539,26 @@ pub fn rewrite_creative_html(settings: &Settings, markup: &str) -> String {
 /// origin and 404.
 ///
 /// Differs from [`rewrite_creative_html`] in the two ways that context requires:
-/// - Proxy/click URLs are emitted **absolute** (`https://<publisher-domain>/first-party/…`)
-///   so they resolve against the publisher origin regardless of the document's
-///   base URL, and independently of whether the custom renderer is honored.
+/// - Proxy/click URLs are emitted **absolute** against `base_origin` (the trusted
+///   request origin — scheme, host, and port the visitor is actually on) so they
+///   resolve regardless of the document's base URL, and independently of whether
+///   the custom renderer is honored. `base_origin` must be a bare origin with no
+///   trailing slash (e.g. `https://news.publisher.example` or
+///   `http://localhost:7676`); the caller derives it from the request rather than
+///   the configured publisher domain, which cannot carry a port and may differ
+///   from the subdomain serving the request.
 /// - The `tsjs` bundle is **not** injected into `<body>`: its only job is to
 ///   safeguard click URLs, which are already absolute here, and shipping the full
 ///   core-plus-integrations bundle into every creative iframe is pure weight.
+#[must_use]
+pub fn rewrite_inline_creative_html(
+    settings: &Settings,
+    base_origin: &str,
+    markup: &str,
+) -> String {
+    rewrite_creative_html_impl(settings, markup, base_origin, false)
+}
+
 /// The clear-price auction macro DSPs embed in creative markup and tracking URLs.
 const AUCTION_PRICE_MACRO: &str = "${AUCTION_PRICE}";
 
@@ -569,12 +583,6 @@ pub fn expand_auction_price_macro(markup: &str, cpm: f64) -> String {
         return markup.to_owned();
     }
     markup.replace(AUCTION_PRICE_MACRO, &cpm.to_string())
-}
-
-#[must_use]
-pub fn rewrite_inline_creative_html(settings: &Settings, markup: &str) -> String {
-    let base_origin = format!("https://{}", settings.publisher.domain);
-    rewrite_creative_html_impl(settings, markup, &base_origin, false)
 }
 
 /// Shared creative rewriter. `base_origin` is prefixed onto first-party proxy and
@@ -996,7 +1004,7 @@ mod tests {
              <img src=\"https://cdn.example/pixel.png\">\
              <a href=\"https://ads.example/click\">go</a>\
              </body></html>";
-        let out = rewrite_inline_creative_html(&settings, html);
+        let out = rewrite_inline_creative_html(&settings, "https://test-publisher.com", html);
 
         assert!(
             out.contains("https://test-publisher.com/first-party/proxy?tsurl="),
@@ -1023,9 +1031,52 @@ mod tests {
         // first-party path.
         let settings = crate::test_support::tests::create_test_settings();
         let html = "<body><img src=\"/local/pixel.png\"></body>";
-        let out = rewrite_inline_creative_html(&settings, html);
+        let out = rewrite_inline_creative_html(&settings, "https://test-publisher.com", html);
         assert!(out.contains("<img src=\"/local/pixel.png\""), "{out}");
         assert!(!out.contains("/first-party/proxy"), "{out}");
+    }
+
+    #[test]
+    fn inline_rewrite_uses_http_localhost_origin_with_port() {
+        // Axum/Viceroy dev runs over HTTP on a port. The inline URLs must carry
+        // the actual request origin (scheme + host + port), not a hardcoded
+        // https://<publisher.domain> that development traffic never reaches.
+        let settings = crate::test_support::tests::create_test_settings();
+        let html = "<body><img src=\"https://cdn.example/pixel.png\"></body>";
+        let out = rewrite_inline_creative_html(&settings, "http://localhost:7676", html);
+        assert!(
+            out.contains("http://localhost:7676/first-party/proxy?tsurl="),
+            "expected the HTTP localhost:port request origin: {out}"
+        );
+        assert!(
+            !out.contains("https://test-publisher.com/first-party/proxy"),
+            "must not fall back to the configured publisher domain: {out}"
+        );
+    }
+
+    #[test]
+    fn inline_rewrite_uses_request_subdomain_origin() {
+        // A deployment may receive traffic on a subdomain that differs from the
+        // configured publisher.domain; the inline URLs must resolve against the
+        // origin the visitor is actually on.
+        let settings = crate::test_support::tests::create_test_settings();
+        let html = "<body><a href=\"https://ads.example/click\">go</a></body>";
+        let out = rewrite_inline_creative_html(&settings, "https://news.test-publisher.com", html);
+        assert!(
+            out.contains("https://news.test-publisher.com/first-party/click?tsurl="),
+            "expected the request subdomain origin: {out}"
+        );
+    }
+
+    #[test]
+    fn inline_rewrite_uses_non_default_https_port_origin() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let html = "<body><img src=\"https://cdn.example/pixel.png\"></body>";
+        let out = rewrite_inline_creative_html(&settings, "https://test-publisher.com:8443", html);
+        assert!(
+            out.contains("https://test-publisher.com:8443/first-party/proxy?tsurl="),
+            "expected the non-default HTTPS port preserved in the origin: {out}"
+        );
     }
 
     #[test]

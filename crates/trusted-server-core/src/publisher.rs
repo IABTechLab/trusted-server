@@ -698,6 +698,7 @@ pub async fn stream_publisher_body_async<W: Write>(
             params.price_granularity,
             &params.ad_bids_state,
             settings,
+            &request_origin(&params.request_scheme, &params.request_host),
             settings.debug.inject_adm_for_testing,
         );
         return stream_publisher_body(body, output, params, settings, integration_registry);
@@ -742,6 +743,7 @@ pub async fn stream_publisher_body_async<W: Write>(
             orchestrator,
             services,
             settings,
+            request_origin: request_origin(&params.request_scheme, &params.request_host),
         },
     )
     .await
@@ -845,11 +847,24 @@ pub(crate) fn should_run_server_side_ad_stack(
 }
 
 /// Write winning bids from an auction result into the shared `ad_bids_state` lock.
+/// Build the request origin (`scheme://host`, where `host` includes any port)
+/// used to emit absolute first-party URLs in inline creatives. Returns an empty
+/// string when the scheme or host is unknown, so callers fall back to the
+/// configured publisher domain.
+fn request_origin(scheme: &str, host: &str) -> String {
+    if scheme.is_empty() || host.is_empty() {
+        String::new()
+    } else {
+        format!("{scheme}://{host}")
+    }
+}
+
 pub(crate) fn write_bids_to_state(
     winning_bids: &std::collections::HashMap<String, Bid>,
     price_granularity: PriceGranularity,
     ad_bids_state: &Arc<Mutex<Option<String>>>,
     settings: &Settings,
+    request_origin: &str,
     include_debug_bid: bool,
 ) {
     log::debug!(
@@ -857,7 +872,13 @@ pub(crate) fn write_bids_to_state(
         winning_bids.len(),
         winning_bids.keys().cloned().collect::<Vec<_>>().join(", ")
     );
-    let bid_map = build_bid_map(winning_bids, price_granularity, settings, include_debug_bid);
+    let bid_map = build_bid_map(
+        winning_bids,
+        price_granularity,
+        settings,
+        request_origin,
+        include_debug_bid,
+    );
     let bids_script = build_bids_script(&bid_map);
     *ad_bids_state.lock().expect("should lock bid state") = Some(bids_script);
 }
@@ -1067,6 +1088,8 @@ struct AuctionCollectCtx<'a> {
     orchestrator: &'a AuctionOrchestrator,
     services: &'a RuntimeServices,
     settings: &'a Settings,
+    /// Trusted request origin (`scheme://host`) for absolute inline creative URLs.
+    request_origin: String,
 }
 
 /// Run the close-body hold loop for HTML bodies, collecting the auction before
@@ -1195,6 +1218,7 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
         orchestrator,
         services,
         settings,
+        request_origin,
     } = ctx;
     let mut buffer = vec![0u8; STREAM_CHUNK_SIZE];
     let mut hold = Some(BodyCloseHoldBuffer::new());
@@ -1215,6 +1239,7 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
                         orchestrator,
                         services,
                         settings,
+                        &request_origin,
                     )
                     .await;
 
@@ -1278,6 +1303,7 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
                             orchestrator,
                             services,
                             settings,
+                            &request_origin,
                         )
                         .await;
 
@@ -1361,6 +1387,7 @@ async fn collect_stream_auction(
     orchestrator: &AuctionOrchestrator,
     services: &RuntimeServices,
     settings: &Settings,
+    request_origin: &str,
 ) {
     log::info!("body_close_hold_loop: collecting dispatched auction before held body tail");
     let placeholder = mediator_placeholder_request();
@@ -1391,6 +1418,7 @@ async fn collect_stream_auction(
         price_granularity,
         ad_bids_state,
         settings,
+        request_origin,
         settings.debug.inject_adm_for_testing,
     );
 
@@ -2087,8 +2115,19 @@ pub(crate) fn build_bid_map(
     winning_bids: &std::collections::HashMap<String, Bid>,
     granularity: crate::price_bucket::PriceGranularity,
     settings: &Settings,
+    request_origin: &str,
     include_debug_bid: bool,
 ) -> serde_json::Map<String, serde_json::Value> {
+    // Inline creatives render in a foreign origin (PUC's srcdoc under GAM), so
+    // their proxy/click URLs must be absolute against the origin the visitor is
+    // actually on — scheme, host, and port. Fall back to the configured publisher
+    // domain only when the request origin is unknown (e.g. an empty host on a
+    // non-navigation path), where no inline render is expected anyway.
+    let base_origin = if request_origin.is_empty() {
+        format!("https://{}", settings.publisher.domain)
+    } else {
+        request_origin.to_owned()
+    };
     winning_bids
         .iter()
         .filter_map(|(slot_id, bid)| {
@@ -2161,7 +2200,11 @@ pub(crate) fn build_bid_map(
                     // URL, and signing would lock that wrong value.
                     let priced = crate::creative::expand_auction_price_macro(raw_creative, cpm);
                     let sanitized = crate::creative::sanitize_creative_html(&priced);
-                    let adm = crate::creative::rewrite_inline_creative_html(settings, &sanitized);
+                    let adm = crate::creative::rewrite_inline_creative_html(
+                        settings,
+                        &base_origin,
+                        &sanitized,
+                    );
                     if !adm.is_empty() {
                         obj.insert("adm".to_string(), serde_json::Value::String(adm));
                     }
@@ -2391,6 +2434,12 @@ pub async fn handle_page_bids(
         return Ok(response);
     };
 
+    // Trusted request origin for absolute inline creative URLs — derived from the
+    // origin the visitor is actually on (scheme, host, port), not the configured
+    // publisher domain, which cannot carry a port and may differ by subdomain.
+    let request_info = RequestInfo::from_request(&req, services.client_info());
+    let page_bids_request_origin = request_origin(&request_info.scheme, &request_info.host);
+
     // CSRF-style gate: refuse cross-site invocations before any auction work.
     if !page_bids_request_allowed(&req) {
         log::debug!(
@@ -2576,6 +2625,7 @@ pub async fn handle_page_bids(
         &winning_bids,
         co_config.price_granularity,
         settings,
+        &page_bids_request_origin,
         settings.debug.inject_adm_for_testing,
     );
 
@@ -3307,6 +3357,7 @@ mod tests {
             orchestrator: &orchestrator,
             services: &services,
             settings: &settings,
+            request_origin: String::new(),
         };
         let mut output = Vec::new();
 
@@ -4406,6 +4457,7 @@ mod tests {
                 &winning_bids,
                 PriceGranularity::Dense,
                 &test_settings(),
+                "",
                 false,
             );
             let entry = map.get("atf_sidebar_ad").expect("should have bid entry");
@@ -4458,6 +4510,7 @@ mod tests {
                 &winning_bids,
                 PriceGranularity::Dense,
                 &test_settings(),
+                "",
                 false,
             );
             let obj = map
@@ -4498,6 +4551,7 @@ mod tests {
                 &winning_bids,
                 PriceGranularity::Dense,
                 &test_settings(),
+                "",
                 false,
             );
             let obj = map
@@ -4543,6 +4597,7 @@ mod tests {
                 &winning_bids,
                 PriceGranularity::Dense,
                 &test_settings(),
+                "",
                 false,
             );
             let adm = map
@@ -4592,6 +4647,7 @@ mod tests {
                 &winning_bids,
                 PriceGranularity::Dense,
                 &test_settings(),
+                "",
                 false,
             );
             let obj = map
@@ -4629,7 +4685,7 @@ mod tests {
             );
             winning_bids.insert("atf_sidebar_ad".to_string(), bid);
 
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, &settings, false);
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, &settings, "", false);
             let adm = map
                 .get("atf_sidebar_ad")
                 .and_then(|v| v.as_object())
@@ -4652,6 +4708,53 @@ mod tests {
             assert!(
                 !adm.contains("/static/tsjs="),
                 "should not inject the tsjs bundle into a foreign-origin creative iframe, got: {adm}"
+            );
+        }
+
+        #[test]
+        fn build_bid_map_uses_request_origin_for_inline_urls() {
+            // The inline adm's absolute first-party URLs must resolve against the
+            // origin the visitor is on (here an HTTP dev host with a port), not the
+            // configured publisher domain.
+            let mut settings = test_settings();
+            settings.publisher.domain = "example.com".to_string();
+
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "examplessp",
+                "abc123",
+                "https://ssp.example.com/win",
+                "https://ssp.example.com/bill",
+            );
+            bid.creative = Some(
+                "<html><body><img src=\"https://cdn.example.com/pixel.png\"></body></html>"
+                    .to_string(),
+            );
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &settings,
+                "http://localhost:7676",
+                false,
+            );
+            let adm = map
+                .get("atf_sidebar_ad")
+                .and_then(|v| v.as_object())
+                .and_then(|o| o.get("adm"))
+                .and_then(|v| v.as_str())
+                .expect("should include a rewritten adm");
+
+            assert!(
+                adm.contains("http://localhost:7676/first-party/proxy?tsurl="),
+                "should emit URLs against the request origin, got: {adm}"
+            );
+            assert!(
+                !adm.contains("https://example.com/first-party/proxy"),
+                "must not fall back to the configured publisher domain, got: {adm}"
             );
         }
 
@@ -4682,7 +4785,7 @@ mod tests {
             );
             winning_bids.insert("atf_sidebar_ad".to_string(), bid);
 
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, &settings, false);
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, &settings, "", false);
             let adm = map
                 .get("atf_sidebar_ad")
                 .and_then(|v| v.as_object())
@@ -4721,6 +4824,7 @@ mod tests {
                 &winning_bids,
                 PriceGranularity::Dense,
                 &test_settings(),
+                "",
                 false,
             );
             let script = build_bids_script(&map);
@@ -4756,6 +4860,7 @@ mod tests {
                 &winning_bids,
                 PriceGranularity::Dense,
                 &test_settings(),
+                "",
                 true,
             );
             let obj = map
@@ -4822,6 +4927,7 @@ mod tests {
                 &winning_bids,
                 PriceGranularity::Dense,
                 &test_settings(),
+                "",
                 false,
             );
             let obj = map
@@ -4873,6 +4979,7 @@ mod tests {
                 &winning_bids,
                 PriceGranularity::Dense,
                 &test_settings(),
+                "",
                 false,
             );
             let obj = map
@@ -4922,6 +5029,7 @@ mod tests {
                 &winning_bids,
                 PriceGranularity::Dense,
                 &test_settings(),
+                "",
                 false,
             );
             let obj = map
@@ -4962,6 +5070,7 @@ mod tests {
                 &winning_bids,
                 PriceGranularity::Dense,
                 &test_settings(),
+                "",
                 false,
             );
             assert!(
