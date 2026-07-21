@@ -905,25 +905,18 @@ export function installTsRenderBridge(): void {
     const sourceSlotId = slotIdForMessageSource(e.source);
     if (!sourceSlotId) return;
 
-    // Build reverse map adId → slotId from live window.tsjs.bids.
+    // Resolve the bid by the requesting slot, not by the first bid whose hb_adid
+    // matches. hb_adid is not unique per bid: absent PBS Cache, it falls back to a
+    // creative id a bidder may reuse across slots. A first-match-by-adId lookup
+    // would resolve every duplicate to one slot, so all but that slot render blank.
     const bids = window.tsjs?.bids ?? {};
-    let slotId: string | undefined;
-    let matchedBid: (typeof bids)[string] | undefined;
-    for (const [sid, bid] of Object.entries(bids)) {
-      if (bid.hb_adid === adId) {
-        slotId = sid;
-        matchedBid = bid;
-        break;
-      }
-    }
+    const slotId = sourceSlotId;
+    const matchedBid = bids[slotId];
 
-    // Not a TS bid — let Prebid.js handle it.
-    if (!slotId || !matchedBid) return;
-
-    // The requesting iframe's slot must own the resolved adId. Without this an
-    // iframe under slot A could request slot B's hb_adid and receive slot B's
-    // creative/dimensions while firing slot B's win/billing beacons.
-    if (slotId !== sourceSlotId) return;
+    // Not a TS bid, or the requesting slot's bid does not own this adId — let
+    // Prebid.js handle it. The adId guard also prevents an iframe under slot A from
+    // pulling slot B's creative and firing slot B's win/billing beacons.
+    if (!matchedBid || matchedBid.hb_adid !== adId) return;
 
     const slot = window.tsjs?.adSlots?.find((s) => s.id === slotId);
     const [width, height] = slot?.formats?.[0] ?? [728, 90];

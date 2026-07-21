@@ -1261,6 +1261,84 @@ describe('installTsRenderBridge', () => {
     beaconSpy.mockRestore();
   });
 
+  it('resolves the requesting slot bid when two slots share one hb_adid', async () => {
+    // Duplicate hb_adid across slots: PBS Cache is absent, so hb_adid falls back
+    // to a creative id that a bidder reuses across slots. The bridge must resolve
+    // the bid by the requesting slot, not the first bid whose hb_adid matches —
+    // otherwise every slot but the first renders blank.
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    const headerAdm = '<div>Header Creative</div>';
+    const inContentAdm = '<div>In-Content Creative</div>';
+    (window as TestWindow).tsjs = {
+      bids: {
+        homepage_header: {
+          hb_adid: 'shared-creative-id',
+          hb_bidder: 'ix',
+          hb_pb: '0.53',
+          adm: headerAdm,
+        },
+        homepage_in_content: {
+          hb_adid: 'shared-creative-id',
+          hb_bidder: 'ix',
+          hb_pb: '0.40',
+          adm: inContentAdm,
+        },
+      },
+      adSlots: [
+        {
+          id: 'homepage_header',
+          formats: [[728, 90]] as [number, number][],
+          gam_unit_path: '/a/b/c',
+          div_id: 'div-header',
+          targeting: {},
+        },
+        {
+          id: 'homepage_in_content',
+          formats: [[300, 250]] as [number, number][],
+          gam_unit_path: '/a/b/c',
+          div_id: 'div-in-content',
+          targeting: {},
+        },
+      ],
+    };
+
+    const bridgeListener = await captureBridgeListener();
+    const stopSpy = vi.fn();
+    const portMessages: string[] = [];
+    const fakePort = { postMessage: (s: string) => portMessages.push(s) };
+
+    // Iframe belongs to the SECOND slot, whose bid is not the first hb_adid match.
+    const slot = document.createElement('div');
+    slot.id = 'div-in-content';
+    const iframe = document.createElement('iframe');
+    slot.appendChild(iframe);
+    document.body.appendChild(slot);
+    const source = iframe.contentWindow!;
+
+    try {
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: 'shared-creative-id' }),
+          ports: [fakePort],
+          source,
+          stopImmediatePropagation: stopSpy,
+        }) as unknown as MessageEvent
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+      expect(portMessages).toHaveLength(1);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const parsed = JSON.parse(portMessages[0]) as Record<string, any>;
+      // The requesting slot's own creative and dimensions, not the first match's.
+      expect(parsed.ad).toBe(inContentAdm);
+      expect(parsed.width).toBe(300);
+      expect(parsed.height).toBe(250);
+    } finally {
+      slot.remove();
+      beaconSpy.mockRestore();
+    }
+  });
+
   it('falls back to keepalive fetch when sendBeacon is unavailable', async () => {
     const originalSendBeacon = navigator.sendBeacon;
     Object.defineProperty(navigator, 'sendBeacon', {
