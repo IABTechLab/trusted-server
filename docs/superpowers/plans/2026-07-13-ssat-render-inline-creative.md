@@ -1,5 +1,27 @@
 # SSAT Inline Creative Rendering — Implementation Plan
 
+> **Status: Superseded — completed with revisions.** The feature shipped on
+> `feat/ssat-render-inline-creative`. The implementation followed this plan's
+> core (always include the winning `adm`; bridge renders it locally; cache is the
+> fallback; gate the GAM-bypass on `debug_bid`) but extended it beyond what the
+> task list below captures:
+>
+> - a dedicated foreign-origin rewriter, `rewrite_inline_creative_html` (absolute
+>   URLs, no tsjs injection), replacing the `rewrite_creative_html` calls named
+>   below;
+> - inline URLs built from the **request origin** (`scheme://host:port`) threaded
+>   through `write_bids_to_state`/`build_bid_map`, not `publisher.domain`;
+> - winning creative dimensions (`w`/`h`) emitted in the bid map and used to size
+>   the render;
+> - `${AUCTION_PRICE}` expanded from the winning CPM before sanitize/rewrite/sign;
+> - a structured PBS Cache decoder (`parseCachedBid`) preserving cached dimensions
+>   and price.
+>
+> The authoritative final description is the design's "Implementation
+> reconciliation" section: `docs/superpowers/specs/2026-07-13-ssat-render-inline-creative-design.md`.
+> The unchecked task list below is retained as historical record; it is **not** an
+> accurate map of the shipped code.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Render SSAT-winning creatives from the copy trusted-server already holds (no render-time PBS Cache round trip), while keeping GAM in the loop.
