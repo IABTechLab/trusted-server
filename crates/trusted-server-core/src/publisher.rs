@@ -2100,9 +2100,9 @@ fn html_escape_for_script(s: &str) -> String {
 ///
 /// Every entry also carries the trace fields `hb_auction_id` (when
 /// `auction_id` is known), `hb_crid` (when the bidder returned a creative ID),
-/// and `hb_adm_hash` (when the bid has creative markup) so the client can
-/// stamp rendered creatives with a tuple that joins back to the server-side
-/// `auction winner:` log lines.
+/// `hb_bid_id` (the bid's own `OpenRTB` `id`), and `hb_adm_hash` (when the bid
+/// has creative markup) so the client can stamp rendered creatives with a tuple
+/// that joins back to the server-side `auction winner:` log lines.
 pub(crate) fn build_bid_map(
     winning_bids: &std::collections::HashMap<String, Bid>,
     granularity: crate::price_bucket::PriceGranularity,
@@ -2130,6 +2130,17 @@ pub(crate) fn build_bid_map(
                     obj.insert(
                         "hb_crid".to_string(),
                         serde_json::Value::String(crid.clone()),
+                    );
+                }
+                // The bid's own OpenRTB `id`, carried separately from `hb_adid`
+                // so the client can stamp the exact bid this render came from.
+                // `hb_adid` cannot serve that purpose: it holds the cache UUID
+                // or `adid` whenever one exists, and only falls back to the bid
+                // ID when neither does. Trace-only — never set as GAM targeting.
+                if let Some(ref bid_id) = bid.bid_id {
+                    obj.insert(
+                        "hb_bid_id".to_string(),
+                        serde_json::Value::String(bid_id.clone()),
                     );
                 }
                 if let Some(hash) = bid.creative_trace_hash() {
@@ -4460,6 +4471,7 @@ mod tests {
                 "https://ssp/bill",
             );
             bid.creative = Some("<div>Creative</div>".to_string());
+            bid.bid_id = Some("bid-abc123".to_string());
             bid.crid = Some("cr-98765".to_string());
             winning_bids.insert("atf_sidebar_ad".to_string(), bid);
 
@@ -4484,6 +4496,11 @@ mod tests {
                 obj.get("hb_crid").and_then(|v| v.as_str()),
                 Some("cr-98765"),
                 "should carry the upstream creative ID"
+            );
+            assert_eq!(
+                obj.get("hb_bid_id").and_then(|v| v.as_str()),
+                Some("bid-abc123"),
+                "should carry the upstream bid ID separately"
             );
             assert_eq!(
                 obj.get("hb_adm_hash").and_then(|v| v.as_str()),

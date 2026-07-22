@@ -57,6 +57,13 @@ export interface AuctionBid {
   adomain: string[];
   /** Server-side auction ID (response top-level `id` / `ext.ts.auction_id`). */
   auctionId?: string;
+  /**
+   * The bid's own OpenRTB `id` — the trace key identifying this exact bid in
+   * the server-side `auction winner:` log line. Kept distinct from
+   * [`creativeId`], which is the advertiser's creative (`crid`) and is reused
+   * across bids and slots.
+   */
+  bidId?: string;
   /** Trace hash of the delivered adm (`ext.ts.adm_hash`, 16 hex chars of SHA-256). */
   admHash?: string;
 }
@@ -160,6 +167,7 @@ export function parseAuctionResponse(body: any): AuctionBid[] {
           typeof tsExt?.auction_id === 'string' && tsExt.auction_id !== ''
             ? tsExt.auction_id
             : responseAuctionId,
+        bidId: typeof b?.id === 'string' && b.id !== '' ? b.id : undefined,
         admHash:
           typeof tsExt?.adm_hash === 'string' && tsExt.adm_hash !== '' ? tsExt.adm_hash : undefined,
       });

@@ -21,6 +21,7 @@ type RenderCreativeInlineOptions = {
   seat: string;
   creativeId: string;
   auctionId?: string;
+  bidId?: string;
   admHash?: string;
 };
 
@@ -64,6 +65,7 @@ export function requestAds(
             seat: bid.seat,
             creativeId: bid.creativeId,
             auctionId: bid.auctionId,
+            bidId: bid.bidId,
             admHash: bid.admHash,
           });
         }
@@ -93,12 +95,14 @@ function renderCreativeInline({
   seat,
   creativeId,
   auctionId,
+  bidId,
   admHash,
 }: RenderCreativeInlineOptions): void {
   const trace = {
     slotId,
     path: 'auction' as const,
     auctionId,
+    bidId,
     bidder: seat,
     creativeId,
     admHash,

@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import {
   recordRender,
+  updateRender,
   stampCreativeTrace,
   traceOverlayEnabled,
   renderTracePanel,
@@ -69,6 +71,68 @@ describe('trace/recordRender', () => {
     expect(event.detail).toEqual(record);
 
     window.removeEventListener(RENDER_EVENT_NAME, listener);
+  });
+
+  it('allocates one sequence across separately bundled IIFEs', async () => {
+    const buildTraceBundle = (): string =>
+      execFileSync(
+        './node_modules/.bin/esbuild',
+        ['--bundle', '--format=iife', '--platform=browser', '--loader=ts'],
+        {
+          cwd: process.cwd(),
+          encoding: 'utf8',
+          input:
+            'import { recordRender } from "./src/core/trace.ts";' +
+            'window.__recordFromTraceBundle = recordRender;',
+        }
+      );
+
+    const firstBundle = buildTraceBundle();
+    const secondBundle = buildTraceBundle();
+    const testWindow = window as typeof window & {
+      __recordFromTraceBundle?: typeof recordRender;
+    };
+
+    Function(firstBundle)();
+    const firstRecord = testWindow.__recordFromTraceBundle!;
+    const first = firstRecord({ slotId: 'iife-a', path: 'auction', rendered: true });
+
+    Function(secondBundle)();
+    const secondRecord = testWindow.__recordFromTraceBundle!;
+    const second = secondRecord({ slotId: 'iife-b', path: 'ssat', rendered: true });
+
+    expect(second.seq).toBe(first.seq + 1);
+    expect(window.tsjs?.renderSeq).toBe(second.seq);
+    delete testWindow.__recordFromTraceBundle;
+  });
+
+  it('enriches an existing impression without changing its bookkeeping', () => {
+    const original = recordRender({
+      slotId: 'slot-enrich',
+      path: 'ssat',
+      rendered: true,
+      injected: false,
+      servedFrom: 'gam',
+    });
+    const bookkeeping = {
+      seq: original.seq,
+      count: original.count,
+      at: original.at,
+      historyLength: window.tsjs?.renderLog?.length,
+    };
+
+    const updated = updateRender(original, { injected: true, servedFrom: 'pbs-cache' });
+
+    expect(updated).toBe(original);
+    expect(window.tsjs?.renders?.['slot-enrich']).toBe(original);
+    expect(window.tsjs?.renderLog?.[0]).toBe(original);
+    expect(updated).toEqual(expect.objectContaining({ injected: true, servedFrom: 'pbs-cache' }));
+    expect({
+      seq: updated.seq,
+      count: updated.count,
+      at: updated.at,
+      historyLength: window.tsjs?.renderLog?.length,
+    }).toEqual(bookkeeping);
   });
 });
 
@@ -307,6 +371,26 @@ describe('trace/floating panel', () => {
     expect(panel.textContent!.match(/◂ current/g)).toHaveLength(1);
   });
 
+  it('uses record identity when duplicate sequence values exist', () => {
+    document.cookie = 'ts-trace=1; Path=/';
+    const oldRecord = { ...record, auctionId: 'auction-old', count: 1, seq: 7, at: 1 };
+    const liveRecord = { ...record, auctionId: 'auction-live', count: 2, seq: 7, at: 2 };
+    (window as { tsjs?: TsjsApi }).tsjs = {
+      renders: { 'slot-1': liveRecord },
+      renderLog: [oldRecord, liveRecord],
+    } as unknown as TsjsApi;
+
+    renderTracePanel();
+
+    const rows = [...document.querySelectorAll(`#${TRACE_PANEL_ID} div[style*="cursor"]`)];
+    const oldRow = rows.find((row) => row.getAttribute('title')?.includes('auction: auction-old'));
+    const liveRow = rows.find((row) =>
+      row.getAttribute('title')?.includes('auction: auction-live')
+    );
+    expect(oldRow?.textContent).not.toContain('◂ current');
+    expect(liveRow?.textContent).toContain('◂ current');
+  });
+
   it('close button removes the panel', () => {
     document.cookie = 'ts-trace=1; Path=/';
     recordRender(record);
@@ -382,6 +466,30 @@ describe('trace/confirmation badge', () => {
     const el = document.createElement('div');
     document.body.appendChild(el);
     stampCreativeTrace(el, { ...okRecord, visible: false });
+    expect(el.querySelector(`.${TRACE_BADGE_CLASS}`)).toBeNull();
+  });
+
+  it('removes the previous badge when a filled slot becomes empty', () => {
+    document.cookie = 'ts-trace=1; Path=/';
+    const el = document.createElement('div');
+    document.body.appendChild(el);
+    stampCreativeTrace(el, okRecord);
+    expect(el.querySelector(`.${TRACE_BADGE_CLASS}`)).toBeTruthy();
+
+    stampCreativeTrace(el, { ...okRecord, rendered: false, injected: false, gamEmpty: true });
+
+    expect(el.querySelector(`.${TRACE_BADGE_CLASS}`)).toBeNull();
+  });
+
+  it('removes the previous badge when a visible slot becomes hidden', () => {
+    document.cookie = 'ts-trace=1; Path=/';
+    const el = document.createElement('div');
+    document.body.appendChild(el);
+    stampCreativeTrace(el, okRecord);
+    expect(el.querySelector(`.${TRACE_BADGE_CLASS}`)).toBeTruthy();
+
+    stampCreativeTrace(el, { ...okRecord, visible: false });
+
     expect(el.querySelector(`.${TRACE_BADGE_CLASS}`)).toBeNull();
   });
 

@@ -8,6 +8,7 @@ const {
   mockRegisterBidAdapter,
   mockGetUserIdsAsEids,
   mockGetConfig,
+  mockOnEvent,
   mockPbjs,
   mockGetBidAdapter,
   mockAdapterManager,
@@ -21,6 +22,7 @@ const {
     () => [] as Array<{ source: string; uids?: Array<{ id: string; atype?: number }> }>
   );
   const mockGetConfig = vi.fn();
+  const mockOnEvent = vi.fn();
   const mockPbjs = {
     setConfig: mockSetConfig,
     processQueue: mockProcessQueue,
@@ -28,6 +30,7 @@ const {
     registerBidAdapter: mockRegisterBidAdapter,
     getUserIdsAsEids: mockGetUserIdsAsEids,
     getConfig: mockGetConfig,
+    onEvent: mockOnEvent,
     adUnits: [] as any[],
   };
   const mockAdapterManager = {
@@ -40,6 +43,7 @@ const {
     mockRegisterBidAdapter,
     mockGetUserIdsAsEids,
     mockGetConfig,
+    mockOnEvent,
     mockPbjs,
     mockGetBidAdapter,
     mockAdapterManager,
@@ -69,7 +73,8 @@ import {
   auctionBidsToPrebidBids,
   installPrebidNpm,
   installRefreshHandler,
-  recordPrebidBidWon,
+  installPrebidRenderTrace,
+  recordPrebidAdRender,
 } from '../../../src/integrations/prebid/index';
 import type { AuctionBid } from '../../../src/core/auction';
 import type { TsjsApi } from '../../../src/core/types';
@@ -219,6 +224,7 @@ describe('prebid/auctionBidsToPrebidBids', () => {
         creativeId: 'KM-CREA-1',
         adomain: ['kargo.com'],
         auctionId: 'ts-auction-xyz',
+        bidId: 'bid-abc-1',
         admHash: 'a1b2c3d4e5f60718',
       },
     ];
@@ -227,10 +233,13 @@ describe('prebid/auctionBidsToPrebidBids', () => {
 
     expect(result[0].meta.tsAuctionId).toBe('ts-auction-xyz');
     expect(result[0].meta.tsAdmHash).toBe('a1b2c3d4e5f60718');
+    // The bid's own OpenRTB id, distinct from the advertiser creative id.
+    expect(result[0].meta.tsBidId).toBe('bid-abc-1');
+    expect(result[0].creativeId).toBe('KM-CREA-1');
   });
 });
 
-describe('prebid/recordPrebidBidWon', () => {
+describe('prebid/recordPrebidAdRender', () => {
   beforeEach(() => {
     delete (window as { tsjs?: TsjsApi }).tsjs;
     document.body.innerHTML = '';
@@ -242,12 +251,19 @@ describe('prebid/recordPrebidBidWon', () => {
 
   it('records an auction-path render for a server-side bid', () => {
     document.body.innerHTML = '<div id="ad-header-0-_R_x_"></div>';
-    const record = recordPrebidBidWon({
-      adUnitCode: 'ad-header-0-_R_x_',
-      bidderCode: 'kargo',
-      creativeId: 'KM-CREA-1',
-      meta: { tsAuctionId: '265dcedd-aa0a', tsAdmHash: 'f68044ca9f68c88c' },
-    });
+    const record = recordPrebidAdRender(
+      {
+        adUnitCode: 'ad-header-0-_R_x_',
+        bidderCode: 'kargo',
+        creativeId: 'KM-CREA-1',
+        meta: {
+          tsAuctionId: '265dcedd-aa0a',
+          tsBidId: 'bid-abc-1',
+          tsAdmHash: 'f68044ca9f68c88c',
+        },
+      },
+      'succeeded'
+    );
 
     expect(record).toBeDefined();
     expect(record).toEqual(
@@ -257,6 +273,7 @@ describe('prebid/recordPrebidBidWon', () => {
         rendered: true,
         injected: true,
         auctionId: '265dcedd-aa0a',
+        bidId: 'bid-abc-1',
         admHash: 'f68044ca9f68c88c',
         bidder: 'kargo',
         creativeId: 'KM-CREA-1',
@@ -266,21 +283,111 @@ describe('prebid/recordPrebidBidWon', () => {
     );
     // Written into the shared registry the panel reads.
     expect((window as { tsjs?: TsjsApi }).tsjs?.renders?.['ad-header-0-_R_x_']).toBeDefined();
+    // The bid id must reach the DOM as its own attribute, never folded into
+    // data-ts-ad-id.
+    const el = document.getElementById('ad-header-0-_R_x_')!;
+    expect(el.getAttribute('data-ts-bid-id')).toBe('bid-abc-1');
+  });
+
+  it('records a failed render as unconfirmed, not as a green render', () => {
+    document.body.innerHTML = '<div id="ad-header-0"></div>';
+    const record = recordPrebidAdRender(
+      {
+        adUnitCode: 'ad-header-0',
+        bidderCode: 'kargo',
+        meta: { tsAuctionId: '265dcedd-aa0a' },
+      },
+      'failed'
+    );
+
+    expect(record).toEqual(
+      expect.objectContaining({ rendered: false, injected: false, visible: false })
+    );
   });
 
   it('skips a bid without the server-side trace tuple (client-side bidder)', () => {
-    const record = recordPrebidBidWon({
-      adUnitCode: 'ad-header-0',
-      bidderCode: 'appnexus',
-      meta: { advertiserDomains: ['x.com'] },
-    });
+    const record = recordPrebidAdRender(
+      {
+        adUnitCode: 'ad-header-0',
+        bidderCode: 'appnexus',
+        meta: { advertiserDomains: ['x.com'] },
+      },
+      'succeeded'
+    );
     expect(record).toBeUndefined();
     expect((window as { tsjs?: TsjsApi }).tsjs?.renders).toBeUndefined();
   });
 
   it('skips a bid with no adUnitCode', () => {
-    expect(recordPrebidBidWon({ meta: { tsAuctionId: 'x' } })).toBeUndefined();
-    expect(recordPrebidBidWon(undefined)).toBeUndefined();
+    expect(recordPrebidAdRender({ meta: { tsAuctionId: 'x' } }, 'succeeded')).toBeUndefined();
+    expect(recordPrebidAdRender(undefined, 'succeeded')).toBeUndefined();
+  });
+});
+
+describe('prebid/installPrebidRenderTrace', () => {
+  beforeEach(() => {
+    delete (window as { tsjs?: TsjsApi }).tsjs;
+    document.body.innerHTML = '';
+    mockOnEvent.mockReset();
+    delete (mockPbjs as { __tsRenderTraceInstalled?: boolean }).__tsRenderTraceInstalled;
+  });
+  afterEach(() => {
+    delete (window as { tsjs?: TsjsApi }).tsjs;
+    document.body.innerHTML = '';
+  });
+
+  it('confirms renders from adRenderSucceeded, never from bidWon', () => {
+    document.body.innerHTML = '<div id="ad-header-0"></div>';
+    installPrebidRenderTrace();
+
+    const events = mockOnEvent.mock.calls.map(([name]) => name);
+    expect(events).toEqual(['adRenderSucceeded', 'adRenderFailed']);
+    // bidWon fires when a bid is marked the winner — before the renderer runs,
+    // and so before the render can fail. Confirming on it would show a green
+    // render for a creative that never reached the page.
+    expect(events).not.toContain('bidWon');
+
+    const handlers = Object.fromEntries(mockOnEvent.mock.calls) as Record<
+      string,
+      (event: unknown) => void
+    >;
+    handlers['adRenderSucceeded']({
+      bid: {
+        adUnitCode: 'ad-header-0',
+        bidderCode: 'kargo',
+        meta: { tsAuctionId: 'auction-success', tsBidId: 'bid-success' },
+      },
+    });
+    expect((window as { tsjs?: TsjsApi }).tsjs?.renders?.['ad-header-0']).toEqual(
+      expect.objectContaining({ rendered: true, injected: true, bidId: 'bid-success' })
+    );
+  });
+
+  it('does not produce a confirmed record when the render fails after the win', () => {
+    document.body.innerHTML = '<div id="ad-header-0"></div>';
+    installPrebidRenderTrace();
+
+    const handlers = Object.fromEntries(mockOnEvent.mock.calls) as Record<
+      string,
+      (event: unknown) => void
+    >;
+    const bid = {
+      adUnitCode: 'ad-header-0',
+      bidderCode: 'kargo',
+      meta: { tsAuctionId: '265dcedd-aa0a' },
+    };
+
+    // Prebid marks the bid as won, then its renderer fails asynchronously.
+    handlers['adRenderFailed']({ reason: 'exception', message: 'boom', bid });
+
+    const record = (window as { tsjs?: TsjsApi }).tsjs?.renders?.['ad-header-0'];
+    expect(record).toEqual(
+      expect.objectContaining({ rendered: false, injected: false, visible: false })
+    );
+    // No green badge and no confirmed-render attributes on the slot.
+    const el = document.getElementById('ad-header-0')!;
+    expect(el.getAttribute('data-ts-rendered')).toBe('false');
+    expect(el.getAttribute('data-ts-injected')).toBe('false');
   });
 });
 

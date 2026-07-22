@@ -57,6 +57,17 @@ export interface AuctionBidData {
   hb_adid?: string;
   hb_cache_host?: string;
   hb_cache_path?: string;
+  /**
+   * Upstream OpenRTB `bid.id` — the trace key that identifies this exact bid in
+   * the server-side `auction winner:` log line.
+   *
+   * Distinct from `hb_adid`, which is whatever value GAM's Universal Creative
+   * must echo back for the render bridge to find the bid (a PBS cache UUID, an
+   * `adid`, or — only when neither exists — the bid ID). Carried for tracing
+   * only: unlike the `hb_*` keys in `TS_BID_TARGETING_KEYS` this is never set as
+   * GAM key-value targeting.
+   */
+  hb_bid_id?: string;
   /** Server-side auction ID — trace key joining this bid to server logs. */
   hb_auction_id?: string;
   /** Upstream creative ID (OpenRTB `crid`), when the bidder returned one. */
@@ -103,6 +114,14 @@ export interface RenderRecord {
   bidder?: string;
   /** hb_adid (PBS cache UUID or OpenRTB adid). */
   adId?: string;
+  /**
+   * Upstream OpenRTB `bid.id`, completing the
+   * (auctionId, slotId, bidder, bidId, creativeId, admHash) tuple that joins
+   * this render to exactly one server-side `auction winner:` log line. Never
+   * overloaded onto [`adId`], which carries a different value whenever the bid
+   * has a PBS cache UUID or an `adid`.
+   */
+  bidId?: string;
   /** Upstream creative ID (OpenRTB crid). */
   creativeId?: string;
   /** Trace hash of the creative markup (16 hex chars of SHA-256). */
@@ -189,13 +208,18 @@ export interface TsjsApi {
   /** Maps actualDivId → slotId for slotRenderEnded billing lookup. */
   divToSlotId?: Record<string, string>;
   /**
-   * Per-slot flag: TS applied server-side bid targeting and no GAM render has
-   * consumed it yet. Set by `adInit()`, cleared by the first `slotRenderEnded`
-   * for that slot, so only that render is attributed to the SSAT auction (see
-   * [`RenderRecord.path`]). Publisher-driven refreshes afterwards find it false
-   * and are recorded as `gam-refresh` without the stale auction tuple.
+   * Monotonic render generation, bumped by every `adInit()` and by the start of
+   * every SPA navigation. Async work captures it and re-checks it on completion
+   * so a result belonging to a superseded route is discarded rather than
+   * applied to the current one.
    */
-  ssatTargetingFresh?: Record<string, boolean>;
+  renderGeneration?: number;
+  /**
+   * Page-global render counter backing [`RenderRecord.seq`]. Lives here, on the
+   * object every bundle shares, because each generated IIFE inlines its own
+   * copy of `core/trace` — a module-scoped counter would restart per bundle.
+   */
+  renderSeq?: number;
   /**
    * Win/billing beacons already fired, keyed by `slotId|bidIdentity|kind|url`.
    * Used by the GPT render bridge so a bid's nurl/burl fire at most once even

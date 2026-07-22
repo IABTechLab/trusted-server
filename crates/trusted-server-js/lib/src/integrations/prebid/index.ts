@@ -220,10 +220,13 @@ export function auctionBidsToPrebidBids(auctionBids: AuctionBid[], bidRequests: 
       bidderCode: bid.seat,
       meta: {
         advertiserDomains: bid.adomain,
-        // Carry the server-side trace tuple through Prebid so the bidWon
-        // render-trace hook can attribute the render to its /auction (see
+        // Carry the server-side trace tuple through Prebid so the render-trace
+        // hook can attribute the render to its /auction (see
         // installPrebidRenderTrace). Prebid passes `meta` through unchanged.
+        // `tsBidId` is the bid's own OpenRTB `id`, kept separate from
+        // `creativeId` (the advertiser's `crid`, reused across bids).
         tsAuctionId: bid.auctionId,
+        tsBidId: bid.bidId,
         tsAdmHash: bid.admHash,
       },
     };
@@ -930,13 +933,29 @@ function syncPrebidEidsCookie(): void {
 // Render trace (client-side /auction path)
 // ---------------------------------------------------------------------------
 
-/** Minimal shape of the bid object Prebid.js passes to a `bidWon` handler. */
-interface PrebidWonBid {
+/** Minimal shape of the bid object Prebid.js attaches to a render event. */
+interface PrebidRenderedBid {
   adUnitCode?: string;
   bidderCode?: string;
   bidder?: string;
   creativeId?: string;
-  meta?: { tsAuctionId?: unknown; tsAdmHash?: unknown; [key: string]: unknown };
+  meta?: {
+    tsAuctionId?: unknown;
+    tsBidId?: unknown;
+    tsAdmHash?: unknown;
+    [key: string]: unknown;
+  };
+}
+
+/**
+ * Payload of Prebid's `adRenderSucceeded` (`{ doc, bid, adId }`) and
+ * `adRenderFailed` (`{ reason, message, bid?, adId? }`) events.
+ */
+interface PrebidRenderEvent {
+  bid?: PrebidRenderedBid;
+  adId?: string;
+  reason?: string;
+  message?: string;
 }
 
 /**
@@ -951,33 +970,44 @@ function findAuctionSlotElement(adUnitCode: string): HTMLElement | null {
 }
 
 /**
- * Record a render-trace entry for a Prebid `bidWon` — the authoritative signal
- * that the client-side `/auction` creative actually rendered, distinct from the
- * SSAT/GAM path. Only server-side (`trustedServer`) bids carry `meta.tsAuctionId`
- * (set in {@link auctionBidsToPrebidBids}); client-side bidders lack it and are
- * skipped so the panel never attributes a non-TS render to Trusted Server.
+ * Record a render-trace entry for a completed Prebid render attempt on the
+ * client-side `/auction` path, distinct from the SSAT/GAM path.
+ *
+ * Only server-side (`trustedServer`) bids carry `meta.tsAuctionId` (set in
+ * {@link auctionBidsToPrebidBids}); client-side bidders lack it and are skipped
+ * so the panel never attributes a non-TS render to Trusted Server.
+ *
+ * `outcome` comes from which event fired. A failed attempt is still recorded —
+ * silence would read as "never won" — but as `rendered: false, injected: false`,
+ * which [`panelStatus`] reports as `empty`, so the panel shows a red row rather
+ * than a confirmed green one.
  *
  * Exported for unit testing; the render path itself is unaffected (this only
  * observes and stamps the DOM).
  */
-export function recordPrebidBidWon(bid: PrebidWonBid | undefined): RenderRecord | undefined {
+export function recordPrebidAdRender(
+  bid: PrebidRenderedBid | undefined,
+  outcome: 'succeeded' | 'failed'
+): RenderRecord | undefined {
   if (!bid || typeof bid.adUnitCode !== 'string' || bid.adUnitCode === '') return undefined;
   const meta = bid.meta ?? {};
   // Only trace our server-side bids: the trustedServer adapter is the only
   // source of meta.tsAuctionId.
   if (typeof meta.tsAuctionId !== 'string') return undefined;
 
+  const succeeded = outcome === 'succeeded';
   const el = findAuctionSlotElement(bid.adUnitCode);
   const record = recordRender({
     slotId: bid.adUnitCode,
     path: 'auction',
-    rendered: true,
+    rendered: succeeded,
     // Prebid rendered the `ad` markup our adapter returned — a confirmed TS
-    // placement for this path.
-    injected: true,
-    visible: isEffectivelyVisible(el),
+    // placement for this path, but only once the render actually succeeded.
+    injected: succeeded,
+    visible: succeeded ? isEffectivelyVisible(el) : false,
     elementId: el?.id,
     auctionId: meta.tsAuctionId,
+    bidId: typeof meta.tsBidId === 'string' ? meta.tsBidId : undefined,
     admHash: typeof meta.tsAdmHash === 'string' ? meta.tsAdmHash : undefined,
     bidder: bid.bidderCode ?? bid.bidder,
     creativeId: bid.creativeId,
@@ -988,28 +1018,39 @@ export function recordPrebidBidWon(bid: PrebidWonBid | undefined): RenderRecord 
 }
 
 /**
- * Install the Prebid `bidWon` render-trace hook (idempotent).
+ * Install the Prebid render-trace hooks (idempotent).
  *
- * `bidWon` is the render-confirmation event for the client-side `/auction`
- * path; without this hook only the one-time SSAT auction is traced and the
- * ongoing Prebid renders are invisible to the panel. Read-only: the listener
- * records and stamps but never alters Prebid's rendering.
+ * Listens on `adRenderSucceeded` / `adRenderFailed`, **not** `bidWon`. `bidWon`
+ * fires when Prebid marks a bid as the auction winner — before it hands the bid
+ * to a renderer that can still fail asynchronously (`emitAdRenderFail`), so a
+ * `bidWon` listener would stamp the DOM and light up a confirmed green render
+ * for a creative that never reached the page. `adRenderSucceeded` is emitted
+ * only after the render function returned without error, and carries the
+ * rendered bid on `event.bid`.
+ *
+ * Without these hooks only the one-time SSAT auction is traced and the ongoing
+ * Prebid renders are invisible to the panel. Read-only: the listeners record and
+ * stamp but never alter Prebid's rendering.
  */
 export function installPrebidRenderTrace(): void {
   if (typeof window === 'undefined') return;
   const p = pbjs as unknown as {
-    onEvent?: (event: string, handler: (bid: PrebidWonBid) => void) => void;
+    onEvent?: (event: string, handler: (event: PrebidRenderEvent) => void) => void;
     __tsRenderTraceInstalled?: boolean;
   };
   if (typeof p.onEvent !== 'function' || p.__tsRenderTraceInstalled) return;
   p.__tsRenderTraceInstalled = true;
-  p.onEvent('bidWon', (bid) => {
-    try {
-      recordPrebidBidWon(bid);
-    } catch (err) {
-      log.warn('[tsjs-prebid] render-trace bidWon failed', err);
-    }
-  });
+  const listen = (name: string, outcome: 'succeeded' | 'failed'): void => {
+    p.onEvent!(name, (event) => {
+      try {
+        recordPrebidAdRender(event?.bid, outcome);
+      } catch (err) {
+        log.warn(`[tsjs-prebid] render-trace ${name} failed`, err);
+      }
+    });
+  };
+  listen('adRenderSucceeded', 'succeeded');
+  listen('adRenderFailed', 'failed');
 }
 
 // Self-initialize when loaded in a browser (same pattern as other integrations).

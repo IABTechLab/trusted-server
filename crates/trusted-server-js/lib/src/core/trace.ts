@@ -31,11 +31,32 @@ export const TRACE_PANEL_ID = 'ts-render-trace-panel';
 const MAX_RENDER_LOG_ENTRIES = 200;
 
 /**
- * Page-global render counter backing [`RenderRecord.seq`]. Module-scoped
- * rather than stored on `window.tsjs` so a re-executed bundle cannot resume
- * mid-sequence and hand two different renders the same number.
+ * Fallback for [`nextRenderSeq`] when `window.tsjs` is unreachable (no DOM, or
+ * a throwing property access). Never the primary counter — see below.
  */
-let renderSeq = 0;
+let fallbackRenderSeq = 0;
+
+/**
+ * Allocate the next value for [`RenderRecord.seq`].
+ *
+ * The counter lives on the shared `window.tsjs` object, not in module scope:
+ * `build-all.mjs` emits core, GPT and every integration as separate
+ * self-contained IIFEs, each with its own inlined copy of this module. A
+ * module-scoped counter would therefore restart at 1 in each bundle and hand
+ * two different renders the same number — duplicate `#1` panel rows and
+ * badges across the SSAT and `/auction` paths.
+ */
+function nextRenderSeq(): number {
+  try {
+    const ts = (window.tsjs ??= {} as TsjsApi);
+    const next = Math.max(ts.renderSeq ?? 0, fallbackRenderSeq) + 1;
+    ts.renderSeq = next;
+    fallbackRenderSeq = next;
+    return next;
+  } catch {
+    return ++fallbackRenderSeq;
+  }
+}
 
 /** CSS class of the per-slot confirmation badge (only on honestly-ok slots). */
 export const TRACE_BADGE_CLASS = 'ts-render-badge';
@@ -131,7 +152,6 @@ const STATUS_STYLE: Record<PanelStatus, { color: string; mark: string; label: st
  */
 function attachTraceBadge(el: HTMLElement, record: RenderRecord): void {
   const style = STATUS_STYLE[panelStatus(record)];
-  el.querySelectorAll(`:scope > .${TRACE_BADGE_CLASS}`).forEach((n) => n.remove());
 
   const position = getComputedStyle(el).position;
   if (position === 'static' || position === '') {
@@ -150,6 +170,7 @@ function attachTraceBadge(el: HTMLElement, record: RenderRecord): void {
     `slot: ${record.slotId}`,
     `auction: ${record.auctionId ?? '—'}`,
     `bidder: ${record.bidder ?? '—'}`,
+    `bid_id: ${record.bidId ?? '—'}`,
     `creative: ${record.creativeId ?? '—'}`,
     `adm_hash: ${record.admHash ?? '—'}`,
     `served: ${record.servedFrom ?? '—'}`,
@@ -166,6 +187,19 @@ function attachTraceBadge(el: HTMLElement, record: RenderRecord): void {
   s.setProperty('background', style.color);
   s.setProperty('border-radius', '3px');
   el.appendChild(badge);
+}
+
+/**
+ * Remove this element's own trace badge, if it has one.
+ *
+ * Must run on *every* stamp, not only the ones that go on to attach a new
+ * badge: a slot that re-renders into `empty` or `hidden` gets no replacement
+ * badge, so without an unconditional removal it would keep displaying the green
+ * or blue badge from its previous render — contradicting the status the panel
+ * shows for the same slot.
+ */
+function removeTraceBadge(el: HTMLElement): void {
+  el.querySelectorAll(`:scope > .${TRACE_BADGE_CLASS}`).forEach((n) => n.remove());
 }
 
 /** Truncate a long id for the compact panel row while keeping the tail. */
@@ -213,10 +247,14 @@ function ensureTracePanel(): HTMLElement | null {
  * Whether this record is still the live render for its slot — i.e. the entry
  * `window.tsjs.renders` currently holds. Every other row in the log has been
  * superseded by a later render of the same slot.
+ *
+ * Compares by object identity, not by `seq`: the registry and the history hold
+ * the same record objects, so identity is exact regardless of how sequence
+ * numbers were allocated.
  */
 function isCurrentRender(record: RenderRecord): boolean {
   try {
-    return window.tsjs?.renders?.[record.slotId]?.seq === record.seq;
+    return window.tsjs?.renders?.[record.slotId] === record;
   } catch {
     return false;
   }
@@ -280,6 +318,7 @@ function buildPanelRow(record: RenderRecord): HTMLElement {
     `bidder: ${record.bidder ?? '—'}`,
     `creative: ${record.creativeId ?? '—'}`,
     `ad_id: ${record.adId ?? '—'}`,
+    `bid_id: ${record.bidId ?? '—'}`,
     `adm_hash: ${record.admHash ?? '—'}`,
     `served: ${record.servedFrom ?? '—'}`,
     `element: ${record.elementId ?? '—'}`,
@@ -404,7 +443,7 @@ export function renderTracePanel(): void {
  * single choke point every render passes through.
  */
 export function recordRender(record: Omit<RenderRecord, 'count' | 'at' | 'seq'>): RenderRecord {
-  const full: RenderRecord = { ...record, count: 1, seq: ++renderSeq, at: Date.now() };
+  const full: RenderRecord = { ...record, count: 1, seq: nextRenderSeq(), at: Date.now() };
   try {
     const ts = (window.tsjs ??= {} as TsjsApi);
     const renders = (ts.renders ??= {});
@@ -432,6 +471,61 @@ export function recordRender(record: Omit<RenderRecord, 'count' | 'at' | 'seq'>)
 }
 
 /**
+ * Fields a later signal about an already-recorded render may contribute.
+ * Identity (`slotId`) and bookkeeping (`seq`, `count`, `at`) are fixed at
+ * [`recordRender`] time and are never revised.
+ */
+export type RenderUpdate = Partial<Omit<RenderRecord, 'slotId' | 'seq' | 'count' | 'at'>>;
+
+/** Confirmation flags that a later, weaker signal must never clear. */
+const CONFIRMATION_FIELDS = ['rendered', 'injected'] as const;
+
+/**
+ * Merge a later signal into an existing render record, **in place**.
+ *
+ * One impression can be observed twice: GAM's `slotRenderEnded` and the Prebid
+ * Universal Creative bridge both describe the same GAM ad request, and a
+ * deferred ADM placement resolves an animation frame after the render was first
+ * recorded. Appending a second [`recordRender`] for those would inflate the
+ * slot's `count`, the history length, the page-global sequence numbers and the
+ * panel totals — one impression must stay one row.
+ *
+ * So the later signal enriches the record instead: `seq`, `count` and `at` are
+ * left untouched and no new history entry is appended. Because the registry and
+ * the history hold the *same* object, mutating it updates both.
+ *
+ * Confirmations only ever strengthen. A `false` in `patch` cannot clear a
+ * `true` already on the record, so the weaker GAM-only signal arriving after
+ * the bridge's confirmed placement does not erase it.
+ */
+export function updateRender(record: RenderRecord, patch: RenderUpdate): RenderRecord {
+  try {
+    const fields = record as unknown as Record<string, unknown>;
+    for (const [key, value] of Object.entries(patch)) {
+      if (value === undefined) continue;
+      if (
+        value === false &&
+        fields[key] === true &&
+        (CONFIRMATION_FIELDS as readonly string[]).includes(key)
+      ) {
+        continue;
+      }
+      fields[key] = value;
+    }
+  } catch (err) {
+    log.warn('trace: failed to update render record', { slotId: record.slotId, err });
+  }
+  try {
+    window.dispatchEvent(new CustomEvent(RENDER_EVENT_NAME, { detail: record }));
+  } catch (err) {
+    // CustomEvent unavailable — the mutated record above still stands.
+    log.debug('trace: failed to dispatch render update event', { slotId: record.slotId, err });
+  }
+  renderTracePanel();
+  return record;
+}
+
+/**
  * Stamp an element with `data-ts-*` attributes carrying the trace tuple, so
  * a creative in the DOM can be joined to the server-side `auction winner:` /
  * `auction delivered creative:` log lines by inspection alone.
@@ -450,6 +544,7 @@ export function stampCreativeTrace(el: Element, record: RenderRecord): void {
     ['data-ts-auction-id', record.auctionId],
     ['data-ts-bidder', record.bidder],
     ['data-ts-ad-id', record.adId],
+    ['data-ts-bid-id', record.bidId],
     ['data-ts-creative-id', record.creativeId],
     ['data-ts-adm-hash', record.admHash],
     ['data-ts-served-from', record.servedFrom],
@@ -470,14 +565,16 @@ export function stampCreativeTrace(el: Element, record: RenderRecord): void {
     // rendered, TS cannot confirm it as its own). Slots with nothing on screen
     // (`empty`) or nothing visible (`hidden`) stay unbadged — there is no
     // creative there to label. Never badge the iframe itself.
-    const status = panelStatus(record);
-    if (
-      el instanceof HTMLElement &&
-      el.tagName !== 'IFRAME' &&
-      traceOverlayEnabled() &&
-      (status === 'ok' || status === 'gam-only')
-    ) {
-      attachTraceBadge(el, record);
+    //
+    // Any previous badge is dropped first, unconditionally, so a slot that
+    // re-renders into `empty` or `hidden` sheds the badge from its last render
+    // instead of contradicting the panel.
+    if (el instanceof HTMLElement && el.tagName !== 'IFRAME') {
+      removeTraceBadge(el);
+      const status = panelStatus(record);
+      if (traceOverlayEnabled() && (status === 'ok' || status === 'gam-only')) {
+        attachTraceBadge(el, record);
+      }
     }
   } catch (err) {
     log.warn('trace: failed to stamp element', { slotId: record.slotId, err });
