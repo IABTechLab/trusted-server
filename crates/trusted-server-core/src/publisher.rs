@@ -2649,9 +2649,14 @@ pub async fn handle_publisher_request(
     let mut dispatched_auction = if matched_slots.is_empty() {
         None
     } else {
+        // Telemetry attribution must use the same publisher identity as the
+        // outbound bid request. On the navigation path `request_host` is the
+        // trusted-server edge host, so using it here would attribute navigation
+        // rows to the edge/staging domain while `/auction` rows (built from
+        // `AuctionRequest::publisher.domain`) use the configured domain.
         let observation = AuctionObservationContext::from_parts(
             AuctionSource::InitialNavigation,
-            request_host,
+            &settings.publisher.domain,
             &request_path,
             matched_slots.len(),
             ec_context,
@@ -3618,9 +3623,11 @@ pub async fn handle_page_bids(
     let (winning_bids, page_auction_id) = if matched_slots.is_empty() {
         (std::collections::HashMap::new(), None)
     } else {
+        // Same publisher identity as the outbound bid request — see the
+        // matching note on the initial-navigation observation above.
         let observation = AuctionObservationContext::from_parts(
             AuctionSource::SpaNavigation,
-            &request_info.host,
+            &settings.publisher.domain,
             &path_param,
             matched_slots.len(),
             ec_context,
@@ -8374,5 +8381,304 @@ mod tests {
             err.to_string().contains("maximum buffered size"),
             "should report the buffer cap in the error message"
         );
+    }
+
+    /// Handler-level coverage that both navigation paths take the publisher
+    /// identity from configuration rather than the incoming edge `Host` header.
+    ///
+    /// The `build_auction_request` unit test above cannot catch a call site
+    /// regressing to `request_info.host`, because both sources are `&str`. These
+    /// tests drive the real handlers with a divergent edge host and assert on
+    /// the auction request the orchestrator dispatched and on the telemetry rows
+    /// the handler emitted.
+    mod navigation_publisher_domain_tests {
+        use super::*;
+        use crate::auction::provider::AuctionProvider;
+        use crate::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink};
+        use crate::auction::types::AuctionRequest;
+        use crate::auction::{AuctionContext, AuctionOrchestrator};
+        use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
+        use crate::platform::test_support::{
+            NoopConfigStore, NoopGeo, NoopSecretStore, StubBackend,
+        };
+        use crate::platform::{ClientInfo, PlatformPendingRequest, PlatformResponse};
+        use crate::test_support::tests::crate_test_settings_str;
+        use std::sync::Mutex;
+
+        /// Trusted-server edge host the browser addresses on the SSAT proxy
+        /// path — deliberately different from the configured publisher domain.
+        const EDGE_HOST: &str = "ts.example.com";
+
+        /// `[publisher] domain` from [`crate_test_settings_str`].
+        const CONFIGURED_DOMAIN: &str = "test-publisher.com";
+
+        const CAPTURING_PROVIDER: &str = "request_capturing_provider";
+
+        /// Records the [`AuctionRequest`] the orchestrator dispatched, then
+        /// fails its launch so no real transport handle is needed.
+        struct RequestCapturingProvider {
+            captured: Arc<Mutex<Option<AuctionRequest>>>,
+        }
+
+        #[async_trait::async_trait(?Send)]
+        impl AuctionProvider for RequestCapturingProvider {
+            fn provider_name(&self) -> &'static str {
+                CAPTURING_PROVIDER
+            }
+
+            async fn request_bids(
+                &self,
+                request: &AuctionRequest,
+                _context: &AuctionContext<'_>,
+            ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+                *self.captured.lock().expect("should lock captured request") =
+                    Some(request.clone());
+                Err(Report::new(TrustedServerError::Auction {
+                    message: "capture only".to_string(),
+                }))
+            }
+
+            async fn parse_response(
+                &self,
+                _response: PlatformResponse,
+                _response_time_ms: u64,
+            ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+                panic!("parse_response must not run when the launch fails");
+            }
+
+            fn timeout_ms(&self) -> u32 {
+                100
+            }
+
+            fn backend_name(
+                &self,
+                _services: &RuntimeServices,
+                _timeout_ms: u32,
+            ) -> Option<String> {
+                Some("capture-backend".to_string())
+            }
+        }
+
+        #[derive(Default)]
+        struct RecordingTelemetrySink {
+            batches: Mutex<Vec<AuctionEventBatch>>,
+        }
+
+        #[async_trait::async_trait(?Send)]
+        impl AuctionTelemetrySink for RecordingTelemetrySink {
+            async fn emit_auction_events(
+                &self,
+                _services: &RuntimeServices,
+                batch: AuctionEventBatch,
+            ) -> Result<(), Report<TrustedServerError>> {
+                self.batches
+                    .lock()
+                    .expect("should lock telemetry batches")
+                    .push(batch);
+                Ok(())
+            }
+        }
+
+        fn settings_with_capturing_provider() -> Settings {
+            let toml = format!(
+                "{}\n[auction]\nenabled = true\nproviders = [\"{CAPTURING_PROVIDER}\"]\n\n\
+                 [creative_opportunities]\ngam_network_id = \"12345\"\n",
+                crate_test_settings_str()
+            );
+            Settings::from_toml(&toml).expect("should parse settings with a capturing provider")
+        }
+
+        fn article_slot() -> Vec<CreativeOpportunitySlot> {
+            vec![CreativeOpportunitySlot {
+                id: "atf".to_string(),
+                gam_unit_path: None,
+                div_id: None,
+                page_patterns: vec!["/20**".to_string()],
+                formats: vec![CreativeOpportunityFormat {
+                    width: 300,
+                    height: 250,
+                    media_type: MediaType::Banner,
+                }],
+                floor_price: Some(0.50),
+                targeting: Default::default(),
+                providers: Default::default(),
+                compiled_patterns: Vec::new(),
+            }]
+        }
+
+        /// [`EcContext`] whose consent context permits the server-side auction.
+        fn consent_allowing_ec_context() -> EcContext {
+            let consent = crate::consent::ConsentContext {
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                ..Default::default()
+            };
+            EcContext::new_for_test(None, consent)
+        }
+
+        fn services_with(
+            http_client: Arc<dyn crate::platform::PlatformHttpClient>,
+            telemetry_sink: Arc<RecordingTelemetrySink>,
+        ) -> RuntimeServices {
+            let telemetry_sink: Arc<dyn AuctionTelemetrySink> = telemetry_sink;
+            RuntimeServices::builder()
+                .config_store(Arc::new(NoopConfigStore))
+                .secret_store(Arc::new(NoopSecretStore))
+                .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+                .backend(Arc::new(StubBackend))
+                .http_client(http_client)
+                .geo(Arc::new(NoopGeo))
+                .auction_telemetry_sink(telemetry_sink)
+                .client_info(ClientInfo::default())
+                .build()
+        }
+
+        fn orchestrator_capturing_request(
+            settings: &Settings,
+            captured: &Arc<Mutex<Option<AuctionRequest>>>,
+        ) -> AuctionOrchestrator {
+            let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            orchestrator.register_provider(Arc::new(RequestCapturingProvider {
+                captured: Arc::clone(captured),
+            }));
+            orchestrator
+        }
+
+        /// Assert the dispatched request and every emitted telemetry row carry
+        /// the configured publisher domain rather than the edge host.
+        fn assert_configured_domain(
+            captured: &Arc<Mutex<Option<AuctionRequest>>>,
+            telemetry_sink: &RecordingTelemetrySink,
+        ) {
+            let request = captured
+                .lock()
+                .expect("should lock captured request")
+                .clone()
+                .expect("should dispatch an auction request");
+            assert_eq!(
+                request.publisher.domain, CONFIGURED_DOMAIN,
+                "publisher.domain should be the configured publisher domain, not the edge host"
+            );
+            let site = request.site.expect("should populate site metadata");
+            assert_eq!(
+                site.domain, CONFIGURED_DOMAIN,
+                "site.domain should be the configured publisher domain, not the edge host"
+            );
+            // Only the host is asserted: the two `AuctionRequest` builders still
+            // disagree on where the scheme comes from (edge-detected here,
+            // canonical `https` in `convert_tsjs_to_auction_request`), which is
+            // tracked separately.
+            let page_url = request
+                .publisher
+                .page_url
+                .as_deref()
+                .expect("should populate page_url");
+            let page_url_host = url::Url::parse(page_url)
+                .expect("should build a parseable page_url")
+                .host_str()
+                .map(str::to_owned)
+                .expect("should populate a page_url host");
+            assert_eq!(
+                page_url_host, CONFIGURED_DOMAIN,
+                "page_url host should be the configured publisher domain, not the edge host"
+            );
+            assert_eq!(
+                site.page, page_url,
+                "site.page should mirror page_url, so it carries the configured publisher domain too"
+            );
+
+            let batches = telemetry_sink
+                .batches
+                .lock()
+                .expect("should lock telemetry batches");
+            let rows: Vec<_> = batches.iter().flat_map(AuctionEventBatch::rows).collect();
+            assert!(!rows.is_empty(), "should emit at least one telemetry row");
+            for row in rows {
+                assert_eq!(
+                    row.publisher_domain, CONFIGURED_DOMAIN,
+                    "telemetry rows should be attributed to the configured publisher domain, not the edge host"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn initial_navigation_advertises_configured_publisher_domain() {
+            let settings = settings_with_capturing_provider();
+            let captured = Arc::new(Mutex::new(None));
+            let orchestrator = orchestrator_capturing_request(&settings, &captured);
+            let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"<html><head></head><body>ok</body></html>".to_vec());
+            let services = services_with(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+                Arc::clone(&telemetry_sink),
+            );
+            let mut ec_context = consent_allowing_ec_context();
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(format!("https://{EDGE_HOST}/2024/01/my-article/"))
+                .header(header::HOST, EDGE_HOST)
+                .header("sec-fetch-dest", "document")
+                .body(EdgeBody::empty())
+                .expect("should build test request");
+
+            let _ = handle_publisher_request(
+                &settings,
+                &services,
+                None,
+                &mut ec_context,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &article_slot(),
+                    registry: None,
+                },
+                req,
+            )
+            .await
+            .expect("should proxy publisher request");
+
+            assert_configured_domain(&captured, &telemetry_sink);
+        }
+
+        #[tokio::test]
+        async fn page_bids_advertises_configured_publisher_domain() {
+            let settings = settings_with_capturing_provider();
+            let captured = Arc::new(Mutex::new(None));
+            let orchestrator = orchestrator_capturing_request(&settings, &captured);
+            let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
+            let services = services_with(
+                Arc::new(crate::platform::test_support::NoopHttpClient),
+                Arc::clone(&telemetry_sink),
+            );
+            let ec_context = consent_allowing_ec_context();
+            let mut req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "https://{EDGE_HOST}/_ts/page-bids?path=/2024/01/my-article/"
+                ))
+                .header(header::HOST, EDGE_HOST)
+                .body(EdgeBody::empty())
+                .expect("should build test request");
+            req.headers_mut().insert(
+                header::HeaderName::from_static("sec-fetch-site"),
+                HeaderValue::from_static("same-origin"),
+            );
+
+            let _ = handle_page_bids(
+                &settings,
+                &services,
+                None,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &article_slot(),
+                    registry: None,
+                },
+                &ec_context,
+                req,
+            )
+            .await
+            .expect("should return ok response");
+
+            assert_configured_domain(&captured, &telemetry_sink);
+        }
     }
 }
