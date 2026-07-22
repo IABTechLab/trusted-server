@@ -360,11 +360,14 @@ fn fastly_response_to_platform(
     mut resp: fastly::Response,
     backend_name: impl Into<String>,
     stream_response: bool,
+    response_body_expected: bool,
 ) -> Result<PlatformResponse, Report<PlatformError>> {
     // Pre-flight: reject oversized responses before copying bytes into WASM heap.
     // Content-Length is advisory but covers most origin responses; chunked
     // responses without it fall through to the post-materialization check below.
-    if !stream_response
+    // HEAD responses report the corresponding GET size but contain no body.
+    if response_body_expected
+        && !stream_response
         && let Some(claimed_len) = resp
             .get_header("content-length")
             .and_then(|v| v.to_str().ok())
@@ -382,7 +385,9 @@ fn fastly_response_to_platform(
     for (name, value) in resp.get_headers() {
         builder = builder.header(name.as_str(), value.as_bytes());
     }
-    let body = if stream_response {
+    let body = if !response_body_expected {
+        edgezero_core::body::Body::empty()
+    } else if stream_response {
         fastly_body_to_edge_stream(resp.take_body())
     } else {
         let body_bytes = resp.take_body_bytes();
@@ -431,6 +436,7 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         let backend_name = request.backend_name.clone();
         let image_optimizer = request.image_optimizer;
         let stream_response = request.stream_response;
+        let response_body_expected = request.request.method() != edgezero_core::http::Method::HEAD;
         let mut fastly_req = edge_request_to_fastly(request.request)?;
         if let Some(options) = image_optimizer {
             apply_fastly_image_optimizer(&mut fastly_req, options)?;
@@ -438,7 +444,12 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         let fastly_resp = fastly_req
             .send(&backend_name)
             .change_context(PlatformError::HttpClient)?;
-        fastly_response_to_platform(fastly_resp, backend_name, stream_response)
+        fastly_response_to_platform(
+            fastly_resp,
+            backend_name,
+            stream_response,
+            response_body_expected,
+        )
     }
 
     async fn send_async(
@@ -501,7 +512,7 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
                         .attach("select: response has no backend name; correlation impossible"));
                 };
                 (
-                    fastly_response_to_platform(fastly_resp, backend_name, false),
+                    fastly_response_to_platform(fastly_resp, backend_name, false, true),
                     None,
                 )
             }
@@ -735,6 +746,55 @@ mod tests {
     }
 
     // --- FastlyPlatformHttpClient -------------------------------------------
+
+    #[test]
+    fn fastly_response_to_platform_allows_oversized_head_content_length() {
+        let mut fastly_response = fastly::Response::from_status(200);
+        fastly_response.set_header(
+            fastly::http::header::CONTENT_LENGTH,
+            (MAX_PLATFORM_RESPONSE_BODY_BYTES + 1).to_string(),
+        );
+
+        let platform_response =
+            fastly_response_to_platform(fastly_response, "origin", false, false)
+                .expect("should allow HEAD metadata for an oversized object");
+
+        assert_eq!(
+            platform_response
+                .response
+                .headers()
+                .get(edgezero_core::http::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            Some("10485761"),
+            "should preserve the origin Content-Length"
+        );
+        assert!(
+            platform_response
+                .response
+                .into_body()
+                .into_bytes()
+                .unwrap_or_default()
+                .is_empty(),
+            "should return an empty HEAD response body"
+        );
+    }
+
+    #[test]
+    fn fastly_response_to_platform_rejects_oversized_buffered_get_content_length() {
+        let mut fastly_response = fastly::Response::from_status(200);
+        fastly_response.set_header(
+            fastly::http::header::CONTENT_LENGTH,
+            (MAX_PLATFORM_RESPONSE_BODY_BYTES + 1).to_string(),
+        );
+
+        let error = fastly_response_to_platform(fastly_response, "origin", false, true)
+            .expect_err("should reject oversized buffered GET metadata");
+
+        assert!(
+            format!("{error:?}").contains("exceeds 10485760-byte response body limit"),
+            "should retain the buffered response size limit: {error:?}"
+        );
+    }
 
     #[test]
     fn fastly_platform_http_client_send_returns_error_for_unregistered_backend() {
