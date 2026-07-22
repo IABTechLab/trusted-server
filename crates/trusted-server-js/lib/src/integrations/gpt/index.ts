@@ -133,6 +133,10 @@ interface GoogleTagPubAdsService {
   disableInitialLoad?(): void;
 }
 
+interface GoogleTagConfig extends Record<string, unknown> {
+  disableInitialLoad?: boolean;
+}
+
 interface GoogleTag {
   cmd: Array<() => void>;
   pubads(): GoogleTagPubAdsService;
@@ -144,6 +148,7 @@ interface GoogleTag {
   destroySlots(slots?: GoogleTagSlot[]): boolean;
   enableServices(): void;
   display(elementId: string): void;
+  setConfig(config: GoogleTagConfig): void;
   _loaded_?: boolean;
 }
 
@@ -438,15 +443,16 @@ function queueWinBillingBeacon(url: string): boolean {
 /**
  * Track whether the publisher disabled GPT initial load.
  *
- * GPT exposes no getter for the initial-load-disabled flag, so wrap
- * `pubads().disableInitialLoad()` to record it on `window.tsjs`. With initial
- * load disabled, `display()` only registers a slot — the ad request must come
- * from a later `refresh()`. adInit() reads this to refresh its own freshly
- * defined slots so they are not left blank.
+ * GPT exposes no getter for the initial-load-disabled flag, so wrap both the
+ * modern `googletag.setConfig({ disableInitialLoad: true })` API and the legacy
+ * `pubads().disableInitialLoad()` method to record it on `window.tsjs`. With
+ * initial load disabled, `display()` only registers a slot — the ad request
+ * must come from a later `refresh()`. adInit() reads this to refresh its own
+ * freshly defined slots so they are not left blank.
  *
- * Installed via the command queue so it runs before the publisher's own
- * `disableInitialLoad()` call (the TS core script is injected ahead of the
- * publisher's GPT setup). Idempotent per pubads service.
+ * Installed via the command queue so it runs before the publisher's own GPT
+ * configuration (the TS core script is injected ahead of the publisher's GPT
+ * setup). Idempotent per googletag object and pubads service.
  *
  * Only hooks an existing `googletag` stub — it never creates one. A plain module
  * import that does not activate the GPT integration must not touch
@@ -459,16 +465,32 @@ function installInitialLoadDetector(ts: TsjsApi): void {
   const cmd = win.googletag?.cmd;
   if (!cmd) return;
   cmd.push(() => {
-    const pubads = win.googletag?.pubads?.();
+    const gpt = win.googletag as
+      | (Partial<GoogleTag> & { __tsInitialLoadConfigHooked?: boolean })
+      | undefined;
+    if (!gpt) return;
+
+    if (typeof gpt.setConfig === 'function' && !gpt.__tsInitialLoadConfigHooked) {
+      const originalSetConfig = gpt.setConfig.bind(gpt);
+      gpt.setConfig = function (config: GoogleTagConfig) {
+        if (config?.disableInitialLoad === true) {
+          ts.gptInitialLoadDisabled = true;
+        }
+        return originalSetConfig(config);
+      };
+      gpt.__tsInitialLoadConfigHooked = true;
+    }
+
+    const pubads = gpt.pubads?.();
     if (!pubads) return;
     const service = pubads as GoogleTagPubAdsService & { __tsInitialLoadHooked?: boolean };
     if (typeof service.disableInitialLoad !== 'function' || service.__tsInitialLoadHooked) {
       return;
     }
-    const original = service.disableInitialLoad.bind(service);
+    const originalDisableInitialLoad = service.disableInitialLoad.bind(service);
     service.disableInitialLoad = function () {
       ts.gptInitialLoadDisabled = true;
-      return original();
+      return originalDisableInitialLoad();
     };
     service.__tsInitialLoadHooked = true;
   });
@@ -653,9 +675,9 @@ export function installTsAdInit(): void {
       // Slots needing an explicit ad request via refresh(). Reused
       // publisher-owned slots always need one to pick up the just-applied
       // server-side targeting. TS-defined slots are normally fetched by the
-      // display() above — but when the publisher called
-      // pubads().disableInitialLoad(), display() only registers the slot and the
-      // ad request must come from refresh(). Without this, a TS-owned
+      // display() above — but when the publisher disabled initial load through
+      // setConfig() or the legacy pubads() method, display() only registers the
+      // slot and the ad request must come from refresh(). Without this, a TS-owned
       // first-impression slot renders blank on initial-load-disabled pages. Only
       // add them in that case; otherwise display() + refresh() would
       // double-request the impression.

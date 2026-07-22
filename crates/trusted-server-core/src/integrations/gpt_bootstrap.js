@@ -20,13 +20,29 @@
   if (ts.adInit) return;
 
   // Track whether the publisher disabled GPT initial load. GPT exposes no
-  // getter for this, so wrap pubads().disableInitialLoad() to record it. With
-  // initial load disabled, display() only registers a slot and the ad request
-  // must come from a later refresh(); adInit() reads this to refresh its own
-  // freshly defined slots so they are not left blank. Pushed onto the command
-  // queue so it runs before the publisher's own disableInitialLoad() call.
+  // getter for this, so wrap both googletag.setConfig() and the legacy
+  // pubads().disableInitialLoad() method to record it. With initial load
+  // disabled, display() only registers a slot and the ad request must come from
+  // a later refresh(); adInit() reads this to refresh its own freshly defined
+  // slots so they are not left blank. Pushed onto the command queue so it runs
+  // before the publisher's own GPT configuration.
   (window.googletag = window.googletag || { cmd: [] }).cmd.push(function () {
-    var pubads = googletag.pubads && googletag.pubads();
+    var gpt = window.googletag;
+    if (
+      typeof gpt.setConfig === "function" &&
+      !gpt.__tsInitialLoadConfigHooked
+    ) {
+      var originalSetConfig = gpt.setConfig.bind(gpt);
+      gpt.setConfig = function (config) {
+        if (config && config.disableInitialLoad === true) {
+          ts.gptInitialLoadDisabled = true;
+        }
+        return originalSetConfig(config);
+      };
+      gpt.__tsInitialLoadConfigHooked = true;
+    }
+
+    var pubads = gpt.pubads && gpt.pubads();
     if (
       !pubads ||
       typeof pubads.disableInitialLoad !== "function" ||
@@ -34,10 +50,10 @@
     ) {
       return;
     }
-    var original = pubads.disableInitialLoad.bind(pubads);
+    var originalDisableInitialLoad = pubads.disableInitialLoad.bind(pubads);
     pubads.disableInitialLoad = function () {
       ts.gptInitialLoadDisabled = true;
-      return original();
+      return originalDisableInitialLoad();
     };
     pubads.__tsInitialLoadHooked = true;
   });

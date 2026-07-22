@@ -260,6 +260,62 @@ describe('installTsAdInit', () => {
     expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
   });
 
+  it('refreshes TS-defined slots when setConfig disables GPT initial load', async () => {
+    // Modern GPT configuration uses googletag.setConfig() rather than the
+    // legacy pubads().disableInitialLoad() method. TS must detect both forms.
+    const mockSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      // Publisher has not defined this slot, so TS defines (owns) it.
+      getSlots: vi.fn().mockReturnValue([]),
+      addEventListener: vi.fn(),
+      refresh: vi.fn(),
+    };
+    const displayMock = vi.fn();
+    const setConfigMock = vi.fn();
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(mockSlot),
+      display: displayMock,
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+      setConfig: setConfigMock,
+    };
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {},
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any;
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+
+    const config = { disableInitialLoad: true, singleRequest: true };
+    ((window as TestWindow).googletag as { setConfig(value: typeof config): void }).setConfig(
+      config
+    );
+    expect(setConfigMock).toHaveBeenCalledWith(config);
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(true);
+
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(displayMock).toHaveBeenCalledWith('div-atf-sidebar');
+    expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
+  });
+
   it('sets adInitRefreshInProgress only for the duration of the internal refresh', async () => {
     const mockSlot = {
       addService: vi.fn().mockReturnThis(),
