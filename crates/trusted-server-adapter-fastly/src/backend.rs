@@ -1,3 +1,4 @@
+use core::fmt::Write as _;
 use std::time::Duration;
 
 use error_stack::{Report, ResultExt as _};
@@ -69,11 +70,11 @@ fn spec_digest_hex(canonical: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(canonical.as_bytes());
     let digest = hasher.finalize();
-    digest
-        .iter()
-        .take(SPEC_DIGEST_HEX_LEN / 2)
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    let mut hex = String::with_capacity(SPEC_DIGEST_HEX_LEN);
+    for byte in digest.iter().take(SPEC_DIGEST_HEX_LEN / 2) {
+        write!(hex, "{byte:02x}").expect("should write hex digit to string");
+    }
+    hex
 }
 
 /// Default first-byte timeout for backends (15 seconds).
@@ -327,11 +328,10 @@ impl<'a> BackendConfig<'a> {
 
     /// Ensure a dynamic backend exists for this configuration and return its name.
     ///
-    /// The backend name is derived from the scheme, host, port, certificate
-    /// setting, `first_byte_timeout`, and `between_bytes_timeout` to avoid
-    /// collisions. Different timeout values produce different backend
-    /// registrations so that a tight deadline cannot be silently widened by an
-    /// earlier registration.
+    /// The name is a collision-resistant function of the complete backend spec
+    /// (see `Self::compute_name`), so different specs — for example, different
+    /// timeout values — always produce different backend registrations and a
+    /// tight deadline cannot be silently widened by an earlier registration.
     ///
     /// # Errors
     ///

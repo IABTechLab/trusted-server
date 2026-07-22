@@ -1,6 +1,17 @@
 import { log } from '../../core/log';
-import { recordRender, stampCreativeTrace } from '../../core/trace';
-import type { AuctionSlot, AuctionBidData, RenderServedFrom, TsjsApi } from '../../core/types';
+import {
+  recordRender,
+  updateRender,
+  stampCreativeTrace,
+  isEffectivelyVisible,
+} from '../../core/trace';
+import type {
+  AuctionSlot,
+  AuctionBidData,
+  RenderRecord,
+  RenderServedFrom,
+  TsjsApi,
+} from '../../core/types';
 import {
   APS_UNIVERSAL_CREATIVE_RENDERER,
   APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
@@ -42,6 +53,159 @@ const TS_BID_TARGETING_KEYS = [
   'hb_cache_path',
 ] as const;
 const TS_BASE_TARGETING_KEYS = [...TS_BID_TARGETING_KEYS, TS_INITIAL_TARGETING_KEY] as const;
+
+// ---- Orphaned-slot recovery (client re-render / hydration race) ------------
+// A client framework can replace the ad divs *after* GPT slots were bound to
+// them: server-rendered React ids (`…-_R_abc_`) are swapped for client ids
+// (`…-_r_1_`) during hydration, leaving GPT holding slots whose element no
+// longer exists ("defineSlot was called without a corresponding DIV"). GAM
+// still fetches a creative for those slots, but it has nowhere to render, so
+// the bid is silently wasted. These bound the recovery re-bind.
+/** Quiet period after DOM mutations before checking for orphaned slots. */
+const ORPHAN_RECONCILE_DEBOUNCE_MS = 250;
+/** How long after an adInit() to keep watching for a re-render. */
+const ORPHAN_RECONCILE_WINDOW_MS = 5000;
+/**
+ * Maximum re-binds per page load. Each re-bind re-requests the affected slots,
+ * so this is deliberately small: it recovers a hydration swap without letting a
+ * continuously-mutating page loop on ad requests.
+ */
+const MAX_ORPHAN_RECONCILE_ATTEMPTS = 2;
+
+// ---- Render generation -----------------------------------------------------
+// Every `adInit()` and every SPA navigation opens a new generation. Async work
+// (a PBS Cache fetch, a debounced orphan re-bind, a GAM render event) captures
+// the generation it started in and re-checks it before acting, so a result that
+// belongs to a route the page has already left is discarded instead of being
+// applied to the route now on screen.
+
+function currentGeneration(ts: TsjsApi): number {
+  return ts.renderGeneration ?? 0;
+}
+
+function bumpGeneration(ts: TsjsApi): number {
+  const next = currentGeneration(ts) + 1;
+  ts.renderGeneration = next;
+  return next;
+}
+
+/** Immutable context for one GPT request TS initiated for a slot. */
+interface PendingGptRender {
+  generation: number;
+  slotId: string;
+  bid: AuctionBidData;
+  attributed: boolean;
+}
+
+/**
+ * Per-slot FIFO of requests awaiting `slotRenderEnded`.
+ *
+ * Publisher-owned GPT slots are reused across SPA routes, so stamping a single
+ * generation on the slot object is insufficient: route B overwrites that stamp
+ * before route A's late event arrives. GPT emits one render event per request in
+ * request order, so retaining each immutable request context lets the old event
+ * retire only route A's entry while route B's attribution remains queued.
+ */
+const pendingGptRenders = new WeakMap<GoogleTagSlot, PendingGptRender[]>();
+
+function enqueueGptRender(slot: GoogleTagSlot, pending: PendingGptRender): void {
+  const queue = pendingGptRenders.get(slot) ?? [];
+  queue.push(pending);
+  pendingGptRenders.set(slot, queue);
+}
+
+function takeGptRender(slot: GoogleTagSlot): PendingGptRender | undefined {
+  const queue = pendingGptRenders.get(slot);
+  const pending = queue?.shift();
+  if (queue?.length === 0) pendingGptRenders.delete(slot);
+  return pending;
+}
+
+/**
+ * The render record for the GAM impression currently open on a slot.
+ *
+ * One GAM ad request is observed twice: `slotRenderEnded` carries GAM's own
+ * fill signal, and the Prebid Universal Creative bridge carries the proof that
+ * TS served the markup. They describe the same impression, so whichever arrives
+ * second enriches the first one's record rather than appending its own —
+ * otherwise a single creative counts as two renders, inflating the slot's
+ * `count`, the history length, the page-global sequence numbers and the panel
+ * totals.
+ */
+interface OpenImpression {
+  record: RenderRecord;
+  /** Generation the impression was opened in. */
+  generation: number;
+  /** `hb_adid` both signals must agree on to be the same impression. */
+  adId?: string;
+  /** Whether `slotRenderEnded` has reported on this impression. */
+  gamSeen: boolean;
+  /** Whether the Universal Creative bridge has reported on this impression. */
+  bridgeSeen: boolean;
+}
+
+const openImpressions = new Map<string, OpenImpression>();
+
+/** PBS Cache fetches still in flight, so navigation can abort them. */
+const inflightCacheFetches = new Set<AbortController>();
+
+/**
+ * Retire everything armed for the route being left.
+ *
+ * Runs at the *start* of a navigation, not after `/__ts/page-bids` returns: a
+ * route whose markup commits faster than that request can otherwise trip the
+ * orphan watch or land a cache fetch on the new DOM while `ts.adSlots` and
+ * `ts.bids` still hold the previous route's auction.
+ */
+function beginNavigation(ts: TsjsApi): void {
+  bumpGeneration(ts);
+  stopOrphanWatch();
+  for (const controller of inflightCacheFetches) {
+    controller.abort();
+  }
+  inflightCacheFetches.clear();
+  openImpressions.clear();
+}
+
+/**
+ * The impression `side` may still enrich, or `undefined` if it must open a new
+ * one.
+ *
+ * Requires the impression to be from the current route, for the same bid, not
+ * already reported on by this side, and still the slot's live render — the last
+ * check is what stops a signal that arrives after a *newer* render of the same
+ * slot from rewriting an impression the page has moved past.
+ */
+function enrichableImpression(
+  ts: TsjsApi,
+  slotId: string,
+  adId: string | undefined,
+  side: 'gam' | 'bridge'
+): OpenImpression | undefined {
+  const open = openImpressions.get(slotId);
+  if (!open) return undefined;
+  if (open.generation !== currentGeneration(ts)) return undefined;
+  if (open.adId !== adId) return undefined;
+  if (side === 'gam' ? open.gamSeen : open.bridgeSeen) return undefined;
+  if (ts.renders?.[slotId] !== open.record) return undefined;
+  return open;
+}
+
+function openImpression(
+  ts: TsjsApi,
+  slotId: string,
+  adId: string | undefined,
+  record: RenderRecord,
+  side: 'gam' | 'bridge'
+): void {
+  openImpressions.set(slotId, {
+    record,
+    generation: currentGeneration(ts),
+    adId,
+    gamSeen: side === 'gam',
+    bridgeSeen: side === 'bridge',
+  });
+}
 
 // ------------------------------------------------------------------
 // googletag type stubs (minimal surface needed by the shim)
@@ -322,13 +486,29 @@ export function safeAdmIframeSrc(src: string): string | undefined {
  * 2. Otherwise replace the slot element's content with a sandboxed srcdoc
  *    iframe (no `allow-same-origin` — see [ADM_IFRAME_SANDBOX]).
  */
-function injectAdmIntoSlot(divId: string, adm: string): void {
+/**
+ * Returns whether the TS creative was placed **synchronously**. The
+ * animation-frame retry branch resolves after this returns, so it reports
+ * `false` (placement deferred/unconfirmed) — the render trace must not claim a
+ * placement that has not happened yet.
+ *
+ * That deferred branch reports its real outcome through `onDeferredPlacement`
+ * once the animation frame runs. Without it a placement that ultimately
+ * succeeded would stay recorded as unconfirmed and the panel would report
+ * `gam-only` forever, even though Trusted Server did place the creative.
+ */
+function injectAdmIntoSlot(
+  divId: string,
+  adm: string,
+  onDeferredPlacement?: (placed: boolean) => void,
+  mayPlaceDeferred?: () => boolean
+): boolean {
   try {
     // divId may be the container div (used by GPT slot) or the inner div.
     // Resolve it the same way the rest of adInit does (exact then prefix) so
     // a config div_id prefix with a render-time suffix still finds the element.
     const slotEl = findSlotElementByDivId(divId);
-    if (!slotEl) return;
+    if (!slotEl) return false;
 
     // Extract the first iframe src from the adm (e.g. mocktioneer creative
     // wraps a first-party proxy iframe in a div). Reject non-http(s) schemes.
@@ -340,27 +520,48 @@ function injectAdmIntoSlot(divId: string, adm: string): void {
       // Set the GAM iframe src — works even cross-origin (no document access needed).
       gamIframe.src = innerSrc;
       log.debug(`[tsjs-gpt] gam-intercept: set iframe src for '${divId}'`);
+      return true;
     } else if (innerSrc) {
       // GAM iframe not yet in DOM (APS renders async after slotRenderEnded).
       // Retry on next animation frame so APS has a tick to insert its iframe;
       // if it still isn't there, replace slot content directly.
       requestAnimationFrame(() => {
-        const retryIframe = slotEl!.querySelector('iframe') as HTMLIFrameElement | null;
-        if (retryIframe) {
-          retryIframe.src = innerSrc;
-          log.debug(`[tsjs-gpt] gam-intercept: set iframe src (retry) for '${divId}'`);
-        } else {
-          slotEl!.innerHTML = '';
-          const f = document.createElement('iframe');
-          f.style.cssText = 'border:none';
-          f.width = String(slotEl!.offsetWidth || 728);
-          f.height = String(slotEl!.offsetHeight || 90);
-          f.setAttribute('sandbox', ADM_IFRAME_SANDBOX);
-          f.src = innerSrc;
-          slotEl!.appendChild(f);
-          log.debug(`[tsjs-gpt] gam-intercept: inserted src iframe for '${divId}'`);
+        let placed = false;
+        try {
+          // Validate before touching the DOM. A newer SPA route may reuse the
+          // same connected publisher slot element, so suppressing only the
+          // later trace update would still let the old callback overwrite the
+          // new route's creative.
+          if (mayPlaceDeferred && !mayPlaceDeferred()) {
+            onDeferredPlacement?.(false);
+            return;
+          }
+          const retryIframe = slotEl!.querySelector('iframe') as HTMLIFrameElement | null;
+          if (retryIframe) {
+            retryIframe.src = innerSrc;
+            placed = true;
+            log.debug(`[tsjs-gpt] gam-intercept: set iframe src (retry) for '${divId}'`);
+          } else {
+            slotEl!.innerHTML = '';
+            const f = document.createElement('iframe');
+            f.style.cssText = 'border:none';
+            f.width = String(slotEl!.offsetWidth || 728);
+            f.height = String(slotEl!.offsetHeight || 90);
+            f.setAttribute('sandbox', ADM_IFRAME_SANDBOX);
+            f.setAttribute('data-ts-injected-adm', 'true');
+            f.src = innerSrc;
+            slotEl!.appendChild(f);
+            placed = true;
+            log.debug(`[tsjs-gpt] gam-intercept: inserted src iframe for '${divId}'`);
+          }
+        } catch (err) {
+          log.warn('[tsjs-gpt] gam-intercept: deferred placement failed', err);
         }
+        onDeferredPlacement?.(placed);
       });
+      // Placement deferred to the animation frame — not confirmed yet. The
+      // callback above corrects the record once it resolves.
+      return false;
     } else {
       // No extractable safe src — replace slot content with a sandboxed srcdoc iframe.
       slotEl.innerHTML = '';
@@ -373,9 +574,11 @@ function injectAdmIntoSlot(divId: string, adm: string): void {
       f.srcdoc = adm;
       slotEl.appendChild(f);
       log.debug(`[tsjs-gpt] gam-intercept: replaced slot content for '${divId}'`);
+      return true;
     }
   } catch (err) {
     log.warn('[tsjs-gpt] gam-intercept: error injecting adm', err);
+    return false;
   }
 }
 
@@ -496,6 +699,88 @@ function installInitialLoadDetector(ts: TsjsApi): void {
   });
 }
 
+// Orphan-watch state. Module-scoped so a re-bind cannot stack observers, and
+// so the attempt budget is shared across the page load rather than reset by the
+// adInit() the watcher itself triggers.
+let orphanObserver: MutationObserver | null = null;
+let orphanDebounceTimer: ReturnType<typeof setTimeout> | undefined;
+let orphanWindowTimer: ReturnType<typeof setTimeout> | undefined;
+let orphanReconcileAttempts = 0;
+
+function stopOrphanWatch(): void {
+  orphanObserver?.disconnect();
+  orphanObserver = null;
+  clearTimeout(orphanDebounceTimer);
+  clearTimeout(orphanWindowTimer);
+}
+
+/**
+ * TS-defined GPT slots whose bound element is no longer in the document.
+ *
+ * Exported for testing.
+ */
+export function orphanedTsSlots(ts: TsjsApi): GoogleTagSlot[] {
+  return ((ts.prevGptSlots ?? []) as GoogleTagSlot[]).filter((slot) => {
+    const elementId = slot?.getSlotElementId?.();
+    return !!elementId && !document.getElementById(elementId);
+  });
+}
+
+/**
+ * Watch for a client re-render that orphans TS's GPT slots and re-bind once it
+ * happens.
+ *
+ * Waiting for the divs to merely *exist* (as the SPA hook does) cannot help
+ * here: at `adInit()` time the server-rendered divs are present — they are
+ * later *replaced*. So instead of delaying the initial ad request, this detects
+ * the swap after the fact and re-runs `adInit()`, which destroys the orphaned
+ * slots and re-binds against the live DOM (reusing the publisher's own slot for
+ * that div when they have since defined one).
+ *
+ * Bounded by {@link MAX_ORPHAN_RECONCILE_ATTEMPTS} and
+ * {@link ORPHAN_RECONCILE_WINDOW_MS} so a page whose DOM never settles cannot
+ * spin on ad requests.
+ *
+ * Scoped to the generation it was armed in. SPA navigation is exactly the kind
+ * of DOM churn this observer reacts to, so without that scope a route change
+ * whose markup commits faster than `/__ts/page-bids` responds would trip the
+ * debounce while `ts.adSlots`/`ts.bids` still describe the *previous* route —
+ * re-binding the finished auction onto the new route's divs, issuing another
+ * billable GAM request, and burning the recovery budget on an ordinary
+ * navigation. `beginNavigation()` also disconnects it outright.
+ */
+function watchForOrphanedSlots(ts: TsjsApi): void {
+  if (typeof MutationObserver === 'undefined' || typeof document === 'undefined') return;
+  // Re-arm: a previous window may still be open from an earlier adInit().
+  stopOrphanWatch();
+  if (orphanReconcileAttempts >= MAX_ORPHAN_RECONCILE_ATTEMPTS) return;
+
+  const generation = currentGeneration(ts);
+  orphanObserver = new MutationObserver(() => {
+    clearTimeout(orphanDebounceTimer);
+    orphanDebounceTimer = setTimeout(() => {
+      // A navigation (or a newer adInit) has superseded the state this watch
+      // was armed for — recovering against it would apply the old route.
+      if (currentGeneration(ts) !== generation) {
+        stopOrphanWatch();
+        return;
+      }
+      const orphans = orphanedTsSlots(ts);
+      if (orphans.length === 0) return;
+      orphanReconcileAttempts += 1;
+      log.warn(
+        `[tsjs-gpt] ${orphans.length} TS slot(s) orphaned by a DOM re-render; re-binding`,
+        orphans.map((slot) => slot.getSlotElementId?.())
+      );
+      // Stop before re-running: adInit() re-arms the watch itself.
+      stopOrphanWatch();
+      ts.adInit?.();
+    }, ORPHAN_RECONCILE_DEBOUNCE_MS);
+  });
+  orphanObserver.observe(document.documentElement, { childList: true, subtree: true });
+  orphanWindowTimer = setTimeout(stopOrphanWatch, ORPHAN_RECONCILE_WINDOW_MS);
+}
+
 export function installTsAdInit(): void {
   const ts = (window.tsjs ??= {} as TsjsApi);
   installInitialLoadDetector(ts);
@@ -509,6 +794,10 @@ export function installTsAdInit(): void {
     if (!g) return;
 
     g.cmd?.push(() => {
+      // A new ad-init opens a new generation: everything armed by the previous
+      // one (SSAT attribution, orphan watch, in-flight bridge fetches) belongs
+      // to state this call is about to replace.
+      const generation = bumpGeneration(ts);
       // Destroy previously defined TS slots before redefining for the new page.
       if (ts.prevGptSlots && ts.prevGptSlots.length > 0) {
         g.destroySlots?.(ts.prevGptSlots as GoogleTagSlot[]);
@@ -592,6 +881,25 @@ export function installTsAdInit(): void {
           if (bid[key]) gptSlot.setTargeting(key, String(bid[key]!));
         });
         gptSlot.setTargeting(TS_INITIAL_TARGETING_KEY, '1');
+        // Arm SSAT attribution for the next render of this slot only. Without
+        // this, every later publisher refresh would still read the page-load
+        // bid out of ts.bids and claim the (long finished) server-side auction
+        // rendered it.
+        //
+        // The tuple is snapshotted here rather than re-read from `ts.bids` when
+        // the render event arrives: by then a newer navigation may have
+        // replaced `bids`, and stamping this render with that route's auction
+        // would both mislabel it and leave the real render of that auction
+        // demoted to `gam-refresh`.
+        const armed = TS_BID_TARGETING_KEYS.some((key) => Boolean(bid[key]));
+        enqueueGptRender(gptSlot, {
+          generation,
+          slotId: slot.id,
+          // Snapshot request data instead of reading a newer route's `ts.bids`
+          // when this request's render event eventually arrives.
+          bid: { ...bid },
+          attributed: armed,
+        });
         // Map both inner div and container div → slot ID so slotRenderEnded
         // (which reports the GPT slot's div, i.e. slotDivId/container) can look up
         // the slot, while adm injection (which targets the inner div) also works.
@@ -634,34 +942,92 @@ export function installTsAdInit(): void {
 
         g.pubads!().addEventListener?.('slotRenderEnded', (event: SlotRenderEndedEvent) => {
           const divId: string = event.slot?.getSlotElementId?.() ?? '';
-          const slotId = (ts.divToSlotId ?? {})[divId];
-          if (!slotId) return;
-          // Read ts.bids live (not the snapshot above) so post-navigation bid data is used.
-          const bid = (ts.bids ?? {})[slotId] ?? {};
-          const record = recordRender({
-            slotId,
-            path: 'ssat',
-            rendered: !event.isEmpty,
-            elementId: divId,
-            auctionId: bid.hb_auction_id,
-            bidder: bid.hb_bidder,
-            adId: bid.hb_adid,
-            creativeId: bid.hb_crid,
-            admHash: bid.hb_adm_hash,
-            servedFrom: 'gam',
-          });
-          const slotElement = document.getElementById(divId);
-          if (slotElement) stampCreativeTrace(slotElement, record);
-
-          // GAM interceptor (testing bypass): directly replace the GAM creative.
-          // `adm` is now always injected in production, so it can no longer gate
-          // this path. `debug_bid` is present only when inject_adm_for_testing is
-          // on, so it is the per-bid signal that the testing bypass is enabled.
-          // In production the render bridge serves the creative and GAM stays in
-          // the loop; this direct replace stays testing-only.
-          if (bid.adm && bid.debug_bid) {
-            injectAdmIntoSlot(divId, bid.adm);
+          const pending = takeGptRender(event.slot);
+          if (pending && pending.generation !== currentGeneration(ts)) {
+            log.debug('[tsjs-gpt] ignoring slotRenderEnded from a superseded route', { divId });
+            return;
           }
+
+          const slotId = pending?.slotId ?? (ts.divToSlotId ?? {})[divId];
+          if (!slotId) return;
+          const bid = pending?.bid ?? (ts.bids ?? {})[slotId] ?? {};
+
+          // Trace: registry entry + DOM markers joining the GAM render to the
+          // server-side auction bid. `rendered` is GAM's own non-empty signal;
+          // `injected`/`visible` carry the honest "is the TS creative actually
+          // on screen" state so the panel does not overclaim (a non-empty GAM
+          // slot is not proof the TS creative rendered).
+          const slotEl = document.getElementById(divId);
+          const eventGeneration = currentGeneration(ts);
+
+          // The server-side auction runs once per navigation. Only the render
+          // that consumes the targeting adInit just applied may be attributed
+          // to it; a later publisher refresh re-requests GAM on its own and the
+          // creative it returns has no traceable link to any TS auction, so no
+          // bid tuple is stamped. Single-shot: the armed tuple is consumed here.
+          const attributed = pending?.attributed
+            ? {
+                path: 'ssat' as const,
+                auctionId: bid.hb_auction_id,
+                bidder: bid.hb_bidder,
+                adId: bid.hb_adid,
+                bidId: bid.hb_bid_id,
+                creativeId: bid.hb_crid,
+                admHash: bid.hb_adm_hash,
+              }
+            : { path: 'gam-refresh' as const };
+
+          // The record this event belongs to, resolved below. Captured by the
+          // deferred-placement callback, which fires an animation frame later.
+          let record: RenderRecord | undefined;
+
+          // GAM interceptor (testing): when adm is present, replace the GAM creative.
+          // Adapted from PR #241 — uses window.tsjs.bids[slotId].adm instead of pbjs.
+          // Only active when inject_adm_for_testing injects adm into bids server-side.
+          // Run before recording so the trace reflects the post-injection state.
+          // No adm to inject means TS only applied GAM targeting: whatever GAM
+          // rendered lives in a cross-origin iframe TS cannot read, so this is
+          // explicitly *not* a confirmed TS placement (status: gam-only).
+          const injected =
+            bid.adm && bid.debug_bid
+              ? injectAdmIntoSlot(
+                  divId,
+                  bid.adm,
+                  (placed) => {
+                    // The animation-frame retry has resolved. Promote the record
+                    // unless a newer render already replaced this impression.
+                    if (!placed || !record || ts.renders?.[slotId] !== record || !slotEl) return;
+                    updateRender(record, { injected: true, visible: isEffectivelyVisible(slotEl) });
+                    stampCreativeTrace(slotEl, record);
+                  },
+                  () =>
+                    currentGeneration(ts) === eventGeneration &&
+                    !!slotEl?.isConnected &&
+                    document.getElementById(divId) === slotEl
+                )
+              : false;
+
+          const gamSignal = {
+            rendered: !event.isEmpty,
+            gamEmpty: event.isEmpty,
+            injected,
+            visible: isEffectivelyVisible(slotEl),
+            elementId: divId,
+          };
+          // The bridge may already have opened this impression's record (it
+          // serves the creative the same GAM request asked for). Enrich that
+          // record rather than appending a second one for the same impression.
+          const open = event.isEmpty
+            ? undefined
+            : enrichableImpression(ts, slotId, bid.hb_adid, 'gam');
+          if (open) {
+            open.gamSeen = true;
+            record = updateRender(open.record, gamSignal);
+          } else {
+            record = recordRender({ slotId, servedFrom: 'gam', ...gamSignal, ...attributed });
+            openImpression(ts, slotId, bid.hb_adid, record, 'gam');
+          }
+          if (slotEl) stampCreativeTrace(slotEl, record);
         });
       }
 
@@ -697,6 +1063,12 @@ export function installTsAdInit(): void {
         } finally {
           ts.adInitRefreshInProgress = false;
         }
+      }
+
+      // Only TS-defined slots can be orphaned by a re-render — publisher-owned
+      // slots are theirs to manage, and TS never destroys them.
+      if (newSlots.length > 0) {
+        watchForOrphanedSlots(ts);
       }
     });
   };
@@ -786,6 +1158,10 @@ export function installSpaAuctionHook(): void {
     if (path === currentPath) return;
     currentPath = path;
     inflight?.abort();
+    // Retire the route being left before awaiting anything. The new DOM can
+    // commit long before page-bids answers, and until then every watcher and
+    // in-flight render still refers to the previous route's auction.
+    beginNavigation(ts);
     const controller = new AbortController();
     inflight = controller;
 
@@ -987,24 +1363,85 @@ export function parseCachedBid(body: string): CachedBid | undefined {
  * below drops the stamp when the captured element has left the document.
  */
 function recordBridgeRender(
+  ts: TsjsApi,
   slotId: string,
   bid: AuctionBidData,
   servedFrom: RenderServedFrom,
   el: HTMLElement | null
 ): void {
-  const record = recordRender({
-    slotId,
-    path: 'ssat',
+  // The bridge serves TS's own markup into the Prebid Universal Creative, so
+  // this is a confirmed TS placement (injected: true).
+  const bridgeSignal = {
     rendered: true,
+    injected: true,
+    visible: isEffectivelyVisible(el),
     elementId: el?.id,
-    auctionId: bid.hb_auction_id,
-    bidder: bid.hb_bidder,
-    adId: bid.hb_adid,
-    creativeId: bid.hb_crid,
-    admHash: bid.hb_adm_hash,
     servedFrom,
-  });
+  };
+  // `slotRenderEnded` may already have opened this impression's record for the
+  // same GAM request. Enrich it — appending here would count one creative as
+  // two renders, and this confirmed placement must not be a separate row from
+  // the GAM fill signal describing it.
+  const open = enrichableImpression(ts, slotId, bid.hb_adid, 'bridge');
+  let record: RenderRecord;
+  if (open) {
+    open.bridgeSeen = true;
+    record = updateRender(open.record, bridgeSignal);
+  } else {
+    record = recordRender({
+      slotId,
+      path: 'ssat',
+      auctionId: bid.hb_auction_id,
+      bidder: bid.hb_bidder,
+      adId: bid.hb_adid,
+      bidId: bid.hb_bid_id,
+      creativeId: bid.hb_crid,
+      admHash: bid.hb_adm_hash,
+      ...bridgeSignal,
+    });
+    openImpression(ts, slotId, bid.hb_adid, record, 'bridge');
+  }
   if (el && el.isConnected) stampCreativeTrace(el, record);
+}
+
+/**
+ * Whether a PBS Cache result may still be applied when its fetch resolves.
+ *
+ * The fetch is started for one specific impression on one specific route, but
+ * settles arbitrarily later. By then an SPA navigation may have rebound the
+ * slot to a new auction — writing the record anyway would make a finished
+ * auction the slot's current render, fire a render event for a creative nobody
+ * can see, and stamp the new route's element with the old route's tuple.
+ *
+ * So all four anchors of that impression must still hold: the route it started
+ * in, the element it resolved to, the message source still living under that
+ * same slot, and the slot still showing the very bid it was fetched for.
+ */
+function bridgeResultStillCurrent(
+  ts: TsjsApi,
+  generation: number,
+  slotId: string,
+  bid: AuctionBidData,
+  el: HTMLElement | null,
+  source: MessageEventSource | null
+): boolean {
+  if (currentGeneration(ts) !== generation) return false;
+  if (!el?.isConnected) return false;
+  if (slotIdForMessageSource(source) !== slotId) return false;
+  const live = (ts.bids ?? {})[slotId];
+  if (!live) return false;
+  return (
+    live.hb_adid === bid.hb_adid &&
+    live.hb_auction_id === bid.hb_auction_id &&
+    live.hb_bid_id === bid.hb_bid_id &&
+    live.hb_bidder === bid.hb_bidder &&
+    live.hb_crid === bid.hb_crid &&
+    live.hb_adm_hash === bid.hb_adm_hash &&
+    live.hb_cache_host === bid.hb_cache_host &&
+    live.hb_cache_path === bid.hb_cache_path &&
+    live.nurl === bid.nurl &&
+    live.burl === bid.burl
+  );
 }
 
 export function installTsRenderBridge(): void {
@@ -1132,20 +1569,26 @@ export function installTsRenderBridge(): void {
     // pulling slot B's creative and firing slot B's win/billing beacons.
     if (!matchedBid || matchedBid.hb_adid !== adId) return;
 
-    const slot = window.tsjs?.adSlots?.find((s) => s.id === slotId);
+    const ts = (window.tsjs ??= {} as TsjsApi);
+    // Snapshot every field the asynchronous cache completion will consume.
+    const capturedBid: AuctionBidData = { ...matchedBid };
+    const slot = ts.adSlots?.find((s) => s.id === slotId);
     // Prefer the winning creative's own dimensions; the first configured slot
     // format is only a fallback and mis-sizes a multi-size slot whose winner is
     // not the first format.
     const [fallbackWidth, fallbackHeight] = slot?.formats?.[0] ?? [728, 90];
-    const width = matchedBid.w ?? fallbackWidth;
-    const height = matchedBid.h ?? fallbackHeight;
+    const width = capturedBid.w ?? fallbackWidth;
+    const height = capturedBid.h ?? fallbackHeight;
     // Resolve the slot element now, at message-receipt time: the PBS Cache
     // branch stamps after an async fetch, and by then an SPA navigation may
     // have swapped tsjs.adSlots/DOM for a new route with the same slot IDs.
     const slotEl = slot ? findSlotElementByDivId(slot.div_id) : null;
+    // The route this render belongs to, re-checked when the async fetch below
+    // resolves.
+    const generation = currentGeneration(ts);
 
-    if (matchedBid.renderer !== undefined) {
-      const renderer = validateApsRenderer(matchedBid.renderer);
+    if (capturedBid.renderer !== undefined) {
+      const renderer = validateApsRenderer(capturedBid.renderer);
       const rendererUrl = apsRendererUrl();
       if (!renderer || !rendererUrl) return;
 
@@ -1177,25 +1620,26 @@ export function installTsRenderBridge(): void {
       return;
     }
 
-    if (matchedBid.adm) {
+    if (capturedBid.adm) {
       e.stopImmediatePropagation();
       port.postMessage(
         JSON.stringify({
           message: 'Prebid Response',
           adId,
-          ad: matchedBid.adm,
+          ad: capturedBid.adm,
           renderer: TS_DISPLAY_RENDERER,
           width,
           height,
         })
       );
-      fireWinBillingBeacons(slotId, matchedBid);
+      fireWinBillingBeacons(slotId, capturedBid);
+      recordBridgeRender(ts, slotId, capturedBid, 'debug-adm', slotEl);
       log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from inline adm`);
       return;
     }
 
     // No TS render source — let Prebid.js handle it.
-    if (!matchedBid.hb_cache_host || !matchedBid.hb_cache_path) return;
+    if (!capturedBid.hb_cache_host || !capturedBid.hb_cache_path) return;
 
     // TS owns this adId — stop Prebid from also processing it.
     e.stopImmediatePropagation();
@@ -1206,11 +1650,20 @@ export function installTsRenderBridge(): void {
     if (renderingKeys.has(renderingKey)) return;
     renderingKeys.add(renderingKey);
 
-    const cacheUrl = `https://${matchedBid.hb_cache_host}${matchedBid.hb_cache_path}?uuid=${encodeURIComponent(adId)}`;
+    const cacheUrl = `https://${capturedBid.hb_cache_host}${capturedBid.hb_cache_path}?uuid=${encodeURIComponent(adId)}`;
 
-    fetch(cacheUrl, { mode: 'cors' })
+    // Abortable so a navigation can cancel a render belonging to the route it
+    // is leaving instead of letting it land on the new one.
+    const controller = new AbortController();
+    inflightCacheFetches.add(controller);
+
+    fetch(cacheUrl, { mode: 'cors', signal: controller.signal })
       .then((res) => (res.ok ? res.text() : Promise.reject(res.status)))
       .then((body) => {
+        if (!bridgeResultStillCurrent(ts, generation, slotId, capturedBid, slotEl, e.source)) {
+          log.debug(`[tsjs-gpt] pbRender bridge: dropping stale PBS Cache result for '${slotId}'`);
+          return;
+        }
         // PBS Cache returns the cached bid as a JSON object; decode its creative
         // and render metadata the same way the Prebid Universal Creative does.
         const cached = parseCachedBid(body);
@@ -1239,15 +1692,21 @@ export function installTsRenderBridge(): void {
             height: cached.height ?? height,
           })
         );
-        fireWinBillingBeacons(slotId, matchedBid);
-        recordBridgeRender(slotId, matchedBid, 'pbs-cache', slotEl);
+        // Beacons carry the server-expanded ${AUCTION_PRICE} from the auction's
+        // clearing price, not `cached.price` — the auction result is the
+        // authoritative clearing price, and the cached copy is only the render
+        // source. Do not re-expand them here.
+        fireWinBillingBeacons(slotId, capturedBid);
+        recordBridgeRender(ts, slotId, capturedBid, 'pbs-cache', slotEl);
         log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from PBS Cache`);
       })
       .catch((err) => {
+        if (err instanceof DOMException && err.name === 'AbortError') return;
         log.warn(`[tsjs-gpt] pbRender bridge: PBS Cache fetch failed for '${slotId}'`, err);
       })
       .finally(() => {
         renderingKeys.delete(renderingKey);
+        inflightCacheFetches.delete(controller);
       });
   });
 }

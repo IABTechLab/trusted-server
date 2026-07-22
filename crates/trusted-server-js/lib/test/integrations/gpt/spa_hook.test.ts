@@ -51,6 +51,7 @@ describe('installSpaAuctionHook', () => {
     originalReplaceState({}, '', '/');
     // Drop any ad containers inserted by a test so DOM state does not leak.
     document.body.innerHTML = '';
+    delete (window as TestWindow).googletag;
     // Remove this test's popstate listener(s) so they do not fire in later tests.
     popstateHandlers.forEach((handler) => window.removeEventListener('popstate', handler));
     popstateHandlers = [];
@@ -302,6 +303,59 @@ describe('installSpaAuctionHook', () => {
 
     expect(ts.adSlots).toEqual([{ id: 'newer', div_id: 'div-newer' }]);
     expect(adInit).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops orphan recovery before a fast route DOM swap can replay old bids', async () => {
+    document.body.innerHTML = '<div id="ad-header-0-_R_old_"></div>';
+    const definedDivs: string[] = [];
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([]),
+      refresh: vi.fn(),
+      addEventListener: vi.fn(),
+    };
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn((_path: string, _sizes: unknown, divId: string) => {
+        definedDivs.push(divId);
+        return {
+          addService: vi.fn().mockReturnThis(),
+          setTargeting: vi.fn().mockReturnThis(),
+          clearTargeting: vi.fn().mockReturnThis(),
+          getSlotElementId: vi.fn().mockReturnValue(divId),
+          getTargeting: vi.fn().mockReturnValue([]),
+        };
+      }),
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+      display: vi.fn(),
+      destroySlots: vi.fn(),
+    };
+    // Keep page-bids slower than the orphan observer's 250 ms debounce.
+    fetchStub.mockReturnValue(new Promise(() => {}));
+
+    await importGptModule();
+    const ts = (window as TestWindow).tsjs!;
+    ts.adSlots = [
+      {
+        id: 'ad-header-0',
+        gam_unit_path: '/123/header',
+        div_id: 'ad-header-0',
+        formats: [[728, 90]],
+        targeting: {},
+      },
+    ];
+    ts.bids = { 'ad-header-0': { hb_adid: 'old-route-ad' } };
+    ts.adInit!();
+    expect(definedDivs).toEqual(['ad-header-0-_R_old_']);
+
+    history.pushState({}, '', '/new-route');
+    document.body.innerHTML = '<div id="ad-header-0-_R_new_"></div>';
+    await new Promise((resolve) => setTimeout(resolve, 350));
+
+    // The pending old-route watcher was disconnected synchronously when
+    // navigation began, so it never rebound or re-requested the old auction.
+    expect(definedDivs).toEqual(['ad-header-0-_R_old_']);
   });
 
   it('leaves slots and bids untouched on a non-OK response', async () => {

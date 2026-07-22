@@ -332,6 +332,7 @@ describe('auction/parseAuctionResponse', () => {
           seat: 'kargo',
           bid: [
             {
+              id: 'bid-uuid-7',
               impid: 'slot-1',
               price: 1.0,
               adm: '<div>A</div>',
@@ -344,6 +345,7 @@ describe('auction/parseAuctionResponse', () => {
 
     const bids = parseAuctionResponse(body);
     expect(bids[0].auctionId).toBe('auction-uuid-2');
+    expect(bids[0].bidId).toBe('bid-uuid-7');
     expect(bids[0].admHash).toBe('a1b2c3d4e5f60718');
   });
 });
