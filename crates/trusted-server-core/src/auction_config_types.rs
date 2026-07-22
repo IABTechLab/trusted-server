@@ -11,6 +11,19 @@ pub struct AuctionConfig {
     #[serde(default)]
     pub enabled: bool,
 
+    /// Strip executable markup from winning-bid creative HTML before delivery.
+    ///
+    /// Sanitization removes `script`/`object`/`embed`/`form`/etc. **with their inner
+    /// content**, which blanks script-based creatives — the majority of programmatic
+    /// display. It is the primary defence when the creative renders in a context that
+    /// shares the publisher's origin.
+    ///
+    /// Disable only when creatives render in a foreign-origin frame (for example the
+    /// Prebid Universal Creative inside the ad server's iframe), where the markup
+    /// cannot reach the publisher origin. Defaults to disabled.
+    #[serde(default = "default_sanitize_creatives")]
+    pub sanitize_creatives: bool,
+
     /// Rewrite sanitized winning-bid creative HTML to first-party endpoints.
     #[serde(default = "default_rewrite_creatives")]
     pub rewrite_creatives: bool,
@@ -45,6 +58,7 @@ impl Default for AuctionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            sanitize_creatives: default_sanitize_creatives(),
             rewrite_creatives: default_rewrite_creatives(),
             providers: Vec::new(),
             mediator: None,
@@ -59,8 +73,12 @@ fn default_timeout() -> u32 {
     2000
 }
 
+fn default_sanitize_creatives() -> bool {
+    false
+}
+
 fn default_rewrite_creatives() -> bool {
-    true
+    false
 }
 
 fn default_creative_store() -> String {
@@ -94,10 +112,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rewrite_creatives_defaults_to_true() {
+    fn creative_processing_defaults_to_disabled() {
+        let config = AuctionConfig::default();
         assert!(
-            AuctionConfig::default().rewrite_creatives,
-            "should enable creative rewriting by default"
+            !config.rewrite_creatives,
+            "creative rewriting is opt-in: creatives ship as the bidder returned them"
+        );
+        assert!(
+            !config.sanitize_creatives,
+            "creative sanitization is opt-in: it strips executable markup with its content"
         );
     }
 }

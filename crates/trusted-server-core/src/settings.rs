@@ -4438,7 +4438,7 @@ adSlot = "67890"
     }
 
     #[test]
-    fn test_auction_rewrite_creatives_defaults_to_true_when_omitted() {
+    fn test_auction_creative_processing_defaults_to_false_when_omitted() {
         let toml_str = crate_test_settings_str()
             + r#"
             [auction]
@@ -4449,8 +4449,12 @@ adSlot = "67890"
         let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
 
         assert!(
-            settings.auction.rewrite_creatives,
-            "should preserve creative rewriting when the setting is omitted"
+            !settings.auction.rewrite_creatives,
+            "creative rewriting is opt-in when the setting is omitted"
+        );
+        assert!(
+            !settings.auction.sanitize_creatives,
+            "creative sanitization is opt-in when the setting is omitted"
         );
     }
 
