@@ -31,8 +31,12 @@ describe('render', () => {
     expect(sandbox).toContain('allow-popups');
     expect(sandbox).toContain('allow-popups-to-escape-sandbox');
     expect(sandbox).toContain('allow-top-navigation-by-user-activation');
-    expect(sandbox).toContain('allow-same-origin');
     expect(sandbox).toContain('allow-scripts');
+    // `allow-scripts` + `allow-same-origin` together defeat the sandbox: creative
+    // markup would run with the publisher origin's privileges (cookies, storage,
+    // same-origin fetches). Matches APS_RENDERER_SANDBOX and ADM_IFRAME_SANDBOX,
+    // which already omit it.
+    expect(sandbox).not.toContain('allow-same-origin');
   });
 
   it('preserves dollar sequences when building the creative document', async () => {
