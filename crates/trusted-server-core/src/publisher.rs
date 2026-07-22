@@ -1738,6 +1738,11 @@ pub async fn handle_publisher_request(
         }
     );
 
+    if should_run_ad_stack {
+        req.headers_mut().remove(header::IF_NONE_MATCH);
+        req.headers_mut().remove(header::IF_MODIFIED_SINCE);
+    }
+
     // Only advertise encodings the rewrite pipeline can decode and re-encode.
     restrict_accept_encoding(&mut req);
     // Strip the internal `fastly-ssl` scheme signal before forwarding to the
@@ -1756,11 +1761,11 @@ pub async fn handle_publisher_request(
 
     // SSP requests are already racing through the platform HTTP client, so
     // origin TTFB tracks origin latency rather than the auction timeout.
-    let mut response = match services
-        .http_client()
-        .send(PlatformHttpRequest::new(req, backend_name))
-        .await
-    {
+    let mut publisher_request = PlatformHttpRequest::new(req, backend_name);
+    if should_run_ad_stack {
+        publisher_request = publisher_request.with_cache_bypass();
+    }
+    let mut response = match services.http_client().send(publisher_request).await {
         Ok(platform_response) => platform_response.response,
         Err(err) => {
             if let Some(dispatched) = dispatched_auction.take() {
@@ -1793,10 +1798,9 @@ pub async fn handle_publisher_request(
         None
     };
 
-    // §4.7: HTML carrying inline per-user bid data must never be shared-cached.
-    // `private, max-age=0` is deliberate (not `no-store`): it keeps the page
-    // BFCache-eligible while restricting reuse to the same user's browser with
-    // revalidation; `Surrogate-Control` removal handles the Fastly shared cache.
+    // §4.7: HTML with synthesized per-navigation auction state must not be
+    // stored or validated as an origin representation. Strip both browser and
+    // surrogate validators/cache directives before returning it.
     //
     // Gate on `should_run_ad_stack` rather than content-type alone: when no slot
     // matched, the feature is disabled, or this is not an ad-eligible navigation,
@@ -1813,8 +1817,10 @@ pub async fn handle_publisher_request(
     if should_run_ad_stack && is_html_content_type(origin_content_type) {
         response.headers_mut().insert(
             header::CACHE_CONTROL,
-            HeaderValue::from_static("private, max-age=0"),
+            HeaderValue::from_static("private, no-store"),
         );
+        response.headers_mut().remove(header::ETAG);
+        response.headers_mut().remove(header::LAST_MODIFIED);
         response.headers_mut().remove("surrogate-control");
         response.headers_mut().remove("fastly-surrogate-control");
     }
@@ -3030,6 +3036,231 @@ mod tests {
         )
         .await
         .expect("should proxy publisher request")
+    }
+
+    mod ssat_cache_policy_tests {
+        use super::*;
+        use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
+        use crate::test_support::tests::crate_test_settings_str;
+
+        const ORIGIN_ETAG: &str = "\"origin-tag\"";
+        const ORIGIN_LAST_MODIFIED: &str = "Wed, 21 Oct 2015 07:28:00 GMT";
+
+        fn settings_with_enabled_auction_and_creative_opportunities() -> Settings {
+            let toml = format!(
+                "{}\n[auction]\nenabled = true\n\n\
+                 [creative_opportunities]\ngam_network_id = \"12345\"\n",
+                crate_test_settings_str()
+            );
+            Settings::from_toml(&toml)
+                .expect("should parse settings with auction and creative opportunities enabled")
+        }
+
+        fn article_slot() -> CreativeOpportunitySlot {
+            CreativeOpportunitySlot {
+                id: "article-slot".to_string(),
+                gam_unit_path: None,
+                div_id: None,
+                page_patterns: vec!["/article".to_string()],
+                formats: vec![CreativeOpportunityFormat {
+                    width: 300,
+                    height: 250,
+                    media_type: MediaType::Banner,
+                }],
+                floor_price: None,
+                targeting: Default::default(),
+                providers: Default::default(),
+                compiled_patterns: Vec::new(),
+            }
+        }
+
+        fn conditional_navigation_request() -> Request<EdgeBody> {
+            HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://ts.example.com/article")
+                .header(header::HOST, "ts.example.com")
+                .header("sec-fetch-dest", "document")
+                .header(header::IF_NONE_MATCH, ORIGIN_ETAG)
+                .header(header::IF_MODIFIED_SINCE, ORIGIN_LAST_MODIFIED)
+                .body(EdgeBody::empty())
+                .expect("should build conditional navigation request")
+        }
+
+        fn queue_cacheable_html_response(stub: &StubHttpClient) {
+            stub.push_response_with_headers(
+                200,
+                b"<html><body>origin</body></html>".to_vec(),
+                vec![
+                    ("content-type", "text/html; charset=utf-8"),
+                    ("cache-control", "public, max-age=300"),
+                    ("etag", ORIGIN_ETAG),
+                    ("last-modified", ORIGIN_LAST_MODIFIED),
+                    ("surrogate-control", "max-age=300"),
+                    ("fastly-surrogate-control", "max-age=300"),
+                ],
+            );
+        }
+
+        async fn run_with_slots(
+            settings: &Settings,
+            services: &RuntimeServices,
+            slots: &[CreativeOpportunitySlot],
+            req: Request<EdgeBody>,
+        ) -> PublisherResponse {
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let consent = crate::consent::ConsentContext {
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                ..Default::default()
+            };
+            let mut ec_context = EcContext::new_for_test(None, consent);
+
+            handle_publisher_request(
+                settings,
+                services,
+                None,
+                &mut ec_context,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots,
+                    registry: None,
+                },
+                req,
+            )
+            .await
+            .expect("should proxy publisher request")
+        }
+
+        fn response_head(response: PublisherResponse) -> http::response::Parts {
+            match response {
+                PublisherResponse::Buffered(response)
+                | PublisherResponse::Stream { response, .. }
+                | PublisherResponse::PassThrough { response, .. } => response.into_parts().0,
+            }
+        }
+
+        fn recorded_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+            headers
+                .iter()
+                .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+        }
+
+        #[tokio::test]
+        async fn eligible_navigation_bypasses_cache_and_returns_non_storable_html() {
+            // Arrange
+            let settings = settings_with_enabled_auction_and_creative_opportunities();
+            let stub = Arc::new(StubHttpClient::new());
+            queue_cacheable_html_response(&stub);
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let slots = [article_slot()];
+            let req = conditional_navigation_request();
+
+            // Act
+            let response = run_with_slots(&settings, &services, &slots, req).await;
+            let response_head = response_head(response);
+
+            // Assert
+            assert_eq!(
+                stub.recorded_cache_bypass_flags(),
+                vec![true],
+                "eligible publisher navigation should bypass the platform cache"
+            );
+            let recorded_requests = stub.recorded_request_headers();
+            let outbound_headers = recorded_requests
+                .first()
+                .expect("should record the outbound publisher request");
+            assert_eq!(
+                recorded_header(outbound_headers, header::IF_NONE_MATCH.as_str()),
+                None,
+                "eligible publisher request should not forward If-None-Match"
+            );
+            assert_eq!(
+                recorded_header(outbound_headers, header::IF_MODIFIED_SINCE.as_str()),
+                None,
+                "eligible publisher request should not forward If-Modified-Since"
+            );
+            assert_eq!(
+                response_head
+                    .headers
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("private, no-store"),
+                "eligible HTML response should be private and non-storable"
+            );
+            for header_name in [
+                header::ETAG,
+                header::LAST_MODIFIED,
+                header::HeaderName::from_static("surrogate-control"),
+                header::HeaderName::from_static("fastly-surrogate-control"),
+            ] {
+                assert!(
+                    !response_head.headers.contains_key(&header_name),
+                    "eligible HTML response should remove {header_name}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn navigation_without_matched_slots_preserves_origin_cache_policy() {
+            // Arrange
+            let settings = settings_with_enabled_auction_and_creative_opportunities();
+            let stub = Arc::new(StubHttpClient::new());
+            queue_cacheable_html_response(&stub);
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let req = conditional_navigation_request();
+
+            // Act
+            let response = run_with_slots(&settings, &services, &[], req).await;
+            let response_head = response_head(response);
+
+            // Assert
+            assert_eq!(
+                stub.recorded_cache_bypass_flags(),
+                vec![false],
+                "publisher navigation without matched slots should use the default cache mode"
+            );
+            let recorded_requests = stub.recorded_request_headers();
+            let outbound_headers = recorded_requests
+                .first()
+                .expect("should record the outbound publisher request");
+            assert_eq!(
+                recorded_header(outbound_headers, header::IF_NONE_MATCH.as_str()),
+                Some(ORIGIN_ETAG),
+                "publisher request without matched slots should preserve If-None-Match"
+            );
+            assert_eq!(
+                recorded_header(outbound_headers, header::IF_MODIFIED_SINCE.as_str()),
+                Some(ORIGIN_LAST_MODIFIED),
+                "publisher request without matched slots should preserve If-Modified-Since"
+            );
+
+            for (header_name, expected) in [
+                (header::CACHE_CONTROL, "public, max-age=300"),
+                (header::ETAG, ORIGIN_ETAG),
+                (header::LAST_MODIFIED, ORIGIN_LAST_MODIFIED),
+                (
+                    header::HeaderName::from_static("surrogate-control"),
+                    "max-age=300",
+                ),
+                (
+                    header::HeaderName::from_static("fastly-surrogate-control"),
+                    "max-age=300",
+                ),
+            ] {
+                assert_eq!(
+                    response_head
+                        .headers
+                        .get(&header_name)
+                        .and_then(|value| value.to_str().ok()),
+                    Some(expected),
+                    "publisher response without matched slots should preserve {header_name}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
