@@ -23,6 +23,12 @@ pub struct PlatformHttpRequest {
     /// Adapters that cannot attach this metadata to their send path should
     /// return an error rather than silently dropping transformations.
     pub image_optimizer: Option<PlatformImageOptimizerOptions>,
+    /// Whether the platform's intermediary response cache must be bypassed.
+    ///
+    /// Adapters without an intermediary outbound cache may treat this as already
+    /// satisfied. The option defaults to `false` so existing call sites preserve
+    /// their current cache behavior.
+    pub bypass_cache: bool,
     /// Whether the response body should stay streaming in the platform response.
     ///
     /// Adapters that cannot preserve streaming response bodies should return an
@@ -38,6 +44,7 @@ impl PlatformHttpRequest {
             request,
             backend_name: backend_name.into(),
             image_optimizer: None,
+            bypass_cache: false,
             stream_response: false,
         }
     }
@@ -50,6 +57,13 @@ impl PlatformHttpRequest {
     #[must_use]
     pub fn with_image_optimizer(mut self, options: PlatformImageOptimizerOptions) -> Self {
         self.image_optimizer = Some(options);
+        self
+    }
+
+    /// Bypass the platform's intermediary response cache for this request.
+    #[must_use]
+    pub fn with_cache_bypass(mut self) -> Self {
+        self.bypass_cache = true;
         self
     }
 
@@ -317,7 +331,41 @@ pub trait PlatformHttpClient: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    use edgezero_core::body::Body;
+    use edgezero_core::http::request_builder;
+
     use super::*;
+
+    #[test]
+    fn platform_http_request_cache_bypass_defaults_to_false() {
+        let request = PlatformHttpRequest::new(
+            request_builder()
+                .body(Body::empty())
+                .expect("should build request"),
+            "stub-backend",
+        );
+
+        assert!(
+            !request.bypass_cache,
+            "should preserve existing cache behavior by default"
+        );
+    }
+
+    #[test]
+    fn platform_http_request_cache_bypass_builder_enables_bypass() {
+        let request = PlatformHttpRequest::new(
+            request_builder()
+                .body(Body::empty())
+                .expect("should build request"),
+            "stub-backend",
+        )
+        .with_cache_bypass();
+
+        assert!(
+            request.bypass_cache,
+            "should enable intermediary cache bypass"
+        );
+    }
 
     // ---------------------------------------------------------------------------
     // Error-correlation interim scope (before EdgeZero #213)

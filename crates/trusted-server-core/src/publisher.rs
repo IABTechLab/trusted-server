@@ -2778,6 +2778,11 @@ pub async fn handle_publisher_request(
         }
     );
 
+    if should_run_ad_stack {
+        req.headers_mut().remove(header::IF_NONE_MATCH);
+        req.headers_mut().remove(header::IF_MODIFIED_SINCE);
+    }
+
     // Only advertise encodings the rewrite pipeline can decode and re-encode.
     restrict_accept_encoding(&mut req);
     // Strip the internal `fastly-ssl` scheme signal before forwarding to the
@@ -2802,6 +2807,9 @@ pub async fn handle_publisher_request(
     // without streaming support may reject the flag outright rather than
     // silently buffering, which would fail every publisher fetch.
     let mut platform_request = PlatformHttpRequest::new(req, backend_name);
+    if should_run_ad_stack {
+        platform_request = platform_request.with_cache_bypass();
+    }
     if services.http_client().supports_streaming_responses() {
         platform_request = platform_request.with_stream_response();
     }
@@ -2830,6 +2838,30 @@ pub async fn handle_publisher_request(
         response.headers().len()
     );
 
+    if should_run_ad_stack && response.status() == StatusCode::NOT_MODIFIED {
+        if let Some(dispatched) = dispatched_auction.take() {
+            emit_abandoned_auction(
+                services,
+                auction_observation.take(),
+                dispatched,
+                "unexpected_origin_304",
+            )
+            .await;
+        }
+
+        let response = Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .header(header::CACHE_CONTROL, "private, no-store")
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(EdgeBody::from(
+                "Publisher origin returned an invalid conditional response",
+            ))
+            .change_context(TrustedServerError::Proxy {
+                message: "failed to build unexpected origin 304 response".to_string(),
+            })?;
+        return Ok(PublisherResponse::Buffered(response));
+    }
+
     let ad_slots_script = if should_run_ad_stack {
         settings
             .creative_opportunities
@@ -2839,10 +2871,9 @@ pub async fn handle_publisher_request(
         None
     };
 
-    // §4.7: HTML carrying inline per-user bid data must never be shared-cached.
-    // `private, max-age=0` is deliberate (not `no-store`): it keeps the page
-    // BFCache-eligible while restricting reuse to the same user's browser with
-    // revalidation; `Surrogate-Control` removal handles the Fastly shared cache.
+    // §4.7: HTML with synthesized per-navigation auction state must not be
+    // stored or validated as an origin representation. Strip both browser and
+    // surrogate validators/cache directives before returning it.
     //
     // Gate on `should_run_ad_stack` rather than content-type alone: when no slot
     // matched, the feature is disabled, or this is not an ad-eligible navigation,
@@ -2859,8 +2890,10 @@ pub async fn handle_publisher_request(
     if should_run_ad_stack && is_html_content_type(origin_content_type) {
         response.headers_mut().insert(
             header::CACHE_CONTROL,
-            HeaderValue::from_static("private, max-age=0"),
+            HeaderValue::from_static("private, no-store"),
         );
+        response.headers_mut().remove(header::ETAG);
+        response.headers_mut().remove(header::LAST_MODIFIED);
         response.headers_mut().remove("surrogate-control");
         response.headers_mut().remove("fastly-surrogate-control");
     }
@@ -4239,6 +4272,526 @@ mod tests {
         )
         .await
         .expect("should proxy publisher request")
+    }
+
+    mod ssat_cache_policy_tests {
+        use super::*;
+        use crate::auction::provider::AuctionProvider;
+        use crate::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink};
+        use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
+        use crate::platform::test_support::{
+            NoopConfigStore, NoopGeo, NoopSecretStore, StubBackend,
+        };
+        use crate::platform::{ClientInfo, PlatformPendingRequest, PlatformResponse};
+        use crate::test_support::tests::crate_test_settings_str;
+
+        const ORIGIN_ETAG: &str = "\"origin-tag\"";
+        const ORIGIN_LAST_MODIFIED: &str = "Wed, 21 Oct 2015 07:28:00 GMT";
+        const UNEXPECTED_304_PROVIDER: &str = "example_navigation_bidder";
+        const UNEXPECTED_304_BACKEND: &str = "example-navigation-bidder-backend";
+
+        struct DispatchingTestProvider;
+
+        #[async_trait::async_trait(?Send)]
+        impl AuctionProvider for DispatchingTestProvider {
+            fn provider_name(&self) -> &'static str {
+                UNEXPECTED_304_PROVIDER
+            }
+
+            async fn request_bids(
+                &self,
+                _request: &AuctionRequest,
+                context: &AuctionContext<'_>,
+            ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+                let request = PlatformHttpRequest::new(
+                    HttpRequest::builder()
+                        .method(Method::POST)
+                        .uri("https://bidder.example.com/navigation-bids")
+                        .body(EdgeBody::empty())
+                        .expect("should build test provider request"),
+                    UNEXPECTED_304_BACKEND,
+                );
+                context
+                    .services
+                    .http_client()
+                    .send_async(request)
+                    .await
+                    .change_context(TrustedServerError::Auction {
+                        message: "test provider launch failed".to_string(),
+                    })
+            }
+
+            async fn parse_response(
+                &self,
+                _response: PlatformResponse,
+                _response_time_ms: u64,
+            ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+                panic!("parse_response must not run for an unexpected origin 304");
+            }
+
+            fn timeout_ms(&self) -> u32 {
+                100
+            }
+
+            fn backend_name(
+                &self,
+                _services: &RuntimeServices,
+                _timeout_ms: u32,
+            ) -> Option<String> {
+                Some(UNEXPECTED_304_BACKEND.to_string())
+            }
+        }
+
+        #[derive(Default)]
+        struct RecordingTelemetrySink {
+            batches: Mutex<Vec<AuctionEventBatch>>,
+        }
+
+        #[async_trait::async_trait(?Send)]
+        impl AuctionTelemetrySink for RecordingTelemetrySink {
+            async fn emit_auction_events(
+                &self,
+                _services: &RuntimeServices,
+                batch: AuctionEventBatch,
+            ) -> Result<(), Report<TrustedServerError>> {
+                self.batches
+                    .lock()
+                    .expect("should lock telemetry batches")
+                    .push(batch);
+                Ok(())
+            }
+        }
+
+        fn settings_with_enabled_auction_and_creative_opportunities() -> Settings {
+            let toml = format!(
+                "{}\n[auction]\nenabled = true\n\n\
+                 [creative_opportunities]\ngam_network_id = \"12345\"\n",
+                crate_test_settings_str()
+            );
+            Settings::from_toml(&toml)
+                .expect("should parse settings with auction and creative opportunities enabled")
+        }
+
+        fn settings_with_dispatching_provider() -> Settings {
+            let toml = format!(
+                "{}\n[auction]\nenabled = true\nproviders = [\"{UNEXPECTED_304_PROVIDER}\"]\n\n\
+                 [creative_opportunities]\ngam_network_id = \"12345\"\n",
+                crate_test_settings_str()
+            );
+            Settings::from_toml(&toml)
+                .expect("should parse settings with the dispatching test provider")
+        }
+
+        fn services_with_telemetry(
+            http_client: Arc<dyn crate::platform::PlatformHttpClient>,
+            telemetry_sink: Arc<RecordingTelemetrySink>,
+        ) -> RuntimeServices {
+            let telemetry_sink: Arc<dyn AuctionTelemetrySink> = telemetry_sink;
+            RuntimeServices::builder()
+                .config_store(Arc::new(NoopConfigStore))
+                .secret_store(Arc::new(NoopSecretStore))
+                .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+                .backend(Arc::new(StubBackend))
+                .http_client(http_client)
+                .geo(Arc::new(NoopGeo))
+                .auction_telemetry_sink(telemetry_sink)
+                .client_info(ClientInfo::default())
+                .build()
+        }
+
+        fn article_slot() -> CreativeOpportunitySlot {
+            CreativeOpportunitySlot {
+                id: "article-slot".to_string(),
+                gam_unit_path: None,
+                div_id: None,
+                page_patterns: vec!["/article".to_string()],
+                formats: vec![CreativeOpportunityFormat {
+                    width: 300,
+                    height: 250,
+                    media_type: MediaType::Banner,
+                }],
+                floor_price: None,
+                targeting: Default::default(),
+                providers: Default::default(),
+                compiled_patterns: Vec::new(),
+            }
+        }
+
+        fn conditional_navigation_request() -> Request<EdgeBody> {
+            HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://ts.example.com/article")
+                .header(header::HOST, "ts.example.com")
+                .header("sec-fetch-dest", "document")
+                .header(header::IF_NONE_MATCH, ORIGIN_ETAG)
+                .header(header::IF_MODIFIED_SINCE, ORIGIN_LAST_MODIFIED)
+                .body(EdgeBody::empty())
+                .expect("should build conditional navigation request")
+        }
+
+        fn queue_cacheable_html_response(stub: &StubHttpClient) {
+            stub.push_response_with_headers(
+                200,
+                b"<html><body>origin</body></html>".to_vec(),
+                vec![
+                    ("content-type", "text/html; charset=utf-8"),
+                    ("cache-control", "public, max-age=300"),
+                    ("etag", ORIGIN_ETAG),
+                    ("last-modified", ORIGIN_LAST_MODIFIED),
+                    ("surrogate-control", "max-age=300"),
+                    ("fastly-surrogate-control", "max-age=300"),
+                ],
+            );
+        }
+
+        async fn run_with_slots(
+            settings: &Settings,
+            services: &RuntimeServices,
+            slots: &[CreativeOpportunitySlot],
+            req: Request<EdgeBody>,
+        ) -> PublisherResponse {
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            run_with_orchestrator(settings, services, &orchestrator, slots, req).await
+        }
+
+        async fn run_with_orchestrator(
+            settings: &Settings,
+            services: &RuntimeServices,
+            orchestrator: &AuctionOrchestrator,
+            slots: &[CreativeOpportunitySlot],
+            req: Request<EdgeBody>,
+        ) -> PublisherResponse {
+            let consent = crate::consent::ConsentContext {
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                ..Default::default()
+            };
+            let mut ec_context = EcContext::new_for_test(None, consent);
+
+            handle_publisher_request(
+                settings,
+                services,
+                None,
+                &mut ec_context,
+                AuctionDispatch {
+                    orchestrator,
+                    slots,
+                    registry: None,
+                },
+                req,
+            )
+            .await
+            .expect("should proxy publisher request")
+        }
+
+        fn response_head(response: PublisherResponse) -> http::response::Parts {
+            match response {
+                PublisherResponse::Buffered(response)
+                | PublisherResponse::Stream { response, .. }
+                | PublisherResponse::PassThrough { response, .. } => response.into_parts().0,
+            }
+        }
+
+        fn recorded_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+            headers
+                .iter()
+                .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+        }
+
+        #[tokio::test]
+        async fn eligible_navigation_bypasses_cache_and_returns_non_storable_html() {
+            // Arrange
+            let settings = settings_with_enabled_auction_and_creative_opportunities();
+            let stub = Arc::new(StubHttpClient::new());
+            queue_cacheable_html_response(&stub);
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let slots = [article_slot()];
+            let req = conditional_navigation_request();
+
+            // Act
+            let response = run_with_slots(&settings, &services, &slots, req).await;
+            let response_head = response_head(response);
+
+            // Assert
+            assert_eq!(
+                stub.recorded_cache_bypass_flags(),
+                vec![true],
+                "eligible publisher navigation should bypass the platform cache"
+            );
+            let recorded_requests = stub.recorded_request_headers();
+            let outbound_headers = recorded_requests
+                .first()
+                .expect("should record the outbound publisher request");
+            assert_eq!(
+                recorded_header(outbound_headers, header::IF_NONE_MATCH.as_str()),
+                None,
+                "eligible publisher request should not forward If-None-Match"
+            );
+            assert_eq!(
+                recorded_header(outbound_headers, header::IF_MODIFIED_SINCE.as_str()),
+                None,
+                "eligible publisher request should not forward If-Modified-Since"
+            );
+            assert_eq!(
+                response_head
+                    .headers
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("private, no-store"),
+                "eligible HTML response should be private and non-storable"
+            );
+            for header_name in [
+                header::ETAG,
+                header::LAST_MODIFIED,
+                header::HeaderName::from_static("surrogate-control"),
+                header::HeaderName::from_static("fastly-surrogate-control"),
+            ] {
+                assert!(
+                    !response_head.headers.contains_key(&header_name),
+                    "eligible HTML response should remove {header_name}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn navigation_without_matched_slots_preserves_origin_cache_policy() {
+            // Arrange
+            let settings = settings_with_enabled_auction_and_creative_opportunities();
+            let stub = Arc::new(StubHttpClient::new());
+            queue_cacheable_html_response(&stub);
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let req = conditional_navigation_request();
+
+            // Act
+            let response = run_with_slots(&settings, &services, &[], req).await;
+            let response_head = response_head(response);
+
+            // Assert
+            assert_eq!(
+                stub.recorded_cache_bypass_flags(),
+                vec![false],
+                "publisher navigation without matched slots should use the default cache mode"
+            );
+            let recorded_requests = stub.recorded_request_headers();
+            let outbound_headers = recorded_requests
+                .first()
+                .expect("should record the outbound publisher request");
+            assert_eq!(
+                recorded_header(outbound_headers, header::IF_NONE_MATCH.as_str()),
+                Some(ORIGIN_ETAG),
+                "publisher request without matched slots should preserve If-None-Match"
+            );
+            assert_eq!(
+                recorded_header(outbound_headers, header::IF_MODIFIED_SINCE.as_str()),
+                Some(ORIGIN_LAST_MODIFIED),
+                "publisher request without matched slots should preserve If-Modified-Since"
+            );
+
+            for (header_name, expected) in [
+                (header::CACHE_CONTROL, "public, max-age=300"),
+                (header::ETAG, ORIGIN_ETAG),
+                (header::LAST_MODIFIED, ORIGIN_LAST_MODIFIED),
+                (
+                    header::HeaderName::from_static("surrogate-control"),
+                    "max-age=300",
+                ),
+                (
+                    header::HeaderName::from_static("fastly-surrogate-control"),
+                    "max-age=300",
+                ),
+            ] {
+                assert_eq!(
+                    response_head
+                        .headers
+                        .get(&header_name)
+                        .and_then(|value| value.to_str().ok()),
+                    Some(expected),
+                    "publisher response without matched slots should preserve {header_name}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn eligible_navigation_rejects_unexpected_origin_304() {
+            for content_type in [None, Some("text/html; charset=utf-8")] {
+                // Arrange
+                let settings = settings_with_dispatching_provider();
+                let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+                orchestrator.register_provider(Arc::new(DispatchingTestProvider));
+                let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
+                let stub = Arc::new(StubHttpClient::new());
+
+                // `send_async` consumes the first response before the publisher
+                // origin request consumes the second response.
+                stub.push_response(200, b"unused provider response".to_vec());
+                let mut origin_headers = vec![
+                    ("cache-control", "public, max-age=300"),
+                    ("etag", ORIGIN_ETAG),
+                    ("last-modified", ORIGIN_LAST_MODIFIED),
+                    ("surrogate-control", "max-age=300"),
+                    ("fastly-surrogate-control", "max-age=300"),
+                ];
+                if let Some(content_type) = content_type {
+                    origin_headers.push(("content-type", content_type));
+                }
+                stub.push_response_with_headers(304, Vec::new(), origin_headers);
+                let services = services_with_telemetry(
+                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+                    Arc::clone(&telemetry_sink),
+                );
+                let slots = [article_slot()];
+
+                // Act
+                let response = run_with_orchestrator(
+                    &settings,
+                    &services,
+                    &orchestrator,
+                    &slots,
+                    conditional_navigation_request(),
+                )
+                .await;
+
+                // Assert
+                let response = match response {
+                    PublisherResponse::Buffered(response) => response,
+                    PublisherResponse::PassThrough { .. } | PublisherResponse::Stream { .. } => {
+                        panic!("unexpected origin 304 should return a buffered response")
+                    }
+                };
+                assert_eq!(
+                    response.status(),
+                    StatusCode::BAD_GATEWAY,
+                    "eligible origin 304 should fail closed with or without Content-Type"
+                );
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("private, no-store"),
+                    "eligible origin 304 should return an explicitly non-storable response"
+                );
+                for header_name in [
+                    header::ETAG,
+                    header::LAST_MODIFIED,
+                    header::HeaderName::from_static("surrogate-control"),
+                    header::HeaderName::from_static("fastly-surrogate-control"),
+                ] {
+                    assert!(
+                        !response.headers().contains_key(&header_name),
+                        "eligible origin 304 should not forward {header_name}"
+                    );
+                }
+
+                let batches = telemetry_sink
+                    .batches
+                    .lock()
+                    .expect("should lock telemetry batches");
+                let summary_rows: Vec<_> = batches
+                    .iter()
+                    .flat_map(AuctionEventBatch::rows)
+                    .filter(|row| row.event_kind == "summary")
+                    .collect();
+                assert_eq!(
+                    summary_rows.len(),
+                    1,
+                    "unexpected origin 304 should emit exactly one summary row"
+                );
+                assert_eq!(
+                    summary_rows[0].terminal_status.as_deref(),
+                    Some("abandoned"),
+                    "unexpected origin 304 should abandon the dispatched auction"
+                );
+                assert_eq!(
+                    summary_rows[0].terminal_reason.as_deref(),
+                    Some("unexpected_origin_304"),
+                    "unexpected origin 304 should use the bounded telemetry reason"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn noneligible_origin_304_preserves_conditional_response_metadata() {
+            // Arrange
+            let settings = settings_with_enabled_auction_and_creative_opportunities();
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                304,
+                Vec::new(),
+                vec![
+                    ("cache-control", "public, max-age=300"),
+                    ("etag", ORIGIN_ETAG),
+                    ("last-modified", ORIGIN_LAST_MODIFIED),
+                    ("surrogate-control", "max-age=300"),
+                    ("fastly-surrogate-control", "max-age=300"),
+                ],
+            );
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+
+            // Act
+            let response =
+                run_with_slots(&settings, &services, &[], conditional_navigation_request()).await;
+
+            // Assert
+            let response = match response {
+                PublisherResponse::Buffered(response) => response,
+                PublisherResponse::PassThrough { .. } | PublisherResponse::Stream { .. } => {
+                    panic!("noneligible origin 304 should remain buffered")
+                }
+            };
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_MODIFIED,
+                "noneligible origin 304 should preserve its status"
+            );
+            for (header_name, expected) in [
+                (header::CACHE_CONTROL, "public, max-age=300"),
+                (header::ETAG, ORIGIN_ETAG),
+                (header::LAST_MODIFIED, ORIGIN_LAST_MODIFIED),
+                (
+                    header::HeaderName::from_static("surrogate-control"),
+                    "max-age=300",
+                ),
+                (
+                    header::HeaderName::from_static("fastly-surrogate-control"),
+                    "max-age=300",
+                ),
+            ] {
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(&header_name)
+                        .and_then(|value| value.to_str().ok()),
+                    Some(expected),
+                    "noneligible origin 304 should preserve {header_name}"
+                );
+            }
+            assert_eq!(
+                stub.recorded_cache_bypass_flags(),
+                vec![false],
+                "noneligible publisher navigation should use the default cache mode"
+            );
+            let recorded_requests = stub.recorded_request_headers();
+            let outbound_headers = recorded_requests
+                .first()
+                .expect("should record the outbound publisher request");
+            assert_eq!(
+                recorded_header(outbound_headers, header::IF_NONE_MATCH.as_str()),
+                Some(ORIGIN_ETAG),
+                "noneligible publisher request should preserve If-None-Match"
+            );
+            assert_eq!(
+                recorded_header(outbound_headers, header::IF_MODIFIED_SINCE.as_str()),
+                Some(ORIGIN_LAST_MODIFIED),
+                "noneligible publisher request should preserve If-Modified-Since"
+            );
+        }
     }
 
     #[tokio::test]

@@ -228,6 +228,7 @@ pub(crate) struct StubHttpClient {
     // streaming response support.
     streaming_responses_supported: std::sync::atomic::AtomicBool,
     image_optimizer_options: Mutex<Vec<Option<PlatformImageOptimizerOptions>>>,
+    cache_bypass_flags: Mutex<Vec<bool>>,
     stream_response_flags: Mutex<Vec<bool>>,
     request_methods: Mutex<Vec<String>>,
     request_uris: Mutex<Vec<String>>,
@@ -251,6 +252,7 @@ impl StubHttpClient {
             concurrent_fanout: std::sync::atomic::AtomicBool::new(true),
             streaming_responses_supported: std::sync::atomic::AtomicBool::new(false),
             image_optimizer_options: Mutex::new(Vec::new()),
+            cache_bypass_flags: Mutex::new(Vec::new()),
             stream_response_flags: Mutex::new(Vec::new()),
             request_methods: Mutex::new(Vec::new()),
             request_uris: Mutex::new(Vec::new()),
@@ -329,6 +331,14 @@ impl StubHttpClient {
             .clone()
     }
 
+    /// Return cache-bypass flags captured per `send` or `send_async` call, in order.
+    pub(crate) fn recorded_cache_bypass_flags(&self) -> Vec<bool> {
+        self.cache_bypass_flags
+            .lock()
+            .expect("should lock cache bypass flags")
+            .clone()
+    }
+
     /// Return streaming-response flags captured per `send` call, in order.
     pub fn recorded_stream_response_flags(&self) -> Vec<bool> {
         self.stream_response_flags
@@ -391,6 +401,10 @@ impl PlatformHttpClient for StubHttpClient {
             .lock()
             .expect("should lock image optimizer options")
             .push(request.image_optimizer.clone());
+        self.cache_bypass_flags
+            .lock()
+            .expect("should lock cache bypass flags")
+            .push(request.bypass_cache);
         self.stream_response_flags
             .lock()
             .expect("should lock stream response flags")
@@ -471,6 +485,10 @@ impl PlatformHttpClient for StubHttpClient {
             .lock()
             .expect("should lock calls")
             .push(backend_name.clone());
+        self.cache_bypass_flags
+            .lock()
+            .expect("should lock cache bypass flags")
+            .push(request.bypass_cache);
 
         let headers: Vec<(String, String)> = request
             .request
@@ -775,6 +793,11 @@ mod tests {
             vec!["stub-backend"],
             "should record the backend name"
         );
+        assert_eq!(
+            stub.recorded_cache_bypass_flags(),
+            vec![false],
+            "should record the default cache-bypass flag"
+        );
     }
 
     #[test]
@@ -820,8 +843,9 @@ mod tests {
 
         let pending_a = futures::executor::block_on(stub.send_async(make_req("backend-a")))
             .expect("should start request a");
-        let pending_b = futures::executor::block_on(stub.send_async(make_req("backend-b")))
-            .expect("should start request b");
+        let pending_b =
+            futures::executor::block_on(stub.send_async(make_req("backend-b").with_cache_bypass()))
+                .expect("should start request b");
 
         assert_eq!(
             pending_a.backend_name(),
@@ -859,6 +883,11 @@ mod tests {
             names,
             vec!["backend-a", "backend-b"],
             "should record both send_async calls in order"
+        );
+        assert_eq!(
+            stub.recorded_cache_bypass_flags(),
+            vec![false, true],
+            "should record both send_async cache-bypass flags in order"
         );
     }
 
