@@ -102,7 +102,7 @@ than allowing the browser to reuse stale personalized HTML.
 
 Existing publisher transport-error handling remains unchanged. The unexpected
 304 case will reuse the existing abandoned-auction event mechanism with a
-specific reason such as `unexpected_origin_304`, allowing it to be distinguished
+specific reason `unexpected_origin_304`, allowing it to be distinguished
 from transport failures and ordinary bodiless responses.
 
 Noneligible publisher requests retain their existing 304 behavior. This avoids a
