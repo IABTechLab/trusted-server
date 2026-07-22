@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1463,6 +1463,11 @@ impl PrebidAuctionProvider {
                 }
 
                 let mut bidder = expanded;
+                // Bidders whose params came from the slot itself rather than from
+                // `trustedServer` expansion. Only these can represent a publisher
+                // misconfiguration if they are dropped below; a dropped fabricated
+                // entry is the designed stored-request path.
+                let mut slot_supplied: HashSet<String> = HashSet::new();
                 for (name, params) in direct {
                     // Direct entries win over the expansion — except when an
                     // unusable direct value (`{}` or a non-object) would overwrite
@@ -1474,6 +1479,7 @@ impl PrebidAuctionProvider {
                             .get(&name)
                             .is_some_and(|existing| !is_unusable_bidder_params(existing));
                     if !clobbers_real {
+                        slot_supplied.insert(name.clone());
                         bidder.insert(name, params);
                     }
                 }
@@ -1492,20 +1498,45 @@ impl PrebidAuctionProvider {
                 // explicitly, and shipping either gets the imp rejected; a single
                 // non-2xx then collapses into an auction-wide bid wipeout (see
                 // `parse_response`), so one misconfigured slot must never reach the
-                // wire. Log each drop at warn so the misconfiguration is visible
-                // where an operator can act on it — the PBS 400 body is otherwise
-                // discarded unless trace logging is enabled.
+                // wire.
+                //
+                // The two drop sources get different levels, one line per slot. A
+                // slot that supplied unusable params inline is a publisher mistake
+                // an operator can act on, so it warns — the PBS 400 body is
+                // otherwise discarded unless trace logging is enabled. Fabricated
+                // empties that no override rule filled are the designed
+                // creative-opportunity path (see `CreativeOpportunitySlot::to_ad_slot`),
+                // so they log at debug and do not bury the warn.
+                let mut dropped_slot_supplied: Vec<String> = Vec::new();
+                let mut dropped_fabricated: Vec<String> = Vec::new();
                 bidder.retain(|name, params| {
                     if is_unusable_bidder_params(params) {
-                        log::warn!(
-                            "prebid: dropping bidder '{}' on slot '{}' — empty or non-object params; slot falls back to its stored request",
-                            name,
-                            slot.id
-                        );
+                        if slot_supplied.contains(name) {
+                            dropped_slot_supplied.push(name.clone());
+                        } else {
+                            dropped_fabricated.push(name.clone());
+                        }
                         return false;
                     }
                     true
                 });
+                if !dropped_slot_supplied.is_empty() {
+                    // Sorted so the line is stable across `HashMap` iteration order.
+                    dropped_slot_supplied.sort();
+                    log::warn!(
+                        "prebid: dropping slot '{}' bidders [{}] — slot supplied empty or non-object params; slot falls back to its stored request",
+                        slot.id,
+                        dropped_slot_supplied.join(", ")
+                    );
+                }
+                if !dropped_fabricated.is_empty() {
+                    dropped_fabricated.sort();
+                    log::debug!(
+                        "prebid: dropping slot '{}' bidders [{}] — expansion fabricated empty params and no override rule filled them; slot falls back to its stored request",
+                        slot.id,
+                        dropped_fabricated.join(", ")
+                    );
+                }
 
                 // When no eligible PBS bidder params remain, tell PBS to resolve
                 // bidder config from the stored request keyed by this slot ID. This
