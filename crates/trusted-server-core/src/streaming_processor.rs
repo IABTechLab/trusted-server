@@ -112,6 +112,11 @@ impl Default for PipelineConfig {
 pub struct StreamingPipeline<P: StreamProcessor> {
     config: PipelineConfig,
     processor: P,
+    /// Cumulative decoded-byte ceiling for the gzip decode path. Defaults to
+    /// `usize::MAX` (unbounded); set via [`Self::with_max_decoded_bytes`] on the
+    /// buffered publisher path so a gzip bomb is rejected mid-decode instead of
+    /// materializing its full expansion.
+    max_decoded_bytes: usize,
 }
 
 impl<P: StreamProcessor> StreamingPipeline<P> {
@@ -121,7 +126,25 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
     ///
     /// No errors are returned by this constructor.
     pub fn new(config: PipelineConfig, processor: P) -> Self {
-        Self { config, processor }
+        Self {
+            config,
+            processor,
+            max_decoded_bytes: usize::MAX,
+        }
+    }
+
+    /// Bound the cumulative decoded output of the gzip decode path.
+    ///
+    /// Only the gzip reader materializes decoded bytes ahead of the downstream
+    /// writer; the deflate and brotli read decoders already emit into the
+    /// caller's fixed-size buffer. Callers that buffer output under a configured
+    /// ceiling (e.g. `publisher.max_buffered_body_bytes`) should pass that
+    /// ceiling here so decode rejection cannot be preceded by a large
+    /// allocation.
+    #[must_use]
+    pub fn with_max_decoded_bytes(mut self, max_decoded_bytes: usize) -> Self {
+        self.max_decoded_bytes = max_decoded_bytes;
+        self
     }
 
     /// Process a stream from input to output
@@ -149,7 +172,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                 // Shares `GzipStreamDecoder` with the streaming `BodyStreamDecoder`
                 // gzip codec, so both paths tolerate trailing garbage after the
                 // final member the same way.
-                let decoder = GzipDecodeReader::new(input);
+                let decoder = GzipDecodeReader::new(input, self.max_decoded_bytes);
                 let mut encoder = GzEncoder::new(output, flate2::Compression::default());
                 self.process_chunks(decoder, &mut encoder)?;
                 encoder.finish().change_context(TrustedServerError::Proxy {
@@ -158,7 +181,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                 Ok(())
             }
             (Compression::Gzip, Compression::None) => {
-                self.process_chunks(GzipDecodeReader::new(input), output)
+                self.process_chunks(GzipDecodeReader::new(input, self.max_decoded_bytes), output)
             }
             (Compression::Deflate, Compression::Deflate) => {
                 let decoder = ZlibDecoder::new(input);
@@ -553,7 +576,13 @@ impl GzipStreamDecoder {
                 }
                 GzipStreamState::TrailingGarbage(_) => break,
                 GzipStreamState::Poisoned => {
-                    unreachable!("poisoned state is never left in place across iterations")
+                    // A prior call errored mid-transition, leaving the state
+                    // poisoned. No current caller retries after an error, but
+                    // returning an error (rather than `unreachable!`, which
+                    // aborts the Wasm instance) keeps a re-entrant caller safe.
+                    return Err(io::Error::other(
+                        "gzip decoder previously failed; stream is unusable",
+                    ));
                 }
             }
         }
@@ -585,7 +614,12 @@ impl GzipStreamDecoder {
             }
             GzipStreamState::TrailingGarbage(sink) => Ok(std::mem::take(&mut sink.buffer)),
             GzipStreamState::Poisoned => {
-                unreachable!("poisoned state is never left in place across calls")
+                // See the `Poisoned` arm in `decode`: a prior mid-transition
+                // error left the decoder unusable; error cleanly rather than
+                // aborting the Wasm instance via `unreachable!`.
+                Err(io::Error::other(
+                    "gzip decoder previously failed; stream is unusable",
+                ))
             }
         }
     }
@@ -617,12 +651,17 @@ impl GzipStreamDecoder {
 
 /// [`Read`] adapter that decodes multi-member gzip through [`GzipStreamDecoder`].
 ///
-/// Used by the buffered [`StreamingPipeline`] so it shares the streaming
-/// path's trailing-garbage tolerance instead of erroring like
-/// `flate2::read::MultiGzDecoder`. The decode budget is unbounded here for
-/// parity with the reader it replaces — the buffered path bounds output
-/// downstream (e.g. via `BoundedWriter`).
-struct GzipDecodeReader<R: Read> {
+/// Used by the buffered [`StreamingPipeline`] and the buffered auction hold path
+/// so both share the streaming path's trailing-garbage tolerance and multi-member
+/// support instead of erroring (or dropping members) like
+/// `flate2::read::MultiGzDecoder`/`GzDecoder`.
+///
+/// `max_decoded_bytes` bounds cumulative decoded output: each compressed block's
+/// expansion is charged against the budget from inside [`GzipStreamDecoder`]'s
+/// bounded sink, so a decompression bomb is rejected mid-decode rather than fully
+/// materialized before a downstream writer (e.g. `BoundedWriter`) can act. Pass
+/// `usize::MAX` where an upstream/downstream stage already bounds the size.
+pub(crate) struct GzipDecodeReader<R: Read> {
     input: R,
     decoder: GzipStreamDecoder,
     raw: Vec<u8>,
@@ -632,10 +671,10 @@ struct GzipDecodeReader<R: Read> {
 }
 
 impl<R: Read> GzipDecodeReader<R> {
-    fn new(input: R) -> Self {
+    pub(crate) fn new(input: R, max_decoded_bytes: usize) -> Self {
         Self {
             input,
-            decoder: GzipStreamDecoder::new(Rc::new(Cell::new(0)), usize::MAX),
+            decoder: GzipStreamDecoder::new(Rc::new(Cell::new(0)), max_decoded_bytes),
             raw: vec![0_u8; STREAM_CHUNK_SIZE],
             decoded: Vec::new(),
             position: 0,
@@ -695,6 +734,28 @@ fn charge_decoded(
     Ok(())
 }
 
+/// Append `data` to `output`, growing capacity with amortized doubling but
+/// never past `max_decoded_bytes + 1`.
+///
+/// A plain `Vec` doubles on growth, so accumulating a decode up to an N-byte
+/// ceiling can leave the buffer with ~2N capacity. Capping the reservation at
+/// the decoded limit keeps a decompression bomb from ballooning the accumulator
+/// to roughly twice the configured ceiling before the cumulative-byte charge
+/// rejects it.
+fn extend_capped(output: &mut Vec<u8>, data: &[u8], max_decoded_bytes: usize) {
+    let needed = output.len() + data.len();
+    if needed > output.capacity() {
+        let target = output
+            .capacity()
+            .saturating_mul(2)
+            .max(needed)
+            .min(max_decoded_bytes.saturating_add(1))
+            .max(needed);
+        output.reserve_exact(target - output.len());
+    }
+    output.extend_from_slice(data);
+}
+
 /// Streaming zlib decoder that tracks whether the stream reached its end
 /// marker, so truncated deflate bodies fail at finalization.
 struct DeflateStreamDecoder {
@@ -719,6 +780,17 @@ impl DeflateStreamDecoder {
         charge_decoded(&self.decoded_bytes, self.max_decoded_bytes, len)
     }
 
+    /// The number of scratch bytes the inflater may write this step: the
+    /// remaining budget plus one — so a decompression bomb produces exactly one
+    /// byte past the ceiling, which [`Self::charge`] then rejects — capped at
+    /// `scratch_len`.
+    fn decode_window(&self, scratch_len: usize) -> usize {
+        let remaining = self
+            .max_decoded_bytes
+            .saturating_sub(self.decoded_bytes.get());
+        remaining.saturating_add(1).min(scratch_len)
+    }
+
     /// Decode as much of `chunk` as possible, draining any output the inflater
     /// can still produce once all input is consumed.
     ///
@@ -729,34 +801,46 @@ impl DeflateStreamDecoder {
     /// makes no further progress, so those pending bytes are never stranded and
     /// a valid stream is not mistaken for a truncated one at `finish`.
     fn decode(&mut self, chunk: &[u8]) -> Result<Vec<u8>, Report<TrustedServerError>> {
-        let mut output = Vec::with_capacity(STREAM_CHUNK_SIZE);
+        let mut output = Vec::new();
         let mut offset = 0usize;
+        // The inflater writes into this fixed-size scratch buffer, never a
+        // growing `Vec`. `decompress_vec` fills a doubled `Vec` to its full
+        // capacity before the produced bytes can be charged, so a bomb could
+        // materialize ~2× the cap before rejection. A fixed scratch window
+        // bounded by the remaining budget produces at most one byte past the
+        // ceiling per step, which `charge` rejects before it is appended.
+        let mut scratch = [0_u8; STREAM_CHUNK_SIZE];
         // Trailing bytes after the zlib end marker are ignored, matching the
         // read-based decoder used by the buffered pipeline.
         while !self.stream_ended {
-            if output.len() == output.capacity() {
-                output.reserve(STREAM_CHUNK_SIZE);
-            }
+            let window = self.decode_window(scratch.len());
             let before_in = self.decompress.total_in();
             let before_out = self.decompress.total_out();
             let status = self
                 .decompress
-                .decompress_vec(&chunk[offset..], &mut output, flate2::FlushDecompress::None)
+                .decompress(
+                    &chunk[offset..],
+                    &mut scratch[..window],
+                    flate2::FlushDecompress::None,
+                )
                 .change_context(TrustedServerError::Proxy {
                     message: "Failed to decode deflate publisher body chunk".to_string(),
                 })?;
             let consumed = (self.decompress.total_in() - before_in) as usize;
             let produced = (self.decompress.total_out() - before_out) as usize;
             offset += consumed;
+            // Charge before appending so a bomb errors before its bytes are
+            // buffered.
             self.charge(produced)?;
+            extend_capped(&mut output, &scratch[..produced], self.max_decoded_bytes);
             match status {
                 flate2::Status::StreamEnd => self.stream_ended = true,
                 flate2::Status::Ok | flate2::Status::BufError => {
-                    // Stop only when the inflater is starved for input: it made
-                    // no progress and there is still spare output capacity, so
-                    // the stall is missing input (arriving in a later chunk, or
-                    // resolved at `finish`), not an exhausted output buffer.
-                    if consumed == 0 && produced == 0 && output.len() < output.capacity() {
+                    // The write window is always at least one byte, so no
+                    // progress means the inflater is starved for input (arriving
+                    // in a later chunk, or resolved at `finish`), not an
+                    // exhausted output buffer.
+                    if consumed == 0 && produced == 0 {
                         break;
                     }
                 }
@@ -773,19 +857,22 @@ impl DeflateStreamDecoder {
     /// truncated stream makes no further progress and errors.
     fn finish(&mut self) -> Result<Vec<u8>, Report<TrustedServerError>> {
         let mut output = Vec::new();
+        // Same fixed scratch buffer as `decode`: the terminal flush can still
+        // expand a withheld bomb, so it must be bounded by the remaining budget
+        // rather than draining into a doubling `Vec`.
+        let mut scratch = [0_u8; STREAM_CHUNK_SIZE];
         while !self.stream_ended {
-            if output.len() == output.capacity() {
-                output.reserve(STREAM_CHUNK_SIZE);
-            }
+            let window = self.decode_window(scratch.len());
             let before_out = self.decompress.total_out();
             let status = self
                 .decompress
-                .decompress_vec(&[], &mut output, flate2::FlushDecompress::Finish)
+                .decompress(&[], &mut scratch[..window], flate2::FlushDecompress::Finish)
                 .change_context(TrustedServerError::Proxy {
                     message: "Failed to finalize deflate publisher body decoder".to_string(),
                 })?;
             let produced = (self.decompress.total_out() - before_out) as usize;
             self.charge(produced)?;
+            extend_capped(&mut output, &scratch[..produced], self.max_decoded_bytes);
             match status {
                 flate2::Status::StreamEnd => self.stream_ended = true,
                 flate2::Status::Ok | flate2::Status::BufError => {
@@ -1211,12 +1298,95 @@ mod tests {
         );
     }
 
+    fn zlib_compress(data: &[u8]) -> Vec<u8> {
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder
+            .write_all(data)
+            .expect("should write deflate test input");
+        encoder.finish().expect("should finish deflate encoding")
+    }
+
+    #[test]
+    fn deflate_decode_caps_buffer_capacity_at_decoded_limit() {
+        // Regression for the ~2× allocation: `decompress_vec` doubled the output
+        // `Vec` and let the inflater fill the doubled capacity before the cap
+        // check ran, so a 16 MiB limit peaked at 32 MiB. The fixed-scratch
+        // decoder must decode a body sitting exactly at the cap without letting
+        // its accumulator balloon toward twice the ceiling.
+        let cap = STREAM_CHUNK_SIZE * 16;
+        let payload = vec![b'a'; cap];
+        let compressed = zlib_compress(&payload);
+        let mut decoder = DeflateStreamDecoder::new(Rc::new(Cell::new(0)), cap);
+
+        let decoded = decoder
+            .decode(&compressed)
+            .expect("a body exactly at the cap must decode");
+
+        assert_eq!(decoded.len(), cap, "should decode the whole payload");
+        assert!(
+            decoded.capacity() <= cap + STREAM_CHUNK_SIZE,
+            "decode buffer must not balloon toward ~2× the cap: cap={cap} capacity={}",
+            decoded.capacity()
+        );
+    }
+
+    #[test]
+    fn deflate_decode_rejects_bomb_before_expanding_past_limit() {
+        // A tiny compressed input that expands to far more than twice the cap
+        // must be rejected by the cumulative charge, not decoded in full first.
+        let cap = STREAM_CHUNK_SIZE * 16;
+        let bomb = zlib_compress(&vec![0_u8; cap * 64]);
+        assert!(
+            bomb.len() < cap,
+            "test precondition: the bomb's compressed form must stay well under the cap"
+        );
+        let mut decoder = DeflateStreamDecoder::new(Rc::new(Cell::new(0)), cap);
+
+        let err = decoder
+            .decode(&bomb)
+            .expect_err("a bomb expanding past the cap must error");
+
+        assert!(
+            format!("{err:?}").contains("decoded size exceeded"),
+            "should report the cumulative decoded cap: {err:?}"
+        );
+    }
+
     fn gzip_member(data: &[u8]) -> Vec<u8> {
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder
             .write_all(data)
             .expect("should write gzip test input");
         encoder.finish().expect("should finish gzip encoding")
+    }
+
+    #[test]
+    fn gzip_decode_reader_rejects_bomb_before_materializing_past_limit() {
+        // A tiny gzip member expanding far past the cap must be rejected by the
+        // reader's bounded sink mid-decode. Before this bound the reader used a
+        // `usize::MAX` budget and decoded the whole compressed block into its
+        // buffer (several MiB) before any downstream writer could reject it.
+        let cap = STREAM_CHUNK_SIZE;
+        let bomb = gzip_member(&vec![0_u8; cap * 512]);
+        assert!(
+            bomb.len() < cap,
+            "test precondition: the compressed bomb must stay under the cap"
+        );
+        let mut reader = GzipDecodeReader::new(std::io::Cursor::new(bomb), cap);
+
+        let mut sink = Vec::new();
+        let err = std::io::copy(&mut reader, &mut sink)
+            .expect_err("a gzip bomb expanding past the cap must error");
+
+        assert!(
+            err.to_string().contains("decoded size exceeded"),
+            "should report the cumulative decoded cap: {err}"
+        );
+        assert!(
+            sink.len() <= cap,
+            "no more than the cap may be emitted before rejection: {} bytes",
+            sink.len()
+        );
     }
 
     #[test]
