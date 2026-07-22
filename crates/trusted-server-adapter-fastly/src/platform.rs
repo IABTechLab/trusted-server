@@ -408,6 +408,12 @@ fn fastly_response_to_platform(
 // FastlyPlatformHttpClient
 // ---------------------------------------------------------------------------
 
+fn apply_fastly_cache_bypass(request: &mut fastly::Request, bypass_cache: bool) {
+    if bypass_cache {
+        request.set_pass(true);
+    }
+}
+
 /// Fastly implementation of [`PlatformHttpClient`].
 ///
 /// - [`send`](PlatformHttpClient::send) converts the platform request to a
@@ -431,10 +437,12 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         let backend_name = request.backend_name.clone();
         let image_optimizer = request.image_optimizer;
         let stream_response = request.stream_response;
+        let bypass_cache = request.bypass_cache;
         let mut fastly_req = edge_request_to_fastly(request.request)?;
         if let Some(options) = image_optimizer {
             apply_fastly_image_optimizer(&mut fastly_req, options)?;
         }
+        apply_fastly_cache_bypass(&mut fastly_req, bypass_cache);
         let fastly_resp = fastly_req
             .send(&backend_name)
             .change_context(PlatformError::HttpClient)?;
@@ -454,7 +462,9 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
             return Err(Report::new(PlatformError::HttpClient)
                 .attach("streaming responses are not supported with Fastly send_async"));
         }
-        let fastly_req = edge_request_to_fastly(request.request)?;
+        let bypass_cache = request.bypass_cache;
+        let mut fastly_req = edge_request_to_fastly(request.request)?;
+        apply_fastly_cache_bypass(&mut fastly_req, bypass_cache);
         let pending = fastly_req
             .send_async(&backend_name)
             .change_context(PlatformError::HttpClient)?;
@@ -735,6 +745,26 @@ mod tests {
     }
 
     // --- FastlyPlatformHttpClient -------------------------------------------
+
+    #[test]
+    fn apply_fastly_cache_bypass_sets_pass_when_enabled() {
+        let mut request = fastly::Request::get("https://example.com/");
+        apply_fastly_cache_bypass(&mut request, true);
+        assert!(
+            format!("{request:?}").contains("cache_override: Pass"),
+            "enabled bypass should select Fastly pass mode"
+        );
+    }
+
+    #[test]
+    fn apply_fastly_cache_bypass_preserves_default_when_disabled() {
+        let mut request = fastly::Request::get("https://example.com/");
+        apply_fastly_cache_bypass(&mut request, false);
+        assert!(
+            format!("{request:?}").contains("cache_override: None"),
+            "disabled bypass should preserve Fastly read-through caching"
+        );
+    }
 
     #[test]
     fn fastly_platform_http_client_send_returns_error_for_unregistered_backend() {
