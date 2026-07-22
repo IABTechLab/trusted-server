@@ -738,12 +738,14 @@ pub async fn stream_publisher_body_async<W: Write>(
         AuctionCollectCtx {
             dispatched,
             telemetry,
-            price_granularity: params.price_granularity,
-            ad_bids_state: &params.ad_bids_state,
-            orchestrator,
-            services,
-            settings,
-            request_origin: request_origin(&params.request_scheme, &params.request_host),
+            deps: AuctionCollectDeps {
+                price_granularity: params.price_granularity,
+                ad_bids_state: &params.ad_bids_state,
+                orchestrator,
+                services,
+                settings,
+                request_origin: request_origin(&params.request_scheme, &params.request_host),
+            },
         },
     )
     .await
@@ -1079,10 +1081,19 @@ impl AuctionTelemetryCarry {
     }
 }
 
-/// Bundles the auction-collection dependencies passed through the streaming helpers.
+/// Bundles the auction-collection state passed through the streaming helpers.
 struct AuctionCollectCtx<'a> {
     dispatched: DispatchedAuction,
     telemetry: AuctionTelemetryCarry,
+    deps: AuctionCollectDeps<'a>,
+}
+
+/// Borrowed dependencies of the auction collect step.
+///
+/// Split from the per-auction state above because `dispatched` and `telemetry`
+/// are moved out at collect time while these stay live for the rest of the
+/// streaming loop.
+struct AuctionCollectDeps<'a> {
     price_granularity: PriceGranularity,
     ad_bids_state: &'a Arc<Mutex<Option<String>>>,
     orchestrator: &'a AuctionOrchestrator,
@@ -1213,12 +1224,7 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
     let AuctionCollectCtx {
         dispatched,
         mut telemetry,
-        price_granularity,
-        ad_bids_state,
-        orchestrator,
-        services,
-        settings,
-        request_origin,
+        deps,
     } = ctx;
     let mut buffer = vec![0u8; STREAM_CHUNK_SIZE];
     let mut hold = Some(BodyCloseHoldBuffer::new());
@@ -1231,17 +1237,7 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
                     let dispatched = dispatched
                         .take()
                         .expect("should have dispatched auction to collect");
-                    collect_stream_auction(
-                        dispatched,
-                        telemetry.take(),
-                        price_granularity,
-                        ad_bids_state,
-                        orchestrator,
-                        services,
-                        settings,
-                        &request_origin,
-                    )
-                    .await;
+                    collect_stream_auction(dispatched, telemetry.take(), &deps).await;
 
                     let held = hold.finish();
                     write_processed_chunk(
@@ -1281,7 +1277,7 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
                     ) {
                         if let Some(dispatched) = dispatched.take() {
                             emit_abandoned_auction(
-                                services,
+                                deps.services,
                                 telemetry.observation.take(),
                                 dispatched,
                                 "stream_process_error",
@@ -1295,17 +1291,7 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
                         let dispatched = dispatched
                             .take()
                             .expect("should have dispatched auction to collect");
-                        collect_stream_auction(
-                            dispatched,
-                            telemetry.take(),
-                            price_granularity,
-                            ad_bids_state,
-                            orchestrator,
-                            services,
-                            settings,
-                            &request_origin,
-                        )
-                        .await;
+                        collect_stream_auction(dispatched, telemetry.take(), &deps).await;
 
                         let held = hold
                             .take()
@@ -1334,7 +1320,7 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
             Err(e) => {
                 if let Some(dispatched) = dispatched.take() {
                     emit_abandoned_auction(
-                        services,
+                        deps.services,
                         telemetry.observation.take(),
                         dispatched,
                         "stream_read_error",
@@ -1379,20 +1365,22 @@ async fn emit_abandoned_auction(
     .await;
 }
 
-// Private orchestration helper called only from `body_close_hold_loop`, whose
-// arguments mirror the fields of `AuctionCollectCtx` it destructures; a separate
-// parameter struct would just duplicate that context.
-#[allow(clippy::too_many_arguments)]
+// Private orchestration helper called only from `body_close_hold_loop`.
+// `dispatched` and `telemetry` are moved per collect, so they stay by value
+// while the rest of the context is borrowed.
 async fn collect_stream_auction(
     dispatched: DispatchedAuction,
     telemetry: AuctionTelemetryCarry,
-    price_granularity: PriceGranularity,
-    ad_bids_state: &Arc<Mutex<Option<String>>>,
-    orchestrator: &AuctionOrchestrator,
-    services: &RuntimeServices,
-    settings: &Settings,
-    request_origin: &str,
+    deps: &AuctionCollectDeps<'_>,
 ) {
+    let AuctionCollectDeps {
+        price_granularity,
+        ad_bids_state,
+        orchestrator,
+        services,
+        settings,
+        request_origin,
+    } = deps;
     log::info!("body_close_hold_loop: collecting dispatched auction before held body tail");
     let placeholder = mediator_placeholder_request();
     let collect_ctx = make_collect_context(settings, services, &placeholder);
@@ -1419,7 +1407,7 @@ async fn collect_stream_auction(
     );
     write_bids_to_state(
         &result.winning_bids,
-        price_granularity,
+        *price_granularity,
         ad_bids_state,
         settings,
         request_origin,
@@ -2191,11 +2179,19 @@ pub(crate) fn build_bid_map(
                         serde_json::Value::String(path.clone()),
                     );
                 }
+                // Win/billing notification URLs, fired verbatim by the bridge.
+                // Per OpenRTB these are the canonical carriers of
+                // `${AUCTION_PRICE}`, so expand it from the same winning CPM used
+                // for the creative below — an unexpanded macro would report an
+                // unresolved clearing price to the SSP, and some reject such
+                // notifications outright.
                 if let Some(ref nurl) = bid.nurl {
-                    obj.insert("nurl".to_string(), serde_json::Value::String(nurl.clone()));
+                    let nurl = crate::creative::expand_auction_price_macro(nurl, cpm);
+                    obj.insert("nurl".to_string(), serde_json::Value::String(nurl));
                 }
                 if let Some(ref burl) = bid.burl {
-                    obj.insert("burl".to_string(), serde_json::Value::String(burl.clone()));
+                    let burl = crate::creative::expand_auction_price_macro(burl, cpm);
+                    obj.insert("burl".to_string(), serde_json::Value::String(burl));
                 }
                 // Always include the winning creative so the pbRender bridge can
                 // render it locally when GAM serves the Prebid Universal Creative
@@ -2232,6 +2228,10 @@ pub(crate) fn build_bid_map(
                 }
                 // Verbose per-bid debug blob only under the testing flag; also
                 // doubles as the client-side gate for the direct GAM-replace path.
+                // Deliberately mirrors the bidder-supplied `creative`/`nurl`/`burl`
+                // verbatim, macros unexpanded: this blob is diagnostic — nothing
+                // renders or fires from it — and showing what the bidder actually
+                // sent is the point.
                 if include_debug_bid {
                     obj.insert(
                         "debug_bid".to_string(),
@@ -3376,12 +3376,14 @@ mod tests {
                 observation: None,
                 auction_request: None,
             },
-            price_granularity: PriceGranularity::default(),
-            ad_bids_state: &ad_bids_state,
-            orchestrator: &orchestrator,
-            services: &services,
-            settings: &settings,
-            request_origin: String::new(),
+            deps: AuctionCollectDeps {
+                price_granularity: PriceGranularity::default(),
+                ad_bids_state: &ad_bids_state,
+                orchestrator: &orchestrator,
+                services: &services,
+                settings: &settings,
+                request_origin: String::new(),
+            },
         };
         let mut output = Vec::new();
 
@@ -4858,6 +4860,51 @@ mod tests {
                 adm.contains("p=1.5"),
                 "the exact winning CPM should be substituted into the signed URL: {adm}"
             );
+        }
+
+        #[test]
+        fn build_bid_map_expands_auction_price_macro_in_notification_urls() {
+            // Per OpenRTB the win/billing notices are the primary carriers of
+            // ${AUCTION_PRICE}, and the bridge fires them verbatim. An unexpanded
+            // macro would report an unresolved clearing price to the SSP, and
+            // would disagree with the price already substituted into the adm.
+            let mut winning_bids = HashMap::new();
+            let bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "examplessp",
+                "abc123",
+                "https://ssp.example.com/win?p=${AUCTION_PRICE}",
+                "https://ssp.example.com/bill?p=${AUCTION_PRICE}",
+            );
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                "",
+                false,
+            );
+            let obj = map
+                .get("atf_sidebar_ad")
+                .and_then(|v| v.as_object())
+                .expect("should have bid entry");
+
+            for field in ["nurl", "burl"] {
+                let url = obj
+                    .get(field)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_else(|| panic!("should include {field}"));
+                assert!(
+                    !url.to_uppercase().contains("AUCTION_PRICE"),
+                    "no literal or encoded ${{AUCTION_PRICE}} macro should survive in {field}: {url}"
+                );
+                assert!(
+                    url.ends_with("?p=1.5"),
+                    "the exact winning CPM should be substituted into {field}: {url}"
+                );
+            }
         }
 
         #[test]

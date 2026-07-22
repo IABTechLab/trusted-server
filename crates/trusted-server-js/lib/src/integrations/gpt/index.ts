@@ -1033,6 +1033,10 @@ export function installTsRenderBridge(): void {
             height: cached.height ?? height,
           })
         );
+        // Beacons carry the server-expanded ${AUCTION_PRICE} from the auction's
+        // clearing price, not `cached.price` — the auction result is the
+        // authoritative clearing price, and the cached copy is only the render
+        // source. Do not re-expand them here.
         fireWinBillingBeacons(slotId, matchedBid);
         log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from PBS Cache`);
       })
