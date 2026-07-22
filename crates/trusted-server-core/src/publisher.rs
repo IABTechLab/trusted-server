@@ -3148,9 +3148,9 @@ fn html_escape_for_script(s: &str) -> String {
 ///
 /// Every entry also carries the trace fields `hb_auction_id` (when
 /// `auction_id` is known), `hb_crid` (when the bidder returned a creative ID),
-/// and `hb_adm_hash` (when the bid has creative markup) so the client can
-/// stamp rendered creatives with a tuple that joins back to the server-side
-/// `auction winner:` log lines.
+/// `hb_bid_id` (the bid's own `OpenRTB` `id`), and `hb_adm_hash` (when the bid
+/// has creative markup) so the client can stamp rendered creatives with a tuple
+/// that joins back to the server-side `auction winner:` log lines.
 pub(crate) fn build_bid_map(
     winning_bids: &std::collections::HashMap<String, Bid>,
     granularity: crate::price_bucket::PriceGranularity,
@@ -3192,11 +3192,16 @@ pub(crate) fn build_bid_map(
                         serde_json::Value::String(creative_id.clone()),
                     );
                 }
-                if let Some(adm_hash) = bid.creative_trace_hash() {
+                // The bid's own OpenRTB `id`, carried separately from `hb_adid`
+                // so the client can stamp the exact bid this render came from.
+                if let Some(ref bid_id) = bid.bid_id {
                     obj.insert(
-                        "hb_adm_hash".to_string(),
-                        serde_json::Value::String(adm_hash),
+                        "hb_bid_id".to_string(),
+                        serde_json::Value::String(bid_id.clone()),
                     );
+                }
+                if let Some(hash) = bid.creative_trace_hash() {
+                    obj.insert("hb_adm_hash".to_string(), serde_json::Value::String(hash));
                 }
                 // Winning creative dimensions — the bridge sizes the inline
                 // render from these, falling back to the first configured slot
@@ -3210,7 +3215,8 @@ pub(crate) fn build_bid_map(
                     obj.insert("h".to_string(), serde_json::Value::from(bid.height));
                 }
                 // PBS Cache remains highest priority. APS uses the selected bid ID
-                // carried by its typed renderer; other providers retain the ad-ID fallback.
+                // carried by its typed renderer, then other providers use their
+                // ad ID. The OpenRTB bid ID is the final stable fallback.
                 let renderer_bid_id = bid
                     .renderer
                     .as_ref()
@@ -3219,7 +3225,8 @@ pub(crate) fn build_bid_map(
                     .cache_id
                     .as_deref()
                     .or(renderer_bid_id)
-                    .or(bid.ad_id.as_deref());
+                    .or(bid.ad_id.as_deref())
+                    .or(bid.bid_id.as_deref());
                 if let Some(id) = hb_adid {
                     obj.insert(
                         "hb_adid".to_string(),
@@ -7252,6 +7259,56 @@ mod tests {
         }
 
         #[test]
+        fn bid_map_includes_trace_fields() {
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "kargo",
+                "abc123",
+                "https://ssp/win",
+                "https://ssp/bill",
+            );
+            bid.creative = Some("<div>Creative</div>".to_string());
+            bid.bid_id = Some("bid-abc123".to_string());
+            bid.creative_id = Some("cr-98765".to_string());
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                "",
+                false,
+                Some("ts-req-trace1"),
+            );
+            let obj = map["atf_sidebar_ad"]
+                .as_object()
+                .expect("should include traced bid");
+
+            assert_eq!(
+                obj.get("hb_auction_id").and_then(|v| v.as_str()),
+                Some("ts-req-trace1"),
+                "should carry the auction ID"
+            );
+            assert_eq!(
+                obj.get("hb_crid").and_then(|v| v.as_str()),
+                Some("cr-98765"),
+                "should carry the upstream creative ID"
+            );
+            assert_eq!(
+                obj.get("hb_bid_id").and_then(|v| v.as_str()),
+                Some("bid-abc123"),
+                "should carry the upstream bid ID separately"
+            );
+            assert_eq!(
+                obj.get("hb_adm_hash").and_then(|v| v.as_str()),
+                Some(crate::auction::adm_trace_hash("<div>Creative</div>").as_str()),
+                "should hash the raw creative markup"
+            );
+        }
+
+        #[test]
         fn bid_map_omits_zero_creative_dimensions() {
             // Missing OpenRTB w/h parse to 0. Emitting w:0/h:0 would make the
             // bridge (which nullish-coalesces) size the frame to 0 instead of
@@ -7783,7 +7840,9 @@ mod tests {
                     height: 250,
                     nurl: None,
                     burl: None,
-                    bid_id: None,
+                    // Present alongside cache_id/ad_id to prove cache_id still wins
+                    // — bid_id is the last resort, not a co-equal fallback.
+                    bid_id: Some("should-be-ignored-bid-id".to_string()),
                     ad_id: Some("bid-impression-id".to_string()),
                     creative_id: None,
                     renderer: None,
@@ -7809,7 +7868,7 @@ mod tests {
             assert_eq!(
                 obj.get("hb_adid").and_then(|v| v.as_str()),
                 Some("f47447a0-b759-4f2f-9887-af458b79b570"),
-                "should use cache_id for hb_adid, not ad_id"
+                "should use cache_id for hb_adid, not ad_id or bid_id"
             );
             assert_eq!(
                 obj.get("hb_cache_host").and_then(|v| v.as_str()),
@@ -7839,7 +7898,9 @@ mod tests {
                     height: 250,
                     nurl: None,
                     burl: None,
-                    bid_id: None,
+                    // Present alongside ad_id to prove ad_id still wins — bid_id
+                    // is the last resort, not a co-equal fallback.
+                    bid_id: Some("should-be-ignored-bid-id".to_string()),
                     ad_id: Some("ordinary-ad-id".to_string()),
                     creative_id: None,
                     renderer: None,
@@ -7878,7 +7939,56 @@ mod tests {
         }
 
         #[test]
-        fn bid_map_omits_hb_adid_when_both_cache_id_and_ad_id_absent() {
+        fn bid_map_falls_back_to_bid_id_when_cache_id_and_ad_id_absent() {
+            // Real shape for bidders like Kargo: no Prebid Cache UUID, no `adid`
+            // in the OpenRTB response, but `id` (the bid's own identifier) is
+            // always present per spec.
+            let mut winning_bids = HashMap::new();
+            winning_bids.insert(
+                "atf_sidebar_ad".to_string(),
+                Bid {
+                    slot_id: "atf_sidebar_ad".to_string(),
+                    price: Some(1.00),
+                    currency: "USD".to_string(),
+                    creative: None,
+                    adomain: None,
+                    bidder: "kargo".to_string(),
+                    width: 300,
+                    height: 250,
+                    nurl: None,
+                    burl: None,
+                    bid_id: Some("019f7e2a-b45b-70b0-a2d1-b651c430700b".to_string()),
+                    ad_id: None,
+                    creative_id: None,
+                    renderer: None,
+                    cache_id: None,
+                    cache_host: None,
+                    cache_path: None,
+                    metadata: Default::default(),
+                },
+            );
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                "",
+                false,
+                None,
+            );
+            let obj = map
+                .get("atf_sidebar_ad")
+                .expect("should have bid entry")
+                .as_object()
+                .expect("should be object");
+            assert_eq!(
+                obj.get("hb_adid").and_then(|v| v.as_str()),
+                Some("019f7e2a-b45b-70b0-a2d1-b651c430700b"),
+                "should fall back to bid_id when cache_id and ad_id are both absent"
+            );
+        }
+
+        #[test]
+        fn bid_map_omits_hb_adid_when_cache_id_ad_id_and_bid_id_all_absent() {
             let mut winning_bids = HashMap::new();
             winning_bids.insert(
                 "atf_sidebar_ad".to_string(),
@@ -7918,7 +8028,7 @@ mod tests {
                 .expect("should be object");
             assert!(
                 obj.get("hb_adid").is_none(),
-                "should omit hb_adid when no cache_id and no ad_id"
+                "should omit hb_adid when no cache_id, ad_id, or bid_id"
             );
         }
 

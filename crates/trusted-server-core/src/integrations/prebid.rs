@@ -1565,6 +1565,7 @@ impl PrebidAuctionProvider {
                     }
                     if name == TRUSTED_SERVER_BIDDER {
                         expanded.extend(expand_trusted_server_bidders(&self.config.bidders, params));
+                        expanded.remove("aps");
                     } else if self.config.bidders.iter().any(|b| b == name) {
                         direct.push((name.clone(), params.clone()));
                     } else if name != "aps" {
