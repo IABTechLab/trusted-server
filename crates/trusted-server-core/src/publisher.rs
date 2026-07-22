@@ -18,6 +18,7 @@
 //! into any [`Write`] (a `Vec<u8>` for buffered routes, a streaming writer for
 //! the streaming route). It is not a content-rewriting concern.
 
+use std::borrow::Cow;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -28,7 +29,7 @@ use brotli::enc::writer::CompressorWriter;
 use cookie::CookieJar;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use flate2::read::{GzDecoder, ZlibDecoder};
+use flate2::read::ZlibDecoder;
 use flate2::write::{GzEncoder, ZlibEncoder};
 use futures::StreamExt as _;
 use http::{HeaderValue, Method, Request, Response, StatusCode, Uri, header};
@@ -60,8 +61,8 @@ use crate::price_bucket::{PriceGranularity, price_bucket};
 use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::Settings;
 use crate::streaming_processor::{
-    BodyStreamDecoder, BodyStreamEncoder, Compression, PipelineConfig, STREAM_CHUNK_SIZE,
-    StreamProcessor, StreamingPipeline,
+    BodyStreamDecoder, BodyStreamEncoder, Compression, GzipDecodeReader, PipelineConfig,
+    STREAM_CHUNK_SIZE, StreamProcessor, StreamingPipeline,
 };
 use crate::streaming_replacer::create_url_replacer;
 
@@ -433,6 +434,10 @@ fn process_response_streaming<W: Write>(
         output_compression: compression,
         chunk_size: 8192,
     };
+    // Bound the gzip decode path to the same ceiling the buffered writer
+    // enforces, so a gzip bomb is rejected mid-decode instead of materializing
+    // its full expansion before the downstream writer can reject it.
+    let max_decoded_bytes = params.settings.publisher.max_buffered_body_bytes;
 
     if is_html {
         let processor = create_html_stream_processor(
@@ -444,7 +449,9 @@ fn process_response_streaming<W: Write>(
             params.ad_slots_script.map(str::to_string),
             params.ad_bids_state.clone(),
         )?;
-        StreamingPipeline::new(config, processor).process(body_as_reader(body)?, output)?;
+        StreamingPipeline::new(config, processor)
+            .with_max_decoded_bytes(max_decoded_bytes)
+            .process(body_as_reader(body)?, output)?;
     } else if is_rsc_flight {
         // RSC Flight responses are length-prefixed (T rows). A naive string replacement will
         // corrupt the stream by changing byte lengths without updating the prefixes.
@@ -454,7 +461,9 @@ fn process_response_streaming<W: Write>(
             params.request_host,
             params.request_scheme,
         );
-        StreamingPipeline::new(config, processor).process(body_as_reader(body)?, output)?;
+        StreamingPipeline::new(config, processor)
+            .with_max_decoded_bytes(max_decoded_bytes)
+            .process(body_as_reader(body)?, output)?;
     } else {
         let replacer = create_url_replacer(
             params.origin_host,
@@ -462,7 +471,9 @@ fn process_response_streaming<W: Write>(
             params.request_host,
             params.request_scheme,
         );
-        StreamingPipeline::new(config, replacer).process(body_as_reader(body)?, output)?;
+        StreamingPipeline::new(config, replacer)
+            .with_max_decoded_bytes(max_decoded_bytes)
+            .process(body_as_reader(body)?, output)?;
     }
 
     Ok(())
@@ -726,10 +737,11 @@ async fn hold_step_decoded_chunk<P: StreamProcessor>(
     collect_refs: &AuctionHoldCollectRefs<'_>,
 ) -> Result<HoldStepSegments, Report<TrustedServerError>> {
     let mut ready = Vec::new();
-    let bytes = match state.hold.as_mut() {
-        // Once the hold has been released the chunk streams straight through.
-        None => chunk.to_vec(),
-        Some(hold_buffer) => hold_buffer.push(chunk),
+    let bytes: Cow<'_, [u8]> = match state.hold.as_mut() {
+        // Once the hold has been released the chunk streams straight through,
+        // borrowed rather than copied.
+        None => Cow::Borrowed(chunk),
+        Some(hold_buffer) => Cow::Owned(hold_buffer.push(chunk)),
     };
     match process_and_encode_chunk(processor, encoder, &bytes, false, "Failed to process chunk") {
         Ok(Some(encoded)) => ready.push(encoded),
@@ -1979,11 +1991,18 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
         .await;
     }
 
+    // Bound the gzip decode budget to the same ceiling the buffered writer
+    // enforces, matching the streaming arm above and the no-hold buffered path.
+    let max_body_bytes = ctx.settings.publisher.max_buffered_body_bytes;
     let body = body_as_reader(body)?;
     match compression {
         Compression::None => body_close_hold_loop(body, output, processor, ctx).await,
         Compression::Gzip => {
-            let decoder = GzDecoder::new(body);
+            // `GzipDecodeReader` decodes concatenated gzip members (RFC 1952)
+            // and bounds decoded output, unlike `flate2::read::GzDecoder`, which
+            // silently drops every member after the first — dropping trailing
+            // markup (potentially including `</body>`) on buffered adapters.
+            let decoder = GzipDecodeReader::new(body, max_body_bytes);
             let mut encoder = GzEncoder::new(&mut *output, flate2::Compression::default());
             body_close_hold_loop(decoder, &mut encoder, processor, ctx).await?;
             encoder.finish().change_context(TrustedServerError::Proxy {
@@ -5995,6 +6014,72 @@ mod tests {
     }
 
     #[test]
+    fn stream_publisher_body_async_auction_hold_decodes_multi_member_gzip_buffered() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let registry =
+                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let services = noop_services();
+            let state = Arc::new(Mutex::new(None));
+            let mut params = OwnedProcessResponseParams {
+                content_encoding: "gzip".to_string(),
+                origin_host: "origin.example.com".to_string(),
+                origin_url: "https://origin.example.com".to_string(),
+                request_host: "proxy.example.com".to_string(),
+                request_scheme: "https".to_string(),
+                content_type: "text/html; charset=utf-8".to_string(),
+                ad_slots_script: Some(
+                    r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
+                        .to_string(),
+                ),
+                ad_bids_state: state,
+                auction_observation: None,
+                auction_request: Some(test_auction_request()),
+                dispatched_auction: Some(DispatchedAuction::empty_for_test(
+                    test_auction_request(),
+                    10,
+                )),
+                price_granularity: crate::price_bucket::PriceGranularity::default(),
+            };
+            // The `</body>` that triggers bid injection lives in the SECOND gzip
+            // member. `flate2::read::GzDecoder` decodes only the first member, so
+            // this buffered `Body::Once` body (the non-stream auction arm) proves
+            // the multi-member decoder now reads every member.
+            let mut compressed = gzip_encode(b"<html><head></head><body>hello");
+            compressed.extend(gzip_encode(b"</body></html>"));
+            let body = EdgeBody::from(compressed);
+            let mut output = Vec::new();
+
+            stream_publisher_body_async(
+                body,
+                &mut output,
+                &mut params,
+                &settings,
+                &registry,
+                &orchestrator,
+                &services,
+            )
+            .await
+            .expect("buffered multi-member gzip auction body should process");
+
+            let html = String::from_utf8(gzip_decode(&output)).expect("should be valid UTF-8");
+            assert!(
+                html.contains("hello"),
+                "should decode the first gzip member. Got: {html}"
+            );
+            assert!(
+                html.contains("</body></html>"),
+                "should decode the second gzip member that a single-member decoder drops. Got: {html}"
+            );
+            assert!(
+                html.contains(".bids=JSON.parse"),
+                "should inject bids before the </body> carried in the second member. Got: {html}"
+            );
+        });
+    }
+
+    #[test]
     fn stream_publisher_body_async_processes_non_html_stream_after_auction_collect() {
         futures::executor::block_on(async {
             let settings = create_test_settings();
@@ -6120,6 +6205,169 @@ mod tests {
         assert!(
             !css.contains("origin.example.com"),
             "streaming response body should not leave origin URLs unrewritten. Got: {css}"
+        );
+    }
+
+    /// An origin body stream that yields `chunk` once and then stays `Pending`
+    /// forever without ever signalling EOF — modelling an origin that has sent
+    /// the document head but not yet finished the response.
+    fn origin_chunk_then_pending(chunk: bytes::Bytes) -> EdgeBody {
+        let mut sent = false;
+        EdgeBody::from_stream(futures::stream::poll_fn(move |_cx| {
+            if sent {
+                return std::task::Poll::Pending;
+            }
+            sent = true;
+            std::task::Poll::Ready(Some(Ok::<_, io::Error>(chunk.clone())))
+        }))
+    }
+
+    /// Poll a lazy `Body::Stream` exactly once and return the first emitted
+    /// chunk. Panics if the first poll is `Pending` (nothing emitted before the
+    /// origin would need its next chunk) or the stream ends.
+    fn first_lazy_body_chunk(body: EdgeBody) -> bytes::Bytes {
+        let mut stream = body
+            .into_stream()
+            .expect("streaming finalize should keep a lazy Body::Stream");
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let next = futures::StreamExt::next(&mut stream);
+        let mut next = std::pin::pin!(next);
+        match std::future::Future::poll(next.as_mut(), &mut cx) {
+            std::task::Poll::Ready(Some(Ok(bytes))) => bytes,
+            std::task::Poll::Ready(other) => {
+                panic!("first poll must emit a chunk, got Ready({other:?})")
+            }
+            std::task::Poll::Pending => {
+                panic!("first poll must emit rewritten content before origin EOF, got Pending")
+            }
+        }
+    }
+
+    fn streaming_finalize_response(params: OwnedProcessResponseParams, body: EdgeBody) -> EdgeBody {
+        let settings = Arc::new(create_test_settings());
+        let registry = Arc::new(
+            IntegrationRegistry::new(&settings).expect("should create integration registry"),
+        );
+        let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
+        let services = noop_services();
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, &params.content_type)
+            .body(EdgeBody::empty())
+            .expect("should build response");
+        let publisher_response = PublisherResponse::Stream {
+            response,
+            body,
+            params: Box::new(params),
+        };
+        futures::executor::block_on(publisher_response_into_streaming_response(
+            publisher_response,
+            &Method::GET,
+            Arc::clone(&settings),
+            registry.as_ref(),
+            orchestrator,
+            services,
+        ))
+        .expect("should build streaming response")
+        .into_body()
+    }
+
+    fn html_stream_params(
+        content_encoding: &str,
+        dispatched_auction: Option<DispatchedAuction>,
+    ) -> OwnedProcessResponseParams {
+        OwnedProcessResponseParams {
+            content_encoding: content_encoding.to_string(),
+            origin_host: "origin.example.com".to_string(),
+            origin_url: "https://origin.example.com".to_string(),
+            request_host: "proxy.example.com".to_string(),
+            request_scheme: "https".to_string(),
+            content_type: "text/html; charset=utf-8".to_string(),
+            ad_slots_script: Some(
+                r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
+                    .to_string(),
+            ),
+            ad_bids_state: Arc::new(Mutex::new(None)),
+            auction_observation: None,
+            auction_request: dispatched_auction.as_ref().map(|_| test_auction_request()),
+            dispatched_auction,
+            price_granularity: crate::price_bucket::PriceGranularity::default(),
+        }
+    }
+
+    #[test]
+    fn streaming_finalize_emits_compressed_html_before_origin_eof() {
+        // The FCP regression from #849: the lazy body must emit its first
+        // rewritten, browser-decodable chunk as soon as the origin delivers one
+        // block — not buffer the whole (compressed) response until EOF. The
+        // origin here sends one gzip member and then stays Pending; the first
+        // poll must still yield gzip bytes that decode to the streamed content.
+        // The page exceeds the deflate decoder's internal output buffer so the
+        // first decoded block flushes downstream before the (never-arriving)
+        // EOF, exactly as a real page does.
+        let mut page = b"<html><head></head><body>".to_vec();
+        for i in 0..4000 {
+            page.extend(format!("<p>hello world paragraph {i}</p>").bytes());
+        }
+        let params = html_stream_params("gzip", None);
+        let body = streaming_finalize_response(
+            params,
+            origin_chunk_then_pending(bytes::Bytes::from(gzip_encode(&page))),
+        );
+
+        let first = first_lazy_body_chunk(body);
+        assert!(
+            !first.is_empty(),
+            "first emitted gzip chunk must not be empty"
+        );
+
+        // Decode the flushed (not finished) gzip prefix the way a browser would
+        // decode bytes received so far while the response is still open.
+        let mut decoder = flate2::write::MultiGzDecoder::new(Vec::new());
+        decoder
+            .write_all(&first)
+            .expect("first chunk must be valid gzip");
+        decoder.flush().expect("should flush gzip decoder");
+        let decoded = String::from_utf8(decoder.get_ref().clone()).expect("should be valid UTF-8");
+        assert!(
+            decoded.contains("hello world"),
+            "first poll must emit decodable streamed content before EOF. Got: {decoded}"
+        );
+    }
+
+    #[test]
+    fn streaming_finalize_auction_hold_emits_prefix_before_origin_eof() {
+        // The auction-hold path must stream the document prefix (up to the held
+        // `</body>` tail) before the origin finishes and before the auction is
+        // collected — otherwise the hold reintroduces the FCP regression. The
+        // origin sends the head/body prefix (no `</body>`) then stays Pending.
+        let page = b"<html><head></head><body><p>hello</p><p>more streamed content here</p>";
+        let params = html_stream_params(
+            "",
+            Some(DispatchedAuction::empty_for_test(
+                test_auction_request(),
+                10,
+            )),
+        );
+        let body = streaming_finalize_response(
+            params,
+            origin_chunk_then_pending(bytes::Bytes::from(&page[..])),
+        );
+
+        let first = first_lazy_body_chunk(body);
+        let html = String::from_utf8(first.to_vec()).expect("should be valid UTF-8");
+        assert!(
+            html.contains("hello"),
+            "auction-hold path must stream the prefix before EOF. Got: {html}"
+        );
+        assert!(
+            html.contains(".adSlots=JSON.parse"),
+            "prefix must carry the injected (rewritten) head before EOF. Got: {html}"
+        );
+        assert!(
+            !html.contains(".bids=JSON.parse"),
+            "bids inject only at </body> after collection, which the first poll must not wait for. Got: {html}"
         );
     }
 
