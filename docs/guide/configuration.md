@@ -1229,6 +1229,81 @@ TRUSTED_SERVER__AUCTION__TIMEOUT_MS=2000
 TRUSTED_SERVER__AUCTION__CREATIVE_STORE=creative_store
 ```
 
+## Creative Opportunities Configuration
+
+### `[creative_opportunities]`
+
+Defines the ad slots the trusted server offers on a page: which pages each slot
+appears on (`page_patterns`), its supported sizes (`formats`), and the GAM ad
+unit it maps to (`gam_unit_path`).
+
+```toml
+[creative_opportunities]
+gam_network_id = "123456789"
+price_granularity = "dense"
+
+# Shared placeholder value for the site root ("/") — see {section} below.
+section_root = "home"
+
+[[creative_opportunities.slot]]
+id = "ad-header"
+gam_unit_path = "/{network_id}/example/{section}"
+page_patterns = ["/", "/news/*", "/reviews/*"]
+formats = [{ width = 728, height = 90 }]
+```
+
+### `gam_unit_path` templating
+
+`gam_unit_path` is a template. A publisher whose ad unit varies by site section
+expresses that in **one** slot rule instead of one rule per (slot × section).
+
+Supported placeholders:
+
+| Placeholder    | Resolves to                                                    |
+| -------------- | -------------------------------------------------------------- |
+| `{network_id}` | `gam_network_id`                                               |
+| `{slot_id}`    | the slot's `id`                                                |
+| `{section}`    | first path segment of the request (see derivation rules below) |
+
+A template with **no** placeholders is used verbatim. A slot with **no**
+`gam_unit_path` falls back to `/<network_id>/<slot_id>`. Both preserve the
+pre-templating behavior, so existing static configs are unchanged.
+
+### `{section}` derivation
+
+`{section}` is derived from the request path at request time:
+
+- It is the **first non-empty path segment**. `/news/article-123` → `news`.
+- It is sanitized: each run of characters outside `[A-Za-z0-9_-]` becomes a
+  single `_`.
+- The path is used **raw — it is not percent-decoded**. So `/new%20s` →
+  `new_20s` (only `%` is disallowed; `2` and `0` are kept), never the decoded
+  `new_s`. This keeps `{section}` consistent with how `page_patterns` match the
+  same raw path.
+- When the path has no segment (`/`, or repeated slashes), `{section}` is
+  `section_root`.
+
+`section_root` is **required** whenever any slot's template uses `{section}`,
+and must match `[A-Za-z0-9_-]+`. There is no default: the home-section name is
+publisher-specific, so the URL→section convention lives in config, not core.
+Startup fails if `{section}` is used without a valid `section_root`.
+
+Example resolution for `gam_unit_path = "/{network_id}/example/{section}"` with
+`gam_network_id = "123456789"` and `section_root = "home"`:
+
+| Request path    | `gam_unit_path`              |
+| --------------- | ---------------------------- |
+| `/`             | `/123456789/example/home`    |
+| `/news`         | `/123456789/example/news`    |
+| `/news/article` | `/123456789/example/news`    |
+| `/reviews/x`    | `/123456789/example/reviews` |
+
+An **unmatched route** — a path matched by no slot's `page_patterns` — produces
+no slot at all, so no template is rendered for it.
+
+Startup validation rejects a malformed template: an unknown placeholder (e.g.
+`{oops}`), an unmatched or nested `{`, a stray `}`, or an empty `gam_unit_path`.
+
 ## Fastly Runtime Config Store
 
 After the EdgeZero cutover, the Fastly adapter always dispatches through the
