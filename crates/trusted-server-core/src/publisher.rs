@@ -4274,6 +4274,7 @@ mod tests {
                 gam_network_id: "21765378893".to_string(),
                 auction_timeout_ms: Some(500),
                 price_granularity: PriceGranularity::Dense,
+                section_root: None,
                 slot: Vec::new(),
             }
         }
@@ -4295,6 +4296,7 @@ mod tests {
                     .collect(),
                 providers: Default::default(),
                 compiled_patterns: Vec::new(),
+            compiled_unit: None,
             }
         }
 
@@ -4942,6 +4944,7 @@ mod tests {
                 targeting: Default::default(),
                 providers: Default::default(),
                 compiled_patterns: Vec::new(),
+            compiled_unit: None,
             }]
         }
 
@@ -5444,6 +5447,7 @@ mod tests {
                 targeting: Default::default(),
                 providers: Default::default(),
                 compiled_patterns: Vec::new(),
+            compiled_unit: None,
             }]
         }
 
