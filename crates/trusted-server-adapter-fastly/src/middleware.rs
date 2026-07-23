@@ -85,10 +85,54 @@ impl Middleware for FinalizeResponseMiddleware {
         });
 
         apply_finalize_headers(&self.settings, geo_info.as_ref(), &mut response);
+        trusted_server_core::integrations::ad_trace::finalize_response(&mut response);
         response
             .headers_mut()
             .insert(HEADER_X_TS_FINALIZED, HeaderValue::from_static("1"));
 
+        Ok(response)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AdTracePrepareMiddleware
+// ---------------------------------------------------------------------------
+
+/// Sanitizes and snapshots the console decision before auth and route dispatch.
+pub struct AdTracePrepareMiddleware {
+    settings: Arc<Settings>,
+}
+
+impl AdTracePrepareMiddleware {
+    pub fn new(settings: Arc<Settings>) -> Self {
+        Self { settings }
+    }
+}
+
+#[async_trait(?Send)]
+impl Middleware for AdTracePrepareMiddleware {
+    async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
+        let decision = match trusted_server_core::integrations::ad_trace::prepare_request(
+            &self.settings,
+            ctx.request_mut(),
+        ) {
+            Ok(decision) => decision,
+            Err(report) => {
+                log::error!("ad trace request preparation failed: {report:?}");
+                return Ok(crate::app::http_error(&report));
+            }
+        };
+        let mut response = match next.run(ctx).await {
+            Ok(response) => response,
+            Err(error) => {
+                log::error!("request handler failed after ad trace preparation: {error:?}");
+                error.into_response()?
+            }
+        };
+        trusted_server_core::integrations::ad_trace::attach_response_decision(
+            &decision,
+            &mut response,
+        );
         Ok(response)
     }
 }

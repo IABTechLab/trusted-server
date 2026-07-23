@@ -27,9 +27,9 @@ import 'prebid.js/modules/userId.js';
 import './_adapters.generated';
 
 import { log } from '../../core/log';
-import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
+import { buildAdRequest, parseAuctionResponse, parseAuctionTraceSummary } from '../../core/auction';
 import type { AuctionBid, AuctionEid } from '../../core/auction';
-import type { AuctionSlot } from '../../core/types';
+import type { AdTraceEventKind, AuctionSlot, TrustedServerBidTrace } from '../../core/types';
 
 import { INCLUDED_PREBID_USER_ID_MODULES } from './_user_ids.generated';
 import { PREBID_USER_ID_MODULE_REGISTRY } from './user_id_modules';
@@ -47,6 +47,7 @@ const TS_REFRESH_TARGETING_KEYS = [
   'hb_adid',
   'hb_cache_host',
   'hb_cache_path',
+  'ts_trace',
 ] as const;
 
 /** Configuration options for the Prebid integration. */
@@ -220,6 +221,12 @@ export function auctionBidsToPrebidBids(auctionBids: AuctionBid[], bidRequests: 
       meta: {
         advertiserDomains: bid.adomain,
       },
+      ...(bid.trace
+        ? {
+            adserverTargeting: { ts_trace: bid.trace.bidTraceId },
+            tsTrace: bid.trace,
+          }
+        : {}),
     };
   });
 }
@@ -242,6 +249,7 @@ type TrustedServerBidRequest = {
   adUnitCode?: string;
   code?: string;
   bidId?: string;
+  auctionId?: string;
 };
 type TrustedServerRequest = {
   method: 'POST';
@@ -458,6 +466,155 @@ function serverSideBidderParamsForRefresh(
   return params;
 }
 
+function installAdTracePrebidObservers(): void {
+  const ts = window.tsjs;
+  if (!ts?.recordAdTrace) return;
+  const instrumented = pbjs as unknown as {
+    __tsAdTraceObserved?: boolean;
+    onEvent?: (event: string, handler: (data: Record<string, unknown>) => void) => void;
+    setTargetingForGPTAsync?: (codes?: string[]) => unknown;
+  };
+  if (instrumented.__tsAdTraceObserved) return;
+  instrumented.__tsAdTraceObserved = true;
+
+  const record =
+    (kind: AdTraceEventKind) =>
+    (data: Record<string, unknown> = {}): void => {
+      const nestedBid =
+        data.bid && typeof data.bid === 'object'
+          ? (data.bid as Record<string, unknown>)
+          : undefined;
+      const evidence = nestedBid ?? data;
+      const slotId =
+        typeof evidence.adUnitCode === 'string'
+          ? evidence.adUnitCode
+          : typeof evidence.code === 'string'
+            ? evidence.code
+            : undefined;
+      const bidder =
+        typeof evidence.bidderCode === 'string'
+          ? evidence.bidderCode
+          : typeof evidence.bidder === 'string'
+            ? evidence.bidder
+            : undefined;
+      const auctionId =
+        typeof evidence.auctionId === 'string'
+          ? evidence.auctionId
+          : typeof data.auctionId === 'string'
+            ? data.auctionId
+            : '';
+      const requestId =
+        typeof evidence.requestId === 'string'
+          ? evidence.requestId
+          : typeof evidence.adId === 'string'
+            ? evidence.adId
+            : '';
+      const adId = typeof evidence.adId === 'string' ? evidence.adId : requestId || undefined;
+      const targeting = evidence.adserverTargeting as Record<string, unknown> | undefined;
+      const serverTrace = evidence.tsTrace as TrustedServerBidTrace | undefined;
+      const traceToken =
+        typeof targeting?.ts_trace === 'string'
+          ? targeting.ts_trace
+          : typeof (evidence.tsTrace as { bidTraceId?: unknown } | undefined)?.bidTraceId ===
+              'string'
+            ? ((evidence.tsTrace as { bidTraceId: string }).bidTraceId as string)
+            : undefined;
+      const ledger = (ts.prebidCorrelation ??= []);
+      if (kind === 'prebid_bid_response' && auctionId && slotId && requestId) {
+        ledger.push({
+          auctionId,
+          slotId,
+          requestId,
+          bidder,
+          adId,
+          traceToken,
+          serverTrace,
+          events: [],
+        });
+        if (ledger.length > 256) ledger.shift();
+      } else if (kind === 'prebid_auction_end' && auctionId) {
+        const adUnits = Array.isArray(data.adUnits)
+          ? (data.adUnits as Array<Record<string, unknown>>)
+          : [];
+        const received = Array.isArray(data.bidsReceived)
+          ? (data.bidsReceived as Array<Record<string, unknown>>)
+          : [];
+        const slotIds = new Set<string>();
+        for (const unit of adUnits) {
+          if (typeof unit.code === 'string') slotIds.add(unit.code);
+        }
+        for (const bid of received) {
+          if (typeof bid.adUnitCode === 'string') slotIds.add(bid.adUnitCode);
+        }
+        for (const entry of ledger) {
+          if (entry.auctionId === auctionId) slotIds.add(entry.slotId);
+        }
+        const completed = (ts.prebidCompletedAuctions ??= []);
+        completed.push({ auctionId, slotIds: [...slotIds] });
+        if (completed.length > 64) completed.shift();
+      } else if (kind !== 'prebid_auction_init') {
+        const selected = (ts.prebidSelectedParticipants ?? []).filter(
+          (entry) => performance.now() - entry.selectedAt <= 30_000
+        );
+        ts.prebidSelectedParticipants = selected;
+        const selectedMatches =
+          auctionId && slotId && requestId
+            ? selected.filter(
+                (entry) =>
+                  entry.auctionId === auctionId &&
+                  entry.slotId === slotId &&
+                  (entry.requestId === requestId || entry.adId === adId) &&
+                  (!traceToken || entry.traceToken === traceToken)
+              )
+            : [];
+        if (selectedMatches.length === 1) {
+          const selectedEntry = selectedMatches[0];
+          ts.recordAdTrace?.({
+            kind,
+            slotId,
+            generation: selectedEntry.generation,
+            bidTraceId: selectedEntry.traceToken,
+            bidder: selectedEntry.bidder ?? bidder,
+          });
+          if (kind === 'prebid_render_succeeded' || kind === 'prebid_render_failed') {
+            ts.prebidSelectedParticipants = selected.filter((entry) => entry !== selectedEntry);
+          }
+          return;
+        }
+
+        const matches = ledger.filter(
+          (entry) =>
+            (!auctionId || entry.auctionId === auctionId) &&
+            (!slotId || entry.slotId === slotId) &&
+            (!requestId || entry.requestId === requestId || entry.adId === adId)
+        );
+        if (matches.length === 1) {
+          const events = (matches[0].events ??= []);
+          events.push(kind);
+          while (events.length > 16) events.shift();
+        }
+      }
+      ts.recordAdTrace?.({ kind, slotId, bidder });
+    };
+
+  instrumented.onEvent?.('auctionInit', record('prebid_auction_init'));
+  instrumented.onEvent?.('bidResponse', record('prebid_bid_response'));
+  instrumented.onEvent?.('bidWon', record('prebid_bid_won'));
+  instrumented.onEvent?.('auctionEnd', record('prebid_auction_end'));
+  instrumented.onEvent?.('adRenderSucceeded', record('prebid_render_succeeded'));
+  instrumented.onEvent?.('adRenderFailed', record('prebid_render_failed'));
+
+  // Observe the actual selection call once. The GPT request-boundary hook reads
+  // the resulting slot targeting synchronously; this wrapper never caches it.
+  const original = instrumented.setTargetingForGPTAsync?.bind(pbjs);
+  if (!original) return;
+  instrumented.setTargetingForGPTAsync = function (codes?: string[]) {
+    const result = original(codes);
+    ts.recordAdTrace?.({ kind: 'prebid_targeting_selected', reason: 'targeting_applied' });
+    return result;
+  };
+}
+
 function clearRefreshTargeting(slot: RefreshGptSlot): void {
   if (typeof slot.clearTargeting !== 'function') return;
 
@@ -551,6 +708,16 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       log.debug('[tsjs-prebid] interpretResponse', { hasSeatbid: !!body?.seatbid });
       const auctionBids = parseAuctionResponse(body);
       const bidRequests = request?.tsjsBidRequests ?? request?.bidRequests ?? [];
+      const summary = parseAuctionTraceSummary(body);
+      if (summary && window.tsjs?.recordAdTrace) {
+        const summaries = (window.tsjs.prebidServerSummaries ??= []);
+        for (const bidRequest of bidRequests) {
+          const auctionId = bidRequest.auctionId;
+          const slotId = bidRequest.adUnitCode ?? bidRequest.code;
+          if (auctionId && slotId) summaries.push({ auctionId, slotId, summary });
+        }
+        while (summaries.length > 64) summaries.shift();
+      }
       return auctionBidsToPrebidBids(auctionBids, bidRequests);
     },
   });
@@ -681,6 +848,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   // prebid.js via NPM.
   pbjs.processQueue();
   recordUserIdModuleDiagnostics();
+  installAdTracePrebidObservers();
 
   // Validate that every client-side bidder has its adapter registered.
   // Adapters self-register on import, so a missing adapter means the bidder
@@ -811,6 +979,9 @@ export function installRefreshHandler(timeoutMs = 1500): void {
         adUnits,
         bidsBackHandler: () => {
           pbjs.setTargetingForGPTAsync?.(refreshAdUnitCodes);
+          targetSlots.forEach((slot) =>
+            window.tsjs?.captureAdTraceRequest?.(slot, 'prebid_refresh')
+          );
           originalRefresh(targetSlots, opts);
         },
         timeout: timeoutMs,

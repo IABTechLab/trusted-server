@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "test": "npx playwright test",
+    "test:ad-trace": "TEST_FRAMEWORK=ad-trace npx playwright test tests/ad-trace/auction-trace.spec.ts",
     "test:nextjs": "TEST_FRAMEWORK=nextjs npx playwright test",
     "test:wordpress": "TEST_FRAMEWORK=wordpress npx playwright test"
   },

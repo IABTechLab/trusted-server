@@ -240,6 +240,14 @@ describe('GPT – installTsAdInit', () => {
       ['ts_initial', ['1']],
       ['pos', ['old-pos']],
     ]);
+    const clearTargeting = vi.fn((key?: string) => {
+      if (key) {
+        slotTargeting.delete(key);
+      } else {
+        slotTargeting.clear();
+      }
+      return gptSlot;
+    });
     const gptSlot: any = {
       getSlotElementId: vi.fn(() => 'div-ad-homepage-header'),
       getTargeting: vi.fn((key: string) => slotTargeting.get(key) ?? []),
@@ -247,14 +255,7 @@ describe('GPT – installTsAdInit', () => {
         slotTargeting.set(key, Array.isArray(value) ? value : [value]);
         return gptSlot;
       }),
-      clearTargeting: vi.fn((key?: string) => {
-        if (key) {
-          slotTargeting.delete(key);
-        } else {
-          slotTargeting.clear();
-        }
-        return gptSlot;
-      }),
+      clearTargeting,
     };
     const pubads = {
       getSlots: vi.fn(() => [gptSlot]),
@@ -295,13 +296,13 @@ describe('GPT – installTsAdInit', () => {
     installTsAdInit();
     (window as any).tsjs.adInit();
 
-    expect(gptSlot.clearTargeting).toHaveBeenCalledWith('hb_pb');
-    expect(gptSlot.clearTargeting).toHaveBeenCalledWith('hb_bidder');
-    expect(gptSlot.clearTargeting).toHaveBeenCalledWith('hb_adid');
-    expect(gptSlot.clearTargeting).toHaveBeenCalledWith('hb_cache_host');
-    expect(gptSlot.clearTargeting).toHaveBeenCalledWith('hb_cache_path');
-    expect(gptSlot.clearTargeting).toHaveBeenCalledWith('ts_initial');
-    expect(gptSlot.clearTargeting).toHaveBeenCalledWith('pos');
+    expect(clearTargeting).toHaveBeenCalledWith('hb_pb');
+    expect(clearTargeting).toHaveBeenCalledWith('hb_bidder');
+    expect(clearTargeting).toHaveBeenCalledWith('hb_adid');
+    expect(clearTargeting).toHaveBeenCalledWith('hb_cache_host');
+    expect(clearTargeting).toHaveBeenCalledWith('hb_cache_path');
+    expect(clearTargeting).toHaveBeenCalledWith('ts_initial');
+    expect(clearTargeting).toHaveBeenCalledWith('pos');
     expect(slotTargeting.get('hb_pb')).toBeUndefined();
     expect(slotTargeting.get('hb_bidder')).toBeUndefined();
     expect(slotTargeting.get('hb_adid')).toBeUndefined();

@@ -93,6 +93,26 @@ runs:
         TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: "false"
       run: cargo build -p trusted-server-adapter-axum
 
+    - name: Set up Node.js for browser fixtures
+      if: ${{ inputs.build-test-images == 'true' }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ steps.node-version.outputs.node-version }}
+        cache: npm
+        cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
+
+    - name: Build external Prebid fixture bundle
+      if: ${{ inputs.build-test-images == 'true' }}
+      shell: bash
+      run: |
+        rm -rf "$GITHUB_WORKSPACE/target/integration-test-artifacts/prebid"
+        mkdir -p "$GITHUB_WORKSPACE/target/integration-test-artifacts/prebid"
+        npm ci --prefix crates/trusted-server-js/lib
+        npm run --prefix crates/trusted-server-js/lib build:prebid-external -- \
+          --adapters=rubicon \
+          --user-id-modules=sharedIdSystem \
+          --out "$GITHUB_WORKSPACE/target/integration-test-artifacts/prebid"
+
     - name: Build WordPress test container
       if: ${{ inputs.build-test-images == 'true' }}
       shell: bash
@@ -108,6 +128,15 @@ runs:
           --build-arg NODE_VERSION=${{ steps.node-version.outputs.node-version }} \
           -t test-nextjs:latest \
           crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/
+
+    - name: Build ad-trace test container
+      if: ${{ inputs.build-test-images == 'true' }}
+      shell: bash
+      run: |
+        docker build \
+          -f crates/trusted-server-integration-tests/fixtures/frameworks/ad-trace/Dockerfile \
+          -t test-ad-trace:latest \
+          .
 
     - name: Add wasm32-unknown-unknown target for Cloudflare build
       if: ${{ inputs.build-cloudflare == 'true' }}

@@ -3,6 +3,12 @@
 // and the Prebid.js trustedServer adapter.
 
 import { log } from './log';
+import type {
+  AuctionTraceOutcome,
+  AuctionTraceSource,
+  AuctionTraceSummary,
+  TrustedServerBidTrace,
+} from './types';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -38,6 +44,11 @@ export interface AdRequest {
 }
 
 /** A parsed bid from an OpenRTB seatbid response. */
+export type AuctionClientResult =
+  | { kind: 'ok'; summary?: AuctionTraceSummary; bids: AuctionBid[] }
+  | { kind: 'transport_error'; reason: 'network' | 'http' }
+  | { kind: 'invalid_response'; reason: 'non_json' | 'invalid_shape' };
+
 export interface AuctionBid {
   /** Matches the `impid` in the response — corresponds to adUnit `code`. */
   impid: string;
@@ -55,6 +66,72 @@ export interface AuctionBid {
   creativeId: string;
   /** Advertiser domains. */
   adomain: string[];
+  /** Tester-gated trace joined to the validated root summary. */
+  trace?: TrustedServerBidTrace;
+}
+
+const TRACE_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const TRACE_LABEL_RE = /^[\w.-]{1,64}$/;
+const TRACE_SOURCES = new Set<AuctionTraceSource>([
+  'initial_navigation',
+  'spa_navigation',
+  'auction_api',
+]);
+const TRACE_OUTCOMES = new Set<AuctionTraceOutcome>([
+  'completed',
+  'no_bid',
+  'skipped',
+  'failed',
+  'abandoned',
+]);
+
+/** Strictly parse the optional Trusted Server root extension. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function parseAuctionTraceSummary(body: any): AuctionTraceSummary | undefined {
+  const trace = body?.ext?.trusted_server?.trace;
+  if (
+    trace?.version !== 1 ||
+    !TRACE_UUID_RE.test(trace.auction_trace_id) ||
+    !TRACE_SOURCES.has(trace.source) ||
+    !TRACE_OUTCOMES.has(trace.outcome)
+  ) {
+    return undefined;
+  }
+  return {
+    version: 1,
+    auctionTraceId: trace.auction_trace_id,
+    source: trace.source,
+    outcome: trace.outcome,
+  };
+}
+
+function parseBidTrace(
+  bid: any, // eslint-disable-line @typescript-eslint/no-explicit-any
+  root: AuctionTraceSummary | undefined
+): TrustedServerBidTrace | undefined {
+  const trace = bid?.ext?.trusted_server?.trace;
+  if (
+    !root ||
+    root.outcome !== 'completed' ||
+    trace?.version !== 1 ||
+    !TRACE_UUID_RE.test(trace.bid_trace_id) ||
+    typeof trace.slot_id !== 'string' ||
+    trace.slot_id !== bid?.impid ||
+    !TRACE_LABEL_RE.test(trace.slot_id) ||
+    !TRACE_LABEL_RE.test(trace.provider) ||
+    !TRACE_LABEL_RE.test(trace.bidder)
+  ) {
+    return undefined;
+  }
+  return {
+    version: 1,
+    auctionTraceId: root.auctionTraceId,
+    bidTraceId: trace.bid_trace_id,
+    source: root.source,
+    slotId: trace.slot_id,
+    provider: trace.provider,
+    bidder: trace.bidder,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +200,7 @@ export function buildAdRequest(units: any[], options?: { eids?: AuctionEid[] }):
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function parseAuctionResponse(body: any): AuctionBid[] {
   const bids: AuctionBid[] = [];
+  const rootTrace = parseAuctionTraceSummary(body);
   const seatbids = body?.seatbid;
   if (!Array.isArray(seatbids)) return bids;
 
@@ -137,6 +215,7 @@ export function parseAuctionResponse(body: any): AuctionBid[] {
       // `if (!bid.adm)` guard. The client-side `typeof !== 'string'` check in
       // sanitizeCreativeHtml is a second line of defense for callers that bypass
       // parseAuctionResponse and pass untrusted values directly.
+      const trace = parseBidTrace(b, rootTrace);
       bids.push({
         impid: b.impid ?? '',
         adm: b.adm ?? '',
@@ -146,10 +225,28 @@ export function parseAuctionResponse(body: any): AuctionBid[] {
         seat,
         creativeId: b.crid ?? `${seat}-${b.impid ?? ''}`,
         adomain: Array.isArray(b.adomain) ? b.adomain : [],
+        ...(trace ? { trace } : {}),
       });
     }
   }
   return bids;
+}
+
+function isValidAuctionResponseShape(data: Record<string, unknown>): boolean {
+  const seatbid = data.seatbid;
+  // Preserve the legacy valid empty response while rejecting a present but
+  // malformed collection that would otherwise be misreported as no-bid.
+  if (seatbid === undefined) return true;
+  if (!Array.isArray(seatbid)) return false;
+  return seatbid.every((seat) => {
+    if (!seat || typeof seat !== 'object' || Array.isArray(seat)) return false;
+    const bids = (seat as Record<string, unknown>).bid;
+    return (
+      bids === undefined ||
+      (Array.isArray(bids) &&
+        bids.every((bid) => !!bid && typeof bid === 'object' && !Array.isArray(bid)))
+    );
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -157,14 +254,16 @@ export function parseAuctionResponse(body: any): AuctionBid[] {
 // ---------------------------------------------------------------------------
 
 /**
- * POST an {@link AdRequest} to the given endpoint and return parsed bids.
- *
- * Returns an empty array on network or parse errors (non-throwing).
+ * POST an {@link AdRequest} and distinguish a valid empty auction from
+ * transport or response-shape failures.
  */
-export async function sendAuction(endpoint: string, request: AdRequest): Promise<AuctionBid[]> {
+export async function sendAuction(
+  endpoint: string,
+  request: AdRequest
+): Promise<AuctionClientResult> {
   if (typeof fetch !== 'function') {
     log.warn('auction: fetch not available');
-    return [];
+    return { kind: 'transport_error', reason: 'network' };
   }
 
   log.info('auction: sending request', { endpoint, units: request.adUnits.length });
@@ -179,17 +278,36 @@ export async function sendAuction(endpoint: string, request: AdRequest): Promise
     });
 
     const ct = res.headers.get('content-type') || '';
-    if (res.ok && ct.includes('application/json')) {
-      const data: unknown = await res.json();
-      const bids = parseAuctionResponse(data);
-      log.info('auction: received bids', { count: bids.length });
-      return bids;
+    if (!res.ok) {
+      log.warn('auction: unexpected response', { ok: res.ok, status: res.status, ct });
+      return { kind: 'transport_error', reason: 'http' };
+    }
+    if (!ct.includes('application/json')) {
+      log.warn('auction: non-json response', { status: res.status, ct });
+      return { kind: 'invalid_response', reason: 'non_json' };
     }
 
-    log.warn('auction: unexpected response', { ok: res.ok, status: res.status, ct });
-    return [];
+    let data: unknown;
+    try {
+      data = await res.json();
+    } catch (err) {
+      log.warn('auction: invalid json response', err);
+      return { kind: 'invalid_response', reason: 'non_json' };
+    }
+    if (
+      !data ||
+      typeof data !== 'object' ||
+      Array.isArray(data) ||
+      !isValidAuctionResponseShape(data as Record<string, unknown>)
+    ) {
+      return { kind: 'invalid_response', reason: 'invalid_shape' };
+    }
+    const bids = parseAuctionResponse(data);
+    const summary = parseAuctionTraceSummary(data);
+    log.info('auction: received bids', { count: bids.length });
+    return { kind: 'ok', ...(summary ? { summary } : {}), bids };
   } catch (err) {
     log.warn('auction: request failed', err);
-    return [];
+    return { kind: 'transport_error', reason: 'network' };
   }
 }

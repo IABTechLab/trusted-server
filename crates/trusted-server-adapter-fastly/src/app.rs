@@ -129,7 +129,7 @@ use trusted_server_core::settings_data::{
 };
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 
-use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
+use crate::middleware::{AdTracePrepareMiddleware, AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::{
     FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformGeo, FastlyPlatformHttpClient,
     FastlyPlatformSecretStore, UnavailableKvStore, open_kv_store,
@@ -1161,6 +1161,7 @@ impl TrustedServerApp {
                 Arc::clone(&state.settings),
                 Arc::new(FastlyPlatformGeo),
             ))
+            .middleware(AdTracePrepareMiddleware::new(Arc::clone(&state.settings)))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)));
 
         let fallback_handler = fallback_route_handler(Arc::clone(state));

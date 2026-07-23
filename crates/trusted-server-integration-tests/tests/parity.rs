@@ -44,6 +44,9 @@ fn test_settings() -> Settings {
 
             [ec]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [integrations.ad_trace]
+            enabled = true
         "#,
     )
     .expect("should parse parity test settings")
@@ -75,6 +78,24 @@ async fn axum_get(uri: &str) -> (u16, HeaderMap) {
         .uri(uri)
         .body(AxumBody::empty())
         .expect("should build GET request");
+    let resp = svc
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
+    (resp.status().as_u16(), resp.headers().clone())
+}
+
+async fn axum_document_get(uri: &str) -> (u16, HeaderMap) {
+    let mut svc = EdgeZeroAxumService::new(axum_router());
+    let req = AxumRequest::builder()
+        .method("GET")
+        .uri(uri)
+        .header("sec-fetch-dest", "document")
+        .body(AxumBody::empty())
+        .expect("should build document GET request");
     let resp = svc
         .ready()
         .await
@@ -131,6 +152,17 @@ async fn cf_get(uri: &str) -> (u16, HeaderMap) {
     (resp.status().as_u16(), resp.headers().clone())
 }
 
+async fn cf_document_get(uri: &str) -> (u16, HeaderMap) {
+    let req = request_builder()
+        .method("GET")
+        .uri(uri)
+        .header("sec-fetch-dest", "document")
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build document GET request");
+    let resp = cf_router().oneshot(req).await.expect("should respond");
+    (resp.status().as_u16(), resp.headers().clone())
+}
+
 /// Send a POST request to the Cloudflare adapter and return (status, headers, body bytes).
 async fn cf_post(uri: &str, body: &str) -> (u16, HeaderMap, bytes::Bytes) {
     let router = cf_router();
@@ -172,6 +204,17 @@ async fn spin_get_body(uri: &str) -> (u16, HeaderMap, bytes::Bytes) {
 async fn spin_get(uri: &str) -> (u16, HeaderMap) {
     let (s, h, _) = spin_get_body(uri).await;
     (s, h)
+}
+
+async fn spin_document_get(uri: &str) -> (u16, HeaderMap) {
+    let req = request_builder()
+        .method("GET")
+        .uri(uri)
+        .header("sec-fetch-dest", "document")
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build document GET request");
+    let resp = spin_router().oneshot(req).await.expect("should respond");
+    (resp.status().as_u16(), resp.headers().clone())
 }
 
 /// Send a POST request to the Spin adapter and return (status, headers, body bytes).
@@ -454,6 +497,34 @@ async fn verify_signature_route_parity() {
         cf_status, spin_status,
         "/verify-signature must return same status: cf={cf_status} spin={spin_status}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn console_activation_finalizes_auth_short_circuits() {
+    let uri = "/_ts/admin/keys/rotate?ts_console=1";
+    let responses = [
+        axum_document_get(uri).await,
+        cf_document_get(uri).await,
+        spin_document_get(uri).await,
+    ];
+
+    for (status, headers) in responses {
+        assert_eq!(status, 401);
+        assert_eq!(
+            headers
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("private, no-store")
+        );
+        assert!(
+            headers
+                .get_all("set-cookie")
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .any(|value| value.starts_with("__Host-ts-console=1;")),
+            "auth short-circuit should preserve the console session action"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -418,6 +418,7 @@ mod tests {
             price_cpm: None,
             currency: None,
             is_win: None,
+            bid_trace_id: None,
             ad_domain: None,
             ad_id: None,
         }

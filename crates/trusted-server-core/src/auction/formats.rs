@@ -19,7 +19,10 @@ use crate::creative;
 use crate::ec::eids::encode_eids_header;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
-use crate::openrtb::{OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid, ToExt, to_openrtb_i32};
+use crate::openrtb::{
+    AuctionTraceWire, BidTraceWire, OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid, ToExt,
+    TrustedServerBidExt, TrustedServerBidTraceContainer, TrustedServerResponseExt, to_openrtb_i32,
+};
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
@@ -230,6 +233,21 @@ pub fn convert_to_openrtb_response(
     auction_request: &AuctionRequest,
     ec_allowed: bool,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    convert_to_openrtb_response_with_trace(result, settings, auction_request, ec_allowed, false)
+}
+
+/// Convert an auction result with optional tester-gated trace extensions.
+///
+/// # Errors
+///
+/// Returns the same errors as [`convert_to_openrtb_response`].
+pub fn convert_to_openrtb_response_with_trace(
+    result: &OrchestrationResult,
+    settings: &Settings,
+    auction_request: &AuctionRequest,
+    ec_allowed: bool,
+    trace_enabled: bool,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     // Build OpenRTB-style seatbid array
     let mut seatbids = Vec::with_capacity(result.winning_bids.len());
 
@@ -275,6 +293,24 @@ pub fn convert_to_openrtb_response(
             String::new()
         };
 
+        let bid_ext = trace_enabled
+            .then(|| result.trace.winning_bids.get(slot_id))
+            .flatten()
+            .and_then(|trace| {
+                TrustedServerBidExt {
+                    trusted_server: TrustedServerBidTraceContainer {
+                        trace: BidTraceWire {
+                            version: 1,
+                            bid_trace_id: trace.bid_trace_id.to_string(),
+                            slot_id: slot_id.clone(),
+                            provider: trace.provider.clone(),
+                            bidder: trace.bidder.clone(),
+                        },
+                    },
+                }
+                .to_ext()
+            });
+
         let openrtb_bid = OpenRtbBid {
             id: Some(format!("{}-{}", bid.bidder, slot_id)),
             impid: Some(slot_id.to_string()),
@@ -284,6 +320,7 @@ pub fn convert_to_openrtb_response(
             w: width,
             h: height,
             adomain: bid.adomain.clone().unwrap_or_default(),
+            ext: bid_ext,
             ..Default::default()
         };
 
@@ -319,6 +356,14 @@ pub fn convert_to_openrtb_response(
                 time_ms: result.total_time_ms,
                 provider_details,
             },
+            trusted_server: trace_enabled.then(|| TrustedServerResponseExt {
+                trace: AuctionTraceWire {
+                    version: 1,
+                    auction_trace_id: result.trace.summary.auction.auction_trace_id.to_string(),
+                    source: result.trace.summary.auction.source.as_str(),
+                    outcome: result.trace.summary.outcome.as_str(),
+                },
+            }),
         }
         .to_ext(),
         ..Default::default()
@@ -416,13 +461,14 @@ mod tests {
     }
 
     fn make_empty_result() -> OrchestrationResult {
-        OrchestrationResult {
-            provider_responses: Vec::new(),
-            mediator_response: None,
-            winning_bids: HashMap::new(),
-            total_time_ms: 10,
-            metadata: HashMap::new(),
-        }
+        let mut result = OrchestrationResult::empty(
+            crate::auction::types::AuctionTraceContext::new(
+                crate::auction::types::AuctionSource::AuctionApi,
+            ),
+            crate::auction::types::AuctionPublicOutcome::NoBid,
+        );
+        result.total_time_ms = 10;
+        result
     }
 
     fn make_bid(slot_id: &str, bidder: &str, price: Option<f64>) -> Bid {
@@ -446,19 +492,34 @@ mod tests {
     }
 
     fn make_result(bid: Bid) -> OrchestrationResult {
-        OrchestrationResult {
-            provider_responses: vec![AuctionResponse {
-                provider: "prebid".to_string(),
-                bids: vec![bid.clone()],
-                status: BidStatus::Success,
-                response_time_ms: 42,
-                metadata: HashMap::new(),
-            }],
-            mediator_response: None,
-            winning_bids: HashMap::from([(bid.slot_id.clone(), bid)]),
-            total_time_ms: 50,
+        let mut result = make_empty_result();
+        result.trace.summary.outcome = crate::auction::types::AuctionPublicOutcome::Completed;
+        result.trace.winning_bids.insert(
+            bid.slot_id.clone(),
+            crate::auction::types::WinningBidTrace {
+                bid_trace_id: crate::auction::types::BidTraceId::new(),
+                provider: "prebid".to_owned(),
+                bidder: bid.bidder.clone(),
+            },
+        );
+        result.winning_bid_origins.insert(
+            bid.slot_id.clone(),
+            crate::auction::types::WinningBidOrigin {
+                response_index: 0,
+                bid_index: 0,
+                mediated: false,
+            },
+        );
+        result.provider_responses = vec![AuctionResponse {
+            provider: "prebid".to_string(),
+            bids: vec![bid.clone()],
+            status: BidStatus::Success,
+            response_time_ms: 42,
             metadata: HashMap::new(),
-        }
+        }];
+        result.winning_bids = HashMap::from([(bid.slot_id.clone(), bid)]);
+        result.total_time_ms = 50;
+        result
     }
 
     fn response_json(response: Response<EdgeBody>) -> JsonValue {
@@ -975,16 +1036,68 @@ mod tests {
     }
 
     #[test]
+    fn gated_response_adds_namespaced_root_and_winning_bid_trace() {
+        let settings = make_settings();
+        let auction_request = make_auction_request();
+        let result = make_result(make_bid("div-gpt-top", "appnexus", Some(2.75)));
+
+        let response = convert_to_openrtb_response_with_trace(
+            &result,
+            &settings,
+            &auction_request,
+            false,
+            true,
+        )
+        .expect("should convert traced response");
+        let json = response_json(response);
+
+        assert_eq!(
+            json["ext"]["trusted_server"]["trace"]["auction_trace_id"],
+            json!(result.trace.summary.auction.auction_trace_id.to_string()),
+            "should expose the shared trace identity"
+        );
+        assert_eq!(
+            json["seatbid"][0]["bid"][0]["ext"]["trusted_server"]["trace"]["bid_trace_id"],
+            json!(
+                result.trace.winning_bids["div-gpt-top"]
+                    .bid_trace_id
+                    .to_string()
+            ),
+            "should expose only the final winner trace"
+        );
+        assert_ne!(
+            json["ext"]["trusted_server"]["trace"]["auction_trace_id"],
+            json!(auction_request.id),
+            "should never expose the internal request ID as trace identity"
+        );
+    }
+
+    #[test]
+    fn ungated_response_omits_all_trace_extensions() {
+        let settings = make_settings();
+        let auction_request = make_auction_request();
+        let result = make_result(make_bid("div-gpt-top", "appnexus", Some(2.75)));
+
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
+            .expect("should convert legacy response");
+        let json = response_json(response);
+
+        assert!(
+            json["ext"].get("trusted_server").is_none(),
+            "ungated root should omit trace"
+        );
+        assert!(
+            json["seatbid"][0]["bid"][0].get("ext").is_none(),
+            "ungated bid should omit trace"
+        );
+    }
+
+    #[test]
     fn convert_to_openrtb_response_allows_empty_winning_bids() {
         let settings = make_settings();
         let auction_request = make_auction_request();
-        let result = OrchestrationResult {
-            provider_responses: vec![],
-            mediator_response: None,
-            winning_bids: HashMap::new(),
-            total_time_ms: 50,
-            metadata: HashMap::new(),
-        };
+        let mut result = make_empty_result();
+        result.total_time_ms = 50;
 
         let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
             .expect("should convert auction result without winning bids");
@@ -1009,22 +1122,27 @@ mod tests {
         let top_bid = make_bid("div-gpt-top", "appnexus", Some(2.75));
         let mut sidebar_bid = make_bid("div-gpt-sidebar", "rubicon", Some(1.25));
         sidebar_bid.creative = Some("<div>Sidebar</div>".to_string());
-        let result = OrchestrationResult {
-            provider_responses: vec![AuctionResponse {
-                provider: "prebid".to_string(),
-                bids: vec![top_bid.clone(), sidebar_bid.clone()],
-                status: BidStatus::Success,
-                response_time_ms: 42,
-                metadata: HashMap::new(),
-            }],
-            mediator_response: None,
-            winning_bids: HashMap::from([
-                (top_bid.slot_id.clone(), top_bid),
-                (sidebar_bid.slot_id.clone(), sidebar_bid),
-            ]),
-            total_time_ms: 50,
-            metadata: HashMap::new(),
-        };
+        let mut result = make_result(top_bid.clone());
+        result.provider_responses[0].bids.push(sidebar_bid.clone());
+        result.trace.winning_bids.insert(
+            sidebar_bid.slot_id.clone(),
+            crate::auction::types::WinningBidTrace {
+                bid_trace_id: crate::auction::types::BidTraceId::new(),
+                provider: "prebid".to_owned(),
+                bidder: sidebar_bid.bidder.clone(),
+            },
+        );
+        result.winning_bid_origins.insert(
+            sidebar_bid.slot_id.clone(),
+            crate::auction::types::WinningBidOrigin {
+                response_index: 0,
+                bid_index: 1,
+                mediated: false,
+            },
+        );
+        result
+            .winning_bids
+            .insert(sidebar_bid.slot_id.clone(), sidebar_bid);
 
         let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
             .expect("should convert multiple winning bids");

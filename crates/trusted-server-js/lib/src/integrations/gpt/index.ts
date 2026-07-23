@@ -1,5 +1,5 @@
 import { log } from '../../core/log';
-import type { AuctionSlot, AuctionBidData, TsjsApi } from '../../core/types';
+import type { AuctionSlot, AuctionBidData, AuctionTraceSummary, TsjsApi } from '../../core/types';
 
 import { installGptGuard } from './script_guard';
 
@@ -32,7 +32,11 @@ const TS_BID_TARGETING_KEYS = [
   'hb_cache_host',
   'hb_cache_path',
 ] as const;
-const TS_BASE_TARGETING_KEYS = [...TS_BID_TARGETING_KEYS, TS_INITIAL_TARGETING_KEY] as const;
+const TS_BASE_TARGETING_KEYS = [
+  ...TS_BID_TARGETING_KEYS,
+  TS_INITIAL_TARGETING_KEY,
+  'ts_trace',
+] as const;
 
 // ------------------------------------------------------------------
 // googletag type stubs (minimal surface needed by the shim)
@@ -48,8 +52,189 @@ interface GoogleTagSlot {
 }
 
 interface SlotRenderEndedEvent {
-  isEmpty: boolean;
+  isEmpty?: boolean;
+  isBackfill?: boolean;
   slot: GoogleTagSlot;
+}
+
+interface GptSlotEvent {
+  slot: GoogleTagSlot;
+  isEmpty?: boolean;
+  isBackfill?: boolean;
+}
+
+interface RenderCandidate {
+  slotId: string;
+  generation: number;
+  slot: GoogleTagSlot;
+  divId: string;
+  /** Renderable only when this record's own hb_adid matches the request snapshot. */
+  bid?: Readonly<AuctionBidData>;
+  adId?: string;
+  traceToken?: string;
+  createdAt: number;
+  terminal: boolean;
+  consumed: boolean;
+  superseded: boolean;
+}
+
+interface ExpectedRender {
+  candidate: RenderCandidate;
+  source: MessageEventSource;
+  expiresAt: number;
+  consumed: boolean;
+}
+
+interface AdTraceRequestBoundarySnapshot {
+  slotId?: string;
+  bidder?: string;
+  adId?: string;
+  traceToken?: string;
+  bid?: AuctionBidData;
+}
+
+const requestCandidates = new Map<string, RenderCandidate[]>();
+const expectedRenders = new Map<string, ExpectedRender[]>();
+const fallbackGenerations = new Map<string, number>();
+
+const MAX_EXPECTED_RENDERS = 200;
+const MAX_FALLBACK_GENERATIONS = 200;
+const MAX_ACTIVE_CACHE_RENDERS = 64;
+const MAX_PRIVATE_REQUEST_OWNERS = 64;
+let privateNavigationGeneration = 0;
+
+interface PrivateRequestOwner {
+  slotId: string;
+  adId?: string;
+  bid?: Readonly<AuctionBidData>;
+  generation?: number;
+  element: HTMLElement | null;
+  navigationGeneration: number;
+  expiresAt: number;
+  served: boolean;
+}
+
+const latestPrivateRequestBySlot = new Map<string, PrivateRequestOwner>();
+const staleTsAdIdBits = new Uint32Array(64);
+
+function staleAdIdHashes(value: string): [number, number] {
+  let first = 2166136261;
+  let second = 5381;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    first = Math.imul(first ^ code, 16777619) >>> 0;
+    second = (Math.imul(second, 33) ^ code) >>> 0;
+  }
+  return [first % 2048, second % 2048];
+}
+
+function rememberStaleAdIdBits(adId: string): void {
+  for (const hash of staleAdIdHashes(adId)) {
+    staleTsAdIdBits[hash >>> 5] |= 1 << (hash & 31);
+  }
+}
+
+function staleAdIdBitsContain(adId: string): boolean {
+  return staleAdIdHashes(adId).every(
+    (hash) => (staleTsAdIdBits[hash >>> 5] & (1 << (hash & 31))) !== 0
+  );
+}
+
+interface ActiveCacheRender {
+  controller: AbortController;
+  slotId: string;
+  adId: string;
+  source: MessageEventSource | null;
+  generation?: number;
+  candidate?: RenderCandidate;
+  cacheHost: string;
+  cachePath: string;
+  traceToken?: string;
+  navigationGeneration: number;
+  expiresAt: number;
+  expiryTimer?: ReturnType<typeof setTimeout>;
+}
+
+const activeCacheRenders = new Set<ActiveCacheRender>();
+const latestCacheRenderBySlot = new Map<string, ActiveCacheRender>();
+
+function rememberStaleTsOwner(owner: PrivateRequestOwner): void {
+  if (!owner.bid || !owner.adId) return;
+  rememberStaleAdIdBits(owner.adId);
+}
+
+function retireActiveCacheRender(render: ActiveCacheRender): void {
+  if (render.expiryTimer) clearTimeout(render.expiryTimer);
+  render.controller.abort();
+  activeCacheRenders.delete(render);
+  if (latestCacheRenderBySlot.get(render.slotId) === render) {
+    latestCacheRenderBySlot.delete(render.slotId);
+  }
+}
+
+function invalidatePrivateRequestOwners(slotId?: string): void {
+  const entries = slotId
+    ? [[slotId, latestPrivateRequestBySlot.get(slotId)] as const]
+    : [...latestPrivateRequestBySlot.entries()];
+  for (const [key, owner] of entries) {
+    if (!owner) continue;
+    rememberStaleTsOwner(owner);
+    latestPrivateRequestBySlot.delete(key);
+  }
+}
+
+function abortActiveCacheRenders(slotId?: string): void {
+  privateNavigationGeneration += slotId ? 0 : 1;
+  for (const render of [...activeCacheRenders]) {
+    if (!slotId || render.slotId === slotId) retireActiveCacheRender(render);
+  }
+  invalidatePrivateRequestOwners(slotId);
+}
+
+function claimPrivateRequestOwner(
+  slotId: string,
+  adId: string | undefined,
+  bid: Readonly<AuctionBidData> | undefined,
+  element: HTMLElement | null
+): PrivateRequestOwner {
+  for (const render of [...activeCacheRenders]) {
+    if (render.slotId === slotId) retireActiveCacheRender(render);
+  }
+  const previous = latestPrivateRequestBySlot.get(slotId);
+  if (previous) rememberStaleTsOwner(previous);
+  const owner: PrivateRequestOwner = {
+    slotId,
+    adId,
+    bid,
+    element,
+    navigationGeneration: privateNavigationGeneration,
+    expiresAt: monotonicNow() + 30_000,
+    served: false,
+  };
+  latestPrivateRequestBySlot.delete(slotId);
+  latestPrivateRequestBySlot.set(slotId, owner);
+  while (latestPrivateRequestBySlot.size > MAX_PRIVATE_REQUEST_OWNERS) {
+    const oldest = latestPrivateRequestBySlot.keys().next().value as string | undefined;
+    if (!oldest) break;
+    const evicted = latestPrivateRequestBySlot.get(oldest);
+    if (evicted) rememberStaleTsOwner(evicted);
+    latestPrivateRequestBySlot.delete(oldest);
+    for (const render of [...activeCacheRenders]) {
+      if (render.slotId === oldest) retireActiveCacheRender(render);
+    }
+  }
+  return owner;
+}
+
+function isKnownStaleTsAdId(adId: string): boolean {
+  // The fixed-size bitset intentionally never forgets within the page session:
+  // false positives fail closed, while bounded-map eviction cannot create a
+  // false negative that lets a stale TS Universal Creative fall through.
+  return staleAdIdBitsContain(adId);
+}
+
+function monotonicNow(): number {
+  return typeof performance === 'undefined' ? Date.now() : performance.now();
 }
 
 function findSlotElementByDivId(divId: string): HTMLElement | null {
@@ -103,7 +288,7 @@ interface GoogleTagPubAdsService {
   setTargeting(key: string, value: string | string[]): GoogleTagPubAdsService;
   getTargeting(key: string): string[];
   enableSingleRequest(): void;
-  addEventListener(event: string, fn: (e: SlotRenderEndedEvent) => void): void;
+  addEventListener(event: string, fn: (e: GptSlotEvent) => void): void;
   refresh(slots?: GoogleTagSlot[]): void;
   getSlots?(): GoogleTagSlot[];
   disableInitialLoad?(): void;
@@ -127,6 +312,39 @@ type GptWindow = Window & {
   googletag?: Partial<GoogleTag>;
   __tsjs_slim_prebid_url?: string;
 };
+
+const cacheInvalidationHookedTags = new WeakSet<object>();
+const cacheInvalidationHookedSlots = new WeakSet<object>();
+
+function installSlotCacheInvalidationHook(slot: GoogleTagSlot): void {
+  if (cacheInvalidationHookedSlots.has(slot) || typeof slot.clearTargeting !== 'function') return;
+  const original = slot.clearTargeting.bind(slot);
+  slot.clearTargeting = (key?: string) => {
+    const slotId = slotIdForGptSlot(slot);
+    if (slotId) abortActiveCacheRenders(slotId);
+    return original(key);
+  };
+  cacheInvalidationHookedSlots.add(slot);
+}
+
+function installGoogleTagCacheInvalidationHooks(g: Partial<GoogleTag>): void {
+  if (cacheInvalidationHookedTags.has(g)) return;
+  if (typeof g.destroySlots === 'function') {
+    const original = g.destroySlots.bind(g);
+    g.destroySlots = (slots?: GoogleTagSlot[]) => {
+      if (slots) {
+        slots.forEach((slot) => {
+          const slotId = slotIdForGptSlot(slot);
+          if (slotId) abortActiveCacheRenders(slotId);
+        });
+      } else {
+        abortActiveCacheRenders();
+      }
+      return original(slots);
+    };
+  }
+  cacheInvalidationHookedTags.add(g);
+}
 
 // ------------------------------------------------------------------
 // Shim implementation
@@ -345,24 +563,40 @@ function injectAdmIntoSlot(divId: string, adm: string): void {
   }
 }
 
-function fireWinBillingBeacons(slotId: string, bid: AuctionBidData): void {
-  if (!slotId || (!bid.nurl && !bid.burl)) return;
+const MAX_BILLING_DEDUPE_KEYS = 512;
+const BILLING_DEDUPE_TTL_MS = 30 * 60_000;
+const firedBillingKeys = new Map<string, number>();
 
-  const fired = (window.tsjs!.firedBeacons ??= {});
+function billingEntries(slotId: string, bid: AuctionBidData): Array<[string, string]> {
   const bidIdentity = bid.hb_adid ?? bid.nurl ?? bid.burl ?? '';
-  const urls = [
-    ['nurl', bid.nurl],
-    ['burl', bid.burl],
-  ] as const;
+  return (
+    [
+      ['nurl', bid.nurl],
+      ['burl', bid.burl],
+    ] as const
+  ).flatMap(([kind, url]) =>
+    url ? [[`${slotId}|${bidIdentity}|${kind}|${url}`, url] as [string, string]] : []
+  );
+}
 
-  for (const [kind, url] of urls) {
-    if (!url) continue;
+function billingCapacityAvailable(slotId: string, bid: AuctionBidData): boolean {
+  const now = monotonicNow();
+  for (const [key, expiresAt] of firedBillingKeys) {
+    if (expiresAt <= now) firedBillingKeys.delete(key);
+  }
+  const additional = billingEntries(slotId, bid).filter(
+    ([key]) => !firedBillingKeys.has(key)
+  ).length;
+  return firedBillingKeys.size + additional <= MAX_BILLING_DEDUPE_KEYS;
+}
 
-    const beaconKey = `${slotId}|${bidIdentity}|${kind}|${url}`;
-    if (fired[beaconKey]) continue;
-
+function fireWinBillingBeacons(slotId: string, bid: AuctionBidData): void {
+  if (!slotId) return;
+  const now = monotonicNow();
+  for (const [key, url] of billingEntries(slotId, bid)) {
+    if (firedBillingKeys.has(key)) continue;
     if (queueWinBillingBeacon(url)) {
-      fired[beaconKey] = true;
+      firedBillingKeys.set(key, now + BILLING_DEDUPE_TTL_MS);
     }
   }
 }
@@ -445,8 +679,363 @@ function installInitialLoadDetector(ts: TsjsApi): void {
   });
 }
 
+function slotIdForGptSlot(slot: GoogleTagSlot): string | undefined {
+  const divId = slot.getSlotElementId?.() ?? '';
+  return (
+    window.tsjs?.divToSlotId?.[divId] ??
+    window.tsjs?.adSlots?.find((item) => {
+      return (
+        divId === item.div_id ||
+        divId === `${item.div_id}-container` ||
+        divId.startsWith(item.div_id)
+      );
+    })?.id
+  );
+}
+
+function firstSlotTarget(slot: GoogleTagSlot, key: string): string | undefined {
+  return slot.getTargeting?.(key)?.find((value) => value.length > 0);
+}
+
+function supersedeCandidate(candidate: RenderCandidate, reason: string): void {
+  if (candidate.superseded) return;
+  candidate.superseded = true;
+  for (const render of [...activeCacheRenders]) {
+    if (render.candidate === candidate) retireActiveCacheRender(render);
+  }
+  window.tsjs?.recordAdTrace?.({
+    kind: 'generation_superseded',
+    slotId: candidate.slotId,
+    generation: candidate.generation,
+    bidTraceId: candidate.traceToken,
+    reason,
+  });
+}
+
+export function supersedeAdTraceSlot(slot: GoogleTagSlot, reason: string): void {
+  const slotId = slotIdForGptSlot(slot);
+  if (slotId) {
+    abortActiveCacheRenders(slotId);
+    if (window.tsjs?.prebidSelectedParticipants) {
+      window.tsjs.prebidSelectedParticipants = window.tsjs.prebidSelectedParticipants.filter(
+        (entry) => entry.slotId !== slotId
+      );
+    }
+  }
+  for (const candidates of requestCandidates.values()) {
+    candidates
+      .filter((candidate) => candidate.slot === slot && !candidate.superseded)
+      .forEach((candidate) => supersedeCandidate(candidate, reason));
+  }
+}
+
+/** Capture immutable attribution immediately before one concrete GPT request. */
+export function captureAdTraceRequest(
+  slot: GoogleTagSlot,
+  trigger: string,
+  snapshot?: AdTraceRequestBoundarySnapshot
+): number {
+  const ts = window.tsjs;
+  const hasBoundarySnapshot = snapshot !== undefined;
+  const slotId = hasBoundarySnapshot ? snapshot.slotId : slotIdForGptSlot(slot);
+  if (!slotId) return 0;
+  installSlotCacheInvalidationHook(slot);
+
+  // Private service ownership is captured for every GPT request, even when the
+  // diagnostic recorder is disabled. It must precede all asynchronous render
+  // work so a later request or navigation can invalidate the exact owner.
+  const bidder = hasBoundarySnapshot ? snapshot.bidder : firstSlotTarget(slot, 'hb_bidder');
+  const adId = hasBoundarySnapshot ? snapshot.adId : firstSlotTarget(slot, 'hb_adid');
+  const rawTraceToken = hasBoundarySnapshot
+    ? snapshot.traceToken
+    : firstSlotTarget(slot, 'ts_trace');
+  const traceToken =
+    rawTraceToken && TRACE_TOKEN_RE.test(rawTraceToken) ? rawTraceToken : undefined;
+  const liveBid = hasBoundarySnapshot ? snapshot.bid : ts?.bids?.[slotId];
+  const renderBidMatches =
+    !!liveBid &&
+    !!adId &&
+    liveBid.hb_adid === adId &&
+    (!traceToken || liveBid.trace?.bidTraceId === traceToken);
+  const divId = slot.getSlotElementId?.() ?? '';
+  const privateBid = renderBidMatches ? Object.freeze({ ...liveBid }) : undefined;
+  const privateOwner = claimPrivateRequestOwner(
+    slotId,
+    adId,
+    privateBid,
+    divId ? findSlotElementByDivId(divId) : null
+  );
+
+  if (!ts?.recordAdTrace) return 0;
+  (requestCandidates.get(slotId) ?? [])
+    .filter((candidate) => !candidate.superseded && !candidate.consumed)
+    .forEach((candidate) => supersedeCandidate(candidate, 'request_replaced'));
+  const generation =
+    ts.nextAdTraceGeneration?.(slotId) ?? (fallbackGenerations.get(slotId) ?? 0) + 1;
+  privateOwner.generation = generation;
+  fallbackGenerations.delete(slotId);
+  fallbackGenerations.set(slotId, generation);
+  while (fallbackGenerations.size > MAX_FALLBACK_GENERATIONS) {
+    const oldest = fallbackGenerations.keys().next().value as string | undefined;
+    if (!oldest) break;
+    fallbackGenerations.delete(oldest);
+  }
+
+  // Diagnostic attribution reads the same immutable request-boundary values as
+  // the private owner, but remains optional and independently gated.
+  const ledger = ts.prebidCorrelation ?? [];
+  const selectedMatches = traceToken
+    ? ledger.filter((entry) => entry.slotId === slotId && entry.traceToken === traceToken)
+    : adId
+      ? ledger.filter((entry) => entry.slotId === slotId && entry.adId === adId)
+      : [];
+  const selectedParticipant = selectedMatches.length === 1 ? selectedMatches[0] : undefined;
+  const completedAuction = [...(ts.prebidCompletedAuctions ?? [])]
+    .reverse()
+    .find((entry) => entry.slotIds.includes(slotId));
+  const auctionId =
+    selectedParticipant?.auctionId ?? (!adId ? completedAuction?.auctionId : undefined);
+  const participants = auctionId
+    ? ledger.filter((entry) => entry.slotId === slotId && entry.auctionId === auctionId)
+    : [];
+  const hasTracedTsParticipant = participants.some((entry) => !!entry.traceToken);
+  const tracedServerParticipant = participants.find((entry) => entry.serverTrace);
+  const serverSummary = auctionId
+    ? (ts.prebidServerSummaries ?? []).find(
+        (entry) => entry.auctionId === auctionId && entry.slotId === slotId
+      )?.summary
+    : undefined;
+  if (selectedParticipant) {
+    const selected = (ts.prebidSelectedParticipants ??= []).filter(
+      (entry) => monotonicNow() - entry.selectedAt <= 30_000
+    );
+    selected.push({
+      auctionId: selectedParticipant.auctionId,
+      slotId,
+      requestId: selectedParticipant.requestId,
+      adId: selectedParticipant.adId,
+      traceToken: selectedParticipant.traceToken,
+      bidder: selectedParticipant.bidder,
+      generation,
+      selectedAt: monotonicNow(),
+    });
+    while (selected.length > 128) selected.shift();
+    ts.prebidSelectedParticipants = selected;
+  }
+  if (auctionId) {
+    ts.prebidCorrelation = ledger.filter(
+      (entry) => !(entry.slotId === slotId && entry.auctionId === auctionId)
+    );
+    ts.prebidCompletedAuctions = (ts.prebidCompletedAuctions ?? []).filter(
+      (entry) => entry.auctionId !== auctionId
+    );
+    ts.prebidServerSummaries = (ts.prebidServerSummaries ?? []).filter(
+      (entry) => !(entry.auctionId === auctionId && entry.slotId === slotId)
+    );
+  }
+
+  const candidate: RenderCandidate = {
+    slotId,
+    generation,
+    slot,
+    divId,
+    ...(privateBid ? { bid: privateBid } : {}),
+    adId,
+    traceToken,
+    createdAt: monotonicNow(),
+    terminal: false,
+    consumed: false,
+    superseded: false,
+  };
+  const capturedElement = candidate.divId ? findSlotElementByDivId(candidate.divId) : null;
+  if (capturedElement) ts.bindAdTraceElement?.(slotId, generation, capturedElement);
+  if (!requestCandidates.has(slotId) && requestCandidates.size >= 64) {
+    const oldestSlotId = requestCandidates.keys().next().value as string | undefined;
+    if (oldestSlotId) {
+      requestCandidates
+        .get(oldestSlotId)
+        ?.forEach((item) => supersedeCandidate(item, 'slot_evicted'));
+      requestCandidates.delete(oldestSlotId);
+    }
+  }
+  const candidates = requestCandidates.get(slotId) ?? [];
+  candidates
+    .filter((item) => !item.superseded && monotonicNow() - item.createdAt > 30_000)
+    .forEach((item) => supersedeCandidate(item, 'generation_expired'));
+  candidates.push(candidate);
+  if (candidates.length > 8) {
+    const evicted = candidates.shift();
+    if (evicted) supersedeCandidate(evicted, 'generation_evicted');
+  }
+  requestCandidates.set(slotId, candidates);
+
+  const serverTrace = tracedServerParticipant?.serverTrace;
+  if (serverTrace) {
+    ts.recordAdTrace({
+      kind: 'ts_winner_observed',
+      slotId,
+      generation,
+      auctionTraceId: serverTrace.auctionTraceId,
+      bidTraceId: serverTrace.bidTraceId,
+      provider: serverTrace.provider,
+      bidder: serverTrace.bidder,
+    });
+  } else if (serverSummary) {
+    ts.recordAdTrace({
+      kind: 'ts_auction_observed',
+      slotId,
+      generation,
+      auctionTraceId: serverSummary.auctionTraceId,
+      outcome: serverSummary.outcome === 'completed' ? 'no_bid' : serverSummary.outcome,
+      confidence: 'definitive',
+      reason: 'terminal_summary',
+    });
+  }
+
+  let outcome = 'no_bid';
+  let reason = 'no_selected_targeting';
+  let confidence: 'definitive' | 'none' = 'definitive';
+  if (selectedMatches.length > 1) {
+    outcome = 'unresolved';
+    reason = 'ambiguous_prebid_request';
+    confidence = 'none';
+  } else if (selectedParticipant) {
+    if (traceToken && selectedParticipant.traceToken === traceToken) outcome = 'won';
+    else if (!traceToken) outcome = hasTracedTsParticipant ? 'lost' : 'client_bid_won';
+    else outcome = hasTracedTsParticipant ? 'lost' : 'unresolved';
+    reason = 'selected_targeting';
+  } else if (completedAuction && !bidder && !adId && !traceToken) {
+    outcome = 'no_bid';
+    reason = 'prebid_no_bid';
+  } else if (bidder || adId || traceToken) {
+    outcome = traceToken && renderBidMatches ? 'not_run' : 'client_bid_won';
+    reason = traceToken && renderBidMatches ? 'direct_gpt_request' : 'unjoined_targeting';
+    if (!traceToken && !renderBidMatches) confidence = 'none';
+  }
+  ts.recordAdTrace({
+    kind: 'prebid_targeting_selected',
+    slotId,
+    generation,
+    bidTraceId: traceToken,
+    bidder,
+    outcome,
+    confidence,
+    reason,
+  });
+  for (const kind of selectedParticipant?.events ?? []) {
+    ts.recordAdTrace({
+      kind,
+      slotId,
+      generation,
+      bidTraceId: traceToken,
+      bidder,
+    });
+  }
+  if (liveBid?.hb_bidder === 'aps' || liveBid?.hb_bidder === 'amazon-aps') {
+    ts.recordAdTrace({
+      kind: 'aps_display_bids_set',
+      slotId,
+      generation,
+      bidTraceId: traceToken,
+    });
+  }
+  ts.recordAdTrace({
+    kind: 'gpt_request_started',
+    slotId,
+    generation,
+    auctionTraceId: liveBid?.trace?.auctionTraceId ?? ts.auctionTrace?.auctionTraceId,
+    bidTraceId: traceToken,
+    provider: liveBid?.trace?.provider,
+    bidder,
+    reason: trigger,
+  });
+  return generation;
+}
+
+function candidateForSlot(
+  slot: GoogleTagSlot,
+  includeTerminal = false
+): RenderCandidate | undefined {
+  const slotId = slotIdForGptSlot(slot);
+  if (!slotId) return undefined;
+  const candidates = (requestCandidates.get(slotId) ?? []).filter(
+    (candidate) =>
+      candidate.slot === slot &&
+      !candidate.superseded &&
+      (includeTerminal || !candidate.terminal) &&
+      monotonicNow() - candidate.createdAt <= 30_000
+  );
+  if (candidates.length !== 1) {
+    if (candidates.length > 1) {
+      candidates.forEach((candidate) =>
+        window.tsjs?.recordAdTrace?.({
+          kind: 'gpt_slot_render_ended',
+          slotId,
+          generation: candidate.generation,
+          bidTraceId: candidate.traceToken,
+          outcome: 'unresolved',
+          confidence: 'none',
+          reason: 'overlapping_request',
+        })
+      );
+    } else {
+      window.tsjs?.recordAdTrace?.({
+        kind: 'gpt_slot_response_received',
+        slotId,
+        outcome: 'unresolved',
+        confidence: 'none',
+        reason: 'missing_generation',
+      });
+    }
+    return undefined;
+  }
+  return candidates[0];
+}
+
+function installGptEvidenceListeners(service: GoogleTagPubAdsService): void {
+  if (!window.tsjs?.recordAdTrace) return;
+  const instrumented = service as GoogleTagPubAdsService & { __tsAdTraceListeners?: boolean };
+  if (instrumented.__tsAdTraceListeners) return;
+  instrumented.__tsAdTraceListeners = true;
+  const record =
+    (kind: 'gpt_slot_requested' | 'gpt_slot_response_received' | 'gpt_slot_onload') =>
+    (event: GptSlotEvent): void => {
+      const candidate = candidateForSlot(event.slot, kind === 'gpt_slot_onload');
+      if (!candidate) return;
+      window.tsjs?.recordAdTrace?.({
+        kind,
+        slotId: candidate.slotId,
+        generation: candidate.generation,
+        bidTraceId: candidate.traceToken,
+      });
+    };
+  service.addEventListener('slotRequested', record('gpt_slot_requested'));
+  service.addEventListener('slotResponseReceived', record('gpt_slot_response_received'));
+  service.addEventListener('slotOnload', record('gpt_slot_onload'));
+  service.addEventListener('slotRenderEnded', (event: GptSlotEvent) => {
+    const candidate = candidateForSlot(event.slot);
+    if (!candidate) return;
+    candidate.terminal = true;
+    window.tsjs?.recordAdTrace?.({
+      kind: 'gpt_slot_render_ended',
+      slotId: candidate.slotId,
+      generation: candidate.generation,
+      bidTraceId: candidate.traceToken,
+      isEmpty: event.isEmpty,
+      isBackfill: event.isBackfill,
+    });
+  });
+}
+
 export function installTsAdInit(): void {
   const ts = (window.tsjs ??= {} as TsjsApi);
+  const pendingBootstrapRequests = ts.pendingAdTraceRequests ?? [];
+  ts.pendingAdTraceRequests = [];
+  ts.captureAdTraceRequest = (slot, trigger, snapshot) =>
+    captureAdTraceRequest(slot as GoogleTagSlot, trigger, snapshot);
+  pendingBootstrapRequests.forEach(({ slot, trigger, snapshot }) =>
+    ts.captureAdTraceRequest?.(slot, trigger, snapshot)
+  );
   installInitialLoadDetector(ts);
   ts.adInit = function () {
     const slots = ts.adSlots ?? [];
@@ -454,18 +1043,51 @@ export function installTsAdInit(): void {
     // The slotRenderEnded listener below reads ts.bids live so SPA navigation
     // updates (new ts.bids injected before </body>) are picked up at render time.
     const bids = ts.bids ?? {};
+    const summary = ts.auctionTrace;
+    for (const slot of slots) {
+      const bid = bids[slot.id];
+      if (bid?.trace && TRACE_TOKEN_RE.test(bid.trace.bidTraceId)) {
+        ts.recordAdTrace?.({
+          kind: 'ts_winner_observed',
+          slotId: slot.id,
+          auctionTraceId: bid.trace.auctionTraceId,
+          bidTraceId: bid.trace.bidTraceId,
+          provider: bid.trace.provider,
+          bidder: bid.trace.bidder,
+        });
+      } else if (summary) {
+        ts.recordAdTrace?.({
+          kind: 'ts_auction_observed',
+          slotId: slot.id,
+          auctionTraceId: summary.auctionTraceId,
+          outcome:
+            summary.outcome === 'completed' || summary.outcome === 'no_bid'
+              ? 'no_bid'
+              : summary.outcome === 'skipped'
+                ? 'skipped'
+                : 'unresolved',
+          confidence: 'definitive',
+          reason: 'terminal_summary',
+        });
+      }
+    }
     const g = (window as GptWindow).googletag;
     if (!g) return;
 
     g.cmd?.push(() => {
+      installGoogleTagCacheInvalidationHooks(g);
       // Destroy previously defined TS slots before redefining for the new page.
       if (ts.prevGptSlots && ts.prevGptSlots.length > 0) {
+        (ts.prevGptSlots as GoogleTagSlot[]).forEach((slot) =>
+          supersedeAdTraceSlot(slot, 'slot_destroyed')
+        );
         g.destroySlots?.(ts.prevGptSlots as GoogleTagSlot[]);
         ts.prevGptSlots = [];
       }
 
       // Slots TS defined itself — tracked for SPA destroy. Publisher-owned
       // slots are reused but never destroyed by TS on navigation.
+      installGptEvidenceListeners(g.pubads!());
       const newSlots: GoogleTagSlot[] = [];
       // Publisher-owned slots TS reused — refreshed to pick up server-side
       // targeting. The publisher already display()ed these.
@@ -493,6 +1115,7 @@ export function installTsAdInit(): void {
         (g.pubads!().getSlots?.() ?? []).forEach((gptSlot: GoogleTagSlot) => {
           const elementId = gptSlot.getSlotElementId();
           if (!prevTouchedDivIds.has(elementId)) return;
+          supersedeAdTraceSlot(gptSlot, 'targeting_cleared');
           clearTargetingKeys(gptSlot, [
             ...TS_BASE_TARGETING_KEYS,
             ...(prevSlotTargetingKeys[elementId] ?? []),
@@ -529,6 +1152,7 @@ export function installTsAdInit(): void {
           tsOwned = true;
         }
 
+        installSlotCacheInvalidationHook(gptSlot);
         const slotDivId2 = gptSlot.getSlotElementId?.() ?? actualDivId;
         clearTargetingKeys(gptSlot, [
           ...TS_BASE_TARGETING_KEYS,
@@ -540,7 +1164,18 @@ export function installTsAdInit(): void {
         TS_BID_TARGETING_KEYS.forEach((key) => {
           if (bid[key]) gptSlot.setTargeting(key, String(bid[key]!));
         });
+        if (bid.trace?.bidTraceId && TRACE_TOKEN_RE.test(bid.trace.bidTraceId)) {
+          gptSlot.setTargeting('ts_trace', bid.trace.bidTraceId);
+        }
         gptSlot.setTargeting(TS_INITIAL_TARGETING_KEY, '1');
+        ts.recordAdTrace?.({
+          kind: 'gpt_targeting_applied',
+          slotId: slot.id,
+          auctionTraceId: bid.trace?.auctionTraceId,
+          bidTraceId: bid.trace?.bidTraceId,
+          provider: bid.trace?.provider,
+          bidder: bid.trace?.bidder,
+        });
         // Map both inner div and container div → slot ID so slotRenderEnded
         // (which reports the GPT slot's div, i.e. slotDivId/container) can look up
         // the slot, while adm injection (which targets the inner div) also works.
@@ -562,6 +1197,11 @@ export function installTsAdInit(): void {
         if (bid.hb_bidder === 'aps' || bid.hb_bidder === 'amazon-aps') {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           (window as any).apstag?.setDisplayBids?.();
+          ts.recordAdTrace?.({
+            kind: 'aps_display_bids_set',
+            slotId: slot.id,
+            bidTraceId: bid.trace?.bidTraceId,
+          });
         }
       });
 
@@ -607,7 +1247,11 @@ export function installTsAdInit(): void {
       // called without a matching display call") and misses its impression.
       // Must run after enableServices(); on SPA navigation services are already
       // enabled, so this runs unconditionally for any newly-defined slots.
-      slotsToDisplay.forEach((divId) => g.display?.(divId));
+      slotsToDisplay.forEach((divId) => {
+        const gptSlot = newSlots.find((slot) => slot.getSlotElementId() === divId);
+        if (gptSlot && !ts.gptInitialLoadDisabled) captureAdTraceRequest(gptSlot, 'display');
+        g.display?.(divId);
+      });
 
       // Slots needing an explicit ad request via refresh(). Reused
       // publisher-owned slots always need one to pick up the just-applied
@@ -630,6 +1274,7 @@ export function installTsAdInit(): void {
         // the same slots still go through the wrapper normally.
         ts.adInitRefreshInProgress = true;
         try {
+          slotsNeedingRefresh.forEach((slot) => captureAdTraceRequest(slot, 'refresh'));
           g.pubads!().refresh(slotsNeedingRefresh);
         } finally {
           ts.adInitRefreshInProgress = false;
@@ -640,6 +1285,7 @@ export function installTsAdInit(): void {
 }
 
 interface PageBidsResponse {
+  auctionTrace?: AuctionTraceSummary;
   slots: AuctionSlot[];
   bids: Record<string, AuctionBidData>;
 }
@@ -712,16 +1358,20 @@ export function installSpaAuctionHook(): void {
   // same-pathname back/forward (scroll restoration), and pushState/replaceState
   // can be called with the current URL, so guard every entry point against
   // re-requesting impressions for a path we already loaded.
-  let currentPath = location.pathname;
+  let currentPath = `${location.pathname}${location.search}`;
   // Last path whose slots/bids were actually applied — the initial SSR page
   // counts. A failed navigation rolls `currentPath` back to this rather than to
   // the immediately-previous committed value: on rapid A→B where A was aborted
   // mid-flight and B then fails, rolling back to A (never loaded) would strand
   // it behind the no-op guard, so we roll back to the last applied route instead.
-  let lastAppliedPath = location.pathname;
+  let lastAppliedPath = `${location.pathname}${location.search}`;
 
   async function onNavigate(path: string): Promise<void> {
+    // Navigation invalidates private render ownership even when the resulting
+    // route key is unchanged (for example a state-only replaceState call).
+    abortActiveCacheRenders();
     if (path === currentPath) return;
+    ts.prebidSelectedParticipants = [];
     currentPath = path;
     inflight?.abort();
     const controller = new AbortController();
@@ -752,6 +1402,7 @@ export function installSpaAuctionHook(): void {
       await waitForSlotElements(data.slots, controller.signal);
       if (inflight !== controller) return;
       ts.adSlots = data.slots;
+      ts.auctionTrace = data.auctionTrace;
       ts.bids = data.bids;
       // This route is now the committed, loaded state — a later failed
       // navigation rolls back here, and a return trip no-ops correctly.
@@ -778,7 +1429,8 @@ export function installSpaAuctionHook(): void {
     const original = history[method].bind(history);
     history[method] = function (state: unknown, unused: string, url?: string | URL | null): void {
       original(state, unused, url);
-      const newPath = url ? new URL(String(url), location.href).pathname : location.pathname;
+      const parsed = url ? new URL(String(url), location.href) : location;
+      const newPath = `${parsed.pathname}${parsed.search}`;
       // onNavigate no-ops when newPath equals the last loaded path.
       void onNavigate(newPath);
     };
@@ -788,7 +1440,7 @@ export function installSpaAuctionHook(): void {
   patchHistoryMethod('replaceState');
 
   window.addEventListener('popstate', () => {
-    void onNavigate(location.pathname);
+    void onNavigate(`${location.pathname}${location.search}`);
   });
 }
 
@@ -816,8 +1468,52 @@ export function installSlimPrebidLoader(): void {
 const TS_DISPLAY_RENDERER =
   '(function(){window.render=function(d,h,w){' +
   'var f=h.mkFrame(w.document,{width:d.width||"100%",height:d.height||"100%"});' +
+  'if(typeof d.traceToken==="string"){f.addEventListener("load",function(){' +
+  'top.postMessage({type:"ts-creative-load",version:1,traceToken:d.traceToken},"*");},{once:true});}' +
   'if(d.adUrl&&!d.ad){f.src=d.adUrl;}else{f.srcdoc=d.ad;}' +
   'w.document.body.appendChild(f);};})();';
+
+const TRACE_TOKEN_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+function pruneExpectedRenders(): void {
+  const now = monotonicNow();
+  for (const [token, entries] of expectedRenders) {
+    const retained = entries.filter((entry) => !entry.consumed && entry.expiresAt >= now);
+    if (retained.length > 0) expectedRenders.set(token, retained);
+    else expectedRenders.delete(token);
+  }
+}
+
+function armExpectedRender(
+  candidate: RenderCandidate | undefined,
+  source: MessageEventSource | null
+): string | undefined {
+  if (
+    !candidate?.bid ||
+    candidate.superseded ||
+    !candidate.traceToken ||
+    !TRACE_TOKEN_RE.test(candidate.traceToken) ||
+    !source
+  ) {
+    return undefined;
+  }
+  pruneExpectedRenders();
+  const expectedCount = [...expectedRenders.values()].reduce(
+    (count, entries) => count + entries.length,
+    0
+  );
+  if (expectedCount >= MAX_EXPECTED_RENDERS) return undefined;
+  candidate.consumed = true;
+  const entries = expectedRenders.get(candidate.traceToken) ?? [];
+  entries.push({
+    candidate,
+    source,
+    expiresAt: monotonicNow() + 30_000,
+    consumed: false,
+  });
+  expectedRenders.set(candidate.traceToken, entries);
+  return candidate.traceToken;
+}
 
 /**
  * Install the TS → pbRender bridge.
@@ -839,13 +1535,6 @@ const TS_DISPLAY_RENDERER =
 export function installTsRenderBridge(): void {
   if (typeof window === 'undefined') return;
 
-  // adIds whose PBS Cache render is in flight. `fireWinBillingBeacons` only
-  // dedups after the async cache fetch resolves, so two Prebid Request messages
-  // for the same adId arriving before the first fetch settles would both fetch
-  // and both fire the nurl/burl beacons. Tracking in-flight adIds prevents the
-  // concurrent double-fire; the entry is cleared once the fetch settles.
-  const renderingAdIds = new Set<string>();
-
   window.addEventListener('message', (e: MessageEvent) => {
     let data: Record<string, unknown>;
     try {
@@ -854,6 +1543,43 @@ export function installTsRenderBridge(): void {
           ? (e.data as Record<string, unknown>)
           : (JSON.parse(e.data as string) as Record<string, unknown>);
     } catch {
+      return;
+    }
+
+    if (data['type'] === 'ts-creative-load') {
+      const token = data['traceToken'];
+      if (data['version'] !== 1 || typeof token !== 'string' || !TRACE_TOKEN_RE.test(token)) return;
+      const entries = expectedRenders.get(token) ?? [];
+      entries
+        .filter((entry) => !entry.consumed && entry.expiresAt < monotonicNow())
+        .forEach((entry) => supersedeCandidate(entry.candidate, 'ack_expired'));
+      const matches = entries.filter(
+        (entry) =>
+          !entry.consumed &&
+          !entry.candidate.superseded &&
+          entry.expiresAt >= monotonicNow() &&
+          entry.source === e.source &&
+          (requestCandidates.get(entry.candidate.slotId) ?? []).includes(entry.candidate)
+      );
+      if (matches.length !== 1) {
+        const candidate = entries[0]?.candidate;
+        window.tsjs?.recordAdTrace?.({
+          kind: 'pb_render_rejected',
+          slotId: candidate?.slotId,
+          generation: candidate?.generation,
+          bidTraceId: TRACE_TOKEN_RE.test(token) ? token : undefined,
+          reason: matches.length > 1 ? 'ambiguous_generation' : 'invalid_acknowledgement',
+        });
+        return;
+      }
+      const expected = matches[0];
+      expected.consumed = true;
+      window.tsjs?.recordAdTrace?.({
+        kind: 'creative_load_acknowledged',
+        slotId: expected.candidate.slotId,
+        generation: expected.candidate.generation,
+        bidTraceId: token,
+      });
       return;
     }
 
@@ -866,30 +1592,65 @@ export function installTsRenderBridge(): void {
     const sourceSlotId = slotIdForMessageSource(e.source);
     if (!sourceSlotId) return;
 
-    // Build reverse map adId → slotId from live window.tsjs.bids.
-    const bids = window.tsjs?.bids ?? {};
-    let slotId: string | undefined;
-    let matchedBid: (typeof bids)[string] | undefined;
-    for (const [sid, bid] of Object.entries(bids)) {
-      if (bid.hb_adid === adId) {
-        slotId = sid;
-        matchedBid = bid;
-        break;
+    const allCandidates = requestCandidates.get(sourceSlotId) ?? [];
+    allCandidates
+      .filter((candidate) => !candidate.superseded && monotonicNow() - candidate.createdAt > 30_000)
+      .forEach((candidate) => supersedeCandidate(candidate, 'generation_expired'));
+    const candidates = allCandidates.filter(
+      (candidate) =>
+        candidate.adId === adId &&
+        !candidate.consumed &&
+        !candidate.superseded &&
+        monotonicNow() - candidate.createdAt <= 30_000
+    );
+    const exactCandidate = candidates.length === 1 ? candidates[0] : undefined;
+    window.tsjs?.recordAdTrace?.({
+      kind: candidates.length === 1 ? 'pb_render_requested' : 'pb_render_rejected',
+      slotId: sourceSlotId,
+      generation: exactCandidate?.generation,
+      bidTraceId: exactCandidate?.traceToken,
+      reason:
+        candidates.length === 1
+          ? 'exact_generation'
+          : candidates.length > 1
+            ? 'ambiguous_generation'
+            : 'missing_generation',
+    });
+
+    const slotId = sourceSlotId;
+    const requestOwner = latestPrivateRequestBySlot.get(slotId);
+    const liveBid = window.tsjs?.bids?.[slotId];
+    const ownerCurrent =
+      !!requestOwner?.bid &&
+      requestOwner.adId === adId &&
+      requestOwner.bid.hb_adid === adId &&
+      requestOwner.navigationGeneration === privateNavigationGeneration &&
+      requestOwner.expiresAt >= monotonicNow() &&
+      !requestOwner.served &&
+      !!requestOwner.element?.isConnected &&
+      findSlotElementByDivId(requestOwner.element.id) === requestOwner.element &&
+      slotIdForMessageSource(e.source) === slotId &&
+      liveBid?.hb_adid === requestOwner.bid.hb_adid &&
+      liveBid.hb_cache_host === requestOwner.bid.hb_cache_host &&
+      liveBid.hb_cache_path === requestOwner.bid.hb_cache_path &&
+      liveBid.trace?.bidTraceId === requestOwner.bid.trace?.bidTraceId;
+    if (!ownerCurrent || !requestOwner?.bid) {
+      // A once-TS-owned message must not escape to ordinary Prebid after its
+      // request owner was replaced or invalidated.
+      if (isKnownStaleTsAdId(adId) || liveBid?.hb_adid === adId) {
+        e.stopImmediatePropagation();
       }
+      return;
     }
-
-    // Not a TS bid — let Prebid.js handle it.
-    if (!slotId || !matchedBid) return;
-
-    // The requesting iframe's slot must own the resolved adId. Without this an
-    // iframe under slot A could request slot B's hb_adid and receive slot B's
-    // creative/dimensions while firing slot B's win/billing beacons.
-    if (slotId !== sourceSlotId) return;
+    const matchedBid = requestOwner.bid;
 
     const slot = window.tsjs?.adSlots?.find((s) => s.id === slotId);
     const [width, height] = slot?.formats?.[0] ?? [728, 90];
 
     if (matchedBid.adm) {
+      if (!billingCapacityAvailable(slotId, matchedBid)) return;
+      const traceToken = armExpectedRender(exactCandidate, e.source);
+      requestOwner.served = true;
       e.stopImmediatePropagation();
       port.postMessage(
         JSON.stringify({
@@ -899,9 +1660,16 @@ export function installTsRenderBridge(): void {
           renderer: TS_DISPLAY_RENDERER,
           width,
           height,
+          ...(traceToken ? { traceToken } : {}),
         })
       );
       fireWinBillingBeacons(slotId, matchedBid);
+      window.tsjs?.recordAdTrace?.({
+        kind: 'pb_render_served',
+        slotId,
+        generation: exactCandidate?.generation,
+        bidTraceId: traceToken,
+      });
       log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from debug adm`);
       return;
     }
@@ -909,19 +1677,114 @@ export function installTsRenderBridge(): void {
     // No TS render source — let Prebid.js handle it.
     if (!matchedBid.hb_cache_host || !matchedBid.hb_cache_path) return;
 
-    // TS owns this adId — stop Prebid from also processing it.
+    const capturedSource = e.source;
+    const capturedElement = requestOwner.element;
+    const capturedCacheHost = matchedBid.hb_cache_host;
+    const capturedCachePath = matchedBid.hb_cache_path;
+    const capturedTraceToken = matchedBid.trace?.bidTraceId;
+
+    const previousOwner = latestCacheRenderBySlot.get(slotId);
+    if (
+      previousOwner &&
+      previousOwner.adId === adId &&
+      previousOwner.source === capturedSource &&
+      previousOwner.generation === requestOwner.generation &&
+      previousOwner.cacheHost === capturedCacheHost &&
+      previousOwner.cachePath === capturedCachePath &&
+      previousOwner.traceToken === capturedTraceToken &&
+      !previousOwner.controller.signal.aborted &&
+      previousOwner.expiresAt >= monotonicNow()
+    ) {
+      // A duplicate message for the exact accepted owner must not start a
+      // second fetch or escape to the ordinary Prebid renderer.
+      e.stopImmediatePropagation();
+      return;
+    }
+    if (previousOwner) retireActiveCacheRender(previousOwner);
+
+    // Capacity overflow must not evict a different live billing owner. Leave
+    // the message untouched so the ordinary Prebid path can process it.
+    if (activeCacheRenders.size >= MAX_ACTIVE_CACHE_RENDERS) return;
+
+    const controller = new AbortController();
+    const activeRender: ActiveCacheRender = {
+      controller,
+      slotId,
+      adId,
+      source: capturedSource,
+      generation: requestOwner.generation,
+      ...(exactCandidate?.generation === requestOwner.generation
+        ? { candidate: exactCandidate }
+        : {}),
+      cacheHost: capturedCacheHost,
+      cachePath: capturedCachePath,
+      traceToken: capturedTraceToken,
+      navigationGeneration: privateNavigationGeneration,
+      expiresAt: requestOwner.expiresAt,
+    };
+
+    activeCacheRenders.add(activeRender);
+    latestCacheRenderBySlot.set(slotId, activeRender);
+    activeRender.expiryTimer = setTimeout(
+      () => retireActiveCacheRender(activeRender),
+      Math.max(0, activeRender.expiresAt - monotonicNow())
+    );
+    // TS owns this accepted render — stop Prebid from also processing it.
     e.stopImmediatePropagation();
 
-    // Skip a concurrent re-render of the same adId so its win/billing beacons
-    // fire at most once even before the first cache fetch resolves.
-    if (renderingAdIds.has(adId)) return;
-    renderingAdIds.add(adId);
+    const stillCurrent = (): boolean => {
+      const liveBid = window.tsjs?.bids?.[slotId];
+      const candidateCurrent =
+        !exactCandidate ||
+        (!exactCandidate.superseded &&
+          (requestCandidates.get(slotId) ?? []).includes(exactCandidate));
+      return (
+        !controller.signal.aborted &&
+        latestCacheRenderBySlot.get(slotId) === activeRender &&
+        latestPrivateRequestBySlot.get(slotId) === requestOwner &&
+        requestOwner.navigationGeneration === privateNavigationGeneration &&
+        requestOwner.expiresAt >= monotonicNow() &&
+        !requestOwner.served &&
+        activeRender.navigationGeneration === privateNavigationGeneration &&
+        activeRender.expiresAt >= monotonicNow() &&
+        candidateCurrent &&
+        !!capturedElement?.isConnected &&
+        findSlotElementByDivId(capturedElement.id) === capturedElement &&
+        slotIdForMessageSource(capturedSource) === slotId &&
+        liveBid?.hb_adid === adId &&
+        liveBid.hb_cache_host === capturedCacheHost &&
+        liveBid.hb_cache_path === capturedCachePath &&
+        liveBid.trace?.bidTraceId === capturedTraceToken
+      );
+    };
 
-    const cacheUrl = `https://${matchedBid.hb_cache_host}${matchedBid.hb_cache_path}?uuid=${encodeURIComponent(adId)}`;
+    const cacheUrl = `https://${capturedCacheHost}${capturedCachePath}?uuid=${encodeURIComponent(adId)}`;
 
-    fetch(cacheUrl, { mode: 'cors' })
+    fetch(cacheUrl, { mode: 'cors', signal: controller.signal })
       .then((res) => (res.ok ? res.text() : Promise.reject(res.status)))
       .then((ad) => {
+        if (!stillCurrent()) {
+          window.tsjs?.recordAdTrace?.({
+            kind: 'pb_render_rejected',
+            slotId,
+            generation: exactCandidate?.generation,
+            bidTraceId: exactCandidate?.traceToken,
+            reason: 'stale_cache_completion',
+          });
+          return;
+        }
+        if (!billingCapacityAvailable(slotId, matchedBid)) {
+          window.tsjs?.recordAdTrace?.({
+            kind: 'pb_render_rejected',
+            slotId,
+            generation: exactCandidate?.generation,
+            bidTraceId: exactCandidate?.traceToken,
+            reason: 'billing_capacity',
+          });
+          return;
+        }
+        const traceToken = armExpectedRender(exactCandidate, capturedSource);
+        requestOwner.served = true;
         port.postMessage(
           JSON.stringify({
             message: 'Prebid Response',
@@ -930,16 +1793,28 @@ export function installTsRenderBridge(): void {
             renderer: TS_DISPLAY_RENDERER,
             width,
             height,
+            ...(traceToken ? { traceToken } : {}),
           })
         );
         fireWinBillingBeacons(slotId, matchedBid);
+        window.tsjs?.recordAdTrace?.({
+          kind: 'pb_render_served',
+          slotId,
+          generation: exactCandidate?.generation,
+          bidTraceId: traceToken,
+        });
         log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from PBS Cache`);
       })
       .catch((err) => {
+        if (err instanceof DOMException && err.name === 'AbortError') return;
         log.warn(`[tsjs-gpt] pbRender bridge: PBS Cache fetch failed for '${slotId}'`, err);
       })
       .finally(() => {
-        renderingAdIds.delete(adId);
+        if (activeRender.expiryTimer) clearTimeout(activeRender.expiryTimer);
+        activeCacheRenders.delete(activeRender);
+        if (latestCacheRenderBySlot.get(slotId) === activeRender) {
+          latestCacheRenderBySlot.delete(slotId);
+        }
       });
   });
 }

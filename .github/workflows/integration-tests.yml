@@ -46,7 +46,7 @@ jobs:
           cp -r crates/trusted-server-adapter-cloudflare/build/. "$CF_BUILD_ARTIFACT_PATH/"
           docker save \
             --output "$DOCKER_ARTIFACT_PATH" \
-            test-wordpress:latest test-nextjs:latest
+            test-ad-trace:latest test-wordpress:latest test-nextjs:latest
 
       - name: Upload integration test artifacts
         uses: actions/upload-artifact@v4
@@ -228,10 +228,29 @@ jobs:
           path: crates/trusted-server-integration-tests/browser/playwright-report-wordpress/
           retention-days: 7
 
+      - name: Run browser tests (ad trace contract)
+        if: always()
+        working-directory: crates/trusted-server-integration-tests/browser
+        env:
+          WASM_BINARY_PATH: ${{ env.WASM_ARTIFACT_PATH }}
+          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
+          VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/configs/viceroy-ad-trace.toml
+          TEST_FRAMEWORK: ad-trace
+          PLAYWRIGHT_HTML_REPORT: playwright-report-ad-trace
+        run: npx playwright test tests/ad-trace/auction-trace.spec.ts
+
+      - name: Upload Playwright report (ad trace contract)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report-ad-trace
+          path: crates/trusted-server-integration-tests/browser/playwright-report-ad-trace/
+          retention-days: 7
+
       - name: Upload Playwright traces and screenshots
         uses: actions/upload-artifact@v4
         if: failure()
         with:
           name: playwright-traces
-          path: crates/trusted-server-integration-tests/browser/test-results/
+          path: crates/trusted-server-integration-tests/browser/test-results-*/
           retention-days: 7

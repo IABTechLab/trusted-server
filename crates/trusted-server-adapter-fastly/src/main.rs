@@ -337,6 +337,8 @@ fn send_edgezero_response(
     // added a per-user Set-Cookie after `apply_finalize_headers` ran, so
     // re-apply the privacy downgrade before send.
     crate::middleware::enforce_set_cookie_cache_privacy(&mut response);
+    // Reassert console no-store after asset/EC/filter response mutations.
+    trusted_server_core::integrations::ad_trace::finalize_response(&mut response);
 
     let (parts, body) = response.into_parts();
 

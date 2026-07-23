@@ -11,6 +11,7 @@ use crate::error::TrustedServerError;
 use crate::platform::{DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, RuntimeServices};
 use crate::settings::Settings;
 
+pub mod ad_trace;
 pub mod adserver_mock;
 pub mod aps;
 pub mod datadome;
@@ -284,6 +285,10 @@ pub(crate) struct IntegrationBuilder {
 
 pub(crate) fn builders() -> &'static [IntegrationBuilder] {
     &[
+        IntegrationBuilder {
+            id: "ad_trace",
+            build: ad_trace::register,
+        },
         IntegrationBuilder {
             id: "prebid",
             build: prebid::register,

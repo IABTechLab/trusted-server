@@ -883,8 +883,22 @@ describe('installTsRenderBridge', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     document.getElementById('div-header')?.remove();
+    document.getElementById('div-sidebar')?.remove();
     delete (window as TestWindow).tsjs;
   });
+
+  function capturePrivateOwner(slotId: string, divId: string): void {
+    const ts = (window as TestWindow).tsjs!;
+    const bid = ts.bids?.[slotId];
+    ts.captureAdTraceRequest?.(
+      {
+        getSlotElementId: () => divId,
+        getTargeting: () => [],
+      },
+      'test_request',
+      { slotId, adId: bid?.hb_adid, bid }
+    );
+  }
 
   function createTrustedSlotIframe(): Window {
     const slot = document.createElement('div');
@@ -892,6 +906,7 @@ describe('installTsRenderBridge', () => {
     const iframe = document.createElement('iframe');
     slot.appendChild(iframe);
     document.body.appendChild(slot);
+    capturePrivateOwner('homepage_header', slot.id);
     return iframe.contentWindow!;
   }
 
@@ -960,7 +975,7 @@ describe('installTsRenderBridge', () => {
 
     expect(fetchStub).toHaveBeenCalledWith(
       'https://openads.example.com/cache?uuid=test-cache-uuid',
-      { mode: 'cors' }
+      expect.objectContaining({ mode: 'cors', signal: expect.any(AbortSignal) })
     );
     expect(stopSpy).toHaveBeenCalled();
     expect(portMessages).toHaveLength(1);
@@ -982,17 +997,15 @@ describe('installTsRenderBridge', () => {
       }) as unknown as MessageEvent
     );
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+    expect(portMessages).toHaveLength(1);
     expect(beaconSpy).toHaveBeenCalledTimes(2);
     beaconSpy.mockRestore();
   });
 
   it('fetches PBS Cache once when two same-adId messages race before the fetch resolves', async () => {
-    // Concurrent render double-fire guard: two 'Prebid Request' messages for the
-    // same adId can arrive before the first cache fetch settles. The in-flight
-    // `renderingAdIds` gate must collapse them to a single fetch — the persistent
-    // firedBeacons dedup only engages after a fetch resolves, so it cannot stop
-    // the second fetch on its own. Deferring the fetch keeps both messages in the
-    // window where only the in-flight gate can prevent the duplicate.
+    // Two duplicate requests from the exact same private owner collapse to one
+    // fetch while it remains current.
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
     const mockAd = '<div>Test Creative</div>';
     let resolveFetch: (value: Response) => void = () => {};
@@ -1036,6 +1049,190 @@ describe('installTsRenderBridge', () => {
     expect(beaconSpy).toHaveBeenCalledWith('https://ssp.example/win');
     expect(beaconSpy).toHaveBeenCalledWith('https://ssp.example/bill');
     expect(beaconSpy).toHaveBeenCalledTimes(2);
+    beaconSpy.mockRestore();
+  });
+
+  it('supersedes a same-adId cache owner from a different source', async () => {
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    const resolves: Array<(value: Response) => void> = [];
+    fetchStub.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolves.push(resolve);
+        })
+    );
+    const bridgeListener = await captureBridgeListener();
+    const oldPort = { postMessage: vi.fn() };
+    const newPort = { postMessage: vi.fn() };
+    const oldSource = createTrustedSlotIframe();
+    const newFrame = document.createElement('iframe');
+    document.getElementById('div-header')?.appendChild(newFrame);
+    const newSource = newFrame.contentWindow!;
+
+    const dispatch = (source: Window, port: { postMessage: ReturnType<typeof vi.fn> }): void => {
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+          ports: [port],
+          source,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+    };
+    dispatch(oldSource, oldPort);
+    dispatch(newSource, newPort);
+    expect(fetchStub).toHaveBeenCalledTimes(2);
+
+    resolves[0]({ ok: true, text: () => Promise.resolve('<div>old</div>') } as Response);
+    resolves[1]({ ok: true, text: () => Promise.resolve('<div>new</div>') } as Response);
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    expect(oldPort.postMessage).not.toHaveBeenCalled();
+    expect(newPort.postMessage).toHaveBeenCalledTimes(1);
+    expect(beaconSpy).toHaveBeenCalledTimes(2);
+    beaconSpy.mockRestore();
+  });
+
+  it('allows concurrent same-adId owners in different slots', async () => {
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    const ts = (window as TestWindow).tsjs!;
+    ts.bids!.sidebar = {
+      ...ts.bids!.homepage_header,
+      nurl: 'https://ssp.example/sidebar-win',
+      burl: 'https://ssp.example/sidebar-bill',
+    };
+    ts.adSlots!.push({
+      id: 'sidebar',
+      formats: [[300, 250]],
+      gam_unit_path: '/a/b/sidebar',
+      div_id: 'div-sidebar',
+      targeting: {},
+    });
+    const resolves: Array<(value: Response) => void> = [];
+    fetchStub.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolves.push(resolve);
+        })
+    );
+    const bridgeListener = await captureBridgeListener();
+    const headerPort = { postMessage: vi.fn() };
+    const sidebarPort = { postMessage: vi.fn() };
+    const headerSource = createTrustedSlotIframe();
+    const sidebar = document.createElement('div');
+    sidebar.id = 'div-sidebar';
+    const sidebarFrame = document.createElement('iframe');
+    sidebar.appendChild(sidebarFrame);
+    document.body.appendChild(sidebar);
+    capturePrivateOwner('sidebar', sidebar.id);
+
+    const dispatch = (source: Window, port: { postMessage: ReturnType<typeof vi.fn> }): void => {
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+          ports: [port],
+          source,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+    };
+    dispatch(headerSource, headerPort);
+    dispatch(sidebarFrame.contentWindow!, sidebarPort);
+    resolves.forEach((resolve, index) =>
+      resolve({
+        ok: true,
+        text: () => Promise.resolve(`<div>creative ${index}</div>`),
+      } as Response)
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    expect(headerPort.postMessage).toHaveBeenCalledTimes(1);
+    expect(sidebarPort.postMessage).toHaveBeenCalledTimes(1);
+    expect(beaconSpy).toHaveBeenCalledTimes(4);
+    beaconSpy.mockRestore();
+  });
+
+  it('blocks a late TS message after navigation before page-bids applies', async () => {
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const port = { postMessage: vi.fn() };
+    const stop = vi.fn();
+
+    window.dispatchEvent(new PopStateEvent('popstate'));
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+        ports: [port],
+        source,
+        stopImmediatePropagation: stop,
+      }) as unknown as MessageEvent
+    );
+
+    expect(stop).toHaveBeenCalledOnce();
+    expect(port.postMessage).not.toHaveBeenCalled();
+    expect(fetchStub).not.toHaveBeenCalled();
+    expect(beaconSpy).not.toHaveBeenCalled();
+    beaconSpy.mockRestore();
+  });
+
+  it('blocks an old traced message after a newer request capture', async () => {
+    const ts = (window as TestWindow).tsjs!;
+    ts.recordAdTrace = vi.fn();
+    ts.nextAdTraceGeneration = vi.fn().mockReturnValueOnce(1).mockReturnValueOnce(2);
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    ts.bids!.homepage_header = {
+      ...ts.bids!.homepage_header,
+      hb_adid: 'new-cache-uuid',
+    };
+    capturePrivateOwner('homepage_header', 'div-header');
+    const port = { postMessage: vi.fn() };
+    const stop = vi.fn();
+
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+        ports: [port],
+        source,
+        stopImmediatePropagation: stop,
+      }) as unknown as MessageEvent
+    );
+
+    expect(stop).toHaveBeenCalledOnce();
+    expect(port.postMessage).not.toHaveBeenCalled();
+    expect(fetchStub).not.toHaveBeenCalled();
+  });
+
+  it('drops a detached stale cache completion without responding or billing', async () => {
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    let resolveFetch: (value: Response) => void = () => {};
+    fetchStub.mockReturnValue(
+      new Promise<Response>((resolve) => {
+        resolveFetch = resolve;
+      })
+    );
+    const bridgeListener = await captureBridgeListener();
+    const port = { postMessage: vi.fn() };
+    const source = createTrustedSlotIframe();
+
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+        ports: [port],
+        source,
+        stopImmediatePropagation: vi.fn(),
+      }) as unknown as MessageEvent
+    );
+    document.getElementById('div-header')?.remove();
+    resolveFetch({
+      ok: true,
+      text: () => Promise.resolve('<div>stale</div>'),
+    } as Response);
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    expect(port.postMessage).not.toHaveBeenCalled();
+    expect(beaconSpy).not.toHaveBeenCalled();
     beaconSpy.mockRestore();
   });
 

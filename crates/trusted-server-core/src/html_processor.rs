@@ -161,6 +161,8 @@ pub struct HtmlProcessorConfig {
     pub request_host: String,
     pub request_scheme: String,
     pub integrations: IntegrationRegistry,
+    /// Request-scoped console bootstrap injected before the unified bundle.
+    pub head_bootstrap_script: Option<String>,
     /// Pre-computed `<script>(window.tsjs=window.tsjs||{}).adSlots=...;</script>`.
     /// Injected at `<head>` open. `None` when no slots matched.
     pub ad_slots_script: Option<String>,
@@ -189,6 +191,7 @@ impl HtmlProcessorConfig {
             request_host: request_host.to_owned(),
             request_scheme: request_scheme.to_owned(),
             integrations: integrations.clone(),
+            head_bootstrap_script: None,
             ad_slots_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: settings.publisher.max_buffered_body_bytes,
@@ -205,9 +208,11 @@ impl HtmlProcessorConfig {
     #[must_use]
     pub fn with_ad_state(
         mut self,
+        head_bootstrap_script: Option<String>,
         ad_slots_script: Option<String>,
         ad_bids_state: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     ) -> Self {
+        self.head_bootstrap_script = head_bootstrap_script;
         self.ad_slots_script = ad_slots_script;
         self.ad_bids_state = ad_bids_state;
         self
@@ -292,6 +297,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     let injected_bids = Arc::new(AtomicBool::new(false));
     let integration_registry = config.integrations.clone();
     let script_rewriters = integration_registry.script_rewriters();
+    let head_bootstrap_script = config.head_bootstrap_script.clone();
     let ad_slots_script = config.ad_slots_script.clone();
     let ad_bids_state = config.ad_bids_state.clone();
 
@@ -302,10 +308,15 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             let integrations = integration_registry.clone();
             let patterns = patterns.clone();
             let document_state = document_state.clone();
+            let head_bootstrap_script = head_bootstrap_script.clone();
             let ad_slots_script = ad_slots_script.clone();
             move |el| {
                 if !injected_tsjs.get() {
                     let mut snippet = String::new();
+                    // Request-scoped activation must run before every TSJS module.
+                    if let Some(ref bootstrap) = head_bootstrap_script {
+                        snippet.push_str(bootstrap);
+                    }
                     // Inject ad slots script first so it appears before tsjs bundle.
                     if let Some(ref slots_script) = ad_slots_script {
                         snippet.push_str(slots_script);
@@ -661,6 +672,7 @@ mod tests {
             request_host: "test.example.com".to_owned(),
             request_scheme: "https".to_owned(),
             integrations: IntegrationRegistry::default(),
+            head_bootstrap_script: None,
             ad_slots_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
@@ -738,6 +750,8 @@ mod tests {
         let html = "<html><head><title>Test</title></head><body></body></html>";
 
         let mut config = create_test_config();
+        config.head_bootstrap_script =
+            Some("<script>window.__tsjs_adTraceActive=true;</script>".to_owned());
         config.integrations = IntegrationRegistry::from_rewriters_with_head_injectors(
             Vec::new(),
             Vec::new(),
@@ -759,6 +773,7 @@ mod tests {
         let processed = String::from_utf8(output).expect("output should be valid UTF-8");
 
         let tsjs_marker = "id=\"trustedserver-js\"";
+        let bootstrap_marker = "window.__tsjs_adTraceActive=true";
         let head_marker = "window.__testHeadInjector=true";
 
         assert_eq!(
@@ -775,6 +790,9 @@ mod tests {
         let tsjs_index = processed
             .find(tsjs_marker)
             .expect("should include unified tsjs tag");
+        let bootstrap_index = processed
+            .find(bootstrap_marker)
+            .expect("should include request bootstrap");
         let head_index = processed
             .find(head_marker)
             .expect("should include head snippet");
@@ -783,8 +801,8 @@ mod tests {
             .expect("should keep existing head content");
 
         assert!(
-            head_index < tsjs_index,
-            "should inject config before tsjs bundle so auto-init can read it"
+            bootstrap_index < head_index && head_index < tsjs_index,
+            "should inject request bootstrap and config before tsjs auto-init"
         );
         assert!(
             tsjs_index < title_index,
@@ -1430,6 +1448,7 @@ mod tests {
             request_host: "example.com".to_string(),
             request_scheme: "https".to_string(),
             integrations: IntegrationRegistry::empty_for_tests(),
+            head_bootstrap_script: None,
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
                     .to_string(),
@@ -1504,6 +1523,7 @@ mod tests {
             request_host: "example.com".to_string(),
             request_scheme: "https".to_string(),
             integrations: IntegrationRegistry::empty_for_tests(),
+            head_bootstrap_script: None,
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=[];</script>"#.to_string(),
             ),
@@ -1539,6 +1559,7 @@ mod tests {
             request_host: "example.com".to_string(),
             request_scheme: "https".to_string(),
             integrations: IntegrationRegistry::empty_for_tests(),
+            head_bootstrap_script: None,
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=[];</script>"#.to_string(),
             ),
@@ -1575,6 +1596,7 @@ mod tests {
             request_host: request_host.to_string(),
             request_scheme: "https".to_string(),
             integrations: IntegrationRegistry::default(),
+            head_bootstrap_script: None,
             ad_slots_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
@@ -1625,6 +1647,7 @@ mod tests {
             request_host: "example.com".to_string(),
             request_scheme: "https".to_string(),
             integrations: IntegrationRegistry::empty_for_tests(),
+            head_bootstrap_script: None,
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=[];</script>"#.to_string(),
             ),
@@ -1653,6 +1676,7 @@ mod tests {
             request_host: "example.com".to_string(),
             request_scheme: "https".to_string(),
             integrations: IntegrationRegistry::empty_for_tests(),
+            head_bootstrap_script: None,
             ad_slots_script: None,
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
