@@ -94,7 +94,7 @@ Chrome or Chromium must be installed locally. The command checks common PATH
 names and standard macOS/Linux install locations.
 
 ```bash
-ts audit https://publisher.example
+ts audit generate https://publisher.example
 ```
 
 By default, the command writes:
@@ -114,13 +114,13 @@ ts config validate
 If a config already exists, avoid overwriting it:
 
 ```bash
-ts audit https://publisher.example --no-config
+ts audit generate https://publisher.example --no-config
 ```
 
 Use custom output paths when reviewing artifacts first:
 
 ```bash
-ts audit https://publisher.example \
+ts audit generate https://publisher.example \
   --js-assets audit/js-assets.toml \
   --config audit/trusted-server.toml
 ```
@@ -128,8 +128,11 @@ ts audit https://publisher.example \
 Use `--force` only when replacing existing output files is intentional:
 
 ```bash
-ts audit https://publisher.example --force
+ts audit generate https://publisher.example --force
 ```
+
+The legacy `ts audit <url>` form remains a compatibility alias for artifact
+generation. New automation should use `ts audit generate <url>`.
 
 `ts audit` is not an EdgeZero adapter command. It has no `--adapter` option and
 it does not provision resources, push config, build, deploy, or contact platform

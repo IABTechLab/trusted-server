@@ -216,8 +216,7 @@ jobs:
           cargo clippy --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')" --all-targets -- -D warnings
 
       - name: cargo test
-        run: |
-          cargo test --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')"
+        run: ./scripts/test-cli.sh
 
   test-typescript:
     name: vitest

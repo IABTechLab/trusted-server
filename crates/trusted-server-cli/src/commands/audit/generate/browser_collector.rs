@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use chromiumoxide::ArcHttpRequest;
 use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::cdp::browser_protocol::network::CookieParam;
 use futures::StreamExt as _;
 use serde::Deserialize;
 use tempfile::TempDir;
@@ -11,15 +12,20 @@ use tokio::time::{sleep, timeout};
 use url::Url;
 use which::which;
 
-use crate::commands::audit::collector::{
-    AuditCollector, CollectedPage, CollectedRequest, CollectedScriptTag,
+use crate::commands::audit::generate::collector::{
+    AuditCollector, CollectedGptSlot, CollectedPage, CollectedRequest, CollectedScriptTag,
 };
 use crate::error::{CliResult, report_error};
 
 const SETTLE_QUIET_PERIOD: Duration = Duration::from_millis(750);
 const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const SETTLE_MAX_WAIT: Duration = Duration::from_secs(6);
-const NAVIGATION_TIMEOUT: Duration = Duration::from_secs(30);
+const SETTLE_MAX_WAIT: Duration = Duration::from_secs(12);
+/// How long to wait for the navigation `load` event (and, separately, the main
+/// document response) before falling through to the settle loop. Ad-heavy pages
+/// (video players, continuous ad refresh) may never fire `load`, so this is a
+/// soft bound: the settle loop is the real readiness signal and the scrape reads
+/// whatever rendered by then.
+const NAVIGATION_LOAD_TIMEOUT: Duration = Duration::from_secs(12);
 const BROWSER_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const RESOURCE_TIMING_BUFFER_WARNING_THRESHOLD: usize = 250;
 const RESOURCE_TIMING_BUFFER_WARNING: &str =
@@ -29,7 +35,11 @@ const RESOURCE_TIMING_BUFFER_WARNING: &str =
 pub(crate) struct BrowserAuditCollector;
 
 impl AuditCollector for BrowserAuditCollector {
-    fn collect_page(&self, target_url: &Url) -> CliResult<CollectedPage> {
+    fn collect_page(
+        &self,
+        target_url: &Url,
+        cookies: &[(String, String)],
+    ) -> CliResult<CollectedPage> {
         let runtime = Builder::new_current_thread()
             .enable_all()
             .build()
@@ -39,11 +49,14 @@ impl AuditCollector for BrowserAuditCollector {
                 ))
             })?;
 
-        runtime.block_on(collect_page_via_browser_async(target_url))
+        runtime.block_on(collect_page_via_browser_async(target_url, cookies))
     }
 }
 
-async fn collect_page_via_browser_async(target_url: &Url) -> CliResult<CollectedPage> {
+async fn collect_page_via_browser_async(
+    target_url: &Url,
+    cookies: &[(String, String)],
+) -> CliResult<CollectedPage> {
     let chrome_executable = find_browser_executable()?;
     let user_data_dir = TempDir::new().map_err(|error| {
         report_error(format!(
@@ -75,7 +88,7 @@ async fn collect_page_via_browser_async(target_url: &Url) -> CliResult<Collected
         }
     });
 
-    let result = collect_page_from_browser(&mut browser, target_url).await;
+    let result = collect_page_from_browser(&mut browser, target_url, cookies).await;
 
     let close_result = timeout(BROWSER_CLOSE_TIMEOUT, browser.close())
         .await
@@ -99,33 +112,58 @@ async fn collect_page_via_browser_async(target_url: &Url) -> CliResult<Collected
 async fn collect_page_from_browser(
     browser: &mut Browser,
     target_url: &Url,
+    cookies: &[(String, String)],
 ) -> CliResult<CollectedPage> {
     let page = browser.new_page("about:blank").await.map_err(|error| {
         report_error(format!("failed to create browser page for audit: {error}"))
     })?;
 
-    timeout(NAVIGATION_TIMEOUT, page.goto(target_url.as_str()))
-        .await
-        .map_err(|_| report_error(format!("timed out navigating to `{target_url}`")))?
-        .map_err(|error| report_error(format!("failed to navigate to `{target_url}`: {error}")))?;
-
-    let navigation_response = timeout(NAVIGATION_TIMEOUT, page.wait_for_navigation_response())
-        .await
-        .map_err(|_| {
-            report_error(format!(
-                "timed out waiting for main document navigation response from `{target_url}`"
-            ))
-        })?
-        .map_err(|error| {
-            report_error(format!(
-                "failed to read main document navigation response: {error}"
-            ))
-        })?;
+    // Set operator-supplied cookies before navigating so the origin sees an
+    // authenticated session on the first request. Scoping each to the target URL
+    // lets Chrome infer domain/path.
+    for (name, value) in cookies {
+        let mut cookie = CookieParam::new(name.clone(), value.clone());
+        cookie.url = Some(target_url.to_string());
+        page.set_cookie(cookie)
+            .await
+            .map_err(|error| report_error(format!("failed to set cookie `{name}`: {error}")))?;
+    }
 
     let mut warnings = Vec::new();
-    if let Some(warning) = validate_navigation_response(navigation_response)? {
-        warnings.push(warning);
+
+    // Navigate, but don't hard-fail when the `load` event never fires. Ad-heavy
+    // pages (video players, continuous ad refresh, anti-bot scripts) can keep
+    // the frame "loading" indefinitely, so a load-wait timeout is downgraded to
+    // a warning: the settle loop below is the real readiness signal and the
+    // scrape reads whatever rendered by then.
+    match timeout(NAVIGATION_LOAD_TIMEOUT, page.goto(target_url.as_str())).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => warnings.push(format!(
+            "navigation to `{target_url}` did not complete cleanly ({error}); results may be partial"
+        )),
+        Err(_) => warnings.push(format!(
+            "navigation to `{target_url}` did not fire `load` within {}s; results may be partial",
+            NAVIGATION_LOAD_TIMEOUT.as_secs()
+        )),
     }
+
+    // Best-effort read of the main-document response for status validation. When
+    // the load wait above times out the response is usually already buffered, so
+    // this returns promptly; tolerate a miss rather than failing the audit.
+    match timeout(NAVIGATION_LOAD_TIMEOUT, page.wait_for_navigation_response()).await {
+        Ok(Ok(navigation_response)) => {
+            if let Some(warning) = validate_navigation_response(navigation_response)? {
+                warnings.push(warning);
+            }
+        }
+        Ok(Err(error)) => warnings.push(format!(
+            "could not read the main document response from `{target_url}` ({error}); results may be partial"
+        )),
+        Err(_) => warnings.push(format!(
+            "timed out reading the main document response from `{target_url}`; results may be partial"
+        )),
+    }
+
     if !wait_for_page_settle(&page).await? {
         warnings.push(
             "browser audit timed out while waiting for the page to settle; results may be partial"
@@ -187,6 +225,14 @@ async fn collect_page_from_browser(
         warnings.push(warning.to_string());
     }
 
+    // Best-effort read of the live GPT slot registry. This is the authoritative
+    // source for slot path/div/size, so a failure here downgrades to empty
+    // rather than failing the whole audit.
+    let gpt_slots: Vec<CollectedGptSlot> = match page.evaluate(GPT_SLOTS_SCRIPT).await {
+        Ok(result) => result.into_value().unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+
     Ok(CollectedPage {
         requested_url: target_url.to_string(),
         final_url,
@@ -206,9 +252,36 @@ async fn collect_page_from_browser(
                 resource_type: entry.initiator_type,
             })
             .collect(),
+        gpt_slots,
         warnings,
     })
 }
+
+/// Reads the live GPT slot registry into `{gam_unit_path, div_id, sizes}` rows.
+///
+/// Mirrors the ad-template verifier's `getSlots()` scrape: it defends against a
+/// missing or partially-initialized `googletag`, keeps only numeric sizes, and
+/// drops slots without a path or div id.
+const GPT_SLOTS_SCRIPT: &str = r#"() => {
+    try {
+        if (!window.googletag || typeof googletag.pubads !== 'function') return [];
+        const pubads = googletag.pubads();
+        if (typeof pubads.getSlots !== 'function') return [];
+        return pubads.getSlots().map((slot) => {
+            const path = typeof slot.getAdUnitPath === 'function' ? slot.getAdUnitPath() : '';
+            const div = typeof slot.getSlotElementId === 'function' ? slot.getSlotElementId() : '';
+            const rawSizes = typeof slot.getSizes === 'function' ? (slot.getSizes() || []) : [];
+            const sizes = rawSizes.map((size) =>
+                (size && typeof size.getWidth === 'function' && typeof size.getHeight === 'function')
+                    ? [size.getWidth(), size.getHeight()]
+                    : null
+            ).filter(Boolean);
+            return { gam_unit_path: path, div_id: div, sizes };
+        }).filter((slot) => slot.gam_unit_path && slot.div_id);
+    } catch (error) {
+        return [];
+    }
+}"#;
 
 async fn wait_for_page_settle(page: &chromiumoxide::Page) -> CliResult<bool> {
     let mut elapsed = Duration::ZERO;
@@ -231,7 +304,11 @@ async fn wait_for_page_settle(page: &chromiumoxide::Page) -> CliResult<bool> {
             .into_value()
             .map_err(|error| report_error(format!("failed to decode resource count: {error}")))?;
 
-        if ready_state == "complete" {
+        // Accept `interactive` as well as `complete`: ad-heavy pages often never
+        // reach `complete` (the `load` event never fires), but their GPT slots
+        // are defined once the DOM is interactive, so a quiet network period at
+        // `interactive` is a valid settle signal for the slot scrape.
+        if ready_state == "complete" || ready_state == "interactive" {
             if previous_count == Some(resource_count) {
                 stable_for += SETTLE_POLL_INTERVAL;
             } else {

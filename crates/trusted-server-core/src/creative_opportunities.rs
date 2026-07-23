@@ -436,9 +436,212 @@ pub fn match_slots<'a>(
     slots.iter().filter(|s| s.matches_path(path)).collect()
 }
 
+/// Three-state outcome of the server-side ad-stack gate.
+///
+/// [`Yes`](RuntimeAdStackExpected::Yes) and [`No`](RuntimeAdStackExpected::No)
+/// are decided purely from known inputs; [`Unknown`](RuntimeAdStackExpected::Unknown)
+/// is reserved for callers (such as the operator CLI) that cannot prove the live
+/// consent state and pass `None` for `consent_allows_auction`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum RuntimeAdStackExpected {
+    /// All known gates pass and consent is known to allow the auction.
+    Yes,
+    /// At least one known gate blocks the server-side ad stack.
+    No,
+    /// All known gates pass but consent is unproven.
+    Unknown,
+}
+
+/// Identifies a single gate evaluated by [`evaluate_ad_stack_gate`].
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum AdStackGateName {
+    /// Request method is `GET`.
+    MethodGet,
+    /// Request is a top-level navigation.
+    Navigation,
+    /// Request is not a prefetch.
+    NotPrefetch,
+    /// Request is not from a known bot.
+    NotBot,
+    /// At least one configured slot matches the request path.
+    MatchedSlots,
+    /// Consent is known to allow the auction.
+    ConsentAllowsAuction,
+    /// The global `[auction].enabled` kill switch is on.
+    AuctionEnabled,
+}
+
+/// Inputs to [`evaluate_ad_stack_gate`].
+///
+/// `consent_allows_auction` is tri-state: `Some(true)` allows, `Some(false)`
+/// blocks, and `None` means the caller cannot prove the consent state.
+#[derive(Debug, Clone, Copy)]
+pub struct AdStackGateInput {
+    /// Request method is `GET`.
+    pub method_get: bool,
+    /// Request is a top-level navigation.
+    pub navigation: bool,
+    /// Request advertises itself as a prefetch.
+    pub prefetch: bool,
+    /// Request is from a known bot.
+    pub bot: bool,
+    /// At least one configured slot matches the request path.
+    pub matched_slots: bool,
+    /// Whether consent allows the auction; `None` when unprovable.
+    pub consent_allows_auction: Option<bool>,
+    /// The global `[auction].enabled` kill switch.
+    pub auction_enabled: bool,
+}
+
+/// Result of [`evaluate_ad_stack_gate`]: the three-state expectation plus the
+/// list of gates that blocked the stack (empty unless `expected` is
+/// [`No`](RuntimeAdStackExpected::No)).
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AdStackGateResult {
+    /// The three-state ad-stack expectation.
+    pub expected: RuntimeAdStackExpected,
+    blocking_gates: Vec<AdStackGateName>,
+}
+
+impl AdStackGateResult {
+    /// Returns the gates that blocked the server-side ad stack.
+    #[must_use]
+    pub fn blocking_gates(&self) -> &[AdStackGateName] {
+        &self.blocking_gates
+    }
+}
+
+/// Evaluates whether the server-side ad stack should run for a request.
+///
+/// Any known gate that fails sets [`No`](RuntimeAdStackExpected::No) and is
+/// recorded in [`AdStackGateResult::blocking_gates`]. When no known gate blocks,
+/// the result is [`Yes`](RuntimeAdStackExpected::Yes) if consent is known to
+/// allow the auction, or [`Unknown`](RuntimeAdStackExpected::Unknown) when
+/// `consent_allows_auction` is `None`.
+///
+/// Gate polarity mirrors the runtime publisher path: `method_get`, `navigation`,
+/// `matched_slots`, and `auction_enabled` block when `false`; `prefetch` and
+/// `bot` block when `true`.
+#[must_use]
+pub fn evaluate_ad_stack_gate(input: AdStackGateInput) -> AdStackGateResult {
+    let mut blocking_gates = Vec::new();
+    if !input.method_get {
+        blocking_gates.push(AdStackGateName::MethodGet);
+    }
+    if !input.navigation {
+        blocking_gates.push(AdStackGateName::Navigation);
+    }
+    if input.prefetch {
+        blocking_gates.push(AdStackGateName::NotPrefetch);
+    }
+    if input.bot {
+        blocking_gates.push(AdStackGateName::NotBot);
+    }
+    if !input.matched_slots {
+        blocking_gates.push(AdStackGateName::MatchedSlots);
+    }
+    if input.consent_allows_auction == Some(false) {
+        blocking_gates.push(AdStackGateName::ConsentAllowsAuction);
+    }
+    if !input.auction_enabled {
+        blocking_gates.push(AdStackGateName::AuctionEnabled);
+    }
+
+    let expected = if !blocking_gates.is_empty() {
+        RuntimeAdStackExpected::No
+    } else if input.consent_allows_auction.is_none() {
+        RuntimeAdStackExpected::Unknown
+    } else {
+        RuntimeAdStackExpected::Yes
+    };
+
+    AdStackGateResult {
+        expected,
+        blocking_gates,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ad_stack_gate_passes_for_eligible_navigation() {
+        let result = evaluate_ad_stack_gate(AdStackGateInput {
+            method_get: true,
+            navigation: true,
+            prefetch: false,
+            bot: false,
+            matched_slots: true,
+            consent_allows_auction: Some(true),
+            auction_enabled: true,
+        });
+
+        assert_eq!(result.expected, RuntimeAdStackExpected::Yes);
+        assert!(result.blocking_gates().is_empty());
+    }
+
+    #[test]
+    fn ad_stack_gate_blocks_known_kill_switch() {
+        let result = evaluate_ad_stack_gate(AdStackGateInput {
+            method_get: true,
+            navigation: true,
+            prefetch: false,
+            bot: false,
+            matched_slots: true,
+            consent_allows_auction: Some(true),
+            auction_enabled: false,
+        });
+
+        assert_eq!(result.expected, RuntimeAdStackExpected::No);
+        assert!(
+            result
+                .blocking_gates()
+                .contains(&AdStackGateName::AuctionEnabled)
+        );
+    }
+
+    #[test]
+    fn ad_stack_gate_is_unknown_when_consent_is_unknown() {
+        let result = evaluate_ad_stack_gate(AdStackGateInput {
+            method_get: true,
+            navigation: true,
+            prefetch: false,
+            bot: false,
+            matched_slots: true,
+            consent_allows_auction: None,
+            auction_enabled: true,
+        });
+
+        assert_eq!(result.expected, RuntimeAdStackExpected::Unknown);
+    }
+
+    // Locks the spec §5.2 mirror invariant: with Some(consent) supplied for every
+    // input combination, `expected == Yes` must equal the legacy all-AND boolean.
+    #[test]
+    fn ad_stack_gate_with_known_consent_matches_legacy_boolean() {
+        for bits in 0u8..128 {
+            let input = AdStackGateInput {
+                method_get: bits & 1 != 0,
+                navigation: bits & 2 != 0,
+                prefetch: bits & 4 != 0,
+                bot: bits & 8 != 0,
+                matched_slots: bits & 16 != 0,
+                consent_allows_auction: Some(bits & 32 != 0),
+                auction_enabled: bits & 64 != 0,
+            };
+            // Legacy semantics: all positive gates true, both negative gates false.
+            let legacy = input.method_get
+                && input.navigation
+                && !input.prefetch
+                && !input.bot
+                && input.matched_slots
+                && input.consent_allows_auction == Some(true)
+                && input.auction_enabled;
+            let got = evaluate_ad_stack_gate(input).expected == RuntimeAdStackExpected::Yes;
+            assert_eq!(got, legacy, "gate mismatch for bits={bits}");
+        }
+    }
 
     fn make_slot(id: &str, patterns: Vec<&str>) -> CreativeOpportunitySlot {
         CreativeOpportunitySlot {
