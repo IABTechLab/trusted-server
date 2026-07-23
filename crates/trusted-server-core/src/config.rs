@@ -282,6 +282,171 @@ password = "production-admin-password-32-bytes"
     }
 
     #[test]
+    fn deploy_validation_rejects_example_publisher_hosts() {
+        let mut settings = valid_settings();
+        settings.publisher.domain = "example.com".to_string();
+        settings.publisher.cookie_domain = ".example.com".to_string();
+        settings.publisher.origin_url = "https://origin.example.com".to_string();
+
+        let err = validate_settings_for_deploy(&settings)
+            .expect_err("should reject unedited example publisher hosts");
+        let text = format!("{err:?}");
+
+        assert!(
+            text.contains("publisher.domain")
+                && text.contains("publisher.cookie_domain")
+                && text.contains("publisher.origin_url"),
+            "should flag all three example publisher placeholders: {err:?}"
+        );
+    }
+
+    #[test]
+    fn deploy_validation_rejects_placeholder_request_signing_store_ids() {
+        let mut settings = valid_settings();
+        settings.request_signing = Some(crate::settings::RequestSigning {
+            enabled: true,
+            config_store_id: "<management-config-store-id>".to_string(),
+            secret_store_id: "<management-secret-store-id>".to_string(),
+        });
+
+        let err = validate_settings_for_deploy(&settings)
+            .expect_err("should reject placeholder request-signing store ids when enabled");
+        let text = format!("{err:?}");
+
+        assert!(
+            text.contains("request_signing.config_store_id")
+                && text.contains("request_signing.secret_store_id"),
+            "should flag both request-signing store ids: {err:?}"
+        );
+    }
+
+    /// The rotate/deactivate admin routes are registered unconditionally and
+    /// read the store IDs without consulting `enabled`, so a disabled block with
+    /// placeholder IDs would still reach key management at runtime.
+    #[test]
+    fn deploy_validation_rejects_placeholder_store_ids_while_request_signing_is_disabled() {
+        let mut settings = valid_settings();
+        settings.request_signing = Some(crate::settings::RequestSigning {
+            enabled: false,
+            config_store_id: "<management-config-store-id>".to_string(),
+            secret_store_id: "<management-secret-store-id>".to_string(),
+        });
+
+        let err = validate_settings_for_deploy(&settings).expect_err(
+            "should reject placeholder store ids even while request signing is disabled",
+        );
+        let text = format!("{err:?}");
+
+        assert!(
+            text.contains("request_signing.config_store_id")
+                && text.contains("request_signing.secret_store_id"),
+            "should flag both request-signing store ids: {err:?}"
+        );
+    }
+
+    #[test]
+    fn deploy_validation_rejects_empty_request_signing_store_ids() {
+        let mut settings = valid_settings();
+        settings.request_signing = Some(crate::settings::RequestSigning {
+            enabled: true,
+            config_store_id: String::new(),
+            secret_store_id: "   ".to_string(),
+        });
+
+        let err = validate_settings_for_deploy(&settings)
+            .expect_err("should reject empty and whitespace-only store ids");
+        let text = format!("{err:?}");
+
+        assert!(
+            text.contains("request_signing.config_store_id")
+                && text.contains("request_signing.secret_store_id"),
+            "should flag both request-signing store ids: {err:?}"
+        );
+    }
+
+    #[test]
+    fn deploy_validation_rejects_placeholder_aps_pub_id() {
+        let mut settings = valid_settings();
+        settings
+            .integrations
+            .insert_config(
+                "aps",
+                &serde_json::json!({
+                    "enabled": true,
+                    "pub_id": "your-aps-publisher-id",
+                    "endpoint": "https://aps.example.com/e/dtb/bid"
+                }),
+            )
+            .expect("should insert APS config");
+
+        let err = validate_settings_for_deploy(&settings)
+            .expect_err("should reject placeholder APS pub_id when enabled");
+
+        assert!(
+            format!("{err:?}").contains("aps"),
+            "should mention the APS integration: {err:?}"
+        );
+    }
+
+    #[test]
+    fn deploy_validation_rejects_blank_aps_pub_id() {
+        for (label, pub_id) in [("empty", ""), ("whitespace-only", "   ")] {
+            let mut settings = valid_settings();
+            settings
+                .integrations
+                .insert_config(
+                    "aps",
+                    &serde_json::json!({
+                        "enabled": true,
+                        "pub_id": pub_id,
+                        "endpoint": "https://aps.example.com/e/dtb/bid"
+                    }),
+                )
+                .expect("should insert APS config");
+
+            let err = validate_settings_for_deploy(&settings)
+                .expect_err("should reject blank APS pub_id when enabled");
+
+            assert!(
+                format!("{err:?}").contains("aps"),
+                "should mention the APS integration for {label} pub_id: {err:?}"
+            );
+        }
+    }
+
+    /// `enabled` defaults to `false` for APS, so a section that omits the flag
+    /// resolves to disabled and must not have its fields validated — otherwise
+    /// the documented template placeholder breaks existing configs on upgrade.
+    #[test]
+    fn deploy_validation_skips_field_validation_for_integrations_with_omitted_enabled() {
+        let mut settings = valid_settings();
+        settings
+            .integrations
+            .insert_config(
+                "aps",
+                &serde_json::json!({
+                    "pub_id": "your-aps-publisher-id",
+                    "endpoint": "https://aps.example.com/e/dtb/bid"
+                }),
+            )
+            .expect("should insert APS config");
+        // `endpoint` parses as a plain string but would fail the `url`
+        // validator, so this section only survives if validation is skipped for
+        // integrations that resolve to disabled.
+        settings
+            .integrations
+            .insert_config(
+                "adserver_mock",
+                &serde_json::json!({ "endpoint": "not-a-valid-url" }),
+            )
+            .expect("should insert adserver_mock config");
+
+        validate_settings_for_deploy(&settings).expect(
+            "should skip field validation for integrations that resolve to disabled via default",
+        );
+    }
+
+    #[test]
     fn deploy_validation_rejects_external_prebid_bundle_without_proxy_allowed_domains() {
         let mut settings = valid_settings();
         settings.proxy.allowed_domains.clear();

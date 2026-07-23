@@ -114,6 +114,39 @@ impl Publisher {
             .any(|p| p.eq_ignore_ascii_case(proxy_secret))
     }
 
+    /// Reserved example publisher values copied verbatim from the config
+    /// template. They deserialize fine but must be replaced before deploying.
+    const PLACEHOLDER_DOMAINS: &[&str] = &["example.com"];
+    const PLACEHOLDER_COOKIE_DOMAINS: &[&str] = &[".example.com"];
+    const PLACEHOLDER_ORIGIN_URLS: &[&str] = &["https://origin.example.com"];
+
+    /// Returns `true` if `domain` is the unedited template placeholder
+    /// (case-insensitive).
+    #[must_use]
+    pub fn is_placeholder_domain(domain: &str) -> bool {
+        Self::PLACEHOLDER_DOMAINS
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(domain.trim()))
+    }
+
+    /// Returns `true` if `cookie_domain` is the unedited template placeholder
+    /// (case-insensitive).
+    #[must_use]
+    pub fn is_placeholder_cookie_domain(cookie_domain: &str) -> bool {
+        Self::PLACEHOLDER_COOKIE_DOMAINS
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(cookie_domain.trim()))
+    }
+
+    /// Returns `true` if `origin_url` is the unedited template placeholder
+    /// (case-insensitive).
+    #[must_use]
+    pub fn is_placeholder_origin_url(origin_url: &str) -> bool {
+        Self::PLACEHOLDER_ORIGIN_URLS
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(origin_url.trim()))
+    }
+
     /// Extracts the host (including port if present) from the `origin_url`.
     ///
     /// # Examples
@@ -254,6 +287,15 @@ impl IntegrationSettings {
             },
         )?;
 
+        // Field validation runs only for integrations that resolve to enabled.
+        // An integration whose `enabled` flag is omitted falls back to its
+        // serde default, which the explicit-`false` fast path above cannot
+        // observe. Validating before this check would reject documented
+        // template placeholders in sections that are not actually turned on.
+        if !config.is_enabled() {
+            return Ok(None);
+        }
+
         config.validate().map_err(|err| {
             Report::new(TrustedServerError::Configuration {
                 message: format!(
@@ -261,10 +303,6 @@ impl IntegrationSettings {
                 ),
             })
         })?;
-
-        if !config.is_enabled() {
-            return Ok(None);
-        }
 
         Ok(Some(config))
     }
@@ -647,6 +685,26 @@ pub struct RequestSigning {
     pub enabled: bool,
     pub config_store_id: String,
     pub secret_store_id: String,
+}
+
+impl RequestSigning {
+    /// Reserved example store-id values from the config template, plus the
+    /// empty string, that must not be deployed while request signing is enabled.
+    pub const STORE_ID_PLACEHOLDERS: &[&str] = &[
+        "<management-config-store-id>",
+        "<management-secret-store-id>",
+    ];
+
+    /// Returns `true` if `store_id` is empty or a known template placeholder
+    /// (case-insensitive).
+    #[must_use]
+    pub fn is_placeholder_store_id(store_id: &str) -> bool {
+        let store_id = store_id.trim();
+        store_id.is_empty()
+            || Self::STORE_ID_PLACEHOLDERS
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(store_id))
+    }
 }
 
 fn default_request_signing_enabled() -> bool {
@@ -1953,6 +2011,7 @@ pub struct Settings {
     #[validate(nested)]
     pub rewrite: Rewrite,
     #[serde(default)]
+    #[validate(nested)]
     pub auction: AuctionConfig,
     #[serde(default)]
     pub consent: ConsentConfig,
@@ -2137,6 +2196,28 @@ impl Settings {
         for handler in &self.handlers {
             if Handler::is_placeholder_password(handler.password.expose()) {
                 insecure_fields.push(format!("handlers[{}].password", handler.path));
+            }
+        }
+        if Publisher::is_placeholder_domain(&self.publisher.domain) {
+            insecure_fields.push("publisher.domain".to_owned());
+        }
+        if Publisher::is_placeholder_cookie_domain(&self.publisher.cookie_domain) {
+            insecure_fields.push("publisher.cookie_domain".to_owned());
+        }
+        if Publisher::is_placeholder_origin_url(&self.publisher.origin_url) {
+            insecure_fields.push("publisher.origin_url".to_owned());
+        }
+        // Checked whenever the block is present, not just when it is enabled:
+        // the key rotate/deactivate admin routes are registered unconditionally
+        // and read these store IDs without consulting `enabled`, so placeholder
+        // IDs behind a disabled block would still reach key management at
+        // runtime.
+        if let Some(request_signing) = &self.request_signing {
+            if RequestSigning::is_placeholder_store_id(&request_signing.config_store_id) {
+                insecure_fields.push("request_signing.config_store_id".to_owned());
+            }
+            if RequestSigning::is_placeholder_store_id(&request_signing.secret_store_id) {
+                insecure_fields.push("request_signing.secret_store_id".to_owned());
             }
         }
 

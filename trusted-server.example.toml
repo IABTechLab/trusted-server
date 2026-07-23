@@ -1,163 +1,384 @@
+# =============================================================================
+# Trusted Server — application configuration template
+# =============================================================================
+#
+# This is the source-controlled starting point for an operator-owned
+# `trusted-server.toml`. Copy it (`ts config init`), fill in the required
+# values, and push it (`ts config push`) as an EdgeZero app-config blob.
+#
+# Only three sections are REQUIRED for the server to start and pass validation:
+#   1. [[handlers]] covering /_ts/admin  (admin authentication)
+#   2. [publisher]                       (domain + origin)
+#   3. [ec] passphrase                   (Edge Cookie identity secret)
+#
+# Everything below those is OPTIONAL. Most optional blocks are commented out —
+# uncomment and edit one to enable it — but a few integrations are kept as active
+# `enabled = false` stubs (see the Integrations section for why). All example
+# hosts use `example.com`; replace them with your real endpoints in your private
+# config, not in this template.
+#
+# `TRUSTED_SERVER__` env vars can override values when the `ts` CLI builds and
+# validates this config for push (e.g. TRUSTED_SERVER__PUBLISHER__DOMAIN=...;
+# nested keys use `__`). The deployed runtime reads the pushed config blob, so
+# these env vars do not change live behavior on their own.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# REQUIRED — Admin authentication
+# -----------------------------------------------------------------------------
+# HTTP Basic-auth handler(s). At least one handler whose `path` regex covers
+# the /_ts/admin endpoints is mandatory; startup fails without it. Each handler
+# needs a non-placeholder username/password (deploy validation rejects the
+# sample password below).
 [[handlers]]
+# Regex matched against the request path. This one guards the admin surface.
 path = "^/_ts/admin"
 username = "admin"
 password = "replace-with-admin-password-32-bytes"
 
+# You can add more handlers to basic-auth-protect other path prefixes. The
+# sample password below is a known placeholder that deploy validation rejects,
+# so it forces a real secret before push:
+# [[handlers]]
+# path = "^/secure"
+# username = "user"
+# password = "replace-with-admin-password"
+
+
+# -----------------------------------------------------------------------------
+# REQUIRED — Publisher / origin
+# -----------------------------------------------------------------------------
 [publisher]
+# Public domain Trusted Server is fronting.
 domain = "example.com"
+# Cookie scope for first-party identity cookies (leading dot = include subdomains).
 cookie_domain = ".example.com"
+# Upstream origin to proxy publisher content from. No trailing slash.
 origin_url = "https://origin.example.com"
-# Optional: override outbound Host header while connecting to origin_url.
-# origin_host_header_override = "www.example.com"
+# HMAC secret for signing first-party proxy URLs. Replace before deploying.
 proxy_secret = "change-me-proxy-secret"
+# Optional: override the outbound Host header sent to origin_url.
+# origin_host_header_override = "www.example.com"
+# Optional: max bytes buffered when a response is post-processed in full (HTML
+# rewriting/injection) instead of streamed. Default 16 MiB; larger responses
+# return 502. Raise for deployments serving very large publisher pages.
+# max_buffered_body_bytes = 16777216  # 16 MiB
 
+
+# -----------------------------------------------------------------------------
+# REQUIRED — Edge Cookie (EC) identity
+# -----------------------------------------------------------------------------
 [ec]
+# Secret used to derive EC identifiers. Must be >= 32 chars and non-placeholder
+# in production (deploy validation rejects known placeholders).
 passphrase = "trusted-server-placeholder-secret"
+# KV store that persists EC identity state. This is the physical store name
+# bound per adapter (e.g. `ec_identity_store` in fastly.toml); edgezero.toml's
+# logical KV id is `trusted_server_kv`.
 ec_store = "ec_identity_store"
+# Max concurrent partner pull-sync requests.
 pull_sync_concurrency = 3
-# cluster_trust_threshold = 10
-# cluster_recheck_secs = 3600
+# Optional cluster-heuristic tuning (defaults shown):
+# cluster_trust_threshold = 10    # entries with cluster_size <= this are individual users
+# cluster_recheck_secs = 3600     # re-evaluate cluster_size after this many seconds
 
-# Example partner configuration. Replace the token before validating/pushing.
+# Optional identity partners (SSP/DSP/identity vendors). Each needs a real,
+# non-placeholder api_token (>= 32 bytes) at deploy. Configure real partners via
+# private config, not this template.
 # [[ec.partners]]
 # name = "Example Partner"
 # source_domain = "partner.example.com"
-# OpenRTB agent type; vendor-specific values are supported (PAIR uses 571187).
+# OpenRTB source.atype (default 3); vendor-specific values are supported
+# (PAIR uses 571187).
 # openrtb_atype = 3
+# include this partner's UIDs in auction user.eids
 # bidstream_enabled = true
 # api_token = "replace-with-partner-api-token-32-bytes-minimum"
-# batch_rate_limit = 60
-# pull_sync_enabled = false
+# batch_rate_limit = 60      # max batch-sync requests/min (default 60)
+# pull_sync_enabled = false  # default false
 
-# Custom headers to include in every response.
+
+# =============================================================================
+# OPTIONAL — Core features (disabled/omitted by default)
+# =============================================================================
+
+# Custom headers added to every response (e.g. X-Robots-Tag: noindex).
 # [response_headers]
 # X-Robots-Tag = "noindex"
 
-[request_signing]
-enabled = false
-config_store_id = "app_config"
-secret_store_id = "secrets"
+# Sign outbound OpenRTB/API requests. When present, both ids are required. These
+# are platform management-API store IDs used for key-rotation WRITES; the runtime
+# reads keys from fixed store names (`jwks_store` / `signing_keys`), not these.
+# [request_signing]
+# enabled = false
+# config_store_id = "<management-config-store-id>"
+# secret_store_id = "<management-secret-store-id>"
 
-[integrations.prebid]
-enabled = false
-server_url = "https://prebid.example.com/openrtb2/auction"
-timeout_ms = 1000
-bidders = []
-debug = false
-client_side_bidders = []
-# Runtime bundle metadata. Set these after running `ts prebid bundle` and uploading the bundle.
+# First-party HTML/CSS rewriting controls.
+# [rewrite]
+# Domains left as-is (not proxied/rewritten). Supports "*.example.com" wildcards.
+# exclude_domains = ["*.cdn.example.com"]
+
+# Tester-cookie endpoints: GET /_ts/set-tester sets ts-tester=true and
+# GET /_ts/clear-tester clears it on publisher.cookie_domain.
+# [tester_cookie]
+# enabled = false
+
+# Consent forwarding. All values below are the defaults — uncomment to override.
+# [consent]
+# mode = "interpreter"            # "interpreter" (decode + forward) or "proxy" (raw passthrough)
+# check_expiration = true         # check TCF consent freshness
+# max_consent_age_days = 395      # max age before consent is treated as expired (~13 months)
+#
+# [consent.gdpr]
+# applies_in = ["AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE","GR","HU","IE","IT","LV","LT","LU","MT","NL","PL","PT","RO","SK","SI","ES","SE","IS","LI","NO","GB"]
+#
+# [consent.us_states]
+# privacy_states = ["CA","VA","CO","CT","UT","MT","OR","TX","FL","DE","IA","NE","NH","NJ","TN","MN","MD","IN","KY","RI"]
+#
+# [consent.us_privacy_defaults]
+# notice_given = true             # has the publisher shown CCPA notice?
+# lspa_covered = false            # is the publisher subject to LSPA?
+# gpc_implies_optout = true       # should Sec-GPC: 1 trigger opt-out?
+#
+# [consent.conflict_resolution]
+# mode = "restrictive"            # "restrictive" | "newest" | "permissive"
+# freshness_threshold_days = 30
+
+# Proxy behavior and first-party asset routing.
+# [proxy]
+# Verify TLS certs when proxying to HTTPS origins (default true; false only for
+# local self-signed dev).
+# certificate_check = true
+# Allowlist for first-party proxy redirect destinations (SSRF guard). Supports
+# exact ("example.com") and wildcard ("*.example.com", also matches apex).
+# REQUIRED to include the Prebid external_bundle_url host when Prebid is enabled.
+# allowed_domains = ["ads.example.com", "assets.example.com", "*.cdn.example.com"]
+#
+# Route first-party asset paths to a different backend origin. Longest matching
+# prefix wins; only GET/HEAD participate; query string is preserved.
+# [[proxy.asset_routes]]
+# prefix = "/.image/"
+# origin_url = "https://assets.example.com"
+# Optional path rewrite before sending upstream (the prefix must match what the
+# pattern expects — here both use `/.image/`):
+# path_pattern = "^/\\.image/(.*)/[^/]+\\.([^/.]+)$"
+# target_path = "/image/upload/$1.$2"
+#
+# Optional S3 SigV4 auth for a private origin:
+# [proxy.asset_routes.auth]
+# type = "s3_sigv4"
+# region = "us-east-1"
+# origin_query = "strip"
+# secret_store = "s3-auth"
+# access_key_id = "access_key_id"
+# secret_access_key = "secret_access_key"
+#
+# Optional Fastly Image Optimizer for the route (references a profile_set below):
+# [proxy.asset_routes.image_optimizer]
+# enabled = true
+# region = "us_east"
+# profile_set = "default_images"
+
+# Reusable Fastly Image Optimizer profile sets referenced by asset routes.
+# Supported IO params are a strict subset: quality, resize-filter, format,
+# width, height, crop. Keep production profile tables in private config.
+# [image_optimizer.profile_sets.default_images]
+# base_params = "quality=70&resize-filter=bicubic"
+# default_profile = "default"
+# unknown_profile = "use_default"   # "use_default" or "reject"
+# profile_param = "profile"
+#
+# [image_optimizer.profile_sets.default_images.profiles]
+# default = "width=1920"
+# thumbnail = "width=150&crop=1:1,smart"
+# medium = "format=auto&width=828"
+
+# Server-side auction. Provider/mediator names must match enabled integrations.
+# [auction]
+# enabled = false
+# providers = ["prebid"]
+# mediator = "adserver_mock"       # optional mediator integration
+# timeout_ms = 2000
+# Context keys the JS client may forward into auction requests (allowlist;
+# empty blocks all).
+# allowed_context_keys = ["permutive_segments"]
+
+# Server-side ad slot templates + creative-opportunity auction.
+# [creative_opportunities]
+# gam_network_id = "123456789"
+# price_granularity = "dense"
+# FCP is not affected by this value — body content above </body> has already
+# streamed and painted before the hold begins. What this caps is the slip on
+# DOMContentLoaded and window.load. 500 ms is the recommended default; raise
+# only if your SSPs need more headroom and analytics confirm the DCL slip is OK.
+# auction_timeout_ms = 500  # override via TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__AUCTION_TIMEOUT_MS
+#
+# Slot templates. Add one block per slot, or override the whole array via
+# TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__SLOT='[{"id":"...","page_patterns":[...],"formats":[...]}]'
+# [[creative_opportunities.slot]]
+# id = "leaderboard"
+# gam_unit_path = "/123456789/leaderboard"
+# div_id = "div-gpt-ad-leaderboard"
+# page_patterns = ["/"]              # glob syntax (not regex); "/" matches only the homepage
+# formats = [{ width = 728, height = 90 }]
+
+# Direct Tinybird auction telemetry (all off / empty by default).
+# [tinybird]
+# enabled = false
+
+# Debug endpoints (all default false — never enable in production).
+# [debug]
+# Exposes GET /_ts/debug/ja4 returning TLS/JA4 fingerprint details. Disable
+# after investigation; it reflects data browser JS cannot normally read.
+# ja4_endpoint_enabled = false
+# Injects a `<!-- ts-debug: ... -->` HTML comment before `</body>` dumping a
+# redacted per-provider auction result (pipeline stats plus every provider
+# response, each bid's creative previewed). Visible in page source and injects
+# bounded raw SSP HTML — never enable in production.
+# auction_html_comment = false
+
+
+# =============================================================================
+# OPTIONAL — Integrations
+# =============================================================================
+# Every integration is off by default. Most are fully commented out; uncomment a
+# block and set `enabled = true` to activate it. Four (gpt, didomi, datadome,
+# google_tag_manager) are kept as active `enabled = false` stubs so the `ts audit`
+# CLI can flip them in place — leave those sections present. Integrations whose
+# `enabled` defaults to true (prebid, permutive, lockr, ...) still stay OFF while
+# their section is commented out. Required fields are noted per block.
+# =============================================================================
+
+# Prebid Server-side auction + first-party Prebid.js bundle.
+# When enabled: `server_url` is required, and `external_bundle_url` is required
+# (its host must be listed in [proxy].allowed_domains).
+# [integrations.prebid]
+# enabled = true
+# server_url = "https://prebid.example.com/openrtb2/auction"
+# timeout_ms = 1000
+# bidders = []
+# debug = false
+# client_side_bidders = []          # bidders running via native Prebid.js adapters
+# Runtime bundle metadata — set after running `ts prebid bundle` and uploading:
 # external_bundle_url = "https://assets.example.com/prebid/trusted-prebid-<sha256>.js"
 # external_bundle_sha256 = "<manifest sha256>"
 # external_bundle_sri = "<manifest sri>"
-
-[integrations.prebid.bundle]
-adapters = ["rubicon"]
+# Per-bidder / per-zone param overrides (canonical rule form):
+# [[integrations.prebid.bid_param_override_rules]]
+# when.bidder = "examplebidder"
+# when.zone = "header"
+# set = { placementId = "_abc" }
+#
+# Bundle build inputs consumed by the `ts prebid bundle` CLI (not the runtime):
+# [integrations.prebid.bundle]
+# adapters = ["rubicon"]
 # user_id_modules = ["sharedIdSystem"]
 
-[integrations.nextjs]
-enabled = false
-rewrite_attributes = ["href", "link", "siteBaseUrl", "siteProductionDomain", "url"]
-max_combined_payload_bytes = 10485760
+# Next.js first-party rewriting for App Router / RSC payloads.
+# [integrations.nextjs]
+# enabled = true
+# rewrite_attributes = ["href", "link", "siteBaseUrl", "siteProductionDomain", "url"]
+# max_combined_payload_bytes = 10485760   # 10 MiB
 
-[integrations.testlight]
-enabled = false
-endpoint = "https://testlight.example.com/openrtb2/auction"
-timeout_ms = 1200
-rewrite_scripts = true
+# Testlight OpenRTB test integration. `endpoint` required when enabled.
+# [integrations.testlight]
+# enabled = true
+# endpoint = "https://testlight.example.com/openrtb2/auction"
+# timeout_ms = 1200
+# rewrite_scripts = true
 
+# Didomi CMP SDK/API first-party proxy. Kept active but disabled so `ts audit`
+# can flip `enabled` to true when Didomi is detected on the audited page.
 [integrations.didomi]
 enabled = false
-sdk_origin = "https://sdk.example.com"
-api_origin = "https://api.example.com"
+# sdk_origin = "https://sdk.example.com"
+# api_origin = "https://api.example.com"
 
-[integrations.sourcepoint]
-enabled = false
-rewrite_sdk = true
-cdn_origin = "https://cdn.example.com"
-cache_ttl_seconds = 3600
+# Sourcepoint CMP first-party proxy.
+# `cdn_origin` is intentionally omitted: the upstream CDN origin is pinned to
+# Sourcepoint's own host and is not operator-selectable. Leave it unset so the
+# validated default applies — overriding it with any other host fails config
+# validation.
+# [integrations.sourcepoint]
+# enabled = true
+# rewrite_sdk = true
+# cache_ttl_seconds = 3600
+# auth_cookie_name = "sp_auth"      # optional: forward a custom authCookie upstream
 
-[integrations.permutive]
-enabled = false
-organization_id = ""
-workspace_id = ""
-project_id = ""
-api_endpoint = "https://api.example.com"
-secure_signals_endpoint = "https://secure-signals.example.com"
+# Osano consent management (proxy toggle only).
+# [integrations.osano]
+# enabled = true
 
-[integrations.lockr]
-enabled = false
-app_id = ""
-api_endpoint = "https://identity.example.com"
-sdk_url = "https://identity.example.com/trusted-server.js"
-cache_ttl_seconds = 3600
-rewrite_sdk = true
+# Permutive DMP. `organization_id` and `workspace_id` required when enabled.
+# [integrations.permutive]
+# enabled = true
+# organization_id = ""
+# workspace_id = ""
+# project_id = ""
+# api_endpoint = "https://api.example.com"
+# secure_signals_endpoint = "https://secure-signals.example.com"
 
+# lockr identity SDK. `app_id` required when enabled.
+# [integrations.lockr]
+# enabled = true
+# app_id = ""
+# api_endpoint = "https://identity.example.com"
+# sdk_url = "https://identity.example.com/trusted-server.js"
+# cache_ttl_seconds = 3600
+# rewrite_sdk = true
+
+# DataDome bot protection. Proxies tags.js + signal-collection API first-party.
+# Kept active but disabled so `ts audit` can flip `enabled` when detected.
 [integrations.datadome]
 enabled = false
-sdk_origin = "https://sdk.example.com"
-api_origin = "https://api.example.com"
-cache_ttl_seconds = 3600
-rewrite_sdk = true
+# sdk_origin = "https://sdk.example.com"
+# api_origin = "https://api.example.com"
+# cache_ttl_seconds = 3600
+# rewrite_sdk = true
+# Server-side Protection API validation (fails open on timeout/error):
+# enable_protection = false
+# server_side_key_secret_store = "ts_secrets"
+# server_side_key_secret_name = "datadome_server_side_key"
+# protection_api_origin = "https://api.example.com"
+# timeout_ms = 1500
+# protection_excluded_methods = ["OPTIONS"]
+# Client-side tag auto-injection (emits only when client_side_key is non-empty):
+# client_side_key = ""
+# inject_client_side_tag = true
+# client_side_tag_url = "/integrations/datadome/tags.js"
 
+# Google Publisher Tag (GPT) first-party proxy. Kept active but disabled so
+# `ts audit` can flip `enabled` to true when GPT is detected.
 [integrations.gpt]
 enabled = false
-script_url = "https://ads.example.com/gpt.js"
-cache_ttl_seconds = 3600
-rewrite_script = true
+# script_url = "https://ads.example.com/gpt.js"
+# cache_ttl_seconds = 3600
+# rewrite_script = true
 
-[proxy]
-# certificate_check = true
-# Required for integrations.prebid.external_bundle_url and first-party proxy redirects.
-# allowed_domains = ["ads.example.com", "assets.example.com", "*.cdn.example.com"]
+# Amazon Publisher Services (APS/TAM). `pub_id` required when enabled.
+# [integrations.aps]
+# enabled = true
+# pub_id = "your-aps-publisher-id"
+# endpoint = "https://aps.example.com/e/dtb/bid"
+# timeout_ms = 1000
 
-[auction]
-enabled = false
-providers = []
-timeout_ms = 2000
-allowed_context_keys = []
-
-[integrations.aps]
-enabled = false
-pub_id = "your-aps-publisher-id"
-endpoint = "https://aps.example.com/e/dtb/bid"
-timeout_ms = 1000
-
+# Google Tag Manager first-party proxy. Kept active but disabled so `ts audit`
+# can fill container_id and flip `enabled` when GTM is detected. `container_id`
+# is required when this integration is actually enabled.
 [integrations.google_tag_manager]
 enabled = false
-container_id = "GTM-EXAMPLE"
-upstream_url = "https://tags.example.com"
+# Invalid placeholder on purpose: enabling GTM without a real GTM-XXXXXX id
+# fails validation. `ts audit` overwrites this when it detects a real container.
+container_id = "GTM-REPLACE-ME"
+# upstream_url = "https://tags.example.com"
 
-[integrations.adserver_mock]
-enabled = false
-endpoint = "https://adserver.example.com/mediate"
-timeout_ms = 1000
-
-[integrations.adserver_mock.context_query_params]
-example_segments = "segments"
-
-[debug]
-ja4_endpoint_enabled = false
-
-# Inject a `<!-- ts-debug: ... -->` HTML comment before `</body>` dumping a
-# redacted per-provider auction result: pipeline stats plus every provider
-# response, with each bid's creative previewed (not the full markup) and
-# provider metadata filtered to a fail-closed allowlist.
-# Visible in page source and injects (bounded) raw HTML from SSPs. NEVER enable
-# in production.
-auction_html_comment = false
-
-[creative_opportunities]
-gam_network_id = "123456789"
-# FCP is not affected by this value — body content above </body> has already
-# streamed and painted before the hold begins. What this caps is the slip on
-# DOMContentLoaded and window.load. Worst case: a cache-hit page where origin
-# drains in <50 ms but the auction runs to the limit. 500 ms is the recommended
-# default; raise only if your SSPs need more headroom and your analytics confirm
-# the DCL slip is acceptable.
-auction_timeout_ms = 500  # override via TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__AUCTION_TIMEOUT_MS
-price_granularity = "dense"
-
-# No slot templates are enabled in the checked-in default config. Add
-# `[[creative_opportunities.slot]]` entries via private config or override the
-# entire array via:
-# TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__SLOT='[{"id":"...","gam_unit_path":"...",...}]'
+# Mock ad server used for auction mediation in dev/testing.
+# [integrations.adserver_mock]
+# enabled = true
+# endpoint = "https://adserver.example.com/mediate"
+# timeout_ms = 1000
+# Map auction context keys to mediation URL query params:
+# [integrations.adserver_mock.context_query_params]
+# example_segments = "segments"

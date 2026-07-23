@@ -47,6 +47,7 @@ pub struct AdServerMockConfig {
 
     /// Timeout in milliseconds
     #[serde(default = "default_timeout_ms")]
+    #[validate(range(min = 1, max = 60000))]
     pub timeout_ms: u32,
 
     /// Optional price floor (minimum acceptable CPM)

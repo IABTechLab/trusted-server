@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use std::collections::HashMap;
 use std::time::Duration;
-use validator::Validate;
+use validator::{Validate, ValidationError};
 
 use crate::auction::provider::AuctionProvider;
 use crate::auction::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid, MediaType};
@@ -201,6 +201,7 @@ pub struct ApsConfig {
 
     /// APS publisher ID (accepts both string and integer from config)
     #[serde(deserialize_with = "deserialize_pub_id")]
+    #[validate(length(min = 1), custom(function = validate_aps_pub_id))]
     pub pub_id: String,
 
     /// APS API endpoint
@@ -210,6 +211,7 @@ pub struct ApsConfig {
 
     /// Timeout in milliseconds
     #[serde(default = "default_timeout_ms")]
+    #[validate(range(min = 1, max = 60000))]
     pub timeout_ms: u32,
 }
 
@@ -283,6 +285,35 @@ impl Default for ApsConfig {
             timeout_ms: default_timeout_ms(),
         }
     }
+}
+
+/// Validator for [`ApsConfig::pub_id`]: rejects blank publisher IDs and the
+/// known template placeholder. The built-in `length` validator counts
+/// whitespace, so a whitespace-only `pub_id` has to be rejected here. This runs
+/// only when APS is enabled, because integration configs validate lazily via
+/// `get_typed`.
+fn validate_aps_pub_id(pub_id: &str) -> Result<(), ValidationError> {
+    let pub_id = pub_id.trim();
+
+    if pub_id.is_empty() {
+        let mut err = ValidationError::new("aps_pub_id_blank");
+        err.message = Some("pub_id must not be blank".into());
+        return Err(err);
+    }
+
+    if ApsConfig::PUB_ID_PLACEHOLDERS
+        .iter()
+        .any(|placeholder| placeholder.eq_ignore_ascii_case(pub_id))
+    {
+        return Err(ValidationError::new("aps_pub_id_placeholder"));
+    }
+    Ok(())
+}
+
+impl ApsConfig {
+    /// Reserved example `pub_id` values from the config template that must not
+    /// be deployed while APS is enabled.
+    pub const PUB_ID_PLACEHOLDERS: &[&str] = &["your-aps-publisher-id"];
 }
 
 impl IntegrationConfig for ApsConfig {
