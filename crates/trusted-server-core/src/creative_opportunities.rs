@@ -80,6 +80,39 @@ fn parse_unit_template(raw: &str) -> Result<Vec<UnitTemplatePart>, String> {
     Ok(parts)
 }
 
+/// Collapses each run of characters outside `[A-Za-z0-9_-]` to a single `_`.
+///
+/// Returns a non-empty string for any non-empty input.
+fn sanitize_section(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    let mut in_bad_run = false;
+    for ch in segment.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            out.push(ch);
+            in_bad_run = false;
+        } else if !in_bad_run {
+            out.push('_');
+            in_bad_run = true;
+        }
+    }
+    out
+}
+
+/// Derives the `{section}` value from a request path.
+///
+/// Uses the first non-empty path segment, sanitized to `[A-Za-z0-9_-]`. Falls
+/// back to `section_root` when the path has no segment (`/`, repeated slashes).
+///
+/// The path is used **raw** (not percent-decoded) so this stays consistent with
+/// how [`page_patterns`](CreativeOpportunitySlot::page_patterns) glob-match the
+/// same path — e.g. `/new%20s` yields `new_20s`, never the decoded `new_s`.
+pub(crate) fn derive_section(path: &str, section_root: &str) -> String {
+    match path.split('/').find(|segment| !segment.is_empty()) {
+        Some(segment) => sanitize_section(segment),
+        None => section_root.to_string(),
+    }
+}
+
 /// Top-level configuration for the creative opportunities system.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -658,6 +691,35 @@ mod tests {
     #[test]
     fn parse_unit_template_rejects_empty() {
         parse_unit_template("").expect_err("should reject empty template");
+    }
+
+    #[test]
+    fn derive_section_uses_first_segment() {
+        assert_eq!(derive_section("/news", "home"), "news");
+        assert_eq!(derive_section("/news/gm-cadillac", "home"), "news");
+        assert_eq!(derive_section("/car-research/x", "home"), "car-research");
+    }
+
+    #[test]
+    fn derive_section_uses_root_when_no_segment() {
+        assert_eq!(derive_section("/", "homepage"), "homepage");
+        assert_eq!(derive_section("///", "homepage"), "homepage");
+    }
+
+    #[test]
+    fn derive_section_sanitizes_unsafe_runs_to_single_underscore() {
+        // Not decoded: in "new%20s" only '%' is disallowed ('2' and '0' are
+        // alphanumeric), so it collapses to a single '_' -> "new_20s". This is
+        // exactly the no-decode contract: had we decoded, %20 would be a space
+        // and yield "new_s"; we do NOT decode.
+        assert_eq!(derive_section("/new%20s", "home"), "new_20s");
+        // A run of disallowed chars collapses to one '_'.
+        assert_eq!(derive_section("/a..b", "home"), "a_b");
+    }
+
+    #[test]
+    fn derive_section_is_non_empty_for_all_disallowed_segment() {
+        assert_eq!(derive_section("/%%%/x", "home"), "_");
     }
 
     #[test]
