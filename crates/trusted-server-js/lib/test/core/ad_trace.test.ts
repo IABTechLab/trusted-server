@@ -276,6 +276,51 @@ describe('ad trace reducer', () => {
     });
   });
 
+  it('keeps an ambiguous GPT response unresolved and preserves a backfill reason', () => {
+    const store = createAdTraceStore(() => 1);
+    const ambiguousGeneration = store.nextGeneration('slot-a');
+    store.record({
+      kind: 'gpt_request_started',
+      slotId: 'slot-a',
+      generation: ambiguousGeneration,
+      reason: 'gpt_slot_requested',
+    });
+    store.record({
+      kind: 'gpt_slot_render_ended',
+      slotId: 'slot-a',
+      generation: ambiguousGeneration,
+      outcome: 'unresolved',
+      confidence: 'none',
+      reason: 'overlapping_request',
+      isEmpty: false,
+    });
+
+    expect(store.getRenderTimeline()[0]).toMatchObject({
+      outcome: 'unresolved',
+      confidence: 'none',
+      reason: 'overlapping_request',
+    });
+    expect(store.getSlot('slot-a')?.stages.gam).toMatchObject({
+      outcome: 'unresolved',
+      confidence: 'none',
+    });
+
+    const backfillGeneration = store.nextGeneration('slot-b');
+    store.record({
+      kind: 'gpt_slot_render_ended',
+      slotId: 'slot-b',
+      generation: backfillGeneration,
+      reason: 'gpt_backfill',
+      isEmpty: false,
+      isBackfill: true,
+    });
+    expect(store.getRenderTimeline()[1]).toMatchObject({
+      outcome: 'gam_only',
+      reason: 'gpt_backfill',
+    });
+    expect(store.getSlot('slot-b')?.stages.gam.outcome).toBe('backfill');
+  });
+
   it('enriches one bounded render record and keeps visibility independent', () => {
     let now = 0;
     const store = createAdTraceStore(() => ++now);

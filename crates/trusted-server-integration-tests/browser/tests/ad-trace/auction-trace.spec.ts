@@ -110,6 +110,75 @@ test.describe("tester-only auction trace contract", () => {
         ).toBe("undefined");
     });
 
+    test("publisher-only pages install universal GPT tracing without adInit", async ({
+        page,
+    }) => {
+        await serveBuiltPrebid(page);
+        await page.goto(runtimeUrl("/publisher-only?ts_console=1"), {
+            waitUntil: "domcontentloaded",
+        });
+        await expect(page).toHaveURL(runtimeUrl("/publisher-only"));
+        await expect
+            .poll(() =>
+                page.evaluate(
+                    () =>
+                        typeof (
+                            window as Window & {
+                                tsjs?: { adTrace?: unknown };
+                            }
+                        ).tsjs?.adTrace,
+                ),
+            )
+            .toBe("object");
+
+        await page.evaluate(() => {
+            (
+                window as Window & {
+                    adTraceFixture: {
+                        requestPublisherLazy(flags: {
+                            isBackfill?: boolean;
+                        }): void;
+                    };
+                }
+            ).adTraceFixture.requestPublisherLazy({ isBackfill: true });
+        });
+        await expect
+            .poll(() =>
+                page.evaluate(() => {
+                    const slots = (
+                        window as Window & {
+                            tsjs: {
+                                adTrace: {
+                                    export(): {
+                                        slots: Array<{
+                                            slotId: string;
+                                            stages: {
+                                                trustedServer: {
+                                                    outcome: string;
+                                                };
+                                                gam: { outcome: string };
+                                            };
+                                        }>;
+                                    };
+                                };
+                            };
+                        }
+                    ).tsjs.adTrace.export().slots;
+                    const slot = slots.find((item) =>
+                        item.slotId.startsWith("gpt_slot_"),
+                    );
+                    return slot
+                        ? {
+                              trustedServer:
+                                  slot.stages.trustedServer.outcome,
+                              gam: slot.stages.gam.outcome,
+                          }
+                        : undefined;
+                }),
+            )
+            .toEqual({ trustedServer: "not_observed", gam: "backfill" });
+    });
+
     test("console session supports true, persists privately, and can be disabled", async ({
         page,
     }) => {
@@ -220,6 +289,203 @@ test.describe("tester-only auction trace contract", () => {
         expect(visibleText).not.toMatch(
             /definitive|strong|probable|not_run|gam_only|TS winner|Prebid winner|#\d/,
         );
+    });
+
+    test("publisher-owned lazy GPT slots receive factual overlays without TS ownership", async ({
+        page,
+    }) => {
+        await openTesterPage(page);
+        await page.locator("#publisher-lazy-slot").scrollIntoViewIfNeeded();
+        await page.evaluate(() => {
+            const fixture = (
+                window as Window & {
+                    adTraceFixture: {
+                        requestPublisherLazy(flags: {
+                            isBackfill?: boolean;
+                            isEmpty?: boolean;
+                        }): void;
+                    };
+                }
+            ).adTraceFixture;
+            fixture.requestPublisherLazy({ isBackfill: true });
+        });
+
+        await expect
+            .poll(() =>
+                page.evaluate(() => {
+                    const result = (
+                        window as Window & {
+                            tsjs: {
+                                adTrace: {
+                                    export(): {
+                                        slots: Array<{
+                                            slotId: string;
+                                            latestGeneration: number;
+                                            stages: Record<
+                                                string,
+                                                { outcome: string }
+                                            >;
+                                        }>;
+                                    };
+                                };
+                            };
+                        }
+                    ).tsjs.adTrace.export();
+                    const slot = result.slots.find((item) =>
+                        item.slotId.startsWith("gpt_slot_"),
+                    );
+                    return slot
+                        ? {
+                              slotId: slot.slotId,
+                              generation: slot.latestGeneration,
+                              trustedServer:
+                                  slot.stages.trustedServer.outcome,
+                              prebid: slot.stages.prebid.outcome,
+                              gam: slot.stages.gam.outcome,
+                              creative: slot.stages.creative.outcome,
+                          }
+                        : undefined;
+                }),
+            )
+            .toEqual(
+                expect.objectContaining({
+                    slotId: expect.stringMatching(/^gpt_slot_\d+$/),
+                    trustedServer: "not_observed",
+                    prebid: "not_observed",
+                    gam: "backfill",
+                    creative: "gpt_iframe_onload",
+                }),
+            );
+
+        await page.evaluate(() => {
+            (
+                window as Window & {
+                    adTraceFixture: { markPublisherLazyViewable(): void };
+                }
+            ).adTraceFixture.markPublisherLazyViewable();
+        });
+        await expect
+            .poll(() =>
+                page.evaluate(() => {
+                    const result = (
+                        window as Window & {
+                            tsjs: {
+                                adTrace: {
+                                    export(): {
+                                        renders: Array<{
+                                            slotId: string;
+                                            viewability?: string;
+                                        }>;
+                                    };
+                                };
+                            };
+                        }
+                    ).tsjs.adTrace.export();
+                    return result.renders.find((item) =>
+                        item.slotId.startsWith("gpt_slot_"),
+                    )?.viewability;
+                }),
+            )
+            .toBe("viewable");
+
+        await expect(page.locator("#publisher-lazy-slot")).toHaveAttribute(
+            "data-ts-trace-outcome",
+            "gam_only",
+        );
+        const genericExport = await page.evaluate(() =>
+            JSON.stringify(
+                (
+                    window as Window & {
+                        tsjs: { adTrace: { export(): unknown } };
+                    }
+                ).tsjs.adTrace.export(),
+            ),
+        );
+        expect(genericExport).not.toContain("publisher-lazy-slot");
+        expect(genericExport).not.toContain("/123456789/example/publisher-lazy");
+        const session = await page.context().newCDPSession(page);
+        await expect
+            .poll(async () => {
+                const tree = (await session.send(
+                    "Accessibility.getFullAXTree",
+                )) as {
+                    nodes: Array<{ name?: { value?: string } }>;
+                };
+                return tree.nodes
+                    .map((node) => node.name?.value || "")
+                    .join("\n");
+            })
+            .toContain("GAM returned backfill");
+
+        const firstGeneration = await page.evaluate(() => {
+            const result = (
+                window as Window & {
+                    tsjs: {
+                        adTrace: {
+                            export(): {
+                                slots: Array<{
+                                    slotId: string;
+                                    latestGeneration: number;
+                                }>;
+                            };
+                        };
+                    };
+                }
+            ).tsjs.adTrace.export();
+            return result.slots.find((item) =>
+                item.slotId.startsWith("gpt_slot_"),
+            )?.latestGeneration;
+        });
+        await page.evaluate(() => {
+            (
+                window as Window & {
+                    adTraceFixture: {
+                        requestPublisherLazy(flags: {
+                            isEmpty?: boolean;
+                        }): void;
+                    };
+                }
+            ).adTraceFixture.requestPublisherLazy({ isEmpty: true });
+        });
+        await expect
+            .poll(() =>
+                page.evaluate((previousGeneration) => {
+                    const result = (
+                        window as Window & {
+                            tsjs: {
+                                adTrace: {
+                                    export(): {
+                                        slots: Array<{
+                                            slotId: string;
+                                            latestGeneration: number;
+                                            stages: Record<
+                                                string,
+                                                { outcome: string }
+                                            >;
+                                        }>;
+                                    };
+                                };
+                            };
+                        }
+                    ).tsjs.adTrace.export();
+                    const slot = result.slots.find((item) =>
+                        item.slotId.startsWith("gpt_slot_"),
+                    );
+                    return slot
+                        ? {
+                              generationAdvanced:
+                                  slot.latestGeneration > previousGeneration,
+                              gam: slot.stages.gam.outcome,
+                              creative: slot.stages.creative.outcome,
+                          }
+                        : undefined;
+                }, firstGeneration ?? 0),
+            )
+            .toEqual({
+                generationAdvanced: true,
+                gam: "empty",
+                creative: "not_observed",
+            });
     });
 
     test("direct auction API render reaches an exact iframe-load acknowledgement", async ({

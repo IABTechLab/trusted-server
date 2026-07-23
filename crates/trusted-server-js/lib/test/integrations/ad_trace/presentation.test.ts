@@ -214,9 +214,29 @@ describe('presentTraceOverlay', () => {
     ],
     ['served renderer', render('served'), 'Creative response sent to the renderer'],
     ['unattributed GAM render', render('gam_only'), 'GAM rendered an ad — source not attributed'],
+    [
+      'GAM backfill response',
+      render('gam_only', { reason: 'gpt_backfill' }),
+      'GAM returned backfill',
+    ],
+    [
+      'generic GPT request',
+      render('unresolved', { reason: 'gpt_slot_requested' }),
+      'GAM request observed',
+    ],
     ['empty GAM response', render('empty'), 'GAM returned no ad'],
   ] as const)('renders %s as a concise factual row status', (_name, snapshot, expected) => {
     expect(presentTraceOverlay(stages(), snapshot).renderStatus).toBe(expected);
+  });
+
+  it('deduplicates the GAM backfill stage and render facts', () => {
+    const presentation = presentTraceOverlay(
+      stages({ gam: stage('backfill') }),
+      render('gam_only', { reason: 'gpt_backfill' })
+    );
+
+    expect(presentation.facts).toEqual(['GAM returned backfill']);
+    expect(presentation.primaryStatus).toBe('GAM returned backfill');
   });
 
   it('falls back to the strongest observed stage fact for a primary row', () => {

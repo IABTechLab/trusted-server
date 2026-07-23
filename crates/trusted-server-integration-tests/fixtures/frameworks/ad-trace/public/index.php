@@ -6,8 +6,9 @@
   <title>Trusted Server ad trace fixture</title>
   <style>
     body { font: 16px/1.4 system-ui, sans-serif; margin: 24px; }
-    #ad-trace-slot { width: 300px; height: 250px; border: 1px solid #777; }
-    #ad-trace-slot iframe { width: 100%; height: 100%; border: 0; }
+    #ad-trace-slot, #publisher-lazy-slot { width: 300px; height: 250px; border: 1px solid #777; }
+    #ad-trace-slot iframe, #publisher-lazy-slot iframe { width: 100%; height: 100%; border: 0; }
+    #publisher-lazy-slot { margin-top: 120vh; }
   </style>
   <script>
     (() => {
@@ -26,31 +27,39 @@
         return values.length ? values[0] : undefined;
       }
 
-      function creativeFrame(slot) {
-        const adId = firstTarget(slot, 'hb_adid');
-        if (!adId || suppressCreative) return;
+      function creativeFrame(slot, isEmpty, onLoad) {
+        if (suppressCreative) return;
         const root = document.getElementById(slot.getSlotElementId());
         if (!root) return;
+        if (isEmpty) {
+          root.replaceChildren();
+          return;
+        }
+        const adId = firstTarget(slot, 'hb_adid');
         const frame = document.createElement('iframe');
-        frame.title = 'Example universal creative';
-        frame.srcdoc = `<!doctype html><script>
-          const channel = new MessageChannel();
-          channel.port1.onmessage = (event) => {
-            const payload = JSON.parse(event.data);
-            if (payload.message !== 'Prebid Response') return;
-            (0, eval)(payload.renderer);
-            const helper = {
-              mkFrame(doc, attrs) {
-                const child = doc.createElement('iframe');
-                Object.assign(child, attrs);
-                return child;
-              },
+        frame.title = adId ? 'Example universal creative' : 'Example publisher creative';
+        if (adId) {
+          frame.srcdoc = `<!doctype html><script>
+            const channel = new MessageChannel();
+            channel.port1.onmessage = (event) => {
+              const payload = JSON.parse(event.data);
+              if (payload.message !== 'Prebid Response') return;
+              (0, eval)(payload.renderer);
+              const helper = {
+                mkFrame(doc, attrs) {
+                  const child = doc.createElement('iframe');
+                  Object.assign(child, attrs);
+                  return child;
+                },
+              };
+              window.render(payload, helper, window);
             };
-            window.render(payload, helper, window);
-          };
-          top.postMessage(${JSON.stringify(JSON.stringify({ message: 'Prebid Request', adId }))}, '*', [channel.port2]);
-        <\/script>`;
-        frame.addEventListener('load', () => emit('slotOnload', { slot }), { once: true });
+            top.postMessage(${JSON.stringify(JSON.stringify({ message: 'Prebid Request', adId }))}, '*', [channel.port2]);
+          <\/script>`;
+        } else {
+          frame.srcdoc = '<!doctype html><p>Example publisher creative</p>';
+        }
+        frame.addEventListener('load', onLoad, { once: true });
         root.replaceChildren(frame);
       }
 
@@ -61,9 +70,15 @@
         // the injected diagnostic module time to install its bridge/listeners
         // after the server's end-of-body bid script starts this request.
         setTimeout(() => {
+          let creativeLoaded = false;
+          let renderEnded = false;
+          const reportLoad = () => {
+            if (renderEnded) emit('slotOnload', { slot });
+            else creativeLoaded = true;
+          };
           emit('slotRequested', { slot });
           emit('slotResponseReceived', { slot });
-          creativeFrame(slot);
+          creativeFrame(slot, flags.isEmpty === true, reportLoad);
           // Universal Creative requests pbRender from its iframe before GPT's
           // terminal render callback. A second task preserves that ordering and
           // prevents the debug ADM interceptor from replacing the requester.
@@ -73,6 +88,8 @@
               isEmpty: flags.isEmpty === true,
               isBackfill: flags.isBackfill === true,
             });
+            renderEnded = true;
+            if (creativeLoaded) emit('slotOnload', { slot });
           }, 500);
         }, 0);
       }
@@ -141,6 +158,10 @@
       tag.cmd = { push(callback) { callback(); return 1; } };
       queued.forEach((callback) => callback());
 
+      const publisherLazySlot = tag
+        .defineSlot('/123456789/example/publisher-lazy', [[300, 250]], 'publisher-lazy-slot')
+        .addService(service);
+
       window.adTraceFixture = {
         latestSlot: () => slots.at(-1),
         setSuppressCreative(value) { suppressCreative = value; },
@@ -148,6 +169,13 @@
         requestCurrent() {
           const slot = slots.at(-1);
           if (slot) requestSlot(slot);
+        },
+        requestPublisherLazy(flags = {}) {
+          nextRender = { ...flags };
+          requestSlot(publisherLazySlot);
+        },
+        markPublisherLazyViewable() {
+          emit('impressionViewable', { slot: publisherLazySlot });
         },
         simulateClientSelection() {
           const slot = slots.at(-1);
@@ -197,5 +225,6 @@
   <h1>Ad trace contract fixture</h1>
   <p>This page uses deterministic local PBS, GPT, and universal creative protocol mocks.</p>
   <div id="ad-trace-slot" aria-label="Example ad slot"></div>
+  <div id="publisher-lazy-slot" aria-label="Example publisher-owned lazy ad slot"></div>
 </body>
 </html>
