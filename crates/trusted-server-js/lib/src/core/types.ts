@@ -87,12 +87,6 @@ export interface AuctionBidData {
   hb_adid?: string;
   hb_cache_host?: string;
   hb_cache_path?: string;
-  /** Server-side auction ID — trace key joining this bid to server logs. */
-  hb_auction_id?: string;
-  /** Upstream creative ID (OpenRTB `crid`), when the bidder returned one. */
-  hb_crid?: string;
-  /** Trace hash of the bid's raw creative markup (16 hex chars of SHA-256). */
-  hb_adm_hash?: string;
   /** Winning creative width; the bridge sizes the inline render from this. */
   w?: number;
   /** Winning creative height; the bridge sizes the inline render from this. */
@@ -117,41 +111,6 @@ export interface AuctionBidData {
    * GAM-replace path.
    */
   debug_bid?: AuctionDebugBidData;
-}
-
-/** How a creative reached the page for a [`RenderRecord`]. */
-export type RenderServedFrom = 'inline' | 'gam' | 'debug-adm' | 'pbs-cache';
-
-/**
- * One entry in `window.tsjs.renders` — the client-side half of the render
- * trace. Field values mirror the server-side `auction winner:` log line so
- * the two can be joined on (auctionId, slotId).
- */
-export interface RenderRecord {
-  /** Slot the creative was rendered for. */
-  slotId: string;
-  /** Which render path produced this record. */
-  path: 'auction' | 'ssat';
-  /** Whether a creative actually rendered (false for empty/rejected). */
-  rendered: boolean;
-  /** Actual DOM element ID the slot resolved to (div_id may be a prefix). */
-  elementId?: string;
-  /** Server-side auction ID. */
-  auctionId?: string;
-  /** Winning bidder / seat. */
-  bidder?: string;
-  /** hb_adid (PBS cache UUID or OpenRTB adid). */
-  adId?: string;
-  /** Upstream creative ID (OpenRTB crid). */
-  creativeId?: string;
-  /** Trace hash of the creative markup (16 hex chars of SHA-256). */
-  admHash?: string;
-  /** Mechanism that delivered the creative. */
-  servedFrom?: RenderServedFrom;
-  /** How many renders this slot has seen (SPA navigations, refreshes). */
-  count: number;
-  /** Epoch ms when the record was written. */
-  at: number;
 }
 
 export interface TsjsApi {
@@ -188,8 +147,6 @@ export interface TsjsApi {
   apsPrebidRenderers?: Record<string, ApsPrebidRendererEntry>;
   /** Initialises GPT slots with server-side bid targeting and calls refresh(). */
   adInit?: () => void;
-  /** Render-trace registry: latest render per slot (see [`RenderRecord`]). */
-  renders?: Record<string, RenderRecord>;
   /** GPT slot objects TS defined — used to destroy stale slots on SPA navigation. */
   prevGptSlots?: unknown[];
   /** Guards one-time-per-page enableSingleRequest/enableServices calls. */
