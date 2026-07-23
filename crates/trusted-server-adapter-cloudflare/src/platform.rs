@@ -71,8 +71,15 @@ impl PlatformBackend for NoopBackend {
         } else {
             "_nocert"
         };
+        // Keep two providers that share an origin on distinct names so auction
+        // response correlation cannot cross providers.
+        let discriminator = spec
+            .discriminator
+            .as_deref()
+            .map(|d| format!("_p_{d}"))
+            .unwrap_or_default();
         Ok(format!(
-            "{}_{}_{}_{timeout_ms}ms{cert_suffix}",
+            "{}_{}_{}_{timeout_ms}ms{cert_suffix}{discriminator}",
             spec.scheme, spec.host, port
         ))
     }
