@@ -5,6 +5,7 @@ import {
   AD_TRACE_MAX_RENDERS,
   AD_TRACE_MAX_SLOTS,
   createAdTraceStore,
+  terminalSummaryStageOutcome,
 } from '../../src/core/ad_trace';
 
 const BID_TRACE_ID = '550e8400-e29b-41d4-a716-446655440000';
@@ -153,6 +154,50 @@ describe('ad trace reducer', () => {
     ).toBe('no_bid');
   });
 
+  it('retains a Trusted Server Prebid selection when bidWon arrives without claiming creative load', () => {
+    const store = createAdTraceStore(() => 1);
+    const generation = store.nextGeneration('slot-a');
+    store.record({
+      kind: 'prebid_targeting_selected',
+      slotId: 'slot-a',
+      generation,
+      bidTraceId: BID_TRACE_ID,
+      outcome: 'won',
+      confidence: 'definitive',
+      reason: 'selected_targeting',
+    });
+    store.record({
+      kind: 'prebid_bid_won',
+      slotId: 'slot-a',
+      generation,
+      bidTraceId: BID_TRACE_ID,
+    });
+
+    expect(store.getSlot('slot-a')?.stages.prebid).toMatchObject({
+      outcome: 'won',
+      reason: 'selected_targeting_with_bid_won',
+    });
+    expect(store.getSlot('slot-a')?.stages.creative.outcome).toBe('not_observed');
+  });
+
+  it('preserves the direct iframe acknowledgement boundary without claiming GAM selection', () => {
+    const store = createAdTraceStore(() => 1);
+    const generation = store.nextGeneration('slot-a');
+    store.record({
+      kind: 'creative_load_acknowledged',
+      slotId: 'slot-a',
+      generation,
+      bidTraceId: BID_TRACE_ID,
+      reason: 'direct_iframe_load',
+    });
+
+    expect(store.getSlot('slot-a')?.stages.creative).toMatchObject({
+      outcome: 'load_acknowledged',
+      reason: 'direct_iframe_load',
+    });
+    expect(store.getSlot('slot-a')?.stages.gam.outcome).toBe('not_observed');
+  });
+
   it('classifies overlap, client Prebid, APS, no-bid, and superseded states', () => {
     const store = createAdTraceStore(() => 1);
     const generation = store.nextGeneration('slot-a');
@@ -272,6 +317,60 @@ describe('ad trace reducer', () => {
     });
   });
 
+  it('keeps GPT viewability separate from element visibility and creative load', () => {
+    const store = createAdTraceStore(() => 1);
+    const generation = store.nextGeneration('slot-a');
+    store.record({
+      kind: 'gpt_slot_render_ended',
+      slotId: 'slot-a',
+      generation,
+      isEmpty: false,
+    });
+    store.updateVisibility('slot-a', generation, 'hidden');
+    store.record({ kind: 'gpt_impression_viewable', slotId: 'slot-a', generation });
+
+    expect(store.getRenderTimeline()[0]).toMatchObject({
+      outcome: 'gam_only',
+      visibility: 'hidden',
+      viewability: 'viewable',
+    });
+    expect(store.getSlot('slot-a')?.stages.creative.outcome).toBe('not_observed');
+  });
+
+  it('distinguishes APS renderer start from the validated ready boundary', () => {
+    const store = createAdTraceStore(() => 1);
+    const generation = store.nextGeneration('slot-a');
+    store.record({
+      kind: 'pb_render_served',
+      slotId: 'slot-a',
+      generation,
+      reason: 'direct_aps_renderer',
+    });
+    expect(store.getSlot('slot-a')?.stages.creative).toMatchObject({
+      outcome: 'renderer_served',
+      reason: 'direct_aps_renderer',
+    });
+    expect(store.getRenderTimeline()[0]).toMatchObject({
+      outcome: 'served',
+      reason: 'direct_aps_renderer',
+    });
+
+    store.record({
+      kind: 'aps_renderer_ready',
+      slotId: 'slot-a',
+      generation,
+      reason: 'direct_aps_renderer_ready',
+    });
+    expect(store.getSlot('slot-a')?.stages.creative).toMatchObject({
+      outcome: 'aps_renderer_ready',
+      reason: 'direct_aps_renderer_ready',
+    });
+    expect(store.getRenderTimeline()[0]).toMatchObject({
+      outcome: 'served',
+      reason: 'direct_aps_renderer_ready',
+    });
+  });
+
   it('dispatches a frozen privacy-safe render event', () => {
     const store = createAdTraceStore(() => 1);
     const observed: unknown[] = [];
@@ -301,6 +400,14 @@ describe('ad trace reducer', () => {
     }
     expect(store.getRenderTimeline()).toHaveLength(AD_TRACE_MAX_RENDERS);
     expect(store.getRenderTimeline()[0].slotId).toBe('render-1');
+  });
+
+  it('preserves failed and abandoned terminal summaries while mapping completed no-winner to no bid', () => {
+    expect(terminalSummaryStageOutcome('completed')).toBe('no_bid');
+    expect(terminalSummaryStageOutcome('completed', true)).toBe('completed');
+    expect(terminalSummaryStageOutcome('failed')).toBe('failed');
+    expect(terminalSummaryStageOutcome('abandoned')).toBe('abandoned');
+    expect(terminalSummaryStageOutcome('skipped')).toBe('skipped');
   });
 
   it('rejects malformed runtime event kinds and confidence values', () => {

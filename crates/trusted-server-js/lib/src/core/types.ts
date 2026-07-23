@@ -94,7 +94,9 @@ export type AdTraceEventKind =
   | 'gpt_slot_response_received'
   | 'gpt_slot_render_ended'
   | 'gpt_slot_onload'
+  | 'gpt_impression_viewable'
   | 'aps_display_bids_set'
+  | 'aps_renderer_ready'
   | 'pb_render_requested'
   | 'pb_render_rejected'
   | 'pb_render_served'
@@ -149,6 +151,10 @@ export interface RenderTraceSnapshot {
   outcome: RenderTraceOutcome;
   confidence: AdTraceConfidence;
   visibility: RenderTraceVisibility;
+  /** GPT reported this exact retained slot generation viewable. */
+  viewability?: 'viewable';
+  /** Bounded privacy-safe reason for the latest render evidence. */
+  reason?: string;
   createdAt: number;
   updatedAt: number;
 }

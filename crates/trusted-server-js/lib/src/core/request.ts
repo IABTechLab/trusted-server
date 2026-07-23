@@ -3,6 +3,7 @@ import { log } from './log';
 import { collectContext } from './context';
 import { getAllUnits, firstSize } from './registry';
 import { createAdIframe, findSlot, buildCreativeDocument, sanitizeCreativeHtml } from './render';
+import { terminalSummaryStageOutcome } from './ad_trace';
 import { buildAdRequest, sendAuction } from './auction';
 import type { AuctionTraceSummary, TrustedServerBidTrace } from './types';
 
@@ -72,7 +73,7 @@ function recordRootSummary(
     slotId: owner.slotId,
     generation: owner.generation,
     auctionTraceId: summary.auctionTraceId,
-    outcome: summary.outcome === 'completed' && !hasWinner ? 'no_bid' : summary.outcome,
+    outcome: terminalSummaryStageOutcome(summary.outcome, hasWinner),
     confidence: 'definitive',
     reason: 'terminal_summary',
   });
