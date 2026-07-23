@@ -325,7 +325,10 @@ impl CreativeOpportunitySlot {
         if let Some(raw) = &self.gam_unit_path
             && raw.trim().is_empty()
         {
-            return Err(format!("slot `{}` gam_unit_path must not be empty", self.id));
+            return Err(format!(
+                "slot `{}` gam_unit_path must not be empty",
+                self.id
+            ));
         }
 
         Ok(())
@@ -750,17 +753,17 @@ mod tests {
 
     #[test]
     fn parse_unit_template_accepts_known_placeholders() {
-        let parts = parse_unit_template("/{network_id}/autoblog/{section}")
+        let parts = parse_unit_template("/{network_id}/example/{section}")
             .expect("should parse valid template");
         assert_eq!(parts.len(), 4, "should split into literal+ph+literal+ph");
     }
 
     #[test]
     fn parse_unit_template_accepts_static_path() {
-        let parts = parse_unit_template("/88059007/autoblog/homepage")
+        let parts = parse_unit_template("/99999/example/homepage")
             .expect("should parse a static path as a single literal");
         assert!(
-            matches!(parts.as_slice(), [UnitTemplatePart::Literal(s)] if s == "/88059007/autoblog/homepage"),
+            matches!(parts.as_slice(), [UnitTemplatePart::Literal(s)] if s == "/99999/example/homepage"),
             "should be one literal part"
         );
     }
@@ -769,7 +772,10 @@ mod tests {
     fn parse_unit_template_rejects_unknown_placeholder() {
         let err = parse_unit_template("/{network_id}/{oops}")
             .expect_err("should reject unknown placeholder");
-        assert!(err.contains("oops"), "error should name the bad placeholder");
+        assert!(
+            err.contains("oops"),
+            "error should name the bad placeholder"
+        );
     }
 
     #[test]
@@ -791,8 +797,8 @@ mod tests {
     #[test]
     fn derive_section_uses_first_segment() {
         assert_eq!(derive_section("/news", "home"), "news");
-        assert_eq!(derive_section("/news/gm-cadillac", "home"), "news");
-        assert_eq!(derive_section("/car-research/x", "home"), "car-research");
+        assert_eq!(derive_section("/news/article-123", "home"), "news");
+        assert_eq!(derive_section("/my-section/x", "home"), "my-section");
     }
 
     #[test]
@@ -817,11 +823,13 @@ mod tests {
         assert_eq!(derive_section("/%%%/x", "home"), "_");
     }
 
-    fn make_config_with_section_template(section_root: Option<&str>) -> CreativeOpportunitiesConfig {
+    fn make_config_with_section_template(
+        section_root: Option<&str>,
+    ) -> CreativeOpportunitiesConfig {
         let mut slot = make_slot("ad-header-0", vec!["/news/*"]);
-        slot.gam_unit_path = Some("/{network_id}/autoblog/{section}".to_string());
+        slot.gam_unit_path = Some("/{network_id}/example/{section}".to_string());
         CreativeOpportunitiesConfig {
-            gam_network_id: "88059007".to_string(),
+            gam_network_id: "99999".to_string(),
             auction_timeout_ms: None,
             price_granularity: PriceGranularity::default(),
             section_root: section_root.map(str::to_string),
@@ -832,11 +840,12 @@ mod tests {
     #[test]
     fn render_gam_unit_path_substitutes_placeholders() {
         let mut slot = make_slot("ad-header-0", vec!["/news/*"]);
-        slot.gam_unit_path = Some("/{network_id}/autoblog/{section}".to_string());
-        slot.compile_unit_template().expect("should compile template");
+        slot.gam_unit_path = Some("/{network_id}/example/{section}".to_string());
+        slot.compile_unit_template()
+            .expect("should compile template");
         assert_eq!(
-            slot.render_gam_unit_path("88059007", "news"),
-            "/88059007/autoblog/news"
+            slot.render_gam_unit_path("99999", "news"),
+            "/99999/example/news"
         );
     }
 
@@ -844,8 +853,12 @@ mod tests {
     fn render_gam_unit_path_defaults_when_no_template() {
         let mut slot = make_slot("sidebar", vec!["/*"]);
         slot.gam_unit_path = None;
-        slot.compile_unit_template().expect("should compile (no template)");
-        assert_eq!(slot.render_gam_unit_path("99999", "ignored"), "/99999/sidebar");
+        slot.compile_unit_template()
+            .expect("should compile (no template)");
+        assert_eq!(
+            slot.render_gam_unit_path("99999", "ignored"),
+            "/99999/sidebar"
+        );
     }
 
     #[test]
@@ -870,7 +883,10 @@ mod tests {
         let err = config
             .validate_runtime()
             .expect_err("should require section_root");
-        assert!(err.contains("section_root"), "error should mention section_root");
+        assert!(
+            err.contains("section_root"),
+            "error should mention section_root"
+        );
     }
 
     #[test]

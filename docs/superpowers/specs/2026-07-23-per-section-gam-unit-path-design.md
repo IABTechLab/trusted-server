@@ -92,14 +92,14 @@ extension that does **not** change the config shape below.
 
 ```toml
 [creative_opportunities]
-gam_network_id = "88059007"
+gam_network_id = "99999"
 auction_timeout_ms = 2000
 price_granularity = "dense"
 section_root = "homepage"          # required when a template uses {section}
 
 [[creative_opportunities.slot]]
 id = "ad-header-0"
-gam_unit_path = "/{network_id}/autoblog/{section}"
+gam_unit_path = "/{network_id}/example/{section}"
 page_patterns = ["/", "/news/*", "/reviews/*", "/deals/*"]
 formats = [{ width = 970, height = 90 }, { width = 728, height = 90 }]
 [creative_opportunities.slot.providers.prebid]
@@ -198,7 +198,7 @@ needed.
       `{section}` template with missing/invalid `section_root`.
 - [ ] `{section}` sanitized to `[A-Za-z0-9_-]`, derived from the raw path.
 - [ ] Documented in `docs/guide/configuration.md`, including unmatched-route
-      behavior and the no-decode rule; example and live autoblog configs updated.
+      behavior and the no-decode rule; example and live example configs updated.
 
 ## Sibling issue (not built here)
 

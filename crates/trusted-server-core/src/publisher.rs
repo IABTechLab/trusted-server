@@ -4304,7 +4304,7 @@ mod tests {
                     .collect(),
                 providers: Default::default(),
                 compiled_patterns: Vec::new(),
-            compiled_unit: None,
+                compiled_unit: None,
             }
         }
 
@@ -4373,18 +4373,19 @@ mod tests {
             let mut config = make_config();
             config.section_root = Some("homepage".to_string());
             let mut slot = make_slot();
-            slot.gam_unit_path = Some("/{network_id}/autoblog/{section}".to_string());
-            slot.compile_unit_template().expect("template should compile");
+            slot.gam_unit_path = Some("/{network_id}/example/{section}".to_string());
+            slot.compile_unit_template()
+                .expect("template should compile");
 
-            let news = crate::publisher::build_slot_json(&slot, &config, "/news/gm-cadillac");
+            let news = crate::publisher::build_slot_json(&slot, &config, "/news/article-123");
             assert_eq!(
-                news["gam_unit_path"], "/21765378893/autoblog/news",
+                news["gam_unit_path"], "/21765378893/example/news",
                 "section should derive from the first path segment"
             );
 
             let home = crate::publisher::build_slot_json(&slot, &config, "/");
             assert_eq!(
-                home["gam_unit_path"], "/21765378893/autoblog/homepage",
+                home["gam_unit_path"], "/21765378893/example/homepage",
                 "root path should use section_root"
             );
         }
@@ -4973,7 +4974,7 @@ mod tests {
                 targeting: Default::default(),
                 providers: Default::default(),
                 compiled_patterns: Vec::new(),
-            compiled_unit: None,
+                compiled_unit: None,
             }]
         }
 
@@ -5476,7 +5477,7 @@ mod tests {
                 targeting: Default::default(),
                 providers: Default::default(),
                 compiled_patterns: Vec::new(),
-            compiled_unit: None,
+                compiled_unit: None,
             }]
         }
 

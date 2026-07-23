@@ -40,7 +40,7 @@ client keeps receiving a resolved `gam_unit_path` string, so no JS change.
 - Modify: `crates/trusted-server-core/src/settings.rs`
   - `prepare_runtime` calls `compile_unit_templates` and surfaces parse errors
 - Modify: `docs/guide/configuration.md` (add creative_opportunities section)
-- Modify: `trusted-server.example.toml` and the live autoblog config
+- Modify: `trusted-server.example.toml` and the live example config
 
 Notes on lifecycle: `page_patterns` inheritance is **out of scope** (sibling
 issue). Templates are parsed at startup and cached with `#[serde(skip)]`,
@@ -62,17 +62,17 @@ Add to `mod tests`:
 ```rust
 #[test]
 fn parse_unit_template_accepts_known_placeholders() {
-    let parts = parse_unit_template("/{network_id}/autoblog/{section}")
+    let parts = parse_unit_template("/{network_id}/example/{section}")
         .expect("should parse valid template");
     assert_eq!(parts.len(), 4, "should split into literal+ph+literal+ph");
 }
 
 #[test]
 fn parse_unit_template_accepts_static_path() {
-    let parts = parse_unit_template("/88059007/autoblog/homepage")
+    let parts = parse_unit_template("/99999/example/homepage")
         .expect("should parse a static path as a single literal");
     assert!(
-        matches!(parts.as_slice(), [UnitTemplatePart::Literal(s)] if s == "/88059007/autoblog/homepage"),
+        matches!(parts.as_slice(), [UnitTemplatePart::Literal(s)] if s == "/99999/example/homepage"),
         "should be one literal part"
     );
 }
@@ -202,8 +202,8 @@ git commit -m "Add gam_unit_path template parser"
 #[test]
 fn derive_section_uses_first_segment() {
     assert_eq!(derive_section("/news", "home"), "news");
-    assert_eq!(derive_section("/news/gm-cadillac", "home"), "news");
-    assert_eq!(derive_section("/car-research/x", "home"), "car-research");
+    assert_eq!(derive_section("/news/article-123", "home"), "news");
+    assert_eq!(derive_section("/my-section/x", "home"), "my-section");
 }
 
 #[test]
@@ -298,11 +298,11 @@ git commit -m "Add request-path section derivation"
 #[test]
 fn render_gam_unit_path_substitutes_placeholders() {
     let mut slot = make_slot("ad-header-0", vec!["/news/*"]);
-    slot.gam_unit_path = Some("/{network_id}/autoblog/{section}".to_string());
+    slot.gam_unit_path = Some("/{network_id}/example/{section}".to_string());
     slot.compile_unit_template().expect("should compile template");
     assert_eq!(
-        slot.render_gam_unit_path("88059007", "news"),
-        "/88059007/autoblog/news"
+        slot.render_gam_unit_path("99999", "news"),
+        "/99999/example/news"
     );
 }
 
@@ -362,9 +362,9 @@ style in this module):
 ```rust
 fn make_config_with_section_template(section_root: Option<&str>) -> CreativeOpportunitiesConfig {
     let mut slot = make_slot("ad-header-0", vec!["/news/*"]);
-    slot.gam_unit_path = Some("/{network_id}/autoblog/{section}".to_string());
+    slot.gam_unit_path = Some("/{network_id}/example/{section}".to_string());
     CreativeOpportunitiesConfig {
-        gam_network_id: "88059007".to_string(),
+        gam_network_id: "99999".to_string(),
         auction_timeout_ms: None,
         price_granularity: PriceGranularity::default(),
         section_root: section_root.map(str::to_string),
@@ -545,14 +545,14 @@ in that module):
 ```rust
 #[test]
 fn build_slot_json_renders_section_from_request_path() {
-    let config = creative_opportunities_config_with_template(); // gam_unit_path = "/{network_id}/autoblog/{section}", section_root = "homepage"
+    let config = creative_opportunities_config_with_template(); // gam_unit_path = "/{network_id}/example/{section}", section_root = "homepage"
     let slot = &config.slot[0];
 
-    let news = build_slot_json(slot, &config, "/news/gm-cadillac");
-    assert_eq!(news["gam_unit_path"], "/88059007/autoblog/news");
+    let news = build_slot_json(slot, &config, "/news/article-123");
+    assert_eq!(news["gam_unit_path"], "/99999/example/news");
 
     let home = build_slot_json(slot, &config, "/");
-    assert_eq!(home["gam_unit_path"], "/88059007/autoblog/homepage");
+    assert_eq!(home["gam_unit_path"], "/99999/example/homepage");
 }
 ```
 
@@ -663,7 +663,7 @@ git commit -m "Render gam_unit_path template per request across initial and SPA 
 
 - Modify: `docs/guide/configuration.md`
 - Modify: `trusted-server.example.toml`
-- Modify: the live autoblog `trusted-server.toml` (operator-owned, gitignored — update locally, do not commit)
+- Modify: the live example `trusted-server.toml` (operator-owned, gitignored — update locally, do not commit)
 
 - [ ] **Step 1: Add a creative_opportunities section to configuration.md**
 
