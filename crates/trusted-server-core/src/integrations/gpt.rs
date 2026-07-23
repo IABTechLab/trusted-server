@@ -1266,6 +1266,10 @@ mod tests {
             "bootstrap should wrap googletag.setConfig() to detect the disabled state"
         );
         assert!(
+            combined.contains("gpt.getConfig"),
+            "bootstrap should read GPT's modern initial-load configuration"
+        );
+        assert!(
             combined.contains("pubads.disableInitialLoad"),
             "bootstrap should wrap legacy disableInitialLoad() calls"
         );
