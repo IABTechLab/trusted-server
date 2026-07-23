@@ -110,7 +110,9 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
     // app-config blob. Migrating app-level secrets to `EdgeZero` secret-store
     // references needs nested/array extraction support and operator migration
     // work tracked separately.
-    const SECRET_FIELDS: &'static [edgezero_core::app_config::SecretField] = &[];
+    fn secret_fields() -> Vec<edgezero_core::app_config::SecretField> {
+        Vec::new()
+    }
 }
 
 /// Runs Trusted Server deploy-time validation for pushed app config.

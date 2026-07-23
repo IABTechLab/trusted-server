@@ -1398,7 +1398,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?tag=v0.0.4#9e661ae520a8130660f18fd10f42703d7f3e050b"
+source = "git+https://github.com/stackpop/edgezero?branch=feature%2Fedgezero-deploy-actions#145f1699d8e8f51027804f21faddbf985cff9a1e"
 dependencies = [
  "toml",
 ]
@@ -1406,7 +1406,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-axum"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?tag=v0.0.4#9e661ae520a8130660f18fd10f42703d7f3e050b"
+source = "git+https://github.com/stackpop/edgezero?branch=feature%2Fedgezero-deploy-actions#145f1699d8e8f51027804f21faddbf985cff9a1e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1434,7 +1434,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-cloudflare"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?tag=v0.0.4#9e661ae520a8130660f18fd10f42703d7f3e050b"
+source = "git+https://github.com/stackpop/edgezero?branch=feature%2Fedgezero-deploy-actions#145f1699d8e8f51027804f21faddbf985cff9a1e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1449,7 +1449,7 @@ dependencies = [
  "log",
  "serde_json",
  "tempfile",
- "toml_edit",
+ "toml_edit 0.25.12+spec-1.1.0",
  "walkdir",
  "worker",
 ]
@@ -1457,7 +1457,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-fastly"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?tag=v0.0.4#9e661ae520a8130660f18fd10f42703d7f3e050b"
+source = "git+https://github.com/stackpop/edgezero?branch=feature%2Fedgezero-deploy-actions#145f1699d8e8f51027804f21faddbf985cff9a1e"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1479,14 +1479,14 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
- "toml_edit",
+ "toml_edit 0.25.12+spec-1.1.0",
  "walkdir",
 ]
 
 [[package]]
 name = "edgezero-adapter-spin"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?tag=v0.0.4#9e661ae520a8130660f18fd10f42703d7f3e050b"
+source = "git+https://github.com/stackpop/edgezero?branch=feature%2Fedgezero-deploy-actions#145f1699d8e8f51027804f21faddbf985cff9a1e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1506,14 +1506,14 @@ dependencies = [
  "subtle",
  "thiserror 2.0.18",
  "toml",
- "toml_edit",
+ "toml_edit 0.25.12+spec-1.1.0",
  "walkdir",
 ]
 
 [[package]]
 name = "edgezero-cli"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?tag=v0.0.4#9e661ae520a8130660f18fd10f42703d7f3e050b"
+source = "git+https://github.com/stackpop/edgezero?branch=feature%2Fedgezero-deploy-actions#145f1699d8e8f51027804f21faddbf985cff9a1e"
 dependencies = [
  "chrono",
  "clap",
@@ -1538,7 +1538,7 @@ dependencies = [
 [[package]]
 name = "edgezero-core"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?tag=v0.0.4#9e661ae520a8130660f18fd10f42703d7f3e050b"
+source = "git+https://github.com/stackpop/edgezero?branch=feature%2Fedgezero-deploy-actions#145f1699d8e8f51027804f21faddbf985cff9a1e"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -1569,7 +1569,7 @@ dependencies = [
 [[package]]
 name = "edgezero-macros"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?tag=v0.0.4#9e661ae520a8130660f18fd10f42703d7f3e050b"
+source = "git+https://github.com/stackpop/edgezero?branch=feature%2Fedgezero-deploy-actions#145f1699d8e8f51027804f21faddbf985cff9a1e"
 dependencies = [
  "log",
  "proc-macro2",
@@ -5075,6 +5075,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "toml_edit"
+version = "0.25.12+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2153edc6955a6c354fad8f5efd38b6a8769bdccf9fe50f8e1329f81b0baa5d7"
+dependencies = [
+ "indexmap 2.14.0",
+ "toml_datetime 1.1.1+spec-1.1.0",
+ "toml_parser",
+ "toml_writer",
+ "winnow 1.0.3",
+]
+
+[[package]]
 name = "toml_parser"
 version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5340,7 +5353,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml",
- "toml_edit",
+ "toml_edit 0.23.10+spec-1.0.0",
  "trusted-server-core",
  "url",
  "webpki-roots",
