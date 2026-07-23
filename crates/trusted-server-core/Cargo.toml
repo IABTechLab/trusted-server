@@ -56,6 +56,9 @@ web-time = { workspace = true }
 getrandom = { workspace = true, features = ["js"] }
 uuid = { workspace = true, features = ["js"] }
 
+[build-dependencies]
+edgezero-core = { workspace = true }
+
 [features]
 default = []
 # Exposes test-only constructors (e.g. `IntegrationRegistry::from_request_filters`)

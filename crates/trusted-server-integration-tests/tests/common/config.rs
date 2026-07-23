@@ -1,6 +1,7 @@
 use edgezero_core::blob_envelope::BlobEnvelope;
 use error_stack::Report;
 use trusted_server_core::config::validate_settings_for_deploy;
+use trusted_server_core::config_payload::CONFIG_BLOB_KEY;
 use trusted_server_core::settings::Settings;
 
 use crate::common::runtime::{TestError, TestResult};
@@ -35,7 +36,11 @@ pub fn integration_app_config_envelope(origin_port: u16) -> TestResult<String> {
 
 pub fn cloudflare_config_json(origin_port: u16) -> TestResult<String> {
     let envelope = integration_app_config_envelope(origin_port)?;
-    serde_json::to_string(&serde_json::json!({ "app_config": envelope })).map_err(|error| {
+    let config = serde_json::Value::Object(serde_json::Map::from_iter([(
+        CONFIG_BLOB_KEY.to_string(),
+        serde_json::Value::String(envelope),
+    )]));
+    serde_json::to_string(&config).map_err(|error| {
         Report::new(TestError::ConfigGeneration).attach(format!(
             "failed to serialize Cloudflare config binding: {error}"
         ))

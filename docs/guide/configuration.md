@@ -1235,25 +1235,28 @@ After the EdgeZero cutover, the Fastly adapter always dispatches through the
 EdgeZero entry point. The former `edgezero_enabled` and `edgezero_rollout_pct`
 canary keys are no longer read.
 
-The Fastly service must still provide a `trusted_server_config` config store
-because the entry point opens it before dispatch and passes the handle to
-EdgeZero-backed platform services. The store may be empty unless another feature
-adds keys to it.
+The Fastly service must provide the logical config store selected by
+`[stores.config].default` in `edgezero.toml`. By default, the logical store ID
+is also the platform store name and the app-config blob key. Deployments can
+override those independently with
+`EDGEZERO__STORES__CONFIG__<ID>__NAME` and
+`EDGEZERO__STORES__CONFIG__<ID>__KEY`.
 
-**Local development** (`fastly.toml`):
+The resolved store and key must contain a valid Trusted Server app-config blob
+envelope. An absent or empty entry makes application startup fail closed. Use
+the Trusted Server CLI to provision the store and publish the validated config.
 
-```toml
-[local_server.config_stores]
-  [local_server.config_stores.trusted_server_config]
-    format = "inline-toml"
-    [local_server.config_stores.trusted_server_config.contents]
-```
-
-**Production setup** (Fastly CLI):
+**Local development** (writes the entry used by Viceroy in `fastly.toml`):
 
 ```bash
-# Create the store once and attach it to the service.
-fastly config-store create --name trusted_server_config
+ts config push --adapter fastly --local
+```
+
+**Production setup**:
+
+```bash
+ts provision --adapter fastly
+ts config push --adapter fastly
 ```
 
 Rollback to the legacy entry point is no longer controlled by runtime config
