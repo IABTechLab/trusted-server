@@ -23,6 +23,7 @@ use crate::auction::provider::AuctionProvider;
 use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid, MediaType,
 };
+use crate::cache_policy::{CacheControlPolicy, EdgeCacheHeader};
 use crate::consent_config::ConsentForwardingMode;
 use crate::cookies::{CONSENT_COOKIE_NAMES, strip_cookies};
 use crate::error::TrustedServerError;
@@ -681,14 +682,16 @@ impl PrebidIntegration {
     ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
         let body = "// Script overridden by Trusted Server\n";
 
-        http::Response::builder()
+        let mut response = http::Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, PREBID_BUNDLE_CONTENT_TYPE)
-            .header(header::CACHE_CONTROL, "public, max-age=31536000")
             .body(EdgeBody::from(body))
             .change_context(TrustedServerError::Prebid {
                 message: "Failed to build Prebid script handler response".to_string(),
-            })
+            })?;
+        CacheControlPolicy::NoStorePrivate
+            .apply_to_headers(response.headers_mut(), EdgeCacheHeader::None);
+        Ok(response)
     }
 
     fn external_bundle_script_src(&self) -> String {
@@ -3209,7 +3212,14 @@ external_bundle_sri = "sha384-AAAA"
             .get(header::CACHE_CONTROL)
             .and_then(|value| value.to_str().ok())
             .expect("should have cache-control");
-        assert!(cache_control.contains("max-age=31536000"));
+        assert_eq!(
+            cache_control, "no-store, private",
+            "neutralized stable shim must not be cached for a year"
+        );
+        assert!(
+            response.headers().get("surrogate-control").is_none(),
+            "neutralized shim must not emit edge-cache headers"
+        );
 
         let body = String::from_utf8(
             response

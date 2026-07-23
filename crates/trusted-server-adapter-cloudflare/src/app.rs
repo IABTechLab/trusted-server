@@ -10,6 +10,7 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+use trusted_server_core::cache_policy::EdgeCacheHeader;
 #[cfg(target_arch = "wasm32")]
 use trusted_server_core::config_payload::settings_from_config_blob;
 use trusted_server_core::ec::EcContext;
@@ -367,7 +368,11 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let allow_tsjs = method == Method::GET;
 
             let result = if allow_tsjs && path.starts_with("/static/tsjs=") {
-                handle_tsjs_dynamic(&req, &state.registry)
+                handle_tsjs_dynamic(
+                    &req,
+                    &state.registry,
+                    EdgeCacheHeader::CloudflareCdnCacheControl,
+                )
             } else if state.registry.has_route(&method, &path) {
                 let mut ec_context = EcContext::default();
                 state
@@ -401,6 +406,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     &mut ec_context,
                     auction,
                     req,
+                    EdgeCacheHeader::CloudflareCdnCacheControl,
                 )
                 .await
                 {

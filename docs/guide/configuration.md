@@ -69,6 +69,7 @@ fail and the service will return its startup-error response.
 | `[ec]`              | Edge Cookie (EC) ID generation               |
 | `[tester_cookie]`   | Optional tester-cookie endpoint              |
 | `[proxy]`           | Proxy SSRF allowlist and asset routes        |
+| `[cache]`           | Static/rehosted asset cache policy rules     |
 | `[image_optimizer]` | Reusable Image Optimizer profile sets        |
 | `[request_signing]` | Ed25519 request signing                      |
 | `[auction]`         | Auction orchestration                        |
@@ -983,6 +984,117 @@ when_missing = "smart"
 ```
 
 See [Asset Routes](/guide/asset-routes) for request flow, S3 auth details, and Image Optimizer behavior.
+
+## Cache Configuration
+
+Static and rehosted asset cache upgrades are operator-controlled. By default,
+Trusted Server leaves arbitrary publisher-origin assets under origin cache
+control. Add `[[cache.asset_rules]]` entries only for paths that are known to be
+content-addressed or otherwise safe for the configured TTL.
+
+### `[[cache.asset_rules]]`
+
+Rules are evaluated in file order; the first enabled matching rule wins.
+Disabled rules never match, and their matcher and policy validation is deferred
+until they are enabled. Rule IDs are always normalized and must remain nonempty
+and unique, including for disabled placeholders.
+
+| Field                            | Type          | Required | Description                                                     |
+| -------------------------------- | ------------- | -------- | --------------------------------------------------------------- |
+| `id`                             | String        | Yes      | Unique operator-facing rule identifier                          |
+| `enabled`                        | Boolean       | No       | Whether the rule participates in matching (default `false`)     |
+| `preset`                         | String        | Matcher  | Built-in preset such as `nextjs-static`                         |
+| `path_prefix`                    | String        | Matcher  | Request path prefix                                             |
+| `path_glob`                      | String        | Matcher  | Single glob matched against the request path                    |
+| `path_globs`                     | Array[String] | Matcher  | Multiple globs matched against the request path                 |
+| `path_regex`                     | String        | Matcher  | Regex matched against the request path                          |
+| `extensions`                     | Array[String] | Matcher  | Case-insensitive file extensions                                |
+| `requires_hash_in_filename`      | Boolean       | No       | Require a supported bundler fingerprint suffix before matching  |
+| `visibility`                     | String        | No       | `public` or `private` (default `public`)                        |
+| `browser_ttl_seconds`            | Integer       | Policy   | Browser `max-age`; must be positive when `immutable = true`     |
+| `edge_ttl_seconds`               | Integer       | Policy   | TTL emitted through the runtime-specific shared-cache directive |
+| `stale_while_revalidate_seconds` | Integer       | No       | Optional `stale-while-revalidate`                               |
+| `stale_if_error_seconds`         | Integer       | No       | Optional `stale-if-error`                                       |
+| `immutable`                      | Boolean       | No       | Add `immutable` for a validated content-addressed rule          |
+
+An enabled rule must configure exactly one matcher and at least one of
+`browser_ttl_seconds` or `edge_ttl_seconds`. `path_glob` and `path_globs` are
+mutually exclusive. `immutable = true` additionally requires a positive browser
+TTL and either the content-addressed `nextjs-static` preset or
+`requires_hash_in_filename = true`.
+
+The filename fingerprint check is intentionally conservative. It examines the
+suffix immediately before the final extension, requires a nonempty filename
+prefix separated by `.`, `-`, `_`, or `~`, and recognizes:
+
+- hexadecimal suffixes of at least eight characters containing a letter;
+- eight-character esbuild-style uppercase Base32 suffixes;
+- eight-character Vite/Base64URL-style suffixes with a mixed character class.
+
+For example, `app.0123abcd.js`, `app-VRTVD5R5.js`, and
+`index-DA15JTLU.js` match, while `app.js`, `deadbeef.js`, and
+`app.20260714.js` do not. This heuristic is not proof of content addressing;
+confirm the publisher's bundler output before enabling a long immutable TTL. A
+base rule that matches while this fingerprint check fails emits a debug log with
+the rule ID and rejected path.
+
+**Next.js preset example** (disabled until the publisher confirms
+`/_next/static/` is content-addressed):
+
+```toml
+[[cache.asset_rules]]
+id = "nextjs-static"
+enabled = false
+preset = "nextjs-static"
+visibility = "public"
+browser_ttl_seconds = 31536000
+edge_ttl_seconds = 31536000
+immutable = true
+```
+
+**Publisher allowlist example** (enable only after verifying the filename
+convention):
+
+```toml
+[[cache.asset_rules]]
+id = "publisher-fingerprinted-assets"
+enabled = false
+path_globs = [
+  "/assets/**/*.js",
+  "/assets/**/*.css",
+  "/assets/**/*.png",
+  "/assets/**/*.webp",
+]
+requires_hash_in_filename = true
+visibility = "public"
+browser_ttl_seconds = 31536000
+edge_ttl_seconds = 31536000
+immutable = true
+```
+
+If `[cache]` is omitted or no enabled rule matches, Trusted Server preserves the
+origin cache policy for publisher-origin assets. On the publisher pass-through
+path, an origin `private` or `no-store` directive vetoes a matching rule. Other
+origin cache directives, including `no-cache`, are replaced by the configured
+policy. `Vary` is preserved, so do not assign a public immutable rule to paths
+that vary by cookies or other user-specific request state.
+
+On a configured Fastly asset-rehost route, a matching rule is authoritative
+over the third-party origin's cache defaults, including `no-store`, because
+Trusted Server owns the rehosted copy. A later Trusted Server or operator-applied
+`private` or `no-store` directive still vetoes public policy reapplication and
+removes shared-cache headers.
+
+TS-owned validated hash URLs such as `/static/tsjs=...js?v=<hash>` use their
+built-in cache policy and do not require an asset rule. Shared-cache keys for
+`/static/tsjs=` must preserve `v`; otherwise a matching immutable response can
+collide with the missing or mismatched version's short-TTL response.
+
+`edge_ttl_seconds` only emits the selected runtime's shared-cache directive. The
+runtime or service must also enable and consume that directive. The checked-in
+Cloudflare manifests enable Workers Cache. Fastly synthetic and final egress
+responses still require explicit runtime cache integration, tracked in
+[#908](https://github.com/IABTechLab/trusted-server/issues/908).
 
 ## Integration Configurations
 

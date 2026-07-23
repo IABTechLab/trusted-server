@@ -11,6 +11,7 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
@@ -176,7 +177,7 @@ async fn dispatch_fallback(
     let method = req.method().clone();
 
     if method == Method::GET && path.starts_with("/static/tsjs=") {
-        return handle_tsjs_dynamic(&req, &state.registry);
+        return handle_tsjs_dynamic(&req, &state.registry, EdgeCacheHeader::SMaxageFallback);
     }
 
     if state.registry.has_route(&method, &path) {
@@ -215,6 +216,7 @@ async fn dispatch_fallback(
         &mut ec_context,
         auction,
         req,
+        EdgeCacheHeader::SMaxageFallback,
     )
     .await?;
     // Async finalize so the dispatched auction is collected and its bids are

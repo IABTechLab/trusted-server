@@ -197,6 +197,42 @@ async fn tsjs_route_prefix_is_handled_not_5xx() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tsjs_route_matching_hash_uses_s_maxage_fallback() {
+    let mut svc = make_service();
+    let src = trusted_server_core::tsjs::tsjs_script_src(&["creative"]);
+    let req = Request::builder()
+        .method("GET")
+        .uri(src)
+        .body(AxumBody::empty())
+        .expect("should build request");
+
+    let resp = svc
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
+
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "matching TSJS hash should serve OK"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("public, max-age=31536000, s-maxage=31536000, immutable"),
+        "Axum adapter should render the portable s-maxage fallback"
+    );
+    assert!(
+        resp.headers().get("surrogate-control").is_none(),
+        "s-maxage fallback must not emit Fastly Surrogate-Control"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Middleware tests
 // ---------------------------------------------------------------------------

@@ -15,10 +15,11 @@ workspace = true
 doctest = false
 name = "trusted_server_js"
 path = "src/lib.rs"
-test = false
 
 [build-dependencies]
 build-print = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
 which = { workspace = true }
 
 [dependencies]
