@@ -246,7 +246,10 @@ fn platform_response_to_fastly_asset(platform_resp: PlatformResponse) -> AssetPr
     }
 }
 
-/// Stream an asset response body directly to a writable client stream.
+/// Stream a platform response body directly to a writable client stream.
+///
+/// Asset routes and Fastly `EdgeZero` publisher fallback both use this bridge
+/// after headers have been committed through `stream_to_client()`.
 ///
 /// # Errors
 ///
@@ -261,7 +264,7 @@ pub async fn stream_asset_body<W: Write>(
             output
                 .write_all(bytes.as_ref())
                 .change_context(TrustedServerError::Proxy {
-                    message: "failed to write buffered asset response body".to_string(),
+                    message: "failed to write buffered platform response body".to_string(),
                 })?;
         }
         EdgeBody::Stream(mut stream) => {
@@ -274,7 +277,7 @@ pub async fn stream_asset_body<W: Write>(
                 output
                     .write_all(chunk.as_ref())
                     .change_context(TrustedServerError::Proxy {
-                        message: "failed to write streaming asset response body".to_string(),
+                        message: "failed to write streaming platform response body".to_string(),
                     })?;
             }
         }
