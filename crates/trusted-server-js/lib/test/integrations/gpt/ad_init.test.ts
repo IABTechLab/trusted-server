@@ -259,6 +259,444 @@ describe('installTsAdInit', () => {
     );
   });
 
+  it('keeps late load on the prior generation and fails closed on ambiguous viewability', async () => {
+    const listeners: Record<string, Array<(event: SlotRenderEvent) => void>> = {};
+    const element = document.createElement('div');
+    element.id = 'publisher-refresh-slot';
+    document.body.appendChild(element);
+    const publisherSlot = {
+      getSlotElementId: vi.fn().mockReturnValue(element.id),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([publisherSlot]),
+      addEventListener: vi.fn((event: string, listener: (value: SlotRenderEvent) => void) => {
+        (listeners[event] ??= []).push(listener);
+      }),
+      refresh: vi.fn(),
+    };
+    const recordAdTrace = vi.fn();
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+    };
+    (window as TestWindow).tsjs = {
+      adSlots: [],
+      bids: {},
+      recordAdTrace,
+      nextAdTraceGeneration: vi.fn().mockReturnValueOnce(1).mockReturnValueOnce(2),
+      bindAdTraceElement: vi.fn(),
+    } as any;
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+    listeners.slotRequested?.forEach((listener) =>
+      listener({ isEmpty: false, slot: publisherSlot })
+    );
+    listeners.slotRenderEnded?.forEach((listener) =>
+      listener({ isEmpty: false, slot: publisherSlot })
+    );
+    listeners.slotRequested?.forEach((listener) =>
+      listener({ isEmpty: false, slot: publisherSlot })
+    );
+    listeners.slotOnload?.forEach((listener) => listener({ isEmpty: false, slot: publisherSlot }));
+    expect(recordAdTrace).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'gpt_slot_onload', generation: 1 })
+    );
+    expect(recordAdTrace).not.toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'gpt_slot_onload', generation: 2 })
+    );
+
+    listeners.slotRenderEnded?.forEach((listener) =>
+      listener({ isEmpty: false, slot: publisherSlot })
+    );
+    listeners.impressionViewable?.forEach((listener) =>
+      listener({ isEmpty: false, slot: publisherSlot })
+    );
+    expect(recordAdTrace).not.toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'gpt_impression_viewable', generation: 2 })
+    );
+    expect(recordAdTrace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        generation: 2,
+        outcome: 'unresolved',
+        reason: 'ambiguous_late_viewability',
+      })
+    );
+    element.remove();
+  });
+
+  it('fails closed when publisher requests overlap on one GPT slot', async () => {
+    const listeners: Record<string, Array<(event: SlotRenderEvent) => void>> = {};
+    const element = document.createElement('div');
+    element.id = 'publisher-overlap-slot';
+    document.body.appendChild(element);
+    const publisherSlot = {
+      getSlotElementId: vi.fn().mockReturnValue(element.id),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([publisherSlot]),
+      addEventListener: vi.fn((event: string, listener: (value: SlotRenderEvent) => void) => {
+        (listeners[event] ??= []).push(listener);
+      }),
+      refresh: vi.fn(),
+    };
+    const recordAdTrace = vi.fn();
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+    };
+    (window as TestWindow).tsjs = {
+      adSlots: [],
+      bids: {},
+      recordAdTrace,
+      nextAdTraceGeneration: vi.fn().mockReturnValueOnce(1).mockReturnValueOnce(2),
+      bindAdTraceElement: vi.fn(),
+    } as any;
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+    listeners.slotRequested?.forEach((listener) =>
+      listener({ isEmpty: false, slot: publisherSlot })
+    );
+    listeners.slotRequested?.forEach((listener) =>
+      listener({ isEmpty: false, slot: publisherSlot })
+    );
+    listeners.slotRenderEnded?.forEach((listener) =>
+      listener({ isEmpty: false, slot: publisherSlot })
+    );
+
+    expect(recordAdTrace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'gpt_slot_render_ended',
+        generation: 2,
+        outcome: 'unresolved',
+        confidence: 'none',
+        reason: 'overlapping_request',
+      })
+    );
+    listeners.slotOnload?.forEach((listener) => listener({ isEmpty: false, slot: publisherSlot }));
+    expect(recordAdTrace).not.toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'gpt_slot_onload', generation: 2 })
+    );
+    element.remove();
+  });
+
+  it('records a publisher-owned GPT lifecycle even when no TS slot calls adInit', async () => {
+    const listeners: Record<string, Array<(event: SlotRenderEvent) => void>> = {};
+    const element = document.createElement('div');
+    element.id = 'publisher-lazy-slot';
+    document.body.appendChild(element);
+    const publisherSlot = {
+      getSlotElementId: vi.fn().mockReturnValue(element.id),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([publisherSlot]),
+      addEventListener: vi.fn((event: string, listener: (value: SlotRenderEvent) => void) => {
+        (listeners[event] ??= []).push(listener);
+      }),
+      refresh: vi.fn(),
+    };
+    const recordAdTrace = vi.fn();
+    const nextAdTraceGeneration = vi.fn().mockReturnValue(7);
+    const bindAdTraceElement = vi.fn();
+    const destroySlots = vi.fn().mockReturnValue(true);
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+      destroySlots,
+    };
+    (window as TestWindow).tsjs = {
+      adSlots: [],
+      bids: {},
+      recordAdTrace,
+      nextAdTraceGeneration,
+      bindAdTraceElement,
+    } as any;
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+
+    listeners.slotRequested?.forEach((listener) =>
+      listener({ isEmpty: false, slot: publisherSlot })
+    );
+    const request = recordAdTrace.mock.calls
+      .map(([value]) => value)
+      .find((value) => value.kind === 'gpt_request_started');
+    expect(request).toEqual(
+      expect.objectContaining({
+        slotId: expect.stringMatching(/^gpt_slot_\d+$/),
+        generation: 7,
+        reason: 'gpt_slot_requested',
+      })
+    );
+    expect(nextAdTraceGeneration).toHaveBeenCalledTimes(1);
+    expect(bindAdTraceElement).toHaveBeenCalledWith(request.slotId, 7, element);
+    expect(recordAdTrace).not.toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'prebid_targeting_selected' })
+    );
+
+    listeners.slotRenderEnded?.forEach((listener) =>
+      listener({ isEmpty: false, isBackfill: true, slot: publisherSlot } as SlotRenderEvent)
+    );
+    listeners.slotOnload?.forEach((listener) => listener({ isEmpty: false, slot: publisherSlot }));
+    listeners.impressionViewable?.forEach((listener) =>
+      listener({ isEmpty: false, slot: publisherSlot })
+    );
+
+    expect(recordAdTrace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'gpt_slot_render_ended',
+        slotId: request.slotId,
+        generation: 7,
+        isBackfill: true,
+        reason: 'gpt_backfill',
+      })
+    );
+    expect(recordAdTrace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'gpt_slot_onload',
+        slotId: request.slotId,
+        generation: 7,
+      })
+    );
+    expect(recordAdTrace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'gpt_impression_viewable',
+        slotId: request.slotId,
+        generation: 7,
+      })
+    );
+    ((window as TestWindow).googletag as any).destroySlots([publisherSlot]);
+    expect(destroySlots).toHaveBeenCalledWith([publisherSlot]);
+    expect(recordAdTrace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'generation_superseded',
+        slotId: request.slotId,
+        generation: 7,
+        reason: 'slot_destroyed',
+      })
+    );
+    element.remove();
+  });
+
+  it('adopts a pre-captured generation when GPT reports slotRequested', async () => {
+    const listeners: Record<string, Array<(event: SlotRenderEvent) => void>> = {};
+    const element = document.createElement('div');
+    element.id = 'publisher-captured-slot';
+    document.body.appendChild(element);
+    const publisherSlot = {
+      getSlotElementId: vi.fn().mockReturnValue(element.id),
+      getTargeting: vi.fn((key: string) => {
+        if (key === 'hb_adid') return ['captured-client-ad'];
+        if (key === 'hb_bidder') return ['captured-client-bidder'];
+        return [];
+      }),
+    };
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([publisherSlot]),
+      addEventListener: vi.fn((event: string, listener: (value: SlotRenderEvent) => void) => {
+        (listeners[event] ??= []).push(listener);
+      }),
+      refresh: vi.fn(),
+    };
+    const recordAdTrace = vi.fn();
+    const nextAdTraceGeneration = vi.fn().mockReturnValue(3);
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+    };
+    (window as TestWindow).tsjs = {
+      adSlots: [],
+      bids: {},
+      recordAdTrace,
+      nextAdTraceGeneration,
+      bindAdTraceElement: vi.fn(),
+      prebidCorrelation: [
+        {
+          auctionId: 'captured-auction',
+          slotId: 'captured_publisher_unit',
+          requestId: 'captured-request',
+          adId: 'captured-client-ad',
+          bidder: 'captured-client-bidder',
+        },
+      ],
+    } as any;
+
+    const module = await import('../../../src/integrations/gpt/index');
+    module.captureAdTraceRequest(publisherSlot as any, 'publisher_refresh');
+    module.installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+    listeners.slotRequested?.forEach((listener) =>
+      listener({ isEmpty: false, slot: publisherSlot })
+    );
+
+    expect(nextAdTraceGeneration).toHaveBeenCalledTimes(1);
+    expect((window as TestWindow).tsjs!.prebidCorrelation).toEqual([]);
+    expect(recordAdTrace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'gpt_slot_requested',
+        slotId: 'captured_publisher_unit',
+        generation: 3,
+      })
+    );
+    element.remove();
+  });
+
+  it('binds a publisher-owned slot that appears after slotRequested', async () => {
+    const listeners: Record<string, Array<(event: SlotRenderEvent) => void>> = {};
+    const publisherSlot = {
+      getSlotElementId: vi.fn().mockReturnValue('publisher-delayed-slot'),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([publisherSlot]),
+      addEventListener: vi.fn((event: string, listener: (value: SlotRenderEvent) => void) => {
+        (listeners[event] ??= []).push(listener);
+      }),
+      refresh: vi.fn(),
+    };
+    const recordAdTrace = vi.fn();
+    const bindAdTraceElement = vi.fn();
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+    };
+    (window as TestWindow).tsjs = {
+      adSlots: [],
+      bids: {},
+      recordAdTrace,
+      nextAdTraceGeneration: vi.fn().mockReturnValue(5),
+      bindAdTraceElement,
+    } as any;
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+    listeners.slotRequested?.forEach((listener) =>
+      listener({ isEmpty: false, slot: publisherSlot })
+    );
+    expect(bindAdTraceElement).not.toHaveBeenCalled();
+
+    const wrapper = document.createElement('div');
+    const element = document.createElement('div');
+    element.id = 'publisher-delayed-slot';
+    vi.spyOn(element, 'getBoundingClientRect').mockReturnValue({
+      width: 0,
+      height: 0,
+    } as DOMRect);
+    vi.spyOn(wrapper, 'getBoundingClientRect').mockReturnValue({
+      width: 300,
+      height: 250,
+    } as DOMRect);
+    wrapper.appendChild(element);
+    document.body.appendChild(wrapper);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(bindAdTraceElement).toHaveBeenCalledWith(
+      expect.stringMatching(/^gpt_slot_\d+$/),
+      5,
+      wrapper
+    );
+    wrapper.remove();
+  });
+
+  it('joins a publisher-owned GPT request to one exact client Prebid participant', async () => {
+    const listeners: Record<string, Array<(event: SlotRenderEvent) => void>> = {};
+    const element = document.createElement('div');
+    element.id = 'publisher-prebid-slot';
+    document.body.appendChild(element);
+    const publisherSlot = {
+      getSlotElementId: vi.fn().mockReturnValue(element.id),
+      getTargeting: vi.fn((key: string) => {
+        if (key === 'hb_adid') return ['client-ad-id'];
+        if (key === 'hb_bidder') return ['client-bidder'];
+        return [];
+      }),
+    };
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([publisherSlot]),
+      addEventListener: vi.fn((event: string, listener: (value: SlotRenderEvent) => void) => {
+        (listeners[event] ??= []).push(listener);
+      }),
+      refresh: vi.fn(),
+    };
+    const recordAdTrace = vi.fn();
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+    };
+    (window as TestWindow).tsjs = {
+      adSlots: [],
+      bids: {},
+      recordAdTrace,
+      nextAdTraceGeneration: vi.fn().mockReturnValueOnce(9).mockReturnValueOnce(10),
+      bindAdTraceElement: vi.fn(),
+      prebidCorrelation: [
+        {
+          auctionId: 'auction-1',
+          slotId: 'publisher_ad_unit',
+          requestId: 'request-1',
+          adId: 'client-ad-id',
+          bidder: 'client-bidder',
+        },
+      ],
+    } as any;
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+    listeners.slotRequested?.forEach((listener) =>
+      listener({ isEmpty: false, slot: publisherSlot })
+    );
+
+    expect(recordAdTrace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'prebid_targeting_selected',
+        slotId: 'publisher_ad_unit',
+        generation: 9,
+        outcome: 'client_bid_won',
+      })
+    );
+    expect((window as TestWindow).tsjs!.prebidSelectedParticipants).toEqual([
+      expect.objectContaining({
+        slotId: 'publisher_ad_unit',
+        adId: 'client-ad-id',
+        generation: 9,
+      }),
+    ]);
+    expect((window as TestWindow).tsjs!.prebidCorrelation).toEqual([]);
+
+    listeners.slotRenderEnded?.forEach((listener) =>
+      listener({ isEmpty: false, slot: publisherSlot })
+    );
+    listeners.slotRequested?.forEach((listener) =>
+      listener({ isEmpty: false, slot: publisherSlot })
+    );
+    expect(
+      recordAdTrace.mock.calls
+        .map(([value]) => value)
+        .filter((value) => value.kind === 'prebid_targeting_selected')
+    ).toHaveLength(1);
+    element.remove();
+  });
+
   it('displays TS-defined slots and does not include them in refresh', async () => {
     const mockSlot = {
       addService: vi.fn().mockReturnThis(),
