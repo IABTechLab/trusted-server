@@ -12,12 +12,16 @@ The First-Party Proxy system rewrites third-party URLs in ad creatives to route 
 - **Click Tracking** - First-party click redirects
 - **Content Security** - Validated, signed URLs prevent tampering
 
+## Generated URL authority
+
+Routes remain path-based, but URLs emitted into rewritten creatives and `/first-party/sign` or `/first-party/proxy-rebuild` responses are absolute on `[publisher].public_origin`, for example `https://ads.publisher.example/first-party/proxy?...`. Existing root-relative signed proxy and click inputs remain accepted. Configure a browser-reachable HTTPS public origin for deployments; HTTP is supported for localhost development.
+
 ## How It Works
 
 ```mermaid
 flowchart TD
   original["`Creative (Original) &lt;img src='tracker.com/pixel.gif' /&gt;`"]
-  rewritten["Creative (Rewritten)<br/>&lt;img src='/first-party/proxy?<br/>tsurl=https://tracker.com/<br/>pixel.gif&amp;tstoken=abc123...' /&gt;"]
+  rewritten["Creative (Rewritten)<br/>&lt;img src='https://ads.publisher.example/first-party/proxy?<br/>tsurl=https://tracker.com/<br/>pixel.gif&amp;tstoken=abc123...' /&gt;"]
   server["Trusted Server<br/>1. Validate tstoken<br/>2. Append ts-ec<br/>3. Proxy to tracker.com<br/>4. Return response"]
 
   original -->|Rewrite| rewritten -->|Browser Request| server
@@ -73,7 +77,7 @@ https://tracker.com/pixel.gif?campaign=123&uid=abc
 Signed proxy URL:
 
 ```
-/first-party/proxy?
+https://ads.publisher.example/first-party/proxy?
   tsurl=https://tracker.com/pixel.gif&
   campaign=123&
   uid=abc&

@@ -2,6 +2,10 @@
 
 Learn how to test Trusted Server locally and in CI/CD.
 
+## Testing absolute creative rewrite URLs
+
+Creative rewrite tests should configure a distinct `publisher.public_origin` and assert the parsed URL origin, not only a `/first-party/...` path substring. Keep manual root-relative proxy and click fixtures for compatibility tests, because deployed creative output is absolute on the configured public origin.
+
 ## Test Infrastructure
 
 ### Viceroy

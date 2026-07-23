@@ -7,7 +7,7 @@
 //!
 //! Key behaviors:
 //! - Absolute and protocol-relative URLs (http/https or `//`) are proxied to
-//!   `/first-party/proxy?tsurl=<base-url>&<original-query-params>&tstoken=<sig>` across these locations:
+//!   `{public_origin}/first-party/proxy?tsurl=<base-url>&<original-query-params>&tstoken=<sig>` across these locations:
 //!   - `<img src>`, `data-src`, `[srcset]`, `[imagesrcset]`
 //!   - `<script src>`
 //!   - `<video src>`, `<audio src>`, `<source src>`
@@ -140,6 +140,13 @@ pub(super) fn rewrite_style_urls(settings: &Settings, style: &str) -> String {
     out
 }
 
+/// Prefixes a controlled root-relative Trusted Server endpoint with its browser-facing origin.
+#[inline]
+pub(crate) fn first_party_url(settings: &Settings, path: &str) -> String {
+    debug_assert!(path.starts_with('/'));
+    format!("{}{}", settings.publisher.effective_public_origin(), path)
+}
+
 #[inline]
 fn build_signed_url_for(
     settings: &Settings,
@@ -183,7 +190,7 @@ fn build_signed_url_for(
         qs.append_pair(k, v);
     }
     qs.append_pair("tstoken", &token);
-    format!("{}?{}", base_path, qs.finish())
+    first_party_url(settings, &format!("{}?{}", base_path, qs.finish()))
 }
 
 #[inline]
@@ -493,11 +500,11 @@ pub fn sanitize_creative_html(markup: &str) -> String {
 }
 
 /// Rewrite ad creative HTML to first-party endpoints.
-/// - 1x1 `<img>` pixels → `/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
-/// - Non-pixel absolute images → `/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
-/// - `<iframe src>` (absolute or protocol-relative) → `/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
+/// - 1x1 `<img>` pixels → `{public_origin}/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
+/// - Non-pixel absolute images → `{public_origin}/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
+/// - `<iframe src>` (absolute or protocol-relative) → `{public_origin}/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
 /// - Injects the `tsjs-creative` script once at the top of `<body>` to safeguard click URLs inside creatives
-///   (served from `/static/tsjs=tsjs-creative.min.js`).
+///   (served from `{public_origin}/static/tsjs=tsjs-creative.min.js`).
 #[must_use]
 pub fn rewrite_creative_html(settings: &Settings, markup: &str) -> String {
     // No size parsing needed now; all absolute/protocol-relative URLs are proxied uniformly.
@@ -511,7 +518,11 @@ pub fn rewrite_creative_html(settings: &Settings, markup: &str) -> String {
                     let injected = injected_ts_creative.clone();
                     move |el| {
                         if !injected.get() {
-                            let script_tag = tsjs::tsjs_unified_script_tag();
+                            let script_src = tsjs::tsjs_unified_script_src();
+                            let script_tag = format!(
+                                "<script src=\"{}\" id=\"trustedserver-js\"></script>",
+                                first_party_url(settings, &script_src)
+                            );
                             el.prepend(&script_tag, ContentType::Html);
                             injected.set(true);
                         }
@@ -769,7 +780,8 @@ impl StreamProcessor for CreativeCssProcessor<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        rewrite_creative_html, rewrite_srcset, rewrite_style_urls, sanitize_creative_html, to_abs,
+        build_click_url, build_proxy_url, rewrite_creative_html, rewrite_srcset,
+        rewrite_style_urls, sanitize_creative_html, to_abs,
     };
 
     fn rewrite_srcset_attr(attr_name: &str, attr_value: &str) -> String {
@@ -1306,7 +1318,7 @@ mod tests {
           <img data-srcset="https://cdn.example/img-1x.png 1x, //cdn.example/img-2x.png 2x, /local/img.png 1x">
         "#;
         let out = rewrite_creative_html(&settings, html);
-        assert!(out.contains("data-src=\"/first-party/proxy?tsurl="));
+        assert!(out.contains("data-src=\"https://test-publisher.com/first-party/proxy?tsurl="));
         assert!(out.matches("/first-party/proxy?tsurl=").count() >= 1);
         // relative candidate remains
         assert!(out.contains("/local/img.png 1x"));
@@ -1439,7 +1451,46 @@ mod tests {
         // Non-excluded should be rewritten and SHOULD have data-tsclick
         assert!(out.contains("/first-party/click?tsurl="));
         assert!(out.contains("advertiser.example.com"));
-        assert!(out.contains("data-tsclick=\"/first-party/click"));
+        assert!(out.contains("data-tsclick=\"https://test-publisher.com/first-party/click"));
+    }
+
+    #[test]
+    fn generated_first_party_urls_use_public_origin() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.publisher.public_origin = Some("https://ads.publisher.example:8443".to_string());
+
+        let proxy = build_proxy_url(&settings, "https://cdn.example.com/ad.png?campaign=1");
+        let click = build_click_url(&settings, "https://advertiser.example.com/landing");
+        for generated in [&proxy, &click] {
+            let parsed = url::Url::parse(generated).expect("should build an absolute URL");
+            assert_eq!(
+                parsed.origin().ascii_serialization(),
+                "https://ads.publisher.example:8443"
+            );
+        }
+
+        let out = rewrite_creative_html(
+            &settings,
+            r#"<body><img src="https://cdn.example.com/ad.png" srcset="https://cdn.example.com/ad-2x.png 2x" style="background:url(https://cdn.example.com/bg.png)"><a href="https://advertiser.example.com/landing">ad</a></body>"#,
+        );
+        assert!(out.contains("https://ads.publisher.example:8443/first-party/proxy?"));
+        assert!(out.contains("https://ads.publisher.example:8443/first-party/click?"));
+        assert_eq!(
+            out.matches("https://ads.publisher.example:8443/first-party/proxy?")
+                .count(),
+            3,
+            "should qualify resource, srcset, and CSS rewrites"
+        );
+        assert!(out.contains("https://ads.publisher.example:8443/static/tsjs="));
+        assert!(!out.contains("origin.test-publisher.com"));
+        assert!(!out.contains("https://test-publisher.com/first-party"));
+    }
+
+    #[test]
+    fn generated_first_party_urls_fall_back_to_publisher_domain() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let proxy = build_proxy_url(&settings, "https://cdn.example.com/ad.png");
+        assert!(proxy.starts_with("https://test-publisher.com/first-party/proxy?"));
     }
 
     // ── sanitize_creative_html tests ────────────────────────────────────────

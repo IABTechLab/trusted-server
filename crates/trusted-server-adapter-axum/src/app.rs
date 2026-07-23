@@ -349,7 +349,7 @@ fn named_routes() -> [NamedRoute; 12] {
         },
         NamedRoute {
             path: "/first-party/proxy-rebuild",
-            primary_methods: &[Method::POST],
+            primary_methods: &[Method::GET, Method::POST],
             handler: NamedRouteHandler::FirstPartyProxyRebuild,
         },
     ]

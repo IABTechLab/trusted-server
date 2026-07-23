@@ -248,7 +248,7 @@ The orchestrator collects all bids and creates an OpenRTB response:
 }
 ```
 
-Note that creative HTML is rewritten to use the first-party proxy (`/first-party/proxy`) for privacy and security.
+Note that creative HTML is rewritten to use the configured browser-facing public origin, for example `https://ads.publisher.example/first-party/proxy`, for privacy and security.
 
 ## Route Registration & Endpoints
 
@@ -262,7 +262,7 @@ The trusted-server handles several types of routes defined in `crates/trusted-se
 | `/first-party/proxy`      | GET    | `handle_first_party_proxy()`   | Proxy creatives through first-party domain       | 84   |
 | `/first-party/click`      | GET    | `handle_first_party_click()`   | Track clicks on ads                              | 85   |
 | `/first-party/sign`       | GET/POST | `handle_first_party_proxy_sign()` | Generate signed URLs for creatives            | 86   |
-| `/first-party/proxy-rebuild` | POST | `handle_first_party_proxy_rebuild()` | Rebuild creative HTML with new settings     | 89   |
+| `/first-party/proxy-rebuild` | GET/POST | `handle_first_party_proxy_rebuild()` | Rebuild signed creative click URLs     | 89   |
 | `/static/tsjs=*`          | GET    | `handle_tsjs_dynamic()`        | Serve tsjs library (Prebid.js alternative)       | 66   |
 | `/.well-known/ts.jwks.json` | GET  | `handle_jwks_endpoint()`       | Public key distribution for request signing      | 71   |
 | `/verify-signature`       | POST   | `handle_verify_signature()`    | Verify signed requests                           | 74   |

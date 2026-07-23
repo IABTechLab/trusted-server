@@ -150,7 +150,7 @@ sequenceDiagram
     Orch->>Orch: Transform to OpenRTB response<br/>Generate iframe creatives<br/>Rewrite creative URLs<br/>Add orchestrator metadata
 
     Orch-->>TS: OpenRTB BidResponse
-    Note right of Orch: { "id": "auction-response",<br/>  "seatbid": [{ "seat": "amazon-aps",<br/>    "bid": [{ "price": 2.50,<br/>      "adm": "<iframe src=\"/first-party/proxy?tsurl=...\">",<br/>      "w": 728, "h": 90 }] }] }<br/>  "ext": { "orchestrator": {<br/>    "strategy": "parallel_mediation",<br/>    "bidders": 2, "time_ms": 150 } }
+    Note right of Orch: { "id": "auction-response",<br/>  "seatbid": [{ "seat": "amazon-aps",<br/>    "bid": [{ "price": 2.50,<br/>      "adm": "<iframe src=\"https://ads.publisher.example/first-party/proxy?tsurl=...\">",<br/>      "w": 728, "h": 90 }] }] }<br/>  "ext": { "orchestrator": {<br/>    "strategy": "parallel_mediation",<br/>    "bidders": 2, "time_ms": 150 } }
 
     TS-->>Client: 200 OpenRTB response<br/>with winning creative
     deactivate Orch
@@ -161,7 +161,7 @@ sequenceDiagram
   rect rgb(239,246,255)
     Note over Client,Mock: Creative Rendering
     Client->>Client: Inject winning creative<br/>Render iframe<br/>Load creative through proxy
-    Note right of Client: iframe src="/first-party/proxy?tsurl=...&tstoken=sig"<br/>Ensures first-party serving<br/>Maintains privacy & security
+    Note right of Client: iframe src="https://ads.publisher.example/first-party/proxy?tsurl=...&tstoken=sig"<br/>Ensures first-party serving<br/>Maintains privacy & security
     deactivate Client
   end
 ```
@@ -531,7 +531,7 @@ Auction results are returned in standard OpenRTB format with an `ext.orchestrato
           "id": "bid-1",
           "impid": "header-banner",
           "price": 2.5,
-          "adm": "<iframe src=\"/first-party/proxy?tsurl=...&tstoken=sig\">...</iframe>",
+          "adm": "<iframe src=\"https://ads.publisher.example/first-party/proxy?tsurl=...&tstoken=sig\">...</iframe>",
           "w": 728,
           "h": 90
         }
@@ -557,16 +557,16 @@ Winning creatives are processed through a streaming HTML rewriter (`lol_html`) b
 
 **Elements rewritten:**
 
-| Element                          | Attributes                  | Target                         |
-| -------------------------------- | --------------------------- | ------------------------------ |
-| `<img>`                          | `src`, `data-src`, `srcset` | `/first-party/proxy?tsurl=...` |
-| `<script>`                       | `src`                       | `/first-party/proxy?tsurl=...` |
-| `<link>`                         | `href`, `imagesrcset`       | `/first-party/proxy?tsurl=...` |
-| `<iframe>`                       | `src`                       | `/first-party/proxy?tsurl=...` |
-| `<video>`, `<audio>`, `<source>` | `src`                       | `/first-party/proxy?tsurl=...` |
-| `<a>`, `<area>`                  | `href`                      | `/first-party/click?tsurl=...` |
-| `<style>`, `[style]`             | `url()` references          | `/first-party/proxy?tsurl=...` |
-| SVG `<image>`, `<use>`           | `href`, `xlink:href`        | `/first-party/proxy?tsurl=...` |
+| Element                          | Attributes                  | Target                                                      |
+| -------------------------------- | --------------------------- | ----------------------------------------------------------- |
+| `<img>`                          | `src`, `data-src`, `srcset` | `https://ads.publisher.example/first-party/proxy?tsurl=...` |
+| `<script>`                       | `src`                       | `https://ads.publisher.example/first-party/proxy?tsurl=...` |
+| `<link>`                         | `href`, `imagesrcset`       | `https://ads.publisher.example/first-party/proxy?tsurl=...` |
+| `<iframe>`                       | `src`                       | `https://ads.publisher.example/first-party/proxy?tsurl=...` |
+| `<video>`, `<audio>`, `<source>` | `src`                       | `https://ads.publisher.example/first-party/proxy?tsurl=...` |
+| `<a>`, `<area>`                  | `href`                      | `/first-party/click?tsurl=...`                              |
+| `<style>`, `[style]`             | `url()` references          | `https://ads.publisher.example/first-party/proxy?tsurl=...` |
+| SVG `<image>`, `<use>`           | `href`, `xlink:href`        | `/first-party/proxy?tsurl=...`                              |
 
 URLs that are relative, or use `data:`, `javascript:`, `blob:`, or `mailto:` schemes are left unchanged. Domains in the `rewrite.exclude_domains` config list (supports wildcards like `*.cloudflare.com`) are also skipped.
 

@@ -4,6 +4,8 @@ import { creativeGlobal } from '../../shared/globals';
 import { delay, queueTask } from '../../shared/async';
 import { createMutationScheduler } from '../../shared/scheduler';
 
+import { resolveFirstPartyPath } from './first_party';
+
 type AnchorLike = HTMLAnchorElement | HTMLAreaElement;
 type Canon = { base: string; params: Record<string, string> };
 type Diff = { add: Record<string, string>; del: string[] };
@@ -37,8 +39,7 @@ function parseQuery(qs: string): Record<string, string> {
 function canonFromFirstPartyClick(url: string): Canon | null {
   try {
     const u = new URL(url, location.href);
-    if (!(u.pathname === '/first-party/click' || u.pathname.startsWith('/first-party/click')))
-      return null;
+    if (u.pathname !== '/first-party/click') return null;
     const p = parseQuery(u.search);
     const tsurl = p['tsurl'];
     if (!tsurl) return null;
@@ -141,7 +142,7 @@ function buildProxyRebuildUrl(tsClickStr: string, diff: Diff): string {
   if (diff.del.length > 0) {
     params.set('del', JSON.stringify(diff.del));
   }
-  return `/first-party/proxy-rebuild?${params.toString()}`;
+  return resolveFirstPartyPath(`/first-party/proxy-rebuild?${params.toString()}`);
 }
 
 // Call the proxy-rebuild endpoint so the edge can re-sign mutated click params.
@@ -169,7 +170,7 @@ async function rebuildClick(a: AnchorLike, tsClickStr: string, diff: Diff): Prom
   if (delKeys.length > 0) payload.del = delKeys;
 
   try {
-    const resp = await fetch('/first-party/proxy-rebuild', {
+    const resp = await fetch(resolveFirstPartyPath('/first-party/proxy-rebuild'), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(payload),

@@ -220,6 +220,7 @@ fn all_explicit_routes_are_registered() {
         ("GET", "/first-party/click"),
         ("GET", "/first-party/sign"),
         ("POST", "/first-party/sign"),
+        ("GET", "/first-party/proxy-rebuild"),
         ("POST", "/first-party/proxy-rebuild"),
     ];
 
