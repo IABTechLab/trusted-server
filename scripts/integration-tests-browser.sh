@@ -38,6 +38,19 @@ TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK=false \
 echo "==> Generating Viceroy configs..."
 INTEGRATION_ORIGIN_PORT="$ORIGIN_PORT" ./scripts/generate-integration-viceroy-configs.sh
 GENERATED_VICEROY_CONFIG_PATH="$REPO_ROOT/target/integration-test-artifacts/configs/viceroy.toml"
+GENERATED_AD_TRACE_CONFIG_PATH="$REPO_ROOT/target/integration-test-artifacts/configs/viceroy-ad-trace.toml"
+
+# Build the actual external Prebid bundle consumed by the isolated ad-trace
+# fixture. The browser routes its first-party managed URL to this local asset;
+# no public ad network is contacted.
+echo "==> Building deterministic external Prebid fixture bundle..."
+rm -rf "$REPO_ROOT/target/integration-test-artifacts/prebid"
+mkdir -p "$REPO_ROOT/target/integration-test-artifacts/prebid"
+npm ci --prefix crates/trusted-server-js/lib
+npm run --prefix crates/trusted-server-js/lib build:prebid-external -- \
+    --adapters=rubicon \
+    --user-id-modules=sharedIdSystem \
+    --out "$REPO_ROOT/target/integration-test-artifacts/prebid"
 
 # --- Build Docker images ---
 echo "==> Building WordPress test container..."
@@ -49,6 +62,12 @@ docker build \
     --build-arg NODE_VERSION="$NODE_VERSION" \
     -t test-nextjs:latest \
     crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/
+
+echo "==> Building ad-trace test container..."
+docker build \
+    -f crates/trusted-server-integration-tests/fixtures/frameworks/ad-trace/Dockerfile \
+    -t test-ad-trace:latest \
+    .
 
 # --- Install Playwright ---
 echo "==> Installing Playwright dependencies..."
@@ -80,15 +99,22 @@ stop_matching_containers() {
 }
 
 cleanup() {
+    stop_matching_containers test-ad-trace:latest
     stop_matching_containers test-nextjs:latest
     stop_matching_containers test-wordpress:latest
 }
 trap cleanup EXIT
 
 # --- Run tests for each framework ---
-for framework in nextjs wordpress; do
+for framework in nextjs wordpress ad-trace; do
     echo "==> Running Playwright tests for $framework..."
-    TEST_FRAMEWORK="$framework" npx playwright test "$@"
+    if [ "$framework" = "ad-trace" ]; then
+        TEST_FRAMEWORK="$framework" VICEROY_CONFIG_PATH="$GENERATED_AD_TRACE_CONFIG_PATH" \
+            npx playwright test "$@"
+    else
+        TEST_FRAMEWORK="$framework" VICEROY_CONFIG_PATH="$GENERATED_VICEROY_CONFIG_PATH" \
+            npx playwright test "$@"
+    fi
 done
 
 echo "==> All browser tests passed."

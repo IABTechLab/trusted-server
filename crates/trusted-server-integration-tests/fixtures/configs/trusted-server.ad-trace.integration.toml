@@ -1,0 +1,67 @@
+[[handlers]]
+path = "^/_ts/admin"
+username = "admin"
+password = "integration-admin-password-32-bytes-ok"
+
+[publisher]
+domain = "localhost"
+cookie_domain = "localhost"
+origin_url = "http://127.0.0.1:8888"
+proxy_secret = "integration-test-proxy-secret"
+
+[ec]
+passphrase = "integration-test-ec-secret-padded-32"
+ec_store = "ec_identity_store"
+
+[request_signing]
+enabled = false
+config_store_id = "app_config"
+secret_store_id = "secrets"
+
+[integrations.ad_trace]
+enabled = true
+
+[integrations.prebid]
+enabled = true
+server_url = "http://127.0.0.1:8888/openrtb2/auction"
+external_bundle_url = "https://assets.example.com/prebid/trusted-prebid.js"
+timeout_ms = 750
+bidders = ["example-bidder"]
+client_side_bidders = []
+debug = false
+test_mode = true
+
+[integrations.gpt]
+enabled = true
+script_url = "https://ads.example.com/gpt.js"
+cache_ttl_seconds = 3600
+rewrite_script = false
+
+[proxy]
+certificate_check = false
+allowed_domains = ["assets.example.com"]
+
+[auction]
+enabled = true
+providers = ["prebid"]
+timeout_ms = 1000
+allowed_context_keys = []
+
+[creative_opportunities]
+gam_network_id = "123456789"
+auction_timeout_ms = 750
+price_granularity = "dense"
+
+[[creative_opportunities.slot]]
+id = "ad-trace-slot"
+div_id = "ad-trace-slot"
+gam_unit_path = "/123456789/example/ad-trace"
+page_patterns = ["/", "/spa*"]
+formats = [{ width = 300, height = 250 }]
+
+[creative_opportunities.slot.providers.prebid]
+bidders = { example-bidder = { placement = "example-placement" } }
+
+[debug]
+ja4_endpoint_enabled = false
+inject_adm_for_testing = true

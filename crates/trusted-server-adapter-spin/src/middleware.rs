@@ -5,6 +5,7 @@ use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Response};
 use edgezero_core::middleware::{Middleware, Next};
+use edgezero_core::response::IntoResponse;
 use trusted_server_core::auth::enforce_basic_auth;
 use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
 use trusted_server_core::settings::Settings;
@@ -39,6 +40,7 @@ impl Middleware for FinalizeResponseMiddleware {
 
         let mut response = next.run(ctx).await?;
         apply_finalize_headers(&self.settings, geo_available, &mut response);
+        trusted_server_core::integrations::ad_trace::finalize_response(&mut response);
         Ok(response)
     }
 }
@@ -95,16 +97,17 @@ impl Middleware for AuthMiddleware {
 /// signing handler that begins deriving an issuer/audience from `RequestInfo`,
 /// cannot silently trust spoofable input by forgetting to opt in.
 ///
-/// Registered after [`AuthMiddleware`] (innermost) so the basic-auth gate still
-/// evaluates the original request, preserving prior behaviour.
-#[derive(Default)]
-pub struct NormalizeMiddleware;
+/// Registered outside [`AuthMiddleware`] so de-spoofing and console sanitation
+/// also apply when auth short-circuits the request.
+pub struct NormalizeMiddleware {
+    settings: Arc<Settings>,
+}
 
 impl NormalizeMiddleware {
     /// Creates a new [`NormalizeMiddleware`].
     #[must_use]
-    pub fn new() -> Self {
-        Self
+    pub fn new(settings: Arc<Settings>) -> Self {
+        Self { settings }
     }
 }
 
@@ -112,7 +115,28 @@ impl NormalizeMiddleware {
 impl Middleware for NormalizeMiddleware {
     async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
         crate::app::normalize_spin_request(ctx.request_mut());
-        next.run(ctx).await
+        let decision = match trusted_server_core::integrations::ad_trace::prepare_request(
+            &self.settings,
+            ctx.request_mut(),
+        ) {
+            Ok(decision) => decision,
+            Err(report) => {
+                log::error!("ad trace request preparation failed: {report:?}");
+                return Ok(crate::app::http_error(&report));
+            }
+        };
+        let mut response = match next.run(ctx).await {
+            Ok(response) => response,
+            Err(error) => {
+                log::error!("request handler failed after ad trace preparation: {error:?}");
+                error.into_response()?
+            }
+        };
+        trusted_server_core::integrations::ad_trace::attach_response_decision(
+            &decision,
+            &mut response,
+        );
+        Ok(response)
     }
 }
 

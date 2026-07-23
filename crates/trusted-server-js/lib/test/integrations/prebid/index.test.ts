@@ -211,6 +211,39 @@ describe('prebid/auctionBidsToPrebidBids', () => {
     );
   });
 
+  it('adds adapter targeting only for a validated Trusted Server trace', () => {
+    const traced: AuctionBid = {
+      impid: 'slot-traced',
+      adm: '<div>Ad</div>',
+      price: 2,
+      width: 300,
+      height: 250,
+      seat: 'example-bidder',
+      creativeId: 'creative-1',
+      adomain: [],
+      trace: {
+        version: 1,
+        auctionTraceId: '650e8400-e29b-41d4-a716-446655440000',
+        bidTraceId: '550e8400-e29b-41d4-a716-446655440000',
+        source: 'auction_api',
+        slotId: 'slot-traced',
+        provider: 'prebid',
+        bidder: 'example-bidder',
+      },
+    };
+
+    const [bid] = auctionBidsToPrebidBids(
+      [traced],
+      [{ adUnitCode: 'slot-traced', bidId: 'request-1' }]
+    );
+    expect(bid.adserverTargeting).toEqual({
+      ts_trace: '550e8400-e29b-41d4-a716-446655440000',
+    });
+    expect(auctionBidsToPrebidBids([{ ...traced, trace: undefined }], [])[0]).not.toHaveProperty(
+      'adserverTargeting'
+    );
+  });
+
   it('falls back to impid when no matching bidRequest found', () => {
     const auctionBids: AuctionBid[] = [
       {
@@ -280,8 +313,9 @@ describe('prebid/installPrebidNpm', () => {
     document.cookie = 'ts-eids=; Path=/; Max-Age=0';
     delete (window as any).__tsjs_prebid;
     delete (window as any).__tsjs_prebid_diagnostics;
-    delete (window as any).tsjs;
     delete (mockPbjs as any).__tsApsBidResponseListenerInstalled;
+    delete (mockPbjs as any).__tsAdTraceObserved;
+    delete window.tsjs;
   });
 
   afterEach(() => {
@@ -939,6 +973,50 @@ describe('prebid/installPrebidNpm', () => {
       pbjs.requestBids({ adUnits: [{ bids: [{ bidder: 'appnexus', params: {} }] }] } as any);
 
       expect(document.cookie).toBe('');
+    });
+
+    it('joins late winner and render events to the retained selected generation', () => {
+      const recordAdTrace = vi.fn();
+      window.tsjs = {
+        recordAdTrace,
+        prebidSelectedParticipants: [
+          {
+            auctionId: 'auction-1',
+            slotId: 'slot-a',
+            requestId: 'request-1',
+            adId: 'ad-1',
+            bidder: 'client-bidder',
+            generation: 7,
+            selectedAt: performance.now(),
+          },
+        ],
+      } as any;
+      installPrebidNpm();
+      const handlers = new Map<string, (data: Record<string, unknown>) => void>(
+        mockOnEvent.mock.calls.map(([event, handler]) => [event, handler])
+      );
+      const bid = {
+        auctionId: 'auction-1',
+        adUnitCode: 'slot-a',
+        requestId: 'request-1',
+        adId: 'ad-1',
+        bidderCode: 'client-bidder',
+      };
+
+      handlers.get('bidWon')?.(bid);
+      handlers.get('adRenderSucceeded')?.({ bid });
+
+      expect(recordAdTrace).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: 'prebid_bid_won', generation: 7, slotId: 'slot-a' })
+      );
+      expect(recordAdTrace).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: 'prebid_render_succeeded',
+          generation: 7,
+          slotId: 'slot-a',
+        })
+      );
+      expect(window.tsjs.prebidSelectedParticipants).toEqual([]);
     });
   });
 });

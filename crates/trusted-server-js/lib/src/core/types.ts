@@ -80,6 +80,126 @@ export interface ApsPrebidRendererEntry {
   markRendered(): void;
 }
 
+export type AuctionTraceSource = 'initial_navigation' | 'spa_navigation' | 'auction_api';
+export type AuctionTraceOutcome = 'completed' | 'no_bid' | 'skipped' | 'failed' | 'abandoned';
+
+/** Privacy-safe summary emitted only for configured tester traffic. */
+export interface AuctionTraceSummary {
+  version: 1;
+  auctionTraceId: string;
+  source: AuctionTraceSource;
+  outcome: AuctionTraceOutcome;
+}
+
+/** Privacy-safe trace for one final Trusted Server winning bid. */
+export interface TrustedServerBidTrace {
+  version: 1;
+  auctionTraceId: string;
+  bidTraceId: string;
+  source: AuctionTraceSource;
+  slotId: string;
+  provider: string;
+  bidder: string;
+}
+
+export type AdTraceConfidence = 'definitive' | 'strong' | 'probable' | 'none';
+export type AdTraceStageName = 'trustedServer' | 'prebid' | 'gam' | 'creative';
+export interface AdTraceStage {
+  outcome: string;
+  confidence: AdTraceConfidence;
+  reason: string;
+}
+
+export type AdTraceEventKind =
+  | 'ts_auction_observed'
+  | 'ts_winner_observed'
+  | 'prebid_auction_init'
+  | 'prebid_bid_response'
+  | 'prebid_targeting_selected'
+  | 'prebid_bid_won'
+  | 'prebid_auction_end'
+  | 'prebid_render_succeeded'
+  | 'prebid_render_failed'
+  | 'gpt_targeting_applied'
+  | 'gpt_request_started'
+  | 'gpt_slot_requested'
+  | 'gpt_slot_response_received'
+  | 'gpt_slot_render_ended'
+  | 'gpt_slot_onload'
+  | 'aps_display_bids_set'
+  | 'pb_render_requested'
+  | 'pb_render_rejected'
+  | 'pb_render_served'
+  | 'direct_render_rejected'
+  | 'creative_load_acknowledged'
+  | 'generation_superseded';
+
+/** Sanitized observation accepted by the optional recorder. */
+export interface AdTraceObservation {
+  kind: AdTraceEventKind;
+  slotId?: string;
+  generation?: number;
+  auctionTraceId?: string;
+  bidTraceId?: string;
+  provider?: string;
+  bidder?: string;
+  outcome?: string;
+  confidence?: AdTraceConfidence;
+  reason?: string;
+  isEmpty?: boolean;
+  isBackfill?: boolean;
+}
+
+export interface AdTraceEvent extends AdTraceObservation {
+  sequence: number;
+  timestamp: number;
+}
+
+export interface GenerationTraceSnapshot {
+  generation: number;
+  stages: Record<AdTraceStageName, AdTraceStage>;
+}
+
+export interface SlotTraceSnapshot {
+  slotId: string;
+  latestGeneration: number;
+  generations: GenerationTraceSnapshot[];
+  /** Convenience view of only the latest retained generation. */
+  stages: Record<AdTraceStageName, AdTraceStage>;
+}
+
+export type RenderTraceOutcome = 'confirmed' | 'served' | 'gam_only' | 'empty' | 'unresolved';
+export type RenderTraceVisibility = 'visible' | 'hidden' | 'disconnected' | 'unknown';
+
+export interface RenderTraceSnapshot {
+  sequence: number;
+  slotId: string;
+  generation: number;
+  auctionTraceId?: string;
+  bidTraceId?: string;
+  source: 'gpt' | 'pb_render' | 'direct_auction';
+  outcome: RenderTraceOutcome;
+  confidence: AdTraceConfidence;
+  visibility: RenderTraceVisibility;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface AdTraceExport {
+  version: 1;
+  slots: SlotTraceSnapshot[];
+  events: AdTraceEvent[];
+  renders: RenderTraceSnapshot[];
+  metadata: { droppedEvents: number; evictedSlots: number };
+}
+
+export interface AdTraceApi {
+  getSlot(slotId: string): SlotTraceSnapshot | undefined;
+  getEvents(): readonly AdTraceEvent[];
+  getRenderTimeline(): readonly RenderTraceSnapshot[];
+  export(): AdTraceExport;
+}
+
 /** Bid targeting data from the server-side auction, injected into `window.tsjs.bids`. */
 export interface AuctionBidData {
   hb_pb?: string;
@@ -95,6 +215,8 @@ export interface AuctionBidData {
   burl?: string;
   /** Typed winning-bid renderer capability. */
   renderer?: AuctionBidRenderer;
+  /** Tester-gated trace; absent for ordinary traffic and malformed input. */
+  trace?: TrustedServerBidTrace;
   /**
    * Sanitized winning creative markup for local rendering through the pbRender
    * bridge. Present whenever the winning bid carried a creative that passed the
@@ -145,6 +267,80 @@ export interface TsjsApi {
    * `hb_adid`. The Universal Creative bridge consumes each entry at most once.
    */
   apsPrebidRenderers?: Record<string, ApsPrebidRendererEntry>;
+  /** Tester-gated terminal auction summary. */
+  auctionTrace?: AuctionTraceSummary;
+  /** Tester-only immutable diagnostic API. */
+  adTrace?: AdTraceApi;
+  /** Private recorder installed only by the optional ad_trace module. */
+  recordAdTrace?: (observation: AdTraceObservation) => void;
+  /** Private generation allocator installed only by the optional module. */
+  nextAdTraceGeneration?: (slotId: string) => number;
+  /** Private overlay subscription installed only by the optional module. */
+  subscribeAdTrace?: (listener: () => void) => () => void;
+  /** Bind one generation to the exact DOM element captured at its request boundary. */
+  bindAdTraceElement?: (slotId: string, generation: number, element: HTMLElement) => void;
+  /** Resolve only that exact captured element; never searches replacement DOM. */
+  getAdTraceElement?: (slotId: string, generation: number) => HTMLElement | undefined;
+  /** Private live visibility updater used only by the active overlay. */
+  updateAdTraceVisibility?: (
+    slotId: string,
+    generation: number,
+    visibility: RenderTraceVisibility
+  ) => void;
+  /** Private request-scoped Prebid correlation ledger; never exported. */
+  prebidCorrelation?: Array<{
+    auctionId: string;
+    slotId: string;
+    requestId: string;
+    bidder?: string;
+    adId?: string;
+    traceToken?: string;
+    serverTrace?: TrustedServerBidTrace;
+    events?: AdTraceEventKind[];
+  }>;
+  /** Exact selected participants retained briefly for post-request terminal events. */
+  prebidSelectedParticipants?: Array<{
+    auctionId: string;
+    slotId: string;
+    requestId: string;
+    adId?: string;
+    traceToken?: string;
+    bidder?: string;
+    generation: number;
+    selectedAt: number;
+  }>;
+  /** Request-scoped root summaries retained until the GPT request boundary. */
+  prebidServerSummaries?: Array<{
+    auctionId: string;
+    slotId: string;
+    summary: AuctionTraceSummary;
+  }>;
+  /** Completed Prebid auctions used to identify request-scoped no-bid selections. */
+  prebidCompletedAuctions?: Array<{ auctionId: string; slotIds: string[] }>;
+  /** Private bootstrap queue used until the GPT module installs its capture hook. */
+  pendingAdTraceRequests?: Array<{
+    slot: unknown;
+    trigger: string;
+    snapshot?: {
+      slotId?: string;
+      bidder?: string;
+      adId?: string;
+      traceToken?: string;
+      bid?: AuctionBidData;
+    };
+  }>;
+  /** Private request-boundary hook shared with bootstrap and slim Prebid. */
+  captureAdTraceRequest?: (
+    slot: unknown,
+    trigger: string,
+    snapshot?: {
+      slotId?: string;
+      bidder?: string;
+      adId?: string;
+      traceToken?: string;
+      bid?: AuctionBidData;
+    }
+  ) => number;
   /** Initialises GPT slots with server-side bid targeting and calls refresh(). */
   adInit?: () => void;
   /** GPT slot objects TS defined — used to destroy stale slots on SPA navigation. */
@@ -153,12 +349,6 @@ export interface TsjsApi {
   servicesEnabled?: boolean;
   /** Maps actualDivId → slotId for slotRenderEnded billing lookup. */
   divToSlotId?: Record<string, string>;
-  /**
-   * Win/billing beacons already fired, keyed by `slotId|bidIdentity|kind|url`.
-   * Used by the GPT render bridge so a bid's nurl/burl fire at most once even
-   * across repeated Prebid Universal Creative requests for the same adId.
-   */
-  firedBeacons?: Record<string, boolean>;
   /** Slot-level GPT targeting keys TS applied on the previous route. */
   prevSlotTargetingKeys?: Record<string, string[]>;
   /**

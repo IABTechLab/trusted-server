@@ -32,7 +32,7 @@ use trusted_server_core::settings_data::{
 
 use trusted_server_core::platform::RuntimeServices;
 
-use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
+use crate::middleware::{AdTracePrepareMiddleware, AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::{AxumPlatformConfigStore, build_runtime_services};
 
 // ---------------------------------------------------------------------------
@@ -540,6 +540,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
 
     let mut router = RouterService::builder()
         .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
+        .middleware(AdTracePrepareMiddleware::new(Arc::clone(&state.settings)))
         .middleware(AuthMiddleware::new(Arc::clone(&state.settings)));
 
     router = router.route("/health", Method::GET, |_ctx: RequestContext| async {

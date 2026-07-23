@@ -16,12 +16,11 @@ const WASM_PATH =
     "../../../target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm",
   );
 
-const VICEROY_CONFIG =
-  process.env.VICEROY_CONFIG_PATH ||
-  resolve(
-    __dirname,
-    "../../../target/integration-test-artifacts/configs/viceroy.toml",
-  );
+function viceroyConfigPath(framework: string): string {
+  if (process.env.VICEROY_CONFIG_PATH) return process.env.VICEROY_CONFIG_PATH;
+  const filename = framework === "ad-trace" ? "viceroy-ad-trace.toml" : "viceroy.toml";
+  return resolve(__dirname, `../../../target/integration-test-artifacts/configs/${filename}`);
+}
 
 /** Persist current state so global-teardown can always clean up. */
 function writeState(state: {
@@ -47,7 +46,7 @@ async function globalSetup(): Promise<void> {
     writeState({ containerId, framework });
 
     console.log(`[global-setup] Starting Viceroy (WASM: ${WASM_PATH})...`);
-    const viceroy = await startViceroy(WASM_PATH, VICEROY_CONFIG);
+    const viceroy = await startViceroy(WASM_PATH, viceroyConfigPath(framework));
     viceroyPid = viceroy.process.pid;
 
     console.log(`[global-setup] Viceroy ready at ${viceroy.baseUrl}`);

@@ -180,15 +180,45 @@ impl ToExt for BidExt<'_> {}
 
 #[derive(Debug, Serialize)]
 pub struct BidTrustedServerExt<'a> {
-    pub renderer: &'a BidRenderer,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renderer: Option<&'a BidRenderer>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace: Option<BidTraceWire>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ResponseExt {
     pub orchestrator: OrchestratorExt,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trusted_server: Option<TrustedServerResponseExt>,
 }
 
 impl ToExt for ResponseExt {}
+
+/// Namespaced Trusted Server response extensions.
+#[derive(Debug, Serialize)]
+pub struct TrustedServerResponseExt {
+    pub trace: AuctionTraceWire,
+}
+
+/// Privacy-safe root trace extension.
+#[derive(Debug, Serialize)]
+pub struct AuctionTraceWire {
+    pub version: u8,
+    pub auction_trace_id: String,
+    pub source: &'static str,
+    pub outcome: &'static str,
+}
+
+/// Privacy-safe final-winning-bid trace extension.
+#[derive(Debug, Serialize)]
+pub struct BidTraceWire {
+    pub version: u8,
+    pub bid_trace_id: String,
+    pub slot_id: String,
+    pub provider: String,
+    pub bidder: String,
+}
 
 #[cfg(test)]
 mod tests {
@@ -223,6 +253,7 @@ mod tests {
                 time_ms: 12,
                 provider_details: vec![],
             },
+            trusted_server: None,
         }
         .to_ext();
 

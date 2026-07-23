@@ -59,6 +59,11 @@ enabled = false
 rewrite_attributes = ["href", "link", "siteBaseUrl", "siteProductionDomain", "url"]
 max_combined_payload_bytes = 10485760
 
+# Session-scoped auction-to-creative trace diagnostics. When enabled, visit a
+# publisher page with `?ts_console=1` or `?ts_console=true` to open the console.
+[integrations.ad_trace]
+enabled = false
+
 [integrations.testlight]
 enabled = false
 endpoint = "https://testlight.example.com/openrtb2/auction"

@@ -5,6 +5,7 @@ use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Response};
 use edgezero_core::middleware::{Middleware, Next};
+use edgezero_core::response::IntoResponse;
 use trusted_server_core::auth::enforce_basic_auth;
 use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
 use trusted_server_core::settings::Settings;
@@ -38,6 +39,51 @@ impl Middleware for FinalizeResponseMiddleware {
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
         let mut response = next.run(ctx).await?;
         apply_finalize_headers(&self.settings, &mut response);
+        trusted_server_core::integrations::ad_trace::finalize_response(&mut response);
+        Ok(response)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AdTracePrepareMiddleware
+// ---------------------------------------------------------------------------
+
+/// Prepares and sanitizes the request before auth, routing, or downstream use.
+pub struct AdTracePrepareMiddleware {
+    settings: Arc<Settings>,
+}
+
+impl AdTracePrepareMiddleware {
+    #[must_use]
+    pub fn new(settings: Arc<Settings>) -> Self {
+        Self { settings }
+    }
+}
+
+#[async_trait(?Send)]
+impl Middleware for AdTracePrepareMiddleware {
+    async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
+        let decision = match trusted_server_core::integrations::ad_trace::prepare_request(
+            &self.settings,
+            ctx.request_mut(),
+        ) {
+            Ok(decision) => decision,
+            Err(report) => {
+                log::error!("ad trace request preparation failed: {report:?}");
+                return Ok(crate::app::http_error(&report));
+            }
+        };
+        let mut response = match next.run(ctx).await {
+            Ok(response) => response,
+            Err(error) => {
+                log::error!("request handler failed after ad trace preparation: {error:?}");
+                error.into_response()?
+            }
+        };
+        trusted_server_core::integrations::ad_trace::attach_response_decision(
+            &decision,
+            &mut response,
+        );
         Ok(response)
     }
 }

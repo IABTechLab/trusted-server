@@ -4,11 +4,156 @@ use edgezero_core::body::Body as EdgeBody;
 use http::Request;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use uuid::Uuid;
 
 use crate::auction::context::ContextValue;
 use crate::geo::GeoInfo;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
+
+/// Source path that initiated an auction candidate.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuctionSource {
+    /// Initial publisher navigation using server-side ad templates.
+    InitialNavigation,
+    /// SPA navigation through `GET /__ts/page-bids`.
+    SpaNavigation,
+    /// Explicit `POST /auction` API.
+    AuctionApi,
+}
+
+impl AuctionSource {
+    /// Return the stable wire label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InitialNavigation => "initial_navigation",
+            Self::SpaNavigation => "spa_navigation",
+            Self::AuctionApi => "auction_api",
+        }
+    }
+}
+
+/// Privacy-safe public identity for one auction candidate.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, derive_more::Display)]
+pub struct AuctionTraceId(Uuid);
+
+impl AuctionTraceId {
+    /// Generate a fresh random trace identity.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// Return the underlying UUID.
+    #[must_use]
+    pub const fn as_uuid(self) -> Uuid {
+        self.0
+    }
+}
+
+impl Default for AuctionTraceId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Privacy-safe public identity for one final winning bid.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, derive_more::Display)]
+pub struct BidTraceId(Uuid);
+
+impl BidTraceId {
+    /// Generate a fresh random trace identity.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn from_uuid(value: Uuid) -> Self {
+        Self(value)
+    }
+}
+
+impl Default for BidTraceId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Trace identity and source shared throughout one auction lifecycle.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AuctionTraceContext {
+    pub auction_trace_id: AuctionTraceId,
+    pub source: AuctionSource,
+}
+
+impl AuctionTraceContext {
+    /// Generate a context for an auction candidate.
+    #[must_use]
+    pub fn new(source: AuctionSource) -> Self {
+        Self {
+            auction_trace_id: AuctionTraceId::new(),
+            source,
+        }
+    }
+}
+
+/// Privacy-safe terminal state exposed to tester traffic.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuctionPublicOutcome {
+    Completed,
+    NoBid,
+    Skipped,
+    Failed,
+    Abandoned,
+}
+
+impl AuctionPublicOutcome {
+    /// Return the stable wire label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::NoBid => "no_bid",
+            Self::Skipped => "skipped",
+            Self::Failed => "failed",
+            Self::Abandoned => "abandoned",
+        }
+    }
+}
+
+/// Result-independent public summary for one auction candidate.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AuctionTraceSummary {
+    pub auction: AuctionTraceContext,
+    pub outcome: AuctionPublicOutcome,
+}
+
+/// Public trace metadata for one final winning bid.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct WinningBidTrace {
+    pub bid_trace_id: BidTraceId,
+    pub provider: String,
+    pub bidder: String,
+}
+
+/// Trace data attached to a finalized auction result.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AuctionResultTrace {
+    pub summary: AuctionTraceSummary,
+    pub winning_bids: HashMap<String, WinningBidTrace>,
+}
+
+/// Exact internal location of a final winning bid.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct WinningBidOrigin {
+    pub response_index: usize,
+    pub bid_index: usize,
+    pub mediated: bool,
+}
 
 /// Represents a unified auction request across all providers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +285,8 @@ pub struct SiteInfo {
 /// [dispatch]: crate::auction::AuctionOrchestrator::dispatch_auction
 /// [collect]: crate::auction::AuctionOrchestrator::collect_dispatched_auction
 pub struct AuctionContext<'a> {
+    /// Trace identity owned by the auction entry point.
+    pub trace: &'a AuctionTraceContext,
     pub settings: &'a Settings,
     pub request: &'a Request<EdgeBody>,
     pub timeout_ms: u32,
