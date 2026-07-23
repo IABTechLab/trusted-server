@@ -81,6 +81,11 @@ describe('request.requestAds', () => {
       width: apsBid.w,
       height: apsBid.h,
     };
+    const recordAdTrace = vi.fn();
+    window.tsjs = {
+      recordAdTrace,
+      nextAdTraceGeneration: vi.fn().mockReturnValue(1),
+    } as any;
     (globalThis as any).fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
@@ -117,6 +122,16 @@ describe('request.requestAds', () => {
     expect(iframe!.srcdoc).toBe('');
     expect(iframe!.getAttribute('sandbox')).not.toContain('allow-same-origin');
     expect(document.querySelector('#slot1 span')).not.toBeNull();
+    expect(recordAdTrace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'pb_render_served',
+        generation: 1,
+        reason: 'direct_aps_renderer',
+      })
+    );
+    expect(recordAdTrace).not.toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'aps_renderer_ready' })
+    );
 
     const postMessage = vi.spyOn(iframe!.contentWindow!, 'postMessage');
     iframe!.dispatchEvent(new Event('load'));
@@ -131,6 +146,13 @@ describe('request.requestAds', () => {
       })
     );
     expect(document.querySelector('#slot1 span')).toBeNull();
+    expect(recordAdTrace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'aps_renderer_ready',
+        generation: 1,
+        reason: 'direct_aps_renderer_ready',
+      })
+    );
   });
 
   it('does not mutate the slot for an invalid APS descriptor', async () => {
@@ -523,6 +545,50 @@ describe('request.requestAds', () => {
       })
     );
   });
+
+  it.each(['failed', 'abandoned'] as const)(
+    'preserves a direct auction %s terminal summary',
+    async (outcome) => {
+      const recordAdTrace = vi.fn();
+      window.tsjs = {
+        recordAdTrace,
+        nextAdTraceGeneration: vi.fn().mockReturnValue(1),
+      } as any;
+      (globalThis as any).fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        headers: { get: () => 'application/json' },
+        json: async () => ({
+          ext: {
+            trusted_server: {
+              trace: {
+                version: 1,
+                auction_trace_id: '550e8400-e29b-41d4-a716-446655440000',
+                source: 'auction_api',
+                outcome,
+              },
+            },
+          },
+          seatbid: [],
+        }),
+      });
+      const { addAdUnits } = await import('../../src/core/registry');
+      const { requestAds } = await import('../../src/core/request');
+      document.body.innerHTML = '<div id="slot1"></div>';
+      addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
+
+      requestAds();
+      await flushRequestAds();
+
+      expect(recordAdTrace).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: 'ts_auction_observed',
+          outcome,
+          reason: 'terminal_summary',
+        })
+      );
+    }
+  );
 
   it('skips iframe insertion when slot is missing', async () => {
     // mock fetch for unified auction endpoint - returns inline HTML

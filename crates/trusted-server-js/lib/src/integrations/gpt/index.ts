@@ -1,3 +1,4 @@
+import { terminalSummaryStageOutcome } from '../../core/ad_trace';
 import { log } from '../../core/log';
 import type { AuctionSlot, AuctionBidData, AuctionTraceSummary, TsjsApi } from '../../core/types';
 import {
@@ -935,7 +936,7 @@ export function captureAdTraceRequest(
       slotId,
       generation,
       auctionTraceId: serverSummary.auctionTraceId,
-      outcome: serverSummary.outcome === 'completed' ? 'no_bid' : serverSummary.outcome,
+      outcome: terminalSummaryStageOutcome(serverSummary.outcome),
       confidence: 'definitive',
       reason: 'terminal_summary',
     });
@@ -1012,7 +1013,12 @@ function candidateForSlot(
       candidate.slot === slot &&
       !candidate.superseded &&
       (includeTerminal || !candidate.terminal) &&
-      monotonicNow() - candidate.createdAt <= 30_000
+      // Terminal evidence such as iframe load and viewability can arrive well
+      // after the 30-second render-request window. Retain the exact terminal
+      // candidate until a replacement, navigation, or bounded eviction supersedes it.
+      (includeTerminal && candidate.terminal
+        ? true
+        : monotonicNow() - candidate.createdAt <= 30_000)
   );
   if (candidates.length !== 1) {
     if (candidates.length > 1) {
@@ -1047,9 +1053,18 @@ function installGptEvidenceListeners(service: GoogleTagPubAdsService): void {
   if (instrumented.__tsAdTraceListeners) return;
   instrumented.__tsAdTraceListeners = true;
   const record =
-    (kind: 'gpt_slot_requested' | 'gpt_slot_response_received' | 'gpt_slot_onload') =>
+    (
+      kind:
+        | 'gpt_slot_requested'
+        | 'gpt_slot_response_received'
+        | 'gpt_slot_onload'
+        | 'gpt_impression_viewable'
+    ) =>
     (event: GptSlotEvent): void => {
-      const candidate = candidateForSlot(event.slot, kind === 'gpt_slot_onload');
+      const candidate = candidateForSlot(
+        event.slot,
+        kind === 'gpt_slot_onload' || kind === 'gpt_impression_viewable'
+      );
       if (!candidate) return;
       window.tsjs?.recordAdTrace?.({
         kind,
@@ -1061,6 +1076,7 @@ function installGptEvidenceListeners(service: GoogleTagPubAdsService): void {
   service.addEventListener('slotRequested', record('gpt_slot_requested'));
   service.addEventListener('slotResponseReceived', record('gpt_slot_response_received'));
   service.addEventListener('slotOnload', record('gpt_slot_onload'));
+  service.addEventListener('impressionViewable', record('gpt_impression_viewable'));
   service.addEventListener('slotRenderEnded', (event: GptSlotEvent) => {
     const candidate = candidateForSlot(event.slot);
     if (!candidate) return;
@@ -1109,12 +1125,7 @@ export function installTsAdInit(): void {
           kind: 'ts_auction_observed',
           slotId: slot.id,
           auctionTraceId: summary.auctionTraceId,
-          outcome:
-            summary.outcome === 'completed' || summary.outcome === 'no_bid'
-              ? 'no_bid'
-              : summary.outcome === 'skipped'
-                ? 'skipped'
-                : 'unresolved',
+          outcome: terminalSummaryStageOutcome(summary.outcome),
           confidence: 'definitive',
           reason: 'terminal_summary',
         });

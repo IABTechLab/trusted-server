@@ -1,9 +1,13 @@
 import type {
   AdTraceApi,
+  AdTraceStage,
+  AdTraceStageName,
   RenderTraceSnapshot,
   RenderTraceVisibility,
   SlotTraceSnapshot,
 } from '../../core/types';
+
+import { presentTraceOverlay } from './presentation';
 
 const HOST_ID = 'ts-ad-trace-overlay';
 const TRACE_ATTRIBUTES = [
@@ -15,20 +19,29 @@ const TRACE_ATTRIBUTES = [
   'data-ts-trace-visibility',
 ] as const;
 
-function stageLine(label: string, stage: { outcome: string; confidence: string }): string {
-  return `${label}: ${stage.outcome} · ${stage.confidence}`;
+const EMPTY_STAGES: Record<AdTraceStageName, AdTraceStage> = {
+  trustedServer: { outcome: 'not_observed', confidence: 'none', reason: 'none' },
+  prebid: { outcome: 'not_observed', confidence: 'none', reason: 'none' },
+  gam: { outcome: 'not_observed', confidence: 'none', reason: 'none' },
+  creative: { outcome: 'not_observed', confidence: 'none', reason: 'none' },
+};
+
+function stagesForRender(slot: SlotTraceSnapshot, render: RenderTraceSnapshot) {
+  return (
+    slot.generations.find((generation) => generation.generation === render.generation)?.stages ??
+    (slot.latestGeneration === render.generation ? slot.stages : undefined)
+  );
 }
 
-function badgeText(slot: SlotTraceSnapshot, render?: RenderTraceSnapshot): string {
-  return [
-    render ? `#${render.sequence}: ${render.outcome} · ${render.visibility}` : undefined,
-    stageLine('TS winner', slot.stages.trustedServer),
-    stageLine('Prebid winner', slot.stages.prebid),
-    stageLine('GAM result', slot.stages.gam),
-    stageLine('Creative', slot.stages.creative),
-  ]
-    .filter(Boolean)
-    .join('\n');
+function latestRenderForSlot(
+  renders: readonly RenderTraceSnapshot[],
+  slot: SlotTraceSnapshot
+): RenderTraceSnapshot | undefined {
+  for (let index = renders.length - 1; index >= 0; index -= 1) {
+    const render = renders[index];
+    if (render.slotId === slot.slotId && render.generation === slot.latestGeneration) return render;
+  }
+  return undefined;
 }
 
 function removeTraceAttributes(element: HTMLElement): void {
@@ -75,7 +88,10 @@ export function installAdTraceOverlay(
     .badge { position: fixed; z-index: 2147483647; max-width: 300px; padding: 6px 8px;
       border: 1px solid #72e0a6; border-radius: 4px; background: rgba(10,18,16,.94);
       color: #eefbf4; font: 11px/1.35 ui-monospace, monospace; white-space: pre; cursor: pointer; }
-    .badge.probable { border-color: #67a8ff; }
+    .badge.attributed { border-color: #72e0a6; }
+    .badge.unattributed { border-color: #67a8ff; }
+    .badge.empty { border-color: #ffd479; }
+    .badge.failed { border-color: #ff7b72; }
     .panel { position: fixed; right: 12px; bottom: 12px; z-index: 2147483647; width: 460px;
       max-height: 60vh; overflow: auto; padding: 10px; background: #0a1210; color: #eefbf4;
       border: 1px solid #72e0a6; font: 11px/1.4 ui-monospace, monospace; }
@@ -136,31 +152,30 @@ export function installAdTraceOverlay(
     rows.replaceChildren();
     const exported = api.export();
     const slotById = new Map(exported.slots.map((slot) => [slot.slotId, slot]));
-    const latestBySlot = new Map<string, RenderTraceSnapshot>();
-    for (const item of exported.renders) latestBySlot.set(item.slotId, item);
     const nextObserved = new Set<HTMLElement>();
 
     for (const item of [...exported.renders].reverse()) {
+      const slot = slotById.get(item.slotId);
+      const stages = slot && stagesForRender(slot, item);
+      // Render history outlives bounded generation-stage retention. Its own
+      // factual render outcome remains safe to show when the stages are gone.
+      const presentation = presentTraceOverlay(stages ?? EMPTY_STAGES, item);
       const row = document.createElement('div');
-      row.className = 'row';
+      row.className = `row ${presentation.className}`;
       const title = document.createElement('strong');
-      title.textContent = `#${item.sequence} ${item.slotId} · ${item.source}`;
+      title.textContent = item.slotId;
       const summary = document.createElement('div');
-      summary.textContent = `${item.outcome} · ${item.confidence} · ${item.visibility}`;
+      summary.textContent = presentation.primaryStatus ?? 'No trace result observed';
       row.append(title, summary);
       row.addEventListener('click', () => {
         details.hidden = false;
-        details.textContent = JSON.stringify(
-          { render: item, stages: slotById.get(item.slotId)?.stages },
-          null,
-          2
-        );
+        details.textContent = JSON.stringify({ render: item, stages }, null, 2);
       });
       rows.appendChild(row);
     }
 
     for (const [slotId, slot] of slotById) {
-      const item = latestBySlot.get(slotId);
+      const item = latestRenderForSlot(exported.renders, slot);
       const element = item ? window.tsjs?.getAdTraceElement?.(slotId, item.generation) : undefined;
       if (!element || !item) continue;
       const rect = element.getBoundingClientRect();
@@ -175,21 +190,29 @@ export function installAdTraceOverlay(
       nextObserved.add(element);
       if (!observedElements.has(element)) resizeObserver?.observe(element);
       stampRender(element, effectiveItem);
-      const badge = document.createElement('div');
-      badge.className = `badge ${item.outcome === 'confirmed' ? '' : 'probable'}`;
-      badge.textContent = badgeText(slot, effectiveItem);
-      badge.style.left = `${Math.max(0, rect.left)}px`;
-      badge.style.top = `${Math.max(0, rect.top)}px`;
-      badge.addEventListener('click', () => {
-        panel.hidden = false;
-        details.hidden = false;
-        details.textContent = JSON.stringify(
-          { render: effectiveItem, stages: slot.stages },
-          null,
-          2
-        );
-      });
-      badgeLayer.appendChild(badge);
+      const presentation = presentTraceOverlay(slot.stages, effectiveItem);
+      // A visibility calculation alone is not trace evidence. Do not place a
+      // marker over an ad until the trace has at least one observed fact.
+      const traceFacts = presentation.facts.filter(
+        (fact) => !fact.startsWith('Slot element currently ')
+      );
+      if (traceFacts.length > 0) {
+        const badge = document.createElement('div');
+        badge.className = `badge ${presentation.className}`;
+        badge.textContent = presentation.facts.join('\n');
+        badge.style.left = `${Math.max(0, rect.left)}px`;
+        badge.style.top = `${Math.max(0, rect.top)}px`;
+        badge.addEventListener('click', () => {
+          panel.hidden = false;
+          details.hidden = false;
+          details.textContent = JSON.stringify(
+            { render: effectiveItem, stages: slot.stages },
+            null,
+            2
+          );
+        });
+        badgeLayer.appendChild(badge);
+      }
     }
     for (const element of observedElements) {
       if (!nextObserved.has(element)) {

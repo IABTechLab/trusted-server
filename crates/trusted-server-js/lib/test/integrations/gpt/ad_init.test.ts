@@ -155,6 +155,127 @@ describe('installTsAdInit', () => {
     fetchSpy.mockRestore();
   });
 
+  it.each(['failed', 'abandoned'] as const)(
+    'preserves a %s terminal summary when adInit has no traced bid',
+    async (outcome) => {
+      const mockSlot = {
+        addService: vi.fn().mockReturnThis(),
+        setTargeting: vi.fn().mockReturnThis(),
+        getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+        getTargeting: vi.fn().mockReturnValue([]),
+      };
+      const mockPubads = {
+        enableSingleRequest: vi.fn(),
+        getSlots: vi.fn().mockReturnValue([mockSlot]),
+        addEventListener: vi.fn(),
+        refresh: vi.fn(),
+      };
+      const recordAdTrace = vi.fn();
+      (window as TestWindow).googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot: vi.fn().mockReturnValue(mockSlot),
+        pubads: vi.fn().mockReturnValue(mockPubads),
+        enableServices: vi.fn(),
+      };
+      (window as TestWindow).tsjs = {
+        adSlots: [
+          {
+            id: 'atf_sidebar_ad',
+            gam_unit_path: '/123/atf',
+            div_id: 'div-atf-sidebar',
+            formats: [[300, 250]],
+            targeting: {},
+          },
+        ],
+        bids: {},
+        auctionTrace: {
+          version: 1,
+          auctionTraceId: '550e8400-e29b-41d4-a716-446655440000',
+          source: 'initial_navigation',
+          outcome,
+        },
+        recordAdTrace,
+      } as any;
+
+      const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+      installTsAdInit();
+      (window as TestWindow).tsjs!.adInit!();
+
+      expect(recordAdTrace).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: 'ts_auction_observed',
+          outcome,
+          reason: 'terminal_summary',
+        })
+      );
+    }
+  );
+
+  it('records late GPT viewability on the exact terminal request generation', async () => {
+    let now = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    const listeners: Record<string, Array<(event: SlotRenderEvent) => void>> = {};
+    const mockSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      clearTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+      getTargeting: vi.fn((key: string) => {
+        if (key === 'hb_adid') return ['client-ad-id'];
+        if (key === 'hb_bidder') return ['client-bidder'];
+        return [];
+      }),
+    };
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([mockSlot]),
+      addEventListener: vi.fn((event: string, fn: (value: SlotRenderEvent) => void) => {
+        (listeners[event] ??= []).push(fn);
+      }),
+      refresh: vi.fn(),
+    };
+    const recordAdTrace = vi.fn();
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(mockSlot),
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+    };
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {},
+      recordAdTrace,
+      nextAdTraceGeneration: vi.fn().mockReturnValue(1),
+    } as any;
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    now = 1;
+    listeners.slotRenderEnded?.forEach((listener) => listener({ isEmpty: false, slot: mockSlot }));
+    now = 60_001;
+    listeners.impressionViewable?.forEach((listener) =>
+      listener({ isEmpty: false, slot: mockSlot })
+    );
+
+    expect(recordAdTrace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'gpt_impression_viewable',
+        slotId: 'atf_sidebar_ad',
+        generation: 1,
+      })
+    );
+  });
+
   it('displays TS-defined slots and does not include them in refresh', async () => {
     const mockSlot = {
       addService: vi.fn().mockReturnThis(),

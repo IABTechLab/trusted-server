@@ -39,7 +39,9 @@ const EVENT_KINDS = new Set<AdTraceEventKind>([
   'gpt_slot_response_received',
   'gpt_slot_render_ended',
   'gpt_slot_onload',
+  'gpt_impression_viewable',
   'aps_display_bids_set',
+  'aps_renderer_ready',
   'pb_render_requested',
   'pb_render_rejected',
   'pb_render_served',
@@ -135,12 +137,21 @@ function updateStage(target: Record<AdTraceStageName, AdTraceStage>, event: AdTr
       if (explicit && target.prebid.confidence !== 'definitive') target.prebid = explicit;
       break;
     case 'prebid_bid_won':
-      if (target.prebid.outcome === 'client_bid_won' || target.prebid.outcome === 'lost') {
+      if (
+        target.prebid.outcome === 'won' ||
+        target.prebid.outcome === 'client_bid_won' ||
+        target.prebid.outcome === 'lost'
+      ) {
+        // A Prebid win corroborates selection only. It is never creative-load
+        // evidence, including when the selected bid originated from Trusted Server.
         target.prebid = {
           ...target.prebid,
           reason: 'selected_targeting_with_bid_won',
         };
-        if (target.gam.outcome === 'direct_or_unattributed') {
+        if (
+          (target.prebid.outcome === 'client_bid_won' || target.prebid.outcome === 'lost') &&
+          target.gam.outcome === 'direct_or_unattributed'
+        ) {
           target.gam = {
             outcome: 'client_prebid_candidate',
             confidence: 'probable',
@@ -202,6 +213,15 @@ function updateStage(target: Record<AdTraceStageName, AdTraceStage>, event: AdTr
       // APS setting display bids is a handoff only. GAM attribution remains
       // unobserved until a correlated non-empty GPT render arrives.
       break;
+    case 'aps_renderer_ready':
+      if (target.creative.confidence !== 'definitive') {
+        target.creative = {
+          outcome: 'aps_renderer_ready',
+          confidence: 'strong',
+          reason: event.reason ?? 'aps_renderer_ready',
+        };
+      }
+      break;
     case 'gpt_slot_onload':
       if (target.creative.outcome === 'not_observed')
         target.creative = {
@@ -232,7 +252,8 @@ function updateStage(target: Record<AdTraceStageName, AdTraceStage>, event: AdTr
       target.creative = {
         outcome: 'load_acknowledged',
         confidence: 'definitive',
-        reason: 'source_validated_load',
+        reason:
+          event.reason === 'direct_iframe_load' ? 'direct_iframe_load' : 'source_validated_load',
       };
       if (event.reason !== 'direct_iframe_load') {
         target.gam = {
@@ -268,6 +289,8 @@ function isRenderEvent(kind: AdTraceEventKind): boolean {
   return (
     kind === 'gpt_request_started' ||
     kind === 'gpt_slot_render_ended' ||
+    kind === 'gpt_impression_viewable' ||
+    kind === 'aps_renderer_ready' ||
     kind === 'prebid_render_succeeded' ||
     kind === 'prebid_render_failed' ||
     kind === 'pb_render_requested' ||
@@ -375,6 +398,8 @@ export function createAdTraceStore(
       render.source = render.source === 'direct_auction' ? render.source : 'pb_render';
     if (event.auctionTraceId) render.auctionTraceId = event.auctionTraceId;
     if (event.bidTraceId) render.bidTraceId = event.bidTraceId;
+    if (event.reason) render.reason = event.reason;
+    if (event.kind === 'gpt_impression_viewable') render.viewability = 'viewable';
     render.updatedAt = timestamp;
     emitRender(render);
   };
@@ -495,6 +520,18 @@ export function createAdTraceStore(
       notify();
     },
   };
+}
+
+/**
+ * Map a public terminal auction outcome to an internal stage outcome.
+ *
+ * A completed auction without a final slot winner is a no-bid result. A
+ * completed auction with a winner is immediately followed by winner evidence,
+ * but remains distinct here so callers never erase failed or abandoned results.
+ */
+export function terminalSummaryStageOutcome(outcome: string, hasWinner = false): string {
+  if (outcome === 'completed') return hasWinner ? 'completed' : 'no_bid';
+  return outcome;
 }
 
 export function isCanonicalTraceUuid(value: unknown): value is string {

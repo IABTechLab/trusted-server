@@ -1,4 +1,9 @@
-import { createAdTraceStore, isBoundedTraceLabel, isCanonicalTraceUuid } from '../../core/ad_trace';
+import {
+  createAdTraceStore,
+  isBoundedTraceLabel,
+  isCanonicalTraceUuid,
+  terminalSummaryStageOutcome,
+} from '../../core/ad_trace';
 import type { AdTraceApi, AuctionBidData, AuctionTraceSummary, TsjsApi } from '../../core/types';
 
 import { installAdTraceOverlay } from './overlay';
@@ -79,12 +84,7 @@ export function installAdTrace(): boolean {
         kind: 'ts_auction_observed',
         slotId: slot.id,
         auctionTraceId: summary.auctionTraceId,
-        outcome:
-          summary.outcome === 'completed' || summary.outcome === 'no_bid'
-            ? 'no_bid'
-            : summary.outcome === 'skipped'
-              ? 'skipped'
-              : 'unresolved',
+        outcome: terminalSummaryStageOutcome(summary.outcome),
         confidence: 'definitive',
         reason: 'terminal_summary',
       });

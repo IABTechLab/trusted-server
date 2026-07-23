@@ -33,6 +33,33 @@ describe('ad_trace integration gate', () => {
     expect(document.querySelectorAll('#ts-ad-trace-overlay')).toHaveLength(1);
   });
 
+  it.each(['failed', 'abandoned'] as const)(
+    'preserves a %s terminal summary when seeding a slot',
+    async (outcome) => {
+      window.__tsjs_adTraceActive = true;
+      window.tsjs = {
+        adSlots: [{ id: 'slot-a' }],
+        auctionTrace: {
+          version: 1,
+          auctionTraceId: '550e8400-e29b-41d4-a716-446655440000',
+          source: 'initial_navigation',
+          outcome,
+        },
+      } as any;
+
+      const { installAdTrace } = await import('../../../src/integrations/ad_trace/index');
+      expect(installAdTrace()).toBe(true);
+      const generation = window.tsjs?.nextAdTraceGeneration?.('slot-a');
+      expect(
+        window.tsjs?.adTrace?.getSlot('slot-a')?.generations[0]?.stages.trustedServer
+      ).toMatchObject({
+        outcome,
+        reason: 'terminal_summary',
+      });
+      expect(generation).toBeGreaterThan(0);
+    }
+  );
+
   it('does not accept the legacy tester cookie without bootstrap', async () => {
     document.cookie = 'ts-tester=true; Path=/';
     const { installAdTrace } = await import('../../../src/integrations/ad_trace/index');
