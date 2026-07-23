@@ -116,7 +116,8 @@ export interface TsjsApi {
   /**
    * True once the publisher has disabled GPT initial load through
    * `googletag.setConfig()` or `googletag.pubads().disableInitialLoad()`.
-   * GPT exposes no getter for this state, so TS tracks both configuration APIs.
+   * GPT's getter may not report state set through the legacy API, so TS tracks
+   * both configuration APIs.
    * When set, `display()` only registers a slot and the ad request must come
    * from a `refresh()`; adInit() uses this to refresh its own freshly defined
    * slots so they are not left blank.
