@@ -14,6 +14,72 @@ use crate::auction::types::{AdFormat, AdSlot, MediaType};
 use crate::price_bucket::PriceGranularity;
 use crate::settings::vec_from_seq_or_map;
 
+/// A single parsed segment of a [`gam_unit_path`](CreativeOpportunitySlot::gam_unit_path) template.
+#[derive(Debug, Clone)]
+pub(crate) enum UnitTemplatePart {
+    /// Verbatim text between placeholders.
+    Literal(String),
+    /// `{network_id}` — replaced with the GAM network id.
+    NetworkId,
+    /// `{section}` — replaced with the request-derived section.
+    Section,
+    /// `{slot_id}` — replaced with the slot id.
+    SlotId,
+}
+
+/// Parses a `gam_unit_path` template into an ordered list of parts.
+///
+/// Supported placeholders: `{network_id}`, `{section}`, `{slot_id}`. A template
+/// with no placeholders is a single [`UnitTemplatePart::Literal`] and renders
+/// verbatim.
+///
+/// # Errors
+///
+/// Returns an error string for an empty template, an unmatched or nested `{`,
+/// a stray `}`, or an unknown placeholder name.
+fn parse_unit_template(raw: &str) -> Result<Vec<UnitTemplatePart>, String> {
+    if raw.is_empty() {
+        return Err("gam_unit_path template must not be empty".to_string());
+    }
+    let mut parts = Vec::new();
+    let mut literal = String::new();
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' => {
+                if !literal.is_empty() {
+                    parts.push(UnitTemplatePart::Literal(std::mem::take(&mut literal)));
+                }
+                let mut name = String::new();
+                loop {
+                    match chars.next() {
+                        Some('}') => break,
+                        Some('{') => return Err(format!("nested '{{' in template `{raw}`")),
+                        Some(ch) => name.push(ch),
+                        None => return Err(format!("unmatched '{{' in template `{raw}`")),
+                    }
+                }
+                match name.as_str() {
+                    "network_id" => parts.push(UnitTemplatePart::NetworkId),
+                    "section" => parts.push(UnitTemplatePart::Section),
+                    "slot_id" => parts.push(UnitTemplatePart::SlotId),
+                    other => {
+                        return Err(format!(
+                            "unknown placeholder `{{{other}}}` in template `{raw}`"
+                        ));
+                    }
+                }
+            }
+            '}' => return Err(format!("stray '}}' in template `{raw}`")),
+            other => literal.push(other),
+        }
+    }
+    if !literal.is_empty() {
+        parts.push(UnitTemplatePart::Literal(literal));
+    }
+    Ok(parts)
+}
+
 /// Top-level configuration for the creative opportunities system.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -552,6 +618,46 @@ mod tests {
     fn resolved_div_id_defaults_to_slot_id() {
         let slot = make_slot("atf", vec!["/"]);
         assert_eq!(slot.resolved_div_id(), "atf");
+    }
+
+    #[test]
+    fn parse_unit_template_accepts_known_placeholders() {
+        let parts = parse_unit_template("/{network_id}/autoblog/{section}")
+            .expect("should parse valid template");
+        assert_eq!(parts.len(), 4, "should split into literal+ph+literal+ph");
+    }
+
+    #[test]
+    fn parse_unit_template_accepts_static_path() {
+        let parts = parse_unit_template("/88059007/autoblog/homepage")
+            .expect("should parse a static path as a single literal");
+        assert!(
+            matches!(parts.as_slice(), [UnitTemplatePart::Literal(s)] if s == "/88059007/autoblog/homepage"),
+            "should be one literal part"
+        );
+    }
+
+    #[test]
+    fn parse_unit_template_rejects_unknown_placeholder() {
+        let err = parse_unit_template("/{network_id}/{oops}")
+            .expect_err("should reject unknown placeholder");
+        assert!(err.contains("oops"), "error should name the bad placeholder");
+    }
+
+    #[test]
+    fn parse_unit_template_rejects_unmatched_brace() {
+        parse_unit_template("/{network_id}/{section").expect_err("should reject unmatched '{'");
+        parse_unit_template("/a}b").expect_err("should reject stray '}'");
+    }
+
+    #[test]
+    fn parse_unit_template_rejects_nested_brace() {
+        parse_unit_template("/{net{work}_id}").expect_err("should reject nested '{'");
+    }
+
+    #[test]
+    fn parse_unit_template_rejects_empty() {
+        parse_unit_template("").expect_err("should reject empty template");
     }
 
     #[test]
