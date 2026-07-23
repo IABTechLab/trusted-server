@@ -70,6 +70,7 @@ pub mod streaming_processor;
 pub mod streaming_replacer;
 pub mod test_support;
 pub mod tester_cookie;
+pub mod trace_cookie;
 pub mod tsjs;
 
 #[cfg(test)]

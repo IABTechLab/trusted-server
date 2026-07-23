@@ -35,6 +35,7 @@ pub use telemetry::{
 };
 pub use types::{
     AdFormat, AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus, MediaType,
+    adm_trace_hash,
 };
 
 /// Type alias for provider builder functions.

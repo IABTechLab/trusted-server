@@ -1921,6 +1921,18 @@ pub struct DebugConfig {
     /// production — injects raw HTML from SSPs.
     #[serde(default)]
     pub inject_adm_for_testing: bool,
+
+    /// Expose `GET /_ts/trace`, which toggles the `ts-trace` cookie and
+    /// redirects to `/`.
+    ///
+    /// The cookie makes the TSJS render-trace overlay draw a floating panel
+    /// summarising every traced slot (render path, bidder, GAM/injected/visible
+    /// state) plus a confirmation badge on each genuinely-rendered creative.
+    /// The overlay only surfaces data already exposed on `window.tsjs`, so
+    /// enabling this leaks nothing new — it is off by default to avoid shipping
+    /// a live toggle route on deployments that never asked for it.
+    #[serde(default)]
+    pub trace_route_enabled: bool,
 }
 
 /// Tester-cookie endpoint configuration.

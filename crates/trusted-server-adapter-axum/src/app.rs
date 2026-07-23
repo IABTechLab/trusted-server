@@ -29,6 +29,7 @@ use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::{
     default_config_key, default_config_store_name, get_settings_from_config_store,
 };
+use trusted_server_core::trace_cookie::handle_trace_mode;
 
 use trusted_server_core::platform::RuntimeServices;
 
@@ -255,6 +256,7 @@ enum NamedRouteHandler {
     /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
     /// reach the publisher fallback (which would leak admin credentials).
     LegacyAdminDenied,
+    TraceMode,
     Auction,
     PageBids,
     FirstPartyProxy,
@@ -279,7 +281,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 12] {
+fn named_routes() -> [NamedRoute; 13] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -319,6 +321,11 @@ fn named_routes() -> [NamedRoute; 12] {
             path: "/admin/keys/deactivate",
             primary_methods: LEGACY_ADMIN_DENY_METHODS,
             handler: NamedRouteHandler::LegacyAdminDenied,
+        },
+        NamedRoute {
+            path: "/_ts/trace",
+            primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::TraceMode,
         },
         NamedRoute {
             path: "/auction",
@@ -389,6 +396,9 @@ fn named_route_handler(
                         Ok(resp)
                     }
                     NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
+                    NamedRouteHandler::TraceMode => {
+                        handle_trace_mode(&state.settings, req.uri().query())
+                    }
                     NamedRouteHandler::Auction => {
                         // Build the geo-aware EC context so the auction consent
                         // gate sees the caller's jurisdiction — `EcContext::default()`

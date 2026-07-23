@@ -2144,6 +2144,18 @@ impl PrebidAuctionProvider {
             .and_then(|v| v.as_str())
             .map(String::from);
 
+        // `crid` is the OpenRTB creative ID — carried so a rendered creative
+        // on the page can be traced back to the upstream creative.
+        let crid = bid_obj
+            .get("crid")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        // OpenRTB `id` is the bidder's identifier for the bid itself — carried
+        // separately from `ad_id` (see the comment above) so the `/auction`
+        // response can echo the upstream bid ID.
+        let bid_id = bid_obj.get("id").and_then(|v| v.as_str()).map(String::from);
+
         let adomain = bid_obj
             .get("adomain")
             .and_then(|v| v.as_array())
@@ -2208,6 +2220,8 @@ impl PrebidAuctionProvider {
             nurl,
             burl,
             ad_id,
+            bid_id,
+            crid,
             cache_id,
             cache_host,
             cache_path,
@@ -6657,6 +6671,49 @@ set = { networkId = 42 }
             Some("/cache"),
             "should extract path from cache URL"
         );
+    }
+
+    #[test]
+    fn parse_bid_extracts_crid() {
+        let bid_json = serde_json::json!({
+            "id": "bid-id-321",
+            "impid": "atf_sidebar_ad",
+            "price": 1.25,
+            "adm": "<div>ad</div>",
+            "crid": "cr-98765",
+            "w": 300,
+            "h": 250
+        });
+        let provider = PrebidAuctionProvider::new(base_config());
+        let bid = provider
+            .parse_bid(&bid_json, "kargo")
+            .expect("should parse bid");
+        assert_eq!(
+            bid.crid.as_deref(),
+            Some("cr-98765"),
+            "should extract the OpenRTB creative ID"
+        );
+        assert_eq!(
+            bid.bid_id.as_deref(),
+            Some("bid-id-321"),
+            "should extract the OpenRTB bid ID"
+        );
+    }
+
+    #[test]
+    fn parse_bid_sets_crid_to_none_when_absent() {
+        let bid_json = serde_json::json!({
+            "id": "bid-id-322",
+            "impid": "atf_sidebar_ad",
+            "price": 1.25,
+            "w": 300,
+            "h": 250
+        });
+        let provider = PrebidAuctionProvider::new(base_config());
+        let bid = provider
+            .parse_bid(&bid_json, "kargo")
+            .expect("should parse bid");
+        assert!(bid.crid.is_none(), "should be None when crid absent");
     }
 
     #[test]

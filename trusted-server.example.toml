@@ -146,6 +146,15 @@ ja4_endpoint_enabled = false
 # in production.
 auction_html_comment = false
 
+# Expose GET /_ts/trace, which toggles the `ts-trace` cookie and redirects to /.
+# While the cookie is set, the TSJS overlay draws a floating panel summarising
+# every traced ad slot (render path, bidder, and GAM/injected/visible state)
+# plus a confirmation badge on each genuinely-rendered creative. It only
+# surfaces data already present on window.tsjs, so it leaks nothing new — but
+# it is off by default so the toggle route is not live on deployments that
+# never asked for it. Enable only for render-verification debugging.
+# trace_route_enabled = false
+
 [creative_opportunities]
 gam_network_id = "123456789"
 # FCP is not affected by this value — body content above </body> has already

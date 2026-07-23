@@ -28,6 +28,7 @@ use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
+use trusted_server_core::trace_cookie::handle_trace_mode;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::build_runtime_services;
@@ -461,6 +462,15 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .post("/_ts/admin/keys/deactivate", |_ctx: RequestContext| async {
                 Ok::<Response, EdgeError>(admin_key_management_not_supported())
             })
+            // Render-trace toggle: arms/disarms the ts-trace cookie and
+            // redirects to `/`. Gated by [debug] trace_route_enabled (404 when
+            // off).
+            .get(
+                "/_ts/trace",
+                make_handler(Arc::clone(&state), |s, _services, req| async move {
+                    handle_trace_mode(&s.settings, req.uri().query())
+                }),
+            )
             .post(
                 "/auction",
                 make_handler(Arc::clone(&state), |s, services, req| async move {

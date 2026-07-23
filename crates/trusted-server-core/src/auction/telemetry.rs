@@ -961,6 +961,8 @@ mod tests {
             nurl: None,
             burl: None,
             ad_id: ad_id.map(str::to_owned),
+            bid_id: None,
+            crid: None,
             cache_id: None,
             cache_host: None,
             cache_path: None,

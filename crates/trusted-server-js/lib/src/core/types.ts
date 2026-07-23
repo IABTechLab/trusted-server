@@ -42,6 +42,8 @@ export interface AuctionDebugBidData {
   nurl?: string | null;
   burl?: string | null;
   ad_id?: string | null;
+  bid_id?: string | null;
+  crid?: string | null;
   cache_id?: string | null;
   cache_host?: string | null;
   cache_path?: string | null;
@@ -55,12 +57,110 @@ export interface AuctionBidData {
   hb_adid?: string;
   hb_cache_host?: string;
   hb_cache_path?: string;
+  /**
+   * Upstream OpenRTB `bid.id` — the trace key that identifies this exact bid in
+   * the server-side `auction winner:` log line.
+   *
+   * Distinct from `hb_adid`, which is whatever value GAM's Universal Creative
+   * must echo back for the render bridge to find the bid (a PBS cache UUID, an
+   * `adid`, or — only when neither exists — the bid ID). Carried for tracing
+   * only: unlike the `hb_*` keys in `TS_BID_TARGETING_KEYS` this is never set as
+   * GAM key-value targeting.
+   */
+  hb_bid_id?: string;
+  /** Server-side auction ID — trace key joining this bid to server logs. */
+  hb_auction_id?: string;
+  /** Upstream creative ID (OpenRTB `crid`), when the bidder returned one. */
+  hb_crid?: string;
+  /** Trace hash of the bid's raw creative markup (16 hex chars of SHA-256). */
+  hb_adm_hash?: string;
   nurl?: string;
   burl?: string;
   /** Raw creative markup. Only present when `[debug] inject_adm_for_testing = true`. */
   adm?: string;
   /** Debug-only bid field mirror. Only present when `[debug] inject_adm_for_testing = true`. */
   debug_bid?: AuctionDebugBidData;
+}
+
+/** How a creative reached the page for a [`RenderRecord`]. */
+export type RenderServedFrom = 'inline' | 'gam' | 'debug-adm' | 'pbs-cache' | 'prebid';
+
+/**
+ * One entry in `window.tsjs.renders` — the client-side half of the render
+ * trace. Field values mirror the server-side `auction winner:` log line so
+ * the two can be joined on (auctionId, slotId).
+ */
+export interface RenderRecord {
+  /** Slot the creative was rendered for. */
+  slotId: string;
+  /**
+   * Which render path produced this record.
+   *
+   * `ssat` is claimed only for the render that consumes the server-side
+   * targeting TS just applied — the server-side auction runs once per
+   * navigation, so a later GAM refresh of the same slot is NOT an SSAT render
+   * even though `window.tsjs.bids` still holds that auction's data.
+   * `gam-refresh` is that later render: GAM re-requested the slot and TS cannot
+   * attribute the returned creative to any TS auction.
+   */
+  path: 'auction' | 'ssat' | 'gam-refresh';
+  /** Whether a creative actually rendered (false for empty/rejected). */
+  rendered: boolean;
+  /** Actual DOM element ID the slot resolved to (div_id may be a prefix). */
+  elementId?: string;
+  /** Server-side auction ID. */
+  auctionId?: string;
+  /** Winning bidder / seat. */
+  bidder?: string;
+  /** hb_adid (PBS cache UUID or OpenRTB adid). */
+  adId?: string;
+  /**
+   * Upstream OpenRTB `bid.id`, completing the
+   * (auctionId, slotId, bidder, bidId, creativeId, admHash) tuple that joins
+   * this render to exactly one server-side `auction winner:` log line. Never
+   * overloaded onto [`adId`], which carries a different value whenever the bid
+   * has a PBS cache UUID or an `adid`.
+   */
+  bidId?: string;
+  /** Upstream creative ID (OpenRTB crid). */
+  creativeId?: string;
+  /** Trace hash of the creative markup (16 hex chars of SHA-256). */
+  admHash?: string;
+  /** Mechanism that delivered the creative. */
+  servedFrom?: RenderServedFrom;
+  /**
+   * GAM's own `slotRenderEnded.isEmpty` (SSAT/GAM path only). `true` means GAM
+   * itself reported the slot empty. Undefined on the `/auction` path, which
+   * never involves GAM.
+   */
+  gamEmpty?: boolean;
+  /**
+   * Whether Trusted Server actually placed the creative markup itself:
+   * `true` for the `/auction` iframe render and for a synchronous
+   * `injectAdmIntoSlot` placement; `false` when TS only applied GAM targeting
+   * (prod GAM path — the creative, if any, is GAM's and lives in a cross-origin
+   * iframe TS cannot read); `undefined` when placement was deferred/unknown.
+   *
+   * This is the honest "is it TS's creative" signal — distinct from `rendered`
+   * (GAM said something rendered) and `visible` (the slot box is on-screen).
+   */
+  injected?: boolean;
+  /**
+   * Whether the slot element was effectively visible at record time — non-zero
+   * box and no ancestor `display:none` / `visibility:hidden` / `opacity:0`.
+   * Catches slots that "rendered" but are hidden behind a publisher reveal gate.
+   */
+  visible?: boolean;
+  /** How many renders this slot has seen (SPA navigations, refreshes). */
+  count: number;
+  /**
+   * Page-global render sequence, starting at 1 and shared by the trace panel
+   * row and the on-creative badge. Unlike `count` (per-slot) this is unique
+   * across the page, so a badge reading `#12` identifies exactly one row.
+   */
+  seq: number;
+  /** Epoch ms when the record was written. */
+  at: number;
 }
 
 export interface TsjsApi {
@@ -92,12 +192,34 @@ export interface TsjsApi {
   bids?: Record<string, AuctionBidData>;
   /** Initialises GPT slots with server-side bid targeting and calls refresh(). */
   adInit?: () => void;
+  /** Render-trace registry: latest render per slot (see [`RenderRecord`]). */
+  renders?: Record<string, RenderRecord>;
+  /**
+   * Append-only history of every render, oldest first, bounded to the most
+   * recent entries. `renders` collapses to one row per slot (useful for
+   * "did this slot ever render" checks); this keeps each individual render so
+   * a refreshing page shows a timeline instead of a climbing counter.
+   */
+  renderLog?: RenderRecord[];
   /** GPT slot objects TS defined — used to destroy stale slots on SPA navigation. */
   prevGptSlots?: unknown[];
   /** Guards one-time-per-page enableSingleRequest/enableServices calls. */
   servicesEnabled?: boolean;
   /** Maps actualDivId → slotId for slotRenderEnded billing lookup. */
   divToSlotId?: Record<string, string>;
+  /**
+   * Monotonic render generation, bumped by every `adInit()` and by the start of
+   * every SPA navigation. Async work captures it and re-checks it on completion
+   * so a result belonging to a superseded route is discarded rather than
+   * applied to the current one.
+   */
+  renderGeneration?: number;
+  /**
+   * Page-global render counter backing [`RenderRecord.seq`]. Lives here, on the
+   * object every bundle shares, because each generated IIFE inlines its own
+   * copy of `core/trace` — a module-scoped counter would restart per bundle.
+   */
+  renderSeq?: number;
   /**
    * Win/billing beacons already fired, keyed by `slotId|bidIdentity|kind|url`.
    * Used by the GPT render bridge so a bid's nurl/burl fire at most once even
