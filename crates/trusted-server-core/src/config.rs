@@ -18,8 +18,9 @@ use crate::error::TrustedServerError;
 use crate::integrations::{
     adserver_mock::AdServerMockConfig, aps::ApsConfig, datadome::DataDomeConfig,
     didomi::DidomiIntegrationConfig, google_tag_manager::GoogleTagManagerConfig, gpt::GptConfig,
-    lockr::LockrConfig, nextjs::NextJsIntegrationConfig, osano::OsanoConfig,
-    permutive::PermutiveConfig, prebid, sourcepoint::SourcepointConfig, testlight::TestlightConfig,
+    js_asset_proxy::JsAssetProxyConfig, lockr::LockrConfig, nextjs::NextJsIntegrationConfig,
+    osano::OsanoConfig, permutive::PermutiveConfig, prebid, sourcepoint::SourcepointConfig,
+    testlight::TestlightConfig,
 };
 use crate::settings::{IntegrationConfig, Settings};
 
@@ -39,6 +40,7 @@ const DEPLOY_VALIDATED_INTEGRATION_IDS: &[&str] = &[
     "google_tag_manager",
     "datadome",
     "gpt",
+    "js_asset_proxy",
 ];
 
 /// Typed app-config root used by the `ts` CLI.
@@ -125,10 +127,30 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
 /// Returns [`TrustedServerError`] when the config should not be deployed.
 pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
     settings.reject_placeholder_secrets()?;
+    validate_js_asset_proxy_config(settings)?;
     let enabled_auction_providers = validate_enabled_integrations(settings)?;
     validate_auction_provider_names(settings, &enabled_auction_providers)?;
     PartnerRegistry::from_config(&settings.ec.partners).map(|_| ())?;
     Ok(())
+}
+
+fn validate_js_asset_proxy_config(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+    let Some(raw_config) = settings.integrations.get("js_asset_proxy") else {
+        return Ok(());
+    };
+
+    let config: JsAssetProxyConfig = serde_json::from_value(raw_config.clone()).map_err(|error| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "integration startup failed for `js_asset_proxy`: configuration could not be parsed: {error}"
+            ),
+        })
+    })?;
+    config.validate().map_err(|error| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!("integration startup failed for `js_asset_proxy`: {error}"),
+        })
+    })
 }
 
 fn validate_enabled_integrations(
@@ -296,6 +318,27 @@ password = "production-admin-password-32-bytes"
     }
 
     #[test]
+    fn validate_rejects_invalid_enabled_js_asset_proxy_config() {
+        let mut settings = valid_settings();
+        settings.integrations.insert(
+            "js_asset_proxy".to_string(),
+            serde_json::json!({ "enabled": true }),
+        );
+
+        let err = validate_settings_for_deploy(&settings)
+            .expect_err("should reject invalid JS asset proxy config");
+        let message = err.to_string();
+        assert!(
+            message.contains("js_asset_proxy"),
+            "error should mention JS asset proxy validation"
+        );
+        assert!(
+            message.contains("empty_assets") || message.contains("assets"),
+            "error should mention the missing assets"
+        );
+    }
+
+    #[test]
     fn deploy_validation_covers_registered_integration_builders() {
         let validated_ids: HashSet<&'static str> =
             DEPLOY_VALIDATED_INTEGRATION_IDS.iter().copied().collect();
@@ -327,6 +370,34 @@ password = "production-admin-password-32-bytes"
         assert!(
             error_text.contains("osano") || error_text.contains("typo"),
             "error should mention Osano or the invalid field: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_disabled_js_asset_proxy_assets() {
+        let mut settings = valid_settings();
+        settings.integrations.insert(
+            "js_asset_proxy".to_string(),
+            serde_json::json!({
+                "enabled": false,
+                "assets": [{
+                    "path": "bad path",
+                    "origin_url": "not-a-url",
+                    "proxy": "disabled"
+                }]
+            }),
+        );
+
+        let err = validate_settings_for_deploy(&settings)
+            .expect_err("should reject invalid disabled asset inventory");
+        let message = err.to_string();
+        assert!(
+            message.contains("js_asset_proxy"),
+            "error should mention JS asset proxy validation"
+        );
+        assert!(
+            message.contains("path") || message.contains("origin_url"),
+            "error should mention the invalid asset fields"
         );
     }
 
