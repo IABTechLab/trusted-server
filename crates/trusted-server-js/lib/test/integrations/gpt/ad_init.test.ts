@@ -801,12 +801,13 @@ describe('installTsAdInit', () => {
       getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
       getTargeting: vi.fn().mockReturnValue([]),
     };
+    const nativeRefresh = vi.fn();
     const mockPubads = {
       enableSingleRequest: vi.fn(),
       // Publisher has not defined this slot, so TS defines (owns) it.
       getSlots: vi.fn().mockReturnValue([]),
       addEventListener: vi.fn(),
-      refresh: vi.fn(),
+      refresh: nativeRefresh,
     };
     const defineSlotMock = vi.fn().mockReturnValue(mockSlot);
     const displayMock = vi.fn();
@@ -840,7 +841,171 @@ describe('installTsAdInit', () => {
     expect(displayMock).toHaveBeenCalledWith('div-atf-sidebar');
     // TS-owned slots are displayed, not refreshed (refresh() no-ops for a slot
     // that was never displayed).
-    expect(mockPubads.refresh).not.toHaveBeenCalled();
+    expect(nativeRefresh).not.toHaveBeenCalled();
+  });
+
+  it('hands a late publisher definition the TS inner-div slot without a second request', async () => {
+    type FakeSlot = {
+      addService(service: unknown): FakeSlot;
+      setTargeting(key: string, value: string | string[]): FakeSlot;
+      getSlotElementId(): string;
+      getTargeting(key?: string): string[];
+    };
+    const slots = new Map<string, FakeSlot>();
+    const requests: string[] = [];
+    const makeSlot = (elementId: string): FakeSlot => ({
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue(elementId),
+      getTargeting: vi.fn().mockReturnValue([]),
+    });
+    const pubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn(() => Array.from(slots.values())),
+      addEventListener: vi.fn(),
+      refresh: vi.fn((requestedSlots?: FakeSlot[]) => {
+        (requestedSlots ?? Array.from(slots.values())).forEach((slot) =>
+          requests.push(slot.getSlotElementId())
+        );
+      }),
+    };
+    const nativeDefineSlot = vi.fn(
+      (_adUnitPath: string, _formats: number[][], elementId: string) => {
+        const slot = makeSlot(elementId);
+        slots.set(elementId, slot);
+        return slot;
+      }
+    );
+    const nativeDisplay = vi.fn((elementId: string) => requests.push(elementId));
+    const destroySlots = vi.fn();
+    const googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: nativeDefineSlot,
+      display: nativeDisplay,
+      pubads: vi.fn().mockReturnValue(pubads),
+      destroySlots,
+      enableServices: vi.fn(),
+    };
+    (window as TestWindow).googletag = googletag;
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {},
+    };
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    const publisherDefineSlot = googletag.defineSlot as unknown as (
+      adUnitPath: string,
+      formats: number[][],
+      elementId: string
+    ) => FakeSlot;
+    const publisherDisplay = googletag.display as unknown as (elementId: string) => void;
+    const publisherSlot = publisherDefineSlot('/123/atf', [[300, 250]], 'div-atf-sidebar');
+    publisherSlot.addService(pubads);
+    publisherDisplay('div-atf-sidebar');
+
+    expect(nativeDefineSlot).toHaveBeenCalledTimes(1);
+    expect(nativeDisplay).toHaveBeenCalledTimes(1);
+    expect(requests).toEqual(['div-atf-sidebar']);
+    expect((window as TestWindow).tsjs!.prevGptSlots).toEqual([]);
+
+    (window as TestWindow).tsjs!.adSlots = [];
+    (window as TestWindow).tsjs!.adInit!();
+    expect(destroySlots).not.toHaveBeenCalled();
+  });
+
+  it('suppresses only the claimed slot from the first disabled-load publisher refresh', async () => {
+    type FakeSlot = {
+      addService(service: unknown): FakeSlot;
+      setTargeting(key: string, value: string | string[]): FakeSlot;
+      getSlotElementId(): string;
+      getTargeting(key?: string): string[];
+    };
+    const slots = new Map<string, FakeSlot>();
+    const requests: string[] = [];
+    let initialLoadDisabled = false;
+    const makeSlot = (elementId: string): FakeSlot => ({
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue(elementId),
+      getTargeting: vi.fn().mockReturnValue([]),
+    });
+    const pubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn(() => Array.from(slots.values())),
+      addEventListener: vi.fn(),
+      refresh: vi.fn((requestedSlots?: FakeSlot[]) => {
+        (requestedSlots ?? Array.from(slots.values())).forEach((slot) =>
+          requests.push(slot.getSlotElementId())
+        );
+      }),
+      disableInitialLoad: vi.fn(() => {
+        initialLoadDisabled = true;
+      }),
+    };
+    const nativeDefineSlot = vi.fn(
+      (_adUnitPath: string, _formats: number[][], elementId: string) => {
+        const slot = makeSlot(elementId);
+        slots.set(elementId, slot);
+        return slot;
+      }
+    );
+    const nativeDisplay = vi.fn((elementId: string) => {
+      if (!initialLoadDisabled) requests.push(elementId);
+    });
+    const googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: nativeDefineSlot,
+      display: nativeDisplay,
+      pubads: vi.fn().mockReturnValue(pubads),
+      enableServices: vi.fn(),
+    };
+    (window as TestWindow).googletag = googletag;
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {},
+    };
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    pubads.disableInitialLoad();
+    (window as TestWindow).tsjs!.adInit!();
+
+    const publisherDefineSlot = googletag.defineSlot as unknown as (
+      adUnitPath: string,
+      formats: number[][],
+      elementId: string
+    ) => FakeSlot;
+    const publisherDisplay = googletag.display as unknown as (elementId: string) => void;
+    const publisherRefresh = pubads.refresh as unknown as () => void;
+    const publisherSlot = publisherDefineSlot('/123/atf', [[300, 250]], 'div-atf-sidebar');
+    publisherSlot.addService(pubads);
+    publisherDisplay('div-atf-sidebar');
+    slots.set('div-unrelated', makeSlot('div-unrelated'));
+    publisherRefresh();
+
+    expect(nativeDefineSlot).toHaveBeenCalledTimes(1);
+    expect(nativeDisplay).toHaveBeenCalledTimes(1);
+    expect(requests.filter((elementId) => elementId === 'div-atf-sidebar')).toHaveLength(1);
+    expect(requests).toContain('div-unrelated');
   });
 
   it('refreshes TS-defined slots when the publisher disabled GPT initial load', async () => {
@@ -853,12 +1018,13 @@ describe('installTsAdInit', () => {
       getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
       getTargeting: vi.fn().mockReturnValue([]),
     };
+    const nativeRefresh = vi.fn();
     const mockPubads = {
       enableSingleRequest: vi.fn(),
       // Publisher has not defined this slot, so TS defines (owns) it.
       getSlots: vi.fn().mockReturnValue([]),
       addEventListener: vi.fn(),
-      refresh: vi.fn(),
+      refresh: nativeRefresh,
       disableInitialLoad: vi.fn(),
     };
     const displayMock = vi.fn();
@@ -896,7 +1062,7 @@ describe('installTsAdInit', () => {
     // The slot is still registered via display(), and additionally refreshed so
     // it actually requests an ad under disableInitialLoad().
     expect(displayMock).toHaveBeenCalledWith('div-atf-sidebar');
-    expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
+    expect(nativeRefresh).toHaveBeenCalledWith([mockSlot]);
   });
 
   it('refreshes TS-defined slots when setConfig disables GPT initial load', async () => {
@@ -908,12 +1074,13 @@ describe('installTsAdInit', () => {
       getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
       getTargeting: vi.fn().mockReturnValue([]),
     };
+    const nativeRefresh = vi.fn();
     const mockPubads = {
       enableSingleRequest: vi.fn(),
       // Publisher has not defined this slot, so TS defines (owns) it.
       getSlots: vi.fn().mockReturnValue([]),
       addEventListener: vi.fn(),
-      refresh: vi.fn(),
+      refresh: nativeRefresh,
     };
     const displayMock = vi.fn();
     const setConfigMock = vi.fn();
@@ -952,7 +1119,7 @@ describe('installTsAdInit', () => {
     (window as TestWindow).tsjs!.adInit!();
 
     expect(displayMock).toHaveBeenCalledWith('div-atf-sidebar');
-    expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
+    expect(nativeRefresh).toHaveBeenCalledWith([mockSlot]);
   });
 
   it('sets adInitRefreshInProgress only for the duration of the internal refresh', async () => {

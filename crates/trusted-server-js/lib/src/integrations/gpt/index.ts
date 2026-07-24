@@ -11,6 +11,7 @@ import type {
   AuctionSlot,
   AuctionBidData,
   AuctionTraceSummary,
+  GptSlotHandoff,
   TsjsApi,
 } from '../../core/types';
 import {
@@ -1618,6 +1619,139 @@ function installGptEvidenceListeners(service: GoogleTagPubAdsService): void {
   });
 }
 
+interface HandoffPatchedFunction {
+  __tsSlotHandoffPatched?: boolean;
+}
+
+function findGptSlotByElementId(
+  pubads: GoogleTagPubAdsService,
+  elementId: string
+): GoogleTagSlot | undefined {
+  return pubads.getSlots?.().find((slot) => slot.getSlotElementId() === elementId);
+}
+
+function handoffForSlot(ts: TsjsApi, slot: GoogleTagSlot): GptSlotHandoff | undefined {
+  return ts.gptSlotHandoffs?.[slot.getSlotElementId()];
+}
+
+function withGptSlotHandoffInternal<T>(ts: TsjsApi, callback: () => T): T {
+  const wasInternal = ts.gptSlotHandoffInternal;
+  ts.gptSlotHandoffInternal = true;
+  try {
+    return callback();
+  } finally {
+    ts.gptSlotHandoffInternal = wasInternal;
+  }
+}
+
+/**
+ * Reuse a TS-created inner-div slot when its publisher defines that div later.
+ *
+ * TS cannot wait an arbitrary amount of time for framework hydration: doing so
+ * would leave placements blank when no publisher slot is ever defined. Instead,
+ * TS creates its fallback on the publisher's actual div and aliases only a later
+ * `defineSlot()` for that exact div. The first duplicate publisher request is
+ * suppressed because TS has already issued the initial request with TS targeting.
+ */
+function installLatePublisherSlotHandoff(ts: TsjsApi): void {
+  const win = window as GptWindow;
+  const cmd = win.googletag?.cmd;
+  if (!cmd) return;
+
+  cmd.push(() => {
+    const g = win.googletag;
+    const pubads = g?.pubads?.();
+    if (!g?.defineSlot || !g.display || !pubads) return;
+
+    const defineSlot = g.defineSlot;
+    if (!(defineSlot as HandoffPatchedFunction).__tsSlotHandoffPatched) {
+      const originalDefineSlot = defineSlot.bind(g);
+      const patchedDefineSlot = (
+        adUnitPath: string,
+        formats: Array<number | number[]>,
+        elementId: string
+      ): GoogleTagSlot | null => {
+        const handoff = ts.gptSlotHandoffs?.[elementId];
+        if (!ts.gptSlotHandoffInternal && handoff) {
+          const existingSlot = findGptSlotByElementId(pubads, elementId);
+          if (existingSlot) {
+            if (!handoff.publisherClaimed) {
+              handoff.publisherClaimed = true;
+              handoff.suppressPublisherDisplay = true;
+              handoff.suppressPublisherRefresh = ts.gptInitialLoadDisabled === true;
+              ts.prevGptSlots = (ts.prevGptSlots ?? []).filter(
+                (ownedSlot) => ownedSlot !== existingSlot
+              );
+              if (
+                handoff.gamUnitPath !== adUnitPath ||
+                JSON.stringify(handoff.formats) !== JSON.stringify(formats)
+              ) {
+                log.warn('GPT slot handoff: publisher definition differs from TS configuration', {
+                  elementId,
+                  tsGamUnitPath: handoff.gamUnitPath,
+                  publisherGamUnitPath: adUnitPath,
+                });
+              }
+            }
+            return existingSlot;
+          }
+        }
+        return originalDefineSlot(adUnitPath, formats, elementId);
+      };
+      (patchedDefineSlot as HandoffPatchedFunction).__tsSlotHandoffPatched = true;
+      g.defineSlot = patchedDefineSlot;
+    }
+
+    const display = g.display;
+    if (!(display as HandoffPatchedFunction).__tsSlotHandoffPatched) {
+      const originalDisplay = display.bind(g);
+      const patchedDisplay = (elementId: string): void => {
+        const handoff = ts.gptSlotHandoffs?.[elementId];
+        if (!ts.gptSlotHandoffInternal && handoff?.suppressPublisherDisplay) {
+          handoff.suppressPublisherDisplay = false;
+          return;
+        }
+        originalDisplay(elementId);
+      };
+      (patchedDisplay as HandoffPatchedFunction).__tsSlotHandoffPatched = true;
+      g.display = patchedDisplay;
+    }
+
+    const refresh = pubads.refresh;
+    if (!(refresh as HandoffPatchedFunction).__tsSlotHandoffPatched) {
+      const originalRefresh = refresh.bind(pubads);
+      const patchedRefresh = (requestedSlots?: GoogleTagSlot[]): void => {
+        if (ts.gptSlotHandoffInternal) {
+          originalRefresh(requestedSlots);
+          return;
+        }
+
+        const slots = requestedSlots ?? pubads.getSlots?.();
+        if (!slots) {
+          originalRefresh(requestedSlots);
+          return;
+        }
+
+        let suppressed = false;
+        const remainingSlots = slots.filter((slot) => {
+          const handoff = handoffForSlot(ts, slot);
+          if (!handoff?.suppressPublisherRefresh) return true;
+          handoff.suppressPublisherRefresh = false;
+          suppressed = true;
+          return false;
+        });
+        if (!suppressed) {
+          originalRefresh(requestedSlots);
+        } else if (remainingSlots.length > 0) {
+          originalRefresh(remainingSlots);
+        }
+      };
+      (patchedRefresh as HandoffPatchedFunction).__tsSlotHandoffPatched = true;
+      pubads.refresh = patchedRefresh;
+    }
+  });
+}
+
 export function installTsAdInit(): void {
   const ts = (window.tsjs ??= {} as TsjsApi);
   const pendingBootstrapRequests = ts.pendingAdTraceRequests ?? [];
@@ -1633,6 +1767,7 @@ export function installTsAdInit(): void {
     installGoogleTagCacheInvalidationHooks(initialGoogleTag);
     installGptEvidenceListeners(initialGoogleTag.pubads!());
   });
+  installLatePublisherSlotHandoff(ts);
   ts.adInit = function () {
     const slots = ts.adSlots ?? [];
     // Snapshot bids at adInit() call time — correct for targeting setup.
@@ -1709,16 +1844,23 @@ export function installTsAdInit(): void {
         if (existingSlot) {
           gptSlot = existingSlot;
         } else {
-          // Use outer container div for TS's slot when publisher hasn't defined
-          // theirs yet — keeps both slots on separate divs so publisher's
-          // later defineSlot on the inner div doesn't conflict.
-          const containerEl = document.getElementById(`${actualDivId}-container`);
-          const slotDivId = containerEl?.id ?? actualDivId;
-          const defined = g.defineSlot?.(slot.gam_unit_path, slot.formats, slotDivId);
+          // Define TS's fallback on the publisher's actual div. A late publisher
+          // defineSlot() for this div is handed the same slot by the scoped GPT
+          // wrapper, preventing a competing container-slot request.
+          const defined = withGptSlotHandoffInternal(ts, () =>
+            g.defineSlot?.(slot.gam_unit_path, slot.formats, actualDivId)
+          );
           if (!defined) return;
           defined.addService(g.pubads!());
           gptSlot = defined;
           tsOwned = true;
+          (ts.gptSlotHandoffs ??= {})[actualDivId] = {
+            gamUnitPath: slot.gam_unit_path,
+            formats: slot.formats,
+            publisherClaimed: false,
+            suppressPublisherDisplay: false,
+            suppressPublisherRefresh: false,
+          };
         }
 
         // Seed server evidence only after this concrete adInit attempt resolves
@@ -1768,9 +1910,8 @@ export function installTsAdInit(): void {
           provider: bid.trace?.provider,
           bidder: bid.trace?.bidder,
         });
-        // Map both inner div and container div → slot ID so slotRenderEnded
-        // (which reports the GPT slot's div, i.e. slotDivId/container) can look up
-        // the slot, while adm injection (which targets the inner div) also works.
+        // Map the resolved inner div to the slot ID so slotRenderEnded and ADM
+        // injection address the same, single GPT slot.
         divToSlotId[actualDivId] = slot.id;
         if (slotDivId2 !== actualDivId) divToSlotId[slotDivId2] = slot.id;
         const slotTargetingKeys = Object.keys(slot.targeting ?? {});
@@ -1847,7 +1988,7 @@ export function installTsAdInit(): void {
       slotsToDisplay.forEach((divId) => {
         const gptSlot = newSlots.find((slot) => slot.getSlotElementId() === divId);
         if (gptSlot && !ts.gptInitialLoadDisabled) captureAdTraceRequest(gptSlot, 'display');
-        g.display?.(divId);
+        withGptSlotHandoffInternal(ts, () => g.display?.(divId));
       });
 
       // Slots needing an explicit ad request via refresh(). Reused
@@ -1872,7 +2013,7 @@ export function installTsAdInit(): void {
         ts.adInitRefreshInProgress = true;
         try {
           slotsNeedingRefresh.forEach((slot) => captureAdTraceRequest(slot, 'refresh'));
-          g.pubads!().refresh(slotsNeedingRefresh);
+          withGptSlotHandoffInternal(ts, () => g.pubads!().refresh(slotsNeedingRefresh));
         } finally {
           ts.adInitRefreshInProgress = false;
         }
