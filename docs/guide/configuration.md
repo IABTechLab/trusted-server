@@ -1002,8 +1002,8 @@ apply when the integration section exists in `trusted-server.toml`.
 
 **Section**: `[integrations.ad_trace]`
 
-| Field     | Type    | Default | Description                                      |
-| --------- | ------- | ------- | ------------------------------------------------ |
+| Field     | Type    | Default | Description                                       |
+| --------- | ------- | ------- | ------------------------------------------------- |
 | `enabled` | Boolean | `false` | Include tester-only auction trace browser support |
 
 Browser-visible auction IDs, bid IDs, targeting, API state, and the console require this setting plus an activated browser session. Visit a publisher page with the exact query `?ts_console=true` or `?ts_console=1`; Trusted Server enables the first response and sets a host-only session cookie automatically. Use `?ts_console=false` or `?ts_console=0` to clear the session. The reserved query is removed from downstream requests and cleaned from eligible HTML URLs. Active trace responses are private and non-storeable.
