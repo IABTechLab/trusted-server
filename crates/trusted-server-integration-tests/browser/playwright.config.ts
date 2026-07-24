@@ -1,7 +1,13 @@
 import { defineConfig } from "@playwright/test";
 
+const framework = process.env.TEST_FRAMEWORK || "nextjs";
+
 export default defineConfig({
   testDir: "./tests",
+  testMatch:
+    framework === "ad-trace"
+      ? ["ad-trace/**/*.spec.ts"]
+      : ["nextjs/**/*.spec.ts", "shared/**/*.spec.ts", "wordpress/**/*.spec.ts"],
   globalSetup: "./global-setup.ts",
   globalTeardown: "./global-teardown.ts",
   timeout: 30_000,
@@ -20,5 +26,5 @@ export default defineConfig({
     },
   ],
   reporter: [["list"], ["html", { open: "never" }]],
-  outputDir: "./test-results",
+  outputDir: `./test-results-${framework}`,
 });

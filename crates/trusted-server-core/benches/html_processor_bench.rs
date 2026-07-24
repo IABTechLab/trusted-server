@@ -9,6 +9,7 @@ fn make_config() -> HtmlProcessorConfig {
         request_host: "proxy.bench.example.com".to_string(),
         request_scheme: "https".to_string(),
         integrations: IntegrationRegistry::default(),
+        head_bootstrap_script: None,
         ad_slots_script: None,
         ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
         max_buffered_body_bytes: 16 * 1024 * 1024,

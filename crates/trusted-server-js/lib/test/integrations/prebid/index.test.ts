@@ -1,4 +1,21 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import envelope from '../../fixtures/aps-renderer-v1.json';
+
+function apsRenderer() {
+  const bid = envelope.seatbid[0].bid[0];
+  return {
+    type: 'aps' as const,
+    version: 1 as const,
+    accountId: 'example-account-id',
+    bidId: bid.id,
+    creativeId: 'fictional-creative-id',
+    tagType: 'iframe' as const,
+    creativeUrl: bid.ext.creativeurl,
+    aaxResponse: btoa(JSON.stringify(envelope)),
+    width: bid.w,
+    height: bid.h,
+  };
+}
 
 // Define mocks using vi.hoisted so they're available inside vi.mock factories
 const {
@@ -8,6 +25,9 @@ const {
   mockRegisterBidAdapter,
   mockGetUserIdsAsEids,
   mockGetConfig,
+  mockMarkBidAsRendered,
+  mockMarkWinner,
+  mockOnEvent,
   mockPbjs,
   mockGetBidAdapter,
   mockAdapterManager,
@@ -17,6 +37,9 @@ const {
   const mockRequestBids = vi.fn();
   const mockRegisterBidAdapter = vi.fn();
   const mockGetBidAdapter = vi.fn();
+  const mockMarkBidAsRendered = vi.fn();
+  const mockMarkWinner = vi.fn();
+  const mockOnEvent = vi.fn();
   const mockGetUserIdsAsEids = vi.fn(
     () => [] as Array<{ source: string; uids?: Array<{ id: string; atype?: number }> }>
   );
@@ -28,6 +51,7 @@ const {
     registerBidAdapter: mockRegisterBidAdapter,
     getUserIdsAsEids: mockGetUserIdsAsEids,
     getConfig: mockGetConfig,
+    onEvent: mockOnEvent,
     adUnits: [] as any[],
   };
   const mockAdapterManager = {
@@ -40,6 +64,9 @@ const {
     mockRegisterBidAdapter,
     mockGetUserIdsAsEids,
     mockGetConfig,
+    mockMarkBidAsRendered,
+    mockMarkWinner,
+    mockOnEvent,
     mockPbjs,
     mockGetBidAdapter,
     mockAdapterManager,
@@ -50,6 +77,10 @@ const {
 // The real prebid.js cannot run in jsdom, so we provide a minimal stub.
 vi.mock('prebid.js', () => ({ default: mockPbjs }));
 vi.mock('prebid.js/src/adapterManager.js', () => ({ default: mockAdapterManager }));
+vi.mock('prebid.js/src/adRendering.js', () => ({
+  markBidAsRendered: mockMarkBidAsRendered,
+  markWinner: mockMarkWinner,
+}));
 
 // Side-effect imports are no-ops in tests
 vi.mock('prebid.js/modules/consentManagementTcf.js', () => ({}));
@@ -149,6 +180,70 @@ describe('prebid/auctionBidsToPrebidBids', () => {
     });
   });
 
+  it('preserves an APS renderer without converting it to executable markup', () => {
+    const renderer = apsRenderer();
+    const auctionBids: AuctionBid[] = [
+      {
+        impid: 'div-aps',
+        adm: '<script>must not become Prebid ad markup</script>',
+        renderer,
+        price: 1.23,
+        width: 300,
+        height: 250,
+        seat: 'aps',
+        creativeId: 'fictional-creative-id',
+        adomain: ['advertiser.example'],
+      },
+    ];
+
+    const result = auctionBidsToPrebidBids(auctionBids, [
+      { adUnitCode: 'div-aps', bidId: 'prebid-request-id' },
+    ]);
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toEqual(
+      expect.objectContaining({
+        requestId: 'prebid-request-id',
+        bidderCode: 'aps',
+        ad: '',
+        trustedServerRenderer: renderer,
+      })
+    );
+  });
+
+  it('adds adapter targeting only for a validated Trusted Server trace', () => {
+    const traced: AuctionBid = {
+      impid: 'slot-traced',
+      adm: '<div>Ad</div>',
+      price: 2,
+      width: 300,
+      height: 250,
+      seat: 'example-bidder',
+      creativeId: 'creative-1',
+      adomain: [],
+      trace: {
+        version: 1,
+        auctionTraceId: '650e8400-e29b-41d4-a716-446655440000',
+        bidTraceId: '550e8400-e29b-41d4-a716-446655440000',
+        source: 'auction_api',
+        slotId: 'slot-traced',
+        provider: 'prebid',
+        bidder: 'example-bidder',
+      },
+    };
+
+    const [bid] = auctionBidsToPrebidBids(
+      [traced],
+      [{ adUnitCode: 'slot-traced', bidId: 'request-1' }]
+    );
+    expect(bid.adserverTargeting).toEqual({
+      ts_trace: '550e8400-e29b-41d4-a716-446655440000',
+    });
+    expect(auctionBidsToPrebidBids([{ ...traced, trace: undefined }], [])[0]).not.toHaveProperty(
+      'adserverTargeting'
+    );
+  });
+
   it('falls back to impid when no matching bidRequest found', () => {
     const auctionBids: AuctionBid[] = [
       {
@@ -218,6 +313,9 @@ describe('prebid/installPrebidNpm', () => {
     document.cookie = 'ts-eids=; Path=/; Max-Age=0';
     delete (window as any).__tsjs_prebid;
     delete (window as any).__tsjs_prebid_diagnostics;
+    delete (mockPbjs as any).__tsApsBidResponseListenerInstalled;
+    delete (mockPbjs as any).__tsAdTraceObserved;
+    delete window.tsjs;
   });
 
   afterEach(() => {
@@ -239,6 +337,116 @@ describe('prebid/installPrebidNpm', () => {
         interpretResponse: expect.any(Function),
       })
     );
+  });
+
+  it('registers accepted APS descriptors under Prebid generated ad IDs', () => {
+    installPrebidNpm();
+
+    const bidResponseListener = mockOnEvent.mock.calls.find(
+      ([eventName]) => eventName === 'bidResponse'
+    )?.[1] as ((bid: Record<string, unknown>) => void) | undefined;
+    expect(bidResponseListener).toBeTypeOf('function');
+
+    const renderer = apsRenderer();
+    bidResponseListener!({
+      adapterCode: 'trustedServer',
+      bidderCode: 'aps',
+      adId: 'prebid-generated-ad-id',
+      adUnitCode: 'div-aps',
+      ttl: 300,
+      trustedServerRenderer: renderer,
+    });
+
+    const entry = (window as any).tsjs.apsPrebidRenderers['prebid-generated-ad-id'];
+    expect(entry).toEqual(
+      expect.objectContaining({
+        adUnitCode: 'div-aps',
+        renderer,
+        expiresAt: expect.any(Number),
+        markRendered: expect.any(Function),
+        markWinner: expect.any(Function),
+      })
+    );
+
+    entry.markWinner();
+    entry.markRendered();
+    expect(mockMarkWinner).toHaveBeenCalledWith(
+      expect.objectContaining({ adId: 'prebid-generated-ad-id' })
+    );
+    expect(mockMarkBidAsRendered).toHaveBeenCalledWith(
+      expect.objectContaining({ adId: 'prebid-generated-ad-id' })
+    );
+  });
+
+  it('registers APS renderer via requestId when Prebid strips the custom field', () => {
+    installPrebidNpm();
+
+    const bidResponseListener = mockOnEvent.mock.calls.find(
+      ([eventName]) => eventName === 'bidResponse'
+    )?.[1] as ((bid: Record<string, unknown>) => void) | undefined;
+    expect(bidResponseListener).toBeTypeOf('function');
+
+    const renderer = apsRenderer();
+    // interpretResponse output: stashes the descriptor keyed by requestId (survives
+    // Prebid's bid normalization, which strips the custom trustedServerRenderer field).
+    auctionBidsToPrebidBids(
+      [
+        {
+          impid: 'div-aps',
+          renderer,
+          price: 1.0,
+          width: 300,
+          height: 250,
+          seat: 'aps',
+          creativeId: 'cr-aps',
+          adomain: [],
+        },
+      ],
+      [{ adUnitCode: 'div-aps', bidId: 'req-strip' }]
+    );
+
+    // Prebid delivered the bid with the custom field REMOVED — only requestId survives.
+    bidResponseListener!({
+      adapterCode: 'trustedServer',
+      bidderCode: 'aps',
+      adId: 'stripped-field-ad-id',
+      adUnitCode: 'div-aps',
+      ttl: 300,
+      requestId: 'req-strip',
+    });
+
+    const entry = (window as any).tsjs.apsPrebidRenderers['stripped-field-ad-id'];
+    expect(entry).toEqual(
+      expect.objectContaining({ adUnitCode: 'div-aps', renderer, markWinner: expect.any(Function) })
+    );
+  });
+
+  it('does not register malformed or non-trusted APS renderer capabilities', () => {
+    installPrebidNpm();
+
+    const bidResponseListener = mockOnEvent.mock.calls.find(
+      ([eventName]) => eventName === 'bidResponse'
+    )?.[1] as ((bid: Record<string, unknown>) => void) | undefined;
+    const malformedBid: Record<string, unknown> = {
+      adapterCode: 'trustedServer',
+      bidderCode: 'aps',
+      adId: 'malformed-ad-id',
+      adUnitCode: 'div-aps',
+      ttl: 300,
+      trustedServerRenderer: { ...apsRenderer(), aaxResponse: 'invalid' },
+    };
+    bidResponseListener!(malformedBid);
+    bidResponseListener!({
+      adapterCode: 'publisherAdapter',
+      bidderCode: 'aps',
+      adId: 'foreign-ad-id',
+      adUnitCode: 'div-aps',
+      trustedServerRenderer: apsRenderer(),
+    });
+
+    expect((window as any).tsjs?.apsPrebidRenderers?.['malformed-ad-id']).toBeUndefined();
+    expect((window as any).tsjs?.apsPrebidRenderers?.['foreign-ad-id']).toBeUndefined();
+    expect(malformedBid).not.toHaveProperty('trustedServerRenderer');
   });
 
   it('calls setConfig with debug=false by default', () => {
@@ -668,6 +876,15 @@ describe('prebid/installPrebidNpm', () => {
       expect(adUnits[0].bids[0].bidder).toBe('trustedServer');
     });
 
+    it('normalizes a truthy non-array bids value without throwing', () => {
+      const pbjs = installPrebidNpm();
+      const adUnits = [{ code: 'example-malformed-slot', bids: { malformed: true } }] as any[];
+
+      expect(() => pbjs.requestBids({ adUnits } as any)).not.toThrow();
+
+      expect(adUnits[0].bids).toEqual([{ bidder: 'trustedServer', params: { bidderParams: {} } }]);
+    });
+
     it('includes zone from mediaTypes.banner.name in trustedServer params', () => {
       const pbjs = installPrebidNpm();
 
@@ -800,6 +1017,89 @@ describe('prebid/installPrebidNpm', () => {
 
       expect(document.cookie).toBe('');
     });
+
+    it('retains only the bounded Prebid auction duration for later generation attachment', () => {
+      let now = 100;
+      vi.spyOn(performance, 'now').mockImplementation(() => now);
+      const recordAdTrace = vi.fn();
+      window.tsjs = { recordAdTrace } as any;
+      installPrebidNpm();
+      const handlers = new Map<string, (data: Record<string, unknown>) => void>(
+        mockOnEvent.mock.calls.map(([event, handler]) => [event, handler])
+      );
+      handlers.get('auctionInit')?.({ auctionId: 'auction-1' });
+      handlers.get('bidResponse')?.({
+        auctionId: 'auction-1',
+        adUnitCode: 'slot-a',
+        requestId: 'request-1',
+        adId: 'ad-1',
+      });
+      now = 1_600;
+      handlers.get('auctionEnd')?.({ auctionId: 'auction-1', adUnits: [{ code: 'slot-a' }] });
+
+      expect(window.tsjs!.prebidCorrelation?.[0]).toMatchObject({
+        slotId: 'slot-a',
+        prebidAuctionDurationMs: 1_500,
+      });
+      expect(window.tsjs!.prebidCompletedAuctions?.[0]).toMatchObject({
+        slotIds: ['slot-a'],
+        prebidAuctionDurationMs: 1_500,
+      });
+      expect(JSON.stringify(window.tsjs!.prebidCorrelation)).not.toContain('performance');
+      expect(recordAdTrace).toHaveBeenCalledWith({ kind: 'prebid_bid_response' });
+      expect(JSON.stringify(recordAdTrace.mock.calls)).not.toContain('slot-a');
+    });
+
+    it('joins late winner and render events to the retained selected generation', () => {
+      const recordAdTrace = vi.fn();
+      const recordAdTraceCoverage = vi.fn();
+      window.tsjs = {
+        recordAdTrace,
+        recordAdTraceCoverage,
+        prebidSelectedParticipants: [
+          {
+            auctionId: 'auction-1',
+            slotId: 'slot-a',
+            requestId: 'request-1',
+            adId: 'ad-1',
+            bidder: 'client-bidder',
+            generation: 7,
+            selectedAt: performance.now(),
+          },
+        ],
+      } as any;
+      installPrebidNpm();
+      const handlers = new Map<string, (data: Record<string, unknown>) => void>(
+        mockOnEvent.mock.calls.map(([event, handler]) => [event, handler])
+      );
+      const bid = {
+        // Some documented terminal payloads omit auctionId. Exact slot plus
+        // immutable request/ad identity must still resolve uniquely.
+        adUnitCode: 'slot-a',
+        requestId: 'request-1',
+        adId: 'ad-1',
+        bidderCode: 'client-bidder',
+      };
+
+      handlers.get('bidWon')?.(bid);
+      handlers.get('adRenderSucceeded')?.({ bid });
+
+      expect(recordAdTrace).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: 'prebid_bid_won', generation: 7, slotId: 'slot-a' })
+      );
+      expect(recordAdTrace).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: 'prebid_render_succeeded',
+          generation: 7,
+          slotId: 'slot-a',
+        })
+      );
+      expect(recordAdTraceCoverage).toHaveBeenCalledWith({
+        category: 'prebid_render_succeeded',
+        resolution: 'correlated',
+      });
+      expect(window.tsjs!.prebidSelectedParticipants).toEqual([]);
+    });
   });
 });
 
@@ -854,11 +1154,13 @@ describe('prebid/installRefreshHandler', () => {
     mockPbjs.adUnits = [];
     (window as any).tsjs = undefined;
     delete (window as any).googletag;
+    delete (window as any).__tsjs_prebid;
   });
 
   afterEach(() => {
     (window as any).tsjs = undefined;
     delete (window as any).googletag;
+    delete (window as any).__tsjs_prebid;
   });
 
   it('builds refresh ad units from injected slot metadata', () => {
@@ -1352,6 +1654,192 @@ describe('prebid/installRefreshHandler', () => {
     expect(originalRefresh).toHaveBeenCalledWith([gptSlot], undefined);
   });
 
+  it('passes an explicitly excluded path directly to GPT after clearing stale targeting', () => {
+    const originalRefresh = vi.fn();
+    const clearTargeting = vi.fn();
+    const gptSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-tracking'),
+      getAdUnitPath: vi.fn(() => '/123/trackingonly'),
+      getTargeting: vi.fn(() => []),
+      clearTargeting,
+    };
+    const pubads = {
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => [gptSlot]),
+    };
+    (window as any).googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    (window as any).__tsjs_prebid = {
+      excludedGamAdUnitPathSuffixes: ['/trackingonly'],
+    };
+    const options = { changeCorrelator: false };
+
+    installRefreshHandler(750);
+    pubads.refresh([gptSlot], options);
+
+    expect(mockRequestBids).not.toHaveBeenCalled();
+    expect(clearTargeting).toHaveBeenCalledWith('ts_initial');
+    expect(clearTargeting).toHaveBeenCalledWith('hb_pb');
+    expect(clearTargeting).toHaveBeenCalledWith('hb_bidder');
+    expect(clearTargeting).toHaveBeenCalledWith('hb_adid');
+    expect(clearTargeting).toHaveBeenCalledWith('hb_cache_host');
+    expect(clearTargeting).toHaveBeenCalledWith('hb_cache_path');
+    expect(originalRefresh).toHaveBeenCalledWith([gptSlot], options);
+  });
+
+  it('passes an all-excluded global refresh directly to GPT', () => {
+    const originalRefresh = vi.fn();
+    const trackingSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-tracking'),
+      getAdUnitPath: vi.fn(() => '/123/trackingonly'),
+      getTargeting: vi.fn(() => []),
+      clearTargeting: vi.fn(),
+    };
+    const measurementSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-measurement'),
+      getAdUnitPath: vi.fn(() => '/123/measurement-only'),
+      getTargeting: vi.fn(() => []),
+      clearTargeting: vi.fn(),
+    };
+    const targetSlots = [trackingSlot, measurementSlot];
+    const pubads = {
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => targetSlots),
+    };
+    (window as any).googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    (window as any).__tsjs_prebid = {
+      excludedGamAdUnitPathSuffixes: ['/trackingonly', '/measurement-only'],
+    };
+    const options = { changeCorrelator: false };
+
+    installRefreshHandler(750);
+    pubads.refresh(undefined, options);
+
+    expect(mockRequestBids).not.toHaveBeenCalled();
+    expect(trackingSlot.clearTargeting).toHaveBeenCalled();
+    expect(measurementSlot.clearTargeting).toHaveBeenCalled();
+    expect(originalRefresh).toHaveBeenCalledWith(targetSlots, options);
+  });
+
+  it('auctions eligible slots and refreshes every slot in a mixed global refresh', () => {
+    const setTargetingForGPTAsync = vi.fn();
+    (mockPbjs as any).setTargetingForGPTAsync = setTargetingForGPTAsync;
+    mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+      opts?.bidsBackHandler?.();
+    });
+    const originalRefresh = vi.fn();
+    const displaySlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-display'),
+      getAdUnitPath: vi.fn(() => '/123/content'),
+      getTargeting: vi.fn(() => []),
+      clearTargeting: vi.fn(),
+    };
+    const trackingSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-tracking'),
+      getAdUnitPath: vi.fn(() => '/123/trackingonly'),
+      getTargeting: vi.fn(() => []),
+      clearTargeting: vi.fn(),
+    };
+    const targetSlots = [displaySlot, trackingSlot];
+    const pubads = {
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => targetSlots),
+    };
+    (window as any).googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    (window as any).__tsjs_prebid = {
+      excludedGamAdUnitPathSuffixes: ['/trackingonly'],
+    };
+
+    installRefreshHandler(750);
+    pubads.refresh();
+
+    expect(displaySlot.clearTargeting).toHaveBeenCalled();
+    expect(trackingSlot.clearTargeting).toHaveBeenCalled();
+    expect(mockRequestBids).toHaveBeenCalledWith(
+      expect.objectContaining({
+        adUnits: [expect.objectContaining({ code: 'div-ad-display' })],
+      })
+    );
+    expect(setTargetingForGPTAsync).toHaveBeenCalledWith(['div-ad-display']);
+    expect(originalRefresh).toHaveBeenCalledWith(targetSlots, undefined);
+
+    delete (mockPbjs as any).setTargetingForGPTAsync;
+  });
+
+  it.each([
+    ['a missing path getter', {}],
+    ['a non-string path', { getAdUnitPath: vi.fn(() => 123) }],
+    [
+      'a throwing path getter',
+      {
+        getAdUnitPath: vi.fn(() => {
+          throw new Error('path unavailable');
+        }),
+      },
+    ],
+  ])('fails open to an auction for %s', (_description, pathBehavior) => {
+    const originalRefresh = vi.fn();
+    const gptSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-display'),
+      getTargeting: vi.fn(() => []),
+      ...pathBehavior,
+    };
+    const pubads = {
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => [gptSlot]),
+    };
+    (window as any).googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    (window as any).__tsjs_prebid = {
+      excludedGamAdUnitPathSuffixes: ['/trackingonly'],
+    };
+
+    installRefreshHandler(750);
+    pubads.refresh([gptSlot]);
+
+    expect(mockRequestBids).toHaveBeenCalled();
+    expect(originalRefresh).not.toHaveBeenCalled();
+  });
+
+  it.each(['/123/TrackingOnly', '/123/trackingonly/'])(
+    'uses literal case-sensitive suffix matching for %s',
+    (adUnitPath) => {
+      const originalRefresh = vi.fn();
+      const gptSlot = {
+        getSlotElementId: vi.fn(() => 'div-ad-display'),
+        getAdUnitPath: vi.fn(() => adUnitPath),
+        getTargeting: vi.fn(() => []),
+      };
+      const pubads = {
+        refresh: originalRefresh,
+        getSlots: vi.fn(() => [gptSlot]),
+      };
+      (window as any).googletag = {
+        cmd: { push: (fn: () => void) => fn() },
+        pubads: () => pubads,
+      };
+      (window as any).__tsjs_prebid = {
+        excludedGamAdUnitPathSuffixes: ['/trackingonly'],
+      };
+
+      installRefreshHandler(750);
+      pubads.refresh([gptSlot]);
+
+      expect(mockRequestBids).toHaveBeenCalled();
+      expect(originalRefresh).not.toHaveBeenCalled();
+    }
+  );
+
   it('passes the adInit internal refresh straight to GPT without a client-side auction', () => {
     const originalRefresh = vi.fn();
     const clearTargeting = vi.fn();
@@ -1400,6 +1888,678 @@ describe('prebid/installRefreshHandler', () => {
 
     expect(mockRequestBids).toHaveBeenCalled();
     expect(originalRefresh).not.toHaveBeenCalled();
+  });
+});
+
+describe('prebid publisher snapshots and delivery refreshes', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockRequestBids.mockReset();
+    mockPbjs.requestBids = mockRequestBids;
+    mockPbjs.adUnits = [];
+    mockGetUserIdsAsEids.mockReset();
+    mockGetUserIdsAsEids.mockReturnValue([]);
+    mockGetBidAdapter.mockReturnValue({});
+    delete (mockPbjs as any).setTargetingForGPTAsync;
+    delete (window as any).__tsjs_prebid;
+    (window as any).tsjs = undefined;
+    delete (window as any).googletag;
+  });
+
+  afterEach(() => {
+    delete (window as any).__tsjs_prebid;
+    (window as any).tsjs = undefined;
+    delete (window as any).googletag;
+  });
+
+  function installGpt(slots: any[]) {
+    const originalRefresh = vi.fn();
+    const pubads = {
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => slots),
+    };
+    (window as any).googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    installRefreshHandler(640);
+    return { originalRefresh, pubads };
+  }
+
+  function refreshAdUnitFromLastRequest(): any {
+    const lastCall = mockRequestBids.mock.calls[mockRequestBids.mock.calls.length - 1];
+    return lastCall?.[0]?.adUnits?.[0];
+  }
+
+  it('recovers inline params, ordered client bids, and zone when pbjs.adUnits is empty', () => {
+    (window as any).__tsjs_prebid = { clientSideBidders: ['exampleBrowser'] };
+    const runtimeInstance = 'example-runtime-instance';
+    const code = `example-slot-${runtimeInstance}`;
+    const slot = {
+      getSlotElementId: () => code,
+      getTargeting: () => [],
+      getSizes: () => [{ getWidth: () => 320, getHeight: () => 100 }],
+      clearTargeting: vi.fn(),
+    };
+    const { pubads } = installGpt([slot]);
+    const pbjs = installPrebidNpm();
+    const firstParams = { placement: 'first' };
+    const effectiveParams = { placement: 'effective' };
+
+    pbjs.requestBids({
+      adUnits: [
+        {
+          code,
+          mediaTypes: { banner: { name: 'example-zone', sizes: [[320, 100]] } },
+          bids: [
+            { bidder: 'exampleServer', params: firstParams },
+            { bidder: 'exampleBrowser', params: { placement: 'browser-one' } },
+            { bidder: 'exampleServer', params: effectiveParams },
+            { bidder: 'exampleBrowser', params: { placement: 'browser-two' } },
+          ],
+        },
+      ],
+    } as any);
+    effectiveParams.placement = 'changed-after-auction';
+
+    pubads.refresh([slot]);
+
+    expect(mockPbjs.adUnits).toEqual([]);
+    expect(mockRequestBids).toHaveBeenCalledTimes(2);
+    expect(refreshAdUnitFromLastRequest()).toEqual({
+      code,
+      mediaTypes: { banner: { name: 'example-zone', sizes: [[320, 100]] } },
+      bids: [
+        {
+          bidder: 'trustedServer',
+          params: {
+            bidderParams: { exampleServer: { placement: 'effective' } },
+            zone: 'example-zone',
+          },
+        },
+        { bidder: 'exampleBrowser', params: { placement: 'browser-one' } },
+        { bidder: 'exampleBrowser', params: { placement: 'browser-two' } },
+      ],
+    });
+  });
+
+  it('isolates nested bidder-param objects and arrays from later publisher mutation', () => {
+    (window as any).__tsjs_prebid = { clientSideBidders: ['exampleBrowser'] };
+    const code = 'example-nested-params-slot';
+    const slot = {
+      getSlotElementId: () => code,
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const { pubads } = installGpt([slot]);
+    const pbjs = installPrebidNpm();
+    const serverParams = {
+      placement: {
+        rules: [{ label: 'original-rule' }],
+        sizes: [300, 250],
+      },
+    };
+    const browserParams = {
+      groups: [{ values: ['original-value'] }],
+    };
+
+    pbjs.requestBids({
+      adUnits: [
+        {
+          code,
+          bids: [
+            { bidder: 'exampleServer', params: serverParams },
+            { bidder: 'exampleBrowser', params: browserParams },
+          ],
+        },
+      ],
+    } as any);
+    serverParams.placement.rules[0].label = 'changed-rule';
+    serverParams.placement.sizes.push(999);
+    browserParams.groups[0].values[0] = 'changed-value';
+
+    pubads.refresh([slot]);
+
+    const expectedBids = [
+      {
+        bidder: 'trustedServer',
+        params: {
+          bidderParams: {
+            exampleServer: {
+              placement: {
+                rules: [{ label: 'original-rule' }],
+                sizes: [300, 250],
+              },
+            },
+          },
+        },
+      },
+      {
+        bidder: 'exampleBrowser',
+        params: { groups: [{ values: ['original-value'] }] },
+      },
+    ];
+    const firstRefreshBids = refreshAdUnitFromLastRequest().bids;
+    expect(firstRefreshBids).toEqual(expectedBids);
+
+    firstRefreshBids[0].params.bidderParams.exampleServer.placement.rules[0].label =
+      'changed-refresh-rule';
+    firstRefreshBids[0].params.bidderParams.exampleServer.placement.sizes.push(777);
+    firstRefreshBids[1].params.groups[0].values[0] = 'changed-refresh-value';
+    pubads.refresh([slot]);
+
+    expect(refreshAdUnitFromLastRequest().bids).toEqual(expectedBids);
+  });
+
+  it('keeps snapshots across repeated synthetic refreshes and overwrites newer publisher config', () => {
+    const code = 'example-dynamic-slot';
+    const slot = {
+      getSlotElementId: () => code,
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const { pubads } = installGpt([slot]);
+    const pbjs = installPrebidNpm();
+
+    pbjs.requestBids({
+      adUnits: [
+        {
+          code,
+          mediaTypes: { banner: { name: 'example-zone-one', sizes: [[300, 250]] } },
+          bids: [{ bidder: 'exampleServer', params: { placement: 'one' } }],
+        },
+      ],
+    } as any);
+    pubads.refresh([slot]);
+    expect(refreshAdUnitFromLastRequest().bids[0].params).toEqual({
+      bidderParams: { exampleServer: { placement: 'one' } },
+      zone: 'example-zone-one',
+    });
+
+    pubads.refresh([slot]);
+    expect(refreshAdUnitFromLastRequest().bids[0].params).toEqual({
+      bidderParams: { exampleServer: { placement: 'one' } },
+      zone: 'example-zone-one',
+    });
+
+    pbjs.requestBids({
+      adUnits: [
+        {
+          code,
+          mediaTypes: { banner: { name: 'example-zone-two', sizes: [[300, 250]] } },
+          bids: [{ bidder: 'exampleServer', params: { placement: 'two' } }],
+        },
+      ],
+    } as any);
+    pubads.refresh([slot]);
+
+    expect(refreshAdUnitFromLastRequest().bids[0].params).toEqual({
+      bidderParams: { exampleServer: { placement: 'two' } },
+      zone: 'example-zone-two',
+    });
+  });
+
+  it('does not cross-contaminate dynamic-code snapshots and retains the global fallback', () => {
+    const slotOne = {
+      getSlotElementId: () => 'example-code-one',
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const slotTwo = {
+      getSlotElementId: () => 'example-code-two',
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const globalSlot = {
+      getSlotElementId: () => 'example-global-code',
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const { pubads } = installGpt([slotOne, slotTwo, globalSlot]);
+    const pbjs = installPrebidNpm();
+
+    pbjs.requestBids({
+      adUnits: [
+        {
+          code: 'example-code-one',
+          bids: [{ bidder: 'exampleServer', params: { placement: 'one' } }],
+        },
+        {
+          code: 'example-code-two',
+          bids: [{ bidder: 'exampleServer', params: { placement: 'two' } }],
+        },
+      ],
+    } as any);
+    mockPbjs.adUnits = [
+      {
+        code: 'example-global-code',
+        bids: [{ bidder: 'exampleFallback', params: { placement: 'global' } }],
+      },
+    ];
+
+    pubads.refresh([slotOne]);
+    expect(refreshAdUnitFromLastRequest().bids[0].params.bidderParams).toEqual({
+      exampleServer: { placement: 'one' },
+    });
+    pubads.refresh([slotTwo]);
+    expect(refreshAdUnitFromLastRequest().bids[0].params.bidderParams).toEqual({
+      exampleServer: { placement: 'two' },
+    });
+    pubads.refresh([globalSlot]);
+    expect(refreshAdUnitFromLastRequest().bids[0].params.bidderParams).toEqual({
+      exampleFallback: { placement: 'global' },
+    });
+  });
+
+  it('bypasses explicit covered subset delivery refreshes without clearing targeting', () => {
+    const slotOne = {
+      getSlotElementId: () => 'example-covered-one',
+      getTargeting: () => [],
+      clearTargeting: vi.fn(),
+    };
+    const slotTwo = {
+      getSlotElementId: () => 'example-covered-two-container',
+      getTargeting: () => [],
+      clearTargeting: vi.fn(),
+    };
+    (window as any).tsjs = {
+      adSlots: [{ div_id: 'example-covered-two', formats: [[300, 250]], targeting: {} }],
+    };
+    const { originalRefresh, pubads } = installGpt([slotOne, slotTwo]);
+    mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+      opts?.bidsBackHandler?.();
+    });
+    const pbjs = installPrebidNpm();
+
+    pbjs.requestBids({
+      adUnits: [
+        { code: 'example-covered-one', bids: [{ bidder: 'exampleServer', params: {} }] },
+        { code: 'example-covered-two', bids: [{ bidder: 'exampleServer', params: {} }] },
+      ],
+      bidsBackHandler: () => {
+        pubads.refresh([slotOne]);
+        pubads.refresh([slotTwo]);
+      },
+    } as any);
+
+    expect(mockRequestBids).toHaveBeenCalledTimes(1);
+    expect(slotOne.clearTargeting).not.toHaveBeenCalled();
+    expect(slotTwo.clearTargeting).not.toHaveBeenCalled();
+    expect(originalRefresh).toHaveBeenCalledTimes(2);
+    expect(originalRefresh).toHaveBeenNthCalledWith(1, [slotOne], undefined);
+    expect(originalRefresh).toHaveBeenNthCalledWith(2, [slotTwo], undefined);
+  });
+
+  it('bypasses a bare delivery refresh even when GPT includes a GAM-only extra slot', () => {
+    const coveredSlot = {
+      getSlotElementId: () => 'example-covered',
+      getTargeting: () => [],
+      clearTargeting: vi.fn(),
+    };
+    const gamOnlySlot = {
+      getSlotElementId: () => 'example-gam-only-interstitial',
+      getTargeting: () => [],
+      clearTargeting: vi.fn(),
+    };
+    const { originalRefresh, pubads } = installGpt([coveredSlot, gamOnlySlot]);
+    mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+      opts?.bidsBackHandler?.();
+    });
+    const pbjs = installPrebidNpm();
+
+    pbjs.requestBids({
+      adUnits: [{ code: 'example-covered', bids: [{ bidder: 'exampleServer', params: {} }] }],
+      bidsBackHandler: () => pubads.refresh(),
+    } as any);
+
+    expect(mockRequestBids).toHaveBeenCalledTimes(1);
+    expect(coveredSlot.clearTargeting).not.toHaveBeenCalled();
+    expect(gamOnlySlot.clearTargeting).not.toHaveBeenCalled();
+    expect(originalRefresh).toHaveBeenCalledTimes(1);
+    expect(originalRefresh).toHaveBeenCalledWith(undefined, undefined);
+  });
+
+  it('keeps explicit unrelated lists synthetic and bypasses mixed delivery lists', () => {
+    const coveredSlot = {
+      getSlotElementId: () => 'example-covered',
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const unrelatedSlot = {
+      getSlotElementId: () => 'example-unrelated',
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const { originalRefresh, pubads } = installGpt([coveredSlot, unrelatedSlot]);
+    mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+      opts?.bidsBackHandler?.();
+    });
+    const pbjs = installPrebidNpm();
+
+    pbjs.requestBids({
+      adUnits: [{ code: 'example-covered', bids: [{ bidder: 'exampleServer', params: {} }] }],
+      bidsBackHandler: () => {
+        pubads.refresh([unrelatedSlot]);
+        pubads.refresh([coveredSlot, unrelatedSlot]);
+      },
+    } as any);
+
+    expect(mockRequestBids).toHaveBeenCalledTimes(2);
+    expect(mockRequestBids.mock.calls[1][0].adUnits.map((unit: any) => unit.code)).toEqual([
+      'example-unrelated',
+    ]);
+    expect(coveredSlot.clearTargeting).not.toHaveBeenCalled();
+    expect(unrelatedSlot.clearTargeting).toHaveBeenCalledWith('ts_initial');
+    expect(unrelatedSlot.clearTargeting).toHaveBeenCalledWith('hb_cache_path');
+    expect(originalRefresh).toHaveBeenCalledTimes(2);
+    expect(originalRefresh).toHaveBeenNthCalledWith(1, [unrelatedSlot], undefined);
+    expect(originalRefresh).toHaveBeenNthCalledWith(2, [coveredSlot, unrelatedSlot], undefined);
+  });
+
+  it('bypasses an explicit delivery refresh with four covered slots and a GAM-only extra', () => {
+    const coveredSlots = Array.from({ length: 4 }, (_, index) => ({
+      getSlotElementId: () => `example-covered-${index}`,
+      getTargeting: () => [],
+      clearTargeting: vi.fn(),
+    }));
+    const gamOnlySlot = {
+      getSlotElementId: () => 'example-gam-only-interstitial',
+      getTargeting: () => [],
+      clearTargeting: vi.fn(),
+    };
+    const refreshSlots = [...coveredSlots, gamOnlySlot];
+    const { originalRefresh, pubads } = installGpt(refreshSlots);
+    mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+      opts?.bidsBackHandler?.();
+    });
+    const pbjs = installPrebidNpm();
+
+    pbjs.requestBids({
+      adUnits: coveredSlots.map((_, index) => ({
+        code: `example-covered-${index}`,
+        bids: [{ bidder: 'exampleServer', params: { placement: index } }],
+      })),
+      bidsBackHandler: () => pubads.refresh(refreshSlots),
+    } as any);
+
+    expect(mockRequestBids).toHaveBeenCalledTimes(1);
+    refreshSlots.forEach((slot) => expect(slot.clearTargeting).not.toHaveBeenCalled());
+    expect(originalRefresh).toHaveBeenCalledTimes(1);
+    expect(originalRefresh).toHaveBeenCalledWith(refreshSlots, undefined);
+  });
+
+  it('bypasses a targeted delivery refresh shortly after the publisher callback returns', () => {
+    vi.useFakeTimers();
+    try {
+      const coveredSlots = Array.from({ length: 4 }, (_, index) => ({
+        getSlotElementId: () => `example-targeted-${index}`,
+        getTargeting: () => [],
+        getSizes: () => [[300, 250]],
+        clearTargeting: vi.fn(),
+      }));
+      const gamOnlySlot = {
+        getSlotElementId: () => 'example-targeted-interstitial',
+        getTargeting: () => [],
+        clearTargeting: vi.fn(),
+      };
+      const refreshSlots = [...coveredSlots, gamOnlySlot];
+      const { originalRefresh, pubads } = installGpt(refreshSlots);
+      const setTargetingForGPTAsync = vi.fn();
+      (mockPbjs as any).setTargetingForGPTAsync = setTargetingForGPTAsync;
+      let refreshAfterCallback: (() => void) | undefined;
+      mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+        opts?.bidsBackHandler?.();
+        const pendingRefresh = refreshAfterCallback;
+        refreshAfterCallback = undefined;
+        if (pendingRefresh) setTimeout(pendingRefresh, 750);
+      });
+      const pbjs = installPrebidNpm();
+      const coveredCodes = coveredSlots.map((slot) => slot.getSlotElementId());
+
+      pbjs.requestBids({
+        adUnits: coveredCodes.map((code, index) => ({
+          code,
+          bids: [{ bidder: 'exampleServer', params: { placement: index } }],
+        })),
+        bidsBackHandler: () => {
+          (pbjs as any).setTargetingForGPTAsync([gamOnlySlot.getSlotElementId(), ...coveredCodes]);
+          refreshAfterCallback = () => pubads.refresh(refreshSlots);
+        },
+      } as any);
+
+      expect(mockRequestBids).toHaveBeenCalledTimes(1);
+      expect(setTargetingForGPTAsync).toHaveBeenCalledWith([
+        gamOnlySlot.getSlotElementId(),
+        ...coveredCodes,
+      ]);
+      expect((mockPbjs as any).setTargetingForGPTAsync).toBe(setTargetingForGPTAsync);
+
+      vi.advanceTimersByTime(750);
+
+      refreshSlots.forEach((slot) => expect(slot.clearTargeting).not.toHaveBeenCalled());
+      expect(originalRefresh).toHaveBeenCalledTimes(1);
+      expect(originalRefresh).toHaveBeenCalledWith(refreshSlots, undefined);
+
+      vi.runOnlyPendingTimers();
+      pubads.refresh([coveredSlots[0]]);
+
+      expect(mockRequestBids).toHaveBeenCalledTimes(2);
+      expect(coveredSlots[0].clearTargeting).toHaveBeenCalledWith('hb_pb');
+      expect(originalRefresh).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.runOnlyPendingTimers();
+      vi.useRealTimers();
+      delete (mockPbjs as any).setTargetingForGPTAsync;
+    }
+  });
+
+  it('expires a targeted delivery context before a later event-loop task', () => {
+    vi.useFakeTimers();
+    try {
+      const slot = {
+        getSlotElementId: () => 'example-expiring-delivery',
+        getTargeting: () => [],
+        getSizes: () => [[300, 250]],
+        clearTargeting: vi.fn(),
+      };
+      const { originalRefresh, pubads } = installGpt([slot]);
+      (mockPbjs as any).setTargetingForGPTAsync = vi.fn();
+      mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+        opts?.bidsBackHandler?.();
+      });
+      const pbjs = installPrebidNpm();
+
+      pbjs.requestBids({
+        adUnits: [
+          { code: 'example-expiring-delivery', bids: [{ bidder: 'exampleServer', params: {} }] },
+        ],
+        bidsBackHandler: () => (pbjs as any).setTargetingForGPTAsync(['example-expiring-delivery']),
+      } as any);
+      vi.runOnlyPendingTimers();
+      pubads.refresh([slot]);
+
+      expect(mockRequestBids).toHaveBeenCalledTimes(2);
+      expect(slot.clearTargeting).toHaveBeenCalledWith('hb_pb');
+      expect(originalRefresh).toHaveBeenCalledTimes(1);
+      expect(originalRefresh).toHaveBeenCalledWith([slot], undefined);
+    } finally {
+      vi.runOnlyPendingTimers();
+      vi.useRealTimers();
+      delete (mockPbjs as any).setTargetingForGPTAsync;
+    }
+  });
+
+  it('bypasses a mixed explicit delivery list spanning nested contexts', () => {
+    const outerSlot = {
+      getSlotElementId: () => 'example-outer-delivery',
+      getTargeting: () => [],
+      clearTargeting: vi.fn(),
+    };
+    const innerSlot = {
+      getSlotElementId: () => 'example-inner-delivery',
+      getTargeting: () => [],
+      clearTargeting: vi.fn(),
+    };
+    const gamOnlySlot = {
+      getSlotElementId: () => 'example-gam-only-interstitial',
+      getTargeting: () => [],
+      clearTargeting: vi.fn(),
+    };
+    const refreshSlots = [innerSlot, outerSlot, gamOnlySlot];
+    const { originalRefresh, pubads } = installGpt(refreshSlots);
+    mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+      opts?.bidsBackHandler?.();
+    });
+    const pbjs = installPrebidNpm();
+
+    pbjs.requestBids({
+      adUnits: [
+        { code: 'example-outer-delivery', bids: [{ bidder: 'exampleServer', params: {} }] },
+      ],
+      bidsBackHandler: () => {
+        pbjs.requestBids({
+          adUnits: [
+            { code: 'example-inner-delivery', bids: [{ bidder: 'exampleServer', params: {} }] },
+          ],
+          bidsBackHandler: () => pubads.refresh(refreshSlots),
+        } as any);
+      },
+    } as any);
+
+    expect(mockRequestBids).toHaveBeenCalledTimes(2);
+    refreshSlots.forEach((slot) => expect(slot.clearTargeting).not.toHaveBeenCalled());
+    expect(originalRefresh).toHaveBeenCalledTimes(1);
+    expect(originalRefresh).toHaveBeenCalledWith(refreshSlots, undefined);
+  });
+
+  it('treats a microtask refresh without a targeting signal as an independent auction', async () => {
+    const slot = {
+      getSlotElementId: () => 'example-deferred-refresh',
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const { originalRefresh, pubads } = installGpt([slot]);
+    mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+      opts?.bidsBackHandler?.();
+    });
+    const pbjs = installPrebidNpm();
+    let deferredRefresh: Promise<void> | undefined;
+
+    pbjs.requestBids({
+      adUnits: [
+        { code: 'example-deferred-refresh', bids: [{ bidder: 'exampleServer', params: {} }] },
+      ],
+      bidsBackHandler: () => {
+        deferredRefresh = Promise.resolve().then(() => pubads.refresh([slot]));
+      },
+    } as any);
+    await deferredRefresh;
+
+    expect(mockRequestBids).toHaveBeenCalledTimes(2);
+    expect(slot.clearTargeting).toHaveBeenCalledWith('hb_pb');
+    expect(originalRefresh).toHaveBeenCalledTimes(1);
+    expect(originalRefresh).toHaveBeenCalledWith([slot], undefined);
+  });
+
+  it('keeps nested publisher delivery contexts isolated during reentrant auctions', () => {
+    const outerSlot = {
+      getSlotElementId: () => 'example-outer-delivery',
+      getTargeting: () => [],
+      clearTargeting: vi.fn(),
+    };
+    const innerSlot = {
+      getSlotElementId: () => 'example-inner-delivery',
+      getTargeting: () => [],
+      clearTargeting: vi.fn(),
+    };
+    const { originalRefresh, pubads } = installGpt([outerSlot, innerSlot]);
+    mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+      opts?.bidsBackHandler?.();
+    });
+    const pbjs = installPrebidNpm();
+
+    pbjs.requestBids({
+      adUnits: [
+        { code: 'example-outer-delivery', bids: [{ bidder: 'exampleServer', params: {} }] },
+      ],
+      bidsBackHandler: () => {
+        pbjs.requestBids({
+          adUnits: [
+            { code: 'example-inner-delivery', bids: [{ bidder: 'exampleServer', params: {} }] },
+          ],
+          bidsBackHandler: () => pubads.refresh([innerSlot]),
+        } as any);
+        pubads.refresh([outerSlot]);
+      },
+    } as any);
+
+    expect(mockRequestBids).toHaveBeenCalledTimes(2);
+    expect(innerSlot.clearTargeting).not.toHaveBeenCalled();
+    expect(outerSlot.clearTargeting).not.toHaveBeenCalled();
+    expect(originalRefresh).toHaveBeenNthCalledWith(1, [innerSlot], undefined);
+    expect(originalRefresh).toHaveBeenNthCalledWith(2, [outerSlot], undefined);
+  });
+
+  it('cleans delivery context after a publisher callback throws', () => {
+    const slot = {
+      getSlotElementId: () => 'example-throwing-callback',
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const { originalRefresh, pubads } = installGpt([slot]);
+    mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+      opts?.bidsBackHandler?.();
+    });
+    const pbjs = installPrebidNpm();
+
+    expect(() =>
+      pbjs.requestBids({
+        adUnits: [
+          {
+            code: 'example-throwing-callback',
+            bids: [{ bidder: 'exampleServer', params: {} }],
+          },
+        ],
+        bidsBackHandler: () => {
+          throw new Error('example callback failure');
+        },
+      } as any)
+    ).toThrow('example callback failure');
+
+    pubads.refresh([slot]);
+
+    expect(mockRequestBids).toHaveBeenCalledTimes(2);
+    expect(slot.clearTargeting).toHaveBeenCalled();
+    expect(originalRefresh).toHaveBeenCalledTimes(1);
+  });
+
+  it('completes an internal synthetic refresh once without recursion', () => {
+    const slot = {
+      getSlotElementId: () => 'example-independent-refresh',
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const { originalRefresh, pubads } = installGpt([slot]);
+    mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+      opts?.bidsBackHandler?.();
+    });
+    installPrebidNpm();
+
+    pubads.refresh([slot]);
+
+    expect(mockRequestBids).toHaveBeenCalledTimes(1);
+    expect(originalRefresh).toHaveBeenCalledTimes(1);
+    expect(originalRefresh).toHaveBeenCalledWith([slot], undefined);
   });
 });
 

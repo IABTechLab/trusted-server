@@ -8,7 +8,7 @@ export interface TestState {
   framework: string;
 }
 
-const KNOWN_FRAMEWORKS = ["nextjs", "wordpress"] as const;
+const KNOWN_FRAMEWORKS = ["ad-trace", "nextjs", "wordpress"] as const;
 
 const STATE_FILE = resolve(__dirname, "../.browser-test-state.json");
 let cachedState: TestState | undefined;

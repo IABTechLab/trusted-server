@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -260,6 +260,13 @@ pub struct PrebidIntegrationConfig {
     /// manages both lists explicitly.
     #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
     pub client_side_bidders: Vec<String>,
+    /// GAM ad-unit-path suffixes excluded from Trusted Server refresh auctions.
+    ///
+    /// Matching is exact and case-sensitive. Excluded slots still refresh through
+    /// GAM, but are not included in synthetic Prebid refresh ad units.
+    #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
+    #[validate(custom(function = "validate_excluded_gam_ad_unit_path_suffixes"))]
+    pub excluded_gam_ad_unit_path_suffixes: Vec<String>,
     /// Compatibility sugar for per-bidder, per-zone param overrides.
     ///
     /// This preserves the natural `bidder -> zone -> params` config shape for
@@ -348,6 +355,58 @@ impl IntegrationConfig for PrebidIntegrationConfig {
     }
 }
 
+fn excluded_gam_ad_unit_path_suffix_validation_error(message: &'static str) -> ValidationError {
+    let mut error = ValidationError::new("invalid_gam_ad_unit_path_suffix");
+    error.message = Some(message.into());
+    error
+}
+
+fn validate_excluded_gam_ad_unit_path_suffix(value: &str) -> Result<(), ValidationError> {
+    if value.trim() != value {
+        return Err(excluded_gam_ad_unit_path_suffix_validation_error(
+            "excluded_gam_ad_unit_path_suffixes entries must not have surrounding whitespace",
+        ));
+    }
+
+    if value.is_empty() {
+        return Err(excluded_gam_ad_unit_path_suffix_validation_error(
+            "excluded_gam_ad_unit_path_suffixes entries must not be empty",
+        ));
+    }
+
+    if !value.starts_with('/') {
+        return Err(excluded_gam_ad_unit_path_suffix_validation_error(
+            "excluded_gam_ad_unit_path_suffixes entries must start with '/'",
+        ));
+    }
+
+    if value == "/" {
+        return Err(excluded_gam_ad_unit_path_suffix_validation_error(
+            "excluded_gam_ad_unit_path_suffixes entries must identify a non-root path suffix",
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_excluded_gam_ad_unit_path_suffixes(values: &[String]) -> Result<(), ValidationError> {
+    for value in values {
+        validate_excluded_gam_ad_unit_path_suffix(value)?;
+    }
+
+    Ok(())
+}
+
+fn canonicalize_excluded_gam_ad_unit_path_suffixes(config: &mut PrebidIntegrationConfig) {
+    let mut canonical = Vec::with_capacity(config.excluded_gam_ad_unit_path_suffixes.len());
+    for suffix in std::mem::take(&mut config.excluded_gam_ad_unit_path_suffixes) {
+        if !canonical.contains(&suffix) {
+            canonical.push(suffix);
+        }
+    }
+    config.excluded_gam_ad_unit_path_suffixes = canonical;
+}
+
 /// Validate enabled Prebid config using the same startup-only checks as runtime registration.
 ///
 /// # Errors
@@ -357,11 +416,12 @@ impl IntegrationConfig for PrebidIntegrationConfig {
 pub fn validate_config_for_startup(
     settings: &Settings,
 ) -> Result<Option<PrebidIntegrationConfig>, Report<TrustedServerError>> {
-    let Some(config) =
+    let Some(mut config) =
         settings.integration_config::<PrebidIntegrationConfig>(PREBID_INTEGRATION_ID)?
     else {
         return Ok(None);
     };
+    canonicalize_excluded_gam_ad_unit_path_suffixes(&mut config);
     BidParamOverrideEngine::try_from_config(&config)?;
     validate_external_bundle_config(&config, &settings.proxy.allowed_domains)?;
     Ok(Some(config))
@@ -879,11 +939,12 @@ fn escape_html_attr(value: &str) -> String {
 fn build(
     settings: &Settings,
 ) -> Result<Option<Arc<PrebidIntegration>>, Report<TrustedServerError>> {
-    let Some(config) =
+    let Some(mut config) =
         settings.integration_config::<PrebidIntegrationConfig>(PREBID_INTEGRATION_ID)?
     else {
         return Ok(None);
     };
+    canonicalize_excluded_gam_ad_unit_path_suffixes(&mut config);
 
     validate_external_bundle_config(&config, &settings.proxy.allowed_domains)?;
 
@@ -1013,6 +1074,8 @@ impl IntegrationHeadInjector for PrebidIntegration {
             bidders: &'a [String],
             #[serde(skip_serializing_if = "<[String]>::is_empty")]
             client_side_bidders: &'a [String],
+            #[serde(skip_serializing_if = "<[String]>::is_empty")]
+            excluded_gam_ad_unit_path_suffixes: &'a [String],
         }
 
         let payload = InjectedPrebidClientConfig {
@@ -1021,6 +1084,7 @@ impl IntegrationHeadInjector for PrebidIntegration {
             debug: self.config.debug,
             bidders: &self.config.bidders,
             client_side_bidders: &self.config.client_side_bidders,
+            excluded_gam_ad_unit_path_suffixes: &self.config.excluded_gam_ad_unit_path_suffixes,
         };
 
         // Escape `</` to prevent breaking out of the script tag.
@@ -1537,14 +1601,31 @@ impl PrebidAuctionProvider {
                 // Only pass through keys that are known PBS bidders — skip provider-specific
                 // keys like "aps" which belong to their own separate auction provider.
                 let mut bidder: HashMap<String, Json> = HashMap::new();
+                // Bidders the publisher explicitly supplied — including an
+                // explicit empty `{}`. A configured bidder that exists only
+                // because `expand_trusted_server_bidders` fabricated an empty
+                // params object is NOT explicit and must not ship as
+                // `"bidder": {}` (which PBS rejects).
+                let mut explicit_bidders: HashSet<String> = HashSet::new();
                 for (name, params) in &slot.bidders {
+                    if name == "aps" {
+                        // Trusted Server APS is a separate OpenRTB provider. Never
+                        // send native APS demand through PBS for the same cohort.
+                        continue;
+                    }
                     if name == TRUSTED_SERVER_BIDDER {
+                        if let Some(per_bidder) =
+                            params.get(BIDDER_PARAMS_KEY).and_then(Json::as_object)
+                        {
+                            explicit_bidders.extend(per_bidder.keys().cloned());
+                        }
                         bidder.extend(expand_trusted_server_bidders(&self.config.bidders, params));
+                        bidder.remove("aps");
                     } else if self.config.bidders.iter().any(|b| b == name) {
+                        explicit_bidders.insert(name.clone());
                         bidder.insert(name.clone(), params.clone());
-                    } else if name != "aps" {
-                        // `aps` is intentionally handled by its own provider. Any
-                        // other unrecognized key is likely a misconfiguration (a
+                    } else {
+                        // Any other unrecognized key is likely a misconfiguration (a
                         // slot bidder absent from `config.bidders`) that silently
                         // yields an empty bidder map and a stored-request no-bid —
                         // log it so the drop is diagnosable.
@@ -1556,16 +1637,32 @@ impl PrebidAuctionProvider {
                     }
                 }
 
-                // When no inline PBS bidder params exist (e.g. creative-opportunity slots
-                // whose PBS params live in stored requests), tell PBS to resolve bidder
-                // config from the stored request keyed by this slot ID.
+                // Apply canonical and compatibility-derived rules in normalized
+                // order. An override rule can populate a bidder that arrived with
+                // empty params, promoting a fabricated empty into a valid bidder.
+                for (name, params) in &mut bidder {
+                    self.bid_param_override_engine
+                        .apply(BidParamOverrideFacts { bidder: name, zone }, params);
+                }
+
+                // Drop bidders that are still an empty object after overrides and
+                // were not explicitly supplied. Shipping `"bidder": {}` makes PBS
+                // reject the imp; an explicit empty object is preserved so genuine
+                // publisher misconfiguration stays visible.
+                bidder.retain(|name, params| {
+                    let is_empty_object = params.as_object().is_some_and(serde_json::Map::is_empty);
+                    !is_empty_object || explicit_bidders.contains(name)
+                });
+
+                // When no eligible PBS bidder params remain (e.g. creative-opportunity
+                // slots whose PBS params live in stored requests, or a slot whose
+                // configured bidders all resolved to fabricated empties), tell PBS to
+                // resolve bidder config from the stored request keyed by this slot ID.
                 //
-                // This cannot fire for the client /auction path: the JS adapter
-                // injects a `trustedServer` entry into every ad unit, so `bidder`
-                // is only empty for server-side creative-opportunity slots with
-                // no inline provider params (or when `config.bidders` is empty,
-                // where PBS previously received an empty bidder map and returned
-                // no bids — a stored-request miss is the same no-bid outcome).
+                // This cannot fire for a client /auction slot that carries real
+                // inline params: the JS adapter injects a `trustedServer` entry, and
+                // any bidder with params survives the drop above. It falls back only
+                // when nothing eligible remains — the same no-bid outcome as before.
                 let storedrequest = if bidder.is_empty() {
                     Some(ImpStoredRequest {
                         id: slot.id.clone(),
@@ -1573,12 +1670,6 @@ impl PrebidAuctionProvider {
                 } else {
                     None
                 };
-
-                // Apply canonical and compatibility-derived rules in normalized order.
-                for (name, params) in &mut bidder {
-                    self.bid_param_override_engine
-                        .apply(BidParamOverrideFacts { bidder: name, zone }, params);
-                }
 
                 Some(Imp {
                     id: Some(slot.id.clone()),
@@ -2139,8 +2230,13 @@ impl PrebidAuctionProvider {
         // not an ad ID, so it is not used as a fallback: surfacing it as `ad_id`
         // (which is exposed raw in the debug bid) would mislead any consumer that
         // treats `ad_id` as a creative identifier. Absent `adid`, `ad_id` is None.
+        let bid_id = bid_obj.get("id").and_then(|v| v.as_str()).map(String::from);
         let ad_id = bid_obj
             .get("adid")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let creative_id = bid_obj
+            .get("crid")
             .and_then(|v| v.as_str())
             .map(String::from);
 
@@ -2207,7 +2303,10 @@ impl PrebidAuctionProvider {
             height,
             nurl,
             burl,
+            bid_id,
             ad_id,
+            creative_id,
+            renderer: None,
             cache_id,
             cache_host,
             cache_path,
@@ -2490,6 +2589,7 @@ mod tests {
             external_bundle_sha256: None,
             external_bundle_sri: None,
             client_side_bidders: Vec::new(),
+            excluded_gam_ad_unit_path_suffixes: Vec::new(),
             bid_param_zone_overrides: HashMap::default(),
             bid_param_overrides: HashMap::default(),
             bid_param_override_rules: Vec::new(),
@@ -2664,6 +2764,7 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
         let context = AuctionContext {
+            trace: crate::auction::test_support::test_trace(),
             settings: &settings,
             request: &http_req,
             timeout_ms: 500,
@@ -2707,6 +2808,7 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
         let context = AuctionContext {
+            trace: crate::auction::test_support::test_trace(),
             settings: &settings,
             request: &http_req,
             timeout_ms: 500,
@@ -2727,6 +2829,11 @@ mod tests {
         assert_eq!(
             request_host, auction_request.publisher.domain,
             "request_host should be the publisher domain, not the edge Host header"
+        );
+        assert!(
+            !String::from_utf8_lossy(&bodies[0])
+                .contains(&context.trace.auction_trace_id.to_string()),
+            "internal trace UUID should never be serialized upstream"
         );
     }
 
@@ -2798,6 +2905,94 @@ passphrase = "test-secret-key-32-bytes-minimum"
 
     fn json_object(value: Json) -> serde_json::Map<String, Json> {
         serde_json::from_value(value).expect("should build JSON object")
+    }
+
+    #[test]
+    fn excluded_gam_ad_unit_path_suffixes_default_to_empty() {
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+server_url = "https://prebid.example/openrtb2/auction"
+"#,
+        );
+
+        assert!(
+            config.excluded_gam_ad_unit_path_suffixes.is_empty(),
+            "should default to no refresh-auction exclusions"
+        );
+    }
+
+    #[test]
+    fn startup_validation_canonicalizes_excluded_gam_ad_unit_path_suffixes() {
+        let mut settings = make_settings();
+        settings
+            .integrations
+            .insert_config(
+                PREBID_INTEGRATION_ID,
+                &json!({
+                    "enabled": true,
+                    "server_url": "https://prebid.example/openrtb2/auction",
+                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
+                    "excluded_gam_ad_unit_path_suffixes": [
+                        "/trackingonly",
+                        "/measurement-only",
+                        "/trackingonly"
+                    ]
+                }),
+            )
+            .expect("should replace Prebid test configuration");
+
+        let config = validate_config_for_startup(&settings)
+            .expect("should validate Prebid configuration")
+            .expect("should return enabled Prebid configuration");
+
+        assert_eq!(
+            config.excluded_gam_ad_unit_path_suffixes,
+            ["/trackingonly", "/measurement-only"],
+            "should retain only the first declaration of each suffix"
+        );
+
+        let integration = PrebidIntegration::new(config);
+        let document_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "pub.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &document_state,
+        };
+        let inserts = integration.head_inserts(&ctx);
+
+        assert!(
+            inserts[0].contains(
+                r#""excludedGamAdUnitPathSuffixes":["/trackingonly","/measurement-only"]"#
+            ),
+            "should inject the canonical suffix list: {}",
+            inserts[0]
+        );
+    }
+
+    #[test]
+    fn excluded_gam_ad_unit_path_suffixes_reject_invalid_values() {
+        for (suffix, expected_message) in [
+            ("", "must not be empty"),
+            (" /trackingonly", "must not have surrounding whitespace"),
+            ("trackingonly", "must start with '/'"),
+            ("/", "must identify a non-root path suffix"),
+        ] {
+            let error = parse_prebid_toml_result(&format!(
+                r#"
+[integrations.prebid]
+server_url = "https://prebid.example/openrtb2/auction"
+excluded_gam_ad_unit_path_suffixes = ["{suffix}"]
+"#
+            ))
+            .expect_err("should reject an invalid refresh-auction exclusion suffix");
+
+            assert!(
+                error.to_string().contains(expected_message),
+                "should report why suffix {suffix:?} is invalid: {error}"
+            );
+        }
     }
 
     #[test]
@@ -3660,6 +3855,36 @@ external_bundle_sri = "sha384-AAAA"
         assert!(
             script.contains(r#""bidders":["exampleBidder"]"#),
             "should include bidders array: {}",
+            script
+        );
+        assert!(
+            !script.contains("excludedGamAdUnitPathSuffixes"),
+            "should omit empty refresh-auction exclusions: {}",
+            script
+        );
+    }
+
+    #[test]
+    fn head_injector_includes_excluded_gam_ad_unit_path_suffixes() {
+        let mut config = base_config();
+        config.excluded_gam_ad_unit_path_suffixes =
+            vec!["/trackingonly".to_string(), "/measurement-only".to_string()];
+        let integration = PrebidIntegration::new(config);
+        let document_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "pub.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &document_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+        let script = &inserts[0];
+        assert!(
+            script.contains(
+                r#""excludedGamAdUnitPathSuffixes":["/trackingonly","/measurement-only"]"#
+            ),
+            "should inject refresh-auction exclusion suffixes: {}",
             script
         );
     }
@@ -5371,13 +5596,14 @@ external_bundle_sri = "sha384-AAAA"
             prebid_platform_response(StatusCode::BAD_REQUEST, Some("application/json"), body);
         let provider_response = futures::executor::block_on(provider.parse_response(response, 42))
             .expect("should classify upstream HTTP error");
-        let result = OrchestrationResult {
-            provider_responses: vec![provider_response],
-            mediator_response: None,
-            winning_bids: HashMap::new(),
-            total_time_ms: 42,
-            metadata: HashMap::new(),
-        };
+        let mut result = OrchestrationResult::empty(
+            crate::auction::types::AuctionTraceContext::new(
+                crate::auction::types::AuctionSource::AuctionApi,
+            ),
+            crate::auction::types::AuctionPublicOutcome::NoBid,
+        );
+        result.provider_responses = vec![provider_response];
+        result.total_time_ms = 42;
         let response = convert_to_openrtb_response(
             &result,
             &make_settings(),
@@ -5494,6 +5720,7 @@ external_bundle_sri = "sha384-AAAA"
             .expect("should build request");
         let services = noop_services();
         let context = AuctionContext {
+            trace: crate::auction::test_support::test_trace(),
             settings: &settings,
             request: &http_req,
             timeout_ms: 1000,
@@ -6553,20 +6780,170 @@ set = { placementId = "explicit_header" }
     }
 
     #[test]
+    fn to_openrtb_drops_fabricated_empty_bidder_params() {
+        // config.bidders lists three, but the slot supplies inline params only
+        // for kargo. Without a matching override, triplelift and criteo would
+        // expand to empty `{}` objects — invalid bidder entries PBS rejects.
+        // They must be dropped; the valid kargo bidder must still ship.
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+bidders = ["kargo", "triplelift", "criteo"]
+"#,
+        );
+
+        let slot = make_ts_slot(
+            "ad-header-0",
+            &json!({ "kargo": { "placementId": "kn1" } }),
+            None,
+        );
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(config, &request);
+        let params = bidder_params(&ortb);
+
+        assert_eq!(
+            params["kargo"]["placementId"], "kn1",
+            "should keep the valid inline bidder"
+        );
+        assert!(
+            !params.contains_key("triplelift"),
+            "should drop a fabricated empty bidder with no inline params or override"
+        );
+        assert!(
+            !params.contains_key("criteo"),
+            "should drop a fabricated empty bidder with no inline params or override"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_preserves_an_explicitly_empty_bidder() {
+        // A publisher-supplied empty `{}` is a real (if misconfigured) signal and
+        // must survive so the misconfiguration stays visible — unlike a fabricated
+        // empty, which is dropped.
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+bidders = ["kargo"]
+"#,
+        );
+
+        let slot = make_ts_slot("ad-header-0", &json!({ "kargo": {} }), None);
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(config, &request);
+        let params = bidder_params(&ortb);
+
+        assert_eq!(
+            params["kargo"],
+            json!({}),
+            "should preserve an explicitly supplied empty bidder object"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_keeps_a_fabricated_bidder_that_an_override_populates() {
+        // criteo has no inline params (fabricated empty), but an override rule
+        // fills it — so it is valid and must ship, not be dropped.
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+bidders = ["criteo"]
+
+[integrations.prebid.bid_param_overrides.criteo]
+networkId = 99999
+"#,
+        );
+
+        let slot = make_ts_slot("ad-header-0", &json!({}), None);
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(config, &request);
+        let params = bidder_params(&ortb);
+
+        assert_eq!(
+            params["criteo"]["networkId"], 99999,
+            "override should populate the fabricated empty bidder, keeping it"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_falls_back_to_stored_request_when_all_bidders_are_fabricated_empty() {
+        // config.bidders present, but the slot supplies no inline params and no
+        // override matches — every configured bidder resolves to a fabricated
+        // empty and is dropped, leaving PBS to resolve via the stored request.
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+bidders = ["kargo", "triplelift"]
+"#,
+        );
+
+        let slot = make_ts_slot("ad-header-0", &json!({}), None);
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(config, &request);
+        let ext = ortb.imp[0].ext.as_ref().expect("should have imp ext");
+        let prebid = ext.get("prebid").expect("should have prebid in ext");
+
+        assert!(
+            prebid.get("bidder").is_none(),
+            "should drop all fabricated empty bidders"
+        );
+        assert_eq!(
+            prebid["storedrequest"]["id"], "ad-header-0",
+            "should fall back to stored request when no eligible bidders remain"
+        );
+    }
+
+    #[test]
     fn to_openrtb_skips_aps_key_from_slot_bidders_in_pbs_request() {
+        let mut config = base_config();
+        config.bidders.push("aps".to_string());
         let slot = make_slot(
             "atf_sidebar_ad",
             HashMap::from([("aps".to_string(), json!({"slotID": "aps-slot-atf-sidebar"}))]),
         );
         let request = make_auction_request(vec![slot]);
 
-        let ortb = call_to_openrtb(base_config(), &request);
+        let ortb = call_to_openrtb(config, &request);
         let ext = ortb.imp[0].ext.as_ref().expect("should have imp ext");
         let prebid = ext.get("prebid").expect("should have prebid in ext");
 
         assert!(
             prebid.get("bidder").is_none(),
             "should not forward aps key into PBS imp.ext.prebid.bidder"
+        );
+    }
+
+    #[test]
+    fn trusted_server_expansion_never_enables_aps_through_pbs() {
+        let mut config = base_config();
+        config.bidders = vec!["kargo".to_string(), "aps".to_string()];
+        let slot = make_ts_slot(
+            "in_content_ad",
+            &json!({
+                "kargo": {"placementId": "client_123"},
+                "aps": {"slotID": "legacy-aps-slot"}
+            }),
+            None,
+        );
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(config, &request);
+        let bidder = &ortb.imp[0].ext.as_ref().expect("should have imp ext")["prebid"]["bidder"];
+        assert_eq!(bidder["kargo"]["placementId"], "client_123");
+        assert!(
+            bidder.get("aps").is_none(),
+            "Trusted Server APS cohorts must not also send APS through PBS"
         );
     }
 
@@ -6818,6 +7195,7 @@ set = { networkId = 42 }
             "id": "bid-impression-id",
             "impid": "atf_sidebar_ad",
             "adid": "bidder-ad-id-abc",
+            "crid": "bidder-creative-id-abc",
             "price": 1.0,
             "w": 300,
             "h": 250,
@@ -6837,9 +7215,19 @@ set = { networkId = 42 }
             .parse_bid(&bid_json, "appnexus")
             .expect("should parse bid");
         assert_eq!(
+            bid.bid_id.as_deref(),
+            Some("bid-impression-id"),
+            "should preserve OpenRTB id separately"
+        );
+        assert_eq!(
             bid.ad_id.as_deref(),
             Some("bidder-ad-id-abc"),
             "should keep ad_id from adid field"
+        );
+        assert_eq!(
+            bid.creative_id.as_deref(),
+            Some("bidder-creative-id-abc"),
+            "should preserve OpenRTB crid separately"
         );
         assert_eq!(
             bid.cache_id.as_deref(),

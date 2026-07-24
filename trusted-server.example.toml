@@ -45,6 +45,9 @@ timeout_ms = 1000
 bidders = []
 debug = false
 client_side_bidders = []
+# Keep selected GAM inventory out of Trusted Server's Prebid refresh auctions.
+# Matching slots still refresh through GAM.
+# excluded_gam_ad_unit_path_suffixes = ["/trackingonly"]
 # Runtime bundle metadata. Set these after running `ts prebid bundle` and uploading the bundle.
 # external_bundle_url = "https://assets.example.com/prebid/trusted-prebid-<sha256>.js"
 # external_bundle_sha256 = "<manifest sha256>"
@@ -58,6 +61,11 @@ adapters = ["rubicon"]
 enabled = false
 rewrite_attributes = ["href", "link", "siteBaseUrl", "siteProductionDomain", "url"]
 max_combined_payload_bytes = 10485760
+
+# Session-scoped auction-to-creative trace diagnostics. When enabled, visit a
+# publisher page with `?ts_console=1` or `?ts_console=true` to open the console.
+[integrations.ad_trace]
+enabled = false
 
 [integrations.testlight]
 enabled = false
@@ -112,15 +120,38 @@ rewrite_script = true
 
 [auction]
 enabled = false
+# Defaults to false. Set true to rewrite winning-bid adm to first-party endpoints,
+# converting proxy/click URLs and injecting the creative TSJS runtime.
+# Sanitization is controlled separately by `sanitize_creatives` below.
+rewrite_creatives = false
+# Strip executable markup (script/object/embed/form/...) from winning-bid adm,
+# removing those elements together with their inner content.
+#
+# Defaults to false: creatives are delivered exactly as the bidder returned them.
+# Enable whenever creatives can render in a context that shares the publisher's
+# origin — it is the primary defence there.
+#
+# Set false only when creatives render in a foreign-origin frame (for example the
+# Prebid Universal Creative inside the ad server's iframe), where the markup cannot
+# reach the publisher origin. Sanitization removes script-based creatives entirely,
+# so leaving it enabled on a script-heavy demand stack silently blanks those slots.
+sanitize_creatives = false
 providers = []
 timeout_ms = 2000
 allowed_context_keys = []
 
 [integrations.aps]
 enabled = false
-pub_id = "your-aps-publisher-id"
-endpoint = "https://aps.example.com/e/dtb/bid"
+account_id = "example-aps-account-id"
+endpoint = "https://web.ads.aps.amazon-adsystem.com/e/pb/bid"
 timeout_ms = 1000
+# Include raw APS request/response data in /auction metadata on test sites only.
+debug = false
+# Set both when the deployment hostname differs from APS-authorized inventory.
+# inventory_domain = "publisher.example"
+# inventory_page_origin = "https://www.publisher.example"
+# Script creatives require separate security validation before opt-in.
+allow_script_creatives = false
 
 [integrations.google_tag_manager]
 enabled = false
@@ -157,7 +188,29 @@ gam_network_id = "123456789"
 auction_timeout_ms = 500  # override via TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__AUCTION_TIMEOUT_MS
 price_granularity = "dense"
 
+# `gam_unit_path` may be a template. Supported placeholders:
+#   {network_id} -> gam_network_id
+#   {slot_id}    -> the slot's id
+#   {section}    -> first path segment of the request, sanitized to
+#                   [A-Za-z0-9_-]; `section_root` below is used for "/".
+# A template with no placeholders (or an absent gam_unit_path) keeps the old
+# behavior: verbatim path, or the default `/<network_id>/<slot_id>`.
+#
+# `section_root` is REQUIRED when any slot's template uses {section}. There is no
+# default — the home-section name is publisher-specific. Must be [A-Za-z0-9_-]+.
+section_root = "home"
+
 # No slot templates are enabled in the checked-in default config. Add
 # `[[creative_opportunities.slot]]` entries via private config or override the
 # entire array via:
 # TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__SLOT='[{"id":"...","gam_unit_path":"...",...}]'
+#
+# Example templated slot (one rule serves every section):
+# [[creative_opportunities.slot]]
+# id = "ad-header"
+# gam_unit_path = "/{network_id}/example/{section}"
+# page_patterns = ["/", "/news/*", "/reviews/*"]
+# formats = [{ width = 728, height = 90 }]
+#   "/"          -> /123456789/example/home
+#   "/news/x"    -> /123456789/example/news
+#   "/reviews/y" -> /123456789/example/reviews

@@ -16,16 +16,18 @@ use validator::{Validate, ValidationError, ValidationErrors};
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    adserver_mock::AdServerMockConfig, aps::ApsConfig, datadome::DataDomeConfig,
-    didomi::DidomiIntegrationConfig, google_tag_manager::GoogleTagManagerConfig, gpt::GptConfig,
-    lockr::LockrConfig, nextjs::NextJsIntegrationConfig, osano::OsanoConfig,
-    permutive::PermutiveConfig, prebid, sourcepoint::SourcepointConfig, testlight::TestlightConfig,
+    ad_trace::AdTraceConfig, adserver_mock::AdServerMockConfig, aps::ApsConfig,
+    datadome::DataDomeConfig, didomi::DidomiIntegrationConfig,
+    google_tag_manager::GoogleTagManagerConfig, gpt::GptConfig, lockr::LockrConfig,
+    nextjs::NextJsIntegrationConfig, osano::OsanoConfig, permutive::PermutiveConfig, prebid,
+    sourcepoint::SourcepointConfig, testlight::TestlightConfig,
 };
 use crate::settings::{IntegrationConfig, Settings};
 
 const DEPLOY_VALIDATION_FIELD: &str = "trusted_server";
 #[cfg(test)]
 const DEPLOY_VALIDATED_INTEGRATION_IDS: &[&str] = &[
+    "ad_trace",
     "prebid",
     "aps",
     "adserver_mock",
@@ -136,6 +138,7 @@ fn validate_enabled_integrations(
 ) -> Result<HashSet<&'static str>, Report<TrustedServerError>> {
     let mut enabled_auction_providers = HashSet::new();
 
+    validate_integration::<AdTraceConfig>(settings, "ad_trace")?;
     if validate_prebid(settings)? {
         enabled_auction_providers.insert("prebid");
     }

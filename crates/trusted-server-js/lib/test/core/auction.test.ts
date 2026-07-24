@@ -1,5 +1,27 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { buildAdRequest, parseAuctionResponse, sendAuction } from '../../src/core/auction';
+import {
+  buildAdRequest,
+  parseAuctionResponse,
+  parseAuctionTraceSummary,
+  sendAuction,
+} from '../../src/core/auction';
+import envelope from '../fixtures/aps-renderer-v1.json';
+
+function apsRenderer(creativeId?: string) {
+  const bid = envelope.seatbid[0].bid[0];
+  return {
+    type: 'aps' as const,
+    version: 1 as const,
+    accountId: 'example-account-id',
+    bidId: bid.id,
+    ...(creativeId ? { creativeId } : {}),
+    tagType: 'iframe' as const,
+    creativeUrl: bid.ext.creativeurl,
+    aaxResponse: btoa(JSON.stringify(envelope)),
+    width: bid.w,
+    height: bid.h,
+  };
+}
 
 describe('auction/buildAdRequest', () => {
   it('builds from tsjs AdUnit objects', () => {
@@ -174,6 +196,83 @@ describe('auction/parseAuctionResponse', () => {
     });
   });
 
+  it('parses an APS typed renderer without requiring adm', () => {
+    const renderer = apsRenderer('fictional-creative-id');
+    const bids = parseAuctionResponse({
+      seatbid: [
+        {
+          seat: 'aps',
+          bid: [
+            {
+              id: renderer.bidId,
+              impid: 'fictional-slot',
+              price: 1.23,
+              crid: renderer.creativeId,
+              w: 300,
+              h: 250,
+              ext: { trusted_server: { renderer } },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(bids).toHaveLength(1);
+    expect(bids[0]).toEqual(
+      expect.objectContaining({
+        impid: 'fictional-slot',
+        adm: '',
+        renderer,
+        width: 300,
+        height: 250,
+        creativeId: 'fictional-creative-id',
+      })
+    );
+  });
+
+  it('parses an APS renderer with optional creativeId omitted', () => {
+    const renderer = apsRenderer();
+    const bids = parseAuctionResponse({
+      seatbid: [
+        {
+          seat: 'aps',
+          bid: [
+            {
+              impid: 'fictional-slot',
+              price: 1.23,
+              w: 300,
+              h: 250,
+              ext: { trusted_server: { renderer } },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(bids[0].renderer).toEqual(renderer);
+    expect(bids[0].creativeId).toBe('aps-fictional-slot');
+  });
+
+  it('ignores unrelated or malformed renderer extensions while retaining ordinary adm', () => {
+    const bids = parseAuctionResponse({
+      seatbid: [
+        {
+          seat: 'ordinary',
+          bid: [
+            {
+              impid: 'slot-1',
+              adm: '<div>ordinary</div>',
+              ext: { trusted_server: { renderer: { type: 'aps', version: 99 } } },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(bids[0].renderer).toBeUndefined();
+    expect(bids[0].adm).toBe('<div>ordinary</div>');
+  });
+
   it('handles multiple seatbids with multiple bids', () => {
     const body = {
       seatbid: [
@@ -203,6 +302,100 @@ describe('auction/parseAuctionResponse', () => {
 
   it('returns empty array for empty seatbid', () => {
     expect(parseAuctionResponse({ seatbid: [] })).toEqual([]);
+  });
+
+  it('strictly joins valid root and bid traces without changing legacy fields', () => {
+    const body = {
+      ext: {
+        trusted_server: {
+          trace: {
+            version: 1,
+            auction_trace_id: '650e8400-e29b-41d4-a716-446655440000',
+            source: 'auction_api',
+            outcome: 'completed',
+          },
+        },
+      },
+      seatbid: [
+        {
+          seat: 'example-bidder',
+          bid: [
+            {
+              impid: 'slot-1',
+              price: 1.5,
+              ext: {
+                trusted_server: {
+                  trace: {
+                    version: 1,
+                    bid_trace_id: '550e8400-e29b-41d4-a716-446655440000',
+                    slot_id: 'slot-1',
+                    provider: 'prebid',
+                    bidder: 'example-bidder',
+                  },
+                },
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    expect(parseAuctionTraceSummary(body)).toEqual({
+      version: 1,
+      auctionTraceId: '650e8400-e29b-41d4-a716-446655440000',
+      source: 'auction_api',
+      outcome: 'completed',
+    });
+    expect(parseAuctionResponse(body)[0].trace).toEqual({
+      version: 1,
+      auctionTraceId: '650e8400-e29b-41d4-a716-446655440000',
+      bidTraceId: '550e8400-e29b-41d4-a716-446655440000',
+      source: 'auction_api',
+      slotId: 'slot-1',
+      provider: 'prebid',
+      bidder: 'example-bidder',
+    });
+  });
+
+  it('ignores malformed, contradictory, mismatched, and oversized trace fields', () => {
+    const body = {
+      ext: {
+        trusted_server: {
+          trace: {
+            version: 1,
+            auction_trace_id: '650e8400-e29b-41d4-a716-446655440000',
+            source: 'auction_api',
+            outcome: 'no_bid',
+          },
+        },
+      },
+      seatbid: [
+        {
+          seat: 'seat',
+          bid: [
+            {
+              impid: 'slot-1',
+              price: 1,
+              ext: {
+                trusted_server: {
+                  trace: {
+                    version: 1,
+                    bid_trace_id: '550e8400-e29b-41d4-a716-446655440000',
+                    slot_id: 'different-slot',
+                    provider: 'p'.repeat(65),
+                    bidder: 'seat',
+                  },
+                },
+              },
+            },
+          ],
+        },
+      ],
+    };
+    expect(parseAuctionTraceSummary(body)?.outcome).toBe('no_bid');
+    expect(parseAuctionResponse(body)[0].trace).toBeUndefined();
+    body.ext.trusted_server.trace.auction_trace_id = 'not-a-uuid';
+    expect(parseAuctionTraceSummary(body)).toBeUndefined();
   });
 
   it('defaults missing fields gracefully', () => {
@@ -259,7 +452,7 @@ describe('auction/sendAuction', () => {
       ],
     };
 
-    const bids = await sendAuction('/auction', request);
+    const result = await sendAuction('/auction', request);
 
     expect(globalThis.fetch).toHaveBeenCalledWith(
       '/auction',
@@ -269,18 +462,46 @@ describe('auction/sendAuction', () => {
         body: JSON.stringify(request),
       })
     );
-    expect(bids).toHaveLength(1);
-    expect(bids[0].price).toBe(2.5);
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') throw new Error('expected successful auction');
+    expect(result.bids).toHaveLength(1);
+    expect(result.bids[0].price).toBe(2.5);
   });
 
-  it('returns empty array on network error', async () => {
+  it('distinguishes a network error from a valid empty auction', async () => {
     globalThis.fetch = vi.fn().mockRejectedValue(new Error('network error')) as any;
 
-    const bids = await sendAuction('/auction', { adUnits: [] });
-    expect(bids).toEqual([]);
+    const result = await sendAuction('/auction', { adUnits: [] });
+    expect(result).toEqual({ kind: 'transport_error', reason: 'network' });
   });
 
-  it('returns empty array for non-JSON response', async () => {
+  it('accepts legacy empty but rejects malformed seatbid collections', async () => {
+    globalThis.fetch = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        headers: { get: () => 'application/json' },
+        json: async () => ({}),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        headers: { get: () => 'application/json' },
+        json: async () => ({ seatbid: {} }),
+      }) as any;
+
+    await expect(sendAuction('/auction', { adUnits: [] })).resolves.toEqual({
+      kind: 'ok',
+      bids: [],
+    });
+    await expect(sendAuction('/auction', { adUnits: [] })).resolves.toEqual({
+      kind: 'invalid_response',
+      reason: 'invalid_shape',
+    });
+  });
+
+  it('distinguishes a non-JSON response', async () => {
     globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
@@ -288,11 +509,11 @@ describe('auction/sendAuction', () => {
       json: async () => ({}),
     }) as any;
 
-    const bids = await sendAuction('/auction', { adUnits: [] });
-    expect(bids).toEqual([]);
+    const result = await sendAuction('/auction', { adUnits: [] });
+    expect(result).toEqual({ kind: 'invalid_response', reason: 'non_json' });
   });
 
-  it('returns empty array for non-OK response', async () => {
+  it('distinguishes a non-OK response', async () => {
     globalThis.fetch = vi.fn().mockResolvedValue({
       ok: false,
       status: 500,
@@ -300,7 +521,7 @@ describe('auction/sendAuction', () => {
       json: async () => ({}),
     }) as any;
 
-    const bids = await sendAuction('/auction', { adUnits: [] });
-    expect(bids).toEqual([]);
+    const result = await sendAuction('/auction', { adUnits: [] });
+    expect(result).toEqual({ kind: 'transport_error', reason: 'http' });
   });
 });

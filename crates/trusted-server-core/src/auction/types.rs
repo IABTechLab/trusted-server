@@ -4,11 +4,156 @@ use edgezero_core::body::Body as EdgeBody;
 use http::Request;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use uuid::Uuid;
 
 use crate::auction::context::ContextValue;
 use crate::geo::GeoInfo;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
+
+/// Source path that initiated an auction candidate.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuctionSource {
+    /// Initial publisher navigation using server-side ad templates.
+    InitialNavigation,
+    /// SPA navigation through `GET /__ts/page-bids`.
+    SpaNavigation,
+    /// Explicit `POST /auction` API.
+    AuctionApi,
+}
+
+impl AuctionSource {
+    /// Return the stable wire label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InitialNavigation => "initial_navigation",
+            Self::SpaNavigation => "spa_navigation",
+            Self::AuctionApi => "auction_api",
+        }
+    }
+}
+
+/// Privacy-safe public identity for one auction candidate.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, derive_more::Display)]
+pub struct AuctionTraceId(Uuid);
+
+impl AuctionTraceId {
+    /// Generate a fresh random trace identity.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// Return the underlying UUID.
+    #[must_use]
+    pub const fn as_uuid(self) -> Uuid {
+        self.0
+    }
+}
+
+impl Default for AuctionTraceId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Privacy-safe public identity for one final winning bid.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, derive_more::Display)]
+pub struct BidTraceId(Uuid);
+
+impl BidTraceId {
+    /// Generate a fresh random trace identity.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn from_uuid(value: Uuid) -> Self {
+        Self(value)
+    }
+}
+
+impl Default for BidTraceId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Trace identity and source shared throughout one auction lifecycle.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AuctionTraceContext {
+    pub auction_trace_id: AuctionTraceId,
+    pub source: AuctionSource,
+}
+
+impl AuctionTraceContext {
+    /// Generate a context for an auction candidate.
+    #[must_use]
+    pub fn new(source: AuctionSource) -> Self {
+        Self {
+            auction_trace_id: AuctionTraceId::new(),
+            source,
+        }
+    }
+}
+
+/// Privacy-safe terminal state exposed to tester traffic.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuctionPublicOutcome {
+    Completed,
+    NoBid,
+    Skipped,
+    Failed,
+    Abandoned,
+}
+
+impl AuctionPublicOutcome {
+    /// Return the stable wire label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::NoBid => "no_bid",
+            Self::Skipped => "skipped",
+            Self::Failed => "failed",
+            Self::Abandoned => "abandoned",
+        }
+    }
+}
+
+/// Result-independent public summary for one auction candidate.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AuctionTraceSummary {
+    pub auction: AuctionTraceContext,
+    pub outcome: AuctionPublicOutcome,
+}
+
+/// Public trace metadata for one final winning bid.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct WinningBidTrace {
+    pub bid_trace_id: BidTraceId,
+    pub provider: String,
+    pub bidder: String,
+}
+
+/// Trace data attached to a finalized auction result.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AuctionResultTrace {
+    pub summary: AuctionTraceSummary,
+    pub winning_bids: HashMap<String, WinningBidTrace>,
+}
+
+/// Exact internal location of a final winning bid.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct WinningBidOrigin {
+    pub response_index: usize,
+    pub bid_index: usize,
+    pub mediated: bool,
+}
 
 /// Represents a unified auction request across all providers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +285,8 @@ pub struct SiteInfo {
 /// [dispatch]: crate::auction::AuctionOrchestrator::dispatch_auction
 /// [collect]: crate::auction::AuctionOrchestrator::collect_dispatched_auction
 pub struct AuctionContext<'a> {
+    /// Trace identity owned by the auction entry point.
+    pub trace: &'a AuctionTraceContext,
     pub settings: &'a Settings,
     pub request: &'a Request<EdgeBody>,
     pub timeout_ms: u32,
@@ -171,18 +318,71 @@ pub struct AuctionResponse {
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
+/// APS creative tag type accepted by the Trusted Server renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApsTagType {
+    /// APS loads the creative URL in a nested iframe.
+    Iframe,
+    /// APS fetches creative HTML and executes it in its nested renderer frame.
+    Script,
+}
+
+/// Version 1 APS renderer descriptor shared with browser clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApsRendererV1 {
+    /// Renderer contract version.
+    pub version: u8,
+    /// APS account identifier used to initialize the fixed runner.
+    pub account_id: String,
+    /// Selected `OpenRTB` bid identifier.
+    pub bid_id: String,
+    /// Optional `OpenRTB` creative identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creative_id: Option<String>,
+    /// APS creative delivery mode.
+    pub tag_type: ApsTagType,
+    /// HTTPS creative URL consumed by the fixed APS runner.
+    pub creative_url: String,
+    /// Base64-encoded exact one-bid APS response envelope.
+    pub aax_response: String,
+    /// Creative width.
+    pub width: u32,
+    /// Creative height.
+    pub height: u32,
+}
+
+/// Typed browser renderer capability carried by a bid.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum BidRenderer {
+    /// APS renderer version 1.
+    Aps(ApsRendererV1),
+}
+
+impl BidRenderer {
+    /// Return the APS renderer descriptor.
+    #[must_use]
+    pub fn aps(&self) -> &ApsRendererV1 {
+        match self {
+            Self::Aps(renderer) => renderer,
+        }
+    }
+}
+
 /// Individual bid from a provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bid {
     /// Slot this bid is for
     pub slot_id: String,
-    /// Bid price in CPM
-    /// None for APS bids where price is encoded and must be decoded by mediation layer
+    /// Bid price in CPM.
     pub price: Option<f64>,
     /// Currency code (e.g., "USD")
     pub currency: String,
-    /// Creative markup (HTML/VAST)
-    /// None when the bidder doesn't provide creative HTML (e.g., APS/TAM)
+    /// Creative markup (HTML/VAST).
+    ///
+    /// `None` when the bid uses a typed [`BidRenderer`] instead.
     pub creative: Option<String>,
     /// Advertiser domain
     pub adomain: Option<Vec<String>>,
@@ -196,8 +396,15 @@ pub struct Bid {
     pub nurl: Option<String>,
     /// Billing notification URL
     pub burl: Option<String>,
-    /// Ad ID from the bidder
+    /// `OpenRTB` bid identifier.
+    pub bid_id: Option<String>,
+    /// Ad ID from the bidder.
     pub ad_id: Option<String>,
+    /// Optional `OpenRTB` creative identifier.
+    pub creative_id: Option<String>,
+    /// Typed browser renderer capability.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renderer: Option<BidRenderer>,
     /// Prebid Cache UUID for this bid.
     ///
     /// Populated from `ext.prebid.cache.bids.cacheId` in the PBS response.
@@ -214,8 +421,7 @@ pub struct Bid {
     /// Populated from the path of `ext.prebid.cache.bids.url`. Used as
     /// `hb_cache_path` targeting value. `None` when cache is absent.
     pub cache_path: Option<String>,
-    /// Provider-specific bid metadata
-    /// For APS bids, contains encoded price in "amznbid" field
+    /// Provider-specific bid metadata.
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
@@ -338,7 +544,10 @@ mod tests {
             height: 250,
             nurl: None,
             burl: None,
+            bid_id: None,
             ad_id: None,
+            creative_id: None,
+            renderer: None,
             cache_id: None,
             cache_host: None,
             cache_path: None,
@@ -467,7 +676,10 @@ mod tests {
             height: 250,
             nurl: None,
             burl: None,
+            bid_id: None,
             ad_id: Some("bid-id".to_string()),
+            creative_id: None,
+            renderer: None,
             cache_id: Some("cache-uuid".to_string()),
             cache_host: Some("cache.example.com".to_string()),
             cache_path: Some("/pbc/v1/cache".to_string()),
@@ -493,6 +705,62 @@ mod tests {
     }
 
     #[test]
+    fn aps_renderer_serializes_to_versioned_camel_case_contract() {
+        let renderer = BidRenderer::Aps(ApsRendererV1 {
+            version: 1,
+            account_id: "example-account-id".to_string(),
+            bid_id: "fictional-bid-id".to_string(),
+            creative_id: Some("fictional-creative-id".to_string()),
+            tag_type: ApsTagType::Iframe,
+            creative_url: "https://creative.example/render".to_string(),
+            aax_response: "base64-data".to_string(),
+            width: 300,
+            height: 250,
+        });
+
+        let serialized = serde_json::to_value(&renderer).expect("should serialize renderer");
+
+        assert_eq!(
+            serialized,
+            json!({
+                "type": "aps",
+                "version": 1,
+                "accountId": "example-account-id",
+                "bidId": "fictional-bid-id",
+                "creativeId": "fictional-creative-id",
+                "tagType": "iframe",
+                "creativeUrl": "https://creative.example/render",
+                "aaxResponse": "base64-data",
+                "width": 300,
+                "height": 250
+            }),
+            "should match renderer wire contract"
+        );
+    }
+
+    #[test]
+    fn aps_renderer_omits_absent_creative_id() {
+        let renderer = BidRenderer::Aps(ApsRendererV1 {
+            version: 1,
+            account_id: "example-account-id".to_string(),
+            bid_id: "fictional-bid-id".to_string(),
+            creative_id: None,
+            tag_type: ApsTagType::Iframe,
+            creative_url: "https://creative.example/render".to_string(),
+            aax_response: "base64-data".to_string(),
+            width: 300,
+            height: 250,
+        });
+
+        let serialized = serde_json::to_value(&renderer).expect("should serialize renderer");
+
+        assert!(
+            serialized.get("creativeId").is_none(),
+            "should omit absent creative ID"
+        );
+    }
+
+    #[test]
     fn media_type_defaults_to_banner() {
         assert_eq!(
             MediaType::default(),
@@ -514,7 +782,10 @@ mod tests {
             height: 250,
             nurl: None,
             burl: None,
+            bid_id: None,
             ad_id: Some("prebid-ad-id-abc".to_string()),
+            creative_id: None,
+            renderer: None,
             cache_id: None,
             cache_host: None,
             cache_path: None,

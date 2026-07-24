@@ -246,7 +246,10 @@ fn platform_response_to_fastly_asset(platform_resp: PlatformResponse) -> AssetPr
     }
 }
 
-/// Stream an asset response body directly to a writable client stream.
+/// Stream a platform response body directly to a writable client stream.
+///
+/// Asset routes and Fastly `EdgeZero` publisher fallback both use this bridge
+/// after headers have been committed through `stream_to_client()`.
 ///
 /// # Errors
 ///
@@ -261,7 +264,7 @@ pub async fn stream_asset_body<W: Write>(
             output
                 .write_all(bytes.as_ref())
                 .change_context(TrustedServerError::Proxy {
-                    message: "failed to write buffered asset response body".to_string(),
+                    message: "failed to write buffered platform response body".to_string(),
                 })?;
         }
         EdgeBody::Stream(mut stream) => {
@@ -274,7 +277,7 @@ pub async fn stream_asset_body<W: Write>(
                 output
                     .write_all(chunk.as_ref())
                     .change_context(TrustedServerError::Proxy {
-                        message: "failed to write streaming asset response body".to_string(),
+                        message: "failed to write streaming platform response body".to_string(),
                     })?;
             }
         }
@@ -2732,7 +2735,7 @@ mod tests {
         let settings = create_test_settings();
         let clear = "https://cdn.example/asset.js?c=3&b=2&a=1";
         // Simulate creative-generated first-party URL
-        let first_party = creative::build_proxy_url(&settings, clear);
+        let first_party = creative::build_proxy_url(&settings, clear, "");
         // Reconstruct and validate (need absolute URL for parsing)
         let st = reconstruct_and_validate_signed_target(
             &settings,
@@ -2748,7 +2751,7 @@ mod tests {
     fn reconstruct_valid_without_params() {
         let settings = create_test_settings();
         let clear = "https://cdn.example/asset.js";
-        let first_party = creative::build_proxy_url(&settings, clear);
+        let first_party = creative::build_proxy_url(&settings, clear, "");
         let st = reconstruct_and_validate_signed_target(
             &settings,
             &format!("https://edge.example{}", first_party),
@@ -2765,7 +2768,7 @@ mod tests {
             let settings = create_test_settings();
             let clear = "ftp://cdn.example/file.gif";
             // Build a first-party proxy URL with a token for the unsupported scheme
-            let first_party = creative::build_proxy_url(&settings, clear);
+            let first_party = creative::build_proxy_url(&settings, clear, "");
             let req =
                 build_http_request(Method::GET, format!("https://edge.example{}", first_party));
             let err: Report<TrustedServerError> =
@@ -2804,7 +2807,7 @@ mod tests {
         futures::executor::block_on(async {
             let settings = create_test_settings();
             let clear = "https://cdn.example/landing.html?x=1";
-            let first_party = creative::build_click_url(&settings, clear);
+            let first_party = creative::build_click_url(&settings, clear, "");
             let req =
                 build_http_request(Method::GET, format!("https://edge.example{}", first_party));
             let resp = handle_first_party_click(&settings, &noop_services(), req)
@@ -2882,6 +2885,51 @@ mod tests {
         let body = response_body_string(out);
         assert!(body.contains("/first-party/proxy?tsurl="), "{}", body);
         assert_eq!(ct, "text/css; charset=utf-8");
+    }
+
+    #[test]
+    fn auction_rewrite_setting_does_not_change_proxied_html_or_css_rewriting() {
+        let mut settings = create_test_settings();
+        settings.auction.rewrite_creatives = false;
+        let req = build_http_request(Method::GET, "https://edge.example/first-party/proxy");
+
+        let html = r#"<html><body><img src="https://cdn.example/ad.png"></body></html>"#;
+        let mut html_response = build_http_response(StatusCode::OK, EdgeBody::from(html));
+        html_response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        let html_output = finalize(
+            &settings,
+            &req,
+            "https://cdn.example/creative.html",
+            html_response,
+        )
+        .expect("should finalize proxied HTML");
+        let html_body = response_body_string(html_output);
+
+        let css = "body{background:url(https://cdn.example/bg.png)}";
+        let mut css_response = build_http_response(StatusCode::OK, EdgeBody::from(css));
+        css_response
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/css"));
+        let css_output = finalize(
+            &settings,
+            &req,
+            "https://cdn.example/creative.css",
+            css_response,
+        )
+        .expect("should finalize proxied CSS");
+        let css_body = response_body_string(css_output);
+
+        assert!(
+            html_body.contains("/first-party/proxy?tsurl="),
+            "should keep rewriting proxied HTML when auction rewriting is disabled: {html_body}"
+        );
+        assert!(
+            css_body.contains("/first-party/proxy?tsurl="),
+            "should keep rewriting proxied CSS when auction rewriting is disabled: {css_body}"
+        );
     }
 
     #[test]

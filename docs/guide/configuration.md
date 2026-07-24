@@ -998,6 +998,23 @@ apply when the integration section exists in `trusted-server.toml`.
 | --------- | ------- | ------------------------------ |
 | `enabled` | Boolean | Enable/disable the integration |
 
+### Ad Trace Integration
+
+**Section**: `[integrations.ad_trace]`
+
+| Field     | Type    | Default | Description                                       |
+| --------- | ------- | ------- | ------------------------------------------------- |
+| `enabled` | Boolean | `false` | Include tester-only auction trace browser support |
+
+Browser-visible auction IDs, bid IDs, targeting, API state, and the console require this setting plus an activated browser session. Visit a publisher page with the exact query `?ts_console=true` or `?ts_console=1`; Trusted Server enables the first response and sets a host-only session cookie automatically. Use `?ts_console=false` or `?ts_console=0` to clear the session. The reserved query is removed from downstream requests and cleaned from eligible HTML URLs. Active trace responses are private and non-storeable.
+
+The integration is disabled by default. The query is a self-service diagnostic toggle, not authorization, and does nothing without the explicit configuration gate. The console never exposes the internal auction request ID, identity data, consent strings, page URLs, partner notification URLs, cache coordinates, raw targeting, or creative markup. A creative marked `confirmed` means its exact Trusted Server renderer iframe load was acknowledged; it does not claim viewability or arbitrary advertiser JavaScript completion.
+
+```toml
+[integrations.ad_trace]
+enabled = false
+```
+
 ### Prebid Integration
 
 **Section**: `[integrations.prebid]`
@@ -1191,26 +1208,42 @@ Settings for the auction orchestrator that coordinates multiple bid providers.
 
 ### `[auction]`
 
-| Field            | Type          | Default            | Description                                                 |
-| ---------------- | ------------- | ------------------ | ----------------------------------------------------------- |
-| `enabled`        | Boolean       | `false`            | Enable the auction orchestrator                             |
-| `providers`      | Array[String] | `[]`               | Provider names that participate (e.g., `["prebid", "aps"]`) |
-| `mediator`       | String        | Optional           | Mediator provider name (runs parallel mediation when set)   |
-| `timeout_ms`     | Integer       | `2000`             | Auction timeout in milliseconds                             |
-| `creative_store` | String        | `"creative_store"` | Deprecated; creatives are now delivered inline              |
+| Field               | Type          | Default            | Description                                                       |
+| ------------------- | ------------- | ------------------ | ----------------------------------------------------------------- |
+| `enabled`           | Boolean       | `false`            | Enable the auction orchestrator                                   |
+| `rewrite_creatives` | Boolean       | `true`             | Rewrite sanitized winning-bid `adm` through first-party endpoints |
+| `providers`         | Array[String] | `[]`               | Provider names that participate (e.g., `["prebid", "aps"]`)       |
+| `mediator`          | String        | Optional           | Mediator provider name (runs parallel mediation when set)         |
+| `timeout_ms`        | Integer       | `2000`             | Auction timeout in milliseconds                                   |
+| `creative_store`    | String        | `"creative_store"` | Deprecated; creatives are now delivered inline                    |
+
+Creative markup returned by `POST /auction` is always server-sanitized. With
+`rewrite_creatives = true` (the default), eligible absolute or protocol-relative
+resource and click URLs not excluded by rewrite configuration are converted to
+signed first-party endpoints, and the creative TSJS runtime is injected when a
+`<body>` exists. Setting it to `false` returns sanitized but unre-written `adm`;
+accepted external URLs remain direct and are not host allowlisted by the
+sanitizer. The setting does not affect HTML or CSS fetched through
+`/first-party/proxy`. See [Creative Processing](/guide/creative-processing#auction-rewrite-control).
 
 **Example**:
 
 ```toml
 [auction]
 enabled = true
+rewrite_creatives = true
 providers = ["aps", "prebid"]
 timeout_ms = 2000
 
 [integrations.aps]
 enabled = true
-pub_id = "example-publisher"
-endpoint = "https://aps.example.com/e/dtb/bid"
+account_id = "example-account"
+endpoint = "https://web.ads.aps.amazon-adsystem.com/e/pb/bid"
+debug = false
+# Optional pair for deployments hosted away from APS-authorized inventory.
+# inventory_domain = "publisher.example"
+# inventory_page_origin = "https://www.publisher.example"
+allow_script_creatives = false
 
 [integrations.prebid]
 enabled = true
@@ -1221,13 +1254,90 @@ server_url = "https://prebid-server.example.com/openrtb2/auction"
 
 ```bash
 TRUSTED_SERVER__AUCTION__ENABLED=true
+TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES=true
 TRUSTED_SERVER__AUCTION__PROVIDERS=aps,prebid
 TRUSTED_SERVER__AUCTION__PROVIDERS__0=aps
 TRUSTED_SERVER__AUCTION__PROVIDERS__1=prebid
 TRUSTED_SERVER__AUCTION__MEDIATOR=adserver_mock
 TRUSTED_SERVER__AUCTION__TIMEOUT_MS=2000
 TRUSTED_SERVER__AUCTION__CREATIVE_STORE=creative_store
+TRUSTED_SERVER__INTEGRATIONS__APS__DEBUG=false
 ```
+
+## Creative Opportunities Configuration
+
+### `[creative_opportunities]`
+
+Defines the ad slots the trusted server offers on a page: which pages each slot
+appears on (`page_patterns`), its supported sizes (`formats`), and the GAM ad
+unit it maps to (`gam_unit_path`).
+
+```toml
+[creative_opportunities]
+gam_network_id = "123456789"
+price_granularity = "dense"
+
+# Shared placeholder value for the site root ("/") — see {section} below.
+section_root = "home"
+
+[[creative_opportunities.slot]]
+id = "ad-header"
+gam_unit_path = "/{network_id}/example/{section}"
+page_patterns = ["/", "/news/*", "/reviews/*"]
+formats = [{ width = 728, height = 90 }]
+```
+
+### `gam_unit_path` templating
+
+`gam_unit_path` is a template. A publisher whose ad unit varies by site section
+expresses that in **one** slot rule instead of one rule per (slot × section).
+
+Supported placeholders:
+
+| Placeholder    | Resolves to                                                    |
+| -------------- | -------------------------------------------------------------- |
+| `{network_id}` | `gam_network_id`                                               |
+| `{slot_id}`    | the slot's `id`                                                |
+| `{section}`    | first path segment of the request (see derivation rules below) |
+
+A template with **no** placeholders is used verbatim. A slot with **no**
+`gam_unit_path` falls back to `/<network_id>/<slot_id>`. Both preserve the
+pre-templating behavior, so existing static configs are unchanged.
+
+### `{section}` derivation
+
+`{section}` is derived from the request path at request time:
+
+- It is the **first non-empty path segment**. `/news/article-123` → `news`.
+- It is sanitized: each run of characters outside `[A-Za-z0-9_-]` becomes a
+  single `_`.
+- The path is used **raw — it is not percent-decoded**. So `/new%20s` →
+  `new_20s` (only `%` is disallowed; `2` and `0` are kept), never the decoded
+  `new_s`. This keeps `{section}` consistent with how `page_patterns` match the
+  same raw path.
+- When the path has no segment (`/`, or repeated slashes), `{section}` is
+  `section_root`.
+
+`section_root` is **required** whenever any slot's template uses `{section}`,
+and must match `[A-Za-z0-9_-]+`. There is no default: the home-section name is
+publisher-specific, so the URL→section convention lives in config, not core.
+Startup fails if `{section}` is used without a valid `section_root`.
+
+Example resolution for `gam_unit_path = "/{network_id}/example/{section}"` with
+`gam_network_id = "123456789"` and `section_root = "home"`:
+
+| Request path    | `gam_unit_path`              |
+| --------------- | ---------------------------- |
+| `/`             | `/123456789/example/home`    |
+| `/news`         | `/123456789/example/news`    |
+| `/news/article` | `/123456789/example/news`    |
+| `/reviews/x`    | `/123456789/example/reviews` |
+
+An **unmatched route** — a path matched by no slot's `page_patterns` — produces
+no slot at all, so no template is rendered for it.
+
+Startup validation rejects a malformed template: an unknown placeholder (e.g.
+`{oops}`), an unmatched or nested `{`, a stray `}`, or an empty `gam_unit_path`.
 
 ## Fastly Runtime Config Store
 

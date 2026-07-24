@@ -32,6 +32,7 @@ SCHEMA >
   `price_cpm` Nullable(Float64),
   `currency` LowCardinality(Nullable(String)),
   `is_win` Nullable(UInt8),
+  `bid_trace_id` Nullable(UUID),
   `ad_domain` Nullable(String),
   `ad_id` Nullable(String),
   `event_date` Date DEFAULT toDate(event_ts)

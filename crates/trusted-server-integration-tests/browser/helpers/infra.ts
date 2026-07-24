@@ -7,6 +7,7 @@ const ORIGIN_PORT = process.env.INTEGRATION_ORIGIN_PORT || "8888";
 
 /** Framework-specific container configuration. */
 const FRAMEWORK_CONFIG: Record<string, { image: string; port: number }> = {
+  "ad-trace": { image: "test-ad-trace:latest", port: 80 },
   nextjs: { image: "test-nextjs:latest", port: 3000 },
   wordpress: { image: "test-wordpress:latest", port: 80 },
 };

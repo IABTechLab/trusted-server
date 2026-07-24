@@ -474,7 +474,8 @@ impl IntegrationHeadInjector for GptIntegration {
     /// ## Scroll / refresh handoff contract (Phase 1)
     ///
     /// `tsjs.adInit` handles **initial render only**: it wires server-side bid
-    /// targeting into GPT slots and refreshes them. Win/billing beacons fire
+    /// targeting into GPT slots and replays only publisher requests held until
+    /// that targeting was available. Win/billing beacons fire
     /// only from the TS render bridge in the JS bundle, where a matching
     /// Prebid Universal Creative request proves the TS creative rendered.
     /// It does **not** trigger refresh auctions or handle GPT slot refresh events.
@@ -1223,6 +1224,39 @@ mod tests {
     }
 
     #[test]
+    fn head_inserts_bootstrap_installs_inner_div_slot_handoff() {
+        let integration = GptIntegration::new(test_config());
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+        let combined = integration.head_inserts(&ctx).join("");
+        assert!(
+            combined.contains("gptSlotHandoffs"),
+            "bootstrap should keep late publisher slot handoff state on window.tsjs"
+        );
+        assert!(
+            combined.contains("__tsSlotHandoffPatched"),
+            "bootstrap should install idempotent GPT handoff wrappers"
+        );
+        assert!(
+            combined.contains("gptInitialRequestGate") && combined.contains("pendingDisplays"),
+            "bootstrap should hold configured publisher requests until initial targeting is applied"
+        );
+        assert!(
+            combined.contains("return googletag.defineSlot") && combined.contains("actualDivId"),
+            "bootstrap should define the TS fallback on the actual inner div"
+        );
+        assert!(
+            !combined.contains("actualDivId + \"-container\""),
+            "bootstrap must not define a competing outer-container GPT slot"
+        );
+    }
+
+    #[test]
     fn head_inserts_bootstrap_guards_enable_services_with_idempotency_flag() {
         let config = test_config();
         let integration = GptIntegration::new(config);
@@ -1247,9 +1281,10 @@ mod tests {
 
     #[test]
     fn head_inserts_bootstrap_refreshes_ts_slots_when_initial_load_disabled() {
-        // Mirrors the bundle: when the publisher calls disableInitialLoad(),
-        // display() only registers a TS-defined slot, so the bootstrap must also
-        // refresh those slots or they render blank.
+        // Mirrors the bundle: when the publisher disables initial load through
+        // setConfig() or the legacy disableInitialLoad() method, display() only
+        // registers a TS-defined slot, so the bootstrap must also refresh those
+        // slots or they render blank.
         let config = test_config();
         let integration = GptIntegration::new(config);
         let doc_state = IntegrationDocumentState::default();
@@ -1261,8 +1296,12 @@ mod tests {
         };
         let combined = integration.head_inserts(&ctx).join("");
         assert!(
-            combined.contains("disableInitialLoad"),
-            "bootstrap should wrap disableInitialLoad() to detect the disabled state"
+            combined.contains("gpt.setConfig"),
+            "bootstrap should wrap googletag.setConfig() to detect the disabled state"
+        );
+        assert!(
+            combined.contains("pubads.disableInitialLoad"),
+            "bootstrap should wrap legacy disableInitialLoad() calls"
         );
         assert!(
             combined.contains("gptInitialLoadDisabled"),

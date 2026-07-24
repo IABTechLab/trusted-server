@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import envelope from '../fixtures/aps-renderer-v1.json';
 
 async function flushRequestAds(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
@@ -10,6 +11,7 @@ describe('request.requestAds', () => {
   beforeEach(async () => {
     await vi.resetModules();
     document.body.innerHTML = '';
+    delete window.tsjs;
     originalFetch = globalThis.fetch;
   });
 
@@ -64,6 +66,129 @@ describe('request.requestAds', () => {
         originalLength: creativeHtml.length,
       })
     );
+  });
+
+  it('dispatches a valid APS descriptor to the opaque static renderer route', async () => {
+    const apsBid = envelope.seatbid[0].bid[0];
+    const renderer = {
+      type: 'aps',
+      version: 1,
+      accountId: 'example-account-id',
+      bidId: apsBid.id,
+      tagType: apsBid.ext.tagtype,
+      creativeUrl: apsBid.ext.creativeurl,
+      aaxResponse: btoa(JSON.stringify(envelope)),
+      width: apsBid.w,
+      height: apsBid.h,
+    };
+    const recordAdTrace = vi.fn();
+    window.tsjs = {
+      recordAdTrace,
+      nextAdTraceGeneration: vi.fn().mockReturnValue(1),
+    } as any;
+    (globalThis as any).fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => 'application/json' },
+      json: async () => ({
+        seatbid: [
+          {
+            seat: 'aps',
+            bid: [
+              {
+                impid: 'slot1',
+                price: 1.23,
+                w: 300,
+                h: 250,
+                ext: { trusted_server: { renderer } },
+              },
+            ],
+          },
+        ],
+      }),
+    });
+
+    const { addAdUnits } = await import('../../src/core/registry');
+    const { requestAds } = await import('../../src/core/request');
+    document.body.innerHTML = '<div id="slot1"><span>existing</span></div>';
+    addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
+
+    requestAds();
+    await flushRequestAds();
+
+    const iframe = document.querySelector('#slot1 iframe') as HTMLIFrameElement | null;
+    expect(iframe).not.toBeNull();
+    expect(iframe!.src).toContain('/integrations/aps/renderer#tsaps=');
+    expect(iframe!.srcdoc).toBe('');
+    expect(iframe!.getAttribute('sandbox')).not.toContain('allow-same-origin');
+    expect(document.querySelector('#slot1 span')).not.toBeNull();
+    expect(recordAdTrace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'pb_render_served',
+        generation: 1,
+        reason: 'direct_aps_renderer',
+      })
+    );
+    expect(recordAdTrace).not.toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'aps_renderer_ready' })
+    );
+
+    const postMessage = vi.spyOn(iframe!.contentWindow!, 'postMessage');
+    iframe!.dispatchEvent(new Event('load'));
+    expect(document.querySelector('#slot1 span')).not.toBeNull();
+    expect(postMessage).toHaveBeenCalledWith(expect.objectContaining({ renderer }), '*');
+
+    const message = postMessage.mock.calls[0][0] as { nonce: string };
+    window.dispatchEvent(
+      new MessageEvent('message', {
+        data: { message: 'trusted-server/aps/renderer-ready', nonce: message.nonce },
+        source: iframe!.contentWindow,
+      })
+    );
+    expect(document.querySelector('#slot1 span')).toBeNull();
+    expect(recordAdTrace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'aps_renderer_ready',
+        generation: 1,
+        reason: 'direct_aps_renderer_ready',
+      })
+    );
+  });
+
+  it('does not mutate the slot for an invalid APS descriptor', async () => {
+    (globalThis as any).fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => 'application/json' },
+      json: async () => ({
+        seatbid: [
+          {
+            seat: 'aps',
+            bid: [
+              {
+                impid: 'slot1',
+                ext: {
+                  trusted_server: {
+                    renderer: { type: 'aps', version: 1, aaxResponse: 'invalid' },
+                  },
+                },
+              },
+            ],
+          },
+        ],
+      }),
+    });
+
+    const { addAdUnits } = await import('../../src/core/registry');
+    const { requestAds } = await import('../../src/core/request');
+    document.body.innerHTML = '<div id="slot1"><span>existing</span></div>';
+    addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
+
+    requestAds();
+    await flushRequestAds();
+
+    expect(document.querySelector('#slot1 iframe')).toBeNull();
+    expect(document.querySelector('#slot1 span')).not.toBeNull();
   });
 
   it('does not render on non-JSON response', async () => {
@@ -217,9 +342,8 @@ describe('request.requestAds', () => {
     expect(JSON.stringify(rejectionCall)).not.toContain('[object Object]');
   });
 
-  it('does not blank the slot when a later bid for the same slot is rejected', async () => {
-    // Regression: multi-bid scenario where a rejected bid must not erase an earlier
-    // successful render into the same slot.
+  it('rejects an ambiguous multi-winner response without blanking the slot', async () => {
+    // A final auction response must contain at most one winner per requested slot.
     const goodCreative = '<div>Safe Ad</div>';
     (globalThis as any).fetch = vi.fn().mockResolvedValue({
       ok: true,
@@ -243,16 +367,14 @@ describe('request.requestAds', () => {
     const { addAdUnits } = await import('../../src/core/registry');
     const { requestAds } = await import('../../src/core/request');
 
-    document.body.innerHTML = '<div id="slot1"></div>';
+    document.body.innerHTML = '<div id="slot1"><span>existing</span></div>';
     addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
 
     requestAds();
     await flushRequestAds();
 
-    // The good creative should have rendered; the bad one should not have blanked it.
-    const iframe = document.querySelector('#slot1 iframe') as HTMLIFrameElement | null;
-    expect(iframe).toBeTruthy();
-    expect(iframe!.srcdoc).toContain(goodCreative);
+    expect(document.querySelector('#slot1 iframe')).toBeNull();
+    expect(document.querySelector('#slot1')?.textContent).toContain('existing');
   });
 
   it('rejects creatives that sanitize to empty markup', async () => {
@@ -295,6 +417,178 @@ describe('request.requestAds', () => {
       })
     );
   });
+
+  it('keeps the latest direct owner when overlapping responses resolve out of order', async () => {
+    const resolves: Array<(response: Response) => void> = [];
+    (globalThis as any).fetch = vi.fn().mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolves.push(resolve);
+        })
+    );
+    const recordAdTrace = vi.fn();
+    window.tsjs = {
+      recordAdTrace,
+      nextAdTraceGeneration: vi.fn().mockReturnValueOnce(1).mockReturnValueOnce(2),
+    } as any;
+    const { addAdUnits } = await import('../../src/core/registry');
+    const { requestAds } = await import('../../src/core/request');
+    document.body.innerHTML = '<div id="slot1"><span>existing</span></div>';
+    addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
+
+    requestAds();
+    requestAds();
+    expect(resolves).toHaveLength(2);
+    const response = (creative: string) =>
+      ({
+        ok: true,
+        status: 200,
+        headers: { get: () => 'application/json' },
+        json: async () => ({
+          seatbid: [{ seat: 'trusted-server', bid: [{ impid: 'slot1', adm: creative }] }],
+        }),
+      }) as Response;
+
+    resolves[1](response('<div>new owner</div>'));
+    await flushRequestAds();
+    resolves[0](response('<div>stale owner</div>'));
+    await flushRequestAds();
+
+    const iframe = document.querySelector('#slot1 iframe') as HTMLIFrameElement;
+    expect(iframe.srcdoc).toContain('new owner');
+    expect(iframe.srcdoc).not.toContain('stale owner');
+    expect(recordAdTrace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'direct_render_rejected',
+        generation: 1,
+        reason: 'direct_owner_replaced',
+      })
+    );
+  });
+
+  it('records an exact direct auction winner, placement, and iframe load', async () => {
+    const auctionTraceId = '550e8400-e29b-41d4-a716-446655440000';
+    const bidTraceId = '123e4567-e89b-42d3-a456-426614174000';
+    const recordAdTrace = vi.fn();
+    window.tsjs = {
+      recordAdTrace,
+      nextAdTraceGeneration: vi.fn().mockReturnValue(1),
+    } as any;
+    (globalThis as any).fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => 'application/json' },
+      json: async () => ({
+        ext: {
+          trusted_server: {
+            trace: {
+              version: 1,
+              auction_trace_id: auctionTraceId,
+              source: 'auction_api',
+              outcome: 'completed',
+            },
+          },
+        },
+        seatbid: [
+          {
+            seat: 'trusted-server',
+            bid: [
+              {
+                impid: 'slot1',
+                adm: '<div>direct</div>',
+                ext: {
+                  trusted_server: {
+                    trace: {
+                      version: 1,
+                      auction_trace_id: auctionTraceId,
+                      bid_trace_id: bidTraceId,
+                      source: 'auction_api',
+                      slot_id: 'slot1',
+                      provider: 'prebid',
+                      bidder: 'example',
+                    },
+                  },
+                },
+              },
+            ],
+          },
+        ],
+      }),
+    });
+
+    const { addAdUnits } = await import('../../src/core/registry');
+    const { requestAds } = await import('../../src/core/request');
+    document.body.innerHTML = '<div id="slot1"></div>';
+    addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
+
+    requestAds();
+    await flushRequestAds();
+    expect(recordAdTrace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'ts_winner_observed',
+        generation: 1,
+        auctionTraceId,
+        bidTraceId,
+      })
+    );
+    expect(recordAdTrace).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'pb_render_served', reason: 'direct_iframe_created' })
+    );
+
+    const iframe = document.querySelector('#slot1 iframe') as HTMLIFrameElement;
+    iframe.dispatchEvent(new Event('load'));
+    expect(recordAdTrace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'creative_load_acknowledged',
+        generation: 1,
+        reason: 'direct_iframe_load',
+      })
+    );
+  });
+
+  it.each(['failed', 'abandoned'] as const)(
+    'preserves a direct auction %s terminal summary',
+    async (outcome) => {
+      const recordAdTrace = vi.fn();
+      window.tsjs = {
+        recordAdTrace,
+        nextAdTraceGeneration: vi.fn().mockReturnValue(1),
+      } as any;
+      (globalThis as any).fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        headers: { get: () => 'application/json' },
+        json: async () => ({
+          ext: {
+            trusted_server: {
+              trace: {
+                version: 1,
+                auction_trace_id: '550e8400-e29b-41d4-a716-446655440000',
+                source: 'auction_api',
+                outcome,
+              },
+            },
+          },
+          seatbid: [],
+        }),
+      });
+      const { addAdUnits } = await import('../../src/core/registry');
+      const { requestAds } = await import('../../src/core/request');
+      document.body.innerHTML = '<div id="slot1"></div>';
+      addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
+
+      requestAds();
+      await flushRequestAds();
+
+      expect(recordAdTrace).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: 'ts_auction_observed',
+          outcome,
+          reason: 'terminal_summary',
+        })
+      );
+    }
+  );
 
   it('skips iframe insertion when slot is missing', async () => {
     // mock fetch for unified auction endpoint - returns inline HTML

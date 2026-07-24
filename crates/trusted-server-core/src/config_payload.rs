@@ -79,6 +79,30 @@ mod tests {
     }
 
     #[test]
+    fn legacy_blob_without_rewrite_creatives_leaves_rewriting_disabled() {
+        let mut data =
+            serde_json::to_value(test_settings()).expect("should serialize settings to JSON");
+        let auction = data
+            .get_mut("auction")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("should serialize auction settings as an object");
+        assert!(
+            auction.remove("rewrite_creatives").is_some(),
+            "should remove the newly serialized setting"
+        );
+        let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_string());
+        let envelope_json = serde_json::to_string(&envelope).expect("should serialize envelope");
+
+        let reconstructed =
+            settings_from_config_blob(&envelope_json).expect("should reconstruct legacy settings");
+
+        assert!(
+            !reconstructed.auction.rewrite_creatives,
+            "creative rewriting is opt-in: a blob without the field leaves it disabled"
+        );
+    }
+
+    #[test]
     fn strings_that_look_like_json_scalars_round_trip_as_strings() {
         let mut original = test_settings();
         original.publisher.proxy_secret = Redacted::new("1234567890".to_string());

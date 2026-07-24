@@ -705,13 +705,10 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
 
         let mut builder = RouterService::builder()
             .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
+            // Normalize and sanitize outside auth so even auth short-circuits
+            // cannot forward reserved console inputs or skip response actions.
+            .middleware(NormalizeMiddleware::new(Arc::clone(&state.settings)))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
-            // Innermost middleware: normalize every routed request (strip
-            // spoofable forwarded headers, derive the trusted Host/scheme/client-IP
-            // from Spin's synthetic runtime headers) so no handler can opt out of
-            // the de-spoofing invariant. Runs after auth so the basic-auth gate
-            // continues to see the original request, matching prior behaviour.
-            .middleware(NormalizeMiddleware::new())
             // Cheap liveness probe, matching the Fastly/Axum adapters. Registered
             // explicitly so it is not absorbed by the publisher `/{*rest}` fallback.
             .get("/health", |_ctx: RequestContext| async {
