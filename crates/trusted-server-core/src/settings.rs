@@ -2055,6 +2055,12 @@ impl Settings {
         settings.validate_admin_coverage()?;
         settings.validate_admin_handler_passwords()?;
 
+        if settings.auction.enabled && !settings.auction.rewrite_creatives {
+            log::warn!(
+                "Auction creative rewriting disabled; creative assets and clicks may contact third-party hosts directly"
+            );
+        }
+
         Ok(settings)
     }
 
@@ -4377,6 +4383,41 @@ origin_host_header_overide = "www.example.com""#,
         // Invalid URLs should not crash and should return false
         assert!(!rewrite.is_excluded("not a url"));
         assert!(!rewrite.is_excluded(""));
+    }
+
+    #[test]
+    fn test_auction_rewrite_creatives_defaults_to_true_when_omitted() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [auction]
+            enabled = true
+            providers = []
+            "#;
+
+        let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
+
+        assert!(
+            settings.auction.rewrite_creatives,
+            "should preserve creative rewriting when the setting is omitted"
+        );
+    }
+
+    #[test]
+    fn test_auction_rewrite_creatives_accepts_explicit_false() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [auction]
+            enabled = true
+            providers = []
+            rewrite_creatives = false
+            "#;
+
+        let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
+
+        assert!(
+            !settings.auction.rewrite_creatives,
+            "should disable creative rewriting when explicitly configured"
+        );
     }
 
     #[test]

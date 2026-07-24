@@ -2392,6 +2392,28 @@ mod tests {
     }
 
     #[test]
+    fn proxy_sign_rejects_excluded_absolute_url() {
+        futures::executor::block_on(async {
+            let mut settings = create_test_settings();
+            settings.rewrite.exclude_domains = vec!["cdn.example".to_owned()];
+            let body = serde_json::json!({
+                "url": "https://cdn.example/asset.js",
+            });
+            let req = build_http_post_json_request("https://edge.example/first-party/sign", &body);
+            let err: Report<TrustedServerError> =
+                handle_first_party_proxy_sign(&settings, &noop_services(), req)
+                    .await
+                    .expect_err("should reject excluded URL");
+
+            assert_eq!(
+                err.current_context().status_code(),
+                StatusCode::BAD_GATEWAY,
+                "should reject excluded absolute URLs as unsupported"
+            );
+        });
+    }
+
+    #[test]
     fn proxy_sign_preserves_non_standard_port() {
         futures::executor::block_on(async {
             let settings = create_test_settings();
@@ -2882,6 +2904,51 @@ mod tests {
         let body = response_body_string(out);
         assert!(body.contains("/first-party/proxy?tsurl="), "{}", body);
         assert_eq!(ct, "text/css; charset=utf-8");
+    }
+
+    #[test]
+    fn auction_rewrite_setting_does_not_change_proxied_html_or_css_rewriting() {
+        let mut settings = create_test_settings();
+        settings.auction.rewrite_creatives = false;
+        let req = build_http_request(Method::GET, "https://edge.example/first-party/proxy");
+
+        let html = r#"<html><body><img src="https://cdn.example/ad.png"></body></html>"#;
+        let mut html_response = build_http_response(StatusCode::OK, EdgeBody::from(html));
+        html_response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        let html_output = finalize(
+            &settings,
+            &req,
+            "https://cdn.example/creative.html",
+            html_response,
+        )
+        .expect("should finalize proxied HTML");
+        let html_body = response_body_string(html_output);
+
+        let css = "body{background:url(https://cdn.example/bg.png)}";
+        let mut css_response = build_http_response(StatusCode::OK, EdgeBody::from(css));
+        css_response
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/css"));
+        let css_output = finalize(
+            &settings,
+            &req,
+            "https://cdn.example/creative.css",
+            css_response,
+        )
+        .expect("should finalize proxied CSS");
+        let css_body = response_body_string(css_output);
+
+        assert!(
+            html_body.contains("/first-party/proxy?tsurl="),
+            "should keep rewriting proxied HTML when auction rewriting is disabled: {html_body}"
+        );
+        assert!(
+            css_body.contains("/first-party/proxy?tsurl="),
+            "should keep rewriting proxied CSS when auction rewriting is disabled: {css_body}"
+        );
     }
 
     #[test]

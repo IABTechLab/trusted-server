@@ -112,6 +112,11 @@ rewrite_script = true
 
 [auction]
 enabled = false
+# Defaults to true. Keep this leaf present when using the EdgeZero v0.0.4
+# environment override. Set false to return sanitized but unre-written winning-bid
+# adm, skipping proxy/click URL conversion and creative TSJS injection.
+# Sanitization is always applied. Restore and push true before an older-binary rollback.
+rewrite_creatives = true
 providers = []
 timeout_ms = 2000
 allowed_context_keys = []
