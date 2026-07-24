@@ -10,8 +10,8 @@
 //   - Both implementations must set `window.tsjs.servicesEnabled = true`
 //     after calling `enableSingleRequest()`/`enableServices()` so a
 //     subsequent call becomes a no-op.
-//   - `refresh()` is called only for TS-defined slots in this pass and
-//     publisher requests the initial gate held, never the global slot list.
+//   - `refresh()` is called only for the slots defined in this pass,
+//     never the global slot list.
 //
 // Only installed if `window.tsjs.adInit` isn't already defined.
 (function () {
@@ -49,45 +49,6 @@
         return slot.getSlotElementId() === elementId;
       }) || null
     );
-  }
-
-  function configuredSlotForElementId(elementId) {
-    return (ts.adSlots || []).find(function (slot) {
-      return (
-        slot.div_id &&
-        (elementId === slot.div_id || elementId.startsWith(slot.div_id)) &&
-        !elementId.endsWith("-container")
-      );
-    });
-  }
-
-  function initialRequestGate() {
-    if (!ts.gptInitialRequestGate) {
-      ts.gptInitialRequestGate = {
-        pendingDisplays: {},
-        pendingRefreshes: {},
-        released: false,
-      };
-    }
-    return ts.gptInitialRequestGate;
-  }
-
-  function takeInitialPublisherRequests(pubads) {
-    var gate = initialRequestGate();
-    if (gate.released) return { displayIds: [], refreshSlots: [] };
-
-    gate.released = true;
-    var displayIds = Object.keys(gate.pendingDisplays);
-    var refreshIds = Object.keys(gate.pendingRefreshes);
-    gate.pendingDisplays = {};
-    gate.pendingRefreshes = {};
-    var slots = pubads.getSlots ? pubads.getSlots() : [];
-    return {
-      displayIds: displayIds,
-      refreshSlots: slots.filter(function (slot) {
-        return refreshIds.includes(slot.getSlotElementId());
-      }),
-    };
   }
 
   function runHandoffInternal(callback) {
@@ -160,15 +121,6 @@
             handoff.suppressPublisherDisplay = false;
             return;
           }
-          var gate = initialRequestGate();
-          if (
-            !ts.gptSlotHandoffInternal &&
-            !gate.released &&
-            configuredSlotForElementId(elementId)
-          ) {
-            gate.pendingDisplays[elementId] = true;
-            return;
-          }
           originalDisplay(elementId);
         };
         patchedDisplay.__tsSlotHandoffPatched = true;
@@ -189,22 +141,13 @@
             return;
           }
           var suppressed = false;
-          var gate = initialRequestGate();
           var remainingSlots = slots.filter(function (slot) {
             var handoff =
               ts.gptSlotHandoffs && ts.gptSlotHandoffs[slot.getSlotElementId()];
-            if (handoff && handoff.suppressPublisherRefresh) {
-              handoff.suppressPublisherRefresh = false;
-              suppressed = true;
-              return false;
-            }
-            var elementId = slot.getSlotElementId();
-            if (!gate.released && configuredSlotForElementId(elementId)) {
-              gate.pendingRefreshes[elementId] = true;
-              suppressed = true;
-              return false;
-            }
-            return true;
+            if (!handoff || !handoff.suppressPublisherRefresh) return true;
+            handoff.suppressPublisherRefresh = false;
+            suppressed = true;
+            return false;
           });
           if (!suppressed) {
             originalRefresh(requestedSlots);
@@ -229,15 +172,13 @@
       // Slots TS defined itself — tracked for SPA destroy. Publisher-owned
       // slots are reused but never destroyed by TS on navigation.
       var newSlots = [];
-      // Publisher-owned slots can be refreshed on SPA navigation. On initial
-      // load their first request is held until the targeting below is applied.
+      // Publisher-owned slots TS reused — refreshed to pick up server-side
+      // targeting. The publisher already display()ed these.
       var slotsToRefresh = [];
-      var isInitialAdInit = !ts.gptInitialAdInitCompleted;
       // Element IDs of slots TS defined itself. GPT requires display() to
       // register/render a freshly-defined slot; refresh() alone no-ops for a
       // slot that was never displayed, so these are display()ed instead.
       var slotsToDisplay = [];
-      var hasAppliedTargeting = false;
       slots.forEach(function (slot) {
         // Resolve actual div ID: exact match first, then safe prefix scan.
         // div_id in config may be a stable prefix (e.g. "ad-header-0-") when
@@ -304,7 +245,6 @@
         });
         // Keep in sync with TS_INITIAL_TARGETING_KEY in index.ts
         s.setTargeting("ts_initial", "1");
-        hasAppliedTargeting = true;
         // Map the resolved inner div to the slot ID. This bootstrap fires no
         // beacons and registers no slotRenderEnded listener; the map is consumed
         // by the bundle's render bridge (index.ts) once it loads.
@@ -317,36 +257,34 @@
           newSlots.push(s);
           var displayId = s.getSlotElementId() || actualDivId;
           slotsToDisplay.push(displayId);
-        } else if (!isInitialAdInit) {
+        } else {
           slotsToRefresh.push(s);
         }
       });
       ts.prevGptSlots = newSlots;
       ts.divToSlotId = divToSlotId;
-      var heldPublisherRequests = isInitialAdInit
-        ? takeInitialPublisherRequests(googletag.pubads())
-        : { displayIds: [], refreshSlots: [] };
-      ts.gptInitialAdInitCompleted = true;
-      if (!ts.servicesEnabled && (hasAppliedTargeting || heldPublisherRequests.displayIds.length > 0 || heldPublisherRequests.refreshSlots.length > 0)) {
+      if (!ts.servicesEnabled) {
         googletag.pubads().enableSingleRequest();
         googletag.enableServices();
         ts.servicesEnabled = true;
       }
-      // Register/render TS-defined slots and replay publisher displays held
-      // before server-side bids were available. The replay is the publisher's
-      // one initial request, not a later TS refresh.
-      heldPublisherRequests.displayIds.concat(slotsToDisplay).forEach(function (divId) {
+      // Register and render TS-defined slots. GPT requires display() for a
+      // freshly-defined slot; without it the slot no-ops and misses its
+      // impression. Runs after enableServices(); on SPA navigation services are
+      // already enabled, so this runs unconditionally for new slots.
+      slotsToDisplay.forEach(function (divId) {
         runHandoffInternal(function () {
           googletag.display(divId);
         });
       });
-      // Replay held publisher refreshes after targeting. On SPA navigation TS
-      // refreshes reused publisher slots as before; TS-defined slots need a
-      // refresh only when initial load was disabled.
-      var slotsNeedingRefresh = heldPublisherRequests.refreshSlots.concat(
-        slotsToRefresh,
-        ts.gptInitialLoadDisabled ? newSlots : [],
-      );
+      // Reused publisher-owned slots always need a refresh to pick up the
+      // server-side targeting. TS-defined slots are fetched by display() above
+      // unless the publisher disabled initial load, in which case display() only
+      // registers them and refresh() must request the ad — otherwise they render
+      // blank. Only add them in that case to avoid double-requesting.
+      var slotsNeedingRefresh = ts.gptInitialLoadDisabled
+        ? slotsToRefresh.concat(newSlots)
+        : slotsToRefresh;
       if (slotsNeedingRefresh.length > 0) {
         // One-shot bypass: this internal refresh delivers the just-applied
         // server-side targeting to GAM. If slim-Prebid has already wrapped

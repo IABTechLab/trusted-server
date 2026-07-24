@@ -1,7 +1,6 @@
 # Prevent Duplicate GPT Slot Requests — Implementation Plan
 
-> **Status:** Revised after production-like validation found a second request for
-> publisher-owned slots when hydration-safe scheduling defers `adInit()`.
+> **Status:** Implemented locally; production-like browser validation remains pending.
 >
 > **Spec:** `docs/superpowers/specs/2026-07-24-prevent-duplicate-gpt-slot-requests-design.md`
 
@@ -9,11 +8,10 @@
 TS `adInit()` runs before a publisher later defines the placement's inner GPT div.
 
 **Architecture:** TS creates its fallback on the resolved inner div and records a
-handoff claim. Narrow, idempotent GPT wrappers also gate a configured publisher
-slot's first `display`/`refresh` while the server auction result is unavailable. At
-`adInit()`, TS applies targeting to that same publisher slot and replays the held
-native request once; it does not issue a second TS refresh. Late-definition handoff
-and SPA ownership transfer remain unchanged. The head bootstrap and full TSJS bundle
+handoff claim. Narrow, idempotent wrappers around GPT's `defineSlot`, `display`, and
+`pubads().refresh` alias a matching late publisher definition to that slot and
+suppress only the duplicate initial publisher request. A successful handoff transfers
+SPA-destruction ownership to the publisher. The head bootstrap and full TSJS bundle
 share this runtime protocol through `window.tsjs`.
 
 **Primary files:**
@@ -45,9 +43,9 @@ share this runtime protocol through `window.tsjs`.
 - Modify `crates/trusted-server-js/lib/src/core/types.ts`
 - Modify `crates/trusted-server-js/lib/src/integrations/gpt/index.ts`
 
-- [ ] Add `TsjsApi` state for both the div-ID-keyed late-handoff registry and an
-      initial publisher-request gate. The gate records held display/refresh IDs and
-      a released marker so it applies only once per page load.
+- [ ] Add a `TsjsApi` property for a div-ID-keyed handoff registry. Each entry must
+      retain serializable lifecycle flags: TS-created, ownership-transferred, initial
+      request made, and one-shot publisher display/refresh suppression state.
 - [ ] Add only the minimal optional/internal type surface needed for idempotence
       markers on GPT functions and `pubads`. Do not weaken the public GPT types with
       `any`.
@@ -83,14 +81,14 @@ npx vitest run test/integrations/gpt/ad_init.test.ts test/integrations/gpt/index
     returning it;
   - log, but do not create a second slot, if publisher arguments differ from the TS
     configuration.
-- [ ] `display` wrapper: consume the one permitted post-handoff display; before the
-      first `adInit()`, also hold a configured publisher slot's native display.
-- [ ] `refresh` wrapper: consume one permitted post-handoff disabled-load refresh;
-      before the first `adInit()`, hold configured publisher refreshes and forward
-      all unrelated slots explicitly, including a no-argument/global refresh.
-- [ ] At initial `adInit()`, apply targeting then replay held native calls; never
-      refresh an existing publisher-owned slot that has already requested.
-- [ ] Ensure wrapper installation precedes publisher setup and fallback creation.
+- [ ] `display` wrapper: consume the one permitted publisher post-handoff display
+      call without invoking native `display`; pass every other call through unchanged.
+- [ ] `refresh` wrapper: when initial load was disabled, consume the one permitted
+      post-handoff refresh for each claimed slot. If called with no slot list, expand
+      `getSlots()`, filter only the claimed slots, and forward the remaining slots
+      explicitly. Preserve all unrelated refreshes.
+- [ ] Ensure wrapper installation precedes the fallback definition path and does not
+      change existing publisher-owned-slot behavior.
 
 **Focused checks:**
 
@@ -138,9 +136,8 @@ npx vitest run test/integrations/gpt/ad_init.test.ts
       makes one request; the publisher's first refresh cannot make a second request.
 - [ ] Add a no-argument publisher refresh test containing an unrelated slot. Assert
       the claimed slot is suppressed once and the unrelated slot is refreshed.
-- [ ] Add publisher-owned tests proving TS holds normal and disabled-load initial
-      requests, applies targeting, and replays exactly one native request. Also prove
-      an already-requested publisher slot is not refreshed again.
+- [ ] Add an already publisher-owned test proving TS does not install a claim, applies
+      targeting, and refreshes that slot.
 - [ ] Add a no-publisher test proving TS still creates, displays, and requests its
       inner-div slot exactly once.
 - [ ] Add a SPA handoff test: after late publisher claim, the next `adInit()` does not
@@ -156,8 +153,8 @@ npx vitest run test/integrations/gpt/ad_init.test.ts
 - Modify `crates/trusted-server-core/src/integrations/gpt_bootstrap.js`
 - Modify `crates/trusted-server-core/src/integrations/gpt.rs`
 
-- [ ] Port the same initial-request gate, actual-inner-div fallback, registry names,
-      lifecycle flags, and idempotence markers to the plain-JavaScript bootstrap.
+- [ ] Port the same actual-inner-div fallback, registry names, lifecycle flags, and
+      idempotence markers to the plain-JavaScript bootstrap.
 - [ ] Use the existing bootstrap `window.tsjs` properties exactly so `index.ts` can
       adopt the initial claim after the bundle loads.
 - [ ] Ensure its internal definition/display/refresh calls use the same guards as the
@@ -201,10 +198,9 @@ npx vitest run test/integrations/gpt/ad_init.test.ts
       format.
 - [ ] Review the diff specifically for bootstrap/bundle protocol drift and for any
       use of container IDs in GPT slot creation.
-- [ ] In a controlled production-like browser capture with the hydration-safe
-      deferred `adInit()` path, verify one targeted initial request for each affected
-      visible placement and independently verify an unrelated placement remains
-      requestable.
+- [ ] In a controlled production-like browser capture, verify one initial request for
+      each affected visible placement and independently verify an unrelated placement
+      remains requestable.
 - [ ] Update issue #944 with the ownership-handoff decision, test evidence, and
       browser-capture result.
 

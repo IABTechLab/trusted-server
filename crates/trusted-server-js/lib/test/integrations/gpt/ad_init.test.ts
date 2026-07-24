@@ -77,7 +77,7 @@ describe('installTsAdInit', () => {
     document.getElementById("ad'prefix-real")?.remove();
   });
 
-  it('reads window.tsjs.bids synchronously without re-requesting an existing publisher slot', async () => {
+  it('reads window.tsjs.bids synchronously and applies bid targeting before refresh', async () => {
     const mockSlot = {
       addService: vi.fn().mockReturnThis(),
       setTargeting: vi.fn().mockReturnThis(),
@@ -133,128 +133,9 @@ describe('installTsAdInit', () => {
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_cache_host', 'cache.example.com');
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_cache_path', '/pbc/v1/cache');
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_initial', '1');
-    expect(mockPubads.refresh).not.toHaveBeenCalled();
+    expect(mockPubads.refresh).toHaveBeenCalled();
 
     fetchSpy.mockRestore();
-  });
-
-  it('holds and replays a publisher display once after applying initial targeting', async () => {
-    const requests: string[] = [];
-    const mockSlot = {
-      addService: vi.fn().mockReturnThis(),
-      setTargeting: vi.fn().mockReturnThis(),
-      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
-      getTargeting: vi.fn().mockReturnValue([]),
-    };
-    const nativeDisplay = vi.fn((elementId: string) => requests.push(elementId));
-    const nativeRefresh = vi.fn();
-    const mockPubads = {
-      enableSingleRequest: vi.fn(),
-      getSlots: vi.fn().mockReturnValue([mockSlot]),
-      addEventListener: vi.fn(),
-      refresh: nativeRefresh,
-    };
-    const googletag = {
-      cmd: { push: vi.fn((fn: () => void) => fn()) },
-      defineSlot: vi.fn().mockReturnValue(mockSlot),
-      display: nativeDisplay,
-      pubads: vi.fn().mockReturnValue(mockPubads),
-      enableServices: vi.fn(),
-    };
-    (window as TestWindow).googletag = googletag;
-    (window as TestWindow).tsjs = {
-      adSlots: [
-        {
-          id: 'atf_sidebar_ad',
-          gam_unit_path: '/123/atf',
-          div_id: 'div-atf-sidebar',
-          formats: [[300, 250]],
-          targeting: { pos: 'atf' },
-        },
-      ],
-      bids: { atf_sidebar_ad: { hb_pb: '1.00' } },
-    };
-
-    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
-    installTsAdInit();
-
-    googletag.display('div-atf-sidebar');
-    expect(nativeDisplay).not.toHaveBeenCalled();
-
-    (window as TestWindow).tsjs!.adInit!();
-
-    expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_pb', '1.00');
-    expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_initial', '1');
-    expect(nativeDisplay).toHaveBeenCalledTimes(1);
-    expect(requests).toEqual(['div-atf-sidebar']);
-    expect(nativeRefresh).not.toHaveBeenCalled();
-  });
-
-  it('holds and replays a disabled-load publisher refresh once after targeting', async () => {
-    const requests: string[] = [];
-    let initialLoadDisabled = false;
-    const mockSlot = {
-      addService: vi.fn().mockReturnThis(),
-      setTargeting: vi.fn().mockReturnThis(),
-      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
-      getTargeting: vi.fn().mockReturnValue([]),
-    };
-    const unrelatedSlot = {
-      getSlotElementId: vi.fn().mockReturnValue('div-unrelated'),
-    };
-    const nativeDisplay = vi.fn((elementId: string) => {
-      if (!initialLoadDisabled) requests.push(elementId);
-    });
-    const nativeRefresh = vi.fn((slots?: Array<typeof mockSlot | typeof unrelatedSlot>) => {
-      (slots ?? [mockSlot, unrelatedSlot]).forEach((slot) =>
-        requests.push(slot.getSlotElementId())
-      );
-    });
-    const mockPubads = {
-      enableSingleRequest: vi.fn(),
-      getSlots: vi.fn().mockReturnValue([mockSlot, unrelatedSlot]),
-      addEventListener: vi.fn(),
-      refresh: nativeRefresh,
-      disableInitialLoad: vi.fn(() => {
-        initialLoadDisabled = true;
-      }),
-    };
-    const googletag = {
-      cmd: { push: vi.fn((fn: () => void) => fn()) },
-      defineSlot: vi.fn().mockReturnValue(mockSlot),
-      display: nativeDisplay,
-      pubads: vi.fn().mockReturnValue(mockPubads),
-      enableServices: vi.fn(),
-    };
-    (window as TestWindow).googletag = googletag;
-    (window as TestWindow).tsjs = {
-      adSlots: [
-        {
-          id: 'atf_sidebar_ad',
-          gam_unit_path: '/123/atf',
-          div_id: 'div-atf-sidebar',
-          formats: [[300, 250]],
-          targeting: {},
-        },
-      ],
-      bids: { atf_sidebar_ad: { hb_pb: '1.00' } },
-    };
-
-    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
-    installTsAdInit();
-    mockPubads.disableInitialLoad();
-    googletag.display('div-atf-sidebar');
-    mockPubads.refresh();
-    expect(nativeDisplay).not.toHaveBeenCalled();
-    expect(nativeRefresh).toHaveBeenCalledWith([unrelatedSlot]);
-
-    (window as TestWindow).tsjs!.adInit!();
-
-    expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_pb', '1.00');
-    expect(nativeDisplay).toHaveBeenCalledTimes(1);
-    expect(nativeRefresh).toHaveBeenCalledTimes(2);
-    expect(nativeRefresh).toHaveBeenLastCalledWith([mockSlot]);
-    expect(requests).toEqual(['div-unrelated', 'div-atf-sidebar']);
   });
 
   it('displays TS-defined slots and does not include them in refresh', async () => {
@@ -563,9 +444,6 @@ describe('installTsAdInit', () => {
         },
       ],
       bids: {},
-      // This models a route update: existing publisher slots are refreshed on
-      // SPA navigation, while initial-load publisher slots are not re-requested.
-      gptInitialAdInitCompleted: true,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any;
 
@@ -711,7 +589,7 @@ describe('installTsAdInit', () => {
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_bidder', 'mocktioneer');
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_adid', 'debug-uuid');
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_initial', '1');
-    expect(mockPubads.refresh).not.toHaveBeenCalled();
+    expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
   });
 
   it('does not fire win/billing beacons from slotRenderEnded targeting alone', async () => {
@@ -1036,7 +914,7 @@ describe('installTsAdInit', () => {
     delete (window as TestWindow).apstag;
   });
 
-  it('does not re-request an existing publisher slot when tsjs.bids is empty', async () => {
+  it('calls refresh even when tsjs.bids is empty (graceful fallback)', async () => {
     const emptyTestSlot = {
       addService: vi.fn().mockReturnThis(),
       setTargeting: vi.fn().mockReturnThis(),
@@ -1075,7 +953,7 @@ describe('installTsAdInit', () => {
     installTsAdInit();
     (window as TestWindow).tsjs!.adInit!();
 
-    expect(mockPubads.refresh).not.toHaveBeenCalled();
+    expect(mockPubads.refresh).toHaveBeenCalled();
   });
 
   it('resolves dynamic div prefixes without interpolating div_id into a CSS selector', async () => {
@@ -1118,7 +996,7 @@ describe('installTsAdInit', () => {
     installTsAdInit();
 
     expect(() => (window as TestWindow).tsjs!.adInit!()).not.toThrow();
-    expect(mockPubads.refresh).not.toHaveBeenCalled();
+    expect(mockPubads.refresh).toHaveBeenCalledWith([dynamicSlot]);
   });
 });
 
