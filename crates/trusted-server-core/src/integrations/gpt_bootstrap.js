@@ -42,6 +42,127 @@
     pubads.__tsInitialLoadHooked = true;
   });
 
+  function findSlotByElementId(pubads, elementId) {
+    var slots = pubads.getSlots ? pubads.getSlots() : [];
+    return (
+      slots.find(function (slot) {
+        return slot.getSlotElementId() === elementId;
+      }) || null
+    );
+  }
+
+  function runHandoffInternal(callback) {
+    var wasInternal = ts.gptSlotHandoffInternal;
+    ts.gptSlotHandoffInternal = true;
+    try {
+      return callback();
+    } finally {
+      ts.gptSlotHandoffInternal = wasInternal;
+    }
+  }
+
+  // TS cannot wait an arbitrary amount of time for a framework to define a
+  // slot: publishers that never define one would render blank. Instead, TS
+  // defines its fallback on the actual inner div and aliases only a later
+  // publisher defineSlot() for that exact div to the same GPT slot.
+  function installSlotHandoff() {
+    window.googletag.cmd.push(function () {
+      var tag = window.googletag;
+      var pubads = tag.pubads && tag.pubads();
+      if (!tag.defineSlot || !tag.display || !pubads) return;
+
+      if (!tag.defineSlot.__tsSlotHandoffPatched) {
+        var originalDefineSlot = tag.defineSlot.bind(tag);
+        var patchedDefineSlot = function (adUnitPath, formats, elementId) {
+          var handoff = ts.gptSlotHandoffs && ts.gptSlotHandoffs[elementId];
+          if (!ts.gptSlotHandoffInternal && handoff) {
+            var existingSlot = findSlotByElementId(pubads, elementId);
+            if (existingSlot) {
+              if (!handoff.publisherClaimed) {
+                handoff.publisherClaimed = true;
+                handoff.suppressPublisherDisplay = true;
+                handoff.suppressPublisherRefresh =
+                  ts.gptInitialLoadDisabled === true;
+                ts.prevGptSlots = (ts.prevGptSlots || []).filter(
+                  function (ownedSlot) {
+                    return ownedSlot !== existingSlot;
+                  },
+                );
+                if (
+                  handoff.gamUnitPath !== adUnitPath ||
+                  JSON.stringify(handoff.formats) !== JSON.stringify(formats)
+                ) {
+                  ts.log &&
+                    ts.log.warn &&
+                    ts.log.warn(
+                      "GPT slot handoff: publisher definition differs from TS configuration",
+                      elementId,
+                    );
+                }
+              }
+              return existingSlot;
+            }
+          }
+          return originalDefineSlot(adUnitPath, formats, elementId);
+        };
+        patchedDefineSlot.__tsSlotHandoffPatched = true;
+        tag.defineSlot = patchedDefineSlot;
+      }
+
+      if (!tag.display.__tsSlotHandoffPatched) {
+        var originalDisplay = tag.display.bind(tag);
+        var patchedDisplay = function (elementId) {
+          var handoff = ts.gptSlotHandoffs && ts.gptSlotHandoffs[elementId];
+          if (
+            !ts.gptSlotHandoffInternal &&
+            handoff &&
+            handoff.suppressPublisherDisplay
+          ) {
+            handoff.suppressPublisherDisplay = false;
+            return;
+          }
+          originalDisplay(elementId);
+        };
+        patchedDisplay.__tsSlotHandoffPatched = true;
+        tag.display = patchedDisplay;
+      }
+
+      if (!pubads.refresh.__tsSlotHandoffPatched) {
+        var originalRefresh = pubads.refresh.bind(pubads);
+        var patchedRefresh = function (requestedSlots) {
+          if (ts.gptSlotHandoffInternal) {
+            originalRefresh(requestedSlots);
+            return;
+          }
+          var slots =
+            requestedSlots || (pubads.getSlots ? pubads.getSlots() : null);
+          if (!slots) {
+            originalRefresh(requestedSlots);
+            return;
+          }
+          var suppressed = false;
+          var remainingSlots = slots.filter(function (slot) {
+            var handoff =
+              ts.gptSlotHandoffs && ts.gptSlotHandoffs[slot.getSlotElementId()];
+            if (!handoff || !handoff.suppressPublisherRefresh) return true;
+            handoff.suppressPublisherRefresh = false;
+            suppressed = true;
+            return false;
+          });
+          if (!suppressed) {
+            originalRefresh(requestedSlots);
+          } else if (remainingSlots.length > 0) {
+            originalRefresh(remainingSlots);
+          }
+        };
+        patchedRefresh.__tsSlotHandoffPatched = true;
+        pubads.refresh = patchedRefresh;
+      }
+    });
+  }
+
+  installSlotHandoff();
+
   ts.adInit = function () {
     var slots = ts.adSlots || [];
     var bids = ts.bids || {};
@@ -88,15 +209,26 @@
           }) || null;
         var tsOwned = false;
         if (!s) {
-          // Use outer container div for TS's slot when publisher hasn't defined
-          // theirs yet — keeps both slots on separate divs so publisher's
-          // later defineSlot on the inner div doesn't conflict.
-          var containerEl = document.getElementById(actualDivId + "-container");
-          var slotDivId = containerEl ? containerEl.id : actualDivId;
-          s = googletag.defineSlot(slot.gam_unit_path, slot.formats, slotDivId);
+          // Define TS's fallback on the publisher's actual div. The scoped
+          // handoff wrapper returns this slot if the publisher defines it later.
+          s = runHandoffInternal(function () {
+            return googletag.defineSlot(
+              slot.gam_unit_path,
+              slot.formats,
+              actualDivId,
+            );
+          });
           if (!s) return;
           s.addService(googletag.pubads());
           tsOwned = true;
+          ts.gptSlotHandoffs = ts.gptSlotHandoffs || {};
+          ts.gptSlotHandoffs[actualDivId] = {
+            gamUnitPath: slot.gam_unit_path,
+            formats: slot.formats,
+            publisherClaimed: false,
+            suppressPublisherDisplay: false,
+            suppressPublisherRefresh: false,
+          };
         }
 
         Object.entries(slot.targeting || {}).forEach(function (e) {
@@ -113,11 +245,9 @@
         });
         // Keep in sync with TS_INITIAL_TARGETING_KEY in index.ts
         s.setTargeting("ts_initial", "1");
-        // Map both the inner div and the GPT slot's element ID (the
-        // "-container" div when TS defined the slot there) into divToSlotId.
-        // This bootstrap fires no beacons and registers no slotRenderEnded
-        // listener; the map is consumed by the bundle's render bridge (index.ts)
-        // once it loads, which reports the GPT slot element ID.
+        // Map the resolved inner div to the slot ID. This bootstrap fires no
+        // beacons and registers no slotRenderEnded listener; the map is consumed
+        // by the bundle's render bridge (index.ts) once it loads.
         divToSlotId[actualDivId] = slot.id;
         var slotElementId = s.getSlotElementId();
         if (slotElementId && slotElementId !== actualDivId) {
@@ -143,7 +273,9 @@
       // impression. Runs after enableServices(); on SPA navigation services are
       // already enabled, so this runs unconditionally for new slots.
       slotsToDisplay.forEach(function (divId) {
-        googletag.display(divId);
+        runHandoffInternal(function () {
+          googletag.display(divId);
+        });
       });
       // Reused publisher-owned slots always need a refresh to pick up the
       // server-side targeting. TS-defined slots are fetched by display() above
@@ -161,7 +293,9 @@
         // bundle's adInit() in crates/trusted-server-js/lib/src/integrations/gpt/index.ts.
         ts.adInitRefreshInProgress = true;
         try {
-          googletag.pubads().refresh(slotsNeedingRefresh);
+          runHandoffInternal(function () {
+            googletag.pubads().refresh(slotsNeedingRefresh);
+          });
         } finally {
           ts.adInitRefreshInProgress = false;
         }
