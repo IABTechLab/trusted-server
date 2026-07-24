@@ -70,6 +70,8 @@ interface InjectedPrebidConfig {
   bidders?: string[];
   /** Bidders that run client-side via native Prebid.js adapters. */
   clientSideBidders?: string[];
+  /** GAM ad-unit-path suffixes excluded from refresh auctions. */
+  excludedGamAdUnitPathSuffixes?: string[];
 }
 
 interface PrebidUserIdDiagnostics {
@@ -259,6 +261,7 @@ type PrebidUserIdEid = {
 
 type RefreshGptSlot = {
   getSlotElementId?: () => string;
+  getAdUnitPath?: () => string;
   getTargeting?: (key: string) => string[];
   clearTargeting?: (key?: string) => RefreshGptSlot;
   getSizes?: () => unknown[];
@@ -456,6 +459,25 @@ function serverSideBidderParamsForRefresh(
   }
 
   return params;
+}
+
+function isExcludedFromRefreshAuction(
+  slot: RefreshGptSlot,
+  excludedGamAdUnitPathSuffixes: Set<string>
+): boolean {
+  if (excludedGamAdUnitPathSuffixes.size === 0) return false;
+
+  try {
+    const adUnitPath = slot.getAdUnitPath?.();
+    return (
+      typeof adUnitPath === 'string' &&
+      [...excludedGamAdUnitPathSuffixes].some((suffix) => adUnitPath.endsWith(suffix))
+    );
+  } catch {
+    // GPT path metadata is optional for this optimization. If it is unavailable,
+    // preserve normal refresh-auction behavior rather than suppressing demand.
+    return false;
+  }
 }
 
 function clearRefreshTargeting(slot: RefreshGptSlot): void {
@@ -768,7 +790,17 @@ export function installRefreshHandler(timeoutMs = 1500): void {
 
       targetSlots.forEach(clearRefreshTargeting);
 
-      const adUnits = targetSlots.map((slot) => {
+      const excludedGamAdUnitPathSuffixes = new Set(
+        getInjectedConfig()?.excludedGamAdUnitPathSuffixes ?? []
+      );
+      const auctionSlots = targetSlots.filter(
+        (slot) => !isExcludedFromRefreshAuction(slot, excludedGamAdUnitPathSuffixes)
+      );
+      if (!auctionSlots.length) {
+        return originalRefresh(targetSlots, opts);
+      }
+
+      const adUnits = auctionSlots.map((slot) => {
         const injectedSlot = findInjectedSlotForRefresh(slot);
         const zone =
           injectedSlot?.targeting?.[ZONE_KEY] ?? firstTargetingValue(slot.getTargeting?.(ZONE_KEY));
