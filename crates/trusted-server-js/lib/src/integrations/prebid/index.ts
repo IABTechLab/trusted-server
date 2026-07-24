@@ -196,6 +196,15 @@ function recordUserIdModuleDiagnostics(): PrebidUserIdDiagnostics {
 /** Resolved endpoint — set by installPrebidNpm, read by the adapter. */
 let auctionEndpoint = '/auction';
 
+// Prebid normalizes each bid into its own internal object during `addBidResponse`,
+// which can drop unknown top-level fields — so the custom `trustedServerRenderer`
+// descriptor set in `interpretResponse` may be gone by the time the `bidResponse`
+// listener runs (observed in production: the field is absent as early as `bidAccepted`).
+// `meta` is a first-class field Prebid preserves through that normalization (its
+// bidderFactory assigns `bid.meta = bidResponse.meta` onto the normalized bid), so the
+// descriptor is also carried as `meta[APS_RENDERER_FIELD]` per bid and the `bidResponse`
+// listener falls back to it. Both copies are scrubbed after the registration attempt.
+
 /**
  * Convert parsed {@link AuctionBid}s into Prebid bid response objects,
  * linking each bid back to the original BidRequest via `requestId`.
@@ -223,9 +232,10 @@ export function auctionBidsToPrebidBids(auctionBids: AuctionBid[], bidRequests: 
     }
 
     const origReq = requestsByCode.get(bid.impid);
+    const requestId = origReq?.bidId ?? bid.impid;
     return [
       {
-        requestId: origReq?.bidId ?? bid.impid,
+        requestId,
         cpm: bid.price,
         width: bid.width,
         height: bid.height,
@@ -238,6 +248,9 @@ export function auctionBidsToPrebidBids(auctionBids: AuctionBid[], bidRequests: 
         bidderCode: bid.seat,
         meta: {
           advertiserDomains: bid.adomain,
+          // Carry the descriptor in `meta` too so registration survives Prebid
+          // stripping the custom top-level field.
+          ...(renderer ? { [APS_RENDERER_FIELD]: renderer } : {}),
         },
       },
     ];
@@ -826,12 +839,15 @@ function installApsBidResponseRegistry(): void {
 
   pbjs.onEvent('bidResponse', (rawBid) => {
     const bid = rawBid as unknown as Record<string, unknown>;
-    const renderer = bid[APS_RENDERER_FIELD];
-    if (
-      bid['adapterCode'] !== ADAPTER_CODE ||
-      bid['bidderCode'] !== APS_BIDDER_CODE ||
-      renderer === undefined
-    ) {
+    if (bid['adapterCode'] !== ADAPTER_CODE || bid['bidderCode'] !== APS_BIDDER_CODE) {
+      return;
+    }
+    // Prefer the custom top-level field; fall back to the per-bid copy in `meta` when
+    // Prebid has stripped the top-level one during bid normalization (the field is
+    // often gone before this listener runs).
+    const meta = bid['meta'] as Record<string, unknown> | undefined;
+    const renderer = bid[APS_RENDERER_FIELD] ?? meta?.[APS_RENDERER_FIELD];
+    if (renderer === undefined) {
       return;
     }
 
@@ -848,6 +864,9 @@ function installApsBidResponseRegistry(): void {
     // Keep the executable capability only in the bounded, one-time registry. Prebid
     // still owns the generated ad ID and ordinary GAM targeting on this bid object.
     delete bid[APS_RENDERER_FIELD];
+    if (meta) {
+      delete meta[APS_RENDERER_FIELD];
+    }
     if (!registered) {
       log.warn('[tsjs-prebid] rejected APS renderer capability that failed registration');
     }
