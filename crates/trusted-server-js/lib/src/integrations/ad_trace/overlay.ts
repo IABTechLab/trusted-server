@@ -12,6 +12,8 @@ import type {
 import { presentTraceOverlay } from './presentation';
 
 const HOST_ID = 'ts-ad-trace-overlay';
+const TRACE_CONTAINER_ID_RE = /^[\w.-]{1,64}$/;
+
 const TRACE_ATTRIBUTES = [
   'data-ts-trace-seq',
   'data-ts-trace-generation',
@@ -127,6 +129,10 @@ function effectiveVisibility(element: HTMLElement, rect: DOMRect): RenderTraceVi
   return 'visible';
 }
 
+function badgeContainerId(element: HTMLElement): string | undefined {
+  return TRACE_CONTAINER_ID_RE.test(element.id) ? element.id : undefined;
+}
+
 function isRectInViewport(rect: DOMRect): boolean {
   const right = Number.isFinite(rect.right) ? rect.right : rect.left + rect.width;
   const bottom = Number.isFinite(rect.bottom) ? rect.bottom : rect.top + rect.height;
@@ -237,7 +243,10 @@ export function installAdTraceOverlay(
     :host { all: initial; }
     .badge { position: fixed; z-index: 2147483647; max-width: 300px; padding: 6px 8px;
       border: 1px solid #72e0a6; border-radius: 4px; background: rgba(10,18,16,.94);
-      color: #eefbf4; font: 11px/1.35 ui-monospace, monospace; white-space: nowrap; cursor: pointer; }
+      color: #eefbf4; font: 11px/1.35 ui-monospace, monospace; cursor: pointer; }
+    .badge-status { white-space: nowrap; }
+    .badge-container { display: block; max-width: 284px; overflow: hidden; color: #b8d8c7;
+      text-overflow: ellipsis; white-space: nowrap; }
     .badge.attributed { border-color: #72e0a6; }
     .badge.unattributed { border-color: #67a8ff; }
     .badge.empty { border-color: #ffd479; }
@@ -417,7 +426,18 @@ export function installAdTraceOverlay(
       const key = `${slotId}:${item.generation}`;
       const badge = document.createElement('div');
       badge.className = `badge ${presentation.className}`;
-      badge.textContent = presentation.badgeStatus;
+      const status = document.createElement('div');
+      status.className = 'badge-status';
+      status.textContent = presentation.badgeStatus;
+      badge.appendChild(status);
+      const containerId = badgeContainerId(element);
+      if (containerId) {
+        const container = document.createElement('div');
+        container.className = 'badge-container';
+        container.textContent = containerId;
+        badge.appendChild(container);
+        badge.setAttribute('aria-label', `${presentation.badgeStatus}; container ${containerId}`);
+      }
       badge.style.visibility = 'hidden';
       badge.addEventListener('click', () => {
         panel.hidden = false;
@@ -438,7 +458,12 @@ export function installAdTraceOverlay(
         key,
         left: rect.left,
         top: rect.top,
-        width: measured.width || Math.min(300, Math.max(120, presentation.badgeStatus.length * 7)),
+        width:
+          measured.width ||
+          Math.min(
+            300,
+            Math.max(120, Math.max(presentation.badgeStatus.length, containerId?.length ?? 0) * 7)
+          ),
         height: measured.height || 30,
       });
       badgeElements.set(key, badge);

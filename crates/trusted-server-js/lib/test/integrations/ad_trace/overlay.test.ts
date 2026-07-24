@@ -123,7 +123,9 @@ describe('ad trace overlay lifecycle', () => {
     expect(updateVisibility).toHaveBeenCalledWith('slot-a', 1, 'visible');
     const badge = shadow?.querySelector('.badge');
     const row = shadow?.querySelector('.row');
-    expect(badge?.textContent).toBe('GAM ad');
+    expect(badge?.querySelector('.badge-status')?.textContent).toBe('GAM ad');
+    expect(badge?.querySelector('.badge-container')?.textContent).toBe('slot-prefix-rendered');
+    expect(badge?.getAttribute('aria-label')).toBe('GAM ad; container slot-prefix-rendered');
     expect(row?.textContent).toContain('GAM rendered an ad — source not attributed');
     expect(`${badge?.textContent}\n${row?.textContent}`).not.toMatch(
       /definitive|strong|probable|not_run|gam_only|TS winner|Prebid winner|#1/
