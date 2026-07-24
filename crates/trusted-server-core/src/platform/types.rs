@@ -143,6 +143,16 @@ pub struct PlatformBackendSpec {
     pub first_byte_timeout: Duration,
     /// Maximum time to wait between response body bytes.
     pub between_bytes_timeout: Duration,
+    /// Optional stable discriminator folded into the backend name.
+    ///
+    /// Two callers can target the same origin (scheme, host, port, TLS) with
+    /// the same transport timeout yet need distinct dynamic backends — for
+    /// example two auction providers behind one gateway host. Because the
+    /// auction orchestrator correlates responses back to providers by backend
+    /// name, a shared name would let one provider's response be parsed as
+    /// another's. Setting this to a per-provider/integration identifier keeps
+    /// their names distinct while remaining stable across requests.
+    pub discriminator: Option<String>,
 }
 
 /// Cloneable container of platform services for a single request.
