@@ -74,11 +74,11 @@ describe('installSpaAuctionHook', () => {
     const adInit = vi.fn();
     ts.adInit = adInit;
 
-    history.pushState({}, '', '/next-page');
+    history.pushState({}, '', '/next-page?edition=fictional#section');
     await flushAsync();
 
     expect(fetchStub).toHaveBeenCalledWith(
-      '/__ts/page-bids?path=%2Fnext-page',
+      '/__ts/page-bids?path=%2Fnext-page%3Fedition%3Dfictional',
       expect.objectContaining({
         credentials: 'include',
         headers: { 'X-TSJS-Page-Bids': '1' },

@@ -171,18 +171,71 @@ pub struct AuctionResponse {
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
+/// APS creative tag type accepted by the Trusted Server renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApsTagType {
+    /// APS loads the creative URL in a nested iframe.
+    Iframe,
+    /// APS fetches creative HTML and executes it in its nested renderer frame.
+    Script,
+}
+
+/// Version 1 APS renderer descriptor shared with browser clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApsRendererV1 {
+    /// Renderer contract version.
+    pub version: u8,
+    /// APS account identifier used to initialize the fixed runner.
+    pub account_id: String,
+    /// Selected `OpenRTB` bid identifier.
+    pub bid_id: String,
+    /// Optional `OpenRTB` creative identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creative_id: Option<String>,
+    /// APS creative delivery mode.
+    pub tag_type: ApsTagType,
+    /// HTTPS creative URL consumed by the fixed APS runner.
+    pub creative_url: String,
+    /// Base64-encoded exact one-bid APS response envelope.
+    pub aax_response: String,
+    /// Creative width.
+    pub width: u32,
+    /// Creative height.
+    pub height: u32,
+}
+
+/// Typed browser renderer capability carried by a bid.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum BidRenderer {
+    /// APS renderer version 1.
+    Aps(ApsRendererV1),
+}
+
+impl BidRenderer {
+    /// Return the APS renderer descriptor when this is an APS renderer.
+    #[must_use]
+    pub fn as_aps(&self) -> Option<&ApsRendererV1> {
+        match self {
+            Self::Aps(renderer) => Some(renderer),
+        }
+    }
+}
+
 /// Individual bid from a provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bid {
     /// Slot this bid is for
     pub slot_id: String,
-    /// Bid price in CPM
-    /// None for APS bids where price is encoded and must be decoded by mediation layer
+    /// Bid price in CPM.
     pub price: Option<f64>,
     /// Currency code (e.g., "USD")
     pub currency: String,
-    /// Creative markup (HTML/VAST)
-    /// None when the bidder doesn't provide creative HTML (e.g., APS/TAM)
+    /// Creative markup (HTML/VAST).
+    ///
+    /// `None` when the bid uses a typed [`BidRenderer`] instead.
     pub creative: Option<String>,
     /// Advertiser domain
     pub adomain: Option<Vec<String>>,
@@ -196,8 +249,15 @@ pub struct Bid {
     pub nurl: Option<String>,
     /// Billing notification URL
     pub burl: Option<String>,
-    /// Ad ID from the bidder
+    /// `OpenRTB` bid identifier.
+    pub bid_id: Option<String>,
+    /// Ad ID from the bidder.
     pub ad_id: Option<String>,
+    /// Optional `OpenRTB` creative identifier.
+    pub creative_id: Option<String>,
+    /// Typed browser renderer capability.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renderer: Option<BidRenderer>,
     /// Prebid Cache UUID for this bid.
     ///
     /// Populated from `ext.prebid.cache.bids.cacheId` in the PBS response.
@@ -214,8 +274,7 @@ pub struct Bid {
     /// Populated from the path of `ext.prebid.cache.bids.url`. Used as
     /// `hb_cache_path` targeting value. `None` when cache is absent.
     pub cache_path: Option<String>,
-    /// Provider-specific bid metadata
-    /// For APS bids, contains encoded price in "amznbid" field
+    /// Provider-specific bid metadata.
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
@@ -338,7 +397,10 @@ mod tests {
             height: 250,
             nurl: None,
             burl: None,
+            bid_id: None,
             ad_id: None,
+            creative_id: None,
+            renderer: None,
             cache_id: None,
             cache_host: None,
             cache_path: None,
@@ -467,7 +529,10 @@ mod tests {
             height: 250,
             nurl: None,
             burl: None,
+            bid_id: None,
             ad_id: Some("bid-id".to_string()),
+            creative_id: None,
+            renderer: None,
             cache_id: Some("cache-uuid".to_string()),
             cache_host: Some("cache.example.com".to_string()),
             cache_path: Some("/pbc/v1/cache".to_string()),
@@ -493,6 +558,62 @@ mod tests {
     }
 
     #[test]
+    fn aps_renderer_serializes_to_versioned_camel_case_contract() {
+        let renderer = BidRenderer::Aps(ApsRendererV1 {
+            version: 1,
+            account_id: "example-account-id".to_string(),
+            bid_id: "fictional-bid-id".to_string(),
+            creative_id: Some("fictional-creative-id".to_string()),
+            tag_type: ApsTagType::Iframe,
+            creative_url: "https://creative.example/render".to_string(),
+            aax_response: "base64-data".to_string(),
+            width: 300,
+            height: 250,
+        });
+
+        let serialized = serde_json::to_value(&renderer).expect("should serialize renderer");
+
+        assert_eq!(
+            serialized,
+            json!({
+                "type": "aps",
+                "version": 1,
+                "accountId": "example-account-id",
+                "bidId": "fictional-bid-id",
+                "creativeId": "fictional-creative-id",
+                "tagType": "iframe",
+                "creativeUrl": "https://creative.example/render",
+                "aaxResponse": "base64-data",
+                "width": 300,
+                "height": 250
+            }),
+            "should match renderer wire contract"
+        );
+    }
+
+    #[test]
+    fn aps_renderer_omits_absent_creative_id() {
+        let renderer = BidRenderer::Aps(ApsRendererV1 {
+            version: 1,
+            account_id: "example-account-id".to_string(),
+            bid_id: "fictional-bid-id".to_string(),
+            creative_id: None,
+            tag_type: ApsTagType::Iframe,
+            creative_url: "https://creative.example/render".to_string(),
+            aax_response: "base64-data".to_string(),
+            width: 300,
+            height: 250,
+        });
+
+        let serialized = serde_json::to_value(&renderer).expect("should serialize renderer");
+
+        assert!(
+            serialized.get("creativeId").is_none(),
+            "should omit absent creative ID"
+        );
+    }
+
+    #[test]
     fn media_type_defaults_to_banner() {
         assert_eq!(
             MediaType::default(),
@@ -514,7 +635,10 @@ mod tests {
             height: 250,
             nurl: None,
             burl: None,
+            bid_id: None,
             ad_id: Some("prebid-ad-id-abc".to_string()),
+            creative_id: None,
+            renderer: None,
             cache_id: None,
             cache_host: None,
             cache_path: None,

@@ -13,6 +13,7 @@
 
 import pbjs from 'prebid.js';
 import adapterManager from 'prebid.js/src/adapterManager.js';
+import { markBidAsRendered, markWinner } from 'prebid.js/src/adRendering.js';
 import 'prebid.js/modules/consentManagementTcf.js';
 import 'prebid.js/modules/consentManagementGpp.js';
 import 'prebid.js/modules/consentManagementUsp.js';
@@ -28,6 +29,7 @@ import './_adapters.generated';
 
 import { log } from '../../core/log';
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
+import { registerApsPrebidRenderer, validateApsRenderer } from '../aps/render';
 import type { AuctionBid, AuctionEid } from '../../core/auction';
 import type { AuctionSlot } from '../../core/types';
 
@@ -35,6 +37,9 @@ import { INCLUDED_PREBID_USER_ID_MODULES } from './_user_ids.generated';
 import { PREBID_USER_ID_MODULE_REGISTRY } from './user_id_modules';
 
 const ADAPTER_CODE = 'trustedServer';
+const APS_BIDDER_CODE = 'aps';
+const APS_RENDERER_FIELD = 'trustedServerRenderer';
+const APS_BID_RESPONSE_LISTENER_SENTINEL = '__tsApsBidResponseListenerInstalled';
 // OpenRTB permits vendor-specific agent types; PAIR uses 571187.
 // Keep this range aligned with the signed 32-bit Rust/OpenRTB representation.
 const MAX_OPENRTB_ATYPE = 2_147_483_647;
@@ -204,23 +209,35 @@ export function auctionBidsToPrebidBids(auctionBids: AuctionBid[], bidRequests: 
     }
   }
 
-  return auctionBids.map((bid) => {
+  return auctionBids.flatMap((bid) => {
+    // Prebid admission is the last point before the descriptor becomes a bid
+    // capability. Drop malformed APS bids rather than letting them participate
+    // in the auction without a render path.
+    const renderer = bid.renderer ? validateApsRenderer(bid.renderer) : undefined;
+    if (bid.renderer && !renderer) {
+      log.warn(`[tsjs-prebid] dropped invalid APS renderer bid for '${bid.impid}'`);
+      return [];
+    }
+
     const origReq = requestsByCode.get(bid.impid);
-    return {
-      requestId: origReq?.bidId ?? bid.impid,
-      cpm: bid.price,
-      width: bid.width,
-      height: bid.height,
-      ad: bid.adm,
-      ttl: 300,
-      creativeId: bid.creativeId,
-      netRevenue: true,
-      currency: 'USD',
-      bidderCode: bid.seat,
-      meta: {
-        advertiserDomains: bid.adomain,
+    return [
+      {
+        requestId: origReq?.bidId ?? bid.impid,
+        cpm: bid.price,
+        width: bid.width,
+        height: bid.height,
+        ad: renderer ? '' : bid.adm,
+        ...(renderer ? { [APS_RENDERER_FIELD]: renderer } : {}),
+        ttl: 300,
+        creativeId: bid.creativeId,
+        netRevenue: true,
+        currency: 'USD',
+        bidderCode: bid.seat,
+        meta: {
+          advertiserDomains: bid.adomain,
+        },
       },
-    };
+    ];
   });
 }
 
@@ -501,6 +518,42 @@ function collectAuctionEids(): AuctionEid[] | undefined {
  * 1. `window.__tsjs_prebid` — injected by the server from trusted-server.toml
  * 2. `config` argument — explicit overrides from the publisher's JS
  */
+function installApsBidResponseRegistry(): void {
+  const prebid = pbjs as typeof pbjs & Record<string, unknown>;
+  if (prebid[APS_BID_RESPONSE_LISTENER_SENTINEL] === true) return;
+
+  pbjs.onEvent('bidResponse', (rawBid) => {
+    const bid = rawBid as unknown as Record<string, unknown>;
+    const renderer = bid[APS_RENDERER_FIELD];
+    if (
+      bid['adapterCode'] !== ADAPTER_CODE ||
+      bid['bidderCode'] !== APS_BIDDER_CODE ||
+      renderer === undefined
+    ) {
+      return;
+    }
+
+    const registered = registerApsPrebidRenderer(
+      bid['adId'],
+      bid['adUnitCode'],
+      renderer,
+      bid['ttl'],
+      {
+        markWinner: () => markWinner(rawBid),
+        markRendered: () => markBidAsRendered(rawBid),
+      }
+    );
+    if (registered) {
+      // Keep the executable capability only in the bounded, one-time registry. Prebid
+      // still owns the generated ad ID and ordinary GAM targeting on this bid object.
+      delete bid[APS_RENDERER_FIELD];
+    } else {
+      log.warn('[tsjs-prebid] rejected APS renderer capability that failed registration');
+    }
+  });
+  prebid[APS_BID_RESPONSE_LISTENER_SENTINEL] = true;
+}
+
 export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs {
   const injected = getInjectedConfig();
   const merged: PrebidNpmConfig = {
@@ -510,6 +563,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   };
 
   auctionEndpoint = merged.endpoint ?? '/auction';
+  installApsBidResponseRegistry();
 
   // Register the trustedServer adapter using pbjs.registerBidAdapter(null, code, spec)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any

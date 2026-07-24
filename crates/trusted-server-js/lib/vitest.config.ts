@@ -11,6 +11,10 @@ export default defineConfig({
         __dirname,
         'node_modules/prebid.js/dist/src/src/adapterManager.js'
       ),
+      'prebid.js/src/adRendering.js': path.resolve(
+        __dirname,
+        'node_modules/prebid.js/dist/src/src/adRendering.js'
+      ),
     },
   },
   test: {

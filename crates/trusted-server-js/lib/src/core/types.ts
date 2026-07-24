@@ -41,11 +41,43 @@ export interface AuctionDebugBidData {
   height?: number;
   nurl?: string | null;
   burl?: string | null;
+  bid_id?: string | null;
   ad_id?: string | null;
+  creative_id?: string | null;
   cache_id?: string | null;
   cache_host?: string | null;
   cache_path?: string | null;
   metadata?: Record<string, unknown>;
+}
+
+export type ApsTagType = 'iframe' | 'script';
+
+/** Version 1 Trusted Server APS renderer descriptor. */
+export interface ApsRendererV1 {
+  type: 'aps';
+  version: 1;
+  accountId: string;
+  bidId: string;
+  creativeId?: string;
+  tagType: ApsTagType;
+  creativeUrl: string;
+  aaxResponse: string;
+  width: number;
+  height: number;
+}
+
+export type AuctionBidRenderer = ApsRendererV1;
+
+/** A client-side Prebid bid's generated ad ID bound to its APS render capability. */
+export interface ApsPrebidRendererEntry {
+  adUnitCode: string;
+  renderer: ApsRendererV1;
+  registeredAt: number;
+  expiresAt: number;
+  /** Notify Prebid that GAM selected this bid before replying to Universal Creative. */
+  markWinner(): void;
+  /** Mark Prebid's bid rendered after the Universal Creative response is posted. */
+  markRendered(): void;
 }
 
 /** Bid targeting data from the server-side auction, injected into `window.tsjs.bids`. */
@@ -57,6 +89,8 @@ export interface AuctionBidData {
   hb_cache_path?: string;
   nurl?: string;
   burl?: string;
+  /** Typed winning-bid renderer capability. */
+  renderer?: AuctionBidRenderer;
   /** Raw creative markup. Only present when `[debug] inject_adm_for_testing = true`. */
   adm?: string;
   /** Debug-only bid field mirror. Only present when `[debug] inject_adm_for_testing = true`. */
@@ -90,6 +124,11 @@ export interface TsjsApi {
   adSlots?: AuctionSlot[];
   /** Winning bid targeting data injected before </body>. */
   bids?: Record<string, AuctionBidData>;
+  /**
+   * Bounded client-side Prebid APS renderer capabilities keyed by Prebid's generated
+   * `hb_adid`. The Universal Creative bridge consumes each entry at most once.
+   */
+  apsPrebidRenderers?: Record<string, ApsPrebidRendererEntry>;
   /** Initialises GPT slots with server-side bid targeting and calls refresh(). */
   adInit?: () => void;
   /** GPT slot objects TS defined — used to destroy stale slots on SPA navigation. */

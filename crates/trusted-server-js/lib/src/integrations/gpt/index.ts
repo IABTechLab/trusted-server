@@ -1,5 +1,13 @@
 import { log } from '../../core/log';
 import type { AuctionSlot, AuctionBidData, TsjsApi } from '../../core/types';
+import {
+  APS_UNIVERSAL_CREATIVE_RENDERER,
+  APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+  apsRendererUrl,
+  consumeApsPrebidRenderer,
+  getApsPrebidRenderer,
+  validateApsRenderer,
+} from '../aps/render';
 
 import { installGptGuard } from './script_guard';
 
@@ -56,10 +64,22 @@ function findSlotElementByDivId(divId: string): HTMLElement | null {
   const exact = document.getElementById(divId);
   if (exact) return exact;
 
+  const configuredDivIds = (window.tsjs?.adSlots ?? [])
+    .map((slot) => slot.div_id)
+    .filter((configured) => configured.length > 0);
+
   return (
-    Array.from(document.querySelectorAll<HTMLElement>('[id]')).find(
-      (el) => el.id.startsWith(divId) && !el.id.endsWith('-container')
-    ) ?? null
+    Array.from(document.querySelectorAll<HTMLElement>('[id]')).find((element) => {
+      if (!element.id.startsWith(divId) || element.id.endsWith('-container')) return false;
+
+      // Generated slot IDs can extend a configured prefix. When configured
+      // prefixes overlap, assign the element to the longest matching prefix so
+      // `div-header` cannot claim an iframe owned by `div-header-mobile`.
+      const owner = configuredDivIds
+        .filter((configured) => element.id.startsWith(configured))
+        .sort((left, right) => right.length - left.length)[0];
+      return owner === undefined || owner === divId;
+    }) ?? null
   );
 }
 
@@ -89,6 +109,16 @@ function slotIdForMessageSource(source: MessageEventSource | null): string | und
       Array.from(root.querySelectorAll('iframe')).some((iframe) => iframe.contentWindow === source)
     )
   )?.id;
+}
+
+function messageSourceBelongsToAdUnit(
+  source: MessageEventSource | null,
+  adUnitCode: string
+): boolean {
+  if (!source) return false;
+  return candidateSlotRoots(adUnitCode).some((root) =>
+    Array.from(root.querySelectorAll('iframe')).some((iframe) => iframe.contentWindow === source)
+  );
 }
 
 function clearTargetingKeys(slot: GoogleTagSlot, keys: Iterable<string>): void {
@@ -556,13 +586,8 @@ export function installTsAdInit(): void {
           slotsToRefresh.push(gptSlot);
         }
 
-        // APS: signal to apstag that bids are ready so Amazon's GAM creative
-        // can render.  apstag must already be initialised on the page (which it
-        // is on production publisher pages).  Safe no-op if apstag is absent.
-        if (bid.hb_bidder === 'aps' || bid.hb_bidder === 'amazon-aps') {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (window as any).apstag?.setDisplayBids?.();
-        }
+        // Trusted Server APS winners carry their own typed renderer and never
+        // enter the publisher-owned native apstag rendering path.
       });
 
       ts.prevGptSlots = newSlots as unknown[];
@@ -708,17 +733,16 @@ export function installSpaAuctionHook(): void {
   ts.spaHookInstalled = true;
 
   let inflight: AbortController | null = null;
-  // Last path an auction was run for. popstate fires for hash-only and
-  // same-pathname back/forward (scroll restoration), and pushState/replaceState
-  // can be called with the current URL, so guard every entry point against
-  // re-requesting impressions for a path we already loaded.
-  let currentPath = location.pathname;
+  // Last path and query an auction was run for. popstate fires for hash-only
+  // changes and pushState/replaceState can be called with the current URL, so
+  // guard every entry point against re-requesting impressions already loaded.
+  let currentPath = `${location.pathname}${location.search}`;
   // Last path whose slots/bids were actually applied — the initial SSR page
   // counts. A failed navigation rolls `currentPath` back to this rather than to
   // the immediately-previous committed value: on rapid A→B where A was aborted
   // mid-flight and B then fails, rolling back to A (never loaded) would strand
   // it behind the no-op guard, so we roll back to the last applied route instead.
-  let lastAppliedPath = location.pathname;
+  let lastAppliedPath = `${location.pathname}${location.search}`;
 
   async function onNavigate(path: string): Promise<void> {
     if (path === currentPath) return;
@@ -778,8 +802,9 @@ export function installSpaAuctionHook(): void {
     const original = history[method].bind(history);
     history[method] = function (state: unknown, unused: string, url?: string | URL | null): void {
       original(state, unused, url);
-      const newPath = url ? new URL(String(url), location.href).pathname : location.pathname;
-      // onNavigate no-ops when newPath equals the last loaded path.
+      const locationUrl = url ? new URL(String(url), location.href) : location;
+      const newPath = `${locationUrl.pathname}${locationUrl.search}`;
+      // onNavigate no-ops when newPath equals the last loaded path and query.
       void onNavigate(newPath);
     };
   }
@@ -788,7 +813,7 @@ export function installSpaAuctionHook(): void {
   patchHistoryMethod('replaceState');
 
   window.addEventListener('popstate', () => {
-    void onNavigate(location.pathname);
+    void onNavigate(`${location.pathname}${location.search}`);
   });
 }
 
@@ -845,6 +870,21 @@ export function installTsRenderBridge(): void {
   // and both fire the nurl/burl beacons. Tracking in-flight adIds prevents the
   // concurrent double-fire; the entry is cleared once the fetch settles.
   const renderingAdIds = new Set<string>();
+  const consumedPrebidApsIds = new Map<string, { adUnitCode: string; expiresAt: number }>();
+  const rememberConsumedPrebidApsId = (
+    adId: string,
+    entry: { adUnitCode: string; expiresAt: number }
+  ): void => {
+    const now = Date.now();
+    for (const [consumedAdId, consumed] of consumedPrebidApsIds) {
+      if (consumed.expiresAt <= now) consumedPrebidApsIds.delete(consumedAdId);
+    }
+    if (!consumedPrebidApsIds.has(adId) && consumedPrebidApsIds.size >= 256) {
+      const oldestAdId = consumedPrebidApsIds.keys().next().value as string | undefined;
+      if (oldestAdId) consumedPrebidApsIds.delete(oldestAdId);
+    }
+    consumedPrebidApsIds.set(adId, entry);
+  };
 
   window.addEventListener('message', (e: MessageEvent) => {
     let data: Record<string, unknown>;
@@ -863,6 +903,71 @@ export function installTsRenderBridge(): void {
 
     const port = e.ports?.[0];
     if (!port) return;
+
+    const consumedPrebidAps = consumedPrebidApsIds.get(adId);
+    if (consumedPrebidAps) {
+      if (consumedPrebidAps.expiresAt <= Date.now()) {
+        consumedPrebidApsIds.delete(adId);
+      } else {
+        if (messageSourceBelongsToAdUnit(e.source, consumedPrebidAps.adUnitCode)) {
+          e.stopImmediatePropagation();
+        }
+        return;
+      }
+    }
+
+    // Client-side trustedServer adapter bids receive a new adId from Prebid. Bind
+    // that ID to the server-validated APS descriptor only after confirming the
+    // requesting Universal Creative frame belongs to the same GPT ad unit.
+    const prebidRendererEntry = getApsPrebidRenderer(adId);
+    if (prebidRendererEntry) {
+      if (!messageSourceBelongsToAdUnit(e.source, prebidRendererEntry.adUnitCode)) return;
+      const renderer = validateApsRenderer(prebidRendererEntry.renderer);
+      const rendererUrl = apsRendererUrl();
+      if (!renderer || !rendererUrl) return;
+      if (!consumeApsPrebidRenderer(adId, prebidRendererEntry)) return;
+      rememberConsumedPrebidApsId(adId, {
+        adUnitCode: prebidRendererEntry.adUnitCode,
+        expiresAt: prebidRendererEntry.expiresAt,
+      });
+
+      e.stopImmediatePropagation();
+      try {
+        prebidRendererEntry.markWinner();
+      } catch (err) {
+        log.warn('[tsjs-gpt] pbRender bridge: Prebid APS winner lifecycle failed', err);
+        return;
+      }
+
+      try {
+        port.postMessage(
+          JSON.stringify({
+            message: 'Prebid Response',
+            adId,
+            renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
+            rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+            rendererUrl,
+            apsRenderer: renderer,
+            width: renderer.width,
+            height: renderer.height,
+          })
+        );
+      } catch (err) {
+        log.warn('[tsjs-gpt] pbRender bridge: Prebid APS response failed', err);
+        return;
+      }
+
+      try {
+        prebidRendererEntry.markRendered();
+      } catch (err) {
+        log.warn('[tsjs-gpt] pbRender bridge: Prebid APS rendered lifecycle failed', err);
+      }
+      log.debug(
+        `[tsjs-gpt] pbRender bridge served Prebid APS bid for '${prebidRendererEntry.adUnitCode}'`
+      );
+      return;
+    }
+
     const sourceSlotId = slotIdForMessageSource(e.source);
     if (!sourceSlotId) return;
 
@@ -888,6 +993,35 @@ export function installTsRenderBridge(): void {
 
     const slot = window.tsjs?.adSlots?.find((s) => s.id === slotId);
     const [width, height] = slot?.formats?.[0] ?? [728, 90];
+
+    if (matchedBid.renderer !== undefined) {
+      const renderer = validateApsRenderer(matchedBid.renderer);
+      const rendererUrl = apsRendererUrl();
+      if (!renderer || !rendererUrl) return;
+
+      // Ownership and the complete envelope are valid before this handler
+      // claims the message. APS responses are intentionally repeatable: GAM can
+      // request the same server-rendered Universal Creative more than once.
+      e.stopImmediatePropagation();
+      try {
+        port.postMessage(
+          JSON.stringify({
+            message: 'Prebid Response',
+            adId,
+            renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
+            rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+            rendererUrl,
+            apsRenderer: renderer,
+            width: renderer.width,
+            height: renderer.height,
+          })
+        );
+        log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' through APS renderer`);
+      } catch (err) {
+        log.warn('[tsjs-gpt] pbRender bridge: APS response failed', err);
+      }
+      return;
+    }
 
     if (matchedBid.adm) {
       e.stopImmediatePropagation();

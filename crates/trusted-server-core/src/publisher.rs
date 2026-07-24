@@ -1538,6 +1538,7 @@ pub async fn handle_publisher_request(
 
     log::debug!("Proxying request to configured publisher backend");
 
+    let request_path_and_query = origin_path_and_query.to_string();
     let request_path = req.uri().path().to_string();
     let is_get = req.method() == http::Method::GET;
 
@@ -1626,7 +1627,7 @@ pub async fn handle_publisher_request(
         if should_run_auction {
             let slots_ctx = MatchedSlotsContext {
                 matched_slots: &matched_slots,
-                request_path: &request_path,
+                request_path_and_query: &request_path_and_query,
             };
             let mut auction_request = build_auction_request(
                 &slots_ctx,
@@ -1937,11 +1938,11 @@ pub async fn handle_publisher_request(
 /// Bundle of the per-request creative-opportunity inputs that travel together.
 ///
 /// Extracted so `build_auction_request` stays under the project's
-/// 7-argument cap (`matched_slots` + `request_path` live for the same
+/// 7-argument cap (`matched_slots` + `request_path_and_query` live for the same
 /// request scope and are passed together everywhere).
 pub(crate) struct MatchedSlotsContext<'a> {
     pub matched_slots: &'a [crate::creative_opportunities::CreativeOpportunitySlot],
-    pub request_path: &'a str,
+    pub request_path_and_query: &'a str,
 }
 
 /// Borrowed inputs for [`apply_auction_eids_and_device`], bundled to keep the
@@ -2028,7 +2029,7 @@ pub(crate) fn build_auction_request(
     // server edge host, which must not leak into the bid request.
     let page_url = format!(
         "{}://{}{}",
-        request_info.scheme, publisher_domain, slots_ctx.request_path
+        request_info.scheme, publisher_domain, slots_ctx.request_path_and_query
     );
     let ec_id = ec_id.filter(|id| !id.is_empty());
     let request_id = ec_id.map_or_else(
@@ -2108,10 +2109,14 @@ pub(crate) fn build_bid_map(
                     "hb_bidder".to_string(),
                     serde_json::Value::String(bid.bidder.clone()),
                 );
-                // hb_adid: use PBS Cache UUID when present — the Prebid Universal Creative uses
-                // this as the cache lookup key, NOT the OpenRTB bid ID (bid.ad_id). Fall back to
-                // bid.ad_id for APS and other non-PBS providers.
-                let hb_adid = bid.cache_id.as_deref().or(bid.ad_id.as_deref());
+                // PBS Cache remains highest priority. Renderer bids use the generic
+                // upstream bid ID; ordinary providers retain the ad-ID fallback.
+                let renderer_bid_id = bid.renderer.as_ref().and(bid.bid_id.as_deref());
+                let hb_adid = bid
+                    .cache_id
+                    .as_deref()
+                    .or(renderer_bid_id)
+                    .or(bid.ad_id.as_deref());
                 if let Some(id) = hb_adid {
                     obj.insert(
                         "hb_adid".to_string(),
@@ -2140,6 +2145,12 @@ pub(crate) fn build_bid_map(
                 if let Some(ref burl) = bid.burl {
                     obj.insert("burl".to_string(), serde_json::Value::String(burl.clone()));
                 }
+                if let Some(ref renderer) = bid.renderer {
+                    obj.insert(
+                        "renderer".to_string(),
+                        serde_json::to_value(renderer).expect("should serialize typed renderer"),
+                    );
+                }
                 // Include raw creative markup only for explicit debug injection.
                 // The pbRender bridge can use it while PBS Cache is unavailable.
                 if include_adm {
@@ -2159,7 +2170,9 @@ pub(crate) fn build_bid_map(
                             "height": bid.height,
                             "nurl": bid.nurl,
                             "burl": bid.burl,
+                            "bid_id": bid.bid_id,
                             "ad_id": bid.ad_id,
+                            "creative_id": bid.creative_id,
                             "cache_id": bid.cache_id,
                             "cache_host": bid.cache_host,
                             "cache_path": bid.cache_path,
@@ -2328,8 +2341,8 @@ pub fn page_bids_preflight_denied() -> Response<EdgeBody> {
 
 /// Normalizes the client-supplied `path` query parameter before glob matching.
 ///
-/// The SPA hook sends `location.pathname`, but the parameter is
-/// client-controlled: strip any query string or fragment and force a leading
+/// The SPA hook sends `location.pathname + location.search`, but the parameter
+/// is client-controlled: strip any query string or fragment and force a leading
 /// `/` so slot `page_patterns` always match against a canonical path shape.
 fn normalize_page_bids_path(raw: &str) -> String {
     let path = raw.split(['?', '#']).next().unwrap_or("");
@@ -2337,6 +2350,20 @@ fn normalize_page_bids_path(raw: &str) -> String {
         path.to_string()
     } else {
         format!("/{path}")
+    }
+}
+
+/// Normalize the page path and query retained in the upstream auction context.
+///
+/// Fragments never reach an HTTP server and are discarded if a client includes
+/// one explicitly. Unlike [`normalize_page_bids_path`], the query is preserved
+/// for the `OpenRTB` `site.page` URL and is not used for slot matching.
+fn normalize_page_bids_path_and_query(raw: &str) -> String {
+    let path_and_query = raw.split('#').next().unwrap_or("");
+    if path_and_query.starts_with('/') {
+        path_and_query.to_string()
+    } else {
+        format!("/{path_and_query}")
     }
 }
 
@@ -2380,15 +2407,17 @@ pub async fn handle_page_bids(
         return Ok(page_bids_preflight_denied());
     }
 
-    let path_param = req
+    let requested_page = req
         .uri()
         .query()
         .and_then(|query| {
             url::form_urlencoded::parse(query.as_bytes())
-                .find(|(k, _)| k == "path")
-                .map(|(_, v)| normalize_page_bids_path(&v))
+                .find(|(key, _)| key == "path")
+                .map(|(_, value)| value.into_owned())
         })
         .unwrap_or_else(|| "/".to_string());
+    let path_param = normalize_page_bids_path(&requested_page);
+    let page_path_and_query = normalize_page_bids_path_and_query(&requested_page);
 
     let matched_slots: Vec<_> =
         crate::creative_opportunities::match_slots(auction.slots, &path_param)
@@ -2453,7 +2482,7 @@ pub async fn handle_page_bids(
         if ad_stack_enabled && !is_bot && !is_prefetch {
             let slots_ctx = MatchedSlotsContext {
                 matched_slots: &matched_slots,
-                request_path: &path_param,
+                request_path_and_query: &page_path_and_query,
             };
             let mut auction_request = build_auction_request(
                 &slots_ctx,
@@ -2626,7 +2655,10 @@ mod tests {
             height: 250,
             nurl: None,
             burl: None,
+            bid_id: None,
             ad_id: None,
+            creative_id: None,
+            renderer: None,
             cache_id: None,
             cache_host: None,
             cache_path: None,
@@ -4261,7 +4293,7 @@ mod tests {
             MatchedSlotsContext, build_ad_slots_script, build_auction_request, build_bid_map,
             build_bids_script, html_escape_for_script,
         };
-        use crate::auction::types::{Bid, MediaType};
+        use crate::auction::types::{ApsRendererV1, ApsTagType, Bid, BidRenderer, MediaType};
         use crate::consent::ConsentContext;
         use crate::creative_opportunities::{
             CreativeOpportunitiesConfig, CreativeOpportunityFormat, CreativeOpportunitySlot,
@@ -4318,7 +4350,10 @@ mod tests {
                 height: 250,
                 nurl: Some(nurl.to_string()),
                 burl: Some(burl.to_string()),
+                bid_id: None,
                 ad_id: Some(ad_id.to_string()),
+                creative_id: None,
+                renderer: None,
                 cache_id: None,
                 cache_host: None,
                 cache_path: None,
@@ -4401,6 +4436,44 @@ mod tests {
                 Some("https://ssp/bill"),
                 "should include burl"
             );
+        }
+
+        #[test]
+        fn bid_map_exposes_aps_renderer_and_selected_bid_id_without_debug_adm() {
+            let mut bid = make_bid("atf_sidebar_ad", 1.50, "aps", "fallback-ad", "", "");
+            bid.bid_id = Some("selected-bid".to_string());
+            bid.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
+                version: 1,
+                account_id: "example-account".to_string(),
+                bid_id: "selected-bid".to_string(),
+                creative_id: None,
+                tag_type: ApsTagType::Iframe,
+                creative_url: "https://creative.example/render".to_string(),
+                aax_response: "fictional-base64</script>".to_string(),
+                width: 300,
+                height: 250,
+            }));
+            bid.nurl = None;
+            bid.burl = None;
+            let winning_bids = HashMap::from([("atf_sidebar_ad".to_string(), bid)]);
+
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
+            let obj = map["atf_sidebar_ad"]
+                .as_object()
+                .expect("should include APS bid");
+
+            assert_eq!(obj["hb_bidder"], "aps");
+            assert_eq!(obj["hb_adid"], "selected-bid");
+            assert_eq!(obj["renderer"]["type"], "aps");
+            assert_eq!(obj["renderer"]["bidId"], "selected-bid");
+            assert!(obj.get("adm").is_none());
+            assert!(obj.get("nurl").is_none());
+            assert!(obj.get("burl").is_none());
+            assert!(obj.get("metadata").is_none());
+
+            let script = build_bids_script(&map);
+            assert!(!script.contains("</script></script>"));
+            assert!(script.contains("\\u003C/script\\u003E"));
         }
 
         #[test]
@@ -4538,7 +4611,10 @@ mod tests {
                     height: 250,
                     nurl: None,
                     burl: None,
+                    bid_id: None,
                     ad_id: Some("bid-impression-id".to_string()),
+                    creative_id: None,
+                    renderer: None,
                     cache_id: Some("f47447a0-b759-4f2f-9887-af458b79b570".to_string()),
                     cache_host: Some("openads.adsrvr.org".to_string()),
                     cache_path: Some("/cache".to_string()),
@@ -4579,12 +4655,15 @@ mod tests {
                     currency: "USD".to_string(),
                     creative: None,
                     adomain: None,
-                    bidder: "amazon-aps".to_string(),
+                    bidder: "ordinary".to_string(),
                     width: 300,
                     height: 250,
                     nurl: None,
                     burl: None,
-                    ad_id: Some("aps-bid-token".to_string()),
+                    bid_id: None,
+                    ad_id: Some("ordinary-ad-id".to_string()),
+                    creative_id: None,
+                    renderer: None,
                     cache_id: None,
                     cache_host: None,
                     cache_path: None,
@@ -4599,7 +4678,7 @@ mod tests {
                 .expect("should be object");
             assert_eq!(
                 obj.get("hb_adid").and_then(|v| v.as_str()),
-                Some("aps-bid-token"),
+                Some("ordinary-ad-id"),
                 "should fall back to ad_id when cache_id absent"
             );
             assert!(
@@ -4623,12 +4702,15 @@ mod tests {
                     currency: "USD".to_string(),
                     creative: None,
                     adomain: None,
-                    bidder: "amazon-aps".to_string(),
+                    bidder: "ordinary".to_string(),
                     width: 300,
                     height: 250,
                     nurl: None,
                     burl: None,
+                    bid_id: None,
                     ad_id: None,
+                    creative_id: None,
+                    renderer: None,
                     cache_id: None,
                     cache_host: None,
                     cache_path: None,
@@ -4663,7 +4745,10 @@ mod tests {
                     height: 250,
                     nurl: None,
                     burl: None,
+                    bid_id: None,
                     ad_id: None,
+                    creative_id: None,
+                    renderer: None,
                     cache_id: None,
                     cache_host: None,
                     cache_path: None,
@@ -4716,7 +4801,7 @@ mod tests {
             let slots = [slot];
             let slots_ctx = MatchedSlotsContext {
                 matched_slots: &slots,
-                request_path: "/2024/01/my-article/",
+                request_path_and_query: "/2024/01/my-article/?edition=fictional",
             };
             let request_info = RequestInfo {
                 host: "publisher.example.com".to_string(),
@@ -4738,6 +4823,11 @@ mod tests {
                 "should use a non-EC request id, got {}",
                 request.id
             );
+            assert_eq!(
+                request.publisher.page_url.as_deref(),
+                Some("https://publisher.example.com/2024/01/my-article/?edition=fictional"),
+                "should preserve the page path and query for auction providers"
+            );
         }
 
         #[test]
@@ -4750,7 +4840,7 @@ mod tests {
             let slots = [slot];
             let slots_ctx = MatchedSlotsContext {
                 matched_slots: &slots,
-                request_path: "/2024/01/my-article/?edition=fictional",
+                request_path_and_query: "/2024/01/my-article/?edition=fictional",
             };
             let request_info = RequestInfo {
                 host: "ts.example.com".to_string(),
@@ -4792,7 +4882,7 @@ mod tests {
             let slots = [slot];
             let slots_ctx = MatchedSlotsContext {
                 matched_slots: &slots,
-                request_path: "/2024/01/my-article/",
+                request_path_and_query: "/2024/01/my-article/",
             };
             let request_info = RequestInfo {
                 host: "publisher.example.com".to_string(),
@@ -5220,6 +5310,20 @@ mod tests {
                 normalize_page_bids_path(""),
                 "/",
                 "empty path should normalize to root"
+            );
+        }
+
+        #[test]
+        fn normalize_page_bids_path_and_query_preserves_query_but_drops_fragment() {
+            assert_eq!(
+                normalize_page_bids_path_and_query("/2024/01/article/?edition=fictional#section"),
+                "/2024/01/article/?edition=fictional",
+                "query should reach auction providers without a browser-only fragment"
+            );
+            assert_eq!(
+                normalize_page_bids_path_and_query("2024/01/article/?edition=fictional"),
+                "/2024/01/article/?edition=fictional",
+                "missing leading slash should be added"
             );
         }
 

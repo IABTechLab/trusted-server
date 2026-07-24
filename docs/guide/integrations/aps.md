@@ -1,412 +1,256 @@
-# Amazon Publisher Services (APS) Integration
+# Amazon Publisher Services (APS) OpenRTB Integration
 
-Server-side bidding integration for Amazon's Transparent Ad Marketplace (TAM).
+Trusted Server can request banner bids from Amazon Publisher Services (APS) through the APS OpenRTB endpoint and let their decoded USD CPMs compete with other auction providers.
 
-## Overview
+> [!IMPORTANT]
+> APS's public adapter metadata describes Prebid Server support as unavailable. Confirm edge/server-originated traffic with your APS account team before a broad production rollout. Start with an isolated cohort and disable publisher-native APS demand for that cohort to avoid duplicate demand.
 
-The APS integration enables publishers to request bids from Amazon's demand sources server-side, providing:
+## Scope
 
-- **Privacy-first bidding**: No client-side ID tracking or third-party cookies required
-- **Reduced latency**: Server-side auction reduces page load impact
-- **Unified auction**: Integrates seamlessly with other bidders (Prebid, GAM)
-- **Performance**: Async bidding with configurable timeouts
+The integration supports:
 
-## Quick Start
+- banner impressions;
+- APS OpenRTB requests to the integration's built-in production endpoint;
+- decoded-CPM winner selection with or without a mediator;
+- direct `/auction` rendering;
+- client-side `trustedServer` Prebid adapter auctions through GAM; and
+- initial-navigation and page-bids rendering through GAM/Prebid Universal Creative.
 
-Get started with server-side APS bidding in 5 minutes.
+The integration does not implement:
 
-### Prerequisites
-
-- Fastly Compute service configured
-- APS publisher account with valid `pub_id`
-- Rust toolchain installed (see main README)
-
-### Step 1: Configure Fastly Backend
-
-Add APS backend to your Fastly service:
-
-**Option A: Via Fastly UI**
-
-1. Go to your service → Origins
-2. Click "Create a Backend"
-3. Configure:
-   - Name: `aax.amazon-adsystem.com`
-   - Address: `aax.amazon-adsystem.com`
-   - Port: `443`
-   - Enable TLS: ✓
-
-**Option B: Via `fastly.toml`**
-
-Add to your `fastly.toml`:
-
-```toml
-[[backends]]
-name = "aax.amazon-adsystem.com"
-address = "aax.amazon-adsystem.com"
-port = 443
-use_ssl = true
-ssl_cert_hostname = "aax.amazon-adsystem.com"
-ssl_sni_hostname = "aax.amazon-adsystem.com"
-```
-
-### Step 2: Enable APS in Configuration
-
-Edit `trusted-server.toml`:
-
-```toml
-# Enable APS bidding
-[integrations.aps]
-enabled = true
-pub_id = "5128"  # Replace with your APS publisher ID
-endpoint = "https://aax.amazon-adsystem.com/e/dtb/bid"
-timeout_ms = 800
-
-# Configure auction to use APS
-[auction]
-enabled = true
-strategy = "parallel_only"  # Run APS alongside other bidders
-bidders = ["aps"]  # Add other bidders like ["aps", "prebid"]
-timeout_ms = 2000
-```
-
-### Step 3: Deploy or Test Locally
-
-**Deploy to Fastly:**
-
-```bash
-cargo build --release --target wasm32-wasip1
-fastly compute publish
-```
-
-**Test Locally:**
-
-```bash
-fastly compute serve
-```
-
-### Step 4: Verify It's Working
-
-Check the logs for APS activity:
-
-```bash
-# You should see:
-INFO APS: requesting bids for 2 slots (pub_id: 5128)
-DEBUG APS: sending bid request: {...}
-DEBUG APS: received response: {...}
-INFO APS returned 2 bids in 150ms
-```
-
-## Architecture
-
-```
-Publisher Page Request
-        ↓
-Auction Orchestrator
-        ↓
-APS Provider (async)
-        ↓
-https://aax.amazon-adsystem.com/e/dtb/bid
-        ↓
-Parse APS Response → Unified Bid Format
-        ↓
-Auction Winner Selection
-```
+- video or native impressions;
+- APS user sync;
+- Trusted Server delivery of APS `nurl` or `burl`; or
+- native `apstag.setDisplayBids()` handling for Trusted Server APS winners.
 
 ## Configuration
 
-### Basic Setup
-
-Add to `trusted-server.toml`:
-
 ```toml
 [integrations.aps]
 enabled = true
-pub_id = "5128"  # Your APS publisher ID
-endpoint = "https://aax.amazon-adsystem.com/e/dtb/bid"
+account_id = "example-aps-account-id"
 timeout_ms = 800
-```
+# Include raw APS request/response data in /auction metadata on test sites only.
+debug = false
+# Set both when the deployment hostname differs from APS-authorized inventory.
+# inventory_domain = "publisher.example"
+# inventory_page_origin = "https://www.publisher.example"
+allow_script_creatives = false
 
-### Environment Variables
-
-Override settings via environment variables:
-
-```bash
-TRUSTED_SERVER__INTEGRATIONS__APS__ENABLED=true
-TRUSTED_SERVER__INTEGRATIONS__APS__PUB_ID=5128
-TRUSTED_SERVER__INTEGRATIONS__APS__TIMEOUT_MS=800
-```
-
-## Auction Strategies
-
-### APS Only
-
-```toml
 [auction]
 enabled = true
-bidders = ["aps"]
-# No mediator = parallel only (highest CPM wins)
+providers = ["aps", "prebid"]
+timeout_ms = 2000
 ```
 
-### APS + Prebid (Parallel)
+`account_id` is the canonical field. `pub_id` remains a compatibility alias for migration, including integer values, but new configuration should not use it. Supplying both names is an error.
 
-Best for maximum revenue:
+`debug` defaults to `false`. Enable it only on controlled test sites because it includes the raw APS request and response, including identity, consent, device, page, account, bid, and creative data, in the client-visible `/auction` response.
+
+`allow_script_creatives` defaults to `false`. While disabled, APS script bids are rejected before per-impression reduction, floors, mediation, and winner selection. Enable it only for a controlled cohort after the browser-security checks in [Rollout](#rollout) pass.
+
+Set `inventory_domain` and `inventory_page_origin` together only when the public deployment hostname differs from the inventory identity authorized by APS. The domain becomes `site.domain`. The HTTPS page origin replaces the current page's scheme and host while preserving its path and query. The origin must be the inventory domain or one of its subdomains and cannot include credentials, a port, path, query, or fragment. These values come only from operator configuration; Trusted Server never accepts APS inventory identity from the client auction payload.
+
+APS uses ordinary auction slot IDs and banner formats. Legacy creative-opportunity APS `slot_id` configuration is accepted for compatibility but ignored, and `bidders.aps.slotID` is not required. Remove both during migration.
+
+The APS provider may also participate through a configured mediator:
 
 ```toml
 [auction]
 enabled = true
 providers = ["aps", "prebid"]
-timeout_ms = 2000
-# No mediator = all providers compete, highest CPM wins
-
-[integrations.aps]
-enabled = true
-pub_id = "5128"
-timeout_ms = 800
-
-[integrations.prebid]
-enabled = true
-server_url = "https://prebid-server.example.com"
-timeout_ms = 1000
-```
-
-**Benefits:**
-
-- Maximum fill rate
-- Best CPM selection
-- All bidders compete equally
-
-### APS + Prebid + Mediation
-
-Let a mediator decide winners:
-
-```toml
-[auction]
-enabled = true
-providers = ["aps", "prebid"]
-mediator = "adserver_mock"  # Enables parallel mediation (mediator decides winner)
+mediator = "adserver_mock"
 timeout_ms = 2000
 ```
 
-## Request Format
+## OpenRTB request
 
-The integration transforms unified `AuctionRequest` to APS TAM format:
+Trusted Server builds the APS request independently from its Prebid Server request. The request includes:
+
+- `ext.account` from `account_id`;
+- `ext.sdk = { "source": "prebid", "version": "2.2.0" }`;
+- secure banner impressions and configured floors;
+- page, site, device, and consent fields allowed by the existing privacy gates; and
+- eligible EIDs only when consent policy permits them.
+
+Precise latitude/longitude, disallowed identifiers, unsupported media types, and Trusted Server/Prebid-only extensions are not forwarded. Unsafe or oversized page URLs are omitted or replaced by the validated publisher fallback.
+
+Raw outbound and inbound payloads are logged only at TRACE level. With debug disabled, auction metadata contains only aggregate counts and drop reasons.
+
+## Debug mode
+
+Set `debug = true` under `[integrations.aps]` to include the direct APS HTTP exchange in the APS provider summary returned by `POST /auction`:
 
 ```json
 {
-  "pubId": "5128",
-  "slots": [
-    {
-      "slotID": "header-banner",
-      "slotName": "header-banner",
-      "sizes": [
-        [728, 90],
-        [970, 250]
-      ]
+  "metadata": {
+    "debug": {
+      "httpcalls": {
+        "aps": [
+          {
+            "requestbody": "{...}",
+            "requestheaders": { "content-type": ["application/json"] },
+            "responsebody": "{...}",
+            "responseheaders": { "content-type": ["application/json"] },
+            "status": 200,
+            "uri": "https://aps.example.com/e/pb/bid"
+          }
+        ]
+      }
     }
-  ],
-  "pageUrl": "https://example.com/article",
-  "ua": "Mozilla/5.0...",
-  "timeout": 800
+  }
 }
 ```
 
-## Response Format
+This follows the Prebid Server `metadata.debug.httpcalls` representation. APS makes one direct HTTP call per auction, so the map uses the provider key `aps` with one entry. Request and captured response bodies are strings, and header values are arrays so repeated headers are preserved. If a non-success response body cannot be read within the existing 2 MiB upstream limit, `responsebody` is omitted rather than reported as an empty body. APS does not add PBS-only `resolvedrequest` or `bidstatus` fields.
 
-APS returns bids in this format:
+The debug exchange is emitted for successful responses, `204 No Content`, malformed response bodies, and non-success HTTP statuses. Transport failures and auction timeouts happen before an HTTP response reaches the parser and continue to use the orchestrator's normal error metadata.
+
+> [!WARNING]
+> APS debug metadata is unredacted and client-visible. Use it only on controlled test sites, and disable it before production rollout.
+
+## Bid eligibility and selection
+
+APS responses must use USD when a response currency is present. Each eligible bid must have:
+
+- a known `impid`;
+- a finite decoded price;
+- positive `w` and `h` that match a configured banner format;
+- an HTTPS, credential-free `ext.creativeurl` on an origin other than the publisher; and
+- `ext.tagtype` equal to `iframe`, or `script` when the script gate is enabled.
+
+Trusted Server rejects legacy contextual response shapes and bids with markup-only render sources. It deterministically keeps one eligible APS candidate per impression by highest price, then lexicographically smallest bid ID. This reduction prevents same-slot renderer ambiguity in mediation.
+
+APS bids use `aps` as both the bidder identity and `hb_bidder`, regardless of an upstream seat value. The selected APS bid ID is used for `hb_adid`. APS then competes directly against other decoded-price bids and ordinary slot floors.
+
+## Rendering security model
+
+Trusted Server does not insert APS creative markup into the publisher document. It serializes only the selected bid into a versioned renderer descriptor. The base64 OpenRTB envelope has exactly this shape:
 
 ```json
 {
-  "bids": [
+  "seatbid": [
     {
-      "slotID": "header-banner",
-      "price": 2.5,
-      "adm": "<div>Creative HTML</div>",
-      "w": 728,
-      "h": 90,
-      "adomain": ["amazon.com"],
-      "bidId": "bid-123",
-      "nurl": "https://win-notification.com",
-      "targeting": {
-        "amzniid": "user-id",
-        "amznbid": "2.50"
-      }
+      "bid": [
+        {
+          "id": "fictional-selected-bid-id",
+          "price": 1.23,
+          "w": 300,
+          "h": 250,
+          "ext": {
+            "creativeurl": "https://creative.example/render",
+            "tagtype": "iframe"
+          }
+        }
+      ]
     }
   ]
 }
 ```
 
-The integration automatically transforms this to unified `Bid` format.
+Seats, `impid`, markup, notifications, user-sync data, sibling bids, losing seats, and unknown fields are not exposed. The browser decodes this envelope and cross-checks the ID, dimensions, URL, and tag type before any DOM mutation or message suppression.
 
-## Testing
+Both rendering paths use `GET /integrations/aps/renderer`, a static Trusted Server document with its own restrictive CSP. The document initializes the account-keyed APS queue and then loads only the fixed runner at `https://client.aps.amazon-adsystem.com/prebid-creative.js`.
 
-### Unit Tests
+The outer iframe uses these sandbox permissions:
 
-```bash
-cargo test -p trusted-server-core aps::tests
+```text
+allow-forms
+allow-pointer-lock
+allow-popups
+allow-popups-to-escape-sandbox
+allow-scripts
+allow-top-navigation-by-user-activation
 ```
 
-### Local Testing
+It deliberately omits `allow-same-origin`, so APS and bidder execution remains below an opaque-origin boundary. The renderer response repeats these restrictions with a CSP `sandbox` directive, preventing another embedding path from restoring publisher-origin execution by omitting the iframe attribute. Trusted Server generates a fresh 128-bit nonce, binds it in the iframe URL fragment before navigation, and requires the same one-time nonce in the parent message and renderer acknowledgement. Existing slot content is retained until the static renderer has accepted the descriptor and loaded the fixed runner.
 
-1. Configure APS in `trusted-server.toml`
-2. Set up Fastly backend
-3. Run locally:
-   ```bash
-   fastly compute serve
-   ```
-4. Inspect logs for bid requests/responses
+### Direct `/auction`
 
-### Testing
+The TSJS auction client validates the typed renderer descriptor, creates the opaque renderer iframe, and sends the minimized envelope after the frame loads. Ordinary non-APS `adm` continues through the existing sanitizer and generic creative iframe.
 
-For local testing without live APS credentials, configure the integration with test values:
+### GAM and Universal Creative
 
-```toml
-[integrations.aps]
-enabled = true
-pub_id = "test-publisher-123"
-endpoint = "https://aax.amazon-adsystem.com/e/dtb/bid"
-timeout_ms = 800
+For initial navigation and page-bids, Trusted Server publishes the same descriptor in `window.tsjs.bids`. The source-checked Prebid Universal Creative bridge accepts requests only from the iframe that owns the matching `hb_adid`, validates the complete envelope, and returns a static dynamic-renderer program that creates the same opaque renderer iframe.
+
+For client-side `trustedServer` adapter auctions, Prebid generates its own `hb_adid`. Trusted Server binds that generated ID to the validated APS descriptor in a bounded, expiring browser registry before GAM refresh. The bridge verifies that the requesting Universal Creative iframe belongs to the same ad unit, consumes the capability once, and passes the APS bid ID separately to the Amazon runner.
+
+These paths do not fetch PBS Cache, fire generic APS win/billing beacons, or call `apstag.setDisplayBids()` for the Trusted Server winner. Publisher-owned native APS objects are otherwise left untouched.
+
+## Publisher CSP
+
+The publisher policy must permit the same-origin renderer route, for example:
+
+```text
+frame-src 'self'
 ```
 
-Run unit tests:
+Do not add `allow-same-origin` to the outer renderer sandbox. The renderer endpoint supplies its own CSP for the fixed runner and HTTPS creative resources.
 
-```bash
-cargo test -p trusted-server-core aps
-```
+Before enabling script creatives, verify under the publisher's actual CSP that both iframe and script-tag creatives:
 
-## Monitoring
+- render and size correctly;
+- cannot read or modify `top.document`;
+- cannot restore publisher-origin execution;
+- reject malformed descriptors, nonce mismatches, and replay; and
+- work through both direct and GAM/Universal Creative paths.
 
-The integration logs detailed information at different levels:
+If script rendering requires weakening the outer sandbox, leave `allow_script_creatives = false` and consult APS instead.
 
-```rust
-// Info: Auction lifecycle
-log::info!("APS: requesting bids for 2 slots (pub_id: 5128)");
-log::info!("APS returned 2 bids in 150ms");
+## Migration from the legacy APS integration
 
-// Debug: Request/response payloads
-log::debug!("APS: sending bid request: {...}");
-log::debug!("APS: received response: {...}");
+This release is a direct protocol cutover:
 
-// Warn: Non-success responses
-log::warn!("APS returned non-success status: 400");
-```
+1. Replace the legacy `/e/dtb/bid` endpoint with `/e/pb/bid`.
+2. Rename `pub_id` to `account_id`.
+3. Remove APS-specific slot ID configuration and remove `aps` from Prebid Server bidder lists. Trusted Server also filters APS from PBS requests for this path.
+4. Prepare GAM line items and Universal Creative for `hb_bidder=aps` and the selected APS `hb_adid`.
+5. Disable publisher-native APS demand for the Trusted Server test cohort.
+
+There is no legacy runtime switch. Roll back by disabling `[integrations.aps]`, restoring native APS for the cohort, or deploying the prior binary.
+
+## Rollout
+
+Use fictional values in source-controlled configuration and fixtures. Supply controlled account details out of band.
+
+1. Obtain APS account-team confirmation for edge-originated OpenRTB traffic.
+2. Enable Trusted Server APS only for an isolated cohort and disable native APS demand there.
+3. Keep `allow_script_creatives = false` and observe iframe bids through direct and GAM paths.
+4. Confirm outbound privacy fields, aggregate diagnostics, decoded-price competition, line-item targeting, dimensions, click-throughs, and opaque-origin isolation.
+5. Run the restrictive-CSP browser proof for script behavior.
+6. Only then enable script creatives for the isolated cohort and validate them in a real browser.
+7. Expand traffic only after APS confirmation and successful controlled validation.
 
 ## Troubleshooting
 
-### Problem: No bids returned
+### No APS bids
 
-**Check:**
+- Confirm `account_id` and account eligibility with APS.
+- Confirm the endpoint is `/e/pb/bid` and uses HTTPS without credentials.
+- If the deployment hostname differs from APS-authorized inventory, configure both `inventory_domain` and `inventory_page_origin` with the APS-approved identity.
+- Ensure `aps` appears in `auction.providers`.
+- Check aggregate APS drop reasons for currency, dimensions, render source, URL, tag type, or script-gate rejection.
+- Confirm the provider timeout fits inside the auction timeout.
+- On a controlled test site, set `debug = true` and inspect `ext.orchestrator.provider_details[].metadata.debug.httpcalls.aps` in the `/auction` response.
 
-1. Verify `pub_id` is correct
-2. Check backend is configured: `fastly backend list`
-3. Increase timeout: `timeout_ms = 1200`
-4. View logs with `fastly compute serve`
+### Winner targets but does not render
 
-**Possible causes:**
+- Confirm `GET /integrations/aps/renderer` returns HTML with its CSP and `Referrer-Policy: no-referrer`.
+- Confirm publisher CSP permits `frame-src 'self'`.
+- Confirm the GAM creative uses the supported Prebid Universal Creative bridge and the winning `hb_adid`.
+- For client-side `trustedServer` adapter auctions, confirm Prebid's `bidResponse` contains a generated `adId` and that the corresponding capability appears briefly in `window.tsjs.apsPrebidRenderers` before rendering.
+- Ensure no native APS path is trying to handle the same cohort.
+- Keep script creatives disabled while diagnosing iframe rendering.
 
-- Invalid `pub_id` configuration
-- Timeout too short (increase `timeout_ms`)
-- Backend not configured correctly
-- APS account not active
+## Verification
 
-### Problem: "Backend not found" error
+```bash
+cargo test-fastly integrations::aps
+cargo test-fastly auction::orchestrator
+cargo test-fastly integrations::adserver_mock
 
-**Solution:**
-Add backend to Fastly (see Step 1)
-
-### Problem: Parse errors
-
-**Check:**
-
-- Enable debug logging
-- Verify endpoint URL is correct
-- Check APS API for changes
-
-**Solutions:**
-
-- Enable debug logging to inspect response
-- Verify APS endpoint is correct
-- Check for API changes (update structs if needed)
-
-### Timeout Errors
-
-**Symptoms:**
-
-```
-APS request failed: Timeout
+cd crates/trusted-server-js/lib
+npx vitest run test/integrations/aps/render.test.ts test/core/auction.test.ts
 ```
 
-**Solutions:**
-
-- Increase `timeout_ms` in config
-- Check backend connectivity
-- Verify DNS resolution for `aax.amazon-adsystem.com`
-
-## Performance Tuning
-
-### Timeout Configuration
-
-- **Default**: 800ms (matches APS client-side behavior)
-- **Aggressive**: 500ms (reduce latency, may miss some bids)
-- **Conservative**: 1200ms (maximize fill rate)
-
-```toml
-[integrations.aps]
-timeout_ms = 800  # Balance latency vs fill rate
-```
-
-### Orchestrator Timeout
-
-Ensure orchestrator timeout exceeds provider timeout:
-
-```toml
-[auction]
-timeout_ms = 2000  # > sum of all provider timeouts
-
-[integrations.aps]
-timeout_ms = 800
-
-[integrations.prebid]
-timeout_ms = 1000
-```
-
-## Integration with Client-Side
-
-While this implementation focuses on server-side bidding, you can optionally add client-side components later:
-
-1. **ID Resolution**: Integrate third-party ID vendors client-side
-2. **Analytics**: Load `aps_csm.js` for viewability tracking
-3. **Config Loading**: Fetch `/configs/{pub_id}` for advanced settings
-
-See the original network flow documentation for client-side patterns.
-
-## Future Enhancements
-
-Potential additions for complete APS TAM parity:
-
-1. **Video Support**: Add video slot formats
-2. **ID Enrichment**: Server-side ID resolution (LiveRamp, ID5, etc.)
-3. **Advanced Targeting**: Pass user segments, geo data
-4. **Config API**: Fetch APS configuration from `/configs/{pub_id}`
-5. **Analytics**: Integrate with APS measurement endpoints
-
-## Reference
-
-- **APS TAM Docs**: https://aps.amazon.com/aps/transparent-ad-marketplace-api/
-- **Integration Code**: `crates/trusted-server-core/src/integrations/aps.rs`
-- **Tests**: `crates/trusted-server-core/src/integrations/aps.rs#tests`
-- **Example Config**: `trusted-server.toml`
-
-## Support
-
-Questions? Issues?
-
-1. Check logs: `fastly compute serve`
-2. Run tests: `cargo test aps`
-3. Verify configuration in `trusted-server.toml`
-4. Review this documentation
-
----
-
-**Status**: ✅ Production Ready (Server-Side Bidding)
-
-**Last Updated**: 2025-12-23
+See `crates/trusted-server-core/src/integrations/aps.rs` for the request/parser implementation and `crates/trusted-server-js/lib/src/integrations/aps/render.ts` for the browser renderer contract.
