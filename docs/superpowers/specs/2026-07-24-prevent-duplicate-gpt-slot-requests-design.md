@@ -8,12 +8,6 @@ slot on the outer `-container` element. The publisher subsequently defines and
 displays an inner-div slot. These are distinct GPT slots, so they make separate GAM
 requests for one visible placement.
 
-A production deployment also exposed the inverse ordering: the hydration-safe
-body bootstrap delays `adInit()` until after `window.load`, so publisher code can
-already have defined **and requested** its inner-div slot. In that ordering,
-reusing the slot and refreshing it applies targeting too late and creates a second
-SRA request.
-
 The affected paths are deliberately duplicated today:
 
 - `crates/trusted-server-js/lib/src/integrations/gpt/index.ts` is the full bundle
@@ -46,7 +40,7 @@ A fix must keep both implementations in sync.
   publisher-owned slot from a placement that the publisher will never define.
 - General interception of unrelated GPT slots.
 
-## Decision: inner-div fallback, late-definition handoff, and an initial request gate
+## Decision: one inner-div slot with late-definition handoff
 
 TS will define its fallback slot on the **actual inner div**, never on its outer
 `-container` element. It will record a narrowly scoped handoff claim keyed by that
@@ -60,36 +54,31 @@ competing container slot and an invalid duplicate definition.
 
 ### Lifecycle
 
-1. **Publisher-owned before bids are available** — a scoped head-installed gate
-   holds the configured placement's first publisher `display()` or `refresh()`.
-   At `adInit()`, TS finds the publisher slot, applies targeting, and replays that
-   held native call exactly once. It never adds a second TS refresh.
-2. **Already-requested publisher-owned slot** — if a configured publisher request
-   was not observed by the gate, TS applies targeting for later lifecycle work but
-   does not re-request the already-served initial impression.
-3. **No slot yet** — TS defines a slot on the resolved inner div, applies targeting,
+1. **Already publisher-owned** — `getSlots()` finds a slot for the resolved inner
+   div. TS applies targeting, records it as publisher-owned, and refreshes it as it
+   does today.
+2. **No slot yet** — TS defines a slot on the resolved inner div, applies targeting,
    enables services when needed, and displays it. When initial load is disabled, TS
    performs its existing one explicit refresh. TS records this slot as TS-owned and
    handoff-eligible.
-4. **Publisher defines later** — the scoped `defineSlot` wrapper sees the recorded
+3. **Publisher defines later** — the scoped `defineSlot` wrapper sees the recorded
    inner-div claim, returns the existing slot, and transfers ownership: it removes
    the slot from TS's future `destroySlots()` set. The publisher's setup continues
    against that same slot.
-5. **Publisher's first request call after a late handoff** — the wrapper suppresses the duplicate
+4. **Publisher's first request call** — the wrapper suppresses the duplicate
    publisher `display()` call. With `disableInitialLoad()`, it instead suppresses
    only the publisher's first refresh for the transferred slot, because TS has
    already issued the required initial refresh. For a no-argument/global refresh,
    the wrapper must expand `getSlots()`, remove only the one-shot suppressed slots,
    and forward the remaining slots explicitly so unrelated slots still refresh.
-6. **Later refreshes and SPA navigation** — after the one-shot suppression is
+5. **Later refreshes and SPA navigation** — after the one-shot suppression is
    consumed, publisher refreshes are untouched. On navigation, TS clears its
    targeting from the shared slot and may reuse it for the next route; it must not
    destroy a slot after ownership has transferred.
 
-The wrappers are not global deduplicators. The initial request gate only holds the
-first `display`/`refresh` for a configured placement until initial TS targeting is
-available; handoff suppression only handles IDs present in TS's handoff registry.
-All unrelated GPT calls retain native behavior.
+The wrapper is not a global deduplicator. It only handles IDs present in TS's
+handoff registry and must preserve native `defineSlot`, `display`, and `refresh`
+behavior for every other placement.
 
 ## Implementation shape
 
@@ -100,10 +89,8 @@ can read after the bundle replaces the bootstrap implementation. It is keyed by 
 resolved actual div ID and records at least:
 
 - whether TS created the slot and whether ownership has transferred;
-- whether one post-handoff publisher `display()` or initial-load-disabled `refresh()`
-  remains to suppress;
-- configured publisher displays and refreshes held before initial targeting, plus a
-  released marker so the gate applies only once per page load.
+- whether one publisher `display()` or initial-load-disabled `refresh()` remains to
+  suppress.
 
 Do not rely only on module-local state: the bootstrap can define the initial slot
 before `index.ts` is loaded. Look up the live slot by element ID through
@@ -122,12 +109,8 @@ In `crates/trusted-server-js/lib/src/integrations/gpt/index.ts`:
 - Replace the container fallback with `actualDivId`.
 - Add the typed handoff-registry state to `TsjsApi` in
   `crates/trusted-server-js/lib/src/core/types.ts`.
-- Install idempotent `defineSlot`, `display`, and `pubads().refresh` wrappers from
-  the GPT command queue before publisher setup. The latter two also hold the first
-  configured publisher request until `adInit()` has applied initial targeting.
-- Replay held initial publisher displays/refreshes after targeting rather than
-  refreshing an existing publisher-owned slot. Retain reused-slot refreshes only for
-  later SPA navigations.
+- Install the idempotent `defineSlot`, `display`, and `pubads().refresh` handoff
+  wrappers from the GPT command queue before `adInit()` can create a fallback slot.
 - When a late publisher definition is aliased to the existing slot, remove it from
   `prevGptSlots` and mark it transferred before returning it.
 - Keep targeting cleanup keyed by the real inner div. Remove the old dual
@@ -149,7 +132,7 @@ suite must exercise both implementations' observable contract.
 | Risk                                                                             | Mitigation                                                                                                                                                                                                                                                                                                               |
 | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Publisher passes a different ad-unit path or sizes in its late `defineSlot` call | Return the existing claimed slot but log a diagnostic. Do not define a second slot. Treat the TS configuration and publisher configuration mismatch as an integration error to resolve separately.                                                                                                                       |
-| Publisher invokes global `refresh()` before bids after `disableInitialLoad()`    | Filter only configured held slots from the expanded list, forward unrelated slots immediately, then replay the held slots once after targeting. A no-argument refresh must not be silently dropped.                                                                                                                      |
+| Publisher invokes global `refresh()` after `disableInitialLoad()`                | Filter the one-shot claimed slot from the expanded slot list and refresh all remaining slots. A no-argument refresh must not be silently dropped.                                                                                                                                                                        |
 | Publisher calls a legitimate refresh without an initial display                  | The one-shot suppression is consumed only immediately after a successful late handoff. Document and test the standard publisher sequence (`defineSlot` → `addService` → `display`, with `refresh` when initial load is disabled). Escalate unusual publisher lifecycle requirements rather than adding a time heuristic. |
 | Publisher-owned slot is destroyed on SPA navigation                              | Transfer ownership synchronously in the `defineSlot` wrapper and remove the slot from `prevGptSlots`.                                                                                                                                                                                                                    |
 | Bootstrap and bundle diverge                                                     | Give both paths the same black-box regression cases; retain a Rust source-contract assertion for bootstrap-specific sentinels.                                                                                                                                                                                           |
@@ -163,9 +146,7 @@ suite must exercise both implementations' observable contract.
   initial-load-disabled modes.
 - The late publisher `display()` (and its first initial-load-disabled refresh) cannot
   create a second request, while unrelated slots retain their normal calls.
-- A configured publisher slot whose first request occurs before the deferred
-  `adInit()` is held, receives TS targeting, and makes exactly one replayed native
-  request. An already-requested publisher slot is never re-requested by TS.
+- Existing publisher slots are still reused and receive TS targeting.
 - A slot that no publisher claims is displayed and requested once by TS.
 - A transferred slot is absent from TS's SPA `destroySlots()` argument; targeting is
   still cleared and reapplied correctly on the next route.
@@ -179,7 +160,6 @@ suite must exercise both implementations' observable contract.
 2. Run the focused GPT test files, then the full TSJS Vitest suite and formatter.
 3. Run the target-matched Rust test suite so the included bootstrap and its source
    assertions compile and pass.
-4. In a controlled browser capture with deferred `adInit()`, verify that one
-   configured header and one configured fixed placement each produce one initial
-   slot request with TS targeting, while a distinct in-content placement remains
-   independently requestable.
+4. In a controlled browser capture, verify that one configured header and one
+   configured fixed placement each produce one initial slot request, while a distinct
+   in-content placement remains independently requestable.
