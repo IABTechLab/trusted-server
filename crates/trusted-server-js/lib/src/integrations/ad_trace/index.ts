@@ -1,36 +1,7 @@
-import {
-  createAdTraceStore,
-  isBoundedTraceLabel,
-  isCanonicalTraceUuid,
-  terminalSummaryStageOutcome,
-} from '../../core/ad_trace';
-import type { AdTraceApi, AuctionBidData, AuctionTraceSummary, TsjsApi } from '../../core/types';
+import { createAdTraceStore } from '../../core/ad_trace';
+import type { AdTraceApi, TsjsApi } from '../../core/types';
 
 import { installAdTraceOverlay } from './overlay';
-
-const TRACE_SOURCES = new Set(['initial_navigation', 'spa_navigation', 'auction_api']);
-const TRACE_OUTCOMES = new Set(['completed', 'no_bid', 'skipped', 'failed', 'abandoned']);
-
-function validSummary(value: AuctionTraceSummary | undefined): value is AuctionTraceSummary {
-  return (
-    value?.version === 1 &&
-    isCanonicalTraceUuid(value.auctionTraceId) &&
-    TRACE_SOURCES.has(value.source) &&
-    TRACE_OUTCOMES.has(value.outcome)
-  );
-}
-
-function validBid(value: AuctionBidData | undefined, slotId: string): boolean {
-  const trace = value?.trace;
-  return !!(
-    trace?.version === 1 &&
-    trace.slotId === slotId &&
-    isCanonicalTraceUuid(trace.auctionTraceId) &&
-    isCanonicalTraceUuid(trace.bidTraceId) &&
-    isBoundedTraceLabel(trace.provider) &&
-    isBoundedTraceLabel(trace.bidder)
-  );
-}
 
 function consumeActiveBootstrap(): boolean {
   if (window.__tsjs_adTraceActive !== true) return false;
@@ -54,6 +25,7 @@ export function installAdTrace(): boolean {
   });
   ts.adTrace = api;
   ts.recordAdTrace = store.record;
+  ts.recordAdTraceCoverage = store.recordCoverage;
   ts.nextAdTraceGeneration = store.nextGeneration;
   ts.subscribeAdTrace = store.subscribe;
   ts.bindAdTraceElement = store.bindElement;
@@ -67,30 +39,9 @@ export function installAdTrace(): boolean {
     };
   }
 
-  const summary = validSummary(ts.auctionTrace) ? ts.auctionTrace : undefined;
-  for (const slot of ts.adSlots ?? []) {
-    const bid = ts.bids?.[slot.id];
-    if (validBid(bid, slot.id) && bid?.trace) {
-      store.record({
-        kind: 'ts_winner_observed',
-        slotId: slot.id,
-        auctionTraceId: bid.trace.auctionTraceId,
-        bidTraceId: bid.trace.bidTraceId,
-        provider: bid.trace.provider,
-        bidder: bid.trace.bidder,
-      });
-    } else if (summary) {
-      store.record({
-        kind: 'ts_auction_observed',
-        slotId: slot.id,
-        auctionTraceId: summary.auctionTraceId,
-        outcome: terminalSummaryStageOutcome(summary.outcome),
-        confidence: 'definitive',
-        reason: 'terminal_summary',
-      });
-    }
-  }
-
+  // Server evidence is attached by the GPT/request integration only after an
+  // exact request owner exists. Seeding here would let an absent slot element
+  // leak generationless evidence into a later route or refresh.
   installAdTraceOverlay(api, store.subscribe);
   return true;
 }

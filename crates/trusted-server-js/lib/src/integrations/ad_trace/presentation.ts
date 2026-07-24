@@ -1,6 +1,7 @@
 import type {
   AdTraceStage,
   AdTraceStageName,
+  GenerationTraceDiagnostics,
   RenderTraceSnapshot,
   RenderTraceVisibility,
 } from '../../core/types';
@@ -14,6 +15,8 @@ export interface TraceOverlayPresentation {
   renderStatus?: string;
   /** Best observed fact for a compact primary timeline row. */
   primaryStatus?: string;
+  /** Concise, single-line badge summary. */
+  badgeStatus?: string;
   className: TraceOverlayPresentationClass;
 }
 
@@ -90,6 +93,14 @@ function stageFacts(name: AdTraceStageName, stage: AdTraceStage): readonly strin
           return ['Creative response sent to the renderer'];
         case 'rejected':
           return ['Trusted Server direct render rejected'];
+        case 'ack_timed_out':
+          return ['Creative confirmation timed out'];
+        case 'ack_missing_token':
+          return ['Creative confirmation unavailable — trace token missing'];
+        case 'ack_source_mismatched':
+          return ['Creative acknowledgement source did not match'];
+        case 'ack_superseded':
+          return ['Creative confirmation superseded'];
         default:
           return [];
       }
@@ -110,6 +121,8 @@ function renderStatus(render?: RenderTraceSnapshot): string | undefined {
       if (render.reason === 'aps_renderer') return 'APS renderer response sent';
       if (render.reason === 'direct_iframe_created') return 'Creative iframe created';
       return 'Creative response sent to the renderer';
+    case 'timed_out':
+      return 'Creative confirmation timed out';
     case 'gam_only':
       return render.reason === 'gpt_backfill'
         ? 'GAM returned backfill'
@@ -150,9 +163,44 @@ function presentationClass(
  * available in technical details and exports; they are intentionally excluded
  * from this presentation surface.
  */
+function compactBadgeStatus(
+  stages: TraceStages,
+  render: RenderTraceSnapshot | undefined,
+  diagnostics: GenerationTraceDiagnostics | undefined,
+  primaryStatus: string | undefined
+): string | undefined {
+  let response: string | undefined;
+  if (stages.gam.outcome === 'trusted_server_won') response = 'TS creative';
+  else if (stages.gam.outcome === 'backfill' || diagnostics?.responseClass === 'backfill') {
+    response = 'GAM backfill';
+  } else if (stages.gam.outcome === 'empty' || diagnostics?.responseClass === 'empty') {
+    response = 'GAM empty';
+  } else if (
+    stages.gam.outcome === 'trusted_server_candidate' ||
+    stages.gam.outcome === 'client_prebid_candidate' ||
+    stages.gam.outcome === 'direct_or_unattributed' ||
+    render?.outcome === 'gam_only'
+  ) {
+    response = 'GAM ad';
+  }
+
+  let delivery: string | undefined;
+  if (diagnostics?.acknowledgement === 'confirmed') delivery = 'confirmed';
+  else if (stages.creative.outcome === 'gpt_iframe_onload') delivery = 'loaded';
+  else if (diagnostics?.acknowledgement === 'timed_out' || render?.outcome === 'timed_out') {
+    delivery = 'confirmation timed out';
+  } else if (stages.creative.outcome === 'render_failed') delivery = 'render failed';
+
+  const parts = [response, delivery, render?.viewability === 'viewable' ? 'viewable' : undefined]
+    .filter((part): part is string => !!part)
+    .slice(0, 3);
+  return parts.length > 0 ? parts.join(' · ') : primaryStatus;
+}
+
 export function presentTraceOverlay(
   stages: TraceStages,
-  render?: RenderTraceSnapshot
+  render?: RenderTraceSnapshot,
+  diagnostics?: GenerationTraceDiagnostics
 ): TraceOverlayPresentation {
   const facts = new Set<string>();
   for (const name of STAGE_ORDER) {
@@ -166,11 +214,13 @@ export function presentTraceOverlay(
   const factList = [...facts];
   const primaryStatus =
     status ?? [...factList].reverse().find((fact) => !fact.startsWith('Slot element currently '));
+  const badgeStatus = compactBadgeStatus(stages, render, diagnostics, primaryStatus);
 
   return {
     facts: factList,
     renderStatus: status,
     ...(primaryStatus ? { primaryStatus } : {}),
+    ...(badgeStatus ? { badgeStatus } : {}),
     className: presentationClass(stages, render),
   };
 }

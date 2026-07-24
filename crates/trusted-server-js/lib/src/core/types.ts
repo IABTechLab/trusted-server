@@ -103,6 +103,28 @@ export interface TrustedServerBidTrace {
 }
 
 export type AdTraceConfidence = 'definitive' | 'strong' | 'probable' | 'none';
+export type AdTraceCoverageCategory =
+  | 'gpt_requests'
+  | 'gpt_responses'
+  | 'gpt_renders'
+  | 'gpt_loads'
+  | 'gpt_viewability'
+  | 'gpt_visibility'
+  | 'prebid_render_succeeded'
+  | 'prebid_render_failed';
+export type AdTraceCorrelationResolution = 'correlated' | 'ambiguous' | 'unmatched' | 'ignored';
+export interface AdTraceCoverageCounter {
+  observed: number;
+  correlated: number;
+  ambiguous: number;
+  unmatched: number;
+  ignored: number;
+}
+export interface AdTraceCoverageObservation {
+  category: AdTraceCoverageCategory;
+  resolution: AdTraceCorrelationResolution;
+  reason?: string;
+}
 export type AdTraceStageName = 'trustedServer' | 'prebid' | 'gam' | 'creative';
 export interface AdTraceStage {
   outcome: string;
@@ -127,6 +149,7 @@ export type AdTraceEventKind =
   | 'gpt_slot_render_ended'
   | 'gpt_slot_onload'
   | 'gpt_impression_viewable'
+  | 'gpt_slot_visibility_changed'
   | 'aps_display_bids_set'
   | 'aps_renderer_ready'
   | 'pb_render_requested'
@@ -134,6 +157,10 @@ export type AdTraceEventKind =
   | 'pb_render_served'
   | 'direct_render_rejected'
   | 'creative_load_acknowledged'
+  | 'creative_ack_timed_out'
+  | 'creative_ack_superseded'
+  | 'creative_ack_source_mismatched'
+  | 'creative_ack_missing_token'
   | 'generation_superseded';
 
 /** Sanitized observation accepted by the optional recorder. */
@@ -150,6 +177,13 @@ export interface AdTraceObservation {
   reason?: string;
   isEmpty?: boolean;
   isBackfill?: boolean;
+  responseClass?: AdTraceResponseClass;
+  renderedWidth?: number;
+  renderedHeight?: number;
+  slotContentChanged?: boolean;
+  sizeMatchesConfigured?: boolean;
+  inViewPercentage?: number;
+  prebidAuctionDurationMs?: number;
 }
 
 export interface AdTraceEvent extends AdTraceObservation {
@@ -157,9 +191,39 @@ export interface AdTraceEvent extends AdTraceObservation {
   timestamp: number;
 }
 
+export type AdTraceResponseClass = 'empty' | 'backfill' | 'reservation' | 'unclassified_non_empty';
+export type AdTraceAcknowledgementState =
+  | 'confirmed'
+  | 'timed_out'
+  | 'superseded'
+  | 'source_mismatched'
+  | 'missing_token';
+export type AdTraceGenerationTerminalState = 'active' | 'rendered' | 'empty' | 'superseded';
+export interface AdTraceLifecycleDurations {
+  requestToResponseMs?: number;
+  responseToRenderMs?: number;
+  renderToIframeLoadMs?: number;
+  renderToCreativeAcknowledgementMs?: number;
+  renderToViewableMs?: number;
+  prebidAuctionMs?: number;
+}
+export interface GenerationTraceDiagnostics {
+  requestNumber: number;
+  terminalState: AdTraceGenerationTerminalState;
+  responseClass?: AdTraceResponseClass;
+  renderedSize?: readonly [number, number];
+  slotContentChanged?: boolean;
+  sizeMatchesConfigured?: boolean;
+  currentVisibilityPercentage?: number;
+  maximumVisibilityPercentage?: number;
+  prebidRender?: 'succeeded' | 'failed';
+  acknowledgement?: AdTraceAcknowledgementState;
+  durations: AdTraceLifecycleDurations;
+}
 export interface GenerationTraceSnapshot {
   generation: number;
   stages: Record<AdTraceStageName, AdTraceStage>;
+  diagnostics: GenerationTraceDiagnostics;
 }
 
 export interface SlotTraceSnapshot {
@@ -170,7 +234,13 @@ export interface SlotTraceSnapshot {
   stages: Record<AdTraceStageName, AdTraceStage>;
 }
 
-export type RenderTraceOutcome = 'confirmed' | 'served' | 'gam_only' | 'empty' | 'unresolved';
+export type RenderTraceOutcome =
+  | 'confirmed'
+  | 'served'
+  | 'timed_out'
+  | 'gam_only'
+  | 'empty'
+  | 'unresolved';
 export type RenderTraceVisibility = 'visible' | 'hidden' | 'disconnected' | 'unknown';
 
 export interface RenderTraceSnapshot {
@@ -196,7 +266,12 @@ export interface AdTraceExport {
   slots: SlotTraceSnapshot[];
   events: AdTraceEvent[];
   renders: RenderTraceSnapshot[];
-  metadata: { droppedEvents: number; evictedSlots: number };
+  metadata: {
+    droppedEvents: number;
+    evictedSlots: number;
+    coverage: Record<AdTraceCoverageCategory, AdTraceCoverageCounter>;
+    anomalies: Record<string, number>;
+  };
 }
 
 export interface AdTraceApi {
@@ -281,6 +356,8 @@ export interface TsjsApi {
   recordAdTrace?: (observation: AdTraceObservation) => void;
   /** Private generation allocator installed only by the optional module. */
   nextAdTraceGeneration?: (slotId: string) => number;
+  /** Record one privacy-safe callback-correlation result without raw identifiers. */
+  recordAdTraceCoverage?: (observation: AdTraceCoverageObservation) => void;
   /** Private overlay subscription installed only by the optional module. */
   subscribeAdTrace?: (listener: () => void) => () => void;
   /** Bind one generation to the exact DOM element captured at its request boundary. */
@@ -302,6 +379,7 @@ export interface TsjsApi {
     adId?: string;
     traceToken?: string;
     serverTrace?: TrustedServerBidTrace;
+    prebidAuctionDurationMs?: number;
     events?: AdTraceEventKind[];
   }>;
   /** Exact selected participants retained briefly for post-request terminal events. */
@@ -314,6 +392,7 @@ export interface TsjsApi {
     bidder?: string;
     generation: number;
     selectedAt: number;
+    prebidAuctionDurationMs?: number;
   }>;
   /** Request-scoped root summaries retained until the GPT request boundary. */
   prebidServerSummaries?: Array<{
@@ -322,7 +401,11 @@ export interface TsjsApi {
     summary: AuctionTraceSummary;
   }>;
   /** Completed Prebid auctions used to identify request-scoped no-bid selections. */
-  prebidCompletedAuctions?: Array<{ auctionId: string; slotIds: string[] }>;
+  prebidCompletedAuctions?: Array<{
+    auctionId: string;
+    slotIds: string[];
+    prebidAuctionDurationMs?: number;
+  }>;
   /** Private bootstrap queue used until the GPT module installs its capture hook. */
   pendingAdTraceRequests?: Array<{
     slot: unknown;

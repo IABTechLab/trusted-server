@@ -180,19 +180,18 @@ describe('GPT immutable ad trace render attribution', () => {
     );
   });
 
-  it('serves, bills once, and acknowledges only the exact immutable generation/source/token', () => {
+  it('serves and bills once, then supersedes acknowledgement ownership on refresh', () => {
     const source = trustedSource();
     const foreignSource = window;
     const port = { postMessage: vi.fn() };
     const beacon = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
-    module.captureAdTraceRequest(
-      slotWithTargeting({
-        hb_adid: 'old-ad-id',
-        hb_bidder: 'example-bidder',
-        ts_trace: OLD_TOKEN,
-      }) as any,
-      'display'
-    );
+    const targeting: Record<string, string> = {
+      hb_adid: 'old-ad-id',
+      hb_bidder: 'example-bidder',
+      ts_trace: OLD_TOKEN,
+    };
+    const slot = slotWithTargeting(targeting);
+    module.captureAdTraceRequest(slot as any, 'display');
 
     bridge(
       Object.assign(new Event('message'), {
@@ -207,10 +206,6 @@ describe('GPT immutable ad trace render attribution', () => {
     expect(response.ad).toBe('<div>Old creative</div>');
     expect(beacon).toHaveBeenCalledTimes(2);
 
-    // A newer generation does not steal or invalidate the retained exact ack.
-    const nextSlot = slotWithTargeting({ hb_adid: 'client-next', hb_bidder: 'client-bidder' });
-    module.captureAdTraceRequest(nextSlot as any, 'prebid_refresh');
-
     bridge(
       Object.assign(new Event('message'), {
         data: { type: 'ts-creative-load', version: 1, traceToken: OLD_TOKEN },
@@ -220,32 +215,41 @@ describe('GPT immutable ad trace render attribution', () => {
     expect(record).not.toHaveBeenCalledWith(
       expect.objectContaining({ kind: 'creative_load_acknowledged' })
     );
-    bridge(
-      Object.assign(new Event('message'), {
-        data: { type: 'ts-creative-load', version: 1, traceToken: NEW_TOKEN },
-        source,
-      }) as unknown as MessageEvent
-    );
-    expect(record).not.toHaveBeenCalledWith(
-      expect.objectContaining({ kind: 'creative_load_acknowledged' })
-    );
-
-    bridge(
-      Object.assign(new Event('message'), {
-        data: { type: 'ts-creative-load', version: 1, traceToken: OLD_TOKEN },
-        source,
-      }) as unknown as MessageEvent
-    );
     expect(record).toHaveBeenCalledWith(
       expect.objectContaining({
-        kind: 'creative_load_acknowledged',
+        kind: 'creative_ack_source_mismatched',
         generation: 1,
         bidTraceId: OLD_TOKEN,
       })
     );
+
+    // GPT acknowledgement messages carry no generation, so a normal refresh
+    // proactively terminates the old pending acknowledgement.
+    Object.assign(targeting, { hb_adid: 'client-next', hb_bidder: 'client-bidder' });
+    delete targeting.ts_trace;
+    module.captureAdTraceRequest(slot as any, 'prebid_refresh');
+    expect(record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'creative_ack_superseded',
+        generation: 1,
+        bidTraceId: OLD_TOKEN,
+      })
+    );
+    record.mockClear();
+    for (const traceToken of [OLD_TOKEN, NEW_TOKEN]) {
+      bridge(
+        Object.assign(new Event('message'), {
+          data: { type: 'ts-creative-load', version: 1, traceToken },
+          source,
+        }) as unknown as MessageEvent
+      );
+    }
+    expect(record).not.toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'creative_load_acknowledged' })
+    );
     expect(beacon).toHaveBeenCalledTimes(2);
 
-    module.supersedeAdTraceSlot(nextSlot as any, 'slot_destroyed');
+    module.supersedeAdTraceSlot(slot as any, 'slot_destroyed');
     expect(record).toHaveBeenCalledWith(
       expect.objectContaining({
         kind: 'generation_superseded',
@@ -274,6 +278,13 @@ describe('GPT immutable ad trace render attribution', () => {
       }) as unknown as MessageEvent
     );
     module.supersedeAdTraceSlot(slot as any, 'slot_destroyed');
+    expect(record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'creative_ack_superseded',
+        generation: 1,
+        bidTraceId: OLD_TOKEN,
+      })
+    );
     record.mockClear();
     bridge(
       Object.assign(new Event('message'), {
@@ -287,6 +298,33 @@ describe('GPT immutable ad trace render attribution', () => {
     expect(record).toHaveBeenCalledWith(
       expect.objectContaining({ kind: 'pb_render_rejected', reason: 'invalid_acknowledgement' })
     );
+  });
+
+  it('records when an exact renderer response cannot arm a trace token', () => {
+    const source = trustedSource();
+    const slot = slotWithTargeting({
+      hb_adid: 'old-ad-id',
+      hb_bidder: 'example-bidder',
+    });
+    const port = { postMessage: vi.fn() };
+    vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    module.captureAdTraceRequest(slot as any, 'display');
+    bridge(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'old-ad-id' }),
+        ports: [port],
+        source,
+        stopImmediatePropagation: vi.fn(),
+      }) as unknown as MessageEvent
+    );
+
+    expect(record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'creative_ack_missing_token',
+        generation: 1,
+      })
+    );
+    expect(JSON.parse(port.postMessage.mock.calls[0][0])).not.toHaveProperty('traceToken');
   });
 
   it('expires pending acknowledgements after thirty seconds', () => {
@@ -321,7 +359,47 @@ describe('GPT immutable ad trace render attribution', () => {
       expect.objectContaining({ kind: 'creative_load_acknowledged' })
     );
     expect(record).toHaveBeenCalledWith(
-      expect.objectContaining({ kind: 'generation_superseded', reason: 'ack_expired' })
+      expect.objectContaining({
+        kind: 'creative_ack_timed_out',
+        generation: 1,
+        bidTraceId: OLD_TOKEN,
+      })
     );
+  });
+
+  it('records an acknowledgement timeout without waiting for another bridge message', () => {
+    vi.useFakeTimers();
+    try {
+      const source = trustedSource();
+      const slot = slotWithTargeting({
+        hb_adid: 'old-ad-id',
+        hb_bidder: 'example-bidder',
+        ts_trace: OLD_TOKEN,
+      });
+      const port = { postMessage: vi.fn() };
+      vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+      module.captureAdTraceRequest(slot as any, 'display');
+      bridge(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: 'old-ad-id' }),
+          ports: [port],
+          source,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+      record.mockClear();
+
+      vi.advanceTimersByTime(30_000);
+
+      expect(record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: 'creative_ack_timed_out',
+          generation: 1,
+          bidTraceId: OLD_TOKEN,
+        })
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

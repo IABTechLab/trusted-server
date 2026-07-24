@@ -144,6 +144,7 @@ describe('ad trace reducer', () => {
       reason: 'terminal_summary',
     });
     const second = store.nextGeneration('slot-a');
+    const third = store.nextGeneration('slot-a');
 
     const slot = store.getSlot('slot-a');
     expect(
@@ -152,6 +153,9 @@ describe('ad trace reducer', () => {
     expect(
       slot?.generations.find((item) => item.generation === second)?.stages.trustedServer.outcome
     ).toBe('no_bid');
+    expect(
+      slot?.generations.find((item) => item.generation === third)?.stages.trustedServer.outcome
+    ).toBe('not_observed');
   });
 
   it('retains a Trusted Server Prebid selection when bidWon arrives without claiming creative load', () => {
@@ -445,6 +449,126 @@ describe('ad trace reducer', () => {
     }
     expect(store.getRenderTimeline()).toHaveLength(AD_TRACE_MAX_RENDERS);
     expect(store.getRenderTimeline()[0].slotId).toBe('render-1');
+  });
+
+  it('exports aggregate callback health without raw correlation identifiers', () => {
+    const store = createAdTraceStore(() => 1);
+    store.recordCoverage({ category: 'gpt_renders', resolution: 'correlated' });
+    store.recordCoverage({
+      category: 'gpt_loads',
+      resolution: 'ambiguous',
+      reason: 'ambiguous_late_onload',
+    });
+    store.recordCoverage({
+      category: 'prebid_render_failed',
+      resolution: 'unmatched',
+      reason: 'unmatched_prebid_terminal',
+    });
+
+    const metadata = store.export().metadata;
+    expect(metadata.coverage.gpt_renders).toMatchObject({ observed: 1, correlated: 1 });
+    expect(metadata.coverage.gpt_loads).toMatchObject({ observed: 1, ambiguous: 1 });
+    expect(metadata.coverage.prebid_render_failed).toMatchObject({
+      observed: 1,
+      unmatched: 1,
+    });
+    expect(metadata.anomalies).toEqual({
+      ambiguous_late_onload: 1,
+      unmatched_prebid_terminal: 1,
+    });
+    expect(JSON.stringify(metadata)).not.toMatch(/auctionId|requestId|adId|targeting/);
+  });
+
+  it('retains bounded generation timing, response, visibility, refresh, and terminal facts', () => {
+    let clock = 0;
+    const store = createAdTraceStore(() => clock);
+    const generation = store.nextGeneration('slot-a');
+    store.record({ kind: 'gpt_request_started', slotId: 'slot-a', generation });
+    clock = 100;
+    store.record({ kind: 'gpt_slot_response_received', slotId: 'slot-a', generation });
+    clock = 140;
+    store.record({
+      kind: 'gpt_slot_render_ended',
+      slotId: 'slot-a',
+      generation,
+      responseClass: 'reservation',
+      renderedWidth: 300,
+      renderedHeight: 250,
+      slotContentChanged: true,
+      sizeMatchesConfigured: true,
+    });
+    clock = 160;
+    store.record({
+      kind: 'gpt_slot_visibility_changed',
+      slotId: 'slot-a',
+      generation,
+      inViewPercentage: 45,
+    });
+    clock = 170;
+    store.record({
+      kind: 'gpt_slot_visibility_changed',
+      slotId: 'slot-a',
+      generation,
+      inViewPercentage: 20,
+    });
+    clock = 180;
+    store.record({
+      kind: 'creative_load_acknowledged',
+      slotId: 'slot-a',
+      generation,
+      bidTraceId: BID_TRACE_ID,
+    });
+    clock = 220;
+    store.record({ kind: 'gpt_slot_onload', slotId: 'slot-a', generation });
+    clock = 440;
+    store.record({ kind: 'gpt_impression_viewable', slotId: 'slot-a', generation });
+    store.record({
+      kind: 'prebid_render_succeeded',
+      slotId: 'slot-a',
+      generation,
+      prebidAuctionDurationMs: 1_500,
+    });
+
+    expect(store.getSlot('slot-a')?.generations[0].diagnostics).toEqual({
+      requestNumber: 1,
+      terminalState: 'rendered',
+      responseClass: 'reservation',
+      renderedSize: [300, 250],
+      slotContentChanged: true,
+      sizeMatchesConfigured: true,
+      currentVisibilityPercentage: 20,
+      maximumVisibilityPercentage: 45,
+      prebidRender: 'succeeded',
+      acknowledgement: 'confirmed',
+      durations: {
+        requestToResponseMs: 100,
+        responseToRenderMs: 40,
+        renderToCreativeAcknowledgementMs: 40,
+        renderToIframeLoadMs: 80,
+        renderToViewableMs: 300,
+        prebidAuctionMs: 1_500,
+      },
+    });
+    expect(store.getEvents().some((event) => event.kind === 'gpt_slot_visibility_changed')).toBe(
+      false
+    );
+
+    const refresh = store.nextGeneration('slot-a');
+    expect(store.getSlot('slot-a')?.generations.slice(-1)[0]).toMatchObject({
+      generation: refresh,
+      diagnostics: { requestNumber: 2, terminalState: 'active' },
+    });
+  });
+
+  it('turns a served renderer response into a factual acknowledgement timeout', () => {
+    const store = createAdTraceStore(() => 1);
+    const generation = store.nextGeneration('slot-a');
+    store.record({ kind: 'pb_render_served', slotId: 'slot-a', generation });
+    store.record({ kind: 'creative_ack_timed_out', slotId: 'slot-a', generation });
+
+    expect(store.getSlot('slot-a')?.generations[0].diagnostics.acknowledgement).toBe('timed_out');
+    expect(store.getSlot('slot-a')?.stages.creative.outcome).toBe('ack_timed_out');
+    expect(store.getRenderTimeline()[0].outcome).toBe('timed_out');
   });
 
   it('preserves failed and abandoned terminal summaries while mapping completed no-winner to no bid', () => {

@@ -154,6 +154,30 @@ describe('presentTraceOverlay', () => {
       ['Trusted Server direct render rejected'],
     ],
     [
+      'creative acknowledgement timeout',
+      stages({ creative: stage('ack_timed_out') }),
+      render('timed_out'),
+      ['Creative confirmation timed out'],
+    ],
+    [
+      'creative acknowledgement source mismatch',
+      stages({ creative: stage('ack_source_mismatched') }),
+      undefined,
+      ['Creative acknowledgement source did not match'],
+    ],
+    [
+      'creative acknowledgement missing token',
+      stages({ creative: stage('ack_missing_token') }),
+      undefined,
+      ['Creative confirmation unavailable — trace token missing'],
+    ],
+    [
+      'creative acknowledgement superseded',
+      stages({ creative: stage('ack_superseded') }),
+      undefined,
+      ['Creative confirmation superseded'],
+    ],
+    [
       'current visibility',
       stages(),
       render('unresolved', { visibility: 'visible' }),
@@ -201,6 +225,27 @@ describe('presentTraceOverlay', () => {
     expect(presentTraceOverlay(input, snapshot).className).toBe(expected);
   });
 
+  it('creates one concise badge from independent response, load, and viewability facts', () => {
+    const presentation = presentTraceOverlay(
+      stages({
+        gam: stage('backfill'),
+        creative: stage('gpt_iframe_onload'),
+      }),
+      render('gam_only', { reason: 'gpt_backfill', viewability: 'viewable' }),
+      {
+        requestNumber: 2,
+        terminalState: 'rendered',
+        responseClass: 'backfill',
+        durations: {},
+      }
+    );
+
+    expect(presentation.badgeStatus).toBe('GAM backfill · loaded · viewable');
+    expect(presentation.facts).toContain('GAM returned backfill');
+    expect(presentation.facts).toContain('GAM creative iframe loaded');
+    expect(presentation.facts).toContain('Viewable impression observed');
+  });
+
   it.each([
     [
       'confirmed Trusted Server creative',
@@ -213,6 +258,7 @@ describe('presentTraceOverlay', () => {
       'Creative iframe load confirmed',
     ],
     ['served renderer', render('served'), 'Creative response sent to the renderer'],
+    ['timed-out confirmation', render('timed_out'), 'Creative confirmation timed out'],
     ['unattributed GAM render', render('gam_only'), 'GAM rendered an ad — source not attributed'],
     [
       'GAM backfill response',

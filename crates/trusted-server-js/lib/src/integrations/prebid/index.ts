@@ -608,6 +608,7 @@ function installAdTracePrebidObservers(): void {
   };
   if (instrumented.__tsAdTraceObserved) return;
   instrumented.__tsAdTraceObserved = true;
+  const auctionStartedAt = new Map<string, number>();
 
   const record =
     (kind: AdTraceEventKind) =>
@@ -652,6 +653,14 @@ function installAdTracePrebidObservers(): void {
             ? ((evidence.tsTrace as { bidTraceId: string }).bidTraceId as string)
             : undefined;
       const ledger = (ts.prebidCorrelation ??= []);
+      if (kind === 'prebid_auction_init' && auctionId) {
+        auctionStartedAt.set(auctionId, performance.now());
+        while (auctionStartedAt.size > 64) {
+          const oldest = auctionStartedAt.keys().next().value as string | undefined;
+          if (!oldest) break;
+          auctionStartedAt.delete(oldest);
+        }
+      }
       if (kind === 'prebid_bid_response' && auctionId && slotId && requestId) {
         ledger.push({
           auctionId,
@@ -665,6 +674,18 @@ function installAdTracePrebidObservers(): void {
         });
         if (ledger.length > 256) ledger.shift();
       } else if (kind === 'prebid_auction_end' && auctionId) {
+        const startedAt = auctionStartedAt.get(auctionId);
+        auctionStartedAt.delete(auctionId);
+        const prebidAuctionDurationMs =
+          startedAt === undefined
+            ? undefined
+            : Math.max(0, Math.round(performance.now() - startedAt));
+        if (prebidAuctionDurationMs !== undefined) {
+          for (const entry of ledger) {
+            if (entry.auctionId === auctionId)
+              entry.prebidAuctionDurationMs = prebidAuctionDurationMs;
+          }
+        }
         const adUnits = Array.isArray(data.adUnits)
           ? (data.adUnits as Array<Record<string, unknown>>)
           : [];
@@ -682,7 +703,7 @@ function installAdTracePrebidObservers(): void {
           if (entry.auctionId === auctionId) slotIds.add(entry.slotId);
         }
         const completed = (ts.prebidCompletedAuctions ??= []);
-        completed.push({ auctionId, slotIds: [...slotIds] });
+        completed.push({ auctionId, slotIds: [...slotIds], prebidAuctionDurationMs });
         if (completed.length > 64) completed.shift();
       } else if (kind !== 'prebid_auction_init') {
         const selected = (ts.prebidSelectedParticipants ?? []).filter(
@@ -690,12 +711,14 @@ function installAdTracePrebidObservers(): void {
         );
         ts.prebidSelectedParticipants = selected;
         const selectedMatches =
-          auctionId && slotId && requestId
+          slotId && (requestId || adId)
             ? selected.filter(
                 (entry) =>
-                  entry.auctionId === auctionId &&
                   entry.slotId === slotId &&
-                  (entry.requestId === requestId || entry.adId === adId) &&
+                  (!auctionId || entry.auctionId === auctionId) &&
+                  (!requestId ||
+                    entry.requestId === requestId ||
+                    (!!adId && entry.adId === adId)) &&
                   (!traceToken || entry.traceToken === traceToken)
               )
             : [];
@@ -707,8 +730,10 @@ function installAdTracePrebidObservers(): void {
             generation: selectedEntry.generation,
             bidTraceId: selectedEntry.traceToken,
             bidder: selectedEntry.bidder ?? bidder,
+            prebidAuctionDurationMs: selectedEntry.prebidAuctionDurationMs,
           });
           if (kind === 'prebid_render_succeeded' || kind === 'prebid_render_failed') {
+            ts.recordAdTraceCoverage?.({ category: kind, resolution: 'correlated' });
             ts.prebidSelectedParticipants = selected.filter((entry) => entry !== selectedEntry);
           }
           return;
@@ -725,8 +750,22 @@ function installAdTracePrebidObservers(): void {
           events.push(kind);
           while (events.length > 16) events.shift();
         }
+        if (kind === 'prebid_render_succeeded' || kind === 'prebid_render_failed') {
+          ts.recordAdTraceCoverage?.({
+            category: kind,
+            resolution: selectedMatches.length > 1 ? 'ambiguous' : 'unmatched',
+            reason:
+              selectedMatches.length > 1
+                ? 'ambiguous_prebid_terminal'
+                : 'unmatched_prebid_terminal',
+          });
+        }
       }
-      ts.recordAdTrace?.({ kind, slotId, bidder });
+      // Uncorrelated Prebid callbacks remain event-count evidence only. Their
+      // publisher ad-unit code is private correlation input and must not enter
+      // the browser export; exact selected participants returned above already
+      // use the canonical generation slot identity.
+      ts.recordAdTrace?.({ kind });
     };
 
   instrumented.onEvent?.('auctionInit', record('prebid_auction_init'));

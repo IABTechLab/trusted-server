@@ -975,10 +975,44 @@ describe('prebid/installPrebidNpm', () => {
       expect(document.cookie).toBe('');
     });
 
+    it('retains only the bounded Prebid auction duration for later generation attachment', () => {
+      let now = 100;
+      vi.spyOn(performance, 'now').mockImplementation(() => now);
+      const recordAdTrace = vi.fn();
+      window.tsjs = { recordAdTrace } as any;
+      installPrebidNpm();
+      const handlers = new Map<string, (data: Record<string, unknown>) => void>(
+        mockOnEvent.mock.calls.map(([event, handler]) => [event, handler])
+      );
+      handlers.get('auctionInit')?.({ auctionId: 'auction-1' });
+      handlers.get('bidResponse')?.({
+        auctionId: 'auction-1',
+        adUnitCode: 'slot-a',
+        requestId: 'request-1',
+        adId: 'ad-1',
+      });
+      now = 1_600;
+      handlers.get('auctionEnd')?.({ auctionId: 'auction-1', adUnits: [{ code: 'slot-a' }] });
+
+      expect(window.tsjs!.prebidCorrelation?.[0]).toMatchObject({
+        slotId: 'slot-a',
+        prebidAuctionDurationMs: 1_500,
+      });
+      expect(window.tsjs!.prebidCompletedAuctions?.[0]).toMatchObject({
+        slotIds: ['slot-a'],
+        prebidAuctionDurationMs: 1_500,
+      });
+      expect(JSON.stringify(window.tsjs!.prebidCorrelation)).not.toContain('performance');
+      expect(recordAdTrace).toHaveBeenCalledWith({ kind: 'prebid_bid_response' });
+      expect(JSON.stringify(recordAdTrace.mock.calls)).not.toContain('slot-a');
+    });
+
     it('joins late winner and render events to the retained selected generation', () => {
       const recordAdTrace = vi.fn();
+      const recordAdTraceCoverage = vi.fn();
       window.tsjs = {
         recordAdTrace,
+        recordAdTraceCoverage,
         prebidSelectedParticipants: [
           {
             auctionId: 'auction-1',
@@ -996,7 +1030,8 @@ describe('prebid/installPrebidNpm', () => {
         mockOnEvent.mock.calls.map(([event, handler]) => [event, handler])
       );
       const bid = {
-        auctionId: 'auction-1',
+        // Some documented terminal payloads omit auctionId. Exact slot plus
+        // immutable request/ad identity must still resolve uniquely.
         adUnitCode: 'slot-a',
         requestId: 'request-1',
         adId: 'ad-1',
@@ -1016,7 +1051,11 @@ describe('prebid/installPrebidNpm', () => {
           slotId: 'slot-a',
         })
       );
-      expect(window.tsjs.prebidSelectedParticipants).toEqual([]);
+      expect(recordAdTraceCoverage).toHaveBeenCalledWith({
+        category: 'prebid_render_succeeded',
+        resolution: 'correlated',
+      });
+      expect(window.tsjs!.prebidSelectedParticipants).toEqual([]);
     });
   });
 });
