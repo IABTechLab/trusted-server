@@ -175,7 +175,7 @@ fn ingest_eid_cookies_with_writer(
     }
 }
 
-fn collect_prebid_eid_updates(
+pub(crate) fn collect_prebid_eid_updates(
     cookie_value: &str,
     registry: &PartnerRegistry,
 ) -> Vec<PartnerIdUpdate> {
@@ -209,7 +209,7 @@ fn collect_prebid_eid_updates(
     updates
 }
 
-fn dedupe_partner_updates(updates: Vec<PartnerIdUpdate>) -> Vec<PartnerIdUpdate> {
+pub(crate) fn dedupe_partner_updates(updates: Vec<PartnerIdUpdate>) -> Vec<PartnerIdUpdate> {
     let mut latest = std::collections::BTreeMap::new();
     for update in updates {
         latest.insert(update.partner_id, update.uid);
@@ -246,7 +246,7 @@ pub fn ingest_sharedid_cookie(
     ingest_eid_cookies(None, Some(cookie_value), ec_id, kv, registry);
 }
 
-fn collect_sharedid_update(
+pub(crate) fn collect_sharedid_update(
     cookie_value: &str,
     registry: &PartnerRegistry,
 ) -> Option<PartnerIdUpdate> {

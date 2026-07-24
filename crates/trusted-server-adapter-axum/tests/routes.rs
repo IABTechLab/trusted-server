@@ -74,6 +74,9 @@ fn all_explicit_routes_are_registered() {
         ("POST", "/verify-signature"),
         ("POST", "/_ts/admin/keys/rotate"),
         ("POST", "/_ts/admin/keys/deactivate"),
+        ("GET", "/_ts/admin/ec"),
+        ("GET", "/_ts/admin/ec/{id}"),
+        ("GET", "/_ts/admin/eids"),
         ("POST", "/admin/keys/rotate"),
         ("POST", "/admin/keys/deactivate"),
         ("POST", "/auction"),
@@ -253,6 +256,63 @@ async fn admin_route_without_credentials_returns_401() {
         resp.status().as_u16(),
         401,
         "admin route must return 401 without credentials"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_admin_ec_routes_return_501() {
+    // The EC identity graph is Fastly KV backed, so the Axum dev server
+    // answers the admin EC lookup routes locally with 501 instead of letting
+    // them fall through to the publisher fallback.
+    let sample_ec_id = format!("{}.abc123", "a".repeat(64));
+    for path in [
+        "/_ts/admin/ec".to_owned(),
+        format!("/_ts/admin/ec/{sample_ec_id}"),
+    ] {
+        let mut svc = make_service();
+        let req = Request::builder()
+            .method("GET")
+            .uri(&path)
+            .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+            .body(AxumBody::empty())
+            .expect("should build request");
+        let resp = svc
+            .ready()
+            .await
+            .expect("should be ready")
+            .call(req)
+            .await
+            .expect("should respond");
+        assert_eq!(
+            resp.status().as_u16(),
+            501,
+            "{path} should report that Axum EC lookup is unsupported"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_admin_eids_route_returns_200() {
+    // The EIDs echo is pure request inspection (no KV), so the dev server
+    // serves the real handler.
+    let mut svc = make_service();
+    let req = Request::builder()
+        .method("GET")
+        .uri("/_ts/admin/eids")
+        .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+        .body(AxumBody::empty())
+        .expect("should build request");
+    let resp = svc
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "/_ts/admin/eids should serve the real EIDs echo handler"
     );
 }
 
