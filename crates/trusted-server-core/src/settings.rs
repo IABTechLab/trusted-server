@@ -2077,6 +2077,13 @@ impl Settings {
 
         if let Some(co) = &mut self.creative_opportunities {
             co.compile_slots();
+            // Parse `gam_unit_path` templates once here (mirrors the compiled
+            // glob cache) so request-time rendering is substitution-only.
+            co.compile_unit_templates().map_err(|err| {
+                Report::new(TrustedServerError::Configuration {
+                    message: format!("Invalid creative opportunity gam_unit_path template: {err}"),
+                })
+            })?;
             // Slots flow into injected HTML/JS, provider payloads, and GPT
             // calls. Env/private config can bypass static review, so validate
             // the full runtime shape on every load path.
@@ -5602,7 +5609,7 @@ gam_unit_path = ""
 page_patterns = ["/"]
 formats = [{ width = 300, height = 250 }]
 "#,
-            "resolved GAM unit path must not be empty",
+            "gam_unit_path template must not be empty",
         );
     }
 
