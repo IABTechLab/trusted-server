@@ -330,6 +330,13 @@ export interface GptSlotHandoff {
   suppressPublisherRefresh: boolean;
 }
 
+/** Publisher requests held until initial TS targeting has been applied. */
+export interface GptInitialRequestGate {
+  pendingDisplays: Record<string, boolean>;
+  pendingRefreshes: Record<string, boolean>;
+  released: boolean;
+}
+
 export interface TsjsApi {
   version: string;
   que: Array<() => void>;
@@ -472,6 +479,10 @@ export interface TsjsApi {
   gptInitialLoadDisabled?: boolean;
   /** Late publisher claims for TS-created GPT slots, keyed by actual div ID. */
   gptSlotHandoffs?: Record<string, GptSlotHandoff>;
+  /** Publisher initial requests held until TS has applied server-side targeting. */
+  gptInitialRequestGate?: GptInitialRequestGate;
+  /** True after the first page-load `adInit()` has handled publisher slots. */
+  gptInitialAdInitCompleted?: boolean;
   /** True only while TS calls a GPT function that the handoff wrappers observe. */
   gptSlotHandoffInternal?: boolean;
   /** Guards SPA pushState hook installation. */
