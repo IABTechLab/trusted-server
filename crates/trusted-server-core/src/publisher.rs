@@ -2959,7 +2959,7 @@ pub async fn handle_publisher_request(
         settings
             .creative_opportunities
             .as_ref()
-            .map(|co_config| build_ad_slots_script(&matched_slots, co_config))
+            .map(|co_config| build_ad_slots_script(&matched_slots, co_config, &request_path))
     } else {
         None
     };
@@ -3529,11 +3529,18 @@ pub(crate) fn build_empty_bids_script() -> String {
 /// definition and the two paths cannot silently diverge. Property names match
 /// what the client-side TSJS bundle expects: `gam_unit_path`, `div_id`,
 /// `formats`, and `targeting`.
-fn build_slot_json(
+pub(crate) fn build_slot_json(
     slot: &crate::creative_opportunities::CreativeOpportunitySlot,
     co_config: &crate::creative_opportunities::CreativeOpportunitiesConfig,
+    request_path: &str,
 ) -> serde_json::Value {
-    let gam_path = slot.resolved_gam_unit_path(&co_config.gam_network_id);
+    // `{section}` derives from the same raw path `page_patterns` matched
+    // against; `section_root` covers the no-segment case (`/`).
+    let section = crate::creative_opportunities::derive_section(
+        request_path,
+        co_config.section_root.as_deref().unwrap_or_default(),
+    );
+    let gam_path = slot.render_gam_unit_path(&co_config.gam_network_id, &section);
     let div_id = slot.resolved_div_id();
     let formats: Vec<serde_json::Value> = slot
         .formats
@@ -3561,10 +3568,11 @@ fn build_slot_json(
 pub(crate) fn build_ad_slots_script(
     matched_slots: &[crate::creative_opportunities::CreativeOpportunitySlot],
     co_config: &crate::creative_opportunities::CreativeOpportunitiesConfig,
+    request_path: &str,
 ) -> String {
     let slots: Vec<serde_json::Value> = matched_slots
         .iter()
-        .map(|slot| build_slot_json(slot, co_config))
+        .map(|slot| build_slot_json(slot, co_config, request_path))
         .collect();
     let json = serde_json::to_string(&slots)
         .expect("serde_json::to_string of Vec<Value> should be infallible");
@@ -3934,7 +3942,7 @@ pub async fn handle_page_bids(
     let slots_json: Vec<serde_json::Value> = if ad_stack_enabled {
         matched_slots
             .iter()
-            .map(|slot| build_slot_json(slot, co_config))
+            .map(|slot| build_slot_json(slot, co_config, &path_param))
             .collect()
     } else {
         Vec::new()
@@ -4570,6 +4578,7 @@ mod tests {
                 targeting: Default::default(),
                 providers: Default::default(),
                 compiled_patterns: Vec::new(),
+                compiled_unit: None,
             }
         }
 
@@ -7563,6 +7572,7 @@ mod tests {
                 gam_network_id: "21765378893".to_string(),
                 auction_timeout_ms: Some(500),
                 price_granularity: PriceGranularity::Dense,
+                section_root: None,
                 slot: Vec::new(),
             }
         }
@@ -7584,6 +7594,7 @@ mod tests {
                     .collect(),
                 providers: Default::default(),
                 compiled_patterns: Vec::new(),
+                compiled_unit: None,
             }
         }
 
@@ -7621,7 +7632,7 @@ mod tests {
         fn ad_slots_script_contains_slot_data() {
             let slots = vec![make_slot()];
             let config = make_config();
-            let script = build_ad_slots_script(&slots, &config);
+            let script = build_ad_slots_script(&slots, &config, "/");
             assert!(
                 script.contains("window.tsjs=window.tsjs||{}"),
                 "should initialise tsjs namespace"
@@ -7642,12 +7653,35 @@ mod tests {
         fn ad_slots_script_is_xss_safe() {
             let slots = vec![make_slot()];
             let config = make_config();
-            let script = build_ad_slots_script(&slots, &config);
+            let script = build_ad_slots_script(&slots, &config, "/");
             let inner = script
                 .trim_start_matches("<script>")
                 .trim_end_matches("</script>");
             assert!(!inner.contains('<'), "no unescaped < in script content");
             assert!(!inner.contains('>'), "no unescaped > in script content");
+        }
+
+        #[test]
+        fn build_slot_json_renders_section_from_request_path() {
+            let mut config = make_config();
+            config.gam_network_id = "99999".to_string();
+            config.section_root = Some("homepage".to_string());
+            let mut slot = make_slot();
+            slot.gam_unit_path = Some("/{network_id}/example/{section}".to_string());
+            slot.compile_unit_template()
+                .expect("template should compile");
+
+            let news = crate::publisher::build_slot_json(&slot, &config, "/news/article-123");
+            assert_eq!(
+                news["gam_unit_path"], "/99999/example/news",
+                "section should derive from the first path segment"
+            );
+
+            let home = crate::publisher::build_slot_json(&slot, &config, "/");
+            assert_eq!(
+                home["gam_unit_path"], "/99999/example/homepage",
+                "root path should use section_root"
+            );
         }
 
         #[test]
@@ -8730,6 +8764,7 @@ mod tests {
                 targeting: Default::default(),
                 providers: Default::default(),
                 compiled_patterns: Vec::new(),
+                compiled_unit: None,
             }]
         }
 
@@ -9293,6 +9328,7 @@ mod tests {
                 targeting: Default::default(),
                 providers: Default::default(),
                 compiled_patterns: Vec::new(),
+                compiled_unit: None,
             }]
         }
 

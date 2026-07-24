@@ -14,6 +14,105 @@ use crate::auction::types::{AdFormat, AdSlot, MediaType};
 use crate::price_bucket::PriceGranularity;
 use crate::settings::vec_from_seq_or_map;
 
+/// A single parsed segment of a [`gam_unit_path`](CreativeOpportunitySlot::gam_unit_path) template.
+#[derive(Debug, Clone)]
+pub(crate) enum UnitTemplatePart {
+    /// Verbatim text between placeholders.
+    Literal(String),
+    /// `{network_id}` — replaced with the GAM network id.
+    NetworkId,
+    /// `{section}` — replaced with the request-derived section.
+    Section,
+    /// `{slot_id}` — replaced with the slot id.
+    SlotId,
+}
+
+/// Parses a `gam_unit_path` template into an ordered list of parts.
+///
+/// Supported placeholders: `{network_id}`, `{section}`, `{slot_id}`. A template
+/// with no placeholders is a single [`UnitTemplatePart::Literal`] and renders
+/// verbatim.
+///
+/// # Errors
+///
+/// Returns an error string for an empty template, an unmatched or nested `{`,
+/// a stray `}`, or an unknown placeholder name.
+fn parse_unit_template(raw: &str) -> Result<Vec<UnitTemplatePart>, String> {
+    if raw.is_empty() {
+        return Err("gam_unit_path template must not be empty".to_string());
+    }
+    let mut parts = Vec::new();
+    let mut literal = String::new();
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' => {
+                if !literal.is_empty() {
+                    parts.push(UnitTemplatePart::Literal(std::mem::take(&mut literal)));
+                }
+                let mut name = String::new();
+                loop {
+                    match chars.next() {
+                        Some('}') => break,
+                        Some('{') => return Err(format!("nested '{{' in template `{raw}`")),
+                        Some(ch) => name.push(ch),
+                        None => return Err(format!("unmatched '{{' in template `{raw}`")),
+                    }
+                }
+                match name.as_str() {
+                    "network_id" => parts.push(UnitTemplatePart::NetworkId),
+                    "section" => parts.push(UnitTemplatePart::Section),
+                    "slot_id" => parts.push(UnitTemplatePart::SlotId),
+                    other => {
+                        return Err(format!(
+                            "unknown placeholder `{{{other}}}` in template `{raw}`"
+                        ));
+                    }
+                }
+            }
+            '}' => return Err(format!("stray '}}' in template `{raw}`")),
+            other => literal.push(other),
+        }
+    }
+    if !literal.is_empty() {
+        parts.push(UnitTemplatePart::Literal(literal));
+    }
+    Ok(parts)
+}
+
+/// Collapses each run of characters outside `[A-Za-z0-9_-]` to a single `_`.
+///
+/// Returns a non-empty string for any non-empty input.
+fn sanitize_section(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    let mut in_bad_run = false;
+    for ch in segment.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            out.push(ch);
+            in_bad_run = false;
+        } else if !in_bad_run {
+            out.push('_');
+            in_bad_run = true;
+        }
+    }
+    out
+}
+
+/// Derives the `{section}` value from a request path.
+///
+/// Uses the first non-empty path segment, sanitized to `[A-Za-z0-9_-]`. Falls
+/// back to `section_root` when the path has no segment (`/`, repeated slashes).
+///
+/// The path is used **raw** (not percent-decoded) so this stays consistent with
+/// how [`page_patterns`](CreativeOpportunitySlot::page_patterns) glob-match the
+/// same path — e.g. `/new%20s` yields `new_20s`, never the decoded `new_s`.
+pub(crate) fn derive_section(path: &str, section_root: &str) -> String {
+    match path.split('/').find(|segment| !segment.is_empty()) {
+        Some(segment) => sanitize_section(segment),
+        None => section_root.to_string(),
+    }
+}
+
 /// Top-level configuration for the creative opportunities system.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -40,6 +139,14 @@ pub struct CreativeOpportunitiesConfig {
     /// Price granularity for header-bidding price bucketing. Defaults to `Dense`.
     #[serde(default)]
     pub price_granularity: PriceGranularity,
+    /// Value substituted for `{section}` when the request path has no first
+    /// segment (e.g. `/`).
+    ///
+    /// Required when any slot's [`gam_unit_path`](CreativeOpportunitySlot::gam_unit_path)
+    /// template contains `{section}`. No default — a home-section name is
+    /// publisher-specific, so the URL→section convention stays in config, not core.
+    #[serde(default)]
+    pub section_root: Option<String>,
     /// Slot templates. Empty vec = feature disabled (no auction fired, no globals injected).
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub slot: Vec<CreativeOpportunitySlot>,
@@ -53,15 +160,54 @@ impl CreativeOpportunitiesConfig {
         }
     }
 
+    /// Parse every slot's [`gam_unit_path`](CreativeOpportunitySlot::gam_unit_path)
+    /// template. Call once after deserialization, before [`validate_runtime`](Self::validate_runtime).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string when any slot's template is malformed.
+    pub fn compile_unit_templates(&mut self) -> Result<(), String> {
+        for slot in &mut self.slot {
+            slot.compile_unit_template()?;
+        }
+        Ok(())
+    }
+
     /// Validate all slot definitions after runtime preparation.
+    ///
+    /// Call [`compile_unit_templates`](Self::compile_unit_templates) first: the
+    /// `{section}` → [`section_root`](Self::section_root) requirement is keyed off
+    /// each slot's compiled template, so an uncompiled config silently skips that
+    /// check. [`Settings::prepare_runtime`](crate::settings::Settings) enforces
+    /// this order.
     ///
     /// # Errors
     ///
     /// Returns an error string when a slot has an invalid identifier, page
-    /// pattern set, format list, dimensions, or resolved GAM unit path.
+    /// pattern set, format list, or dimensions, or when a slot's `gam_unit_path`
+    /// template uses `{section}` without a valid [`section_root`](Self::section_root).
     pub fn validate_runtime(&self) -> Result<(), String> {
         for slot in &self.slot {
-            slot.validate_runtime(&self.gam_network_id)?;
+            slot.validate_runtime()?;
+        }
+
+        if self
+            .slot
+            .iter()
+            .any(CreativeOpportunitySlot::template_uses_section)
+        {
+            match self.section_root.as_deref() {
+                Some(root)
+                    if !root.is_empty()
+                        && root
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') => {}
+                _ => {
+                    return Err("section_root is required and must match [A-Za-z0-9_-]+ \
+                                when a gam_unit_path template uses {section}"
+                        .to_string());
+                }
+            }
         }
 
         Ok(())
@@ -106,6 +252,14 @@ pub struct CreativeOpportunitySlot {
     /// crate can construct slots via struct-literal syntax with an empty cache.
     #[serde(skip, default)]
     pub(crate) compiled_patterns: Vec<Pattern>,
+    /// Pre-parsed [`gam_unit_path`](Self::gam_unit_path) template, populated by
+    /// [`compile_unit_template`](Self::compile_unit_template) at startup.
+    ///
+    /// `None` when the slot has no explicit `gam_unit_path` (renders the default
+    /// `/<network_id>/<id>`). `pub(crate)` so cross-module test helpers can build
+    /// slots via struct-literal syntax with an empty cache.
+    #[serde(skip, default)]
+    pub(crate) compiled_unit: Option<Vec<UnitTemplatePart>>,
 }
 
 impl CreativeOpportunitySlot {
@@ -115,7 +269,7 @@ impl CreativeOpportunitySlot {
     ///
     /// Returns an error string when required slot fields are empty, invalid,
     /// or semantically unusable at runtime.
-    pub fn validate_runtime(&self, gam_network_id: &str) -> Result<(), String> {
+    pub fn validate_runtime(&self) -> Result<(), String> {
         validate_slot_id(&self.id)?;
 
         if self.page_patterns.is_empty() {
@@ -170,13 +324,15 @@ impl CreativeOpportunitySlot {
             ));
         }
 
-        if self
-            .resolved_gam_unit_path(gam_network_id)
-            .trim()
-            .is_empty()
+        // A present-but-blank `gam_unit_path` renders to an empty/whitespace
+        // unit path. An empty string also fails template parsing at startup;
+        // this keeps the slot-level check self-contained (tests call
+        // `validate_runtime` without compiling templates first).
+        if let Some(raw) = &self.gam_unit_path
+            && raw.trim().is_empty()
         {
             return Err(format!(
-                "slot `{}` resolved GAM unit path must not be empty",
+                "slot `{}` gam_unit_path must not be empty",
                 self.id
             ));
         }
@@ -254,15 +410,50 @@ impl CreativeOpportunitySlot {
             .collect();
     }
 
-    /// Returns the GAM ad unit path for this slot.
+    /// Parses [`gam_unit_path`](Self::gam_unit_path) into
+    /// [`compiled_unit`](Self::compiled_unit). Call once at startup via
+    /// [`CreativeOpportunitiesConfig::compile_unit_templates`].
     ///
-    /// Uses the explicit [`gam_unit_path`](Self::gam_unit_path) override when set,
-    /// otherwise constructs `/<gam_network_id>/<id>`.
+    /// # Errors
+    ///
+    /// Returns an error string (prefixed with the slot id) when the template is
+    /// malformed. See [`parse_unit_template`].
+    pub(crate) fn compile_unit_template(&mut self) -> Result<(), String> {
+        self.compiled_unit = match &self.gam_unit_path {
+            Some(raw) => {
+                Some(parse_unit_template(raw).map_err(|e| format!("slot `{}`: {e}", self.id))?)
+            }
+            None => None,
+        };
+        Ok(())
+    }
+
+    /// Renders the resolved GAM unit path for a given network id and section.
+    ///
+    /// Substitutes `{network_id}`, `{section}`, and `{slot_id}` in the parsed
+    /// template. Falls back to `/<network_id>/<id>` when the slot has no template.
     #[must_use]
-    pub fn resolved_gam_unit_path(&self, gam_network_id: &str) -> String {
-        self.gam_unit_path
-            .clone()
-            .unwrap_or_else(|| format!("/{}/{}", gam_network_id, self.id))
+    pub(crate) fn render_gam_unit_path(&self, gam_network_id: &str, section: &str) -> String {
+        match &self.compiled_unit {
+            Some(parts) => parts
+                .iter()
+                .map(|part| match part {
+                    UnitTemplatePart::Literal(s) => s.as_str(),
+                    UnitTemplatePart::NetworkId => gam_network_id,
+                    UnitTemplatePart::Section => section,
+                    UnitTemplatePart::SlotId => self.id.as_str(),
+                })
+                .collect(),
+            None => format!("/{}/{}", gam_network_id, self.id),
+        }
+    }
+
+    /// Returns `true` if this slot's compiled template contains `{section}`.
+    #[must_use]
+    pub(crate) fn template_uses_section(&self) -> bool {
+        self.compiled_unit
+            .as_ref()
+            .is_some_and(|parts| parts.iter().any(|p| matches!(p, UnitTemplatePart::Section)))
     }
 
     /// Returns the div element ID for this slot.
@@ -453,6 +644,7 @@ mod tests {
             targeting: Default::default(),
             providers: Default::default(),
             compiled_patterns: Vec::new(),
+            compiled_unit: None,
         }
     }
 
@@ -528,28 +720,181 @@ mod tests {
     }
 
     #[test]
-    fn resolved_gam_unit_path_uses_default_when_absent() {
-        let slot = make_slot("atf", vec!["/"]);
-        assert_eq!(
-            slot.resolved_gam_unit_path("21765378893"),
-            "/21765378893/atf"
-        );
-    }
-
-    #[test]
-    fn resolved_gam_unit_path_uses_override_when_set() {
-        let mut slot = make_slot("atf", vec!["/"]);
-        slot.gam_unit_path = Some("/21765378893/publisher/atf-sidebar".to_string());
-        assert_eq!(
-            slot.resolved_gam_unit_path("21765378893"),
-            "/21765378893/publisher/atf-sidebar"
-        );
-    }
-
-    #[test]
     fn resolved_div_id_defaults_to_slot_id() {
         let slot = make_slot("atf", vec!["/"]);
         assert_eq!(slot.resolved_div_id(), "atf");
+    }
+
+    #[test]
+    fn parse_unit_template_accepts_known_placeholders() {
+        let parts = parse_unit_template("/{network_id}/example/{section}")
+            .expect("should parse valid template");
+        assert_eq!(parts.len(), 4, "should split into literal+ph+literal+ph");
+    }
+
+    #[test]
+    fn parse_unit_template_accepts_static_path() {
+        let parts = parse_unit_template("/99999/example/homepage")
+            .expect("should parse a static path as a single literal");
+        assert!(
+            matches!(parts.as_slice(), [UnitTemplatePart::Literal(s)] if s == "/99999/example/homepage"),
+            "should be one literal part"
+        );
+    }
+
+    #[test]
+    fn parse_unit_template_rejects_unknown_placeholder() {
+        let err = parse_unit_template("/{network_id}/{oops}")
+            .expect_err("should reject unknown placeholder");
+        assert!(
+            err.contains("oops"),
+            "error should name the bad placeholder"
+        );
+    }
+
+    #[test]
+    fn parse_unit_template_rejects_unmatched_brace() {
+        parse_unit_template("/{network_id}/{section").expect_err("should reject unmatched '{'");
+        parse_unit_template("/a}b").expect_err("should reject stray '}'");
+    }
+
+    #[test]
+    fn parse_unit_template_rejects_nested_brace() {
+        parse_unit_template("/{net{work}_id}").expect_err("should reject nested '{'");
+    }
+
+    #[test]
+    fn parse_unit_template_rejects_empty() {
+        parse_unit_template("").expect_err("should reject empty template");
+    }
+
+    #[test]
+    fn derive_section_uses_first_segment() {
+        assert_eq!(derive_section("/news", "home"), "news");
+        assert_eq!(derive_section("/news/article-123", "home"), "news");
+        assert_eq!(derive_section("/my-section/x", "home"), "my-section");
+    }
+
+    #[test]
+    fn derive_section_uses_root_when_no_segment() {
+        assert_eq!(derive_section("/", "homepage"), "homepage");
+        assert_eq!(derive_section("///", "homepage"), "homepage");
+    }
+
+    #[test]
+    fn derive_section_sanitizes_unsafe_runs_to_single_underscore() {
+        // Not decoded: in "new%20s" only '%' is disallowed ('2' and '0' are
+        // alphanumeric), so it collapses to a single '_' -> "new_20s". This is
+        // exactly the no-decode contract: had we decoded, %20 would be a space
+        // and yield "new_s"; we do NOT decode.
+        assert_eq!(derive_section("/new%20s", "home"), "new_20s");
+        // A run of disallowed chars collapses to one '_'.
+        assert_eq!(derive_section("/a..b", "home"), "a_b");
+    }
+
+    #[test]
+    fn derive_section_is_non_empty_for_all_disallowed_segment() {
+        assert_eq!(derive_section("/%%%/x", "home"), "_");
+    }
+
+    fn make_config_with_section_template(
+        section_root: Option<&str>,
+    ) -> CreativeOpportunitiesConfig {
+        let mut slot = make_slot("ad-header-0", vec!["/news/*"]);
+        slot.gam_unit_path = Some("/{network_id}/example/{section}".to_string());
+        CreativeOpportunitiesConfig {
+            gam_network_id: "99999".to_string(),
+            auction_timeout_ms: None,
+            price_granularity: PriceGranularity::default(),
+            section_root: section_root.map(str::to_string),
+            slot: vec![slot],
+        }
+    }
+
+    #[test]
+    fn render_gam_unit_path_substitutes_placeholders() {
+        let mut slot = make_slot("ad-header-0", vec!["/news/*"]);
+        slot.gam_unit_path = Some("/{network_id}/example/{section}".to_string());
+        slot.compile_unit_template()
+            .expect("should compile template");
+        assert_eq!(
+            slot.render_gam_unit_path("99999", "news"),
+            "/99999/example/news"
+        );
+    }
+
+    #[test]
+    fn render_gam_unit_path_defaults_when_no_template() {
+        let mut slot = make_slot("sidebar", vec!["/*"]);
+        slot.gam_unit_path = None;
+        slot.compile_unit_template()
+            .expect("should compile (no template)");
+        assert_eq!(
+            slot.render_gam_unit_path("99999", "ignored"),
+            "/99999/sidebar"
+        );
+    }
+
+    #[test]
+    fn render_gam_unit_path_uses_static_template_verbatim() {
+        let mut slot = make_slot("atf", vec!["/"]);
+        slot.gam_unit_path = Some("/99999/example/homepage".to_string());
+        slot.compile_unit_template()
+            .expect("should compile static template");
+        assert_eq!(
+            slot.render_gam_unit_path("99999", "news"),
+            "/99999/example/homepage"
+        );
+    }
+
+    #[test]
+    fn validate_runtime_requires_section_root_when_template_uses_section() {
+        let mut config = make_config_with_section_template(None);
+        config.compile_slots();
+        config
+            .compile_unit_templates()
+            .expect("templates should compile");
+        let err = config
+            .validate_runtime()
+            .expect_err("should require section_root");
+        assert!(
+            err.contains("section_root"),
+            "error should mention section_root"
+        );
+    }
+
+    #[test]
+    fn validate_runtime_rejects_invalid_section_root() {
+        let mut config = make_config_with_section_template(Some("has space"));
+        config.compile_slots();
+        config
+            .compile_unit_templates()
+            .expect("templates should compile");
+        config
+            .validate_runtime()
+            .expect_err("should reject non [A-Za-z0-9_-] root");
+    }
+
+    #[test]
+    fn validate_runtime_accepts_section_template_with_valid_root() {
+        let mut config = make_config_with_section_template(Some("homepage"));
+        config.compile_slots();
+        config
+            .compile_unit_templates()
+            .expect("templates should compile");
+        config
+            .validate_runtime()
+            .expect("should accept valid section_root");
+    }
+
+    #[test]
+    fn compile_unit_templates_surfaces_parse_error() {
+        let mut config = make_config_with_section_template(Some("home"));
+        config.slot[0].gam_unit_path = Some("/{bad}".to_string());
+        config.compile_slots();
+        config
+            .compile_unit_templates()
+            .expect_err("should surface unknown-placeholder error");
     }
 
     #[test]
@@ -561,19 +906,19 @@ mod tests {
 
         slot.div_id = Some(String::new());
         assert!(
-            slot.validate_runtime("1234").is_err(),
+            slot.validate_runtime().is_err(),
             "empty div_id override should fail validation"
         );
 
         slot.div_id = Some("   ".to_string());
         assert!(
-            slot.validate_runtime("1234").is_err(),
+            slot.validate_runtime().is_err(),
             "whitespace-only div_id override should fail validation"
         );
 
         slot.div_id = Some("div-ad-x".to_string());
         assert!(
-            slot.validate_runtime("1234").is_ok(),
+            slot.validate_runtime().is_ok(),
             "a concrete div_id override should pass validation"
         );
     }
@@ -585,31 +930,31 @@ mod tests {
 
         slot.floor_price = Some(-0.01);
         assert!(
-            slot.validate_runtime("1234").is_err(),
+            slot.validate_runtime().is_err(),
             "negative floor_price should fail validation"
         );
 
         slot.floor_price = Some(f64::NAN);
         assert!(
-            slot.validate_runtime("1234").is_err(),
+            slot.validate_runtime().is_err(),
             "NaN floor_price should fail validation"
         );
 
         slot.floor_price = Some(f64::INFINITY);
         assert!(
-            slot.validate_runtime("1234").is_err(),
+            slot.validate_runtime().is_err(),
             "infinite floor_price should fail validation"
         );
 
         slot.floor_price = Some(0.0);
         assert!(
-            slot.validate_runtime("1234").is_ok(),
+            slot.validate_runtime().is_ok(),
             "zero floor_price should pass validation"
         );
 
         slot.floor_price = None;
         assert!(
-            slot.validate_runtime("1234").is_ok(),
+            slot.validate_runtime().is_ok(),
             "absent floor_price should pass validation"
         );
     }

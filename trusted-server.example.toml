@@ -185,7 +185,29 @@ gam_network_id = "123456789"
 auction_timeout_ms = 500  # override via TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__AUCTION_TIMEOUT_MS
 price_granularity = "dense"
 
+# `gam_unit_path` may be a template. Supported placeholders:
+#   {network_id} -> gam_network_id
+#   {slot_id}    -> the slot's id
+#   {section}    -> first path segment of the request, sanitized to
+#                   [A-Za-z0-9_-]; `section_root` below is used for "/".
+# A template with no placeholders (or an absent gam_unit_path) keeps the old
+# behavior: verbatim path, or the default `/<network_id>/<slot_id>`.
+#
+# `section_root` is REQUIRED when any slot's template uses {section}. There is no
+# default — the home-section name is publisher-specific. Must be [A-Za-z0-9_-]+.
+section_root = "home"
+
 # No slot templates are enabled in the checked-in default config. Add
 # `[[creative_opportunities.slot]]` entries via private config or override the
 # entire array via:
 # TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__SLOT='[{"id":"...","gam_unit_path":"...",...}]'
+#
+# Example templated slot (one rule serves every section):
+# [[creative_opportunities.slot]]
+# id = "ad-header"
+# gam_unit_path = "/{network_id}/example/{section}"
+# page_patterns = ["/", "/news/*", "/reviews/*"]
+# formats = [{ width = 728, height = 90 }]
+#   "/"          -> /123456789/example/home
+#   "/news/x"    -> /123456789/example/news
+#   "/reviews/y" -> /123456789/example/reviews
