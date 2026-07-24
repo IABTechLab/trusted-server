@@ -67,11 +67,14 @@ rewrite_creatives = true
 | `false`           | Sanitize, then return the sanitized HTML without rewriting. Sanitizer-accepted external resource, click, and inline CSS URLs remain direct.                                     |
 
 ::: warning Sanitization remains mandatory
-Setting `rewrite_creatives = false` returns sanitized but unre-written HTML, not
-byte-for-byte upstream markup. It does not restore scripts, stylesheets, style
-blocks, forms, event handlers, or other content removed by sanitization.
-Sanitizer acceptance is not a host allowlist; ordinary accepted HTTP(S) URLs may
-cause the browser to contact external creative hosts directly.
+Setting `rewrite_creatives = false` returns sanitized but not rewritten HTML,
+not byte-for-byte upstream markup. It does not restore scripts, stylesheets,
+style blocks, forms, event handlers, or other content removed by sanitization.
+The client render bridge still creates and sizes its sandboxed iframe from bid
+or ad-unit dimensions, but the creative TSJS runtime and its click/resource
+protections are not injected. Sanitizer acceptance is not a host allowlist;
+ordinary accepted HTTP(S) URLs may cause the browser to contact external
+creative hosts directly.
 :::
 
 This setting does not affect HTML/CSS response rewriting under

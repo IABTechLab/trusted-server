@@ -2055,6 +2055,12 @@ impl Settings {
         settings.validate_admin_coverage()?;
         settings.validate_admin_handler_passwords()?;
 
+        if settings.auction.enabled && !settings.auction.rewrite_creatives {
+            log::warn!(
+                "Auction creative rewriting disabled; creative assets and clicks may contact third-party hosts directly"
+            );
+        }
+
         Ok(settings)
     }
 

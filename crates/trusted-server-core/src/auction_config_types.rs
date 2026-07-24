@@ -12,6 +12,11 @@ pub struct AuctionConfig {
     pub enabled: bool,
 
     /// Rewrite sanitized winning-bid creative HTML to first-party endpoints.
+    ///
+    /// The default must stay omitted from serialized config blobs: older
+    /// [`AuctionConfig`] schemas reject unknown fields during binary rollback.
+    /// An explicit `false` remains serialized and requires restoring a
+    /// compatible blob before rolling back.
     #[serde(
         default = "default_rewrite_creatives",
         skip_serializing_if = "is_default_rewrite_creatives"
@@ -66,6 +71,7 @@ fn default_rewrite_creatives() -> bool {
     true
 }
 
+// This predicate preserves rollback compatibility by omitting the default field.
 fn is_default_rewrite_creatives(value: &bool) -> bool {
     *value == default_rewrite_creatives()
 }

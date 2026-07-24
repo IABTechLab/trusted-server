@@ -483,6 +483,20 @@ pub fn sanitize_creative_html(markup: &str) -> String {
     String::from_utf8(out).unwrap_or_default()
 }
 
+/// Sanitize auction creative HTML, then optionally rewrite it to first-party endpoints.
+///
+/// Sanitization is mandatory in both modes. Rewriting is controlled by
+/// [`crate::auction_config_types::AuctionConfig::rewrite_creatives`].
+#[must_use]
+pub fn process_auction_creative(settings: &Settings, raw: &str) -> String {
+    let sanitized = sanitize_creative_html(raw);
+    if settings.auction.rewrite_creatives {
+        rewrite_creative_html(settings, &sanitized)
+    } else {
+        sanitized
+    }
+}
+
 /// Rewrite ad creative HTML to first-party endpoints.
 /// - 1x1 `<img>` pixels → `/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
 /// - Non-pixel absolute images → `/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
@@ -760,7 +774,8 @@ impl StreamProcessor for CreativeCssProcessor<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        rewrite_creative_html, rewrite_srcset, rewrite_style_urls, sanitize_creative_html, to_abs,
+        process_auction_creative, rewrite_creative_html, rewrite_srcset, rewrite_style_urls,
+        sanitize_creative_html, to_abs,
     };
 
     fn rewrite_srcset_attr(attr_name: &str, attr_value: &str) -> String {
@@ -1275,6 +1290,53 @@ mod tests {
         assert!(out.contains("<a href=\"/local\""));
         // Ensure we expose data-tsclick for client guard
         assert!(out.contains("data-tsclick"), "{}", out);
+    }
+
+    #[test]
+    fn process_auction_creative_rewrites_after_sanitizing_by_default() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let html = r#"<html><body><img src="https://cdn.example/ad.png"><script>marker</script></body></html>"#;
+
+        let processed = process_auction_creative(&settings, html);
+
+        assert!(
+            processed.contains("/first-party/proxy?tsurl="),
+            "should rewrite accepted resource URLs: {processed}"
+        );
+        assert!(
+            processed.contains("tsjs-unified.min.js"),
+            "should inject the creative runtime: {processed}"
+        );
+        assert!(
+            !processed.contains("marker"),
+            "should sanitize scripts before rewriting: {processed}"
+        );
+    }
+
+    #[test]
+    fn process_auction_creative_can_skip_rewriting_but_not_sanitization() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.auction.rewrite_creatives = false;
+        let html = r#"<html><body><img src="https://cdn.example/ad.png"><script>marker</script></body></html>"#;
+
+        let processed = process_auction_creative(&settings, html);
+
+        assert!(
+            processed.contains(r#"src="https://cdn.example/ad.png""#),
+            "should keep accepted resource URLs direct: {processed}"
+        );
+        assert!(
+            !processed.contains("/first-party/proxy?tsurl="),
+            "should not rewrite resource URLs: {processed}"
+        );
+        assert!(
+            !processed.contains("tsjs-unified.min.js"),
+            "should not inject the creative runtime: {processed}"
+        );
+        assert!(
+            !processed.contains("marker"),
+            "should sanitize scripts even without rewriting: {processed}"
+        );
     }
 
     #[test]

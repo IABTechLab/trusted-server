@@ -58,6 +58,7 @@ fn validate_with_overlay(project: &MigratedProject, raw_value: &str) -> Output {
         .arg(&project.manifest_path)
         .arg("--app-config")
         .arg(&project.config_path)
+        .current_dir(project.directory.path())
         .env(REWRITE_ENV, raw_value)
         .output()
         .expect("should run ts config validate")
@@ -72,6 +73,7 @@ fn migrated_legacy_config_applies_rewrite_creatives_environment_override() {
         .arg("--app-config")
         .arg(&project.config_path)
         .args(["--yes", "--no-diff"])
+        .current_dir(project.directory.path())
         .env(REWRITE_ENV, "false")
         .output()
         .expect("should run ts config push");
@@ -102,6 +104,76 @@ fn migrated_legacy_config_applies_rewrite_creatives_environment_override() {
         envelope["data"]["auction"]["rewrite_creatives"],
         serde_json::Value::Bool(false),
         "pushed config should contain the environment override"
+    );
+}
+
+#[test]
+fn migrated_legacy_config_default_rewrite_creatives_has_no_local_diff() {
+    let project = migrated_legacy_project();
+    let push = Command::new(env!("CARGO_BIN_EXE_ts"))
+        .args(["config", "push", "--adapter", "axum", "--manifest"])
+        .arg(&project.manifest_path)
+        .arg("--app-config")
+        .arg(&project.config_path)
+        .args(["--yes", "--no-diff"])
+        .current_dir(project.directory.path())
+        .output()
+        .expect("should run ts config push");
+
+    assert!(
+        push.status.success(),
+        "default rewrite setting should push successfully: {}",
+        String::from_utf8_lossy(&push.stderr)
+    );
+
+    let local_store_path = project
+        .directory
+        .path()
+        .join(".edgezero/local-config-trusted_server_config.json");
+    let local_store: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(local_store_path).expect("should read pushed local config"),
+    )
+    .expect("should parse local config store");
+    let envelope_json = local_store
+        .as_object()
+        .and_then(|entries| entries.values().next())
+        .and_then(serde_json::Value::as_str)
+        .expect("should contain a blob envelope");
+    let envelope: serde_json::Value =
+        serde_json::from_str(envelope_json).expect("should parse blob envelope");
+
+    assert!(
+        envelope["data"]["auction"]
+            .get("rewrite_creatives")
+            .is_none(),
+        "should omit the default rewrite setting from the pushed blob"
+    );
+
+    let diff = Command::new(env!("CARGO_BIN_EXE_ts"))
+        .args([
+            "config",
+            "diff",
+            "--adapter",
+            "axum",
+            "--local",
+            "--manifest",
+        ])
+        .arg(&project.manifest_path)
+        .arg("--app-config")
+        .arg(&project.config_path)
+        .current_dir(project.directory.path())
+        .output()
+        .expect("should run ts config diff");
+
+    assert!(
+        diff.status.success(),
+        "default rewrite setting should have no local diff: {}",
+        String::from_utf8_lossy(&diff.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&diff.stderr).contains("# no changes"),
+        "diff should report no changes: {}",
+        String::from_utf8_lossy(&diff.stderr)
     );
 }
 

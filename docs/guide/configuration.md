@@ -1214,7 +1214,7 @@ Creative markup returned by `POST /auction` is always server-sanitized. With
 `rewrite_creatives = true` (the default), eligible absolute or protocol-relative
 resource and click URLs not excluded by rewrite configuration are converted to
 signed first-party endpoints, and the creative TSJS runtime is injected when a
-`<body>` exists. Setting it to `false` returns sanitized but unre-written `adm`;
+`<body>` exists. Setting it to `false` returns sanitized but not rewritten `adm`;
 accepted external URLs remain direct and are not host allowlisted by the
 sanitizer. The setting does not affect HTML or CSS fetched through
 `/first-party/proxy`. See [Creative Processing](/guide/creative-processing#auction-rewrite-control).

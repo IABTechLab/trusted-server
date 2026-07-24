@@ -233,6 +233,7 @@ pub fn convert_to_openrtb_response(
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     // Build OpenRTB-style seatbid array
     let mut seatbids = Vec::with_capacity(result.winning_bids.len());
+    let rewrite_creatives = settings.auction.rewrite_creatives;
 
     for (slot_id, bid) in &result.winning_bids {
         let price = bid.price.ok_or_else(|| {
@@ -253,28 +254,15 @@ pub fn convert_to_openrtb_response(
 
         // Process creative HTML if present — always sanitize dangerous markup first.
         let creative_html = if let Some(ref raw_creative) = bid.creative {
-            let sanitized = creative::sanitize_creative_html(raw_creative);
-            let sanitized_len = sanitized.len();
-            let rewrite_creatives = settings.auction.rewrite_creatives;
-            let processed = if rewrite_creatives {
-                creative::rewrite_creative_html(settings, &sanitized)
-            } else {
-                sanitized
-            };
-            let rewrite_mode = if rewrite_creatives {
-                "enabled"
-            } else {
-                "disabled"
-            };
+            let processed = creative::process_auction_creative(settings, raw_creative);
 
             log::debug!(
-                "Processed creative for auction {} slot {} bidder {} (rewrite {}, raw {} bytes, sanitized {} bytes, output {} bytes)",
+                "Processed creative for auction {} slot {} bidder {} (rewrite {}, raw {} bytes, output {} bytes)",
                 auction_request.id,
                 slot_id,
                 bid.bidder,
-                rewrite_mode,
+                rewrite_creatives,
                 raw_creative.len(),
-                sanitized_len,
                 processed.len()
             );
 
