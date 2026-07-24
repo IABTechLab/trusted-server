@@ -77,6 +77,56 @@ describe('installTsAdInit', () => {
     document.getElementById("ad'prefix-real")?.remove();
   });
 
+  it('does not seed generationless server evidence when the configured element is absent', async () => {
+    document.getElementById('div-atf-sidebar')?.remove();
+    const recordAdTrace = vi.fn();
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([]),
+      addEventListener: vi.fn(),
+      refresh: vi.fn(),
+    };
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn(),
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+    };
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {
+        atf_sidebar_ad: {
+          trace: {
+            version: 1,
+            auctionTraceId: '750e8400-e29b-41d4-a716-446655440000',
+            bidTraceId: '550e8400-e29b-41d4-a716-446655440000',
+            source: 'initial_navigation',
+            slotId: 'atf_sidebar_ad',
+            provider: 'prebid',
+            bidder: 'example-bidder',
+          },
+        },
+      },
+      recordAdTrace,
+    } as any;
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(recordAdTrace).not.toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'ts_winner_observed' })
+    );
+  });
+
   it('reads window.tsjs.bids synchronously and applies bid targeting before refresh', async () => {
     const mockSlot = {
       addService: vi.fn().mockReturnThis(),
@@ -259,7 +309,7 @@ describe('installTsAdInit', () => {
     );
   });
 
-  it('keeps late load on the prior generation and fails closed on ambiguous viewability', async () => {
+  it('fails closed for late callbacks after refresh and correlates only the current terminal generation', async () => {
     const listeners: Record<string, Array<(event: SlotRenderEvent) => void>> = {};
     const element = document.createElement('div');
     element.id = 'publisher-refresh-slot';
@@ -303,11 +353,8 @@ describe('installTsAdInit', () => {
       listener({ isEmpty: false, slot: publisherSlot })
     );
     listeners.slotOnload?.forEach((listener) => listener({ isEmpty: false, slot: publisherSlot }));
-    expect(recordAdTrace).toHaveBeenCalledWith(
-      expect.objectContaining({ kind: 'gpt_slot_onload', generation: 1 })
-    );
     expect(recordAdTrace).not.toHaveBeenCalledWith(
-      expect.objectContaining({ kind: 'gpt_slot_onload', generation: 2 })
+      expect.objectContaining({ kind: 'gpt_slot_onload' })
     );
 
     listeners.slotRenderEnded?.forEach((listener) =>
@@ -317,15 +364,20 @@ describe('installTsAdInit', () => {
       listener({ isEmpty: false, slot: publisherSlot })
     );
     expect(recordAdTrace).not.toHaveBeenCalledWith(
-      expect.objectContaining({ kind: 'gpt_impression_viewable', generation: 2 })
+      expect.objectContaining({ kind: 'gpt_impression_viewable', generation: 1 })
     );
     expect(recordAdTrace).toHaveBeenCalledWith(
-      expect.objectContaining({
-        generation: 2,
-        outcome: 'unresolved',
-        reason: 'ambiguous_late_viewability',
-      })
+      expect.objectContaining({ kind: 'gpt_impression_viewable', generation: 2 })
     );
+    const viewabilityCalls = recordAdTrace.mock.calls.filter(
+      ([event]) => event.kind === 'gpt_impression_viewable'
+    );
+    listeners.impressionViewable?.forEach((listener) =>
+      listener({ isEmpty: false, slot: publisherSlot })
+    );
+    expect(
+      recordAdTrace.mock.calls.filter(([event]) => event.kind === 'gpt_impression_viewable')
+    ).toHaveLength(viewabilityCalls.length);
     element.remove();
   });
 
@@ -397,6 +449,7 @@ describe('installTsAdInit', () => {
     const publisherSlot = {
       getSlotElementId: vi.fn().mockReturnValue(element.id),
       getTargeting: vi.fn().mockReturnValue([]),
+      getSizes: vi.fn().mockReturnValue([[300, 250]]),
     };
     const mockPubads = {
       enableSingleRequest: vi.fn(),
@@ -407,6 +460,7 @@ describe('installTsAdInit', () => {
       refresh: vi.fn(),
     };
     const recordAdTrace = vi.fn();
+    const recordAdTraceCoverage = vi.fn();
     const nextAdTraceGeneration = vi.fn().mockReturnValue(7);
     const bindAdTraceElement = vi.fn();
     const destroySlots = vi.fn().mockReturnValue(true);
@@ -420,6 +474,7 @@ describe('installTsAdInit', () => {
       adSlots: [],
       bids: {},
       recordAdTrace,
+      recordAdTraceCoverage,
       nextAdTraceGeneration,
       bindAdTraceElement,
     } as any;
@@ -447,9 +502,18 @@ describe('installTsAdInit', () => {
     );
 
     listeners.slotRenderEnded?.forEach((listener) =>
-      listener({ isEmpty: false, isBackfill: true, slot: publisherSlot } as SlotRenderEvent)
+      listener({
+        isEmpty: false,
+        isBackfill: true,
+        size: [300, 250],
+        slotContentChanged: true,
+        slot: publisherSlot,
+      } as SlotRenderEvent)
     );
     listeners.slotOnload?.forEach((listener) => listener({ isEmpty: false, slot: publisherSlot }));
+    listeners.slotVisibilityChanged?.forEach((listener) =>
+      listener({ inViewPercentage: 65, slot: publisherSlot } as unknown as SlotRenderEvent)
+    );
     listeners.impressionViewable?.forEach((listener) =>
       listener({ isEmpty: false, slot: publisherSlot })
     );
@@ -461,6 +525,11 @@ describe('installTsAdInit', () => {
         generation: 7,
         isBackfill: true,
         reason: 'gpt_backfill',
+        responseClass: 'backfill',
+        renderedWidth: 300,
+        renderedHeight: 250,
+        slotContentChanged: true,
+        sizeMatchesConfigured: true,
       })
     );
     expect(recordAdTrace).toHaveBeenCalledWith(
@@ -477,6 +546,17 @@ describe('installTsAdInit', () => {
         generation: 7,
       })
     );
+    expect(recordAdTrace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'gpt_slot_visibility_changed',
+        generation: 7,
+        inViewPercentage: 65,
+      })
+    );
+    expect(recordAdTraceCoverage).toHaveBeenCalledWith({
+      category: 'gpt_visibility',
+      resolution: 'correlated',
+    });
     ((window as TestWindow).googletag as any).destroySlots([publisherSlot]);
     expect(destroySlots).toHaveBeenCalledWith([publisherSlot]);
     expect(recordAdTrace).toHaveBeenCalledWith(

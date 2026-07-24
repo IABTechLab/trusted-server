@@ -1,12 +1,16 @@
 import type {
   AdTraceApi,
   AdTraceConfidence,
+  AdTraceCoverageCategory,
+  AdTraceCoverageCounter,
+  AdTraceCoverageObservation,
   AdTraceEvent,
   AdTraceEventKind,
   AdTraceExport,
   AdTraceObservation,
   AdTraceStage,
   AdTraceStageName,
+  GenerationTraceDiagnostics,
   GenerationTraceSnapshot,
   RenderTraceOutcome,
   RenderTraceSnapshot,
@@ -20,6 +24,7 @@ export const AD_TRACE_MAX_GENERATIONS = 8;
 export const AD_TRACE_MAX_RENDERS = 200;
 export const AD_TRACE_ACK_TTL_MS = 30_000;
 const AD_TRACE_MAX_LISTENERS = 32;
+const AD_TRACE_MAX_ANOMALIES = 64;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const LABEL_RE = /^[\w.-]{1,64}$/;
@@ -40,6 +45,7 @@ const EVENT_KINDS = new Set<AdTraceEventKind>([
   'gpt_slot_render_ended',
   'gpt_slot_onload',
   'gpt_impression_viewable',
+  'gpt_slot_visibility_changed',
   'aps_display_bids_set',
   'aps_renderer_ready',
   'pb_render_requested',
@@ -47,21 +53,36 @@ const EVENT_KINDS = new Set<AdTraceEventKind>([
   'pb_render_served',
   'direct_render_rejected',
   'creative_load_acknowledged',
+  'creative_ack_timed_out',
+  'creative_ack_superseded',
+  'creative_ack_source_mismatched',
+  'creative_ack_missing_token',
   'generation_superseded',
 ]);
 const CONFIDENCES = new Set(['definitive', 'strong', 'probable', 'none']);
 const EMPTY_STAGE: AdTraceStage = { outcome: 'not_observed', confidence: 'none', reason: 'none' };
 
-type MutableGeneration = GenerationTraceSnapshot;
+interface MutableGeneration extends GenerationTraceSnapshot {
+  timestamps: {
+    requestedAt?: number;
+    responseAt?: number;
+    renderedAt?: number;
+    iframeLoadedAt?: number;
+    acknowledgedAt?: number;
+    viewableAt?: number;
+  };
+}
 interface MutableSlot {
   slotId: string;
   latestGeneration: number;
+  nextRequestNumber: number;
   baseStages: Record<AdTraceStageName, AdTraceStage>;
   generations: MutableGeneration[];
 }
 
 export interface AdTraceStore extends AdTraceApi {
   record(observation: AdTraceObservation): void;
+  recordCoverage(observation: AdTraceCoverageObservation): void;
   nextGeneration(slotId: string): number;
   subscribe(listener: () => void): () => void;
   bindElement(slotId: string, generation: number, element: HTMLElement): void;
@@ -100,7 +121,21 @@ function cloneFreeze<T>(value: T): T {
   return clone;
 }
 function newSlot(slotId: string): MutableSlot {
-  return { slotId, latestGeneration: 0, baseStages: stages(), generations: [] };
+  return {
+    slotId,
+    latestGeneration: 0,
+    nextRequestNumber: 0,
+    baseStages: stages(),
+    generations: [],
+  };
+}
+
+function generationDiagnostics(requestNumber: number): GenerationTraceDiagnostics {
+  return {
+    requestNumber,
+    terminalState: 'active',
+    durations: {},
+  };
 }
 
 function updateStage(target: Record<AdTraceStageName, AdTraceStage>, event: AdTraceEvent): void {
@@ -263,6 +298,42 @@ function updateStage(target: Record<AdTraceStageName, AdTraceStage>, event: AdTr
         };
       }
       break;
+    case 'creative_ack_timed_out':
+      if (target.creative.confidence !== 'definitive') {
+        target.creative = {
+          outcome: 'ack_timed_out',
+          confidence: 'none',
+          reason: 'ack_timed_out',
+        };
+      }
+      break;
+    case 'creative_ack_missing_token':
+      if (target.creative.confidence !== 'definitive') {
+        target.creative = {
+          outcome: 'ack_missing_token',
+          confidence: 'none',
+          reason: 'ack_missing_token',
+        };
+      }
+      break;
+    case 'creative_ack_source_mismatched':
+      if (target.creative.confidence !== 'definitive') {
+        target.creative = {
+          outcome: 'ack_source_mismatched',
+          confidence: 'none',
+          reason: 'ack_source_mismatched',
+        };
+      }
+      break;
+    case 'creative_ack_superseded':
+      if (target.creative.confidence !== 'definitive') {
+        target.creative = {
+          outcome: 'ack_superseded',
+          confidence: 'none',
+          reason: 'ack_superseded',
+        };
+      }
+      break;
     case 'generation_superseded':
       // Ownership cleanup is lifecycle evidence, not contradictory render
       // evidence. Preserve every previously observed stage unchanged.
@@ -273,16 +344,178 @@ function updateStage(target: Record<AdTraceStageName, AdTraceStage>, event: AdTr
 }
 
 function snapshot(slot: MutableSlot): SlotTraceSnapshot {
-  const latest = slot.generations.at(-1);
+  const latest = slot.generations[slot.generations.length - 1];
   return {
     slotId: slot.slotId,
     latestGeneration: slot.latestGeneration,
     generations: slot.generations.map((item) => ({
       generation: item.generation,
       stages: cloneStages(item.stages),
+      diagnostics: cloneFreeze(item.diagnostics),
     })),
     stages: cloneStages(latest?.stages ?? slot.baseStages),
   };
+}
+
+const COVERAGE_CATEGORIES: readonly AdTraceCoverageCategory[] = [
+  'gpt_requests',
+  'gpt_responses',
+  'gpt_renders',
+  'gpt_loads',
+  'gpt_viewability',
+  'gpt_visibility',
+  'prebid_render_succeeded',
+  'prebid_render_failed',
+];
+const RESPONSE_CLASSES = new Set(['empty', 'backfill', 'reservation', 'unclassified_non_empty']);
+
+function emptyCoverage(): Record<AdTraceCoverageCategory, AdTraceCoverageCounter> {
+  return Object.fromEntries(
+    COVERAGE_CATEGORIES.map((category) => [
+      category,
+      { observed: 0, correlated: 0, ambiguous: 0, unmatched: 0, ignored: 0 },
+    ])
+  ) as Record<AdTraceCoverageCategory, AdTraceCoverageCounter>;
+}
+
+function boundedInteger(value: unknown, minimum: number, maximum: number): number | undefined {
+  return typeof value === 'number' &&
+    Number.isInteger(value) &&
+    value >= minimum &&
+    value <= maximum
+    ? value
+    : undefined;
+}
+
+function setDuration(
+  diagnostics: GenerationTraceDiagnostics,
+  name: keyof GenerationTraceDiagnostics['durations'],
+  start: number | undefined,
+  end: number,
+  recordAnomaly: (reason: string) => void
+): void {
+  if (start === undefined) return;
+  const duration = Math.round(end - start);
+  if (duration < 0) {
+    recordAnomaly('out_of_order_timing');
+    return;
+  }
+  diagnostics.durations[name] = duration;
+}
+
+function updateGenerationDiagnostics(
+  generation: MutableGeneration,
+  event: AdTraceEvent,
+  recordAnomaly: (reason: string) => void
+): void {
+  const { diagnostics, timestamps } = generation;
+  switch (event.kind) {
+    case 'gpt_request_started':
+    case 'gpt_slot_requested':
+      timestamps.requestedAt ??= event.timestamp;
+      break;
+    case 'gpt_slot_response_received':
+      timestamps.responseAt ??= event.timestamp;
+      setDuration(
+        diagnostics,
+        'requestToResponseMs',
+        timestamps.requestedAt,
+        event.timestamp,
+        recordAnomaly
+      );
+      break;
+    case 'gpt_slot_render_ended':
+      timestamps.renderedAt ??= event.timestamp;
+      diagnostics.terminalState = event.isEmpty ? 'empty' : 'rendered';
+      if (event.responseClass) diagnostics.responseClass = event.responseClass;
+      if (event.renderedWidth !== undefined && event.renderedHeight !== undefined) {
+        diagnostics.renderedSize = [event.renderedWidth, event.renderedHeight];
+      }
+      if (event.slotContentChanged !== undefined) {
+        diagnostics.slotContentChanged = event.slotContentChanged;
+      }
+      if (event.sizeMatchesConfigured !== undefined) {
+        diagnostics.sizeMatchesConfigured = event.sizeMatchesConfigured;
+      }
+      setDuration(
+        diagnostics,
+        'responseToRenderMs',
+        timestamps.responseAt,
+        event.timestamp,
+        recordAnomaly
+      );
+      break;
+    case 'gpt_slot_onload':
+      timestamps.iframeLoadedAt ??= event.timestamp;
+      setDuration(
+        diagnostics,
+        'renderToIframeLoadMs',
+        timestamps.renderedAt,
+        event.timestamp,
+        recordAnomaly
+      );
+      break;
+    case 'gpt_impression_viewable':
+      timestamps.viewableAt ??= event.timestamp;
+      setDuration(
+        diagnostics,
+        'renderToViewableMs',
+        timestamps.renderedAt,
+        event.timestamp,
+        recordAnomaly
+      );
+      break;
+    case 'gpt_slot_visibility_changed':
+      if (event.inViewPercentage !== undefined) {
+        diagnostics.currentVisibilityPercentage = event.inViewPercentage;
+        diagnostics.maximumVisibilityPercentage = Math.max(
+          diagnostics.maximumVisibilityPercentage ?? 0,
+          event.inViewPercentage
+        );
+      }
+      break;
+    case 'prebid_render_succeeded':
+      diagnostics.prebidRender = 'succeeded';
+      break;
+    case 'prebid_render_failed':
+      diagnostics.prebidRender = 'failed';
+      break;
+    case 'creative_load_acknowledged':
+      timestamps.acknowledgedAt ??= event.timestamp;
+      diagnostics.acknowledgement = 'confirmed';
+      setDuration(
+        diagnostics,
+        'renderToCreativeAcknowledgementMs',
+        timestamps.renderedAt,
+        event.timestamp,
+        recordAnomaly
+      );
+      break;
+    case 'creative_ack_timed_out':
+      if (diagnostics.acknowledgement !== 'confirmed') diagnostics.acknowledgement = 'timed_out';
+      break;
+    case 'creative_ack_superseded':
+      if (diagnostics.acknowledgement !== 'confirmed') diagnostics.acknowledgement = 'superseded';
+      break;
+    case 'creative_ack_source_mismatched':
+      if (diagnostics.acknowledgement !== 'confirmed') {
+        diagnostics.acknowledgement = 'source_mismatched';
+      }
+      break;
+    case 'creative_ack_missing_token':
+      if (diagnostics.acknowledgement !== 'confirmed') {
+        diagnostics.acknowledgement = 'missing_token';
+      }
+      break;
+    case 'generation_superseded':
+      diagnostics.terminalState = 'superseded';
+      break;
+    default:
+      break;
+  }
+  if (event.prebidAuctionDurationMs !== undefined) {
+    diagnostics.durations.prebidAuctionMs = event.prebidAuctionDurationMs;
+  }
 }
 
 function isRenderEvent(kind: AdTraceEventKind): boolean {
@@ -298,6 +531,10 @@ function isRenderEvent(kind: AdTraceEventKind): boolean {
     kind === 'pb_render_served' ||
     kind === 'direct_render_rejected' ||
     kind === 'creative_load_acknowledged' ||
+    kind === 'creative_ack_timed_out' ||
+    kind === 'creative_ack_superseded' ||
+    kind === 'creative_ack_source_mismatched' ||
+    kind === 'creative_ack_missing_token' ||
     kind === 'generation_superseded'
   );
 }
@@ -319,6 +556,8 @@ function renderOutcome(
   }
   if (event.kind === 'creative_load_acknowledged')
     return { outcome: 'confirmed', confidence: 'definitive' };
+  if (event.kind === 'creative_ack_timed_out') return { outcome: 'timed_out', confidence: 'none' };
+  if (current.outcome === 'timed_out') return { outcome: 'timed_out', confidence: 'none' };
   if (current.outcome === 'served') return { outcome: 'served', confidence: 'strong' };
   if (event.kind === 'pb_render_served') return { outcome: 'served', confidence: 'strong' };
   if (event.kind === 'gpt_slot_render_ended') {
@@ -345,6 +584,17 @@ export function createAdTraceStore(
   let renderSequence = 0;
   let droppedEvents = 0;
   let evictedSlots = 0;
+  const coverage = emptyCoverage();
+  const anomalies = new Map<string, number>();
+  const recordAnomaly = (reason: string): void => {
+    const safeReason = safeLabel(reason);
+    if (!safeReason) return;
+    if (!anomalies.has(safeReason) && anomalies.size >= AD_TRACE_MAX_ANOMALIES) {
+      anomalies.set('other', (anomalies.get('other') ?? 0) + 1);
+      return;
+    }
+    anomalies.set(safeReason, (anomalies.get(safeReason) ?? 0) + 1);
+  };
   const ensureSlot = (slotId: string): MutableSlot => {
     let slot = slots.get(slotId);
     if (slot) return slot;
@@ -368,7 +618,7 @@ export function createAdTraceStore(
     if (!isRenderEvent(event.kind)) return;
     const key = `${slotId}:${generation}`;
     let render = renderByGeneration.get(key);
-    const timestamp = now();
+    const timestamp = event.timestamp;
     if (!render) {
       render = {
         sequence: ++renderSequence,
@@ -434,19 +684,44 @@ export function createAdTraceStore(
         ...(typeof observation.isBackfill === 'boolean'
           ? { isBackfill: observation.isBackfill }
           : {}),
+        ...(RESPONSE_CLASSES.has(observation.responseClass ?? '')
+          ? { responseClass: observation.responseClass }
+          : {}),
+        ...(boundedInteger(observation.renderedWidth, 1, 10_000) !== undefined
+          ? { renderedWidth: observation.renderedWidth }
+          : {}),
+        ...(boundedInteger(observation.renderedHeight, 1, 10_000) !== undefined
+          ? { renderedHeight: observation.renderedHeight }
+          : {}),
+        ...(typeof observation.slotContentChanged === 'boolean'
+          ? { slotContentChanged: observation.slotContentChanged }
+          : {}),
+        ...(typeof observation.sizeMatchesConfigured === 'boolean'
+          ? { sizeMatchesConfigured: observation.sizeMatchesConfigured }
+          : {}),
+        ...(boundedInteger(observation.inViewPercentage, 0, 100) !== undefined
+          ? { inViewPercentage: observation.inViewPercentage }
+          : {}),
+        ...(boundedInteger(observation.prebidAuctionDurationMs, 0, 300_000) !== undefined
+          ? { prebidAuctionDurationMs: observation.prebidAuctionDurationMs }
+          : {}),
       };
-      events.push(event);
-      if (events.length > AD_TRACE_MAX_EVENTS) {
-        events.shift();
-        droppedEvents += 1;
+      if (event.kind !== 'gpt_slot_visibility_changed') {
+        events.push(event);
+        if (events.length > AD_TRACE_MAX_EVENTS) {
+          events.shift();
+          droppedEvents += 1;
+        }
       }
       if (slotId) {
         const slot = ensureSlot(slotId);
         const exact = generation
           ? slot.generations.find((item) => item.generation === generation)
           : undefined;
-        if (exact) updateStage(exact.stages, event);
-        else if (
+        if (exact) {
+          updateStage(exact.stages, event);
+          updateGenerationDiagnostics(exact, event, recordAnomaly);
+        } else if (
           !generation &&
           (event.kind === 'ts_winner_observed' || event.kind === 'ts_auction_observed')
         ) {
@@ -454,7 +729,20 @@ export function createAdTraceStore(
           // the latest retained generation would rewrite prior-navigation history.
           updateStage(slot.baseStages, event);
         }
-        if (generation) updateRender(event, slotId, generation);
+        if (generation) {
+          if (!exact) recordAnomaly('missing_retained_generation');
+          updateRender(event, slotId, generation);
+        }
+      }
+      notify();
+    },
+    recordCoverage(observation) {
+      const counter = coverage[observation.category];
+      if (!counter) return;
+      counter.observed += 1;
+      counter[observation.resolution] += 1;
+      if (observation.resolution === 'ambiguous' || observation.resolution === 'unmatched') {
+        recordAnomaly(observation.reason ?? `${observation.category}_${observation.resolution}`);
       }
       notify();
     },
@@ -463,10 +751,15 @@ export function createAdTraceStore(
       if (!safeSlotId) return 0;
       const slot = ensureSlot(safeSlotId);
       slot.latestGeneration = ++generationSequence;
+      slot.nextRequestNumber += 1;
       slot.generations.push({
         generation: slot.latestGeneration,
         stages: cloneStages(slot.baseStages),
+        diagnostics: generationDiagnostics(slot.nextRequestNumber),
+        timestamps: {},
       });
+      // Generationless server evidence belongs to one future request only.
+      slot.baseStages = stages();
       if (slot.generations.length > AD_TRACE_MAX_GENERATIONS) slot.generations.shift();
       notify();
       return slot.latestGeneration;
@@ -487,7 +780,12 @@ export function createAdTraceStore(
         slots: [...slots.values()].map(snapshot),
         events,
         renders,
-        metadata: { droppedEvents, evictedSlots },
+        metadata: {
+          droppedEvents,
+          evictedSlots,
+          coverage,
+          anomalies: Object.fromEntries(anomalies),
+        },
       };
       return cloneFreeze(value);
     },

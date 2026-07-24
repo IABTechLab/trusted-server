@@ -169,8 +169,7 @@ test.describe("tester-only auction trace contract", () => {
                     );
                     return slot
                         ? {
-                              trustedServer:
-                                  slot.stages.trustedServer.outcome,
+                              trustedServer: slot.stages.trustedServer.outcome,
                               gam: slot.stages.gam.outcome,
                           }
                         : undefined;
@@ -338,8 +337,7 @@ test.describe("tester-only auction trace contract", () => {
                         ? {
                               slotId: slot.slotId,
                               generation: slot.latestGeneration,
-                              trustedServer:
-                                  slot.stages.trustedServer.outcome,
+                              trustedServer: slot.stages.trustedServer.outcome,
                               prebid: slot.stages.prebid.outcome,
                               gam: slot.stages.gam.outcome,
                               creative: slot.stages.creative.outcome,
@@ -358,11 +356,16 @@ test.describe("tester-only auction trace contract", () => {
             );
 
         await page.evaluate(() => {
-            (
+            const fixture = (
                 window as Window & {
-                    adTraceFixture: { markPublisherLazyViewable(): void };
+                    adTraceFixture: {
+                        markPublisherLazyVisibility(percent: number): void;
+                        markPublisherLazyViewable(): void;
+                    };
                 }
-            ).adTraceFixture.markPublisherLazyViewable();
+            ).adTraceFixture;
+            fixture.markPublisherLazyVisibility(65);
+            fixture.markPublisherLazyViewable();
         });
         await expect
             .poll(() =>
@@ -387,6 +390,73 @@ test.describe("tester-only auction trace contract", () => {
                 }),
             )
             .toBe("viewable");
+        await expect
+            .poll(() =>
+                page.evaluate(() => {
+                    const result = (
+                        window as Window & {
+                            tsjs: {
+                                adTrace: {
+                                    export(): {
+                                        slots: Array<{
+                                            slotId: string;
+                                            generations: Array<{
+                                                diagnostics: {
+                                                    responseClass?: string;
+                                                    renderedSize?: number[];
+                                                    currentVisibilityPercentage?: number;
+                                                    maximumVisibilityPercentage?: number;
+                                                };
+                                            }>;
+                                        }>;
+                                        metadata: {
+                                            coverage: Record<
+                                                string,
+                                                {
+                                                    observed: number;
+                                                    correlated: number;
+                                                }
+                                            >;
+                                        };
+                                    };
+                                };
+                            };
+                        }
+                    ).tsjs.adTrace.export();
+                    const slot = result.slots.find((item) =>
+                        item.slotId.startsWith("gpt_slot_"),
+                    );
+                    return {
+                        diagnostics: slot?.generations.at(-1)?.diagnostics,
+                        renderCoverageComplete:
+                            result.metadata.coverage.gpt_renders.observed > 0 &&
+                            result.metadata.coverage.gpt_renders.correlated ===
+                                result.metadata.coverage.gpt_renders.observed,
+                        loadCoverageComplete:
+                            result.metadata.coverage.gpt_loads.observed > 0 &&
+                            result.metadata.coverage.gpt_loads.correlated ===
+                                result.metadata.coverage.gpt_loads.observed,
+                        visibilityCoverageComplete:
+                            result.metadata.coverage.gpt_visibility.observed >
+                                0 &&
+                            result.metadata.coverage.gpt_visibility
+                                .correlated ===
+                                result.metadata.coverage.gpt_visibility
+                                    .observed,
+                    };
+                }),
+            )
+            .toMatchObject({
+                diagnostics: {
+                    responseClass: "backfill",
+                    renderedSize: [300, 250],
+                    currentVisibilityPercentage: 65,
+                    maximumVisibilityPercentage: 65,
+                },
+                renderCoverageComplete: true,
+                loadCoverageComplete: true,
+                visibilityCoverageComplete: true,
+            });
 
         await expect(page.locator("#publisher-lazy-slot")).toHaveAttribute(
             "data-ts-trace-outcome",
@@ -402,7 +472,9 @@ test.describe("tester-only auction trace contract", () => {
             ),
         );
         expect(genericExport).not.toContain("publisher-lazy-slot");
-        expect(genericExport).not.toContain("/123456789/example/publisher-lazy");
+        expect(genericExport).not.toContain(
+            "/123456789/example/publisher-lazy",
+        );
         const session = await page.context().newCDPSession(page);
         await expect
             .poll(async () => {
