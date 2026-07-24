@@ -566,10 +566,10 @@ exists.
 rewrite_creatives = true
 ```
 
-| Setting           | Winning-bid `adm` behavior                                                                                                                                          |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Omitted or `true` | Sanitize, rewrite eligible URLs, add click-guard attributes, and inject creative TSJS.                                                                              |
-| `false`           | Sanitize, then return sanitized but unre-written HTML. Accepted asset and click URLs remain direct, so the browser may contact third-party hosts without mediation. |
+| Setting           | Winning-bid `adm` behavior                                                                                                                                           |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Omitted or `true` | Sanitize, rewrite eligible URLs, add click-guard attributes, and inject creative TSJS.                                                                               |
+| `false`           | Sanitize, then return sanitized but not rewritten HTML. Accepted asset and click URLs remain direct, so the browser may contact third-party hosts without mediation. |
 
 Disabling rewriting does not disable or reverse sanitization. Scripts,
 stylesheets, style blocks, forms, event handlers, dangerous URL schemes, and

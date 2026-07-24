@@ -48,6 +48,9 @@ mod tests {
     use crate::test_support::tests::crate_test_settings_str;
     use serde::Deserialize;
 
+    // Intentionally mirrors `AuctionConfig` before `rewrite_creatives` existed.
+    // Do not add fields introduced after that snapshot: this test proves a
+    // default payload remains readable by the previous binary schema.
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct LegacyAuctionConfig {

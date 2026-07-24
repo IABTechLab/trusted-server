@@ -2392,6 +2392,28 @@ mod tests {
     }
 
     #[test]
+    fn proxy_sign_rejects_excluded_absolute_url() {
+        futures::executor::block_on(async {
+            let mut settings = create_test_settings();
+            settings.rewrite.exclude_domains = vec!["cdn.example".to_owned()];
+            let body = serde_json::json!({
+                "url": "https://cdn.example/asset.js",
+            });
+            let req = build_http_post_json_request("https://edge.example/first-party/sign", &body);
+            let err: Report<TrustedServerError> =
+                handle_first_party_proxy_sign(&settings, &noop_services(), req)
+                    .await
+                    .expect_err("should reject excluded URL");
+
+            assert_eq!(
+                err.current_context().status_code(),
+                StatusCode::BAD_GATEWAY,
+                "should reject excluded absolute URLs as unsupported"
+            );
+        });
+    }
+
+    #[test]
     fn proxy_sign_preserves_non_standard_port() {
         futures::executor::block_on(async {
             let settings = create_test_settings();
