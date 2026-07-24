@@ -175,6 +175,12 @@ impl CreativeOpportunitiesConfig {
 
     /// Validate all slot definitions after runtime preparation.
     ///
+    /// Call [`compile_unit_templates`](Self::compile_unit_templates) first: the
+    /// `{section}` → [`section_root`](Self::section_root) requirement is keyed off
+    /// each slot's compiled template, so an uncompiled config silently skips that
+    /// check. [`Settings::prepare_runtime`](crate::settings::Settings) enforces
+    /// this order.
+    ///
     /// # Errors
     ///
     /// Returns an error string when a slot has an invalid identifier, page
@@ -404,17 +410,6 @@ impl CreativeOpportunitySlot {
             .collect();
     }
 
-    /// Returns the GAM ad unit path for this slot.
-    ///
-    /// Uses the explicit [`gam_unit_path`](Self::gam_unit_path) override when set,
-    /// otherwise constructs `/<gam_network_id>/<id>`.
-    #[must_use]
-    pub fn resolved_gam_unit_path(&self, gam_network_id: &str) -> String {
-        self.gam_unit_path
-            .clone()
-            .unwrap_or_else(|| format!("/{}/{}", gam_network_id, self.id))
-    }
-
     /// Parses [`gam_unit_path`](Self::gam_unit_path) into
     /// [`compiled_unit`](Self::compiled_unit). Call once at startup via
     /// [`CreativeOpportunitiesConfig::compile_unit_templates`].
@@ -423,7 +418,7 @@ impl CreativeOpportunitySlot {
     ///
     /// Returns an error string (prefixed with the slot id) when the template is
     /// malformed. See [`parse_unit_template`].
-    pub fn compile_unit_template(&mut self) -> Result<(), String> {
+    pub(crate) fn compile_unit_template(&mut self) -> Result<(), String> {
         self.compiled_unit = match &self.gam_unit_path {
             Some(raw) => {
                 Some(parse_unit_template(raw).map_err(|e| format!("slot `{}`: {e}", self.id))?)
@@ -438,7 +433,7 @@ impl CreativeOpportunitySlot {
     /// Substitutes `{network_id}`, `{section}`, and `{slot_id}` in the parsed
     /// template. Falls back to `/<network_id>/<id>` when the slot has no template.
     #[must_use]
-    pub fn render_gam_unit_path(&self, gam_network_id: &str, section: &str) -> String {
+    pub(crate) fn render_gam_unit_path(&self, gam_network_id: &str, section: &str) -> String {
         match &self.compiled_unit {
             Some(parts) => parts
                 .iter()
@@ -724,25 +719,6 @@ mod tests {
             "html in id should fail"
         );
         assert!(validate_slot_id("has space").is_err(), "spaces should fail");
-    }
-
-    #[test]
-    fn resolved_gam_unit_path_uses_default_when_absent() {
-        let slot = make_slot("atf", vec!["/"]);
-        assert_eq!(
-            slot.resolved_gam_unit_path("21765378893"),
-            "/21765378893/atf"
-        );
-    }
-
-    #[test]
-    fn resolved_gam_unit_path_uses_override_when_set() {
-        let mut slot = make_slot("atf", vec!["/"]);
-        slot.gam_unit_path = Some("/21765378893/publisher/atf-sidebar".to_string());
-        assert_eq!(
-            slot.resolved_gam_unit_path("21765378893"),
-            "/21765378893/publisher/atf-sidebar"
-        );
     }
 
     #[test]

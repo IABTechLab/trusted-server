@@ -4371,6 +4371,7 @@ mod tests {
         #[test]
         fn build_slot_json_renders_section_from_request_path() {
             let mut config = make_config();
+            config.gam_network_id = "99999".to_string();
             config.section_root = Some("homepage".to_string());
             let mut slot = make_slot();
             slot.gam_unit_path = Some("/{network_id}/example/{section}".to_string());
@@ -4379,13 +4380,13 @@ mod tests {
 
             let news = crate::publisher::build_slot_json(&slot, &config, "/news/article-123");
             assert_eq!(
-                news["gam_unit_path"], "/21765378893/example/news",
+                news["gam_unit_path"], "/99999/example/news",
                 "section should derive from the first path segment"
             );
 
             let home = crate::publisher::build_slot_json(&slot, &config, "/");
             assert_eq!(
-                home["gam_unit_path"], "/21765378893/example/homepage",
+                home["gam_unit_path"], "/99999/example/homepage",
                 "root path should use section_root"
             );
         }
