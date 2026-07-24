@@ -8,9 +8,10 @@
  *   tsjs-core.js          — core API (always included)
  *   tsjs-<integration>.js — one per discovered integration
  *
- * Prebid is intentionally excluded from this embedded build. Use
- * build-prebid-external.mjs to generate publisher-specific Prebid bundles
- * outside the Cargo build.
+ * The prebid integration builds here as the tsjs shim only — Prebid.js itself
+ * is never bundled into tsjs. Use build-prebid-external.mjs to generate the
+ * pure Prebid.js external bundle (core + adapters + user ID modules) that the
+ * shim requires at runtime via integrations.prebid.external_bundle_url.
  */
 
 import fs from 'node:fs';
@@ -34,9 +35,7 @@ const integrationModules = fs.existsSync(integrationsDir)
       .filter((name) => {
         const fullPath = path.join(integrationsDir, name);
         return (
-          name !== 'prebid' &&
-          fs.statSync(fullPath).isDirectory() &&
-          fs.existsSync(path.join(fullPath, 'index.ts'))
+          fs.statSync(fullPath).isDirectory() && fs.existsSync(path.join(fullPath, 'index.ts'))
         );
       })
       .sort()

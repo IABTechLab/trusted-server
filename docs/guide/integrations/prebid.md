@@ -374,11 +374,13 @@ available modules and default preset are checked in at
 `--user-id-modules` to `build-prebid-external.mjs` when a publisher needs a
 specific subset; omit it to use the default preset.
 
-This is deliberate: Trusted Server injects a generated Prebid.js bundle so we
-can install the `trustedServer` adapter and route auctions through `/auction`,
-but publishers often need different User ID submodules. Moving that selection to
-the external bundle keeps publisher-specific Prebid choices out of the Trusted
-Server WASM artifact while preserving a manifest and bundle hash for auditing.
+This is deliberate: the external bundle is pure Prebid.js (core, consent and
+User ID modules, and client-side bid adapters) while the server-served TSJS
+prebid shim installs the `trustedServer` adapter onto `window.pbjs` and routes
+auctions through `/auction` — but publishers often need different User ID
+submodules. Moving that selection to the external bundle keeps
+publisher-specific Prebid choices out of the Trusted Server WASM artifact while
+preserving a manifest and bundle hash for auditing.
 
 The current preset includes common ID modules such as Yahoo ConnectID, Criteo,
 LiveIntent, SharedID, UID2, ID5, LiveRamp IdentityLink, PubProvidedID, and

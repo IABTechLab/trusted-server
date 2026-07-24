@@ -921,7 +921,7 @@ pub fn register(
             .with_proxy(integration.clone())
             .with_attribute_rewriter(integration.clone())
             .with_head_injector(integration)
-            .without_js()
+            .with_deferred_js()
             .build(),
     ))
 }
@@ -2937,8 +2937,8 @@ passphrase = "test-secret-key-32-bytes-minimum"
             "External prebid bundle route should be injected"
         );
         assert!(
-            !processed.contains("tsjs-prebid.min.js"),
-            "Embedded deferred prebid bundle should not be injected"
+            processed.contains("tsjs-prebid.min.js"),
+            "Deferred tsjs prebid shim should be injected"
         );
     }
 

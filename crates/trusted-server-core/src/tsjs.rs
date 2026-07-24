@@ -192,12 +192,13 @@ mod tests {
     }
 
     #[test]
-    fn tsjs_deferred_script_src_uses_empty_hash_for_external_or_unknown_module() {
-        assert_eq!(
-            tsjs_deferred_script_src("prebid"),
-            "/static/tsjs=tsjs-prebid.min.js?v=",
-            "prebid now ships as an external bundle and has no local hash"
+    fn tsjs_deferred_script_src_hashes_prebid_shim_and_empties_unknown_module() {
+        let prebid_src = tsjs_deferred_script_src("prebid");
+        assert!(
+            prebid_src.starts_with("/static/tsjs=tsjs-prebid.min.js?v="),
+            "prebid shim should be served from the deferred tsjs route"
         );
+        assert_sha256_hex_hash(hash_query_value(&prebid_src));
         assert_eq!(
             tsjs_deferred_script_src("unknown-module"),
             "/static/tsjs=tsjs-unknown-module.min.js?v=",

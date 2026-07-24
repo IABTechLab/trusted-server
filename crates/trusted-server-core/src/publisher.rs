@@ -3796,7 +3796,7 @@ mod tests {
     }
 
     #[test]
-    fn tsjs_dynamic_does_not_serve_embedded_prebid() {
+    fn tsjs_dynamic_serves_prebid_shim_when_enabled() {
         let settings = create_test_settings();
         let registry =
             IntegrationRegistry::new(&settings).expect("should create integration registry");
@@ -3808,8 +3808,8 @@ mod tests {
         let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
         assert_eq!(
             response.status(),
-            StatusCode::NOT_FOUND,
-            "should not serve embedded prebid module"
+            StatusCode::OK,
+            "should serve the deferred prebid shim module when prebid is enabled"
         );
     }
 
