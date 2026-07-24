@@ -43,7 +43,13 @@ fn test_settings() -> Settings {
             proxy_secret = "parity-test-proxy-secret"
 
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            default_country = "FR"
         "#,
     )
     .expect("should parse parity test settings")

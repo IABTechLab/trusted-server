@@ -261,7 +261,13 @@ cookie_domain = ".example.com"
 origin_url = "https://origin.example.com"
 proxy_secret = "change-me-proxy-secret"
 
+[geo]
+default_country = "FR"
+
 [ec]
+provider = "hmac"
+
+[ec.providers.hmac]
 passphrase = "production-secret-key-32-bytes-min"
 
 [[handlers]]

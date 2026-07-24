@@ -23,8 +23,11 @@ Set EC configuration in `trusted-server.toml`:
 
 ```toml
 [ec]
-passphrase = "replace-with-32-plus-byte-random-secret"
+provider = "hmac"
 ec_store = "ec_identity_store"
+
+[ec.providers.hmac]
+passphrase = "replace-with-32-plus-byte-random-secret"
 
 [[ec.partners]]
 name = "Mocktioneer SSP"
@@ -35,6 +38,7 @@ bidstream_enabled = true
 
 Required behavior assumptions:
 
+- `provider = "hmac"` selects the built-in HMAC provider; its `passphrase` lives under `[ec.providers.hmac]`
 - `passphrase` is long-lived HMAC-SHA256 keying material for EC ID derivation; use a high-entropy random value of at least 32 characters
 - `ec_store` is linked to the active Fastly service version
 - `ec_store` is the only KV-backed EC lifecycle store; it contains identity graph state, minimal consent metadata, source-domain keyed partner UIDs, and withdrawal tombstones

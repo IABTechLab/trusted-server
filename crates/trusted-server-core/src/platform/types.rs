@@ -9,6 +9,7 @@ use super::{
     PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformHttpClient, PlatformKvStore,
     PlatformSecretStore,
 };
+use crate::evidence::HostSignals;
 
 /// Geographic information extracted from a request.
 ///
@@ -18,7 +19,7 @@ use super::{
 pub struct GeoInfo {
     /// City name.
     pub city: String,
-    /// Two-letter country code.
+    /// ISO 3166-1 alpha-2 country code, for example `US` or `GB`.
     pub country: String,
     /// Continent name.
     pub continent: String,
@@ -28,7 +29,8 @@ pub struct GeoInfo {
     pub longitude: f64,
     /// DMA (Designated Market Area) / metro code.
     pub metro_code: i64,
-    /// Region code.
+    /// ISO 3166-2 subdivision code without the country prefix, for example `CA`
+    /// for California, or `None` when no region resolves.
     pub region: Option<String>,
     /// Autonomous System Number (e.g. `7922` = Comcast).
     /// Used to distinguish home ISP vs. corporate VPN.
@@ -178,6 +180,10 @@ pub struct RuntimeServices {
     pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
     /// Per-request client metadata extracted at the entry point.
     pub(crate) client_info: ClientInfo,
+    /// Host-computed client fingerprints (TLS JA4, HTTP/2), when the host
+    /// supplies them. `None` on a host that exposes none, so a provider that
+    /// requires them cannot be built and the request stops.
+    pub(crate) host_signals: Option<Arc<dyn HostSignals>>,
 }
 
 impl RuntimeServices {
@@ -253,6 +259,18 @@ impl RuntimeServices {
         &self.client_info
     }
 
+    /// Returns the host-computed client fingerprints, when the host supplies
+    /// them.
+    ///
+    /// A provider that derives identity from the TLS JA4 or HTTP/2 fingerprints
+    /// takes these as an injected service. The result is `None` on a host that
+    /// exposes none, so such a provider cannot be built there and the request
+    /// stops rather than minting a degraded identifier.
+    #[must_use]
+    pub fn host_signals(&self) -> Option<Arc<dyn HostSignals>> {
+        self.host_signals.clone()
+    }
+
     /// Wrap the KV store in a [`super::KvHandle`] for ergonomic access to
     /// JSON helpers, pagination, and validation.
     #[must_use]
@@ -295,6 +313,7 @@ pub struct RuntimeServicesBuilder {
     geo: Option<Arc<dyn PlatformGeo>>,
     auction_telemetry_sink: Option<Arc<dyn AuctionTelemetrySink>>,
     client_info: Option<ClientInfo>,
+    host_signals: Option<Arc<dyn HostSignals>>,
 }
 
 impl RuntimeServicesBuilder {
@@ -308,6 +327,7 @@ impl RuntimeServicesBuilder {
             geo: None,
             auction_telemetry_sink: None,
             client_info: None,
+            host_signals: None,
         }
     }
 
@@ -370,6 +390,17 @@ impl RuntimeServicesBuilder {
         self
     }
 
+    /// Set the host-computed client fingerprints service.
+    ///
+    /// Optional: a host that exposes no TLS/HTTP-2 fingerprints leaves this
+    /// unset, so a provider that requires them cannot be built and the request
+    /// stops.
+    #[must_use]
+    pub fn host_signals(mut self, host_signals: Arc<dyn HostSignals>) -> Self {
+        self.host_signals = Some(host_signals);
+        self
+    }
+
     /// Construct [`RuntimeServices`] from the accumulated configuration.
     ///
     /// # Panics
@@ -402,6 +433,7 @@ impl RuntimeServicesBuilder {
             client_info: self
                 .client_info
                 .expect("should set client_info before building RuntimeServices"),
+            host_signals: self.host_signals,
         }
     }
 }

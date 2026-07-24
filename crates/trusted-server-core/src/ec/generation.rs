@@ -11,7 +11,6 @@ use rand::Rng;
 use sha2::Sha256;
 
 use crate::error::TrustedServerError;
-use crate::settings::Settings;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -81,19 +80,39 @@ fn generate_random_suffix(length: usize) -> String {
 ///
 /// - [`TrustedServerError::EdgeCookie`] if HMAC generation fails
 pub fn generate_ec_id(
-    settings: &Settings,
+    passphrase: &str,
     client_ip: &str,
 ) -> Result<String, Report<TrustedServerError>> {
-    let mut mac = HmacSha256::new_from_slice(settings.ec.passphrase.expose().as_bytes())
-        .change_context(TrustedServerError::EdgeCookie {
+    generate_hmac_ec_id(passphrase, &[client_ip])
+}
+
+/// Mints an Edge Cookie identifier as HMAC-SHA256 over the given parts plus a
+/// random suffix, in the `{64hex}.{6alnum}` format.
+///
+/// The parts are joined with a unit separator (`\u{1f}`), which cannot appear in
+/// a client IP, User-Agent, JA4, or HTTP/2 fingerprint, so distinct part lists
+/// cannot collide. A provider that derives identity from several request signals
+/// (for example a Fastly provider over JA4, H2, IP, and UA) passes them as
+/// separate parts. Each part must be pre-normalized by the caller.
+///
+/// # Errors
+///
+/// - [`TrustedServerError::EdgeCookie`] if HMAC generation fails
+pub fn generate_hmac_ec_id(
+    passphrase: &str,
+    parts: &[&str],
+) -> Result<String, Report<TrustedServerError>> {
+    let mut mac = HmacSha256::new_from_slice(passphrase.as_bytes()).change_context(
+        TrustedServerError::EdgeCookie {
             message: "Failed to create HMAC instance".to_string(),
-        })?;
-    mac.update(client_ip.as_bytes());
+        },
+    )?;
+    // A unit separator cannot occur in any part, so distinct lists never collide.
+    mac.update(parts.join("\u{1f}").as_bytes());
     let hmac_hash = hex::encode(mac.finalize().into_bytes());
 
-    // Append random 6-character alphanumeric suffix for additional uniqueness.
-    let random_suffix = generate_random_suffix(6);
-    let ec_id = format!("{hmac_hash}.{random_suffix}");
+    // Append a random 6-character alphanumeric suffix for additional uniqueness.
+    let ec_id = format!("{hmac_hash}.{}", generate_random_suffix(6));
 
     log::trace!("Generated fresh EC ID: {}", super::log_id(&ec_id));
 
@@ -175,7 +194,39 @@ mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
-    use crate::test_support::tests::create_test_settings;
+    const TEST_PASSPHRASE: &str = "test-secret-key-32-bytes-minimum";
+
+    #[test]
+    fn generate_hmac_ec_id_is_stable_per_parts_and_collision_resistant() {
+        // The 64-char hex prefix is HMAC over the parts and is stable for the
+        // same parts; the random suffix varies, so compare prefixes only.
+        let prefix = |parts: &[&str]| {
+            generate_hmac_ec_id(TEST_PASSPHRASE, parts)
+                .expect("should generate")
+                .split('.')
+                .next()
+                .expect("should have a prefix")
+                .to_owned()
+        };
+
+        assert_eq!(
+            prefix(&["a", "b"]),
+            prefix(&["a", "b"]),
+            "the same parts should yield the same stable prefix"
+        );
+        assert_ne!(
+            prefix(&["a", "b"]),
+            prefix(&["a", "c"]),
+            "different parts should yield a different prefix"
+        );
+        // The unit separator prevents a join collision: ["a", "b"] must not hash
+        // the same as ["ab"].
+        assert_ne!(
+            prefix(&["a", "b"]),
+            prefix(&["ab"]),
+            "the separator should prevent ['a','b'] colliding with ['ab']"
+        );
+    }
 
     #[test]
     fn normalize_ipv4_unchanged() {
@@ -215,8 +266,7 @@ mod tests {
 
     #[test]
     fn generate_produces_valid_format() {
-        let settings = create_test_settings();
-        let ec_id = generate_ec_id(&settings, "192.168.1.1").expect("should generate EC ID");
+        let ec_id = generate_ec_id(TEST_PASSPHRASE, "192.168.1.1").expect("should generate EC ID");
         assert!(
             is_valid_ec_id(&ec_id),
             "should match EC ID format: {{64hex}}.{{6alnum}}, got: {ec_id}"
@@ -225,10 +275,10 @@ mod tests {
 
     #[test]
     fn generate_same_ip_produces_consistent_hash_prefix() {
-        let settings = create_test_settings();
-        let first = generate_ec_id(&settings, "192.168.1.1").expect("should generate first EC ID");
+        let first =
+            generate_ec_id(TEST_PASSPHRASE, "192.168.1.1").expect("should generate first EC ID");
         let second =
-            generate_ec_id(&settings, "192.168.1.1").expect("should generate second EC ID");
+            generate_ec_id(TEST_PASSPHRASE, "192.168.1.1").expect("should generate second EC ID");
 
         assert_eq!(
             ec_hash(&first),

@@ -4,7 +4,7 @@ Trusted Server's EC module maintains user recognition across all browsers throug
 
 ## What are Edge Cookies?
 
-Edge Cookies (EC) are privacy-safe identifiers generated on a first site visit using HMAC-based hashing that allow tracking with user consent while protecting user privacy. Trusted Server derives a deterministic HMAC base from the client IP address and appends a short random suffix to reduce collision risk. They are passed in requests on subsequent visits and activity.
+Edge Cookies (EC) are privacy-safe identifiers generated on a first site visit using HMAC-based hashing, created only when the permission model allows it. Trusted Server derives a deterministic HMAC base from the client IP address and appends a short random suffix to reduce collision risk. They are passed in requests on subsequent visits and activity.
 
 Trusted Server surfaces the current EC ID via response headers and a first-party cookie. For the exact header and cookie names, see the [API Reference](/guide/api-reference).
 
@@ -22,7 +22,7 @@ EC IDs use HMAC (Hash-based Message Authentication Code) to generate a determini
 
 ### Request Lifecycle
 
-Every request passes through four phases. EC generation only happens on organic routes (publisher proxy, integration proxy, auction) — read-only endpoints like `/identify` and `/batch-sync` skip generation entirely. During pre-routing, Trusted Server builds consent from request-local cookies, headers, geolocation, and policy defaults; it does not load consent from a separate KV store.
+Every request passes through four phases. EC generation only happens on organic routes (publisher proxy, integration proxy, auction). Read-only endpoints like `/identify` and `/batch-sync` skip generation entirely. During pre-routing, Trusted Server builds the consent context from request-local cookies, headers, geolocation, and policy defaults. It does not load consent from a separate KV store.
 
 ```mermaid
 sequenceDiagram
@@ -40,7 +40,7 @@ sequenceDiagram
         Note over TS: Phase 3: Finalize<br/>Ingest Prebid EID cookies
         TS-->>B: Response + Set-Cookie: ts-ec=...
     else Return Visit (EC cookie present)
-        Note over TS: Phase 2: Routing<br/>EC exists — skip generation
+        Note over TS: Phase 2: Routing<br/>EC exists, skip generation
         Note over TS: Phase 3: Finalize<br/>Ingest Prebid EID cookies
         TS-->>B: Response<br/>(no cookie refresh)
     end
@@ -50,11 +50,11 @@ sequenceDiagram
 
 ### Response Finalization
 
-After routing completes, the server evaluates consent state and cookie presence to decide what to do with the EC cookie on the response.
+After routing completes, the server evaluates the permission state and cookie presence to decide what to do with the EC cookie on the response.
 
 ```mermaid
 flowchart TD
-    Start[ec_finalize_response] --> ConsentCheck{Consent<br/>allows EC?}
+    Start[ec_finalize_response] --> ConsentCheck{Permissions<br/>allow EC?}
 
     ConsentCheck -- "No" --> ExplicitWithdrawal{Explicit<br/>withdrawal?}
     ExplicitWithdrawal -- "Yes" --> CookiePresent{Cookie was<br/>present?}
@@ -67,44 +67,71 @@ flowchart TD
     WasPresent -- "No, just generated" --> NewEc["Ingest Prebid EID cookies<br/>Set ts-ec cookie"]
 ```
 
-When consent cannot be verified for the current request — for example, unknown jurisdiction or missing/undecodable consent signals in a regulated region — Trusted Server fails closed for EC use by stripping EC headers, but it does **not** treat that as authoritative revocation of an already-issued EC.
+When the required permissions cannot be established for the current request (for example an unknown country with no configured default, or missing or undecodable consent signals), Trusted Server fails closed for EC use by stripping EC headers, but it does **not** treat that as authoritative revocation of an already-issued EC.
 
-## Consent Model
+## Permission Gating
 
-EC creation is gated by jurisdiction. The server detects jurisdiction from geolocation data attached to the request and applies the appropriate consent framework. Live consent comes from request-local signals (`euconsent-v2`, `__gpp`, `__gpp_sid`, `us_privacy`, `Sec-GPC`) plus geolocation and policy defaults; there is no separate consent KV fallback.
+EC creation is gated through the [permission model](/guide/permission-model), not by a jurisdiction rule baked into the core. The Edge Cookie provider advertises the permissions its data use requires, and Trusted Server creates an Edge Cookie only when every required permission is set. The built-in HMAC provider requires `store-on-device` (TCF Purpose 1), because the `Set-Cookie` operation stores information on the device.
+
+The Edge Cookie code never reads consent. It checks only whether the required **permission** is set. Consent is one of the sources that _set_ a permission, not something the gate reads directly, so the Edge Cookie logic does not change when a consent framework changes. Two sources combine for each request:
+
+- **A country and region baseline.** The country, and an optional region such as a US state, that the geo provider returns. A region rule takes precedence over its country, and when no country is identified, or the country/region has no rule, the configured default country applies.
+- **Consent and privacy signals.** TCF, GPP, and GPC (`euconsent-v2`, `__gpp` / `__gpp_sid`, `us_privacy`, `Sec-GPC`) decoded from the request and mapped onto permissions as a **grant or a revoke** on top of that baseline. There is no separate consent KV fallback.
+
+Today only `store-on-device` is resolved this way: its country and region baseline is adjusted by the incoming TCF signal, and the Edge Cookie is created only when the result is set. With no configured default country, an unknown country sets nothing without a signal, so the cookie is not created unless a signal grants the permission. The core encodes no jurisdiction's law. The deployer brings the policy, and the per-country and per-region rules are configuration rather than core logic. See the [permission model](/guide/permission-model) for the full list of permission sources and the resolution order.
 
 ```mermaid
 flowchart TD
-    Start[Detect Jurisdiction] --> J{Jurisdiction?}
-
-    J -- "GDPR<br/>(EU/UK)" --> TCF{TCF string<br/>present?}
-    TCF -- "Yes" --> P1{Purpose 1<br/>granted?}
-    P1 -- "Yes" --> Allow([Allow EC])
-    P1 -- "No" --> Deny([Deny EC])
-    TCF -- "No" --> Deny
-
-    J -- "US State" --> GPC{GPC header<br/>set?}
-    GPC -- "Yes" --> Deny
-    GPC -- "No" --> USTCF{TCF from CMP<br/>e.g. Didomi?}
-    USTCF -- "Yes" --> USP1{Purpose 1<br/>granted?}
-    USP1 -- "Yes" --> Allow
-    USP1 -- "No" --> Deny
-    USTCF -- "No" --> USP{US Privacy<br/>string?}
-    USP -- "Yes" --> OptOut{Opt-out<br/>sale?}
-    OptOut -- "No" --> Allow
-    OptOut -- "Yes" --> Deny
-    USP -- "No" --> Deny
-
-    J -- "Non-regulated" --> Allow
-    J -- "Unknown<br/>(no geo data)" --> Deny
+    Start[Resolve country and region] --> Baseline[Country or region rule,<br/>else the default country]
+    Baseline --> Signals[Apply consent/privacy signals<br/>as a grant or revoke]
+    Signals --> Check{Provider's required<br/>permissions all set?}
+    Check -- "Yes" --> Allow([Create EC])
+    Check -- "No" --> Deny([No EC])
 ```
 
-- **GDPR**: Opt-in required. TCF Purpose 1 (store/access device) must be explicitly consented.
-- **US State**: Opt-out model with three-tier fallback — GPC always blocks, then TCF if a CMP uses it, then US Privacy string, then fail-closed.
-- **Non-regulated**: EC always allowed.
-- **Unknown**: Fail-closed when jurisdiction cannot be determined.
+The `ec_identity_store` KV store is the only EC lifecycle store. It holds identity graph state, source-domain keyed partner UIDs, a minimal consent snapshot used for EC entry metadata, and withdrawal tombstones. Permission resolution for each request is based on the live request signals listed above.
 
-The `ec_identity_store` KV store is the only EC lifecycle store. It holds identity graph state, source-domain keyed partner UIDs, a minimal consent snapshot used for EC entry metadata, and withdrawal tombstones. Consent interpretation for each request remains based on the live request signals listed above.
+## Provider Types: Server-Side and Client-Side
+
+The Edge Cookie identifier comes from a configurable provider, selected by `[ec] provider`. A provider is one of two types, and the permission gate above applies to both. The two reach the **same outcome** (a `ts-ec` cookie set and carried on every later request) by **different routes**.
+
+- **Server-side** (for example the built-in HMAC provider, or the built-in `host-signals` provider that mints from the host's TLS JA4 and HTTP/2 fingerprints on a host that supplies them). The provider derives the identifier at the edge from request data in `generate()`, and the **page response** sets the cookie. Nothing client-side is involved.
+- **Client-side** (for example the `client-fixed` demo). The provider cannot derive the identifier at the edge, so `generate()` defers and returns no identifier. The page then runs the provider's own JavaScript in the browser, which does its work and posts the result to the resolve endpoint. The provider mints from that value in `resolve_from_client()`, and the **resolve response** sets the cookie.
+
+```mermaid
+flowchart TD
+    Start(["Page request, no Edge Cookie"]) --> Type{"Provider type"}
+
+    Type -->|"Server-side (e.g. HMAC)"| SGen["generate() mints at the edge from request data"]
+    SGen --> SSet["Page response sets ts-ec"]
+
+    Type -->|"Client-side (e.g. client-fixed)"| CDefer["generate() defers, returns no identifier"]
+    CDefer --> CPage["Page response, no cookie, delivers the provider JS"]
+    CPage --> CBox[["Provider JS (black box): runs in the browser and does its work"]]
+    CBox --> CPost["JS posts the result to POST /_ts/api/v1/ec/resolve"]
+    CPost --> CResolve["resolve_from_client() verifies and mints"]
+    CResolve --> CSet["Resolve response sets ts-ec"]
+
+    SSet --> Same(["Same outcome: ts-ec set, carried on every later request"])
+    CSet --> Same
+```
+
+The two types differ only in route and in the methods they use:
+
+| Feature              | Server-side               | Client-side                                    |
+| -------------------- | ------------------------- | ---------------------------------------------- |
+| Example              | HMAC (`hmac`)             | `client-fixed` (demo)                          |
+| Mints in             | `generate()`, at the edge | `resolve_from_client()`, from the posted value |
+| `generate()` returns | the identifier            | no identifier (defers)                         |
+| Client JavaScript    | none                      | the provider JS (black box), which posts back  |
+| Endpoint             | none                      | `POST /_ts/api/v1/ec/resolve`                  |
+| Cookie set on        | the page response         | the resolve response                           |
+
+The resolve endpoint sets the cookie on its own first-party `200` response, so the value is live for every subsequent request without a second navigation. The cookie is `HttpOnly`, so the page script never reads it back. The script only posts the value, which the server then uses.
+
+Because the posted value comes from the browser, **verification is the provider's responsibility**. A client-side provider must verify the payload (for example a signature) before minting, or a client could forge an Edge Cookie. The endpoint itself is provider-agnostic. It bounds the body, applies the same permission gate as organic generation, calls the provider, and writes the cookie.
+
+A built-in `client-fixed` provider demonstrates the client-side type end to end with no vendor coupling. Client and server share one fixed, known word. When no Edge Cookie is present, the page script (shipped in the tsjs bundle when that provider is selected) posts that word, the server verifies it matches, and on a match sets it as the Edge Cookie. The value is verifiable because it is a known constant, which is the point of the demo. It is useless in production, because a fixed value is not an identity, so it is for demonstration and testing only.
 
 ## Partner Sync Channels
 

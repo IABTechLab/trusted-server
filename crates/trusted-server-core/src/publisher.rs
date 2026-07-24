@@ -40,7 +40,7 @@ use crate::auction::telemetry::{
 use crate::auction::types::{
     AuctionContext, AuctionRequest, Bid, DeviceInfo, PublisherInfo, SiteInfo, UserInfo,
 };
-use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
+use crate::consent::{consent_allows_server_side_auction, gate_eids_by_permissions};
 use crate::constants::{COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
 use crate::cookies::handle_request_cookies;
 use crate::ec::EcContext;
@@ -1985,10 +1985,10 @@ fn apply_auction_eids_and_device(
     let merged_eids = merge_auction_eids(client_eids, kv_eids);
     let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
     auction_request.user.eids =
-        gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref());
+        gate_eids_by_permissions(merged_eids, targeting.ec_context.permissions());
     if had_eids && auction_request.user.eids.is_none() {
         log::warn!(
-            "{} auction EIDs stripped by TCF consent gating",
+            "{} auction EIDs stripped by permission gating",
             targeting.path_label
         );
     }
