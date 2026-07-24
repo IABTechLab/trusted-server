@@ -196,6 +196,13 @@ const SUB_QUANTUM_LADDER_MS: [u32; 4] = [200, 150, 100, 50];
 /// the greatest rung no larger than the remaining budget, and anything above
 /// the top rung clamps to it. Rounding down never extends a transport cap past
 /// the remaining budget.
+///
+/// The rung spacing trades transport window for cardinality: just below a rung
+/// the haircut approaches the gap to the rung beneath (worst case ~50%, e.g. a
+/// remaining budget of 9,999 ms snaps to 5,000 ms). This is accepted — on the
+/// mediator path this value is the effective bound, but a denser ladder would
+/// buy back at most half a bucket of transport time at the cost of
+/// proportionally more backend names.
 const TRANSPORT_TIMEOUT_COARSE_LADDER_MS: [u32; 8] =
     [2000, 3000, 5000, 10000, 20000, 30000, 45000, 60000];
 
@@ -1220,6 +1227,12 @@ mod tests {
                 "canonical value {value}ms (from remaining {remaining}ms) is neither a quantum \
                  multiple nor a ladder rung"
             );
+            // The mediator </body> hold bound relies on canonicalization never
+            // extending a transport cap past the wall-clock budget.
+            assert!(
+                value <= remaining,
+                "canonical value {value}ms must not extend past the remaining {remaining}ms budget"
+            );
         }
         assert!(
             distinct.len() <= 16,
@@ -1249,6 +1262,12 @@ mod tests {
                     || SUB_QUANTUM_LADDER_MS.contains(&value),
                 "canonical value {value}ms (from remaining {remaining}ms) is neither a quantum \
                  multiple nor a ladder rung"
+            );
+            // The mediator </body> hold bound relies on canonicalization never
+            // extending a transport cap past the wall-clock budget.
+            assert!(
+                value <= remaining,
+                "canonical value {value}ms must not extend past the remaining {remaining}ms budget"
             );
         }
         // A budget above the top coarse rung must clamp to it, not open a new

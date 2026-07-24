@@ -1,3 +1,4 @@
+use core::fmt::Write as _;
 use std::time::Duration;
 
 use error_stack::{Report, ResultExt as _};
@@ -69,11 +70,11 @@ fn spec_digest_hex(canonical: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(canonical.as_bytes());
     let digest = hasher.finalize();
-    digest
-        .iter()
-        .take(SPEC_DIGEST_HEX_LEN / 2)
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    let mut hex = String::with_capacity(SPEC_DIGEST_HEX_LEN);
+    for byte in digest.iter().take(SPEC_DIGEST_HEX_LEN / 2) {
+        write!(hex, "{byte:02x}").expect("should write hex digit to string");
+    }
+    hex
 }
 
 /// Default first-byte timeout for backends (15 seconds).

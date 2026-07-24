@@ -272,6 +272,20 @@ impl AuctionOrchestrator {
             }
         }
 
+        // A provider that is also the mediator would be called twice per
+        // auction — once in the bidding phase and again as the mediator. The
+        // mediator's own demand already flows through its mediation response,
+        // so the overlap is never a legitimate configuration.
+        if let Some(mediator_name) = &self.config.mediator
+            && seen.contains(mediator_name.as_str())
+        {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "Auction mediator `{mediator_name}` is also listed in [auction].providers; a provider may not mediate its own auction"
+                ),
+            }));
+        }
+
         for provider_name in self
             .config
             .providers
@@ -1143,17 +1157,34 @@ impl AuctionOrchestrator {
             let start_time = Instant::now();
             match provider.request_bids(request, &provider_context).await {
                 Ok(pending) => {
-                    // Post-launch defense: a backend name already claimed by
-                    // another provider this auction would misattribute the
-                    // collected response, so fail this launch attributably
-                    // rather than overwrite the mapping.
-                    if backend_to_provider.contains_key(&backend_name) {
+                    // Correlate on the resolved backend name the pending request
+                    // carries, falling back to the prediction only when the adapter
+                    // left it unset. Collection keys on the name the response
+                    // reports, so keying the map on the prediction could drop a
+                    // response whose resolved name diverged.
+                    let request_backend_name = pending
+                        .backend_name()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| {
+                            log::warn!(
+                                "Provider '{}' pending request returned no backend name; \
+                                 using predicted name '{}'",
+                                provider.provider_name(),
+                                backend_name,
+                            );
+                            backend_name.clone()
+                        });
+                    // Post-launch defense: a resolved backend name already claimed
+                    // by another provider this auction would misattribute the
+                    // collected response, so fail this launch attributably rather
+                    // than overwrite the mapping.
+                    if backend_to_provider.contains_key(&request_backend_name) {
                         let response_time_ms = start_time.elapsed().as_millis() as u64;
                         log::warn!(
                             "Provider '{}' resolved to backend name '{}' already claimed by another \
                              provider this auction; skipping dispatch to avoid response misattribution",
                             provider.provider_name(),
-                            backend_name,
+                            request_backend_name,
                         );
                         launch_responses.push(provider_launch_failed_response(
                             provider.provider_name(),
@@ -1163,11 +1194,11 @@ impl AuctionOrchestrator {
                         log::info!(
                             "Dispatching bid request to '{}' (backend: {}, budget: {}ms)",
                             provider.provider_name(),
-                            backend_name,
+                            request_backend_name,
                             effective_timeout
                         );
                         backend_to_provider.insert(
-                            backend_name.clone(),
+                            request_backend_name.clone(),
                             (
                                 provider.provider_name().to_string(),
                                 start_time,
@@ -1175,7 +1206,7 @@ impl AuctionOrchestrator {
                                 effective_timeout,
                             ),
                         );
-                        pending_requests.push(pending.with_backend_name(backend_name));
+                        pending_requests.push(pending.with_backend_name(request_backend_name));
                     }
                 }
                 Err(e) => {
@@ -1766,6 +1797,74 @@ mod tests {
         fn backend_name(&self, _services: &RuntimeServices, timeout_ms: u32) -> Option<String> {
             Self::record(&self.predicted_timeouts, timeout_ms);
             Some(self.backend.to_string())
+        }
+    }
+
+    /// Provider whose `backend_name` prediction deliberately differs from the
+    /// backend name its `request_bids` puts on the wire.
+    struct DivergentBackendProvider {
+        name: &'static str,
+        predicted: &'static str,
+        resolved: &'static str,
+    }
+
+    impl DivergentBackendProvider {
+        fn new(name: &'static str, predicted: &'static str, resolved: &'static str) -> Self {
+            Self {
+                name,
+                predicted,
+                resolved,
+            }
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl AuctionProvider for DivergentBackendProvider {
+        fn provider_name(&self) -> &'static str {
+            self.name
+        }
+
+        async fn request_bids(
+            &self,
+            _request: &AuctionRequest,
+            context: &AuctionContext<'_>,
+        ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+            let req = PlatformHttpRequest::new(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("https://example.com/bid")
+                    .body(edgezero_core::body::Body::empty())
+                    .expect("should build stub bid request"),
+                self.resolved,
+            );
+            context
+                .services
+                .http_client()
+                .send_async(req)
+                .await
+                .change_context(TrustedServerError::Auction {
+                    message: "stub launch failed".to_string(),
+                })
+        }
+
+        async fn parse_response(
+            &self,
+            _response: PlatformResponse,
+            response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            Ok(AuctionResponse::success(
+                self.name,
+                vec![],
+                response_time_ms,
+            ))
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            2000
+        }
+
+        fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
+            Some(self.predicted.to_string())
         }
     }
 
@@ -2375,6 +2474,26 @@ mod tests {
     }
 
     #[test]
+    fn rejects_mediator_also_listed_as_provider() {
+        let config = AuctionConfig {
+            enabled: true,
+            providers: vec!["prebid".to_string()],
+            mediator: Some("prebid".to_string()),
+            timeout_ms: 2000,
+            ..Default::default()
+        };
+        let orchestrator = AuctionOrchestrator::new(config);
+
+        let err = orchestrator
+            .validate_configured_provider_names()
+            .expect_err("should reject a mediator that is also a provider");
+        assert!(
+            err.to_string().contains("may not mediate its own auction"),
+            "should explain the mediator/provider overlap, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_orchestrator_is_enabled() {
         let config = AuctionConfig {
             enabled: true,
@@ -2941,6 +3060,138 @@ mod tests {
                 BidStatus::Error,
                 "the second provider on the shared name should fail attributably, not be dropped"
             );
+        });
+    }
+
+    #[test]
+    fn dispatched_resolved_backend_name_diverging_from_prediction_still_correlates() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"{}".to_vec());
+            let services = build_services_with_http_client(stub);
+            // SAFETY: `Box::leak` creates a `'static` reference for test use only.
+            // The leaked allocation is bounded to the test process lifetime.
+            let services: &'static RuntimeServices = Box::leak(Box::new(services));
+
+            let config = AuctionConfig {
+                enabled: true,
+                providers: vec!["provider-a".to_string()],
+                timeout_ms: 2000,
+                mediator: None,
+                ..Default::default()
+            };
+            let mut orchestrator = AuctionOrchestrator::new(config);
+            orchestrator.register_provider(Arc::new(DivergentBackendProvider::new(
+                "provider-a",
+                "predicted-backend",
+                "resolved-backend",
+            )));
+
+            let request = create_test_auction_request();
+            let settings = create_test_settings();
+            let req = http::Request::builder()
+                .method(http::Method::GET)
+                .uri("https://example.com/test")
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build request");
+            let context = AuctionContext {
+                trace: crate::auction::test_support::test_trace(),
+                settings: &settings,
+                request: &req,
+                timeout_ms: 2000,
+                provider_responses: None,
+                services,
+            };
+
+            let dispatched = match orchestrator.dispatch_auction(&request, &context).await {
+                DispatchAuctionOutcome::Dispatched(dispatched) => dispatched,
+                _ => panic!("should dispatch the diverging provider"),
+            };
+            let result = orchestrator
+                .collect_dispatched_auction(dispatched, services, &context)
+                .await;
+
+            let provider_a = result
+                .provider_responses
+                .iter()
+                .find(|response| response.provider == "provider-a")
+                .expect("should have provider-a response");
+            assert_eq!(
+                provider_a.status,
+                BidStatus::Success,
+                "response should correlate by the resolved backend name, not the prediction"
+            );
+        });
+    }
+
+    #[test]
+    fn dispatched_post_launch_resolved_name_collision_fails_second_provider_attributably() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"{}".to_vec());
+            stub.push_response(200, b"{}".to_vec());
+            let services = build_services_with_http_client(stub);
+            // SAFETY: `Box::leak` creates a `'static` reference for test use only.
+            // The leaked allocation is bounded to the test process lifetime.
+            let services: &'static RuntimeServices = Box::leak(Box::new(services));
+
+            let config = AuctionConfig {
+                enabled: true,
+                providers: vec!["provider-a".to_string(), "provider-b".to_string()],
+                timeout_ms: 2000,
+                mediator: None,
+                ..Default::default()
+            };
+            let mut orchestrator = AuctionOrchestrator::new(config);
+            orchestrator.register_provider(Arc::new(DivergentBackendProvider::new(
+                "provider-a",
+                "predicted-a",
+                "shared-resolved",
+            )));
+            orchestrator.register_provider(Arc::new(DivergentBackendProvider::new(
+                "provider-b",
+                "predicted-b",
+                "shared-resolved",
+            )));
+
+            let request = create_test_auction_request();
+            let settings = create_test_settings();
+            let req = http::Request::builder()
+                .method(http::Method::GET)
+                .uri("https://example.com/test")
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build request");
+            let context = AuctionContext {
+                trace: crate::auction::test_support::test_trace(),
+                settings: &settings,
+                request: &req,
+                timeout_ms: 2000,
+                provider_responses: None,
+                services,
+            };
+
+            let dispatched = match orchestrator.dispatch_auction(&request, &context).await {
+                DispatchAuctionOutcome::Dispatched(dispatched) => dispatched,
+                _ => {
+                    panic!("should dispatch the first provider despite the resolved-name collision")
+                }
+            };
+            let result = orchestrator
+                .collect_dispatched_auction(dispatched, services, &context)
+                .await;
+
+            let provider_a = result
+                .provider_responses
+                .iter()
+                .find(|response| response.provider == "provider-a")
+                .expect("should have provider-a response");
+            let provider_b = result
+                .provider_responses
+                .iter()
+                .find(|response| response.provider == "provider-b")
+                .expect("should have provider-b response");
+            assert_eq!(provider_a.status, BidStatus::Success);
+            assert_eq!(provider_b.status, BidStatus::Error);
         });
     }
 
