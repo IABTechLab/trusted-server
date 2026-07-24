@@ -19,14 +19,47 @@
   var ts = (window.tsjs = window.tsjs || {});
   if (ts.adInit) return;
 
-  // Track whether the publisher disabled GPT initial load. GPT exposes no
-  // getter for this, so wrap pubads().disableInitialLoad() to record it. With
-  // initial load disabled, display() only registers a slot and the ad request
-  // must come from a later refresh(); adInit() reads this to refresh its own
-  // freshly defined slots so they are not left blank. Pushed onto the command
-  // queue so it runs before the publisher's own disableInitialLoad() call.
+  // Track whether the publisher disabled GPT initial load. Read the modern
+  // googletag.getConfig() value when available, and wrap googletag.setConfig()
+  // and the legacy pubads().disableInitialLoad() method as fallbacks because
+  // getConfig() may not report the legacy API's state. With initial load
+  // disabled, display() only registers a slot and the ad request must come from
+  // a later refresh(); adInit() reads this to refresh its own freshly defined
+  // slots so they are not left blank. Pushed onto the command queue so it runs
+  // before the publisher's own GPT configuration.
+  function syncInitialLoadDisabled(gpt) {
+    if (typeof gpt.getConfig !== "function") return false;
+    var config = gpt.getConfig("disableInitialLoad");
+    if (!config || typeof config.disableInitialLoad === "undefined") {
+      return false;
+    }
+    ts.gptInitialLoadDisabled = config.disableInitialLoad === true;
+    return true;
+  }
+
   (window.googletag = window.googletag || { cmd: [] }).cmd.push(function () {
-    var pubads = googletag.pubads && googletag.pubads();
+    var gpt = window.googletag;
+    syncInitialLoadDisabled(gpt);
+    if (
+      typeof gpt.setConfig === "function" &&
+      !gpt.__tsInitialLoadConfigHooked
+    ) {
+      var originalSetConfig = gpt.setConfig.bind(gpt);
+      gpt.setConfig = function (config) {
+        var result = originalSetConfig.apply(gpt, arguments);
+        if (
+          !syncInitialLoadDisabled(gpt) &&
+          config &&
+          "disableInitialLoad" in config
+        ) {
+          ts.gptInitialLoadDisabled = config.disableInitialLoad === true;
+        }
+        return result;
+      };
+      gpt.__tsInitialLoadConfigHooked = true;
+    }
+
+    var pubads = gpt.pubads && gpt.pubads();
     if (
       !pubads ||
       typeof pubads.disableInitialLoad !== "function" ||
@@ -34,10 +67,13 @@
     ) {
       return;
     }
-    var original = pubads.disableInitialLoad.bind(pubads);
+    var originalDisableInitialLoad = pubads.disableInitialLoad.bind(pubads);
     pubads.disableInitialLoad = function () {
-      ts.gptInitialLoadDisabled = true;
-      return original();
+      var result = originalDisableInitialLoad.apply(pubads, arguments);
+      if (!syncInitialLoadDisabled(gpt)) {
+        ts.gptInitialLoadDisabled = true;
+      }
+      return result;
     };
     pubads.__tsInitialLoadHooked = true;
   });
@@ -150,6 +186,7 @@
       // unless the publisher disabled initial load, in which case display() only
       // registers them and refresh() must request the ad — otherwise they render
       // blank. Only add them in that case to avoid double-requesting.
+      syncInitialLoadDisabled(window.googletag);
       var slotsNeedingRefresh = ts.gptInitialLoadDisabled
         ? slotsToRefresh.concat(newSlots)
         : slotsToRefresh;

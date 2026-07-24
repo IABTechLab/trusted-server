@@ -1,3 +1,6 @@
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
+
 import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
 
 // Track every 'message' EventListener added to window across the entire test
@@ -205,6 +208,7 @@ describe('installTsAdInit', () => {
       refresh: vi.fn(),
       disableInitialLoad: vi.fn(),
     };
+    const getConfigMock = vi.fn().mockReturnValue(undefined);
     const displayMock = vi.fn();
     (window as TestWindow).googletag = {
       cmd: { push: vi.fn((fn: () => void) => fn()) },
@@ -212,6 +216,8 @@ describe('installTsAdInit', () => {
       display: displayMock,
       pubads: vi.fn().mockReturnValue(mockPubads),
       enableServices: vi.fn(),
+      // GPT's modern getter does not report legacy disableInitialLoad() state.
+      getConfig: getConfigMock,
     };
     (window as TestWindow).tsjs = {
       adSlots: [
@@ -239,6 +245,202 @@ describe('installTsAdInit', () => {
 
     // The slot is still registered via display(), and additionally refreshed so
     // it actually requests an ad under disableInitialLoad().
+    expect(displayMock).toHaveBeenCalledWith('div-atf-sidebar');
+    expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
+  });
+
+  it('keeps the legacy disabled state in the edge bootstrap when getConfig is unavailable', async () => {
+    const mockSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+    };
+    const disableInitialLoadMock = vi.fn();
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([]),
+      refresh: vi.fn(),
+      disableInitialLoad: disableInitialLoadMock,
+    };
+    const displayMock = vi.fn();
+    const getConfigMock = vi.fn().mockReturnValue(undefined);
+    const googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(mockSlot),
+      display: displayMock,
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+      getConfig: getConfigMock,
+    };
+    (window as TestWindow).googletag = googletag;
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {},
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any;
+
+    const bootstrap = await readFile(
+      path.resolve(process.cwd(), '../../trusted-server-core/src/integrations/gpt_bootstrap.js'),
+      'utf8'
+    );
+    const runBootstrap = new Function('window', 'googletag', bootstrap) as (
+      window: Window,
+      googletag: object
+    ) => void;
+    runBootstrap(window, googletag);
+
+    mockPubads.disableInitialLoad();
+    expect(disableInitialLoadMock).toHaveBeenCalledOnce();
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(true);
+
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(displayMock).toHaveBeenCalledWith('div-atf-sidebar');
+    expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
+  });
+
+  it('tracks the effective initial-load state from setConfig', async () => {
+    // Modern GPT configuration uses googletag.setConfig() rather than the
+    // legacy pubads().disableInitialLoad() method. TS must detect both forms.
+    const mockSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      // Publisher has not defined this slot, so TS defines (owns) it.
+      getSlots: vi.fn().mockReturnValue([]),
+      addEventListener: vi.fn(),
+      refresh: vi.fn(),
+    };
+    const displayMock = vi.fn();
+    type InitialLoadConfig = {
+      disableInitialLoad?: boolean | null;
+      singleRequest?: boolean;
+    };
+    let effectiveConfig: InitialLoadConfig = {};
+    const setConfigMock = vi.fn((config: InitialLoadConfig) => {
+      if ('disableInitialLoad' in config) {
+        effectiveConfig = { disableInitialLoad: config.disableInitialLoad };
+      }
+    });
+    const getConfigMock = vi.fn(() => effectiveConfig);
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(mockSlot),
+      display: displayMock,
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+      getConfig: getConfigMock,
+      setConfig: setConfigMock,
+    };
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {},
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any;
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    installTsAdInit();
+
+    const gpt = (window as TestWindow).googletag as {
+      setConfig(config: InitialLoadConfig): void;
+    };
+    gpt.setConfig({ singleRequest: true });
+    expect(setConfigMock).toHaveBeenCalledOnce();
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).not.toBe(true);
+
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(displayMock).toHaveBeenCalledWith('div-atf-sidebar');
+    expect(mockPubads.refresh).not.toHaveBeenCalled();
+
+    const config = { disableInitialLoad: true, singleRequest: true };
+    gpt.setConfig(config);
+    expect(setConfigMock).toHaveBeenCalledTimes(2);
+    expect(setConfigMock).toHaveBeenLastCalledWith(config);
+    expect(getConfigMock).toHaveBeenCalledWith('disableInitialLoad');
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(true);
+
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
+
+    mockPubads.refresh.mockClear();
+    gpt.setConfig({ disableInitialLoad: false });
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(false);
+    gpt.setConfig({ disableInitialLoad: null });
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(false);
+
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(mockPubads.refresh).not.toHaveBeenCalled();
+  });
+
+  it('reads initial-load configuration effective before detector installation', async () => {
+    const mockSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([]),
+      addEventListener: vi.fn(),
+      refresh: vi.fn(),
+    };
+    const displayMock = vi.fn();
+    const getConfigMock = vi.fn().mockReturnValue({ disableInitialLoad: true });
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(mockSlot),
+      display: displayMock,
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+      getConfig: getConfigMock,
+    };
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {},
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any;
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+
+    expect(getConfigMock).toHaveBeenCalledWith('disableInitialLoad');
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(true);
+
+    (window as TestWindow).tsjs!.adInit!();
+
     expect(displayMock).toHaveBeenCalledWith('div-atf-sidebar');
     expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
   });
