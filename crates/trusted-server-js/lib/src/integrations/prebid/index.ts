@@ -47,6 +47,7 @@ const TS_REFRESH_TARGETING_KEYS = [
 ] as const;
 const MAX_PUBLISHER_AD_UNIT_SNAPSHOTS = 256;
 const MAX_PENDING_PUBLISHER_BIDS = 2048;
+const PENDING_PUBLISHER_DELIVERY_TTL_MS = 5000;
 
 /** Configuration options for the Prebid integration. */
 export interface PrebidNpmConfig {
@@ -238,11 +239,23 @@ type PublisherAdUnitSnapshot = {
 };
 type PendingPublisherBid = {
   adUnitCode: string;
+  expiresAt: number;
+  registrationId: number;
+};
+type PendingPublisherCode = {
+  expiresAt: number;
+  registrationId: number;
 };
 type RemoveAdUnit = (adUnitCode?: string | string[]) => unknown;
+type PrebidWithRemoveAdUnit = {
+  removeAdUnit?: RemoveAdUnit;
+  __tsRemoveAdUnitWrapped?: boolean;
+};
 
 let publisherAdUnitSnapshots = new Map<string, PublisherAdUnitSnapshot>();
 let pendingPublisherBids = new Map<string, PendingPublisherBid>();
+let pendingPublisherCodes = new Map<string, PendingPublisherCode>();
+let pendingPublisherRegistrationId = 0;
 let syntheticRefreshAdUnits = new WeakSet<TrustedServerAdUnit>();
 type TrustedServerBidRequest = {
   adUnitCode?: string;
@@ -599,7 +612,45 @@ function clearRefreshTargeting(slot: RefreshGptSlot): void {
   }
 }
 
-/** Store an auction-local bid ID for one-shot GPT delivery correlation. */
+/** Remove pending delivery state for an ad unit, optionally from one registration only. */
+function removePendingPublisherBidsForCode(adUnitCode: string, registrationId?: number): void {
+  const pendingCode = pendingPublisherCodes.get(adUnitCode);
+  if (registrationId !== undefined && pendingCode?.registrationId !== registrationId) return;
+
+  pendingPublisherCodes.delete(adUnitCode);
+  for (const [adId, pendingBid] of pendingPublisherBids) {
+    if (
+      pendingBid.adUnitCode === adUnitCode &&
+      (registrationId === undefined || pendingBid.registrationId === registrationId)
+    ) {
+      pendingPublisherBids.delete(adId);
+    }
+  }
+}
+
+/** Discard delivery state that outlived the publisher auction which created it. */
+function prunePendingPublisherBids(now = Date.now()): void {
+  for (const [adUnitCode, pendingCode] of pendingPublisherCodes) {
+    if (pendingCode.expiresAt <= now) removePendingPublisherBidsForCode(adUnitCode);
+  }
+
+  for (const [adId, pendingBid] of pendingPublisherBids) {
+    if (pendingBid.expiresAt <= now) pendingPublisherBids.delete(adId);
+  }
+}
+
+/** Store a short-lived pending publisher ad-unit code for delivery correlation. */
+function storePendingPublisherCode(adUnitCode: string, pendingCode: PendingPublisherCode): void {
+  pendingPublisherCodes.delete(adUnitCode);
+  pendingPublisherCodes.set(adUnitCode, pendingCode);
+
+  if (pendingPublisherCodes.size > MAX_PENDING_PUBLISHER_BIDS) {
+    const oldestCode = pendingPublisherCodes.keys().next().value;
+    if (oldestCode !== undefined) removePendingPublisherBidsForCode(oldestCode);
+  }
+}
+
+/** Store an auction-local bid ID for precise one-shot GPT delivery correlation. */
 function storePendingPublisherBid(adId: string, pendingBid: PendingPublisherBid): void {
   pendingPublisherBids.delete(adId);
   pendingPublisherBids.set(adId, pendingBid);
@@ -610,16 +661,23 @@ function storePendingPublisherBid(adId: string, pendingBid: PendingPublisherBid)
   }
 }
 
-/** Remove every pending auction bid for an ad-unit code. */
-function removePendingPublisherBidsForCode(adUnitCode: string): void {
-  for (const [adId, pendingBid] of pendingPublisherBids) {
-    if (pendingBid.adUnitCode === adUnitCode) pendingPublisherBids.delete(adId);
-  }
-}
+/** Register every requested publisher code and any bid IDs returned for that auction. */
+function registerPendingPublisherBids(
+  publisherAdUnitCodes: Set<string>,
+  bidResponses: unknown
+): number {
+  prunePendingPublisherBids();
+  const registrationId = ++pendingPublisherRegistrationId;
+  const expiresAt = Date.now() + PENDING_PUBLISHER_DELIVERY_TTL_MS;
 
-/** Register bid IDs from the current `bidsBackHandler` callback only. */
-function registerPendingPublisherBids(bidResponses: unknown): void {
-  if (!bidResponses || typeof bidResponses !== 'object' || Array.isArray(bidResponses)) return;
+  for (const adUnitCode of publisherAdUnitCodes) {
+    removePendingPublisherBidsForCode(adUnitCode);
+    storePendingPublisherCode(adUnitCode, { expiresAt, registrationId });
+  }
+
+  if (!bidResponses || typeof bidResponses !== 'object' || Array.isArray(bidResponses)) {
+    return registrationId;
+  }
 
   for (const [responseCode, responseGroup] of Object.entries(bidResponses)) {
     if (!responseGroup || typeof responseGroup !== 'object') continue;
@@ -632,36 +690,53 @@ function registerPendingPublisherBids(bidResponses: unknown): void {
       const adId = typeof response.adId === 'string' ? response.adId : undefined;
       const adUnitCode =
         typeof response.adUnitCode === 'string' ? response.adUnitCode : responseCode;
-      if (!adId || !adUnitCode) continue;
+      if (!adId || !adUnitCode || !publisherAdUnitCodes.has(adUnitCode)) continue;
 
-      storePendingPublisherBid(adId, { adUnitCode });
+      storePendingPublisherBid(adId, { adUnitCode, expiresAt, registrationId });
     }
   }
+
+  return registrationId;
 }
 
 /**
- * Partition slots by whether their current `hb_adid` belongs to a pending
- * publisher auction, consuming every older pending bid for each matched code.
+ * Partition slots by whether they belong to a pending publisher auction.
+ *
+ * A current `hb_adid` is the precise signal. When publishers intentionally
+ * omit that targeting, a short-lived requested-code match preserves delivery
+ * for no-bid and custom-targeting auctions. A non-empty unmatched ID remains
+ * independent so stale targeting cannot suppress a fresh auction. Every match
+ * is consumed once.
  */
 function publisherDeliverySlots(targetSlots: RefreshGptSlot[]): Set<RefreshGptSlot> {
+  prunePendingPublisherBids();
   const deliverySlots = new Set<RefreshGptSlot>();
   const deliveredCodes = new Set<string>();
 
   for (const slot of targetSlots) {
     const adIds = slot.getTargeting?.('hb_adid');
-    if (!Array.isArray(adIds)) continue;
-
-    const pendingBid = adIds
-      .filter((adId): adId is string => typeof adId === 'string' && adId.length > 0)
-      .map((adId) => pendingPublisherBids.get(adId))
-      .find((bid): bid is PendingPublisherBid => bid !== undefined);
-    if (!pendingBid) continue;
+    const pendingBid = Array.isArray(adIds)
+      ? adIds
+          .filter((adId): adId is string => typeof adId === 'string' && adId.length > 0)
+          .map((adId) => pendingPublisherBids.get(adId))
+          .find((bid): bid is PendingPublisherBid => bid !== undefined)
+      : undefined;
+    const hasAdId =
+      Array.isArray(adIds) && adIds.some((adId) => typeof adId === 'string' && adId.length > 0);
+    const injectedSlot = findInjectedSlotForRefresh(slot);
+    const pendingCode = hasAdId
+      ? undefined
+      : [refreshSlotElementId(slot), injectedSlot?.div_id]
+          .filter((code): code is string => typeof code === 'string' && code.length > 0)
+          .find((code) => pendingPublisherCodes.has(code));
+    const adUnitCode = pendingBid?.adUnitCode ?? pendingCode;
+    if (!adUnitCode) continue;
 
     deliverySlots.add(slot);
-    deliveredCodes.add(pendingBid.adUnitCode);
+    deliveredCodes.add(adUnitCode);
   }
 
-  deliveredCodes.forEach(removePendingPublisherBidsForCode);
+  deliveredCodes.forEach((adUnitCode) => removePendingPublisherBidsForCode(adUnitCode));
   return deliverySlots;
 }
 
@@ -670,6 +745,7 @@ function removePublisherState(adUnitCode?: string | string[]): void {
   if (!adUnitCode) {
     publisherAdUnitSnapshots.clear();
     pendingPublisherBids.clear();
+    pendingPublisherCodes.clear();
     return;
   }
 
@@ -718,16 +794,21 @@ function collectAuctionEids(): AuctionEid[] | undefined {
 export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs {
   publisherAdUnitSnapshots = new Map();
   pendingPublisherBids = new Map();
+  pendingPublisherCodes = new Map();
+  pendingPublisherRegistrationId = 0;
   syntheticRefreshAdUnits = new WeakSet();
 
-  const prebidWithRemoveAdUnit = pbjs as unknown as { removeAdUnit?: RemoveAdUnit };
-  const originalRemoveAdUnit = prebidWithRemoveAdUnit.removeAdUnit;
-  if (typeof originalRemoveAdUnit === 'function') {
-    prebidWithRemoveAdUnit.removeAdUnit = function (adUnitCode?: string | string[]) {
-      const result = originalRemoveAdUnit.call(this, adUnitCode);
-      removePublisherState(adUnitCode);
-      return result;
-    };
+  const prebidWithRemoveAdUnit = pbjs as unknown as PrebidWithRemoveAdUnit;
+  if (!prebidWithRemoveAdUnit.__tsRemoveAdUnitWrapped) {
+    const originalRemoveAdUnit = prebidWithRemoveAdUnit.removeAdUnit;
+    if (typeof originalRemoveAdUnit === 'function') {
+      prebidWithRemoveAdUnit.removeAdUnit = function (adUnitCode?: string | string[]) {
+        const result = originalRemoveAdUnit.call(this, adUnitCode);
+        removePublisherState(adUnitCode);
+        return result;
+      };
+      prebidWithRemoveAdUnit.__tsRemoveAdUnitWrapped = true;
+    }
   }
 
   const injected = getInjectedConfig();
@@ -798,7 +879,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   pbjs.requestBids = function (requestObj?: Parameters<typeof originalRequestBids>[0]) {
     log.debug('[tsjs-prebid] requestBids called');
 
-    const opts = requestObj || {};
+    const opts = { ...(requestObj ?? {}) };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const adUnits = ((opts as any).adUnits || pbjs.adUnits || []) as TrustedServerAdUnit[];
     const isSyntheticRefresh =
@@ -902,12 +983,21 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     const originalBidsBack = opts.bidsBackHandler;
     opts.bidsBackHandler = function (...args: unknown[]) {
       syncPrebidEidsCookie();
+      const registrationId = isSyntheticRefresh
+        ? undefined
+        : registerPendingPublisherBids(publisherAdUnitCodes, args[0]);
       if (typeof originalBidsBack !== 'function') return;
-      if (!isSyntheticRefresh) {
-        publisherAdUnitCodes.forEach(removePendingPublisherBidsForCode);
-        registerPendingPublisherBids(args[0]);
+
+      try {
+        originalBidsBack.apply(this, args as Parameters<typeof originalBidsBack>);
+      } catch (error) {
+        if (registrationId !== undefined) {
+          publisherAdUnitCodes.forEach((code) =>
+            removePendingPublisherBidsForCode(code, registrationId)
+          );
+        }
+        throw error;
       }
-      originalBidsBack.apply(this, args as Parameters<typeof originalBidsBack>);
     };
 
     return originalRequestBids(opts);
@@ -1007,16 +1097,15 @@ export function installRefreshHandler(timeoutMs = 1500): void {
         return originalRefresh(slots, opts);
       }
 
-      if (!targetSlots.length) {
+      if (!targetSlots.length || (slots !== undefined && targetSlots.length !== slots.length)) {
         return originalRefresh(slots, opts);
       }
 
       const deliverySlots = publisherDeliverySlots(targetSlots);
       const independentSlots = targetSlots.filter((slot) => !deliverySlots.has(slot));
-      if (deliverySlots.size > 0) {
-        originalRefresh([...deliverySlots], opts);
+      if (independentSlots.length === 0) {
+        return originalRefresh(slots, opts);
       }
-      if (independentSlots.length === 0) return;
 
       independentSlots.forEach(clearRefreshTargeting);
 
@@ -1061,14 +1150,44 @@ export function installRefreshHandler(timeoutMs = 1500): void {
       // `targetSlots` — leaving their next request dependent on stale state.
       const refreshAdUnitCodes = adUnits.map((unit) => unit.code);
       adUnits.forEach((unit) => syntheticRefreshAdUnits.add(unit));
-      pbjs.requestBids({
-        adUnits,
-        bidsBackHandler: () => {
-          pbjs.setTargetingForGPTAsync?.(refreshAdUnitCodes);
-          originalRefresh(independentSlots, opts);
-        },
-        timeout: timeoutMs,
-      });
+
+      // Preserve GPT Single Request Architecture: when a publisher refresh
+      // includes both already-targeted delivery slots and independent slots,
+      // delay the whole original list until the independent auction completes.
+      // A one-shot fallback prevents a failed Prebid callback from dropping any
+      // slots, and a late callback cannot issue a second GAM request.
+      let completed = false;
+      let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
+      function completeRefresh(): void {
+        if (completed) return;
+        completed = true;
+        if (fallbackTimer !== undefined) clearTimeout(fallbackTimer);
+        originalRefresh(slots, opts);
+      }
+
+      try {
+        pbjs.requestBids({
+          adUnits,
+          bidsBackHandler: () => {
+            if (completed) return;
+            try {
+              pbjs.setTargetingForGPTAsync?.(refreshAdUnitCodes);
+            } catch (error) {
+              log.error('[tsjs-prebid] refresh targeting failed', error);
+            } finally {
+              completeRefresh();
+            }
+          },
+          timeout: timeoutMs,
+        });
+        // Prebid schedules its own timeout during requestBids(). Schedule this
+        // fallback afterward so its normal timeout callback gets first chance
+        // to apply targeting before the one-shot GPT completion path runs.
+        if (!completed) fallbackTimer = setTimeout(completeRefresh, timeoutMs);
+      } catch (error) {
+        log.error('[tsjs-prebid] refresh auction failed', error);
+        completeRefresh();
+      }
     };
 
     log.info('[tsjs-prebid] GPT refresh handler installed');
