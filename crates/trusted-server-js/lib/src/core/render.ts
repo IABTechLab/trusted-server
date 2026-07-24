@@ -7,15 +7,21 @@ import NORMALIZE_CSS from './styles/normalize.css?inline';
 import IFRAME_TEMPLATE from './templates/iframe.html?raw';
 
 // Sandbox permissions granted to creative iframes.
+//
 // Ad creatives routinely contain scripts for tracking, click handling, and
-// viewability measurement, so allow-scripts and allow-same-origin are required
-// for creatives to render correctly. Server-side sanitization is the primary
-// defense against malicious markup; the sandbox provides defense-in-depth.
+// viewability measurement, so `allow-scripts` is required for them to render.
+//
+// `allow-same-origin` is deliberately excluded: combined with `allow-scripts` on
+// srcdoc (or first-party src) content, that pair effectively removes the sandbox's
+// origin isolation and would let SSP-provided markup run with the publisher
+// origin's privileges — cookies, storage, and same-origin fetches. The origin
+// boundary must not depend on server-side sanitization, which is optional
+// (`auction.sanitize_creatives`) and cannot run at all for renderer-based bids.
+// Matches APS_RENDERER_SANDBOX and ADM_IFRAME_SANDBOX, which already omit it.
 const CREATIVE_SANDBOX_TOKENS = [
   'allow-forms',
   'allow-popups',
   'allow-popups-to-escape-sandbox',
-  'allow-same-origin',
   'allow-scripts',
   'allow-top-navigation-by-user-activation',
 ] as const;
