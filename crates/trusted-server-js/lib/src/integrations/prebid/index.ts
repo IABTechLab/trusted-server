@@ -11,11 +11,12 @@
 // The shim on requestBids injects "trustedServer" into every ad unit so all
 // bids flow through the orchestrator.
 
+import type _pbjsDefault from 'prebid.js';
+
 import { log } from '../../core/log';
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
 import type { AuctionBid, AuctionEid } from '../../core/auction';
 import type { AuctionSlot } from '../../core/types';
-import type _pbjsDefault from 'prebid.js';
 
 import { PREBID_USER_ID_MODULE_REGISTRY } from './user_id_modules';
 
