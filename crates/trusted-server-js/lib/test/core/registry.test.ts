@@ -17,7 +17,7 @@ describe('registry', () => {
           ],
         },
       },
-    } as any;
+    } as unknown as Parameters<typeof addAdUnits>[0];
     addAdUnits(unit);
 
     const all = getAllUnits();
