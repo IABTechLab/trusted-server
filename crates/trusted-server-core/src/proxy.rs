@@ -1101,6 +1101,7 @@ pub async fn handle_asset_proxy_request(
             certificate_check: settings.proxy.certificate_check,
             first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
             between_bytes_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
+            discriminator: None,
         })
         .change_context(TrustedServerError::Proxy {
             message: "asset backend registration failed".to_string(),
@@ -1290,6 +1291,7 @@ async fn proxy_with_redirects(
                 certificate_check: settings.proxy.certificate_check,
                 first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
                 between_bytes_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
+                discriminator: None,
             })
             .change_context(TrustedServerError::Proxy {
                 message: "backend registration failed".to_string(),
