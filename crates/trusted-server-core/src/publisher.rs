@@ -3491,22 +3491,26 @@ fn build_bids_script_with_trace(
     // those ad-slot subtrees. Running it before React hydration commits trips a #418
     // hydration mismatch on Next.js App Router. Defer it until hydration has run.
     //
-    // The App Router loads its hydration chunks as `async` scripts, which do NOT
-    // block DOMContentLoaded — so DCL alone can precede hydration. `window.load` is
-    // safe (it awaits async scripts) but also waits for every image/tracker, which is
-    // ~52s on heavy pages. So: at DOMContentLoaded, wait for the async
-    // `/_next/static/chunks/` scripts to finish (PerformanceResourceTiming for the
-    // ones already done, load/error for the rest), then a double requestAnimationFrame,
-    // then adInit. window.load stays as an unconditional can't-hang fallback and as the
-    // unchanged path for non-Next publishers (no chunks matched). A `fired` flag makes
-    // whichever path completes first win exactly once.
+    // Gating on `window.load` is safe but load-weight dependent — ~40-50s on heavy
+    // publishers, leaving TS ad slots empty that whole time. Waiting for the async
+    // `/_next/static/chunks/` scripts was tried and failed on a live publisher: the
+    // chunks finish before they can be observed (already-fired load events, evicted
+    // resource-timing entries, phantom prefetch tags that never complete), so the wait
+    // never resolved and always fell back to `window.load`.
+    //
+    // Instead, gate on the App Router runtime signal: `window.__next_f.push` is
+    // replaced by the RSC runtime once it starts hydrating the streamed tree (~9s on
+    // the tested publisher, vs ~40s for load). Poll for it, then a double
+    // `requestAnimationFrame` so adInit runs after the commit. `window.load` stays as an
+    // unconditional can't-hang fallback and the unchanged path for non-Next publishers
+    // (`__next_f` is never patched there). A `fired` flag plus `clearInterval` make it
+    // fire exactly once via whichever path wins — not a retry timer.
     //
     // The route guard captures the route this run was scheduled for and no-ops if an
     // SPA navigation changed it (a deferred adInit must not run against a newer route).
     //
-    // IMPORTANT: the emitted script must contain no `<` or `>` (see
-    // `bids_script_is_xss_safe`; only the JSON payload is HTML-escaped). Iterate with
-    // `forEach` / `Array.prototype.forEach.call`, never a C-style index loop.
+    // The emitted script must contain no `<` or `>` (see `bids_script_is_xss_safe`;
+    // only the JSON payload is HTML-escaped).
     format!(
         "<script>window.tsjs=window.tsjs||{{}};\
 {trace_assignment}window.tsjs.bids=JSON.parse(\"{escaped}\");\
@@ -3517,23 +3521,10 @@ if(location.pathname+location.search!==p)return;\
 var a=window.tsjs.adInit;if(typeof a===\"function\")a();}};\
 var d=function(){{window.requestAnimationFrame(function(){{window.requestAnimationFrame(f);}});}};\
 if(document.readyState===\"complete\"){{d();return;}}\
-var fired=false;\
-var t=function(){{if(fired)return;fired=true;d();}};\
+var fired=false;var iv;\
+var t=function(){{if(fired)return;fired=true;clearInterval(iv);d();}};\
 window.addEventListener(\"load\",t,{{once:true}});\
-var c=function(){{\
-var s=document.querySelectorAll('script[src*=\"/_next/static/chunks/\"]');\
-if(s.length===0)return;\
-var n=s.length;var done={{}};\
-var es=(window.performance&&window.performance.getEntriesByType)?window.performance.getEntriesByType(\"resource\"):[];\
-es.forEach(function(e){{done[e.name]=true;}});\
-var dec=function(){{if(--n===0)t();}};\
-Array.prototype.forEach.call(s,function(x){{\
-if(x.src&&done[x.src])dec();\
-else{{x.addEventListener(\"load\",dec,{{once:true}});x.addEventListener(\"error\",dec,{{once:true}});}}\
-}});\
-}};\
-if(document.readyState===\"loading\")document.addEventListener(\"DOMContentLoaded\",c,{{once:true}});\
-else c();\
+iv=setInterval(function(){{if(window.__next_f&&window.__next_f.push!==Array.prototype.push)t();}},50);\
 }})();</script>"
     )
 }
@@ -8551,26 +8542,24 @@ mod tests {
                 "should capture route identity to discard a stale deferred callback"
             );
 
-            // The App Router loads hydration chunks as `async` scripts, which do
-            // not block DOMContentLoaded — so the gate waits for those chunks to
-            // finish (pre-clearing already-loaded ones via resource timing) rather
-            // than firing at bare DCL. Iteration uses forEach so the emitted script
-            // stays free of `<` / `>` (see `bids_script_is_xss_safe`).
+            // Gate on the App Router runtime signal (window.__next_f.push replaced by
+            // the RSC runtime), not the async chunks — those can't be reliably observed
+            // as complete on a live page. Poll for it, then the double-rAF above.
             assert!(
-                script.contains("/_next/static/chunks/"),
-                "should gate on the Next.js hydration chunks"
+                script.contains("__next_f"),
+                "should gate on the Next.js App Router runtime signal"
             );
             assert!(
-                script.contains("getEntriesByType"),
-                "should pre-clear already-finished chunks via resource timing"
+                script.contains("setInterval"),
+                "should poll for the runtime signal"
             );
             assert!(
-                script.contains("DOMContentLoaded"),
-                "should start the chunk check at DOMContentLoaded"
+                script.contains("clearInterval"),
+                "should stop polling once fired (single fire, not a retry)"
             );
             assert!(
-                script.contains("forEach"),
-                "should iterate with forEach, keeping the script free of < and >"
+                !script.contains("_next/static/chunks"),
+                "should not gate on the unobservable hydration chunks"
             );
         }
 

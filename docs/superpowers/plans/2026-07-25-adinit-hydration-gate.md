@@ -10,6 +10,16 @@
 
 **Spec:** `docs/superpowers/specs/2026-07-24-adinit-hydration-gate-design.md`
 
+> **UPDATE (post-live-test): chunk-await was replaced by a `__next_f` runtime-signal gate.**
+> The chunk-await mechanism in Tasks 1–2 below was implemented and deployed, then failed on a live
+> publisher — it never fired early and always fell back to `window.load` (chunk completion is not
+> reliably observable: already-fired `load` events, evicted resource-timing entries, phantom prefetch
+> tags). The gate now polls `window.__next_f.push` being replaced by the RSC runtime (~9s vs ~40s),
+> then double-rAF, with `window.load` fallback. Tests assert `__next_f` / `setInterval` /
+> `clearInterval` instead of the chunk selectors. See the spec's "Update" section. Safety is pending
+> the #418 A/B, which is blocked by a separate rc/july bug (`elementId.startsWith`, PR #966, since
+> reverted on #966 — adopt that revert in the deploy). Tasks below are kept for the record.
+
 ---
 
 ## Preconditions
