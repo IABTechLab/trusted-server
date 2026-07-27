@@ -148,12 +148,16 @@ function clearTargetingKeys(slot: GoogleTagSlot, keys: Iterable<string>): void {
   }
 }
 
+interface GoogleTagRefreshOptions {
+  changeCorrelator?: boolean;
+}
+
 interface GoogleTagPubAdsService {
   setTargeting(key: string, value: string | string[]): GoogleTagPubAdsService;
   getTargeting(key: string): string[];
   enableSingleRequest(): void;
   addEventListener(event: string, fn: (e: SlotRenderEndedEvent) => void): void;
-  refresh(slots?: GoogleTagSlot[]): void;
+  refresh(slots?: GoogleTagSlot[], options?: GoogleTagRefreshOptions): void;
   getSlots?(): GoogleTagSlot[];
   disableInitialLoad?(): void;
 }
@@ -166,6 +170,8 @@ interface GoogleTagEffectiveConfig {
   disableInitialLoad?: boolean;
 }
 
+type GoogleTagDisplayTarget = string | Element | GoogleTagSlot;
+
 interface GoogleTag {
   cmd: Array<() => void>;
   pubads(): GoogleTagPubAdsService;
@@ -176,7 +182,7 @@ interface GoogleTag {
   ): GoogleTagSlot | null;
   destroySlots(slots?: GoogleTagSlot[]): boolean;
   enableServices(): void;
-  display(elementId: string): void;
+  display(target: GoogleTagDisplayTarget): void;
   setConfig?(config: GoogleTagConfig): void;
   getConfig?(keys: string | string[]): GoogleTagEffectiveConfig | undefined;
   _loaded_?: boolean;
@@ -620,6 +626,38 @@ function handoffForSlot(ts: TsjsApi, slot: GoogleTagSlot): GptSlotHandoff | unde
   return ts.gptSlotHandoffs?.[slot.getSlotElementId()];
 }
 
+function displayTargetElementId(target: GoogleTagDisplayTarget): string | undefined {
+  if (typeof target === 'string') return target;
+  if (target instanceof Element) return target.id || undefined;
+  return target.getSlotElementId();
+}
+
+function matchingHandoff(
+  ts: TsjsApi,
+  pubads: GoogleTagPubAdsService,
+  adUnitPath: string,
+  formats: Array<number | number[]>,
+  elementId: string
+): GptSlotHandoff | undefined {
+  const exact = ts.gptSlotHandoffs?.[elementId];
+  if (exact) return exact;
+
+  const candidates = new Set(Object.values(ts.gptSlotHandoffs ?? {})).values();
+  const matching = Array.from(candidates).filter(
+    (handoff) =>
+      !handoff.publisherClaimed &&
+      elementId.startsWith(handoff.divIdPrefix) &&
+      handoff.gamUnitPath === adUnitPath &&
+      JSON.stringify(handoff.formats) === JSON.stringify(formats) &&
+      findGptSlotByElementId(pubads, handoff.slotElementId)
+  );
+  return matching.length === 1 ? matching[0] : undefined;
+}
+
+function registerHandoffAlias(ts: TsjsApi, elementId: string, handoff: GptSlotHandoff): void {
+  (ts.gptSlotHandoffs ??= {})[elementId] = handoff;
+}
+
 function withGptSlotHandoffInternal<T>(ts: TsjsApi, callback: () => T): T {
   const wasInternal = ts.gptSlotHandoffInternal;
   ts.gptSlotHandoffInternal = true;
@@ -657,11 +695,12 @@ function installLatePublisherSlotHandoff(ts: TsjsApi): void {
         formats: Array<number | number[]>,
         elementId: string
       ): GoogleTagSlot | null => {
-        const handoff = ts.gptSlotHandoffs?.[elementId];
+        const handoff = matchingHandoff(ts, pubads, adUnitPath, formats, elementId);
         if (!ts.gptSlotHandoffInternal && handoff) {
-          const existingSlot = findGptSlotByElementId(pubads, elementId);
+          const existingSlot = findGptSlotByElementId(pubads, handoff.slotElementId);
           if (existingSlot) {
             if (!handoff.publisherClaimed) {
+              registerHandoffAlias(ts, elementId, handoff);
               handoff.publisherClaimed = true;
               handoff.suppressPublisherDisplay = true;
               handoff.suppressPublisherRefresh = ts.gptInitialLoadDisabled === true;
@@ -691,13 +730,14 @@ function installLatePublisherSlotHandoff(ts: TsjsApi): void {
     const display = g.display;
     if (!(display as HandoffPatchedFunction).__tsSlotHandoffPatched) {
       const originalDisplay = display.bind(g);
-      const patchedDisplay = (elementId: string): void => {
-        const handoff = ts.gptSlotHandoffs?.[elementId];
+      const patchedDisplay = (target: GoogleTagDisplayTarget): void => {
+        const elementId = displayTargetElementId(target);
+        const handoff = elementId ? ts.gptSlotHandoffs?.[elementId] : undefined;
         if (!ts.gptSlotHandoffInternal && handoff?.suppressPublisherDisplay) {
           handoff.suppressPublisherDisplay = false;
           return;
         }
-        originalDisplay(elementId);
+        originalDisplay(target);
       };
       (patchedDisplay as HandoffPatchedFunction).__tsSlotHandoffPatched = true;
       g.display = patchedDisplay;
@@ -706,15 +746,28 @@ function installLatePublisherSlotHandoff(ts: TsjsApi): void {
     const refresh = pubads.refresh;
     if (!(refresh as HandoffPatchedFunction).__tsSlotHandoffPatched) {
       const originalRefresh = refresh.bind(pubads);
-      const patchedRefresh = (requestedSlots?: GoogleTagSlot[]): void => {
+      const callRefresh = (
+        slots: GoogleTagSlot[] | undefined,
+        options: GoogleTagRefreshOptions | undefined
+      ): void => {
+        if (options === undefined) {
+          originalRefresh(slots);
+        } else {
+          originalRefresh(slots, options);
+        }
+      };
+      const patchedRefresh = (
+        requestedSlots?: GoogleTagSlot[],
+        options?: GoogleTagRefreshOptions
+      ): void => {
         if (ts.gptSlotHandoffInternal) {
-          originalRefresh(requestedSlots);
+          callRefresh(requestedSlots, options);
           return;
         }
 
         const slots = requestedSlots ?? pubads.getSlots?.();
         if (!slots) {
-          originalRefresh(requestedSlots);
+          callRefresh(requestedSlots, options);
           return;
         }
 
@@ -727,9 +780,9 @@ function installLatePublisherSlotHandoff(ts: TsjsApi): void {
           return false;
         });
         if (!suppressed) {
-          originalRefresh(requestedSlots);
+          callRefresh(requestedSlots, options);
         } else if (remainingSlots.length > 0) {
-          originalRefresh(remainingSlots);
+          callRefresh(remainingSlots, options);
         }
       };
       (patchedRefresh as HandoffPatchedFunction).__tsSlotHandoffPatched = true;
@@ -834,6 +887,8 @@ export function installTsAdInit(): void {
           (ts.gptSlotHandoffs ??= {})[actualDivId] = {
             gamUnitPath: slot.gam_unit_path,
             formats: slot.formats,
+            divIdPrefix: slot.div_id,
+            slotElementId: actualDivId,
             publisherClaimed: false,
             suppressPublisherDisplay: false,
             suppressPublisherRefresh: false,
