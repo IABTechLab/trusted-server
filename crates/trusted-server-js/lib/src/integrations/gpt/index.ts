@@ -1225,6 +1225,7 @@ export function installTsRenderBridge(): void {
   // is scoped to the slot, not the bare adId: hb_adid is not unique per bid, so
   // keying on it alone would let one slot block a distinct slot's render.
   const renderingKeys = new Set<string>();
+  const consumedPrebidApsIds = new Map<string, { adUnitCode: string; expiresAt: number }>();
 
   window.addEventListener('message', (e: MessageEvent) => {
     let data: Record<string, unknown>;
@@ -1245,6 +1246,42 @@ export function installTsRenderBridge(): void {
     if (!port) return;
     const sourceSlotId = slotIdForMessageSource(e.source);
     if (!sourceSlotId) return;
+
+    const consumedPrebidAps = consumedPrebidApsIds.get(adId);
+    if (consumedPrebidAps && consumedPrebidAps.expiresAt > Date.now()) {
+      if (messageSourceBelongsToAdUnit(e.source, consumedPrebidAps.adUnitCode)) {
+        e.stopImmediatePropagation();
+      }
+      return;
+    }
+
+    const prebidRendererEntry = getApsPrebidRenderer(adId);
+    if (prebidRendererEntry) {
+      if (!messageSourceBelongsToAdUnit(e.source, prebidRendererEntry.adUnitCode)) return;
+      const renderer = validateApsRenderer(prebidRendererEntry.renderer);
+      const rendererUrl = apsRendererUrl();
+      if (!renderer || !rendererUrl || !consumeApsPrebidRenderer(adId, prebidRendererEntry)) return;
+      e.stopImmediatePropagation();
+      consumedPrebidApsIds.set(adId, {
+        adUnitCode: prebidRendererEntry.adUnitCode,
+        expiresAt: prebidRendererEntry.expiresAt,
+      });
+      prebidRendererEntry.markWinner();
+      port.postMessage(
+        JSON.stringify({
+          message: 'Prebid Response',
+          adId,
+          renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
+          rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+          rendererUrl,
+          apsRenderer: renderer,
+          width: renderer.width,
+          height: renderer.height,
+        })
+      );
+      prebidRendererEntry.markRendered();
+      return;
+    }
 
     // Resolve the bid by the requesting slot, not by the first bid whose hb_adid
     // matches. hb_adid is not unique per bid: absent PBS Cache it falls back to a
