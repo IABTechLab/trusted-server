@@ -55,10 +55,16 @@ pub struct Publisher {
     /// raw (still compressed) bytes pulled from origin, and cumulative decoded
     /// bytes emitted by the decompressor — the latter so a decompression bomb
     /// cannot push an unbounded decoded volume through the rewrite pipeline.
-    /// Buffered adapters keep using it as the post-rewrite output buffer cap.
     /// On the streaming path headers are already committed when either cap
     /// trips, so the response is truncated mid-body (with the error logged)
     /// rather than replaced with a 5xx.
+    ///
+    /// Buffered adapters keep using it as the post-rewrite output buffer cap.
+    /// There it additionally bounds how much decoded gzip output may sit in the
+    /// heap at once, so a bomb is rejected mid-decode instead of after its full
+    /// expansion; that bound is per-step, never cumulative, so a gzip-encoded
+    /// body is judged by the same post-rewrite total as an identity, deflate or
+    /// brotli one.
     ///
     /// Must be at least 1: a zero-byte cap fails every non-empty buffered
     /// publisher response at request time, so it is rejected at config

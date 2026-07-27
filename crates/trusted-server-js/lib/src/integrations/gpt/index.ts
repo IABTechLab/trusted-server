@@ -2876,6 +2876,10 @@ export function installTsRenderBridge(): void {
             ...(traceToken ? { traceToken } : {}),
           })
         );
+        // Beacons carry the server-expanded ${AUCTION_PRICE} from the auction's
+        // clearing price, not `cached.price` — the auction result is the
+        // authoritative clearing price, and the cached copy is only the render
+        // source. Do not re-expand them here.
         fireWinBillingBeacons(slotId, matchedBid);
         window.tsjs?.recordAdTrace?.({
           kind: 'pb_render_served',

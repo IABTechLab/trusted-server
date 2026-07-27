@@ -22,6 +22,15 @@ In scope:
 
 Out of scope:
 
+- HTML post-processor configs (the `nextjs` integration). When any
+  `IntegrationHtmlPostProcessor` is registered, `HtmlWithPostProcessing`
+  accumulates the full rewritten document and runs post-processors at origin
+  EOF, so the lazy stream emits no body bytes until the whole origin transfer
+  completes — even for pages where `should_process()` would return `false`.
+  Headers still commit early, but first byte/FCP tracks origin EOF for that
+  configuration; #849's objective is unmet there. The eventual fix is an
+  up-front or streaming `should_process` gate so non-RSC pages skip
+  accumulation entirely (follow-up issue).
 - Cloudflare origin streaming. Current adapter rejects `PlatformHttpRequest::stream_response`.
 - Spin streaming. Current adapter and upstream EdgeZero Spin conversion are buffered/blocking issues.
 - Axum client streaming. Axum is dev-only and has `LocalBoxStream`/`Send` constraints.
