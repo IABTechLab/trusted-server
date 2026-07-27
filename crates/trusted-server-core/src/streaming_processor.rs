@@ -457,7 +457,7 @@ impl Write for BoundedDecodeSink {
             )));
         }
         self.decoded_bytes.set(next);
-        self.buffer.extend_from_slice(data);
+        extend_capped(&mut self.buffer, data, self.max_decoded_bytes);
         Ok(data.len())
     }
 
@@ -500,8 +500,9 @@ enum GzipStreamState {
     /// Non-member bytes followed a completed member; all further input is
     /// dropped.
     TrailingGarbage(BoundedDecodeSink),
-    /// Transient placeholder while ownership moves between states. Never
-    /// observable by callers.
+    /// Transient placeholder while ownership moves between states. An error
+    /// raised mid-transition can leave it in place, so every arm that reads it
+    /// fails (or drains empty) instead of panicking.
     Poisoned,
 }
 
@@ -642,9 +643,11 @@ impl GzipStreamDecoder {
             GzipStreamState::Boundary { sink, .. } | GzipStreamState::TrailingGarbage(sink) => {
                 std::mem::take(&mut sink.buffer)
             }
-            GzipStreamState::Poisoned => {
-                unreachable!("poisoned state is never left in place across calls")
-            }
+            // An empty chunk skips `decode`'s loop (and its error-returning
+            // `Poisoned` arm) and lands here, so a poisoned decoder must yield
+            // no bytes rather than abort the Wasm instance. `finish` still
+            // errors, so a truncated body can never be reported as success.
+            GzipStreamState::Poisoned => Vec::new(),
         }
     }
 }
@@ -1386,6 +1389,66 @@ mod tests {
             sink.len() <= cap,
             "no more than the cap may be emitted before rejection: {} bytes",
             sink.len()
+        );
+    }
+
+    #[test]
+    fn bounded_decode_sink_caps_buffer_capacity_at_decoded_limit() {
+        // Companion to `deflate_decode_caps_buffer_capacity_at_decoded_limit`
+        // for the sink the gzip and brotli decoders write through. It charged
+        // the budget correctly but appended with a plain `extend_from_slice`, so
+        // `Vec` doubling could commit ~2× the ceiling of Wasm heap while the
+        // decoded total still sat under the cap. The cap is deliberately off a
+        // doubling boundary: the last block lands past 128 KiB of capacity, so
+        // an uncapped reservation jumps to 256 KiB.
+        let cap = STREAM_CHUNK_SIZE * 20 + 1;
+        let mut sink = BoundedDecodeSink::new(Rc::new(Cell::new(0)), cap);
+        let block = vec![b'a'; STREAM_CHUNK_SIZE];
+
+        for _ in 0..20 {
+            let written = sink
+                .write(&block)
+                .expect("writes under the cap must succeed");
+            assert_eq!(
+                written, STREAM_CHUNK_SIZE,
+                "a write under the cap must buffer the whole block"
+            );
+        }
+
+        assert_eq!(
+            sink.buffer.len(),
+            STREAM_CHUNK_SIZE * 20,
+            "every write under the cap should be buffered"
+        );
+        assert!(
+            sink.buffer.capacity() <= cap + 1,
+            "decode sink must not balloon toward ~2× the cap: cap={cap} capacity={}",
+            sink.buffer.capacity()
+        );
+    }
+
+    #[test]
+    fn gzip_decode_of_empty_chunk_on_poisoned_decoder_yields_no_bytes() {
+        // `decode`'s error-returning `Poisoned` arm lives inside the
+        // `while !input.is_empty()` loop, so an empty chunk — which
+        // `BodyChunkSource` may legally yield — skipped it and reached
+        // `take_decoded`, whose `unreachable!` aborts the Wasm instance.
+        let mut decoder = GzipStreamDecoder::new(Rc::new(Cell::new(0)), usize::MAX);
+        decoder.state = GzipStreamState::Poisoned;
+
+        let decoded = decoder
+            .decode(&[])
+            .expect("an empty chunk must not fail on a poisoned decoder");
+
+        assert!(
+            decoded.is_empty(),
+            "a poisoned decoder must drain no bytes: {} byte(s)",
+            decoded.len()
+        );
+        assert!(
+            decoder.finish().is_err(),
+            "finalizing a poisoned decoder must still fail, so a truncated body \
+             is never reported as success"
         );
     }
 
