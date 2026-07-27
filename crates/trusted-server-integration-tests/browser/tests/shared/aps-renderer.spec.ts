@@ -361,9 +361,7 @@ parent.postMessage(JSON.stringify({
         expect(auctionRequests).toBe(1);
         expect(result.acceptedAd).toBe("");
         expect(result.acceptedAdId).not.toBe(apsRenderer.bidId);
-        expect(result.foreignUniversalCreativeResponse).not.toEqual(
-            expect.objectContaining({ apsRenderer }),
-        );
+        expect(result.foreignUniversalCreativeResponse).toBeUndefined();
         expect(result.universalCreativeResponse).toEqual(
             expect.objectContaining({
                 message: "Prebid Response",

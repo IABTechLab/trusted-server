@@ -480,7 +480,7 @@ describe('prebid/installPrebidNpm', () => {
 
     expect((window as any).tsjs?.apsPrebidRenderers?.['malformed-ad-id']).toBeUndefined();
     expect((window as any).tsjs?.apsPrebidRenderers?.['foreign-ad-id']).toBeUndefined();
-    expect(malformedBid).toHaveProperty('trustedServerRenderer');
+    expect(malformedBid).not.toHaveProperty('trustedServerRenderer');
     expect(warnSpy).toHaveBeenCalledWith(
       '[tsjs-prebid] rejected APS renderer capability that failed registration'
     );

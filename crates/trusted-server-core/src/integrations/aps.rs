@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
+use http::header::HeaderName;
 use http::{HeaderMap, Method, StatusCode, header};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Serialize};
@@ -132,6 +133,9 @@ pub struct ApsConfig {
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u32,
     /// Whether to include the APS HTTP exchange in auction response metadata.
+    ///
+    /// Only enable this for controlled test sites: the client-visible metadata can
+    /// include raw request and response bodies, including creative markup.
     #[serde(default)]
     pub debug: bool,
     /// Whether APS script creatives are eligible before winner selection.
@@ -580,8 +584,15 @@ impl ApsAuctionProvider {
     }
 
     fn debug_headers(headers: &HeaderMap) -> BTreeMap<String, Vec<String>> {
+        // This metadata is returned to page JavaScript. Keep the list fail-closed so
+        // identity or authentication headers from an upstream response never leak.
+        const ALLOWED_HEADERS: &[HeaderName] = &[header::CONTENT_TYPE];
+
         let mut values = BTreeMap::<String, Vec<String>>::new();
         for (name, value) in headers {
+            if !ALLOWED_HEADERS.contains(name) {
+                continue;
+            }
             let Ok(value) = value.to_str() else {
                 continue;
             };
@@ -1794,9 +1805,9 @@ mod tests {
             call["responseheaders"]["content-type"],
             json!(["application/json"])
         );
-        assert_eq!(
-            call["responseheaders"]["x-example-debug"],
-            json!(["first", "second"])
+        assert!(
+            call["responseheaders"].get("x-example-debug").is_none(),
+            "should omit unapproved debug response headers"
         );
         assert_eq!(call["status"], 200);
         assert_eq!(call["uri"], "https://aps.example/openrtb");

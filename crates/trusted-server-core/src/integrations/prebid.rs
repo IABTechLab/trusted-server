@@ -201,7 +201,6 @@ fn extract_prebid_error_message(
 const GPC_US_PRIVACY: &str = "1YYN";
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
-#[validate(schema(function = "validate_prebid_bidder_lists"))]
 pub struct PrebidIntegrationConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -333,27 +332,19 @@ pub struct PrebidIntegrationConfig {
     pub suppress_nurl_bidders: Vec<String>,
 }
 
-fn validate_prebid_bidder_lists(config: &PrebidIntegrationConfig) -> Result<(), ValidationError> {
+fn remove_aps_bidders(config: &mut PrebidIntegrationConfig) {
     for (field, bidders) in [
-        ("bidders", &config.bidders),
-        ("client_side_bidders", &config.client_side_bidders),
+        ("bidders", &mut config.bidders),
+        ("client_side_bidders", &mut config.client_side_bidders),
     ] {
-        if bidders
-            .iter()
-            .any(|bidder| bidder.eq_ignore_ascii_case("aps"))
-        {
-            let mut error = ValidationError::new("aps_managed_by_dedicated_integration");
-            error.message = Some(
-                format!(
-                    "integrations.prebid.{field} must not include APS; configure APS under [integrations.aps]"
-                )
-                .into(),
+        let original_len = bidders.len();
+        bidders.retain(|bidder| !bidder.eq_ignore_ascii_case("aps"));
+        if bidders.len() != original_len {
+            log::warn!(
+                "prebid: ignoring APS in integrations.prebid.{field}; configure APS under [integrations.aps]"
             );
-            return Err(error);
         }
     }
-
-    Ok(())
 }
 
 impl IntegrationConfig for PrebidIntegrationConfig {
@@ -893,12 +884,13 @@ fn escape_html_attr(value: &str) -> String {
 fn build(
     settings: &Settings,
 ) -> Result<Option<Arc<PrebidIntegration>>, Report<TrustedServerError>> {
-    let Some(config) =
+    let Some(mut config) =
         settings.integration_config::<PrebidIntegrationConfig>(PREBID_INTEGRATION_ID)?
     else {
         return Ok(None);
     };
 
+    remove_aps_bidders(&mut config);
     validate_external_bundle_config(&config, &settings.proxy.allowed_domains)?;
 
     // Warn about bidders that appear in both lists — this is likely a config
@@ -6722,7 +6714,7 @@ set = { placementId = "explicit_header" }
     }
 
     #[test]
-    fn config_rejects_aps_in_prebid_bidder_lists_case_insensitively() {
+    fn config_accepts_aps_in_prebid_bidder_lists_for_upgrade_compatibility() {
         for (field, bidder) in [
             ("bidders", "aps"),
             ("bidders", "APS"),
@@ -6736,11 +6728,7 @@ server_url = "https://prebid.example"
 {field} = ["{bidder}"]
 "#
             ));
-            let error = result.expect_err("should reject APS in Prebid bidder lists");
-            assert!(
-                error.to_string().contains("configure APS under"),
-                "should include migration guidance for {field}: {error:?}"
-            );
+            assert!(result.is_ok(), "should accept legacy APS in {field}");
         }
     }
 
