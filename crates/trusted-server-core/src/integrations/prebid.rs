@@ -345,6 +345,21 @@ impl IntegrationConfig for PrebidIntegrationConfig {
     }
 }
 
+fn remove_aps_bidders(config: &mut PrebidIntegrationConfig) {
+    for (field, bidders) in [
+        ("bidders", &mut config.bidders),
+        ("client_side_bidders", &mut config.client_side_bidders),
+    ] {
+        let original_len = bidders.len();
+        bidders.retain(|bidder| !bidder.eq_ignore_ascii_case("aps"));
+        if bidders.len() != original_len {
+            log::warn!(
+                "prebid: ignoring APS in integrations.prebid.{field}; configure APS under [integrations.aps]"
+            );
+        }
+    }
+}
+
 fn excluded_gam_ad_unit_path_suffix_validation_error(message: &'static str) -> ValidationError {
     let mut error = ValidationError::new("invalid_gam_ad_unit_path_suffix");
     error.message = Some(message.into());
@@ -406,6 +421,7 @@ fn load_config(
         return Ok(None);
     };
     canonicalize_excluded_gam_ad_unit_path_suffixes(&mut config);
+    remove_aps_bidders(&mut config);
     Ok(Some(config))
 }
 
@@ -7235,7 +7251,7 @@ bidders = ["kargo", "triplelift"]
     }
 
     #[test]
-    fn to_openrtb_skips_aps_key_from_slot_bidders_in_pbs_request() {
+    fn to_openrtb_drops_aps_only_demand_instead_of_using_stored_request() {
         let slot = make_slot(
             "atf_sidebar_ad",
             HashMap::from([("aps".to_string(), json!({"slotID": "aps-slot-atf-sidebar"}))]),
@@ -7243,13 +7259,29 @@ bidders = ["kargo", "triplelift"]
         let request = make_auction_request(vec![slot]);
 
         let ortb = call_to_openrtb(base_config(), &request);
-        let ext = ortb.imp[0].ext.as_ref().expect("should have imp ext");
-        let prebid = ext.get("prebid").expect("should have prebid in ext");
-
         assert!(
-            prebid.get("bidder").is_none(),
-            "should not forward aps key into PBS imp.ext.prebid.bidder"
+            ortb.imp.is_empty(),
+            "should not fall back to a PBS stored request after excluding APS-only demand"
         );
+    }
+
+    #[test]
+    fn config_accepts_aps_in_prebid_bidder_lists_for_upgrade_compatibility() {
+        for (field, bidder) in [
+            ("bidders", "aps"),
+            ("bidders", "APS"),
+            ("client_side_bidders", "Aps"),
+        ] {
+            let result = parse_prebid_toml_result(&format!(
+                r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+{field} = ["{bidder}"]
+"#
+            ));
+            assert!(result.is_ok(), "should accept legacy APS in {field}");
+        }
     }
 
     #[test]

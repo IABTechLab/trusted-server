@@ -1000,11 +1000,10 @@ function installApsBidResponseRegistry(): void {
         markRendered: () => markBidAsRendered(rawBid),
       }
     );
-    if (registered) {
-      // Keep the executable capability only in the bounded, one-time registry. Prebid
-      // still owns the generated ad ID and ordinary GAM targeting on this bid object.
-      delete bid[APS_RENDERER_FIELD];
-    } else {
+    // Keep the executable capability only in the bounded, one-time registry. Prebid
+    // still owns the generated ad ID and ordinary GAM targeting on this bid object.
+    delete bid[APS_RENDERER_FIELD];
+    if (!registered) {
       log.warn('[tsjs-prebid] rejected APS renderer capability that failed registration');
     }
   });
