@@ -187,35 +187,6 @@ impl IntegrationSettings {
         Ok(())
     }
 
-    #[cfg(test)]
-    fn normalize_env_value(value: JsonValue) -> JsonValue {
-        match value {
-            JsonValue::Object(map) => JsonValue::Object(
-                map.into_iter()
-                    .map(|(key, value)| (key, Self::normalize_env_value(value)))
-                    .collect(),
-            ),
-            JsonValue::Array(items) => {
-                JsonValue::Array(items.into_iter().map(Self::normalize_env_value).collect())
-            }
-            JsonValue::String(raw) => {
-                if let Ok(parsed) = serde_json::from_str::<JsonValue>(&raw) {
-                    parsed
-                } else {
-                    JsonValue::String(raw)
-                }
-            }
-            other => other,
-        }
-    }
-
-    #[cfg(test)]
-    fn normalize_legacy_env(&mut self) {
-        for value in self.entries.values_mut() {
-            *value = Self::normalize_env_value(value.clone());
-        }
-    }
-
     fn is_explicitly_disabled(raw: &JsonValue) -> bool {
         raw.as_object()
             .and_then(|map| map.get("enabled"))
@@ -2028,13 +1999,12 @@ impl Settings {
             .change_context(TrustedServerError::Configuration {
                 message: "Failed to build configuration".to_string(),
             })?;
-        let mut settings: Self =
+        let settings: Self =
             config
                 .try_deserialize()
                 .change_context(TrustedServerError::Configuration {
                     message: "Failed to deserialize configuration".to_string(),
                 })?;
-        settings.integrations.normalize_legacy_env();
 
         Self::finalize_deserialized(settings, "Build-time configuration")
     }
@@ -2600,12 +2570,8 @@ mod tests {
 
     use crate::auction::build_orchestrator;
     use crate::integrations::{
-        IntegrationRegistry,
-        datadome::{DataDomeConfig, ProtectionMatcherConfig},
-        gpt::GptConfig,
-        nextjs::NextJsIntegrationConfig,
+        IntegrationRegistry, gpt::GptConfig, nextjs::NextJsIntegrationConfig,
         prebid::PrebidIntegrationConfig,
-        testlight::TestlightConfig,
     };
     use crate::redacted::Redacted;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
@@ -3202,278 +3168,6 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     #[test]
-    fn prebid_numeric_string_bid_param_overrides_survive_config_roundtrip() {
-        let toml_str = format!(
-            r#"{}
-
-[integrations.prebid.bid_param_overrides.pubmatic]
-publisherId = "12345"
-adSlot = "67890"
-
-[integrations.prebid.bid_param_zone_overrides.pubmatic]
-header = {{ placementId = "24680" }}
-
-[[integrations.prebid.bid_param_override_rules]]
-when = {{ bidder = "pubmatic", zone = "in_content" }}
-set = {{ placementId = "13579" }}
-"#,
-            crate_test_settings_str()
-        );
-        let settings = Settings::from_toml(&toml_str).expect("should parse TOML settings");
-        let serialized = serde_json::to_value(&settings).expect("should serialize settings");
-        let runtime_settings =
-            Settings::from_json_value(serialized).expect("should parse runtime JSON settings");
-        let raw = runtime_settings
-            .integrations
-            .get("prebid")
-            .expect("should contain Prebid settings");
-
-        assert_eq!(
-            raw["bid_param_overrides"]["pubmatic"]["publisherId"],
-            json!("12345"),
-            "should preserve numeric-looking publisherId as a string"
-        );
-        assert_eq!(
-            raw["bid_param_overrides"]["pubmatic"]["adSlot"],
-            json!("67890"),
-            "should preserve numeric-looking adSlot as a string"
-        );
-        assert_eq!(
-            raw["bid_param_zone_overrides"]["pubmatic"]["header"]["placementId"],
-            json!("24680"),
-            "should preserve numeric-looking zone override parameters as strings"
-        );
-        assert_eq!(
-            raw["bid_param_override_rules"][0]["set"]["placementId"],
-            json!("13579"),
-            "should preserve numeric-looking rule parameters as strings"
-        );
-    }
-
-    #[test]
-    fn test_datadome_protection_scope_overrides_with_json_env() {
-        let toml_str = crate_test_settings_str();
-        let separator = ENVIRONMENT_VARIABLE_SEPARATOR;
-        let origin_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_URL",
-            ENVIRONMENT_VARIABLE_PREFIX, separator, separator
-        );
-        let enabled_key = format!(
-            "{}{}INTEGRATIONS{}DATADOME{}ENABLED",
-            ENVIRONMENT_VARIABLE_PREFIX, separator, separator, separator
-        );
-        let enable_protection_key = format!(
-            "{}{}INTEGRATIONS{}DATADOME{}ENABLE_PROTECTION",
-            ENVIRONMENT_VARIABLE_PREFIX, separator, separator, separator
-        );
-        let excluded_methods_key = format!(
-            "{}{}INTEGRATIONS{}DATADOME{}PROTECTION_EXCLUDED_METHODS",
-            ENVIRONMENT_VARIABLE_PREFIX, separator, separator, separator
-        );
-        let cidr_sources_key = format!(
-            "{}{}INTEGRATIONS{}DATADOME{}PROTECTION_EXCLUDED_IP_CIDR_SOURCES",
-            ENVIRONMENT_VARIABLE_PREFIX, separator, separator, separator
-        );
-        let rules_key = format!(
-            "{}{}INTEGRATIONS{}DATADOME{}PROTECTION_EXCLUSION_RULES",
-            ENVIRONMENT_VARIABLE_PREFIX, separator, separator, separator
-        );
-
-        temp_env::with_vars(
-            [
-                (origin_key, Some("https://origin.test-publisher.com")),
-                (enabled_key, Some("true")),
-                (enable_protection_key, Some("true")),
-                (excluded_methods_key, Some(r#"["OPTIONS","TRACE"]"#)),
-                (
-                    cidr_sources_key,
-                    Some(r#"[{"config_store":"datadome-ip-bypass","key":"googlebot_ips"}]"#),
-                ),
-                (
-                    rules_key,
-                    Some(
-                        r#"[{"id":"legacy-static-get-head","methods":["GET","HEAD"],"type":"path_regex","patterns":["(?i)\\.(css|js)$"]},{"id":"next-rsc","type":"query_param_non_empty","names":["_rsc"]}]"#,
-                    ),
-                ),
-            ],
-            || {
-                let settings = Settings::from_toml_and_env(&toml_str)
-                    .expect("Settings should parse DataDome JSON env overrides");
-                let cfg = settings
-                    .integration_config::<DataDomeConfig>("datadome")
-                    .expect("DataDome config query should succeed")
-                    .expect("DataDome config should exist with env override");
-
-                assert!(cfg.enabled, "should parse enabled override as bool");
-                assert!(
-                    cfg.enable_protection,
-                    "should parse enable_protection override as bool"
-                );
-                assert_eq!(
-                    cfg.protection_excluded_methods,
-                    vec!["OPTIONS".to_string(), "TRACE".to_string()],
-                    "should parse method list from JSON env override"
-                );
-                assert_eq!(
-                    cfg.protection_excluded_ip_cidr_sources[0].config_store, "datadome-ip-bypass",
-                    "should parse CIDR source config_store from JSON env override"
-                );
-                assert_eq!(
-                    cfg.protection_excluded_ip_cidr_sources[0].key, "googlebot_ips",
-                    "should parse CIDR source key from JSON env override"
-                );
-                assert_eq!(
-                    cfg.protection_exclusion_rules.len(),
-                    2,
-                    "should parse all structured rules from JSON env override"
-                );
-                assert!(matches!(
-                    &cfg.protection_exclusion_rules[0].matcher,
-                    ProtectionMatcherConfig::PathRegex { patterns }
-                        if patterns == &vec!["(?i)\\.(css|js)$".to_string()]
-                ));
-                assert!(matches!(
-                    &cfg.protection_exclusion_rules[1].matcher,
-                    ProtectionMatcherConfig::QueryParamNonEmpty { names }
-                        if names == &vec!["_rsc".to_string()]
-                ));
-            },
-        );
-    }
-
-    #[test]
-    fn test_datadome_protection_scope_overrides_with_indexed_env() {
-        let toml_str = crate_test_settings_str();
-        let separator = ENVIRONMENT_VARIABLE_SEPARATOR;
-        let datadome_prefix = format!(
-            "{}{}INTEGRATIONS{}DATADOME{}",
-            ENVIRONMENT_VARIABLE_PREFIX, separator, separator, separator
-        );
-        let origin_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_URL",
-            ENVIRONMENT_VARIABLE_PREFIX, separator, separator
-        );
-
-        temp_env::with_vars(
-            [
-                (origin_key, Some("https://origin.test-publisher.com")),
-                (format!("{datadome_prefix}ENABLED"), Some("true")),
-                (format!("{datadome_prefix}ENABLE_PROTECTION"), Some("true")),
-                (
-                    format!("{datadome_prefix}PROTECTION_EXCLUDED_METHODS{separator}0"),
-                    Some("OPTIONS"),
-                ),
-                (
-                    format!("{datadome_prefix}PROTECTION_EXCLUDED_METHODS{separator}1"),
-                    Some("TRACE"),
-                ),
-                (
-                    format!("{datadome_prefix}PROTECTION_EXCLUDED_ASNS{separator}0"),
-                    Some("19750"),
-                ),
-                (
-                    format!("{datadome_prefix}PROTECTION_EXCLUDED_IP_CIDRS{separator}0"),
-                    Some("198.51.100.0/24"),
-                ),
-                (
-                    format!(
-                        "{datadome_prefix}PROTECTION_EXCLUDED_IP_CIDR_SOURCES{separator}0{separator}CONFIG_STORE"
-                    ),
-                    Some("datadome-ip-bypass"),
-                ),
-                (
-                    format!(
-                        "{datadome_prefix}PROTECTION_EXCLUDED_IP_CIDR_SOURCES{separator}0{separator}KEY"
-                    ),
-                    Some("googlebot_ips"),
-                ),
-                (
-                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}ID"),
-                    Some("legacy-static-get-head"),
-                ),
-                (
-                    format!(
-                        "{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}METHODS{separator}0"
-                    ),
-                    Some("GET"),
-                ),
-                (
-                    format!(
-                        "{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}METHODS{separator}1"
-                    ),
-                    Some("HEAD"),
-                ),
-                (
-                    format!(
-                        "{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}TYPE"
-                    ),
-                    Some("path_regex"),
-                ),
-                (
-                    format!(
-                        "{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}PATTERNS{separator}0"
-                    ),
-                    Some(r"(?i)\.(css|js)$"),
-                ),
-                (
-                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}1{separator}ID"),
-                    Some("next-rsc"),
-                ),
-                (
-                    format!(
-                        "{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}1{separator}TYPE"
-                    ),
-                    Some("query_param_non_empty"),
-                ),
-                (
-                    format!(
-                        "{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}1{separator}NAMES{separator}0"
-                    ),
-                    Some("_rsc"),
-                ),
-            ],
-            || {
-                let settings = Settings::from_toml_and_env(&toml_str)
-                    .expect("Settings should parse DataDome indexed env overrides");
-                let cfg = settings
-                    .integration_config::<DataDomeConfig>("datadome")
-                    .expect("DataDome config query should succeed")
-                    .expect("DataDome config should exist with indexed env override");
-
-                assert_eq!(
-                    cfg.protection_excluded_methods,
-                    vec!["OPTIONS".to_string(), "TRACE".to_string()],
-                    "should parse indexed method list"
-                );
-                assert_eq!(
-                    cfg.protection_excluded_asns,
-                    vec![19750],
-                    "should parse indexed ASN list"
-                );
-                assert_eq!(
-                    cfg.protection_excluded_ip_cidrs,
-                    vec!["198.51.100.0/24".to_string()],
-                    "should parse indexed IP CIDR list"
-                );
-                assert_eq!(
-                    cfg.protection_excluded_ip_cidr_sources[0].key, "googlebot_ips",
-                    "should parse indexed CIDR source list"
-                );
-                assert!(matches!(
-                    &cfg.protection_exclusion_rules[0].matcher,
-                    ProtectionMatcherConfig::PathRegex { patterns }
-                        if patterns == &vec!["(?i)\\.(css|js)$".to_string()]
-                ));
-                assert!(matches!(
-                    &cfg.protection_exclusion_rules[1].matcher,
-                    ProtectionMatcherConfig::QueryParamNonEmpty { names }
-                        if names == &vec!["_rsc".to_string()]
-                ));
-            },
-        );
-    }
-
-    #[test]
     fn test_handlers_override_with_env() {
         let toml_str = crate_test_settings_str();
 
@@ -3997,67 +3691,6 @@ set = {{ placementId = "13579" }}
     }
 
     #[test]
-    fn test_integration_settings_from_env() {
-        use crate::integrations::testlight::TestlightConfig;
-
-        let toml_str = crate_test_settings_str();
-
-        let origin_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_URL",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-
-        let integration_prefix = format!(
-            "{}{}INTEGRATIONS{}TESTLIGHT{}",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-
-        let endpoint_key = format!("{}ENDPOINT", integration_prefix);
-        let timeout_key = format!("{}TIMEOUT_MS", integration_prefix);
-        let rewrite_key = format!("{}REWRITE_SCRIPTS", integration_prefix);
-        let enabled_key = format!("{}ENABLED", integration_prefix);
-
-        temp_env::with_var(
-            origin_key,
-            Some("https://origin.test-publisher.com"),
-            || {
-                temp_env::with_var(
-                    endpoint_key,
-                    Some("https://testlight-env.test/auction"),
-                    || {
-                        temp_env::with_var(timeout_key, Some("2500"), || {
-                            temp_env::with_var(rewrite_key, Some("true"), || {
-                                temp_env::with_var(enabled_key, Some("true"), || {
-                                    let settings = Settings::from_toml_and_env(&toml_str)
-                                        .expect("Settings should load");
-
-                                    let config = settings
-                                        .integration_config::<TestlightConfig>("testlight")
-                                        .expect("integration parsing should succeed")
-                                        .expect("integration should be enabled");
-
-                                    assert_eq!(
-                                        config.endpoint,
-                                        "https://testlight-env.test/auction"
-                                    );
-                                    assert_eq!(config.timeout_ms, 2500);
-                                    assert!(config.rewrite_scripts);
-                                    assert!(config.enabled);
-                                });
-                            });
-                        });
-                    },
-                );
-            },
-        );
-    }
-
-    #[test]
     fn test_disabled_integration_does_not_register() {
         use crate::integrations::testlight::TestlightConfig;
         use serde_json::json;
@@ -4216,62 +3849,6 @@ set = {{ placementId = "13579" }}
                 .contains("Integration 'prebid' configuration failed validation"),
             "should surface a validation error for prebid.server_url"
         );
-    }
-
-    /// Tests the full build.rs round-trip: env vars are baked into Settings
-    /// at build time via `from_toml_and_env`, serialized to TOML, then parsed
-    /// back at runtime via `from_toml`. Verifies that env-sourced integration
-    /// values (strings like "true") are normalized to proper types so the
-    /// serialized TOML has correct types.
-    #[test]
-    fn test_env_var_roundtrip_normalizes_integration_types() {
-        let toml_str = crate_test_settings_str();
-
-        let integration_prefix = format!(
-            "{}{}INTEGRATIONS{}TESTLIGHT{}",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-        );
-        let enabled_key = format!("{}ENABLED", integration_prefix);
-        let endpoint_key = format!("{}ENDPOINT", integration_prefix);
-
-        temp_env::with_var(enabled_key, Some("true"), || {
-            temp_env::with_var(
-                endpoint_key,
-                Some("https://testlight-env.test/auction"),
-                || {
-                    // Step 1: Parse with env vars (what build.rs does)
-                    let settings =
-                        Settings::from_toml_and_env(&toml_str).expect("Settings should parse");
-
-                    // Verify normalization converted "true" to bool
-                    let raw = settings.integrations.get("testlight").unwrap();
-                    assert!(
-                        raw.get("enabled").unwrap().is_boolean(),
-                        "enabled should be normalized to bool, got: {:?}",
-                        raw.get("enabled")
-                    );
-
-                    // Step 2: Serialize to TOML (what build.rs does)
-                    let merged_toml =
-                        toml::to_string_pretty(&settings).expect("Should serialize to TOML");
-
-                    // Step 3: Parse back (what runtime does)
-                    let runtime_settings =
-                        Settings::from_toml(&merged_toml).expect("Runtime should parse");
-
-                    let config = runtime_settings
-                        .integration_config::<TestlightConfig>("testlight")
-                        .expect("should get config")
-                        .expect("should be enabled");
-
-                    assert_eq!(config.endpoint, "https://testlight-env.test/auction");
-                    assert!(config.enabled);
-                },
-            );
-        });
     }
 
     /// Verifies that `from_toml` does NOT read environment variables.

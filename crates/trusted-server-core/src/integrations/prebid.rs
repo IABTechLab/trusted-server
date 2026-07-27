@@ -5719,6 +5719,91 @@ set = { keywords = { genre = "news" } }
     }
 
     #[test]
+    fn bid_param_override_numeric_strings_survive_runtime_config_roundtrip() {
+        let toml_str = format!(
+            r#"{}
+
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+bidders = ["pubmatic"]
+
+[integrations.prebid.bid_param_overrides.pubmatic]
+publisherId = "12345"
+adSlot = "67890"
+
+[integrations.prebid.bid_param_zone_overrides.pubmatic]
+header = {{ placementId = "24680" }}
+
+[[integrations.prebid.bid_param_override_rules]]
+when = {{ bidder = "pubmatic", zone = "in_content" }}
+set = {{ placementId = "13579" }}
+"#,
+            TOML_BASE
+        );
+        let settings = Settings::from_toml(&toml_str).expect("should parse TOML settings");
+
+        // This mirrors the typed data transition beneath `ts config push`:
+        // `BlobEnvelope` data is deserialized by `settings_from_config_blob`.
+        let serialized = serde_json::to_value(&settings).expect("should serialize settings");
+        let runtime_settings =
+            Settings::from_json_value(serialized).expect("should parse runtime JSON settings");
+        let config = runtime_settings
+            .integration_config::<PrebidIntegrationConfig>(PREBID_INTEGRATION_ID)
+            .expect("should parse Prebid config")
+            .expect("should enable Prebid config");
+
+        let static_request = make_auction_request(vec![make_ts_slot(
+            "ad-static-0",
+            &json!({ "pubmatic": { "keep": "client" } }),
+            None,
+        )]);
+        let static_ortb = call_to_openrtb(config.clone(), &static_request);
+        let static_params = bidder_params(&static_ortb);
+        assert_eq!(
+            static_params["pubmatic"]["publisherId"],
+            json!("12345"),
+            "static override publisherId should remain a string"
+        );
+        assert_eq!(
+            static_params["pubmatic"]["adSlot"],
+            json!("67890"),
+            "static override adSlot should remain a string"
+        );
+        assert_eq!(
+            static_params["pubmatic"]["keep"],
+            json!("client"),
+            "static override should preserve client parameters"
+        );
+
+        let header_request = make_auction_request(vec![make_ts_slot(
+            "ad-header-0",
+            &json!({ "pubmatic": {} }),
+            Some("header"),
+        )]);
+        let header_ortb = call_to_openrtb(config.clone(), &header_request);
+        let header_params = bidder_params(&header_ortb);
+        assert_eq!(
+            header_params["pubmatic"]["placementId"],
+            json!("24680"),
+            "zone override placementId should remain a string"
+        );
+
+        let in_content_request = make_auction_request(vec![make_ts_slot(
+            "ad-in-content-0",
+            &json!({ "pubmatic": {} }),
+            Some("in_content"),
+        )]);
+        let in_content_ortb = call_to_openrtb(config, &in_content_request);
+        let in_content_params = bidder_params(&in_content_ortb);
+        assert_eq!(
+            in_content_params["pubmatic"]["placementId"],
+            json!("13579"),
+            "canonical rule placementId should remain a string"
+        );
+    }
+
+    #[test]
     fn zone_override_replaces_placement_id() {
         let mut config = base_config();
         config.bidders = vec!["kargo".to_string()];
