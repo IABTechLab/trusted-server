@@ -2181,20 +2181,26 @@ pub(crate) fn build_bids_script(bid_map: &serde_json::Map<String, serde_json::Va
     let json = serde_json::to_string(bid_map)
         .expect("serde_json::to_string of Map<String,Value> should be infallible");
     let escaped = html_escape_for_script(&json);
-    // adInit() defines GPT slots on the publisher's `-container` wrappers, which
-    // mutates those ad-slot subtrees. Calling it synchronously here (this script
-    // runs at body-parse time) lands those mutations inside React's hydration
-    // window and trips a #418 hydration mismatch. Defer adInit until after the
-    // page has hydrated: gate on window `load` (client bundles that hydrate the
-    // tree have executed by then), then a double `requestAnimationFrame` so it
-    // runs after React has committed. Not a retry timer — a single deferred call.
+    // adInit() defines GPT slots on the publisher's `-container` wrappers, mutating
+    // those ad-slot subtrees. Running it before React hydration commits trips a #418
+    // hydration mismatch on Next.js App Router. Defer it until hydration has run.
     //
-    // Deferring opens a window in which an SPA navigation can commit a new route
-    // (and run its own `adInit` via the SPA auction hook) before this callback
-    // fires. The callback therefore captures the route it was scheduled for and
-    // no-ops when the route has since changed; without that guard it would run
-    // `adInit` a second time against the newer route's live slots/bids, which
-    // destroys and redefines that route's TS slots and refreshes it twice.
+    // The App Router loads its hydration chunks as `async` scripts, which do NOT
+    // block DOMContentLoaded — so DCL alone can precede hydration. `window.load` is
+    // safe (it awaits async scripts) but also waits for every image/tracker, which is
+    // ~52s on heavy pages. So: at DOMContentLoaded, wait for the async
+    // `/_next/static/chunks/` scripts to finish (PerformanceResourceTiming for the
+    // ones already done, load/error for the rest), then a double requestAnimationFrame,
+    // then adInit. window.load stays as an unconditional can't-hang fallback and as the
+    // unchanged path for non-Next publishers (no chunks matched). A `fired` flag makes
+    // whichever path completes first win exactly once.
+    //
+    // The route guard captures the route this run was scheduled for and no-ops if an
+    // SPA navigation changed it (a deferred adInit must not run against a newer route).
+    //
+    // IMPORTANT: the emitted script must contain no `<` or `>` (see
+    // `bids_script_is_xss_safe`; only the JSON payload is HTML-escaped). Iterate with
+    // `forEach` / `Array.prototype.forEach.call`, never a C-style index loop.
     format!(
         "<script>(window.tsjs=window.tsjs||{{}}).bids=JSON.parse(\"{}\");\
 (function(){{\
@@ -2203,8 +2209,24 @@ var f=function(){{\
 if(location.pathname+location.search!==p)return;\
 var a=window.tsjs.adInit;if(typeof a===\"function\")a();}};\
 var d=function(){{window.requestAnimationFrame(function(){{window.requestAnimationFrame(f);}});}};\
-if(document.readyState===\"complete\")d();\
-else window.addEventListener(\"load\",d,{{once:true}});\
+if(document.readyState===\"complete\"){{d();return;}}\
+var fired=false;\
+var t=function(){{if(fired)return;fired=true;d();}};\
+window.addEventListener(\"load\",t,{{once:true}});\
+var c=function(){{\
+var s=document.querySelectorAll('script[src*=\"/_next/static/chunks/\"]');\
+if(s.length===0)return;\
+var n=s.length;var done={{}};\
+var es=(window.performance&&window.performance.getEntriesByType)?window.performance.getEntriesByType(\"resource\"):[];\
+es.forEach(function(e){{done[e.name]=true;}});\
+var dec=function(){{if(--n===0)t();}};\
+Array.prototype.forEach.call(s,function(x){{\
+if(x.src&&done[x.src])dec();\
+else{{x.addEventListener(\"load\",dec,{{once:true}});x.addEventListener(\"error\",dec,{{once:true}});}}\
+}});\
+}};\
+if(document.readyState===\"loading\")document.addEventListener(\"DOMContentLoaded\",c,{{once:true}});\
+else c();\
 }})();</script>",
         escaped
     )
@@ -4741,17 +4763,19 @@ mod tests {
             let script = build_bids_script(&map);
 
             // adInit() mutates ad-slot subtrees (GPT defineSlot on the
-            // `-container` wrapper). Running it synchronously at body-parse time
-            // lands those mutations inside React's hydration window and trips a
-            // #418 hydration mismatch. The bootstrap must defer adInit until
-            // after hydration: gate on window `load`, then a `requestAnimationFrame`.
+            // `-container` wrapper). Running it before React hydration commits
+            // trips a #418 hydration mismatch on Next.js App Router. The bootstrap
+            // waits for the async `/_next/static/chunks/` hydration scripts, then a
+            // double `requestAnimationFrame`, before handing off to adInit.
             assert!(
                 script.contains("requestAnimationFrame"),
                 "should defer adInit to a post-hydration animation frame"
             );
+            // window.load is retained as the unconditional can't-hang fallback
+            // (and the unchanged path for non-Next publishers).
             assert!(
                 script.contains("\"load\""),
-                "should gate adInit on the window load event"
+                "should keep window.load as the can't-hang fallback"
             );
             // Deferral must not regress into a retry timer.
             assert!(
@@ -4782,6 +4806,28 @@ mod tests {
             assert!(
                 script.contains("location.pathname"),
                 "should capture route identity to discard a stale deferred callback"
+            );
+
+            // The App Router loads hydration chunks as `async` scripts, which do
+            // not block DOMContentLoaded — so the gate waits for those chunks to
+            // finish (pre-clearing already-loaded ones via resource timing) rather
+            // than firing at bare DCL. Iteration uses forEach so the emitted script
+            // stays free of `<` / `>` (see `bids_script_is_xss_safe`).
+            assert!(
+                script.contains("/_next/static/chunks/"),
+                "should gate on the Next.js hydration chunks"
+            );
+            assert!(
+                script.contains("getEntriesByType"),
+                "should pre-clear already-finished chunks via resource timing"
+            );
+            assert!(
+                script.contains("DOMContentLoaded"),
+                "should start the chunk check at DOMContentLoaded"
+            );
+            assert!(
+                script.contains("forEach"),
+                "should iterate with forEach, keeping the script free of < and >"
             );
         }
 
