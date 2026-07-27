@@ -119,6 +119,33 @@
     );
   }
 
+  function matchingHandoff(pubads, adUnitPath, formats, elementId) {
+    var exact = ts.gptSlotHandoffs && ts.gptSlotHandoffs[elementId];
+    if (exact) return exact;
+
+    var candidates = Object.values(ts.gptSlotHandoffs || {}).filter(
+      function (handoff, index, allHandoffs) {
+        return (
+          allHandoffs.indexOf(handoff) === index &&
+          !handoff.publisherClaimed &&
+          elementId.startsWith(handoff.divIdPrefix) &&
+          handoff.gamUnitPath === adUnitPath &&
+          JSON.stringify(handoff.formats) === JSON.stringify(formats) &&
+          findSlotByElementId(pubads, handoff.slotElementId)
+        );
+      },
+    );
+    return candidates.length === 1 ? candidates[0] : null;
+  }
+
+  function displayTargetElementId(target) {
+    if (typeof target === "string") return target;
+    if (target && typeof target.getSlotElementId === "function") {
+      return target.getSlotElementId();
+    }
+    return target && target.id ? target.id : null;
+  }
+
   function runHandoffInternal(callback) {
     var wasInternal = ts.gptSlotHandoffInternal;
     ts.gptSlotHandoffInternal = true;
@@ -142,11 +169,12 @@
       if (!tag.defineSlot.__tsSlotHandoffPatched) {
         var originalDefineSlot = tag.defineSlot.bind(tag);
         var patchedDefineSlot = function (adUnitPath, formats, elementId) {
-          var handoff = ts.gptSlotHandoffs && ts.gptSlotHandoffs[elementId];
+          var handoff = matchingHandoff(pubads, adUnitPath, formats, elementId);
           if (!ts.gptSlotHandoffInternal && handoff) {
-            var existingSlot = findSlotByElementId(pubads, elementId);
+            var existingSlot = findSlotByElementId(pubads, handoff.slotElementId);
             if (existingSlot) {
               if (!handoff.publisherClaimed) {
+                ts.gptSlotHandoffs[elementId] = handoff;
                 handoff.publisherClaimed = true;
                 handoff.suppressPublisherDisplay = true;
                 handoff.suppressPublisherRefresh =
@@ -179,8 +207,10 @@
 
       if (!tag.display.__tsSlotHandoffPatched) {
         var originalDisplay = tag.display.bind(tag);
-        var patchedDisplay = function (elementId) {
-          var handoff = ts.gptSlotHandoffs && ts.gptSlotHandoffs[elementId];
+        var patchedDisplay = function (target) {
+          var elementId = displayTargetElementId(target);
+          var handoff =
+            elementId && ts.gptSlotHandoffs && ts.gptSlotHandoffs[elementId];
           if (
             !ts.gptSlotHandoffInternal &&
             handoff &&
@@ -189,7 +219,7 @@
             handoff.suppressPublisherDisplay = false;
             return;
           }
-          originalDisplay(elementId);
+          originalDisplay(target);
         };
         patchedDisplay.__tsSlotHandoffPatched = true;
         tag.display = patchedDisplay;
@@ -197,15 +227,22 @@
 
       if (!pubads.refresh.__tsSlotHandoffPatched) {
         var originalRefresh = pubads.refresh.bind(pubads);
-        var patchedRefresh = function (requestedSlots) {
+        var callRefresh = function (slots, options) {
+          if (options === undefined) {
+            originalRefresh(slots);
+          } else {
+            originalRefresh(slots, options);
+          }
+        };
+        var patchedRefresh = function (requestedSlots, options) {
           if (ts.gptSlotHandoffInternal) {
-            originalRefresh(requestedSlots);
+            callRefresh(requestedSlots, options);
             return;
           }
           var slots =
             requestedSlots || (pubads.getSlots ? pubads.getSlots() : null);
           if (!slots) {
-            originalRefresh(requestedSlots);
+            callRefresh(requestedSlots, options);
             return;
           }
           var suppressed = false;
@@ -218,9 +255,9 @@
             return false;
           });
           if (!suppressed) {
-            originalRefresh(requestedSlots);
+            callRefresh(requestedSlots, options);
           } else if (remainingSlots.length > 0) {
-            originalRefresh(remainingSlots);
+            callRefresh(remainingSlots, options);
           }
         };
         patchedRefresh.__tsSlotHandoffPatched = true;
@@ -299,6 +336,8 @@
           ts.gptSlotHandoffs[actualDivId] = {
             gamUnitPath: slot.gam_unit_path,
             formats: slot.formats,
+            divIdPrefix: slot.div_id,
+            slotElementId: actualDivId,
             publisherClaimed: false,
             suppressPublisherDisplay: false,
             suppressPublisherRefresh: false,

@@ -184,6 +184,10 @@ export interface GptDiagnosticsApi {
 export interface GptSlotHandoff {
   gamUnitPath: string;
   formats: Array<[number, number]>;
+  /** Stable configured prefix used to safely bridge framework-generated IDs. */
+  divIdPrefix: string;
+  /** Element ID GPT received when TS created the fallback slot. */
+  slotElementId: string;
   publisherClaimed: boolean;
   suppressPublisherDisplay: boolean;
   suppressPublisherRefresh: boolean;

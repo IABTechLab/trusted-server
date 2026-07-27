@@ -46,7 +46,11 @@ TS will define its fallback slot on the **actual inner div**, never on its outer
 `-container` element. It will record a narrowly scoped handoff claim keyed by that
 inner div ID. A `googletag.defineSlot` wrapper then recognizes a later publisher
 request for that exact div and returns the existing TS slot rather than invoking
-GPT's native `defineSlot` again.
+GPT's native `defineSlot` again. Framework hydration can change generated suffixes
+between the first TS request and the publisher definition; in that case, TS may
+alias the new ID only when exactly one unclaimed fallback has the configured div-ID
+prefix, identical GAM path, identical formats, and a live GPT slot. Ambiguous or
+mismatched definitions remain native GPT calls.
 
 GPT requires a one-to-one slot-to-div relationship and documents that a slot should
 be displayed only once. Sharing the initial inner-div slot therefore avoids both the
@@ -62,9 +66,9 @@ competing container slot and an invalid duplicate definition.
    performs its existing one explicit refresh. TS records this slot as TS-owned and
    handoff-eligible.
 3. **Publisher defines later** — the scoped `defineSlot` wrapper sees the recorded
-   inner-div claim, returns the existing slot, and transfers ownership: it removes
-   the slot from TS's future `destroySlots()` set. The publisher's setup continues
-   against that same slot.
+   inner-div claim (or the uniquely matching hydrated-ID claim), returns the existing
+   slot, and transfers ownership: it removes the slot from TS's future
+   `destroySlots()` set. The publisher's setup continues against that same slot.
 4. **Publisher's first request call** — the wrapper suppresses the duplicate
    publisher `display()` call. With `disableInitialLoad()`, it instead suppresses
    only the publisher's first refresh for the transferred slot, because TS has
@@ -77,8 +81,9 @@ competing container slot and an invalid duplicate definition.
    destroy a slot after ownership has transferred.
 
 The wrapper is not a global deduplicator. It only handles IDs present in TS's
-handoff registry and must preserve native `defineSlot`, `display`, and `refresh`
-behavior for every other placement.
+handoff registry, or one uniquely safe hydrated-ID match, and must preserve native
+`defineSlot`, all supported `display()` argument forms, and both `refresh()`
+arguments for every other placement.
 
 ## Implementation shape
 

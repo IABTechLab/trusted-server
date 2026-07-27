@@ -44,8 +44,9 @@ share this runtime protocol through `window.tsjs`.
 - Modify `crates/trusted-server-js/lib/src/integrations/gpt/index.ts`
 
 - [ ] Add a `TsjsApi` property for a div-ID-keyed handoff registry. Each entry must
-      retain serializable lifecycle flags: TS-created, ownership-transferred, initial
-      request made, and one-shot publisher display/refresh suppression state.
+      retain serializable lifecycle flags, the configured stable div-ID prefix, the
+      original GPT slot element ID, ownership transfer state, and one-shot publisher
+      display/refresh suppression state.
 - [ ] Add only the minimal optional/internal type surface needed for idempotence
       markers on GPT functions and `pubads`. Do not weaken the public GPT types with
       `any`.
@@ -76,7 +77,9 @@ npx vitest run test/integrations/gpt/ad_init.test.ts test/integrations/gpt/index
 - [ ] `defineSlot` wrapper:
   - pass through TS-internal calls and IDs absent from the registry;
   - for a late publisher call on a claimed inner div, find and return the existing
-    slot without calling native `defineSlot`;
+    slot without calling native `defineSlot`; for hydration-generated ID changes,
+    permit this only for one live, unclaimed fallback with identical path/formats and
+    the configured div-ID prefix;
   - mark ownership transferred and remove that slot from `prevGptSlots` before
     returning it;
   - log, but do not create a second slot, if publisher arguments differ from the TS
@@ -131,11 +134,14 @@ npx vitest run test/integrations/gpt/ad_init.test.ts
   2. TS defines/displays the inner div and makes one request;
   3. publisher calls `defineSlot(innerDiv).addService(...); display(innerDiv)`;
   4. assert native `defineSlot` was called once, there is one slot, and there is one
-     request.
+     request. Repeat with the SSR-generated ID changed to the publisher's hydrated
+     ID, and assert an ambiguous prefix does not transfer ownership.
 - [ ] Add the same sequence with `disableInitialLoad()`: TS display plus its refresh
       makes one request; the publisher's first refresh cannot make a second request.
-- [ ] Add a no-argument publisher refresh test containing an unrelated slot. Assert
-      the claimed slot is suppressed once and the unrelated slot is refreshed.
+- [ ] Add no-argument and explicit-slot publisher refresh tests containing an
+      unrelated slot. Assert the claimed slot is suppressed once, the unrelated slot
+      is refreshed, and `changeCorrelator` options are preserved. Cover string,
+      element, and slot-object `display()` calls.
 - [ ] Add an already publisher-owned test proving TS does not install a claim, applies
       targeting, and refreshes that slot.
 - [ ] Add a no-publisher test proving TS still creates, displays, and requests its
@@ -161,11 +167,8 @@ npx vitest run test/integrations/gpt/ad_init.test.ts
       bundle; bootstrap must not transfer or suppress its own operations.
 - [ ] Extend the `gpt.rs` head-insert tests to assert that the bootstrap contains the
       inner-div handoff protocol and no longer contains the container fallback.
-- [ ] Add an executable bootstrap behavior test if practical by evaluating the
-      injected script against the same fake GPT fixture. If the test setup cannot execute
-      the included asset without duplication, record that limitation and keep the Rust
-      source-contract assertion plus identical bundle lifecycle tests as the minimum
-      coverage.
+- [ ] Add an executable bootstrap behavior test by evaluating the included asset
+      against the fake GPT fixture, including a bootstrap-to-bundle adoption check.
 
 ## Task 6: Validate, inspect, and ship
 
