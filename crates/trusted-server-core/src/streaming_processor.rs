@@ -112,11 +112,12 @@ impl Default for PipelineConfig {
 pub struct StreamingPipeline<P: StreamProcessor> {
     config: PipelineConfig,
     processor: P,
-    /// Cumulative decoded-byte ceiling for the gzip decode path. Defaults to
-    /// `usize::MAX` (unbounded); set via [`Self::with_max_decoded_bytes`] on the
-    /// buffered publisher path so a gzip bomb is rejected mid-decode instead of
-    /// materializing its full expansion.
-    max_decoded_bytes: usize,
+    /// Ceiling on the decoded bytes the gzip decode path may hold at once.
+    /// Defaults to `usize::MAX` (unbounded); set via
+    /// [`Self::with_max_pending_decoded_bytes`] on the buffered publisher path so
+    /// a gzip bomb is rejected mid-decode instead of materializing its full
+    /// expansion.
+    max_pending_decoded_bytes: usize,
 }
 
 impl<P: StreamProcessor> StreamingPipeline<P> {
@@ -129,21 +130,23 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
         Self {
             config,
             processor,
-            max_decoded_bytes: usize::MAX,
+            max_pending_decoded_bytes: usize::MAX,
         }
     }
 
-    /// Bound the cumulative decoded output of the gzip decode path.
+    /// Bound how many decoded bytes the gzip decode path may hold at once.
     ///
     /// Only the gzip reader materializes decoded bytes ahead of the downstream
     /// writer; the deflate and brotli read decoders already emit into the
     /// caller's fixed-size buffer. Callers that buffer output under a configured
     /// ceiling (e.g. `publisher.max_buffered_body_bytes`) should pass that
     /// ceiling here so decode rejection cannot be preceded by a large
-    /// allocation.
+    /// allocation. The limit is per-step, not cumulative: the total decoded
+    /// volume stays the downstream output cap's responsibility, so gzip does not
+    /// reject a body the other encodings would accept.
     #[must_use]
-    pub fn with_max_decoded_bytes(mut self, max_decoded_bytes: usize) -> Self {
-        self.max_decoded_bytes = max_decoded_bytes;
+    pub fn with_max_pending_decoded_bytes(mut self, max_pending_decoded_bytes: usize) -> Self {
+        self.max_pending_decoded_bytes = max_pending_decoded_bytes;
         self
     }
 
@@ -172,7 +175,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                 // Shares `GzipStreamDecoder` with the streaming `BodyStreamDecoder`
                 // gzip codec, so both paths tolerate trailing garbage after the
                 // final member the same way.
-                let decoder = GzipDecodeReader::new(input, self.max_decoded_bytes);
+                let decoder = GzipDecodeReader::new(input, self.max_pending_decoded_bytes);
                 let mut encoder = GzEncoder::new(output, flate2::Compression::default());
                 self.process_chunks(decoder, &mut encoder)?;
                 encoder.finish().change_context(TrustedServerError::Proxy {
@@ -180,9 +183,10 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                 })?;
                 Ok(())
             }
-            (Compression::Gzip, Compression::None) => {
-                self.process_chunks(GzipDecodeReader::new(input, self.max_decoded_bytes), output)
-            }
+            (Compression::Gzip, Compression::None) => self.process_chunks(
+                GzipDecodeReader::new(input, self.max_pending_decoded_bytes),
+                output,
+            ),
             (Compression::Deflate, Compression::Deflate) => {
                 let decoder = ZlibDecoder::new(input);
                 let mut encoder = ZlibEncoder::new(output, flate2::Compression::default());
@@ -485,6 +489,11 @@ const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 /// with the magic number are decoded as a member and fail if they are not one.
 struct GzipStreamDecoder {
     state: GzipStreamState,
+    /// The charge counter shared with the active sink, so an owner that hands
+    /// decoded bytes onward can release them via [`Self::release_pending`] and
+    /// turn the sink's cap into a pending-bytes bound instead of a cumulative
+    /// one.
+    decoded_bytes: Rc<Cell<usize>>,
 }
 
 enum GzipStreamState {
@@ -510,10 +519,22 @@ impl GzipStreamDecoder {
     fn new(decoded_bytes: Rc<Cell<usize>>, max_decoded_bytes: usize) -> Self {
         Self {
             state: GzipStreamState::Member(flate2::write::GzDecoder::new(BoundedDecodeSink::new(
-                decoded_bytes,
+                Rc::clone(&decoded_bytes),
                 max_decoded_bytes,
             ))),
+            decoded_bytes,
         }
+    }
+
+    /// Release `len` decoded bytes from the shared charge counter.
+    ///
+    /// Call this when decoded bytes leave the decoder's owner for good. The
+    /// counter then measures the bytes currently held rather than the total ever
+    /// produced, which turns the sink's ceiling into a bound on buffered decode
+    /// output instead of a cumulative decoded-input limit.
+    fn release_pending(&self, len: usize) {
+        self.decoded_bytes
+            .set(self.decoded_bytes.get().saturating_sub(len));
     }
 
     /// Decode one compressed chunk, returning the decoded bytes it produced.
@@ -587,6 +608,18 @@ impl GzipStreamDecoder {
                 }
             }
         }
+        // `flate2::write::GzDecoder` keeps decoded output in its own 32 KiB
+        // buffer and only pushes it into the sink on the *next* write or on a
+        // flush. Without this flush a member whose expansion fits in that
+        // buffer — a small page, or the tail of a large one — surfaces no bytes
+        // until `finish`, so a streaming caller would poll the origin again
+        // instead of emitting renderable content. This is a sync flush, not a
+        // stream finish: member integrity is still validated by the trailer
+        // check in `finish`/`try_finish`. States other than `Member` already
+        // finished their decoder, so their output is in the sink.
+        if let GzipStreamState::Member(decoder) = &mut self.state {
+            decoder.flush()?;
+        }
         Ok(self.take_decoded())
     }
 
@@ -659,11 +692,19 @@ impl GzipStreamDecoder {
 /// support instead of erroring (or dropping members) like
 /// `flate2::read::MultiGzDecoder`/`GzDecoder`.
 ///
-/// `max_decoded_bytes` bounds cumulative decoded output: each compressed block's
-/// expansion is charged against the budget from inside [`GzipStreamDecoder`]'s
-/// bounded sink, so a decompression bomb is rejected mid-decode rather than fully
-/// materialized before a downstream writer (e.g. `BoundedWriter`) can act. Pass
-/// `usize::MAX` where an upstream/downstream stage already bounds the size.
+/// `max_pending_decoded_bytes` bounds the decoded bytes the reader may hold at
+/// once — the expansion of the compressed block being decoded, plus whatever the
+/// caller has not read out yet. Each block's expansion is charged against the
+/// budget from inside [`GzipStreamDecoder`]'s bounded sink, so a decompression
+/// bomb is rejected mid-decode rather than fully materialized before a
+/// downstream writer (e.g. `BoundedWriter`) can act, while a large but honest
+/// body still streams through in bounded steps. Deliberately *not* a cumulative
+/// decoded-input limit: capping the total would reject a valid body whose
+/// decoded input exceeds the ceiling even when the rewritten output stays under
+/// it, and only the gzip encoding would be affected — the deflate and brotli
+/// read decoders emit into the caller's fixed-size buffer and leave the total to
+/// the downstream output cap. Pass `usize::MAX` where an upstream stage already
+/// bounds the decoded size.
 pub(crate) struct GzipDecodeReader<R: Read> {
     input: R,
     decoder: GzipStreamDecoder,
@@ -674,10 +715,10 @@ pub(crate) struct GzipDecodeReader<R: Read> {
 }
 
 impl<R: Read> GzipDecodeReader<R> {
-    pub(crate) fn new(input: R, max_decoded_bytes: usize) -> Self {
+    pub(crate) fn new(input: R, max_pending_decoded_bytes: usize) -> Self {
         Self {
             input,
-            decoder: GzipStreamDecoder::new(Rc::new(Cell::new(0)), max_decoded_bytes),
+            decoder: GzipStreamDecoder::new(Rc::new(Cell::new(0)), max_pending_decoded_bytes),
             raw: vec![0_u8; STREAM_CHUNK_SIZE],
             decoded: Vec::new(),
             position: 0,
@@ -697,6 +738,11 @@ impl<R: Read> Read for GzipDecodeReader<R> {
                 let amount = available.min(buf.len());
                 buf[..amount].copy_from_slice(&self.decoded[self.position..self.position + amount]);
                 self.position += amount;
+                // These bytes have left the reader, so they stop counting
+                // against the pending-decode budget. Releasing here — rather
+                // than when the sink is drained — keeps the charge covering both
+                // the sink and this reader's undelivered remainder.
+                self.decoder.release_pending(amount);
                 return Ok(amount);
             }
             if self.finished {
@@ -1364,6 +1410,36 @@ mod tests {
     }
 
     #[test]
+    fn body_stream_decoder_emits_small_gzip_member_before_finish() {
+        // `flate2::write::GzDecoder` holds decoded output in a 32 KiB internal
+        // buffer that drains only on the next write or on a flush, so a page
+        // whose whole expansion fits there surfaced zero bytes from
+        // `decode_chunk`. The streaming caller then polled the origin again
+        // instead of emitting content, and the document reached the client only
+        // at `finish` — after origin EOF, and on the publisher hold path after
+        // auction collection.
+        let document = b"<html><head></head><body>small page</body></html>";
+        let mut decoder = BodyStreamDecoder::new(Compression::Gzip, usize::MAX);
+
+        let decoded = decoder
+            .decode_chunk(bytes::Bytes::from(gzip_member(document)))
+            .expect("a complete small gzip member must decode");
+
+        assert_eq!(
+            decoded.as_ref(),
+            document,
+            "the first chunk must release the decoded document instead of withholding it until finish"
+        );
+        assert!(
+            decoder
+                .finish()
+                .expect("a complete gzip member must finalize")
+                .is_empty(),
+            "finish must have nothing left to emit once the chunk released it"
+        );
+    }
+
+    #[test]
     fn gzip_decode_reader_rejects_bomb_before_materializing_past_limit() {
         // A tiny gzip member expanding far past the cap must be rejected by the
         // reader's bounded sink mid-decode. Before this bound the reader used a
@@ -1383,12 +1459,55 @@ mod tests {
 
         assert!(
             err.to_string().contains("decoded size exceeded"),
-            "should report the cumulative decoded cap: {err}"
+            "should report the pending decoded cap: {err}"
         );
         assert!(
             sink.len() <= cap,
             "no more than the cap may be emitted before rejection: {} bytes",
             sink.len()
+        );
+    }
+
+    /// Deterministic pseudo-random bytes (xorshift64). gzip cannot compress
+    /// these, so a member of them spans several source reads and each read
+    /// expands by roughly the read size.
+    fn incompressible_bytes(len: usize) -> Vec<u8> {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn gzip_decode_reader_streams_body_larger_than_the_pending_cap() {
+        // The cap bounds the decoded bytes held at once, not the cumulative
+        // decoded input. While it was cumulative it made the buffered adapters'
+        // configured output ceiling behave as a gzip-only decoded-input limit: a
+        // valid body whose decode exceeded it failed even when the rewritten
+        // output would have fit, and the identity, deflate and brotli paths
+        // accepted the same body.
+        let cap = STREAM_CHUNK_SIZE * 4;
+        let document = incompressible_bytes(STREAM_CHUNK_SIZE * 32);
+        let compressed = gzip_member(&document);
+        assert!(
+            compressed.len() > cap,
+            "test precondition: the member must span several source reads, got {} bytes",
+            compressed.len()
+        );
+        let mut reader = GzipDecodeReader::new(std::io::Cursor::new(compressed), cap);
+
+        let mut decoded = Vec::new();
+        std::io::copy(&mut reader, &mut decoded)
+            .expect("a valid body decoding past the cap must still stream through");
+
+        assert_eq!(
+            decoded, document,
+            "should decode every byte of a body larger than the pending cap"
         );
     }
 

@@ -307,7 +307,12 @@ and the per-stream raw/decoded byte ceiling on the Fastly streaming path.
 **Usage**:
 
 - On **buffered adapters** (Axum, Cloudflare, Spin) it caps the _decoded,
-  post-rewrite_ output buffer for a publisher response processed in full.
+  post-rewrite_ output buffer for a publisher response processed in full. It
+  also bounds how much decoded gzip output may sit in the heap at any one
+  moment, so a decompression bomb is rejected mid-decode rather than after its
+  full expansion. That second bound is per-step, not a total: a gzip-encoded
+  response passes or fails on the same post-rewrite output size as the identity,
+  deflate and brotli versions of the same body.
 - On the **Fastly streaming path** the origin body is preserved as a stream, so
   the same value caps the stream twice over: the cumulative _raw_ (still
   compressed) bytes pulled from origin, and the cumulative _decoded_ bytes

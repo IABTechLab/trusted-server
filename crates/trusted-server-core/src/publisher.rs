@@ -434,10 +434,13 @@ fn process_response_streaming<W: Write>(
         output_compression: compression,
         chunk_size: 8192,
     };
-    // Bound the gzip decode path to the same ceiling the buffered writer
-    // enforces, so a gzip bomb is rejected mid-decode instead of materializing
-    // its full expansion before the downstream writer can reject it.
-    let max_decoded_bytes = params.settings.publisher.max_buffered_body_bytes;
+    // Bound how much decoded gzip output may sit in the heap at once, using the
+    // same ceiling the buffered writer enforces on the rewritten output: a gzip
+    // bomb is then rejected mid-decode instead of materializing its full
+    // expansion first. The bound is per-step, so a large honest body still
+    // streams through and only the buffered writer judges the total — otherwise
+    // gzip would reject bodies the identity, deflate and brotli paths accept.
+    let max_pending_decoded_bytes = params.settings.publisher.max_buffered_body_bytes;
 
     if is_html {
         let processor = create_html_stream_processor(
@@ -450,7 +453,7 @@ fn process_response_streaming<W: Write>(
             params.ad_bids_state.clone(),
         )?;
         StreamingPipeline::new(config, processor)
-            .with_max_decoded_bytes(max_decoded_bytes)
+            .with_max_pending_decoded_bytes(max_pending_decoded_bytes)
             .process(body_as_reader(body)?, output)?;
     } else if is_rsc_flight {
         // RSC Flight responses are length-prefixed (T rows). A naive string replacement will
@@ -462,7 +465,7 @@ fn process_response_streaming<W: Write>(
             params.request_scheme,
         );
         StreamingPipeline::new(config, processor)
-            .with_max_decoded_bytes(max_decoded_bytes)
+            .with_max_pending_decoded_bytes(max_pending_decoded_bytes)
             .process(body_as_reader(body)?, output)?;
     } else {
         let replacer = create_url_replacer(
@@ -472,7 +475,7 @@ fn process_response_streaming<W: Write>(
             params.request_scheme,
         );
         StreamingPipeline::new(config, replacer)
-            .with_max_decoded_bytes(max_decoded_bytes)
+            .with_max_pending_decoded_bytes(max_pending_decoded_bytes)
             .process(body_as_reader(body)?, output)?;
     }
 
@@ -760,8 +763,9 @@ async fn hold_step_decoded_chunk<P: StreamProcessor>(
 
 /// Collect the dispatched auction and process the held `</body>` tail.
 ///
-/// Call only after [`hold_step_decoded_chunk`] (or [`hold_finish_segments`])
-/// reports `close_found` and the ready prefix has already been emitted:
+/// Call only after [`hold_step_decoded_chunk`] (or
+/// [`hold_finish_ready_segments`]) reports `close_found` and the ready prefix
+/// has already been emitted:
 /// collecting here — after the prefix streams — is what keeps the auction
 /// riding alongside transfer instead of blocking it. Collection runs before the
 /// tail is processed so `lol_html` sees live bids at the injection point.
@@ -802,7 +806,8 @@ async fn hold_collect_close_tail<P: StreamProcessor>(
 /// through [`hold_step_decoded_chunk`].
 ///
 /// Returns `Ok(None)` when the source is exhausted; the caller must then emit
-/// [`hold_finish_segments`]. On read or decode failure the pending auction is
+/// [`hold_finish_ready_segments`] followed by [`hold_finish_tail_segments`]. On
+/// read or decode failure the pending auction is
 /// abandoned before the error is returned. Shared by the write-sink driver
 /// ([`body_close_hold_loop_stream`]) and the lazy publisher body stream so
 /// the two hold paths cannot drift apart.
@@ -840,23 +845,24 @@ async fn hold_step_next_chunk<P: StreamProcessor>(
         .map(Some)
 }
 
-/// Finalize the close-body hold pipeline at end of the origin stream.
+/// Drain the decoder tail at end of the origin stream, returning the prefix the
+/// caller must emit before [`hold_finish_tail_segments`].
 ///
-/// Drains the decoder tail through the hold (or straight through when the
-/// hold was already released mid-stream), collects the auction if the
-/// close-body tag never streamed, processes the held tail plus the
-/// processor's final chunk, and emits the encoder trailer. Returns the
-/// encoded segments for the caller to emit. On decoder failure the pending
-/// auction is abandoned before the error is returned.
-async fn hold_finish_segments<P: StreamProcessor>(
+/// A codec can hold document bytes back until its own finalization — the gzip
+/// decoder releases the remainder of the final member at `finish()` — and that
+/// remainder may be the whole document for a small page. Returning it ahead of
+/// collection keeps the invariant the mid-stream path already has: only the
+/// closing `</body>` tail waits for the auction, never renderable content.
+///
+/// On decoder failure the pending auction is abandoned before the error is
+/// returned.
+async fn hold_finish_ready_segments<P: StreamProcessor>(
     processor: &mut P,
     decoder: &mut BodyStreamDecoder,
     encoder: &mut BodyStreamEncoder,
     state: &mut AuctionHoldState,
     collect_refs: &AuctionCollectDeps<'_>,
 ) -> Result<Vec<bytes::Bytes>, Report<TrustedServerError>> {
-    let mut segments = Vec::new();
-
     let decoded_tail = match decoder.finish() {
         Ok(decoded_tail) => decoded_tail,
         Err(err) => {
@@ -864,15 +870,30 @@ async fn hold_finish_segments<P: StreamProcessor>(
             return Err(err);
         }
     };
-    if !decoded_tail.is_empty() {
-        let step =
-            hold_step_decoded_chunk(processor, encoder, &decoded_tail, state, collect_refs).await?;
-        segments.extend(step.ready);
+    if decoded_tail.is_empty() {
+        return Ok(Vec::new());
     }
+    let step =
+        hold_step_decoded_chunk(processor, encoder, &decoded_tail, state, collect_refs).await?;
+    Ok(step.ready)
+}
+
+/// Finalize the close-body hold pipeline after [`hold_finish_ready_segments`].
+///
+/// Collects the auction if the close-body tag never streamed, processes the held
+/// tail plus the processor's final chunk, and emits the encoder trailer. Returns
+/// the encoded segments for the caller to emit.
+async fn hold_finish_tail_segments<P: StreamProcessor>(
+    processor: &mut P,
+    encoder: &mut BodyStreamEncoder,
+    state: &mut AuctionHoldState,
+    collect_refs: &AuctionCollectDeps<'_>,
+) -> Result<Vec<bytes::Bytes>, Report<TrustedServerError>> {
+    let mut segments = Vec::new();
 
     // If the hold is still armed the auction was never collected mid-stream:
-    // `</body>` arrived only in this tail, or the document had none at all.
-    // Collect now and flush the held remainder before finalizing.
+    // `</body>` arrived only in the decoder tail, or the document had none at
+    // all. Collect now and flush the held remainder before finalizing.
     if state.hold.is_some() {
         segments.extend(hold_collect_close_tail(processor, encoder, state, collect_refs).await?);
     }
@@ -1321,9 +1342,24 @@ pub async fn publisher_response_into_streaming_response(
                         }
                     }
 
-                    for encoded in hold_finish_segments(
+                    // Whatever the decoder released at finalization is emitted
+                    // before collection, for the same reason as the mid-stream
+                    // prefix above: a small compressed page can surface its
+                    // whole document here.
+                    for encoded in hold_finish_ready_segments(
                         &mut processor,
                         &mut decoder,
+                        &mut encoder,
+                        &mut state,
+                        &collect_refs,
+                    )
+                    .await
+                    .map_err(publisher_stream_error)?
+                    {
+                        yield encoded;
+                    }
+                    for encoded in hold_finish_tail_segments(
+                        &mut processor,
                         &mut encoder,
                         &mut state,
                         &collect_refs,
@@ -1385,19 +1421,36 @@ fn response_carries_body(method: &Method, status: StatusCode) -> bool {
 ///   origin length is wrong (RFC 9110 §15.4.6); normalize it to `0`.
 /// - **HEAD and 304 Not Modified**: `Content-Length` legitimately advertises
 ///   the `GET` representation length, so it is preserved untouched.
+///
+/// The normalized 204/205 responses also drop chunked-framing metadata the
+/// adapters would otherwise copy verbatim: RFC 9112 §6.1 forbids
+/// `Transfer-Encoding` on a 204, and keeping it on a 205 alongside the
+/// `Content-Length: 0` inserted above would advertise two conflicting framings.
+/// `Trailer` describes fields that only a chunked body can carry, so it goes
+/// with it. `HEAD` and 304 keep both for the same reason they keep
+/// `Content-Length`: the fields describe the `GET` representation, not this
+/// message.
 fn make_response_bodiless(response: &mut Response<EdgeBody>) {
     *response.body_mut() = EdgeBody::empty();
     match response.status() {
         StatusCode::NO_CONTENT => {
             response.headers_mut().remove(header::CONTENT_LENGTH);
+            remove_chunked_framing_headers(response.headers_mut());
         }
         StatusCode::RESET_CONTENT => {
             response
                 .headers_mut()
                 .insert(header::CONTENT_LENGTH, HeaderValue::from(0_u64));
+            remove_chunked_framing_headers(response.headers_mut());
         }
         _ => {}
     }
+}
+
+/// Remove the framing fields that only apply to a message with a chunked body.
+fn remove_chunked_framing_headers(headers: &mut header::HeaderMap) {
+    headers.remove(header::TRANSFER_ENCODING);
+    headers.remove(header::TRAILER);
 }
 
 /// A [`Write`] sink that buffers into a `Vec<u8>` but fails once the configured
@@ -2023,7 +2076,7 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
 
 /// Async-pull variant of [`body_close_hold_loop`] for live origin streams.
 ///
-/// Shares [`hold_step_next_chunk`] and [`hold_finish_segments`] with the
+/// Shares [`hold_step_next_chunk`] and the finish stages with the
 /// lazy streaming body built by [`publisher_response_into_streaming_response`],
 /// so the two async hold paths cannot drift apart.
 ///
@@ -2074,7 +2127,9 @@ async fn body_close_hold_loop_stream<W: Write, P: StreamProcessor>(
         }
     }
 
-    for encoded in hold_finish_segments(
+    // Write the decoder-finalized prefix before collection, matching the lazy
+    // Fastly stream: only the held `</body>` tail waits on the auction.
+    for encoded in hold_finish_ready_segments(
         processor,
         &mut decoder,
         &mut encoder,
@@ -2082,6 +2137,11 @@ async fn body_close_hold_loop_stream<W: Write, P: StreamProcessor>(
         &collect_refs,
     )
     .await?
+    {
+        write_encoded_segment(writer, &encoded)?;
+    }
+    for encoded in
+        hold_finish_tail_segments(processor, &mut encoder, &mut state, &collect_refs).await?
     {
         write_encoded_segment(writer, &encoded)?;
     }
@@ -6247,15 +6307,101 @@ mod tests {
         );
     }
 
-    // (method, status, expected Content-Length after bodiless normalization).
-    // 204 forbids Content-Length (removed); 205 must advertise a zero-length
-    // body; HEAD and 304 legitimately advertise the GET representation length.
-    const BODILESS_FRAMING_CASES: [(Method, StatusCode, Option<&str>); 4] = [
-        (Method::HEAD, StatusCode::OK, Some("42")),
-        (Method::GET, StatusCode::NO_CONTENT, None),
-        (Method::GET, StatusCode::RESET_CONTENT, Some("0")),
-        (Method::GET, StatusCode::NOT_MODIFIED, Some("42")),
+    #[test]
+    fn streaming_finalize_auction_hold_emits_small_compressed_page_before_collection() {
+        // A small gzip page arrives as one origin chunk whose whole expansion
+        // fits inside `flate2`'s internal decode buffer, and its `</body>` lands
+        // in that same chunk. Both stages that could withhold it must not: the
+        // decoder sync-flushes per source chunk instead of holding output until
+        // its own finalization, and the finish path emits the decoder tail
+        // before awaiting collection. Otherwise the client holds committed
+        // headers and an empty body until the auction resolves.
+        let page = b"<html><head></head><body><p>small compressed page</p></body></html>";
+        let params = html_stream_params(
+            "gzip",
+            Some(DispatchedAuction::empty_for_test(
+                test_auction_request(),
+                500,
+            )),
+        );
+        let body = streaming_finalize_response(
+            params,
+            origin_chunk_then_pending(bytes::Bytes::from(gzip_encode(page))),
+        );
+
+        let first = first_lazy_body_chunk(body);
+        // Decode the flushed (not finished) prefix the way a browser decodes the
+        // bytes received while the response is still open.
+        let mut decoder = flate2::write::MultiGzDecoder::new(Vec::new());
+        decoder
+            .write_all(&first)
+            .expect("first chunk must be valid gzip");
+        decoder.flush().expect("should flush gzip decoder");
+        let decoded = String::from_utf8(decoder.get_ref().clone()).expect("should be valid UTF-8");
+
+        assert!(
+            decoded.contains("small compressed page"),
+            "first poll must emit the decoded document prefix of a small gzip page. Got: {decoded}"
+        );
+        assert!(
+            !decoded.contains(".bids=JSON.parse"),
+            "bids inject only at </body> after collection, which the first poll must not wait for. Got: {decoded}"
+        );
+    }
+
+    // (method, status, expected Content-Length, expected Transfer-Encoding)
+    // after bodiless normalization. 204 forbids Content-Length (removed); 205
+    // must advertise a zero-length body; HEAD and 304 legitimately advertise the
+    // GET representation length. Chunked framing is stripped from 204 (forbidden
+    // by RFC 9112 §6.1) and 205 (would conflict with the inserted
+    // `Content-Length: 0`), but preserved for HEAD and 304, whose message length
+    // is fixed by the header section regardless of framing fields
+    // (RFC 9112 §6.3, rule 1).
+    const BODILESS_FRAMING_CASES: [(Method, StatusCode, Option<&str>, Option<&str>); 4] = [
+        (Method::HEAD, StatusCode::OK, Some("42"), Some("chunked")),
+        (Method::GET, StatusCode::NO_CONTENT, None, None),
+        (Method::GET, StatusCode::RESET_CONTENT, Some("0"), None),
+        (
+            Method::GET,
+            StatusCode::NOT_MODIFIED,
+            Some("42"),
+            Some("chunked"),
+        ),
     ];
+
+    /// Assert the framing fields left on a normalized bodiless response.
+    fn assert_bodiless_framing(
+        response: &Response<EdgeBody>,
+        method: &Method,
+        status: StatusCode,
+        expected_length: Option<&str>,
+        expected_transfer_encoding: Option<&str>,
+    ) {
+        let header_value = |name: header::HeaderName| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            header_value(header::CONTENT_LENGTH).as_deref(),
+            expected_length,
+            "bodiless {method} {status} must carry the corrected Content-Length"
+        );
+        assert_eq!(
+            header_value(header::TRANSFER_ENCODING).as_deref(),
+            expected_transfer_encoding,
+            "bodiless {method} {status} must carry the corrected Transfer-Encoding"
+        );
+        assert_eq!(
+            header_value(header::TRAILER).as_deref(),
+            // `Trailer` only describes fields a chunked body can carry, so it
+            // survives exactly where chunked framing does.
+            expected_transfer_encoding.map(|_| "expires"),
+            "bodiless {method} {status} must drop Trailer with its chunked framing"
+        );
+    }
 
     #[test]
     fn publisher_response_streaming_finalize_normalizes_bodiless_framing() {
@@ -6269,10 +6415,13 @@ mod tests {
         );
         let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
 
-        for (method, status, expected_length) in BODILESS_FRAMING_CASES {
+        for (method, status, expected_length, expected_transfer_encoding) in BODILESS_FRAMING_CASES
+        {
             let response = Response::builder()
                 .status(status)
                 .header(header::CONTENT_LENGTH, "42")
+                .header(header::TRANSFER_ENCODING, "chunked")
+                .header(header::TRAILER, "expires")
                 .body(EdgeBody::stream(futures::stream::iter(vec![
                     bytes::Bytes::from_static(b"origin body bytes that must not reach the client"),
                 ])))
@@ -6293,13 +6442,12 @@ mod tests {
                 !matches!(response.body(), EdgeBody::Stream(_)),
                 "bodiless {method} {status} must not carry a streaming body"
             );
-            assert_eq!(
-                response
-                    .headers()
-                    .get(header::CONTENT_LENGTH)
-                    .and_then(|v| v.to_str().ok()),
+            assert_bodiless_framing(
+                &response,
+                &method,
+                status,
                 expected_length,
-                "bodiless {method} {status} must carry the corrected Content-Length"
+                expected_transfer_encoding,
             );
 
             let drained = futures::executor::block_on(
@@ -6327,10 +6475,13 @@ mod tests {
         let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
         let services = noop_services();
 
-        for (method, status, expected_length) in BODILESS_FRAMING_CASES {
+        for (method, status, expected_length, expected_transfer_encoding) in BODILESS_FRAMING_CASES
+        {
             let response = Response::builder()
                 .status(status)
                 .header(header::CONTENT_LENGTH, "42")
+                .header(header::TRANSFER_ENCODING, "chunked")
+                .header(header::TRAILER, "expires")
                 .body(EdgeBody::from(
                     b"origin body bytes that must not reach the client".to_vec(),
                 ))
@@ -6347,13 +6498,12 @@ mod tests {
             ))
             .expect("should finalize buffered response");
 
-            assert_eq!(
-                response
-                    .headers()
-                    .get(header::CONTENT_LENGTH)
-                    .and_then(|v| v.to_str().ok()),
+            assert_bodiless_framing(
+                &response,
+                &method,
+                status,
                 expected_length,
-                "bodiless {method} {status} must carry the corrected Content-Length"
+                expected_transfer_encoding,
             );
 
             let drained = futures::executor::block_on(
