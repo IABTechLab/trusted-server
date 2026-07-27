@@ -86,7 +86,7 @@ const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
 /// callers** (e.g. slim-Prebid, native apps, server-to-server integrations).
 /// It is **not** the intended path for scroll or GPT refresh events.
 ///
-/// **SPA navigation** is handled by `GET /__ts/page-bids`: the client-side SPA
+/// **SPA navigation** is handled by `GET /_ts/page-bids`: the client-side SPA
 /// hook (`installSpaAuctionHook`) intercepts `pushState`/`replaceState`/`popstate`
 /// events and calls that endpoint to fetch fresh slots and bids for each new
 /// route, then invokes `window.tsjs.adInit()` with the updated data.
@@ -171,7 +171,7 @@ pub async fn handle_auction(
     let consent_context = ec_context.consent().clone();
 
     // Server-side auction consent gate. The publisher-navigation and
-    // `/__ts/page-bids` paths fail closed for GDPR/unknown jurisdictions that
+    // `/_ts/page-bids` paths fail closed for GDPR/unknown jurisdictions that
     // lack effective TCF Purpose 1. `/auction` is the programmatic entry point
     // for the same server-side auction, so it must gate identically: returning
     // a no-bid response here prevents outbound PBS/APS calls and the forwarding
@@ -234,7 +234,7 @@ pub async fn handle_auction(
     // denied but a non-personalized auction may still run — could forward
     // persistent client EIDs from the body/cookie, since `gate_eids_by_consent`
     // only strips on TCF/GDPR signals. This matches the publisher and
-    // `/__ts/page-bids` paths, which also resolve client EIDs only when
+    // `/_ts/page-bids` paths, which also resolve client EIDs only when
     // `ec_id.is_some()`.
     let client_eids = if ec_id.is_some() {
         resolve_client_auction_eids(
@@ -646,7 +646,7 @@ mod tests {
         // GDPR/unknown jurisdiction lacking effective TCF Purpose 1 must not run
         // a server-side auction. The /auction endpoint must short-circuit to a
         // no-bid response before dispatching to any provider — matching the
-        // publisher-navigation and /__ts/page-bids paths.
+        // publisher-navigation and /_ts/page-bids paths.
         let settings = create_test_settings();
         let config = AuctionConfig {
             enabled: true,

@@ -78,7 +78,7 @@ describe('installSpaAuctionHook', () => {
     await flushAsync();
 
     expect(fetchStub).toHaveBeenCalledWith(
-      '/__ts/page-bids?path=%2Fnext-page',
+      '/_ts/page-bids?path=%2Fnext-page',
       expect.objectContaining({
         credentials: 'include',
         headers: { 'X-TSJS-Page-Bids': '1' },
@@ -223,7 +223,7 @@ describe('installSpaAuctionHook', () => {
     history.replaceState({}, '', '/replaced');
     await flushAsync();
     expect(fetchStub).toHaveBeenCalledWith(
-      '/__ts/page-bids?path=%2Freplaced',
+      '/_ts/page-bids?path=%2Freplaced',
       expect.objectContaining({ credentials: 'include' })
     );
   });
@@ -241,7 +241,7 @@ describe('installSpaAuctionHook', () => {
     window.dispatchEvent(new PopStateEvent('popstate'));
     await flushAsync();
     expect(fetchStub).toHaveBeenCalledWith(
-      '/__ts/page-bids?path=%2Fpopped',
+      '/_ts/page-bids?path=%2Fpopped',
       expect.objectContaining({ credentials: 'include' })
     );
   });
