@@ -1911,12 +1911,17 @@ pub struct DebugConfig {
     #[serde(default)]
     pub auction_html_comment: bool,
 
-    /// Include raw `adm` creative markup in `window.tsjs.bids` for GPT/GAM
-    /// debug rendering through the Prebid Universal Creative bridge.
+    /// Enable the testing-only direct GAM-replace path and the verbose per-bid
+    /// `debug_bid` blob in `window.tsjs.bids`.
     ///
-    /// Use this to validate the server-side auction→GAM targeting→creative
-    /// rendering pipeline while PBS Cache is unavailable. Never enable in
-    /// production — injects raw HTML from SSPs.
+    /// Note: the sanitized winning `adm` is now injected **unconditionally** for
+    /// production inline rendering through the pbRender bridge (see
+    /// [`crate::publisher::build_bid_map`]); this flag no longer gates `adm`.
+    /// What it still gates is the client-side `debug_bid` signal that turns on
+    /// the direct GAM-creative replacement (`injectAdmIntoSlot`), which bypasses
+    /// GAM entirely — useful for validating the auction→creative pipeline while
+    /// PBS Cache is unavailable. The `debug_bid` blob also carries the raw,
+    /// un-sanitized creative for diagnostics, so never enable in production.
     #[serde(default)]
     pub inject_adm_for_testing: bool,
 }
