@@ -23,6 +23,30 @@ problem. The "refresh too quickly" symptom is two separable behaviors:
 The root cause worth fixing is (2): SSAT is late. That is what this spec addresses. The refresh
 behavior in (1) is left as-is.
 
+## Update (post-deployment live test): pivot from chunk-await to `__next_f`
+
+The chunk-await approach described in the sections below was implemented, deployed, and
+**live-tested — and it does not work.** On the real publisher the gate never fired early and always
+fell back to `window.load` (~43s, no improvement). Measured cause: the async `/_next/static/chunks/`
+scripts finish **before** they can be observed — their `load` events have already fired (so late
+listeners never hear them), their `PerformanceResourceTiming` entries are evicted (only 1–15 of 24
+present), and ~9 of 24 are phantom prefetch/duplicate tags that never complete — so "all chunks
+done" is never detectable.
+
+**The gate was changed to the App Router runtime signal instead:** poll for `window.__next_f.push`
+being replaced by the RSC runtime (~9s on the tested publisher, vs ~40s for `window.load`), then the
+double `requestAnimationFrame`; `window.load` stays as the can't-hang fallback and the non-Next
+path. This is reliable and early where chunk-await was neither.
+
+**Safety is still pending the #418 A/B.** `__next_f.push` replaced means "RSC runtime started
+hydrating," not provably "hydration committed" — the double-rAF is the margin, and the #418 count on
+a live A/B is the proof. That A/B is currently blocked by a separate rc/july bug
+(`elementId.startsWith`, PR #966's `configuredSlotForElementId`, since reverted on #966) that crashes
+the ad stack; the fix is to pick up #966's revert in the deploy, then run the A/B.
+
+The sections below document the superseded chunk-await approach and why it was chosen — kept for the
+record. The **current** implementation is the `__next_f` gate.
+
 ## Problem
 
 PR #945 makes the `</body>` bids bootstrap defer `window.tsjs.adInit()` until after React
