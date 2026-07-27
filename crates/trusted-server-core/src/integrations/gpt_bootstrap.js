@@ -68,6 +68,16 @@
   }
 
   function configuredSlotForElementId(elementId) {
+    // googletag.display()/refresh() may receive a Slot object rather than a
+    // string element id; resolve it to its id so the string matching below
+    // cannot throw (a non-resolvable value falls back to "").
+    if (typeof elementId !== "string") {
+      elementId =
+        (elementId &&
+          typeof elementId.getSlotElementId === "function" &&
+          elementId.getSlotElementId()) ||
+        "";
+    }
     return (ts.adSlots || []).find(function (slot) {
       return (
         slot.div_id &&

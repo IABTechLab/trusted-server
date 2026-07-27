@@ -1636,11 +1636,17 @@ function handoffForSlot(ts: TsjsApi, slot: GoogleTagSlot): GptSlotHandoff | unde
 }
 
 function configuredSlotForElementId(ts: TsjsApi, elementId: string): AuctionSlot | undefined {
+  // display()/refresh() may pass a Slot object at runtime despite the string
+  // type; resolve it to its element id so the string matching cannot throw.
+  const id =
+    typeof elementId === 'string'
+      ? elementId
+      : ((elementId as unknown as { getSlotElementId?: () => string })?.getSlotElementId?.() ?? '');
   return ts.adSlots?.find(
     (slot) =>
       !!slot.div_id &&
-      (elementId === slot.div_id || elementId.startsWith(slot.div_id)) &&
-      !elementId.endsWith('-container')
+      (id === slot.div_id || id.startsWith(slot.div_id)) &&
+      !id.endsWith('-container')
   );
 }
 
