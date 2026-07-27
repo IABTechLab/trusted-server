@@ -64,22 +64,10 @@ function findSlotElementByDivId(divId: string): HTMLElement | null {
   const exact = document.getElementById(divId);
   if (exact) return exact;
 
-  const configuredDivIds = (window.tsjs?.adSlots ?? [])
-    .map((slot) => slot.div_id)
-    .filter((configured) => configured.length > 0);
-
   return (
-    Array.from(document.querySelectorAll<HTMLElement>('[id]')).find((element) => {
-      if (!element.id.startsWith(divId) || element.id.endsWith('-container')) return false;
-
-      // Generated slot IDs can extend a configured prefix. When configured
-      // prefixes overlap, assign the element to the longest matching prefix so
-      // `div-header` cannot claim an iframe owned by `div-header-mobile`.
-      const owner = configuredDivIds
-        .filter((configured) => element.id.startsWith(configured))
-        .sort((left, right) => right.length - left.length)[0];
-      return owner === undefined || owner === divId;
-    }) ?? null
+    Array.from(document.querySelectorAll<HTMLElement>('[id]')).find(
+      (el) => el.id.startsWith(divId) && !el.id.endsWith('-container')
+    ) ?? null
   );
 }
 
@@ -104,10 +92,17 @@ function slotIdForMessageSource(source: MessageEventSource | null): string | und
   if (!source) return undefined;
 
   const slots = window.tsjs?.adSlots ?? [];
-  return slots.find((slot) =>
-    candidateSlotRoots(slot.div_id).some((root) =>
+  const ownsSource = (roots: HTMLElement[]): boolean =>
+    roots.some((root) =>
       Array.from(root.querySelectorAll('iframe')).some((iframe) => iframe.contentWindow === source)
-    )
+    );
+  // Prefer exact configured IDs before prefix/container fallbacks so a nested
+  // dynamic slot cannot be claimed by an overlapping parent slot.
+  return (
+    slots.find((slot) => {
+      const root = document.getElementById(slot.div_id);
+      return root !== null && ownsSource([root]);
+    }) ?? slots.find((slot) => ownsSource(candidateSlotRoots(slot.div_id)))
   )?.id;
 }
 
@@ -311,7 +306,11 @@ export function safeAdmIframeSrc(src: string): string | undefined {
  *
  * Adapted from PR #241 (github.com/IABTechLab/trusted-server/pull/241).
  * Instead of reading from pbjs, reads adm directly from window.tsjs.bids.
- * Only active when inject_adm_for_testing injects adm server-side.
+ *
+ * This is the testing-only direct-replace path that bypasses GAM entirely. The
+ * sanitized `adm` now ships in production for the pbRender bridge, so `adm`
+ * presence no longer gates it; the caller gates on the per-bid `debug_bid`
+ * signal (present only under `inject_adm_for_testing`) instead.
  *
  * Strategy:
  * 1. If adm contains an <iframe src="..."> with a safe http(s) src, set that
@@ -586,8 +585,16 @@ export function installTsAdInit(): void {
           slotsToRefresh.push(gptSlot);
         }
 
-        // Trusted Server APS winners carry their own typed renderer and never
-        // enter the publisher-owned native apstag rendering path.
+        // APS: signal to apstag that bids are ready so Amazon's GAM creative
+        // can render.  apstag must already be initialised on the page (which it
+        // is on production publisher pages).  Safe no-op if apstag is absent.
+        if (
+          (bid.hb_bidder === 'aps' || bid.hb_bidder === 'amazon-aps') &&
+          bid.renderer === undefined
+        ) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (window as any).apstag?.setDisplayBids?.();
+        }
       });
 
       ts.prevGptSlots = newSlots as unknown[];
@@ -618,10 +625,13 @@ export function installTsAdInit(): void {
           // Read ts.bids live (not the snapshot above) so post-navigation bid data is used.
           const bid = (ts.bids ?? {})[slotId] ?? {};
 
-          // GAM interceptor (testing): when adm is present, replace the GAM creative.
-          // Adapted from PR #241 — uses window.tsjs.bids[slotId].adm instead of pbjs.
-          // Only active when inject_adm_for_testing injects adm into bids server-side.
-          if (bid.adm) {
+          // GAM interceptor (testing bypass): directly replace the GAM creative.
+          // `adm` is now always injected in production, so it can no longer gate
+          // this path. `debug_bid` is present only when inject_adm_for_testing is
+          // on, so it is the per-bid signal that the testing bypass is enabled.
+          // In production the render bridge serves the creative and GAM stays in
+          // the loop; this direct replace stays testing-only.
+          if (bid.adm && bid.debug_bid) {
             injectAdmIntoSlot(divId, bid.adm);
           }
         });
@@ -733,16 +743,17 @@ export function installSpaAuctionHook(): void {
   ts.spaHookInstalled = true;
 
   let inflight: AbortController | null = null;
-  // Last path and query an auction was run for. popstate fires for hash-only
-  // changes and pushState/replaceState can be called with the current URL, so
-  // guard every entry point against re-requesting impressions already loaded.
-  let currentPath = `${location.pathname}${location.search}`;
+  // Last path an auction was run for. popstate fires for hash-only and
+  // same-pathname back/forward (scroll restoration), and pushState/replaceState
+  // can be called with the current URL, so guard every entry point against
+  // re-requesting impressions for a path we already loaded.
+  let currentPath = location.pathname;
   // Last path whose slots/bids were actually applied — the initial SSR page
   // counts. A failed navigation rolls `currentPath` back to this rather than to
   // the immediately-previous committed value: on rapid A→B where A was aborted
   // mid-flight and B then fails, rolling back to A (never loaded) would strand
   // it behind the no-op guard, so we roll back to the last applied route instead.
-  let lastAppliedPath = `${location.pathname}${location.search}`;
+  let lastAppliedPath = location.pathname;
 
   async function onNavigate(path: string): Promise<void> {
     if (path === currentPath) return;
@@ -802,9 +813,8 @@ export function installSpaAuctionHook(): void {
     const original = history[method].bind(history);
     history[method] = function (state: unknown, unused: string, url?: string | URL | null): void {
       original(state, unused, url);
-      const locationUrl = url ? new URL(String(url), location.href) : location;
-      const newPath = `${locationUrl.pathname}${locationUrl.search}`;
-      // onNavigate no-ops when newPath equals the last loaded path and query.
+      const newPath = url ? new URL(String(url), location.href).pathname : location.pathname;
+      // onNavigate no-ops when newPath equals the last loaded path.
       void onNavigate(newPath);
     };
   }
@@ -813,7 +823,7 @@ export function installSpaAuctionHook(): void {
   patchHistoryMethod('replaceState');
 
   window.addEventListener('popstate', () => {
-    void onNavigate(`${location.pathname}${location.search}`);
+    void onNavigate(location.pathname);
   });
 }
 
@@ -844,6 +854,79 @@ const TS_DISPLAY_RENDERER =
   'if(d.adUrl&&!d.ad){f.src=d.adUrl;}else{f.srcdoc=d.ad;}' +
   'w.document.body.appendChild(f);};})();';
 
+/** The clear-price auction macro DSPs embed in creative markup and tracking URLs. */
+const AUCTION_PRICE_MACRO = '${AUCTION_PRICE}';
+
+/**
+ * Substitute the `${AUCTION_PRICE}` macro with a clearing price. Mirrors the
+ * server-side `expand_auction_price_macro`: only the exact clear-price token is
+ * replaced, so the encrypted `${AUCTION_PRICE:B64}` variant is left intact.
+ */
+function expandAuctionPriceMacro(markup: string, cpm: number): string {
+  return markup.includes(AUCTION_PRICE_MACRO)
+    ? markup.split(AUCTION_PRICE_MACRO).join(String(cpm))
+    : markup;
+}
+
+/** A decoded PBS Cache bid: the renderable creative plus its render metadata. */
+export interface CachedBid {
+  adm: string;
+  width?: number;
+  height?: number;
+  price?: number;
+}
+
+/**
+ * Decode a PBS Cache GET response into a renderable bid.
+ *
+ * Prebid Cache entries are JSON bid objects (`{ "adm": "<div…>", "w": …, … }`);
+ * the Prebid Universal Creative's own cache path `JSON.parse`s the response and
+ * renders `bidObject.adm`, sizing from the cached dimensions. This mirrors that,
+ * retaining the fields the fallback render needs — creative dimensions (`w`/`h`
+ * or `width`/`height`) and clearing `price` for macro expansion — rather than
+ * reducing the payload to a bare `adm` string that forces the first slot format
+ * and leaves price macros unresolved.
+ *
+ * A non-JSON body is treated as raw creative markup (the `{ adm }`-only variant)
+ * for backward compatibility with caches that store the creative directly.
+ * Returns `undefined` when the JSON payload carries no usable string `adm`, so
+ * the caller can decline to render instead of injecting a serialized object.
+ */
+export function parseCachedBid(body: string): CachedBid | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    // Not JSON — a cache that returned the creative markup directly. No render
+    // metadata is available, so only the raw markup variant is returned.
+    return body.trim().length > 0 ? { adm: body } : undefined;
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    // A JSON primitive (string/number/bool) is not a valid cached bid object.
+    return undefined;
+  }
+  const obj = parsed as Record<string, unknown>;
+  const adm = obj.adm;
+  if (typeof adm !== 'string' || adm.length === 0) return undefined;
+
+  const num = (v: unknown): number | undefined =>
+    typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+  // A zero (or missing) dimension is not usable render metadata; treat it as
+  // absent so the caller falls back to the slot format rather than sizing to 0.
+  const dim = (v: unknown): number | undefined => {
+    const n = num(v);
+    return n !== undefined && n > 0 ? n : undefined;
+  };
+
+  return {
+    adm,
+    // PBS OpenRTB bids carry w/h; the Prebid.js cache format uses width/height.
+    width: dim(obj.w) ?? dim(obj.width),
+    height: dim(obj.h) ?? dim(obj.height),
+    price: num(obj.price),
+  };
+}
+
 /**
  * Install the TS → pbRender bridge.
  *
@@ -853,7 +936,9 @@ const TS_DISPLAY_RENDERER =
  *
  * When `adId` matches a TS server-side bid in `window.tsjs.bids` AND the bid
  * has renderable markup, the bridge:
- *   1. Uses debug `adm` directly when present, otherwise fetches from PBS Cache.
+ *   1. Uses the inline `adm` directly when present (the sanitized winning
+ *      creative, now shipped in production), otherwise fetches from PBS Cache
+ *      and extracts `adm` from the cached bid JSON (see `extractCachedAdm`).
  *   2. Replies via the MessageChannel port with a `"Prebid Response"`.
  *   3. Calls `stopImmediatePropagation()` so Prebid.js does not also process
  *      the message and log spurious failures.
@@ -864,27 +949,15 @@ const TS_DISPLAY_RENDERER =
 export function installTsRenderBridge(): void {
   if (typeof window === 'undefined') return;
 
-  // adIds whose PBS Cache render is in flight. `fireWinBillingBeacons` only
-  // dedups after the async cache fetch resolves, so two Prebid Request messages
-  // for the same adId arriving before the first fetch settles would both fetch
-  // and both fire the nurl/burl beacons. Tracking in-flight adIds prevents the
-  // concurrent double-fire; the entry is cleared once the fetch settles.
-  const renderingAdIds = new Set<string>();
+  // `slotId|adId` renders whose PBS Cache fetch is in flight. `fireWinBillingBeacons`
+  // only dedups after the async fetch resolves, so two Prebid Request messages for
+  // the same render arriving before the first fetch settles would both fetch and
+  // both fire the nurl/burl beacons. Tracking the in-flight render prevents the
+  // concurrent double-fire; the entry is cleared once the fetch settles. The key
+  // is scoped to the slot, not the bare adId: hb_adid is not unique per bid, so
+  // keying on it alone would let one slot block a distinct slot's render.
+  const renderingKeys = new Set<string>();
   const consumedPrebidApsIds = new Map<string, { adUnitCode: string; expiresAt: number }>();
-  const rememberConsumedPrebidApsId = (
-    adId: string,
-    entry: { adUnitCode: string; expiresAt: number }
-  ): void => {
-    const now = Date.now();
-    for (const [consumedAdId, consumed] of consumedPrebidApsIds) {
-      if (consumed.expiresAt <= now) consumedPrebidApsIds.delete(consumedAdId);
-    }
-    if (!consumedPrebidApsIds.has(adId) && consumedPrebidApsIds.size >= 256) {
-      const oldestAdId = consumedPrebidApsIds.keys().next().value as string | undefined;
-      if (oldestAdId) consumedPrebidApsIds.delete(oldestAdId);
-    }
-    consumedPrebidApsIds.set(adId, entry);
-  };
 
   window.addEventListener('message', (e: MessageEvent) => {
     let data: Record<string, unknown>;
@@ -903,125 +976,85 @@ export function installTsRenderBridge(): void {
 
     const port = e.ports?.[0];
     if (!port) return;
+    const sourceSlotId = slotIdForMessageSource(e.source);
+    if (!sourceSlotId) return;
 
     const consumedPrebidAps = consumedPrebidApsIds.get(adId);
-    if (consumedPrebidAps) {
-      if (consumedPrebidAps.expiresAt <= Date.now()) {
-        consumedPrebidApsIds.delete(adId);
-      } else {
-        if (messageSourceBelongsToAdUnit(e.source, consumedPrebidAps.adUnitCode)) {
-          e.stopImmediatePropagation();
-        }
-        return;
+    if (consumedPrebidAps && consumedPrebidAps.expiresAt > Date.now()) {
+      if (messageSourceBelongsToAdUnit(e.source, consumedPrebidAps.adUnitCode)) {
+        e.stopImmediatePropagation();
       }
+      return;
     }
 
-    // Client-side trustedServer adapter bids receive a new adId from Prebid. Bind
-    // that ID to the server-validated APS descriptor only after confirming the
-    // requesting Universal Creative frame belongs to the same GPT ad unit.
     const prebidRendererEntry = getApsPrebidRenderer(adId);
     if (prebidRendererEntry) {
       if (!messageSourceBelongsToAdUnit(e.source, prebidRendererEntry.adUnitCode)) return;
       const renderer = validateApsRenderer(prebidRendererEntry.renderer);
       const rendererUrl = apsRendererUrl();
-      if (!renderer || !rendererUrl) return;
-      if (!consumeApsPrebidRenderer(adId, prebidRendererEntry)) return;
-      rememberConsumedPrebidApsId(adId, {
+      if (!renderer || !rendererUrl || !consumeApsPrebidRenderer(adId, prebidRendererEntry)) return;
+      e.stopImmediatePropagation();
+      consumedPrebidApsIds.set(adId, {
         adUnitCode: prebidRendererEntry.adUnitCode,
         expiresAt: prebidRendererEntry.expiresAt,
       });
-
-      e.stopImmediatePropagation();
-      try {
-        prebidRendererEntry.markWinner();
-      } catch (err) {
-        log.warn('[tsjs-gpt] pbRender bridge: Prebid APS winner lifecycle failed', err);
-        return;
-      }
-
-      try {
-        port.postMessage(
-          JSON.stringify({
-            message: 'Prebid Response',
-            adId,
-            renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
-            rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
-            rendererUrl,
-            apsRenderer: renderer,
-            width: renderer.width,
-            height: renderer.height,
-          })
-        );
-      } catch (err) {
-        log.warn('[tsjs-gpt] pbRender bridge: Prebid APS response failed', err);
-        return;
-      }
-
-      try {
-        prebidRendererEntry.markRendered();
-      } catch (err) {
-        log.warn('[tsjs-gpt] pbRender bridge: Prebid APS rendered lifecycle failed', err);
-      }
-      log.debug(
-        `[tsjs-gpt] pbRender bridge served Prebid APS bid for '${prebidRendererEntry.adUnitCode}'`
+      prebidRendererEntry.markWinner();
+      port.postMessage(
+        JSON.stringify({
+          message: 'Prebid Response',
+          adId,
+          renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
+          rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+          rendererUrl,
+          apsRenderer: renderer,
+          width: renderer.width,
+          height: renderer.height,
+        })
       );
+      prebidRendererEntry.markRendered();
       return;
     }
 
-    const sourceSlotId = slotIdForMessageSource(e.source);
-    if (!sourceSlotId) return;
-
-    // Build reverse map adId → slotId from live window.tsjs.bids.
+    // Resolve the bid by the requesting slot, not by the first bid whose hb_adid
+    // matches. hb_adid is not unique per bid: absent PBS Cache, it falls back to a
+    // creative id a bidder may reuse across slots. A first-match-by-adId lookup
+    // would resolve every duplicate to one slot, so all but that slot render blank.
     const bids = window.tsjs?.bids ?? {};
-    let slotId: string | undefined;
-    let matchedBid: (typeof bids)[string] | undefined;
-    for (const [sid, bid] of Object.entries(bids)) {
-      if (bid.hb_adid === adId) {
-        slotId = sid;
-        matchedBid = bid;
-        break;
-      }
-    }
+    const slotId = sourceSlotId;
+    const matchedBid = bids[slotId];
 
-    // Not a TS bid — let Prebid.js handle it.
-    if (!slotId || !matchedBid) return;
-
-    // The requesting iframe's slot must own the resolved adId. Without this an
-    // iframe under slot A could request slot B's hb_adid and receive slot B's
-    // creative/dimensions while firing slot B's win/billing beacons.
-    if (slotId !== sourceSlotId) return;
-
-    const slot = window.tsjs?.adSlots?.find((s) => s.id === slotId);
-    const [width, height] = slot?.formats?.[0] ?? [728, 90];
+    // Not a TS bid, or the requesting slot's bid does not own this adId — let
+    // Prebid.js handle it. The adId guard also prevents an iframe under slot A from
+    // pulling slot B's creative and firing slot B's win/billing beacons.
+    if (!matchedBid || matchedBid.hb_adid !== adId) return;
 
     if (matchedBid.renderer !== undefined) {
       const renderer = validateApsRenderer(matchedBid.renderer);
       const rendererUrl = apsRendererUrl();
       if (!renderer || !rendererUrl) return;
-
-      // Ownership and the complete envelope are valid before this handler
-      // claims the message. APS responses are intentionally repeatable: GAM can
-      // request the same server-rendered Universal Creative more than once.
       e.stopImmediatePropagation();
-      try {
-        port.postMessage(
-          JSON.stringify({
-            message: 'Prebid Response',
-            adId,
-            renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
-            rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
-            rendererUrl,
-            apsRenderer: renderer,
-            width: renderer.width,
-            height: renderer.height,
-          })
-        );
-        log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' through APS renderer`);
-      } catch (err) {
-        log.warn('[tsjs-gpt] pbRender bridge: APS response failed', err);
-      }
+      port.postMessage(
+        JSON.stringify({
+          message: 'Prebid Response',
+          adId,
+          renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
+          rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+          rendererUrl,
+          apsRenderer: renderer,
+          width: renderer.width,
+          height: renderer.height,
+        })
+      );
       return;
     }
+
+    const slot = window.tsjs?.adSlots?.find((s) => s.id === slotId);
+    // Prefer the winning creative's own dimensions; the first configured slot
+    // format is only a fallback and mis-sizes a multi-size slot whose winner is
+    // not the first format.
+    const [fallbackWidth, fallbackHeight] = slot?.formats?.[0] ?? [728, 90];
+    const width = matchedBid.w ?? fallbackWidth;
+    const height = matchedBid.h ?? fallbackHeight;
 
     if (matchedBid.adm) {
       e.stopImmediatePropagation();
@@ -1036,7 +1069,7 @@ export function installTsRenderBridge(): void {
         })
       );
       fireWinBillingBeacons(slotId, matchedBid);
-      log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from debug adm`);
+      log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from inline adm`);
       return;
     }
 
@@ -1046,26 +1079,49 @@ export function installTsRenderBridge(): void {
     // TS owns this adId — stop Prebid from also processing it.
     e.stopImmediatePropagation();
 
-    // Skip a concurrent re-render of the same adId so its win/billing beacons
-    // fire at most once even before the first cache fetch resolves.
-    if (renderingAdIds.has(adId)) return;
-    renderingAdIds.add(adId);
+    // Skip a concurrent re-render of the same slot's adId so its win/billing
+    // beacons fire at most once even before the first cache fetch resolves.
+    const renderingKey = `${slotId}|${adId}`;
+    if (renderingKeys.has(renderingKey)) return;
+    renderingKeys.add(renderingKey);
 
     const cacheUrl = `https://${matchedBid.hb_cache_host}${matchedBid.hb_cache_path}?uuid=${encodeURIComponent(adId)}`;
 
     fetch(cacheUrl, { mode: 'cors' })
       .then((res) => (res.ok ? res.text() : Promise.reject(res.status)))
-      .then((ad) => {
+      .then((body) => {
+        // PBS Cache returns the cached bid as a JSON object; decode its creative
+        // and render metadata the same way the Prebid Universal Creative does.
+        const cached = parseCachedBid(body);
+        if (!cached) {
+          // No renderable creative in the cache payload — decline rather than
+          // ship a serialized bid document to PUC. Beacons stay unfired.
+          log.warn(
+            `[tsjs-gpt] pbRender bridge: PBS Cache response for '${slotId}' had no renderable adm`
+          );
+          return;
+        }
+        // Resolve the auction-price macro from the cached clearing price, and
+        // size from the cached bid's own dimensions, falling back to the slot
+        // format only when the cache omits them.
+        const ad =
+          cached.price !== undefined
+            ? expandAuctionPriceMacro(cached.adm, cached.price)
+            : cached.adm;
         port.postMessage(
           JSON.stringify({
             message: 'Prebid Response',
             adId,
             ad,
             renderer: TS_DISPLAY_RENDERER,
-            width,
-            height,
+            width: cached.width ?? width,
+            height: cached.height ?? height,
           })
         );
+        // Beacons carry the server-expanded ${AUCTION_PRICE} from the auction's
+        // clearing price, not `cached.price` — the auction result is the
+        // authoritative clearing price, and the cached copy is only the render
+        // source. Do not re-expand them here.
         fireWinBillingBeacons(slotId, matchedBid);
         log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from PBS Cache`);
       })
@@ -1073,7 +1129,7 @@ export function installTsRenderBridge(): void {
         log.warn(`[tsjs-gpt] pbRender bridge: PBS Cache fetch failed for '${slotId}'`, err);
       })
       .finally(() => {
-        renderingAdIds.delete(adId);
+        renderingKeys.delete(renderingKey);
       });
   });
 }
