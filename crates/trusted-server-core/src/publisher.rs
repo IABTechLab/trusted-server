@@ -2919,6 +2919,9 @@ pub async fn handle_publisher_request(
     if services.http_client().supports_streaming_responses() {
         platform_request = platform_request.with_stream_response();
     }
+    if should_run_ad_stack {
+        platform_request = platform_request.with_cache_bypass();
+    }
 
     let mut response = match services.http_client().send(platform_request).await {
         Ok(platform_response) => platform_response.response,

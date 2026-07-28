@@ -253,13 +253,44 @@ fn is_hop_by_hop_response_header(name: &str, connection_tokens: &[String]) -> bo
     HOP_BY_HOP.iter().any(|header| *header == lower) || connection_tokens.contains(&lower)
 }
 
+/// Cache policy for the outbound Workers `fetch` derived from
+/// [`PlatformHttpRequest::bypass_cache`].
+///
+/// Workers subrequests are eligible for Cloudflare's cache by default, so an
+/// ad-stack navigation could otherwise be satisfied from cache (or revalidated
+/// into a bodyless 304) instead of receiving a complete origin body. Mapping
+/// the bypass flag to the runtime's `no-store` mode keeps the core contract's
+/// cache-bypass guarantee intact on this adapter.
+///
+/// Extracted as a free function over a target-independent enum so the mapping
+/// is testable on native targets, where the `#[cfg(target_arch = "wasm32")]`
+/// `execute` impl and its `worker` dependency are excluded from the test
+/// binary.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum OutboundCacheMode {
+    /// Leave the Workers runtime's default cache behavior in place.
+    RuntimeDefault,
+    /// Maps to `worker::CacheMode::NoStore`.
+    NoStore,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn outbound_cache_mode(bypass_cache: bool) -> OutboundCacheMode {
+    if bypass_cache {
+        OutboundCacheMode::NoStore
+    } else {
+        OutboundCacheMode::RuntimeDefault
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 impl CloudflareHttpClient {
     async fn execute(
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
-        use worker::{Fetch, Headers, Method, Request, RequestInit, RequestRedirect};
+        use worker::{CacheMode, Fetch, Headers, Method, Request, RequestInit, RequestRedirect};
 
         // The Cloudflare fetch path cannot honor Fastly-style Image Optimizer
         // metadata, and it always buffers the response body (see below). The
@@ -278,6 +309,8 @@ impl CloudflareHttpClient {
                 "streaming response bodies are not supported on the Cloudflare Workers runtime",
             ));
         }
+
+        let cache_mode = outbound_cache_mode(request.bypass_cache);
 
         let uri = request.request.uri().to_string();
         // http::Method always stores uppercase; worker 0.7 implements From<String> only.
@@ -318,6 +351,12 @@ impl CloudflareHttpClient {
         init.with_method(method)
             .with_headers(headers)
             .with_redirect(RequestRedirect::Manual);
+        match cache_mode {
+            OutboundCacheMode::NoStore => {
+                init.with_cache(CacheMode::NoStore);
+            }
+            OutboundCacheMode::RuntimeDefault => {}
+        }
         if !body_bytes.is_empty() {
             let uint8 = js_sys::Uint8Array::from(body_bytes.as_slice());
             init.with_body(Some(uint8.into()));
@@ -864,6 +903,28 @@ mod tests {
         assert!(
             msg.contains("5"),
             "error message should include provider count"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // outbound_cache_mode tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn outbound_cache_mode_maps_bypass_to_no_store() {
+        assert_eq!(
+            outbound_cache_mode(true),
+            OutboundCacheMode::NoStore,
+            "bypass_cache should force the Workers `no-store` cache mode"
+        );
+    }
+
+    #[test]
+    fn outbound_cache_mode_leaves_default_when_not_bypassing() {
+        assert_eq!(
+            outbound_cache_mode(false),
+            OutboundCacheMode::RuntimeDefault,
+            "requests without bypass_cache should keep the runtime default cache behavior"
         );
     }
 }
