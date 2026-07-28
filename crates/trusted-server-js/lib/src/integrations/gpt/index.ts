@@ -404,6 +404,10 @@ interface GoogleTagPubAdsService {
 }
 
 interface GoogleTagConfig extends Record<string, unknown> {
+  disableInitialLoad?: boolean | null;
+}
+
+interface GoogleTagEffectiveConfig {
   disableInitialLoad?: boolean;
 }
 
@@ -418,7 +422,8 @@ interface GoogleTag {
   destroySlots(slots?: GoogleTagSlot[]): boolean;
   enableServices(): void;
   display(elementId: string): void;
-  setConfig(config: GoogleTagConfig): void;
+  setConfig?(config: GoogleTagConfig): void;
+  getConfig?(keys: string | string[]): GoogleTagEffectiveConfig | undefined;
   _loaded_?: boolean;
 }
 
@@ -759,10 +764,10 @@ function queueWinBillingBeacon(url: string): boolean {
 /**
  * Track whether the publisher disabled GPT initial load.
  *
- * GPT exposes no getter for the initial-load-disabled flag, so wrap both the
- * modern `googletag.setConfig({ disableInitialLoad: true })` API and the legacy
- * `pubads().disableInitialLoad()` method to record it on `window.tsjs`. With
- * initial load disabled, `display()` only registers a slot — the ad request
+ * Read GPT's effective state through `getConfig()` when available and wrap both
+ * configuration APIs so changes are synchronized immediately. The wrappers also
+ * provide a fallback for runtimes where the getter is unavailable. With initial
+ * load disabled, `display()` only registers a slot — the ad request
  * must come from a later `refresh()`. adInit() reads this to refresh its own
  * freshly defined slots so they are not left blank.
  *
@@ -776,6 +781,16 @@ function queueWinBillingBeacon(url: string): boolean {
  * `installTsAdInit` runs, so the detector is still queued ahead of the
  * publisher's GPT setup.
  */
+function syncInitialLoadDisabled(gpt: Partial<GoogleTag>, ts: TsjsApi): boolean {
+  if (typeof gpt.getConfig !== 'function') return false;
+
+  const config = gpt.getConfig('disableInitialLoad');
+  if (!config || config.disableInitialLoad === undefined) return false;
+
+  ts.gptInitialLoadDisabled = config.disableInitialLoad === true;
+  return true;
+}
+
 function installInitialLoadDetector(ts: TsjsApi): void {
   const win = window as GptWindow;
   const cmd = win.googletag?.cmd;
@@ -786,13 +801,17 @@ function installInitialLoadDetector(ts: TsjsApi): void {
       | undefined;
     if (!gpt) return;
 
+    syncInitialLoadDisabled(gpt, ts);
+
     if (typeof gpt.setConfig === 'function' && !gpt.__tsInitialLoadConfigHooked) {
       const originalSetConfig = gpt.setConfig.bind(gpt);
-      gpt.setConfig = function (config: GoogleTagConfig) {
-        if (config?.disableInitialLoad === true) {
-          ts.gptInitialLoadDisabled = true;
+      gpt.setConfig = function (...args: Parameters<typeof originalSetConfig>) {
+        const config = args[0];
+        const result = originalSetConfig(...args);
+        if (!syncInitialLoadDisabled(gpt, ts) && config && 'disableInitialLoad' in config) {
+          ts.gptInitialLoadDisabled = config.disableInitialLoad === true;
         }
-        return originalSetConfig(config);
+        return result;
       };
       gpt.__tsInitialLoadConfigHooked = true;
     }
@@ -805,8 +824,11 @@ function installInitialLoadDetector(ts: TsjsApi): void {
     }
     const originalDisableInitialLoad = service.disableInitialLoad.bind(service);
     service.disableInitialLoad = function () {
-      ts.gptInitialLoadDisabled = true;
-      return originalDisableInitialLoad();
+      const result = originalDisableInitialLoad();
+      if (!syncInitialLoadDisabled(gpt, ts)) {
+        ts.gptInitialLoadDisabled = true;
+      }
+      return result;
     };
     service.__tsInitialLoadHooked = true;
   });
@@ -2112,7 +2134,9 @@ export function installTsAdInit(): void {
 
       // Publisher refreshes held on the initial page load are replayed after
       // targeting. On SPA navigation TS refreshes reused publisher slots as
-      // before. TS-defined slots need a refresh only when initial load is disabled.
+      // before. TS-defined slots need a refresh only when effective GPT
+      // configuration disabled initial load.
+      syncInitialLoadDisabled(g, ts);
       const slotsNeedingRefresh = heldPublisherRequests.refreshSlots.concat(
         slotsToRefresh,
         ts.gptInitialLoadDisabled ? newSlots : []

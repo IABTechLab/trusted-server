@@ -19,25 +19,43 @@
   var ts = (window.tsjs = window.tsjs || {});
   if (ts.adInit) return;
 
-  // Track whether the publisher disabled GPT initial load. GPT exposes no
-  // getter for this, so wrap both googletag.setConfig() and the legacy
-  // pubads().disableInitialLoad() method to record it. With initial load
-  // disabled, display() only registers a slot and the ad request must come from
-  // a later refresh(); adInit() reads this to refresh its own freshly defined
+  // Track whether the publisher disabled GPT initial load. Read the effective
+  // googletag.getConfig() value when available, and wrap googletag.setConfig()
+  // and the legacy pubads().disableInitialLoad() method so changes are
+  // synchronized immediately and still detected when getConfig() is
+  // unavailable. With initial load disabled, display() only registers a slot
+  // and the ad request must come from a later refresh(); adInit() reads this to
+  // refresh its own freshly defined
   // slots so they are not left blank. Pushed onto the command queue so it runs
   // before the publisher's own GPT configuration.
+  function syncInitialLoadDisabled(gpt) {
+    if (typeof gpt.getConfig !== "function") return false;
+    var config = gpt.getConfig("disableInitialLoad");
+    if (!config || typeof config.disableInitialLoad === "undefined") {
+      return false;
+    }
+    ts.gptInitialLoadDisabled = config.disableInitialLoad === true;
+    return true;
+  }
+
   (window.googletag = window.googletag || { cmd: [] }).cmd.push(function () {
     var gpt = window.googletag;
+    syncInitialLoadDisabled(gpt);
     if (
       typeof gpt.setConfig === "function" &&
       !gpt.__tsInitialLoadConfigHooked
     ) {
       var originalSetConfig = gpt.setConfig.bind(gpt);
       gpt.setConfig = function (config) {
-        if (config && config.disableInitialLoad === true) {
-          ts.gptInitialLoadDisabled = true;
+        var result = originalSetConfig.apply(gpt, arguments);
+        if (
+          !syncInitialLoadDisabled(gpt) &&
+          config &&
+          "disableInitialLoad" in config
+        ) {
+          ts.gptInitialLoadDisabled = config.disableInitialLoad === true;
         }
-        return originalSetConfig(config);
+        return result;
       };
       gpt.__tsInitialLoadConfigHooked = true;
     }
@@ -52,8 +70,11 @@
     }
     var originalDisableInitialLoad = pubads.disableInitialLoad.bind(pubads);
     pubads.disableInitialLoad = function () {
-      ts.gptInitialLoadDisabled = true;
-      return originalDisableInitialLoad();
+      var result = originalDisableInitialLoad.apply(pubads, arguments);
+      if (!syncInitialLoadDisabled(gpt)) {
+        ts.gptInitialLoadDisabled = true;
+      }
+      return result;
     };
     pubads.__tsInitialLoadHooked = true;
   });
@@ -409,7 +430,8 @@
       });
       // Replay held publisher refreshes after targeting. On SPA navigation TS
       // refreshes reused publisher slots as before; TS-defined slots need a
-      // refresh only when initial load was disabled.
+      // refresh only when effective GPT configuration disabled initial load.
+      syncInitialLoadDisabled(window.googletag);
       var slotsNeedingRefresh = heldPublisherRequests.refreshSlots.concat(
         slotsToRefresh,
         ts.gptInitialLoadDisabled ? newSlots : [],
