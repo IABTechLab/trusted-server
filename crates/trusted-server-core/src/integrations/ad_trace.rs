@@ -249,7 +249,8 @@ pub fn finalize_response(response: &mut Response<EdgeBody>) {
 fn trace_payload_request(request: &Request<EdgeBody>, eligible_navigation: bool) -> bool {
     eligible_navigation
         || request.uri().path() == "/auction"
-        || request.uri().path() == "/__ts/page-bids"
+        || request.uri().path() == crate::publisher::PAGE_BIDS_PATH
+        || request.uri().path() == crate::publisher::PAGE_BIDS_LEGACY_PATH
 }
 
 fn is_eligible_console_navigation(request: &Request<EdgeBody>) -> bool {

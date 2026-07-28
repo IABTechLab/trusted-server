@@ -767,28 +767,34 @@ async fn auction_not_challenged_by_auth_parity() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn page_bids_options_preflight_denied_parity() {
-    // OPTIONS /__ts/page-bids is a CORS preflight to a side-effecting endpoint.
+    // OPTIONS /_ts/page-bids is a CORS preflight to a side-effecting endpoint.
     // Every adapter must refuse it with 403 rather than proxy it to the origin:
     // a permissive origin preflight would let a cross-site page defeat the GET
     // handler's `X-TSJS-Page-Bids` gate and trigger real auctions in a visitor's
     // browser. The denial is unconditional (independent of creative-opportunity
     // configuration), so all adapters must agree on 403.
-    let (axum_status, _) = axum_options("/__ts/page-bids").await;
-    let (cf_status, _) = cf_options("/__ts/page-bids").await;
-    let (spin_status, _) = spin_options("/__ts/page-bids").await;
+    //
+    // The deprecated `/__ts/page-bids` alias routes to the same handler, so it
+    // must deny the preflight identically — an alias that fell through to the
+    // origin would reopen the hole the canonical path closes.
+    for path in ["/_ts/page-bids", "/__ts/page-bids"] {
+        let (axum_status, _) = axum_options(path).await;
+        let (cf_status, _) = cf_options(path).await;
+        let (spin_status, _) = spin_options(path).await;
 
-    assert_eq!(
-        axum_status, 403,
-        "Axum OPTIONS /__ts/page-bids must be denied with 403, got {axum_status}"
-    );
-    assert_eq!(
-        cf_status, 403,
-        "Cloudflare OPTIONS /__ts/page-bids must be denied with 403, got {cf_status}"
-    );
-    assert_eq!(
-        spin_status, 403,
-        "Spin OPTIONS /__ts/page-bids must be denied with 403, got {spin_status}"
-    );
+        assert_eq!(
+            axum_status, 403,
+            "Axum OPTIONS {path} must be denied with 403, got {axum_status}"
+        );
+        assert_eq!(
+            cf_status, 403,
+            "Cloudflare OPTIONS {path} must be denied with 403, got {cf_status}"
+        );
+        assert_eq!(
+            spin_status, 403,
+            "Spin OPTIONS {path} must be denied with 403, got {spin_status}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

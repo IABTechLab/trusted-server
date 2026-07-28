@@ -17,7 +17,7 @@ use crate::settings::Settings;
 pub enum AuctionSource {
     /// Initial publisher navigation using server-side ad templates.
     InitialNavigation,
-    /// SPA navigation through `GET /__ts/page-bids`.
+    /// SPA navigation through `GET /_ts/page-bids`.
     SpaNavigation,
     /// Explicit `POST /auction` API.
     AuctionApi,

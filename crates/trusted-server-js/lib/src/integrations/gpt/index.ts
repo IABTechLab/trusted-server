@@ -2142,7 +2142,7 @@ function waitForSlotElements(slots: AuctionSlot[], signal: AbortSignal): Promise
  *
  * Patches `history.pushState` and `history.replaceState`, and listens to
  * `popstate`, so that after each client-side route change the trusted server
- * fetches fresh slots + bids from `/__ts/page-bids?path=<new_path>`, updates
+ * fetches fresh slots + bids from `/_ts/page-bids?path=<new_path>`, updates
  * `window.tsjs.adSlots` / `window.tsjs.bids`, and calls `window.tsjs.adInit()`.
  *
  * Idempotent: guarded by `window.tsjs.spaHookInstalled` so multiple calls are safe.
@@ -2178,7 +2178,7 @@ export function installSpaAuctionHook(): void {
     inflight = controller;
 
     try {
-      const res = await fetch(`/__ts/page-bids?path=${encodeURIComponent(path)}`, {
+      const res = await fetch(`/_ts/page-bids?path=${encodeURIComponent(path)}`, {
         credentials: 'include',
         // Non-simple header doubles as a CSRF token: the server rejects
         // requests that carry neither same-origin Fetch Metadata nor this
