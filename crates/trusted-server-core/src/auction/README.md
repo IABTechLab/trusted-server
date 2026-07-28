@@ -249,10 +249,12 @@ The orchestrator collects all bids and creates an OpenRTB response:
 }
 ```
 
-Creative HTML is always sanitized. By default, it is then rewritten to use the
-first-party proxy (`/first-party/proxy`) and the creative runtime is injected.
-Setting `[auction].rewrite_creatives = false` skips only that rewrite and
-injection pass.
+Creative HTML is always sanitized. By default, each auction delivery path then
+rewrites eligible URLs through the first-party proxy (`/first-party/proxy`). The
+`POST /auction` response also injects the creative runtime; the publisher SSAT
+inline path uses absolute first-party URLs without injecting that bundle. Setting
+`[auction].rewrite_creatives = false` skips rewriting in both paths and runtime
+injection on `POST /auction`.
 
 ## Route Registration & Endpoints
 
@@ -384,7 +386,7 @@ The `/auction` endpoint is the primary entry point for auctions:
 - `adUnits[].code` → `seatbid[].bid[].impid` (slot identifier)
 - `mediaTypes.banner.sizes` → evaluated by providers, winning size in `bid.w` and `bid.h`
 - Creative HTML is always sanitized, then rewritten to use `/first-party/proxy` URLs by default
-- `[auction].rewrite_creatives = false` skips rewriting and creative runtime injection, not sanitization
+- `[auction].rewrite_creatives = false` skips rewriting in both delivery paths and `POST /auction` creative runtime injection, not sanitization
 - Multiple bids per slot become separate `seatbid` entries
 - Orchestrator metadata added in `ext.orchestrator`
 

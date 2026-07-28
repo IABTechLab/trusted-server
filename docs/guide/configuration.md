@@ -1222,14 +1222,17 @@ Settings for the auction orchestrator that coordinates multiple bid providers.
 | `timeout_ms`        | Integer       | `2000`             | Auction timeout in milliseconds                                   |
 | `creative_store`    | String        | `"creative_store"` | Deprecated; creatives are now delivered inline                    |
 
-Creative markup returned by `POST /auction` is always server-sanitized. With
-`rewrite_creatives = true` (the default), eligible absolute or protocol-relative
-resource and click URLs not excluded by rewrite configuration are converted to
-signed first-party endpoints, and the creative TSJS runtime is injected when a
-`<body>` exists. Setting it to `false` returns sanitized but not rewritten `adm`;
-accepted external URLs remain direct and are not host allowlisted by the
-sanitizer. The setting does not affect HTML or CSS fetched through
-`/first-party/proxy`. See [Creative Processing](/guide/creative-processing#auction-rewrite-control).
+Creative markup delivered by `POST /auction` and the publisher SSAT/page-bids
+path is always server-sanitized. With `rewrite_creatives = true` (the default),
+eligible absolute or protocol-relative resource and click URLs not excluded by
+rewrite configuration are converted to signed first-party endpoints. The
+`POST /auction` path emits root-relative endpoints and injects the creative TSJS
+runtime when a `<body>` exists; the foreign-origin SSAT renderer emits absolute
+endpoints and does not inject that bundle. Setting the option to `false` returns
+sanitized but not rewritten `adm` from both paths. Accepted external URLs remain
+direct and are not host allowlisted by the sanitizer. The setting does not
+affect HTML or CSS fetched through `/first-party/proxy`. See
+[Creative Processing](/guide/creative-processing#auction-rewrite-control).
 
 ::: warning Existing configs and rollback
 Configs created before `rewrite_creatives` was introduced must first add

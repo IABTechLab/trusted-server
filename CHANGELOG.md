@@ -18,11 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Protocol-relative creative URLs now honor `rewrite.exclude_domains`, so excluded creative assets stay direct and excluded absolute URLs submitted to `/first-party/sign` are rejected.
+- Protocol-relative creative URLs now honor `rewrite.exclude_domains`, so excluded creative assets stay direct and excluded absolute or protocol-relative URLs submitted to `/first-party/sign` are rejected.
 
 ### Added
 
-- Added the default-true `[auction].rewrite_creatives` option. Setting it to `false` preserves mandatory `/auction` creative sanitization while skipping first-party resource/click URL rewriting and creative TSJS injection.
+- Added the default-true `[auction].rewrite_creatives` option. Setting it to `false` preserves mandatory creative sanitization across `POST /auction` and publisher SSAT/page-bids delivery while skipping first-party resource/click URL rewriting; it also skips creative TSJS injection on `POST /auction`.
 - Added Osano consent mirror integration docs and public enablement guidance.
 - Implemented basic authentication for configurable endpoint paths (#73)
 - Added integrations guide with example `testlight` integration

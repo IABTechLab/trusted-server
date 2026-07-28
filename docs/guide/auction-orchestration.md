@@ -578,10 +578,15 @@ runtime and first-party proxy/click mediation from the resulting `adm`.
 Sanitizer-accepted hosts are not allowlisted or trusted merely because their
 URLs remain in the output.
 
-The setting applies only to the shared `POST /auction` response converter.
-HTML/CSS returned by `/first-party/proxy` continues to be rewritten. The
-separate debug-only `[debug].inject_adm_for_testing` publisher and page-bids
-path is unchanged and may include raw `adm` for non-production diagnostics.
+The setting applies to winning-bid `adm` in both the shared `POST /auction`
+response converter and the production publisher SSAT/page-bids path. The former
+emits root-relative first-party URLs and injects creative TSJS; the latter emits
+absolute first-party URLs for its foreign-origin renderer and does not inject
+that bundle. Both paths always sanitize, and both skip rewriting when the
+setting is `false`. HTML/CSS returned by `/first-party/proxy` continues to be
+rewritten independently. `[debug].inject_adm_for_testing` adds the diagnostic
+`debug_bid` blob and enables a testing-only direct GAM replacement; it does not
+control whether sanitized `adm` is delivered.
 
 **Elements handled by the rewrite pass:**
 

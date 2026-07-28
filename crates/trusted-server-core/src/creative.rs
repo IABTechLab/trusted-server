@@ -512,9 +512,35 @@ pub fn sanitize_creative_html(markup: &str) -> String {
 /// [`crate::auction_config_types::AuctionConfig::rewrite_creatives`].
 #[must_use]
 pub fn process_auction_creative(settings: &Settings, raw: &str) -> String {
+    process_auction_creative_with_rewriter(settings, raw, |sanitized| {
+        rewrite_creative_html(settings, sanitized)
+    })
+}
+
+/// Process an inline auction creative rendered from a foreign-origin document.
+///
+/// Sanitization is mandatory. When auction creative rewriting is enabled, proxy
+/// and click URLs are emitted as absolute URLs against `base_origin` without
+/// injecting the creative TSJS bundle.
+#[must_use]
+pub(crate) fn process_inline_auction_creative(
+    settings: &Settings,
+    base_origin: &str,
+    raw: &str,
+) -> String {
+    process_auction_creative_with_rewriter(settings, raw, |sanitized| {
+        rewrite_inline_creative_html(settings, base_origin, sanitized)
+    })
+}
+
+fn process_auction_creative_with_rewriter(
+    settings: &Settings,
+    raw: &str,
+    rewrite: impl FnOnce(&str) -> String,
+) -> String {
     let sanitized = sanitize_creative_html(raw);
     if settings.auction.rewrite_creatives {
-        rewrite_creative_html(settings, &sanitized)
+        rewrite(&sanitized)
     } else {
         sanitized
     }
