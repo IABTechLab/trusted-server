@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Validate synthetic ID format on inbound values from the `x-synthetic-id` header and `synthetic_id` cookie; values that do not match the expected format (`64-hex-hmac.6-alphanumeric-suffix`) are discarded and a fresh ID is generated rather than forwarded to response headers, cookies, or third-party APIs
 
+### Fixed
+
+- Protocol-relative creative URLs now honor `rewrite.exclude_domains`, so excluded creative assets stay direct and excluded absolute URLs submitted to `/first-party/sign` are rejected.
+
 ### Added
 
 - Added opt-in APS HTTP debug metadata for controlled test sites, exposing the direct request and response under `/auction` provider metadata using the Prebid Server `debug.httpcalls` shape.

@@ -299,8 +299,8 @@ pub fn convert_to_openrtb_response_with_trace(
         let width = to_openrtb_i32(bid.width, "width", &bid_context);
         let height = to_openrtb_i32(bid.height, "height", &bid_context);
 
-        // Ordinary markup remains on the mandatory sanitize/rewrite path. A
-        // typed renderer is serialized separately and never enters the HTML sanitizer.
+        // Ordinary markup follows the configured sanitize/rewrite path. A typed
+        // renderer is serialized separately and never enters the HTML sanitizer.
         let (adm, renderer) = if let Some(ref raw_creative) = bid.creative {
             let sanitize_creatives = settings.auction.sanitize_creatives;
             let sanitized = if sanitize_creatives {
