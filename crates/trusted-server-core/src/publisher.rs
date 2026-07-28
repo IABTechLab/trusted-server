@@ -3375,15 +3375,15 @@ pub(crate) fn build_bid_map(
                 // — no PBS Cache round trip. The `hb_cache_*` coordinates above
                 // remain as the fallback for an absent `adm`.
                 //
-                // Sanitize dangerous markup first, then rewrite URLs to
-                // first-party proxies — the same creative-processing boundary as
-                // the `/auction` path (see `auction::formats`), except the inline
-                // variant. Unlike `/auction`, this `adm` is rendered by the Prebid
+                // Optionally sanitize dangerous markup, then optionally rewrite
+                // URLs to first-party proxies — the same independent controls as
+                // the `/auction` path (see `auction::formats`), except for the
+                // inline render context. This `adm` is rendered by the Prebid
                 // Universal Creative inside GAM's iframe (`f.srcdoc = d.ad`), a
                 // foreign origin where root-relative `/first-party/…` URLs resolve
-                // against GAM and 404. `rewrite_inline_creative_html` emits
+                // against GAM and 404. The inline rewriter therefore emits
                 // absolute first-party URLs and omits the tsjs bundle injection.
-                // `sanitize_creative_html` also enforces the 1 MiB creative cap,
+                // When enabled, sanitization also enforces the 1 MiB creative cap,
                 // returning an empty string for oversized or unparseable markup —
                 // in which case the entry is omitted and the bridge falls back to
                 // the PBS Cache coordinates.
@@ -3393,11 +3393,10 @@ pub(crate) fn build_bid_map(
                     // otherwise encode the literal macro into the signed proxy/click
                     // URL, and signing would lock that wrong value.
                     let priced = crate::creative::expand_auction_price_macro(raw_creative, cpm);
-                    let sanitized = crate::creative::sanitize_creative_html(&priced);
-                    let adm = crate::creative::rewrite_inline_creative_html(
+                    let adm = crate::creative::process_inline_auction_creative(
                         settings,
                         &base_origin,
-                        &sanitized,
+                        &priced,
                     );
                     if !adm.is_empty() {
                         obj.insert("adm".to_string(), serde_json::Value::String(adm));
@@ -7948,9 +7947,8 @@ mod tests {
         use crate::settings::Settings;
         use std::collections::HashMap;
 
-        // Default settings are enough for the creative boundary: the sanitize
-        // pass needs no config, and `rewrite_creative_html` only signs URLs it
-        // actually rewrites (none of these fixtures carry proxyable URLs).
+        // Creative processing is opt-in, so tests enable each control explicitly
+        // when they need to exercise sanitization or rewriting.
         fn test_settings() -> Settings {
             Settings::default()
         }
@@ -8283,10 +8281,10 @@ mod tests {
 
         #[test]
         fn build_bid_map_sanitizes_hostile_adm() {
-            // The inline-adm path must run the same creative-processing boundary
-            // as the `/auction` path (sanitize → rewrite) before the creative
-            // reaches window.tsjs.bids, so hostile executable markup never lands
-            // in the client-facing `adm` for the Prebid Universal Creative to run.
+            // The inline-adm path must honor the same opt-in sanitization boundary
+            // as `/auction` before the creative reaches window.tsjs.bids.
+            let mut settings = test_settings();
+            settings.auction.sanitize_creatives = true;
             let mut winning_bids = HashMap::new();
             let mut bid = make_bid(
                 "atf_sidebar_ad",
@@ -8303,13 +8301,7 @@ mod tests {
             );
             winning_bids.insert("atf_sidebar_ad".to_string(), bid);
 
-            let map = build_bid_map(
-                &winning_bids,
-                PriceGranularity::Dense,
-                &test_settings(),
-                "",
-                false,
-            );
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, &settings, "", false);
             let adm = map
                 .get("atf_sidebar_ad")
                 .and_then(|v| v.as_object())
@@ -8336,11 +8328,104 @@ mod tests {
         }
 
         #[test]
-        fn build_bid_map_omits_oversized_adm() {
+        fn build_bid_map_can_skip_rewriting_while_sanitizing() {
+            let mut settings = test_settings();
+            settings.auction.sanitize_creatives = true;
+            settings.auction.rewrite_creatives = false;
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "kargo",
+                "abc123",
+                "https://ssp/win",
+                "https://ssp/bill",
+            );
+            bid.creative = Some(
+                "<div onclick=\"steal()\"><script>marker</script>\
+                 <a href=\"https://click.example/landing\">x</a>\
+                 <img src=\"https://cdn.example/ad.png\"></div>"
+                    .to_string(),
+            );
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &settings,
+                "https://publisher.example",
+                false,
+            );
+            let adm = map
+                .get("atf_sidebar_ad")
+                .and_then(|value| value.as_object())
+                .and_then(|object| object.get("adm"))
+                .and_then(|value| value.as_str())
+                .expect("should include a sanitized adm");
+
+            assert!(
+                adm.contains(r#"href="https://click.example/landing""#),
+                "should keep accepted click URLs direct: {adm}"
+            );
+            assert!(
+                adm.contains(r#"src="https://cdn.example/ad.png""#),
+                "should keep accepted resource URLs direct: {adm}"
+            );
+            assert!(
+                !adm.contains("/first-party/"),
+                "should skip first-party URL rewriting: {adm}"
+            );
+            assert!(
+                !adm.contains("data-tsclick"),
+                "should skip click-guard attributes: {adm}"
+            );
+            assert!(
+                !adm.contains("marker") && !adm.contains("onclick"),
+                "should still sanitize executable markup: {adm}"
+            );
+        }
+
+        #[test]
+        fn build_bid_map_can_skip_both_sanitization_and_rewriting() {
+            let settings = test_settings();
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "kargo",
+                "abc123",
+                "https://ssp/win",
+                "https://ssp/bill",
+            );
+            let raw = "<script>renderAd()</script><img src=\"https://cdn.example/ad.png\">";
+            bid.creative = Some(raw.to_string());
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &settings,
+                "https://publisher.example",
+                false,
+            );
+            let adm = map
+                .get("atf_sidebar_ad")
+                .and_then(|value| value.as_object())
+                .and_then(|object| object.get("adm"))
+                .and_then(|value| value.as_str())
+                .expect("should include the raw adm");
+
+            assert_eq!(adm, raw, "should preserve the bidder creative by default");
+        }
+
+        #[test]
+        fn build_bid_map_omits_oversized_adm_when_sanitizing() {
             // Creatives larger than the sanitize pass's 1 MiB cap are rejected
             // (empty result), so the inline `adm` is omitted and the pbRender
             // bridge falls back to the PBS Cache coordinates instead of shipping
             // an unbounded creative to the client.
+            let mut settings = test_settings();
+            settings.auction.sanitize_creatives = true;
             let mut winning_bids = HashMap::new();
             let mut bid = make_bid(
                 "atf_sidebar_ad",
@@ -8353,13 +8438,7 @@ mod tests {
             bid.creative = Some(format!("<div>{}</div>", "a".repeat(1024 * 1024 + 1)));
             winning_bids.insert("atf_sidebar_ad".to_string(), bid);
 
-            let map = build_bid_map(
-                &winning_bids,
-                PriceGranularity::Dense,
-                &test_settings(),
-                "",
-                false,
-            );
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, &settings, "", false);
             let obj = map
                 .get("atf_sidebar_ad")
                 .and_then(|v| v.as_object())
@@ -8379,6 +8458,7 @@ mod tests {
             // The tsjs bundle must NOT be injected into that foreign-origin iframe.
             let mut settings = test_settings();
             settings.publisher.domain = "example.com".to_string();
+            settings.auction.rewrite_creatives = true;
 
             let mut winning_bids = HashMap::new();
             let mut bid = make_bid(
@@ -8428,6 +8508,7 @@ mod tests {
             // configured publisher domain.
             let mut settings = test_settings();
             settings.publisher.domain = "example.com".to_string();
+            settings.auction.rewrite_creatives = true;
 
             let mut winning_bids = HashMap::new();
             let mut bid = make_bid(
@@ -8477,6 +8558,7 @@ mod tests {
             // signature locks the wrong value.
             let mut settings = test_settings();
             settings.publisher.domain = "example.com".to_string();
+            settings.auction.rewrite_creatives = true;
 
             let mut winning_bids = HashMap::new();
             let mut bid = make_bid(

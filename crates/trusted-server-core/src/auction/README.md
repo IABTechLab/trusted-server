@@ -136,8 +136,8 @@ When a request arrives at the `/auction` endpoint, it goes through the following
 ┌──────────────────────────────────────────────────────────────────────┐
 │  11. Transform to OpenRTB Response (mod.rs:274-322)                  │
 │      - Build seatbid array (one per winning bid)                     │
-│      - Always sanitize creative HTML                                 │
-│      - Rewrite creative HTML when enabled (default)                  │
+│      - Sanitize creative HTML when enabled                           │
+│      - Rewrite creative HTML when enabled                            │
 │      - Add orchestrator metadata (timing, strategy, bid count)       │
 └──────────────────────────────────────────────────────────────────────┘
                               │
@@ -252,10 +252,10 @@ The orchestrator collects all bids and creates an OpenRTB response:
 }
 ```
 
-Creative HTML is always sanitized. By default, it is then rewritten to use the
-first-party proxy (`/first-party/proxy`) and the creative runtime is injected.
-Setting `[auction].rewrite_creatives = false` skips only that rewrite and
-injection pass.
+Creative sanitization and rewriting are independent opt-in controls. Both apply
+to `POST /auction` and publisher SSAT/page-bids delivery. Rewriting uses
+root-relative first-party URLs and injects the creative runtime on `POST /auction`;
+the SSAT inline path uses absolute first-party URLs without injecting that bundle.
 
 ## Route Registration & Endpoints
 
@@ -386,8 +386,8 @@ The `/auction` endpoint is the primary entry point for auctions:
 **Key Transformations:**
 - `adUnits[].code` → `seatbid[].bid[].impid` (slot identifier)
 - `mediaTypes.banner.sizes` → evaluated by providers, winning size in `bid.w` and `bid.h`
-- Creative HTML is always sanitized, then rewritten to use `/first-party/proxy` URLs by default
-- `[auction].rewrite_creatives = false` skips rewriting and creative runtime injection, not sanitization
+- `[auction].sanitize_creatives = true` sanitizes winning-bid creative HTML in both delivery paths
+- `[auction].rewrite_creatives = true` rewrites eligible URLs in both delivery paths and injects the creative runtime on `POST /auction`
 - Multiple bids per slot become separate `seatbid` entries
 - Orchestrator metadata added in `ext.orchestrator`
 

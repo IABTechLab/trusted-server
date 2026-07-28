@@ -23,12 +23,12 @@ Creative processing has separate auction-response and proxied-response paths. Wh
 └──────────────────────────────────────────────────────┘
                         ↓
 ┌──────────────────────────────────────────────────────┐
-│  Trusted Server Processing (rewrite-enabled)         │
-│  1. Sanitize first for POST /auction adm             │
+│  Trusted Server Processing (opt-in)                  │
+│  1. Sanitize when configured                         │
 │  2. Parse HTML with streaming processor              │
 │  3. Detect absolute/protocol-relative URLs           │
 │  4. Generate signed proxy URLs                       │
-│  5. Rewrite in-place and inject TSJS                  │
+│  5. Rewrite in place; inject TSJS on POST /auction   │
 └──────────────────────────────────────────────────────┘
                         ↓
 ┌──────────────────────────────────────────────────────┐
@@ -43,41 +43,52 @@ Creative processing has separate auction-response and proxied-response paths. Wh
 
 The creative rewriters are invoked by independent delivery paths:
 
-1. **Auction `adm`**: Winning-bid HTML returned by `POST /auction` is always sanitized, then rewritten by default. This pass is controlled by `[auction].rewrite_creatives`.
-2. **First-party proxy**: Non-streaming `text/html` and `text/css` responses fetched through `/first-party/proxy` are rewritten independently of the auction setting.
+1. **Auction `adm`**: Winning-bid HTML returned by `POST /auction` and delivered through publisher SSAT/page-bids follows the independent `[auction].sanitize_creatives` and `[auction].rewrite_creatives` controls.
+2. **First-party proxy**: Non-streaming `text/html` and `text/css` responses fetched through `/first-party/proxy` are rewritten independently of the auction settings.
 3. **Integration processing**: Publisher HTML integrations use their own registration and configuration controls.
 
 ::: info Streaming Mode
-When `with_streaming()` is enabled in `ProxyRequestConfig`, proxied HTML/CSS processing is **skipped** to preserve origin compression and reduce latency. This does not change the `POST /auction` sanitizer or rewrite setting.
+When `with_streaming()` is enabled in `ProxyRequestConfig`, proxied HTML/CSS processing is **skipped** to preserve origin compression and reduce latency. This does not change auction creative processing.
 :::
 
-## Auction Rewrite Control
+## Auction Creative Processing Controls
 
-Use the default-true auction setting to control only the rewrite pass applied to
-winning-bid `adm` returned by `POST /auction`:
+Sanitization and rewriting are independent and opt in. Both settings apply to
+winning-bid `adm` returned by `POST /auction` and delivered through the publisher
+SSAT/page-bids path:
 
 ```toml
 [auction]
+sanitize_creatives = true
 rewrite_creatives = true
 ```
 
-| Setting           | `POST /auction` winning-bid `adm` behavior                                                                                                                                      |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Omitted or `true` | Sanitize, rewrite eligible resource/CSS and click URLs to signed first-party endpoints, add `data-tsclick`, and inject the unified creative TSJS script when a `<body>` exists. |
-| `false`           | Sanitize, then return the sanitized HTML without rewriting. Sanitizer-accepted external resource, click, and inline CSS URLs remain direct.                                     |
+| `sanitize_creatives` | `rewrite_creatives` | Auction winning-bid `adm` behavior                                                                            |
+| -------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `false`              | `false`             | Deliver bidder markup unchanged except for auction-price macro expansion.                                     |
+| `true`               | `false`             | Sanitize executable markup and unsafe attributes, but leave accepted external resource and click URLs direct. |
+| `false`              | `true`              | Preserve markup while rewriting eligible resource/CSS and click URLs to signed first-party endpoints.         |
+| `true`               | `true`              | Sanitize first, then rewrite eligible URLs.                                                                   |
 
-::: warning Sanitization remains mandatory
-Setting `rewrite_creatives = false` returns sanitized but unre-written HTML, not
-byte-for-byte upstream markup. It does not restore scripts, stylesheets, style
-blocks, forms, event handlers, or other content removed by sanitization.
-Sanitizer acceptance is not a host allowlist; ordinary accepted HTTP(S) URLs may
-cause the browser to contact external creative hosts directly.
+Both options default to `false`. On the rewrite path, `POST /auction` emits
+root-relative first-party endpoints and injects creative TSJS when a `<body>`
+exists. SSAT/page-bids emits absolute endpoints for its foreign-origin renderer
+and does not inject that bundle. The client render bridge still creates and sizes
+its sandboxed iframe from bid or ad-unit dimensions.
+
+::: warning Opting out of sanitization
+With `sanitize_creatives = false`, scripts, stylesheets, style blocks, forms,
+event handlers, and other bidder markup are preserved. Creative frames therefore
+rely on origin-isolating sandbox attributes and do not use `allow-same-origin`.
+When sanitization is enabled, sanitizer acceptance is not a host allowlist;
+ordinary accepted HTTP(S) URLs may still contact external creative hosts directly
+unless rewriting is also enabled.
 :::
 
-This setting does not affect HTML/CSS response rewriting under
-`/first-party/proxy`. It also does not change the separate debug-only
-`[debug].inject_adm_for_testing` publisher and page-bids path, which may include
-raw `adm` for non-production diagnostics.
+These settings do not affect HTML/CSS response rewriting under
+`/first-party/proxy`. `[debug].inject_adm_for_testing` controls only the
+additional `debug_bid` diagnostic blob and testing-only direct GAM replacement;
+it does not control whether `adm` is present.
 
 ## Rewritten Elements
 

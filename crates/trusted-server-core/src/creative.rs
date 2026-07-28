@@ -506,6 +506,29 @@ pub fn sanitize_creative_html(markup: &str) -> String {
     String::from_utf8(out).unwrap_or_default()
 }
 
+/// Process an inline auction creative rendered from a foreign-origin document.
+///
+/// Sanitization and rewriting are independent opt-in steps. When rewriting is
+/// enabled, proxy and click URLs are emitted as absolute URLs against
+/// `base_origin` without injecting the creative TSJS bundle.
+#[must_use]
+pub(crate) fn process_inline_auction_creative(
+    settings: &Settings,
+    base_origin: &str,
+    raw: &str,
+) -> String {
+    let processed = if settings.auction.sanitize_creatives {
+        sanitize_creative_html(raw)
+    } else {
+        raw.to_owned()
+    };
+    if settings.auction.rewrite_creatives {
+        rewrite_inline_creative_html(settings, base_origin, &processed)
+    } else {
+        processed
+    }
+}
+
 /// Rewrite ad creative HTML to first-party endpoints, for creatives rendered
 /// from the first-party origin (the `/auction` iframe `srcdoc`).
 /// - 1x1 `<img>` pixels → `/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`

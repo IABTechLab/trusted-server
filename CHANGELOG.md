@@ -22,12 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Protocol-relative creative URLs now honor `rewrite.exclude_domains`, so excluded creative assets stay direct and excluded absolute URLs submitted to `/first-party/sign` are rejected.
+- Protocol-relative creative URLs now honor `rewrite.exclude_domains`, so excluded creative assets stay direct and excluded absolute or protocol-relative URLs submitted to `/first-party/sign` are rejected.
 
 ### Added
 
 - Added opt-in APS HTTP debug metadata for controlled test sites, exposing the direct request and response under `/auction` provider metadata using the Prebid Server `debug.httpcalls` shape.
-- Added the default-true `[auction].rewrite_creatives` option. Setting it to `false` preserves mandatory `/auction` creative sanitization while skipping first-party resource/click URL rewriting and creative TSJS injection.
+- Added independent opt-in `[auction].sanitize_creatives` and `[auction].rewrite_creatives` controls for both `POST /auction` and publisher SSAT/page-bids creative delivery.
 - Added typed APS renderer transport for direct auctions and GAM/Prebid Universal Creative, using a minimized one-bid envelope, a fragment-bound nonce, and an opaque sandboxed renderer endpoint.
 - Added Osano consent mirror integration docs and public enablement guidance.
 - Implemented basic authentication for configurable endpoint paths (#73)

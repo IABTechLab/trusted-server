@@ -1654,6 +1654,12 @@ pub async fn handle_first_party_proxy_sign(
         })?
     };
 
+    if settings.rewrite.is_excluded(&abs) {
+        return Err(Report::new(TrustedServerError::Proxy {
+            message: "unsupported url".to_string(),
+        }));
+    }
+
     let parsed = url::Url::parse(&abs).change_context(TrustedServerError::Proxy {
         message: "invalid url".to_string(),
     })?;
@@ -2409,24 +2415,26 @@ mod tests {
     }
 
     #[test]
-    fn proxy_sign_rejects_excluded_absolute_url() {
+    fn proxy_sign_rejects_excluded_urls() {
         futures::executor::block_on(async {
             let mut settings = create_test_settings();
             settings.rewrite.exclude_domains = vec!["cdn.example".to_owned()];
-            let body = serde_json::json!({
-                "url": "https://cdn.example/asset.js",
-            });
-            let req = build_http_post_json_request("https://edge.example/first-party/sign", &body);
-            let err: Report<TrustedServerError> =
-                handle_first_party_proxy_sign(&settings, &noop_services(), req)
-                    .await
-                    .expect_err("should reject excluded URL");
 
-            assert_eq!(
-                err.current_context().status_code(),
-                StatusCode::BAD_GATEWAY,
-                "should reject excluded absolute URLs as unsupported"
-            );
+            for url in ["https://cdn.example/asset.js", "//cdn.example/asset.js"] {
+                let body = serde_json::json!({ "url": url });
+                let req =
+                    build_http_post_json_request("https://edge.example/first-party/sign", &body);
+                let err: Report<TrustedServerError> =
+                    handle_first_party_proxy_sign(&settings, &noop_services(), req)
+                        .await
+                        .expect_err("should reject excluded URL");
+
+                assert_eq!(
+                    err.current_context().status_code(),
+                    StatusCode::BAD_GATEWAY,
+                    "should reject excluded URL `{url}` as unsupported"
+                );
+            }
         });
     }
 
