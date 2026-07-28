@@ -2105,6 +2105,35 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     }
   });
 
+  it('expires an unconsumed targeted delivery before a later refresh', () => {
+    vi.useFakeTimers();
+    try {
+      const code = 'example-expired-targeted-delivery';
+      const slot = {
+        getSlotElementId: () => code,
+        getTargeting: () => [],
+        getSizes: () => [[300, 250]],
+        clearTargeting: vi.fn(),
+      };
+      const { originalRefresh, pubads } = installGpt([slot]);
+      mockRequestBids.mockImplementation((opts) => completePublisherAuction(opts));
+      const pbjs = installPrebidNpm();
+
+      pbjs.requestBids({
+        adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
+      } as any);
+      vi.advanceTimersByTime(5001);
+      pubads.refresh([slot]);
+
+      expect(mockRequestBids).toHaveBeenCalledTimes(2);
+      expect(slot.clearTargeting).toHaveBeenCalledWith('hb_adid');
+      expect(originalRefresh).toHaveBeenCalledWith([slot], undefined);
+    } finally {
+      vi.runOnlyPendingTimers();
+      vi.useRealTimers();
+    }
+  });
+
   it('correlates a targeted delivery refresh after more than one second without a timer race', () => {
     vi.useFakeTimers();
     try {
@@ -2218,6 +2247,37 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     expect(originalRefresh).toHaveBeenCalledWith([slot], undefined);
   });
 
+  it('bounds code-only delivery correlation to one suppressed independent refresh', () => {
+    const code = 'example-code-only-delivery';
+    const slot = {
+      getSlotElementId: () => code,
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const { originalRefresh, pubads } = installGpt([slot]);
+    mockRequestBids.mockImplementation((opts) =>
+      completePublisherAuction(opts, { applyTargeting: false })
+    );
+    const pbjs = installPrebidNpm();
+
+    // Model an initial impression rendered with display() after an auction
+    // that did not apply hb_adid targeting. Its code-only state is unconsumed.
+    pbjs.requestBids({
+      adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
+    } as any);
+
+    pubads.refresh([slot]);
+    expect(mockRequestBids).toHaveBeenCalledTimes(1);
+    expect(slot.clearTargeting).not.toHaveBeenCalled();
+    expect(originalRefresh).toHaveBeenCalledTimes(1);
+
+    pubads.refresh([slot]);
+    expect(mockRequestBids).toHaveBeenCalledTimes(2);
+    expect(slot.clearTargeting).toHaveBeenCalledWith('hb_adid');
+    expect(originalRefresh).toHaveBeenCalledTimes(2);
+  });
+
   it('does not use code fallback when a slot has an unmatched hb_adid', () => {
     const code = 'example-stale-targeting';
     const slot = {
@@ -2236,6 +2296,44 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
       adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
       bidsBackHandler: () => pubads.refresh([slot]),
     } as any);
+
+    expect(mockRequestBids).toHaveBeenCalledTimes(2);
+    expect(slot.clearTargeting).toHaveBeenCalledWith('hb_adid');
+    expect(originalRefresh).toHaveBeenCalledWith([slot], undefined);
+  });
+
+  it('uses an independent auction when a pending hb_adid exceeds the capacity bound', () => {
+    const capacity = 2048;
+    const code = 'example-capacity-delivery';
+    const oldestAdId = 'example-capacity-ad-0';
+    const slot = {
+      getSlotElementId: () => code,
+      getTargeting: () => [],
+      getSizes: () => [[300, 250]],
+      clearTargeting: vi.fn(),
+    };
+    const { originalRefresh, pubads } = installGpt([slot]);
+    mockRequestBids.mockImplementation((opts) => {
+      if (mockRequestBids.mock.calls.length === 1) {
+        opts.bidsBackHandler?.({
+          [code]: {
+            bids: Array.from({ length: capacity + 1 }, (_, index) => ({
+              adId: `example-capacity-ad-${index}`,
+              adUnitCode: code,
+            })),
+          },
+        });
+        return;
+      }
+      completePublisherAuction(opts);
+    });
+    const pbjs = installPrebidNpm();
+
+    pbjs.requestBids({
+      adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
+    } as any);
+    deliveryAdIds.set(slot, oldestAdId);
+    pubads.refresh([slot]);
 
     expect(mockRequestBids).toHaveBeenCalledTimes(2);
     expect(slot.clearTargeting).toHaveBeenCalledWith('hb_adid');
@@ -2437,6 +2535,8 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
       clearTargeting: vi.fn(),
     };
     const { originalRefresh, pubads } = installGpt([slot]);
+    const setTargetingForGPTAsync = vi.fn();
+    (mockPbjs as any).setTargetingForGPTAsync = setTargetingForGPTAsync;
     mockRequestBids.mockImplementation(() => {
       throw new Error('example synthetic failure');
     });
@@ -2445,11 +2545,12 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     pubads.refresh([slot]);
 
     expect(slot.clearTargeting).toHaveBeenCalledWith('hb_adid');
+    expect(setTargetingForGPTAsync).not.toHaveBeenCalled();
     expect(originalRefresh).toHaveBeenCalledTimes(1);
     expect(originalRefresh).toHaveBeenCalledWith([slot], undefined);
   });
 
-  it('falls back once when a synthetic auction never calls back', () => {
+  it('applies targeting before falling back when a synthetic auction never calls back', () => {
     vi.useFakeTimers();
     try {
       const slot = {
@@ -2458,6 +2559,8 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
         clearTargeting: vi.fn(),
       };
       const { originalRefresh, pubads } = installGpt([slot]);
+      const setTargetingForGPTAsync = vi.fn();
+      (mockPbjs as any).setTargetingForGPTAsync = setTargetingForGPTAsync;
       mockRequestBids.mockImplementation(() => undefined);
       installPrebidNpm();
 
@@ -2465,6 +2568,10 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
       expect(originalRefresh).not.toHaveBeenCalled();
       vi.advanceTimersByTime(640);
 
+      expect(setTargetingForGPTAsync).toHaveBeenCalledWith(['example-missing-refresh-callback']);
+      expect(setTargetingForGPTAsync.mock.invocationCallOrder[0]).toBeLessThan(
+        originalRefresh.mock.invocationCallOrder[0]
+      );
       expect(originalRefresh).toHaveBeenCalledTimes(1);
       expect(originalRefresh).toHaveBeenCalledWith([slot], undefined);
     } finally {
@@ -2473,7 +2580,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     }
   });
 
-  it('ignores a synthetic callback that arrives after the fallback refresh', () => {
+  it('applies fallback targeting once and ignores a late synthetic callback', () => {
     vi.useFakeTimers();
     try {
       const slot = {
@@ -2494,8 +2601,12 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
       vi.advanceTimersByTime(640);
       syntheticBidsBackHandler?.();
 
+      expect(setTargetingForGPTAsync).toHaveBeenCalledTimes(1);
+      expect(setTargetingForGPTAsync).toHaveBeenCalledWith(['example-late-refresh-callback']);
+      expect(setTargetingForGPTAsync.mock.invocationCallOrder[0]).toBeLessThan(
+        originalRefresh.mock.invocationCallOrder[0]
+      );
       expect(originalRefresh).toHaveBeenCalledTimes(1);
-      expect(setTargetingForGPTAsync).not.toHaveBeenCalled();
     } finally {
       vi.runOnlyPendingTimers();
       vi.useRealTimers();

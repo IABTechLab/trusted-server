@@ -641,7 +641,7 @@ function removePendingPublisherBidsForCode(adUnitCode: string, registrationId?: 
 /** Discard delivery state that outlived the publisher auction which created it. */
 function prunePendingPublisherBids(now = Date.now()): void {
   for (const [adUnitCode, pendingCode] of pendingPublisherCodes) {
-    if (pendingCode.expiresAt <= now) removePendingPublisherBidsForCode(adUnitCode);
+    if (pendingCode.expiresAt <= now) pendingPublisherCodes.delete(adUnitCode);
   }
 
   for (const [adId, pendingBid] of pendingPublisherBids) {
@@ -714,9 +714,11 @@ function registerPendingPublisherBids(
  *
  * A current `hb_adid` is the precise signal. When publishers intentionally
  * omit that targeting, a short-lived requested-code match preserves delivery
- * for no-bid and custom-targeting auctions. A non-empty unmatched ID remains
- * independent so stale targeting cannot suppress a fresh auction. Every match
- * is consumed once.
+ * for no-bid and custom-targeting auctions. Without an ID, that fallback cannot
+ * distinguish a delayed delivery from the first independent refresh, so it may
+ * conservatively suppress one auction before its one-shot state is consumed.
+ * A non-empty unmatched ID remains independent so stale targeting cannot
+ * suppress a fresh auction. Every match is consumed once.
  */
 function publisherDeliverySlots(targetSlots: RefreshGptSlot[]): Set<RefreshGptSlot> {
   prunePendingPublisherBids();
@@ -1169,35 +1171,35 @@ export function installRefreshHandler(timeoutMs = 1500): void {
       // slots, and a late callback cannot issue a second GAM request.
       let completed = false;
       let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
-      function completeRefresh(): void {
+      function completeRefresh(applyTargeting: boolean): void {
         if (completed) return;
         completed = true;
         if (fallbackTimer !== undefined) clearTimeout(fallbackTimer);
+        if (applyTargeting) {
+          try {
+            pbjs.setTargetingForGPTAsync?.(refreshAdUnitCodes);
+          } catch (error) {
+            log.error('[tsjs-prebid] refresh targeting failed', error);
+          }
+        }
         originalRefresh(slots, opts);
       }
 
       try {
         pbjs.requestBids({
           adUnits,
-          bidsBackHandler: () => {
-            if (completed) return;
-            try {
-              pbjs.setTargetingForGPTAsync?.(refreshAdUnitCodes);
-            } catch (error) {
-              log.error('[tsjs-prebid] refresh targeting failed', error);
-            } finally {
-              completeRefresh();
-            }
-          },
+          bidsBackHandler: () => completeRefresh(true),
           timeout: timeoutMs,
         });
-        // Prebid schedules its own timeout during requestBids(). Schedule this
-        // fallback afterward so its normal timeout callback gets first chance
-        // to apply targeting before the one-shot GPT completion path runs.
-        if (!completed) fallbackTimer = setTimeout(completeRefresh, timeoutMs);
+        // A one-shot watchdog completes the GAM request even if Prebid never
+        // invokes its callback. Apply any bids available at that point before
+        // refreshing because Prebid's own timeout completion may run later.
+        if (!completed) {
+          fallbackTimer = setTimeout(() => completeRefresh(true), timeoutMs);
+        }
       } catch (error) {
         log.error('[tsjs-prebid] refresh auction failed', error);
-        completeRefresh();
+        completeRefresh(false);
       }
     };
 
