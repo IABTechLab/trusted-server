@@ -244,4 +244,90 @@ describe('scheduleInitialAdInit', () => {
     const refreshOrder = mockPubads.refresh.mock.invocationCallOrder[0]!;
     expect(targetingOrder).toBeLessThan(refreshOrder);
   });
+
+  it('fires on the Next.js __next_f runtime signal before window load', async () => {
+    // Fake only the poll's interval — leave requestAnimationFrame to the
+    // manual rafQueue override installed in beforeEach.
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      await importGptModule();
+      const ts = (window as TestWindow).tsjs!;
+      const adInit = vi.fn();
+      ts.adInit = adInit;
+
+      // App Router runtime has patched __next_f.push (no longer the array's).
+      (window as unknown as { __next_f?: { push: () => void } }).__next_f = {
+        push: () => {},
+      };
+
+      ts.scheduleInitialAdInit!();
+      // No load event dispatched — the runtime-signal poll must trigger it.
+      vi.advanceTimersByTime(50);
+      // The trigger fired, but the double rAF still gates the actual call.
+      flushFrame();
+      expect(adInit).not.toHaveBeenCalled();
+      flushFrame();
+      expect(adInit).toHaveBeenCalledTimes(1);
+    } finally {
+      delete (window as unknown as Record<string, unknown>).__next_f;
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not fire from the runtime poll on non-Next pages, falls back to window load', async () => {
+    // Fake only the poll's interval — leave requestAnimationFrame to the
+    // manual rafQueue override installed in beforeEach.
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      await importGptModule();
+      const ts = (window as TestWindow).tsjs!;
+      const adInit = vi.fn();
+      ts.adInit = adInit;
+
+      // No __next_f (non-Next publisher): the poll must never fire adInit.
+      ts.scheduleInitialAdInit!();
+      vi.advanceTimersByTime(500);
+      flushFrame();
+      flushFrame();
+      expect(adInit).not.toHaveBeenCalled();
+
+      // window.load remains the fallback trigger.
+      window.dispatchEvent(new Event('load'));
+      flushFrame();
+      flushFrame();
+      expect(adInit).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('fires exactly once when the runtime signal and a later load event both occur', async () => {
+    // Fake only the poll's interval — leave requestAnimationFrame to the
+    // manual rafQueue override installed in beforeEach.
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      await importGptModule();
+      const ts = (window as TestWindow).tsjs!;
+      const adInit = vi.fn();
+      ts.adInit = adInit;
+
+      (window as unknown as { __next_f?: { push: () => void } }).__next_f = {
+        push: () => {},
+      };
+      ts.scheduleInitialAdInit!();
+      vi.advanceTimersByTime(50);
+      flushFrame();
+      flushFrame();
+      expect(adInit).toHaveBeenCalledTimes(1);
+
+      // A later load event must not re-run adInit (poll cleared, load fires once).
+      window.dispatchEvent(new Event('load'));
+      flushFrame();
+      flushFrame();
+      expect(adInit).toHaveBeenCalledTimes(1);
+    } finally {
+      delete (window as unknown as Record<string, unknown>).__next_f;
+      vi.useRealTimers();
+    }
+  });
 });

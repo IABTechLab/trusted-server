@@ -457,10 +457,11 @@ function installInitialLoadDetector(ts: TsjsApi): void {
  * time. `adInit()` defines GPT slots on the publisher's `-container`
  * wrappers, mutating those ad-slot subtrees; on a Next.js App Router page a
  * synchronous call lands that mutation inside React's hydration window and
- * trips a #418 hydration mismatch. Deferral: gate on window `load` (the
- * client bundles that hydrate the tree have executed by then), then a double
- * `requestAnimationFrame` so the call runs after React has committed. A
- * single deferred call — no retry timer.
+ * trips a #418 hydration mismatch. Deferral: gate on the first hydration
+ * signal to arrive — the Next.js App Router runtime patching `window.__next_f`
+ * (~9s on heavy publishers) or window `load` (fallback, and the only signal on
+ * non-Next publishers) — then a double `requestAnimationFrame` so the call runs
+ * after React has committed. A single deferred call — no retry timer.
  *
  * Deferring opens a window in which an SPA navigation can commit a new route
  * (and run its own `adInit()` via the SPA auction hook) before the deferred
@@ -487,9 +488,32 @@ function installScheduleInitialAdInit(ts: TsjsApi): void {
     };
     if (document.readyState === 'complete') {
       afterHydrationFrames();
-    } else {
-      window.addEventListener('load', afterHydrationFrames, { once: true });
+      return;
     }
+    // Fire on whichever hydration signal arrives first, exactly once:
+    //  - Next.js App Router runtime: window.__next_f.push is replaced by the RSC
+    //    runtime once it starts hydrating the streamed tree (~9s on heavy
+    //    publishers, vs ~40s for window.load). Poll for it.
+    //  - window.load: unconditional fallback, and the only signal on non-Next
+    //    publishers (__next_f is never patched there, so the poll never fires).
+    // The double requestAnimationFrame after the trigger still lands the call
+    // after React commits, and runUnlessNavigated still honors navGeneration.
+    let fired = false;
+    let poll: ReturnType<typeof setInterval> | undefined;
+    const fire = (): void => {
+      if (fired) return;
+      fired = true;
+      if (poll !== undefined) clearInterval(poll);
+      afterHydrationFrames();
+    };
+    window.addEventListener('load', fire, { once: true });
+    const nextRuntimeReady = (): boolean => {
+      const flight = (window as unknown as { __next_f?: { push?: unknown } }).__next_f;
+      return !!flight && flight.push !== Array.prototype.push;
+    };
+    poll = setInterval(() => {
+      if (nextRuntimeReady()) fire();
+    }, 50);
   };
 }
 
