@@ -793,6 +793,56 @@ mod tests {
     }
 
     #[test]
+    fn gpt_diagnostics_bootstrap_precedes_immediate_bundle_once() {
+        let html = "<html><head><title>Test</title></head><body></body></html>";
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config("gpt_diagnostics", &json!({ "enabled": true }))
+            .expect("should insert GPT diagnostics config");
+
+        let mut config = create_test_config();
+        config.integrations =
+            IntegrationRegistry::new(&settings).expect("should build integration registry");
+
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+        let mut output = Vec::new();
+
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .expect("should process HTML");
+        let processed = String::from_utf8(output).expect("should produce valid UTF-8");
+        let bootstrap_marker = "__tsjs_gpt_diagnostics_active";
+        let bundle_marker = "id=\"trustedserver-js\"";
+
+        assert_eq!(
+            processed.matches(bootstrap_marker).count(),
+            1,
+            "should inject the diagnostics bootstrap once"
+        );
+        assert_eq!(
+            processed.matches(bundle_marker).count(),
+            1,
+            "should inject the immediate TSJS bundle once"
+        );
+        assert!(
+            processed
+                .find(bootstrap_marker)
+                .expect("should include diagnostics bootstrap")
+                < processed
+                    .find(bundle_marker)
+                    .expect("should include immediate TSJS bundle"),
+            "should activate diagnostics before the immediate bundle executes"
+        );
+    }
+
+    #[test]
     fn test_create_html_processor_url_replacement() {
         let config = create_test_config();
         let processor = create_html_processor(config);

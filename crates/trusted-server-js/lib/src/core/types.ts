@@ -79,6 +79,101 @@ export interface AuctionBidData {
   debug_bid?: AuctionDebugBidData;
 }
 
+export type GptDiagnosticsCallbackKind =
+  | 'slotRequested'
+  | 'slotResponseReceived'
+  | 'slotRenderEnded'
+  | 'slotOnload'
+  | 'impressionViewable'
+  | 'slotVisibilityChanged';
+
+export type GptDiagnosticsCallbackDisposition = 'matched' | 'unmatched' | 'ambiguous';
+
+export type GptDiagnosticsBindingReason =
+  | 'missing_slot_element_id'
+  | 'missing_element'
+  | 'duplicate_dom_id'
+  | 'duplicate_gpt_slot_id';
+
+export interface GptDiagnosticsBinding {
+  status: 'bound' | 'unbound' | 'ambiguous';
+  reason?: GptDiagnosticsBindingReason;
+}
+
+export interface GptDiagnosticsDurations {
+  requestToResponseMs?: number;
+  responseToRenderMs?: number;
+  requestToRenderMs?: number;
+  renderToLoadMs?: number;
+  renderToViewableMs?: number;
+}
+
+export interface GptDiagnosticsRequestCycle {
+  requestNumber: number;
+  requestedAtMs?: number;
+  responseAtMs?: number;
+  renderAtMs?: number;
+  loadAtMs?: number;
+  viewableAtMs?: number;
+  durations: GptDiagnosticsDurations;
+  isEmpty?: boolean;
+  size?: Size;
+  isBackfill?: boolean;
+  slotContentChanged?: boolean;
+  incompleteSequence: boolean;
+}
+
+export interface GptDiagnosticsSlotExport {
+  runtimeSlotNumber: number;
+  slotElementId?: string;
+  adUnitPath?: string;
+  binding: GptDiagnosticsBinding;
+  currentVisibilityPercentage?: number;
+  maximumVisibilityPercentage?: number;
+  requests: GptDiagnosticsRequestCycle[];
+}
+
+export interface GptDiagnosticsCallbackIssue {
+  kind: GptDiagnosticsCallbackKind;
+  runtimeSlotNumber: number;
+  slotElementId?: string;
+  timestampMs: number;
+  disposition: GptDiagnosticsCallbackDisposition;
+  reason: string;
+}
+
+export interface GptDiagnosticsCoverageCounters {
+  observed: number;
+  matched: number;
+  unmatched: number;
+  ambiguous: number;
+}
+
+export interface GptDiagnosticsExportV1 {
+  version: 1;
+  capturedAt: string;
+  page: {
+    origin: string;
+    pathname: string;
+  };
+  slots: GptDiagnosticsSlotExport[];
+  callbackIssues: GptDiagnosticsCallbackIssue[];
+  coverage: Record<GptDiagnosticsCallbackKind, GptDiagnosticsCoverageCounters>;
+  metadata: {
+    droppedCallbacks: number;
+    evictedSlots: number;
+    evictedRequestCycles: number;
+  };
+}
+
+export interface GptDiagnosticsApi {
+  snapshot(): GptDiagnosticsExportV1;
+  export(): void;
+  subscribe(listener: (snapshot: GptDiagnosticsExportV1) => void): () => void;
+  show(): void;
+  hide(): void;
+}
+
 export interface TsjsApi {
   version: string;
   que: Array<() => void>;
@@ -166,4 +261,6 @@ export interface TsjsApi {
    * a minimal fallback for pages where the bundle fails to load.
    */
   scheduleInitialAdInit?: (initialBids?: Record<string, AuctionBidData>) => void;
+  /** Read-only GPT lifecycle diagnostics API, present only in an activated tab. */
+  gptDiagnostics?: GptDiagnosticsApi;
 }
