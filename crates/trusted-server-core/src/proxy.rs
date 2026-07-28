@@ -246,7 +246,10 @@ fn platform_response_to_fastly_asset(platform_resp: PlatformResponse) -> AssetPr
     }
 }
 
-/// Stream an asset response body directly to a writable client stream.
+/// Stream a platform response body directly to a writable client stream.
+///
+/// Asset routes and Fastly `EdgeZero` publisher fallback both use this bridge
+/// after headers have been committed through `stream_to_client()`.
 ///
 /// # Errors
 ///
@@ -261,7 +264,7 @@ pub async fn stream_asset_body<W: Write>(
             output
                 .write_all(bytes.as_ref())
                 .change_context(TrustedServerError::Proxy {
-                    message: "failed to write buffered asset response body".to_string(),
+                    message: "failed to write buffered platform response body".to_string(),
                 })?;
         }
         EdgeBody::Stream(mut stream) => {
@@ -274,8 +277,20 @@ pub async fn stream_asset_body<W: Write>(
                 output
                     .write_all(chunk.as_ref())
                     .change_context(TrustedServerError::Proxy {
-                        message: "failed to write streaming asset response body".to_string(),
+                        message: "failed to write streaming platform response body".to_string(),
                     })?;
+                // Flush per chunk: Fastly's `StreamingBody` is a
+                // `BufWriter<StreamingBodyHandle>`, so a segment smaller than
+                // the write buffer would sit in the Wasm heap until a later
+                // write filled it. The publisher stream yields compressed
+                // segments that are commonly smaller than that buffer, and the
+                // generator then awaits the origin (or the auction) before
+                // producing the next one — without this flush the client sees
+                // committed headers and no body, undoing the codec's per-chunk
+                // sync flush and delaying first paint.
+                output.flush().change_context(TrustedServerError::Proxy {
+                    message: "failed to flush streaming platform response body".to_string(),
+                })?;
             }
         }
     }
@@ -2024,8 +2039,10 @@ fn reconstruct_and_validate_signed_target(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::{HashMap, VecDeque};
     use std::io;
+    use std::rc::Rc;
     use std::sync::{Arc, Mutex};
 
     use super::{
@@ -4518,6 +4535,68 @@ mod tests {
                 "should describe the streaming failure: {err:?}"
             );
         });
+    }
+
+    /// One observable step of [`stream_asset_body`] driving a buffered sink.
+    #[derive(Debug, PartialEq, Eq)]
+    enum StreamSinkEvent {
+        SourcePolled(usize),
+        Wrote(usize),
+        Flushed,
+    }
+
+    /// Sink that records its calls so a test can assert how they interleave
+    /// with the source stream's polls.
+    struct RecordingSink(Rc<RefCell<Vec<StreamSinkEvent>>>);
+
+    impl io::Write for RecordingSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.borrow_mut().push(StreamSinkEvent::Wrote(buf.len()));
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.borrow_mut().push(StreamSinkEvent::Flushed);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn stream_asset_body_flushes_each_chunk_before_polling_the_source_again() {
+        // Fastly's `StreamingBody` is a `BufWriter`, so a yielded segment only
+        // reaches the client once the sink is flushed. The publisher stream
+        // awaits the origin (and the auction) between segments, so a segment
+        // smaller than the write buffer must be flushed before the next poll or
+        // the client renders nothing behind committed headers.
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let source_events = Rc::clone(&events);
+        let body = EdgeBody::from_stream(async_stream::stream! {
+            for (index, segment) in ["<html><head>", "</head><body>"].into_iter().enumerate() {
+                source_events
+                    .borrow_mut()
+                    .push(StreamSinkEvent::SourcePolled(index));
+                yield Ok::<Bytes, io::Error>(Bytes::from_static(segment.as_bytes()));
+            }
+        });
+
+        futures::executor::block_on(stream_asset_body(
+            body,
+            &mut RecordingSink(Rc::clone(&events)),
+        ))
+        .expect("should stream asset body");
+
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                StreamSinkEvent::SourcePolled(0),
+                StreamSinkEvent::Wrote(12),
+                StreamSinkEvent::Flushed,
+                StreamSinkEvent::SourcePolled(1),
+                StreamSinkEvent::Wrote(13),
+                StreamSinkEvent::Flushed,
+            ],
+            "each segment must be flushed to the client before the source is polled again"
+        );
     }
 
     #[test]
