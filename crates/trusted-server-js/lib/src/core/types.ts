@@ -139,4 +139,23 @@ export interface TsjsApi {
   gptInitialLoadDisabled?: boolean;
   /** Guards SPA pushState hook installation. */
   spaHookInstalled?: boolean;
+  /**
+   * Monotonic count of committed SPA navigations, incremented synchronously by
+   * the SPA auction hook the moment it accepts a route change. The deferred
+   * initial-adInit bootstrap ([`scheduleInitialAdInit`]) captures this counter
+   * and no-ops when a navigation committed while it was pending. A counter is
+   * used instead of a URL comparison so the guard cannot diverge from the
+   * auction path: a query-only history change (which the hook deliberately
+   * ignores) leaves the counter unchanged, and an `/a → /b → /a` round trip
+   * (where the URL compares equal again) advances it.
+   */
+  navGeneration?: number;
+  /**
+   * Defers the initial `adInit()` until after React hydration: window `load`,
+   * then a double `requestAnimationFrame`, cancelled when an SPA navigation
+   * committed while pending. Called by the server-injected `</body>` bids
+   * script; lives in the bundle so the lifecycle is executable under test and
+   * shares [`navGeneration`] with the SPA auction hook.
+   */
+  scheduleInitialAdInit?: () => void;
 }

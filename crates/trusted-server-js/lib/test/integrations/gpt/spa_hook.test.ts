@@ -58,6 +58,31 @@ describe('installSpaAuctionHook', () => {
     vi.unstubAllGlobals();
   });
 
+  it('increments navGeneration only when a pathname navigation is accepted', async () => {
+    // The deferred initial-adInit bootstrap keys off this counter, so it must
+    // move in lockstep with the hook's own navigation identity: bumped
+    // synchronously for each accepted pathname change, untouched by the
+    // query-only and same-path history calls the hook ignores.
+    fetchStub.mockResolvedValue({
+      ok: true,
+      json: async () => ({ slots: [], bids: {} }),
+    });
+    const { installSpaAuctionHook } = await importGptModule();
+    installSpaAuctionHook();
+    const ts = (window as TestWindow).tsjs!;
+    expect(ts.navGeneration).toBe(0);
+
+    history.pushState({}, '', '/next-page');
+    expect(ts.navGeneration).toBe(1);
+
+    history.replaceState({}, '', '/next-page?utm_source=x');
+    expect(ts.navGeneration).toBe(1);
+
+    history.pushState({}, '', '/next-page');
+    expect(ts.navGeneration).toBe(1);
+    await flushAsync();
+  });
+
   it('fetches page-bids on pushState and applies slots/bids via adInit', async () => {
     // The route's ad container already exists, so bids apply immediately.
     document.body.innerHTML = '<div id="div-s1"></div>';
