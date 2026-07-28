@@ -50,15 +50,21 @@ pub struct Publisher {
     /// exceeding it fails the response rather than allocating past the cap.
     /// Defaults to 16 MiB — a conservative cap that prevents Wasm-heap OOM.
     ///
-    /// On Fastly the *effective* ceiling for a publisher page is lower: the
-    /// platform HTTP client rejects any origin response whose raw (still
-    /// compressed) body exceeds 10 MiB before this buffer is ever filled, so
-    /// raising this value only helps highly compressible pages whose decoded
-    /// size exceeds the 16 MiB default while their compressed origin body stays
-    /// under 10 MiB. Raising it above ~10 MiB does not lift the platform cap for
-    /// uncompressed pages. That platform limit is removed once true streaming
-    /// lands (tracked for PR 15, issue #495), after which this setting becomes
-    /// the sole ceiling.
+    /// Fastly origin bodies are preserved as streams on the publisher path, so
+    /// this setting also caps the streaming pipeline twice over: cumulative
+    /// raw (still compressed) bytes pulled from origin, and cumulative decoded
+    /// bytes emitted by the decompressor — the latter so a decompression bomb
+    /// cannot push an unbounded decoded volume through the rewrite pipeline.
+    /// On the streaming path headers are already committed when either cap
+    /// trips, so the response is truncated mid-body (with the error logged)
+    /// rather than replaced with a 5xx.
+    ///
+    /// Buffered adapters keep using it as the post-rewrite output buffer cap.
+    /// There it additionally bounds how much decoded gzip output may sit in the
+    /// heap at once, so a bomb is rejected mid-decode instead of after its full
+    /// expansion; that bound is per-step, never cumulative, so a gzip-encoded
+    /// body is judged by the same post-rewrite total as an identity, deflate or
+    /// brotli one.
     ///
     /// Must be at least 1: a zero-byte cap fails every non-empty buffered
     /// publisher response at request time, so it is rejected at config
@@ -1913,12 +1919,17 @@ pub struct DebugConfig {
     #[serde(default)]
     pub auction_html_comment: bool,
 
-    /// Include raw `adm` creative markup in `window.tsjs.bids` for GPT/GAM
-    /// debug rendering through the Prebid Universal Creative bridge.
+    /// Enable the testing-only direct GAM-replace path and the verbose per-bid
+    /// `debug_bid` blob in `window.tsjs.bids`.
     ///
-    /// Use this to validate the server-side auction→GAM targeting→creative
-    /// rendering pipeline while PBS Cache is unavailable. Never enable in
-    /// production — injects raw HTML from SSPs.
+    /// Note: the sanitized winning `adm` is now injected **unconditionally** for
+    /// production inline rendering through the pbRender bridge (see
+    /// [`crate::publisher::build_bid_map`]); this flag no longer gates `adm`.
+    /// What it still gates is the client-side `debug_bid` signal that turns on
+    /// the direct GAM-creative replacement (`injectAdmIntoSlot`), which bypasses
+    /// GAM entirely — useful for validating the auction→creative pipeline while
+    /// PBS Cache is unavailable. The `debug_bid` blob also carries the raw,
+    /// un-sanitized creative for diagnostics, so never enable in production.
     #[serde(default)]
     pub inject_adm_for_testing: bool,
 }

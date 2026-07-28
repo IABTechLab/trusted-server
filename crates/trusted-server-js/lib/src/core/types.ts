@@ -55,11 +55,27 @@ export interface AuctionBidData {
   hb_adid?: string;
   hb_cache_host?: string;
   hb_cache_path?: string;
+  /** Winning creative width; the bridge sizes the inline render from this. */
+  w?: number;
+  /** Winning creative height; the bridge sizes the inline render from this. */
+  h?: number;
   nurl?: string;
   burl?: string;
-  /** Raw creative markup. Only present when `[debug] inject_adm_for_testing = true`. */
+  /**
+   * Sanitized winning creative markup for local rendering through the pbRender
+   * bridge. Present whenever the winning bid carried a creative that passed the
+   * server-side sanitize/rewrite boundary; absent when there was no creative or
+   * it was rejected (e.g. over the 1 MiB cap), in which case the bridge falls
+   * back to the PBS Cache coordinates. This is NOT gated by
+   * `inject_adm_for_testing`.
+   */
   adm?: string;
-  /** Debug-only bid field mirror. Only present when `[debug] inject_adm_for_testing = true`. */
+  /**
+   * Verbose per-bid debug blob (carries the raw, un-sanitized creative among
+   * other fields). Only present when `[debug] inject_adm_for_testing = true`;
+   * its presence is also the client-side gate for the testing-only direct
+   * GAM-replace path.
+   */
   debug_bid?: AuctionDebugBidData;
 }
 
@@ -123,4 +139,23 @@ export interface TsjsApi {
   gptInitialLoadDisabled?: boolean;
   /** Guards SPA pushState hook installation. */
   spaHookInstalled?: boolean;
+  /**
+   * Monotonic count of committed SPA navigations, incremented synchronously by
+   * the SPA auction hook the moment it accepts a route change. The deferred
+   * initial-adInit bootstrap ([`scheduleInitialAdInit`]) captures this counter
+   * and no-ops when a navigation committed while it was pending. A counter is
+   * used instead of a URL comparison so the guard cannot diverge from the
+   * auction path: a query-only history change (which the hook deliberately
+   * ignores) leaves the counter unchanged, and an `/a → /b → /a` round trip
+   * (where the URL compares equal again) advances it.
+   */
+  navGeneration?: number;
+  /**
+   * Defers the initial `adInit()` until after React hydration: window `load`,
+   * then a double `requestAnimationFrame`, cancelled when an SPA navigation
+   * committed while pending. Called by the server-injected `</body>` bids
+   * script; lives in the bundle so the lifecycle is executable under test and
+   * shares [`navGeneration`] with the SPA auction hook.
+   */
+  scheduleInitialAdInit?: () => void;
 }

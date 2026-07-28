@@ -321,10 +321,9 @@ fn run_edgezero_pull_sync_after_send(
 
 /// Sends a finalized `EdgeZero` response to the client.
 ///
-/// Asset streams commit headers first, then pipe the origin body chunk by chunk
-/// so large responses do not materialize in the Wasm heap. Publisher responses
-/// are buffered by the server-side auction path so bids can be injected into the
-/// document, and are sent in one shot along with all other responses.
+/// Streaming `EdgeZero` bodies commit headers first, then pipe chunks to Fastly's
+/// client stream so large asset and publisher-origin responses do not
+/// materialize in the Wasm heap.
 fn send_edgezero_response(
     mut response: HttpResponse,
     request_filter_effects: Option<&RequestFilterEffects>,
@@ -350,11 +349,11 @@ fn send_edgezero_response(
             match futures::executor::block_on(stream_asset_body(body, &mut streaming_body)) {
                 Ok(()) => {
                     if let Err(e) = streaming_body.finish() {
-                        log::error!("failed to finish EdgeZero asset streaming body: {e}");
+                        log::error!("failed to finish EdgeZero streaming body: {e}");
                     }
                 }
                 Err(e) => {
-                    log::error!("EdgeZero asset streaming failed: {e:?}");
+                    log::error!("EdgeZero streaming failed: {e:?}");
                     drop(streaming_body);
                 }
             }
