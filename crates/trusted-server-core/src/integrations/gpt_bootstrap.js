@@ -19,12 +19,13 @@
   var ts = (window.tsjs = window.tsjs || {});
   if (ts.adInit) return;
 
-  // Track whether the publisher disabled GPT initial load. Read the modern
+  // Track whether the publisher disabled GPT initial load. Read the effective
   // googletag.getConfig() value when available, and wrap googletag.setConfig()
-  // and the legacy pubads().disableInitialLoad() method as fallbacks because
-  // getConfig() may not report the legacy API's state. With initial load
-  // disabled, display() only registers a slot and the ad request must come from
-  // a later refresh(); adInit() reads this to refresh its own freshly defined
+  // and the legacy pubads().disableInitialLoad() method so changes are
+  // synchronized immediately and still detected when getConfig() is
+  // unavailable. With initial load disabled, display() only registers a slot
+  // and the ad request must come from a later refresh(); adInit() reads this to
+  // refresh its own freshly defined
   // slots so they are not left blank. Pushed onto the command queue so it runs
   // before the publisher's own GPT configuration.
   function syncInitialLoadDisabled(gpt) {

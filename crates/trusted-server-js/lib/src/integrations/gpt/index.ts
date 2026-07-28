@@ -113,6 +113,10 @@ interface GoogleTagConfig extends Record<string, unknown> {
   disableInitialLoad?: boolean | null;
 }
 
+interface GoogleTagEffectiveConfig {
+  disableInitialLoad?: boolean;
+}
+
 interface GoogleTag {
   cmd: Array<() => void>;
   pubads(): GoogleTagPubAdsService;
@@ -125,7 +129,7 @@ interface GoogleTag {
   enableServices(): void;
   display(elementId: string): void;
   setConfig?(config: GoogleTagConfig): void;
-  getConfig?(key: 'disableInitialLoad'): GoogleTagConfig | undefined;
+  getConfig?(keys: string | string[]): GoogleTagEffectiveConfig | undefined;
   _loaded_?: boolean;
 }
 
@@ -419,10 +423,10 @@ function queueWinBillingBeacon(url: string): boolean {
 /**
  * Track whether the publisher disabled GPT initial load.
  *
- * GPT's modern `getConfig()` getter may not report state set through the legacy
- * `pubads().disableInitialLoad()` API, so read it when available and wrap both
- * configuration APIs to record the state on `window.tsjs`. With
- * initial load disabled, `display()` only registers a slot — the ad request
+ * Read GPT's effective state through `getConfig()` when available and wrap both
+ * configuration APIs so changes are synchronized immediately. The wrappers also
+ * provide a fallback for runtimes where the getter is unavailable. With initial
+ * load disabled, `display()` only registers a slot — the ad request
  * must come from a later `refresh()`. adInit() reads this to refresh its own
  * freshly defined slots so they are not left blank.
  *
