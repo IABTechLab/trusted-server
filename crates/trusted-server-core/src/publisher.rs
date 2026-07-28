@@ -3515,26 +3515,22 @@ fn build_bids_script_with_trace(
     // adInit() defines GPT slots on the publisher's `-container` wrappers, which
     // mutates those ad-slot subtrees. Calling it synchronously here (this script
     // runs at body-parse time) lands those mutations inside React's hydration
-    // window and trips a #418 hydration mismatch. Defer adInit until after the
-    // page has hydrated: gate on window `load` (client bundles that hydrate the
-    // tree have executed by then), then a double `requestAnimationFrame` so it
-    // runs after React has committed. Not a retry timer — a single deferred call.
-    //
-    // Deferring opens a window in which an SPA navigation can commit a new route
-    // (and run its own `adInit` via the SPA auction hook) before this callback
-    // fires. The callback therefore captures the route it was scheduled for and
-    // no-ops when the route has since changed.
+    // window and trips a #418 hydration mismatch. The deferral — gate on window
+    // `load`, then a double `requestAnimationFrame`, cancelled when an SPA
+    // navigation committed in between — lives in the GPT bundle module as
+    // `tsjs.scheduleInitialAdInit` (crates/trusted-server-js/lib/src/
+    // integrations/gpt/index.ts), where the lifecycle is executable under
+    // Vitest (schedule_initial_ad_init.test.ts) and the navigation-generation
+    // guard is shared with the SPA auction hook. The GPT module ships in the
+    // synchronous head bundle, so it has always executed by the time this
+    // inline script runs; when the GPT integration is disabled the scheduler is
+    // absent — but so is `adInit`, so there is nothing to schedule.
     format!(
         "<script>window.tsjs=window.tsjs||{{}};\
 {trace_assignment}window.tsjs.bids=JSON.parse(\"{escaped}\");\
 (function(){{\
-var p=location.pathname+location.search;\
-var f=function(){{\
-if(location.pathname+location.search!==p)return;\
-var a=window.tsjs.adInit;if(typeof a===\"function\")a();}};\
-var d=function(){{window.requestAnimationFrame(function(){{window.requestAnimationFrame(f);}});}};\
-if(document.readyState===\"complete\")d();\
-else window.addEventListener(\"load\",d,{{once:true}});\
+var s=window.tsjs.scheduleInitialAdInit;\
+if(typeof s===\"function\")s();\
 }})();</script>"
     )
 }
@@ -8945,7 +8941,7 @@ mod tests {
         }
 
         #[test]
-        fn traced_bids_script_assigns_summary_and_bids_before_ad_init() {
+        fn traced_bids_script_assigns_summary_and_bids_before_scheduling_ad_init() {
             let mut map = serde_json::Map::new();
             map.insert("atf".to_string(), serde_json::json!({"hb_pb": "1.00"}));
             let trace = serde_json::json!({
@@ -8961,23 +8957,25 @@ mod tests {
                 .find(".auctionTrace=JSON.parse")
                 .expect("should assign trace");
             let bids_pos = script.find(".bids=JSON.parse").expect("should assign bids");
-            let init_pos = script.find("adInit").expect("should invoke adInit");
+            let scheduler_pos = script
+                .find("scheduleInitialAdInit")
+                .expect("should schedule adInit");
             assert!(
-                trace_pos < bids_pos && bids_pos < init_pos,
-                "should atomically assign trace and bids before adInit"
+                trace_pos < bids_pos && bids_pos < scheduler_pos,
+                "should atomically assign trace and bids before scheduling adInit"
             );
         }
 
         #[test]
-        fn bids_script_calls_ad_init_without_retry_timer() {
+        fn bids_script_schedules_ad_init_without_retry_timer() {
             let mut map = serde_json::Map::new();
             map.insert("atf".to_string(), serde_json::json!({"hb_pb": "1.00"}));
 
             let script = build_bids_script(&map);
 
             assert!(
-                script.contains("window.tsjs.adInit"),
-                "should hand off bids to adInit"
+                script.contains("window.tsjs.scheduleInitialAdInit"),
+                "should hand off bids to the bundle's deferred adInit scheduler"
             );
             assert!(
                 !script.contains("setTimeout"),
@@ -8999,45 +8997,28 @@ mod tests {
             // adInit() mutates ad-slot subtrees (GPT defineSlot on the
             // `-container` wrapper). Running it synchronously at body-parse time
             // lands those mutations inside React's hydration window and trips a
-            // #418 hydration mismatch. The bootstrap must defer adInit until
-            // after hydration: gate on window `load`, then a `requestAnimationFrame`.
+            // #418 hydration mismatch. The deferral lifecycle (window `load`,
+            // double `requestAnimationFrame`, stale-navigation cancellation via
+            // `tsjs.navGeneration`) lives in the GPT bundle module where it is
+            // executable under Vitest (schedule_initial_ad_init.test.ts); this
+            // inline script must only delegate to that scheduler.
             assert!(
-                script.contains("requestAnimationFrame"),
-                "should defer adInit to a post-hydration animation frame"
+                script.contains("var s=window.tsjs.scheduleInitialAdInit"),
+                "should delegate deferral to the bundle scheduler"
             );
             assert!(
-                script.contains("\"load\""),
-                "should gate adInit on the window load event"
+                script.contains("if(typeof s===\"function\")s()"),
+                "should guard the scheduler call for pages without the GPT module"
             );
-            // Deferral must not regress into a retry timer.
+            // The one hydration-unsafe thing this script could do is invoke
+            // adInit synchronously at body-parse time — it must not.
+            assert!(
+                !script.contains("adInit()"),
+                "should not invoke adInit synchronously at parse time"
+            );
             assert!(
                 !script.contains("setTimeout"),
                 "should not retry adInit on a timer"
-            );
-            assert!(
-                script.contains("window.tsjs.adInit"),
-                "should still hand off bids to adInit"
-            );
-
-            // Browser globals are window-qualified so a page-level lexical
-            // binding of the same name cannot shadow them.
-            assert!(
-                script.contains("window.requestAnimationFrame"),
-                "should qualify requestAnimationFrame on window"
-            );
-            assert!(
-                script.contains("window.addEventListener"),
-                "should qualify addEventListener on window"
-            );
-
-            // Deferring opens a window in which an SPA navigation can commit a
-            // new route (and its own adInit) before this callback fires. The
-            // callback must capture the route it was scheduled for and no-op if
-            // the route has since changed, otherwise it re-runs adInit against
-            // the newer route's live slots/bids and double-refreshes it.
-            assert!(
-                script.contains("location.pathname"),
-                "should capture route identity to discard a stale deferred callback"
             );
         }
 
