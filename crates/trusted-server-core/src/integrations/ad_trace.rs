@@ -529,6 +529,38 @@ mod tests {
         assert_eq!(decision.bootstrap_script(), None);
     }
 
+    /// Both page-bids paths must mark the response private and non-storeable.
+    ///
+    /// `trace_payload_request` once hardcoded the endpoint as a string literal,
+    /// so renaming the route to [`PAGE_BIDS_PATH`] silently desynced it: the
+    /// comparison still named the old path, still compiled, and the response
+    /// carrying per-user trace data lost its `private, no-store` marking. The
+    /// canonical path and its deprecated alias are asserted together so a
+    /// future rename cannot reintroduce that gap for either one.
+    #[test]
+    fn page_bids_trace_responses_are_private_on_both_paths() {
+        for path in [
+            crate::publisher::PAGE_BIDS_PATH,
+            crate::publisher::PAGE_BIDS_LEGACY_PATH,
+        ] {
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri(format!("https://publisher.example{path}?path=%2Fnews"))
+                .header("sec-fetch-dest", "empty")
+                .header(header::COOKIE, "__Host-ts-console=1")
+                .body(EdgeBody::empty())
+                .expect("should build request");
+
+            let decision = prepare_request(&settings(true), &mut req).expect("should prepare");
+
+            assert!(decision.enabled(), "trace should be active on {path}");
+            assert!(
+                decision.requires_private_no_store(),
+                "page-bids trace payload on {path} must be private and non-storeable"
+            );
+        }
+    }
+
     #[test]
     fn invalid_api_query_fails_closed_even_with_session_cookie() {
         let mut req = Request::builder()
