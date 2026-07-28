@@ -348,7 +348,7 @@ describe('installTsAdInit', () => {
       display: displayMock,
       pubads: vi.fn().mockReturnValue(mockPubads),
       enableServices: vi.fn(),
-      getConfig: vi.fn(() => effectiveConfig),
+      getConfig: undefined as undefined | (() => { disableInitialLoad?: boolean }),
       setConfig: setConfigMock,
     };
     (window as TestWindow).googletag = googletag;
@@ -368,6 +368,15 @@ describe('installTsAdInit', () => {
 
     await runGptBootstrap(googletag);
 
+    // Older GPT runtimes may expose setConfig without getConfig. In that case,
+    // the wrapper tracks explicit initial-load updates directly.
+    googletag.setConfig({ disableInitialLoad: true });
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(true);
+    googletag.setConfig({ disableInitialLoad: false });
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(false);
+
+    googletag.getConfig = vi.fn(() => effectiveConfig);
+    setConfigMock.mockClear();
     googletag.setConfig({ disableInitialLoad: true });
     expect(setConfigMock).toHaveBeenCalledOnce();
     expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(true);
@@ -426,15 +435,16 @@ describe('installTsAdInit', () => {
     };
     const displayMock = vi.fn();
     const getConfigMock = vi.fn(() => effectiveConfig);
-    (window as TestWindow).googletag = {
+    const googletag = {
       cmd: { push: vi.fn((fn: () => void) => fn()) },
       defineSlot: vi.fn().mockReturnValue(mockSlot),
       display: displayMock,
       pubads: vi.fn().mockReturnValue(mockPubads),
       enableServices: vi.fn(),
-      getConfig: getConfigMock,
+      getConfig: undefined as undefined | typeof getConfigMock,
       setConfig: setConfigMock,
     };
+    (window as TestWindow).googletag = googletag;
     (window as TestWindow).tsjs = {
       adSlots: [
         {
@@ -465,9 +475,17 @@ describe('installTsAdInit', () => {
     expect(displayMock).toHaveBeenCalledWith('div-atf-sidebar');
     expect(mockPubads.refresh).not.toHaveBeenCalled();
 
+    // Fall back to the explicit setConfig value when getConfig is unavailable.
+    gpt.setConfig({ disableInitialLoad: true });
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(true);
+    gpt.setConfig({ disableInitialLoad: false });
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(false);
+
+    googletag.getConfig = getConfigMock;
+    setConfigMock.mockClear();
     const config = { disableInitialLoad: true, singleRequest: true };
     gpt.setConfig(config);
-    expect(setConfigMock).toHaveBeenCalledTimes(2);
+    expect(setConfigMock).toHaveBeenCalledOnce();
     expect(setConfigMock).toHaveBeenLastCalledWith(config);
     expect(getConfigMock).toHaveBeenCalledWith('disableInitialLoad');
     expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(true);
