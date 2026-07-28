@@ -193,6 +193,7 @@ impl IntegrationSettings {
         Ok(())
     }
 
+    #[cfg(test)]
     fn normalize_env_value(value: JsonValue) -> JsonValue {
         match value {
             JsonValue::Object(map) => JsonValue::Object(
@@ -226,6 +227,7 @@ impl IntegrationSettings {
         }
     }
 
+    #[cfg(test)]
     fn normalize_opaque_json_value(value: JsonValue) -> JsonValue {
         match value {
             JsonValue::String(raw) => {
@@ -235,11 +237,8 @@ impl IntegrationSettings {
         }
     }
 
-    /// Normalizes all entries in place, converting JSON-encoded strings from
-    /// environment variables into their proper typed representations.
-    /// Called eagerly after deserialization so that TOML serialization in
-    /// build.rs preserves correct types.
-    pub fn normalize(&mut self) {
+    #[cfg(test)]
+    fn normalize_legacy_env(&mut self) {
         for value in self.entries.values_mut() {
             *value = Self::normalize_env_value(value.clone());
         }
@@ -2057,12 +2056,13 @@ impl Settings {
             .change_context(TrustedServerError::Configuration {
                 message: "Failed to build configuration".to_string(),
             })?;
-        let settings: Self =
+        let mut settings: Self =
             config
                 .try_deserialize()
                 .change_context(TrustedServerError::Configuration {
                     message: "Failed to deserialize configuration".to_string(),
                 })?;
+        settings.integrations.normalize_legacy_env();
 
         Self::finalize_deserialized(settings, "Build-time configuration")
     }
@@ -2071,7 +2071,6 @@ impl Settings {
         mut settings: Self,
         validation_label: &str,
     ) -> Result<Self, Report<TrustedServerError>> {
-        settings.integrations.normalize();
         settings.proxy.normalize();
         settings.image_optimizer.normalize();
         settings.consent.validate();
@@ -2641,7 +2640,6 @@ mod tests {
         gpt::GptConfig,
         nextjs::NextJsIntegrationConfig,
         prebid::PrebidIntegrationConfig,
-        testlight::TestlightConfig,
     };
     use crate::redacted::Redacted;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
@@ -4123,67 +4121,6 @@ adSlot = "67890"
     }
 
     #[test]
-    fn test_integration_settings_from_env() {
-        use crate::integrations::testlight::TestlightConfig;
-
-        let toml_str = crate_test_settings_str();
-
-        let origin_key = format!(
-            "{}{}PUBLISHER{}ORIGIN_URL",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-
-        let integration_prefix = format!(
-            "{}{}INTEGRATIONS{}TESTLIGHT{}",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-
-        let endpoint_key = format!("{}ENDPOINT", integration_prefix);
-        let timeout_key = format!("{}TIMEOUT_MS", integration_prefix);
-        let rewrite_key = format!("{}REWRITE_SCRIPTS", integration_prefix);
-        let enabled_key = format!("{}ENABLED", integration_prefix);
-
-        temp_env::with_var(
-            origin_key,
-            Some("https://origin.test-publisher.com"),
-            || {
-                temp_env::with_var(
-                    endpoint_key,
-                    Some("https://testlight-env.test/auction"),
-                    || {
-                        temp_env::with_var(timeout_key, Some("2500"), || {
-                            temp_env::with_var(rewrite_key, Some("true"), || {
-                                temp_env::with_var(enabled_key, Some("true"), || {
-                                    let settings = Settings::from_toml_and_env(&toml_str)
-                                        .expect("Settings should load");
-
-                                    let config = settings
-                                        .integration_config::<TestlightConfig>("testlight")
-                                        .expect("integration parsing should succeed")
-                                        .expect("integration should be enabled");
-
-                                    assert_eq!(
-                                        config.endpoint,
-                                        "https://testlight-env.test/auction"
-                                    );
-                                    assert_eq!(config.timeout_ms, 2500);
-                                    assert!(config.rewrite_scripts);
-                                    assert!(config.enabled);
-                                });
-                            });
-                        });
-                    },
-                );
-            },
-        );
-    }
-
-    #[test]
     fn test_disabled_integration_does_not_register() {
         use crate::integrations::testlight::TestlightConfig;
         use serde_json::json;
@@ -4342,62 +4279,6 @@ adSlot = "67890"
                 .contains("Integration 'prebid' configuration failed validation"),
             "should surface a validation error for prebid.server_url"
         );
-    }
-
-    /// Tests the full build.rs round-trip: env vars are baked into Settings
-    /// at build time via `from_toml_and_env`, serialized to TOML, then parsed
-    /// back at runtime via `from_toml`. Verifies that env-sourced integration
-    /// values (strings like "true") are normalized to proper types so the
-    /// serialized TOML has correct types.
-    #[test]
-    fn test_env_var_roundtrip_normalizes_integration_types() {
-        let toml_str = crate_test_settings_str();
-
-        let integration_prefix = format!(
-            "{}{}INTEGRATIONS{}TESTLIGHT{}",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-        );
-        let enabled_key = format!("{}ENABLED", integration_prefix);
-        let endpoint_key = format!("{}ENDPOINT", integration_prefix);
-
-        temp_env::with_var(enabled_key, Some("true"), || {
-            temp_env::with_var(
-                endpoint_key,
-                Some("https://testlight-env.test/auction"),
-                || {
-                    // Step 1: Parse with env vars (what build.rs does)
-                    let settings =
-                        Settings::from_toml_and_env(&toml_str).expect("Settings should parse");
-
-                    // Verify normalization converted "true" to bool
-                    let raw = settings.integrations.get("testlight").unwrap();
-                    assert!(
-                        raw.get("enabled").unwrap().is_boolean(),
-                        "enabled should be normalized to bool, got: {:?}",
-                        raw.get("enabled")
-                    );
-
-                    // Step 2: Serialize to TOML (what build.rs does)
-                    let merged_toml =
-                        toml::to_string_pretty(&settings).expect("Should serialize to TOML");
-
-                    // Step 3: Parse back (what runtime does)
-                    let runtime_settings =
-                        Settings::from_toml(&merged_toml).expect("Runtime should parse");
-
-                    let config = runtime_settings
-                        .integration_config::<TestlightConfig>("testlight")
-                        .expect("should get config")
-                        .expect("should be enabled");
-
-                    assert_eq!(config.endpoint, "https://testlight-env.test/auction");
-                    assert!(config.enabled);
-                },
-            );
-        });
     }
 
     /// Verifies that `from_toml` does NOT read environment variables.
