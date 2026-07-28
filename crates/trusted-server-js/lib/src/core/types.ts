@@ -288,10 +288,6 @@ export interface AuctionBidData {
   hb_adid?: string;
   hb_cache_host?: string;
   hb_cache_path?: string;
-  /** Winning creative width; the bridge sizes the inline render from this. */
-  w?: number;
-  /** Winning creative height; the bridge sizes the inline render from this. */
-  h?: number;
   nurl?: string;
   burl?: string;
   /** Typed winning-bid renderer capability. */
@@ -307,12 +303,7 @@ export interface AuctionBidData {
    * `inject_adm_for_testing`.
    */
   adm?: string;
-  /**
-   * Verbose per-bid debug blob (carries the raw, un-sanitized creative among
-   * other fields). Only present when `[debug] inject_adm_for_testing = true`;
-   * its presence is also the client-side gate for the testing-only direct
-   * GAM-replace path.
-   */
+  /** Debug-only bid field mirror. Only present when `[debug] inject_adm_for_testing = true`. */
   debug_bid?: AuctionDebugBidData;
 }
 

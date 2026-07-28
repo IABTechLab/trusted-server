@@ -301,12 +301,24 @@ pub fn convert_to_openrtb_response_with_trace(
 
         // Ordinary markup follows the configured sanitize/rewrite path. A typed
         // renderer is serialized separately and never enters the HTML sanitizer.
-        let (adm, renderer) = if let Some(ref raw_creative) = bid.creative {
+        let (adm, renderer) = if let Some(raw_creative) = bid
+            .creative
+            .as_deref()
+            .filter(|creative| !creative.trim().is_empty())
+        {
+            if bid.renderer.is_some() {
+                log::warn!(
+                    "Auction {}: winning bid for slot '{}' from '{}' has both creative markup and a renderer; using creative markup",
+                    auction_request.id,
+                    slot_id,
+                    bid.bidder
+                );
+            }
             let sanitize_creatives = settings.auction.sanitize_creatives;
             let sanitized = if sanitize_creatives {
                 creative::sanitize_creative_html(raw_creative)
             } else {
-                raw_creative.clone()
+                raw_creative.to_owned()
             };
             let sanitized_len = sanitized.len();
             let rewrite_creatives = settings.auction.rewrite_creatives;
@@ -342,12 +354,13 @@ pub fn convert_to_openrtb_response_with_trace(
         } else if let Some(renderer) = bid.renderer.as_ref() {
             (None, Some(renderer))
         } else {
-            return Err(Report::new(TrustedServerError::Auction {
-                message: format!(
-                    "Winning bid for slot '{}' from '{}' has no render source",
-                    slot_id, bid.bidder
-                ),
-            }));
+            log::warn!(
+                "Auction {}: skipping winning bid for slot '{}' from '{}' because it has no render source",
+                auction_request.id,
+                slot_id,
+                bid.bidder
+            );
+            continue;
         };
 
         let bid_trace = trace_enabled
@@ -360,17 +373,27 @@ pub fn convert_to_openrtb_response_with_trace(
                 provider: trace.provider.clone(),
                 bidder: trace.bidder.clone(),
             });
-        let ext = (renderer.is_some() || bid_trace.is_some())
-            .then(|| {
-                BidExt {
-                    trusted_server: BidTrustedServerExt {
-                        renderer,
-                        trace: bid_trace,
-                    },
-                }
-                .to_ext()
-            })
-            .flatten();
+        let ext = if renderer.is_some() || bid_trace.is_some() {
+            let ext = BidExt {
+                trusted_server: BidTrustedServerExt {
+                    renderer,
+                    trace: bid_trace,
+                },
+            }
+            .to_ext();
+            if ext.is_none() && renderer.is_some() {
+                log::warn!(
+                    "Auction {}: skipping winning bid for slot '{}' from '{}' because its renderer extension could not be serialized",
+                    auction_request.id,
+                    slot_id,
+                    bid.bidder
+                );
+                continue;
+            }
+            ext
+        } else {
+            None
+        };
 
         let openrtb_bid = OpenRtbBid {
             id: bid
@@ -1304,19 +1327,99 @@ mod tests {
     }
 
     #[test]
-    fn convert_to_openrtb_response_rejects_winner_without_render_source() {
+    fn convert_to_openrtb_response_skips_invalid_winners_without_dropping_valid_slots() {
         let settings = make_settings();
         let auction_request = make_auction_request();
-        let mut bid = make_bid("div-gpt-top", "appnexus", Some(2.75));
-        bid.creative = None;
+        let mut missing = make_bid("missing", "invalid", Some(3.0));
+        missing.creative = None;
+        let mut whitespace = make_bid("whitespace", "invalid", Some(2.9));
+        whitespace.creative = Some(" \n\t ".to_string());
+        let ordinary = make_bid("ordinary", "appnexus", Some(2.75));
+        let mut renderer = make_bid("renderer", "aps", Some(2.5));
+        renderer.creative = Some("  ".to_string());
+        renderer.bid_id = Some("upstream-renderer-bid".to_string());
+        renderer.creative_id = None;
+        renderer.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
+            version: 1,
+            account_id: "example-account".to_string(),
+            bid_id: "upstream-renderer-bid".to_string(),
+            creative_id: None,
+            tag_type: ApsTagType::Iframe,
+            creative_url: "https://creative.example/render".to_string(),
+            aax_response: "fictional-base64".to_string(),
+            width: 300,
+            height: 250,
+        }));
+        let mut result = OrchestrationResult::empty(
+            crate::auction::types::AuctionTraceContext::new(
+                crate::auction::types::AuctionSource::AuctionApi,
+            ),
+            crate::auction::types::AuctionPublicOutcome::NoBid,
+        );
+        result.winning_bids = HashMap::from([
+            (missing.slot_id.clone(), missing),
+            (whitespace.slot_id.clone(), whitespace),
+            (ordinary.slot_id.clone(), ordinary),
+            (renderer.slot_id.clone(), renderer),
+        ]);
+        result.total_time_ms = 50;
+
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
+            .expect("should omit invalid winners and preserve valid slots");
+        let json = response_json(response);
+        let bids: Vec<&JsonValue> = json["seatbid"]
+            .as_array()
+            .expect("should include valid seatbids")
+            .iter()
+            .map(|seatbid| &seatbid["bid"][0])
+            .collect();
+
+        assert_eq!(bids.len(), 2, "should omit only invalid winners");
+        let ordinary = bids
+            .iter()
+            .find(|bid| bid["impid"] == "ordinary")
+            .expect("should preserve ordinary winner");
+        assert_eq!(ordinary["adm"], "<div>Ad</div>");
+        let renderer = bids
+            .iter()
+            .find(|bid| bid["impid"] == "renderer")
+            .expect("should preserve renderer winner");
+        assert!(renderer.get("adm").is_none(), "should omit renderer adm");
+        assert!(
+            renderer.get("crid").is_none(),
+            "should omit absent upstream crid"
+        );
+        assert_eq!(renderer["id"], "upstream-renderer-bid");
+        assert!(renderer.get("ext").is_some(), "should include renderer ext");
+    }
+
+    #[test]
+    fn convert_to_openrtb_response_prefers_creative_when_both_render_sources_exist() {
+        let settings = make_settings();
+        let auction_request = make_auction_request();
+        let mut bid = make_bid("div-gpt-top", "aps", Some(2.75));
+        bid.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
+            version: 1,
+            account_id: "example-account".to_string(),
+            bid_id: "fictional-bid".to_string(),
+            creative_id: None,
+            tag_type: ApsTagType::Iframe,
+            creative_url: "https://creative.example/render".to_string(),
+            aax_response: "fictional-base64".to_string(),
+            width: 300,
+            height: 250,
+        }));
         let result = make_result(bid);
 
-        let error = convert_to_openrtb_response(&result, &settings, &auction_request, false)
-            .expect_err("should reject bid without a render source");
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
+            .expect("should prefer ordinary creative markup");
+        let json = response_json(response);
+        let bid = &json["seatbid"][0]["bid"][0];
 
+        assert_eq!(bid["adm"], "<div>Ad</div>");
         assert!(
-            format!("{error:?}").contains("has no render source"),
-            "should explain the missing render source"
+            bid.get("ext").is_none(),
+            "should omit the renderer extension when creative markup wins precedence"
         );
     }
 

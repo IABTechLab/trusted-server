@@ -546,6 +546,45 @@ Auction results are returned in standard OpenRTB format with an `ext.orchestrato
 }
 ```
 
+APS renderer winners use the same OpenRTB response with a typed renderer extension instead of `adm`:
+
+```json
+{
+  "id": "auction-abc123",
+  "seatbid": [
+    {
+      "seat": "aps",
+      "bid": [
+        {
+          "id": "upstream-aps-bid-id",
+          "impid": "header-banner",
+          "price": 2.5,
+          "w": 728,
+          "h": 90,
+          "ext": {
+            "trusted_server": {
+              "renderer": {
+                "type": "aps",
+                "version": 1,
+                "accountId": "example-account",
+                "bidId": "upstream-aps-bid-id",
+                "tagType": "iframe",
+                "creativeUrl": "https://creative.example/render",
+                "aaxResponse": "fictional-base64-envelope",
+                "width": 728,
+                "height": 90
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+For these bids, `id` preserves APS's upstream bid ID, `crid` is present only when APS supplies one, and `adm` is absent. TSJS understands this contract; other `/auction` consumers must render `ext.trusted_server.renderer` explicitly.
+
 EC identity is maintained with the `ts-ec` cookie; auction responses do not emit EC ID headers.
 
 ## Creative Processing

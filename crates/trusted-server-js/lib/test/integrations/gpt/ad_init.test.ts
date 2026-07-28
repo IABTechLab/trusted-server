@@ -2023,9 +2023,9 @@ describe('installTsRenderBridge', () => {
     );
   }
 
-  function createTrustedSlotIframe(): Window {
+  function createTrustedSlotIframe(divId = 'div-header'): Window {
     const slot = document.createElement('div');
-    slot.id = 'div-header';
+    slot.id = divId;
     const iframe = document.createElement('iframe');
     slot.appendChild(iframe);
     document.body.appendChild(slot);
@@ -2085,7 +2085,9 @@ describe('installTsRenderBridge', () => {
     expect(stopSpy).toHaveBeenCalledTimes(2);
     expect(fetchStub).not.toHaveBeenCalled();
     expect(beaconSpy).not.toHaveBeenCalled();
-    expect(portMessages).toHaveLength(1);
+    // Server-rendered APS descriptors are reusable: GAM can issue repeated
+    // Universal Creative requests for the same winning ad ID.
+    expect(portMessages).toHaveLength(2);
     const response = JSON.parse(portMessages[0]) as Record<string, unknown>;
     expect(Object.keys(response).sort()).toEqual(
       [

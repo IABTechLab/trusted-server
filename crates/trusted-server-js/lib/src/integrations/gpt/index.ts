@@ -356,10 +356,17 @@ function slotIdForMessageSource(source: MessageEventSource | null): string | und
   if (!source) return undefined;
 
   const slots = window.tsjs?.adSlots ?? [];
-  return slots.find((slot) =>
-    candidateSlotRoots(slot.div_id).some((root) =>
+  const ownsSource = (roots: HTMLElement[]): boolean =>
+    roots.some((root) =>
       Array.from(root.querySelectorAll('iframe')).some((iframe) => iframe.contentWindow === source)
-    )
+    );
+  // Prefer exact configured IDs before prefix/container fallbacks so a nested
+  // dynamic slot cannot be claimed by an overlapping parent slot.
+  return (
+    slots.find((slot) => {
+      const root = document.getElementById(slot.div_id);
+      return root !== null && ownsSource([root]);
+    }) ?? slots.find((slot) => ownsSource(candidateSlotRoots(slot.div_id)))
   )?.id;
 }
 
@@ -2660,6 +2667,26 @@ export function installTsRenderBridge(): void {
       return;
     }
     const matchedBid = requestOwner.bid;
+
+    if (matchedBid.renderer !== undefined) {
+      const renderer = validateApsRenderer(matchedBid.renderer);
+      const rendererUrl = apsRendererUrl();
+      if (!renderer || !rendererUrl) return;
+      e.stopImmediatePropagation();
+      port.postMessage(
+        JSON.stringify({
+          message: 'Prebid Response',
+          adId,
+          renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
+          rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+          rendererUrl,
+          apsRenderer: renderer,
+          width: renderer.width,
+          height: renderer.height,
+        })
+      );
+      return;
+    }
 
     const slot = window.tsjs?.adSlots?.find((s) => s.id === slotId);
     // Prefer the winning creative's own dimensions; the first configured slot

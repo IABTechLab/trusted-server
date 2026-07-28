@@ -339,6 +339,21 @@ pub struct PrebidIntegrationConfig {
     pub suppress_nurl_bidders: Vec<String>,
 }
 
+fn remove_aps_bidders(config: &mut PrebidIntegrationConfig) {
+    for (field, bidders) in [
+        ("bidders", &mut config.bidders),
+        ("client_side_bidders", &mut config.client_side_bidders),
+    ] {
+        let original_len = bidders.len();
+        bidders.retain(|bidder| !bidder.eq_ignore_ascii_case("aps"));
+        if bidders.len() != original_len {
+            log::warn!(
+                "prebid: ignoring APS in integrations.prebid.{field}; configure APS under [integrations.aps]"
+            );
+        }
+    }
+}
+
 impl IntegrationConfig for PrebidIntegrationConfig {
     fn is_enabled(&self) -> bool {
         self.enabled
@@ -935,6 +950,7 @@ fn build(
         return Ok(None);
     };
     canonicalize_excluded_gam_ad_unit_path_suffixes(&mut config);
+    remove_aps_bidders(&mut config);
 
     validate_external_bundle_config(&config, &settings.proxy.allowed_domains)?;
 
@@ -1611,10 +1627,12 @@ impl PrebidAuctionProvider {
                 // a non-object) must not clobber real params from the expansion.
                 let mut expanded: HashMap<String, Json> = HashMap::new();
                 let mut direct: Vec<(String, Json)> = Vec::new();
+                let mut excluded_aps = false;
                 for (name, params) in &slot.bidders {
-                    if name == "aps" {
+                    if name.eq_ignore_ascii_case("aps") {
                         // Trusted Server APS is a separate OpenRTB provider. Never
                         // send native APS demand through PBS for the same cohort.
+                        excluded_aps = true;
                         continue;
                     }
                     if name == TRUSTED_SERVER_BIDDER {
@@ -1623,10 +1641,14 @@ impl PrebidAuctionProvider {
                         // predate the native provider. The expansion above would
                         // fabricate a PBS entry for it, re-enabling the duplicate
                         // demand path the `aps` skip above exists to prevent.
-                        expanded.remove("aps");
+                        expanded.retain(|name, _| {
+                            let keep = !name.eq_ignore_ascii_case("aps");
+                            excluded_aps |= !keep;
+                            keep
+                        });
                     } else if self.config.bidders.iter().any(|b| b == name) {
                         direct.push((name.clone(), params.clone()));
-                    } else if name != "aps" {
+                    } else {
                         // `aps` is intentionally handled by its own provider. Any
                         // other unrecognized key is likely a misconfiguration (a
                         // slot bidder absent from `config.bidders`) that silently
@@ -1714,6 +1736,14 @@ impl PrebidAuctionProvider {
                         slot.id,
                         dropped_fabricated.join(", ")
                     );
+                }
+
+                if excluded_aps && bidder.is_empty() {
+                    log::warn!(
+                        "prebid: dropping imp '{}' because it contains only APS demand; refusing PBS stored-request fallback",
+                        slot.id
+                    );
+                    return None;
                 }
 
                 // When no eligible PBS bidder params remain, tell PBS to resolve
@@ -1922,14 +1952,6 @@ impl PrebidAuctionProvider {
         }
         .to_ext();
 
-        // Extract Referer header for site.ref
-        let referer = context
-            .request
-            .headers()
-            .get(header::REFERER)
-            .and_then(|value| value.to_str().ok())
-            .map(std::string::ToString::to_string);
-
         // Advertise the effective auction budget, not the raw provider config:
         // the orchestrator caps `context.timeout_ms` to the remaining auction
         // budget, and the edge backend stops waiting after that long. Telling
@@ -1943,7 +1965,6 @@ impl PrebidAuctionProvider {
             site: Some(Site {
                 domain: Some(request.publisher.domain.clone()),
                 page: page_url,
-                r#ref: referer,
                 publisher: Some(Publisher {
                     domain: Some(request.publisher.domain.clone()),
                     ..Default::default()
@@ -5154,7 +5175,7 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn to_openrtb_sets_site_ref_from_referer_header() {
+    fn to_openrtb_omits_raw_referer_from_site_ref() {
         let provider = PrebidAuctionProvider::new(base_config());
         let auction_request = create_test_auction_request();
 
@@ -5174,10 +5195,9 @@ external_bundle_sri = "sha384-AAAA"
         );
         let site = openrtb.site.as_ref().expect("should have site");
 
-        assert_eq!(
-            site.r#ref.as_deref(),
-            Some("https://google.com/search?q=test"),
-            "should set site.ref from Referer header"
+        assert!(
+            site.r#ref.is_none(),
+            "should not duplicate the raw browser Referer in site.ref"
         );
     }
 
@@ -6868,8 +6888,7 @@ set = { placementId = "explicit_header" }
     // ========================================================================
 
     #[test]
-    fn to_openrtb_uses_stored_request_when_slot_has_no_pbs_bidder_params() {
-        // Slot only has "aps" provider — not a PBS bidder
+    fn to_openrtb_drops_aps_only_slots_instead_of_using_stored_requests() {
         let slot = make_slot(
             "atf_sidebar_ad",
             HashMap::from([("aps".to_string(), json!({"slotID": "aps-slot-atf-sidebar"}))]),
@@ -6877,16 +6896,10 @@ set = { placementId = "explicit_header" }
         let request = make_auction_request(vec![slot]);
 
         let ortb = call_to_openrtb(base_config(), &request);
-        let ext = ortb.imp[0].ext.as_ref().expect("should have imp ext");
-        let prebid = ext.get("prebid").expect("should have prebid in ext");
 
         assert!(
-            prebid.get("bidder").is_none(),
-            "should not send inline bidder params when using stored request"
-        );
-        assert_eq!(
-            prebid["storedrequest"]["id"], "atf_sidebar_ad",
-            "should use slot id as stored request id"
+            ortb.imp.is_empty(),
+            "should not route APS-only demand through a PBS stored request"
         );
     }
 
@@ -7219,7 +7232,7 @@ bidders = ["kargo", "triplelift"]
     }
 
     #[test]
-    fn to_openrtb_skips_aps_key_from_slot_bidders_in_pbs_request() {
+    fn to_openrtb_drops_aps_only_trusted_server_expansion() {
         let mut config = base_config();
         config.bidders.push("aps".to_string());
         let slot = make_slot(
@@ -7229,12 +7242,10 @@ bidders = ["kargo", "triplelift"]
         let request = make_auction_request(vec![slot]);
 
         let ortb = call_to_openrtb(config, &request);
-        let ext = ortb.imp[0].ext.as_ref().expect("should have imp ext");
-        let prebid = ext.get("prebid").expect("should have prebid in ext");
 
         assert!(
-            prebid.get("bidder").is_none(),
-            "should not forward aps key into PBS imp.ext.prebid.bidder"
+            ortb.imp.is_empty(),
+            "should not re-enable APS through PBS expansion or stored-request fallback"
         );
     }
 

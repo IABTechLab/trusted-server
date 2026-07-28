@@ -29,7 +29,7 @@ import './_adapters.generated';
 
 import { log } from '../../core/log';
 import { buildAdRequest, parseAuctionResponse, parseAuctionTraceSummary } from '../../core/auction';
-import { registerApsPrebidRenderer } from '../aps/render';
+import { registerApsPrebidRenderer, validateApsRenderer } from '../aps/render';
 import type { AuctionBid, AuctionEid } from '../../core/auction';
 import type { AdTraceEventKind, AuctionSlot, TrustedServerBidTrace } from '../../core/types';
 
@@ -244,7 +244,16 @@ export function auctionBidsToPrebidBids(auctionBids: AuctionBid[], bidRequests: 
     }
   }
 
-  return auctionBids.map((bid) => {
+  return auctionBids.flatMap((bid) => {
+    // Prebid admission is the last point before the descriptor becomes a bid
+    // capability. Drop malformed APS bids rather than letting them participate
+    // in the auction without a render path.
+    const renderer = bid.renderer ? validateApsRenderer(bid.renderer) : undefined;
+    if (bid.renderer && !renderer) {
+      log.warn(`[tsjs-prebid] dropped invalid APS renderer bid for '${bid.impid}'`);
+      return [];
+    }
+
     const origReq = requestsByCode.get(bid.impid);
     const requestId = origReq?.bidId ?? bid.impid;
     // Stash by requestId so registration survives Prebid stripping the custom field.
