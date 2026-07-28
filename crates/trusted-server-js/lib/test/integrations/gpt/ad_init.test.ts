@@ -200,6 +200,7 @@ describe('installTsAdInit', () => {
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_cache_host', 'cache.example.com');
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_cache_path', '/pbc/v1/cache');
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_initial', '1');
+    expect(mockPubads.enableSingleRequest).toHaveBeenCalledOnce();
     expect(mockPubads.refresh).not.toHaveBeenCalled();
 
     fetchSpy.mockRestore();
