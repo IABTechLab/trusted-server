@@ -1248,6 +1248,19 @@ accepted external URLs remain direct and are not host allowlisted by the
 sanitizer. The setting does not affect HTML or CSS fetched through
 `/first-party/proxy`. See [Creative Processing](/guide/creative-processing#auction-rewrite-control).
 
+::: warning Existing configs and rollback
+Configs created before `rewrite_creatives` was introduced must first add
+`rewrite_creatives = true` under `[auction]`. After adding the leaf, set
+`TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES`, run `ts config validate`, and push
+the resolved config.
+
+The default `true` is omitted from stored JSON so older binaries can read the
+blob during rollback. An explicit `false` must remain serialized. Before rolling
+back to a binary without this field, remove the `false` environment override (or
+set the file value to `true`), push the resulting default-compatible blob, and
+only then roll back the binary.
+:::
+
 **Example**:
 
 ```toml

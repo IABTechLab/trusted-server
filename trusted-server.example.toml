@@ -120,8 +120,9 @@ rewrite_script = true
 
 [auction]
 enabled = false
-# Defaults to false. Set true to rewrite winning-bid adm to first-party endpoints,
-# converting proxy/click URLs and injecting the creative TSJS runtime.
+# Defaults to false. Keep this leaf present when using the EdgeZero v0.0.4
+# environment override. Set true to rewrite winning-bid adm to first-party
+# endpoints, converting proxy/click URLs and injecting the creative TSJS runtime.
 # Sanitization is controlled separately by `sanitize_creatives` below.
 rewrite_creatives = false
 # Strip executable markup (script/object/embed/form/...) from winning-bid adm,
@@ -131,10 +132,10 @@ rewrite_creatives = false
 # Enable whenever creatives can render in a context that shares the publisher's
 # origin — it is the primary defence there.
 #
-# Set false only when creatives render in a foreign-origin frame (for example the
+# Leave disabled when creatives render in a foreign-origin frame (for example the
 # Prebid Universal Creative inside the ad server's iframe), where the markup cannot
 # reach the publisher origin. Sanitization removes script-based creatives entirely,
-# so leaving it enabled on a script-heavy demand stack silently blanks those slots.
+# so enabling it on a script-heavy demand stack silently blanks those slots.
 sanitize_creatives = false
 providers = []
 timeout_ms = 2000
