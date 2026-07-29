@@ -66,7 +66,7 @@ type TestWindow = Omit<Window, 'tsjs'> & {
   tsjs?: Partial<TsjsApi>;
 };
 
-async function runGptBootstrap(googletag: object): Promise<void> {
+async function runGptBootstrapWithGoogleTag(googletag: object): Promise<void> {
   const bootstrapUrl = new URL(
     '../../../../../trusted-server-core/src/integrations/gpt_bootstrap.js',
     import.meta.url
@@ -104,6 +104,43 @@ async function installHandoff(implementation: HandoffImplementation): Promise<vo
   installTsAdInit();
 }
 
+function appendResponsiveSlotElement(
+  id: string,
+  containerHasLayout: boolean,
+  elementHidden = false,
+  elementHasLayout = false
+): HTMLDivElement {
+  const container = document.createElement('div');
+  container.id = `${id}-container`;
+  container.dataset.responsiveSlotTest = 'true';
+  container.style.display = containerHasLayout ? 'block' : 'none';
+  container.getBoundingClientRect = () =>
+    ({
+      width: containerHasLayout ? 320 : 0,
+      height: containerHasLayout ? 100 : 0,
+    }) as DOMRect;
+
+  const element = document.createElement('div');
+  element.id = id;
+  element.style.display = elementHidden ? 'none' : 'block';
+  element.getBoundingClientRect = () =>
+    ({
+      width: elementHasLayout ? 300 : 0,
+      height: elementHasLayout ? 250 : 0,
+    }) as DOMRect;
+  container.appendChild(element);
+  document.body.appendChild(container);
+  return element;
+}
+
+function runGptBootstrap(): void {
+  const bootstrap = readFileSync(
+    resolve(process.cwd(), '../../trusted-server-core/src/integrations/gpt_bootstrap.js'),
+    'utf8'
+  );
+  window.eval(bootstrap);
+}
+
 describe('installTsAdInit', () => {
   beforeEach(() => {
     vi.resetModules();
@@ -132,6 +169,7 @@ describe('installTsAdInit', () => {
     document.getElementById('div-size-hydrated')?.remove();
     document.getElementById('ad-header-0-_r_1_')?.remove();
     document.getElementById("ad'prefix-real")?.remove();
+    document.querySelectorAll('[data-responsive-slot-test]').forEach((element) => element.remove());
   });
 
   it('reads window.tsjs.bids synchronously and applies bid targeting before refresh', async () => {
@@ -1269,7 +1307,7 @@ describe('installTsAdInit', () => {
       bids: {},
     };
 
-    await runGptBootstrap(googletag);
+    await runGptBootstrapWithGoogleTag(googletag);
 
     mockPubads.disableInitialLoad();
     expect(disableInitialLoadMock).toHaveBeenCalledOnce();
@@ -1326,7 +1364,7 @@ describe('installTsAdInit', () => {
       bids: {},
     };
 
-    await runGptBootstrap(googletag);
+    await runGptBootstrapWithGoogleTag(googletag);
 
     // Older GPT runtimes may expose setConfig without getConfig. In that case,
     // the wrapper tracks explicit initial-load updates directly.
@@ -2157,6 +2195,113 @@ describe('installTsAdInit', () => {
 
     expect(mockPubads.refresh).toHaveBeenCalled();
   });
+
+  it.each([
+    { implementation: 'runtime', activeIndexes: [2], publisherOwned: true, selectedIndex: 2 },
+    { implementation: 'runtime', activeIndexes: [], selectedIndex: null },
+    { implementation: 'runtime', activeIndexes: [], elementLayoutIndexes: [1], selectedIndex: 1 },
+    { implementation: 'runtime', activeIndexes: [0, 2], selectedIndex: null },
+    {
+      implementation: 'runtime',
+      activeIndexes: [2, 3],
+      hiddenElementIndexes: [2],
+      selectedIndex: 3,
+    },
+    { implementation: 'runtime', activeIndexes: [2], divId: '', selectedIndex: null },
+    { implementation: 'bootstrap', activeIndexes: [2], publisherOwned: true, selectedIndex: 2 },
+    { implementation: 'bootstrap', activeIndexes: [], selectedIndex: null },
+    { implementation: 'bootstrap', activeIndexes: [], elementLayoutIndexes: [1], selectedIndex: 1 },
+    { implementation: 'bootstrap', activeIndexes: [0, 2], selectedIndex: null },
+    {
+      implementation: 'bootstrap',
+      activeIndexes: [2, 3],
+      hiddenElementIndexes: [2],
+      selectedIndex: 3,
+    },
+    { implementation: 'bootstrap', activeIndexes: [2], divId: '', selectedIndex: null },
+  ] as const)(
+    '$implementation resolves responsive matches $activeIndexes to $selectedIndex',
+    async (testCase) => {
+      const { implementation, activeIndexes, selectedIndex } = testCase;
+      const hiddenElementIndexes =
+        'hiddenElementIndexes' in testCase ? testCase.hiddenElementIndexes : [];
+      const elementLayoutIndexes =
+        'elementLayoutIndexes' in testCase ? testCase.elementLayoutIndexes : [];
+      const divId = 'divId' in testCase ? testCase.divId : 'ad-responsive-';
+      const publisherOwned = 'publisherOwned' in testCase && testCase.publisherOwned;
+      const elements = ['a', 'b', 'c', 'd'].map((suffix, index) =>
+        appendResponsiveSlotElement(
+          `ad-responsive-${suffix}`,
+          (activeIndexes as readonly number[]).includes(index),
+          (hiddenElementIndexes as readonly number[]).includes(index),
+          (elementLayoutIndexes as readonly number[]).includes(index)
+        )
+      );
+      const selectedElement = selectedIndex === null ? undefined : elements[selectedIndex];
+      const mockSlot = {
+        addService: vi.fn().mockReturnThis(),
+        setTargeting: vi.fn().mockReturnThis(),
+        getSlotElementId: vi.fn().mockReturnValue(selectedElement?.id ?? elements[0]!.id),
+        getTargeting: vi.fn().mockReturnValue([]),
+      };
+      const nativeRefresh = vi.fn();
+      const mockPubads = {
+        enableSingleRequest: vi.fn(),
+        getSlots: vi.fn().mockReturnValue(publisherOwned ? [mockSlot] : []),
+        addEventListener: vi.fn(),
+        refresh: nativeRefresh,
+      };
+      const defineSlot = vi.fn().mockReturnValue(mockSlot);
+      const nativeDisplay = vi.fn();
+      (window as TestWindow).googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot,
+        display: nativeDisplay,
+        pubads: vi.fn().mockReturnValue(mockPubads),
+        enableServices: vi.fn(),
+      };
+      (window as TestWindow).tsjs = {
+        adSlots: [
+          {
+            id: 'responsive_slot',
+            gam_unit_path: '/123/responsive',
+            div_id: divId,
+            formats: [[300, 250]],
+            targeting: {},
+          },
+        ],
+        bids: {},
+      };
+
+      if (implementation === 'runtime') {
+        const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+        installTsAdInit();
+      } else {
+        runGptBootstrap();
+      }
+      (window as TestWindow).tsjs!.adInit!();
+
+      if (selectedElement) {
+        if (publisherOwned) {
+          expect(defineSlot).not.toHaveBeenCalled();
+          expect(nativeRefresh).toHaveBeenCalledWith([mockSlot]);
+        } else {
+          expect(defineSlot).toHaveBeenCalledWith(
+            '/123/responsive',
+            [[300, 250]],
+            selectedElement.id
+          );
+          expect(nativeDisplay).toHaveBeenCalledWith(selectedElement.id);
+        }
+        expect((window as TestWindow).tsjs!.divToSlotId).toEqual({
+          [selectedElement.id]: 'responsive_slot',
+        });
+      } else {
+        expect(defineSlot).not.toHaveBeenCalled();
+        expect((window as TestWindow).tsjs!.divToSlotId).toEqual({});
+      }
+    }
+  );
 
   it('resolves dynamic div prefixes without interpolating div_id into a CSS selector', async () => {
     const dynamicDiv = document.createElement('div');
