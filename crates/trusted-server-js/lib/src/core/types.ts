@@ -115,6 +115,7 @@ export type AdTraceEventKind =
   | 'gpt_slot_requested'
   | 'gpt_slot_response_received'
   | 'gpt_slot_render_ended'
+  | 'gpt_render_unclaimed'
   | 'gpt_slot_onload'
   | 'gpt_impression_viewable'
   | 'gpt_slot_visibility_changed'
@@ -152,6 +153,7 @@ export interface AdTraceObservation {
   sizeMatchesConfigured?: boolean;
   inViewPercentage?: number;
   prebidAuctionDurationMs?: number;
+  gamIdentity?: AdTraceGamIdentity;
 }
 
 export interface AdTraceEvent extends AdTraceObservation {
@@ -160,6 +162,25 @@ export interface AdTraceEvent extends AdTraceObservation {
 }
 
 export type AdTraceResponseClass = 'empty' | 'backfill' | 'reservation' | 'unclassified_non_empty';
+
+/**
+ * Ad Manager's own account of what it served, as reported by `slotRenderEnded`.
+ *
+ * These are the publisher's own Ad Manager identifiers for the delivered ad —
+ * the same values Google's `?google_console=1` shows for the page. They are the
+ * only authoritative statement of which line item beat the Trusted Server
+ * candidate, so a render that Trusted Server cannot claim can still be named.
+ */
+export interface AdTraceGamIdentity {
+  lineItemId?: number;
+  creativeId?: number;
+  campaignId?: number;
+  advertiserId?: number;
+  sourceAgnosticLineItemId?: number;
+  sourceAgnosticCreativeId?: number;
+  yieldGroupIds?: readonly number[];
+  companyIds?: readonly number[];
+}
 export type AdTraceAcknowledgementState =
   | 'confirmed'
   | 'timed_out'
@@ -179,6 +200,7 @@ export interface GenerationTraceDiagnostics {
   requestNumber: number;
   terminalState: AdTraceGenerationTerminalState;
   responseClass?: AdTraceResponseClass;
+  gamIdentity?: AdTraceGamIdentity;
   renderedSize?: readonly [number, number];
   slotContentChanged?: boolean;
   sizeMatchesConfigured?: boolean;

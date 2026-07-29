@@ -7,6 +7,7 @@ import { log } from '../../core/log';
 import type {
   AdTraceCorrelationResolution,
   AdTraceCoverageCategory,
+  AdTraceGamIdentity,
   AdTraceResponseClass,
   AuctionSlot,
   AuctionBidData,
@@ -75,6 +76,12 @@ interface SlotRenderEndedEvent {
   slotContentChanged?: boolean;
   lineItemId?: number | null;
   creativeId?: number | null;
+  campaignId?: number | null;
+  advertiserId?: number | null;
+  sourceAgnosticLineItemId?: number | null;
+  sourceAgnosticCreativeId?: number | null;
+  yieldGroupIds?: readonly number[] | null;
+  companyIds?: readonly number[] | null;
 }
 
 interface GptSlotEvent extends SlotRenderEndedEvent {
@@ -101,6 +108,10 @@ interface RenderCandidate {
   lateEventsAllowed: boolean;
   consumed: boolean;
   superseded: boolean;
+  /** The rendered creative asked Trusted Server for this generation's markup. */
+  creativeRequestObserved: boolean;
+  /** Bounded wait for that request before the render is called unclaimed. */
+  attributionTimer?: ReturnType<typeof setTimeout>;
 }
 
 interface ExpectedRender {
@@ -312,6 +323,79 @@ function responseClass(event: GptSlotEvent): AdTraceResponseClass {
   if (event.isBackfill === true) return 'backfill';
   if (event.lineItemId != null || event.creativeId != null) return 'reservation';
   return 'unclassified_non_empty';
+}
+
+const MAX_GAM_ID_LIST = 8;
+
+function gamId(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+function gamIdList(value: unknown): readonly number[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const ids = value
+    .map(gamId)
+    .filter((id): id is number => id !== undefined)
+    .slice(0, MAX_GAM_ID_LIST);
+  return ids.length > 0 ? ids : undefined;
+}
+
+/**
+ * Ad Manager's own identifiers for the ad it just delivered into the slot.
+ *
+ * Only Ad Manager can say which line item beat the Trusted Server candidate, so
+ * an unclaimed render is nameable — house, direct-sold, or backfill — instead of
+ * collapsing into a single unattributed bucket.
+ */
+function gamIdentity(event: GptSlotEvent): AdTraceGamIdentity | undefined {
+  const identity: AdTraceGamIdentity = {
+    ...(gamId(event.lineItemId) !== undefined ? { lineItemId: event.lineItemId as number } : {}),
+    ...(gamId(event.creativeId) !== undefined ? { creativeId: event.creativeId as number } : {}),
+    ...(gamId(event.campaignId) !== undefined ? { campaignId: event.campaignId as number } : {}),
+    ...(gamId(event.advertiserId) !== undefined
+      ? { advertiserId: event.advertiserId as number }
+      : {}),
+    ...(gamId(event.sourceAgnosticLineItemId) !== undefined
+      ? { sourceAgnosticLineItemId: event.sourceAgnosticLineItemId as number }
+      : {}),
+    ...(gamId(event.sourceAgnosticCreativeId) !== undefined
+      ? { sourceAgnosticCreativeId: event.sourceAgnosticCreativeId as number }
+      : {}),
+    ...(gamIdList(event.yieldGroupIds) ? { yieldGroupIds: gamIdList(event.yieldGroupIds) } : {}),
+    ...(gamIdList(event.companyIds) ? { companyIds: gamIdList(event.companyIds) } : {}),
+  };
+  return Object.keys(identity).length > 0 ? identity : undefined;
+}
+
+/**
+ * How long a Trusted Server candidate waits for its creative to ask for markup.
+ *
+ * The Universal Creative requests markup as soon as Ad Manager writes it into
+ * the slot. When nothing arrives within this window, Ad Manager delivered other
+ * demand instead, and the render is reported as unclaimed rather than pending
+ * forever. A late request still upgrades the generation afterwards.
+ */
+const GAM_ATTRIBUTION_WINDOW_MS = 5_000;
+
+function settleGamAttribution(candidate: RenderCandidate): void {
+  candidate.creativeRequestObserved = true;
+  if (candidate.attributionTimer) clearTimeout(candidate.attributionTimer);
+  candidate.attributionTimer = undefined;
+}
+
+function armGamAttributionWindow(candidate: RenderCandidate): void {
+  if (candidate.creativeRequestObserved || candidate.attributionTimer) return;
+  candidate.attributionTimer = setTimeout(() => {
+    candidate.attributionTimer = undefined;
+    if (candidate.creativeRequestObserved || candidate.superseded) return;
+    window.tsjs?.recordAdTrace?.({
+      kind: 'gpt_render_unclaimed',
+      slotId: candidate.slotId,
+      generation: candidate.generation,
+      bidTraceId: candidate.traceToken,
+      reason: 'creative_markup_never_requested',
+    });
+  }, GAM_ATTRIBUTION_WINDOW_MS);
 }
 
 function findSlotElementByDivId(divId: string): HTMLElement | null {
@@ -876,6 +960,8 @@ function supersedeCandidate(candidate: RenderCandidate, reason: string): void {
   if (candidate.superseded) return;
   settleSupersededExpectedRenders(candidate);
   candidate.superseded = true;
+  if (candidate.attributionTimer) clearTimeout(candidate.attributionTimer);
+  candidate.attributionTimer = undefined;
   // GPT late callbacks carry only a slot object, never a generation. Once a
   // request is replaced, attributing any later callback to the old generation
   // would be a guess, so replacement always closes late-event ownership.
@@ -1082,6 +1168,7 @@ export function captureAdTraceRequest(
     lateEventsAllowed: true,
     consumed: false,
     superseded: false,
+    creativeRequestObserved: false,
   };
   retainCandidate(candidate);
 
@@ -1253,6 +1340,7 @@ function candidateForGptRequest(slot: GoogleTagSlot): RenderCandidate | undefine
     lateEventsAllowed: true,
     consumed: false,
     superseded: false,
+    creativeRequestObserved: false,
   };
 
   retainCandidate(candidate);
@@ -1561,11 +1649,23 @@ function installGptEvidenceListeners(service: GoogleTagPubAdsService): void {
       isEmpty: event.isEmpty,
       isBackfill: event.isBackfill,
       responseClass: responseClass(event),
+      gamIdentity: gamIdentity(event),
       renderedWidth: size?.[0],
       renderedHeight: size?.[1],
       slotContentChanged: event.slotContentChanged,
       sizeMatchesConfigured,
     });
+    // Only a generation that had a Trusted Server bid to render has something
+    // for Ad Manager to have passed over.
+    if (
+      !event.isEmpty &&
+      !event.isBackfill &&
+      !candidate.ambiguousRequest &&
+      !candidate.superseded &&
+      (candidate.traceToken || candidate.bid)
+    ) {
+      armGamAttributionWindow(candidate);
+    }
   });
 }
 
@@ -2201,6 +2301,9 @@ export function installTsRenderBridge(): void {
         monotonicNow() - candidate.createdAt <= 30_000
     );
     const exactCandidate = candidates.length === 1 ? candidates[0] : undefined;
+    // The creative Ad Manager rendered asked for this generation's markup, so
+    // Ad Manager's line item decision is settled regardless of what follows.
+    if (exactCandidate) settleGamAttribution(exactCandidate);
     window.tsjs?.recordAdTrace?.({
       kind: candidates.length === 1 ? 'pb_render_requested' : 'pb_render_rejected',
       slotId: sourceSlotId,

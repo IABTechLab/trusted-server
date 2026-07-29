@@ -1,4 +1,5 @@
 import type {
+  AdTraceGamIdentity,
   AdTraceStage,
   AdTraceStageName,
   GenerationTraceDiagnostics,
@@ -23,6 +24,13 @@ export interface TraceOverlayPresentation {
 type TraceStages = Record<AdTraceStageName, AdTraceStage>;
 
 const STAGE_ORDER: readonly AdTraceStageName[] = ['trustedServer', 'prebid', 'gam', 'creative'];
+const UNATTRIBUTED_RENDER_STATUS = 'GAM rendered an ad — source not attributed';
+const NAMED_GAM_OUTCOMES = new Set([
+  'trusted_server_won',
+  'other_gam_demand',
+  'other_reservation',
+  'gam_default_or_unclassified',
+]);
 
 function stageFacts(name: AdTraceStageName, stage: AdTraceStage): readonly string[] {
   if (stage.outcome === 'not_observed' || stage.outcome === 'not_run') return [];
@@ -62,6 +70,12 @@ function stageFacts(name: AdTraceStageName, stage: AdTraceStage): readonly strin
           return ['GAM returned backfill'];
         case 'trusted_server_won':
           return ['GAM selected the Trusted Server creative'];
+        case 'other_gam_demand':
+          return ['GAM delivered other demand — the Trusted Server creative never ran'];
+        case 'other_reservation':
+          return ['GAM delivered another reservation line item'];
+        case 'gam_default_or_unclassified':
+          return ['GAM delivered its own default or backup ad'];
         case 'trusted_server_candidate':
         case 'client_prebid_candidate':
         case 'direct_or_unattributed':
@@ -134,6 +148,30 @@ function renderStatus(render?: RenderTraceSnapshot): string | undefined {
   }
 }
 
+/**
+ * Name the delivered ad using Ad Manager's own report of what it served.
+ *
+ * These identifiers are the operator's own Ad Manager data — the same values
+ * `?google_console=1` shows — and are the only way to tell a house ad from a
+ * direct-sold line item when Trusted Server did not win the Ad Manager decision.
+ */
+function gamIdentityFact(identity: AdTraceGamIdentity | undefined): string | undefined {
+  if (!identity) return undefined;
+
+  const parts: string[] = [];
+  const lineItem = identity.lineItemId ?? identity.sourceAgnosticLineItemId;
+  const creative = identity.creativeId ?? identity.sourceAgnosticCreativeId;
+  if (lineItem) parts.push(`line item ${lineItem}`);
+  if (identity.campaignId) parts.push(`order ${identity.campaignId}`);
+  if (identity.advertiserId) parts.push(`advertiser ${identity.advertiserId}`);
+  if (creative) parts.push(`creative ${creative}`);
+  if (identity.yieldGroupIds?.length) {
+    parts.push(`yield group ${identity.yieldGroupIds.join(', ')}`);
+  }
+  if (identity.companyIds?.length) parts.push(`company ${identity.companyIds.join(', ')}`);
+  return parts.length > 0 ? `GAM reported ${parts.join(' · ')}` : undefined;
+}
+
 function visibilityFact(visibility: RenderTraceVisibility | undefined): string | undefined {
   if (visibility === 'visible') return 'Slot element currently visible';
   if (visibility === 'hidden') return 'Slot element currently hidden';
@@ -175,6 +213,15 @@ function compactBadgeStatus(
     response = 'GAM backfill';
   } else if (stages.gam.outcome === 'empty' || diagnostics?.responseClass === 'empty') {
     response = 'GAM empty';
+  } else if (stages.gam.outcome === 'gam_default_or_unclassified') {
+    response = 'GAM default ad';
+  } else if (
+    stages.gam.outcome === 'other_gam_demand' ||
+    stages.gam.outcome === 'other_reservation'
+  ) {
+    const lineItem =
+      diagnostics?.gamIdentity?.lineItemId ?? diagnostics?.gamIdentity?.sourceAgnosticLineItemId;
+    response = lineItem ? `GAM line item ${lineItem}` : 'GAM other demand';
   } else if (
     stages.gam.outcome === 'trusted_server_candidate' ||
     stages.gam.outcome === 'client_prebid_candidate' ||
@@ -206,8 +253,20 @@ export function presentTraceOverlay(
   for (const name of STAGE_ORDER) {
     for (const fact of stageFacts(name, stages[name])) facts.add(fact);
   }
-  const status = renderStatus(render);
+  // A named GAM decision outranks the generic render-timeline wording, which
+  // cannot distinguish other Ad Manager demand from an unresolved Trusted
+  // Server render.
+  const namedGamStatus = NAMED_GAM_OUTCOMES.has(stages.gam.outcome)
+    ? stageFacts('gam', stages.gam)[0]
+    : undefined;
+  const timelineStatus = renderStatus(render);
+  const status =
+    namedGamStatus && timelineStatus === UNATTRIBUTED_RENDER_STATUS
+      ? namedGamStatus
+      : timelineStatus;
   if (status) facts.add(status);
+  const identity = gamIdentityFact(diagnostics?.gamIdentity);
+  if (identity) facts.add(identity);
   const visibility = visibilityFact(render?.visibility);
   if (visibility) facts.add(visibility);
   if (render?.viewability === 'viewable') facts.add('Viewable impression observed');

@@ -614,7 +614,7 @@ test.describe("tester-only auction trace contract", () => {
             });
     });
 
-    test("actual generated Prebid selects the traced TS bid before an unattributed GAM render", async ({
+    test("actual generated Prebid selects the traced TS bid before GAM delivers other demand", async ({
         page,
     }) => {
         await openTesterPage(page);
@@ -645,34 +645,40 @@ test.describe("tester-only auction trace contract", () => {
             win.adTraceFixture.setSuppressCreative(true);
             win.googletag.pubads().refresh([win.adTraceFixture.latestSlot()]);
         });
+        // The suppressed creative never requests markup, so the bounded
+        // attribution window resolves the render as other Ad Manager demand
+        // instead of leaving it a permanent Trusted Server candidate.
         await expect
-            .poll(async () => {
-                const result = await exported(page);
-                const slot = result.slots.find(
-                    (item) => item.slotId === "ad-trace-slot",
-                ) as
-                    | {
-                          stages?: Record<
-                              string,
-                              { outcome?: string; confidence?: string }
-                          >;
-                      }
-                    | undefined;
-                return {
-                    prebid: slot?.stages?.prebid,
-                    gam: slot?.stages?.gam,
-                };
-            })
+            .poll(
+                async () => {
+                    const result = await exported(page);
+                    const slot = result.slots.find(
+                        (item) => item.slotId === "ad-trace-slot",
+                    ) as
+                        | {
+                              stages?: Record<
+                                  string,
+                                  { outcome?: string; confidence?: string }
+                              >;
+                          }
+                        | undefined;
+                    return {
+                        prebid: slot?.stages?.prebid,
+                        gam: slot?.stages?.gam,
+                    };
+                },
+                { timeout: 15_000 },
+            )
             .toMatchObject({
                 prebid: { outcome: "won", confidence: "definitive" },
                 gam: {
-                    outcome: "trusted_server_candidate",
-                    confidence: "probable",
+                    outcome: "other_gam_demand",
+                    confidence: "strong",
                 },
             });
     });
 
-    test("client selection, backfill, direct-or-unattributed, and retained generations stay independent", async ({
+    test("client selection, backfill, named reservation, and retained generations stay independent", async ({
         page,
     }) => {
         await openTesterPage(page);
@@ -744,6 +750,7 @@ test.describe("tester-only auction trace contract", () => {
             const win = window as Window & {
                 adTraceFixture: {
                     latestSlot(): { clearTargeting(): void };
+                    setNextRender(flags: Record<string, boolean>): void;
                     requestCurrent(): void;
                 };
                 tsjs: {
@@ -753,19 +760,35 @@ test.describe("tester-only auction trace contract", () => {
             const slot = win.adTraceFixture.latestSlot();
             slot.clearTargeting();
             win.tsjs.captureAdTraceRequest(slot, "fixture_direct");
+            win.adTraceFixture.setNextRender({ isReservation: true });
             win.adTraceFixture.requestCurrent();
         });
+        // Ad Manager reported its own reservation line item for a slot carrying
+        // no Trusted Server targeting, so the render is named rather than
+        // reported as unattributed.
         await expect
             .poll(async () => {
                 const result = await exported(page);
                 const slot = result.slots.find(
                     (item) => item.slotId === "ad-trace-slot",
                 ) as
-                    | { stages?: Record<string, { outcome?: string }> }
+                    | {
+                          stages?: Record<string, { outcome?: string }>;
+                          generations?: Array<{
+                              diagnostics?: {
+                                  gamIdentity?: { lineItemId?: number };
+                              };
+                          }>;
+                      }
                     | undefined;
-                return slot?.stages?.gam?.outcome;
+                return {
+                    gam: slot?.stages?.gam?.outcome,
+                    lineItemId:
+                        slot?.generations?.[slot.generations.length - 1]
+                            ?.diagnostics?.gamIdentity?.lineItemId,
+                };
             })
-            .toBe("direct_or_unattributed");
+            .toEqual({ gam: "other_reservation", lineItemId: 101 });
 
         const generations = await page.evaluate(() => {
             const win = window as Window & {

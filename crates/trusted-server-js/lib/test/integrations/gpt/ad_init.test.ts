@@ -1471,6 +1471,198 @@ describe('installTsAdInit', () => {
     expect(() => (window as TestWindow).tsjs!.adInit!()).not.toThrow();
     expect(mockPubads.refresh).toHaveBeenCalledWith([dynamicSlot]);
   });
+
+  describe('Ad Manager render attribution', () => {
+    const TRACE_ID = '550e8400-e29b-41d4-a716-446655440000';
+    const AUCTION_ID = '750e8400-e29b-41d4-a716-446655440000';
+
+    interface AttributionHarness {
+      recordAdTrace: ReturnType<typeof vi.fn>;
+      renderEnded: (event: Record<string, unknown>) => void;
+      slotElement: HTMLElement;
+    }
+
+    async function setupAttributionSlot(): Promise<AttributionHarness> {
+      const slotElement = document.createElement('div');
+      slotElement.id = 'div-attribution';
+      document.body.appendChild(slotElement);
+
+      const listeners: Record<string, Array<(event: Record<string, unknown>) => void>> = {};
+      // GPT echoes applied targeting back through getTargeting; the trace token
+      // reaches the request boundary that way.
+      const targeting: Record<string, string> = { hb_adid: 'ts-ad-id' };
+      const mockSlot = {
+        addService: vi.fn().mockReturnThis(),
+        setTargeting: vi.fn(function (this: unknown, key: string, value: string) {
+          targeting[key] = value;
+          return this;
+        }),
+        clearTargeting: vi.fn(function (this: unknown, key?: string) {
+          if (key) delete targeting[key];
+          return this;
+        }),
+        getSlotElementId: vi.fn().mockReturnValue('div-attribution'),
+        getTargeting: vi.fn((key: string) => (targeting[key] ? [targeting[key]] : [])),
+        getSizes: vi.fn().mockReturnValue([[300, 250]]),
+      };
+      const mockPubads = {
+        enableSingleRequest: vi.fn(),
+        getSlots: vi.fn().mockReturnValue([mockSlot]),
+        addEventListener: vi.fn((event: string, fn: (value: Record<string, unknown>) => void) => {
+          (listeners[event] ??= []).push(fn);
+        }),
+        refresh: vi.fn(),
+      };
+      (window as TestWindow).googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot: vi.fn().mockReturnValue(mockSlot),
+        pubads: vi.fn().mockReturnValue(mockPubads),
+        enableServices: vi.fn(),
+      };
+      const recordAdTrace = vi.fn();
+      (window as TestWindow).tsjs = {
+        adSlots: [
+          {
+            id: 'slot-a',
+            gam_unit_path: '/123/example',
+            div_id: 'div-attribution',
+            formats: [[300, 250]],
+            targeting: {},
+          },
+        ],
+        bids: {
+          'slot-a': {
+            hb_adid: 'ts-ad-id',
+            adm: '<div>Trusted Server creative</div>',
+            trace: {
+              version: 1,
+              auctionTraceId: AUCTION_ID,
+              bidTraceId: TRACE_ID,
+              source: 'initial_navigation',
+              slotId: 'slot-a',
+              provider: 'prebid',
+              bidder: 'example-bidder',
+            },
+          },
+        },
+        recordAdTrace,
+        nextAdTraceGeneration: vi.fn().mockReturnValue(1),
+      };
+
+      const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+      installTsAdInit();
+      (window as TestWindow).tsjs!.adInit!();
+
+      return {
+        recordAdTrace,
+        renderEnded: (event) =>
+          listeners.slotRenderEnded?.forEach((listener) => listener({ ...event, slot: mockSlot })),
+        slotElement,
+      };
+    }
+
+    afterEach(() => {
+      document.getElementById('div-attribution')?.remove();
+      vi.useRealTimers();
+    });
+
+    it("forwards Ad Manager's own identifiers for the delivered ad", async () => {
+      const { recordAdTrace, renderEnded } = await setupAttributionSlot();
+
+      renderEnded({
+        isEmpty: false,
+        isBackfill: false,
+        size: [300, 250],
+        lineItemId: 6543210987,
+        creativeId: 1234567890,
+        campaignId: 2345678901,
+        advertiserId: 3456789012,
+        yieldGroupIds: [11, 12],
+      });
+
+      expect(recordAdTrace).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: 'gpt_slot_render_ended',
+          responseClass: 'reservation',
+          gamIdentity: {
+            lineItemId: 6543210987,
+            creativeId: 1234567890,
+            campaignId: 2345678901,
+            advertiserId: 3456789012,
+            yieldGroupIds: [11, 12],
+          },
+        })
+      );
+    });
+
+    it('reports an unclaimed render when the creative never requests markup', async () => {
+      vi.useFakeTimers();
+      const { recordAdTrace, renderEnded } = await setupAttributionSlot();
+
+      renderEnded({ isEmpty: false, isBackfill: false, lineItemId: 6543210987 });
+      expect(recordAdTrace).not.toHaveBeenCalledWith(
+        expect.objectContaining({ kind: 'gpt_render_unclaimed' })
+      );
+
+      vi.advanceTimersByTime(5_000);
+      expect(recordAdTrace).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: 'gpt_render_unclaimed',
+          slotId: 'slot-a',
+          generation: 1,
+          bidTraceId: TRACE_ID,
+          reason: 'creative_markup_never_requested',
+        })
+      );
+    });
+
+    it('leaves an empty or backfill render to its own definitive classification', async () => {
+      vi.useFakeTimers();
+      const { recordAdTrace, renderEnded } = await setupAttributionSlot();
+
+      renderEnded({ isEmpty: true });
+      vi.advanceTimersByTime(5_000);
+
+      expect(recordAdTrace).not.toHaveBeenCalledWith(
+        expect.objectContaining({ kind: 'gpt_render_unclaimed' })
+      );
+    });
+
+    it('cancels the unclaimed report once the creative requests markup', async () => {
+      vi.useFakeTimers();
+      const { recordAdTrace, renderEnded, slotElement } = await setupAttributionSlot();
+      const iframe = document.createElement('iframe');
+      slotElement.appendChild(iframe);
+
+      const { installTsRenderBridge } = await import('../../../src/integrations/gpt/index');
+      const handlers: EventListener[] = [];
+      const spy = vi.spyOn(window, 'addEventListener').mockImplementation((type, listener) => {
+        if (type === 'message') handlers.push(listener as EventListener);
+      });
+      installTsRenderBridge();
+      spy.mockRestore();
+      // eslint-disable-next-line no-console
+
+      renderEnded({ isEmpty: false, isBackfill: false, lineItemId: 6543210987 });
+      handlers.forEach((handler) =>
+        handler({
+          data: { message: 'Prebid Request', adId: 'ts-ad-id' },
+          source: document.getElementById('div-attribution')!.querySelector('iframe')!
+            .contentWindow,
+          ports: [{ postMessage: vi.fn() }],
+          stopImmediatePropagation: vi.fn(),
+        } as unknown as Event)
+      );
+      vi.advanceTimersByTime(5_000);
+
+      expect(recordAdTrace).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: 'pb_render_requested', reason: 'exact_generation' })
+      );
+      expect(recordAdTrace).not.toHaveBeenCalledWith(
+        expect.objectContaining({ kind: 'gpt_render_unclaimed' })
+      );
+    });
+  });
 });
 
 describe('installTsRenderBridge', () => {
