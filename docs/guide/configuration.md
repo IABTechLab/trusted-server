@@ -635,6 +635,31 @@ path = "^/api/v[0-9]+/private"  # /api/v1/private, /api/v2/private
 
 **Validation**: Application startup fails if regex is invalid.
 
+::: warning Scope patterns to the paths you mean
+
+Handler patterns are matched against the full request path, so a broad pattern
+covers everything beneath it. The `/_ts/` namespace holds both admin routes and
+browser-facing endpoints that anonymous visitors must be able to reach:
+
+| Path                     | Called by                            |
+| ------------------------ | ------------------------------------ |
+| `/_ts/page-bids`         | Trusted Server JS, on SPA navigation |
+| `/_ts/api/v1/identify`   | Trusted Server JS, in the browser    |
+| `/_ts/api/v1/batch-sync` | Trusted Server JS, in the browser    |
+
+A pattern such as `path = "^/_ts"` puts those behind Basic Auth. Browser
+fetches never carry Basic credentials, so every visitor gets `401` — on
+`/_ts/page-bids` that means no ads after any client-side navigation. Match the
+admin routes specifically (`^/_ts/admin`) instead.
+
+Upgrading from a release before `/_ts/page-bids` existed: if any handler
+pattern covers it, narrow the pattern. The Trusted Server JS bundle falls back
+to the deprecated `/__ts/page-bids` alias in the meantime, but that alias is
+scheduled for removal
+([#970](https://github.com/IABTechLab/trusted-server/issues/970)).
+
+:::
+
 ### Security Considerations
 
 **Password Storage**:

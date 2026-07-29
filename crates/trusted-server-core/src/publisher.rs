@@ -3415,7 +3415,44 @@ fn is_supported_content_encoding(encoding: &str) -> bool {
     matches!(encoding, "" | "identity" | "gzip" | "deflate" | "br")
 }
 
-/// Same-origin gate for `/__ts/page-bids`.
+/// Canonical URL path of the SPA re-auction endpoint.
+///
+/// Lives in the internal `/_ts/` namespace shared by every other Trusted
+/// Server route. Adapters register this path; the tsjs SPA hook fetches it.
+pub const PAGE_BIDS_PATH: &str = "/_ts/page-bids";
+
+/// Deprecated double-underscore alias of [`PAGE_BIDS_PATH`].
+///
+/// The endpoint originally shipped as `/__ts/page-bids`, the only internal path
+/// using a `__` prefix. Renaming it is atomic on the server, but a browser runs
+/// whichever tsjs bundle it was already served: pages loaded before the rename —
+/// and cached bundles — keep requesting this path, and on a SPA that path is what
+/// delivers ads for in-session navigations. Adapters route it to the same handler
+/// so those clients keep working.
+///
+/// The alias is bidirectional in practice: the current tsjs bundle requests
+/// [`PAGE_BIDS_PATH`] first and falls back here when that path does not serve
+/// page-bids on a deployment. That covers a server rolled back to before the
+/// rename, and an operator `[[handlers]]` auth regex broad enough to cover
+/// `/_ts` (which would answer the canonical path with `401`). Both are
+/// transitional — an affected operator must narrow the regex before the alias
+/// is removed.
+///
+/// Removal is tracked by IABTechLab/trusted-server#970: drop this const, its
+/// four adapter registrations, and the client fallback once access logs show no
+/// remaining traffic on the legacy path.
+pub const PAGE_BIDS_LEGACY_PATH: &str = "/__ts/page-bids";
+
+/// `X-TSJS-Page-Bids` value the current tsjs bundle sends when it retries
+/// [`PAGE_BIDS_LEGACY_PATH`] because [`PAGE_BIDS_PATH`] was unusable.
+///
+/// Separates the two populations on the deprecated alias: pre-rename bundles
+/// (which age out by themselves) from current bundles falling back (which do
+/// not, because the cause is deployment configuration). See the logging in
+/// [`handle_page_bids`].
+pub const PAGE_BIDS_FALLBACK_MARKER: &str = "fallback";
+
+/// Same-origin gate for `/_ts/page-bids`.
 ///
 /// The endpoint is a side-effecting GET: it dispatches real PBS/APS auctions
 /// and forwards request-derived signals (IP, UA, geo, consent) to partners.
@@ -3445,7 +3482,7 @@ fn page_bids_request_allowed(req: &Request<EdgeBody>) -> bool {
 }
 
 /// Builds the `403 Forbidden` returned when the side-effecting
-/// `/__ts/page-bids` endpoint refuses a request — both the CORS preflight
+/// `/_ts/page-bids` endpoint refuses a request — both the CORS preflight
 /// (`OPTIONS`) and the GET cross-site gate ([`page_bids_request_allowed`])
 /// return this single denial shape.
 ///
@@ -3454,7 +3491,8 @@ fn page_bids_request_allowed(req: &Request<EdgeBody>) -> bool {
 /// preflight; letting `OPTIONS` fall through to the publisher origin (which may
 /// return permissive CORS) would defeat that, allowing a cross-site page to
 /// trigger real PBS/APS auctions from a visitor's browser. Every adapter returns
-/// this same response for `OPTIONS /__ts/page-bids`.
+/// this same response for `OPTIONS /_ts/page-bids` and for its deprecated
+/// `/__ts/page-bids` alias.
 pub fn page_bids_preflight_denied() -> Response<EdgeBody> {
     let mut response = Response::new(EdgeBody::from("Forbidden"));
     *response.status_mut() = StatusCode::FORBIDDEN;
@@ -3479,7 +3517,7 @@ fn normalize_page_bids_path(raw: &str) -> String {
     }
 }
 
-/// Handle `GET /__ts/page-bids?path=<path>` — server-side auction for SPA navigation.
+/// Handle `GET /_ts/page-bids?path=<path>` — server-side auction for SPA navigation.
 ///
 /// Matches creative opportunity slots for the given path, runs a server-side
 /// auction (APS + PBS), and returns the slot definitions and winning bids as JSON.
@@ -3501,19 +3539,9 @@ pub async fn handle_page_bids(
     ec_context: &EcContext,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    let Some(co_config) = &settings.creative_opportunities else {
-        let mut response = Response::new(EdgeBody::from("Creative opportunities not configured"));
-        *response.status_mut() = StatusCode::NOT_FOUND;
-        return Ok(response);
-    };
-
-    // Trusted request origin for absolute inline creative URLs — derived from the
-    // origin the visitor is actually on (scheme, host, port), not the configured
-    // publisher domain, which cannot carry a port and may differ by subdomain.
-    let request_info = RequestInfo::from_request(&req, services.client_info());
-    let page_bids_request_origin = request_origin(&request_info.scheme, &request_info.host);
-
-    // CSRF-style gate: refuse cross-site invocations before any auction work.
+    // CSRF-style gate: refuse cross-site invocations before any other work —
+    // including the not-configured 404 below, which would otherwise tell a
+    // cross-site caller whether this deployment has creative opportunities.
     if !page_bids_request_allowed(&req) {
         log::debug!(
             "page-bids: rejecting request (sec-fetch-site={:?}, tsjs header present={})",
@@ -3524,6 +3552,60 @@ pub async fn handle_page_bids(
         );
         return Ok(page_bids_preflight_denied());
     }
+
+    // Deprecation signal for the transition alias. Evaluated after the
+    // cross-site gate, so the count reflects genuine SPA clients still running a
+    // pre-rename tsjs bundle rather than anything a third-party page can
+    // inflate — and before the not-configured 404 below, so deployments with no
+    // creative opportunities still report their alias traffic instead of
+    // reading as zero. The log line and the response marker are the only in-app
+    // signals that `PAGE_BIDS_LEGACY_PATH` is still in use — the removal
+    // precondition in IABTechLab/trusted-server#970 is "no remaining traffic on
+    // the legacy path", which is otherwise only answerable from edge access
+    // logs.
+    //
+    // Two different clients land here, and they age out differently, so the log
+    // separates them by the `X-TSJS-Page-Bids` value. A pre-rename bundle sends
+    // `1` and disappears on its own as caches turn over. The current bundle
+    // sends `fallback` and does *not* — it only reaches the alias when the
+    // canonical path is unusable on this deployment (an operator `[[handlers]]`
+    // regex covering `/_ts`, or a server rolled back past the rename), which
+    // persists until that is fixed. Treating the two as one number would make
+    // #970 wait forever on a config problem. The value is client-supplied, so
+    // it is a diagnostic hint only; the gate above does not trust it.
+    let is_legacy_alias = req.uri().path() == PAGE_BIDS_LEGACY_PATH;
+    if is_legacy_alias {
+        let is_client_fallback = req
+            .headers()
+            .get("x-tsjs-page-bids")
+            .and_then(|value| value.to_str().ok())
+            == Some(PAGE_BIDS_FALLBACK_MARKER);
+        if is_client_fallback {
+            log::warn!(
+                "page-bids: served deprecated alias {PAGE_BIDS_LEGACY_PATH} to a current \
+                 tsjs bundle that could not use {PAGE_BIDS_PATH} — check `[[handlers]]` for \
+                 a pattern covering `/_ts`; see IABTechLab/trusted-server#970"
+            );
+        } else {
+            log::info!(
+                "page-bids: served deprecated alias {PAGE_BIDS_LEGACY_PATH} \
+                 (pre-rename tsjs bundle); see IABTechLab/trusted-server#970"
+            );
+        }
+    }
+
+    let Some(co_config) = &settings.creative_opportunities else {
+        let mut response = Response::new(EdgeBody::from("Creative opportunities not configured"));
+        *response.status_mut() = StatusCode::NOT_FOUND;
+        mark_deprecated_alias(&mut response, is_legacy_alias);
+        return Ok(response);
+    };
+
+    // Trusted request origin for absolute inline creative URLs — derived from the
+    // origin the visitor is actually on (scheme, host, port), not the configured
+    // publisher domain, which cannot carry a port and may differ by subdomain.
+    let request_info = RequestInfo::from_request(&req, services.client_info());
+    let page_bids_request_origin = request_origin(&request_info.scheme, &request_info.host);
 
     let path_param = req
         .uri()
@@ -3734,8 +3816,33 @@ pub async fn handle_page_bids(
         header::CACHE_CONTROL,
         HeaderValue::from_static("private, no-store"),
     );
+    mark_deprecated_alias(&mut response, is_legacy_alias);
 
     Ok(response)
+}
+
+/// Marks a response served through [`PAGE_BIDS_LEGACY_PATH`] as deprecated.
+///
+/// Attaches the RFC 9745 `deprecation` link relation pointing at the removal
+/// issue, so CDN and edge log pipelines can measure remaining legacy traffic
+/// from any vantage point — the removal precondition in
+/// IABTechLab/trusted-server#970 is otherwise answerable only from application
+/// logs. RFC 9745's companion `Deprecation` field is deliberately omitted: it
+/// carries a date, and there is no source of truth here for when the alias was
+/// deprecated.
+///
+/// No-op for the canonical path.
+fn mark_deprecated_alias(response: &mut Response<EdgeBody>, is_legacy_alias: bool) {
+    if !is_legacy_alias {
+        return;
+    }
+
+    response.headers_mut().insert(
+        header::LINK,
+        HeaderValue::from_static(
+            "<https://github.com/IABTechLab/trusted-server/issues/970>; rel=\"deprecation\"",
+        ),
+    );
 }
 
 #[cfg(test)]
@@ -8153,6 +8260,14 @@ mod tests {
             Settings::from_toml(&toml).expect("should parse settings with creative_opportunities")
         }
 
+        /// Settings for a deployment that has no `[creative_opportunities]`
+        /// section, so page-bids answers `404`.
+        fn settings_without_co() -> Settings {
+            let toml = format!("{}\n[auction]\nenabled = true\n", crate_test_settings_str());
+            Settings::from_toml(&toml)
+                .expect("should parse settings without creative_opportunities")
+        }
+
         fn settings_with_co_auction_disabled() -> Settings {
             let toml = format!(
                 "{}\n[auction]\nenabled = false\n\n[creative_opportunities]\ngam_network_id = \"12345\"\n",
@@ -8221,11 +8336,15 @@ mod tests {
         }
 
         fn make_page_bids_request(path: &str) -> Request<EdgeBody> {
+            make_page_bids_request_on(PAGE_BIDS_PATH, path)
+        }
+
+        /// Builds a page-bids request against an explicit endpoint path, so the
+        /// canonical route and its deprecated alias can be compared directly.
+        fn make_page_bids_request_on(endpoint: &str, path: &str) -> Request<EdgeBody> {
             let mut req = Request::builder()
                 .method(Method::GET)
-                .uri(format!(
-                    "https://test-publisher.com/_ts/page-bids?path={path}"
-                ))
+                .uri(format!("https://test-publisher.com{endpoint}?path={path}"))
                 .body(EdgeBody::empty())
                 .expect("should build test request");
             // Pass the same-origin gate the way a browser fetch from the
@@ -8274,6 +8393,142 @@ mod tests {
             )
             .await
             .expect("should return ok response")
+        }
+
+        /// The deprecated `/__ts/page-bids` alias must be handled identically to
+        /// the canonical path — same status, same JSON body.
+        ///
+        /// The alias exists so pre-rename tsjs bundles keep getting ads on SPA
+        /// navigations. If the handler ever varied its output by request path
+        /// (slot matching reads the `path` *query parameter*, not the endpoint
+        /// path), those clients would silently get different results from the
+        /// ones on the canonical route.
+        #[tokio::test]
+        async fn deprecated_alias_response_matches_canonical_path() {
+            let settings = settings_with_co();
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+
+            let canonical = run_page_bids_response(
+                &settings,
+                &orchestrator,
+                &article_slot(),
+                make_page_bids_request_on(PAGE_BIDS_PATH, "/2024/01/my-article/"),
+            )
+            .await;
+            let alias = run_page_bids_response(
+                &settings,
+                &orchestrator,
+                &article_slot(),
+                make_page_bids_request_on(PAGE_BIDS_LEGACY_PATH, "/2024/01/my-article/"),
+            )
+            .await;
+
+            assert_eq!(
+                canonical.status(),
+                alias.status(),
+                "alias must return the same status as the canonical path"
+            );
+            assert_eq!(
+                canonical.into_body().into_bytes(),
+                alias.into_body().into_bytes(),
+                "alias must return the same body as the canonical path"
+            );
+        }
+
+        /// Traffic on the deprecated alias must be measurable from edge access
+        /// logs, not just application logs: the removal precondition in
+        /// IABTechLab/trusted-server#970 is "no remaining traffic on the legacy
+        /// path", and operators who cannot read app logs need a response-side
+        /// marker to count.
+        #[tokio::test]
+        async fn deprecated_alias_response_is_marked_deprecated() {
+            let settings = settings_with_co();
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+
+            let canonical = run_page_bids_response(
+                &settings,
+                &orchestrator,
+                &article_slot(),
+                make_page_bids_request_on(PAGE_BIDS_PATH, "/2024/01/my-article/"),
+            )
+            .await;
+            let alias = run_page_bids_response(
+                &settings,
+                &orchestrator,
+                &article_slot(),
+                make_page_bids_request_on(PAGE_BIDS_LEGACY_PATH, "/2024/01/my-article/"),
+            )
+            .await;
+
+            assert_eq!(
+                alias
+                    .headers()
+                    .get(header::LINK)
+                    .and_then(|value| value.to_str().ok()),
+                Some(
+                    "<https://github.com/IABTechLab/trusted-server/issues/970>; rel=\"deprecation\""
+                ),
+                "alias response should carry the RFC 9745 deprecation link relation"
+            );
+            assert!(
+                !canonical.headers().contains_key(header::LINK),
+                "canonical path should not be marked deprecated"
+            );
+        }
+
+        /// A deployment without creative opportunities answers page-bids with a
+        /// 404, but its alias traffic still has to be counted — otherwise a
+        /// silent legacy signal on such a config reads as "no remaining
+        /// traffic" when evaluating IABTechLab/trusted-server#970.
+        #[tokio::test]
+        async fn deprecated_alias_is_marked_without_creative_opportunities() {
+            let settings = settings_without_co();
+            assert!(
+                settings.creative_opportunities.is_none(),
+                "test settings should have no creative opportunities configured"
+            );
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+
+            let response = run_page_bids_response(
+                &settings,
+                &orchestrator,
+                &[],
+                make_page_bids_request_on(PAGE_BIDS_LEGACY_PATH, "/2024/01/my-article/"),
+            )
+            .await;
+
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "should 404 when creative opportunities are not configured"
+            );
+            assert!(
+                response.headers().contains_key(header::LINK),
+                "alias 404 should still be marked deprecated so it is countable"
+            );
+        }
+
+        /// The cross-site gate runs before the not-configured 404, so a
+        /// cross-site caller cannot probe whether a deployment has creative
+        /// opportunities configured.
+        #[tokio::test]
+        async fn cross_site_request_is_denied_before_configuration_is_revealed() {
+            let settings = settings_without_co();
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri(format!("https://test-publisher.com{PAGE_BIDS_PATH}?path=/"))
+                .body(EdgeBody::empty())
+                .expect("should build test request");
+            set_test_header(&mut req, "sec-fetch-site", "cross-site");
+
+            let response = run_page_bids_response(&settings, &orchestrator, &[], req).await;
+
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "cross-site request should be denied, not answered with the 404"
+            );
         }
 
         #[tokio::test]
