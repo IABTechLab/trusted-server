@@ -645,6 +645,31 @@ path = "^/api/v[0-9]+/private"  # /api/v1/private, /api/v2/private
 
 **Validation**: Application startup fails if regex is invalid.
 
+::: warning Scope patterns to the paths you mean
+
+Handler patterns are matched against the full request path, so a broad pattern
+covers everything beneath it. The `/_ts/` namespace holds both admin routes and
+browser-facing endpoints that anonymous visitors must be able to reach:
+
+| Path                     | Called by                            |
+| ------------------------ | ------------------------------------ |
+| `/_ts/page-bids`         | Trusted Server JS, on SPA navigation |
+| `/_ts/api/v1/identify`   | Trusted Server JS, in the browser    |
+| `/_ts/api/v1/batch-sync` | Trusted Server JS, in the browser    |
+
+A pattern such as `path = "^/_ts"` puts those behind Basic Auth. Browser
+fetches never carry Basic credentials, so every visitor gets `401` — on
+`/_ts/page-bids` that means no ads after any client-side navigation. Match the
+admin routes specifically (`^/_ts/admin`) instead.
+
+Upgrading from a release before `/_ts/page-bids` existed: if any handler
+pattern covers it, narrow the pattern. The Trusted Server JS bundle falls back
+to the deprecated `/__ts/page-bids` alias in the meantime, but that alias is
+scheduled for removal
+([#970](https://github.com/IABTechLab/trusted-server/issues/970)).
+
+:::
+
 ### Security Considerations
 
 **Password Storage**:
@@ -1298,11 +1323,16 @@ price_granularity = "dense"
 
 # Shared placeholder value for the site root ("/") — see {section} below.
 section_root = "home"
+# Which path segment names the section, 0-based. Default 0 (first segment).
+# Set to 1 for locale-prefixed URLs such as "/en/news/article".
+# section_segment = 0
 
 [[creative_opportunities.slot]]
 id = "ad-header"
 gam_unit_path = "/{network_id}/example/{section}"
-page_patterns = ["/", "/news/*", "/reviews/*"]
+# List each section landing page as well as its subtree: `/news/*` matches
+# `/news/article` but NOT `/news` — the glob requires the trailing separator.
+page_patterns = ["/", "/news", "/news/*", "/reviews", "/reviews/*"]
 formats = [{ width = 728, height = 90 }]
 ```
 
@@ -1327,23 +1357,39 @@ pre-templating behavior, so existing static configs are unchanged.
 
 `{section}` is derived from the request path at request time:
 
-- It is the **first non-empty path segment**. `/news/article-123` → `news`.
+- It is the non-empty path segment at `section_segment` (0-based, default `0`).
+  With the default, `/news/article-123` → `news`. A site that prefixes a locale
+  sets `section_segment = 1`, so `/en/news/article` → `news` rather than `en`.
 - It is sanitized: each run of characters outside `[A-Za-z0-9_-]` becomes a
   single `_`.
 - The path is used **raw — it is not percent-decoded**. So `/new%20s` →
   `new_20s` (only `%` is disallowed; `2` and `0` are kept), never the decoded
   `new_s`. This keeps `{section}` consistent with how `page_patterns` match the
   same raw path.
-- When the path has no segment (`/`, or repeated slashes), `{section}` is
-  `section_root`.
+- When the path has no segment at that index — the site root (`/`, or repeated
+  slashes), or a path shorter than `section_segment` — `{section}` is
+  `section_root`. So with `section_segment = 1`, the path `/en` renders the root
+  section rather than reusing the locale.
 
 `section_root` is **required** whenever any slot's template uses `{section}`,
 and must match `[A-Za-z0-9_-]+`. There is no default: the home-section name is
-publisher-specific, so the URL→section convention lives in config, not core.
-Startup fails if `{section}` is used without a valid `section_root`.
+publisher-specific. Startup fails if `{section}` is used without a valid
+`section_root`, and also if `gam_network_id` is blank while any slot is
+configured (a template referencing `{network_id}` would otherwise render an
+unusable path). A `[creative_opportunities]` block with no slots is disabled, so
+its `gam_network_id` is not checked.
+
+Both knobs are config-driven, so the URL→section convention stays with the
+publisher: `section_segment` selects which segment names the section, and
+`section_root` names the section when there is none.
+
+Leave both keys out when no template uses `{section}`. The pushed config blob
+carries only the keys your config sets, and a binary older than these keys
+rejects a blob containing them — so an unused key would block a rollback.
 
 Example resolution for `gam_unit_path = "/{network_id}/example/{section}"` with
-`gam_network_id = "123456789"` and `section_root = "home"`:
+`gam_network_id = "123456789"`, `section_root = "home"`, and the
+`page_patterns` shown above:
 
 | Request path    | `gam_unit_path`              |
 | --------------- | ---------------------------- |
@@ -1351,6 +1397,15 @@ Example resolution for `gam_unit_path = "/{network_id}/example/{section}"` with
 | `/news`         | `/123456789/example/news`    |
 | `/news/article` | `/123456789/example/news`    |
 | `/reviews/x`    | `/123456789/example/reviews` |
+
+The same config with `section_segment = 1` and locale-prefixed patterns
+(`["/en", "/en/news", "/en/news/*"]`):
+
+| Request path       | `gam_unit_path`           |
+| ------------------ | ------------------------- |
+| `/en`              | `/123456789/example/home` |
+| `/en/news`         | `/123456789/example/news` |
+| `/en/news/article` | `/123456789/example/news` |
 
 An **unmatched route** — a path matched by no slot's `page_patterns` — produces
 no slot at all, so no template is rendered for it.

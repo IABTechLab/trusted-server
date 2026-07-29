@@ -12,14 +12,16 @@
 
 ## File Map
 
-| File                                                      | Responsibility                                                                                                                                    |
-| --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `crates/trusted-server-core/src/platform/http.rs`         | Define the platform-neutral, default-off cache-bypass request option.                                                                             |
-| `crates/trusted-server-core/src/platform/test_support.rs` | Record cache-bypass options in the shared stub HTTP client for publisher tests.                                                                   |
-| `crates/trusted-server-adapter-fastly/src/platform.rs`    | Translate the platform option to Fastly `Request::set_pass(true)` in both send paths.                                                             |
-| `crates/trusted-server-core/src/publisher.rs`             | Apply the eligibility gate, strip validators, set the synthesized response policy, fail closed on unexpected 304, and test the complete behavior. |
+| File                                                                         | Responsibility                                                                                                                                    |
+| ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `crates/trusted-server-core/src/platform/http.rs`                            | Define the platform-neutral, default-off cache-bypass request option.                                                                             |
+| `crates/trusted-server-core/src/platform/test_support.rs`                    | Record cache-bypass options in the shared stub HTTP client for publisher tests.                                                                   |
+| `crates/trusted-server-adapter-fastly/src/platform.rs`                       | Translate the platform option to Fastly `Request::set_pass(true)` in both send paths.                                                             |
+| `crates/trusted-server-adapter-cloudflare/src/platform.rs`                   | Translate the platform option to `CacheMode::NoStore` on the outbound subrequest `RequestInit`.                                                   |
+| `crates/trusted-server-adapter-cloudflare/wrangler.toml`, `wrangler.ci.toml` | Enable the `cache_option_enabled` compatibility flag required by `CacheMode::NoStore`.                                                            |
+| `crates/trusted-server-core/src/publisher.rs`                                | Apply the eligibility gate, strip validators, set the synthesized response policy, fail closed on unexpected 304, and test the complete behavior. |
 
-No configuration schema, JavaScript, `/page-bids`, auction-ID, asset, or integration files change.
+No configuration schema, JavaScript, `/page-bids`, auction-ID, asset, or integration files change. The Cloudflare wrangler files change only to enable a compatibility flag the runtime mapping requires.
 
 ### Task 1: Add Platform Cache-Bypass Metadata and Test Recording
 

@@ -100,14 +100,25 @@ fn sanitize_section(segment: &str) -> String {
 
 /// Derives the `{section}` value from a request path.
 ///
-/// Uses the first non-empty path segment, sanitized to `[A-Za-z0-9_-]`. Falls
-/// back to `section_root` when the path has no segment (`/`, repeated slashes).
+/// Takes the non-empty path segment at `section_segment` (0-based, counting
+/// only non-empty segments), sanitized to `[A-Za-z0-9_-]`. Falls back to
+/// `section_root` when the path has no such segment — the site root (`/`,
+/// repeated slashes), or a path shorter than the configured index.
+///
+/// `section_segment` exists because the URL→section convention is
+/// publisher-specific: a site that prefixes a locale (`/en/news/article`) sets
+/// `section_segment = 1` to get `news` rather than `en`.
 ///
 /// The path is used **raw** (not percent-decoded) so this stays consistent with
 /// how [`page_patterns`](CreativeOpportunitySlot::page_patterns) glob-match the
 /// same path — e.g. `/new%20s` yields `new_20s`, never the decoded `new_s`.
-pub(crate) fn derive_section(path: &str, section_root: &str) -> String {
-    match path.split('/').find(|segment| !segment.is_empty()) {
+#[must_use]
+pub fn derive_section(path: &str, section_root: &str, section_segment: usize) -> String {
+    match path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .nth(section_segment)
+    {
         Some(segment) => sanitize_section(segment),
         None => section_root.to_string(),
     }
@@ -144,15 +155,54 @@ pub struct CreativeOpportunitiesConfig {
     ///
     /// Required when any slot's [`gam_unit_path`](CreativeOpportunitySlot::gam_unit_path)
     /// template contains `{section}`. No default — a home-section name is
-    /// publisher-specific, so the URL→section convention stays in config, not core.
-    #[serde(default)]
+    /// publisher-specific, so it stays in config, not core.
+    ///
+    /// Skipped when absent so a config blob pushed by a newer binary stays
+    /// readable by an older one: these structs use `deny_unknown_fields`, so
+    /// emitting `"section_root": null` would make a rollback fail at startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub section_root: Option<String>,
+    /// Index of the path segment `{section}` is taken from, 0-based over
+    /// non-empty segments. Defaults to `0` (the first segment).
+    ///
+    /// The URL→section convention is publisher-specific: a site that prefixes a
+    /// locale (`/en/news/article`) sets `section_segment = 1` to select `news`
+    /// instead of `en`. Paths with no segment at this index fall back to
+    /// [`section_root`](Self::section_root), so on `/en` a config with
+    /// `section_segment = 1` renders the root section.
+    ///
+    /// `Option` rather than a plain `usize` with a serde default for the same
+    /// rollback reason as [`section_root`](Self::section_root): an unset key
+    /// must not appear in the serialized config blob.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_segment: Option<usize>,
     /// Slot templates. Empty vec = feature disabled (no auction fired, no globals injected).
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub slot: Vec<CreativeOpportunitySlot>,
 }
 
 impl CreativeOpportunitiesConfig {
+    /// Derives the `{section}` value for `path` under this config's section
+    /// policy ([`section_root`](Self::section_root) and
+    /// [`section_segment`](Self::section_segment)).
+    ///
+    /// Prefer this over calling [`derive_section`] directly: it keeps both
+    /// policy knobs together so a call site cannot apply one and forget the
+    /// other.
+    ///
+    /// An unset [`section_root`](Self::section_root) yields an empty section for
+    /// a path with no matching segment. [`validate_runtime`](Self::validate_runtime)
+    /// rejects that combination for any template that uses `{section}`, so it
+    /// cannot reach a rendered unit path.
+    #[must_use]
+    pub fn section_for_path(&self, path: &str) -> String {
+        derive_section(
+            path,
+            self.section_root.as_deref().unwrap_or_default(),
+            self.section_segment.unwrap_or(0),
+        )
+    }
+
     /// Pre-compile glob patterns for all slots. Call once after deserialization.
     pub fn compile_slots(&mut self) {
         for slot in &mut self.slot {
@@ -183,10 +233,24 @@ impl CreativeOpportunitiesConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error string when a slot has an invalid identifier, page
-    /// pattern set, format list, or dimensions, or when a slot's `gam_unit_path`
-    /// template uses `{section}` without a valid [`section_root`](Self::section_root).
+    /// Returns an error string when [`gam_network_id`](Self::gam_network_id) is
+    /// blank while slots are configured, when a slot has an invalid identifier,
+    /// page pattern set, format list, or dimensions, or when a slot's
+    /// `gam_unit_path` template uses `{section}` without a valid
+    /// [`section_root`](Self::section_root).
     pub fn validate_runtime(&self) -> Result<(), String> {
+        // Every rendered unit path either substitutes `{network_id}` or uses the
+        // `/<network_id>/<slot_id>` default, so a blank network id produces a
+        // path GAM cannot resolve (`""` or `//slot`). Reject at startup rather
+        // than shipping it to `googletag.defineSlot`.
+        //
+        // Gated on a non-empty slot list: an empty list disables the feature, so
+        // no path is ever rendered and the id is inert. Failing startup there
+        // would take a site down over a value it does not use.
+        if !self.slot.is_empty() && self.gam_network_id.trim().is_empty() {
+            return Err("gam_network_id must not be empty".to_string());
+        }
+
         for slot in &self.slot {
             slot.validate_runtime()?;
         }
@@ -255,9 +319,15 @@ pub struct CreativeOpportunitySlot {
     /// Pre-parsed [`gam_unit_path`](Self::gam_unit_path) template, populated by
     /// [`compile_unit_template`](Self::compile_unit_template) at startup.
     ///
-    /// `None` when the slot has no explicit `gam_unit_path` (renders the default
-    /// `/<network_id>/<id>`). `pub(crate)` so cross-module test helpers can build
-    /// slots via struct-literal syntax with an empty cache.
+    /// `None` means *not compiled* — either the slot has no explicit
+    /// `gam_unit_path`, or it was deserialized/built without running
+    /// [`CreativeOpportunitiesConfig::compile_unit_templates`]. Callers must
+    /// therefore fall back to [`gam_unit_path`](Self::gam_unit_path) rather than
+    /// treating `None` as "no template"; see
+    /// [`render_gam_unit_path`](Self::render_gam_unit_path).
+    ///
+    /// `pub(crate)` so cross-module test helpers can build slots via
+    /// struct-literal syntax with an empty cache.
     #[serde(skip, default)]
     pub(crate) compiled_unit: Option<Vec<UnitTemplatePart>>,
 }
@@ -431,11 +501,24 @@ impl CreativeOpportunitySlot {
     /// Renders the resolved GAM unit path for a given network id and section.
     ///
     /// Substitutes `{network_id}`, `{section}`, and `{slot_id}` in the parsed
-    /// template. Falls back to `/<network_id>/<id>` when the slot has no template.
+    /// template. Falls back to `/<network_id>/<id>` only when the slot has no
+    /// [`gam_unit_path`](Self::gam_unit_path) at all.
+    ///
+    /// This is the path-aware replacement for the pre-templating
+    /// `resolved_gam_unit_path(&self, gam_network_id)`.
+    ///
+    /// # Performance
+    ///
+    /// The hot path reads the [`compiled_unit`](Self::compiled_unit) cache. A
+    /// slot with an explicit `gam_unit_path` but no cache (built by hand, or
+    /// deserialized without [`CreativeOpportunitiesConfig::compile_unit_templates`])
+    /// re-parses its template on every call — same fallback shape as
+    /// [`matches_path`](Self::matches_path). It must never silently degrade to
+    /// the default path, which would bid against the wrong inventory.
     #[must_use]
-    pub(crate) fn render_gam_unit_path(&self, gam_network_id: &str, section: &str) -> String {
-        match &self.compiled_unit {
-            Some(parts) => parts
+    pub fn render_gam_unit_path(&self, gam_network_id: &str, section: &str) -> String {
+        let render = |parts: &[UnitTemplatePart]| -> String {
+            parts
                 .iter()
                 .map(|part| match part {
                     UnitTemplatePart::Literal(s) => s.as_str(),
@@ -443,17 +526,37 @@ impl CreativeOpportunitySlot {
                     UnitTemplatePart::Section => section,
                     UnitTemplatePart::SlotId => self.id.as_str(),
                 })
-                .collect(),
-            None => format!("/{}/{}", gam_network_id, self.id),
+                .collect()
+        };
+
+        match (&self.compiled_unit, &self.gam_unit_path) {
+            (Some(parts), _) => render(parts),
+            // A malformed template cannot reach a compiled config (startup
+            // rejects it), so on this path use the raw string verbatim — the
+            // pre-templating behaviour — instead of dropping to the default.
+            (None, Some(raw)) => parse_unit_template(raw)
+                .map(|parts| render(&parts))
+                .unwrap_or_else(|_| raw.clone()),
+            (None, None) => format!("/{}/{}", gam_network_id, self.id),
         }
     }
 
-    /// Returns `true` if this slot's compiled template contains `{section}`.
+    /// Returns `true` if this slot's `gam_unit_path` template contains `{section}`.
+    ///
+    /// Reads the raw template when [`compiled_unit`](Self::compiled_unit) is
+    /// empty so validation cannot silently skip the
+    /// [`section_root`](CreativeOpportunitiesConfig::section_root) requirement
+    /// for an uncompiled config.
     #[must_use]
     pub(crate) fn template_uses_section(&self) -> bool {
-        self.compiled_unit
-            .as_ref()
-            .is_some_and(|parts| parts.iter().any(|p| matches!(p, UnitTemplatePart::Section)))
+        let uses_section = |parts: &[UnitTemplatePart]| {
+            parts.iter().any(|p| matches!(p, UnitTemplatePart::Section))
+        };
+        match (&self.compiled_unit, &self.gam_unit_path) {
+            (Some(parts), _) => uses_section(parts),
+            (None, Some(raw)) => parse_unit_template(raw).is_ok_and(|parts| uses_section(&parts)),
+            (None, None) => false,
+        }
     }
 
     /// Returns the div element ID for this slot.
@@ -770,15 +873,32 @@ mod tests {
 
     #[test]
     fn derive_section_uses_first_segment() {
-        assert_eq!(derive_section("/news", "home"), "news");
-        assert_eq!(derive_section("/news/article-123", "home"), "news");
-        assert_eq!(derive_section("/my-section/x", "home"), "my-section");
+        assert_eq!(derive_section("/news", "home", 0), "news");
+        assert_eq!(derive_section("/news/article-123", "home", 0), "news");
+        assert_eq!(derive_section("/my-section/x", "home", 0), "my-section");
+    }
+
+    #[test]
+    fn derive_section_uses_configured_segment_index() {
+        // A locale-prefixed site sets section_segment = 1.
+        assert_eq!(derive_section("/en/news/article", "home", 1), "news");
+        assert_eq!(derive_section("/en/news", "home", 1), "news");
+        // Repeated separators are not counted as segments.
+        assert_eq!(derive_section("//en//news//x", "home", 1), "news");
+    }
+
+    #[test]
+    fn derive_section_uses_root_when_segment_index_out_of_range() {
+        // Section landing page of a locale-prefixed site: no segment 1 exists,
+        // so the root value stands in rather than reusing the locale.
+        assert_eq!(derive_section("/en", "home", 1), "home");
+        assert_eq!(derive_section("/", "home", 1), "home");
     }
 
     #[test]
     fn derive_section_uses_root_when_no_segment() {
-        assert_eq!(derive_section("/", "homepage"), "homepage");
-        assert_eq!(derive_section("///", "homepage"), "homepage");
+        assert_eq!(derive_section("/", "homepage", 0), "homepage");
+        assert_eq!(derive_section("///", "homepage", 0), "homepage");
     }
 
     #[test]
@@ -787,14 +907,48 @@ mod tests {
         // alphanumeric), so it collapses to a single '_' -> "new_20s". This is
         // exactly the no-decode contract: had we decoded, %20 would be a space
         // and yield "new_s"; we do NOT decode.
-        assert_eq!(derive_section("/new%20s", "home"), "new_20s");
+        assert_eq!(derive_section("/new%20s", "home", 0), "new_20s");
         // A run of disallowed chars collapses to one '_'.
-        assert_eq!(derive_section("/a..b", "home"), "a_b");
+        assert_eq!(derive_section("/a..b", "home", 0), "a_b");
+    }
+
+    #[test]
+    fn section_for_path_applies_both_policy_knobs() {
+        let mut config = make_config_with_section_template(Some("home"));
+        assert_eq!(
+            config.section_for_path("/en/news/article"),
+            "en",
+            "should default to the first segment when section_segment is unset"
+        );
+
+        config.section_segment = Some(1);
+        assert_eq!(
+            config.section_for_path("/en/news/article"),
+            "news",
+            "should honour the configured segment index"
+        );
+        assert_eq!(
+            config.section_for_path("/en"),
+            "home",
+            "should fall back to section_root when the index is out of range"
+        );
+    }
+
+    #[test]
+    fn section_segment_is_omitted_from_serialized_config_when_unset() {
+        // Same rollback contract as section_root: `deny_unknown_fields` on the
+        // previous binary rejects a blob carrying keys it does not know.
+        let config = make_config_with_section_template(None);
+        let value = serde_json::to_value(&config).expect("should serialize config");
+        assert!(
+            value.get("section_segment").is_none(),
+            "unset section_segment should not be serialized, got {value}"
+        );
     }
 
     #[test]
     fn derive_section_is_non_empty_for_all_disallowed_segment() {
-        assert_eq!(derive_section("/%%%/x", "home"), "_");
+        assert_eq!(derive_section("/%%%/x", "home", 0), "_");
     }
 
     fn make_config_with_section_template(
@@ -807,6 +961,7 @@ mod tests {
             auction_timeout_ms: None,
             price_granularity: PriceGranularity::default(),
             section_root: section_root.map(str::to_string),
+            section_segment: None,
             slot: vec![slot],
         }
     }
@@ -885,6 +1040,174 @@ mod tests {
         config
             .validate_runtime()
             .expect("should accept valid section_root");
+    }
+
+    #[test]
+    fn render_gam_unit_path_honours_raw_template_without_compiled_cache() {
+        // A slot deserialized straight from JSON (or built by a test helper)
+        // never ran `compile_unit_templates`. It must still render its explicit
+        // path — dropping to `/<network>/<id>` would bid the wrong inventory.
+        let slot: CreativeOpportunitySlot = serde_json::from_value(serde_json::json!({
+            "id": "ad-header-0",
+            "gam_unit_path": "/{network_id}/example/{section}",
+            "page_patterns": ["/news/*"],
+            "formats": [{ "width": 728, "height": 90 }],
+        }))
+        .expect("should deserialize slot");
+        assert!(
+            slot.compiled_unit.is_none(),
+            "direct deserialization should leave the template cache empty"
+        );
+        assert_eq!(
+            slot.render_gam_unit_path("99999", "news"),
+            "/99999/example/news",
+            "uncompiled slot should still substitute placeholders"
+        );
+    }
+
+    #[test]
+    fn render_gam_unit_path_honours_static_path_without_compiled_cache() {
+        let mut slot = make_slot("atf", vec!["/"]);
+        slot.gam_unit_path = Some("/99999/example/homepage".to_string());
+        assert_eq!(
+            slot.render_gam_unit_path("99999", "news"),
+            "/99999/example/homepage",
+            "uncompiled static path should render verbatim, not the default"
+        );
+    }
+
+    #[test]
+    fn validate_runtime_requires_section_root_for_uncompiled_template() {
+        // `template_uses_section` must read the raw template, otherwise an
+        // uncompiled config silently skips the section_root requirement.
+        let mut config = make_config_with_section_template(None);
+        config.compile_slots();
+        assert!(
+            config.slot[0].compiled_unit.is_none(),
+            "test precondition: template cache is empty"
+        );
+        let err = config
+            .validate_runtime()
+            .expect_err("should require section_root even without compiled templates");
+        assert!(
+            err.contains("section_root"),
+            "error should mention section_root"
+        );
+    }
+
+    #[test]
+    fn validate_runtime_rejects_blank_network_id() {
+        // `gam_unit_path = "{network_id}"` renders to an empty string with a
+        // blank network id, which reaches googletag.defineSlot as an invalid path.
+        let mut config = make_config_with_section_template(Some("home"));
+        config.slot[0].gam_unit_path = Some("{network_id}".to_string());
+        config.gam_network_id = String::new();
+        config.compile_slots();
+        config
+            .compile_unit_templates()
+            .expect("templates should compile");
+        let err = config
+            .validate_runtime()
+            .expect_err("blank gam_network_id should fail startup validation");
+        assert!(
+            err.contains("gam_network_id"),
+            "error should name gam_network_id, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_runtime_allows_blank_network_id_when_no_slots_configured() {
+        // An empty slot list disables the feature, so the id is never rendered.
+        // Failing startup there would break a deploy over an unused value.
+        let mut config = make_config_with_section_template(Some("home"));
+        config.gam_network_id = String::new();
+        config.slot.clear();
+        config
+            .validate_runtime()
+            .expect("a disabled creative_opportunities stack should not fail on a blank id");
+    }
+
+    #[test]
+    fn section_root_is_omitted_from_serialized_config_when_unset() {
+        // Older binaries deserialize this struct with `deny_unknown_fields`, so
+        // a pushed config blob must not carry `"section_root": null`.
+        let config = CreativeOpportunitiesConfig {
+            gam_network_id: "99999".to_string(),
+            auction_timeout_ms: None,
+            price_granularity: PriceGranularity::default(),
+            section_root: None,
+            section_segment: None,
+            slot: Vec::new(),
+        };
+        let value = serde_json::to_value(&config).expect("should serialize config");
+        assert!(
+            value.get("section_root").is_none(),
+            "unset section_root should not be serialized, got {value}"
+        );
+
+        let with_root = CreativeOpportunitiesConfig {
+            section_root: Some("home".to_string()),
+            ..config
+        };
+        assert_eq!(
+            serde_json::to_value(&with_root)
+                .expect("should serialize config")
+                .get("section_root")
+                .and_then(serde_json::Value::as_str),
+            Some("home"),
+            "a set section_root should still round-trip"
+        );
+    }
+
+    #[test]
+    fn documented_page_patterns_match_and_render_their_documented_paths() {
+        // Mirrors the example in docs/guide/configuration.md. `/news/*` alone
+        // does NOT match `/news` (the glob needs the trailing separator), so the
+        // documented config must list the section landing pages explicitly.
+        let mut slot = make_slot(
+            "ad-header",
+            vec!["/", "/news", "/news/*", "/reviews", "/reviews/*"],
+        );
+        slot.gam_unit_path = Some("/{network_id}/example/{section}".to_string());
+        slot.compile_patterns();
+        slot.compile_unit_template()
+            .expect("should compile template");
+        let slots = vec![slot];
+
+        for (path, expected) in [
+            ("/", "/123456789/example/home"),
+            ("/news", "/123456789/example/news"),
+            ("/news/article", "/123456789/example/news"),
+            ("/reviews/x", "/123456789/example/reviews"),
+        ] {
+            let matched = match_slots(&slots, path);
+            assert_eq!(
+                matched.len(),
+                1,
+                "`{path}` should match the documented slot"
+            );
+            assert_eq!(
+                matched[0].render_gam_unit_path("123456789", &derive_section(path, "home", 0)),
+                expected,
+                "`{path}` should render the documented unit path"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_section_pattern_does_not_match_without_trailing_separator() {
+        // Guards the docs fix above: a `"/news/*"`-only config loses the section
+        // landing page entirely.
+        let mut slot = make_slot("ad-header", vec!["/news/*"]);
+        slot.compile_patterns();
+        assert!(
+            !slot.matches_path("/news"),
+            "`/news/*` must not match `/news`"
+        );
+        assert!(
+            slot.matches_path("/news/article"),
+            "`/news/*` should match descendants"
+        );
     }
 
     #[test]
