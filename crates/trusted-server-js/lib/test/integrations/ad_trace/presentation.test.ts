@@ -285,6 +285,64 @@ describe('presentTraceOverlay', () => {
     expect(presentation.primaryStatus).toBe('GAM returned backfill');
   });
 
+  it('names other Ad Manager demand instead of the generic unattributed row', () => {
+    const presentation = presentTraceOverlay(
+      stages({ trustedServer: stage('won'), gam: stage('other_gam_demand', 'creative_never_ran') }),
+      render('gam_only'),
+      {
+        requestNumber: 1,
+        terminalState: 'rendered',
+        responseClass: 'reservation',
+        gamIdentity: { lineItemId: 6543210987, campaignId: 2345678901, advertiserId: 3456789012 },
+        durations: {},
+      }
+    );
+
+    expect(presentation.primaryStatus).toBe(
+      'GAM delivered other demand — the Trusted Server creative never ran'
+    );
+    expect(presentation.facts).toContain(
+      'GAM reported line item 6543210987 · order 2345678901 · advertiser 3456789012'
+    );
+    expect(presentation.facts).not.toContain('GAM rendered an ad — source not attributed');
+    expect(presentation.badgeStatus).toBe('GAM line item 6543210987');
+  });
+
+  it('names an Ad Manager default render', () => {
+    const presentation = presentTraceOverlay(
+      stages({ gam: stage('gam_default_or_unclassified') }),
+      render('gam_only'),
+      {
+        requestNumber: 1,
+        terminalState: 'rendered',
+        responseClass: 'unclassified_non_empty',
+        durations: {},
+      }
+    );
+
+    expect(presentation.primaryStatus).toBe('GAM delivered its own default or backup ad');
+    expect(presentation.badgeStatus).toBe('GAM default ad');
+  });
+
+  it('keeps a Trusted Server win visible when its creative never confirmed', () => {
+    const presentation = presentTraceOverlay(
+      stages({
+        gam: stage('trusted_server_won', 'creative_requested_markup'),
+        creative: stage('ack_timed_out'),
+      }),
+      render('timed_out'),
+      {
+        requestNumber: 1,
+        terminalState: 'rendered',
+        acknowledgement: 'timed_out',
+        durations: {},
+      }
+    );
+
+    expect(presentation.facts).toContain('GAM selected the Trusted Server creative');
+    expect(presentation.badgeStatus).toBe('TS creative · confirmation timed out');
+  });
+
   it('falls back to the strongest observed stage fact for a primary row', () => {
     const presentation = presentTraceOverlay(
       stages({ creative: stage('render_failed') }),

@@ -590,6 +590,155 @@ describe('ad trace reducer', () => {
     expect(store.getEvents()).toHaveLength(0);
   });
 
+  it('names Ad Manager demand that outranked the Trusted Server candidate', () => {
+    const store = createAdTraceStore(() => 10);
+    const generation = store.nextGeneration('slot-a');
+    store.record({
+      kind: 'gpt_slot_render_ended',
+      slotId: 'slot-a',
+      generation,
+      isEmpty: false,
+      responseClass: 'reservation',
+      gamIdentity: {
+        lineItemId: 6543210987,
+        creativeId: 1234567890,
+        campaignId: 2345678901,
+        advertiserId: 3456789012,
+        yieldGroupIds: [11, 12],
+      },
+    });
+
+    expect(store.getSlot('slot-a')?.stages.gam, 'should report a named reservation').toMatchObject({
+      outcome: 'other_reservation',
+      confidence: 'strong',
+    });
+    expect(
+      store.getSlot('slot-a')?.generations[0].diagnostics.gamIdentity,
+      'should retain the Ad Manager identifiers for the operator'
+    ).toEqual({
+      lineItemId: 6543210987,
+      creativeId: 1234567890,
+      campaignId: 2345678901,
+      advertiserId: 3456789012,
+      yieldGroupIds: [11, 12],
+    });
+  });
+
+  it('separates an Ad Manager default render from an attributed one', () => {
+    const store = createAdTraceStore(() => 10);
+    const generation = store.nextGeneration('slot-a');
+    store.record({
+      kind: 'gpt_slot_render_ended',
+      slotId: 'slot-a',
+      generation,
+      isEmpty: false,
+      responseClass: 'unclassified_non_empty',
+    });
+
+    expect(store.getSlot('slot-a')?.stages.gam.outcome).toBe('gam_default_or_unclassified');
+    expect(store.getSlot('slot-a')?.generations[0].diagnostics.gamIdentity).toBeUndefined();
+  });
+
+  it('settles the Ad Manager decision when the rendered creative requests markup', () => {
+    const store = createAdTraceStore(() => 10);
+    const generation = store.nextGeneration('slot-a');
+    store.record({
+      kind: 'gpt_slot_render_ended',
+      slotId: 'slot-a',
+      generation,
+      bidTraceId: BID_TRACE_ID,
+      isEmpty: false,
+      responseClass: 'reservation',
+    });
+    store.record({
+      kind: 'pb_render_requested',
+      slotId: 'slot-a',
+      generation,
+      bidTraceId: BID_TRACE_ID,
+      reason: 'exact_generation',
+    });
+
+    expect(store.getSlot('slot-a')?.stages.gam, 'should credit the render to TS').toMatchObject({
+      outcome: 'trusted_server_won',
+      confidence: 'strong',
+      reason: 'creative_requested_markup',
+    });
+    // The creative may still never load; the Ad Manager decision stands anyway.
+    store.record({ kind: 'creative_ack_timed_out', slotId: 'slot-a', generation });
+    expect(store.getSlot('slot-a')?.stages.gam.outcome).toBe('trusted_server_won');
+    expect(store.getSlot('slot-a')?.stages.creative.outcome).toBe('ack_timed_out');
+  });
+
+  it('resolves an unclaimed render without downgrading settled outcomes', () => {
+    const store = createAdTraceStore(() => 10);
+    const unclaimed = store.nextGeneration('slot-a');
+    store.record({
+      kind: 'gpt_slot_render_ended',
+      slotId: 'slot-a',
+      generation: unclaimed,
+      bidTraceId: BID_TRACE_ID,
+      isEmpty: false,
+      responseClass: 'reservation',
+      gamIdentity: { lineItemId: 6543210987 },
+    });
+    expect(store.getSlot('slot-a')?.stages.gam.outcome).toBe('trusted_server_candidate');
+
+    store.record({
+      kind: 'gpt_render_unclaimed',
+      slotId: 'slot-a',
+      generation: unclaimed,
+      bidTraceId: BID_TRACE_ID,
+      reason: 'creative_markup_never_requested',
+    });
+    expect(store.getSlot('slot-a')?.stages.gam, 'should name other demand').toMatchObject({
+      outcome: 'other_gam_demand',
+      confidence: 'strong',
+      reason: 'creative_markup_never_requested',
+    });
+
+    const claimed = store.nextGeneration('slot-b');
+    store.record({
+      kind: 'pb_render_requested',
+      slotId: 'slot-b',
+      generation: claimed,
+      bidTraceId: BID_TRACE_ID,
+      reason: 'exact_generation',
+    });
+    store.record({
+      kind: 'gpt_render_unclaimed',
+      slotId: 'slot-b',
+      generation: claimed,
+      bidTraceId: BID_TRACE_ID,
+    });
+    expect(
+      store.getSlot('slot-b')?.stages.gam.outcome,
+      'should never contradict observed creative evidence'
+    ).toBe('trusted_server_won');
+  });
+
+  it('drops malformed Ad Manager identifiers', () => {
+    const store = createAdTraceStore(() => 10);
+    const generation = store.nextGeneration('slot-a');
+    store.record({
+      kind: 'gpt_slot_render_ended',
+      slotId: 'slot-a',
+      generation,
+      isEmpty: false,
+      responseClass: 'reservation',
+      gamIdentity: {
+        lineItemId: 0,
+        creativeId: '1234567890',
+        campaignId: 2345678901,
+        yieldGroupIds: ['a', -1],
+        adUnitPath: '/1234/private',
+      },
+    } as never);
+
+    expect(store.getSlot('slot-a')?.generations[0].diagnostics.gamIdentity).toEqual({
+      campaignId: 2345678901,
+    });
+  });
+
   it('exports an immutable sanitized clone', () => {
     const store = createAdTraceStore(() => 1);
     store.record({

@@ -7,6 +7,7 @@ import type {
   AdTraceEvent,
   AdTraceEventKind,
   AdTraceExport,
+  AdTraceGamIdentity,
   AdTraceObservation,
   AdTraceStage,
   AdTraceStageName,
@@ -43,6 +44,7 @@ const EVENT_KINDS = new Set<AdTraceEventKind>([
   'gpt_slot_requested',
   'gpt_slot_response_received',
   'gpt_slot_render_ended',
+  'gpt_render_unclaimed',
   'gpt_slot_onload',
   'gpt_impression_viewable',
   'gpt_slot_visibility_changed',
@@ -214,9 +216,11 @@ function updateStage(target: Record<AdTraceStageName, AdTraceStage>, event: AdTr
       }
       break;
     case 'gpt_slot_render_ended':
-      // Cooperative acknowledgement is stronger than later GPT callbacks and
+      // Cooperative creative evidence is stronger than later GPT callbacks and
       // must never be downgraded to a probable candidate.
-      if (target.gam.confidence === 'definitive') break;
+      if (target.gam.confidence === 'definitive' || target.gam.outcome === 'trusted_server_won') {
+        break;
+      }
       if (explicit?.outcome === 'unresolved') target.gam = explicit;
       else if (event.isEmpty)
         target.gam = { outcome: 'empty', confidence: 'definitive', reason: 'gpt_empty' };
@@ -237,12 +241,58 @@ function updateStage(target: Record<AdTraceStageName, AdTraceStage>, event: AdTr
           confidence: 'probable',
           reason: 'client_bid_won_and_gpt_rendered',
         };
+      // Ad Manager reported a reservation line item it chose on its own. No
+      // Trusted Server targeting was live on the slot, so the delivered ad came
+      // from other Ad Manager demand — direct-sold or house.
+      else if (event.responseClass === 'reservation')
+        target.gam = {
+          outcome: 'other_reservation',
+          confidence: 'strong',
+          reason: 'reservation_reported_without_trusted_server_targeting',
+        };
+      // Non-empty with no reservation or backfill identifiers: Ad Manager's own
+      // default or backup image, or a render by a service other than PubAds.
+      else if (event.responseClass === 'unclassified_non_empty')
+        target.gam = {
+          outcome: 'gam_default_or_unclassified',
+          confidence: 'probable',
+          reason: 'non_empty_without_ad_manager_identifiers',
+        };
       else
         target.gam = {
           outcome: 'direct_or_unattributed',
           confidence: 'probable',
           reason: 'non_empty_unattributed',
         };
+      break;
+    case 'gpt_render_unclaimed':
+      // Ad Manager rendered while Trusted Server targeting was live, but the
+      // rendered creative never asked Trusted Server for markup. Ad Manager
+      // delivered other demand — house, direct-sold, or its own default.
+      if (
+        target.gam.confidence !== 'definitive' &&
+        target.gam.outcome !== 'trusted_server_won' &&
+        target.gam.outcome !== 'empty' &&
+        target.gam.outcome !== 'backfill'
+      ) {
+        target.gam = {
+          outcome: 'other_gam_demand',
+          confidence: 'strong',
+          reason: event.reason ?? 'creative_markup_never_requested',
+        };
+      }
+      break;
+    case 'pb_render_requested':
+      // The Prebid Universal Creative only executes when Ad Manager selected the
+      // header-bidding line item, and it asked for this generation's own ad ID.
+      // That settles the Ad Manager decision even if the creative never loads.
+      if (target.gam.confidence !== 'definitive') {
+        target.gam = {
+          outcome: 'trusted_server_won',
+          confidence: 'strong',
+          reason: 'creative_requested_markup',
+        };
+      }
       break;
     case 'aps_display_bids_set':
       // APS setting display bids is a handoff only. GAM attribution remains
@@ -271,6 +321,15 @@ function updateStage(target: Record<AdTraceStageName, AdTraceStage>, event: AdTr
           outcome: 'renderer_served',
           confidence: 'strong',
           reason: event.reason ?? 'pb_render_response',
+        };
+      }
+      // Serving markup to the creative Ad Manager rendered is the same Ad
+      // Manager decision evidence as the request that preceded it.
+      if (target.gam.confidence !== 'definitive') {
+        target.gam = {
+          outcome: 'trusted_server_won',
+          confidence: 'strong',
+          reason: 'creative_markup_served',
         };
       }
       break;
@@ -378,6 +437,37 @@ function emptyCoverage(): Record<AdTraceCoverageCategory, AdTraceCoverageCounter
   ) as Record<AdTraceCoverageCategory, AdTraceCoverageCounter>;
 }
 
+const GAM_IDENTITY_ID_KEYS = [
+  'lineItemId',
+  'creativeId',
+  'campaignId',
+  'advertiserId',
+  'sourceAgnosticLineItemId',
+  'sourceAgnosticCreativeId',
+] as const;
+const GAM_IDENTITY_LIST_KEYS = ['yieldGroupIds', 'companyIds'] as const;
+const GAM_IDENTITY_MAX_LIST = 8;
+
+function sanitizeGamIdentity(value: unknown): AdTraceGamIdentity | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const source = value as Record<string, unknown>;
+  const identity: Record<string, number | readonly number[]> = {};
+  for (const key of GAM_IDENTITY_ID_KEYS) {
+    const id = boundedInteger(source[key], 1, Number.MAX_SAFE_INTEGER);
+    if (id !== undefined) identity[key] = id;
+  }
+  for (const key of GAM_IDENTITY_LIST_KEYS) {
+    const raw = source[key];
+    if (!Array.isArray(raw)) continue;
+    const ids = raw
+      .map((item) => boundedInteger(item, 1, Number.MAX_SAFE_INTEGER))
+      .filter((item): item is number => item !== undefined)
+      .slice(0, GAM_IDENTITY_MAX_LIST);
+    if (ids.length > 0) identity[key] = ids;
+  }
+  return Object.keys(identity).length > 0 ? (identity as AdTraceGamIdentity) : undefined;
+}
+
 function boundedInteger(value: unknown, minimum: number, maximum: number): number | undefined {
   return typeof value === 'number' &&
     Number.isInteger(value) &&
@@ -428,6 +518,7 @@ function updateGenerationDiagnostics(
       timestamps.renderedAt ??= event.timestamp;
       diagnostics.terminalState = event.isEmpty ? 'empty' : 'rendered';
       if (event.responseClass) diagnostics.responseClass = event.responseClass;
+      if (event.gamIdentity) diagnostics.gamIdentity = event.gamIdentity;
       if (event.renderedWidth !== undefined && event.renderedHeight !== undefined) {
         diagnostics.renderedSize = [event.renderedWidth, event.renderedHeight];
       }
@@ -704,6 +795,9 @@ export function createAdTraceStore(
           : {}),
         ...(boundedInteger(observation.prebidAuctionDurationMs, 0, 300_000) !== undefined
           ? { prebidAuctionDurationMs: observation.prebidAuctionDurationMs }
+          : {}),
+        ...(sanitizeGamIdentity(observation.gamIdentity)
+          ? { gamIdentity: sanitizeGamIdentity(observation.gamIdentity) }
           : {}),
       };
       if (event.kind !== 'gpt_slot_visibility_changed') {
