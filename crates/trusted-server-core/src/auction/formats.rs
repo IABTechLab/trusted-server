@@ -9,7 +9,7 @@ use error_stack::{Report, ResultExt, ensure};
 use http::{HeaderValue, Request, Response, StatusCode, header};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use url::Url;
 use uuid::Uuid;
 
@@ -90,21 +90,25 @@ pub struct BannerUnit {
 
 const MAX_PUBLISHER_PAGE_URL_BYTES: usize = 8192;
 
-fn publisher_page_url(req: &Request<EdgeBody>, publisher_domain: &str) -> String {
+/// Sanitize publisher page identity before forwarding it into the bidstream.
+///
+/// The candidate must be credential-free HTTP(S) on the configured publisher
+/// host or a DNS-boundary subdomain. Query and fragment components are always
+/// removed to prevent client-controlled private data from reaching providers.
+/// Accepting publisher subdomains is deliberate; deployments with delegated or
+/// user-content subdomains should account for that inventory trust boundary.
+pub(crate) fn sanitize_publisher_page_url(
+    candidate: Option<&str>,
+    publisher_domain: &str,
+) -> String {
     let fallback = format!("https://{publisher_domain}");
-    let Some(candidate) = req
-        .headers()
-        .get(header::REFERER)
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| value.len() <= MAX_PUBLISHER_PAGE_URL_BYTES)
+    let Some(candidate) = candidate.filter(|value| value.len() <= MAX_PUBLISHER_PAGE_URL_BYTES)
     else {
-        log::debug!(
-            "Auction page URL: using publisher origin because Referer is absent or invalid"
-        );
+        log::debug!("Auction page URL: using publisher origin because input is absent or invalid");
         return fallback;
     };
     let Ok(mut parsed) = Url::parse(candidate) else {
-        log::debug!("Auction page URL: using publisher origin because Referer is not a URL");
+        log::debug!("Auction page URL: using publisher origin because input is not a URL");
         return fallback;
     };
     let publisher_domain = publisher_domain.trim_end_matches('.').to_ascii_lowercase();
@@ -122,13 +126,26 @@ fn publisher_page_url(req: &Request<EdgeBody>, publisher_domain: &str) -> String
         || parsed.password().is_some()
     {
         log::debug!(
-            "Auction page URL: using publisher origin because Referer is not publisher-owned HTTP(S)"
+            "Auction page URL: using publisher origin because input is not publisher-owned HTTP(S)"
         );
         return fallback;
     }
     parsed.set_query(None);
     parsed.set_fragment(None);
     parsed.to_string()
+}
+
+fn publisher_page_url(req: &Request<EdgeBody>, publisher_domain: &str) -> String {
+    let candidate = req.headers().get(header::REFERER).and_then(|value| {
+        value.to_str().map_or_else(
+            |_| {
+                log::debug!("Auction page URL: ignoring non-ASCII Referer header");
+                None
+            },
+            Some,
+        )
+    });
+    sanitize_publisher_page_url(candidate, publisher_domain)
 }
 
 /// Convert tsjs/Prebid.js request format to internal [`AuctionRequest`].
@@ -264,6 +281,35 @@ pub fn convert_tsjs_to_auction_request(
     })
 }
 
+/// Delivery facts produced while serializing winning bids.
+#[derive(Debug, Default)]
+pub(crate) struct AuctionDeliveryReport {
+    /// Winning slot IDs included in the serialized response.
+    pub delivered_winner_slots: HashSet<String>,
+    /// Winners omitted because they could not be delivered safely.
+    pub dropped_winner_count: usize,
+    /// Machine-readable reasons for omitted winners.
+    pub dropped_winner_reasons: BTreeMap<String, usize>,
+}
+
+impl AuctionDeliveryReport {
+    fn record_drop(&mut self, reason: &str) {
+        self.dropped_winner_count += 1;
+        *self
+            .dropped_winner_reasons
+            .entry(reason.to_string())
+            .or_default() += 1;
+    }
+}
+
+/// Serialized response and the delivery facts used to produce it.
+pub(crate) struct OpenRtbResponseConversion {
+    /// HTTP response returned to the auction client.
+    pub response: Response<EdgeBody>,
+    /// Delivery facts for telemetry and diagnostics.
+    pub delivery: AuctionDeliveryReport,
+}
+
 /// Convert `OrchestrationResult` to `OpenRTB` response format.
 ///
 /// Returns rewritten ordinary creative HTML in `adm` or a typed renderer extension.
@@ -279,8 +325,20 @@ pub fn convert_to_openrtb_response(
     auction_request: &AuctionRequest,
     ec_allowed: bool,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    // Build OpenRTB-style seatbid array
+    Ok(
+        convert_to_openrtb_response_with_report(result, settings, auction_request, ec_allowed)?
+            .response,
+    )
+}
+
+pub(crate) fn convert_to_openrtb_response_with_report(
+    result: &OrchestrationResult,
+    settings: &Settings,
+    auction_request: &AuctionRequest,
+    ec_allowed: bool,
+) -> Result<OpenRtbResponseConversion, Report<TrustedServerError>> {
     let mut seatbids = Vec::with_capacity(result.winning_bids.len());
+    let mut delivery = AuctionDeliveryReport::default();
 
     for (slot_id, bid) in &result.winning_bids {
         let price = bid.price.ok_or_else(|| {
@@ -338,6 +396,7 @@ pub fn convert_to_openrtb_response(
                     slot_id,
                     bid.bidder
                 );
+                delivery.record_drop("renderer_extension_serialization_failed");
                 continue;
             };
             (None, Some(ext))
@@ -348,6 +407,7 @@ pub fn convert_to_openrtb_response(
                 slot_id,
                 bid.bidder
             );
+            delivery.record_drop("no_render_source");
             continue;
         };
 
@@ -373,6 +433,7 @@ pub fn convert_to_openrtb_response(
             bid: vec![openrtb_bid],
             ..Default::default()
         });
+        delivery.delivered_winner_slots.insert(slot_id.clone());
     }
 
     // Determine strategy name for response metadata
@@ -399,6 +460,8 @@ pub fn convert_to_openrtb_response(
                 total_bids: result.total_bids(),
                 time_ms: result.total_time_ms,
                 provider_details,
+                dropped_winner_count: delivery.dropped_winner_count,
+                dropped_winner_reasons: delivery.dropped_winner_reasons.clone(),
             },
         }
         .to_ext(),
@@ -440,7 +503,7 @@ pub fn convert_to_openrtb_response(
         }
     }
 
-    Ok(response)
+    Ok(OpenRtbResponseConversion { response, delivery })
 }
 
 #[cfg(test)]
@@ -591,6 +654,28 @@ mod tests {
             None,
         )
         .expect("should convert banner request")
+    }
+
+    #[test]
+    fn response_serializes_prebid_immediate_no_bid_without_error_metadata() {
+        let request = make_auction_request();
+        let settings = make_settings();
+        let mut result = make_empty_result();
+        result.provider_responses = vec![AuctionResponse::no_bid("prebid", 0)];
+
+        let response = convert_to_openrtb_response(&result, &settings, &request, false)
+            .expect("should serialize immediate no-bid response");
+        let json = response_json(response);
+        let details = &json["ext"]["orchestrator"]["provider_details"][0];
+
+        assert_eq!(details["name"], "prebid");
+        assert_eq!(details["status"], "nobid");
+        assert_eq!(details["bid_count"], 0);
+        assert_eq!(details["bidders"], json!([]));
+        assert!(
+            details.get("metadata").is_none(),
+            "should omit empty launch/error metadata"
+        );
     }
 
     #[test]
@@ -1153,9 +1238,20 @@ mod tests {
             metadata: HashMap::new(),
         };
 
-        let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
-            .expect("should omit invalid winners and preserve valid slots");
-        let json = response_json(response);
+        let conversion =
+            convert_to_openrtb_response_with_report(&result, &settings, &auction_request, false)
+                .expect("should omit invalid winners and preserve valid slots");
+        assert_eq!(
+            conversion.delivery.delivered_winner_slots,
+            HashSet::from(["ordinary".to_string(), "renderer".to_string()]),
+            "should report only serialized winners as delivered"
+        );
+        assert_eq!(conversion.delivery.dropped_winner_count, 2);
+        assert_eq!(
+            conversion.delivery.dropped_winner_reasons["no_render_source"],
+            2
+        );
+        let json = response_json(conversion.response);
         let bids: Vec<&JsonValue> = json["seatbid"]
             .as_array()
             .expect("should include valid seatbids")
@@ -1164,6 +1260,11 @@ mod tests {
             .collect();
 
         assert_eq!(bids.len(), 2, "should omit only invalid winners");
+        assert_eq!(json["ext"]["orchestrator"]["dropped_winner_count"], 2);
+        assert_eq!(
+            json["ext"]["orchestrator"]["dropped_winner_reasons"]["no_render_source"],
+            2
+        );
         let ordinary = bids
             .iter()
             .find(|bid| bid["impid"] == "ordinary")

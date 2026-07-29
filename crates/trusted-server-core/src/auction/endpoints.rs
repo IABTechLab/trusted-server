@@ -24,7 +24,10 @@ use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
 use super::AuctionOrchestrator;
-use super::formats::{convert_to_openrtb_response, convert_tsjs_to_auction_request};
+use super::formats::{
+    convert_to_openrtb_response, convert_to_openrtb_response_with_report,
+    convert_tsjs_to_auction_request,
+};
 use super::telemetry::{
     AuctionObservationContext, AuctionSource, AuctionTerminalOutcome, build_auction_events,
     emit_auction_events_best_effort_lazy,
@@ -317,26 +320,52 @@ pub async fn handle_auction(
         }
     };
 
+    let conversion = match convert_to_openrtb_response_with_report(
+        &result,
+        settings,
+        &auction_request,
+        ec_context.ec_allowed(),
+    ) {
+        Ok(conversion) => conversion,
+        Err(error) => {
+            let elapsed_ms = observation.elapsed_ms();
+            emit_auction_events_best_effort_lazy(services, || {
+                build_auction_events(
+                    observation,
+                    AuctionTerminalOutcome::ExecutionFailed {
+                        request: Some(&auction_request),
+                        provider_responses: &result.provider_responses,
+                        reason: "response_conversion_failed",
+                        elapsed_ms,
+                    },
+                )
+            })
+            .await;
+            return Err(error);
+        }
+    };
+
     emit_auction_events_best_effort_lazy(services, || {
         build_auction_events(
             observation,
             AuctionTerminalOutcome::Completed {
                 request: &auction_request,
                 result: &result,
+                delivered_winner_slots: Some(&conversion.delivery.delivered_winner_slots),
             },
         )
     })
     .await;
 
     log::info!(
-        "Auction completed: {} providers, {} winning bids, {}ms total",
+        "Auction completed: {} providers, {} delivered winning bids, {} dropped winners, {}ms total",
         result.provider_responses.len(),
-        result.winning_bids.len(),
+        conversion.delivery.delivered_winner_slots.len(),
+        conversion.delivery.dropped_winner_count,
         result.total_time_ms
     );
 
-    // Convert to OpenRTB response format with inline creative HTML
-    convert_to_openrtb_response(&result, settings, &auction_request, ec_context.ec_allowed())
+    Ok(conversion.response)
 }
 
 /// Resolves partner EIDs from the KV identity graph for bidstream decoration.
@@ -546,7 +575,7 @@ pub(crate) fn merge_auction_eids(
 mod tests {
     use super::*;
     use crate::auction::config::AuctionConfig;
-    use crate::auction::provider::AuctionProvider;
+    use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
     use crate::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink};
     use crate::auction::types::{AuctionRequest, AuctionResponse};
     use crate::consent::jurisdiction::Jurisdiction;
@@ -555,7 +584,7 @@ mod tests {
     use crate::platform::test_support::{
         NoopBackend, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore, noop_services,
     };
-    use crate::platform::{ClientInfo, PlatformPendingRequest, PlatformResponse};
+    use crate::platform::{ClientInfo, PlatformResponse};
     use crate::test_support::tests::create_test_settings;
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
@@ -620,7 +649,7 @@ mod tests {
             &self,
             _request: &AuctionRequest,
             _context: &AuctionContext<'_>,
-        ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
             panic!("provider must not be contacted when the consent gate denies the auction");
         }
 
@@ -742,7 +771,7 @@ mod tests {
             &self,
             request: &AuctionRequest,
             _context: &AuctionContext<'_>,
-        ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
             *self.had_eids.lock().expect("should lock captured eids") =
                 Some(request.user.eids.is_some());
             Err(Report::new(TrustedServerError::Auction {

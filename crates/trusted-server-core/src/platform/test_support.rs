@@ -704,6 +704,10 @@ pub(crate) fn noop_services_with_client_ip(ip: IpAddr) -> RuntimeServices {
 /// [`PlatformBackend::canonicalize_transport_timeout_ms`] returns a controlled
 /// value, so the orchestrator's transport-timeout wiring can be asserted
 /// deterministically without depending on wall-clock timing.
+#[allow(
+    dead_code,
+    reason = "retained for target-specific transport-timeout tests"
+)]
 pub(crate) fn build_services_with_backend_and_http_client(
     backend: Arc<dyn PlatformBackend>,
     http_client: Arc<dyn PlatformHttpClient>,

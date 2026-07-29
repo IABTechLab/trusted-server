@@ -1172,7 +1172,16 @@ describe('installTsRenderBridge', () => {
     }) as unknown as MessageEvent;
 
     bridgeListener(event);
-    bridgeListener(event);
+    const foreignIframe = document.createElement('iframe');
+    document.body.appendChild(foreignIframe);
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+        source: foreignIframe.contentWindow,
+        stopImmediatePropagation: stopSpy,
+      }) as unknown as MessageEvent
+    );
 
     expect(stopSpy).toHaveBeenCalledTimes(2);
     expect(portMessages).toHaveLength(1);
@@ -1190,6 +1199,7 @@ describe('installTsRenderBridge', () => {
     expect(renderer.bidId).not.toBe(prebidAdId);
     expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeUndefined();
     expect(fetchStub).not.toHaveBeenCalled();
+    foreignIframe.remove();
   });
 
   it('does not expose a registered Prebid APS renderer to another slot iframe', async () => {
@@ -1224,7 +1234,7 @@ describe('installTsRenderBridge', () => {
       }) as unknown as MessageEvent
     );
 
-    expect(stopSpy).not.toHaveBeenCalled();
+    expect(stopSpy).toHaveBeenCalledTimes(1);
     expect(portMessages).toEqual([]);
     expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeDefined();
     footer.remove();
