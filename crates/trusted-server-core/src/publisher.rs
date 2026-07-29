@@ -3003,8 +3003,22 @@ pub async fn handle_publisher_request(
         );
         response.headers_mut().remove(header::ETAG);
         response.headers_mut().remove(header::LAST_MODIFIED);
-        response.headers_mut().remove("surrogate-control");
-        response.headers_mut().remove("fastly-surrogate-control");
+        // Every CDN-targeted cache directive, not just the browser-facing
+        // `Cache-Control` above: an origin emitting any of these would otherwise
+        // instruct an intermediary to store a synthesized per-navigation
+        // document. `Surrogate-Control` and `Fastly-Surrogate-Control` cover
+        // Fastly; `CDN-Cache-Control` is the standard targeted field (RFC 9213)
+        // and `Cloudflare-CDN-Cache-Control` is the Cloudflare-specific field
+        // that overrides it there, so both are needed to close the gap on the
+        // Cloudflare adapter.
+        for directive in [
+            "surrogate-control",
+            "fastly-surrogate-control",
+            "cdn-cache-control",
+            "cloudflare-cdn-cache-control",
+        ] {
+            response.headers_mut().remove(directive);
+        }
     }
 
     let content_type = response
@@ -4733,6 +4747,8 @@ mod tests {
                     ("last-modified", ORIGIN_LAST_MODIFIED),
                     ("surrogate-control", "max-age=300"),
                     ("fastly-surrogate-control", "max-age=300"),
+                    ("cdn-cache-control", "max-age=300"),
+                    ("cloudflare-cdn-cache-control", "max-age=300"),
                 ],
             );
         }
@@ -4840,6 +4856,8 @@ mod tests {
                 header::LAST_MODIFIED,
                 header::HeaderName::from_static("surrogate-control"),
                 header::HeaderName::from_static("fastly-surrogate-control"),
+                header::HeaderName::from_static("cdn-cache-control"),
+                header::HeaderName::from_static("cloudflare-cdn-cache-control"),
             ] {
                 assert!(
                     !response_head.headers.contains_key(&header_name),
@@ -4894,6 +4912,14 @@ mod tests {
                 ),
                 (
                     header::HeaderName::from_static("fastly-surrogate-control"),
+                    "max-age=300",
+                ),
+                (
+                    header::HeaderName::from_static("cdn-cache-control"),
+                    "max-age=300",
+                ),
+                (
+                    header::HeaderName::from_static("cloudflare-cdn-cache-control"),
                     "max-age=300",
                 ),
             ] {

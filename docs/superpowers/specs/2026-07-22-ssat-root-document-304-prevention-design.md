@@ -50,8 +50,13 @@ The corresponding `PlatformHttpRequest` will carry an explicit, default-false
 cache-bypass option. The Fastly adapter will translate that option to
 `fastly::Request::set_pass(true)` before both synchronous and asynchronous sends.
 All other `PlatformHttpRequest` call sites retain their current behavior because
-the option defaults to false. Adapters without an intermediary read-through
-cache require no runtime change.
+the option defaults to false.
+
+Every adapter whose outbound fetch can hit an intermediary read-through cache
+honors the option. The Cloudflare adapter maps it to `CacheMode::NoStore` on the
+subrequest `RequestInit`, which requires the `cache_option_enabled` compatibility
+flag under the pinned compatibility date. Adapters whose outbound path has no
+such cache — Axum and Spin — require no runtime change.
 
 This bypass is deliberately scoped to the publisher fetch for an eligible SSAT
 navigation. It must not be set on assets, image optimization, SSP fan-out, or
@@ -64,7 +69,11 @@ When the eligible publisher response is HTML, Trusted Server will:
 - set `Cache-Control: private, no-store`;
 - remove `ETag` and `Last-Modified`;
 - continue removing `Surrogate-Control` and
-  `Fastly-Surrogate-Control`.
+  `Fastly-Surrogate-Control`; and
+- remove `CDN-Cache-Control`, the standard CDN-targeted cache field, and
+  `Cloudflare-CDN-Cache-Control`, the Cloudflare-specific field that overrides it
+  on that platform, so an origin cannot instruct the Cloudflare edge to store the
+  synthesized document.
 
 `no-store` is an intentional correctness choice. It prevents the browser from
 retaining a synthesized document that could later be resurrected through

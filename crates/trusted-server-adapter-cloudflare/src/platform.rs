@@ -351,6 +351,11 @@ impl CloudflareHttpClient {
         init.with_method(method)
             .with_headers(headers)
             .with_redirect(RequestRedirect::Manual);
+        // Setting the `cache` field requires the `cache_option_enabled`
+        // compatibility flag, which is only on by default from compatibility
+        // date 2024-11-11. `wrangler.toml`/`wrangler.ci.toml` pin an earlier
+        // date and set the flag explicitly; without it the Workers runtime
+        // throws here rather than failing at deploy time.
         match cache_mode {
             OutboundCacheMode::NoStore => {
                 init.with_cache(CacheMode::NoStore);

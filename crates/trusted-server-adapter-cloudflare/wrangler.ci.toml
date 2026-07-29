@@ -1,7 +1,9 @@
 name = "trusted-server"
 main = "build/index.js"
 compatibility_date = "2024-09-23"
-compatibility_flags = ["nodejs_compat"]
+# Keep in sync with wrangler.toml. `cache_option_enabled` is required for the
+# outbound `CacheMode::NoStore` cache bypass under this compatibility date.
+compatibility_flags = ["nodejs_compat", "cache_option_enabled"]
 # No [build] section — bundle is pre-built in CI; wrangler dev must not rebuild.
 
 [[kv_namespaces]]
