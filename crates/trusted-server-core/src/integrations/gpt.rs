@@ -1213,7 +1213,7 @@ mod tests {
             "bootstrap should scan ID-bearing elements instead of interpolating div_id into CSS"
         );
         assert!(
-            combined.contains(".startsWith(slot.div_id)"),
+            combined.contains("candidate.id.startsWith(divId)"),
             "bootstrap should match metacharacter-containing div_id prefixes with startsWith"
         );
         assert!(

@@ -52,15 +52,47 @@ interface SlotRenderEndedEvent {
   slot: GoogleTagSlot;
 }
 
+function isElementVisible(element: HTMLElement): boolean {
+  const style = window.getComputedStyle(element);
+  return (
+    style.display !== 'none' && style.visibility !== 'hidden' && style.visibility !== 'collapse'
+  );
+}
+
+function slotElementHasLayout(element: HTMLElement): boolean {
+  if (!isElementVisible(element)) return false;
+  const elementRect = element.getBoundingClientRect();
+  if (elementRect.width > 0 && elementRect.height > 0) return true;
+
+  const container = document.getElementById(`${element.id}-container`);
+  if (!container || !isElementVisible(container)) return false;
+  const containerRect = container.getBoundingClientRect();
+  return containerRect.width > 0 && containerRect.height > 0;
+}
+
 function findSlotElementByDivId(divId: string): HTMLElement | null {
+  if (!divId) return null;
   const exact = document.getElementById(divId);
   if (exact) return exact;
 
-  return (
-    Array.from(document.querySelectorAll<HTMLElement>('[id]')).find(
-      (el) => el.id.startsWith(divId) && !el.id.endsWith('-container')
-    ) ?? null
+  const prefixMatches = Array.from(document.querySelectorAll<HTMLElement>('[id]')).filter(
+    (element) => element.id.startsWith(divId) && !element.id.endsWith('-container')
   );
+  // A unique prefix match may be a lazy slot that has not been sized yet.
+  // Geometry is only needed to disambiguate multiple responsive siblings.
+  if (prefixMatches.length === 1) return prefixMatches[0] ?? null;
+
+  const activeMatches = prefixMatches.filter(slotElementHasLayout);
+  if (activeMatches.length === 1) return activeMatches[0] ?? null;
+
+  if (prefixMatches.length > 1) {
+    log.warn('GPT slot prefix did not resolve to one active element', {
+      divId,
+      prefixMatchCount: prefixMatches.length,
+      activeMatchCount: activeMatches.length,
+    });
+  }
+  return null;
 }
 
 function candidateSlotRoots(divId: string): HTMLElement[] {
