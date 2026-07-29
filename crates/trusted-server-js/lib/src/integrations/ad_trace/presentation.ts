@@ -111,13 +111,11 @@ function renderStatus(render?: RenderTraceSnapshot): string | undefined {
       if (render.reason === 'direct_iframe_created') return 'Creative iframe created';
       return 'Creative response sent to the renderer';
     case 'gam_only':
-      return render.reason === 'gpt_backfill'
-        ? 'GAM returned backfill'
-        : 'GAM rendered an ad — source not attributed';
+      return 'GAM rendered an ad — source not attributed';
     case 'empty':
       return 'GAM returned no ad';
     case 'unresolved':
-      return render.reason === 'gpt_slot_requested' ? 'GAM request observed' : undefined;
+      return undefined;
   }
 }
 

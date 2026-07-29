@@ -321,12 +321,10 @@ function renderOutcome(
     return { outcome: 'confirmed', confidence: 'definitive' };
   if (current.outcome === 'served') return { outcome: 'served', confidence: 'strong' };
   if (event.kind === 'pb_render_served') return { outcome: 'served', confidence: 'strong' };
-  if (event.kind === 'gpt_slot_render_ended') {
-    if (event.outcome === 'unresolved') return { outcome: 'unresolved', confidence: 'none' };
+  if (event.kind === 'gpt_slot_render_ended')
     return event.isEmpty
       ? { outcome: 'empty', confidence: 'definitive' }
       : { outcome: 'gam_only', confidence: 'probable' };
-  }
   if (current.outcome === 'gam_only') return { outcome: 'gam_only', confidence: 'probable' };
   return { outcome: 'unresolved', confidence: 'none' };
 }

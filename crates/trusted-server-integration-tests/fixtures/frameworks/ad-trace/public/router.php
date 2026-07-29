@@ -40,7 +40,7 @@ if ($path === '/prebid-bundle.js') {
     return;
 }
 
-if ($path === '/' || $path === '/spa-one' || $path === '/spa-two' || $path === '/publisher-only') {
+if ($path === '/' || $path === '/spa-one' || $path === '/spa-two') {
     require __DIR__ . '/index.php';
     return;
 }
