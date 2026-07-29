@@ -115,10 +115,10 @@ bidders = {}
 
 ### Placeholders
 
-| placeholder    | resolves to                                           |
-| -------------- | ----------------------------------------------------- |
-| `{network_id}` | `gam_network_id`                                      |
-| `{slot_id}`    | slot `id`                                             |
+| placeholder    | resolves to                                              |
+| -------------- | -------------------------------------------------------- |
+| `{network_id}` | `gam_network_id`                                         |
+| `{slot_id}`    | slot `id`                                                |
 | `{section}`    | segment at `section_segment`; `section_root` when absent |
 
 ### Resolution model
