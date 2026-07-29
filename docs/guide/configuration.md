@@ -161,14 +161,14 @@ Core publisher settings for domain, origin, and proxy configuration.
 
 ### `[publisher]`
 
-| Field                         | Type    | Required | Description                                                                             |
-| ----------------------------- | ------- | -------- | --------------------------------------------------------------------------------------- |
-| `domain`                      | String  | Yes      | Publisher's apex domain name                                                            |
-| `cookie_domain`               | String  | Yes      | Domain for non-EC cookies (typically with leading dot)                                  |
-| `origin_url`                  | String  | Yes      | Full URL of publisher origin server                                                     |
-| `origin_host_header_override` | String  | No       | Outbound Host header to send while connecting to `origin_url`                           |
-| `proxy_secret`                | String  | Yes      | Secret key for encrypting/signing proxy URLs                                            |
-| `max_buffered_body_bytes`     | Integer | No       | Max bytes buffered when a publisher response is post-processed in full (default 16 MiB) |
+| Field                         | Type    | Required | Description                                                                 |
+| ----------------------------- | ------- | -------- | --------------------------------------------------------------------------- |
+| `domain`                      | String  | Yes      | Publisher's apex domain name                                                |
+| `cookie_domain`               | String  | Yes      | Domain for non-EC cookies (typically with leading dot)                      |
+| `origin_url`                  | String  | Yes      | Full URL of publisher origin server                                         |
+| `origin_host_header_override` | String  | No       | Outbound Host header to send while connecting to `origin_url`               |
+| `proxy_secret`                | String  | Yes      | Secret key for encrypting/signing proxy URLs                                |
+| `max_buffered_body_bytes`     | Integer | No       | Buffered-body cap / Fastly stream raw+decoded byte ceiling (default 16 MiB) |
 
 > **Note:** EC cookies (`ts-ec`) derive their domain automatically as `.{domain}` and
 > do not use `cookie_domain`. The `cookie_domain` field is used by other cookie helpers.
@@ -300,29 +300,41 @@ Changing `proxy_secret` invalidates all existing signed URLs. Plan rotations car
 
 #### `max_buffered_body_bytes`
 
-**Purpose**: Upper bound on the in-memory buffer used when a publisher origin
-response must be processed in full (HTML rewriting and integration injection)
-instead of streamed.
+**Purpose**: Upper bound on how much of a publisher origin body the rewrite
+pipeline holds in memory — the post-rewrite output buffer on buffered adapters,
+and the per-stream raw/decoded byte ceiling on the Fastly streaming path.
 
 **Usage**:
 
-- Caps the _decoded, post-rewrite_ output buffer for any buffered publisher
-  response on both the legacy and EdgeZero paths.
-- Exceeding the cap fails the response (mapped to a 5xx proxy error) rather than
-  allocating past the limit, preventing Wasm-heap exhaustion on highly
-  compressible documents.
+- On **buffered adapters** (Axum, Cloudflare, Spin) it caps the _decoded,
+  post-rewrite_ output buffer for a publisher response processed in full. It
+  also bounds how much decoded gzip output may sit in the heap at any one
+  moment, so a decompression bomb is rejected mid-decode rather than after its
+  full expansion. That second bound is per-step, not a total: a gzip-encoded
+  response passes or fails on the same post-rewrite output size as the identity,
+  deflate and brotli versions of the same body.
+- On the **Fastly streaming path** the origin body is preserved as a stream, so
+  the same value caps the stream twice over: the cumulative _raw_ (still
+  compressed) bytes pulled from origin, and the cumulative _decoded_ bytes
+  emitted by the decompressor. The decoded cap is enforced _during_
+  decompression, so a decompression bomb is rejected before its expansion is
+  materialized rather than after.
 
-**Default**: `16777216` (16 MiB).
+**Behavior when exceeded**:
 
-**Effective Fastly limit**: On Fastly the practical ceiling for a publisher page
-is lower. The platform HTTP client rejects any origin response whose raw (still
-compressed) body exceeds **10 MiB** before this buffer is filled, so raising the
-value only helps highly compressible pages whose decoded size exceeds 16 MiB
-while their compressed origin body stays under 10 MiB. Raising it above ~10 MiB
-does not lift the platform cap for uncompressed pages.
+- On **buffered adapters** the response fails before any bytes are committed.
+- On the **streaming path** the response headers are already committed when
+  either cap trips, so the body is **truncated mid-stream** and the error is
+  logged — the client receives a short (incomplete) body rather than a `5xx`.
+  Size the cap above your largest expected decoded page so legitimate responses
+  are never truncated.
+
+**Default**: `16777216` (16 MiB). On the Fastly streaming path this is now the
+sole ceiling: origin bodies are streamed rather than materialized in full, so
+the previous ~10 MiB raw-body limit no longer applies.
 
 **Minimum**: Must be at least `1`. A value of `0` is rejected at startup because
-a zero-byte cap fails every non-empty buffered response.
+a zero-byte cap fails every non-empty publisher response.
 
 **Environment Override**:
 
@@ -622,6 +634,31 @@ path = "^/api/v[0-9]+/private"  # /api/v1/private, /api/v2/private
 ```
 
 **Validation**: Application startup fails if regex is invalid.
+
+::: warning Scope patterns to the paths you mean
+
+Handler patterns are matched against the full request path, so a broad pattern
+covers everything beneath it. The `/_ts/` namespace holds both admin routes and
+browser-facing endpoints that anonymous visitors must be able to reach:
+
+| Path                     | Called by                            |
+| ------------------------ | ------------------------------------ |
+| `/_ts/page-bids`         | Trusted Server JS, on SPA navigation |
+| `/_ts/api/v1/identify`   | Trusted Server JS, in the browser    |
+| `/_ts/api/v1/batch-sync` | Trusted Server JS, in the browser    |
+
+A pattern such as `path = "^/_ts"` puts those behind Basic Auth. Browser
+fetches never carry Basic credentials, so every visitor gets `401` — on
+`/_ts/page-bids` that means no ads after any client-side navigation. Match the
+admin routes specifically (`^/_ts/admin`) instead.
+
+Upgrading from a release before `/_ts/page-bids` existed: if any handler
+pattern covers it, narrow the pattern. The Trusted Server JS bundle falls back
+to the deprecated `/__ts/page-bids` alias in the meantime, but that alias is
+scheduled for removal
+([#970](https://github.com/IABTechLab/trusted-server/issues/970)).
+
+:::
 
 ### Security Considerations
 
