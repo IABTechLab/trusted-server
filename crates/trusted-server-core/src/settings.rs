@@ -2429,7 +2429,6 @@ impl Settings {
         mut settings: Self,
         validation_label: &str,
     ) -> Result<Self, Report<TrustedServerError>> {
-        settings.integrations.normalize();
         settings.cache.normalize();
         settings.proxy.normalize();
         settings.image_optimizer.normalize();
