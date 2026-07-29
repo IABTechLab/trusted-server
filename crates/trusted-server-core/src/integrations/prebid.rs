@@ -19,7 +19,7 @@ use url::{Url, Url as ParsedUrl};
 use validator::{Validate, ValidationError};
 
 use crate::auction::orchestrator::ERROR_TYPE_HTTP_STATUS;
-use crate::auction::provider::AuctionProvider;
+use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
 use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid, MediaType,
 };
@@ -38,9 +38,7 @@ use crate::openrtb::{
     OpenRtbRequest, PrebidExt, PrebidImpExt, Publisher, Regs, RegsExt, RequestExt, Site, ToExt,
     TrustedServerExt, User, UserExt, to_openrtb_i32,
 };
-use crate::platform::{
-    PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, RuntimeServices,
-};
+use crate::platform::{PlatformHttpRequest, PlatformResponse, RuntimeServices};
 use crate::proxy::{ProxyRequestConfig, is_host_allowed, proxy_request};
 use crate::request_signing::{RequestSigner, SIGNING_VERSION, SigningParams};
 use crate::settings::{IntegrationConfig, Settings};
@@ -1538,6 +1536,17 @@ pub struct PrebidAuctionProvider {
     bid_param_override_engine: Arc<BidParamOverrideEngine>,
 }
 
+#[derive(Default)]
+struct PrebidImpressionDisposition {
+    aps_only: usize,
+    invalid: usize,
+}
+
+struct PrebidRequestBuild {
+    request: OpenRtbRequest,
+    disposition: PrebidImpressionDisposition,
+}
+
 impl PrebidAuctionProvider {
     #[cfg(test)]
     fn new(config: PrebidIntegrationConfig) -> Self {
@@ -1571,14 +1580,15 @@ impl PrebidAuctionProvider {
         }
     }
 
-    /// Convert auction request to `OpenRTB` format with all enrichments.
-    fn to_openrtb(
+    /// Build an enriched `OpenRTB` request and retain impression drop provenance.
+    fn build_openrtb(
         &self,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
         signer: Option<(&RequestSigner, String, &SigningParams)>,
         request_info: RequestInfo,
-    ) -> OpenRtbRequest {
+    ) -> PrebidRequestBuild {
+        let mut disposition = PrebidImpressionDisposition::default();
         let imps = request
             .slots
             .iter()
@@ -1604,6 +1614,7 @@ impl PrebidAuctionProvider {
                     .collect();
 
                 if formats.is_empty() {
+                    disposition.invalid += 1;
                     log::warn!(
                         "prebid: dropping imp '{}' — no valid banner formats after filtering",
                         slot.id
@@ -1742,6 +1753,7 @@ impl PrebidAuctionProvider {
                 }
 
                 if excluded_aps && bidder.is_empty() {
+                    disposition.aps_only += 1;
                     log::warn!(
                         "prebid: dropping imp '{}' because it contains only APS demand; refusing PBS stored-request fallback",
                         slot.id
@@ -1970,7 +1982,7 @@ impl PrebidAuctionProvider {
         // edge timeouts.
         let tmax = to_openrtb_i32(context.timeout_ms, "tmax", "request");
 
-        OpenRtbRequest {
+        let request = OpenRtbRequest {
             id: Some(request.id.clone()),
             imp: imps,
             site: Some(Site {
@@ -1991,7 +2003,25 @@ impl PrebidAuctionProvider {
             cur: vec![DEFAULT_CURRENCY.to_string()],
             ext,
             ..Default::default()
+        };
+
+        PrebidRequestBuild {
+            request,
+            disposition,
         }
+    }
+
+    /// Convert an auction request to `OpenRTB` format with all enrichments.
+    #[cfg(test)]
+    fn to_openrtb(
+        &self,
+        request: &AuctionRequest,
+        context: &AuctionContext<'_>,
+        signer: Option<(&RequestSigner, String, &SigningParams)>,
+        request_info: RequestInfo,
+    ) -> OpenRtbRequest {
+        self.build_openrtb(request, context, signer, request_info)
+            .request
     }
 
     /// Builds the `regs` object from a [`ConsentContext`].
@@ -2426,7 +2456,8 @@ impl AuctionProvider for PrebidAuctionProvider {
         &self,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
-    ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+    ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
+        let request_start = web_time::Instant::now();
         log::info!("Prebid: requesting bids for {} slots", request.slots.len());
 
         // `ext.trusted_server.request_host` must be the publisher's own domain
@@ -2465,20 +2496,33 @@ impl AuctionProvider for PrebidAuctionProvider {
                 None
             };
 
-        // Convert to OpenRTB with all enrichments
-        let openrtb = self.to_openrtb(
+        let PrebidRequestBuild {
+            request: openrtb,
+            disposition,
+        } = self.build_openrtb(
             request,
             context,
             signer_with_signature
                 .as_ref()
-                .map(|(s, sig, params)| (s, sig.clone(), params)),
+                .map(|(signer, signature, params)| (signer, signature.clone(), params)),
             request_info,
         );
 
-        // An empty `imp` array violates the OpenRTB spec and wastes a network
-        // round-trip. This can happen when all slots are non-Banner or all
-        // banner dimensions overflow `i32::MAX`.
         if openrtb.imp.is_empty() {
+            let all_slots_are_aps_only = !request.slots.is_empty()
+                && disposition.invalid == 0
+                && disposition.aps_only == request.slots.len();
+            if all_slots_are_aps_only {
+                log::info!(
+                    "Prebid: returning no-bid because all {} valid impressions are APS-only",
+                    disposition.aps_only
+                );
+                return Ok(ProviderRequestOutcome::Immediate(AuctionResponse::no_bid(
+                    PREBID_INTEGRATION_ID,
+                    request_start.elapsed().as_millis() as u64,
+                )));
+            }
+
             log::info!("Prebid: skipping request — no valid impressions after filtering");
             return Err(Report::new(TrustedServerError::Prebid {
                 message: "No valid impressions after filtering".to_string(),
@@ -2547,7 +2591,7 @@ impl AuctionProvider for PrebidAuctionProvider {
                 message: "Failed to send async request to Prebid Server".to_string(),
             })?;
 
-        Ok(pending)
+        Ok(ProviderRequestOutcome::pending(pending))
     }
 
     async fn parse_response(

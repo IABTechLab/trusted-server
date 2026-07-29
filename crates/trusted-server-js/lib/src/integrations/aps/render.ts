@@ -33,6 +33,12 @@ const DEFAULT_PREBID_RENDERER_TTL_SECONDS = 300;
 const MAX_PREBID_RENDERER_TTL_SECONDS = 3600;
 const MAX_PREBID_ID_BYTES = 1024;
 
+type ValidatedRendererCacheEntry = {
+  publisherOrigin: string;
+  renderer: ApsRendererV1;
+};
+const validatedRendererCache = new WeakMap<object, ValidatedRendererCacheEntry>();
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -125,6 +131,11 @@ export function validateApsRenderer(
   value: unknown,
   publisherOrigin = window.location.origin
 ): ApsRendererV1 | undefined {
+  if (isRecord(value)) {
+    const cached = validatedRendererCache.get(value);
+    if (cached?.publisherOrigin === publisherOrigin) return cached.renderer;
+  }
+
   const renderer = parseApsRendererDescriptor(value);
   if (!renderer || !validCreativeUrl(renderer.creativeUrl, publisherOrigin)) return undefined;
 
@@ -163,7 +174,10 @@ export function validateApsRenderer(
     return undefined;
   }
 
-  return renderer;
+  const validated = Object.freeze({ ...renderer }) as ApsRendererV1;
+  validatedRendererCache.set(value as object, { publisherOrigin, renderer: validated });
+  validatedRendererCache.set(validated, { publisherOrigin, renderer: validated });
+  return validated;
 }
 
 function validPrebidIdentity(value: unknown): value is string {

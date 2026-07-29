@@ -3,12 +3,16 @@
 use edgezero_core::body::Body as EdgeBody;
 use http::Request;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::auction::context::ContextValue;
 use crate::geo::GeoInfo;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
 
 /// Represents a unified auction request across all providers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -329,6 +333,12 @@ pub struct OrchestratorExt {
     /// Per-provider breakdown of the auction.
     #[serde(default)]
     pub provider_details: Vec<ProviderSummary>,
+    /// Winners omitted during final response conversion.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dropped_winner_count: usize,
+    /// Machine-readable reasons for omitted winners.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dropped_winner_reasons: BTreeMap<String, usize>,
 }
 
 /// Status of bid response.

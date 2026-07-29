@@ -488,9 +488,9 @@ timeout_ms = 500
 
 ```rust
 use async_trait::async_trait;
-use crate::auction::provider::AuctionProvider;
+use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
 use crate::auction::types::{AuctionContext, AuctionRequest, AuctionResponse};
-use crate::platform::{PlatformPendingRequest, PlatformResponse};
+use crate::platform::PlatformResponse;
 
 pub struct YourAuctionProvider {
     config: YourConfig,
@@ -506,10 +506,10 @@ impl AuctionProvider for YourAuctionProvider {
         &self,
         request: &AuctionRequest,
         _context: &AuctionContext<'_>,
-    ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+    ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
         // 1. Transform AuctionRequest to your provider's format
-        // 2. Launch HTTP request through services.http_client().send_async(...)
-        // 3. Return PlatformPendingRequest for the orchestrator to await
+        // 2. Launch through services.http_client().send_async(...)
+        // 3. Wrap the handle with ProviderRequestOutcome::pending(...)
         todo!()
     }
 
