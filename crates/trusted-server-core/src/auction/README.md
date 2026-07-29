@@ -136,8 +136,8 @@ When a request arrives at the `/auction` endpoint, it goes through the following
 ┌──────────────────────────────────────────────────────────────────────┐
 │  11. Transform to OpenRTB Response (mod.rs:274-322)                  │
 │      - Build seatbid array (one per winning bid)                     │
-│      - Always sanitize creative HTML                                 │
-│      - Rewrite creative HTML when enabled (default)                  │
+│      - Sanitize creative HTML when enabled (opt-in)                  │
+│      - Rewrite creative HTML when enabled (opt-in)                   │
 │      - Add orchestrator metadata (timing, strategy, bid count)       │
 └──────────────────────────────────────────────────────────────────────┘
                               │
@@ -270,7 +270,7 @@ The trusted-server handles several types of routes defined in `crates/trusted-se
 | `/first-party/proxy`      | GET    | `handle_first_party_proxy()`   | Proxy creatives through first-party domain       | 84   |
 | `/first-party/click`      | GET    | `handle_first_party_click()`   | Track clicks on ads                              | 85   |
 | `/first-party/sign`       | GET/POST | `handle_first_party_proxy_sign()` | Generate signed URLs for creatives            | 86   |
-| `/first-party/proxy-rebuild` | POST | `handle_first_party_proxy_rebuild()` | Rebuild creative HTML with new settings     | 89   |
+| `/first-party/proxy-rebuild` | GET/POST | `handle_first_party_proxy_rebuild()` | Re-sign mutated click URLs (GET 302s for the opaque-origin click guard) | 89   |
 | `/static/tsjs=*`          | GET    | `handle_tsjs_dynamic()`        | Serve tsjs library (Prebid.js alternative)       | 66   |
 | `/.well-known/ts.jwks.json` | GET  | `handle_jwks_endpoint()`       | Public key distribution for request signing      | 71   |
 | `/verify-signature`       | POST   | `handle_verify_signature()`    | Verify signed requests                           | 74   |

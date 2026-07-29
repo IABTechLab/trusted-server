@@ -217,8 +217,15 @@ pub fn convert_tsjs_to_auction_request(
 
 /// Convert `OrchestrationResult` to `OpenRTB` response format.
 ///
-/// Always sanitizes creative HTML in the `adm` field and optionally rewrites it
-/// according to the auction configuration.
+/// Creative HTML in the `adm` field is optionally sanitized and optionally
+/// rewritten according to the auction configuration
+/// ([`AuctionConfig::sanitize_creatives`] and
+/// [`AuctionConfig::rewrite_creatives`], both opt-in); with both disabled the
+/// creative ships exactly as the bidder returned it, subject to the 1 MiB
+/// per-creative cap.
+///
+/// [`AuctionConfig::sanitize_creatives`]: crate::auction_config_types::AuctionConfig::sanitize_creatives
+/// [`AuctionConfig::rewrite_creatives`]: crate::auction_config_types::AuctionConfig::rewrite_creatives
 ///
 /// # Errors
 ///
@@ -1016,17 +1023,50 @@ mod tests {
         let auction_request = make_auction_request();
         let result = make_result(make_complete_creative_bid());
 
+        let original = make_complete_creative_bid()
+            .creative
+            .expect("should have a creative fixture");
+
         let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
             .expect("should convert creative with sanitization disabled");
         let adm = response_adm(response);
 
+        assert_eq!(
+            adm, original,
+            "should deliver the creative byte-for-byte as the bidder returned it"
+        );
+    }
+
+    #[test]
+    fn convert_to_openrtb_response_rewrites_raw_markup_without_sanitizing() {
+        // The fourth mode: rewriting enabled while sanitization stays off. The
+        // rewriter converts eligible resource/click URLs on the raw bidder
+        // markup and preserves executable content.
+        let mut settings = make_settings();
+        settings.auction.sanitize_creatives = false;
+        settings.auction.rewrite_creatives = true;
+        let auction_request = make_auction_request();
+        let result = make_result(make_complete_creative_bid());
+
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
+            .expect("should convert creative with rewriting only");
+        let adm = response_adm(response);
+
+        assert!(
+            adm.contains("/first-party/proxy?tsurl="),
+            "should rewrite accepted resource URLs: {adm}"
+        );
+        assert!(
+            adm.contains("/first-party/click?tsurl="),
+            "should rewrite accepted click URLs: {adm}"
+        );
         assert!(
             adm.contains("auction-script-marker"),
-            "should retain script content when sanitization is disabled: {adm}"
+            "should preserve script content when sanitization is disabled: {adm}"
         );
         assert!(
             adm.contains("auction-handler-marker"),
-            "should retain event handlers when sanitization is disabled: {adm}"
+            "should preserve event handlers when sanitization is disabled: {adm}"
         );
     }
 

@@ -144,6 +144,19 @@ function buildProxyRebuildUrl(tsClickStr: string, diff: Diff): string {
   return `/first-party/proxy-rebuild?${params.toString()}`;
 }
 
+// A sandboxed srcdoc creative without `allow-same-origin` runs in an opaque
+// origin: its JSON POST is cross-origin (`Origin: null`), triggers a CORS
+// preflight the edge does not answer, and always fails. Detect that up front so
+// the guard recovers via the GET navigation fallback, which the edge answers
+// with a 302 chain (no CORS applies to navigations).
+function hasOpaqueOrigin(): boolean {
+  try {
+    return typeof window !== 'undefined' && window.origin === 'null';
+  } catch {
+    return true;
+  }
+}
+
 // Call the proxy-rebuild endpoint so the edge can re-sign mutated click params.
 async function rebuildClick(a: AnchorLike, tsClickStr: string, diff: Diff): Promise<string> {
   const addKeys = Object.keys(diff.add);
@@ -154,7 +167,7 @@ async function rebuildClick(a: AnchorLike, tsClickStr: string, diff: Diff): Prom
 
   const fallback = buildProxyRebuildUrl(tsClickStr, diff);
 
-  if (typeof fetch !== 'function') {
+  if (typeof fetch !== 'function' || hasOpaqueOrigin()) {
     try {
       const el = a as Element;
       el.setAttribute('href', fallback);

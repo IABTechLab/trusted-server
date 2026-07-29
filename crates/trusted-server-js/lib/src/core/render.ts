@@ -32,8 +32,10 @@ export type AcceptedCreativeHtml = {
   kind: 'accepted';
   originalLength: number;
   sanitizedHtml: string;
-  // Always equal to originalLength: the client validates type/emptiness only;
-  // server-side sanitization has already run before adm reaches this function.
+  // Always equal to originalLength: the client validates type/emptiness only
+  // and never removes content. Server-side sanitization is opt-in
+  // (`auction.sanitize_creatives`); the origin boundary for this markup is the
+  // iframe sandbox, not this function.
   // Retained so both union members of SanitizeCreativeHtmlResult have consistent fields.
   sanitizedLength: number;
   // Always 0 for the same reason — no content is removed client-side.
@@ -59,9 +61,12 @@ function normalizeId(raw: string): string {
 }
 
 // Validate the untrusted creative fragment before embedding it in the sandboxed iframe.
-// Dangerous markup is stripped server-side before adm reaches the client; this function
-// only guards against type errors and empty payloads. As a result, sanitizedLength always
-// equals originalLength and removedCount is always 0 for accepted creatives — these fields
+// This is validation-only, not sanitization: it guards against type errors and empty
+// payloads and never removes content. Server-side stripping of executable markup is
+// opt-in (`auction.sanitize_creatives`), so the adm arriving here may be raw bidder
+// markup — the origin boundary is the iframe sandbox (no `allow-same-origin`), which
+// does not depend on any sanitization having run. sanitizedLength always equals
+// originalLength and removedCount is always 0 for accepted creatives — these fields
 // exist for structural consistency with the shared result type but carry no signal here.
 export function sanitizeCreativeHtml(creativeHtml: unknown): SanitizeCreativeHtmlResult {
   if (typeof creativeHtml !== 'string') {

@@ -604,10 +604,11 @@ control whether processed `adm` is delivered.
 | `<style>`, `[style]`             | `url()` references          | `/first-party/proxy?tsurl=...` |
 | SVG `<image>`, `<use>`           | `href`, `xlink:href`        | `/first-party/proxy?tsurl=...` |
 
-The rewrite pass leaves relative URLs and non-network schemes unchanged. On the
-auction path, mandatory sanitization runs first and strips dangerous schemes,
-so only sanitizer-accepted values reach this pass. Domains in the
-`rewrite.exclude_domains` config list (supports wildcards like
+The rewrite pass leaves relative URLs and non-network schemes unchanged. When
+`sanitize_creatives` is also enabled, sanitization runs first and strips
+dangerous schemes, so only sanitizer-accepted values reach this pass; with
+sanitization disabled, the rewriter operates on the raw bidder markup. Domains
+in the `rewrite.exclude_domains` config list (supports wildcards like
 `*.cdn.example.com`) are also skipped.
 
 Each proxied URL includes a `tstoken` HMAC signature for tamper protection. See [Proxy Signing](/guide/proxy-signing) for details.

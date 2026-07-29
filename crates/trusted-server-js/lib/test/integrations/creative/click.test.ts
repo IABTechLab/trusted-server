@@ -71,4 +71,46 @@ describe('creative/click.ts', () => {
     expect(anchor.getAttribute('href')).toBe(PROXY_RESPONSE);
     expect(anchor.getAttribute('data-tsclick')).toBe(PROXY_RESPONSE);
   });
+
+  it('skips the doomed POST and uses the GET fallback in an opaque origin', async () => {
+    // A sandboxed srcdoc creative without `allow-same-origin` has origin
+    // "null": its JSON POST preflights and fails, so the guard must go
+    // straight to the GET navigation fallback instead of fetching.
+    vi.useFakeTimers();
+
+    const originDescriptor = Object.getOwnPropertyDescriptor(window, 'origin');
+    Object.defineProperty(window, 'origin', { value: 'null', configurable: true });
+
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ href: PROXY_RESPONSE }),
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    try {
+      const anchor = document.createElement('a');
+      anchor.setAttribute('data-tsclick', FIRST_PARTY_CLICK);
+      anchor.setAttribute('href', FIRST_PARTY_CLICK);
+      document.body.appendChild(anchor);
+
+      await importCreativeModule();
+
+      anchor.setAttribute('href', MUTATED_CLICK);
+
+      await Promise.resolve();
+      await vi.runAllTimersAsync();
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      const finalHref = anchor.getAttribute('href') ?? '';
+      expect(finalHref.startsWith('/first-party/proxy-rebuild?')).toBe(true);
+      expect(finalHref).toContain('add=%7B%22bar%22%3A%222%22%7D');
+      expect(finalHref).toContain('del=%5B%22foo%22%5D');
+    } finally {
+      if (originDescriptor) {
+        Object.defineProperty(window, 'origin', originDescriptor);
+      } else {
+        delete (window as { origin?: string }).origin;
+      }
+    }
+  });
 });

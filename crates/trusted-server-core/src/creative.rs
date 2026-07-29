@@ -543,6 +543,19 @@ fn process_auction_creative_with_rewriter(
     raw: &str,
     rewrite: impl FnOnce(&str) -> String,
 ) -> String {
+    // The per-creative size cap is a delivery invariant, not a sanitizer
+    // implementation detail: it must hold in every processing mode, including
+    // full pass-through, so oversized markup never reaches rewriting, JSON
+    // serialization, or the client. Fail closed with an empty string, matching
+    // the sanitizer's own oversized-input behaviour.
+    if raw.len() > MAX_CREATIVE_SIZE {
+        log::warn!(
+            "process_auction_creative: creative of {} bytes exceeds {} byte cap; rejecting",
+            raw.len(),
+            MAX_CREATIVE_SIZE
+        );
+        return String::new();
+    }
     let sanitized = if settings.auction.sanitize_creatives {
         sanitize_creative_html(raw)
     } else {
@@ -1599,6 +1612,63 @@ mod tests {
             !processed.contains("marker"),
             "should sanitize scripts even without rewriting: {processed}"
         );
+    }
+
+    #[test]
+    fn process_auction_creative_passes_through_byte_for_byte_when_disabled() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let html = r#"<html><body onload="init()"><img src="https://cdn.example/ad.png"><script>marker</script><form action="https://x.example"></form></body></html>"#;
+
+        let processed = process_auction_creative(&settings, html);
+
+        assert_eq!(
+            processed, html,
+            "should return the creative exactly as the bidder sent it when both controls are disabled"
+        );
+    }
+
+    #[test]
+    fn process_auction_creative_rewrites_raw_markup_without_sanitizing() {
+        // The fourth mode: rewriting enabled, sanitization disabled. Eligible
+        // URLs are rewritten while executable markup is preserved.
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.auction.sanitize_creatives = false;
+        settings.auction.rewrite_creatives = true;
+        let html = r#"<html><body><img src="https://cdn.example/ad.png"><script>marker</script><div onclick="handler()">x</div></body></html>"#;
+
+        let processed = process_auction_creative(&settings, html);
+
+        assert!(
+            processed.contains("/first-party/proxy?tsurl="),
+            "should rewrite accepted resource URLs: {processed}"
+        );
+        assert!(
+            processed.contains("marker"),
+            "should preserve script content when sanitization is disabled: {processed}"
+        );
+        assert!(
+            processed.contains("onclick"),
+            "should preserve event handlers when sanitization is disabled: {processed}"
+        );
+    }
+
+    #[test]
+    fn process_auction_creative_rejects_oversized_markup_in_every_mode() {
+        // The 1 MiB per-creative cap is a delivery invariant independent of the
+        // sanitize/rewrite flags: oversized markup fails closed everywhere.
+        let oversized = format!("<div>{}</div>", "a".repeat(super::MAX_CREATIVE_SIZE + 1));
+        for (sanitize, rewrite) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut settings = crate::test_support::tests::create_test_settings();
+            settings.auction.sanitize_creatives = sanitize;
+            settings.auction.rewrite_creatives = rewrite;
+
+            let processed = process_auction_creative(&settings, &oversized);
+
+            assert!(
+                processed.is_empty(),
+                "should reject oversized creative with sanitize={sanitize} rewrite={rewrite}"
+            );
+        }
     }
 
     #[test]

@@ -21,6 +21,17 @@ export function shouldProxyExternalUrl(raw: string): boolean {
 
 export async function signProxyUrl(raw: string): Promise<string | null> {
   if (typeof fetch !== 'function') return null;
+  // A sandboxed srcdoc creative without `allow-same-origin` has an opaque
+  // origin: this JSON POST would preflight with `Origin: null` and fail, so
+  // skip the doomed request and leave the resource URL unsigned. Dynamic
+  // signing from opaque-origin creatives needs a same-origin parent
+  // postMessage broker (tracked as a follow-up); resources degrade to loading
+  // directly, which the sandbox still isolates from the publisher origin.
+  try {
+    if (typeof window !== 'undefined' && window.origin === 'null') return null;
+  } catch {
+    return null;
+  }
   let absolute: string;
   try {
     absolute = new URL(raw, location.href).toString();
