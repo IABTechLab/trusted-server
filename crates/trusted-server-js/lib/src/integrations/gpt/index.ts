@@ -1165,7 +1165,7 @@ export function installTsRenderBridge(): void {
   // is scoped to the slot, not the bare adId: hb_adid is not unique per bid, so
   // keying on it alone would let one slot block a distinct slot's render.
   const renderingKeys = new Set<string>();
-  const consumedPrebidApsIds = new Map<string, { adUnitCode: string; expiresAt: number }>();
+  const consumedPrebidApsIds = new Map<string, { expiresAt: number }>();
 
   window.addEventListener('message', (e: MessageEvent) => {
     let data: Record<string, unknown>;
@@ -1184,26 +1184,31 @@ export function installTsRenderBridge(): void {
 
     const port = e.ports?.[0];
     if (!port) return;
-    const sourceSlotId = slotIdForMessageSource(e.source);
-    if (!sourceSlotId) return;
 
+    const now = Date.now();
+    for (const [consumedAdId, consumed] of consumedPrebidApsIds) {
+      if (consumed.expiresAt <= now) consumedPrebidApsIds.delete(consumedAdId);
+    }
     const consumedPrebidAps = consumedPrebidApsIds.get(adId);
-    if (consumedPrebidAps && consumedPrebidAps.expiresAt > Date.now()) {
-      if (messageSourceBelongsToAdUnit(e.source, consumedPrebidAps.adUnitCode)) {
-        e.stopImmediatePropagation();
-      }
+    if (consumedPrebidAps) {
+      // Once TS claims an APS capability, keep the ad ID unavailable to every
+      // other iframe. Letting Prebid's global handler answer a foreign source
+      // would expose the creative despite the slot-bound capability check.
+      e.stopImmediatePropagation();
       return;
     }
 
     const prebidRendererEntry = getApsPrebidRenderer(adId);
     if (prebidRendererEntry) {
+      // Fail closed for a TS-owned APS ad ID before checking its source. Native
+      // Prebid handles ad IDs globally and would otherwise answer a request from
+      // an unrelated iframe when this slot-bound capability rejects it.
+      e.stopImmediatePropagation();
       if (!messageSourceBelongsToAdUnit(e.source, prebidRendererEntry.adUnitCode)) return;
       const renderer = validateApsRenderer(prebidRendererEntry.renderer);
       const rendererUrl = apsRendererUrl();
       if (!renderer || !rendererUrl || !consumeApsPrebidRenderer(adId, prebidRendererEntry)) return;
-      e.stopImmediatePropagation();
       consumedPrebidApsIds.set(adId, {
-        adUnitCode: prebidRendererEntry.adUnitCode,
         expiresAt: prebidRendererEntry.expiresAt,
       });
       prebidRendererEntry.markWinner();
@@ -1222,6 +1227,9 @@ export function installTsRenderBridge(): void {
       prebidRendererEntry.markRendered();
       return;
     }
+
+    const sourceSlotId = slotIdForMessageSource(e.source);
+    if (!sourceSlotId) return;
 
     // Resolve the bid by the requesting slot, not by the first bid whose hb_adid
     // matches. hb_adid is not unique per bid: absent PBS Cache, it falls back to a

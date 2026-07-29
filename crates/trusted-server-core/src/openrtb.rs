@@ -222,6 +222,8 @@ mod tests {
                 total_bids: 3,
                 time_ms: 12,
                 provider_details: vec![],
+                dropped_winner_count: 0,
+                dropped_winner_reasons: Default::default(),
             },
         }
         .to_ext();

@@ -16,7 +16,7 @@ use std::time::Duration;
 use validator::Validate;
 
 use crate::auction::context::{ContextQueryParams, build_url_with_context_params};
-use crate::auction::provider::AuctionProvider;
+use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
 use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus, MediaType,
 };
@@ -25,9 +25,7 @@ use crate::integrations::{
     UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
     ensure_integration_backend_with_timeout, predict_integration_backend_name,
 };
-use crate::platform::{
-    PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, RuntimeServices,
-};
+use crate::platform::{PlatformHttpRequest, PlatformResponse, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
 
 // ============================================================================
@@ -398,7 +396,7 @@ impl AuctionProvider for AdServerMockProvider {
         &self,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
-    ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+    ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
         // Get bidder responses from context (passed by orchestrator for mediation)
         let bidder_responses = context.provider_responses.unwrap_or(&[]);
 
@@ -482,7 +480,7 @@ impl AuctionProvider for AdServerMockProvider {
                 message: "Failed to send mediation request".to_string(),
             })?;
 
-        Ok(pending)
+        Ok(ProviderRequestOutcome::pending(pending))
     }
 
     async fn parse_response(

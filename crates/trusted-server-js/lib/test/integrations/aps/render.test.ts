@@ -59,6 +59,27 @@ describe('APS renderer validation', () => {
     expect(validateApsRenderer(withoutCreativeId)).toEqual(withoutCreativeId);
   });
 
+  it('caches an immutable validated descriptor for the same publisher origin', () => {
+    const input = descriptor();
+    const atobSpy = vi.spyOn(window, 'atob');
+
+    const first = validateApsRenderer(input, 'https://publisher.example');
+    input.width = 728;
+    const second = validateApsRenderer(first, 'https://publisher.example');
+
+    expect(first?.width).toBe(300);
+    expect(first).toBe(second);
+    expect(Object.isFrozen(first)).toBe(true);
+    expect(atobSpy).toHaveBeenCalledTimes(1);
+    expect(() => {
+      first!.width = 728;
+    }).toThrow(TypeError);
+
+    expect(validateApsRenderer(first, 'https://other-publisher.example')).toBeDefined();
+    expect(atobSpy).toHaveBeenCalledTimes(2);
+    atobSpy.mockRestore();
+  });
+
   it('keeps auction parsing structural and leaves complete trust validation to render time', () => {
     const renderer = descriptor({ aaxResponse: 'not-base64' });
 
