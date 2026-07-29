@@ -294,16 +294,10 @@ export function apsRendererUrl(pageOrigin = window.location.origin): string | un
 export interface RenderApsCreativeOptions {
   slotId: string;
   renderer: unknown;
-  /** Observational callback after the renderer's nonce-bound ready message. */
-  onReady?: () => void;
 }
 
 /** Render APS through the static endpoint under an outer opaque-origin sandbox. */
-export function renderApsCreative({
-  slotId,
-  renderer: input,
-  onReady,
-}: RenderApsCreativeOptions): boolean {
+export function renderApsCreative({ slotId, renderer: input }: RenderApsCreativeOptions): boolean {
   const renderer = validateApsRenderer(input);
   const rendererUrl = apsRendererUrl();
   const nonce = createNonce();
@@ -352,11 +346,6 @@ export function renderApsCreative({
       if (child !== iframe) child.remove();
     }
     iframe.style.display = '';
-    try {
-      onReady?.();
-    } catch {
-      // Read-only diagnostics must never affect a successfully committed render.
-    }
   };
   function receive(event: MessageEvent): void {
     if (event.source !== iframe.contentWindow || !hasExactKeys(event.data, ['message', 'nonce'])) {

@@ -182,11 +182,8 @@ describe('direct APS rendering', () => {
     document.body.innerHTML = '';
   });
 
-  it('loads the static route with a fragment-bound 128-bit nonce and reports only validated readiness', () => {
-    const onReady = vi.fn();
-    expect(renderApsCreative({ slotId: 'fictional-slot', renderer: descriptor(), onReady })).toBe(
-      true
-    );
+  it('loads the static route with a fragment-bound 128-bit nonce and opaque sandbox', () => {
+    expect(renderApsCreative({ slotId: 'fictional-slot', renderer: descriptor() })).toBe(true);
 
     const slot = document.getElementById('fictional-slot')!;
     const iframe = slot.querySelector('iframe')!;
@@ -222,7 +219,6 @@ describe('direct APS rendering', () => {
       })
     );
     expect(slot.querySelector('span')).not.toBeNull();
-    expect(onReady).not.toHaveBeenCalled();
 
     window.dispatchEvent(
       new MessageEvent('message', {
@@ -232,7 +228,6 @@ describe('direct APS rendering', () => {
     );
     expect(slot.querySelector('span')).toBeNull();
     expect(iframe.style.display).toBe('');
-    expect(onReady).toHaveBeenCalledTimes(1);
   });
 
   it('leaves existing slot content intact when validation or loading fails', () => {

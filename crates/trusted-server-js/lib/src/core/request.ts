@@ -1,7 +1,6 @@
 // Request orchestration for tsjs: unified auction endpoint with iframe-based creative rendering.
 import { renderApsCreative } from '../integrations/aps/render';
 
-import { terminalSummaryStageOutcome } from './ad_trace';
 import { buildAdRequest, sendAuction } from './auction';
 import { collectContext } from './context';
 import { log } from './log';
@@ -75,7 +74,7 @@ function recordRootSummary(
     slotId: owner.slotId,
     generation: owner.generation,
     auctionTraceId: summary.auctionTraceId,
-    outcome: terminalSummaryStageOutcome(summary.outcome, hasWinner),
+    outcome: summary.outcome === 'completed' && !hasWinner ? 'no_bid' : summary.outcome,
     confidence: 'definitive',
     reason: 'terminal_summary',
   });
@@ -171,22 +170,7 @@ export function requestAds(
         }
         if (bid.renderer) {
           if (!ownerIsCurrent(owner)) continue;
-          const started = renderApsCreative({
-            slotId,
-            renderer: bid.renderer,
-            onReady: () => {
-              if (!ownerIsCurrent(owner) || !owner.generation) return;
-              window.tsjs?.recordAdTrace?.({
-                kind: 'aps_renderer_ready',
-                slotId,
-                generation: owner.generation,
-                auctionTraceId: trace?.auctionTraceId,
-                bidTraceId: trace?.bidTraceId,
-                reason: 'direct_aps_renderer_ready',
-              });
-            },
-          });
-          if (!started) {
+          if (!renderApsCreative({ slotId, renderer: bid.renderer })) {
             recordDirectRejection(owner, 'aps_render_rejected');
           } else if (owner.generation) {
             window.tsjs?.recordAdTrace?.({

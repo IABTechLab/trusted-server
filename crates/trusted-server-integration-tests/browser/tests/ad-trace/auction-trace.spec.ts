@@ -118,9 +118,7 @@ test.describe("tester-only auction trace contract", () => {
             waitUntil: "domcontentloaded",
         });
         await expect(page).toHaveURL(runtimeUrl("/"));
-        expect(activation?.headers()["cache-control"]).toBe(
-            "private, no-store",
-        );
+        expect(activation?.headers()["cache-control"]).toBe("private, no-store");
         await expect
             .poll(() =>
                 page.evaluate(
@@ -212,13 +210,9 @@ test.describe("tester-only auction trace contract", () => {
         const visibleText = tree.nodes
             .map((node) => node.name?.value || "")
             .join("\n");
-        expect(visibleText).toContain("Trusted Server selected a bid");
+        expect(visibleText).toContain("TS winner: won · definitive");
         expect(visibleText).toContain(
-            "GAM selected the Trusted Server creative",
-        );
-        expect(visibleText).toContain("Trusted Server creative load confirmed");
-        expect(visibleText).not.toMatch(
-            /definitive|strong|probable|not_run|gam_only|TS winner|Prebid winner|#\d/,
+            "Creative: load_acknowledged · definitive",
         );
     });
 
@@ -230,14 +224,12 @@ test.describe("tester-only auction trace contract", () => {
             const direct = document.createElement("div");
             direct.id = "direct-api-slot";
             document.body.appendChild(direct);
-            const ts = (
-                window as Window & {
-                    tsjs: {
-                        addAdUnits(unit: unknown): void;
-                        requestAds(): void;
-                    };
-                }
-            ).tsjs;
+            const ts = (window as Window & {
+                tsjs: {
+                    addAdUnits(unit: unknown): void;
+                    requestAds(): void;
+                };
+            }).tsjs;
             ts.addAdUnits({
                 code: "direct-api-slot",
                 mediaTypes: { banner: { sizes: [[300, 250]] } },
@@ -276,7 +268,7 @@ test.describe("tester-only auction trace contract", () => {
             });
     });
 
-    test("actual generated Prebid selects the traced TS bid before an unattributed GAM render", async ({
+    test("actual generated Prebid selects the traced TS bid before a probable GAM result", async ({
         page,
     }) => {
         await openTesterPage(page);
@@ -359,20 +351,6 @@ test.describe("tester-only auction trace contract", () => {
                 };
             })
             .toEqual({ prebid: "lost", gam: "client_prebid_candidate" });
-
-        const session = await page.context().newCDPSession(page);
-        await expect
-            .poll(async () => {
-                const tree = (await session.send(
-                    "Accessibility.getFullAXTree",
-                )) as {
-                    nodes: Array<{ name?: { value?: string } }>;
-                };
-                return tree.nodes
-                    .map((node) => node.name?.value || "")
-                    .join("\n");
-            })
-            .toContain("Prebid selected a client bid");
 
         await page.evaluate(() => {
             const win = window as Window & {
