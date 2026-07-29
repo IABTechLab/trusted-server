@@ -17,9 +17,15 @@ This design makes `gam_unit_path` a **template** with a small, fixed placeholder
 set — `{network_id}`, `{section}`, `{slot_id}` — where `{section}` is derived
 from the request path at render time. One slot rule then covers all sections.
 
-The derivation policy that matters (`{section}` for the site root) lives in
-config via a required `section_root`, not in core — honoring the issue's
-constraint that the URL→section convention is publisher-specific.
+The derivation policy lives in config, not core — honoring the issue's
+constraint that the URL→section convention is publisher-specific:
+`section_segment` selects which path segment names the section, and a required
+`section_root` supplies the value when the path has no such segment.
+
+**Revision (2026-07-29, PR review):** `section_segment` was originally listed as
+a non-goal (below) with first-segment derivation hardcoded. Review found that
+this left the convention only half configurable, so `section_segment` was pulled
+into scope.
 
 Scope is deliberately narrow: **only** `gam_unit_path` templating. Sharing
 `page_patterns`/`gam_unit_path` defaults across slots is a related but distinct
@@ -45,9 +51,9 @@ duplication problem, tracked as a sibling issue, not built here.
 Documented here so onboarding publishers know the boundary. Each is an additive
 extension that does **not** change the config shape below.
 
-1. **Locale offset** — deriving `{section}` from a segment other than the first
-   (e.g. `/en/news` → `news`). `{section}` is the first path segment. A
-   `section_segment` index knob can be added later.
+1. ~~**Locale offset**~~ — **now in scope.** Deriving `{section}` from a segment
+   other than the first (e.g. `/en/news` → `news`) is configured with
+   `section_segment` (0-based, default `0`).
 2. **Full-path mirror** — `{section}` spanning multiple segments (`/a/b` →
    `a/b`). Real GAM trees bucket by section, not per-article, so this is rare;
    use a static per-slot `gam_unit_path` for the exception.
@@ -96,6 +102,7 @@ gam_network_id = "99999"
 auction_timeout_ms = 2000
 price_granularity = "dense"
 section_root = "homepage"          # required when a template uses {section}
+section_segment = 0                # which segment names the section (default 0)
 
 [[creative_opportunities.slot]]
 id = "ad-header-0"
@@ -112,7 +119,7 @@ bidders = {}
 | -------------- | ----------------------------------------------------- |
 | `{network_id}` | `gam_network_id`                                      |
 | `{slot_id}`    | slot `id`                                             |
-| `{section}`    | first path segment; `section_root` when path has none |
+| `{section}`    | segment at `section_segment`; `section_root` when absent |
 
 ### Resolution model
 
@@ -127,9 +134,10 @@ startup (prepare_runtime, once):
 
 request (per matched slot, path known):
   if slot has a parsed template:
-    section = first non-empty segment of the RAW path,
+    section = non-empty segment #section_segment of the RAW path,
               runs of [^A-Za-z0-9_-] replaced with a single '_';
-              section_root when the path has no segment ("/", repeated slashes)
+              section_root when the path has no segment at that index
+              ("/", repeated slashes, or a path shorter than the index)
     render template
   else:
     "/{network_id}/{slot_id}"          # existing default (back-compat)
@@ -137,12 +145,14 @@ request (per matched slot, path known):
 
 ### Section derivation rules (deterministic)
 
-- Extract the **first non-empty** path segment.
+- Extract the non-empty path segment at `section_segment` (0-based, default
+  `0`), counting only non-empty segments.
 - Replace each run of disallowed characters (`[^A-Za-z0-9_-]`) with a single
   `_`. Guarantees a non-empty result for any non-empty segment. Because the path
   is **not** decoded, `new%20s` → `new_20s` (only `%` is disallowed; `2` and `0`
   are alphanumeric) — never silently `news`, and never the decoded `new_s`.
-- Use `section_root` **only** when there is no segment (`/`, repeated slashes).
+- Use `section_root` **only** when there is no segment at that index (`/`,
+  repeated slashes, or a path with fewer segments than the index).
 - Derive from the **raw, undecoded** path — the same string `page_patterns`
   glob-match against — so matching and derivation never disagree. Percent-encoded
   segments are **not** decoded.
@@ -176,7 +186,8 @@ needed.
   section still edits all N slots. Rejected.
 - **Hardcoded first-segment derivation** (issue option 3, literal): smallest,
   but bakes one site's URL convention into core, which the issue forbids. The
-  chosen design keeps the one publisher-specific knob (`section_root`) in config.
+  chosen design keeps both publisher-specific knobs (`section_segment`,
+  `section_root`) in config.
 
 ## Risks
 

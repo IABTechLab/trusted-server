@@ -3341,11 +3341,9 @@ pub(crate) fn build_slot_json(
     request_path: &str,
 ) -> serde_json::Value {
     // `{section}` derives from the same raw path `page_patterns` matched
-    // against; `section_root` covers the no-segment case (`/`).
-    let section = crate::creative_opportunities::derive_section(
-        request_path,
-        co_config.section_root.as_deref().unwrap_or_default(),
-    );
+    // against; `section_root` covers the no-segment case (`/`) and paths shorter
+    // than the configured `section_segment`.
+    let section = co_config.section_for_path(request_path);
     let gam_path = slot.render_gam_unit_path(&co_config.gam_network_id, &section);
     let div_id = slot.resolved_div_id();
     let formats: Vec<serde_json::Value> = slot
@@ -7099,6 +7097,7 @@ mod tests {
                 auction_timeout_ms: Some(500),
                 price_granularity: PriceGranularity::Dense,
                 section_root: None,
+                section_segment: None,
                 slot: Vec::new(),
             }
         }
@@ -7204,6 +7203,32 @@ mod tests {
             assert_eq!(
                 home["gam_unit_path"], "/99999/example/homepage",
                 "root path should use section_root"
+            );
+        }
+
+        #[test]
+        fn build_slot_json_honours_configured_section_segment() {
+            // Locale-prefixed publisher: `/en/news/article` must resolve to the
+            // `news` unit, not `en`.
+            let mut config = make_config();
+            config.gam_network_id = "99999".to_string();
+            config.section_root = Some("homepage".to_string());
+            config.section_segment = Some(1);
+            let mut slot = make_slot();
+            slot.gam_unit_path = Some("/{network_id}/example/{section}".to_string());
+            slot.compile_unit_template()
+                .expect("template should compile");
+
+            let news = crate::publisher::build_slot_json(&slot, &config, "/en/news/article-123");
+            assert_eq!(
+                news["gam_unit_path"], "/99999/example/news",
+                "section should derive from the configured segment index"
+            );
+
+            let locale_root = crate::publisher::build_slot_json(&slot, &config, "/en");
+            assert_eq!(
+                locale_root["gam_unit_path"], "/99999/example/homepage",
+                "a path with no segment at the configured index should use section_root"
             );
         }
 
