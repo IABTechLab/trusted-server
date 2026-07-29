@@ -126,8 +126,57 @@ function formatMilliseconds(value: number | undefined): string | undefined {
   return `${Math.round(value * 10) / 10} ms`;
 }
 
+function deliveryFact(cycle: GptDiagnosticsRequestCycle): string | undefined {
+  switch (cycle.delivery) {
+    case 'trusted_server':
+      return 'Trusted Server creative rendered — it requested its markup';
+    case 'other_demand':
+      return 'Other Ad Manager demand rendered — no Trusted Server creative ran';
+    case 'no_candidate':
+      return 'No Trusted Server candidate on this slot';
+    case 'pending':
+      return 'Trusted Server candidate — waiting for the creative';
+    default:
+      return undefined;
+  }
+}
+
+function adManagerFact(cycle: GptDiagnosticsRequestCycle): string | undefined {
+  const identity = cycle.adManager;
+  if (!identity) return undefined;
+
+  const parts: string[] = [];
+  const lineItem = identity.lineItemId ?? identity.sourceAgnosticLineItemId;
+  const creative = identity.creativeId ?? identity.sourceAgnosticCreativeId;
+  if (lineItem) parts.push(`line item ${lineItem}`);
+  if (identity.campaignId) parts.push(`order ${identity.campaignId}`);
+  if (identity.advertiserId) parts.push(`advertiser ${identity.advertiserId}`);
+  if (creative) parts.push(`creative ${creative}`);
+  if (identity.yieldGroupIds?.length)
+    parts.push(`yield group ${identity.yieldGroupIds.join(', ')}`);
+  if (identity.companyIds?.length) parts.push(`company ${identity.companyIds.join(', ')}`);
+  return parts.length > 0 ? `Ad Manager reported ${parts.join(' · ')}` : undefined;
+}
+
+function responseClassFact(cycle: GptDiagnosticsRequestCycle): string | undefined {
+  switch (cycle.responseClass) {
+    case 'reservation':
+      return 'Ad Manager reservation line item';
+    case 'unclassified_non_empty':
+      return 'Filled without Ad Manager identifiers — default, backup, or another service';
+    default:
+      return undefined;
+  }
+}
+
 function cycleFacts(cycle: GptDiagnosticsRequestCycle): string[] {
   const facts: string[] = [];
+  const deliveryLine = deliveryFact(cycle);
+  if (deliveryLine) facts.push(deliveryLine);
+  const responseClassLine = responseClassFact(cycle);
+  if (responseClassLine) facts.push(responseClassLine);
+  const adManagerLine = adManagerFact(cycle);
+  if (adManagerLine) facts.push(adManagerLine);
   if (cycle.loadAtMs !== undefined) facts.push('Loaded');
   else if (cycle.isEmpty === false) facts.push('Load not observed');
   if (cycle.viewableAtMs !== undefined) facts.push('Viewable');

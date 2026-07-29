@@ -9,7 +9,9 @@
 
 GPT Runtime Diagnostics is an opt-in browser console for documented Google Publisher Tag (GPT) lifecycle callbacks. It organizes observed callbacks into per-slot request cycles, displays directly observed timings and render facts, binds slots to exact DOM elements, and downloads the same information as versioned JSON.
 
-The console reports **GPT-observed facts, not creative provenance**. **Filled** means only that GPT emitted `slotRenderEnded` with `isEmpty === false`. It does not mean that Trusted Server, Prebid, Google Ad Manager, a particular bidder, or any other demand source supplied the creative.
+The console reports **observed facts, never inferred provenance**. **Filled** means only that GPT emitted `slotRenderEnded` with `isEmpty === false`. On its own it does not mean that Trusted Server, Prebid, Google Ad Manager, a particular bidder, or any other demand source supplied the creative.
+
+A render is attributed to Trusted Server only on direct evidence — the rendered creative asking Trusted Server for its markup — and never from targeting, price, or timing. See [Delivery Attribution](#delivery-attribution).
 
 The diagnostics integration is independent of the [GPT first-party script integration](./gpt.md). Either integration can be enabled without the other.
 
@@ -61,6 +63,35 @@ Each slot may show:
 - Current DOM binding status and viewport visibility.
 
 Elapsed time alone never changes a pending request to Incomplete. A filled render without a load callback remains Filled with **Load not observed**; missing viewability is not classified as a failure.
+
+### Delivery Attribution
+
+A filled slot answers the operator question the lifecycle alone cannot: did the line item Trusted Server won actually render, or did Ad Manager deliver something else?
+
+Two independent pieces of evidence answer it.
+
+**Ad Manager's own report.** `slotRenderEnded` carries the publisher's Ad Manager identifiers for the delivered ad — line item, order, advertiser, creative, and the yield group or company for backfill. These are the same values `?google_console=1` shows. The console reports them verbatim and derives one response class from them:
+
+| Response class           | Meaning                                                                           |
+| ------------------------ | --------------------------------------------------------------------------------- |
+| `empty`                  | GPT reported no ad.                                                               |
+| `backfill`               | Ad Manager filled the slot from backfill demand.                                  |
+| `reservation`            | Ad Manager reported a reservation line item.                                      |
+| `unclassified_non_empty` | Filled with no identifiers — an Ad Manager default or backup, or another service. |
+
+**The creative's own request.** Only the creative of the line item carrying Trusted Server's targeting asks Trusted Server for its markup. When it does, the Trusted Server GPT integration reports that claim, and the cycle is attributed:
+
+| Delivery         | Meaning                                                                                                 |
+| ---------------- | ------------------------------------------------------------------------------------------------------- |
+| `trusted_server` | The rendered creative requested its markup from Trusted Server. Ad Manager selected it.                 |
+| `other_demand`   | Trusted Server had a candidate and Ad Manager filled the slot, but no creative asked. Other demand won. |
+| `no_candidate`   | Trusted Server had no bid targeting on this slot, so the render was never its to win.                   |
+| `pending`        | A candidate render is still inside its five-second attribution window.                                  |
+| `not_applicable` | The cycle was empty or has not rendered.                                                                |
+
+`trusted_server` is proof the Trusted Server creative ran, independent of whether it later loaded or confirmed. `other_demand` is only reported once the window has elapsed; a late claim still corrects the verdict. A claim that matches no retained render is preserved as a `trusted_server_claim_*` issue rather than attached to a guess.
+
+Attribution requires the Trusted Server GPT integration to be serving the slot. Without it, every filled cycle is `no_candidate` and the Ad Manager identifiers still name what rendered.
 
 ### Callback Coverage
 

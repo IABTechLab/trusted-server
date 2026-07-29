@@ -115,6 +115,47 @@ describe('GptDiagnosticsBadgeManager', () => {
     manager.destroy();
   });
 
+  it('names the delivered demand in badge text when it is settled', () => {
+    expect(
+      gptDiagnosticsBadgeTextForTest({
+        requestNumber: 1,
+        isEmpty: false,
+        incompleteSequence: false,
+        durations: {},
+        delivery: 'trusted_server',
+      })
+    ).toBe('Filled · TS creative');
+    expect(
+      gptDiagnosticsBadgeTextForTest({
+        requestNumber: 1,
+        isEmpty: false,
+        incompleteSequence: false,
+        durations: {},
+        delivery: 'other_demand',
+        adManager: { lineItemId: 6543210987 },
+      })
+    ).toBe('Filled · GAM line item 6543210987');
+    expect(
+      gptDiagnosticsBadgeTextForTest({
+        requestNumber: 1,
+        isEmpty: false,
+        incompleteSequence: false,
+        durations: {},
+        delivery: 'other_demand',
+      })
+    ).toBe('Filled · Other GAM demand');
+    expect(
+      gptDiagnosticsBadgeTextForTest({
+        requestNumber: 1,
+        isEmpty: false,
+        incompleteSequence: false,
+        durations: {},
+        delivery: 'no_candidate',
+      }),
+      'should stay silent when Trusted Server had nothing on the slot'
+    ).toBe('Filled');
+  });
+
   it('uses only GPT-observed lifecycle facts in badge text', () => {
     expect(
       gptDiagnosticsBadgeTextForTest({
