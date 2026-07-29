@@ -9442,6 +9442,7 @@ mod tests {
                     registry: None,
                 },
                 req,
+                EdgeCacheHeader::SurrogateControl,
             )
             .await
             .expect("should proxy publisher request");
