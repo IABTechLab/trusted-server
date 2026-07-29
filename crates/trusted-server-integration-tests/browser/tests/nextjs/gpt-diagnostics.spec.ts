@@ -90,7 +90,10 @@ test.describe("GPT runtime diagnostics", () => {
         for (const eventName of EVENT_NAMES)
             expect(listenerCounts[eventName]).toBe(1);
 
-        await page.getByRole("link", { name: "Home" }).click();
+        await page
+            .getByRole("navigation", { name: "Fixture navigation" })
+            .getByRole("link", { name: "Home" })
+            .click();
         await page.waitForURL("**/");
         expect(
             await page.evaluate(() =>
