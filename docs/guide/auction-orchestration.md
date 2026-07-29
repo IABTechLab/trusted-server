@@ -12,7 +12,7 @@ Key capabilities:
 - **Strategy-based winner selection** — Automatic strategy detection based on configuration
 - **Mediator support** — Optional external mediator for decoding encoded prices (e.g., APS) and applying unified floor pricing
 - **Provider abstraction** — Pluggable provider interface for adding new demand sources
-- **Creative rewriting** — Winning creatives are sanitized and rewritten with first-party proxy URLs by default
+- **Creative processing** — Winning creatives can opt in to sanitization and first-party proxy URL rewriting
 
 ## System Flow (Prebid + APS)
 
@@ -147,7 +147,7 @@ sequenceDiagram
     Note over Client,Mock: Response Assembly
     activate TS
     activate Client
-    Orch->>Orch: Transform to OpenRTB response<br/>Sanitize creative HTML<br/>Optionally rewrite creative URLs<br/>Add orchestrator metadata
+    Orch->>Orch: Transform to OpenRTB response<br/>Optionally sanitize creative HTML<br/>Optionally rewrite creative URLs<br/>Add orchestrator metadata
 
     Orch-->>TS: OpenRTB BidResponse
     Note right of Orch: { "id": "auction-response",<br/>  "seatbid": [{ "seat": "amazon-aps",<br/>    "bid": [{ "price": 2.50,<br/>      "adm": "<iframe src=\"/first-party/proxy?tsurl=...\">",<br/>      "w": 728, "h": 90 }] }] }<br/>  "ext": { "orchestrator": {<br/>    "strategy": "parallel_mediation",<br/>    "bidders": 2, "time_ms": 150 } }
@@ -554,34 +554,42 @@ EC identity is maintained with the `ts-ec` cookie; auction responses do not emit
 
 ## Creative Processing
 
-Winning creatives returned by `POST /auction` are always passed through the
-server-side sanitizer. By default, the sanitized HTML is then processed by an
-HTML rewriter (`lol_html`) that converts eligible external resource and click
-URLs to signed first-party paths, adds `data-tsclick`, rewrites inline CSS
-`url(...)` values, and injects the unified creative TSJS runtime when a `<body>`
-exists.
+Winning creatives returned by `POST /auction` pass through two independent
+opt-in transforms, both disabled by default. `sanitize_creatives` strips
+executable markup with its inner content. `rewrite_creatives` runs an HTML
+rewriter (`lol_html`) that converts eligible external resource and click URLs to
+signed first-party paths, adds `data-tsclick`, rewrites inline CSS `url(...)`
+values, and injects the unified creative TSJS runtime when a `<body>` exists.
 
 ```toml
 [auction]
-rewrite_creatives = true
+sanitize_creatives = false
+rewrite_creatives = false
 ```
 
-| Setting           | Winning-bid `adm` behavior                                                                                                                                          |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Omitted or `true` | Sanitize, rewrite eligible URLs, add click-guard attributes, and inject creative TSJS.                                                                              |
-| `false`           | Sanitize, then return sanitized but unre-written HTML. Accepted asset and click URLs remain direct, so the browser may contact third-party hosts without mediation. |
+| `sanitize_creatives` | `rewrite_creatives` | Winning-bid `adm` behavior                                                                                                              |
+| -------------------- | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `false` (default)    | `false` (default)   | Deliver the creative exactly as the bidder returned it.                                                                                 |
+| `true`               | `false`             | Strip executable markup, then deliver without rewriting. Accepted asset and click URLs remain direct.                                   |
+| `false`              | `true`              | Rewrite eligible URLs, add click-guard attributes, and inject creative TSJS into the raw bidder markup. Executable markup is preserved. |
+| `true`               | `true`              | Sanitize first, then rewrite eligible URLs, add click-guard attributes, and inject creative TSJS.                                       |
 
-Disabling rewriting does not disable or reverse sanitization. Scripts,
-stylesheets, style blocks, forms, event handlers, dangerous URL schemes, and
-other rejected content remain removed. It also removes the injected creative
-runtime and first-party proxy/click mediation from the resulting `adm`.
-Sanitizer-accepted hosts are not allowlisted or trusted merely because their
-URLs remain in the output.
+When sanitization is enabled, scripts, stylesheets, style blocks, forms, event
+handlers, dangerous URL schemes, and other rejected content are removed together
+with their inner content — which blanks script-based creatives. Disabling
+rewriting removes the injected creative runtime and first-party proxy/click
+mediation from the resulting `adm`, so the browser may contact third-party hosts
+without mediation. Sanitizer-accepted hosts are not allowlisted or trusted
+merely because their URLs remain in the output.
 
-The setting applies only to the shared `POST /auction` response converter.
-HTML/CSS returned by `/first-party/proxy` continues to be rewritten. The
-separate debug-only `[debug].inject_adm_for_testing` publisher and page-bids
-path is unchanged and may include raw `adm` for non-production diagnostics.
+Both settings apply to winning-bid `adm` in both the shared `POST /auction`
+response converter and the production publisher SSAT/page-bids path. The former
+emits root-relative first-party URLs and injects creative TSJS; the latter emits
+absolute first-party URLs for its foreign-origin renderer and does not inject
+that bundle. HTML/CSS returned by `/first-party/proxy` continues to be
+rewritten independently. `[debug].inject_adm_for_testing` adds the diagnostic
+`debug_bid` blob and enables a testing-only direct GAM replacement; it does not
+control whether processed `adm` is delivered.
 
 **Elements handled by the rewrite pass:**
 

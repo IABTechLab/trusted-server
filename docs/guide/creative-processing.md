@@ -24,7 +24,7 @@ Creative processing has separate auction-response and proxied-response paths. Wh
                         ↓
 ┌──────────────────────────────────────────────────────┐
 │  Trusted Server Processing (rewrite-enabled)         │
-│  1. Sanitize first for POST /auction adm             │
+│  1. Sanitize POST /auction adm when opted in         │
 │  2. Parse HTML with streaming processor              │
 │  3. Detect absolute/protocol-relative URLs           │
 │  4. Generate signed proxy URLs                       │
@@ -43,7 +43,7 @@ Creative processing has separate auction-response and proxied-response paths. Wh
 
 The creative rewriters are invoked by independent delivery paths:
 
-1. **Auction `adm`**: Winning-bid HTML returned by `POST /auction` is always sanitized, then rewritten by default. This pass is controlled by `[auction].rewrite_creatives`.
+1. **Auction `adm`**: Winning-bid HTML returned by `POST /auction` is optionally sanitized (`[auction].sanitize_creatives`) and optionally rewritten (`[auction].rewrite_creatives`); both are opt-in and default to `false`.
 2. **First-party proxy**: Non-streaming `text/html` and `text/css` responses fetched through `/first-party/proxy` are rewritten independently of the auction setting.
 3. **Integration processing**: Publisher HTML integrations use their own registration and configuration controls.
 
@@ -53,31 +53,40 @@ When `with_streaming()` is enabled in `ProxyRequestConfig`, proxied HTML/CSS pro
 
 ## Auction Rewrite Control
 
-Use the default-true auction setting to control only the rewrite pass applied to
-winning-bid `adm` returned by `POST /auction`:
+Two independent, default-false auction settings control the processing applied
+to winning-bid `adm` returned by `POST /auction` and delivered through the
+publisher SSAT/page-bids path:
 
 ```toml
 [auction]
-rewrite_creatives = true
+sanitize_creatives = false
+rewrite_creatives = false
 ```
 
-| Setting           | `POST /auction` winning-bid `adm` behavior                                                                                                                                      |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Omitted or `true` | Sanitize, rewrite eligible resource/CSS and click URLs to signed first-party endpoints, add `data-tsclick`, and inject the unified creative TSJS script when a `<body>` exists. |
-| `false`           | Sanitize, then return the sanitized HTML without rewriting. Sanitizer-accepted external resource, click, and inline CSS URLs remain direct.                                     |
+| `sanitize_creatives` | `rewrite_creatives` | Auction winning-bid `adm` behavior                                                                                                                                                                                                    |
+| -------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `false` (default)    | `false` (default)   | Deliver the creative exactly as the bidder returned it.                                                                                                                                                                               |
+| `true`               | `false`             | Strip executable markup (`script`/`object`/`embed`/`form`, event handlers) with its inner content, then deliver without rewriting. Sanitizer-accepted external resource, click, and inline CSS URLs remain direct.                    |
+| `false`              | `true`              | Rewrite eligible resource/CSS and click URLs in the raw bidder markup to signed first-party endpoints. Executable markup is preserved.                                                                                                |
+| `true`               | `true`              | Sanitize first, then rewrite. `POST /auction` emits root-relative endpoints and injects creative TSJS when a `<body>` exists; SSAT/page-bids emits absolute endpoints for its foreign-origin renderer and does not inject the bundle. |
 
-::: warning Sanitization remains mandatory
-Setting `rewrite_creatives = false` returns sanitized but unre-written HTML, not
-byte-for-byte upstream markup. It does not restore scripts, stylesheets, style
-blocks, forms, event handlers, or other content removed by sanitization.
-Sanitizer acceptance is not a host allowlist; ordinary accepted HTTP(S) URLs may
-cause the browser to contact external creative hosts directly.
+::: warning Sanitization blanks script-based creatives
+Sanitization removes `script`/`object`/`embed`/`form` and similar elements
+**together with their inner content**, which destroys script-based creatives —
+the majority of programmatic display. Enable `sanitize_creatives` when creatives
+render in a context that shares the publisher's origin; leave it disabled when
+creatives render in a foreign-origin frame (for example the Prebid Universal
+Creative inside the ad server's iframe), where the markup cannot reach the
+publisher origin. Sanitizer acceptance is not a host allowlist; ordinary
+accepted HTTP(S) URLs may cause the browser to contact external creative hosts
+directly.
 :::
 
-This setting does not affect HTML/CSS response rewriting under
-`/first-party/proxy`. It also does not change the separate debug-only
-`[debug].inject_adm_for_testing` publisher and page-bids path, which may include
-raw `adm` for non-production diagnostics.
+Neither setting affects HTML/CSS response rewriting under
+`/first-party/proxy`. The publisher SSAT/page-bids path is a production creative
+path and follows both settings. `[debug].inject_adm_for_testing` controls only the
+additional `debug_bid` diagnostic blob and testing-only direct GAM replacement;
+it does not control whether the processed `adm` is present.
 
 ## Rewritten Elements
 

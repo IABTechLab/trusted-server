@@ -171,14 +171,14 @@ Core publisher settings for domain, origin, and proxy configuration.
 
 ### `[publisher]`
 
-| Field                         | Type    | Required | Description                                                                             |
-| ----------------------------- | ------- | -------- | --------------------------------------------------------------------------------------- |
-| `domain`                      | String  | Yes      | Publisher's apex domain name                                                            |
-| `cookie_domain`               | String  | Yes      | Domain for non-EC cookies (typically with leading dot)                                  |
-| `origin_url`                  | String  | Yes      | Full URL of publisher origin server                                                     |
-| `origin_host_header_override` | String  | No       | Outbound Host header to send while connecting to `origin_url`                           |
-| `proxy_secret`                | String  | Yes      | Secret key for encrypting/signing proxy URLs                                            |
-| `max_buffered_body_bytes`     | Integer | No       | Max bytes buffered when a publisher response is post-processed in full (default 16 MiB) |
+| Field                         | Type    | Required | Description                                                                 |
+| ----------------------------- | ------- | -------- | --------------------------------------------------------------------------- |
+| `domain`                      | String  | Yes      | Publisher's apex domain name                                                |
+| `cookie_domain`               | String  | Yes      | Domain for non-EC cookies (typically with leading dot)                      |
+| `origin_url`                  | String  | Yes      | Full URL of publisher origin server                                         |
+| `origin_host_header_override` | String  | No       | Outbound Host header to send while connecting to `origin_url`               |
+| `proxy_secret`                | String  | Yes      | Secret key for encrypting/signing proxy URLs                                |
+| `max_buffered_body_bytes`     | Integer | No       | Buffered-body cap / Fastly stream raw+decoded byte ceiling (default 16 MiB) |
 
 > **Note:** EC cookies (`ts-ec`) derive their domain automatically as `.{domain}` and
 > do not use `cookie_domain`. The `cookie_domain` field is used by other cookie helpers.
@@ -310,29 +310,41 @@ Changing `proxy_secret` invalidates all existing signed URLs. Plan rotations car
 
 #### `max_buffered_body_bytes`
 
-**Purpose**: Upper bound on the in-memory buffer used when a publisher origin
-response must be processed in full (HTML rewriting and integration injection)
-instead of streamed.
+**Purpose**: Upper bound on how much of a publisher origin body the rewrite
+pipeline holds in memory — the post-rewrite output buffer on buffered adapters,
+and the per-stream raw/decoded byte ceiling on the Fastly streaming path.
 
 **Usage**:
 
-- Caps the _decoded, post-rewrite_ output buffer for any buffered publisher
-  response on both the legacy and EdgeZero paths.
-- Exceeding the cap fails the response (mapped to a 5xx proxy error) rather than
-  allocating past the limit, preventing Wasm-heap exhaustion on highly
-  compressible documents.
+- On **buffered adapters** (Axum, Cloudflare, Spin) it caps the _decoded,
+  post-rewrite_ output buffer for a publisher response processed in full. It
+  also bounds how much decoded gzip output may sit in the heap at any one
+  moment, so a decompression bomb is rejected mid-decode rather than after its
+  full expansion. That second bound is per-step, not a total: a gzip-encoded
+  response passes or fails on the same post-rewrite output size as the identity,
+  deflate and brotli versions of the same body.
+- On the **Fastly streaming path** the origin body is preserved as a stream, so
+  the same value caps the stream twice over: the cumulative _raw_ (still
+  compressed) bytes pulled from origin, and the cumulative _decoded_ bytes
+  emitted by the decompressor. The decoded cap is enforced _during_
+  decompression, so a decompression bomb is rejected before its expansion is
+  materialized rather than after.
 
-**Default**: `16777216` (16 MiB).
+**Behavior when exceeded**:
 
-**Effective Fastly limit**: On Fastly the practical ceiling for a publisher page
-is lower. The platform HTTP client rejects any origin response whose raw (still
-compressed) body exceeds **10 MiB** before this buffer is filled, so raising the
-value only helps highly compressible pages whose decoded size exceeds 16 MiB
-while their compressed origin body stays under 10 MiB. Raising it above ~10 MiB
-does not lift the platform cap for uncompressed pages.
+- On **buffered adapters** the response fails before any bytes are committed.
+- On the **streaming path** the response headers are already committed when
+  either cap trips, so the body is **truncated mid-stream** and the error is
+  logged — the client receives a short (incomplete) body rather than a `5xx`.
+  Size the cap above your largest expected decoded page so legitimate responses
+  are never truncated.
+
+**Default**: `16777216` (16 MiB). On the Fastly streaming path this is now the
+sole ceiling: origin bodies are streamed rather than materialized in full, so
+the previous ~10 MiB raw-body limit no longer applies.
 
 **Minimum**: Must be at least `1`. A value of `0` is rejected at startup because
-a zero-byte cap fails every non-empty buffered response.
+a zero-byte cap fails every non-empty publisher response.
 
 **Environment Override**:
 
@@ -1201,35 +1213,44 @@ Settings for the auction orchestrator that coordinates multiple bid providers.
 
 ### `[auction]`
 
-| Field               | Type          | Default            | Description                                                       |
-| ------------------- | ------------- | ------------------ | ----------------------------------------------------------------- |
-| `enabled`           | Boolean       | `false`            | Enable the auction orchestrator                                   |
-| `rewrite_creatives` | Boolean       | `true`             | Rewrite sanitized winning-bid `adm` through first-party endpoints |
-| `providers`         | Array[String] | `[]`               | Provider names that participate (e.g., `["prebid", "aps"]`)       |
-| `mediator`          | String        | Optional           | Mediator provider name (runs parallel mediation when set)         |
-| `timeout_ms`        | Integer       | `2000`             | Auction timeout in milliseconds                                   |
-| `creative_store`    | String        | `"creative_store"` | Deprecated; creatives are now delivered inline                    |
+| Field                | Type          | Default            | Description                                                    |
+| -------------------- | ------------- | ------------------ | -------------------------------------------------------------- |
+| `enabled`            | Boolean       | `false`            | Enable the auction orchestrator                                |
+| `sanitize_creatives` | Boolean       | `false`            | Strip executable markup from winning-bid `adm` before delivery |
+| `rewrite_creatives`  | Boolean       | `false`            | Rewrite winning-bid `adm` through first-party endpoints        |
+| `providers`          | Array[String] | `[]`               | Provider names that participate (e.g., `["prebid", "aps"]`)    |
+| `mediator`           | String        | Optional           | Mediator provider name (runs parallel mediation when set)      |
+| `timeout_ms`         | Integer       | `2000`             | Auction timeout in milliseconds                                |
+| `creative_store`     | String        | `"creative_store"` | Deprecated; creatives are now delivered inline                 |
 
-Creative markup returned by `POST /auction` is always server-sanitized. With
-`rewrite_creatives = true` (the default), eligible absolute or protocol-relative
-resource and click URLs not excluded by rewrite configuration are converted to
-signed first-party endpoints, and the creative TSJS runtime is injected when a
-`<body>` exists. Setting it to `false` returns sanitized but unre-written `adm`;
-accepted external URLs remain direct and are not host allowlisted by the
-sanitizer. The setting does not affect HTML or CSS fetched through
-`/first-party/proxy`. See [Creative Processing](/guide/creative-processing#auction-rewrite-control).
+Creative markup delivered by `POST /auction` and the publisher SSAT/page-bids
+path is processed by two independent opt-in passes; with both left at their
+`false` defaults, `adm` ships exactly as the bidder returned it. With
+`sanitize_creatives = true`, executable markup (`script`/`object`/`embed`/`form`
+and event handlers) is stripped together with its inner content — note this
+blanks script-based creatives, so enable it only when creatives render in a
+context that shares the publisher's origin. With `rewrite_creatives = true`,
+eligible absolute or protocol-relative resource and click URLs not excluded by
+rewrite configuration are converted to signed first-party endpoints. The
+`POST /auction` path emits root-relative endpoints and injects the creative TSJS
+runtime when a `<body>` exists; the foreign-origin SSAT renderer emits absolute
+endpoints and does not inject that bundle. Accepted external URLs are not host
+allowlisted by the sanitizer. Neither setting affects HTML or CSS fetched
+through `/first-party/proxy`. See
+[Creative Processing](/guide/creative-processing#auction-rewrite-control).
 
 ::: warning Existing configs and rollback
-Configs created before `rewrite_creatives` was introduced must first add
-`rewrite_creatives = true` under `[auction]`. After adding the leaf, set
-`TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES`, run `ts config validate`, and push
-the resolved config.
+Both creative-processing fields default to `false`, and the default is omitted
+from stored JSON so older binaries can read the blob during rollback. An
+explicit `true` remains serialized. Before rolling back to a binary that does
+not know a field, set that field to `false` (or remove it and any environment
+override), run `ts config validate`, push the resulting default-compatible
+blob, and only then roll back the binary.
 
-The default `true` is omitted from stored JSON so older binaries can read the
-blob during rollback. An explicit `false` must remain serialized. Before rolling
-back to a binary without this field, remove the `false` environment override (or
-set the file value to `true`), push the resulting default-compatible blob, and
-only then roll back the binary.
+Deployments upgrading from a binary where sanitization was unconditional and
+rewriting defaulted to `true` must now opt in explicitly: add
+`sanitize_creatives = true` and/or `rewrite_creatives = true` under `[auction]`
+before upgrading to preserve the previous processing behavior.
 :::
 
 **Example**:
@@ -1237,6 +1258,7 @@ only then roll back the binary.
 ```toml
 [auction]
 enabled = true
+sanitize_creatives = false
 rewrite_creatives = true
 providers = ["aps", "prebid"]
 timeout_ms = 2000
@@ -1255,6 +1277,7 @@ server_url = "https://prebid-server.example.com/openrtb2/auction"
 
 ```bash
 TRUSTED_SERVER__AUCTION__ENABLED=true
+TRUSTED_SERVER__AUCTION__SANITIZE_CREATIVES=false
 TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES=true
 TRUSTED_SERVER__AUCTION__PROVIDERS=aps,prebid
 TRUSTED_SERVER__AUCTION__PROVIDERS__0=aps

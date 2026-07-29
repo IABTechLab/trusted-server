@@ -10,15 +10,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Breaking** — `bid_param_zone_overrides` inner values must now be JSON objects; previously non-object or empty values (`"header" = "x"`, `"header" = {}`) were accepted and silently produced a dead rule at runtime. They now fail at startup with a configuration error. Operators upgrading should audit their `bid_param_zone_overrides` config for non-object zone entries.
+- **Breaking** — Integration configuration strings are no longer globally reinterpreted as JSON scalars. Operators upgrading should audit `[integrations.*]` settings and use native TOML/typed-config booleans and numbers (for example, `enabled = true`, not `enabled = "true"`); quoted numeric and boolean scalars now fail validation instead of silently converting.
 - **Breaking** — Sourcepoint browser module inclusion now requires explicit `[integrations.sourcepoint].enabled = true`; operators relying on the previous unconditional Sourcepoint module should enable the integration before upgrading.
 
 ### Security
 
 - Validate synthetic ID format on inbound values from the `x-synthetic-id` header and `synthetic_id` cookie; values that do not match the expected format (`64-hex-hmac.6-alphanumeric-suffix`) are discarded and a fresh ID is generated rather than forwarded to response headers, cookies, or third-party APIs
 
+### Fixed
+
+- Protocol-relative creative URLs now honor `rewrite.exclude_domains`, so excluded creative assets stay direct and excluded absolute or protocol-relative URLs submitted to `/first-party/sign` are rejected.
+
 ### Added
 
-- Added the default-true `[auction].rewrite_creatives` option. Setting it to `false` preserves mandatory `/auction` creative sanitization while skipping first-party resource/click URL rewriting and creative TSJS injection.
+- Added the `[auction].rewrite_creatives` and `[auction].sanitize_creatives` options, both default-false (opt-in). Enabling `rewrite_creatives` rewrites winning-bid adm to first-party endpoints across `POST /auction` and publisher SSAT/page-bids delivery (proxy/click URL conversion; creative TSJS injection on `POST /auction` only). Enabling `sanitize_creatives` strips executable markup from winning-bid adm before delivery.
 - Added Osano consent mirror integration docs and public enablement guidance.
 - Implemented basic authentication for configurable endpoint paths (#73)
 - Added integrations guide with example `testlight` integration

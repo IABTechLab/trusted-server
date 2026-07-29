@@ -48,6 +48,9 @@ mod tests {
     use crate::test_support::tests::crate_test_settings_str;
     use serde::Deserialize;
 
+    // Intentionally mirrors `AuctionConfig` before `rewrite_creatives` existed.
+    // Do not add fields introduced after that snapshot: this test proves a
+    // default payload remains readable by the previous binary schema.
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct LegacyAuctionConfig {
@@ -98,7 +101,7 @@ mod tests {
 
     #[test]
     fn legacy_blob_without_rewrite_creatives_leaves_rewriting_disabled() {
-        let mut data =
+        let data =
             serde_json::to_value(test_settings()).expect("should serialize settings to JSON");
         let auction = data
             .get("auction")

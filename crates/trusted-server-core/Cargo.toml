@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+async-stream = { workspace = true }
 base64 = { workspace = true }
 brotli = { workspace = true }
 bytes = { workspace = true }
