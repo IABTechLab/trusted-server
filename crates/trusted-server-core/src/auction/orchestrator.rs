@@ -367,7 +367,7 @@ impl AuctionOrchestrator {
             // restore nurl/burl/ad_id and PBS cache fields from the collected SSP
             // responses. The dispatched collect path already does this; the
             // synchronous mediation path used by POST /auction and
-            // /__ts/page-bids must match or mediated cache bids lose the metadata
+            // /_ts/page-bids must match or mediated cache bids lose the metadata
             // needed for creative rendering and win/billing beacons.
             let mediator_resp = mediator
                 .parse_response_with_context(
@@ -1779,7 +1779,7 @@ mod tests {
         // run_parallel_mediation must parse the mediator response via
         // parse_response_with_context so cache/nurl fields restored from SSP
         // responses survive the synchronous mediation path (POST /auction,
-        // /__ts/page-bids), matching the dispatched collect path.
+        // /_ts/page-bids), matching the dispatched collect path.
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response(200, b"{}".to_vec()); // bidder send_async
         stub.push_response(200, b"{}".to_vec()); // mediator send_async

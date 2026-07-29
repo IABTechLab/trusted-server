@@ -651,6 +651,77 @@ interface PageBidsResponse {
   bids: Record<string, AuctionBidData>;
 }
 
+/** Canonical SPA re-auction endpoint. Mirrors `PAGE_BIDS_PATH` in Rust. */
+const PAGE_BIDS_PATH = '/_ts/page-bids';
+
+/**
+ * Deprecated alias of {@link PAGE_BIDS_PATH}, kept registered server-side so
+ * pre-rename bundles keep working. This bundle falls back to it when the
+ * canonical path does not serve page-bids: a server rolled back to before the
+ * rename does not register the canonical path, and an operator `[[handlers]]`
+ * auth regex broad enough to cover `/_ts` answers it with `401` that no
+ * anonymous browser fetch can satisfy. Without the fallback either case
+ * silently drops ads on every SPA navigation.
+ *
+ * Removed together with the server-side alias in IABTechLab/trusted-server#970.
+ */
+const PAGE_BIDS_LEGACY_PATH = '/__ts/page-bids';
+
+/**
+ * `X-TSJS-Page-Bids` value sent on a fallback request, so the server can tell
+ * a current bundle that could not use the canonical path from a pre-rename
+ * bundle that only knows the alias. Only the former signals a deployment that
+ * needs fixing. Mirrors `PAGE_BIDS_FALLBACK_MARKER` in Rust.
+ */
+const PAGE_BIDS_FALLBACK_MARKER = 'fallback';
+
+/** Outcome of one page-bids request against a specific endpoint path. */
+interface PageBidsAttempt {
+  /** Parsed payload, or `null` when this endpoint did not serve one. */
+  data: PageBidsResponse | null;
+  /**
+   * The response says this path does not serve page-bids on this deployment,
+   * so the other registered path is worth trying. Transient failures and the
+   * endpoint's own cross-site denial apply equally to both paths and do not
+   * set this.
+   */
+  wrongEndpoint: boolean;
+}
+
+async function fetchPageBids(
+  endpoint: string,
+  path: string,
+  signal: AbortSignal
+): Promise<PageBidsAttempt> {
+  const res = await fetch(`${endpoint}?path=${encodeURIComponent(path)}`, {
+    credentials: 'include',
+    // Non-simple header doubles as a CSRF token: the server rejects
+    // requests that carry neither same-origin Fetch Metadata nor this
+    // header, and cross-origin pages cannot send it without a CORS
+    // preflight the endpoint never grants. The server checks presence, not
+    // value, so the value carries the fallback diagnostic.
+    headers: {
+      'X-TSJS-Page-Bids': endpoint === PAGE_BIDS_LEGACY_PATH ? PAGE_BIDS_FALLBACK_MARKER : '1',
+    },
+    signal,
+  });
+  if (!res.ok) {
+    // 401: an operator auth handler regex covers this path. 404: this server
+    // does not know the route. Either way the other path may still answer.
+    // 403 (cross-site gate) and 5xx would repeat on both, so they do not.
+    return { data: null, wrongEndpoint: res.status === 401 || res.status === 404 };
+  }
+  try {
+    return { data: (await res.json()) as PageBidsResponse, wrongEndpoint: false };
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') throw err;
+    // A server with no route for this path proxies it to the publisher origin,
+    // which answers 200 HTML. An unparseable body is the wrong endpoint, not a
+    // transient failure.
+    return { data: null, wrongEndpoint: true };
+  }
+}
+
 /**
  * Upper bound (ms) on how long the SPA hook waits for a route's ad containers
  * to appear before applying bids anyway.
@@ -703,7 +774,7 @@ function waitForSlotElements(slots: AuctionSlot[], signal: AbortSignal): Promise
  *
  * Patches `history.pushState` and `history.replaceState`, and listens to
  * `popstate`, so that after each client-side route change the trusted server
- * fetches fresh slots + bids from `/__ts/page-bids?path=<new_path>`, updates
+ * fetches fresh slots + bids from `/_ts/page-bids?path=<new_path>`, updates
  * `window.tsjs.adSlots` / `window.tsjs.bids`, and calls `window.tsjs.adInit()`.
  *
  * Idempotent: guarded by `window.tsjs.spaHookInstalled` so multiple calls are safe.
@@ -726,6 +797,29 @@ export function installSpaAuctionHook(): void {
   // mid-flight and B then fails, rolling back to A (never loaded) would strand
   // it behind the no-op guard, so we roll back to the last applied route instead.
   let lastAppliedPath = location.pathname;
+  // Endpoint this session requests. Starts canonical; if the deployment does
+  // not serve page-bids there, one navigation retries on the deprecated alias
+  // and the session stays on it rather than re-probing every navigation.
+  let pageBidsEndpoint = PAGE_BIDS_PATH;
+
+  async function requestPageBids(
+    path: string,
+    signal: AbortSignal
+  ): Promise<PageBidsResponse | null> {
+    const attempt = await fetchPageBids(pageBidsEndpoint, path, signal);
+    if (attempt.data || !attempt.wrongEndpoint || pageBidsEndpoint !== PAGE_BIDS_PATH) {
+      return attempt.data;
+    }
+
+    const fallback = await fetchPageBids(PAGE_BIDS_LEGACY_PATH, path, signal);
+    if (!fallback.data) return null;
+    log.warn(
+      `SPA auction hook: ${PAGE_BIDS_PATH} does not serve page-bids here, ` +
+        `falling back to ${PAGE_BIDS_LEGACY_PATH}`
+    );
+    pageBidsEndpoint = PAGE_BIDS_LEGACY_PATH;
+    return fallback.data;
+  }
 
   async function onNavigate(path: string): Promise<void> {
     if (path === currentPath) return;
@@ -735,16 +829,8 @@ export function installSpaAuctionHook(): void {
     inflight = controller;
 
     try {
-      const res = await fetch(`/__ts/page-bids?path=${encodeURIComponent(path)}`, {
-        credentials: 'include',
-        // Non-simple header doubles as a CSRF token: the server rejects
-        // requests that carry neither same-origin Fetch Metadata nor this
-        // header, and cross-origin pages cannot send it without a CORS
-        // preflight the endpoint never grants.
-        headers: { 'X-TSJS-Page-Bids': '1' },
-        signal: controller.signal,
-      });
-      if (!res.ok) {
+      const data = await requestPageBids(path, controller.signal);
+      if (!data) {
         // A transient page-bids failure must not strand this route: roll the
         // committed path back so a later navigation here retries instead of
         // being skipped by the no-op guard at the top. Only roll back when no
@@ -752,7 +838,6 @@ export function installSpaAuctionHook(): void {
         if (inflight === controller) currentPath = lastAppliedPath;
         return;
       }
-      const data = (await res.json()) as PageBidsResponse;
       if (inflight !== controller) return;
       // Defer applying bids until the new route's ad containers exist, so a
       // fast edge response cannot beat the DOM and drop server-side bids.
