@@ -87,10 +87,6 @@
               slot,
               isEmpty: flags.isEmpty === true,
               isBackfill: flags.isBackfill === true,
-              size: flags.isEmpty === true ? null : [300, 250],
-              slotContentChanged: flags.slotContentChanged !== false,
-              lineItemId: flags.isReservation === true ? 101 : null,
-              creativeId: flags.isReservation === true ? 202 : null,
             });
             renderEnded = true;
             if (creativeLoaded) emit('slotOnload', { slot });
@@ -177,9 +173,6 @@
         requestPublisherLazy(flags = {}) {
           nextRender = { ...flags };
           requestSlot(publisherLazySlot);
-        },
-        markPublisherLazyVisibility(inViewPercentage) {
-          emit('slotVisibilityChanged', { slot: publisherLazySlot, inViewPercentage });
         },
         markPublisherLazyViewable() {
           emit('impressionViewable', { slot: publisherLazySlot });

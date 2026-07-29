@@ -1,13 +1,6 @@
-import {
-  AD_TRACE_ACK_TTL_MS,
-  isBoundedTraceLabel,
-  terminalSummaryStageOutcome,
-} from '../../core/ad_trace';
+import { isBoundedTraceLabel, terminalSummaryStageOutcome } from '../../core/ad_trace';
 import { log } from '../../core/log';
 import type {
-  AdTraceCorrelationResolution,
-  AdTraceCoverageCategory,
-  AdTraceResponseClass,
   AuctionSlot,
   AuctionBidData,
   AuctionTraceSummary,
@@ -72,23 +65,18 @@ interface GoogleTagSlot {
   clearTargeting?(key?: string): GoogleTagSlot;
   addService(service: GoogleTagPubAdsService): GoogleTagSlot;
   getTargeting?(key: string): string[];
-  getSizes?(): Array<
-    readonly [number, number] | string | { getWidth(): number; getHeight(): number }
-  >;
 }
 
 interface SlotRenderEndedEvent {
   isEmpty?: boolean;
   isBackfill?: boolean;
   slot: GoogleTagSlot;
-  size?: readonly [number, number] | string;
-  slotContentChanged?: boolean;
-  lineItemId?: number | null;
-  creativeId?: number | null;
 }
 
-interface GptSlotEvent extends SlotRenderEndedEvent {
-  inViewPercentage?: number;
+interface GptSlotEvent {
+  slot: GoogleTagSlot;
+  isEmpty?: boolean;
+  isBackfill?: boolean;
 }
 
 interface RenderCandidate {
@@ -100,7 +88,6 @@ interface RenderCandidate {
   bid?: Readonly<AuctionBidData>;
   adId?: string;
   traceToken?: string;
-  requestedSizeKeys: ReadonlySet<string>;
   createdAt: number;
   requestObserved: boolean;
   ambiguousRequest: boolean;
@@ -118,7 +105,6 @@ interface ExpectedRender {
   source: MessageEventSource;
   expiresAt: number;
   consumed: boolean;
-  expiryTimer?: ReturnType<typeof setTimeout>;
 }
 
 interface AdTraceRequestBoundarySnapshot {
@@ -276,52 +262,6 @@ function isKnownStaleTsAdId(adId: string): boolean {
 
 function monotonicNow(): number {
   return typeof performance === 'undefined' ? Date.now() : performance.now();
-}
-
-function recordCoverage(
-  category: AdTraceCoverageCategory,
-  resolution: AdTraceCorrelationResolution,
-  reason?: string
-): void {
-  window.tsjs?.recordAdTraceCoverage?.({ category, resolution, ...(reason ? { reason } : {}) });
-}
-
-function sizeKey(width: number, height: number): string | undefined {
-  return Number.isInteger(width) &&
-    Number.isInteger(height) &&
-    width > 0 &&
-    height > 0 &&
-    width <= 10_000 &&
-    height <= 10_000
-    ? `${width}x${height}`
-    : undefined;
-}
-
-function requestedSizeKeys(slot: GoogleTagSlot): ReadonlySet<string> {
-  const keys = new Set<string>();
-  for (const value of slot.getSizes?.() ?? []) {
-    if (typeof value === 'string') continue;
-    const objectSize = value as { getWidth(): number; getHeight(): number };
-    const width = Array.isArray(value) ? value[0] : objectSize.getWidth();
-    const height = Array.isArray(value) ? value[1] : objectSize.getHeight();
-    const key = sizeKey(width, height);
-    if (key) keys.add(key);
-  }
-  return keys;
-}
-
-function renderedSize(event: GptSlotEvent): readonly [number, number] | undefined {
-  if (!Array.isArray(event.size) || event.size.length !== 2) return undefined;
-  const width = event.size[0];
-  const height = event.size[1];
-  return sizeKey(width, height) ? [width, height] : undefined;
-}
-
-function responseClass(event: GptSlotEvent): AdTraceResponseClass {
-  if (event.isEmpty === true) return 'empty';
-  if (event.isBackfill === true) return 'backfill';
-  if (event.lineItemId != null || event.creativeId != null) return 'reservation';
-  return 'unclassified_non_empty';
 }
 
 function findSlotElementByDivId(divId: string): HTMLElement | null {
@@ -954,12 +894,8 @@ function bindCandidateElement(candidate: RenderCandidate): void {
 
 function supersedeCandidate(candidate: RenderCandidate, reason: string): void {
   if (candidate.superseded) return;
-  settleSupersededExpectedRenders(candidate);
   candidate.superseded = true;
-  // GPT late callbacks carry only a slot object, never a generation. Once a
-  // request is replaced, attributing any later callback to the old generation
-  // would be a guess, so replacement always closes late-event ownership.
-  candidate.lateEventsAllowed = false;
+  candidate.lateEventsAllowed = reason === 'request_replaced' && candidate.terminal;
   pendingElementBindings.delete(candidate);
   if (pendingElementBindings.size === 0) {
     pendingElementObserver?.disconnect();
@@ -1083,7 +1019,9 @@ export function captureAdTraceRequest(
   if (!ts?.recordAdTrace) return 0;
   for (const candidates of requestCandidates.values()) {
     candidates
-      .filter((candidate) => candidate.slot === slot && !candidate.superseded)
+      .filter(
+        (candidate) => candidate.slot === slot && !candidate.superseded && !candidate.consumed
+      )
       .forEach((candidate) => supersedeCandidate(candidate, 'request_replaced'));
   }
   const generation = nextTraceGeneration(ts, slotId);
@@ -1126,7 +1064,6 @@ export function captureAdTraceRequest(
       bidder: selectedParticipant.bidder,
       generation,
       selectedAt: monotonicNow(),
-      prebidAuctionDurationMs: selectedParticipant.prebidAuctionDurationMs,
     });
     while (selected.length > 128) selected.shift();
     ts.prebidSelectedParticipants = selected;
@@ -1151,7 +1088,6 @@ export function captureAdTraceRequest(
     ...(privateBid ? { bid: privateBid } : {}),
     adId,
     traceToken,
-    requestedSizeKeys: requestedSizeKeys(slot),
     createdAt: monotonicNow(),
     requestObserved: false,
     ambiguousRequest: false,
@@ -1217,8 +1153,6 @@ export function captureAdTraceRequest(
     outcome,
     confidence,
     reason,
-    prebidAuctionDurationMs:
-      selectedParticipant?.prebidAuctionDurationMs ?? completedAuction?.prebidAuctionDurationMs,
   });
   for (const kind of selectedParticipant?.events ?? []) {
     ts.recordAdTrace({
@@ -1254,10 +1188,7 @@ function candidateForGptRequest(slot: GoogleTagSlot): RenderCandidate | undefine
   const ts = window.tsjs;
   if (!ts?.recordAdTrace) return undefined;
   const slotId = slotIdForGptSlot(slot);
-  if (!slotId) {
-    recordCoverage('gpt_requests', 'unmatched', 'missing_slot_identity');
-    return undefined;
-  }
+  if (!slotId) return undefined;
   const retained = requestCandidates.get(slotId) ?? [];
   retained
     .filter(
@@ -1267,16 +1198,13 @@ function candidateForGptRequest(slot: GoogleTagSlot): RenderCandidate | undefine
         monotonicNow() - candidate.createdAt > 30_000
     )
     .forEach((candidate) => supersedeCandidate(candidate, 'generation_expired'));
-  const current = retained.filter((candidate) => candidate.slot === slot && !candidate.superseded);
-  const active = current.filter((candidate) => !candidate.consumed);
+  const active = retained.filter(
+    (candidate) => candidate.slot === slot && !candidate.superseded && !candidate.consumed
+  );
   const pending = active.filter((candidate) => !candidate.requestObserved && !candidate.terminal);
   if (pending.length === 1 && active.length === 1) {
-    current
-      .filter((candidate) => candidate !== pending[0])
-      .forEach((candidate) => supersedeCandidate(candidate, 'request_replaced'));
     pending[0].requestObserved = true;
     bindCandidateElement(pending[0]);
-    recordCoverage('gpt_requests', 'correlated');
     return pending[0];
   }
   if (pending.length > 1) {
@@ -1290,14 +1218,13 @@ function candidateForGptRequest(slot: GoogleTagSlot): RenderCandidate | undefine
         reason: 'ambiguous_generation',
       })
     );
-    recordCoverage('gpt_requests', 'ambiguous', 'ambiguous_generation');
     return undefined;
   }
 
-  const hasOverlappingRequest = current.some(
+  const hasOverlappingRequest = active.some(
     (candidate) => candidate.requestObserved && !candidate.terminal
   );
-  current.forEach((candidate) =>
+  active.forEach((candidate) =>
     supersedeCandidate(
       candidate,
       hasOverlappingRequest ? 'overlapping_request' : 'request_replaced'
@@ -1305,10 +1232,7 @@ function candidateForGptRequest(slot: GoogleTagSlot): RenderCandidate | undefine
   );
 
   const generation = nextTraceGeneration(ts, slotId);
-  if (!generation) {
-    recordCoverage('gpt_requests', 'unmatched', 'missing_generation');
-    return undefined;
-  }
+  if (!generation) return undefined;
 
   const bidder = firstSlotTarget(slot, 'hb_bidder');
   const adId = firstSlotTarget(slot, 'hb_adid');
@@ -1322,7 +1246,6 @@ function candidateForGptRequest(slot: GoogleTagSlot): RenderCandidate | undefine
     divId: slot.getSlotElementId?.() ?? '',
     adId,
     traceToken,
-    requestedSizeKeys: requestedSizeKeys(slot),
     createdAt: monotonicNow(),
     requestObserved: true,
     ambiguousRequest: hasOverlappingRequest,
@@ -1357,7 +1280,6 @@ function candidateForGptRequest(slot: GoogleTagSlot): RenderCandidate | undefine
       bidder: selectedParticipant.bidder,
       generation,
       selectedAt: monotonicNow(),
-      prebidAuctionDurationMs: selectedParticipant.prebidAuctionDurationMs,
     });
     while (selected.length > 128) selected.shift();
     ts.prebidSelectedParticipants = selected;
@@ -1384,7 +1306,6 @@ function candidateForGptRequest(slot: GoogleTagSlot): RenderCandidate | undefine
         traceToken && selectedParticipant.traceToken === traceToken ? 'won' : 'client_bid_won',
       confidence: 'definitive',
       reason: 'selected_targeting',
-      prebidAuctionDurationMs: selectedParticipant.prebidAuctionDurationMs,
     });
     if (selectedParticipant.serverTrace) {
       ts.recordAdTrace({
@@ -1417,25 +1338,16 @@ function candidateForGptRequest(slot: GoogleTagSlot): RenderCandidate | undefine
     bidder,
     reason: 'gpt_slot_requested',
   });
-  recordCoverage(
-    'gpt_requests',
-    hasOverlappingRequest ? 'ambiguous' : 'correlated',
-    hasOverlappingRequest ? 'overlapping_request' : undefined
-  );
   return candidate;
 }
 
 function candidateForSlot(
   slot: GoogleTagSlot,
-  coverageCategory: 'gpt_responses' | 'gpt_renders',
   includeTerminal = false,
   includeAmbiguous = false
 ): RenderCandidate | undefined {
   const slotId = slotIdForGptSlot(slot);
-  if (!slotId) {
-    recordCoverage(coverageCategory, 'unmatched', 'missing_slot_identity');
-    return undefined;
-  }
+  if (!slotId) return undefined;
   const candidates = (requestCandidates.get(slotId) ?? []).filter(
     (candidate) =>
       candidate.slot === slot &&
@@ -1449,12 +1361,10 @@ function candidateForSlot(
         : monotonicNow() - candidate.createdAt <= 30_000)
   );
   if (candidates.length !== 1) {
-    const eventKind =
-      coverageCategory === 'gpt_renders' ? 'gpt_slot_render_ended' : 'gpt_slot_response_received';
     if (candidates.length > 1) {
       candidates.forEach((candidate) =>
         window.tsjs?.recordAdTrace?.({
-          kind: eventKind,
+          kind: 'gpt_slot_render_ended',
           slotId,
           generation: candidate.generation,
           bidTraceId: candidate.traceToken,
@@ -1465,18 +1375,13 @@ function candidateForSlot(
       );
     } else {
       window.tsjs?.recordAdTrace?.({
-        kind: eventKind,
+        kind: 'gpt_slot_response_received',
         slotId,
         outcome: 'unresolved',
         confidence: 'none',
         reason: 'missing_generation',
       });
     }
-    recordCoverage(
-      coverageCategory,
-      candidates.length > 1 ? 'ambiguous' : 'unmatched',
-      candidates.length > 1 ? 'overlapping_request' : 'missing_generation'
-    );
     return undefined;
   }
   const candidate = candidates[0];
@@ -1489,78 +1394,70 @@ function candidateForSlot(
       confidence: 'none',
       reason: 'overlapping_request',
     });
-    recordCoverage(coverageCategory, 'ambiguous', 'overlapping_request');
     return undefined;
   }
-  recordCoverage(
-    coverageCategory,
-    candidate.ambiguousRequest ? 'ambiguous' : 'correlated',
-    candidate.ambiguousRequest ? 'overlapping_request' : undefined
-  );
   return candidate;
 }
 
 function candidateForLateGptEvent(
   slot: GoogleTagSlot,
-  kind: 'gpt_slot_onload' | 'gpt_impression_viewable' | 'gpt_slot_visibility_changed'
+  kind: 'gpt_slot_onload' | 'gpt_impression_viewable'
 ): RenderCandidate | undefined {
-  const category: AdTraceCoverageCategory =
-    kind === 'gpt_slot_onload'
-      ? 'gpt_loads'
-      : kind === 'gpt_impression_viewable'
-        ? 'gpt_viewability'
-        : 'gpt_visibility';
-  const retainedCandidates: RenderCandidate[] = [];
+  const candidates: RenderCandidate[] = [];
   for (const retained of requestCandidates.values()) {
-    retainedCandidates.push(
+    candidates.push(
       ...retained.filter(
         (candidate) =>
           candidate.slot === slot &&
           candidate.terminal &&
           candidate.lateEventsAllowed &&
+          !candidate.ambiguousRequest &&
+          !candidate.renderEmpty &&
           candidateIsRetained(candidate)
       )
     );
   }
-  if (retainedCandidates.length === 0) {
-    recordCoverage(category, 'unmatched', 'missing_generation');
-    return undefined;
-  }
-  const candidates = retainedCandidates.filter((candidate) => !candidate.renderEmpty);
-  if (candidates.length === 0) {
-    recordCoverage(category, 'ignored', 'empty_render');
-    return undefined;
-  }
-  if (candidates.length !== 1 || candidates[0].ambiguousRequest) {
-    const reason =
-      kind === 'gpt_slot_onload'
-        ? 'ambiguous_late_onload'
-        : kind === 'gpt_impression_viewable'
-          ? 'ambiguous_late_viewability'
-          : 'ambiguous_late_visibility';
-    window.tsjs?.recordAdTrace?.({
-      kind: 'gpt_slot_response_received',
-      slotId: candidates[0].slotId,
-      outcome: 'unresolved',
-      confidence: 'none',
-      reason,
-    });
-    recordCoverage(category, 'ambiguous', 'overlapping_request');
-    return undefined;
+  candidates.sort((left, right) => left.generation - right.generation);
+  const latest = candidates.at(-1);
+  if (!latest) return undefined;
+
+  if (kind === 'gpt_slot_onload') {
+    if (latest.onloadObserved) return undefined;
+    const olderOnloadPending = candidates
+      .slice(0, -1)
+      .some((candidate) => !candidate.onloadObserved);
+    if (olderOnloadPending) {
+      window.tsjs?.recordAdTrace?.({
+        kind: 'gpt_slot_response_received',
+        slotId: latest.slotId,
+        generation: latest.generation,
+        outcome: 'unresolved',
+        confidence: 'none',
+        reason: 'ambiguous_late_onload',
+      });
+      return undefined;
+    }
+    latest.onloadObserved = true;
+    return latest;
   }
 
-  const candidate = candidates[0];
-  if (
-    kind !== 'gpt_slot_visibility_changed' &&
-    (kind === 'gpt_slot_onload' ? candidate.onloadObserved : candidate.viewabilityObserved)
-  ) {
-    recordCoverage(category, 'ignored', 'duplicate_callback');
+  if (latest.viewabilityObserved) return undefined;
+  const olderViewabilityPending = candidates
+    .slice(0, -1)
+    .some((candidate) => !candidate.viewabilityObserved);
+  if (olderViewabilityPending) {
+    window.tsjs?.recordAdTrace?.({
+      kind: 'gpt_slot_response_received',
+      slotId: latest.slotId,
+      generation: latest.generation,
+      outcome: 'unresolved',
+      confidence: 'none',
+      reason: 'ambiguous_late_viewability',
+    });
     return undefined;
   }
-  if (kind === 'gpt_slot_onload') candidate.onloadObserved = true;
-  else if (kind === 'gpt_impression_viewable') candidate.viewabilityObserved = true;
-  recordCoverage(category, 'correlated');
-  return candidate;
+  latest.viewabilityObserved = true;
+  return latest;
 }
 
 function installGptEvidenceListeners(service: GoogleTagPubAdsService): void {
@@ -1568,17 +1465,8 @@ function installGptEvidenceListeners(service: GoogleTagPubAdsService): void {
   if (instrumented.__tsAdTraceListeners) return;
   instrumented.__tsAdTraceListeners = true;
   const recordLate =
-    (kind: 'gpt_slot_onload' | 'gpt_impression_viewable' | 'gpt_slot_visibility_changed') =>
+    (kind: 'gpt_slot_onload' | 'gpt_impression_viewable') =>
     (event: GptSlotEvent): void => {
-      if (
-        kind === 'gpt_slot_visibility_changed' &&
-        (!Number.isFinite(event.inViewPercentage) ||
-          (event.inViewPercentage ?? -1) < 0 ||
-          (event.inViewPercentage ?? 101) > 100)
-      ) {
-        recordCoverage('gpt_visibility', 'ignored', 'invalid_visibility_percentage');
-        return;
-      }
       const candidate = candidateForLateGptEvent(event.slot, kind);
       if (!candidate) return;
       window.tsjs?.recordAdTrace?.({
@@ -1586,9 +1474,6 @@ function installGptEvidenceListeners(service: GoogleTagPubAdsService): void {
         slotId: candidate.slotId,
         generation: candidate.generation,
         bidTraceId: candidate.traceToken,
-        ...(kind === 'gpt_slot_visibility_changed'
-          ? { inViewPercentage: Math.round(event.inViewPercentage ?? 0) }
-          : {}),
       });
     };
   service.addEventListener('slotRequested', (event: GptSlotEvent) => {
@@ -1602,7 +1487,7 @@ function installGptEvidenceListeners(service: GoogleTagPubAdsService): void {
     });
   });
   service.addEventListener('slotResponseReceived', (event: GptSlotEvent) => {
-    const candidate = candidateForSlot(event.slot, 'gpt_responses');
+    const candidate = candidateForSlot(event.slot);
     if (!candidate) return;
     window.tsjs?.recordAdTrace?.({
       kind: 'gpt_slot_response_received',
@@ -1613,17 +1498,11 @@ function installGptEvidenceListeners(service: GoogleTagPubAdsService): void {
   });
   service.addEventListener('slotOnload', recordLate('gpt_slot_onload'));
   service.addEventListener('impressionViewable', recordLate('gpt_impression_viewable'));
-  service.addEventListener('slotVisibilityChanged', recordLate('gpt_slot_visibility_changed'));
   service.addEventListener('slotRenderEnded', (event: GptSlotEvent) => {
-    const candidate = candidateForSlot(event.slot, 'gpt_renders', false, true);
+    const candidate = candidateForSlot(event.slot, false, true);
     if (!candidate) return;
     candidate.terminal = true;
     candidate.renderEmpty = event.isEmpty === true;
-    const size = renderedSize(event);
-    const sizeMatchesConfigured =
-      size && candidate.requestedSizeKeys.size > 0
-        ? candidate.requestedSizeKeys.has(`${size[0]}x${size[1]}`)
-        : undefined;
     window.tsjs?.recordAdTrace?.({
       kind: 'gpt_slot_render_ended',
       slotId: candidate.slotId,
@@ -1640,11 +1519,6 @@ function installGptEvidenceListeners(service: GoogleTagPubAdsService): void {
             : 'non_empty_unattributed',
       isEmpty: event.isEmpty,
       isBackfill: event.isBackfill,
-      responseClass: responseClass(event),
-      renderedWidth: size?.[0],
-      renderedHeight: size?.[1],
-      slotContentChanged: event.slotContentChanged,
-      sizeMatchesConfigured,
     });
   });
 }
@@ -1903,6 +1777,28 @@ export function installTsAdInit(): void {
     // updates (new ts.bids injected before </body>) are picked up at render time.
     const bids = ts.bids ?? {};
     const summary = ts.auctionTrace;
+    for (const slot of slots) {
+      const bid = bids[slot.id];
+      if (bid?.trace && TRACE_TOKEN_RE.test(bid.trace.bidTraceId)) {
+        ts.recordAdTrace?.({
+          kind: 'ts_winner_observed',
+          slotId: slot.id,
+          auctionTraceId: bid.trace.auctionTraceId,
+          bidTraceId: bid.trace.bidTraceId,
+          provider: bid.trace.provider,
+          bidder: bid.trace.bidder,
+        });
+      } else if (summary) {
+        ts.recordAdTrace?.({
+          kind: 'ts_auction_observed',
+          slotId: slot.id,
+          auctionTraceId: summary.auctionTraceId,
+          outcome: terminalSummaryStageOutcome(summary.outcome),
+          confidence: 'definitive',
+          reason: 'terminal_summary',
+        });
+      }
+    }
     const g = (window as GptWindow).googletag;
     if (!g) return;
 
@@ -1991,29 +1887,6 @@ export function installTsAdInit(): void {
             suppressPublisherDisplay: false,
             suppressPublisherRefresh: false,
           };
-        }
-
-        // Seed server evidence only after this concrete adInit attempt resolves
-        // both its exact top-document element and GPT slot. A failed setup must
-        // not leave generationless evidence for a later route to consume.
-        if (bid.trace && TRACE_TOKEN_RE.test(bid.trace.bidTraceId)) {
-          ts.recordAdTrace?.({
-            kind: 'ts_winner_observed',
-            slotId: slot.id,
-            auctionTraceId: bid.trace.auctionTraceId,
-            bidTraceId: bid.trace.bidTraceId,
-            provider: bid.trace.provider,
-            bidder: bid.trace.bidder,
-          });
-        } else if (summary) {
-          ts.recordAdTrace?.({
-            kind: 'ts_auction_observed',
-            slotId: slot.id,
-            auctionTraceId: summary.auctionTraceId,
-            outcome: terminalSummaryStageOutcome(summary.outcome),
-            confidence: 'definitive',
-            reason: 'terminal_summary',
-          });
         }
 
         installSlotCacheInvalidationHook(gptSlot);
@@ -2432,46 +2305,12 @@ export function parseCachedBid(body: string): CachedBid | undefined {
 
 const TRACE_TOKEN_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
-function removeExpectedRender(entry: ExpectedRender): void {
-  if (entry.expiryTimer) clearTimeout(entry.expiryTimer);
-  const token = entry.candidate.traceToken;
-  if (!token) return;
-  const retained = (expectedRenders.get(token) ?? []).filter((item) => item !== entry);
-  if (retained.length > 0) expectedRenders.set(token, retained);
-  else expectedRenders.delete(token);
-}
-
-function settleExpectedRender(
-  entry: ExpectedRender,
-  kind: 'creative_ack_timed_out' | 'creative_ack_superseded'
-): void {
-  if (entry.consumed) return;
-  entry.consumed = true;
-  removeExpectedRender(entry);
-  window.tsjs?.recordAdTrace?.({
-    kind,
-    slotId: entry.candidate.slotId,
-    generation: entry.candidate.generation,
-    bidTraceId: entry.candidate.traceToken,
-  });
-}
-
-function settleSupersededExpectedRenders(candidate: RenderCandidate): void {
-  for (const entries of expectedRenders.values()) {
-    for (const entry of [...entries]) {
-      if (entry.candidate === candidate) settleExpectedRender(entry, 'creative_ack_superseded');
-    }
-  }
-}
-
 function pruneExpectedRenders(): void {
   const now = monotonicNow();
-  for (const entries of expectedRenders.values()) {
-    for (const entry of [...entries]) {
-      if (!entry.consumed && entry.expiresAt < now) {
-        settleExpectedRender(entry, 'creative_ack_timed_out');
-      }
-    }
+  for (const [token, entries] of expectedRenders) {
+    const retained = entries.filter((entry) => !entry.consumed && entry.expiresAt >= now);
+    if (retained.length > 0) expectedRenders.set(token, retained);
+    else expectedRenders.delete(token);
   }
 }
 
@@ -2479,40 +2318,29 @@ function armExpectedRender(
   candidate: RenderCandidate | undefined,
   source: MessageEventSource | null
 ): string | undefined {
-  if (!candidate?.bid || candidate.superseded || !source) return undefined;
-  if (!candidate.traceToken || !TRACE_TOKEN_RE.test(candidate.traceToken)) {
-    window.tsjs?.recordAdTrace?.({
-      kind: 'creative_ack_missing_token',
-      slotId: candidate.slotId,
-      generation: candidate.generation,
-    });
+  if (
+    !candidate?.bid ||
+    candidate.superseded ||
+    !candidate.traceToken ||
+    !TRACE_TOKEN_RE.test(candidate.traceToken) ||
+    !source
+  ) {
     return undefined;
   }
   pruneExpectedRenders();
-  let expectedCount = 0;
-  let oldest: ExpectedRender | undefined;
-  for (const entries of expectedRenders.values()) {
-    expectedCount += entries.length;
-    for (const entry of entries) {
-      if (!oldest || entry.expiresAt < oldest.expiresAt) oldest = entry;
-    }
-  }
-  if (expectedCount >= MAX_EXPECTED_RENDERS && oldest) {
-    settleExpectedRender(oldest, 'creative_ack_superseded');
-  }
+  const expectedCount = [...expectedRenders.values()].reduce(
+    (count, entries) => count + entries.length,
+    0
+  );
+  if (expectedCount >= MAX_EXPECTED_RENDERS) return undefined;
   candidate.consumed = true;
-  const entry: ExpectedRender = {
+  const entries = expectedRenders.get(candidate.traceToken) ?? [];
+  entries.push({
     candidate,
     source,
-    expiresAt: monotonicNow() + AD_TRACE_ACK_TTL_MS,
+    expiresAt: monotonicNow() + 30_000,
     consumed: false,
-  };
-  entry.expiryTimer = setTimeout(
-    () => settleExpectedRender(entry, 'creative_ack_timed_out'),
-    AD_TRACE_ACK_TTL_MS
-  );
-  const entries = expectedRenders.get(candidate.traceToken) ?? [];
-  entries.push(entry);
+  });
   expectedRenders.set(candidate.traceToken, entries);
   return candidate.traceToken;
 }
@@ -2577,39 +2405,31 @@ export function installTsRenderBridge(): void {
     if (data['type'] === 'ts-creative-load') {
       const token = data['traceToken'];
       if (data['version'] !== 1 || typeof token !== 'string' || !TRACE_TOKEN_RE.test(token)) return;
-      pruneExpectedRenders();
       const entries = expectedRenders.get(token) ?? [];
-      const active = entries.filter(
+      entries
+        .filter((entry) => !entry.consumed && entry.expiresAt < monotonicNow())
+        .forEach((entry) => supersedeCandidate(entry.candidate, 'ack_expired'));
+      const matches = entries.filter(
         (entry) =>
           !entry.consumed &&
           !entry.candidate.superseded &&
           entry.expiresAt >= monotonicNow() &&
+          entry.source === e.source &&
           (requestCandidates.get(entry.candidate.slotId) ?? []).includes(entry.candidate)
       );
-      const matches = active.filter((entry) => entry.source === e.source);
       if (matches.length !== 1) {
-        const candidate = active.length === 1 ? active[0].candidate : entries[0]?.candidate;
-        if (active.length === 1 && matches.length === 0) {
-          window.tsjs?.recordAdTrace?.({
-            kind: 'creative_ack_source_mismatched',
-            slotId: candidate?.slotId,
-            generation: candidate?.generation,
-            bidTraceId: token,
-          });
-        } else {
-          window.tsjs?.recordAdTrace?.({
-            kind: 'pb_render_rejected',
-            slotId: candidate?.slotId,
-            generation: candidate?.generation,
-            bidTraceId: token,
-            reason: matches.length > 1 ? 'ambiguous_generation' : 'invalid_acknowledgement',
-          });
-        }
+        const candidate = entries[0]?.candidate;
+        window.tsjs?.recordAdTrace?.({
+          kind: 'pb_render_rejected',
+          slotId: candidate?.slotId,
+          generation: candidate?.generation,
+          bidTraceId: TRACE_TOKEN_RE.test(token) ? token : undefined,
+          reason: matches.length > 1 ? 'ambiguous_generation' : 'invalid_acknowledgement',
+        });
         return;
       }
       const expected = matches[0];
       expected.consumed = true;
-      removeExpectedRender(expected);
       window.tsjs?.recordAdTrace?.({
         kind: 'creative_load_acknowledged',
         slotId: expected.candidate.slotId,
