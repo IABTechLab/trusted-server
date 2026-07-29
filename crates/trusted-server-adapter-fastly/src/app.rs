@@ -117,8 +117,9 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, handle_page_bids, handle_publisher_request, handle_tsjs_dynamic,
-    page_bids_preflight_denied, publisher_response_into_streaming_response,
+    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, handle_page_bids,
+    handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
+    publisher_response_into_streaming_response,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
@@ -1082,7 +1083,17 @@ const NAMED_ROUTES: &[NamedRoute] = &[
     // GET runs the SPA re-auction; OPTIONS is denied in-handler as a CORS
     // preflight guard for this side-effecting endpoint.
     NamedRoute {
-        path: "/__ts/page-bids",
+        path: PAGE_BIDS_PATH,
+        primary_methods: &[Method::GET, Method::OPTIONS],
+        handler: NamedRouteHandler::PageBids,
+    },
+    // Deprecated double-underscore alias. tsjs bundles served before the
+    // `/_ts/page-bids` rename keep requesting this path from already-loaded
+    // pages and browser caches; dropping it would strand SPA navigations
+    // without ads until those bundles age out. See `PAGE_BIDS_LEGACY_PATH`;
+    // removal is tracked by IABTechLab/trusted-server#970.
+    NamedRoute {
+        path: PAGE_BIDS_LEGACY_PATH,
         primary_methods: &[Method::GET, Method::OPTIONS],
         handler: NamedRouteHandler::PageBids,
     },
@@ -1213,8 +1224,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        AppState, NAMED_ROUTES, NamedRouteHandler, TrustedServerApp, build_state_from_settings,
-        startup_error_router,
+        AppState, NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH,
+        TrustedServerApp, build_state_from_settings, startup_error_router,
     };
     use bytes::Bytes;
     use edgezero_core::body::Body;
@@ -1623,6 +1634,48 @@ mod tests {
                     "legacy {method} {path} must route to the local deny handler, not publisher fallback"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn page_bids_serves_canonical_path_and_deprecated_alias() {
+        // The SPA re-auction endpoint lives at the canonical single-underscore
+        // `/_ts/page-bids`, matching every other internal route. The deprecated
+        // `/__ts/page-bids` alias must stay registered to the same handler with
+        // the same methods until pre-rename tsjs bundles age out of browser
+        // caches — dropping it would leave those clients without ads on SPA
+        // navigations.
+        //
+        // The paths are literals, not `PAGE_BIDS_PATH` / `PAGE_BIDS_LEGACY_PATH`.
+        // Looking a route up by the same const it was registered with is
+        // tautological: it keeps passing if the const's value changes, which is
+        // exactly the break that would silently desync the server from the tsjs
+        // client's hardcoded fetch path. Pin the consts to their literals too so
+        // a rename has to be deliberate.
+        assert_eq!(
+            PAGE_BIDS_PATH, "/_ts/page-bids",
+            "canonical page-bids path must match the path tsjs fetches"
+        );
+        assert_eq!(
+            PAGE_BIDS_LEGACY_PATH, "/__ts/page-bids",
+            "legacy alias must match the path pre-rename tsjs bundles fetch"
+        );
+
+        for path in ["/_ts/page-bids", "/__ts/page-bids"] {
+            let route = NAMED_ROUTES
+                .iter()
+                .find(|route| route.path == path)
+                .unwrap_or_else(|| panic!("{path} should be registered"));
+
+            assert!(
+                matches!(route.handler, NamedRouteHandler::PageBids),
+                "{path} must map to the page-bids handler"
+            );
+            assert_eq!(
+                route.primary_methods,
+                &[Method::GET, Method::OPTIONS],
+                "{path} must handle GET and OPTIONS directly, not fall through to the publisher"
+            );
         }
     }
 
