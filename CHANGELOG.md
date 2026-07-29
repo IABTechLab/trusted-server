@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Breaking** — `bid_param_zone_overrides` inner values must now be JSON objects; previously non-object or empty values (`"header" = "x"`, `"header" = {}`) were accepted and silently produced a dead rule at runtime. They now fail at startup with a configuration error. Operators upgrading should audit their `bid_param_zone_overrides` config for non-object zone entries.
+- **Breaking** — Integration configuration strings are no longer globally reinterpreted as JSON scalars. Operators upgrading should audit `[integrations.*]` settings and use native TOML/typed-config booleans and numbers (for example, `enabled = true`, not `enabled = "true"`); quoted numeric and boolean scalars now fail validation instead of silently converting.
 - **Breaking** — Sourcepoint browser module inclusion now requires explicit `[integrations.sourcepoint].enabled = true`; operators relying on the previous unconditional Sourcepoint module should enable the integration before upgrading.
 
 ### Security
