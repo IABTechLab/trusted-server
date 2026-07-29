@@ -1,5 +1,7 @@
 //! HTTP endpoint handlers for auction requests.
 
+use std::collections::HashMap;
+
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::{Request, Response, StatusCode, header};
@@ -22,12 +24,12 @@ use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
 use super::AuctionOrchestrator;
-use super::formats::{convert_to_openrtb_response_with_trace, convert_tsjs_to_auction_request};
+use super::formats::{convert_to_openrtb_response, convert_tsjs_to_auction_request};
 use super::telemetry::{
     AuctionObservationContext, AuctionSource, AuctionTerminalOutcome, build_auction_events,
     emit_auction_events_best_effort_lazy,
 };
-use super::types::{AuctionContext, AuctionPublicOutcome, AuctionTraceContext};
+use super::types::AuctionContext;
 
 const MAX_CLIENT_EID_SOURCES: usize = 64;
 const MAX_CLIENT_UIDS_PER_SOURCE: usize = 32;
@@ -158,8 +160,6 @@ pub async fn handle_auction(
     );
 
     let http_req = Request::from_parts(parts, EdgeBody::empty());
-    let trace_enabled = crate::integrations::ad_trace::browser_trace_enabled(&http_req);
-    let trace = AuctionTraceContext::new(AuctionSource::AuctionApi);
 
     // Story 5 middleware contract: auction is a read-only EC route.
     // It must not generate EC IDs; it only consumes pre-routed context.
@@ -193,8 +193,11 @@ pub async fn handle_auction(
             ec_id,
             None,
         )?;
-        let observation =
-            AuctionObservationContext::from_auction_request(&trace, &auction_request, ec_context);
+        let observation = AuctionObservationContext::from_auction_request(
+            AuctionSource::AuctionApi,
+            &auction_request,
+            ec_context,
+        );
         emit_auction_events_best_effort_lazy(services, || {
             build_auction_events(
                 observation,
@@ -206,13 +209,18 @@ pub async fn handle_auction(
         })
         .await;
 
-        let empty_result = OrchestrationResult::empty(trace, AuctionPublicOutcome::Skipped);
-        return convert_to_openrtb_response_with_trace(
+        let empty_result = OrchestrationResult {
+            provider_responses: Vec::new(),
+            mediator_response: None,
+            winning_bids: HashMap::new(),
+            total_time_ms: 0,
+            metadata: HashMap::new(),
+        };
+        return convert_to_openrtb_response(
             &empty_result,
             settings,
             &auction_request,
             ec_context.ec_allowed(),
-            trace_enabled,
         );
     }
 
@@ -274,7 +282,6 @@ pub async fn handle_auction(
 
     // Create auction context
     let context = AuctionContext {
-        trace: &trace,
         settings,
         request: &http_req,
         timeout_ms: settings.auction.timeout_ms,
@@ -282,8 +289,11 @@ pub async fn handle_auction(
         services,
     };
 
-    let observation =
-        AuctionObservationContext::from_auction_request(&trace, &auction_request, ec_context);
+    let observation = AuctionObservationContext::from_auction_request(
+        AuctionSource::AuctionApi,
+        &auction_request,
+        ec_context,
+    );
 
     // Run the auction
     let result = match orchestrator.run_auction(&auction_request, &context).await {
@@ -327,13 +337,7 @@ pub async fn handle_auction(
     );
 
     // Convert to OpenRTB response format with inline creative HTML
-    convert_to_openrtb_response_with_trace(
-        &result,
-        settings,
-        &auction_request,
-        ec_context.ec_allowed(),
-        trace_enabled,
-    )
+    convert_to_openrtb_response(&result, settings, &auction_request, ec_context.ec_allowed())
 }
 
 /// Resolves partner EIDs from the KV identity graph for bidstream decoration.

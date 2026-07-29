@@ -30,7 +30,7 @@ use trusted_server_core::request_signing::{
 };
 use trusted_server_core::settings::Settings;
 
-use crate::middleware::{AdTracePrepareMiddleware, AuthMiddleware, FinalizeResponseMiddleware};
+use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::build_runtime_services;
 
 // ---------------------------------------------------------------------------
@@ -433,7 +433,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
 
         let mut router = RouterService::builder()
             .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
-            .middleware(AdTracePrepareMiddleware::new(Arc::clone(&state.settings)))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
             .get(
                 "/.well-known/trusted-server.json",

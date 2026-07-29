@@ -1273,7 +1273,6 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build downstream request");
         let context = AuctionContext {
-            trace: crate::auction::test_support::test_trace(),
             settings: &settings,
             request: &downstream,
             timeout_ms: 321,
@@ -1406,7 +1405,6 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build downstream request");
         let context = AuctionContext {
-            trace: crate::auction::test_support::test_trace(),
             settings: &settings,
             request: &downstream,
             timeout_ms: 321,
@@ -1490,7 +1488,6 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build downstream request");
         let context = AuctionContext {
-            trace: crate::auction::test_support::test_trace(),
             settings: &settings,
             request: &downstream,
             timeout_ms: 321,

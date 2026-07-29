@@ -14,11 +14,7 @@ use crate::platform::{PlatformPendingRequest, RuntimeServices};
 use super::config::AuctionConfig;
 use super::provider::AuctionProvider;
 use super::telemetry::AbandonedProviderCall;
-use super::types::{
-    AuctionContext, AuctionPublicOutcome, AuctionRequest, AuctionResponse, AuctionResultTrace,
-    AuctionTraceContext, AuctionTraceSummary, Bid, BidStatus, BidTraceId, WinningBidOrigin,
-    WinningBidTrace,
-};
+use super::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus};
 
 /// In-flight auction requests dispatched to SSP backends.
 ///
@@ -28,7 +24,6 @@ use super::types::{
 /// race in Fastly's native layer, enabling TTFB ≈ origin latency rather than
 /// TTFB ≈ auction timeout.
 pub struct DispatchedAuction {
-    trace: AuctionTraceContext,
     pending_requests: Vec<PlatformPendingRequest>,
     backend_to_provider: HashMap<String, (String, Instant, Arc<dyn AuctionProvider>, u32)>,
     launch_responses: Vec<AuctionResponse>,
@@ -58,12 +53,6 @@ pub enum DispatchAuctionOutcome {
 }
 
 impl DispatchedAuction {
-    /// Return the trace context retained for split-phase collection.
-    #[must_use]
-    pub fn trace(&self) -> &AuctionTraceContext {
-        &self.trace
-    }
-
     /// Consume the dispatch token without collecting provider responses.
     #[must_use]
     pub fn abandon(
@@ -93,7 +82,6 @@ impl DispatchedAuction {
 impl DispatchedAuction {
     pub(crate) fn empty_for_test(request: AuctionRequest, timeout_ms: u32) -> Self {
         Self {
-            trace: AuctionTraceContext::new(super::types::AuctionSource::InitialNavigation),
             pending_requests: Vec::new(),
             backend_to_provider: HashMap::new(),
             launch_responses: Vec::new(),
@@ -160,39 +148,6 @@ fn provider_transport_failed_response(
     AuctionResponse::error(provider_name, response_time_ms)
         .with_metadata("error_type", serde_json::json!(ERROR_TYPE_TRANSPORT))
         .with_metadata("message", serde_json::json!("Provider request failed"))
-}
-
-fn build_winning_bid_traces(
-    winning_bids: &HashMap<String, Bid>,
-    origins: &HashMap<String, WinningBidOrigin>,
-    provider_responses: &[AuctionResponse],
-    mediator_response: Option<&AuctionResponse>,
-    mut id_source: impl FnMut() -> BidTraceId,
-) -> HashMap<String, WinningBidTrace> {
-    let mut traces = HashMap::with_capacity(winning_bids.len());
-    for (slot_id, bid) in winning_bids {
-        let provider = origins
-            .get(slot_id)
-            .and_then(|origin| {
-                if origin.mediated {
-                    mediator_response.map(|response| response.provider.clone())
-                } else {
-                    provider_responses
-                        .get(origin.response_index)
-                        .map(|response| response.provider.clone())
-                }
-            })
-            .unwrap_or_else(|| "unattributed".to_owned());
-        traces.insert(
-            slot_id.clone(),
-            WinningBidTrace {
-                bid_trace_id: id_source(),
-                provider,
-                bidder: bid.bidder.clone(),
-            },
-        );
-    }
-    traces
 }
 
 fn provider_timeout_response(provider_name: &str, response_time_ms: u64) -> AuctionResponse {
@@ -360,103 +315,120 @@ impl AuctionOrchestrator {
         let provider_responses = self.run_providers_parallel(request, context).await?;
 
         let floor_prices = self.floor_prices_by_slot(request);
-        let (mediator_response, winning_bids, winning_bid_origins) =
-            if let Some(mediator_name) = &self.config.mediator {
-                let mediator = self.get_provider(mediator_name)?;
+        let (mediator_response, winning_bids) = if let Some(mediator_name) = &self.config.mediator {
+            let mediator = self.get_provider(mediator_name)?;
 
-                log::info!(
-                    "Sending {} provider responses to mediator: {}",
-                    provider_responses.len(),
-                    mediator.provider_name()
-                );
+            log::info!(
+                "Sending {} provider responses to mediator: {}",
+                provider_responses.len(),
+                mediator.provider_name()
+            );
 
-                // Give the mediator only the remaining time from the auction
-                // deadline, not the full timeout — the bidding phase already
-                // consumed part of it. Canonicalize the value for backend-name
-                // stability without exceeding the remaining budget.
-                let remaining_ms = remaining_budget_ms(mediation_start, context.timeout_ms);
-                let mediator_timeout = context
-                    .services
-                    .backend()
-                    .canonicalize_transport_timeout_ms(remaining_ms, mediator.timeout_ms());
+            // Give the mediator only the remaining time from the auction
+            // deadline, not the full timeout — the bidding phase already
+            // consumed part of it, and the mediator has no select-loop
+            // deadline backstop. The platform canonicalizes the value for
+            // backend-name stability (see
+            // `PlatformBackend::canonicalize_transport_timeout_ms`); it never
+            // exceeds the remaining budget. See the transport-deadline note on
+            // `run_providers_parallel` for the limits of this bound.
+            let remaining_ms = remaining_budget_ms(mediation_start, context.timeout_ms);
+            let mediator_timeout = context
+                .services
+                .backend()
+                .canonicalize_transport_timeout_ms(remaining_ms, mediator.timeout_ms());
 
-                if mediator_timeout == 0 {
-                    log::warn!("Auction timeout exhausted during bidding phase; skipping mediator");
-                    let (winning_bids, winning_bid_origins) =
-                        self.select_winning_bids(&provider_responses, &floor_prices);
-                    return Ok(self.finalize_result(
-                        context.trace,
-                        provider_responses,
-                        None,
-                        winning_bids,
-                        winning_bid_origins,
-                        0,
-                    ));
-                }
+            if mediator_timeout == 0 {
+                log::warn!("Auction timeout exhausted during bidding phase; skipping mediator");
+                let winning = self.select_winning_bids(&provider_responses, &floor_prices);
+                return Ok(OrchestrationResult {
+                    provider_responses,
+                    mediator_response: None,
+                    winning_bids: winning,
+                    total_time_ms: 0,
+                    metadata: HashMap::new(),
+                });
+            }
 
-                let mediator_context = AuctionContext {
-                    trace: context.trace,
-                    settings: context.settings,
-                    request: context.request,
-                    timeout_ms: mediator_timeout,
-                    provider_responses: Some(&provider_responses),
-                    services: context.services,
-                };
-
-                let start_time = Instant::now();
-                let pending = mediator
-                    .request_bids(request, &mediator_context)
-                    .await
-                    .change_context(TrustedServerError::Auction {
-                        message: format!("Mediator {} failed to launch", mediator.provider_name()),
-                    })?;
-
-                let platform_resp = mediator_context
-                    .services
-                    .http_client()
-                    .wait(pending)
-                    .await
-                    .change_context(TrustedServerError::Auction {
-                        message: format!("Mediator {} request failed", mediator.provider_name()),
-                    })?;
-
-                let response_time_ms = start_time.elapsed().as_millis() as u64;
-                // Use the context-aware parse so mediators (e.g. adserver_mock) can
-                // restore nurl/burl/ad_id and PBS cache fields from the collected SSP
-                // responses. The dispatched collect path already does this; the
-                // synchronous mediation path used by POST /auction and
-                // /_ts/page-bids must match or mediated cache bids lose the metadata
-                // needed for creative rendering and win/billing beacons.
-                let mediator_resp = mediator
-                    .parse_response_with_context(
-                        platform_resp,
-                        response_time_ms,
-                        request,
-                        &mediator_context,
-                    )
-                    .await
-                    .change_context(TrustedServerError::Auction {
-                        message: format!("Mediator {} parse failed", mediator.provider_name()),
-                    })?;
-
-                let (winning_bids, winning_bid_origins) =
-                    self.select_mediator_winning_bids(&mediator_resp, &floor_prices);
-                (Some(mediator_resp), winning_bids, winning_bid_origins)
-            } else {
-                // No mediator - select best bid per slot from bidder responses
-                let (winning_bids, winning_bid_origins) =
-                    self.select_winning_bids(&provider_responses, &floor_prices);
-                (None, winning_bids, winning_bid_origins)
+            let mediator_context = AuctionContext {
+                settings: context.settings,
+                request: context.request,
+                timeout_ms: mediator_timeout,
+                provider_responses: Some(&provider_responses),
+                services: context.services,
             };
 
-        Ok(self.finalize_result(
-            context.trace,
+            let start_time = Instant::now();
+            let pending = mediator
+                .request_bids(request, &mediator_context)
+                .await
+                .change_context(TrustedServerError::Auction {
+                    message: format!("Mediator {} failed to launch", mediator.provider_name()),
+                })?;
+
+            let platform_resp = mediator_context
+                .services
+                .http_client()
+                .wait(pending)
+                .await
+                .change_context(TrustedServerError::Auction {
+                    message: format!("Mediator {} request failed", mediator.provider_name()),
+                })?;
+
+            let response_time_ms = start_time.elapsed().as_millis() as u64;
+            // Use the context-aware parse so mediators (e.g. adserver_mock) can
+            // restore nurl/burl/ad_id and PBS cache fields from the collected SSP
+            // responses. The dispatched collect path already does this; the
+            // synchronous mediation path used by POST /auction and
+            // /_ts/page-bids must match or mediated cache bids lose the metadata
+            // needed for creative rendering and win/billing beacons.
+            let mediator_resp = mediator
+                .parse_response_with_context(
+                    platform_resp,
+                    response_time_ms,
+                    request,
+                    &mediator_context,
+                )
+                .await
+                .change_context(TrustedServerError::Auction {
+                    message: format!("Mediator {} parse failed", mediator.provider_name()),
+                })?;
+
+            // Extract only mediator bids with comparable numeric prices.
+            let winning = mediator_resp
+                .bids
+                .iter()
+                .filter_map(|bid| {
+                    if bid.price.is_none() {
+                        log::warn!(
+                            "Mediator '{}' returned bid for slot '{}' without a price - skipping",
+                            mediator.provider_name(),
+                            bid.slot_id
+                        );
+                        None
+                    } else {
+                        Some((bid.slot_id.clone(), bid.clone()))
+                    }
+                })
+                .collect();
+
+            (
+                Some(mediator_resp),
+                self.apply_floor_prices(winning, &floor_prices),
+            )
+        } else {
+            // No mediator - select best bid per slot from bidder responses
+            let winning = self.select_winning_bids(&provider_responses, &floor_prices);
+            (None, winning)
+        };
+
+        Ok(OrchestrationResult {
             provider_responses,
             mediator_response,
             winning_bids,
-            winning_bid_origins,
-            0,
-        ))
+            total_time_ms: 0, // Will be set by caller
+            metadata: HashMap::new(),
+        })
     }
 
     /// Run auction with only parallel bidding (no mediation).
@@ -467,17 +439,15 @@ impl AuctionOrchestrator {
     ) -> Result<OrchestrationResult, Report<TrustedServerError>> {
         let provider_responses = self.run_providers_parallel(request, context).await?;
         let floor_prices = self.floor_prices_by_slot(request);
-        let (winning_bids, winning_bid_origins) =
-            self.select_winning_bids(&provider_responses, &floor_prices);
+        let winning_bids = self.select_winning_bids(&provider_responses, &floor_prices);
 
-        Ok(self.finalize_result(
-            context.trace,
+        Ok(OrchestrationResult {
             provider_responses,
-            None,
+            mediator_response: None,
             winning_bids,
-            winning_bid_origins,
-            0,
-        ))
+            total_time_ms: 0,
+            metadata: HashMap::new(),
+        })
     }
 
     /// Run all providers in parallel and collect responses.
@@ -593,7 +563,6 @@ impl AuctionOrchestrator {
             }
 
             let provider_context = AuctionContext {
-                trace: context.trace,
                 settings: context.settings,
                 request: context.request,
                 timeout_ms: effective_timeout,
@@ -738,7 +707,6 @@ impl AuctionOrchestrator {
                     {
                         let response_time_ms = start_time.elapsed().as_millis() as u64;
                         let provider_context = AuctionContext {
-                            trace: context.trace,
                             settings: context.settings,
                             request: context.request,
                             timeout_ms: effective_timeout,
@@ -840,24 +808,20 @@ impl AuctionOrchestrator {
         Ok(responses)
     }
 
-    /// Select the best decoded-price bid for each slot while retaining its exact origin.
-    ///
-    /// Bids with no decoded price (for example, encoded APS bids) are skipped when
-    /// no mediator is configured because they cannot be compared.
+    /// Select the best decoded-price bid for each slot from all responses.
     fn select_winning_bids(
         &self,
         responses: &[AuctionResponse],
         floor_prices: &HashMap<String, f64>,
-    ) -> (HashMap<String, Bid>, HashMap<String, WinningBidOrigin>) {
+    ) -> HashMap<String, Bid> {
         let mut winning_bids: HashMap<String, Bid> = HashMap::new();
-        let mut origins = HashMap::new();
 
-        for (response_index, response) in responses.iter().enumerate() {
+        for response in responses {
             if response.status != BidStatus::Success {
                 continue;
             }
 
-            for (bid_index, bid) in response.bids.iter().enumerate() {
+            for bid in &response.bids {
                 let bid_price = match bid.price {
                     Some(p) => p,
                     None => {
@@ -878,91 +842,12 @@ impl AuctionOrchestrator {
                 };
 
                 if should_replace {
-                    origins.insert(
-                        bid.slot_id.clone(),
-                        WinningBidOrigin {
-                            response_index,
-                            bid_index,
-                            mediated: false,
-                        },
-                    );
                     winning_bids.insert(bid.slot_id.clone(), bid.clone());
                 }
             }
         }
 
-        let winning_bids = self.apply_floor_prices(winning_bids, floor_prices);
-        origins.retain(|slot_id, _| winning_bids.contains_key(slot_id));
-        (winning_bids, origins)
-    }
-
-    fn select_mediator_winning_bids(
-        &self,
-        response: &AuctionResponse,
-        floor_prices: &HashMap<String, f64>,
-    ) -> (HashMap<String, Bid>, HashMap<String, WinningBidOrigin>) {
-        let mut winning_bids = HashMap::new();
-        let mut origins = HashMap::new();
-        for (bid_index, bid) in response.bids.iter().enumerate() {
-            if bid.price.is_none() {
-                log::warn!(
-                    "Mediator '{}' returned bid for slot '{}' without decoded price - skipping",
-                    response.provider,
-                    bid.slot_id
-                );
-                continue;
-            }
-            origins.insert(
-                bid.slot_id.clone(),
-                WinningBidOrigin {
-                    response_index: 0,
-                    bid_index,
-                    mediated: true,
-                },
-            );
-            winning_bids.insert(bid.slot_id.clone(), bid.clone());
-        }
-        let winning_bids = self.apply_floor_prices(winning_bids, floor_prices);
-        origins.retain(|slot_id, _| winning_bids.contains_key(slot_id));
-        (winning_bids, origins)
-    }
-
-    fn finalize_result(
-        &self,
-        trace: &AuctionTraceContext,
-        provider_responses: Vec<AuctionResponse>,
-        mediator_response: Option<AuctionResponse>,
-        winning_bids: HashMap<String, Bid>,
-        winning_bid_origins: HashMap<String, WinningBidOrigin>,
-        total_time_ms: u64,
-    ) -> OrchestrationResult {
-        let outcome = if winning_bids.is_empty() {
-            AuctionPublicOutcome::NoBid
-        } else {
-            AuctionPublicOutcome::Completed
-        };
-        let trace_bids = build_winning_bid_traces(
-            &winning_bids,
-            &winning_bid_origins,
-            &provider_responses,
-            mediator_response.as_ref(),
-            BidTraceId::new,
-        );
-        OrchestrationResult {
-            trace: AuctionResultTrace {
-                summary: AuctionTraceSummary {
-                    auction: trace.clone(),
-                    outcome,
-                },
-                winning_bids: trace_bids,
-            },
-            winning_bid_origins,
-            provider_responses,
-            mediator_response,
-            winning_bids,
-            total_time_ms,
-            metadata: HashMap::new(),
-        }
+        self.apply_floor_prices(winning_bids, floor_prices)
     }
 
     fn apply_floor_prices(
@@ -1146,7 +1031,6 @@ impl AuctionOrchestrator {
             }
 
             let provider_context = AuctionContext {
-                trace: context.trace,
                 settings: context.settings,
                 request: context.request,
                 timeout_ms: effective_timeout,
@@ -1243,7 +1127,6 @@ impl AuctionOrchestrator {
         );
 
         DispatchAuctionOutcome::Dispatched(DispatchedAuction {
-            trace: context.trace.clone(),
             pending_requests,
             backend_to_provider,
             launch_responses,
@@ -1272,7 +1155,6 @@ impl AuctionOrchestrator {
         context: &AuctionContext<'_>,
     ) -> OrchestrationResult {
         let DispatchedAuction {
-            trace,
             pending_requests,
             mut backend_to_provider,
             launch_responses,
@@ -1324,7 +1206,6 @@ impl AuctionOrchestrator {
                     {
                         let response_time_ms = start_time.elapsed().as_millis() as u64;
                         let provider_context = AuctionContext {
-                            trace: context.trace,
                             settings: context.settings,
                             request: &provider_request_context,
                             timeout_ms: effective_timeout,
@@ -1418,7 +1299,7 @@ impl AuctionOrchestrator {
         }
         backend_to_provider.clear();
 
-        let (mediator_response, selection) = if let Some(mediator_name) = &self.config.mediator {
+        let (mediator_response, winning_bids) = if let Some(mediator_name) = &self.config.mediator {
             match self.providers.get(mediator_name.as_str()) {
                 Some(mediator) => {
                     // Cap the mediator at whichever is tighter: its own configured
@@ -1449,16 +1330,14 @@ impl AuctionOrchestrator {
                             mediator.provider_name(),
                             responses.len(),
                         );
-                        let (winning_bids, winning_bid_origins) =
-                            self.select_winning_bids(&responses, &floor_prices);
-                        return self.finalize_result(
-                            &trace,
-                            responses,
-                            None,
-                            winning_bids,
-                            winning_bid_origins,
-                            auction_start.elapsed().as_millis() as u64,
-                        );
+                        let winning = self.select_winning_bids(&responses, &floor_prices);
+                        return OrchestrationResult {
+                            provider_responses: responses,
+                            mediator_response: None,
+                            winning_bids: winning,
+                            total_time_ms: auction_start.elapsed().as_millis() as u64,
+                            metadata: HashMap::new(),
+                        };
                     }
                     let mediator_start = Instant::now();
                     log::info!(
@@ -1479,7 +1358,6 @@ impl AuctionOrchestrator {
                         .body(edgezero_core::body::Body::empty())
                         .unwrap_or_else(|_| http::Request::new(edgezero_core::body::Body::empty()));
                     let mediator_context = AuctionContext {
-                        trace: &trace,
                         settings: context.settings,
                         request: &placeholder,
                         timeout_ms: mediator_timeout,
@@ -1511,11 +1389,25 @@ impl AuctionOrchestrator {
                                         .await
                                     {
                                         Ok(mediator_resp) => {
-                                            let selection = self.select_mediator_winning_bids(
-                                                &mediator_resp,
-                                                &floor_prices,
-                                            );
-                                            (Some(mediator_resp), selection)
+                                            let winning = mediator_resp
+                                                .bids
+                                                .iter()
+                                                .filter_map(|bid| {
+                                                    if bid.price.is_none() {
+                                                        log::warn!(
+                                                            "Mediator '{}' returned bid for slot '{}' without decoded price - skipping",
+                                                            mediator.provider_name(),
+                                                            bid.slot_id
+                                                        );
+                                                        None
+                                                    } else {
+                                                        Some((bid.slot_id.clone(), bid.clone()))
+                                                    }
+                                                })
+                                                .collect();
+                                            let winning =
+                                                self.apply_floor_prices(winning, &floor_prices);
+                                            (Some(mediator_resp), winning)
                                         }
                                         Err(e) => {
                                             log::warn!(
@@ -1556,15 +1448,13 @@ impl AuctionOrchestrator {
             (None, self.select_winning_bids(&responses, &floor_prices))
         };
 
-        let (winning_bids, winning_bid_origins) = selection;
-        self.finalize_result(
-            &trace,
-            responses,
+        OrchestrationResult {
+            provider_responses: responses,
             mediator_response,
             winning_bids,
-            winning_bid_origins,
-            auction_start.elapsed().as_millis() as u64,
-        )
+            total_time_ms: auction_start.elapsed().as_millis() as u64,
+            metadata: HashMap::new(),
+        }
     }
 
     /// Check if orchestrator is enabled.
@@ -1577,10 +1467,6 @@ impl AuctionOrchestrator {
 /// Result of an orchestrated auction.
 #[derive(Debug, Clone)]
 pub struct OrchestrationResult {
-    /// Privacy-safe tester trace for this finalized result.
-    pub trace: AuctionResultTrace,
-    /// Exact internal origin of each final winning bid.
-    pub(crate) winning_bid_origins: HashMap<String, WinningBidOrigin>,
     /// All responses from providers
     pub provider_responses: Vec<AuctionResponse>,
     /// Final response from mediator (if used)
@@ -1594,32 +1480,6 @@ pub struct OrchestrationResult {
 }
 
 impl OrchestrationResult {
-    /// Build a no-bid result for a terminal path that already returns a response.
-    #[must_use]
-    pub fn empty(trace: AuctionTraceContext, outcome: AuctionPublicOutcome) -> Self {
-        Self {
-            trace: AuctionResultTrace {
-                summary: AuctionTraceSummary {
-                    auction: trace,
-                    outcome,
-                },
-                winning_bids: HashMap::new(),
-            },
-            winning_bid_origins: HashMap::new(),
-            provider_responses: Vec::new(),
-            mediator_response: None,
-            winning_bids: HashMap::new(),
-            total_time_ms: 0,
-            metadata: HashMap::new(),
-        }
-    }
-
-    /// Return the exact provider/bid location for a final winning slot.
-    #[must_use]
-    pub(crate) fn winning_origin(&self, slot_id: &str) -> Option<WinningBidOrigin> {
-        self.winning_bid_origins.get(slot_id).copied()
-    }
-
     /// Get the winning bid for a specific slot.
     #[must_use]
     pub fn get_winning_bid(&self, slot_id: &str) -> Option<&Bid> {
@@ -1654,8 +1514,7 @@ mod tests {
     use crate::auction::test_support::create_test_auction_context;
     use crate::auction::types::{
         AdFormat, AdSlot, ApsRendererV1, ApsTagType, AuctionContext, AuctionRequest,
-        AuctionResponse, Bid, BidRenderer, BidStatus, BidTraceId, MediaType, PublisherInfo,
-        UserInfo, WinningBidOrigin,
+        AuctionResponse, Bid, BidRenderer, BidStatus, MediaType, PublisherInfo, UserInfo,
     };
     use crate::error::TrustedServerError;
     use crate::platform::test_support::{
@@ -1671,7 +1530,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
 
-    use super::{AuctionOrchestrator, build_winning_bid_traces};
+    use super::AuctionOrchestrator;
 
     // ---------------------------------------------------------------------------
     // Minimal test double for AuctionProvider
@@ -1934,62 +1793,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn mediated_selection_retains_the_mediator_response_origin() {
-        let orchestrator = AuctionOrchestrator::new(AuctionConfig::default());
-        let selected = mediated_bid(None);
-        let mediator_response = AuctionResponse::success("mediator", vec![selected], 1);
-
-        let (_, origins) =
-            orchestrator.select_mediator_winning_bids(&mediator_response, &HashMap::new());
-
-        let origin = origins["header-banner"];
-        assert!(
-            origin.mediated,
-            "mediated selection should retain mediator origin"
-        );
-        assert_eq!(
-            origin.bid_index, 0,
-            "should retain exact mediator bid index"
-        );
-    }
-
-    #[test]
-    fn winning_trace_builder_uses_supplied_id_source_only_for_final_winners() {
-        let mut winner = mediated_bid(None);
-        winner.bidder = "example-bidder".to_owned();
-        let provider_responses = vec![AuctionResponse::success(
-            "provider-a",
-            vec![winner.clone()],
-            1,
-        )];
-        let winning_bids = HashMap::from([("header-banner".to_owned(), winner)]);
-        let origins = HashMap::from([(
-            "header-banner".to_owned(),
-            WinningBidOrigin {
-                response_index: 0,
-                bid_index: 0,
-                mediated: false,
-            },
-        )]);
-        let fixed = uuid::Uuid::parse_str("650e8400-e29b-41d4-a716-446655440000")
-            .expect("should parse fixed UUID");
-        let mut calls = 0;
-
-        let traces =
-            build_winning_bid_traces(&winning_bids, &origins, &provider_responses, None, || {
-                calls += 1;
-                BidTraceId::from_uuid(fixed)
-            });
-
-        assert_eq!(calls, 1, "should allocate one ID for one final winner");
-        assert_eq!(
-            traces["header-banner"].bid_trace_id.to_string(),
-            fixed.to_string(),
-            "should use the supplied deterministic ID"
-        );
-    }
-
     #[async_trait::async_trait(?Send)]
     impl AuctionProvider for CacheRestoringMediator {
         fn provider_name(&self) -> &'static str {
@@ -2091,7 +1894,6 @@ mod tests {
             .body(edgezero_core::body::Body::empty())
             .expect("should build request");
         let context = AuctionContext {
-            trace: crate::auction::test_support::test_trace(),
             settings: &settings,
             request: &req,
             timeout_ms: 2000,
@@ -2634,7 +2436,6 @@ mod tests {
                 .body(edgezero_core::body::Body::empty())
                 .expect("should build request");
             let context = AuctionContext {
-                trace: crate::auction::test_support::test_trace(),
                 settings: &settings,
                 request: &req,
                 timeout_ms: 2000,
@@ -2713,7 +2514,6 @@ mod tests {
                 .body(edgezero_core::body::Body::empty())
                 .expect("should build request");
             let context = AuctionContext {
-                trace: crate::auction::test_support::test_trace(),
                 settings: &settings,
                 request: &req,
                 timeout_ms: 2000,
@@ -2775,7 +2575,6 @@ mod tests {
                 .body(edgezero_core::body::Body::empty())
                 .expect("should build request");
             let context = AuctionContext {
-                trace: crate::auction::test_support::test_trace(),
                 settings: &settings,
                 request: &req,
                 timeout_ms: 2000,
@@ -2858,7 +2657,6 @@ mod tests {
                 .body(edgezero_core::body::Body::empty())
                 .expect("should build request");
             let context = AuctionContext {
-                trace: crate::auction::test_support::test_trace(),
                 settings: &settings,
                 request: &req,
                 timeout_ms: 2000,
@@ -2956,7 +2754,6 @@ mod tests {
                 .body(edgezero_core::body::Body::empty())
                 .expect("should build request");
             let context = AuctionContext {
-                trace: crate::auction::test_support::test_trace(),
                 settings: &settings,
                 request: &req,
                 timeout_ms: 2000,
@@ -3034,7 +2831,6 @@ mod tests {
                 .body(edgezero_core::body::Body::empty())
                 .expect("should build request");
             let context = AuctionContext {
-                trace: crate::auction::test_support::test_trace(),
                 settings: &settings,
                 request: &req,
                 timeout_ms: 2000,
@@ -3095,7 +2891,6 @@ mod tests {
                 .body(edgezero_core::body::Body::empty())
                 .expect("should build request");
             let context = AuctionContext {
-                trace: crate::auction::test_support::test_trace(),
                 settings: &settings,
                 request: &req,
                 timeout_ms: 2000,
@@ -3162,7 +2957,6 @@ mod tests {
                 .body(edgezero_core::body::Body::empty())
                 .expect("should build request");
             let context = AuctionContext {
-                trace: crate::auction::test_support::test_trace(),
                 settings: &settings,
                 request: &req,
                 timeout_ms: 2000,
@@ -3236,7 +3030,6 @@ mod tests {
                 .body(edgezero_core::body::Body::empty())
                 .expect("should build request");
             let context = AuctionContext {
-                trace: crate::auction::test_support::test_trace(),
                 settings: &settings,
                 request: &req,
                 timeout_ms: 2000,
@@ -3306,7 +3099,6 @@ mod tests {
                 .body(edgezero_core::body::Body::empty())
                 .expect("should build downstream request");
             let dispatch_context = AuctionContext {
-                trace: crate::auction::test_support::test_trace(),
                 settings: &settings,
                 request: &downstream,
                 timeout_ms: 750,
@@ -3325,7 +3117,6 @@ mod tests {
                 .body(edgezero_core::body::Body::empty())
                 .expect("should build placeholder request");
             let collect_context = AuctionContext {
-                trace: crate::auction::test_support::test_trace(),
                 settings: &settings,
                 request: &placeholder,
                 timeout_ms: 750,
@@ -3391,7 +3182,6 @@ mod tests {
                 .body(edgezero_core::body::Body::empty())
                 .expect("should build request");
             let context = AuctionContext {
-                trace: crate::auction::test_support::test_trace(),
                 settings: &settings,
                 request: &req,
                 timeout_ms: 2000,
@@ -3457,7 +3247,6 @@ mod tests {
                 .body(edgezero_core::body::Body::empty())
                 .expect("should build request");
             let context = AuctionContext {
-                trace: crate::auction::test_support::test_trace(),
                 settings: &settings,
                 request: &req,
                 timeout_ms: 2000,
@@ -3486,7 +3275,7 @@ mod tests {
         let floor_prices = HashMap::new();
         let response = |provider: &str, bid: Bid| AuctionResponse::success(provider, vec![bid], 1);
 
-        let (aps_wins, _) = orchestrator.select_winning_bids(
+        let aps_wins = orchestrator.select_winning_bids(
             &[
                 response("aps", auction_bid("aps", 2.0)),
                 response("ordinary", auction_bid("ordinary", 1.0)),
@@ -3498,7 +3287,7 @@ mod tests {
         assert!(winner.renderer.is_some());
         assert!(winner.creative.is_none());
 
-        let (ordinary_wins, _) = orchestrator.select_winning_bids(
+        let ordinary_wins = orchestrator.select_winning_bids(
             &[
                 response("aps", auction_bid("aps", 2.0)),
                 response("ordinary", auction_bid("ordinary", 3.0)),

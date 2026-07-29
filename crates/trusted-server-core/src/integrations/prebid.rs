@@ -2852,7 +2852,6 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
         let context = AuctionContext {
-            trace: crate::auction::test_support::test_trace(),
             settings: &settings,
             request: &http_req,
             timeout_ms: 500,
@@ -2896,7 +2895,6 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
         let context = AuctionContext {
-            trace: crate::auction::test_support::test_trace(),
             settings: &settings,
             request: &http_req,
             timeout_ms: 500,
@@ -2917,11 +2915,6 @@ mod tests {
         assert_eq!(
             request_host, auction_request.publisher.domain,
             "request_host should be the publisher domain, not the edge Host header"
-        );
-        assert!(
-            !String::from_utf8_lossy(&bodies[0])
-                .contains(&context.trace.auction_trace_id.to_string()),
-            "internal trace UUID should never be serialized upstream"
         );
     }
 
@@ -5683,14 +5676,13 @@ external_bundle_sri = "sha384-AAAA"
             prebid_platform_response(StatusCode::BAD_REQUEST, Some("application/json"), body);
         let provider_response = futures::executor::block_on(provider.parse_response(response, 42))
             .expect("should classify upstream HTTP error");
-        let mut result = OrchestrationResult::empty(
-            crate::auction::types::AuctionTraceContext::new(
-                crate::auction::types::AuctionSource::AuctionApi,
-            ),
-            crate::auction::types::AuctionPublicOutcome::NoBid,
-        );
-        result.provider_responses = vec![provider_response];
-        result.total_time_ms = 42;
+        let result = OrchestrationResult {
+            provider_responses: vec![provider_response],
+            mediator_response: None,
+            winning_bids: HashMap::new(),
+            total_time_ms: 42,
+            metadata: HashMap::new(),
+        };
         let response = convert_to_openrtb_response(
             &result,
             &make_settings(),
@@ -5807,7 +5799,6 @@ external_bundle_sri = "sha384-AAAA"
             .expect("should build request");
         let services = noop_services();
         let context = AuctionContext {
-            trace: crate::auction::test_support::test_trace(),
             settings: &settings,
             request: &http_req,
             timeout_ms: 1000,

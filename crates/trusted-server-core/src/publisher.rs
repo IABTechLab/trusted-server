@@ -38,7 +38,7 @@ use crate::auction::endpoints::{
     merge_auction_eids, resolve_auction_eids, resolve_client_auction_eids,
 };
 use crate::auction::orchestrator::{
-    AuctionOrchestrator, DispatchAuctionOutcome, DispatchedAuction, OrchestrationResult,
+    AuctionOrchestrator, DispatchAuctionOutcome, DispatchedAuction,
 };
 use crate::auction::telemetry::{
     AuctionObservationContext, AuctionSource, AuctionTerminalOutcome, build_auction_events,
@@ -349,7 +349,6 @@ struct ProcessResponseParams<'a> {
     settings: &'a Settings,
     content_type: &'a str,
     integration_registry: &'a IntegrationRegistry,
-    head_bootstrap_script: Option<&'a str>,
     ad_slots_script: Option<&'a str>,
     ad_bids_state: &'a Arc<Mutex<Option<String>>>,
 }
@@ -374,14 +373,8 @@ impl PublisherBodyProcessor {
                 &params.request_scheme,
                 settings,
                 integration_registry,
-                HtmlAdState {
-                    head_bootstrap_script: params
-                        .head_bootstrap_script
-                        .as_deref()
-                        .map(str::to_string),
-                    ad_slots_script: params.ad_slots_script.as_deref().map(str::to_string),
-                    ad_bids_state: Arc::clone(&params.ad_bids_state),
-                },
+                params.ad_slots_script.as_deref().map(str::to_string),
+                Arc::clone(&params.ad_bids_state),
             )?)
         } else if is_rsc_flight {
             Box::new(RscFlightUrlRewriter::new(
@@ -456,11 +449,8 @@ fn process_response_streaming<W: Write>(
             params.request_scheme,
             params.settings,
             params.integration_registry,
-            HtmlAdState {
-                head_bootstrap_script: params.head_bootstrap_script.map(str::to_string),
-                ad_slots_script: params.ad_slots_script.map(str::to_string),
-                ad_bids_state: params.ad_bids_state.clone(),
-            },
+            params.ad_slots_script.map(str::to_string),
+            params.ad_bids_state.clone(),
         )?;
         StreamingPipeline::new(config, processor)
             .with_max_pending_decoded_bytes(max_pending_decoded_bytes)
@@ -936,19 +926,14 @@ async fn hold_finish_tail_segments<P: StreamProcessor>(
 /// `use<>` states that explicitly: without it, Rust 2024 would have the opaque
 /// type capture every input lifetime, forcing callers to keep the settings and
 /// registry alive for as long as the processor.
-struct HtmlAdState {
-    head_bootstrap_script: Option<String>,
-    ad_slots_script: Option<String>,
-    ad_bids_state: Arc<Mutex<Option<String>>>,
-}
-
 fn create_html_stream_processor(
     origin_host: &str,
     request_host: &str,
     request_scheme: &str,
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
-    ad_state: HtmlAdState,
+    ad_slots_script: Option<String>,
+    ad_bids_state: Arc<Mutex<Option<String>>>,
 ) -> Result<impl StreamProcessor + use<>, Report<TrustedServerError>> {
     use crate::html_processor::{HtmlProcessorConfig, create_html_processor};
 
@@ -959,11 +944,7 @@ fn create_html_stream_processor(
         request_host,
         request_scheme,
     )
-    .with_ad_state(
-        ad_state.head_bootstrap_script,
-        ad_state.ad_slots_script,
-        ad_state.ad_bids_state,
-    );
+    .with_ad_state(ad_slots_script, ad_bids_state);
 
     Ok(create_html_processor(config))
 }
@@ -1072,7 +1053,6 @@ pub struct OwnedProcessResponseParams {
     pub(crate) request_host: String,
     pub(crate) request_scheme: String,
     pub(crate) content_type: String,
-    pub(crate) head_bootstrap_script: Option<String>,
     pub(crate) ad_slots_script: Option<String>,
     pub(crate) ad_bids_state: Arc<Mutex<Option<String>>>,
     /// Observation context for the in-flight auction.
@@ -1085,8 +1065,6 @@ pub struct OwnedProcessResponseParams {
     pub(crate) dispatched_auction: Option<DispatchedAuction>,
     /// Price granularity used to bucket bids when building `tsjs.bids`.
     pub(crate) price_granularity: PriceGranularity,
-    /// Whether the config and exact tester cookie permit browser trace output.
-    pub(crate) ad_trace_enabled: bool,
 }
 
 /// Buffers a [`PublisherResponse`] into a single [`Response`], collecting the
@@ -1330,7 +1308,6 @@ pub async fn publisher_response_into_streaming_response(
                             &params.request_scheme,
                             &params.request_host,
                         ),
-                        trace_enabled: params.ad_trace_enabled,
                     };
 
                     while let Some(step) = hold_step_next_chunk(
@@ -1549,7 +1526,6 @@ pub fn stream_publisher_body<W: Write>(
         settings,
         content_type: &params.content_type,
         integration_registry,
-        head_bootstrap_script: params.head_bootstrap_script.as_deref(),
         ad_slots_script: params.ad_slots_script.as_deref(),
         ad_bids_state: &params.ad_bids_state,
     };
@@ -1642,11 +1618,8 @@ pub async fn stream_publisher_body_async<W: Write>(
         &params.request_scheme,
         settings,
         integration_registry,
-        HtmlAdState {
-            head_bootstrap_script: params.head_bootstrap_script.as_deref().map(str::to_string),
-            ad_slots_script: params.ad_slots_script.as_deref().map(str::to_string),
-            ad_bids_state: params.ad_bids_state.clone(),
-        },
+        params.ad_slots_script.as_deref().map(str::to_string),
+        params.ad_bids_state.clone(),
     ) {
         Ok(processor) => processor,
         Err(err) => {
@@ -1677,7 +1650,6 @@ pub async fn stream_publisher_body_async<W: Write>(
                 services,
                 settings,
                 request_origin: request_origin(&params.request_scheme, &params.request_host),
-                trace_enabled: params.ad_trace_enabled,
             },
         },
     )
@@ -1707,7 +1679,6 @@ fn mediator_placeholder_request() -> Request<EdgeBody> {
 /// this argument is plumbing for the (presently unused) case where the
 /// orchestrator needs the caller's request shape.
 fn make_collect_context<'a>(
-    trace: &'a crate::auction::types::AuctionTraceContext,
     settings: &'a Settings,
     services: &'a RuntimeServices,
     placeholder: &'a Request<EdgeBody>,
@@ -1719,7 +1690,6 @@ fn make_collect_context<'a>(
          callers must not forward a real client request through the collect path"
     );
     AuctionContext {
-        trace,
         settings,
         request: placeholder,
         timeout_ms: 0,
@@ -1797,36 +1767,26 @@ fn request_origin(scheme: &str, host: &str) -> String {
 
 /// Write winning bids from an auction result into the shared `ad_bids_state` lock.
 pub(crate) fn write_bids_to_state(
-    result: &crate::auction::orchestrator::OrchestrationResult,
+    winning_bids: &std::collections::HashMap<String, Bid>,
     price_granularity: PriceGranularity,
     ad_bids_state: &Arc<Mutex<Option<String>>>,
     settings: &Settings,
     request_origin: &str,
     include_debug_bid: bool,
-    trace_enabled: bool,
 ) {
     log::debug!(
         "write_bids_to_state: {} winning bid(s): [{}]",
-        result.winning_bids.len(),
-        result
-            .winning_bids
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ")
+        winning_bids.len(),
+        winning_bids.keys().cloned().collect::<Vec<_>>().join(", ")
     );
-    let bid_map = build_bid_map_with_trace(
-        result,
+    let bid_map = build_bid_map(
+        winning_bids,
         price_granularity,
         settings,
         request_origin,
         include_debug_bid,
-        trace_enabled,
     );
-    let bids_script = build_bids_script_with_trace(
-        &bid_map,
-        trace_enabled.then(|| auction_trace_json(&result.trace.summary)),
-    );
+    let bids_script = build_bids_script(&bid_map);
     *ad_bids_state.lock().expect("should lock bid state") = Some(bids_script);
 }
 
@@ -2046,7 +2006,6 @@ struct AuctionCollectDeps<'a> {
     settings: &'a Settings,
     /// Trusted request origin (`scheme://host`) for absolute inline creative URLs.
     request_origin: String,
-    trace_enabled: bool,
 }
 
 /// Run the close-body hold loop for HTML bodies, collecting the auction before
@@ -2414,12 +2373,11 @@ async fn collect_non_html_auction(
     settings: &Settings,
 ) {
     let placeholder = mediator_placeholder_request();
-    let trace = dispatched.trace().clone();
     let result = orchestrator
         .collect_dispatched_auction(
             dispatched,
             services,
-            &make_collect_context(&trace, settings, services, &placeholder),
+            &make_collect_context(settings, services, &placeholder),
         )
         .await;
     if let (Some(observation), Some(auction_request)) =
@@ -2437,13 +2395,12 @@ async fn collect_non_html_auction(
         .await;
     }
     write_bids_to_state(
-        &result,
+        &result.winning_bids,
         params.price_granularity,
         &params.ad_bids_state,
         settings,
         &request_origin(&params.request_scheme, &params.request_host),
         settings.debug.inject_adm_for_testing,
-        params.ad_trace_enabled,
     );
 }
 
@@ -2462,12 +2419,10 @@ async fn collect_stream_auction(
         services,
         settings,
         request_origin,
-        trace_enabled,
     } = deps;
     log::info!("body_close_hold_loop: collecting dispatched auction before held body tail");
     let placeholder = mediator_placeholder_request();
-    let trace = dispatched.trace().clone();
-    let collect_ctx = make_collect_context(&trace, settings, services, &placeholder);
+    let collect_ctx = make_collect_context(settings, services, &placeholder);
     let result = orchestrator
         .collect_dispatched_auction(dispatched, services, &collect_ctx)
         .await;
@@ -2490,13 +2445,12 @@ async fn collect_stream_auction(
         result.winning_bids.len()
     );
     write_bids_to_state(
-        &result,
+        &result.winning_bids,
         *price_granularity,
         ad_bids_state,
         settings,
         request_origin,
         settings.debug.inject_adm_for_testing,
-        *trace_enabled,
     );
 
     if settings.debug.auction_html_comment {
@@ -2601,9 +2555,6 @@ pub async fn handle_publisher_request(
     );
 
     let consent_context = ec_context.consent().clone();
-    let ad_trace_decision = crate::integrations::ad_trace::request_decision(&req);
-    let ad_trace_enabled = ad_trace_decision.enabled();
-    let ad_trace_bootstrap = ad_trace_decision.bootstrap_script();
     let ec_id = ec_context.ec_value().filter(|_| ec_allowed);
     let cookie_jar = handle_request_cookies(&req)?;
     let geo = ec_context.geo_info().cloned();
@@ -2722,15 +2673,13 @@ pub async fn handle_publisher_request(
     let mut dispatched_auction = if matched_slots.is_empty() {
         None
     } else {
-        let trace =
-            crate::auction::types::AuctionTraceContext::new(AuctionSource::InitialNavigation);
         // Telemetry attribution must use the same publisher identity as the
         // outbound bid request. On the navigation path `request_host` is the
         // trusted-server edge host, so using it here would attribute navigation
         // rows to the edge/staging domain while `/auction` rows (built from
         // `AuctionRequest::publisher.domain`) use the configured domain.
         let observation = AuctionObservationContext::from_parts(
-            &trace,
+            AuctionSource::InitialNavigation,
             &settings.publisher.domain,
             &request_path,
             matched_slots.len(),
@@ -2766,7 +2715,6 @@ pub async fn handle_publisher_request(
                 },
             );
             let auction_context = AuctionContext {
-                trace: &trace,
                 settings,
                 request: &req,
                 timeout_ms: auction_timeout_ms,
@@ -2788,21 +2736,6 @@ pub async fn handle_publisher_request(
                     provider_responses,
                     elapsed_ms,
                 } => {
-                    if ad_trace_enabled {
-                        let terminal = OrchestrationResult::empty(
-                            trace.clone(),
-                            crate::auction::types::AuctionPublicOutcome::Failed,
-                        );
-                        write_bids_to_state(
-                            &terminal,
-                            price_granularity,
-                            &ad_bids_state,
-                            settings,
-                            &request_origin(request_scheme, request_host),
-                            settings.debug.inject_adm_for_testing,
-                            true,
-                        );
-                    }
                     emit_auction_events_best_effort_lazy(services, || {
                         build_auction_events(
                             observation,
@@ -2818,21 +2751,6 @@ pub async fn handle_publisher_request(
                     None
                 }
                 DispatchAuctionOutcome::NotStarted => {
-                    if ad_trace_enabled {
-                        let terminal = OrchestrationResult::empty(
-                            trace.clone(),
-                            crate::auction::types::AuctionPublicOutcome::Failed,
-                        );
-                        write_bids_to_state(
-                            &terminal,
-                            price_granularity,
-                            &ad_bids_state,
-                            settings,
-                            &request_origin(request_scheme, request_host),
-                            settings.debug.inject_adm_for_testing,
-                            true,
-                        );
-                    }
                     let elapsed_ms = observation.elapsed_ms();
                     emit_auction_events_best_effort_lazy(services, || {
                         build_auction_events(
@@ -3109,14 +3027,12 @@ pub async fn handle_publisher_request(
                     request_host: request_host.to_string(),
                     request_scheme: request_scheme.to_string(),
                     content_type,
-                    head_bootstrap_script: ad_trace_bootstrap.clone(),
                     ad_slots_script: ad_slots_script.clone(),
                     ad_bids_state: ad_bids_state.clone(),
                     auction_observation,
                     auction_request: auction_request_for_telemetry,
                     dispatched_auction,
                     price_granularity,
-                    ad_trace_enabled,
                 }),
             })
         }
@@ -3438,80 +3354,14 @@ pub(crate) fn build_bid_map(
         .collect()
 }
 
-fn auction_trace_json(summary: &crate::auction::types::AuctionTraceSummary) -> serde_json::Value {
-    serde_json::json!({
-        "version": 1,
-        "auctionTraceId": summary.auction.auction_trace_id.to_string(),
-        "source": summary.auction.source.as_str(),
-        "outcome": summary.outcome.as_str(),
-    })
-}
-
-fn apply_bid_traces(
-    bid_map: &mut serde_json::Map<String, serde_json::Value>,
-    result_trace: &crate::auction::types::AuctionResultTrace,
-) {
-    for (slot_id, trace) in &result_trace.winning_bids {
-        if let Some(serde_json::Value::Object(bid)) = bid_map.get_mut(slot_id) {
-            bid.insert(
-                "trace".to_owned(),
-                serde_json::json!({
-                    "version": 1,
-                    "auctionTraceId": result_trace.summary.auction.auction_trace_id.to_string(),
-                    "bidTraceId": trace.bid_trace_id.to_string(),
-                    "source": result_trace.summary.auction.source.as_str(),
-                    "slotId": slot_id,
-                    "provider": trace.provider,
-                    "bidder": trace.bidder,
-                }),
-            );
-        }
-    }
-}
-
-fn build_bid_map_with_trace(
-    result: &crate::auction::orchestrator::OrchestrationResult,
-    granularity: crate::price_bucket::PriceGranularity,
-    settings: &Settings,
-    request_origin: &str,
-    include_debug_bid: bool,
-    trace_enabled: bool,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut bid_map = build_bid_map(
-        &result.winning_bids,
-        granularity,
-        settings,
-        request_origin,
-        include_debug_bid,
-    );
-    if !trace_enabled {
-        return bid_map;
-    }
-    apply_bid_traces(&mut bid_map, &result.trace);
-    bid_map
-}
-
 /// Build the `tsjs.bids` `<script>` tag from a bucketed bid map.
 ///
 /// The JSON is embedded via `JSON.parse(…)` so the browser parser never sees
 /// raw `</script>` sequences inside the string.
 pub(crate) fn build_bids_script(bid_map: &serde_json::Map<String, serde_json::Value>) -> String {
-    build_bids_script_with_trace(bid_map, None)
-}
-
-fn build_bids_script_with_trace(
-    bid_map: &serde_json::Map<String, serde_json::Value>,
-    auction_trace: Option<serde_json::Value>,
-) -> String {
     let json = serde_json::to_string(bid_map)
         .expect("serde_json::to_string of Map<String,Value> should be infallible");
     let escaped = html_escape_for_script(&json);
-    let trace_assignment = auction_trace.map_or_else(String::new, |trace| {
-        let trace_json = serde_json::to_string(&trace)
-            .expect("serde_json::to_string of trace should be infallible");
-        let escaped_trace = html_escape_for_script(&trace_json);
-        format!("window.tsjs.auctionTrace=JSON.parse(\"{escaped_trace}\");")
-    });
     // adInit() defines GPT slots on the publisher's `-container` wrappers, which
     // mutates those ad-slot subtrees. Calling it synchronously here (this script
     // runs at body-parse time) lands those mutations inside React's hydration
@@ -3526,8 +3376,7 @@ fn build_bids_script_with_trace(
     // inline script runs; when the GPT integration is disabled the scheduler is
     // absent — but so is `adInit`, so there is nothing to schedule.
     format!(
-        "<script>window.tsjs=window.tsjs||{{}};\
-{trace_assignment}window.tsjs.bids=JSON.parse(\"{escaped}\");\
+        "<script>(window.tsjs=window.tsjs||{{}}).bids=JSON.parse(\"{escaped}\");\
 (function(){{\
 var s=window.tsjs.scheduleInitialAdInit;\
 if(typeof s===\"function\")s();\
@@ -3776,7 +3625,6 @@ pub async fn handle_page_bids(
         );
         return Ok(page_bids_preflight_denied());
     }
-    let trace_enabled = crate::integrations::ad_trace::browser_trace_enabled(&req);
 
     // Deprecation signal for the transition alias. Logged only after the
     // cross-site gate passes, so the count reflects genuine SPA clients still
@@ -3854,21 +3702,13 @@ pub async fn handle_page_bids(
     // skip the live auction, matching the existing bot/prefetch behaviour.
     let ad_stack_enabled = auction_enabled && consent_allows_auction;
 
-    let trace = crate::auction::types::AuctionTraceContext::new(AuctionSource::SpaNavigation);
-    let mut result_trace = crate::auction::types::AuctionResultTrace {
-        summary: crate::auction::types::AuctionTraceSummary {
-            auction: trace.clone(),
-            outcome: crate::auction::types::AuctionPublicOutcome::Skipped,
-        },
-        winning_bids: std::collections::HashMap::new(),
-    };
-    let completed_result: Option<OrchestrationResult> = if matched_slots.is_empty() {
-        None
+    let winning_bids = if matched_slots.is_empty() {
+        std::collections::HashMap::new()
     } else {
         // Same publisher identity as the outbound bid request — see the
         // matching note on the initial-navigation observation above.
         let observation = AuctionObservationContext::from_parts(
-            &trace,
+            AuctionSource::SpaNavigation,
             &settings.publisher.domain,
             &path_param,
             matched_slots.len(),
@@ -3906,7 +3746,6 @@ pub async fn handle_page_bids(
                 .auction_timeout_ms
                 .unwrap_or(settings.auction.timeout_ms);
             let auction_context = AuctionContext {
-                trace: &trace,
                 settings,
                 request: &req,
                 timeout_ms,
@@ -3919,7 +3758,7 @@ pub async fn handle_page_bids(
                 .await
             {
                 Ok(result) => {
-                    result_trace = result.trace.clone();
+                    let winning_bids = result.winning_bids.clone();
                     emit_auction_events_best_effort_lazy(services, || {
                         build_auction_events(
                             observation,
@@ -3930,12 +3769,10 @@ pub async fn handle_page_bids(
                         )
                     })
                     .await;
-                    Some(result)
+                    winning_bids
                 }
                 Err(e) => {
                     log::warn!("page-bids auction failed: {e:?}");
-                    result_trace.summary.outcome =
-                        crate::auction::types::AuctionPublicOutcome::Failed;
                     let elapsed_ms = observation.elapsed_ms();
                     emit_auction_events_best_effort_lazy(services, || {
                         build_auction_events(
@@ -3949,7 +3786,7 @@ pub async fn handle_page_bids(
                         )
                     })
                     .await;
-                    None
+                    std::collections::HashMap::new()
                 }
             }
         } else {
@@ -3975,25 +3812,17 @@ pub async fn handle_page_bids(
                 )
             })
             .await;
-            None
+            std::collections::HashMap::new()
         }
     };
 
-    let winning_bids = completed_result
-        .as_ref()
-        .map(|result| &result.winning_bids)
-        .cloned()
-        .unwrap_or_default();
-    let mut bid_map = build_bid_map(
+    let bid_map = build_bid_map(
         &winning_bids,
         co_config.price_granularity,
         settings,
         &page_bids_request_origin,
         settings.debug.inject_adm_for_testing,
     );
-    if trace_enabled {
-        apply_bid_traces(&mut bid_map, &result_trace);
-    }
 
     // Gate slots on the ad-stack kill switch / consent: when disabled, return no
     // slots so the SPA hook does not call `adInit()` / create GPT slots.
@@ -4006,13 +3835,10 @@ pub async fn handle_page_bids(
         Vec::new()
     };
 
-    let mut body = serde_json::json!({
+    let body = serde_json::json!({
         "slots": slots_json,
         "bids": bid_map,
     });
-    if trace_enabled && !matched_slots.is_empty() {
-        body["auctionTrace"] = auction_trace_json(&result_trace.summary);
-    }
 
     let json_str = serde_json::to_string(&body).change_context(TrustedServerError::Proxy {
         message: "Failed to serialize page-bids response".to_string(),
@@ -4084,15 +3910,16 @@ mod tests {
     fn dump_comment_for_creative(creative: &str) -> String {
         let mut bid = make_test_bid_with_creative(creative);
         bid.slot_id = "ad-header-0".to_string();
-        let mut result = OrchestrationResult::empty(
-            crate::auction::types::AuctionTraceContext::new(AuctionSource::InitialNavigation),
-            crate::auction::types::AuctionPublicOutcome::NoBid,
-        );
-        result.provider_responses = vec![
-            AuctionResponse::no_bid("prebid", 665),
-            AuctionResponse::success("aps", vec![bid], 42),
-        ];
-        result.total_time_ms = 665;
+        let result = OrchestrationResult {
+            provider_responses: vec![
+                AuctionResponse::no_bid("prebid", 665),
+                AuctionResponse::success("aps", vec![bid], 42),
+            ],
+            mediator_response: None,
+            winning_bids: std::collections::HashMap::new(),
+            total_time_ms: 665,
+            metadata: std::collections::HashMap::new(),
+        };
         let state = Arc::new(Mutex::new(Some("BIDS_SCRIPT".to_string())));
         prepend_auction_debug_comment("stream", &result, &state);
         let comment = state
@@ -4147,12 +3974,13 @@ mod tests {
             )
             // An allowlisted key must still survive.
             .with_metadata("error_type", serde_json::json!("http_status"));
-        let mut result = OrchestrationResult::empty(
-            crate::auction::types::AuctionTraceContext::new(AuctionSource::InitialNavigation),
-            crate::auction::types::AuctionPublicOutcome::NoBid,
-        );
-        result.provider_responses = vec![response];
-        result.total_time_ms = 12;
+        let result = OrchestrationResult {
+            provider_responses: vec![response],
+            mediator_response: None,
+            winning_bids: std::collections::HashMap::new(),
+            total_time_ms: 12,
+            metadata: std::collections::HashMap::new(),
+        };
         let state = Arc::new(Mutex::new(Some("BIDS_SCRIPT".to_string())));
         prepend_auction_debug_comment("stream", &result, &state);
         let comment = state
@@ -4327,14 +4155,12 @@ mod tests {
             request_host: settings.publisher.domain.clone(),
             request_scheme: "https".to_owned(),
             content_type: "application/json".to_owned(),
-            head_bootstrap_script: None,
             ad_slots_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             auction_observation: None,
             auction_request: None,
             dispatched_auction: None,
             price_granularity: Default::default(),
-            ad_trace_enabled: false,
         }
     }
 
@@ -5361,7 +5187,6 @@ mod tests {
                 services: &services,
                 settings: &settings,
                 request_origin: String::new(),
-                trace_enabled: false,
             },
         };
         let mut output = Vec::new();
@@ -5411,7 +5236,6 @@ mod tests {
             services: &services,
             settings: &settings,
             request_origin: String::new(),
-            trace_enabled: false,
         };
         // Passthrough processor: the ordering contract is about collection, not
         // HTML rewriting, so keep the emitted bytes verbatim.
@@ -6083,14 +5907,12 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/css".to_string(),
-            head_bootstrap_script: None,
             ad_slots_script: None,
             ad_bids_state: Arc::new(Mutex::new(None)),
             auction_observation: None,
             auction_request: None,
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
-            ad_trace_enabled: false,
         };
 
         let mut output = Vec::new();
@@ -6132,14 +5954,12 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/html; charset=utf-8".to_string(),
-            head_bootstrap_script: None,
             ad_slots_script: None,
             ad_bids_state: Arc::new(Mutex::new(None)),
             auction_observation: None,
             auction_request: None,
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
-            ad_trace_enabled: false,
         };
 
         let mut output = Vec::new();
@@ -6170,14 +5990,12 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/html; charset=utf-8".to_string(),
-            head_bootstrap_script: None,
             ad_slots_script: None,
             ad_bids_state: Arc::new(Mutex::new(None)),
             auction_observation: None,
             auction_request: None,
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
-            ad_trace_enabled: false,
         };
         let body = EdgeBody::from_stream(futures::stream::iter(vec![Ok::<_, io::Error>(
             bytes::Bytes::from_static(b"<html><body>live</body></html>"),
@@ -6286,14 +6104,12 @@ mod tests {
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
                 content_type: "text/css".to_string(),
-                head_bootstrap_script: None,
                 ad_slots_script: None,
                 ad_bids_state: Arc::new(Mutex::new(None)),
                 auction_observation: None,
                 auction_request: None,
                 dispatched_auction: None,
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
-                ad_trace_enabled: false,
             };
             let body = EdgeBody::stream(futures::stream::iter(vec![
                 bytes::Bytes::from_static(b"body{background:url('https://origin.example.com/"),
@@ -6340,14 +6156,12 @@ mod tests {
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
                 content_type: "text/css".to_string(),
-                head_bootstrap_script: None,
                 ad_slots_script: None,
                 ad_bids_state: Arc::new(Mutex::new(None)),
                 auction_observation: None,
                 auction_request: None,
                 dispatched_auction: None,
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
-                ad_trace_enabled: false,
             };
             let compressed =
                 gzip_encode(b"body{background:url('https://origin.example.com/asset.png')}");
@@ -6397,14 +6211,12 @@ mod tests {
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
                 content_type: "text/css".to_string(),
-                head_bootstrap_script: None,
                 ad_slots_script: None,
                 ad_bids_state: Arc::new(Mutex::new(None)),
                 auction_observation: None,
                 auction_request: None,
                 dispatched_auction: None,
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
-                ad_trace_enabled: false,
             };
             let compressed =
                 deflate_encode(b"body{background:url('https://origin.example.com/asset.png')}");
@@ -6454,14 +6266,12 @@ mod tests {
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
                 content_type: "text/css".to_string(),
-                head_bootstrap_script: None,
                 ad_slots_script: None,
                 ad_bids_state: Arc::new(Mutex::new(None)),
                 auction_observation: None,
                 auction_request: None,
                 dispatched_auction: None,
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
-                ad_trace_enabled: false,
             };
             let compressed =
                 brotli_encode(b"body{background:url('https://origin.example.com/asset.png')}");
@@ -6511,14 +6321,12 @@ mod tests {
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
                 content_type: "text/css".to_string(),
-                head_bootstrap_script: None,
                 ad_slots_script: None,
                 ad_bids_state: Arc::new(Mutex::new(None)),
                 auction_observation: None,
                 auction_request: None,
                 dispatched_auction: None,
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
-                ad_trace_enabled: false,
             };
             let compressed =
                 brotli_encode(b"body{background:url('https://origin.example.com/asset.png')}");
@@ -6556,14 +6364,12 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/css".to_string(),
-            head_bootstrap_script: None,
             ad_slots_script: None,
             ad_bids_state: Arc::new(Mutex::new(None)),
             auction_observation: None,
             auction_request: None,
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
-            ad_trace_enabled: false,
         }
     }
 
@@ -6745,7 +6551,6 @@ mod tests {
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
                 content_type: "text/html; charset=utf-8".to_string(),
-                head_bootstrap_script: None,
                 ad_slots_script: Some(
                     r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
                         .to_string(),
@@ -6758,7 +6563,6 @@ mod tests {
                     10,
                 )),
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
-                ad_trace_enabled: false,
             };
             let body = EdgeBody::stream(futures::stream::iter(vec![
                 bytes::Bytes::from_static(b"<html><head></head><body>hello"),
@@ -6814,7 +6618,6 @@ mod tests {
                     r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
                         .to_string(),
                 ),
-                head_bootstrap_script: None,
                 ad_bids_state: state,
                 auction_observation: None,
                 auction_request: Some(test_auction_request()),
@@ -6823,7 +6626,6 @@ mod tests {
                     10,
                 )),
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
-                ad_trace_enabled: false,
             };
             // The `</body>` that triggers bid injection lives in the SECOND gzip
             // member. `flate2::read::GzDecoder` decodes only the first member, so
@@ -6877,7 +6679,6 @@ mod tests {
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
                 content_type: "text/css".to_string(),
-                head_bootstrap_script: None,
                 ad_slots_script: None,
                 ad_bids_state: Arc::new(Mutex::new(None)),
                 auction_observation: None,
@@ -6887,7 +6688,6 @@ mod tests {
                     10,
                 )),
                 price_granularity: crate::price_bucket::PriceGranularity::default(),
-                ad_trace_enabled: false,
             };
             let body = EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from_static(
                 b"body{background:url('https://origin.example.com/asset.png')}",
@@ -6937,14 +6737,12 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/css".to_string(),
-            head_bootstrap_script: None,
             ad_slots_script: None,
             ad_bids_state: Arc::new(Mutex::new(None)),
             auction_observation: None,
             auction_request: None,
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
-            ad_trace_enabled: false,
         };
         let publisher_response = PublisherResponse::Stream {
             response,
@@ -7075,13 +6873,11 @@ mod tests {
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
                     .to_string(),
             ),
-            head_bootstrap_script: None,
             ad_bids_state: Arc::new(Mutex::new(None)),
             auction_observation: None,
             auction_request: dispatched_auction.as_ref().map(|_| test_auction_request()),
             dispatched_auction,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
-            ad_trace_enabled: false,
         }
     }
 
@@ -7417,11 +7213,10 @@ mod tests {
                 request_host: "proxy.example.com".to_string(),
                 request_scheme: "https".to_string(),
                 content_type: "text/html; charset=utf-8".to_string(),
-                head_bootstrap_script: None,
                 ad_slots_script: None,
                 ad_bids_state: Arc::new(Mutex::new(None)),
                 auction_observation: Some(AuctionObservationContext::from_parts(
-                    &crate::auction::types::AuctionTraceContext::new(AuctionSource::SpaNavigation),
+                    AuctionSource::SpaNavigation,
                     "proxy.example.com",
                     "/article",
                     1,
@@ -7433,7 +7228,6 @@ mod tests {
                     10,
                 )),
                 price_granularity: PriceGranularity::default(),
-                ad_trace_enabled: false,
             }
         };
         let make_stream_response = || PublisherResponse::Stream {
@@ -7600,7 +7394,6 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/html; charset=utf-8".to_string(),
-            head_bootstrap_script: None,
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
                     .to_string(),
@@ -7613,7 +7406,6 @@ mod tests {
                 10,
             )),
             price_granularity: crate::price_bucket::PriceGranularity::default(),
-            ad_trace_enabled: false,
         };
         let publisher_response = PublisherResponse::Stream {
             response,
@@ -7671,7 +7463,6 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "Text/HTML; Charset=utf-8".to_string(),
-            head_bootstrap_script: None,
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
                     .to_string(),
@@ -7681,7 +7472,6 @@ mod tests {
             auction_request: None,
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
-            ad_trace_enabled: false,
         };
         let mut output = Vec::new();
 
@@ -7725,14 +7515,12 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/html".to_string(),
-            head_bootstrap_script: None,
             ad_slots_script: None,
             ad_bids_state: Arc::new(Mutex::new(None)),
             auction_observation: None,
             auction_request: None,
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
-            ad_trace_enabled: false,
         };
 
         let bogus_body = EdgeBody::from(b"<html>not gzip</html>".to_vec());
@@ -7834,14 +7622,12 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/html; charset=utf-8".to_string(),
-            head_bootstrap_script: None,
             ad_slots_script: None,
             ad_bids_state: Arc::new(Mutex::new(None)),
             auction_observation: None,
             auction_request: None,
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
-            ad_trace_enabled: false,
         };
         let mut output = Vec::new();
         stream_publisher_body(body, &mut output, &params, &settings, &registry)
@@ -7892,14 +7678,12 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/html".to_string(),
-            head_bootstrap_script: None,
             ad_slots_script: None,
             ad_bids_state: Arc::new(Mutex::new(None)),
             auction_observation: None,
             auction_request: None,
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
-            ad_trace_enabled: false,
         };
 
         let mut output = Vec::new();
@@ -7931,7 +7715,7 @@ mod tests {
     mod creative_opportunities_tests {
         use super::super::{
             MatchedSlotsContext, build_ad_slots_script, build_auction_request, build_bid_map,
-            build_bids_script, build_bids_script_with_trace, html_escape_for_script,
+            build_bids_script, html_escape_for_script,
         };
         use crate::auction::types::{ApsRendererV1, ApsTagType, Bid, BidRenderer, MediaType};
         use crate::consent::ConsentContext;
@@ -8941,32 +8725,6 @@ mod tests {
         }
 
         #[test]
-        fn traced_bids_script_assigns_summary_and_bids_before_scheduling_ad_init() {
-            let mut map = serde_json::Map::new();
-            map.insert("atf".to_string(), serde_json::json!({"hb_pb": "1.00"}));
-            let trace = serde_json::json!({
-                "version": 1,
-                "auctionTraceId": "550e8400-e29b-41d4-a716-446655440000",
-                "source": "initial_navigation",
-                "outcome": "completed",
-            });
-
-            let script = build_bids_script_with_trace(&map, Some(trace));
-
-            let trace_pos = script
-                .find(".auctionTrace=JSON.parse")
-                .expect("should assign trace");
-            let bids_pos = script.find(".bids=JSON.parse").expect("should assign bids");
-            let scheduler_pos = script
-                .find("scheduleInitialAdInit")
-                .expect("should schedule adInit");
-            assert!(
-                trace_pos < bids_pos && bids_pos < scheduler_pos,
-                "should atomically assign trace and bids before scheduling adInit"
-            );
-        }
-
-        #[test]
         fn bids_script_schedules_ad_init_without_retry_timer() {
             let mut map = serde_json::Map::new();
             map.insert("atf".to_string(), serde_json::json!({"hb_pb": "1.00"}));
@@ -9305,10 +9063,8 @@ mod tests {
             orchestrator: &AuctionOrchestrator,
             slots: &[CreativeOpportunitySlot],
             ec_context: &EcContext,
-            mut req: Request<EdgeBody>,
+            req: Request<EdgeBody>,
         ) -> Response<EdgeBody> {
-            crate::integrations::ad_trace::prepare_request(settings, &mut req)
-                .expect("should prepare ad trace request");
             let services = noop_services();
             handle_page_bids(
                 settings,
@@ -9532,17 +9288,11 @@ mod tests {
 
         #[tokio::test]
         async fn url_not_matching_any_pattern_returns_empty_response() {
-            // Slots exist but request path does not match — no auction, no injection,
-            // and no unjoinable trace identity even when the tester gate is open.
-            let mut settings = settings_with_co();
-            settings
-                .integrations
-                .insert_config("ad_trace", &serde_json::json!({ "enabled": true }))
-                .expect("should configure ad trace");
+            // Slots exist but request path does not match — no auction, no injection.
+            let settings = settings_with_co();
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let slots = article_slot(); // slot matches /20** only
-            let mut req = make_page_bids_request("/about"); // does not match
-            set_test_header(&mut req, "cookie", "__Host-ts-console=1");
+            let req = make_page_bids_request("/about"); // does not match
 
             let body = run_page_bids(&settings, &orchestrator, &slots, req).await;
 
@@ -9561,45 +9311,6 @@ mod tests {
                     .len(),
                 0,
                 "non-matching URL should produce zero bids"
-            );
-            assert!(
-                body.get("auctionTrace").is_none(),
-                "non-matching URL should not expose an identity without telemetry"
-            );
-        }
-
-        #[tokio::test]
-        async fn page_bids_trace_requires_config_and_console_session() {
-            let mut settings = settings_with_co_auction_disabled();
-            settings
-                .integrations
-                .insert_config("ad_trace", &serde_json::json!({ "enabled": true }))
-                .expect("should configure ad trace");
-            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-            let slots = article_slot();
-
-            let without_cookie = make_page_bids_request("/2024/01/my-article/");
-            let without_cookie_body =
-                run_page_bids_consent_allowed(&settings, &orchestrator, &slots, without_cookie)
-                    .await;
-            assert!(
-                without_cookie_body.get("auctionTrace").is_none(),
-                "config alone should not expose trace"
-            );
-
-            let mut gated = make_page_bids_request("/2024/01/my-article/");
-            set_test_header(&mut gated, "cookie", "__Host-ts-console=1");
-            let gated_body =
-                run_page_bids_consent_allowed(&settings, &orchestrator, &slots, gated).await;
-            assert_eq!(
-                gated_body["auctionTrace"]["source"],
-                serde_json::json!("spa_navigation"),
-                "both gates should expose generic SPA trace"
-            );
-            assert_eq!(
-                gated_body["auctionTrace"]["outcome"],
-                serde_json::json!("skipped"),
-                "disabled auction should not be fabricated as completed no-bid"
             );
         }
 

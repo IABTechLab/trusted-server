@@ -257,48 +257,6 @@
 
   installSlotHandoff();
 
-  function captureRequest(slot, trigger) {
-    function firstTarget(key) {
-      if (!slot || typeof slot.getTargeting !== "function") return undefined;
-      var values = slot.getTargeting(key);
-      return values && values.length ? String(values[0]) : undefined;
-    }
-    var divId =
-      slot && typeof slot.getSlotElementId === "function"
-        ? slot.getSlotElementId()
-        : "";
-    var slotId = (ts.divToSlotId || {})[divId];
-    var liveBid = slotId && ts.bids ? ts.bids[slotId] : undefined;
-    var bidSnapshot = liveBid
-      ? Object.freeze(
-          Object.assign({}, liveBid, {
-            trace: liveBid.trace ? Object.freeze(Object.assign({}, liveBid.trace)) : undefined,
-          }),
-        )
-      : undefined;
-    // Freeze request-boundary attribution before display()/refresh(). If the
-    // optional module loads later, draining this queue never rereads mutable GPT
-    // targeting or the current route's bid object.
-    var snapshot = Object.freeze({
-      slotId: slotId,
-      bidder: firstTarget("hb_bidder"),
-      adId: firstTarget("hb_adid"),
-      traceToken: firstTarget("ts_trace"),
-      bid: bidSnapshot,
-    });
-    if (typeof ts.captureAdTraceRequest === "function") {
-      ts.captureAdTraceRequest(slot, trigger, snapshot);
-      return;
-    }
-    // The unified bundle may load after this bootstrap. Queue private request
-    // ownership unconditionally so trace-off traffic receives the same stale
-    // render and billing protection; diagnostic fields remain independently gated.
-    ts.pendingAdTraceRequests = ts.pendingAdTraceRequests || [];
-    if (ts.pendingAdTraceRequests.length < 64) {
-      ts.pendingAdTraceRequests.push({ slot: slot, trigger: trigger, snapshot: snapshot });
-    }
-  }
-
   ts.adInit = function () {
     var slots = ts.adSlots || [];
     var bids = ts.bids || {};
@@ -381,9 +339,6 @@
         ].forEach(function (k) {
           if (b[k]) s.setTargeting(k, b[k]);
         });
-        if (b.trace && b.trace.bidTraceId) {
-          s.setTargeting("ts_trace", b.trace.bidTraceId);
-        }
         // Keep in sync with TS_INITIAL_TARGETING_KEY in index.ts
         s.setTargeting("ts_initial", "1");
         hasAppliedTargeting = true;
@@ -418,12 +373,6 @@
       // before server-side bids were available. The replay is the publisher's
       // one initial request, not a later TS refresh.
       heldPublisherRequests.displayIds.concat(slotsToDisplay).forEach(function (divId) {
-        var requestSlot = googletag.pubads().getSlots().find(function (slot) {
-          return slot.getSlotElementId() === divId;
-        });
-        if (requestSlot && !ts.gptInitialLoadDisabled) {
-          captureRequest(requestSlot, "bootstrap_display");
-        }
         runHandoffInternal(function () {
           googletag.display(divId);
         });
@@ -444,9 +393,6 @@
         // bundle's adInit() in crates/trusted-server-js/lib/src/integrations/gpt/index.ts.
         ts.adInitRefreshInProgress = true;
         try {
-          slotsNeedingRefresh.forEach(function (slot) {
-            captureRequest(slot, "bootstrap_refresh");
-          });
           runHandoffInternal(function () {
             googletag.pubads().refresh(slotsNeedingRefresh);
           });

@@ -17,12 +17,7 @@ use crate::settings::Settings;
 ///
 /// A single source of truth so the adapter copies of the privacy downgrade
 /// cannot drift apart.
-pub const SURROGATE_CACHE_HEADERS: &[&str] = &[
-    "surrogate-control",
-    "fastly-surrogate-control",
-    "cdn-cache-control",
-    "cloudflare-cdn-cache-control",
-];
+pub const SURROGATE_CACHE_HEADERS: &[&str] = &["surrogate-control", "fastly-surrogate-control"];
 
 /// Forces cookie-bearing responses to stay private to shared caches.
 ///
@@ -87,9 +82,8 @@ pub fn apply_response_headers_with_cache_privacy(settings: &Settings, response: 
     for (key, value) in &settings.response_headers {
         if response_is_uncacheable
             && (key.eq_ignore_ascii_case(header::CACHE_CONTROL.as_str())
-                || SURROGATE_CACHE_HEADERS
-                    .iter()
-                    .any(|name| key.eq_ignore_ascii_case(name)))
+                || key.eq_ignore_ascii_case("surrogate-control")
+                || key.eq_ignore_ascii_case("fastly-surrogate-control"))
         {
             continue;
         }

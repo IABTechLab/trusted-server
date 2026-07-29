@@ -3,6 +3,7 @@
 //! Core owns the privacy-preserving auction observation model and pure row
 //! builder. Platform adapters provide the concrete sink implementation.
 
+use std::collections::HashSet;
 use std::time::Instant;
 
 use chrono::Utc;
@@ -11,16 +12,34 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::auction::orchestrator::OrchestrationResult;
-pub use crate::auction::types::AuctionSource;
-use crate::auction::types::{
-    AuctionRequest, AuctionResponse, AuctionTraceContext, Bid, BidStatus, MediaType,
-};
+use crate::auction::types::{AuctionRequest, AuctionResponse, Bid, BidStatus, MediaType};
 use crate::ec::EcContext;
 use crate::error::TrustedServerError;
 use crate::platform::RuntimeServices;
 
 const MAX_PAGE_PATH_BYTES: usize = 256;
 const DYNAMIC_SEGMENT_REPLACEMENT: &str = ":id";
+
+/// Source path that initiated an auction candidate.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum AuctionSource {
+    /// Initial publisher navigation using server-side ad templates.
+    InitialNavigation,
+    /// SPA navigation through `GET /_ts/page-bids`.
+    SpaNavigation,
+    /// Explicit `POST /auction` API.
+    AuctionApi,
+}
+
+impl AuctionSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InitialNavigation => "initial_navigation",
+            Self::SpaNavigation => "spa_navigation",
+            Self::AuctionApi => "auction_api",
+        }
+    }
+}
 
 /// Terminal status for one auction observation.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -104,7 +123,7 @@ impl AuctionObservationContext {
     /// Build an observation context from an auction request.
     #[must_use]
     pub fn from_auction_request(
-        trace: &AuctionTraceContext,
+        auction_source: AuctionSource,
         request: &AuctionRequest,
         ec_context: &EcContext,
     ) -> Self {
@@ -116,7 +135,7 @@ impl AuctionObservationContext {
             .map(|url| url.path().to_owned())
             .unwrap_or_else(|| "/".to_owned());
         Self::from_parts(
-            trace,
+            auction_source,
             &request.publisher.domain,
             &raw_path,
             request.slots.len(),
@@ -127,7 +146,7 @@ impl AuctionObservationContext {
     /// Build an observation context from publisher request parts.
     #[must_use]
     pub fn from_parts(
-        trace: &AuctionTraceContext,
+        auction_source: AuctionSource,
         publisher_domain: &str,
         raw_page_path: &str,
         slot_count: usize,
@@ -138,8 +157,8 @@ impl AuctionObservationContext {
         let consent = ec_context.consent();
         let slot_count = u16::try_from(slot_count).unwrap_or(u16::MAX);
         Self {
-            auction_id: trace.auction_trace_id.as_uuid(),
-            auction_source: trace.source,
+            auction_id: Uuid::new_v4(),
+            auction_source,
             publisher_domain: publisher_domain.to_owned(),
             page_path: normalize_page_path(raw_page_path),
             country: geo
@@ -245,7 +264,7 @@ pub struct AuctionEventRow {
     pub event_ts: String,
     /// `summary`, `provider_call`, or `bid`.
     pub event_kind: String,
-    /// Privacy-safe UUID shared with tester-gated trace output.
+    /// Fresh telemetry auction UUID.
     pub auction_id: String,
     /// Source path label.
     pub auction_source: String,
@@ -301,8 +320,6 @@ pub struct AuctionEventRow {
     pub currency: Option<String>,
     /// Whether this is the canonical winning row for its slot.
     pub is_win: Option<u8>,
-    /// Trace UUID for the canonical winning bid only.
-    pub bid_trace_id: Option<String>,
     /// Advertiser domain.
     pub ad_domain: Option<String>,
     /// Creative/ad ID.
@@ -342,7 +359,6 @@ impl AuctionEventRow {
             price_cpm: None,
             currency: None,
             is_win: None,
-            bid_trace_id: None,
             ad_domain: None,
             ad_id: None,
         }
@@ -667,75 +683,58 @@ fn push_bid_rows(
     request: &AuctionRequest,
     result: &OrchestrationResult,
 ) {
-    for (response_index, response) in result.provider_responses.iter().enumerate() {
-        for (bid_index, bid) in response.bids.iter().enumerate() {
-            let winning_slot = result.winning_bids.keys().find(|slot_id| {
-                result.winning_origin(slot_id).is_some_and(|origin| {
-                    !origin.mediated
-                        && origin.response_index == response_index
-                        && origin.bid_index == bid_index
+    let mut matched_wins = HashSet::new();
+
+    for response in &result.provider_responses {
+        for bid in &response.bids {
+            let matched_slot = result
+                .winning_bids
+                .iter()
+                .find(|(slot_id, winning)| {
+                    !matched_wins.contains(*slot_id) && bid_matches_winning_bid(bid, winning)
                 })
-            });
-            let trace_id = winning_slot.and_then(|slot_id| {
-                result
-                    .trace
-                    .winning_bids
-                    .get(slot_id)
-                    .map(|trace| trace.bid_trace_id.to_string())
-            });
-            let price = winning_slot
-                .and_then(|slot_id| result.winning_bids.get(slot_id))
-                .and_then(|winning| winning.price)
-                .or(bid.price);
+                .map(|(slot_id, winning)| (slot_id.clone(), winning));
+            let (is_win, price) = if let Some((slot_id, winning)) = matched_slot {
+                matched_wins.insert(slot_id);
+                (1, bid.price.or(winning.price))
+            } else {
+                (0, bid.price)
+            };
             rows.push(bid_row(
                 observation,
                 event_ts,
                 request,
                 &response.provider,
                 bid,
-                BidRowOutcome {
-                    is_win: u8::from(winning_slot.is_some()),
-                    price,
-                    bid_trace_id: trace_id,
-                },
+                is_win,
+                price,
             ));
         }
     }
 
     if let Some(mediator_response) = &result.mediator_response {
-        for (bid_index, bid) in mediator_response.bids.iter().enumerate() {
-            let winning_slot = result.winning_bids.keys().find(|slot_id| {
-                result
-                    .winning_origin(slot_id)
-                    .is_some_and(|origin| origin.mediated && origin.bid_index == bid_index)
-            });
-            if let Some(slot_id) = winning_slot {
-                let trace_id = result
-                    .trace
-                    .winning_bids
-                    .get(slot_id)
-                    .map(|trace| trace.bid_trace_id.to_string());
+        for (slot_id, winning) in &result.winning_bids {
+            if matched_wins.contains(slot_id) {
+                continue;
+            }
+            if mediator_response
+                .bids
+                .iter()
+                .any(|bid| bid_matches_winning_bid(bid, winning))
+            {
                 rows.push(bid_row(
                     observation,
                     event_ts,
                     request,
                     &mediator_response.provider,
-                    bid,
-                    BidRowOutcome {
-                        is_win: 1,
-                        price: bid.price,
-                        bid_trace_id: trace_id,
-                    },
+                    winning,
+                    1,
+                    winning.price,
                 ));
+                matched_wins.insert(slot_id.clone());
             }
         }
     }
-}
-
-struct BidRowOutcome {
-    is_win: u8,
-    price: Option<f64>,
-    bid_trace_id: Option<String>,
 }
 
 fn bid_row(
@@ -744,7 +743,8 @@ fn bid_row(
     request: &AuctionRequest,
     provider: &str,
     bid: &Bid,
-    outcome: BidRowOutcome,
+    is_win: u8,
+    price: Option<f64>,
 ) -> AuctionEventRow {
     let mut row = AuctionEventRow::base(observation, "bid", event_ts);
     row.provider = Some(provider.to_owned());
@@ -753,16 +753,25 @@ fn bid_row(
     row.slot_h = Some(u16::try_from(bid.height).unwrap_or(u16::MAX));
     row.media_type = media_type_for_slot(request, &bid.slot_id).map(str::to_owned);
     row.seat = Some(bid.bidder.clone());
-    row.price_cpm = outcome.price;
+    row.price_cpm = price;
     row.currency = Some(bid.currency.clone());
-    row.is_win = Some(outcome.is_win);
-    row.bid_trace_id = outcome.bid_trace_id;
+    row.is_win = Some(is_win);
     row.ad_domain = bid
         .adomain
         .as_ref()
         .and_then(|domains| domains.first().cloned());
     row.ad_id = bid.ad_id.clone();
     row
+}
+
+fn bid_matches_winning_bid(candidate: &Bid, winning: &Bid) -> bool {
+    if candidate.slot_id != winning.slot_id || candidate.bidder != winning.bidder {
+        return false;
+    }
+    match winning.ad_id.as_deref() {
+        Some(winning_ad_id) => candidate.ad_id.as_deref() == Some(winning_ad_id),
+        None => true,
+    }
 }
 
 fn media_type_for_slot<'a>(request: &'a AuctionRequest, slot_id: &str) -> Option<&'a str> {
@@ -939,15 +948,6 @@ mod tests {
         }
     }
 
-    fn empty_result(total_time_ms: u64) -> OrchestrationResult {
-        let mut result = OrchestrationResult::empty(
-            AuctionTraceContext::new(AuctionSource::AuctionApi),
-            crate::auction::types::AuctionPublicOutcome::NoBid,
-        );
-        result.total_time_ms = total_time_ms;
-        result
-    }
-
     fn bid(slot_id: &str, bidder: &str, ad_id: Option<&str>, price: Option<f64>) -> Bid {
         Bid {
             slot_id: slot_id.to_owned(),
@@ -1027,27 +1027,13 @@ mod tests {
         let provider_error =
             AuctionResponse::error("mock", 12).with_metadata("error_type", json!("parse_response"));
         let winning = provider_success.bids[0].clone();
-        let mut result = empty_result(99);
-        result.provider_responses = vec![provider_success, provider_no_bid, provider_error];
-        result
-            .winning_bids
-            .insert("slot-1".to_owned(), winning.clone());
-        result.winning_bid_origins.insert(
-            "slot-1".to_owned(),
-            crate::auction::types::WinningBidOrigin {
-                response_index: 0,
-                bid_index: 0,
-                mediated: false,
-            },
-        );
-        result.trace.winning_bids.insert(
-            "slot-1".to_owned(),
-            crate::auction::types::WinningBidTrace {
-                bid_trace_id: crate::auction::types::BidTraceId::new(),
-                provider: "prebid".to_owned(),
-                bidder: winning.bidder,
-            },
-        );
+        let result = OrchestrationResult {
+            provider_responses: vec![provider_success, provider_no_bid, provider_error],
+            mediator_response: None,
+            winning_bids: HashMap::from([("slot-1".to_owned(), winning)]),
+            total_time_ms: 99,
+            metadata: HashMap::new(),
+        };
         let observation =
             AuctionObservationContext::for_test(AuctionSource::AuctionApi, "/article/1", 1);
 
@@ -1105,8 +1091,13 @@ mod tests {
         let provider_http_error = AuctionResponse::error("prebid", 12)
             .with_metadata("error_type", json!("http_status"))
             .with_metadata("status", json!(403));
-        let mut result = empty_result(12);
-        result.provider_responses = vec![provider_http_error];
+        let result = OrchestrationResult {
+            provider_responses: vec![provider_http_error],
+            mediator_response: None,
+            winning_bids: HashMap::new(),
+            total_time_ms: 12,
+            metadata: HashMap::new(),
+        };
         let observation =
             AuctionObservationContext::for_test(AuctionSource::AuctionApi, "/article/1", 1);
 
@@ -1137,28 +1128,13 @@ mod tests {
         let mediator_bid = bid("slot-1", "kargo", Some("ad-1"), Some(2.0));
         let mediator_response =
             AuctionResponse::success("adserver_mock", vec![mediator_bid.clone()], 15);
-        let mut result = empty_result(80);
-        result.provider_responses = vec![provider_success];
-        result.mediator_response = Some(mediator_response);
-        result
-            .winning_bids
-            .insert("slot-1".to_owned(), mediator_bid.clone());
-        result.winning_bid_origins.insert(
-            "slot-1".to_owned(),
-            crate::auction::types::WinningBidOrigin {
-                response_index: 0,
-                bid_index: 0,
-                mediated: false,
-            },
-        );
-        result.trace.winning_bids.insert(
-            "slot-1".to_owned(),
-            crate::auction::types::WinningBidTrace {
-                bid_trace_id: crate::auction::types::BidTraceId::new(),
-                provider: "prebid".to_owned(),
-                bidder: mediator_bid.bidder,
-            },
-        );
+        let result = OrchestrationResult {
+            provider_responses: vec![provider_success],
+            mediator_response: Some(mediator_response),
+            winning_bids: HashMap::from([("slot-1".to_owned(), mediator_bid)]),
+            total_time_ms: 80,
+            metadata: HashMap::new(),
+        };
         let observation =
             AuctionObservationContext::for_test(AuctionSource::InitialNavigation, "/", 1);
 
@@ -1191,7 +1167,13 @@ mod tests {
     #[test]
     fn ndjson_serialization_has_one_json_object_per_line_and_no_private_ids() {
         let request = test_request("ts-ec-derived-id");
-        let result = empty_result(1);
+        let result = OrchestrationResult {
+            provider_responses: Vec::new(),
+            mediator_response: None,
+            winning_bids: HashMap::new(),
+            total_time_ms: 1,
+            metadata: HashMap::new(),
+        };
         let observation =
             AuctionObservationContext::for_test(AuctionSource::AuctionApi, "/auction", 1);
 
