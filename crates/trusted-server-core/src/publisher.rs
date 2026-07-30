@@ -3244,29 +3244,28 @@ pub(crate) fn build_bid_map(
                 // — no PBS Cache round trip. The `hb_cache_*` coordinates above
                 // remain as the fallback for an absent `adm`.
                 //
-                // Sanitize dangerous markup first, then rewrite URLs to
-                // first-party proxies — the same creative-processing boundary as
-                // the `/auction` path (see `auction::formats`), except the inline
-                // variant. Unlike `/auction`, this `adm` is rendered by the Prebid
+                // Sanitize dangerous markup first, then optionally rewrite URLs
+                // to first-party proxies — the same creative-processing policy as
+                // the `/auction` path (see `auction::formats`), except for the
+                // inline render context. This `adm` is rendered by the Prebid
                 // Universal Creative inside GAM's iframe (`f.srcdoc = d.ad`), a
                 // foreign origin where root-relative `/first-party/…` URLs resolve
-                // against GAM and 404. `rewrite_inline_creative_html` emits
+                // against GAM and 404. The inline rewriter therefore emits
                 // absolute first-party URLs and omits the tsjs bundle injection.
-                // `sanitize_creative_html` also enforces the 1 MiB creative cap,
-                // returning an empty string for oversized or unparseable markup —
-                // in which case the entry is omitted and the bridge falls back to
-                // the PBS Cache coordinates.
+                // Sanitization also enforces the 1 MiB creative cap, returning an
+                // empty string for oversized or unparseable markup — in which case
+                // the entry is omitted and the bridge falls back to the PBS Cache
+                // coordinates.
                 if let Some(ref raw_creative) = bid.creative {
                     // Resolve ${AUCTION_PRICE} from the exact winning CPM BEFORE
                     // sanitizing, rewriting, and signing — URL rewriting would
                     // otherwise encode the literal macro into the signed proxy/click
                     // URL, and signing would lock that wrong value.
                     let priced = crate::creative::expand_auction_price_macro(raw_creative, cpm);
-                    let sanitized = crate::creative::sanitize_creative_html(&priced);
-                    let adm = crate::creative::rewrite_inline_creative_html(
+                    let adm = crate::creative::process_inline_auction_creative(
                         settings,
                         &base_origin,
-                        &sanitized,
+                        &priced,
                     );
                     if !adm.is_empty() {
                         obj.insert("adm".to_string(), serde_json::Value::String(adm));
@@ -7497,6 +7496,63 @@ mod tests {
             assert!(
                 !adm.contains("javascript:"),
                 "should strip javascript: URIs from the inline adm"
+            );
+        }
+
+        #[test]
+        fn build_bid_map_can_skip_rewriting_but_not_sanitization() {
+            let mut settings = test_settings();
+            settings.auction.rewrite_creatives = false;
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "kargo",
+                "abc123",
+                "https://ssp/win",
+                "https://ssp/bill",
+            );
+            bid.creative = Some(
+                "<div onclick=\"steal()\"><script>marker</script>\
+                 <a href=\"https://click.example/landing\">x</a>\
+                 <img src=\"https://cdn.example/ad.png\"></div>"
+                    .to_string(),
+            );
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &settings,
+                "https://publisher.example",
+                false,
+            );
+            let adm = map
+                .get("atf_sidebar_ad")
+                .and_then(|value| value.as_object())
+                .and_then(|object| object.get("adm"))
+                .and_then(|value| value.as_str())
+                .expect("should include a sanitized adm");
+
+            assert!(
+                adm.contains(r#"href="https://click.example/landing""#),
+                "should keep accepted click URLs direct: {adm}"
+            );
+            assert!(
+                adm.contains(r#"src="https://cdn.example/ad.png""#),
+                "should keep accepted resource URLs direct: {adm}"
+            );
+            assert!(
+                !adm.contains("/first-party/"),
+                "should skip first-party URL rewriting: {adm}"
+            );
+            assert!(
+                !adm.contains("data-tsclick"),
+                "should skip click-guard attributes: {adm}"
+            );
+            assert!(
+                !adm.contains("marker") && !adm.contains("onclick"),
+                "should still sanitize executable markup: {adm}"
             );
         }
 
