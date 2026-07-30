@@ -100,7 +100,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_blob_without_rewrite_creatives_leaves_rewriting_disabled() {
+    fn legacy_blob_without_rewrite_creatives_preserves_rewriting() {
         let data =
             serde_json::to_value(test_settings()).expect("should serialize settings to JSON");
         let auction = data
@@ -118,8 +118,8 @@ mod tests {
             settings_from_config_blob(&envelope_json).expect("should reconstruct legacy settings");
 
         assert!(
-            !reconstructed.auction.rewrite_creatives,
-            "creative rewriting is opt-in: a blob without the field leaves it disabled"
+            reconstructed.auction.rewrite_creatives,
+            "should enable creative rewriting for legacy blobs"
         );
     }
 

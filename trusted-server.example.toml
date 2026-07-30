@@ -112,11 +112,12 @@ rewrite_script = true
 
 [auction]
 enabled = false
-# Defaults to false. Keep this leaf present when using the EdgeZero v0.0.4
-# environment override. Set true to rewrite winning-bid adm to first-party
-# endpoints, converting proxy/click URLs and injecting the creative TSJS runtime.
+# Defaults to true. Keep this leaf present when using the EdgeZero v0.0.4
+# environment override. Set false to return unre-written winning-bid adm,
+# skipping proxy/click URL conversion and creative TSJS injection.
 # Sanitization is controlled separately by `sanitize_creatives` below.
-rewrite_creatives = false
+# Restore and push true before an older-binary rollback.
+rewrite_creatives = true
 # Strip executable markup (script/object/embed/form/...) from winning-bid adm,
 # removing those elements together with their inner content.
 #

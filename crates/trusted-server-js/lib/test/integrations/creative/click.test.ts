@@ -105,6 +105,50 @@ describe('creative/click.ts', () => {
       expect(finalHref.startsWith('/first-party/proxy-rebuild?')).toBe(true);
       expect(finalHref).toContain('add=%7B%22bar%22%3A%222%22%7D');
       expect(finalHref).toContain('del=%5B%22foo%22%5D');
+      // The fallback must never become the canonical click: data-tsclick is
+      // what future mutation diffs compare against.
+      expect(anchor.getAttribute('data-tsclick')).toBe(FIRST_PARTY_CLICK);
+    } finally {
+      if (originDescriptor) {
+        Object.defineProperty(window, 'origin', originDescriptor);
+      } else {
+        delete (window as { origin?: string }).origin;
+      }
+    }
+  });
+
+  it('rebuilds a second mutation wave after an opaque-origin fallback', async () => {
+    // Wave 1 replaces href with the GET fallback; the canonical signed click in
+    // data-tsclick must survive so wave 2's mutation is still diffed and
+    // rebuilt instead of being lost.
+    vi.useFakeTimers();
+
+    const originDescriptor = Object.getOwnPropertyDescriptor(window, 'origin');
+    Object.defineProperty(window, 'origin', { value: 'null', configurable: true });
+    global.fetch = undefined as any;
+
+    try {
+      const anchor = document.createElement('a');
+      anchor.setAttribute('data-tsclick', FIRST_PARTY_CLICK);
+      anchor.setAttribute('href', FIRST_PARTY_CLICK);
+      document.body.appendChild(anchor);
+
+      await importCreativeModule();
+
+      anchor.setAttribute('href', MUTATED_CLICK);
+      await Promise.resolve();
+      await vi.runAllTimersAsync();
+
+      expect(anchor.getAttribute('data-tsclick')).toBe(FIRST_PARTY_CLICK);
+
+      anchor.setAttribute('href', 'https://example.com/landing?baz=3');
+      await Promise.resolve();
+      await vi.runAllTimersAsync();
+
+      const finalHref = anchor.getAttribute('href') ?? '';
+      expect(finalHref.startsWith('/first-party/proxy-rebuild?')).toBe(true);
+      expect(finalHref).toContain('baz');
+      expect(anchor.getAttribute('data-tsclick')).toBe(FIRST_PARTY_CLICK);
     } finally {
       if (originDescriptor) {
         Object.defineProperty(window, 'origin', originDescriptor);

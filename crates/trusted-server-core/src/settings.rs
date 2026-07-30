@@ -3914,7 +3914,7 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     #[test]
-    fn test_auction_creative_processing_defaults_to_false_when_omitted() {
+    fn test_auction_creative_processing_defaults_when_omitted() {
         let toml_str = crate_test_settings_str()
             + r#"
             [auction]
@@ -3925,8 +3925,8 @@ origin_host_header_overide = "www.example.com""#,
         let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
 
         assert!(
-            !settings.auction.rewrite_creatives,
-            "creative rewriting is opt-in when the setting is omitted"
+            settings.auction.rewrite_creatives,
+            "creative rewriting stays enabled when the setting is omitted"
         );
         assert!(
             !settings.auction.sanitize_creatives,

@@ -3210,21 +3210,6 @@ pub(crate) fn build_bid_map(
                     );
                 }
 
-                // Cache endpoint coordinates — only present for PBS bids with Prebid Cache enabled.
-                // The Prebid Universal Creative constructs:
-                //   https://<hb_cache_host><hb_cache_path>?uuid=<hb_adid>
-                if let Some(ref host) = bid.cache_host {
-                    obj.insert(
-                        "hb_cache_host".to_string(),
-                        serde_json::Value::String(host.clone()),
-                    );
-                }
-                if let Some(ref path) = bid.cache_path {
-                    obj.insert(
-                        "hb_cache_path".to_string(),
-                        serde_json::Value::String(path.clone()),
-                    );
-                }
                 // Win/billing notification URLs, fired verbatim by the bridge.
                 // Per OpenRTB these are the canonical carriers of
                 // `${AUCTION_PRICE}`, so expand it from the same winning CPM used
@@ -3241,8 +3226,7 @@ pub(crate) fn build_bid_map(
                 }
                 // Always include the winning creative so the pbRender bridge can
                 // render it locally when GAM serves the Prebid Universal Creative
-                // — no PBS Cache round trip. The `hb_cache_*` coordinates above
-                // remain as the fallback for an absent `adm`.
+                // — no PBS Cache round trip.
                 //
                 // Optionally sanitize dangerous markup, then optionally rewrite
                 // URLs to first-party proxies — the same opt-in creative-processing
@@ -3252,23 +3236,59 @@ pub(crate) fn build_bid_map(
                 // a foreign origin where root-relative `/first-party/…` URLs resolve
                 // against GAM and 404. The inline rewriter therefore emits
                 // absolute first-party URLs and omits the tsjs bundle injection.
-                // When enabled, sanitization also enforces the 1 MiB creative cap,
-                // returning an empty string for oversized or unparseable markup —
-                // in which case the entry is omitted and the bridge falls back to
-                // the PBS Cache coordinates.
-                if let Some(ref raw_creative) = bid.creative {
+                //
+                // Processing may reject the creative outright (empty output from
+                // non-empty input): sanitization can strip everything, parsing can
+                // fail, or the 1 MiB per-creative cap can trip. `None` = no
+                // creative supplied; `Some("")` = supplied but rejected.
+                let processed_adm = bid.creative.as_ref().and_then(|raw_creative| {
+                    if raw_creative.is_empty() {
+                        return None;
+                    }
                     // Resolve ${AUCTION_PRICE} from the exact winning CPM BEFORE
                     // sanitizing, rewriting, and signing — URL rewriting would
                     // otherwise encode the literal macro into the signed proxy/click
                     // URL, and signing would lock that wrong value.
                     let priced = crate::creative::expand_auction_price_macro(raw_creative, cpm);
-                    let adm = crate::creative::process_inline_auction_creative(
+                    Some(crate::creative::process_inline_auction_creative(
                         settings,
                         &base_origin,
                         &priced,
-                    );
-                    if !adm.is_empty() {
+                    ))
+                });
+                // Cache endpoint coordinates — only present for PBS bids with
+                // Prebid Cache enabled, and only when the bid supplied no creative
+                // of its own. The Prebid Universal Creative constructs:
+                //   https://<hb_cache_host><hb_cache_path>?uuid=<hb_adid>
+                // and renders the cached bid's ORIGINAL adm, bypassing every
+                // server-side processing policy. A supplied creative that
+                // processing REJECTED must therefore also suppress the cache
+                // fallback — otherwise sanitization and the size cap could be
+                // undone by re-fetching the raw creative from PBS Cache.
+                match processed_adm {
+                    Some(adm) if !adm.is_empty() => {
                         obj.insert("adm".to_string(), serde_json::Value::String(adm));
+                    }
+                    Some(_) => {
+                        log::warn!(
+                            "build_bid_map: creative for slot {} bidder {} rejected by processing; suppressing PBS Cache fallback",
+                            slot_id,
+                            bid.bidder
+                        );
+                    }
+                    None => {
+                        if let Some(ref host) = bid.cache_host {
+                            obj.insert(
+                                "hb_cache_host".to_string(),
+                                serde_json::Value::String(host.clone()),
+                            );
+                        }
+                        if let Some(ref path) = bid.cache_path {
+                            obj.insert(
+                                "hb_cache_path".to_string(),
+                                serde_json::Value::String(path.clone()),
+                            );
+                        }
                     }
                 }
                 // Verbose per-bid debug blob only under the testing flag; also
@@ -7556,12 +7576,10 @@ mod tests {
 
         #[test]
         fn build_bid_map_omits_oversized_adm() {
-            // With sanitization enabled, creatives larger than the sanitize
-            // pass's 1 MiB cap are rejected (empty result), so the inline `adm`
-            // is omitted and the pbRender bridge falls back to the PBS Cache
-            // coordinates instead of shipping an unbounded creative to the client.
-            let mut settings = test_settings();
-            settings.auction.sanitize_creatives = true;
+            // Creatives larger than the 1 MiB cap are rejected (empty result)
+            // in every processing mode, so the inline `adm` is omitted rather
+            // than shipping an unbounded creative to the client. Runs with
+            // default settings to cover the shipped configuration.
             let mut winning_bids = HashMap::new();
             let mut bid = make_bid(
                 "atf_sidebar_ad",
@@ -7574,7 +7592,13 @@ mod tests {
             bid.creative = Some(format!("<div>{}</div>", "a".repeat(1024 * 1024 + 1)));
             winning_bids.insert("atf_sidebar_ad".to_string(), bid);
 
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, &settings, "", false);
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                "",
+                false,
+            );
             let obj = map
                 .get("atf_sidebar_ad")
                 .and_then(|v| v.as_object())
@@ -7582,6 +7606,107 @@ mod tests {
             assert!(
                 obj.get("adm").is_none(),
                 "should omit the inline adm when the creative exceeds the 1 MiB cap"
+            );
+        }
+
+        // A supplied creative that processing rejects must not fall back to the
+        // PBS Cache coordinates: the GPT bridge fetches the cached bid's ORIGINAL
+        // adm, which would undo sanitization and the size cap entirely.
+        fn cached_bid_with_creative(creative: &str) -> Bid {
+            Bid {
+                slot_id: "atf_sidebar_ad".to_string(),
+                price: Some(1.50),
+                currency: "USD".to_string(),
+                creative: Some(creative.to_string()),
+                adomain: None,
+                bidder: "prebid".to_string(),
+                width: 300,
+                height: 250,
+                nurl: None,
+                burl: None,
+                ad_id: Some("bid-impression-id".to_string()),
+                cache_id: Some("cache-uuid".to_string()),
+                cache_host: Some("prebid-cache.example.com".to_string()),
+                cache_path: Some("/cache".to_string()),
+                metadata: Default::default(),
+            }
+        }
+
+        fn assert_no_render_source(settings: &Settings, creative: String, case: &str) {
+            let mut winning_bids = HashMap::new();
+            let mut bid = cached_bid_with_creative("");
+            bid.creative = Some(creative);
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, settings, "", false);
+            let obj = map
+                .get("atf_sidebar_ad")
+                .and_then(|v| v.as_object())
+                .expect("should have a bid entry");
+
+            assert!(
+                obj.get("adm").is_none(),
+                "{case}: rejected creative should not emit adm"
+            );
+            assert!(
+                obj.get("hb_cache_host").is_none(),
+                "{case}: rejected creative should suppress hb_cache_host"
+            );
+            assert!(
+                obj.get("hb_cache_path").is_none(),
+                "{case}: rejected creative should suppress hb_cache_path"
+            );
+        }
+
+        #[test]
+        fn build_bid_map_suppresses_cache_fallback_for_rejected_creatives() {
+            let mut sanitizing = test_settings();
+            sanitizing.auction.sanitize_creatives = true;
+
+            // Script-only creative: sanitization strips everything.
+            assert_no_render_source(
+                &sanitizing,
+                "<script>document.write('ad')</script>".to_string(),
+                "script-only",
+            );
+            // Oversized creative: rejected by the cap in every mode.
+            assert_no_render_source(
+                &test_settings(),
+                format!("<div>{}</div>", "a".repeat(1024 * 1024 + 1)),
+                "oversized",
+            );
+        }
+
+        #[test]
+        fn build_bid_map_keeps_cache_fallback_for_absent_creatives() {
+            // A bid with no supplied creative is the legitimate PBS Cache case:
+            // the coordinates are the only render source.
+            let mut winning_bids = HashMap::new();
+            let mut bid = cached_bid_with_creative("");
+            bid.creative = None;
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                "",
+                false,
+            );
+            let obj = map
+                .get("atf_sidebar_ad")
+                .and_then(|v| v.as_object())
+                .expect("should have a bid entry");
+
+            assert_eq!(
+                obj.get("hb_cache_host").and_then(|v| v.as_str()),
+                Some("prebid-cache.example.com"),
+                "absent creative should keep hb_cache_host"
+            );
+            assert_eq!(
+                obj.get("hb_cache_path").and_then(|v| v.as_str()),
+                Some("/cache"),
+                "absent creative should keep hb_cache_path"
             );
         }
 

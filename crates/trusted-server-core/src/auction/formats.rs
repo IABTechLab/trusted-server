@@ -219,8 +219,8 @@ pub fn convert_tsjs_to_auction_request(
 ///
 /// Creative HTML in the `adm` field is optionally sanitized and optionally
 /// rewritten according to the auction configuration
-/// ([`AuctionConfig::sanitize_creatives`] and
-/// [`AuctionConfig::rewrite_creatives`], both opt-in); with both disabled the
+/// ([`AuctionConfig::sanitize_creatives`], opt-in, and
+/// [`AuctionConfig::rewrite_creatives`], default-on); with both disabled the
 /// creative ships exactly as the bidder returned it, subject to the 1 MiB
 /// per-creative cap.
 ///
@@ -259,9 +259,9 @@ pub fn convert_to_openrtb_response(
         let width = to_openrtb_i32(bid.width, "width", &bid_context);
         let height = to_openrtb_i32(bid.height, "height", &bid_context);
 
-        // Process creative HTML if present. Sanitization and rewriting are each
-        // opt-in: with both disabled the creative ships exactly as the bidder
-        // returned it.
+        // Process creative HTML if present. Sanitization is opt-in and
+        // rewriting is on by default; with both disabled the creative ships
+        // exactly as the bidder returned it.
         let creative_html = if let Some(ref raw_creative) = bid.creative {
             let processed = creative::process_auction_creative(settings, raw_creative);
 
@@ -1075,11 +1075,11 @@ mod tests {
         let config = crate::auction_config_types::AuctionConfig::default();
         assert!(
             !config.sanitize_creatives,
-            "creatives are delivered as the bidder returned them unless a publisher opts in"
+            "sanitization is opt-in: it blanks script-based creatives"
         );
         assert!(
-            !config.rewrite_creatives,
-            "creative URL rewriting is opt-in"
+            config.rewrite_creatives,
+            "creative URL rewriting stays enabled by default"
         );
     }
 

@@ -174,7 +174,9 @@ export function renderAllAdUnits(): void {
 
 type IframeOptions = { name?: string; title?: string; width?: number; height?: number };
 
-// Construct a sandboxed iframe sized for sanitized, non-executable creative HTML.
+// Construct a sandboxed iframe for creative HTML. The markup may be raw bidder
+// output (server-side sanitization is opt-in); the sandbox's origin isolation,
+// not any sanitization, is the security boundary.
 export function createAdIframe(
   container: HTMLElement,
   opts: IframeOptions = {}

@@ -27,11 +27,12 @@ pub struct AuctionConfig {
     )]
     pub sanitize_creatives: bool,
 
-    /// Rewrite sanitized winning-bid creative HTML to first-party endpoints.
+    /// Rewrite winning-bid creative HTML to first-party endpoints (applied
+    /// after sanitization when [`Self::sanitize_creatives`] is enabled).
     ///
     /// The default must stay omitted from serialized config blobs: older
     /// [`AuctionConfig`] schemas reject unknown fields during binary rollback.
-    /// An explicit `true` remains serialized and requires restoring a
+    /// An explicit `false` remains serialized and requires restoring a
     /// compatible blob before rolling back.
     #[serde(
         default = "default_rewrite_creatives",
@@ -89,7 +90,7 @@ fn default_sanitize_creatives() -> bool {
 }
 
 fn default_rewrite_creatives() -> bool {
-    false
+    true
 }
 
 // This predicate preserves rollback compatibility by omitting the default field.
@@ -132,13 +133,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn creative_processing_defaults_to_disabled() {
+    fn creative_processing_defaults() {
         let config: AuctionConfig =
             serde_json::from_value(serde_json::json!({})).expect("should deserialize defaults");
 
         assert!(
-            !config.rewrite_creatives,
-            "creative rewriting is opt-in: creatives ship as the bidder returned them"
+            config.rewrite_creatives,
+            "creative rewriting stays enabled by default: existing deployments keep first-party proxying"
         );
         assert!(
             !config.sanitize_creatives,
@@ -158,17 +159,17 @@ mod tests {
     }
 
     #[test]
-    fn enabled_rewrite_creatives_is_serialized() {
+    fn disabled_rewrite_creatives_is_serialized() {
         let config = AuctionConfig {
-            rewrite_creatives: true,
+            rewrite_creatives: false,
             ..AuctionConfig::default()
         };
-        let serialized = serde_json::to_value(config).expect("should serialize enabled rewriting");
+        let serialized = serde_json::to_value(config).expect("should serialize disabled rewriting");
 
         assert_eq!(
             serialized.get("rewrite_creatives"),
-            Some(&serde_json::Value::Bool(true)),
-            "should preserve an explicit rewrite opt-in"
+            Some(&serde_json::Value::Bool(false)),
+            "should preserve an explicit rewrite opt-out"
         );
     }
 

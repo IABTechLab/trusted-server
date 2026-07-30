@@ -513,7 +513,8 @@ pub fn sanitize_creative_html(markup: &str) -> String {
 /// [`crate::auction_config_types::AuctionConfig::sanitize_creatives`] and
 /// rewriting by
 /// [`crate::auction_config_types::AuctionConfig::rewrite_creatives`]. With both
-/// disabled the creative is returned exactly as the bidder sent it.
+/// disabled the creative is returned exactly as the bidder sent it. In every
+/// mode, input over the 1 MiB per-creative cap is rejected (empty string).
 #[must_use]
 pub fn process_auction_creative(settings: &Settings, raw: &str) -> String {
     process_auction_creative_with_rewriter(settings, raw, |sanitized| {
@@ -655,6 +656,16 @@ fn rewrite_creative_html_impl(
     let mut rewriter = HtmlRewriter::new(
         HtmlSettings {
             element_content_handlers: vec![
+                // Remove <base> unconditionally: a bidder-supplied base URL
+                // rebases the root-relative `/first-party/…` and `/static/tsjs=…`
+                // URLs this pass emits onto an attacker-chosen origin, hijacking
+                // proxy/click mediation and leaking signed URL data. The
+                // sanitizer also strips <base>, but rewriting must not depend on
+                // sanitization, which is independently optional.
+                element!("base", |el| {
+                    el.remove();
+                    Ok(())
+                }),
                 // Inject unified tsjs bundle at the top of body once
                 element!("body", {
                     let injected = injected_ts_creative.clone();
@@ -1616,7 +1627,9 @@ mod tests {
 
     #[test]
     fn process_auction_creative_passes_through_byte_for_byte_when_disabled() {
-        let settings = crate::test_support::tests::create_test_settings();
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.auction.sanitize_creatives = false;
+        settings.auction.rewrite_creatives = false;
         let html = r#"<html><body onload="init()"><img src="https://cdn.example/ad.png"><script>marker</script><form action="https://x.example"></form></body></html>"#;
 
         let processed = process_auction_creative(&settings, html);
@@ -1649,6 +1662,48 @@ mod tests {
         assert!(
             processed.contains("onclick"),
             "should preserve event handlers when sanitization is disabled: {processed}"
+        );
+    }
+
+    #[test]
+    fn rewrite_only_mode_strips_base_elements() {
+        // Rewriting emits root-relative `/first-party/…` and `/static/tsjs=…`
+        // URLs, so a bidder-supplied <base> would rebase them onto a foreign
+        // origin. The rewriter must remove <base> itself: sanitization also
+        // strips it, but is independently optional.
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.auction.sanitize_creatives = false;
+        settings.auction.rewrite_creatives = true;
+        let html = r#"<html><head><base href="https://third-party.example/"></head><body><base href="https://third-party.example/deep/"><img src="https://cdn.example/ad.png"><a href="https://click.example/landing">x</a></body></html>"#;
+
+        let processed = process_auction_creative(&settings, html);
+
+        assert!(
+            !processed.contains("<base"),
+            "should strip every <base> element, head or body: {processed}"
+        );
+        assert!(
+            processed.contains("/first-party/proxy?tsurl="),
+            "should still rewrite resource URLs: {processed}"
+        );
+    }
+
+    #[test]
+    fn inline_rewrite_strips_base_elements() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.auction.sanitize_creatives = false;
+        settings.auction.rewrite_creatives = true;
+        let html = r#"<html><head><base href="https://third-party.example/"></head><body><img src="https://cdn.example/ad.png"></body></html>"#;
+
+        let processed = super::process_inline_auction_creative(
+            &settings,
+            "https://news.publisher.example",
+            html,
+        );
+
+        assert!(
+            !processed.contains("<base"),
+            "should strip <base> from inline creatives too: {processed}"
         );
     }
 

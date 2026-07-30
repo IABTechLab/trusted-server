@@ -43,7 +43,7 @@ Creative processing has separate auction-response and proxied-response paths. Wh
 
 The creative rewriters are invoked by independent delivery paths:
 
-1. **Auction `adm`**: Winning-bid HTML returned by `POST /auction` is optionally sanitized (`[auction].sanitize_creatives`) and optionally rewritten (`[auction].rewrite_creatives`); both are opt-in and default to `false`.
+1. **Auction `adm`**: Winning-bid HTML returned by `POST /auction` is optionally sanitized (`[auction].sanitize_creatives`, opt-in, default `false`) and rewritten (`[auction].rewrite_creatives`, default `true`).
 2. **First-party proxy**: Non-streaming `text/html` and `text/css` responses fetched through `/first-party/proxy` are rewritten independently of the auction setting.
 3. **Integration processing**: Publisher HTML integrations use their own registration and configuration controls.
 
@@ -53,21 +53,25 @@ When `with_streaming()` is enabled in `ProxyRequestConfig`, proxied HTML/CSS pro
 
 ## Auction Rewrite Control
 
-Two independent, default-false auction settings control the processing applied
-to winning-bid `adm` returned by `POST /auction` and delivered through the
-publisher SSAT/page-bids path:
+Two independent auction settings control the processing applied to winning-bid
+`adm` returned by `POST /auction` and delivered through the publisher
+SSAT/page-bids path. Sanitization is opt-in (default `false`); rewriting is
+enabled by default:
 
 ```toml
 [auction]
 sanitize_creatives = false
-rewrite_creatives = false
+rewrite_creatives = true
 ```
+
+Regardless of mode, a creative larger than the 1 MiB per-creative cap is
+rejected and its `adm` is dropped.
 
 | `sanitize_creatives` | `rewrite_creatives` | Auction winning-bid `adm` behavior                                                                                                                                                                                                    |
 | -------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `false` (default)    | `false` (default)   | Deliver the creative exactly as the bidder returned it.                                                                                                                                                                               |
+| `false` (default)    | `false`             | Deliver the creative exactly as the bidder returned it (subject to the size cap).                                                                                                                                                     |
 | `true`               | `false`             | Strip executable markup (`script`/`object`/`embed`/`form`, event handlers) with its inner content, then deliver without rewriting. Sanitizer-accepted external resource, click, and inline CSS URLs remain direct.                    |
-| `false`              | `true`              | Rewrite eligible resource/CSS and click URLs in the raw bidder markup to signed first-party endpoints. Executable markup is preserved.                                                                                                |
+| `false`              | `true` (default)    | Rewrite eligible resource/CSS and click URLs in the raw bidder markup to signed first-party endpoints, removing any bidder `<base>` element. Executable markup is preserved.                                                          |
 | `true`               | `true`              | Sanitize first, then rewrite. `POST /auction` emits root-relative endpoints and injects creative TSJS when a `<body>` exists; SSAT/page-bids emits absolute endpoints for its foreign-origin renderer and does not inject the bundle. |
 
 ::: warning Sanitization blanks script-based creatives
@@ -80,6 +84,21 @@ Creative inside the ad server's iframe), where the markup cannot reach the
 publisher origin. Sanitizer acceptance is not a host allowlist; ordinary
 accepted HTTP(S) URLs may cause the browser to contact external creative hosts
 directly.
+:::
+
+::: info Runtime protections inside the sandboxed creative iframe
+Creatives rendered by Trusted Server's own path run in a sandboxed iframe
+**without** `allow-same-origin`, i.e. an opaque origin. The injected creative
+runtime's click guard recovers mutated clicks there via a GET
+`/first-party/proxy-rebuild` navigation (302 chain). Its **dynamic** resource
+protection is currently unavailable in that context: runtime-inserted
+`<img>`/`<iframe>` URLs cannot be signed from an opaque origin (the signing
+request is blocked by CORS), so they load directly from third parties — the
+sandbox still isolates them from the publisher origin, but they are not
+first-party proxied. A same-origin parent postMessage broker restoring dynamic
+signing is tracked in
+[#982](https://github.com/IABTechLab/trusted-server/issues/982). URLs rewritten
+server-side are unaffected.
 :::
 
 Neither setting affects HTML/CSS response rewriting under

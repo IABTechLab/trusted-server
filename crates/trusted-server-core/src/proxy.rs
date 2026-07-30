@@ -1732,7 +1732,7 @@ pub async fn handle_first_party_proxy_rebuild(
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let method = req.method().clone();
-    let req_url = req.uri().to_string();
+    let req_query = req.uri().query().unwrap_or_default().to_owned();
     let payload = if method == Method::POST {
         let body_bytes = request_body_bytes(req.into_body(), "first-party rebuild")?;
         enforce_max_body_size(&body_bytes, REBUILD_MAX_BODY_BYTES, "first-party rebuild")?;
@@ -1745,13 +1745,13 @@ pub async fn handle_first_party_proxy_rebuild(
         })?
     } else {
         // Support GET: /first-party/proxy-rebuild?tsclick=...&add=...&del=...
-        let parsed = url::Url::parse(&req_url).change_context(TrustedServerError::Proxy {
-            message: "Invalid URL".to_string(),
-        })?;
+        // Parse the query component directly rather than the full URI: browsers
+        // (and the Axum/Spin adapters) deliver origin-form URIs (`/path?query`),
+        // which `url::Url::parse` rejects as relative.
         let mut tsclick: Option<String> = None;
         let mut add: Option<std::collections::HashMap<String, String>> = None;
         let mut del: Option<Vec<String>> = None;
-        for (k, v) in parsed.query_pairs() {
+        for (k, v) in url::form_urlencoded::parse(req_query.as_bytes()) {
             match k.as_ref() {
                 "tsclick" => tsclick = Some(v.into_owned()),
                 "add" => {
@@ -2672,6 +2672,58 @@ mod tests {
             );
             assert!(json.contains("\"added\":{\"y\":\"2\"}"), "{}", json);
             assert!(json.contains("\"removed\":[\"x\"]"), "{}", json);
+        });
+    }
+
+    #[test]
+    fn proxy_rebuild_get_with_origin_form_uri_redirects() {
+        // The opaque-origin creative click guard navigates to this endpoint,
+        // and browsers (via the Axum/Spin adapters) deliver origin-form URIs
+        // (`/path?query`) rather than absolute URLs. The handler must parse the
+        // query and answer with the 302 recovery redirect.
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let tsurl = "https://cdn.example/landing.html";
+            let full_for_token = format!("{}?x=1", tsurl);
+            let token =
+                crate::http_util::compute_encrypted_sha256_token(&settings, &full_for_token);
+            let tsclick = format!(
+                "/first-party/click?tsurl={}&x=1&tstoken={}",
+                url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
+                token,
+            );
+            let mut query = url::form_urlencoded::Serializer::new(String::new());
+            query.append_pair("tsclick", &tsclick);
+            query.append_pair("add", "{\"y\":\"2\"}");
+            query.append_pair("del", "[\"x\"]");
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(format!("/first-party/proxy-rebuild?{}", query.finish()))
+                .body(EdgeBody::empty())
+                .expect("should build origin-form rebuild request");
+
+            let resp = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
+                .await
+                .expect("origin-form GET rebuild should succeed");
+
+            assert_eq!(
+                resp.status(),
+                StatusCode::FOUND,
+                "should answer GET with the 302 recovery redirect"
+            );
+            let location = resp
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .expect("should carry a Location header");
+            assert!(
+                location.starts_with("/first-party/click?tsurl="),
+                "should redirect to the rebuilt first-party click: {location}"
+            );
+            assert!(
+                location.contains("y=2") && !location.contains("x=1"),
+                "should apply the add/del mutations: {location}"
+            );
         });
     }
 
