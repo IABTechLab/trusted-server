@@ -156,6 +156,82 @@ fn backend_config_from_spec(spec: &PlatformBackendSpec) -> BackendConfig<'_> {
         .certificate_check(spec.certificate_check)
         .first_byte_timeout(spec.first_byte_timeout)
         .between_bytes_timeout(spec.between_bytes_timeout)
+        .discriminator(spec.discriminator.as_deref())
+}
+
+/// Transport-timeout quantum for auction backends (see
+/// [`FastlyPlatformBackend::canonicalize_transport_timeout_ms`]).
+const TRANSPORT_TIMEOUT_QUANTUM_MS: u32 = 250;
+
+/// Upper bound of the fine-grained quantum range.
+///
+/// Budget-bound values below this ceiling are floored to a
+/// [`TRANSPORT_TIMEOUT_QUANTUM_MS`] multiple (the issue #847 behavior for the
+/// default 2000 ms auction). At or above it, values snap to the coarse
+/// [`TRANSPORT_TIMEOUT_COARSE_LADDER_MS`] instead so the total number of
+/// distinct budget-derived buckets stays globally bounded regardless of how
+/// large the configured ceiling is.
+const TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS: u32 = 2000;
+
+/// Coarse rungs for budget-bound transport timeouts below one quantum,
+/// ordered high to low.
+///
+/// Below one quantum, passing the exact wall-clock remainder through would mint
+/// a distinct backend name for every millisecond in `1..250`, so the
+/// near-exhausted tail alone could exceed Fastly's per-service dynamic backend
+/// limit. Snapping to this finite ladder instead bounds the number of
+/// budget-derived names an origin can produce. Budgets below the smallest rung
+/// round to zero, which callers treat as "budget exhausted — skip the launch".
+const SUB_QUANTUM_LADDER_MS: [u32; 4] = [200, 150, 100, 50];
+
+/// Coarse rungs for budget-bound transport timeouts at or above the quantum
+/// ceiling, ascending. Every rung is a [`TRANSPORT_TIMEOUT_QUANTUM_MS`]
+/// multiple.
+///
+/// Above [`TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS`], flooring to a 250 ms multiple
+/// would let a large configured ceiling (e.g. 60,000 ms) mint hundreds of
+/// distinct backend names — recreating the per-service dynamic backend
+/// exhaustion this quantization exists to prevent. This fixed, globally finite
+/// ladder caps the number of high-budget buckets instead: values are floored to
+/// the greatest rung no larger than the remaining budget, and anything above
+/// the top rung clamps to it. Rounding down never extends a transport cap past
+/// the remaining budget.
+///
+/// The rung spacing trades transport window for cardinality: just below a rung
+/// the haircut approaches the gap to the rung beneath (worst case ~50%, e.g. a
+/// remaining budget of 9,999 ms snaps to 5,000 ms). This is accepted — on the
+/// mediator path this value is the effective bound, but a denser ladder would
+/// buy back at most half a bucket of transport time at the cost of
+/// proportionally more backend names.
+const TRANSPORT_TIMEOUT_COARSE_LADDER_MS: [u32; 8] =
+    [2000, 3000, 5000, 10000, 20000, 30000, 45000, 60000];
+
+/// Round a budget-bound transport timeout down to a stable, globally bounded
+/// bucket.
+///
+/// - At or above [`TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS`], floors to the
+///   greatest [`TRANSPORT_TIMEOUT_COARSE_LADDER_MS`] rung no larger than
+///   `remaining_ms` (clamping to the top rung above it).
+/// - Within the quantum range, floors to a [`TRANSPORT_TIMEOUT_QUANTUM_MS`]
+///   multiple.
+/// - Below one quantum, snaps down to the greatest [`SUB_QUANTUM_LADDER_MS`]
+///   rung no larger than `remaining_ms` (or zero).
+fn quantize_transport_timeout_ms(remaining_ms: u32) -> u32 {
+    if remaining_ms >= TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS {
+        return TRANSPORT_TIMEOUT_COARSE_LADDER_MS
+            .into_iter()
+            .rev()
+            .find(|&rung| rung <= remaining_ms)
+            .unwrap_or(TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS);
+    }
+    let floored = (remaining_ms / TRANSPORT_TIMEOUT_QUANTUM_MS) * TRANSPORT_TIMEOUT_QUANTUM_MS;
+    if floored > 0 {
+        return floored;
+    }
+    SUB_QUANTUM_LADDER_MS
+        .into_iter()
+        .find(|&rung| rung <= remaining_ms)
+        .unwrap_or(0)
 }
 
 impl PlatformBackend for FastlyPlatformBackend {
@@ -169,6 +245,28 @@ impl PlatformBackend for FastlyPlatformBackend {
         backend_config_from_spec(spec)
             .ensure()
             .change_context(PlatformError::Backend)
+    }
+
+    /// Quantize the transport timeout so budget-derived values do not mint a
+    /// new dynamic backend name on every request.
+    ///
+    /// Fastly embeds the first-byte and between-bytes timeouts in the dynamic
+    /// backend name (see [`BackendConfig`]) and pools connections per backend
+    /// name. A per-request wall-clock budget would otherwise defeat that
+    /// pooling and accumulate registrations toward the per-service dynamic
+    /// backend limit.
+    ///
+    /// A provider's own configured timeout is a constant, so when it is the
+    /// binding constraint it is returned verbatim — including sub-quantum
+    /// configured values, which must not be rounded away or the provider could
+    /// never launch. Only the budget-bound value is snapped to a stable bucket
+    /// via [`quantize_transport_timeout_ms`]. Rounding down never extends a
+    /// transport cap past the remaining budget.
+    fn canonicalize_transport_timeout_ms(&self, remaining_ms: u32, configured_ms: u32) -> u32 {
+        if remaining_ms >= configured_ms {
+            return configured_ms;
+        }
+        quantize_transport_timeout_ms(remaining_ms)
     }
 }
 
@@ -355,16 +453,34 @@ fn fastly_body_to_edge_stream(body: fastly::Body) -> edgezero_core::body::Body {
     edgezero_core::body::Body::from_stream(stream)
 }
 
+/// Return whether a response is allowed to carry a body.
+///
+/// `HEAD` responses and informational, 204, 205, and 304 statuses carry no
+/// content. In particular, HEAD and 304 may legitimately retain a
+/// `Content-Length` for the corresponding GET representation.
+fn response_carries_body(request_is_head: bool, status: fastly::http::StatusCode) -> bool {
+    !request_is_head
+        && !status.is_informational()
+        && status != fastly::http::StatusCode::NO_CONTENT
+        && status != fastly::http::StatusCode::RESET_CONTENT
+        && status != fastly::http::StatusCode::NOT_MODIFIED
+}
+
 /// Convert a [`fastly::Response`] to a [`PlatformResponse`] with the given backend name.
 fn fastly_response_to_platform(
     mut resp: fastly::Response,
     backend_name: impl Into<String>,
     stream_response: bool,
+    request_is_head: bool,
 ) -> Result<PlatformResponse, Report<PlatformError>> {
+    let status = resp.get_status();
+    let response_body_expected = response_carries_body(request_is_head, status);
+
     // Pre-flight: reject oversized responses before copying bytes into WASM heap.
     // Content-Length is advisory but covers most origin responses; chunked
     // responses without it fall through to the post-materialization check below.
-    if !stream_response
+    if response_body_expected
+        && !stream_response
         && let Some(claimed_len) = resp
             .get_header("content-length")
             .and_then(|v| v.to_str().ok())
@@ -377,12 +493,13 @@ fn fastly_response_to_platform(
         )));
     }
 
-    let status = resp.get_status();
     let mut builder = edgezero_core::http::response_builder().status(status);
     for (name, value) in resp.get_headers() {
         builder = builder.header(name.as_str(), value.as_bytes());
     }
-    let body = if stream_response {
+    let body = if !response_body_expected {
+        edgezero_core::body::Body::empty()
+    } else if stream_response {
         fastly_body_to_edge_stream(resp.take_body())
     } else {
         let body_bytes = resp.take_body_bytes();
@@ -424,6 +541,10 @@ pub struct FastlyPlatformHttpClient;
 
 #[async_trait::async_trait(?Send)]
 impl PlatformHttpClient for FastlyPlatformHttpClient {
+    fn supports_streaming_responses(&self) -> bool {
+        true
+    }
+
     async fn send(
         &self,
         request: PlatformHttpRequest,
@@ -431,6 +552,7 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         let backend_name = request.backend_name.clone();
         let image_optimizer = request.image_optimizer;
         let stream_response = request.stream_response;
+        let request_is_head = request.request.method() == edgezero_core::http::Method::HEAD;
         let mut fastly_req = edge_request_to_fastly(request.request)?;
         if let Some(options) = image_optimizer {
             apply_fastly_image_optimizer(&mut fastly_req, options)?;
@@ -438,7 +560,7 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         let fastly_resp = fastly_req
             .send(&backend_name)
             .change_context(PlatformError::HttpClient)?;
-        fastly_response_to_platform(fastly_resp, backend_name, stream_response)
+        fastly_response_to_platform(fastly_resp, backend_name, stream_response, request_is_head)
     }
 
     async fn send_async(
@@ -500,8 +622,14 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
                     return Err(Report::new(PlatformError::HttpClient)
                         .attach("select: response has no backend name; correlation impossible"));
                 };
+                let Some(backend_request) = fastly_resp.get_backend_request() else {
+                    return Err(Report::new(PlatformError::HttpClient).attach(
+                        "select: response has no originating request; body semantics unknown",
+                    ));
+                };
+                let request_is_head = backend_request.get_method() == fastly::http::Method::HEAD;
                 (
-                    fastly_response_to_platform(fastly_resp, backend_name, false),
+                    fastly_response_to_platform(fastly_resp, backend_name, false, request_is_head),
                     None,
                 )
             }
@@ -635,15 +763,16 @@ mod tests {
             certificate_check: true,
             first_byte_timeout: Duration::from_secs(15),
             between_bytes_timeout: Duration::from_secs(15),
+            discriminator: None,
         };
 
         let name = backend
             .predict_name(&spec)
             .expect("should compute backend name for valid spec");
 
-        assert_eq!(
-            name, "backend_https_origin_example_com_443_fb15000_bb15000",
-            "should match BackendConfig naming convention"
+        assert!(
+            name.starts_with("backend_https_origin_example_com_443_fb15000_bb15000_"),
+            "should match BackendConfig naming convention, got {name}"
         );
     }
 
@@ -658,15 +787,18 @@ mod tests {
             certificate_check: true,
             first_byte_timeout: Duration::from_secs(15),
             between_bytes_timeout: Duration::from_secs(15),
+            discriminator: None,
         };
 
         let name = backend
             .predict_name(&spec)
             .expect("should compute backend name for host header override");
 
-        assert_eq!(
-            name, "backend_https_origin_example_com_443_oh_www_example_com_fb15000_bb15000",
-            "should match BackendConfig naming convention with host header override"
+        assert!(
+            name.starts_with(
+                "backend_https_origin_example_com_443_oh_www_example_com_fb15000_bb15000_"
+            ),
+            "should match BackendConfig naming convention with host header override, got {name}"
         );
     }
 
@@ -681,6 +813,7 @@ mod tests {
             certificate_check: false,
             first_byte_timeout: Duration::from_secs(15),
             between_bytes_timeout: Duration::from_secs(15),
+            discriminator: None,
         };
 
         let name = backend
@@ -704,6 +837,7 @@ mod tests {
             certificate_check: true,
             first_byte_timeout: Duration::from_secs(15),
             between_bytes_timeout: Duration::from_secs(15),
+            discriminator: None,
         };
 
         let result = backend.predict_name(&spec);
@@ -722,6 +856,7 @@ mod tests {
             certificate_check: true,
             first_byte_timeout: Duration::from_millis(2000),
             between_bytes_timeout: Duration::from_millis(2000),
+            discriminator: None,
         };
 
         let name = backend
@@ -729,12 +864,120 @@ mod tests {
             .expect("should compute name with custom timeout");
 
         assert!(
-            name.ends_with("_fb2000_bb2000"),
-            "should encode 2000ms first-byte and between-bytes timeouts in name"
+            name.contains("_fb2000_bb2000_"),
+            "should encode 2000ms first-byte and between-bytes timeouts in name, got {name}"
+        );
+    }
+
+    #[test]
+    fn predict_name_matches_ensured_backend_name() {
+        // The auction orchestrator maps responses back to providers by the
+        // predicted backend name, so predict_name and ensure must return the
+        // identical string for the same spec — a divergence would make
+        // responses land in the "unknown backend" branch and drop bids
+        // silently.
+        let backend = FastlyPlatformBackend;
+        let spec = PlatformBackendSpec {
+            scheme: "https".to_string(),
+            host: "consistency.example.com".to_string(),
+            port: None,
+            host_header_override: None,
+            certificate_check: true,
+            first_byte_timeout: Duration::from_millis(750),
+            between_bytes_timeout: Duration::from_millis(750),
+            discriminator: None,
+        };
+
+        let predicted = backend
+            .predict_name(&spec)
+            .expect("should predict backend name");
+        let ensured = backend
+            .ensure(&spec)
+            .expect("should register backend for valid spec");
+
+        assert_eq!(
+            predicted, ensured,
+            "predicted backend name should match the registered backend name"
         );
     }
 
     // --- FastlyPlatformHttpClient -------------------------------------------
+
+    #[test]
+    fn fastly_response_to_platform_allows_oversized_bodiless_content_length() {
+        let oversized_content_length = (MAX_PLATFORM_RESPONSE_BODY_BYTES + 1).to_string();
+        for (request_is_head, status) in [
+            (true, fastly::http::StatusCode::OK),
+            (false, fastly::http::StatusCode::CONTINUE),
+            (false, fastly::http::StatusCode::NO_CONTENT),
+            (false, fastly::http::StatusCode::RESET_CONTENT),
+            (false, fastly::http::StatusCode::NOT_MODIFIED),
+        ] {
+            let mut fastly_response = fastly::Response::from_status(status);
+            fastly_response.set_header(
+                fastly::http::header::CONTENT_LENGTH,
+                oversized_content_length.as_str(),
+            );
+
+            let platform_response =
+                fastly_response_to_platform(fastly_response, "origin", false, request_is_head)
+                    .expect("should allow oversized metadata for a bodiless response");
+
+            assert_eq!(
+                platform_response
+                    .response
+                    .headers()
+                    .get(edgezero_core::http::header::CONTENT_LENGTH)
+                    .and_then(|value| value.to_str().ok()),
+                Some(oversized_content_length.as_str()),
+                "should preserve the origin Content-Length"
+            );
+            let body = platform_response
+                .response
+                .into_body()
+                .into_bytes()
+                .expect("should return a buffered body");
+            assert!(body.is_empty(), "should return an empty bodiless response");
+        }
+    }
+
+    #[test]
+    fn fastly_response_to_platform_rejects_oversized_buffered_get_content_length() {
+        let mut fastly_response = fastly::Response::from_status(200);
+        fastly_response.set_header(
+            fastly::http::header::CONTENT_LENGTH,
+            (MAX_PLATFORM_RESPONSE_BODY_BYTES + 1).to_string(),
+        );
+
+        let error = fastly_response_to_platform(fastly_response, "origin", false, false)
+            .expect_err("should reject oversized buffered GET metadata");
+        let expected_error =
+            format!("exceeds {MAX_PLATFORM_RESPONSE_BODY_BYTES}-byte response body limit");
+
+        assert!(
+            format!("{error:?}").contains(&expected_error),
+            "should retain the buffered response size limit: {error:?}"
+        );
+    }
+
+    #[test]
+    fn response_carries_body_rejects_all_informational_statuses() {
+        let status = fastly::http::StatusCode::from_u16(199)
+            .expect("should construct an informational status code");
+
+        assert!(
+            !response_carries_body(false, status),
+            "should reject every informational response body"
+        );
+        assert!(
+            !response_carries_body(true, fastly::http::StatusCode::OK),
+            "should reject HEAD response bodies"
+        );
+        assert!(
+            response_carries_body(false, fastly::http::StatusCode::OK),
+            "should retain ordinary GET response bodies"
+        );
+    }
 
     #[test]
     fn fastly_platform_http_client_send_returns_error_for_unregistered_backend() {
@@ -902,6 +1145,192 @@ mod tests {
         assert!(
             format!("{err:?}").contains("streaming request body"),
             "should describe the unsupported streaming body: {err:?}"
+        );
+    }
+
+    // --- FastlyPlatformBackend::canonicalize_transport_timeout_ms -----------
+
+    #[test]
+    fn canonicalize_prefers_configured_timeout_when_budget_allows() {
+        let backend = FastlyPlatformBackend;
+        assert_eq!(
+            backend.canonicalize_transport_timeout_ms(2000, 1000),
+            1000,
+            "should use the configured timeout verbatim when the budget allows"
+        );
+        assert_eq!(
+            backend.canonicalize_transport_timeout_ms(2000, 100),
+            100,
+            "should preserve a sub-quantum configured constant — it is name-stable on its own"
+        );
+    }
+
+    #[test]
+    fn canonicalize_floors_budget_bound_value_to_quantum() {
+        let backend = FastlyPlatformBackend;
+        assert_eq!(
+            backend.canonicalize_transport_timeout_ms(999, 2000),
+            750,
+            "should floor a 999ms budget to the 750ms quantum bucket"
+        );
+        assert_eq!(
+            backend.canonicalize_transport_timeout_ms(300, 2000),
+            250,
+            "should floor a tight budget down to one quantum"
+        );
+        assert_eq!(
+            backend.canonicalize_transport_timeout_ms(250, 2000),
+            250,
+            "should keep an exact quantum multiple"
+        );
+    }
+
+    #[test]
+    fn canonicalize_snaps_sub_quantum_budget_to_bounded_ladder() {
+        let backend = FastlyPlatformBackend;
+        // Exact wall-clock values in 1..250 must NOT pass through — that is the
+        // unbounded-cardinality regression this ladder closes.
+        assert_eq!(
+            backend.canonicalize_transport_timeout_ms(249, 2000),
+            200,
+            "should snap a sub-quantum budget down to the greatest ladder rung, not pass 249 through"
+        );
+        assert_eq!(backend.canonicalize_transport_timeout_ms(200, 2000), 200);
+        assert_eq!(backend.canonicalize_transport_timeout_ms(150, 2000), 150);
+        assert_eq!(backend.canonicalize_transport_timeout_ms(100, 2000), 100);
+        assert_eq!(backend.canonicalize_transport_timeout_ms(50, 2000), 50);
+        assert_eq!(
+            backend.canonicalize_transport_timeout_ms(49, 2000),
+            0,
+            "a budget below the smallest rung rounds to zero (launch skipped)"
+        );
+        assert_eq!(
+            backend.canonicalize_transport_timeout_ms(0, 1000),
+            0,
+            "an exhausted budget canonicalizes to zero"
+        );
+        assert_eq!(
+            backend.canonicalize_transport_timeout_ms(100, 0),
+            0,
+            "a zero configured timeout canonicalizes to zero"
+        );
+    }
+
+    #[test]
+    fn canonicalize_budget_derived_names_stay_within_a_safe_cardinality() {
+        // Enumerate every reachable remaining budget for a normal 2000ms
+        // ceiling and confirm the number of distinct backend-name-bearing
+        // transport values an origin can mint stays far below Fastly's
+        // per-service dynamic backend limit (documented default 200).
+        let backend = FastlyPlatformBackend;
+        let configured = 2000;
+        let mut distinct = std::collections::BTreeSet::new();
+        for remaining in 0..=configured {
+            let value = backend.canonicalize_transport_timeout_ms(remaining, configured);
+            if value > 0 {
+                distinct.insert(value);
+            }
+            // No arbitrary clock-derived value may leak: every canonical value
+            // is either a quantum multiple or one of the bounded ladder rungs.
+            assert!(
+                value == 0
+                    || value % TRANSPORT_TIMEOUT_QUANTUM_MS == 0
+                    || SUB_QUANTUM_LADDER_MS.contains(&value),
+                "canonical value {value}ms (from remaining {remaining}ms) is neither a quantum \
+                 multiple nor a ladder rung"
+            );
+            // The mediator </body> hold bound relies on canonicalization never
+            // extending a transport cap past the wall-clock budget.
+            assert!(
+                value <= remaining,
+                "canonical value {value}ms must not extend past the remaining {remaining}ms budget"
+            );
+        }
+        assert!(
+            distinct.len() <= 16,
+            "budget-derived transport values should stay well under the dynamic backend limit, \
+             got {} distinct values: {distinct:?}",
+            distinct.len()
+        );
+    }
+
+    #[test]
+    fn canonicalize_budget_derived_names_stay_bounded_for_large_ceiling() {
+        // A large configured ceiling (e.g. a 60s mediator budget) must not let
+        // the budget-derived buckets grow with the ceiling. Without the coarse
+        // ladder a 60,000ms ceiling would mint ~240 distinct 250ms buckets and
+        // blow past Fastly's documented per-service dynamic backend limit (200).
+        let backend = FastlyPlatformBackend;
+        let configured = 60_000;
+        let mut distinct = std::collections::BTreeSet::new();
+        for remaining in 0..=configured {
+            let value = backend.canonicalize_transport_timeout_ms(remaining, configured);
+            if value > 0 {
+                distinct.insert(value);
+            }
+            assert!(
+                value == 0
+                    || value % TRANSPORT_TIMEOUT_QUANTUM_MS == 0
+                    || SUB_QUANTUM_LADDER_MS.contains(&value),
+                "canonical value {value}ms (from remaining {remaining}ms) is neither a quantum \
+                 multiple nor a ladder rung"
+            );
+            // The mediator </body> hold bound relies on canonicalization never
+            // extending a transport cap past the wall-clock budget.
+            assert!(
+                value <= remaining,
+                "canonical value {value}ms must not extend past the remaining {remaining}ms budget"
+            );
+        }
+        // A budget above the top coarse rung must clamp to it, not open a new
+        // bucket per 250ms step.
+        assert_eq!(
+            backend.canonicalize_transport_timeout_ms(120_000, 240_000),
+            60_000,
+            "a budget above the top coarse rung clamps to it"
+        );
+        assert!(
+            distinct.len() <= 20,
+            "large-ceiling budget-derived values must stay bounded, got {} distinct values: {distinct:?}",
+            distinct.len()
+        );
+    }
+
+    // --- FastlyPlatformBackend::predict_name discriminator ------------------
+
+    #[test]
+    fn predict_name_includes_provider_discriminator() {
+        let backend = FastlyPlatformBackend;
+        let base = PlatformBackendSpec {
+            scheme: "https".to_string(),
+            host: "gateway.example.com".to_string(),
+            port: None,
+            host_header_override: None,
+            certificate_check: true,
+            first_byte_timeout: Duration::from_millis(750),
+            between_bytes_timeout: Duration::from_millis(750),
+            discriminator: Some("prebid".to_string()),
+        };
+        let prebid_name = backend
+            .predict_name(&base)
+            .expect("should predict name with discriminator");
+        assert!(
+            prebid_name.contains("_p_prebid"),
+            "should fold the provider discriminator into the name, got {prebid_name}"
+        );
+
+        // Same origin + same transport timeout, different provider → distinct
+        // backend names, so auction response correlation cannot cross them.
+        let aps = PlatformBackendSpec {
+            discriminator: Some("aps".to_string()),
+            ..base.clone()
+        };
+        let aps_name = backend
+            .predict_name(&aps)
+            .expect("should predict name for the second provider");
+        assert_ne!(
+            prebid_name, aps_name,
+            "two providers on one origin must not share a backend name"
         );
     }
 }
