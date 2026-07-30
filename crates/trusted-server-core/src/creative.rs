@@ -56,30 +56,21 @@ pub(super) fn to_abs(settings: &Settings, u: &str) -> Option<String> {
         return None;
     }
 
-    // Skip if excluded from rewrites in settings
-    if settings.rewrite.is_excluded(t) {
-        return None;
-    }
-
-    // Skip non-network schemes commonly found in creatives
     let lower = t.to_ascii_lowercase();
-    if lower.starts_with("data:")
-        || lower.starts_with("javascript:")
-        || lower.starts_with("mailto:")
-        || lower.starts_with("tel:")
-        || lower.starts_with("blob:")
-        || lower.starts_with("about:")
-    {
+    let absolute = if t.starts_with("//") {
+        format!("https:{t}")
+    } else if lower.starts_with("http://") || lower.starts_with("https://") {
+        t.to_owned()
+    } else {
+        return None;
+    };
+
+    // Match exclusions against the same absolute URL used for rewriting.
+    if settings.rewrite.is_excluded(&absolute) {
         return None;
     }
 
-    if t.starts_with("//") {
-        Some(format!("https:{t}"))
-    } else if lower.starts_with("http://") || lower.starts_with("https://") {
-        Some(t.to_owned())
-    } else {
-        None
-    }
+    Some(absolute)
 }
 
 // Helper: rewrite url(...) occurrences inside a CSS style string to first-party proxy.
@@ -515,6 +506,46 @@ pub fn sanitize_creative_html(markup: &str) -> String {
     String::from_utf8(out).unwrap_or_default()
 }
 
+/// Sanitize auction creative HTML, then optionally rewrite it to first-party endpoints.
+///
+/// Sanitization is mandatory in both modes. Rewriting is controlled by
+/// [`crate::auction_config_types::AuctionConfig::rewrite_creatives`].
+#[must_use]
+pub(crate) fn process_auction_creative(settings: &Settings, raw: &str) -> String {
+    process_auction_creative_with_rewriter(settings, raw, |sanitized| {
+        rewrite_creative_html(settings, sanitized)
+    })
+}
+
+/// Process an inline auction creative rendered from a foreign-origin document.
+///
+/// Sanitization is mandatory. When auction creative rewriting is enabled, proxy
+/// and click URLs are emitted as absolute URLs against `base_origin` without
+/// injecting the creative TSJS bundle.
+#[must_use]
+pub(crate) fn process_inline_auction_creative(
+    settings: &Settings,
+    base_origin: &str,
+    raw: &str,
+) -> String {
+    process_auction_creative_with_rewriter(settings, raw, |sanitized| {
+        rewrite_inline_creative_html(settings, base_origin, sanitized)
+    })
+}
+
+fn process_auction_creative_with_rewriter(
+    settings: &Settings,
+    raw: &str,
+    rewrite: impl FnOnce(&str) -> String,
+) -> String {
+    let sanitized = sanitize_creative_html(raw);
+    if settings.auction.rewrite_creatives {
+        rewrite(&sanitized)
+    } else {
+        sanitized
+    }
+}
+
 /// Rewrite ad creative HTML to first-party endpoints, for creatives rendered
 /// from the first-party origin (the `/auction` iframe `srcdoc`).
 /// - 1x1 `<img>` pixels → `/first-party/proxy?tsurl=&lt;base-url&gt;&lt;params&gt;&tstoken=&lt;sig&gt;`
@@ -879,8 +910,8 @@ impl StreamProcessor for CreativeCssProcessor<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        rewrite_creative_html, rewrite_inline_creative_html, rewrite_srcset, rewrite_style_urls,
-        sanitize_creative_html, to_abs,
+        process_auction_creative, rewrite_creative_html, rewrite_inline_creative_html,
+        rewrite_srcset, rewrite_style_urls, sanitize_creative_html, to_abs,
     };
 
     fn rewrite_srcset_attr(attr_name: &str, attr_value: &str) -> String {
@@ -1512,6 +1543,53 @@ mod tests {
     }
 
     #[test]
+    fn process_auction_creative_rewrites_after_sanitizing_by_default() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let html = r#"<html><body><img src="https://cdn.example/ad.png"><script>marker</script></body></html>"#;
+
+        let processed = process_auction_creative(&settings, html);
+
+        assert!(
+            processed.contains("/first-party/proxy?tsurl="),
+            "should rewrite accepted resource URLs: {processed}"
+        );
+        assert!(
+            processed.contains("tsjs-unified.min.js"),
+            "should inject the creative runtime: {processed}"
+        );
+        assert!(
+            !processed.contains("marker"),
+            "should sanitize scripts before rewriting: {processed}"
+        );
+    }
+
+    #[test]
+    fn process_auction_creative_can_skip_rewriting_but_not_sanitization() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.auction.rewrite_creatives = false;
+        let html = r#"<html><body><img src="https://cdn.example/ad.png"><script>marker</script></body></html>"#;
+
+        let processed = process_auction_creative(&settings, html);
+
+        assert!(
+            processed.contains(r#"src="https://cdn.example/ad.png""#),
+            "should keep accepted resource URLs direct: {processed}"
+        );
+        assert!(
+            !processed.contains("/first-party/proxy?tsurl="),
+            "should not rewrite resource URLs: {processed}"
+        );
+        assert!(
+            !processed.contains("tsjs-unified.min.js"),
+            "should not inject the creative runtime: {processed}"
+        );
+        assert!(
+            !processed.contains("marker"),
+            "should sanitize scripts even without rewriting: {processed}"
+        );
+    }
+
+    #[test]
     fn to_abs_additional_cases() {
         let settings = crate::test_support::tests::create_test_settings();
         assert_eq!(
@@ -1548,10 +1626,21 @@ mod tests {
             None
         );
 
+        assert_eq!(
+            to_abs(&settings, "//trusted-cdn.example.com/lib.js"),
+            None,
+            "should exclude a protocol-relative URL by exact domain"
+        );
+
         // Non-excluded domain should return Some
         assert_eq!(
             to_abs(&settings, "https://other-cdn.example.com/lib.js"),
             Some("https://other-cdn.example.com/lib.js".to_owned())
+        );
+        assert_eq!(
+            to_abs(&settings, "//other-cdn.example.com/lib.js"),
+            Some("https://other-cdn.example.com/lib.js".to_owned()),
+            "should normalize a non-excluded protocol-relative URL"
         );
     }
 
@@ -1568,6 +1657,16 @@ mod tests {
             to_abs(&settings, "https://cdnjs.cloudflare.com/lib.js"),
             None
         );
+        assert_eq!(
+            to_abs(&settings, "//cloudflare.com/cdn.js"),
+            None,
+            "should exclude a protocol-relative wildcard base domain"
+        );
+        assert_eq!(
+            to_abs(&settings, "//cdnjs.cloudflare.com/lib.js"),
+            None,
+            "should exclude a protocol-relative wildcard subdomain"
+        );
 
         // Should not exclude different domain
         assert_eq!(
@@ -1583,6 +1682,7 @@ mod tests {
 
         let html = r#"
             <img src="https://trusted-cdn.example.com/logo.png">
+            <img src="//trusted-cdn.example.com/protocol-relative.png">
             <img src="https://other-cdn.example.com/banner.jpg">
         "#;
 
@@ -1590,6 +1690,11 @@ mod tests {
 
         // Excluded domain should NOT be rewritten
         assert!(out.contains(r#"src="https://trusted-cdn.example.com/logo.png"#));
+
+        assert!(
+            out.contains(r#"src="//trusted-cdn.example.com/protocol-relative.png""#),
+            "excluded protocol-relative URL should remain direct: {out}"
+        );
 
         // Non-excluded domain SHOULD be rewritten
         assert!(out.contains("/first-party/proxy?tsurl="));
