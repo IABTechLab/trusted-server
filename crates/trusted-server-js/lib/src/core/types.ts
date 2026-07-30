@@ -151,11 +151,13 @@ export interface TsjsApi {
    */
   navGeneration?: number;
   /**
-   * Defers the initial `adInit()` until after React hydration: window `load`,
-   * then a double `requestAnimationFrame`, cancelled when an SPA navigation
-   * committed while pending. Called by the server-injected `</body>` bids
-   * script; lives in the bundle so the lifecycle is executable under test and
-   * shares [`navGeneration`] with the SPA auction hook.
+   * Defers the initial `adInit()` until after React hydration: the first
+   * hydration signal to arrive — the Next.js App Router runtime patching
+   * `window.__next_f`, or window `load` as the fallback and the only signal on
+   * non-Next publishers — then a double `requestAnimationFrame`, cancelled when
+   * an SPA navigation committed while pending. Called by the server-injected
+   * `</body>` bids script; lives in the bundle so the lifecycle is executable
+   * under test and shares [`navGeneration`] with the SPA auction hook.
    */
   scheduleInitialAdInit?: () => void;
 }
