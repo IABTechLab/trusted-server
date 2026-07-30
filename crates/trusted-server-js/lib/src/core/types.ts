@@ -130,11 +130,13 @@ export interface TsjsApi {
    */
   adInitRefreshInProgress?: boolean;
   /**
-   * True once the publisher has called `googletag.pubads().disableInitialLoad()`.
-   * GPT exposes no getter for this state, so it is tracked by wrapping the
-   * setter. When set, `display()` only registers a slot and the ad request must
-   * come from a `refresh()`; adInit() uses this to refresh its own freshly
-   * defined slots so they are not left blank.
+   * Whether the publisher disabled GPT initial load through
+   * `googletag.setConfig()` or `googletag.pubads().disableInitialLoad()`.
+   * TS synchronizes this from GPT's getter and wraps both configuration APIs as
+   * a fallback when the getter is unavailable.
+   * When set, `display()` only registers a slot and the ad request must come
+   * from a `refresh()`; adInit() uses this to refresh its own freshly defined
+   * slots so they are not left blank.
    */
   gptInitialLoadDisabled?: boolean;
   /** Guards SPA pushState hook installation. */
@@ -142,8 +144,9 @@ export interface TsjsApi {
   /**
    * Monotonic count of committed SPA navigations, incremented synchronously by
    * the SPA auction hook the moment it accepts a route change. The deferred
-   * initial-adInit bootstrap ([`scheduleInitialAdInit`]) captures this counter
-   * and no-ops when a navigation committed while it was pending. A counter is
+   * initial-adInit bootstrap ([`scheduleInitialAdInit`]) is pinned to
+   * generation 0 (the SSR document) and no-ops when a navigation has
+   * committed — before it was called, or while it was pending. A counter is
    * used instead of a URL comparison so the guard cannot diverge from the
    * auction path: a query-only history change (which the hook deliberately
    * ignores) leaves the counter unchanged, and an `/a → /b → /a` round trip

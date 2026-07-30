@@ -1230,10 +1230,10 @@ mod tests {
             combined.contains("\"load\""),
             "fallback scheduler should gate on window load"
         );
-        assert!(
-            !combined.contains("setTimeout"),
-            "fallback scheduler must not retry on a timer"
-        );
+        // The no-retry-timer property is owned by the executable suite
+        // (gpt_bootstrap.test.ts asserts adInit runs exactly once); a
+        // `!contains("setTimeout")` over the whole joined head-insert output
+        // would misattribute any future unrelated timer to the scheduler.
     }
 
     #[test]
@@ -1287,9 +1287,10 @@ mod tests {
 
     #[test]
     fn head_inserts_bootstrap_refreshes_ts_slots_when_initial_load_disabled() {
-        // Mirrors the bundle: when the publisher calls disableInitialLoad(),
-        // display() only registers a TS-defined slot, so the bootstrap must also
-        // refresh those slots or they render blank.
+        // Mirrors the bundle: when the publisher disables initial load through
+        // setConfig() or the legacy disableInitialLoad() method, display() only
+        // registers a TS-defined slot, so the bootstrap must also refresh those
+        // slots or they render blank.
         let config = test_config();
         let integration = GptIntegration::new(config);
         let doc_state = IntegrationDocumentState::default();
@@ -1301,8 +1302,16 @@ mod tests {
         };
         let combined = integration.head_inserts(&ctx).join("");
         assert!(
-            combined.contains("disableInitialLoad"),
-            "bootstrap should wrap disableInitialLoad() to detect the disabled state"
+            combined.contains("gpt.setConfig"),
+            "bootstrap should wrap googletag.setConfig() to detect the disabled state"
+        );
+        assert!(
+            combined.contains("gpt.getConfig"),
+            "bootstrap should read GPT's modern initial-load configuration"
+        );
+        assert!(
+            combined.contains("pubads.disableInitialLoad"),
+            "bootstrap should wrap legacy disableInitialLoad() calls"
         );
         assert!(
             combined.contains("gptInitialLoadDisabled"),

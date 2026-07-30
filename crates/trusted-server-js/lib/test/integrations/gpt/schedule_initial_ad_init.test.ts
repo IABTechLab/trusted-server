@@ -82,8 +82,9 @@ describe('scheduleInitialAdInit', () => {
     document.body.innerHTML = '';
     popstateHandlers.forEach((handler) => window.removeEventListener('popstate', handler));
     popstateHandlers = [];
-    // Remove the instance property so the prototype getter is visible again.
+    // Remove the instance properties so the prototype getters are visible again.
     delete (document as unknown as Record<string, unknown>).readyState;
+    delete (document as unknown as Record<string, unknown>).hidden;
     delete (window as unknown as Record<string, unknown>).requestAnimationFrame;
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
@@ -506,5 +507,33 @@ describe('scheduleInitialAdInit', () => {
     expect(destroySlots).not.toHaveBeenCalled();
     expect(mockPubads.refresh).not.toHaveBeenCalled();
     expect(mockPubads.enableSingleRequest).not.toHaveBeenCalled();
+  });
+
+  it('rides animation frames in a hidden document, holding adInit until first view', async () => {
+    // Browsers do not service rAF while the document is hidden, so a
+    // background-tab load queues the frames but does not run them until the
+    // tab is first viewed. This is intended (see installScheduleInitialAdInit):
+    // the initial request spends its impression on a viewed tab. The scheduler
+    // must keep riding rAF — not switch to a timer — while hidden.
+    Object.defineProperty(document, 'hidden', {
+      configurable: true,
+      get: () => true,
+    });
+    await importGptModule();
+    const ts = (window as TestWindow).tsjs!;
+    const adInit = vi.fn();
+    ts.adInit = adInit;
+
+    ts.scheduleInitialAdInit!({ atf: { hb_pb: '1.00' } });
+    window.dispatchEvent(new Event('load'));
+
+    // Hidden tab: the frame chain is queued but unserviced — adInit waits.
+    expect(rafQueue.length).toBeGreaterThan(0);
+    expect(adInit).not.toHaveBeenCalled();
+
+    // First view: the browser services the pending frames.
+    flushFrame();
+    flushFrame();
+    expect(adInit).toHaveBeenCalledTimes(1);
   });
 });

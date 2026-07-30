@@ -63,6 +63,7 @@ describe('gpt_bootstrap.js fallback', () => {
   afterEach(() => {
     document.body.innerHTML = '';
     delete (document as unknown as Record<string, unknown>).readyState;
+    delete (document as unknown as Record<string, unknown>).hidden;
     delete (window as unknown as Record<string, unknown>).requestAnimationFrame;
     delete (window as TestWindow).tsjs;
     delete (window as TestWindow).googletag;
@@ -100,6 +101,29 @@ describe('gpt_bootstrap.js fallback', () => {
     window.dispatchEvent(new Event('load'));
     flushFrame();
     expect(adInit).not.toHaveBeenCalled();
+    flushFrame();
+    expect(adInit).toHaveBeenCalledTimes(1);
+  });
+
+  it('fallback scheduler rides animation frames in a hidden document, holding adInit until first view', () => {
+    // Mirrors the bundle scheduler's intended hidden-tab behavior: rAF is not
+    // serviced while hidden, so a background-tab load holds the initial
+    // adInit until first view — the fallback must not diverge to a timer.
+    Object.defineProperty(document, 'hidden', {
+      configurable: true,
+      get: () => true,
+    });
+    runBootstrap();
+    const ts = (window as TestWindow).tsjs!;
+    const adInit = vi.fn();
+    ts.adInit = adInit;
+
+    ts.scheduleInitialAdInit({ atf: { hb_pb: '1.00' } });
+    window.dispatchEvent(new Event('load'));
+    expect(rafQueue.length).toBeGreaterThan(0);
+    expect(adInit).not.toHaveBeenCalled();
+
+    flushFrame();
     flushFrame();
     expect(adInit).toHaveBeenCalledTimes(1);
   });
