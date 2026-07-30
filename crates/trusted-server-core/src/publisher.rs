@@ -3317,9 +3317,11 @@ pub(crate) fn build_bids_script(bid_map: &serde_json::Map<String, serde_json::Va
     // adInit() defines GPT slots on the publisher's `-container` wrappers, which
     // mutates those ad-slot subtrees. Calling it synchronously here (this script
     // runs at body-parse time) lands those mutations inside React's hydration
-    // window and trips a #418 hydration mismatch. The deferral — gate on window
-    // `load`, then a double `requestAnimationFrame`, cancelled when an SPA
-    // navigation committed in between — lives in the GPT bundle module as
+    // window and trips a #418 hydration mismatch. The deferral — gate on the
+    // first hydration signal to arrive (the Next.js App Router runtime patching
+    // `window.__next_f`, or window `load` as the fallback and the only signal on
+    // non-Next publishers), then a double `requestAnimationFrame`, cancelled
+    // when an SPA navigation committed in between — lives in the GPT module as
     // `tsjs.scheduleInitialAdInit` (crates/trusted-server-js/lib/src/
     // integrations/gpt/index.ts), where the lifecycle is executable under
     // Vitest (schedule_initial_ad_init.test.ts) and the navigation-generation

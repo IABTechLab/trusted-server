@@ -473,6 +473,15 @@ function installInitialLoadDetector(ts: TsjsApi): void {
  * auction hook's own navigation identity: a query-only history change the
  * hook ignores must not cancel the initial call, while an `/a → /b → /a`
  * round trip — where the URL compares equal again — must.
+ *
+ * `window.__next_f` is a Next.js **internal**: the App Router RSC flight-data
+ * global, present only on App Router pages (Next 13+) and observed on the
+ * App Router publisher this gate was measured against. Pages Router
+ * publishers never define it, and a future Next release that renames it would
+ * stop patching the name we poll — in both cases the poll simply never fires
+ * and the publisher takes the `load` path, so the failure mode is slow, not
+ * broken. Worth re-checking this signal on a gated publisher's major Next
+ * upgrade, since nothing else would surface the regression.
  */
 function installScheduleInitialAdInit(ts: TsjsApi): void {
   ts.scheduleInitialAdInit = function () {
@@ -511,6 +520,15 @@ function installScheduleInitialAdInit(ts: TsjsApi): void {
       const flight = (window as unknown as { __next_f?: { push?: unknown } }).__next_f;
       return !!flight && flight.push !== Array.prototype.push;
     };
+    // This script runs at `</body>`, and on a streamed App Router page the async
+    // chunks can already have executed by then — so check once synchronously
+    // before installing the interval, rather than idling up to a poll period.
+    // The `load` listener above stays registered; `once: true` plus the `fired`
+    // guard make it inert.
+    if (nextRuntimeReady()) {
+      fire();
+      return;
+    }
     poll = setInterval(() => {
       if (nextRuntimeReady()) fire();
     }, 50);

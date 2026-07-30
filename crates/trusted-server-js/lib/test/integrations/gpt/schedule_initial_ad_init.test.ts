@@ -255,12 +255,13 @@ describe('scheduleInitialAdInit', () => {
       const adInit = vi.fn();
       ts.adInit = adInit;
 
-      // App Router runtime has patched __next_f.push (no longer the array's).
+      ts.scheduleInitialAdInit!();
+      // App Router runtime patches __next_f.push (no longer the array's) only
+      // after the schedule call, so the interval — not the synchronous
+      // pre-check — is what observes it.
       (window as unknown as { __next_f?: { push: () => void } }).__next_f = {
         push: () => {},
       };
-
-      ts.scheduleInitialAdInit!();
       // No load event dispatched — the runtime-signal poll must trigger it.
       vi.advanceTimersByTime(50);
       // The trigger fired, but the double rAF still gates the actual call.
@@ -311,10 +312,10 @@ describe('scheduleInitialAdInit', () => {
       const adInit = vi.fn();
       ts.adInit = adInit;
 
+      ts.scheduleInitialAdInit!();
       (window as unknown as { __next_f?: { push: () => void } }).__next_f = {
         push: () => {},
       };
-      ts.scheduleInitialAdInit!();
       vi.advanceTimersByTime(50);
       flushFrame();
       flushFrame();
@@ -323,6 +324,63 @@ describe('scheduleInitialAdInit', () => {
       // A later load event must not re-run adInit (poll cleared, load fires once).
       window.dispatchEvent(new Event('load'));
       flushFrame();
+      flushFrame();
+      expect(adInit).toHaveBeenCalledTimes(1);
+    } finally {
+      delete (window as unknown as Record<string, unknown>).__next_f;
+      vi.useRealTimers();
+    }
+  });
+
+  it('fires exactly once when a load event precedes the runtime signal', async () => {
+    // The reverse signal order: `load` wins the race on a page that only
+    // becomes observably "Next" afterwards. The poll installed at schedule time
+    // must have been cleared, so the late __next_f patch cannot re-run adInit.
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      await importGptModule();
+      const ts = (window as TestWindow).tsjs!;
+      const adInit = vi.fn();
+      ts.adInit = adInit;
+
+      ts.scheduleInitialAdInit!();
+      window.dispatchEvent(new Event('load'));
+      flushFrame();
+      flushFrame();
+      expect(adInit).toHaveBeenCalledTimes(1);
+
+      (window as unknown as { __next_f?: { push: () => void } }).__next_f = {
+        push: () => {},
+      };
+      vi.advanceTimersByTime(500);
+      flushFrame();
+      flushFrame();
+      expect(adInit).toHaveBeenCalledTimes(1);
+    } finally {
+      delete (window as unknown as Record<string, unknown>).__next_f;
+      vi.useRealTimers();
+    }
+  });
+
+  it('fires without waiting a poll tick when the runtime is already patched at schedule time', async () => {
+    // On a streamed App Router page the chunks can execute before the `</body>`
+    // bids script runs, so the synchronous pre-check must catch it — no timer
+    // is ever advanced here.
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      await importGptModule();
+      const ts = (window as TestWindow).tsjs!;
+      const adInit = vi.fn();
+      ts.adInit = adInit;
+
+      (window as unknown as { __next_f?: { push: () => void } }).__next_f = {
+        push: () => {},
+      };
+
+      ts.scheduleInitialAdInit!();
+      expect(vi.getTimerCount()).toBe(0);
+      flushFrame();
+      expect(adInit).not.toHaveBeenCalled();
       flushFrame();
       expect(adInit).toHaveBeenCalledTimes(1);
     } finally {

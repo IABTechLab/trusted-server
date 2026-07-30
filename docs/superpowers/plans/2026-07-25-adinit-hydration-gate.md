@@ -19,6 +19,15 @@
 > `clearInterval` instead of the chunk selectors. See the spec's "Update" section. Safety is pending
 > the #418 A/B, which is blocked by a separate rc/july bug (`elementId.startsWith`, PR #966, since
 > reverted on #966 — adopt that revert in the deploy). Tasks below are kept for the record.
+>
+> **The gate also moved out of Rust.** The "Architecture" and "File Structure" sections below name
+> `crates/trusted-server-core/src/publisher.rs::build_bids_script` as the only production change;
+> that is no longer where the gate lives. `build_bids_script` now only calls
+> `window.tsjs.scheduleInitialAdInit()`, and the gate itself is
+> `installScheduleInitialAdInit` in `crates/trusted-server-js/lib/src/integrations/gpt/index.ts`,
+> covered by `crates/trusted-server-js/lib/test/integrations/gpt/schedule_initial_ad_init.test.ts`
+> (executable Vitest lifecycle assertions, not string matches on emitted Rust output). Edit the TS
+> module, not the Rust `format!`.
 
 ---
 

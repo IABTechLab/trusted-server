@@ -44,6 +44,35 @@ a live A/B is the proof. That A/B is currently blocked by a separate rc/july bug
 (`elementId.startsWith`, PR #966's `configuredSlotForElementId`, since reverted on #966) that crashes
 the ad stack; the fix is to pick up #966's revert in the deploy, then run the A/B.
 
+**Considered and deferred: `requestIdleCallback` between the signal and the frames.** Review raised
+signal → `requestIdleCallback` (timeout-bounded) → double `requestAnimationFrame`. The reasoning is
+sound: idle _after_ runtime boot means the hydration work has drained, which is a stronger
+post-commit proxy than two frames, and it does not have the "fires at ~3s, before the runtime" defect
+that ruled out `requestIdleCallback` on its own (see "Alternatives"). It is deferred rather than
+adopted because (a) the timeout would be an invented constant — nothing here measures when the tree
+finishes draining, so any value is a guess that delays _every_ publisher; (b) the live capture puts
+#418 at 2/38 runs (~5%) on the deployed build with **0/38** correlation to slot loss, so the residual
+mid-hydration risk this would buy down is small and not impression-costing; and (c)
+`requestIdleCallback` needs its own fallback branch (Safari only since 16.4), widening a gate whose
+whole value is that its failure mode is "slow, not broken". Sequencing: run the A/B on the current
+gate. If it shows #418 with slot loss, add the idle step and derive its timeout from the hydration
+tail the A/B measures, rather than picking one now.
+
+**The gate also moved out of Rust.** The sections below place the gate in
+`crates/trusted-server-core/src/publisher.rs::build_bids_script`, as an inline `<script>` built by a
+Rust `format!`. It no longer lives there: `build_bids_script` emits only a call to
+`window.tsjs.scheduleInitialAdInit()`, and the gate is `installScheduleInitialAdInit` in
+`crates/trusted-server-js/lib/src/integrations/gpt/index.ts`, with lifecycle coverage in
+`crates/trusted-server-js/lib/test/integrations/gpt/schedule_initial_ad_init.test.ts`. That move is
+what makes the gate executable under Vitest — the Rust tests could only string-match the emitted
+script — and lets the initial call share the SPA auction hook's `navGeneration` guard.
+
+Two refinements landed on top of the `__next_f` poll: the runtime check also runs **once
+synchronously** before the interval is installed (on a streamed page the chunks can already have
+executed by `</body>`), and `__next_f` is documented in the module as a Next.js App Router internal
+whose absence — Pages Router, or a future rename — degrades to the `window.load` path rather than
+breaking.
+
 The sections below document the superseded chunk-await approach and why it was chosen — kept for the
 record. The **current** implementation is the `__next_f` gate.
 
