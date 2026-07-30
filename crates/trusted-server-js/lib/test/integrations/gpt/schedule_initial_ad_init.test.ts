@@ -89,13 +89,16 @@ describe('scheduleInitialAdInit', () => {
     vi.unstubAllGlobals();
   });
 
-  it('defers adInit until window load plus two animation frames', async () => {
+  it('applies the SSR payload and defers adInit until window load plus two animation frames', async () => {
     await importGptModule();
     const ts = (window as TestWindow).tsjs!;
     const adInit = vi.fn();
     ts.adInit = adInit;
 
-    ts.scheduleInitialAdInit!();
+    ts.scheduleInitialAdInit!({ atf: { hb_pb: '1.00' } });
+    // On the initial document (generation 0) the SSR bids are adopted
+    // immediately — the deferral applies to the GPT work, not the payload.
+    expect(ts.bids).toEqual({ atf: { hb_pb: '1.00' } });
     expect(adInit).not.toHaveBeenCalled();
 
     // load alone must not run it — React commits after the load-time frame.
@@ -243,5 +246,121 @@ describe('scheduleInitialAdInit', () => {
     const targetingOrder = mockSlot.setTargeting.mock.invocationCallOrder[0]!;
     const refreshOrder = mockPubads.refresh.mock.invocationCallOrder[0]!;
     expect(targetingOrder).toBeLessThan(refreshOrder);
+  });
+
+  it('drops the SSR payload when a navigation committed before scheduling', async () => {
+    // The SPA hook is installed by the synchronous head bundle, so a
+    // navigation can commit while the document is still streaming — before
+    // the </body> script calls the scheduler. The SSR payload then belongs
+    // to a document the page has already left: it must not overwrite the
+    // live route's bids, and the initial adInit must never fire.
+    fetchStub.mockResolvedValue({
+      ok: true,
+      json: async () => ({ slots: [], bids: {} }),
+    });
+    await importGptModule();
+    const ts = (window as TestWindow).tsjs!;
+    const adInit = vi.fn();
+    ts.adInit = adInit;
+
+    history.pushState({}, '', '/b');
+    await flushAsync();
+    expect(ts.navGeneration).toBe(1);
+    ts.bids = { live_slot: { hb_pb: '2.50' } };
+
+    ts.scheduleInitialAdInit!({ ssr_slot: { hb_pb: '1.00' } });
+    expect(ts.bids).toEqual({ live_slot: { hb_pb: '2.50' } });
+
+    window.dispatchEvent(new Event('load'));
+    flushFrame();
+    flushFrame();
+    expect(adInit).not.toHaveBeenCalled();
+  });
+
+  it('preserves a page-bids response applied before scheduling', async () => {
+    // Same race, with the SPA navigation's page-bids response fully applied
+    // (slots + bids + its own adInit) before the scheduler is called: the
+    // stale SSR payload must not corrupt the applied state, and the route's
+    // adInit count must stay at the SPA hook's single call.
+    document.body.innerHTML = '<div id="div-s1"></div>';
+    fetchStub.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        slots: [{ id: 's1', div_id: 'div-s1' }],
+        bids: { s1: { hb_pb: '3.00' } },
+      }),
+    });
+    await importGptModule();
+    const ts = (window as TestWindow).tsjs!;
+    const adInit = vi.fn();
+    ts.adInit = adInit;
+
+    history.pushState({}, '', '/b');
+    await flushAsync();
+    expect(ts.bids).toEqual({ s1: { hb_pb: '3.00' } });
+    expect(adInit).toHaveBeenCalledTimes(1);
+
+    ts.scheduleInitialAdInit!({ ssr_slot: { hb_pb: '1.00' } });
+    window.dispatchEvent(new Event('load'));
+    flushFrame();
+    flushFrame();
+
+    expect(ts.bids).toEqual({ s1: { hb_pb: '3.00' } });
+    expect(adInit).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancels queued GPT work when a navigation commits before the command queue drains', async () => {
+    // adInit() only queues its slot work on googletag.cmd, which drains when
+    // GPT itself loads — possibly long after the generation check that
+    // guarded the adInit() call. A navigation in that gap must cancel the
+    // queued mutation, not let it run against the new route's DOM.
+    const commandQueue: Array<() => void> = [];
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([]),
+      addEventListener: vi.fn(),
+      refresh: vi.fn(),
+    };
+    const defineSlot = vi.fn();
+    const destroySlots = vi.fn();
+    (window as TestWindow).googletag = {
+      cmd: commandQueue,
+      defineSlot,
+      destroySlots,
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+    };
+    fetchStub.mockResolvedValue({
+      ok: true,
+      json: async () => ({ slots: [], bids: {} }),
+    });
+    document.body.innerHTML = '<div id="div-atf-sidebar"></div>';
+    await importGptModule();
+    const ts = (window as TestWindow).tsjs!;
+    ts.adSlots = [
+      {
+        id: 'atf_sidebar_ad',
+        gam_unit_path: '/123/atf',
+        div_id: 'div-atf-sidebar',
+        formats: [[300, 250]],
+      },
+    ];
+    ts.bids = { atf_sidebar_ad: { hb_pb: '1.00' } };
+
+    // GPT not loaded yet: the queued work sits in the command array.
+    ts.adInit!();
+    expect(commandQueue.length).toBeGreaterThan(0);
+
+    // A navigation commits before GPT drains the queue.
+    history.pushState({}, '', '/b');
+    await flushAsync();
+    expect(ts.navGeneration).toBe(1);
+
+    // GPT loads and drains the queue: the stale callback must stand down.
+    commandQueue.splice(0).forEach((fn) => fn());
+    expect(defineSlot).not.toHaveBeenCalled();
+    expect(destroySlots).not.toHaveBeenCalled();
+    expect(mockPubads.refresh).not.toHaveBeenCalled();
+    expect(mockPubads.enableSingleRequest).not.toHaveBeenCalled();
   });
 });

@@ -152,10 +152,15 @@ export interface TsjsApi {
   navGeneration?: number;
   /**
    * Defers the initial `adInit()` until after React hydration: window `load`,
-   * then a double `requestAnimationFrame`, cancelled when an SPA navigation
-   * committed while pending. Called by the server-injected `</body>` bids
-   * script; lives in the bundle so the lifecycle is executable under test and
-   * shares [`navGeneration`] with the SPA auction hook.
+   * then a double `requestAnimationFrame`. Called by the server-injected
+   * `</body>` bids script with the SSR bids payload. The whole initial pass
+   * is pinned to navigation generation 0 (the SSR document): if an SPA
+   * navigation has already committed — or commits while the deferred callback
+   * is pending — the payload is dropped and `adInit()` is not run, so a stale
+   * SSR bootstrap can neither clobber the live route's bids nor re-run it.
+   * Lives in the bundle so the lifecycle is executable under test and shares
+   * [`navGeneration`] with the SPA auction hook; `gpt_bootstrap.js` installs
+   * a minimal fallback for pages where the bundle fails to load.
    */
-  scheduleInitialAdInit?: () => void;
+  scheduleInitialAdInit?: (initialBids?: Record<string, AuctionBidData>) => void;
 }
