@@ -1687,7 +1687,7 @@ mod tests {
             .expect("should process");
         let html = std::str::from_utf8(&output).expect("should be utf8");
         assert!(
-            html.contains(".bids=JSON.parse(\"{}\")"),
+            html.contains("JSON.parse(\"{}\")"),
             "should inject empty bids fallback when auction produced nothing"
         );
     }
@@ -1713,7 +1713,7 @@ mod tests {
             .expect("should process");
         let html = std::str::from_utf8(&output).expect("should be utf8");
         assert!(
-            !html.contains(".bids=JSON.parse"),
+            !html.contains("JSON.parse"),
             "should NOT inject tsjs.bids when no slots matched"
         );
     }

@@ -298,22 +298,29 @@ export interface TsjsApi {
   /**
    * Monotonic count of committed SPA navigations, incremented synchronously by
    * the SPA auction hook the moment it accepts a route change. The deferred
-   * initial-adInit bootstrap ([`scheduleInitialAdInit`]) captures this counter
-   * and no-ops when a navigation committed while it was pending. A counter is
-   * used instead of comparing only the current route after the fact, so an
-   * `/a → /b → /a` round trip still advances it. The route identity includes
-   * pathname and query, matching the page-bids refresh hook; hash-only changes
-   * leave the counter unchanged.
+   * initial-adInit bootstrap ([`scheduleInitialAdInit`]) is pinned to
+   * generation 0 (the SSR document) and no-ops when a navigation has
+   * committed — before it was called, or while it was pending. A counter is
+   * used instead of a URL comparison so the guard cannot diverge from the
+   * auction path: the hook's route identity is pathname plus query (matching
+   * the page-bids refresh hook), hash-only changes leave the counter
+   * unchanged, and an `/a → /b → /a` round trip (where the URL compares
+   * equal again) still advances it.
    */
   navGeneration?: number;
   /**
    * Defers the initial `adInit()` until after React hydration: window `load`,
-   * then a double `requestAnimationFrame`, cancelled when an SPA navigation
-   * committed while pending. Called by the server-injected `</body>` bids
-   * script; lives in the bundle so the lifecycle is executable under test and
-   * shares [`navGeneration`] with the SPA auction hook.
+   * then a double `requestAnimationFrame`. Called by the server-injected
+   * `</body>` bids script with the SSR bids payload. The whole initial pass
+   * is pinned to navigation generation 0 (the SSR document): if an SPA
+   * navigation has already committed — or commits while the deferred callback
+   * is pending — the payload is dropped and `adInit()` is not run, so a stale
+   * SSR bootstrap can neither clobber the live route's bids nor re-run it.
+   * Lives in the bundle so the lifecycle is executable under test and shares
+   * [`navGeneration`] with the SPA auction hook; `gpt_bootstrap.js` installs
+   * a minimal fallback for pages where the bundle fails to load.
    */
-  scheduleInitialAdInit?: () => void;
+  scheduleInitialAdInit?: (initialBids?: Record<string, AuctionBidData>) => void;
   /** Read-only GPT lifecycle diagnostics API, present only in an activated tab. */
   gptDiagnostics?: GptDiagnosticsApi;
 }

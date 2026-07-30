@@ -773,22 +773,39 @@ function installLatePublisherSlotHandoff(ts: TsjsApi): void {
  * `requestAnimationFrame` so the call runs after React has committed. A
  * single deferred call — no retry timer.
  *
- * Deferring opens a window in which an SPA navigation can commit a new route
- * (and run its own `adInit()` via the SPA auction hook) before the deferred
- * callback fires. The callback captures `tsjs.navGeneration` at schedule time
- * and no-ops when a navigation has committed since — running anyway would
- * re-run `adInit()` against the newer route's live slots/bids, destroying and
- * redefining that route's TS slots and double-refreshing it. The generation
- * counter keeps this guard aligned with the SPA auction hook's pathname-and-query
- * route identity: query changes cancel the initial call because they request fresh
- * page bids, while an `/a → /b → /a` round trip remains distinguishable even
- * though the final URL equals the original.
+ * The SSR document is navigation generation 0 by definition, so the scheduler
+ * pins the whole initial pass to generation 0 rather than capturing whatever
+ * the counter reads when the `</body>` script runs: the SPA hook is installed
+ * by the synchronous head bundle, so a navigation can commit while the HTML
+ * is still streaming, and capturing that advanced value would adopt the stale
+ * SSR bootstrap as current. For the same reason the initial bids payload is
+ * passed in and applied here, generation-guarded — assigning it
+ * unconditionally at body end would clobber the live bids a faster SPA
+ * navigation already applied. When a navigation has committed since — or
+ * commits while the deferred callback is pending — the SSR payload is
+ * dropped and `adInit()` is not run: running anyway would re-run the newer
+ * route's live slots/bids, destroying and redefining that route's TS slots
+ * and double-refreshing it. The generation counter (not a URL comparison)
+ * keeps this guard aligned with the SPA auction hook's pathname-and-query
+ * route identity: query changes cancel the initial call because they request
+ * fresh page bids, while an `/a → /b → /a` round trip remains
+ * distinguishable even though the final URL equals the original.
+ *
+ * Hidden documents: browsers do not service `requestAnimationFrame` while a
+ * document is hidden, so a background-tab load (Cmd+click, open-in-new-tab)
+ * holds the initial `adInit()` until the tab is first viewed. This is
+ * intended, not an oversight: the initial ad request then spends its
+ * impression on a tab someone is actually looking at instead of firing —
+ * unviewable — at parse time in a tab that may never be foregrounded, and
+ * riding rAF keeps a single code path whose post-hydration-commit guarantee
+ * holds whenever the request is actually issued.
  */
 function installScheduleInitialAdInit(ts: TsjsApi): void {
-  ts.scheduleInitialAdInit = function () {
-    const generation = ts.navGeneration ?? 0;
+  ts.scheduleInitialAdInit = function (initialBids?: Record<string, AuctionBidData>) {
+    if ((ts.navGeneration ?? 0) !== 0) return;
+    if (initialBids) ts.bids = initialBids;
     const runUnlessNavigated = (): void => {
-      if ((ts.navGeneration ?? 0) !== generation) return;
+      if ((ts.navGeneration ?? 0) !== 0) return;
       ts.adInit?.();
     };
     const afterHydrationFrames = (): void => {
@@ -815,10 +832,18 @@ export function installTsAdInit(): void {
     // The slotRenderEnded listener below reads ts.bids live so SPA navigation
     // updates (new ts.bids injected before </body>) are picked up at render time.
     const bids = ts.bids ?? {};
+    // Generation this invocation belongs to. The destructive slot work below
+    // is queued on googletag.cmd, which only drains when GPT itself loads —
+    // possibly much later (e.g. consent-gated GPT). A navigation can commit
+    // in that gap, so the queued callback rechecks the generation as its
+    // first act and stands down rather than applying this invocation's
+    // slots/bids to the newer route's DOM and double-requesting it.
+    const generation = ts.navGeneration ?? 0;
     const g = (window as GptWindow).googletag;
     if (!g) return;
 
     g.cmd?.push(() => {
+      if ((ts.navGeneration ?? 0) !== generation) return;
       // Destroy previously defined TS slots before redefining for the new page.
       if (ts.prevGptSlots && ts.prevGptSlots.length > 0) {
         g.destroySlots?.(ts.prevGptSlots as GoogleTagSlot[]);

@@ -3380,21 +3380,42 @@ pub(crate) fn build_bids_script(bid_map: &serde_json::Map<String, serde_json::Va
     // mutates those ad-slot subtrees. Calling it synchronously here (this script
     // runs at body-parse time) lands those mutations inside React's hydration
     // window and trips a #418 hydration mismatch. The deferral — gate on window
-    // `load`, then a double `requestAnimationFrame`, cancelled when an SPA
-    // navigation committed in between — lives in the GPT bundle module as
-    // `tsjs.scheduleInitialAdInit` (crates/trusted-server-js/lib/src/
-    // integrations/gpt/index.ts), where the lifecycle is executable under
-    // Vitest (schedule_initial_ad_init.test.ts) and the navigation-generation
-    // guard is shared with the SPA auction hook. The GPT module ships in the
-    // synchronous head bundle, so it has always executed by the time this
-    // inline script runs; when the GPT integration is disabled the scheduler is
-    // absent — but so is `adInit`, so there is nothing to schedule.
+    // `load`, then a double `requestAnimationFrame`, pinned to navigation
+    // generation 0 so a faster SPA navigation cancels it — lives in the GPT
+    // bundle module as `tsjs.scheduleInitialAdInit`
+    // (crates/trusted-server-js/lib/src/integrations/gpt/index.ts), where the
+    // lifecycle is executable under Vitest (schedule_initial_ad_init.test.ts)
+    // and the navigation-generation guard is shared with the SPA auction hook;
+    // gpt_bootstrap.js installs a minimal head-injected fallback so a failed
+    // bundle load still initializes initial ads.
+    //
+    // The deferral is deliberately unconditional — every publisher, every
+    // page — even though only hydrating React publishers exhibit the #418
+    // failure. Uniform behavior keeps one code path to reason about and
+    // avoids a framework-detection or config surface that must be kept
+    // truthful per publisher; the cost is that non-React pages also move the
+    // initial request from parse time to window load. The agreed follow-up
+    // (branch 958-adinit-hydration-chunk-gate, spec in docs/superpowers/
+    // specs/2026-07-24-adinit-hydration-gate-design.md) narrows the gate to
+    // the Next.js hydration chunks with `load` as the can't-hang fallback,
+    // which recovers most of that latency without a new config surface.
+    //
+    // The bids payload is handed to the scheduler instead of being assigned
+    // here: an SPA navigation that committed while this document was still
+    // streaming has already replaced `tsjs.bids`, and an unconditional
+    // assignment would clobber the live route's bids with the stale SSR
+    // payload. Only when no scheduler exists at all (GPT integration active
+    // without its head bootstrap — not an expected deployment) does the script
+    // fall back to a plain assignment, where no SPA hook exists to race with.
     format!(
-        "<script>(window.tsjs=window.tsjs||{{}}).bids=JSON.parse(\"{escaped}\");\
-(function(){{\
-var s=window.tsjs.scheduleInitialAdInit;\
-if(typeof s===\"function\")s();\
-}})();</script>"
+        "<script>(function(){{\
+var t=window.tsjs=window.tsjs||{{}};\
+var b=JSON.parse(\"{}\");\
+var s=t.scheduleInitialAdInit;\
+if(typeof s===\"function\")s(b);\
+else t.bids=b;\
+}})();</script>",
+        escaped
     )
 }
 
@@ -6686,7 +6707,7 @@ mod tests {
                 "should still inject ad slots. Got: {html}"
             );
             assert!(
-                html.contains(".bids=JSON.parse"),
+                html.contains("var b=JSON.parse("),
                 "should collect auction and inject bids before body close. Got: {html}"
             );
         });
@@ -6752,7 +6773,7 @@ mod tests {
                 "should decode the second gzip member that a single-member decoder drops. Got: {html}"
             );
             assert!(
-                html.contains(".bids=JSON.parse"),
+                html.contains("var b=JSON.parse("),
                 "should inject bids before the </body> carried in the second member. Got: {html}"
             );
         });
@@ -7045,7 +7066,7 @@ mod tests {
             "prefix must carry the injected (rewritten) head before EOF. Got: {html}"
         );
         assert!(
-            !html.contains(".bids=JSON.parse"),
+            !html.contains("var b=JSON.parse("),
             "bids inject only at </body> after collection, which the first poll must not wait for. Got: {html}"
         );
     }
@@ -7087,7 +7108,7 @@ mod tests {
             "first poll must emit the decoded document prefix of a small gzip page. Got: {decoded}"
         );
         assert!(
-            !decoded.contains(".bids=JSON.parse"),
+            !decoded.contains("var b=JSON.parse("),
             "bids inject only at </body> after collection, which the first poll must not wait for. Got: {decoded}"
         );
     }
@@ -7527,7 +7548,7 @@ mod tests {
 
         let html = String::from_utf8(gzip_decode(&output)).expect("should be valid UTF-8");
         assert!(
-            html.contains(".bids=JSON.parse"),
+            html.contains("var b=JSON.parse("),
             "should collect the held auction and inject bids. Got tail: {}",
             &html[html.len().saturating_sub(200)..]
         );
@@ -8857,8 +8878,8 @@ mod tests {
             let script = build_bids_script(&map);
 
             assert!(
-                script.contains("window.tsjs.scheduleInitialAdInit"),
-                "should hand off bids to the bundle's deferred adInit scheduler"
+                script.contains("t.scheduleInitialAdInit"),
+                "should hand off bids to the deferred adInit scheduler"
             );
             assert!(
                 !script.contains("setTimeout"),
@@ -8881,17 +8902,30 @@ mod tests {
             // `-container` wrapper). Running it synchronously at body-parse time
             // lands those mutations inside React's hydration window and trips a
             // #418 hydration mismatch. The deferral lifecycle (window `load`,
-            // double `requestAnimationFrame`, stale-navigation cancellation via
-            // `tsjs.navGeneration`) lives in the GPT bundle module where it is
-            // executable under Vitest (schedule_initial_ad_init.test.ts); this
-            // inline script must only delegate to that scheduler.
+            // double `requestAnimationFrame`, generation-0 pinning via
+            // `tsjs.navGeneration`) lives in the GPT bundle module (with a
+            // head-injected fallback in gpt_bootstrap.js) where it is executable
+            // under Vitest (schedule_initial_ad_init.test.ts); this inline
+            // script must only delegate to that scheduler.
             assert!(
-                script.contains("var s=window.tsjs.scheduleInitialAdInit"),
-                "should delegate deferral to the bundle scheduler"
+                script.contains("var s=t.scheduleInitialAdInit"),
+                "should delegate deferral to the installed scheduler"
+            );
+            // The bids payload is handed to the scheduler (which applies it only
+            // while the page is still on navigation generation 0) instead of
+            // being assigned unconditionally, so a faster SPA navigation's live
+            // bids cannot be clobbered by the stale SSR payload.
+            assert!(
+                script.contains("if(typeof s===\"function\")s(b)"),
+                "should pass the SSR bids payload to the scheduler"
             );
             assert!(
-                script.contains("if(typeof s===\"function\")s()"),
-                "should guard the scheduler call for pages without the GPT module"
+                script.contains("else t.bids=b"),
+                "should fall back to a plain bids assignment without a scheduler"
+            );
+            assert!(
+                !script.contains(".bids=JSON.parse"),
+                "should not assign the SSR payload unconditionally"
             );
             // The one hydration-unsafe thing this script could do is invoke
             // adInit synchronously at body-parse time — it must not.

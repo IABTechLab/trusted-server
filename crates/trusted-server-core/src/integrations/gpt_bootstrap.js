@@ -325,12 +325,49 @@
 
   installSlotHandoff();
 
+  // Minimal fallback for tsjs.scheduleInitialAdInit, mirroring the bundle's
+  // hydration-safe scheduler in
+  // crates/trusted-server-js/lib/src/integrations/gpt/index.ts: the </body>
+  // bids script hands the SSR bids payload to this scheduler, which applies
+  // it and runs adInit only while the page is still on navigation
+  // generation 0 (the SSR document), after window load plus a double
+  // requestAnimationFrame so the call lands outside React's hydration
+  // window. Keeps initial server-side ads working when the main TSJS bundle
+  // fails to load; the bundle overwrites this with the full implementation.
+  //
+  // Hidden documents: rAF is not serviced while the document is hidden, so a
+  // background-tab load holds the initial adInit until first view. Intended,
+  // and deliberately identical to the bundle scheduler — the impression is
+  // spent on a viewed tab, and the post-hydration guarantee holds whenever
+  // the request is actually issued.
+  ts.scheduleInitialAdInit = function (initialBids) {
+    if ((ts.navGeneration || 0) !== 0) return;
+    if (initialBids) ts.bids = initialBids;
+    var fire = function () {
+      if ((ts.navGeneration || 0) !== 0) return;
+      if (typeof ts.adInit === "function") ts.adInit();
+    };
+    var afterFrames = function () {
+      window.requestAnimationFrame(function () {
+        window.requestAnimationFrame(fire);
+      });
+    };
+    if (document.readyState === "complete") afterFrames();
+    else window.addEventListener("load", afterFrames, { once: true });
+  };
+
   ts.adInit = function () {
     var slots = ts.adSlots || [];
     var bids = ts.bids || {};
     var divToSlotId = {};
+    // Generation this invocation belongs to. The slot work below is queued on
+    // googletag.cmd, which drains only when GPT loads; recheck first inside
+    // the queued callback so a navigation committed in the gap cancels the
+    // stale mutation — mirrors the bundle's adInit.
+    var generation = ts.navGeneration || 0;
 
     googletag.cmd.push(function () {
+      if ((ts.navGeneration || 0) !== generation) return;
       // Slots TS defined itself — tracked for SPA destroy. Publisher-owned
       // slots are reused but never destroyed by TS on navigation.
       var newSlots = [];
