@@ -1081,11 +1081,12 @@ fn response_cache_control_is_private_or_no_store(response: &Response<EdgeBody>) 
 fn apply_publisher_asset_cache_policy(
     settings: &Settings,
     path: &str,
-    cache_rule_method: bool,
+    method: &Method,
     edge_header: EdgeCacheHeader,
     response: &mut Response<EdgeBody>,
 ) -> Result<(), Report<TrustedServerError>> {
-    if !cache_rule_method || response_cache_control_is_private_or_no_store(response) {
+    let is_cacheable_method = *method == Method::GET || *method == Method::HEAD;
+    if !is_cacheable_method || response_cache_control_is_private_or_no_store(response) {
         return Ok(());
     }
 
@@ -2659,8 +2660,8 @@ pub async fn handle_publisher_request(
     log::debug!("Proxying request to configured publisher backend");
 
     let request_path = req.uri().path().to_string();
-    let is_get = req.method() == http::Method::GET;
-    let cache_rule_method = req.method() == Method::GET || req.method() == Method::HEAD;
+    let request_method = req.method().clone();
+    let is_get = request_method == Method::GET;
 
     let is_prefetch = is_prefetch_request(&req);
     let is_bot = is_bot_user_agent(&req);
@@ -2944,7 +2945,7 @@ pub async fn handle_publisher_request(
     apply_publisher_asset_cache_policy(
         settings,
         &request_path,
-        cache_rule_method,
+        &request_method,
         edge_header,
         &mut response,
     )?;
@@ -4432,7 +4433,7 @@ mod tests {
             id = "publisher-fingerprinted-assets"
             enabled = true
             path_globs = ["/assets/**/*.png"]
-            requires_hash_in_filename = true
+            fingerprint_style = "hex"
             visibility = "public"
             browser_ttl_seconds = 31536000
             edge_ttl_seconds = 31536000
@@ -4523,7 +4524,7 @@ mod tests {
             id = "publisher-fingerprinted-assets"
             enabled = true
             path_globs = ["/assets/**/*.png"]
-            requires_hash_in_filename = true
+            fingerprint_style = "hex"
             visibility = "public"
             browser_ttl_seconds = 31536000
             edge_ttl_seconds = 31536000

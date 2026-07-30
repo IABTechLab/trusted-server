@@ -4353,7 +4353,7 @@ mod tests {
                 id = "fingerprinted-assets"
                 enabled = true
                 path_globs = ["/assets/**/*.js"]
-                requires_hash_in_filename = true
+                fingerprint_style = "hex"
                 visibility = "public"
                 browser_ttl_seconds = 31536000
                 edge_ttl_seconds = 31536000
@@ -4463,7 +4463,7 @@ mod tests {
                 id = "fingerprinted-assets"
                 enabled = true
                 path_globs = ["/assets/**/*.js"]
-                requires_hash_in_filename = true
+                fingerprint_style = "hex"
                 visibility = "public"
                 browser_ttl_seconds = 31536000
                 edge_ttl_seconds = 31536000

@@ -340,7 +340,7 @@ path_globs = [
   "/assets/**/*.webp",
   "/assets/**/*.avif",
 ]
-requires_hash_in_filename = true
+fingerprint_style = "vite-base64-url"
 visibility = "public"
 browser_ttl_seconds = 31536000
 edge_ttl_seconds = 31536000

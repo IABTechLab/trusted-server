@@ -1,7 +1,7 @@
 #[cfg(test)]
 use config::{Config, Environment, File, FileFormat};
 use error_stack::{Report, ResultExt};
-use glob::Pattern;
+use glob::{MatchOptions, Pattern};
 use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
@@ -1957,9 +1957,9 @@ pub struct CacheAssetRule {
     /// File extensions matched against the request path, case-insensitively.
     #[serde(default)]
     pub extensions: Vec<String>,
-    /// Require a supported bundler fingerprint suffix in the filename before matching.
+    /// Bundler fingerprint style required in the filename before matching.
     #[serde(default)]
-    pub requires_hash_in_filename: bool,
+    pub fingerprint_style: Option<CacheAssetFingerprintStyle>,
     /// Browser-facing cache visibility.
     #[serde(default)]
     pub visibility: CachePolicyVisibility,
@@ -2083,10 +2083,10 @@ impl CacheAssetRule {
 
         let preset_is_content_addressed =
             matches!(self.preset, Some(CacheAssetPreset::NextJsStatic));
-        if !preset_is_content_addressed && !self.requires_hash_in_filename {
+        if !preset_is_content_addressed && self.fingerprint_style.is_none() {
             return Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
-                    "cache.asset_rules `{}` sets immutable without requires_hash_in_filename or a content-addressed preset",
+                    "cache.asset_rules `{}` sets immutable without fingerprint_style or a content-addressed preset",
                     self.id
                 ),
             }));
@@ -2119,16 +2119,16 @@ impl CacheAssetRule {
         }
 
         match self.compiled_globs.get_or_init(|| {
-            if let Some(glob) = self.path_glob.as_deref() {
-                Pattern::new(glob)
-                    .map(|pattern| vec![pattern])
-                    .map_err(|err| err.to_string())
-            } else {
-                self.path_globs
-                    .iter()
-                    .map(|pattern| Pattern::new(pattern).map_err(|err| err.to_string()))
-                    .collect()
+            let mut compiled = Vec::new();
+            let source_patterns = self
+                .path_glob
+                .iter()
+                .chain(self.path_globs.iter())
+                .map(String::as_str);
+            for pattern in source_patterns {
+                compile_cache_asset_glob_patterns(pattern, &mut compiled)?;
             }
+            Ok(compiled)
         }) {
             Ok(patterns) => Ok(Some(patterns.as_slice())),
             Err(message) => Err(Report::new(TrustedServerError::Configuration {
@@ -2145,9 +2145,11 @@ impl CacheAssetRule {
             return Ok(false);
         }
 
-        if self.requires_hash_in_filename && !filename_contains_fingerprint(path) {
+        if let Some(style) = self.fingerprint_style
+            && !filename_contains_fingerprint(path, style)
+        {
             log::debug!(
-                "cache asset rule `{}` rejects path `{path}` because the filename has no supported fingerprint",
+                "cache asset rule `{}` rejects path `{path}` because the filename has no {style:?} fingerprint",
                 self.id
             );
             return Ok(false);
@@ -2164,7 +2166,9 @@ impl CacheAssetRule {
             return Ok(path.starts_with(prefix));
         }
         if let Some(patterns) = self.compiled_globs()? {
-            return Ok(patterns.iter().any(|pattern| pattern.matches(path)));
+            return Ok(patterns
+                .iter()
+                .any(|pattern| pattern.matches_with(path, CACHE_ASSET_GLOB_MATCH_OPTIONS)));
         }
         if let Some(regex) = self.compiled_regex()? {
             return Ok(regex.is_match(path));
@@ -2189,6 +2193,30 @@ impl CacheAssetRule {
             immutable: self.immutable,
         }
     }
+}
+
+const CACHE_ASSET_GLOB_MATCH_OPTIONS: MatchOptions = MatchOptions {
+    case_sensitive: true,
+    require_literal_separator: true,
+    require_literal_leading_dot: false,
+};
+
+fn compile_cache_asset_glob_patterns(
+    pattern: &str,
+    compiled: &mut Vec<Pattern>,
+) -> Result<(), String> {
+    compiled.push(Pattern::new(pattern).map_err(|err| err.to_string())?);
+
+    if let Some(optional_recursive_start) = pattern.find("**/") {
+        let without_recursive_segment = format!(
+            "{}{}",
+            &pattern[..optional_recursive_start],
+            &pattern[optional_recursive_start + "**/".len()..]
+        );
+        compile_cache_asset_glob_patterns(&without_recursive_segment, compiled)?;
+    }
+
+    Ok(())
 }
 
 /// Built-in cache-rule presets that operators can enable explicitly.
@@ -2234,7 +2262,48 @@ fn path_extension(path: &str) -> Option<String> {
     (!extension.is_empty()).then(|| extension.to_ascii_lowercase())
 }
 
-fn filename_contains_fingerprint(path: &str) -> bool {
+/// Operator-selected filename fingerprint convention for an immutable custom rule.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CacheAssetFingerprintStyle {
+    /// A hexadecimal suffix, such as `app.0123abcd.js`.
+    Hex,
+    /// An eight-character uppercase Base32 suffix, such as `app-VRTVD5R5.js`.
+    EsbuildBase32,
+    /// An eight-character `Base64URL` suffix, such as `index-BsELY24f.js`.
+    ViteBase64Url,
+}
+
+impl CacheAssetFingerprintStyle {
+    fn matches_candidate(self, candidate: &str) -> bool {
+        match self {
+            Self::Hex => {
+                candidate.len() >= 8
+                    && candidate.chars().all(|ch| ch.is_ascii_hexdigit())
+                    && candidate.chars().any(|ch| ch.is_ascii_alphabetic())
+            }
+            Self::EsbuildBase32 => {
+                candidate.len() == 8
+                    && candidate
+                        .chars()
+                        .all(|ch| ch.is_ascii_uppercase() || matches!(ch, '2'..='7'))
+                    && candidate.chars().any(|ch| ch.is_ascii_alphabetic())
+            }
+            Self::ViteBase64Url => {
+                candidate.len() == 8
+                    && candidate
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+                    && candidate.chars().any(|ch| ch.is_ascii_uppercase())
+                    && candidate.chars().any(|ch| {
+                        ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_')
+                    })
+            }
+        }
+    }
+}
+
+fn filename_contains_fingerprint(path: &str, style: CacheAssetFingerprintStyle) -> bool {
     let filename = path.rsplit('/').next().unwrap_or(path);
     let Some((stem, extension)) = filename.rsplit_once('.') else {
         return false;
@@ -2249,29 +2318,8 @@ fn filename_contains_fingerprint(path: &str) -> bool {
             let candidate_start = separator_index + separator.len_utf8();
             let prefix = &stem[..separator_index];
             let candidate = &stem[candidate_start..];
-            !prefix.is_empty() && fingerprint_candidate_is_supported(candidate)
+            !prefix.is_empty() && style.matches_candidate(candidate)
         })
-}
-
-fn fingerprint_candidate_is_supported(candidate: &str) -> bool {
-    let is_hex = candidate.len() >= 8
-        && candidate.chars().all(|ch| ch.is_ascii_hexdigit())
-        && candidate.chars().any(|ch| ch.is_ascii_alphabetic());
-    let is_esbuild_base32 = candidate.len() == 8
-        && candidate
-            .chars()
-            .all(|ch| ch.is_ascii_uppercase() || matches!(ch, '2'..='7'))
-        && candidate.chars().any(|ch| ch.is_ascii_alphabetic());
-    let is_vite_base64url = candidate.len() == 8
-        && candidate
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
-        && candidate.chars().any(|ch| ch.is_ascii_uppercase())
-        && candidate
-            .chars()
-            .any(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_'));
-
-    is_hex || is_esbuild_base32 || is_vite_base64url
 }
 
 /// Debug-only features. All flags default to `false` (off in production).
@@ -3194,77 +3242,149 @@ mod tests {
     }
 
     #[test]
-    fn cache_asset_rule_requires_hash_in_filename_when_configured() {
-        let toml_str = format!(
-            r#"{}
-
-            [[cache.asset_rules]]
-            id = "publisher-assets"
-            enabled = true
-            path_globs = ["/assets/**/*.js"]
-            requires_hash_in_filename = true
-            visibility = "public"
-            browser_ttl_seconds = 31536000
-            edge_ttl_seconds = 31536000
-            immutable = true
-        "#,
-            crate_test_settings_str()
-        );
-        let settings = Settings::from_toml(&toml_str).expect("should parse cache asset rule");
+    fn cache_asset_rule_requires_selected_fingerprint_style() {
         let expected_policy = CachePolicy::public_immutable(Duration::from_secs(31_536_000));
-
-        for path in [
-            "/assets/app.0123abcd.js",
-            "/assets/index-DA15JTLU.js",
-            "/assets/index-BsELY24f.js",
-            "/assets/app-VRTVD5R5.js",
-            "/assets/app-VCMCQCKZ.js",
+        for (style, matching_path, non_matching_path) in [
+            ("hex", "/assets/app.0123abcd.js", "/assets/app-VRTVD5R5.js"),
+            (
+                "esbuild-base32",
+                "/assets/app-VRTVD5R5.js",
+                "/assets/index-BsELY24f.js",
+            ),
+            (
+                "vite-base64-url",
+                "/assets/index-BsELY24f.js",
+                "/assets/app.0123abcd.js",
+            ),
         ] {
+            let toml_str = format!(
+                r#"{}
+
+                [[cache.asset_rules]]
+                id = "publisher-assets"
+                enabled = true
+                path_globs = ["/assets/**/*.js"]
+                fingerprint_style = "{style}"
+                visibility = "public"
+                browser_ttl_seconds = 31536000
+                edge_ttl_seconds = 31536000
+                immutable = true
+            "#,
+                crate_test_settings_str()
+            );
+            let settings = Settings::from_toml(&toml_str).expect("should parse cache asset rule");
+
             assert_eq!(
                 settings
-                    .asset_cache_policy_for_path(path)
+                    .asset_cache_policy_for_path(matching_path)
                     .expect("should evaluate cache rules"),
                 Some(expected_policy),
-                "supported fingerprint should match asset rule for {path}"
+                "{style} should match its configured fingerprint convention"
             );
-        }
-
-        for path in ["/assets/app.js", "/assets/deadbeef.js"] {
             assert!(
                 settings
-                    .asset_cache_policy_for_path(path)
+                    .asset_cache_policy_for_path(non_matching_path)
                     .expect("should evaluate cache rules")
                     .is_none(),
-                "non-fingerprinted filename should not match asset rule for {path}"
+                "{style} should not fall through to another fingerprint convention"
             );
         }
     }
 
     #[test]
-    fn filename_fingerprint_gate_supports_conservative_bundler_suffixes() {
-        for (path, expected) in [
-            ("/assets/index-DA15JTLU.js", true),
-            ("/assets/index-BsELY24f.js", true),
-            ("/assets/index-aB_cD-12.js", true),
-            ("/assets/app-VRTVD5R5.js", true),
-            ("/assets/app-VCMCQCKZ.js", true),
-            ("/assets/app.a1B2c3D4.js", true),
-            ("/assets/main.a1b2c3d4e5f6.js", true),
-            ("/assets/index.8f3a2b1c.js", true),
-            ("/assets/app.deadbeef.js", true),
-            ("/assets/deadbeef.js", false),
-            ("/assets/VCMCQCKZ.js", false),
-            ("/assets/app.js", false),
-            ("/assets/app-manifest.js", false),
-            ("/assets/app-release2.js", false),
-            ("/assets/app.20260714.js", false),
-            ("/assets/app-abc123.js", false),
-            ("/assets/deadbeef/app.js", false),
+    fn filename_fingerprint_gate_matches_only_the_selected_style() {
+        for (style, path, expected) in [
+            (
+                CacheAssetFingerprintStyle::Hex,
+                "/assets/app.0123abcd.js",
+                true,
+            ),
+            (
+                CacheAssetFingerprintStyle::Hex,
+                "/assets/hero-Portrait.jpg",
+                false,
+            ),
+            (
+                CacheAssetFingerprintStyle::EsbuildBase32,
+                "/assets/app-VRTVD5R5.js",
+                true,
+            ),
+            (
+                CacheAssetFingerprintStyle::EsbuildBase32,
+                "/assets/hero-Portrait.jpg",
+                false,
+            ),
+            (
+                CacheAssetFingerprintStyle::ViteBase64Url,
+                "/assets/index-BsELY24f.js",
+                true,
+            ),
+            (
+                CacheAssetFingerprintStyle::ViteBase64Url,
+                "/assets/hero-Portrait.jpg",
+                true,
+            ),
+            (
+                CacheAssetFingerprintStyle::ViteBase64Url,
+                "/assets/app.js",
+                false,
+            ),
+            (
+                CacheAssetFingerprintStyle::ViteBase64Url,
+                "/assets/deadbeef.js",
+                false,
+            ),
         ] {
             assert_eq!(
-                filename_contains_fingerprint(path),
+                filename_contains_fingerprint(path, style),
                 expected,
-                "fingerprint result should match for {path}"
+                "{style:?} fingerprint result should match for {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_asset_rule_globs_respect_path_separators() {
+        let toml_str = format!(
+            r#"{}
+
+            [[cache.asset_rules]]
+            id = "direct-assets"
+            enabled = true
+            path_glob = "/assets/*.js"
+            browser_ttl_seconds = 300
+        "#,
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&toml_str).expect("should parse cache asset rule");
+
+        assert!(
+            settings
+                .asset_cache_policy_for_path("/assets/app.js")
+                .expect("should evaluate direct asset rule")
+                .is_some(),
+            "single-star glob should match a direct child"
+        );
+        for path in ["/assets/vendor/app.js", "/assets/app.JS"] {
+            assert!(
+                settings
+                    .asset_cache_policy_for_path(path)
+                    .expect("should evaluate direct asset rule")
+                    .is_none(),
+                "single-star glob should not match {path}"
+            );
+        }
+
+        let recursive_toml = toml_str.replace("/assets/*.js", "/assets/**/*.js");
+        let recursive_settings =
+            Settings::from_toml(&recursive_toml).expect("should parse recursive cache asset rule");
+        for path in ["/assets/app.js", "/assets/vendor/app.js"] {
+            assert!(
+                recursive_settings
+                    .asset_cache_policy_for_path(path)
+                    .expect("should evaluate recursive asset rule")
+                    .is_some(),
+                "double-star glob should match {path}"
             );
         }
     }
@@ -3322,7 +3442,7 @@ mod tests {
             "should explain missing TTL: {missing_ttl_err:?}"
         );
 
-        let immutable_without_fingerprint = format!(
+        let immutable_without_fingerprint_style = format!(
             r#"{}
 
             [[cache.asset_rules]]
@@ -3334,11 +3454,11 @@ mod tests {
         "#,
             crate_test_settings_str()
         );
-        let fingerprint_err = Settings::from_toml(&immutable_without_fingerprint)
-            .expect_err("should reject immutable rule without fingerprint requirement");
+        let fingerprint_style_err = Settings::from_toml(&immutable_without_fingerprint_style)
+            .expect_err("should reject immutable rule without a fingerprint style");
         assert!(
-            format!("{fingerprint_err:?}").contains("requires_hash_in_filename"),
-            "should explain immutable fingerprint requirement: {fingerprint_err:?}"
+            format!("{fingerprint_style_err:?}").contains("fingerprint_style"),
+            "should explain immutable fingerprint-style requirement: {fingerprint_style_err:?}"
         );
 
         let immutable_without_browser_ttl = format!(
@@ -3348,7 +3468,7 @@ mod tests {
             id = "immutable-without-browser-ttl"
             enabled = true
             path_prefix = "/assets/"
-            requires_hash_in_filename = true
+            fingerprint_style = "hex"
             browser_ttl_seconds = 0
             edge_ttl_seconds = 31536000
             immutable = true

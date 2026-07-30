@@ -1056,7 +1056,7 @@ and unique, including for disabled placeholders.
 | `path_globs`                     | Array[String] | Matcher  | Multiple globs matched against the request path                 |
 | `path_regex`                     | String        | Matcher  | Regex matched against the request path                          |
 | `extensions`                     | Array[String] | Matcher  | Case-insensitive file extensions                                |
-| `requires_hash_in_filename`      | Boolean       | No       | Require a supported bundler fingerprint suffix before matching  |
+| `fingerprint_style`              | String        | No       | Required bundler fingerprint convention before matching         |
 | `visibility`                     | String        | No       | `public` or `private` (default `public`)                        |
 | `browser_ttl_seconds`            | Integer       | Policy   | Browser `max-age`; must be positive when `immutable = true`     |
 | `edge_ttl_seconds`               | Integer       | Policy   | TTL emitted through the runtime-specific shared-cache directive |
@@ -1067,23 +1067,30 @@ and unique, including for disabled placeholders.
 An enabled rule must configure exactly one matcher and at least one of
 `browser_ttl_seconds` or `edge_ttl_seconds`. `path_glob` and `path_globs` are
 mutually exclusive. `immutable = true` additionally requires a positive browser
-TTL and either the content-addressed `nextjs-static` preset or
-`requires_hash_in_filename = true`.
+TTL and either the content-addressed `nextjs-static` preset or an explicit
+`fingerprint_style`.
 
-The filename fingerprint check is intentionally conservative. It examines the
-suffix immediately before the final extension, requires a nonempty filename
-prefix separated by `.`, `-`, `_`, or `~`, and recognizes:
+The filename fingerprint check is intentionally conservative and style-specific.
+It examines the suffix immediately before the final extension and requires a
+nonempty filename prefix separated by `.`, `-`, `_`, or `~`. Set exactly the
+style emitted by the publisher's bundler:
 
-- hexadecimal suffixes of at least eight characters containing a letter;
-- eight-character esbuild-style uppercase Base32 suffixes;
-- eight-character Vite/Base64URL-style suffixes with a mixed character class.
+- `hex`: hexadecimal suffixes of at least eight characters containing a letter,
+  such as `app.0123abcd.js`;
+- `esbuild-base32`: eight-character uppercase Base32 suffixes, such as
+  `app-VRTVD5R5.js`;
+- `vite-base64-url`: eight-character Base64URL suffixes with a mixed character
+  class, such as `index-BsELY24f.js`.
 
-For example, `app.0123abcd.js`, `app-VRTVD5R5.js`, and
-`index-DA15JTLU.js` match, while `app.js`, `deadbeef.js`, and
-`app.20260714.js` do not. This heuristic is not proof of content addressing;
-confirm the publisher's bundler output before enabling a long immutable TTL. A
-base rule that matches while this fingerprint check fails emits a debug log with
-the rule ID and rejected path.
+A style is an explicit operator assertion, not proof of content addressing.
+For example, some human-written mixed-case names can resemble a Vite suffix, so
+only select `vite-base64-url` after verifying the publisher's build output. A
+base rule that matches while its selected fingerprint style fails emits a debug
+log with the rule ID and rejected path.
+
+Glob patterns are case-sensitive. `*` matches within a single path component,
+while `**` matches recursively: `/assets/*.js` matches `/assets/app.js` but not
+`/assets/vendor/app.js`; `/assets/**/*.js` matches both.
 
 **Next.js preset example** (disabled until the publisher confirms
 `/_next/static/` is content-addressed):
@@ -1112,7 +1119,7 @@ path_globs = [
   "/assets/**/*.png",
   "/assets/**/*.webp",
 ]
-requires_hash_in_filename = true
+fingerprint_style = "vite-base64-url"
 visibility = "public"
 browser_ttl_seconds = 31536000
 edge_ttl_seconds = 31536000
