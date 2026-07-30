@@ -483,7 +483,7 @@ impl IntegrationHeadInjector for GptIntegration {
     /// for GPT refresh events, runs client-side auctions, and sets targeting for
     /// subsequent impressions. SPA navigation is handled separately by
     /// `installSpaAuctionHook()` in the GPT bundle, which re-runs the server-side
-    /// auction via `GET /__ts/page-bids` on pushState / replaceState / popstate
+    /// auction via `GET /_ts/page-bids` on pushState / replaceState / popstate
     /// route changes (see `auction/endpoints.rs`).
     /// The `POST /auction` endpoint is not involved in scroll or refresh flows.
     fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
