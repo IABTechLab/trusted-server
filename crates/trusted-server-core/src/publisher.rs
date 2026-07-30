@@ -3305,18 +3305,18 @@ pub(crate) fn build_bid_map(
                 // — no PBS Cache round trip. The `hb_cache_*` coordinates above
                 // remain as the fallback for an absent `adm`.
                 //
-                // Optionally sanitize dangerous markup, then optionally rewrite
-                // URLs to first-party proxies — the same independent controls as
+                // Sanitize dangerous markup, then optionally rewrite URLs to
+                // first-party proxies — the same creative-processing policy as
                 // the `/auction` path (see `auction::formats`), except for the
                 // inline render context. This `adm` is rendered by the Prebid
                 // Universal Creative inside GAM's iframe (`f.srcdoc = d.ad`), a
                 // foreign origin where root-relative `/first-party/…` URLs resolve
                 // against GAM and 404. The inline rewriter therefore emits
                 // absolute first-party URLs and omits the tsjs bundle injection.
-                // When enabled, sanitization also enforces the 1 MiB creative cap,
-                // returning an empty string for oversized or unparseable markup —
-                // in which case the entry is omitted and the bridge falls back to
-                // the PBS Cache coordinates.
+                // Sanitization also enforces the 1 MiB creative cap, returning an
+                // empty string for oversized or unparseable markup — in which case
+                // the entry is omitted and the bridge falls back to the PBS Cache
+                // coordinates.
                 if let Some(ref raw_creative) = bid.creative {
                     // Resolve ${AUCTION_PRICE} from the exact winning CPM BEFORE
                     // sanitizing, rewriting, and signing — URL rewriting would
@@ -7821,8 +7821,8 @@ mod tests {
         use crate::settings::Settings;
         use std::collections::HashMap;
 
-        // Creative processing is opt-in, so tests enable each control explicitly
-        // when they need to exercise sanitization or rewriting.
+        // Rewriting is enabled by default; tests disable it when they need to
+        // inspect sanitizer-accepted URLs directly.
         fn test_settings() -> Settings {
             Settings::default()
         }
@@ -8182,10 +8182,9 @@ mod tests {
 
         #[test]
         fn build_bid_map_sanitizes_hostile_adm() {
-            // The inline-adm path must honor the same opt-in sanitization boundary
-            // as `/auction` before the creative reaches window.tsjs.bids.
-            let mut settings = test_settings();
-            settings.auction.sanitize_creatives = true;
+            // The inline-adm path must honor the same sanitization boundary as
+            // `/auction` before the creative reaches window.tsjs.bids.
+            let settings = test_settings();
             let mut winning_bids = HashMap::new();
             let mut bid = make_bid(
                 "atf_sidebar_ad",
@@ -8231,7 +8230,6 @@ mod tests {
         #[test]
         fn build_bid_map_can_skip_rewriting_while_sanitizing() {
             let mut settings = test_settings();
-            settings.auction.sanitize_creatives = true;
             settings.auction.rewrite_creatives = false;
             let mut winning_bids = HashMap::new();
             let mut bid = make_bid(
@@ -8287,7 +8285,7 @@ mod tests {
         }
 
         #[test]
-        fn build_bid_map_can_skip_both_sanitization_and_rewriting() {
+        fn build_bid_map_sanitizes_adm_by_default() {
             let settings = test_settings();
             let mut winning_bids = HashMap::new();
             let mut bid = make_bid(
@@ -8314,9 +8312,16 @@ mod tests {
                 .and_then(|value| value.as_object())
                 .and_then(|object| object.get("adm"))
                 .and_then(|value| value.as_str())
-                .expect("should include the raw adm");
+                .expect("should include the sanitized adm");
 
-            assert_eq!(adm, raw, "should preserve the bidder creative by default");
+            assert!(
+                !adm.contains("renderAd()"),
+                "should remove executable markup by default: {adm}"
+            );
+            assert!(
+                adm.contains("/first-party/proxy?tsurl="),
+                "should rewrite sanitizer-accepted URLs by default: {adm}"
+            );
         }
 
         #[test]
@@ -8325,8 +8330,7 @@ mod tests {
             // (empty result), so the inline `adm` is omitted and the pbRender
             // bridge falls back to the PBS Cache coordinates instead of shipping
             // an unbounded creative to the client.
-            let mut settings = test_settings();
-            settings.auction.sanitize_creatives = true;
+            let settings = test_settings();
             let mut winning_bids = HashMap::new();
             let mut bid = make_bid(
                 "atf_sidebar_ad",

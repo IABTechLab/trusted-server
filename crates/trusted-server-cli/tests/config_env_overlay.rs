@@ -42,8 +42,7 @@ fn migrated_legacy_project() -> MigratedProject {
     let mut document = LEGACY_CONFIG
         .parse::<DocumentMut>()
         .expect("should parse legacy integration config");
-    document["auction"]["rewrite_creatives"] = value(false);
-    document["auction"]["sanitize_creatives"] = value(false);
+    document["auction"]["rewrite_creatives"] = value(true);
     fs::write(&config_path, document.to_string()).expect("should write migrated config");
     fs::write(&manifest_path, MANIFEST).expect("should write test manifest");
     MigratedProject {
@@ -75,7 +74,7 @@ fn migrated_legacy_config_applies_rewrite_creatives_environment_override() {
         .arg(&project.config_path)
         .args(["--yes", "--no-diff"])
         .current_dir(project.directory.path())
-        .env(REWRITE_ENV, "true")
+        .env(REWRITE_ENV, "false")
         .output()
         .expect("should run ts config push");
 
@@ -103,8 +102,8 @@ fn migrated_legacy_config_applies_rewrite_creatives_environment_override() {
 
     assert_eq!(
         envelope["data"]["auction"]["rewrite_creatives"],
-        serde_json::Value::Bool(true),
-        "pushed config should contain the rewrite opt-in environment override"
+        serde_json::Value::Bool(false),
+        "pushed config should contain the environment override"
     );
 }
 

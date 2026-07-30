@@ -1238,34 +1238,31 @@ Settings for the auction orchestrator that coordinates multiple bid providers.
 
 ### `[auction]`
 
-| Field                | Type          | Default            | Description                                                 |
-| -------------------- | ------------- | ------------------ | ----------------------------------------------------------- |
-| `enabled`            | Boolean       | `false`            | Enable the auction orchestrator                             |
-| `sanitize_creatives` | Boolean       | `false`            | Sanitize winning-bid `adm` before delivery                  |
-| `rewrite_creatives`  | Boolean       | `false`            | Rewrite winning-bid `adm` through first-party endpoints     |
-| `providers`          | Array[String] | `[]`               | Provider names that participate (e.g., `["prebid", "aps"]`) |
-| `mediator`           | String        | Optional           | Mediator provider name (runs parallel mediation when set)   |
-| `timeout_ms`         | Integer       | `2000`             | Auction timeout in milliseconds                             |
-| `creative_store`     | String        | `"creative_store"` | Deprecated; creatives are now delivered inline              |
+| Field               | Type          | Default            | Description                                                       |
+| ------------------- | ------------- | ------------------ | ----------------------------------------------------------------- |
+| `enabled`           | Boolean       | `false`            | Enable the auction orchestrator                                   |
+| `rewrite_creatives` | Boolean       | `true`             | Rewrite sanitized winning-bid `adm` through first-party endpoints |
+| `providers`         | Array[String] | `[]`               | Provider names that participate (e.g., `["prebid", "aps"]`)       |
+| `mediator`          | String        | Optional           | Mediator provider name (runs parallel mediation when set)         |
+| `timeout_ms`        | Integer       | `2000`             | Auction timeout in milliseconds                                   |
+| `creative_store`    | String        | `"creative_store"` | Deprecated; creatives are now delivered inline                    |
 
-The sanitization and rewriting controls apply independently to creative markup
-delivered by `POST /auction` and the publisher SSAT/page-bids path. When
-`sanitize_creatives = true`, executable markup and unsafe attributes are removed.
-When `rewrite_creatives = true`, eligible absolute or protocol-relative resource
-and click URLs not excluded by rewrite configuration are converted to signed
-first-party endpoints. The `POST /auction` path emits root-relative endpoints and
-injects creative TSJS when a `<body>` exists; the foreign-origin SSAT renderer
-emits absolute endpoints and does not inject that bundle. With both settings
-omitted or `false`, bidder markup is delivered unchanged except for auction-price
-macro expansion. These settings do not affect HTML or CSS fetched through
-`/first-party/proxy`. See
-[Creative Processing](/guide/creative-processing#auction-creative-processing-controls).
+Creative markup delivered by `POST /auction` and the publisher SSAT/page-bids
+path is always sanitized, removing executable markup and unsafe attributes. By
+default, eligible absolute or protocol-relative resource and click URLs not
+excluded by rewrite configuration are then converted to signed first-party
+endpoints. Set `rewrite_creatives = false` to retain sanitizer-accepted external
+URLs. The `POST /auction` path emits root-relative endpoints and injects creative
+TSJS when a `<body>` exists; the foreign-origin SSAT renderer emits absolute
+endpoints and does not inject that bundle. These settings do not affect HTML or
+CSS fetched through `/first-party/proxy`. See
+[Creative Processing](/guide/creative-processing#auction-rewrite-control).
 
 ::: warning Existing configs and rollback
-Both creative controls default to `false` and are omitted from stored JSON.
-Explicit `true` opt-ins remain serialized. Before rolling back to a binary that
-does not recognize these fields, disable any opt-ins and push the resulting
-default-compatible blob.
+`rewrite_creatives` defaults to `true` and is omitted from stored JSON. An
+explicit `false` remains serialized. Before rolling back to a binary that does
+not recognize this field, restore it to `true` and push the resulting
+compatible blob.
 :::
 
 **Example**:
@@ -1273,7 +1270,6 @@ default-compatible blob.
 ```toml
 [auction]
 enabled = true
-sanitize_creatives = true
 rewrite_creatives = true
 providers = ["aps", "prebid"]
 timeout_ms = 2000
@@ -1297,7 +1293,6 @@ server_url = "https://prebid-server.example.com/openrtb2/auction"
 
 ```bash
 TRUSTED_SERVER__AUCTION__ENABLED=true
-TRUSTED_SERVER__AUCTION__SANITIZE_CREATIVES=true
 TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES=true
 TRUSTED_SERVER__AUCTION__PROVIDERS=aps,prebid
 TRUSTED_SERVER__AUCTION__PROVIDERS__0=aps

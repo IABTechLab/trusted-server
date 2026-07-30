@@ -23,12 +23,12 @@ Creative processing has separate auction-response and proxied-response paths. Wh
 └──────────────────────────────────────────────────────┘
                         ↓
 ┌──────────────────────────────────────────────────────┐
-│  Trusted Server Processing (opt-in)                  │
-│  1. Sanitize when configured                         │
+│  Trusted Server Processing (rewrite-enabled)         │
+│  1. Sanitize first for POST /auction adm             │
 │  2. Parse HTML with streaming processor              │
 │  3. Detect absolute/protocol-relative URLs           │
 │  4. Generate signed proxy URLs                       │
-│  5. Rewrite in place; inject TSJS on POST /auction   │
+│  5. Rewrite in-place and inject TSJS                  │
 └──────────────────────────────────────────────────────┘
                         ↓
 ┌──────────────────────────────────────────────────────┐
@@ -43,52 +43,47 @@ Creative processing has separate auction-response and proxied-response paths. Wh
 
 The creative rewriters are invoked by independent delivery paths:
 
-1. **Auction `adm`**: Winning-bid HTML returned by `POST /auction` and delivered through publisher SSAT/page-bids follows the independent `[auction].sanitize_creatives` and `[auction].rewrite_creatives` controls.
-2. **First-party proxy**: Non-streaming `text/html` and `text/css` responses fetched through `/first-party/proxy` are rewritten independently of the auction settings.
+1. **Auction `adm`**: Winning-bid HTML returned by `POST /auction` is always sanitized, then rewritten by default. This pass is controlled by `[auction].rewrite_creatives`.
+2. **First-party proxy**: Non-streaming `text/html` and `text/css` responses fetched through `/first-party/proxy` are rewritten independently of the auction setting.
 3. **Integration processing**: Publisher HTML integrations use their own registration and configuration controls.
 
 ::: info Streaming Mode
-When `with_streaming()` is enabled in `ProxyRequestConfig`, proxied HTML/CSS processing is **skipped** to preserve origin compression and reduce latency. This does not change auction creative processing.
+When `with_streaming()` is enabled in `ProxyRequestConfig`, proxied HTML/CSS processing is **skipped** to preserve origin compression and reduce latency. This does not change the `POST /auction` sanitizer or rewrite setting.
 :::
 
-## Auction Creative Processing Controls
+## Auction Rewrite Control
 
-Sanitization and rewriting are independent and opt in. Both settings apply to
+Use the default-true auction setting to control the rewrite pass applied to
 winning-bid `adm` returned by `POST /auction` and delivered through the publisher
 SSAT/page-bids path:
 
 ```toml
 [auction]
-sanitize_creatives = true
 rewrite_creatives = true
 ```
 
-| `sanitize_creatives` | `rewrite_creatives` | Auction winning-bid `adm` behavior                                                                            |
-| -------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------- |
-| `false`              | `false`             | Deliver bidder markup unchanged except for auction-price macro expansion.                                     |
-| `true`               | `false`             | Sanitize executable markup and unsafe attributes, but leave accepted external resource and click URLs direct. |
-| `false`              | `true`              | Preserve markup while rewriting eligible resource/CSS and click URLs to signed first-party endpoints.         |
-| `true`               | `true`              | Sanitize first, then rewrite eligible URLs.                                                                   |
+| Setting           | Auction winning-bid `adm` behavior                                                                                                                                                                                                                                          |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Omitted or `true` | Sanitize and rewrite eligible resource/CSS and click URLs to signed first-party endpoints. `POST /auction` emits root-relative endpoints and injects creative TSJS; SSAT/page-bids emits absolute endpoints for its foreign-origin renderer and does not inject the bundle. |
+| `false`           | Sanitize, then deliver the sanitized HTML without rewriting in either path. Sanitizer-accepted external resource, click, and inline CSS URLs remain direct.                                                                                                                 |
 
-Both options default to `false`. On the rewrite path, `POST /auction` emits
-root-relative first-party endpoints and injects creative TSJS when a `<body>`
-exists. SSAT/page-bids emits absolute endpoints for its foreign-origin renderer
-and does not inject that bundle. The client render bridge still creates and sizes
-its sandboxed iframe from bid or ad-unit dimensions.
-
-::: warning Opting out of sanitization
-With `sanitize_creatives = false`, scripts, stylesheets, style blocks, forms,
-event handlers, and other bidder markup are preserved. Creative frames therefore
-rely on origin-isolating sandbox attributes and do not use `allow-same-origin`.
-When sanitization is enabled, sanitizer acceptance is not a host allowlist;
-ordinary accepted HTTP(S) URLs may still contact external creative hosts directly
-unless rewriting is also enabled.
+::: warning Sanitization remains mandatory
+Setting `rewrite_creatives = false` returns sanitized but not rewritten HTML,
+not byte-for-byte upstream markup. It does not restore scripts, stylesheets,
+style blocks, forms, event handlers, or other content removed by sanitization.
+The client render bridge still creates and sizes its sandboxed iframe from bid
+or ad-unit dimensions. On `POST /auction`, the creative TSJS runtime and its
+click/resource protections are not injected. The SSAT renderer never injects
+that bundle and continues to render the sanitized inline `adm`. Sanitizer
+acceptance is not a host allowlist; ordinary accepted HTTP(S) URLs may cause the
+browser to contact external creative hosts directly.
 :::
 
-These settings do not affect HTML/CSS response rewriting under
-`/first-party/proxy`. `[debug].inject_adm_for_testing` controls only the
+This setting does not affect HTML/CSS response rewriting under
+`/first-party/proxy`. The publisher SSAT/page-bids path is a production creative
+path and follows this setting. `[debug].inject_adm_for_testing` controls only the
 additional `debug_bid` diagnostic blob and testing-only direct GAM replacement;
-it does not control whether `adm` is present.
+it does not control whether the sanitized `adm` is present.
 
 ## Rewritten Elements
 

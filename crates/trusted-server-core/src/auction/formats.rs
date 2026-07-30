@@ -284,8 +284,8 @@ pub fn convert_to_openrtb_response(
         let width = to_openrtb_i32(bid.width, "width", &bid_context);
         let height = to_openrtb_i32(bid.height, "height", &bid_context);
 
-        // Ordinary markup follows the configured sanitize/rewrite path. A typed
-        // renderer is serialized separately and never enters the HTML sanitizer.
+        // Ordinary markup is sanitized and optionally rewritten. A typed renderer
+        // is serialized separately and never enters the HTML sanitizer.
         let (adm, renderer) = if let Some(raw_creative) = bid
             .creative
             .as_deref()
@@ -299,39 +299,15 @@ pub fn convert_to_openrtb_response(
                     bid.bidder
                 );
             }
-            let sanitize_creatives = settings.auction.sanitize_creatives;
-            let sanitized = if sanitize_creatives {
-                creative::sanitize_creative_html(raw_creative)
-            } else {
-                raw_creative.to_owned()
-            };
-            let sanitized_len = sanitized.len();
-            let rewrite_creatives = settings.auction.rewrite_creatives;
-            let processed = if rewrite_creatives {
-                creative::rewrite_creative_html(settings, &sanitized)
-            } else {
-                sanitized
-            };
-            let sanitize_mode = if sanitize_creatives {
-                "enabled"
-            } else {
-                "disabled"
-            };
-            let rewrite_mode = if rewrite_creatives {
-                "enabled"
-            } else {
-                "disabled"
-            };
+            let processed = creative::process_auction_creative(settings, raw_creative);
 
             log::debug!(
-                "Processed creative for auction {} slot {} bidder {} (sanitize {}, rewrite {}, raw {} bytes, sanitized {} bytes, output {} bytes)",
+                "Processed creative for auction {} slot {} bidder {} (rewrite {}, raw {} bytes, output {} bytes)",
                 auction_request.id,
                 slot_id,
                 bid.bidder,
-                sanitize_mode,
-                rewrite_mode,
+                settings.auction.rewrite_creatives,
                 raw_creative.len(),
-                sanitized_len,
                 processed.len()
             );
 
@@ -1089,7 +1065,6 @@ mod tests {
     #[test]
     fn convert_to_openrtb_response_rewrites_sanitized_creative_when_enabled() {
         let mut settings = make_settings();
-        settings.auction.sanitize_creatives = true;
         settings.auction.rewrite_creatives = true;
         let auction_request = make_auction_request();
         let result = make_result(make_complete_creative_bid());
@@ -1137,52 +1112,39 @@ mod tests {
     }
 
     #[test]
-    fn convert_to_openrtb_response_can_skip_sanitization_when_disabled() {
-        // Sanitization strips every executable element with its inner content, which
-        // destroys script-based creatives (the majority of programmatic display).
-        // Publishers whose creatives render in a foreign-origin frame — where the
-        // markup cannot reach the publisher origin — can opt out and deliver the
-        // creative exactly as the bidder returned it.
+    fn convert_to_openrtb_response_sanitizes_when_rewriting_is_disabled() {
         let mut settings = make_settings();
-        settings.auction.sanitize_creatives = false;
         settings.auction.rewrite_creatives = false;
         let auction_request = make_auction_request();
         let result = make_result(make_complete_creative_bid());
 
         let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
-            .expect("should convert creative with sanitization disabled");
+            .expect("should convert creative with rewriting disabled");
         let adm = response_adm(response);
 
         assert!(
-            adm.contains("auction-script-marker"),
-            "should retain script content when sanitization is disabled: {adm}"
+            !adm.contains("auction-script-marker"),
+            "should remove script content even when rewriting is disabled: {adm}"
         );
         assert!(
-            adm.contains("auction-handler-marker"),
-            "should retain event handlers when sanitization is disabled: {adm}"
+            !adm.contains("auction-handler-marker") && !adm.contains("onerror"),
+            "should remove event handlers even when rewriting is disabled: {adm}"
         );
     }
 
     #[test]
-    fn sanitize_creatives_defaults_to_disabled() {
+    fn rewrite_creatives_defaults_to_enabled() {
         let config = crate::auction_config_types::AuctionConfig::default();
         assert!(
-            !config.sanitize_creatives,
-            "creatives are delivered as the bidder returned them unless a publisher opts in"
-        );
-        assert!(
-            !config.rewrite_creatives,
-            "creative URL rewriting is opt-in"
+            config.rewrite_creatives,
+            "creative URL rewriting should be enabled by default"
         );
     }
 
     #[test]
     fn convert_to_openrtb_response_can_skip_rewriting_while_sanitizing() {
-        // The two controls are independent: sanitization can stay on while URL
-        // rewriting is off.
         let mut settings = make_settings();
         settings.auction.rewrite_creatives = false;
-        settings.auction.sanitize_creatives = true;
         let auction_request = make_auction_request();
         let result = make_result(make_complete_creative_bid());
 

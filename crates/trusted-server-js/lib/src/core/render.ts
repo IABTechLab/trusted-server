@@ -15,8 +15,8 @@ import IFRAME_TEMPLATE from './templates/iframe.html?raw';
 // srcdoc (or first-party src) content, that pair effectively removes the sandbox's
 // origin isolation and would let SSP-provided markup run with the publisher
 // origin's privileges — cookies, storage, and same-origin fetches. The origin
-// boundary must not depend on server-side sanitization, which is optional
-// (`auction.sanitize_creatives`) and cannot run at all for renderer-based bids.
+// boundary must not depend on server-side sanitization. Renderer-based bids do
+// not carry ordinary HTML and therefore cannot enter that processing path.
 // Matches APS_RENDERER_SANDBOX and ADM_IFRAME_SANDBOX, which already omit it.
 const CREATIVE_SANDBOX_TOKENS = [
   'allow-forms',

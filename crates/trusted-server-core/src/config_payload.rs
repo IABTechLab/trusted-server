@@ -100,7 +100,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_blob_without_rewrite_creatives_leaves_rewriting_disabled() {
+    fn legacy_blob_without_rewrite_creatives_preserves_rewriting() {
         let data =
             serde_json::to_value(test_settings()).expect("should serialize settings to JSON");
         let auction = data
@@ -118,8 +118,8 @@ mod tests {
             settings_from_config_blob(&envelope_json).expect("should reconstruct legacy settings");
 
         assert!(
-            !reconstructed.auction.rewrite_creatives,
-            "creative rewriting is opt-in: a blob without the field leaves it disabled"
+            reconstructed.auction.rewrite_creatives,
+            "should enable creative rewriting for legacy blobs"
         );
     }
 
@@ -137,21 +137,16 @@ mod tests {
     }
 
     #[test]
-    fn enabled_creative_processing_survives_blob_round_trip() {
+    fn disabled_rewrite_creatives_survives_blob_round_trip() {
         let mut original = test_settings();
-        original.auction.rewrite_creatives = true;
-        original.auction.sanitize_creatives = true;
+        original.auction.rewrite_creatives = false;
 
         let reconstructed = settings_from_config_blob(&envelope_json(&original))
-            .expect("should reconstruct enabled creative processing");
+            .expect("should reconstruct disabled rewriting");
 
         assert!(
-            reconstructed.auction.rewrite_creatives,
-            "should preserve the explicit rewrite opt-in"
-        );
-        assert!(
-            reconstructed.auction.sanitize_creatives,
-            "should preserve the explicit sanitize opt-in"
+            !reconstructed.auction.rewrite_creatives,
+            "should preserve the explicit rewrite opt-out"
         );
     }
 
