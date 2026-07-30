@@ -276,6 +276,17 @@ pub trait PlatformHttpClient: Send + Sync {
         true
     }
 
+    /// Whether [`send`](Self::send) can preserve upstream response bodies as
+    /// [`Body::Stream`](edgezero_core::body::Body::Stream) when requested via
+    /// [`PlatformHttpRequest::with_stream_response`].
+    ///
+    /// Adapters that cannot preserve streaming response bodies must keep the
+    /// default `false` so callers do not request a contract the adapter will
+    /// reject or silently buffer.
+    fn supports_streaming_responses(&self) -> bool {
+        false
+    }
+
     /// Wait for one of the in-flight requests to complete.
     ///
     /// # Errors

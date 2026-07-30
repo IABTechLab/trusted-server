@@ -246,7 +246,10 @@ fn platform_response_to_fastly_asset(platform_resp: PlatformResponse) -> AssetPr
     }
 }
 
-/// Stream an asset response body directly to a writable client stream.
+/// Stream a platform response body directly to a writable client stream.
+///
+/// Asset routes and Fastly `EdgeZero` publisher fallback both use this bridge
+/// after headers have been committed through `stream_to_client()`.
 ///
 /// # Errors
 ///
@@ -261,7 +264,7 @@ pub async fn stream_asset_body<W: Write>(
             output
                 .write_all(bytes.as_ref())
                 .change_context(TrustedServerError::Proxy {
-                    message: "failed to write buffered asset response body".to_string(),
+                    message: "failed to write buffered platform response body".to_string(),
                 })?;
         }
         EdgeBody::Stream(mut stream) => {
@@ -274,8 +277,20 @@ pub async fn stream_asset_body<W: Write>(
                 output
                     .write_all(chunk.as_ref())
                     .change_context(TrustedServerError::Proxy {
-                        message: "failed to write streaming asset response body".to_string(),
+                        message: "failed to write streaming platform response body".to_string(),
                     })?;
+                // Flush per chunk: Fastly's `StreamingBody` is a
+                // `BufWriter<StreamingBodyHandle>`, so a segment smaller than
+                // the write buffer would sit in the Wasm heap until a later
+                // write filled it. The publisher stream yields compressed
+                // segments that are commonly smaller than that buffer, and the
+                // generator then awaits the origin (or the auction) before
+                // producing the next one — without this flush the client sees
+                // committed headers and no body, undoing the codec's per-chunk
+                // sync flush and delaying first paint.
+                output.flush().change_context(TrustedServerError::Proxy {
+                    message: "failed to flush streaming platform response body".to_string(),
+                })?;
             }
         }
     }
@@ -1098,6 +1113,7 @@ pub async fn handle_asset_proxy_request(
             certificate_check: settings.proxy.certificate_check,
             first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
             between_bytes_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
+            discriminator: None,
         })
         .change_context(TrustedServerError::Proxy {
             message: "asset backend registration failed".to_string(),
@@ -1287,6 +1303,7 @@ async fn proxy_with_redirects(
                 certificate_check: settings.proxy.certificate_check,
                 first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
                 between_bytes_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
+                discriminator: None,
             })
             .change_context(TrustedServerError::Proxy {
                 message: "backend registration failed".to_string(),
@@ -1636,6 +1653,12 @@ pub async fn handle_first_party_proxy_sign(
             })
         })?
     };
+
+    if settings.rewrite.is_excluded(&abs) {
+        return Err(Report::new(TrustedServerError::Proxy {
+            message: "unsupported url".to_string(),
+        }));
+    }
 
     let parsed = url::Url::parse(&abs).change_context(TrustedServerError::Proxy {
         message: "invalid url".to_string(),
@@ -2022,8 +2045,10 @@ fn reconstruct_and_validate_signed_target(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::{HashMap, VecDeque};
     use std::io;
+    use std::rc::Rc;
     use std::sync::{Arc, Mutex};
 
     use super::{
@@ -2390,6 +2415,30 @@ mod tests {
     }
 
     #[test]
+    fn proxy_sign_rejects_excluded_urls() {
+        futures::executor::block_on(async {
+            let mut settings = create_test_settings();
+            settings.rewrite.exclude_domains = vec!["cdn.example".to_owned()];
+
+            for url in ["https://cdn.example/asset.js", "//cdn.example/asset.js"] {
+                let body = serde_json::json!({ "url": url });
+                let req =
+                    build_http_post_json_request("https://edge.example/first-party/sign", &body);
+                let err: Report<TrustedServerError> =
+                    handle_first_party_proxy_sign(&settings, &noop_services(), req)
+                        .await
+                        .expect_err("should reject excluded URL");
+
+                assert_eq!(
+                    err.current_context().status_code(),
+                    StatusCode::BAD_GATEWAY,
+                    "should reject excluded URL `{url}` as unsupported"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn proxy_sign_preserves_non_standard_port() {
         futures::executor::block_on(async {
             let settings = create_test_settings();
@@ -2730,7 +2779,7 @@ mod tests {
         let settings = create_test_settings();
         let clear = "https://cdn.example/asset.js?c=3&b=2&a=1";
         // Simulate creative-generated first-party URL
-        let first_party = creative::build_proxy_url(&settings, clear);
+        let first_party = creative::build_proxy_url(&settings, clear, "");
         // Reconstruct and validate (need absolute URL for parsing)
         let st = reconstruct_and_validate_signed_target(
             &settings,
@@ -2746,7 +2795,7 @@ mod tests {
     fn reconstruct_valid_without_params() {
         let settings = create_test_settings();
         let clear = "https://cdn.example/asset.js";
-        let first_party = creative::build_proxy_url(&settings, clear);
+        let first_party = creative::build_proxy_url(&settings, clear, "");
         let st = reconstruct_and_validate_signed_target(
             &settings,
             &format!("https://edge.example{}", first_party),
@@ -2763,7 +2812,7 @@ mod tests {
             let settings = create_test_settings();
             let clear = "ftp://cdn.example/file.gif";
             // Build a first-party proxy URL with a token for the unsupported scheme
-            let first_party = creative::build_proxy_url(&settings, clear);
+            let first_party = creative::build_proxy_url(&settings, clear, "");
             let req =
                 build_http_request(Method::GET, format!("https://edge.example{}", first_party));
             let err: Report<TrustedServerError> =
@@ -2802,7 +2851,7 @@ mod tests {
         futures::executor::block_on(async {
             let settings = create_test_settings();
             let clear = "https://cdn.example/landing.html?x=1";
-            let first_party = creative::build_click_url(&settings, clear);
+            let first_party = creative::build_click_url(&settings, clear, "");
             let req =
                 build_http_request(Method::GET, format!("https://edge.example{}", first_party));
             let resp = handle_first_party_click(&settings, &noop_services(), req)
@@ -2880,6 +2929,51 @@ mod tests {
         let body = response_body_string(out);
         assert!(body.contains("/first-party/proxy?tsurl="), "{}", body);
         assert_eq!(ct, "text/css; charset=utf-8");
+    }
+
+    #[test]
+    fn auction_rewrite_setting_does_not_change_proxied_html_or_css_rewriting() {
+        let mut settings = create_test_settings();
+        settings.auction.rewrite_creatives = false;
+        let req = build_http_request(Method::GET, "https://edge.example/first-party/proxy");
+
+        let html = r#"<html><body><img src="https://cdn.example/ad.png"></body></html>"#;
+        let mut html_response = build_http_response(StatusCode::OK, EdgeBody::from(html));
+        html_response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        let html_output = finalize(
+            &settings,
+            &req,
+            "https://cdn.example/creative.html",
+            html_response,
+        )
+        .expect("should finalize proxied HTML");
+        let html_body = response_body_string(html_output);
+
+        let css = "body{background:url(https://cdn.example/bg.png)}";
+        let mut css_response = build_http_response(StatusCode::OK, EdgeBody::from(css));
+        css_response
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/css"));
+        let css_output = finalize(
+            &settings,
+            &req,
+            "https://cdn.example/creative.css",
+            css_response,
+        )
+        .expect("should finalize proxied CSS");
+        let css_body = response_body_string(css_output);
+
+        assert!(
+            html_body.contains("/first-party/proxy?tsurl="),
+            "should keep rewriting proxied HTML when auction rewriting is disabled: {html_body}"
+        );
+        assert!(
+            css_body.contains("/first-party/proxy?tsurl="),
+            "should keep rewriting proxied CSS when auction rewriting is disabled: {css_body}"
+        );
     }
 
     #[test]
@@ -4449,6 +4543,68 @@ mod tests {
                 "should describe the streaming failure: {err:?}"
             );
         });
+    }
+
+    /// One observable step of [`stream_asset_body`] driving a buffered sink.
+    #[derive(Debug, PartialEq, Eq)]
+    enum StreamSinkEvent {
+        SourcePolled(usize),
+        Wrote(usize),
+        Flushed,
+    }
+
+    /// Sink that records its calls so a test can assert how they interleave
+    /// with the source stream's polls.
+    struct RecordingSink(Rc<RefCell<Vec<StreamSinkEvent>>>);
+
+    impl io::Write for RecordingSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.borrow_mut().push(StreamSinkEvent::Wrote(buf.len()));
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.borrow_mut().push(StreamSinkEvent::Flushed);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn stream_asset_body_flushes_each_chunk_before_polling_the_source_again() {
+        // Fastly's `StreamingBody` is a `BufWriter`, so a yielded segment only
+        // reaches the client once the sink is flushed. The publisher stream
+        // awaits the origin (and the auction) between segments, so a segment
+        // smaller than the write buffer must be flushed before the next poll or
+        // the client renders nothing behind committed headers.
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let source_events = Rc::clone(&events);
+        let body = EdgeBody::from_stream(async_stream::stream! {
+            for (index, segment) in ["<html><head>", "</head><body>"].into_iter().enumerate() {
+                source_events
+                    .borrow_mut()
+                    .push(StreamSinkEvent::SourcePolled(index));
+                yield Ok::<Bytes, io::Error>(Bytes::from_static(segment.as_bytes()));
+            }
+        });
+
+        futures::executor::block_on(stream_asset_body(
+            body,
+            &mut RecordingSink(Rc::clone(&events)),
+        ))
+        .expect("should stream asset body");
+
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                StreamSinkEvent::SourcePolled(0),
+                StreamSinkEvent::Wrote(12),
+                StreamSinkEvent::Flushed,
+                StreamSinkEvent::SourcePolled(1),
+                StreamSinkEvent::Wrote(13),
+                StreamSinkEvent::Flushed,
+            ],
+            "each segment must be flushed to the client before the source is polled again"
+        );
     }
 
     #[test]
