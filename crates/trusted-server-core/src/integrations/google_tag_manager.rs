@@ -1,7 +1,7 @@
 //! Google Tag Manager integration for first-party tag delivery.
 //!
 //! Proxies GTM scripts and Google Analytics beacons through the publisher's
-//! domain, improving tracking accuracy and ad-blocker resistance.
+//! domain, improving measurement accuracy and ad-blocker resistance.
 //!
 //! # Endpoints
 //!

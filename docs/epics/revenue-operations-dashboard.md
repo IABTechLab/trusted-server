@@ -7,7 +7,7 @@ A real-time publisher transparency dashboard providing visibility into ad moneti
 ## Business Value
 
 - **Revenue Optimization**: Identify underperforming exchanges, timeout issues, and bid density gaps
-- **Compliance Assurance**: Detect unauthorized calls, consent violations, and policy breaches
+- **Policy Monitoring**: Detect calls outside the configured allowlist, consent mismatches, and policy breaches
 - **Operational Visibility**: Debug issues faster with real-time data on all ad-related activity
 - **Vendor Accountability**: Hold partners accountable with data on their behavior
 
@@ -74,7 +74,7 @@ A real-time publisher transparency dashboard providing visibility into ad moneti
 - [ ] Instrument proxy request handlers to emit domain call events
 - [ ] Add session/page_id correlation (via EC ID or request header)
 - [ ] Create domain allowlist configuration in settings.toml
-- [ ] Emit `unauthorized_domain` alert event when unknown domain called
+- [ ] Emit `non_allowlisted_domain` alert event when a domain outside the configured allowlist is called
 - [ ] Track request timing (DNS, connect, TTFB, total)
 
 #### Data Schema
@@ -112,7 +112,7 @@ A real-time publisher transparency dashboard providing visibility into ad moneti
 #### Technical Tasks
 
 - [ ] Parse request paths to categorize endpoint types
-- [ ] Build SDK fingerprinting logic (match known SDK URL patterns)
+- [ ] Build SDK detection logic (match known SDK URL patterns)
 - [ ] Emit `sdk_call` events with SDK attribution
 - [ ] Create SDK registry configuration for known vendors
 
@@ -138,21 +138,21 @@ A real-time publisher transparency dashboard providing visibility into ad moneti
 
 **As a** publisher
 **I want** to track consent state and detect compliance violations
-**So that** I can ensure GDPR/CCPA compliance and avoid regulatory risk
+**So that** I can monitor my GDPR/CCPA posture and reduce regulatory risk
 
 #### Acceptance Criteria
 
 - [ ] Log consent state (TCF string, USP string) per request
-- [ ] Flag calls made to tracking domains when consent not granted
+- [ ] Flag calls made to consent-gated domains when consent not granted
 - [ ] Track consent rate by geography
-- [ ] Alert on potential violations (call to tracking domain without consent)
+- [ ] Alert on potential violations (call to a consent-gated domain without consent)
 
 #### Technical Tasks
 
 - [ ] Parse TCF/GPP consent strings in request flow
-- [ ] Build tracking domain classification (analytics, advertising, functional)
+- [ ] Build domain purpose classification (analytics, advertising, functional)
 - [ ] Cross-reference consent state with domain calls
-- [ ] Emit `compliance_violation` events when unauthorized tracking detected
+- [ ] Emit `policy_check_failed` events when a call reaches a consent-gated domain without the consent signal the deployer's policy requires
 - [ ] Add geo detection for consent rate reporting
 
 #### Data Schema
@@ -165,7 +165,7 @@ A real-time publisher transparency dashboard providing visibility into ad moneti
   "consent_tcf": "CO...",
   "consent_usp": "1YNN",
   "geo_country": "DE",
-  "tracking_authorized": true,
+  "consent_authorized": true,
   "violation_detected": false,
   "violation_domain": null
 }

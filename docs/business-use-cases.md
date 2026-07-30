@@ -1,6 +1,8 @@
 # Business Use Cases
 
-Trusted Server delivers measurable business value across revenue generation, compliance, performance, and user experience. This page outlines real-world scenarios where Trusted Server provides significant ROI.
+Scenarios where publishers can realize measurable value with Trusted
+Server across revenue, consent handling, performance, and user
+experience.
 
 ---
 
@@ -8,9 +10,9 @@ Trusted Server delivers measurable business value across revenue generation, com
 
 ### 1. Increased Ad Revenue in Cookieless Environments
 
-**Problem**: Safari and Firefox block third-party cookies, fragmenting user identity and reducing addressable inventory CPMs by 30-50%.
+**Problem**: Safari and Firefox restrict third-party cookie scope, reducing cross-site identifier continuity and addressable inventory CPMs by 30-50%.
 
-**Solution**: Trusted Server's Edge Cookie (EC) system maintains user recognition across cookieless browsers through first-party identifiers.
+**Solution**: Trusted Server's Edge Cookie (EC) system provides first-party identifiers for user recognition in restricted cookie environments.
 
 **Business Impact**:
 
@@ -47,10 +49,10 @@ Trusted Server delivers measurable business value across revenue generation, com
 
 **Key Differentiators**:
 
-- Granular consent controls (GDPR compliant)
+- Granular consent controls (TCF v2 format Purpose/vendor scope, GPC)
 - Real-time segment activation
 - First-party data ownership
-- Privacy-preserving sharing
+- Consent-based sharing
 
 ---
 
@@ -104,16 +106,16 @@ Trusted Server delivers measurable business value across revenue generation, com
 
 ## Compliance & Risk Mitigation
 
-### 5. GDPR Fine Prevention
+### 5. GDPR Fine Risk Reduction
 
-**Problem**: Third-party ad tech vendors inject non-compliant tracking scripts, exposing publishers to multi-million dollar GDPR fines.
+**Problem**: Third-party ad tech vendors can introduce scripts that conflict with the publisher's consent policy, exposing publishers to multi-million dollar GDPR fines.
 
-**Solution**: Trusted Server's Creative Forensics Engine detects and blocks GDPR violations before they reach users.
+**Solution**: Trusted Server's planned Creative Forensics Engine (see the [roadmap](/roadmap)) is designed to detect and block creative behavior that conflicts with the publisher's configured consent policy before it reaches users.
 
 **Business Impact**:
 
-- **Fine Avoidance**: Prevent €2.3M+ fines (4% of global revenue)
-- **Regulatory Risk Reduction**: Automated compliance monitoring
+- **Fine Exposure Reduction**: Reduce exposure to €2.3M+ fines (4% of global revenue)
+- **Regulatory Risk Reduction**: Automated policy monitoring
 - **Brand Protection**: Avoid public regulatory actions
 
 **Real-World Example**:
@@ -123,12 +125,12 @@ Trusted Server delivers measurable business value across revenue generation, com
 - Trusted Server cost: €100K annually
 - **ROI**: 20:1 (risk mitigation value)
 
-**Compliance Features**:
+**Planned Capabilities**:
 
 - Real-time creative scanning
-- Unauthorized pixel detection
-- GDPR consent validation
-- Automated blocking of violations
+- Detection of pixels outside the publisher's domain allowlist
+- Consent signal validation (TCF v2 format, GPP, GPC)
+- Automated blocking per configured policy
 
 ---
 
@@ -248,7 +250,7 @@ Trusted Server delivers measurable business value across revenue generation, com
 
 **Problem**: Reliance on 10+ third-party vendors creates operational complexity, security risks, and hidden costs.
 
-**Solution**: Trusted Server consolidates identity, ad serving, privacy, and analytics into a single edge platform.
+**Solution**: Trusted Server consolidates identity, ad serving, consent management, and analytics into a single edge platform.
 
 **Business Impact**:
 
@@ -267,17 +269,17 @@ Trusted Server delivers measurable business value across revenue generation, com
 
 ## Competitive Differentiation
 
-### 11. Privacy-First Publisher Positioning
+### 11. Publisher Positioning on Transparency
 
-**Problem**: Users increasingly distrust ad-supported content due to invasive tracking.
+**Problem**: Some user groups disengage from ad-supported content where data flows are opaque to them.
 
-**Solution**: Trusted Server enables transparent, consent-based advertising that rebuilds user trust.
+**Solution**: Trusted Server provides transparent, consent-based advertising mechanisms. Trust is a user outcome that depends on the publisher's choices and on what users do with the controls available to them.
 
 **Business Impact**:
 
-- **User Loyalty**: Privacy-conscious users stay engaged
-- **Premium Positioning**: Differentiate from surveillance-based competitors
-- **Regulatory Advantage**: Early GDPR/CCPA compliance = competitive moat
+- **User Engagement**: Privacy-conscious users have visible controls
+- **Positioning**: Differentiate via consent transparency
+- **Regulatory Advantage**: Early consent infrastructure adoption = competitive moat
 
 **Brand Value**:
 
@@ -291,12 +293,12 @@ Trusted Server delivers measurable business value across revenue generation, com
 
 **Problem**: Privacy regulations (GDPR, CCPA, etc.) and browser changes (cookie deprecation) create constant technical debt.
 
-**Solution**: Trusted Server's architecture is built for a cookieless, privacy-first future.
+**Solution**: Trusted Server's architecture is built for a cookieless future and evolving regulatory requirements.
 
 **Business Impact**:
 
 - **Reduced Technical Debt**: No emergency migrations when browsers change
-- **Regulatory Readiness**: Built-in compliance for new regulations
+- **Regulatory Readiness**: Configurable consent handling as new regulations emerge
 - **Competitive Advantage**: Move faster than competitors stuck on legacy tech
 
 **Long-Term Value**:
@@ -338,7 +340,7 @@ Trusted Server delivers measurable business value across revenue generation, com
 
 **Risk Mitigation**:
 
-1. GDPR fine avoidance: +$2.3M (risk value)
+1. GDPR fine risk reduction: +$2.3M (risk value)
 2. Malvertising prevention: +$1.2M (user retention)
 
 **Net Impact**: +$3.68M annually
