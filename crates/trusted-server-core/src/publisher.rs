@@ -3327,6 +3327,17 @@ pub(crate) fn build_bids_script(bid_map: &serde_json::Map<String, serde_json::Va
     // gpt_bootstrap.js installs a minimal head-injected fallback so a failed
     // bundle load still initializes initial ads.
     //
+    // The deferral is deliberately unconditional — every publisher, every
+    // page — even though only hydrating React publishers exhibit the #418
+    // failure. Uniform behavior keeps one code path to reason about and
+    // avoids a framework-detection or config surface that must be kept
+    // truthful per publisher; the cost is that non-React pages also move the
+    // initial request from parse time to window load. The agreed follow-up
+    // (branch 958-adinit-hydration-chunk-gate, spec in docs/superpowers/
+    // specs/2026-07-24-adinit-hydration-gate-design.md) narrows the gate to
+    // the Next.js hydration chunks with `load` as the can't-hang fallback,
+    // which recovers most of that latency without a new config surface.
+    //
     // The bids payload is handed to the scheduler instead of being assigned
     // here: an SPA navigation that committed while this document was still
     // streaming has already replaced `tsjs.bids`, and an unconditional

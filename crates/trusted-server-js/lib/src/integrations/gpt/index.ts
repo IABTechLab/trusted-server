@@ -479,6 +479,15 @@ function installInitialLoadDetector(ts: TsjsApi): void {
  * identity: a query-only history change the hook ignores must not cancel the
  * initial call, while an `/a → /b → /a` round trip — where the URL compares
  * equal again — must.
+ *
+ * Hidden documents: browsers do not service `requestAnimationFrame` while a
+ * document is hidden, so a background-tab load (Cmd+click, open-in-new-tab)
+ * holds the initial `adInit()` until the tab is first viewed. This is
+ * intended, not an oversight: the initial ad request then spends its
+ * impression on a tab someone is actually looking at instead of firing —
+ * unviewable — at parse time in a tab that may never be foregrounded, and
+ * riding rAF keeps a single code path whose post-hydration-commit guarantee
+ * holds whenever the request is actually issued.
  */
 function installScheduleInitialAdInit(ts: TsjsApi): void {
   ts.scheduleInitialAdInit = function (initialBids?: Record<string, AuctionBidData>) {

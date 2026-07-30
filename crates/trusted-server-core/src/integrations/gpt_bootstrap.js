@@ -51,6 +51,12 @@
   // requestAnimationFrame so the call lands outside React's hydration
   // window. Keeps initial server-side ads working when the main TSJS bundle
   // fails to load; the bundle overwrites this with the full implementation.
+  //
+  // Hidden documents: rAF is not serviced while the document is hidden, so a
+  // background-tab load holds the initial adInit until first view. Intended,
+  // and deliberately identical to the bundle scheduler — the impression is
+  // spent on a viewed tab, and the post-hydration guarantee holds whenever
+  // the request is actually issued.
   ts.scheduleInitialAdInit = function (initialBids) {
     if ((ts.navGeneration || 0) !== 0) return;
     if (initialBids) ts.bids = initialBids;

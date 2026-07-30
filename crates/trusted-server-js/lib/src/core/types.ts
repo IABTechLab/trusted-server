@@ -142,8 +142,9 @@ export interface TsjsApi {
   /**
    * Monotonic count of committed SPA navigations, incremented synchronously by
    * the SPA auction hook the moment it accepts a route change. The deferred
-   * initial-adInit bootstrap ([`scheduleInitialAdInit`]) captures this counter
-   * and no-ops when a navigation committed while it was pending. A counter is
+   * initial-adInit bootstrap ([`scheduleInitialAdInit`]) is pinned to
+   * generation 0 (the SSR document) and no-ops when a navigation has
+   * committed — before it was called, or while it was pending. A counter is
    * used instead of a URL comparison so the guard cannot diverge from the
    * auction path: a query-only history change (which the hook deliberately
    * ignores) leaves the counter unchanged, and an `/a → /b → /a` round trip

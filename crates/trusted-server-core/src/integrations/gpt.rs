@@ -1230,10 +1230,10 @@ mod tests {
             combined.contains("\"load\""),
             "fallback scheduler should gate on window load"
         );
-        assert!(
-            !combined.contains("setTimeout"),
-            "fallback scheduler must not retry on a timer"
-        );
+        // The no-retry-timer property is owned by the executable suite
+        // (gpt_bootstrap.test.ts asserts adInit runs exactly once); a
+        // `!contains("setTimeout")` over the whole joined head-insert output
+        // would misattribute any future unrelated timer to the scheduler.
     }
 
     #[test]
