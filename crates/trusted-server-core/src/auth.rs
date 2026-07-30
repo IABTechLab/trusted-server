@@ -258,6 +258,42 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// A handler regex is matched against the whole request path, so a broad
+    /// pattern such as `^/_ts` covers browser-facing endpoints in that
+    /// namespace — `/_ts/page-bids` and `/_ts/api/v1/identify` — not just the
+    /// admin routes it was probably meant for. Anonymous browser fetches never
+    /// carry Basic credentials, so those endpoints answer `401` for every
+    /// visitor.
+    ///
+    /// This pins the behaviour rather than exempting the paths: which paths a
+    /// handler covers is the operator's decision, and silently carving holes in
+    /// it would be worse than a documented constraint. Operators must scope
+    /// handler patterns to the paths they mean (`^/_ts/admin`) — see the
+    /// configuration guide. The tsjs client's `/__ts/page-bids` fallback keeps
+    /// affected deployments serving SPA ads until they do, but it disappears
+    /// with the alias in IABTechLab/trusted-server#970.
+    #[test]
+    fn broad_handler_regex_also_covers_browser_facing_endpoints() {
+        let config = crate_test_settings_str().replace(r#"path = "^/secure""#, r#"path = "^/_ts""#);
+        let settings = Settings::from_toml(&config).expect("should parse broad handler regex");
+
+        for path in [
+            "https://example.com/_ts/page-bids?path=/article",
+            "https://example.com/_ts/api/v1/identify",
+        ] {
+            let req = build_request(Method::GET, path);
+
+            let response = enforce_basic_auth(&settings, &req)
+                .expect("should evaluate auth")
+                .unwrap_or_else(|| panic!("should challenge {path} under a `^/_ts` handler"));
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "a `^/_ts` handler should challenge {path}"
+            );
+        }
+    }
+
     #[test]
     fn challenge_admin_path_with_missing_credentials() {
         let settings = create_test_settings();
