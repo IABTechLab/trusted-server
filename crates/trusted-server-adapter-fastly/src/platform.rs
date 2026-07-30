@@ -453,17 +453,32 @@ fn fastly_body_to_edge_stream(body: fastly::Body) -> edgezero_core::body::Body {
     edgezero_core::body::Body::from_stream(stream)
 }
 
+/// Return whether a response is allowed to carry a body.
+///
+/// `HEAD` responses and informational, 204, 205, and 304 statuses carry no
+/// content. In particular, HEAD and 304 may legitimately retain a
+/// `Content-Length` for the corresponding GET representation.
+fn response_carries_body(request_is_head: bool, status: fastly::http::StatusCode) -> bool {
+    !request_is_head
+        && !status.is_informational()
+        && status != fastly::http::StatusCode::NO_CONTENT
+        && status != fastly::http::StatusCode::RESET_CONTENT
+        && status != fastly::http::StatusCode::NOT_MODIFIED
+}
+
 /// Convert a [`fastly::Response`] to a [`PlatformResponse`] with the given backend name.
 fn fastly_response_to_platform(
     mut resp: fastly::Response,
     backend_name: impl Into<String>,
     stream_response: bool,
-    response_body_expected: bool,
+    request_is_head: bool,
 ) -> Result<PlatformResponse, Report<PlatformError>> {
+    let status = resp.get_status();
+    let response_body_expected = response_carries_body(request_is_head, status);
+
     // Pre-flight: reject oversized responses before copying bytes into WASM heap.
     // Content-Length is advisory but covers most origin responses; chunked
     // responses without it fall through to the post-materialization check below.
-    // HEAD responses report the corresponding GET size but contain no body.
     if response_body_expected
         && !stream_response
         && let Some(claimed_len) = resp
@@ -478,7 +493,6 @@ fn fastly_response_to_platform(
         )));
     }
 
-    let status = resp.get_status();
     let mut builder = edgezero_core::http::response_builder().status(status);
     for (name, value) in resp.get_headers() {
         builder = builder.header(name.as_str(), value.as_bytes());
@@ -544,7 +558,7 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         let backend_name = request.backend_name.clone();
         let image_optimizer = request.image_optimizer;
         let stream_response = request.stream_response;
-        let response_body_expected = request.request.method() != edgezero_core::http::Method::HEAD;
+        let request_is_head = request.request.method() == edgezero_core::http::Method::HEAD;
         let bypass_cache = request.bypass_cache;
         let mut fastly_req = edge_request_to_fastly(request.request)?;
         if let Some(options) = image_optimizer {
@@ -554,12 +568,7 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         let fastly_resp = fastly_req
             .send(&backend_name)
             .change_context(PlatformError::HttpClient)?;
-        fastly_response_to_platform(
-            fastly_resp,
-            backend_name,
-            stream_response,
-            response_body_expected,
-        )
+        fastly_response_to_platform(fastly_resp, backend_name, stream_response, request_is_head)
     }
 
     async fn send_async(
@@ -623,8 +632,14 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
                     return Err(Report::new(PlatformError::HttpClient)
                         .attach("select: response has no backend name; correlation impossible"));
                 };
+                let Some(backend_request) = fastly_resp.get_backend_request() else {
+                    return Err(Report::new(PlatformError::HttpClient).attach(
+                        "select: response has no originating request; body semantics unknown",
+                    ));
+                };
+                let request_is_head = backend_request.get_method() == fastly::http::Method::HEAD;
                 (
-                    fastly_response_to_platform(fastly_resp, backend_name, false, true),
+                    fastly_response_to_platform(fastly_resp, backend_name, false, request_is_head),
                     None,
                 )
             }
@@ -899,34 +914,59 @@ mod tests {
     // --- FastlyPlatformHttpClient -------------------------------------------
 
     #[test]
-    fn fastly_response_to_platform_allows_oversized_head_content_length() {
+    fn fastly_response_to_platform_allows_oversized_bodiless_content_length() {
+        let oversized_content_length = (MAX_PLATFORM_RESPONSE_BODY_BYTES + 1).to_string();
+        for (request_is_head, status) in [
+            (true, fastly::http::StatusCode::OK),
+            (false, fastly::http::StatusCode::CONTINUE),
+            (false, fastly::http::StatusCode::NO_CONTENT),
+            (false, fastly::http::StatusCode::RESET_CONTENT),
+            (false, fastly::http::StatusCode::NOT_MODIFIED),
+        ] {
+            let mut fastly_response = fastly::Response::from_status(status);
+            fastly_response.set_header(
+                fastly::http::header::CONTENT_LENGTH,
+                oversized_content_length.as_str(),
+            );
+
+            let platform_response =
+                fastly_response_to_platform(fastly_response, "origin", false, request_is_head)
+                    .expect("should allow oversized metadata for a bodiless response");
+
+            assert_eq!(
+                platform_response
+                    .response
+                    .headers()
+                    .get(edgezero_core::http::header::CONTENT_LENGTH)
+                    .and_then(|value| value.to_str().ok()),
+                Some(oversized_content_length.as_str()),
+                "should preserve the origin Content-Length"
+            );
+            let body = platform_response
+                .response
+                .into_body()
+                .into_bytes()
+                .expect("should return a buffered body");
+            assert!(body.is_empty(), "should return an empty bodiless response");
+        }
+    }
+
+    #[test]
+    fn fastly_response_to_platform_rejects_oversized_buffered_get_content_length() {
         let mut fastly_response = fastly::Response::from_status(200);
         fastly_response.set_header(
             fastly::http::header::CONTENT_LENGTH,
             (MAX_PLATFORM_RESPONSE_BODY_BYTES + 1).to_string(),
         );
 
-        let platform_response =
-            fastly_response_to_platform(fastly_response, "origin", false, false)
-                .expect("should allow HEAD metadata for an oversized object");
+        let error = fastly_response_to_platform(fastly_response, "origin", false, false)
+            .expect_err("should reject oversized buffered GET metadata");
+        let expected_error =
+            format!("exceeds {MAX_PLATFORM_RESPONSE_BODY_BYTES}-byte response body limit");
 
-        assert_eq!(
-            platform_response
-                .response
-                .headers()
-                .get(edgezero_core::http::header::CONTENT_LENGTH)
-                .and_then(|value| value.to_str().ok()),
-            Some("10485761"),
-            "should preserve the origin Content-Length"
-        );
         assert!(
-            platform_response
-                .response
-                .into_body()
-                .into_bytes()
-                .unwrap_or_default()
-                .is_empty(),
-            "should return an empty HEAD response body"
+            format!("{error:?}").contains(&expected_error),
+            "should retain the buffered response size limit: {error:?}"
         );
     }
 
@@ -941,29 +981,31 @@ mod tests {
     }
 
     #[test]
-    fn fastly_response_to_platform_rejects_oversized_buffered_get_content_length() {
-        let mut fastly_response = fastly::Response::from_status(200);
-        fastly_response.set_header(
-            fastly::http::header::CONTENT_LENGTH,
-            (MAX_PLATFORM_RESPONSE_BODY_BYTES + 1).to_string(),
-        );
-
-        let error = fastly_response_to_platform(fastly_response, "origin", false, true)
-            .expect_err("should reject oversized buffered GET metadata");
-
-        assert!(
-            format!("{error:?}").contains("exceeds 10485760-byte response body limit"),
-            "should retain the buffered response size limit: {error:?}"
-        );
-    }
-
-    #[test]
     fn apply_fastly_cache_bypass_preserves_default_when_disabled() {
         let mut request = fastly::Request::get("https://example.com/");
         apply_fastly_cache_bypass(&mut request, false);
         assert!(
             format!("{request:?}").contains("cache_override: None"),
             "disabled bypass should preserve Fastly read-through caching"
+        );
+    }
+
+    #[test]
+    fn response_carries_body_rejects_all_informational_statuses() {
+        let status = fastly::http::StatusCode::from_u16(199)
+            .expect("should construct an informational status code");
+
+        assert!(
+            !response_carries_body(false, status),
+            "should reject every informational response body"
+        );
+        assert!(
+            !response_carries_body(true, fastly::http::StatusCode::OK),
+            "should reject HEAD response bodies"
+        );
+        assert!(
+            response_carries_body(false, fastly::http::StatusCode::OK),
+            "should retain ordinary GET response bodies"
         );
     }
 
