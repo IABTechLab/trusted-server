@@ -103,7 +103,7 @@ describe('installSpaAuctionHook', () => {
     await flushAsync();
 
     expect(fetchStub).toHaveBeenCalledWith(
-      '/__ts/page-bids?path=%2Fnext-page',
+      '/_ts/page-bids?path=%2Fnext-page',
       expect.objectContaining({
         credentials: 'include',
         headers: { 'X-TSJS-Page-Bids': '1' },
@@ -248,7 +248,7 @@ describe('installSpaAuctionHook', () => {
     history.replaceState({}, '', '/replaced');
     await flushAsync();
     expect(fetchStub).toHaveBeenCalledWith(
-      '/__ts/page-bids?path=%2Freplaced',
+      '/_ts/page-bids?path=%2Freplaced',
       expect.objectContaining({ credentials: 'include' })
     );
   });
@@ -266,7 +266,7 @@ describe('installSpaAuctionHook', () => {
     window.dispatchEvent(new PopStateEvent('popstate'));
     await flushAsync();
     expect(fetchStub).toHaveBeenCalledWith(
-      '/__ts/page-bids?path=%2Fpopped',
+      '/_ts/page-bids?path=%2Fpopped',
       expect.objectContaining({ credentials: 'include' })
     );
   });
@@ -429,6 +429,123 @@ describe('installSpaAuctionHook', () => {
     resolveA?.({ ok: true, json: async () => ({ slots: [{ id: 'stale' }], bids: {} }) });
     await flushAsync();
     expect(ts.adSlots).toEqual([{ id: 'a', div_id: 'div-a' }]);
+  });
+
+  it('falls back to the deprecated alias when the canonical path is behind Basic Auth', async () => {
+    // An operator `[[handlers]]` regex broad enough to cover `/_ts` answers the
+    // canonical path with 401 that no anonymous browser fetch can satisfy.
+    // Without the fallback, every SPA navigation on that deployment loses ads.
+    document.body.innerHTML = '<div id="div-s1"></div>';
+    fetchStub.mockResolvedValueOnce({ ok: false, status: 401 }).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        slots: [{ id: 's1', div_id: 'div-s1' }],
+        bids: { s1: { hb_pb: '1.00' } },
+      }),
+    });
+    const { installSpaAuctionHook } = await importGptModule();
+    installSpaAuctionHook();
+    const ts = (window as TestWindow).tsjs!;
+    const adInit = vi.fn();
+    ts.adInit = adInit;
+
+    history.pushState({}, '', '/auth-gated');
+    await flushAsync();
+
+    expect(fetchStub).toHaveBeenNthCalledWith(
+      1,
+      '/_ts/page-bids?path=%2Fauth-gated',
+      expect.anything()
+    );
+    // The fallback marks itself so the server can separate a current bundle
+    // that could not use the canonical path (a deployment to fix) from a
+    // pre-rename bundle (which ages out on its own).
+    expect(fetchStub).toHaveBeenNthCalledWith(
+      2,
+      '/__ts/page-bids?path=%2Fauth-gated',
+      expect.objectContaining({ headers: { 'X-TSJS-Page-Bids': 'fallback' } })
+    );
+    expect(ts.adSlots).toEqual([{ id: 's1', div_id: 'div-s1' }]);
+    expect(adInit).toHaveBeenCalledTimes(1);
+  });
+
+  it('falls back to the deprecated alias when the canonical path returns a non-JSON body', async () => {
+    // A server rolled back to before the rename does not register the canonical
+    // path, so it falls through to the publisher-origin proxy and answers 200
+    // HTML. That is the wrong endpoint, not a transient failure.
+    document.body.innerHTML = '<div id="div-s1"></div>';
+    fetchStub
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => {
+          throw new SyntaxError('Unexpected token <');
+        },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          slots: [{ id: 's1', div_id: 'div-s1' }],
+          bids: { s1: { hb_pb: '1.00' } },
+        }),
+      });
+    const { installSpaAuctionHook } = await importGptModule();
+    installSpaAuctionHook();
+    const ts = (window as TestWindow).tsjs!;
+
+    history.pushState({}, '', '/rolled-back');
+    await flushAsync();
+
+    expect(fetchStub).toHaveBeenNthCalledWith(
+      2,
+      '/__ts/page-bids?path=%2Frolled-back',
+      expect.anything()
+    );
+    expect(ts.adSlots).toEqual([{ id: 's1', div_id: 'div-s1' }]);
+  });
+
+  it('stays on the alias for the rest of the session once the fallback works', async () => {
+    // Re-probing the canonical path on every navigation would double the
+    // request count for the whole session on an affected deployment.
+    document.body.innerHTML = '<div id="div-s1"></div>';
+    fetchStub.mockResolvedValueOnce({ ok: false, status: 401 }).mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        slots: [{ id: 's1', div_id: 'div-s1' }],
+        bids: { s1: { hb_pb: '1.00' } },
+      }),
+    });
+    const { installSpaAuctionHook } = await importGptModule();
+    installSpaAuctionHook();
+
+    history.pushState({}, '', '/first');
+    await flushAsync();
+    history.pushState({}, '', '/second');
+    await flushAsync();
+
+    expect(fetchStub).toHaveBeenCalledTimes(3);
+    expect(fetchStub).toHaveBeenNthCalledWith(
+      3,
+      '/__ts/page-bids?path=%2Fsecond',
+      expect.anything()
+    );
+  });
+
+  it('does not retry the alias when the endpoint denies the request', async () => {
+    // 403 is the cross-site gate, which applies to both registered paths — the
+    // alias would deny it identically, so retrying only burns a request.
+    fetchStub.mockResolvedValue({ ok: false, status: 403 });
+    const { installSpaAuctionHook } = await importGptModule();
+    installSpaAuctionHook();
+    const ts = (window as TestWindow).tsjs!;
+    const adInit = vi.fn();
+    ts.adInit = adInit;
+
+    history.pushState({}, '', '/denied');
+    await flushAsync();
+
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+    expect(ts.adSlots).toBeUndefined();
+    expect(adInit).not.toHaveBeenCalled();
   });
 
   it('is idempotent — repeated install calls do not double-fetch a navigation', async () => {
