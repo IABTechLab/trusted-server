@@ -511,7 +511,7 @@ pub fn sanitize_creative_html(markup: &str) -> String {
 /// Sanitization is mandatory in both modes. Rewriting is controlled by
 /// [`crate::auction_config_types::AuctionConfig::rewrite_creatives`].
 #[must_use]
-pub fn process_auction_creative(settings: &Settings, raw: &str) -> String {
+pub(crate) fn process_auction_creative(settings: &Settings, raw: &str) -> String {
     process_auction_creative_with_rewriter(settings, raw, |sanitized| {
         rewrite_creative_html(settings, sanitized)
     })
