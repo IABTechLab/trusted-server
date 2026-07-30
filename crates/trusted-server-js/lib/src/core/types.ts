@@ -130,11 +130,13 @@ export interface TsjsApi {
    */
   adInitRefreshInProgress?: boolean;
   /**
-   * True once the publisher has called `googletag.pubads().disableInitialLoad()`.
-   * GPT exposes no getter for this state, so it is tracked by wrapping the
-   * setter. When set, `display()` only registers a slot and the ad request must
-   * come from a `refresh()`; adInit() uses this to refresh its own freshly
-   * defined slots so they are not left blank.
+   * Whether the publisher disabled GPT initial load through
+   * `googletag.setConfig()` or `googletag.pubads().disableInitialLoad()`.
+   * TS synchronizes this from GPT's getter and wraps both configuration APIs as
+   * a fallback when the getter is unavailable.
+   * When set, `display()` only registers a slot and the ad request must come
+   * from a `refresh()`; adInit() uses this to refresh its own freshly defined
+   * slots so they are not left blank.
    */
   gptInitialLoadDisabled?: boolean;
   /** Guards SPA pushState hook installation. */
