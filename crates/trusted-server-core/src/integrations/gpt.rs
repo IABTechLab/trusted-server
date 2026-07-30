@@ -1197,6 +1197,46 @@ mod tests {
     }
 
     #[test]
+    fn head_inserts_bootstrap_installs_fallback_scheduler() {
+        // The `</body>` bids script hands its payload to
+        // `tsjs.scheduleInitialAdInit`. The bundle installs the real scheduler,
+        // but when the bundle fails to load this head bootstrap must provide
+        // the degradation path — otherwise a failed bundle request would leave
+        // initial server-side ads uninitialized. Executable coverage of the
+        // fallback lives in the Vitest suite (gpt_bootstrap.test.ts).
+        let config = test_config();
+        let integration = GptIntegration::new(config);
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+        let combined = integration.head_inserts(&ctx).join("");
+        assert!(
+            combined.contains("ts.scheduleInitialAdInit"),
+            "should install the fallback scheduler for bundle-load failures"
+        );
+        assert!(
+            combined.contains("navGeneration"),
+            "fallback scheduler should honor the navigation-generation guard"
+        );
+        assert!(
+            combined.contains("requestAnimationFrame"),
+            "fallback scheduler should defer past hydration frames"
+        );
+        assert!(
+            combined.contains("\"load\""),
+            "fallback scheduler should gate on window load"
+        );
+        // The no-retry-timer property is owned by the executable suite
+        // (gpt_bootstrap.test.ts asserts adInit runs exactly once); a
+        // `!contains("setTimeout")` over the whole joined head-insert output
+        // would misattribute any future unrelated timer to the scheduler.
+    }
+
+    #[test]
     fn head_inserts_bootstrap_uses_css_safe_div_prefix_lookup() {
         let config = test_config();
         let integration = GptIntegration::new(config);
