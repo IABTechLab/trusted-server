@@ -1,5 +1,6 @@
 // ESLint v9 flat config
 import js from '@eslint/js';
+import globals from 'globals';
 import tseslint from 'typescript-eslint';
 import importPlugin from 'eslint-plugin-import';
 import jsdoc from 'eslint-plugin-jsdoc';
@@ -34,6 +35,24 @@ export default [
       'unicorn/prevent-abbreviations': 'off',
       'unicorn/filename-case': 'off',
       'import/order': ['error', { 'newlines-between': 'always' }],
+      '@typescript-eslint/no-unused-vars': [
+        'error',
+        { argsIgnorePattern: '^_', varsIgnorePattern: '^_', caughtErrorsIgnorePattern: '^_' },
+      ],
+    },
+  },
+  // Node build scripts and Node-run test harnesses
+  {
+    files: ['*.mjs', 'test/**/*.mjs'],
+    languageOptions: {
+      globals: globals.node,
+    },
+  },
+  // Tests routinely poke at private state and mock boundaries via `any`
+  {
+    files: ['test/**/*.ts', 'test/**/*.tsx'],
+    rules: {
+      '@typescript-eslint/no-explicit-any': 'off',
     },
   },
 ];

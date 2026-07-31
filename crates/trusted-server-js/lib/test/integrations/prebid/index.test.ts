@@ -22,7 +22,16 @@ const {
     () => [] as Array<{ source: string; uids?: Array<{ id: string; atype?: number }> }>
   );
   const mockGetConfig = vi.fn();
-  let mockPbjs: {
+  // Only called after mockPbjs is initialized below, so the forward reference is safe.
+  const mockRemoveAdUnit = vi.fn((adUnitCode?: string | string[]) => {
+    if (!adUnitCode) {
+      mockPbjs.adUnits = [];
+      return;
+    }
+    const codes = new Set(Array.isArray(adUnitCode) ? adUnitCode : [adUnitCode]);
+    mockPbjs.adUnits = mockPbjs.adUnits.filter((unit) => !codes.has(unit.code));
+  });
+  const mockPbjs: {
     setConfig: typeof mockSetConfig;
     processQueue: typeof mockProcessQueue;
     requestBids: typeof mockRequestBids;
@@ -32,16 +41,7 @@ const {
     removeAdUnit: ReturnType<typeof vi.fn>;
     adUnits: any[];
     [key: string]: any;
-  };
-  const mockRemoveAdUnit = vi.fn((adUnitCode?: string | string[]) => {
-    if (!adUnitCode) {
-      mockPbjs.adUnits = [];
-      return;
-    }
-    const codes = new Set(Array.isArray(adUnitCode) ? adUnitCode : [adUnitCode]);
-    mockPbjs.adUnits = mockPbjs.adUnits.filter((unit) => !codes.has(unit.code));
-  });
-  mockPbjs = {
+  } = {
     setConfig: mockSetConfig,
     processQueue: mockProcessQueue,
     requestBids: mockRequestBids,

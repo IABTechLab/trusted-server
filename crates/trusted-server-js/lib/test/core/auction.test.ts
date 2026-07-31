@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
 import { buildAdRequest, parseAuctionResponse, sendAuction } from '../../src/core/auction';
 
 describe('auction/buildAdRequest', () => {
