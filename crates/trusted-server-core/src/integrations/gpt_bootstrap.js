@@ -119,6 +119,22 @@
     );
   }
 
+  function normalizedGptFormats(formats) {
+    return formats.length === 2 &&
+      formats.every(function (format) {
+        return typeof format === "number";
+      })
+      ? [formats]
+      : formats;
+  }
+
+  function handoffFormatsMatch(handoff, formats) {
+    return (
+      JSON.stringify(handoff.formats) ===
+      JSON.stringify(normalizedGptFormats(formats))
+    );
+  }
+
   function matchingHandoff(pubads, adUnitPath, formats, elementId) {
     var exact = ts.gptSlotHandoffs && ts.gptSlotHandoffs[elementId];
     if (exact) return exact.publisherClaimed ? null : exact;
@@ -128,9 +144,10 @@
         return (
           allHandoffs.indexOf(handoff) === index &&
           !handoff.publisherClaimed &&
+          !document.getElementById(handoff.slotElementId) &&
           elementId.startsWith(handoff.divIdPrefix) &&
           handoff.gamUnitPath === adUnitPath &&
-          JSON.stringify(handoff.formats) === JSON.stringify(formats) &&
+          handoffFormatsMatch(handoff, formats) &&
           findSlotByElementId(pubads, handoff.slotElementId)
         );
       },
@@ -159,7 +176,8 @@
   // TS cannot wait an arbitrary amount of time for a framework to define a
   // slot: publishers that never define one would render blank. Instead, TS
   // defines its fallback on the actual inner div and aliases only a later
-  // publisher defineSlot() for that exact div to the same GPT slot.
+  // publisher defineSlot() for that exact div, or a hydration-renamed replacement
+  // after the original div is gone, to the same GPT slot.
   function installSlotHandoff() {
     window.googletag.cmd.push(function () {
       var tag = window.googletag;
@@ -170,9 +188,17 @@
         var originalDefineSlot = tag.defineSlot.bind(tag);
         var patchedDefineSlot = function (adUnitPath, formats, elementId) {
           if (!ts.gptSlotHandoffInternal && typeof elementId === "string") {
-            var handoff = matchingHandoff(pubads, adUnitPath, formats, elementId);
+            var handoff = matchingHandoff(
+              pubads,
+              adUnitPath,
+              formats,
+              elementId,
+            );
             if (handoff) {
-              var existingSlot = findSlotByElementId(pubads, handoff.slotElementId);
+              var existingSlot = findSlotByElementId(
+                pubads,
+                handoff.slotElementId,
+              );
               if (existingSlot) {
                 ts.gptSlotHandoffs[elementId] = handoff;
                 handoff.publisherClaimed = true;
@@ -188,7 +214,7 @@
                 );
                 if (
                   handoff.gamUnitPath !== adUnitPath ||
-                  JSON.stringify(handoff.formats) !== JSON.stringify(formats)
+                  !handoffFormatsMatch(handoff, formats)
                 ) {
                   ts.log &&
                     ts.log.warn &&
