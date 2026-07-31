@@ -108,12 +108,13 @@ function appendResponsiveSlotElement(
   id: string,
   containerHasLayout: boolean,
   elementHidden = false,
-  elementHasLayout = false
+  elementHasLayout = false,
+  containerVisible = containerHasLayout
 ): HTMLDivElement {
   const container = document.createElement('div');
   container.id = `${id}-container`;
   container.dataset.responsiveSlotTest = 'true';
-  container.style.display = containerHasLayout ? 'block' : 'none';
+  container.style.display = containerVisible ? 'block' : 'none';
   container.getBoundingClientRect = () =>
     ({
       width: containerHasLayout ? 320 : 0,
@@ -2207,6 +2208,13 @@ describe('installTsAdInit', () => {
       hiddenElementIndexes: [2],
       selectedIndex: 3,
     },
+    {
+      implementation: 'runtime',
+      activeIndexes: [],
+      hiddenElementIndexes: [0, 1, 3],
+      visibleContainerIndexes: [2],
+      selectedIndex: 2,
+    },
     { implementation: 'runtime', activeIndexes: [2], divId: '', selectedIndex: null },
     { implementation: 'bootstrap', activeIndexes: [2], publisherOwned: true, selectedIndex: 2 },
     { implementation: 'bootstrap', activeIndexes: [], selectedIndex: null },
@@ -2218,6 +2226,13 @@ describe('installTsAdInit', () => {
       hiddenElementIndexes: [2],
       selectedIndex: 3,
     },
+    {
+      implementation: 'bootstrap',
+      activeIndexes: [],
+      hiddenElementIndexes: [0, 1, 3],
+      visibleContainerIndexes: [2],
+      selectedIndex: 2,
+    },
     { implementation: 'bootstrap', activeIndexes: [2], divId: '', selectedIndex: null },
   ] as const)(
     '$implementation resolves responsive matches $activeIndexes to $selectedIndex',
@@ -2227,6 +2242,8 @@ describe('installTsAdInit', () => {
         'hiddenElementIndexes' in testCase ? testCase.hiddenElementIndexes : [];
       const elementLayoutIndexes =
         'elementLayoutIndexes' in testCase ? testCase.elementLayoutIndexes : [];
+      const visibleContainerIndexes =
+        'visibleContainerIndexes' in testCase ? testCase.visibleContainerIndexes : activeIndexes;
       const divId = 'divId' in testCase ? testCase.divId : 'ad-responsive-';
       const publisherOwned = 'publisherOwned' in testCase && testCase.publisherOwned;
       const elements = ['a', 'b', 'c', 'd'].map((suffix, index) =>
@@ -2234,7 +2251,8 @@ describe('installTsAdInit', () => {
           `ad-responsive-${suffix}`,
           (activeIndexes as readonly number[]).includes(index),
           (hiddenElementIndexes as readonly number[]).includes(index),
-          (elementLayoutIndexes as readonly number[]).includes(index)
+          (elementLayoutIndexes as readonly number[]).includes(index),
+          (visibleContainerIndexes as readonly number[]).includes(index)
         )
       );
       const selectedElement = selectedIndex === null ? undefined : elements[selectedIndex];

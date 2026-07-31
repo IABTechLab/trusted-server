@@ -203,7 +203,10 @@
     // Geometry is only needed to disambiguate multiple responsive siblings.
     if (prefixMatches.length === 1) return prefixMatches[0];
 
-    var activeMatches = prefixMatches.filter(slotElementHasLayout);
+    var visibleMatches = prefixMatches.filter(isElementVisible);
+    if (visibleMatches.length === 1) return visibleMatches[0];
+
+    var activeMatches = visibleMatches.filter(slotElementHasLayout);
     if (activeMatches.length === 1) return activeMatches[0];
 
     if (
