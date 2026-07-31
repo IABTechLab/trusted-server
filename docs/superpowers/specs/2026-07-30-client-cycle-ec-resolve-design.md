@@ -65,13 +65,15 @@ Everything in this spec follows from that.
    that are signed by an expected party, **audience-bound** to this
    publisher, and **expiring**. Audience binding and expiry alone do not
    mitigate replay — a captured token installs in another browser for the
-   whole validity window — so one of the following is additionally
-   required: **binding to the requesting browser session** (a server-issued
-   nonce the payload must embed), or **server-side one-time consumption**
-   (a replay cache on the payload's unique id). A scheme that can support
-   neither may only ship if its residual replay window is quantified and
-   explicitly accepted in the feature's issue — "single-use where the
-   scheme allows" is not a mitigation.
+   whole validity window. **Production schemes require session binding**
+   (a server-issued nonce the payload must embed): one-time consumption
+   alone limits multiplicity but proves nothing about _which_ browser
+   redeems first — a captured bearer payload can simply win the race — so
+   it is defense-in-depth, not the mitigation. First-presenter
+   at-most-once semantics may ship **only** as an explicitly accepted
+   posture recorded in the feature's issue, together with a specified
+   orphan-row cleanup path. "Single-use where the scheme allows" is not a
+   mitigation.
 3. **Preserve the identity-graph invariant.** The cookie is set only after
    the corresponding graph row is written, mirroring the organic path. Graph
    unavailable → no cookie, same as organic generation.
@@ -86,13 +88,18 @@ Everything in this spec follows from that.
 6. **Be uncacheable and permission-gated.** `Cache-Control: no-store`;
    the same `store-on-device` permission gate as organic EC creation runs
    before any cookie is set.
-7. **Bound every input.** A maximum request-body size (order of the 64 KiB
-   limit PR #838 at least had), enforced by a **bounded read independent of
-   `Content-Length`** — a missing, false, or chunked length must not bypass
-   it; a `Content-Type` allowlist; and a length/character-set constraint on
-   the resulting identifier that keeps it cookie-safe and within the KV
-   limits of the providers spec §3. Tests exercise the exact 413 boundary
-   and the missing/false/chunked-length cases.
+7. **Bound every input — exact values, testable boundaries.** Request
+   body: at most **65,536 bytes** (inclusive; byte 65,537 → `413`),
+   enforced by a bounded read independent of `Content-Length` — a
+   missing, false, or chunked length must not bypass it. `Content-Type`
+   allowlist: `text/plain` and `application/json`; anything else → `415`.
+   The resulting identifier: at most **256 bytes**, cookie-safe alphabet
+   (providers spec §3 global bounds); violation → `400`. Reservation key
+   (payload unique id): at most **128 bytes**. Status codes are part of
+   the contract: `400` malformed payload/identifier, `403` origin/token
+   rejection, `409` different-identity or revoked-family conflict (§3.8),
+   `413` body, `415` content type. Tests exercise each boundary at its
+   exact edge, including the missing/false/chunked-length cases.
 8. **Define behavior against an existing identity — no silent
    replacement.** When the request already carries a recognized EC:
    resolving to the **same** identity is an idempotent no-op (cookie
@@ -109,23 +116,36 @@ Everything in this spec follows from that.
    residual rows. Required shape: consumption is an **atomic single-key
    reservation** (CAS — an adapter capability the composition root checks,
    providers spec §7) keyed by the payload's unique id, with explicit
-   states: `pending` → `committed` | `failed`. The graph write happens
-   under the reservation and is retried under the same key; a `pending`
-   reservation older than its **lease** may be taken over by a retry;
-   reservations are retained at least through the token's expiry; the
-   graph write is deterministic under the reservation key so a retry
-   converges on the same row.
+   states: `pending` → `committed` | `failed`, each carrying an **owner
+   hash** (the session binding) and a **monotonic lease epoch**. Takeover
+   of an expired `pending` lease increments the epoch, and every state
+   transition is a fenced CAS on (state, epoch) — a stale owner resuming
+   after its lease expired cannot commit over the takeover's work, because
+   its epoch no longer matches. `failed` is retryable: the same owner may
+   supersede it with a fresh `pending` at a higher epoch. The graph write
+   happens under the reservation and is deterministic under its key, so
+   any retry converges on the same row; reservations are retained at least
+   through the token's expiry.
 
-   **A duplicate must never receive the cookie unless the reservation is
-   session-bound.** "Duplicates observe the recorded outcome" cannot mean
-   replaying `Set-Cookie` — that would hand a captured token's identity to
-   a second browser, recreating the fixation §2 exists to prevent. In
-   one-time mode without session binding, a duplicate gets a terminal
-   response with **no cookie**; only a requester that proves the original
-   session binding (the §3.2 nonce) may have the `Set-Cookie` re-emitted.
-   Tests cover crash-between-steps, lease takeover, two concurrent
-   requests with the same payload, and a duplicate from a second client
-   receiving no cookie.
+   **A duplicate must never receive the cookie unless it proves the
+   original session binding.** "Duplicates observe the recorded outcome"
+   cannot mean replaying `Set-Cookie` — that would hand a captured token's
+   identity to a second browser, recreating the fixation §2 exists to
+   prevent. A requester matching the reservation's owner hash **does**
+   have the `Set-Cookie` re-emitted — which is precisely how a legitimate
+   browser whose original response was lost recovers on retry, so a
+   committed graph row never strands as an orphan for the intended
+   browser; anyone else gets a terminal response with no cookie. In the
+   explicitly-accepted at-most-once posture (no owner hash), a lost
+   response is an **orphan row** handled by the specified cleanup path.
+   The **same-identity no-op of §3.8 first checks the family revocation
+   record** (permission model spec §4.3): a resolve against a revoked
+   family is rejected, never refreshed, and a create racing a revocation
+   loses — revocation wins. Tests cover crash-between-steps, lease
+   takeover with a stale-epoch commit attempt, two concurrent requests
+   with the same payload, a duplicate from a second client receiving no
+   cookie, owner-hash recovery receiving the cookie, and
+   resolve-vs-revocation races.
 
 ## 4. Requirements on the page script
 

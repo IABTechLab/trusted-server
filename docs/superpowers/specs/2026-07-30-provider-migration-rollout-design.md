@@ -40,6 +40,10 @@ discoverable only because a deleted test had pinned the old behavior.
 | 3a  | US-state request, explicit GPP `sale_opt_out = false` or a US Privacy string that is present and not opting out (including "not applicable") → EC allowed                           | Same: these are grant-class signals satisfying `requires_signal` (permission spec §4)                                                                                                                                                                             | Preserved — **must not regress**                                                                      |
 | 3b  | US-state request, TCF record present and refusing Purpose 1 (no US opt-out signal) → no EC                                                                                          | Same: refusal beats coexisting non-TCF grant signals (permission spec §4, precedence 3–4)                                                                                                                                                                         | Preserved                                                                                             |
 | 3c  | Consent-record conflict modes (restrictive/permissive/newest), expiry, KV fallback, proxy mode                                                                                      | Each row of the normalization matrix (permission spec §4.4) is individually marked preserved or changed there; changed rows: malformed-present now blocks acquisition                                                                                             | Per §4.4 matrix                                                                                       |
+| 3d  | Valid + expired consent records: conflict resolution runs first and can select the expired record                                                                                   | Expired sources drop **before** conflict resolution (permission spec §4.4 pipeline)                                                                                                                                                                               | **Changed (declared)**                                                                                |
+| 3e  | Only the GPP sale field (and USP) is consulted; `SharingOptOut` / `TargetedAdvertisingOptOut` are ignored                                                                           | All three fields enforced per the §4.5 mapping (targeted-advertising affects P4 only, never destructive)                                                                                                                                                          | **New enforcement, declared** — strictly more protective                                              |
+| 3f  | Non-privacy-state US traffic (e.g. Wyoming) is non-regulated → EC allowed                                                                                                           | Same: policy enumerates `US/<state>` rules for configured privacy states; country-level `US` resolves non-regulated (permission spec §3.4)                                                                                                                        | Preserved — **must not regress** (a country-wide `US = "us-opt-out"` rule would deny all of it)       |
+| 3g  | Graph rows persist JA4 class, H2 fingerprint hash, and buyer-facing quality metadata                                                                                                | Discontinued for new rows; v1 values retained read-only, never egressed, dropped at rewrite (providers spec §6.3)                                                                                                                                                 | **Changed (declared)** — more protective                                                              |
 | 4   | UK request, no TCF record → no EC                                                                                                                                                   | Same, unless the policy deliberately adopts a `granted` storage baseline for GB, with citation and sign-off                                                                                                                                                       | Declared change (if made)                                                                             |
 | 5   | No country resolvable (geo unavailable) → no EC (fail-closed)                                                                                                                       | `default_country` baseline, constrained by permission spec §5.3 so the fail-open combination cannot occur silently                                                                                                                                                | Declared change, guarded                                                                              |
 | 6   | Non-regulated country, TCF record refusing Purpose 1 → EC still created, existing identity never tombstoned                                                                         | Refusal now blocks _new_ grants everywhere (permission spec §4, precedence 3) — a declared, more-protective change. Existing identity is still **never tombstoned** where the baseline is `granted` (permission spec §4.2)                                        | Split: creation is a declared change; no-tombstone is preserved                                       |
@@ -129,15 +133,26 @@ Requirements:
    rewrite links — and two failure modes must be engineered away: a naive
    schema-version bump makes old readers fail closed on new rows, and an
    old worker that reads, modifies, and reserializes a row **silently
-   drops** fields it does not model. Sequence: (a) a **reader/preserver
-   release** ships first — it understands the new fields and, critically,
-   preserves unknown fields verbatim through read-modify-write; (b) a
-   **fleet-convergence gate**; (c) only then does **writer activation**
-   begin emitting the new fields. Rows carry an explicit schema version;
-   backfill is lazy via live requests (the same pass that backfills legacy
-   provenance, permission spec §7). Mixed-version tests are mandatory:
-   old-reader/new-row, new-reader/old-row, and old-worker
-   read-modify-write preserving new fields byte-for-byte.
+   drops** fields it does not model. The sequence shares the config
+   release names: **N+1 is the reader/preserver release** — it understands
+   the new fields and preserves unknown keys **semantically** through
+   read-modify-write (values round-trip; byte-identical JSON is neither
+   required nor achievable through a structured serializer — and a
+   genuinely pre-N+1 worker cannot preserve at all, which is exactly why
+   the floor exists); after the **fleet-convergence gate**, **N+2
+   activates the writer** and begins emitting the new fields. **Rollback
+   below N+1 is prohibited once any new-format row exists** — a pre-floor
+   binary would silently strip the new fields from every row it touches.
+   Rows carry the existing `v` schema discriminator; backfill is lazy via
+   live requests (the same pass that backfills legacy provenance,
+   permission spec §7) — and, critically, **withdrawal never depends on
+   backfill**: the family ID for an untouched v1 row is derived
+   deterministically (permission spec §4.3), so a first-post-upgrade
+   GPC request withdraws correctly with zero migrated state. Mixed-version tests with stated expected results:
+   N+1-reader/old-row → full function; old-reader/new-row → v1 semantics,
+   new fields untouched if read-only, preserved semantically if
+   read-modify-write on N+1, **test-proven lost on pre-N+1** (documenting
+   why the floor is a floor); N+2-reader/N+1-written-row → full function.
 3. **Half-migrated fails loud.** A `[ec.providers.hmac]` block with no
    `provider = "hmac"` selector is a startup error (providers spec §6). In
    PR #838 this configuration — the exact state an operator following the
@@ -188,12 +203,16 @@ declares `[permissions.rules]`, and reopening a TOML table is a parse
 error; a prose delta cannot be validated, a committed fixture can.) The
 fixture contains, in one document:
 
-- `[ec] provider = "hmac"` with its passphrase block;
+- `[ec] provider = "hmac"` with its passphrase block, **and the
+  identity-graph store configuration** — selecting a minting provider
+  without an openable graph store is a startup error (providers spec §6),
+  so a fixture omitting it would not start;
 - `[device] provider = "fastly"` (Fastly deployments: preserves the JA4
   bot gate);
 - `[geo] provider = "platform"` and `default_country = "FR"` (per-request
-  jurisdiction detection preserved; the default is fail-closed because FR
-  resolves to the `gdpr-eu` rule);
+  jurisdiction detection preserved; the FR default is a **protective
+  opt-in fallback**, not fail-closed — valid TCF consent still grants,
+  where today's unresolved-geo path always denies);
 - (Fastly fixture; other adapters substitute their valid selections)
   the full `gdpr-eu` / `gdpr-uk` / `us-opt-out` groups and country rules
   from the example policy (US as `requires_signal` with the grant-signal
@@ -238,11 +257,26 @@ global honoring of opt-out signals is unconditional.
    is not churn), and a nonzero rewrite-failure rate blocks retirement
    outright. The telemetry set also includes: graph read/commit failures,
    stored-provenance denials, schema-migration failures, and
-   replay-reservation recoveries.
+   replay-reservation recoveries. **Each rollout-gate metric ships with a
+   threshold, an evaluation window, and a named action** (pause rollout /
+   roll back / block retirement) in the migration guide — a metric with a
+   "healthy range" but no action is dashboard decoration; the two already
+   specified (legacy-reader quiet period, rewrite failures) are the
+   pattern the rest follow.
 3. Startup logs always print: selected provider per concern, whether geo is
    live, the effective default baseline, and the count of granted-without-
    signal permissions. One line, greppable, stable format.
-4. Rollback is config-only where possible: reverting to the previous
+4. **The batch-sync coverage dip is operationalized, not discovered.**
+   Because legacy rows fail closed for batch updates until backfilled
+   (permission spec §7), batch-sync acceptance drops toward zero at
+   cutover and recovers along the live-traffic backfill curve. The
+   **provenance-coverage metric** (share of active rows carrying
+   provenance) is the tracking signal; the migration guide states the
+   expected recovery shape, tells operators to notify batch-sync partners
+   of the transient rejection rate, and defines no fail-open shortcut —
+   the alternative (grandfathering pre-epic identities past the
+   permission model) is rejected in the permission spec.
+5. Rollback is config-only where possible: reverting to the previous
    config version restores the previous behavior on the previous binary. The
    one irreversible artifact is withdrawal tombstones — which is why the
    withdrawal triggers (permission spec §4.2) are exhaustive, why partial

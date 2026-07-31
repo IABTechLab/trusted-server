@@ -213,9 +213,24 @@ cookie write, no egress, no auction use may observe a minted identifier
 before its graph row (with provenance, §6.1) has committed — PR #838 let a
 generated EC reach an auction before finalization refused the cookie,
 producing an identity that existed for one request and nowhere else. The
-normative order is: gate → `generate` → graph-row commit → cookie write →
-eligible for egress. A graph-commit failure means the mint never happened:
-no cookie, no egress, error logged, the next request retries.
+normative order is: gate → `generate` → graph-row commit → cookie
+scheduled → eligible for egress. "Cookie scheduled" means queued onto the
+final response — `Set-Cookie` is physically emitted after first-request
+processing, so egress eligibility begins at **graph commit**, not at
+header emission; the identity exists durably from that moment. A
+graph-commit failure means the mint never happened: no cookie, no egress,
+error logged, the next request retries.
+
+**Egress is typed, not policed.** The inventory-and-denylist test
+(permission model spec §7) is a backstop, but conventions do not survive
+new code — the ungated proxy/click/Testlight paths happened precisely
+because raw EC values circulate as ordinary strings. Core therefore
+introduces an **`AuthorizedIdentity`** newtype constructible only by core,
+only after parse + permission gate + graph/family-revocation check;
+outbound serializers (ORTB builder, page bids, sync, identify, forwarding)
+accept `AuthorizedIdentity`, never `&str`/`EcId`. A future bypass then
+requires deliberately reconstructing the raw string — visible in review —
+rather than passing along what was already in hand.
 
 The gate applies to EC providers **only**. Geo and device are ungated for
 two _different_ reasons, stated separately because only one of them is
@@ -244,10 +259,8 @@ structural:
   fingerprint-derived buyer-facing fields into new rows** (a declared
   change, migration spec §2); the boolean security classification outcome
   may be persisted. Re-adding them is the vocabulary-extension route.
-  Relatedly, the implementation PR must deliver a **field-level graph
-  contract table** — for every persisted row field: purpose, source,
-  gating permission, TTL, rewrite behavior, egress paths, and tombstone
-  scrubbing — reviewed against the egress inventory.
+  The field-level graph contract itself is normative in this spec —
+  §6.3 — not deferred to the implementation.
 
 PR #838 declared `required_permissions` on all three traits but consulted
 it only for the EC provider; the geo and device declarations were
@@ -317,19 +330,26 @@ The contract:
   active writer is a per-deployment choice
   (`[ec] rewrite_legacy = true|false`), and re-minting is subject to the
   full minting gate of §5.
-- **Rewrite is transactional, linking, and confirmed by presentation.**
-  Order: new row commits first, carrying a link to the old row (sharing
-  its revocation family ID, permission model spec §4.3) and a copy of the
-  old row's consent metadata and partner mappings; then the new cookie is
-  emitted. The server only emits `Set-Cookie` — it cannot observe delivery
-  or acceptance, so **both linked rows stay live** until a later request
-  **presents the new cookie** (confirmation by presentation); only then is
-  the old row retired. A deployment may additionally cap the window with a
-  grace period no shorter than the old cookie's maximum lifetime plus
-  rollout skew. An interrupted or unconfirmed rewrite leaves the old
-  cookie fully valid — no state in which neither identity works.
-  **Withdrawal of either linked row revokes the shared family, i.e.
-  both.**
+- **Rewrite aliases to one canonical row — no dual-write window.** Order:
+  the new canonical row commits first, sharing the old row's revocation
+  family ID (permission model spec §4.3); its provenance is the **current
+  live resolution** (rewrite happens on a live request — copying old
+  consent evidence would rejuvenate stale authority), while partner
+  mappings copy **with their original per-field timestamps and expiry**.
+  Then a fenced CAS **replaces the old row with an alias record** pointing
+  at the canonical row; from that moment every read or update through
+  either cookie chases the alias (single hop) to the one canonical row —
+  a concurrent pull/batch/identify update cannot land on a row about to
+  be discarded, because after the CAS there is only one row to land on,
+  and an update racing the CAS itself retries against the canonical. Then
+  the new cookie is emitted. The server cannot observe `Set-Cookie`
+  acceptance, so the **alias stays live** until a later request presents
+  the new cookie (confirmation by presentation), and in any case until a
+  **finite retirement deadline** no shorter than the old cookie's maximum
+  lifetime plus rollout skew. An interrupted rewrite leaves the old
+  cookie resolving (directly or via the alias) — no state in which
+  neither identity works. **Withdrawal through either cookie revokes the
+  shared family.**
 - Retiring a legacy reader is the explicit end of those identities:
   the migration guide documents the cleanup procedure (migration spec §6).
 - Tests: switch active provider → request with old cookie → identity still
@@ -361,6 +381,43 @@ when a healthy configuration meets an unhealthy runtime. Every row logs at
 | Geo provider returns invalid output (unparseable country) at runtime      | Treated as lookup failure → `default_country` (permission model spec §5.2), counted in the lookup-failure metric |
 | Device provider signals unavailable at runtime (e.g. no JA4 on a request) | Classification degrades per the provider's declared fallback, never silently upgrades `looks_like_browser`       |
 
+The **degraded-graph health signal** referenced above and by the
+withdrawal contract is a defined state machine, not a vibe: it is
+**per-instance and in-memory** (no shared propagation, no stored health
+record whose own read could fail), entered when graph-write failures cross
+a sliding-window threshold (N failures within window W), and exited with
+hysteresis after M consecutive successes. While degraded: S2S partner
+egress and sync updates fail closed; organic requests continue stateless.
+The thresholds ship as constants with the implementation and are printed
+in the startup log.
+
+### 6.3 Graph row contract — normative
+
+The per-field contract for identity rows, covering today's v1 fields and
+the fields this epic adds. Serialization is JSON with the existing `v`
+schema-version discriminator; from release N+1 onward (migration spec §4),
+readers round-trip unknown keys **semantically** (values preserved through
+read-modify-write; byte-identical output is not required and not
+achievable through a structured serializer).
+
+| Field                                                                                                                                 | Purpose                                                                                                                                                                                                           | Source                                                  | Gating permission (egress)                | TTL / refresh                                                       | Rewrite                                    | On revocation                                                                                                           |
+| ------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------- | ----------------------------------------- | ------------------------------------------------------------------- | ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
+| key (v1: identifier verbatim; v2: core-constructed, §4)                                                                               | Row identity                                                                                                                                                                                                      | Provider/core                                           | —                                         | Row TTL (1 y today)                                                 | New canonical row; old key becomes alias   | Family record governs; member tombstone as cleanup                                                                      |
+| `v`                                                                                                                                   | Schema discriminator                                                                                                                                                                                              | Core                                                    | —                                         | —                                                                   | Written at current version                 | Retained                                                                                                                |
+| `created`                                                                                                                             | Row age                                                                                                                                                                                                           | Core                                                    | P1 (first-party ops)                      | Never refreshed                                                     | Preserved (no rejuvenation)                | Retained in tombstone                                                                                                   |
+| `consent.tcf` / `consent.gpp`                                                                                                         | Raw signal snapshot for audit; superseded as authority by provenance                                                                                                                                              | Request                                                 | Never egressed to partners                | Replaced on live resolution (§7 snapshot rule, permission spec)     | Fresh live values                          | Scrubbed                                                                                                                |
+| `consent.ok` / `consent.updated`                                                                                                      | v1 liveness flag — **superseded by the family revocation record**; written during member cleanup for v1-reader benefit through the transition                                                                     | Core                                                    | —                                         | —                                                                   | Fresh                                      | `ok = false` written as cleanup; the family record is authoritative (v1's 24 h tombstone TTL does not bound revocation) |
+| New: per-permission provenance (grant basis, authoritative timestamp, `valid_until`, jurisdiction, policy revision, provider/version) | S2S authority                                                                                                                                                                                                     | Live resolution only                                    | Read by S2S recompute                     | `valid_until` per evidence class; replaced atomically, never merged | **Fresh live resolution** — never copied   | Scrubbed                                                                                                                |
+| New: `family_id`                                                                                                                      | Revocation discovery                                                                                                                                                                                              | Core at mint (derived for legacy, permission spec §4.3) | —                                         | Immutable                                                           | Shared across linked rows                  | Is the revocation key                                                                                                   |
+| `geo.country` / `geo.region`                                                                                                          | Jurisdiction snapshot                                                                                                                                                                                             | Geo provider at mint                                    | P1                                        | Written at mint                                                     | Fresh                                      | Scrubbed                                                                                                                |
+| `geo.asn` / `geo.dma`                                                                                                                 | Cluster disambiguation / market signal                                                                                                                                                                            | Platform at mint                                        | P1; DMA additionally P4 for bidstream use | Written at mint                                                     | Fresh                                      | Scrubbed                                                                                                                |
+| `pub_properties` (origin/seen domains)                                                                                                | Creation context                                                                                                                                                                                                  | Core at mint                                            | P1                                        | Write-once                                                          | Preserved                                  | Scrubbed                                                                                                                |
+| `device.*` (JA4 class, H2 hash, quality metadata)                                                                                     | **Discontinued for new rows** (§5): fingerprint-derived, buyer-facing — beyond security-classification authorization. v1 rows retain them read-only; they are never egressed post-epic and are dropped at rewrite | Fastly device provider                                  | None grants egress                        | Write-once (v1)                                                     | **Dropped**                                | Scrubbed                                                                                                                |
+| New: security classification outcome (boolean)                                                                                        | Bot-gate result                                                                                                                                                                                                   | Device provider                                         | — (never egressed)                        | Written at mint                                                     | Fresh                                      | Scrubbed                                                                                                                |
+| `network.*`                                                                                                                           | Cluster disambiguation                                                                                                                                                                                            | Platform at mint                                        | P1                                        | Write-once                                                          | Fresh                                      | Scrubbed                                                                                                                |
+| `ids` (partner → UID map)                                                                                                             | Partner identity graph                                                                                                                                                                                            | Pixel/pull/batch sync                                   | P1 ∧ P4 (partner egress)                  | Per-mapping timestamps; bounded count/length                        | Copied **with original timestamps/expiry** | Scrubbed                                                                                                                |
+| New: alias record kind                                                                                                                | Rewrite indirection (§6.1)                                                                                                                                                                                        | Core                                                    | —                                         | Retirement deadline                                                 | Is the mechanism                           | Family-revoked like any member                                                                                          |
+
 ## 7. Composition root and adapter parity
 
 Provider construction happens in exactly one place per concern
@@ -373,16 +430,25 @@ outcomes.
 
 Requirements:
 
-- **Adapters declare capabilities against an explicit matrix.** The
-  capability set the composition root checks selections against is
-  enumerated, not ad hoc: identity-graph persistence, atomic single-key
-  reservation (CAS — required by the client-cycle reservation and any
-  future compare-and-set use), KV prefix listing (cluster support),
-  platform geo, device host evidence (JA4/HTTP-2), and legacy-rewrite
-  support. Each adapter's declaration is part of its wiring, and the §6
-  capability-mismatch startup error is driven by this matrix. Every §6.2
-  runtime-failure row gets fault-injection coverage on every adapter that
-  declares the corresponding capability.
+- **Adapters declare capabilities against an explicit matrix — with
+  consistency semantics, not just feature bits.** The capability set:
+  identity-graph persistence, atomic single-key reservation, KV prefix
+  listing (cluster support), platform geo, device host evidence
+  (JA4/HTTP-2), and legacy-rewrite support. Persistence capabilities carry
+  **per-record-class consistency requirements**, because "has KV" says
+  nothing about whether revocation is observable:
+
+  | Record class                       | Required semantics                                                                                                                                                                                                                                                                                                                                                     |
+  | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+  | Replay reservations (client-cycle) | **Linearizable CAS with fencing** (ownership epoch). Eventually-consistent KV cannot provide this — on Cloudflare that means a Durable-Object-class primitive, not Workers KV; an adapter without it fails startup for client-cycle selection                                                                                                                          |
+  | Family revocation records          | Strongest read the backend offers, plus a **declared, bounded revocation-visibility lag** (Workers KV documents up to ~60 s eventual propagation — that bound must be declared, and the residual it implies stated in operator docs). Unboundable lag → startup failure for identity features. A **failed or erroring revocation-record read fails closed** for egress |
+  | Identity rows                      | Eventual consistency acceptable — rows are accretive, and the family-record check (strong, per above) governs use                                                                                                                                                                                                                                                      |
+
+  Each adapter's declaration is part of its wiring, drives the §6
+  capability-mismatch startup error, and every §6.2 runtime-failure row
+  gets fault-injection coverage on every adapter declaring the
+  corresponding capability.
+
 - Each adapter's runtime-services setup routes through the shared builders.
 - Providers are constructed **once** per application instance and stored in
   app state; PR #838 rebuilt the provider (cloning the secret into a fresh

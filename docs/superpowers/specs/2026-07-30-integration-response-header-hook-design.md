@@ -53,13 +53,17 @@ mutators to the outbound response for HTML document responses it processed.
   `Set-Cookie` with a replaced public `Cache-Control` into a
   **shared-cacheable cookie response**. The invariant pass therefore runs
   after all mutations, unconditionally — and it enforces more than the
-  cookie rule: **any private/no-store classification core assigned before
-  the hook is preserved** (processed auction HTML is marked private even
-  when no cookie is emitted — today's final helper returns early without
-  `Set-Cookie`, so cookie-triggered enforcement alone would let an
-  integration make cookieless personalized HTML publicly cacheable), and
-  every CDN/surrogate cache directive is stripped from any response so
-  classified. Middle-stage placement also keeps
+  cookie rule. Core **snapshots the complete pre-hook cache restriction
+  state** — whether the restriction came from core's own classification
+  (processed auction HTML is marked private even when no cookie is
+  emitted; today's final helper returns early without `Set-Cookie`) **or
+  from the origin** (an origin-supplied `private, no-store` that core
+  merely passed through) — and the post-hook response may only be
+  **equal or stronger** on the privacy axis: integrations can tighten
+  caching, never loosen it, regardless of which header they replaced.
+  Every CDN/surrogate cache directive (`Surrogate-Control`,
+  `CDN-Cache-Control`, host-specific equivalents) is stripped from any
+  restricted response. Middle-stage placement also keeps
   the earlier property: an integration mutation is not silently stripped
   by ordinary core handling — only by the invariant pass, which logs the
   downgrade it applies.
@@ -70,8 +74,11 @@ mutators to the outbound response for HTML document responses it processed.
   granularities because `Set-Cookie` is multi-valued: (a) reserved header
   _names_ — HTTP framing and hop-by-hop headers (`Content-Length`,
   `Transfer-Encoding`, `Connection`, `Trailer`, `Upgrade`, `TE`,
-  `Keep-Alive`), the `x-ts-*` namespace, and the consent/privacy headers
-  core emits; (b) reserved cookie _names_ within `Set-Cookie` — `ts-ec`,
+  `Keep-Alive`), **representation headers coupled to body bytes the hook
+  cannot see** (`Content-Encoding`, `Content-Range` — relabeling
+  uncompressed bytes as Brotli, or stripping the encoding from compressed
+  bytes, corrupts the response), the `x-ts-*` namespace, and the
+  consent/privacy headers core emits; (b) reserved cookie _names_ within `Set-Cookie` — `ts-ec`,
   `ts-eids`, and the other `ts-*` cookies core owns. An integration may
   append its own `Set-Cookie` values; it may not set or expire a reserved
   cookie name. Violations are rejected at the operation layer (§2) and
@@ -135,9 +142,16 @@ processed documents (§6).
 6. **Every row of the §3a eligibility matrix has a test** — streaming,
    cache-hit, pass-through, redirect, error, and 304 each proven to run or
    not run the hook — not merely one positive header test per adapter.
-7. The cache/privacy invariant test: an integration appends a cookie and
-   replaces `Cache-Control` with a public/surrogate-cacheable value → the
-   final response is private/no-store with surrogate caching stripped.
+7. Cache/privacy invariant tests, one per restriction source and shape:
+   cookie appended + public `Cache-Control` replacement → private/no-store,
+   surrogate stripped; **core-private cookieless** processed HTML +
+   public replacement → restriction preserved; **origin-private
+   cookieless** pass-through-classified content + public replacement →
+   restriction preserved; a cache-hit serve re-applying mutations without
+   weakening the stored classification; a `Vary` mutation neither
+   dropping core-required values nor bypassing the snapshot; each CDN
+   directive (`Surrogate-Control`, `CDN-Cache-Control`, host equivalents)
+   individually stripped; and a rejected `Content-Encoding` mutation.
 
 ## 5. Size and sequencing
 
