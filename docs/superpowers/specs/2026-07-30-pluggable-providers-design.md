@@ -98,7 +98,7 @@ through the selected provider:
 | ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Mint**                                 | EC generation on first eligible request                                                                                | Provider returns the identifier (and only core writes the cookie).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | **Parse / canonicalize**                 | Reading `ts-ec` back from the request; deciding `ec_was_present`; batch-sync ingestion                                 | Provider parses a cookie value into its **canonical** identifier, or rejects it. Canonicalization and **equivalence are provider-declared, never imposed globally**: each provider ships equivalence fixtures naming exactly which variants are the same identity — case sensitivity is provider-specific (signed/base64-style envelopes are case-sensitive; even the built-in HMAC id is case-insensitive only in its hex prefix, with a case-preserved suffix). Declared-equivalent values parse to the same canonical identifier (satisfying #778). A value the selected provider does not recognize is treated as absent (but see §6.1 legacy readers). |
-| **Canonical graph key**                  | KV identity-graph row reads/writes                                                                                     | The provider maps a canonical identifier to its graph key: stable, KV-safe (within KV length and character-set limits), collision-free across the provider's identifier space, and namespaced so two providers' key spaces cannot collide. Two equivalent envelopes of one identity map to one key — verbatim cookie bytes as the key would fork graph rows on canonicalization differences and discard today's batch-sync canonicalization.                                                                                                                                                                                                                |
+| **Canonical graph key**                  | KV identity-graph row reads/writes                                                                                     | The provider supplies a canonical key **suffix**; **core constructs the physical key** per the §6.3 key grammar (legacy-HMAC verbatim keys excepted), so cross-provider and cross-record-kind isolation is enforced by construction rather than promised by provider code. Suffixes are stable, KV-safe (length and character-set limits), and collision-free within the provider's space. Two equivalent envelopes of one identity map to one key — verbatim cookie bytes as the key would fork graph rows on canonicalization differences and discard today's batch-sync canonicalization.                                                                |
 | **Cluster prefix** (optional capability) | IP-cluster sizing (`cluster_trust_threshold`, implemented as a **KV prefix listing**), pull-sync dedupe, log redaction | A provider declaring cluster support returns a prefix that is a **literal byte prefix of the canonical graph key** — the cluster count lists keys by prefix, so an independently derived hash that is not an actual key prefix silently reports the wrong cluster size. The prefix deliberately collides across identifiers minted from the same client evidence. A provider without the capability declares so, and cluster-dependent gating follows a configured degradation policy (treat cluster size as unknown, with the KV-write decision that implies made explicit in config) instead of counting garbage.                                         |
 | **Tombstone**                            | Withdrawal: expiring the cookie and writing revocation markers                                                         | The identifiers eligible for tombstoning are exactly those the provider parses — never a shape-gated subset.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 
@@ -176,19 +176,33 @@ pub trait EdgeCookieProvider {
     /// Permissions this provider's data use requires. Enforced by core for
     /// minting and identity use — never for parse/tombstone (§5).
     fn required_permissions(&self) -> PermissionSet;
-    /// Mint an identifier from request evidence.
-    fn generate(&self, input: &IdentityInput<'_>) -> Result<EcId, Report<EcError>>;
     /// Parse and canonicalize a cookie value into this provider's
-    /// identifier; None when unrecognized. Values the provider's declared
+    /// identifier; None when unrecognized. Identifies the provider
+    /// NAMESPACE only — never a configuration version (§6.1: versions
+    /// resolve from row provenance). Values the provider's declared
     /// equivalence fixtures name as equivalent canonicalize identically.
     fn parse(&self, value: &str) -> Option<EcId>;
-    /// Canonical KV graph key for a parsed identifier.
-    fn graph_key(&self, id: &EcId) -> GraphKey;
-    /// Cluster capability: a literal byte prefix of `graph_key(id)`, shared
-    /// across identifiers minted from the same client evidence. None when
-    /// the provider does not support IP-cluster semantics (§3).
+    /// Canonical graph-key SUFFIX (bounded length, KV-safe). Core — not
+    /// the provider — constructs the physical key (§6.3 key grammar), so
+    /// cross-provider and cross-record-kind isolation is structural.
+    /// Sole exception: hmac v0 keys are the identifier verbatim.
+    fn graph_key_suffix(&self, id: &EcId) -> GraphKeySuffix;
+    /// Cluster capability: a literal byte prefix of the physical graph
+    /// key, shared across identifiers minted from the same client
+    /// evidence. None when the provider lacks IP-cluster semantics (§3).
     fn cluster_prefix(&self, id: &EcId) -> Option<HashPrefix>;
+    /// Acquisition mode — exactly one:
+    fn acquisition(&self) -> Acquisition<'_>;
 }
+
+/// How a provider's identifiers come into being. Server-mint providers
+/// generate from request evidence; client-resolve providers verify a
+/// browser-posted payload (client-cycle spec) and declare the JS module
+/// their page leg needs. One provider implements exactly one mode.
+pub enum Acquisition<'a> {
+    ServerMint(&'a dyn ServerMint),      // fn generate(&IdentityInput) -> EcId
+    ClientResolve(&'a dyn ClientResolve),// fn resolve_from_client(&Payload) -> EcId
+}                                        //   + fn js_module_id() -> &str
 ```
 
 (Names indicative; the shape is normative. `required_permissions` joins the
@@ -225,10 +239,14 @@ error logged, the next request retries.
 (permission model spec §7) is a backstop, but conventions do not survive
 new code — the ungated proxy/click/Testlight paths happened precisely
 because raw EC values circulate as ordinary strings. Core therefore
-introduces an **`AuthorizedIdentity`** newtype constructible only by core,
-only after parse + permission gate + graph/family-revocation check;
-outbound serializers (ORTB builder, page bids, sync, identify, forwarding)
-accept `AuthorizedIdentity`, never `&str`/`EcId`. A future bypass then
+introduces a **scope-parameterized `AuthorizedIdentity<Scope>`**,
+constructible only by core, only after the checks _for that exact scope_:
+`AuthorizedIdentity<GraphOps>` after parse + `store-on-device` +
+family-revocation check; `AuthorizedIdentity<PartnerEgress>` additionally
+after `select-personalised-ads`. Outbound serializers (ORTB builder, page
+bids, sync, identify, forwarding) accept `AuthorizedIdentity<PartnerEgress>`
+and nothing weaker — an unparameterized wrapper would let a P1-only
+identity flow into an ORTB request. A future bypass then
 requires deliberately reconstructing the raw string — visible in review —
 rather than passing along what was already in hand.
 
@@ -247,8 +265,11 @@ structural:
   JA4/HTTP-2 fingerprints) for **security classification** — the bot gate
   protecting KV-backed identity writes — which must run precisely for
   traffic that has granted nothing. The authorization for that processing
-  is the operator's explicit `[device] provider` selection, and this spec
-  records that as the decision, with its privacy implication stated: a
+  is the operator's explicit `[device] provider` selection — a statement
+  about the **opt-in host-fingerprint provider**; the `builtin` UA-only
+  default processes nothing beyond the User-Agent every request already
+  carries and needs no such authorization — and this spec records that as
+  the decision, with its privacy implication stated: a
   device provider whose data use goes beyond security classification (for
   example feeding fingerprints into targeting or identity) is **not
   authorized by selection alone** and requires a vocabulary extension plus
@@ -321,35 +342,55 @@ The contract:
   Same-provider key/passphrase rotation is configuration, not a provider
   switch: a provider block may hold multiple `versions` entries
   (`[ec.providers.hmac.versions.v2] passphrase = …`) with
-  `mint_version = "v2"` selecting the writer; `parse` consults versions in
-  declared order, newest first; removing a version entry is a retirement
-  subject to the same evidence rules as retiring a legacy reader
-  (migration spec §6).
+  `mint_version = "v2"` selecting the writer. **`parse` cannot identify a
+  version** — every HMAC version shares one grammar and `parse` returns no
+  version — so the mint version lives in **immutable row provenance**
+  (rows without a tag are `hmac-v0`), and cryptographic verification
+  consults configured versions newest-first only where provenance is
+  unavailable (a cookie with no reachable row). Removing a version entry
+  is a retirement subject to the same evidence rules as retiring a legacy
+  reader (migration spec §6).
 - A cookie recognized by a legacy reader is a live identity for
   read/withdrawal purposes; whether it is transparently re-minted under the
   active writer is a per-deployment choice
   (`[ec] rewrite_legacy = true|false`), and re-minting is subject to the
   full minting gate of §5.
-- **Rewrite aliases to one canonical row — no dual-write window.** Order:
-  the new canonical row commits first, sharing the old row's revocation
-  family ID (permission model spec §4.3); its provenance is the **current
-  live resolution** (rewrite happens on a live request — copying old
-  consent evidence would rejuvenate stale authority), while partner
-  mappings copy **with their original per-field timestamps and expiry**.
-  Then a fenced CAS **replaces the old row with an alias record** pointing
-  at the canonical row; from that moment every read or update through
-  either cookie chases the alias (single hop) to the one canonical row —
-  a concurrent pull/batch/identify update cannot land on a row about to
-  be discarded, because after the CAS there is only one row to land on,
-  and an update racing the CAS itself retries against the canonical. Then
-  the new cookie is emitted. The server cannot observe `Set-Cookie`
-  acceptance, so the **alias stays live** until a later request presents
-  the new cookie (confirmation by presentation), and in any case until a
+- **Rewrite is a persistent fenced transaction aliasing to one canonical
+  row — no dual-write window, no duplicate targets, no lost updates.**
+  The steps, each resumable because the transaction record (its own
+  linearizable record class, §7 matrix) is written **first** and pins the
+  chosen target key and fencing epoch:
+  1. **Transaction record** commits: source key, target key, epoch,
+     state. A crashed rewrite retried later reads it and resumes with
+     the **same** target — a fresh random target (and an orphaned first
+     one) cannot exist, and any target row without a committed transaction
+     pointing at it is garbage-collectable by that absence.
+  2. **Canonical row** commits under the pinned target key, sharing the
+     old row's revocation family ID (permission model spec §4.3);
+     provenance is the **current live resolution** (copying old consent
+     evidence would rejuvenate stale authority); partner mappings copy
+     with their **original per-field timestamps and expiry**, and the
+     copy point is recorded in the transaction.
+  3. **Fenced CAS replaces the old row with an alias record** targeting
+     the canonical. If the CAS loses to a concurrent pull/batch/identify
+     update, the rewrite **re-runs a reconciliation pass** under its
+     epoch — merging updates newer than the recorded copy point into the
+     canonical — and retries the CAS; an update that won the old row is
+     therefore never lost.
+  4. The new cookie is emitted; the transaction marks complete.
+
+  From step 3 on, every read or update through either cookie chases the
+  alias (one hop) to the single canonical row. **Chains stay single-hop**:
+  a later rewrite B→C retargets every alias pointing at B (the canonical
+  row records its inbound aliases; alias records are in the linearizable
+  class, so retargeting is fenced) so A points directly at C. The server
+  cannot observe `Set-Cookie` acceptance, so the alias stays live until a
+  later request **presents the new cookie**, and in any case until a
   **finite retirement deadline** no shorter than the old cookie's maximum
-  lifetime plus rollout skew. An interrupted rewrite leaves the old
-  cookie resolving (directly or via the alias) — no state in which
-  neither identity works. **Withdrawal through either cookie revokes the
-  shared family.**
+  lifetime plus rollout skew. An interrupted rewrite at any step leaves
+  the old cookie resolving — no state in which neither identity works.
+  **Withdrawal through either cookie revokes the shared family.**
+
 - Retiring a legacy reader is the explicit end of those identities:
   the migration guide documents the cleanup procedure (migration spec §6).
 - Tests: switch active provider → request with old cookie → identity still
@@ -391,7 +432,49 @@ egress and sync updates fail closed; organic requests continue stateless.
 The thresholds ship as constants with the implementation and are printed
 in the startup log.
 
-### 6.3 Graph row contract — normative
+Its protection is therefore **local-only, and the spec says so**: a
+backend-wide outage degrades every instance through its own observations
+within one window, but an instance-local family-write failure leaves
+other instances — which have no record to find, and healthy backends of
+their own — serving S2S egress until the browser's durable signal retries
+successfully. That residual is bounded by the user's return latency, is
+counted (failed family writes are a first-class metric), and is accepted
+in place of a deployment-wide shared fail-closed channel, whose own
+availability and freshness would be a harder problem than the one it
+solves.
+
+### 6.3 Storage contract — normative
+
+**Physical key grammar.** Core constructs every key; providers supply only
+the bounded suffix:
+
+| Record class                  | Key                                                              | Notes                                                                             |
+| ----------------------------- | ---------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| Identity row (v2+)            | `id/<provider>/<version>/<suffix>`                               | Suffix from `graph_key_suffix`, ≤ 128 bytes, KV-safe alphabet                     |
+| Identity row (legacy hmac-v0) | The identifier verbatim (`{64hex}.{6alnum}`)                     | Reserved grammar; no other class or provider may produce a matching key           |
+| Alias                         | `alias/<provider>/<version>/<suffix>`                            | Same suffix as the row it replaced                                                |
+| Family revocation             | `fam/<family-id>`                                                | Family ID from mint or the deterministic legacy derivation (permission spec §4.3) |
+| Rewrite transaction           | `rwx/<family-id>`                                                | One in-flight rewrite per family                                                  |
+| Replay reservation            | `resv/<publisher-origin-hash>/<provider>/<version>/<payload-id>` | Client-cycle spec; payload id ≤ 128 bytes                                         |
+
+Grammars are pairwise non-intersecting by their literal prefixes (plus the
+reserved legacy grammar), which is what makes cross-class collision
+impossible rather than unlikely.
+
+**Wire schemas** (JSON, like identity rows; every class carries a schema
+version): the **alias record** holds target key, created-at, retirement
+deadline, and fencing epoch; the **family revocation record** holds the
+family ID, revoked-at, triggering signal class (§4.5 destructive column),
+and epoch — deliberately no identity data, so it can outlive its members;
+the **rewrite transaction** holds source key, target key, copy point,
+state, and epoch; the **reservation** holds state, owner hash, lease
+epoch, outcome, and created-at (client-cycle spec). Field validation and
+TTLs: aliases live to their retirement deadline; family records to the
+§7 retention rule (beyond every member, cookie, rewrite, and retry
+lifetime); transactions to completion plus an audit window; reservations
+at least through token expiry.
+
+#### Graph row contract
 
 The per-field contract for identity rows, covering today's v1 fields and
 the fields this epic adds. Serialization is JSON with the existing `v`
@@ -438,16 +521,29 @@ Requirements:
   **per-record-class consistency requirements**, because "has KV" says
   nothing about whether revocation is observable:
 
-  | Record class                       | Required semantics                                                                                                                                                                                                                                                                                                                                                     |
-  | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-  | Replay reservations (client-cycle) | **Linearizable CAS with fencing** (ownership epoch). Eventually-consistent KV cannot provide this — on Cloudflare that means a Durable-Object-class primitive, not Workers KV; an adapter without it fails startup for client-cycle selection                                                                                                                          |
-  | Family revocation records          | Strongest read the backend offers, plus a **declared, bounded revocation-visibility lag** (Workers KV documents up to ~60 s eventual propagation — that bound must be declared, and the residual it implies stated in operator docs). Unboundable lag → startup failure for identity features. A **failed or erroring revocation-record read fails closed** for egress |
-  | Identity rows                      | Eventual consistency acceptable — rows are accretive, and the family-record check (strong, per above) governs use                                                                                                                                                                                                                                                      |
+  | Record class                        | Required semantics                                                                                                                                                                                                                                                                                                                                                                                                                      |
+  | ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+  | Replay reservations (client-cycle)  | **Linearizable CAS with fencing** (ownership epoch). Eventually-consistent KV cannot provide this — on Cloudflare that means a Durable-Object-class primitive, not Workers KV; an adapter without it fails startup for client-cycle selection                                                                                                                                                                                           |
+  | Family revocation records           | **Strongly consistent (read-after-write) primitive required.** Cloudflare Workers KV is **not eligible** — its documentation says propagation may take "60 seconds or more", an expectation, not a bound; on Cloudflare this record class needs a Durable-Object-class primitive. An adapter without an eligible primitive fails startup for identity features. A **failed or erroring revocation-record read fails closed** for egress |
+  | Alias / rewrite-transaction records | **Linearizable fenced CAS required** (same primitive class as reservations). `rewrite_legacy = true` is rejected at startup on adapters lacking it (§6)                                                                                                                                                                                                                                                                                 |
+  | Identity rows                       | Eventual consistency acceptable — rows are accretive, and the family-record check (strong, per above) governs use                                                                                                                                                                                                                                                                                                                       |
 
   Each adapter's declaration is part of its wiring, drives the §6
   capability-mismatch startup error, and every §6.2 runtime-failure row
   gets fault-injection coverage on every adapter declaring the
-  corresponding capability.
+  corresponding capability. The **concrete per-adapter values** — the
+  actual matrix, not the abstract capability list — as known today; a
+  cell marked _verify_ must be established before the depending feature
+  is selectable on that adapter, and the filled matrix is normative:
+
+  | Capability                                            | Fastly                                                                                                | Axum (dev)                   | Cloudflare                                                                                                                                                                 | Spin           |
+  | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------- | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------- |
+  | Graph persistence (eventual OK)                       | KV Store: yes                                                                                         | Local store: yes (dev-grade) | Workers KV: yes (eventually consistent)                                                                                                                                    | Key-value: yes |
+  | Prefix listing (cluster)                              | Yes (used today)                                                                                      | Yes                          | Yes (eventual)                                                                                                                                                             | _verify_       |
+  | Strongly consistent revocation reads                  | _verify_ against Fastly KV semantics                                                                  | Yes (in-process)             | **Workers KV: no** — needs Durable Objects, not currently wired                                                                                                            | _verify_       |
+  | Linearizable fenced CAS (reservations, alias/rewrite) | **Not currently available** — client-cycle and `rewrite_legacy` unselectable until a primitive exists | Yes (in-process)             | Durable Objects: possible, not wired                                                                                                                                       | **No**         |
+  | Platform geo                                          | Yes — country + region                                                                                | No                           | **Yes — country only, no region** (`cf-ipcountry`): regionless US traffic degrades per the permission spec's declared rule, which directly changes state-level US outcomes | No             |
+  | Device host evidence (JA4/H2)                         | Yes                                                                                                   | No                           | No                                                                                                                                                                         | No             |
 
 - Each adapter's runtime-services setup routes through the shared builders.
 - Providers are constructed **once** per application instance and stored in

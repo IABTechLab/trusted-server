@@ -61,9 +61,17 @@ mutators to the outbound response for HTML document responses it processed.
   merely passed through) — and the post-hook response may only be
   **equal or stronger** on the privacy axis: integrations can tighten
   caching, never loosen it, regardless of which header they replaced.
-  Every CDN/surrogate cache directive (`Surrogate-Control`,
-  `CDN-Cache-Control`, host-specific equivalents) is stripped from any
-  restricted response. Middle-stage placement also keeps
+  "Equal or stronger" is a defined merge, not a vibe: restriction
+  strength is ordered `no-store` > `no-cache` > `private` > `public`,
+  and the final value per axis is the **stronger of snapshot and
+  mutation**; `max-age`/`s-maxage` may only shrink relative to the
+  snapshot; `stale-while-revalidate`/`stale-if-error` may appear only if
+  the snapshot had them; every CDN/surrogate directive
+  (`Surrogate-Control`, `CDN-Cache-Control`, host-specific equivalents)
+  is stripped from any restricted response; and **core-required `Vary`
+  members are protected in the contract, not just the tests** — the
+  final `Vary` is the union of the snapshot's required members and the
+  mutation. Middle-stage placement also keeps
   the earlier property: an integration mutation is not silently stripped
   by ordinary core handling — only by the invariant pass, which logs the
   downgrade it applies.
@@ -75,18 +83,31 @@ mutators to the outbound response for HTML document responses it processed.
   _names_ — HTTP framing and hop-by-hop headers (`Content-Length`,
   `Transfer-Encoding`, `Connection`, `Trailer`, `Upgrade`, `TE`,
   `Keep-Alive`), **representation headers coupled to body bytes the hook
-  cannot see** (`Content-Encoding`, `Content-Range` — relabeling
-  uncompressed bytes as Brotli, or stripping the encoding from compressed
-  bytes, corrupts the response), the `x-ts-*` namespace, and the
+  cannot see** (`Content-Encoding`, `Content-Range`, `Content-Type`,
+  `ETag`, `Last-Modified`, `Accept-Ranges`, and digest headers —
+  relabeling uncompressed bytes as Brotli, or advertising a validator or
+  digest for bytes the hook never saw, corrupts responses or poisons
+  caches), the `x-ts-*` namespace, and the
   consent/privacy headers core emits; (b) reserved cookie _names_ within `Set-Cookie` — `ts-ec`,
-  `ts-eids`, and the other `ts-*` cookies core owns. An integration may
-  append its own `Set-Cookie` values; it may not set or expire a reserved
-  cookie name. Violations are rejected at the operation layer (§2) and
+  `ts-eids`, and the other `ts-*` cookies core owns. Integration cookies are **inside the permission model, not beside it**
+  (product sign-off item 9, migration spec §8) — otherwise the hook is a
+  door around the EC gate: an integration could write a durable
+  identifier while `store-on-device` is denied. `append_set_cookie`
+  therefore requires the cookie name to be **declared at registration**
+  with a stated purpose and maximum retention; a **persistent** cookie
+  (any `Max-Age`/`Expires`) is applied only when the request's resolved
+  permissions include `store-on-device`, while **session cookies** (no
+  persistence attributes) are the narrow, documented exemption.
+  Undeclared cookie names are rejected like reserved ones. An integration
+  may never set or expire a reserved cookie name. Violations are rejected at the operation layer (§2) and
   logged at `warn` with the integration id. The reserved lists are single
   constants next to the definitions they protect, not duplicated in the
   hook.
 - For non-reserved headers, the mutator API distinguishes **append** from
-  **replace** explicitly; the default is append (for `Set-Cookie`, append is
+  **replace** explicitly; **append is valid only for genuinely
+  list-valued headers** (a singleton header accepts only replace — two
+  values of a singleton header by append is a malformed response, not a
+  merge); the default is append where legal (for `Set-Cookie`, append is
   the only non-reserved operation — replace is not offered). Replacing a
   header the origin set is a deliberate act, visible in the mutator's code.
 - Later registrations see earlier mutations (order = registration order,
@@ -95,10 +116,15 @@ mutators to the outbound response for HTML document responses it processed.
   `Set-Cookie` header name outright — cookies go only through
   `append_set_cookie`, so its validation cannot be bypassed by spelling
   the header name in a generic op. Per-integration limits bound total
-  operations, added header count, and added header bytes, and a
-  **cumulative final-response budget** (total header count and bytes)
-  bounds the sum across integrations — enforced in registration order, so
-  which operations are rejected when the budget trips is deterministic.
+  operations (≤ 32), added headers (≤ 16), and added bytes (≤ 8 KiB), and
+  a **cumulative final-response budget** (≤ 128 headers / ≤ 32 KiB total,
+  counting `name: value` plus separators, within any lower adapter
+  ceiling) bounds the sum across integrations — enforced in registration
+  order, so which operations are rejected when a budget trips is
+  deterministic. Each mutator receives an **immutable snapshot of the
+  response head** (status and headers as of its turn, prior integrations'
+  accepted operations applied) as its read context; it never holds a
+  mutable reference (§2).
   Exceeding a limit rejects the excess operations (logged, attributed),
   never the response. A mutator that returns an error is skipped in full — its
   operations are all-or-nothing — and the response proceeds without it.
@@ -145,9 +171,9 @@ processed documents (§6).
 7. Cache/privacy invariant tests, one per restriction source and shape:
    cookie appended + public `Cache-Control` replacement → private/no-store,
    surrogate stripped; **core-private cookieless** processed HTML +
-   public replacement → restriction preserved; **origin-private
-   cookieless** pass-through-classified content + public replacement →
-   restriction preserved; a cache-hit serve re-applying mutations without
+   public replacement → restriction preserved; **origin-private cookieless** processed HTML that retained the
+   origin's cache restrictions + public replacement → restriction
+   preserved (pass-through responses never run the hook, §3a); a cache-hit serve re-applying mutations without
    weakening the stored classification; a `Vary` mutation neither
    dropping core-required values nor bypassing the snapshot; each CDN
    directive (`Surrogate-Control`, `CDN-Cache-Control`, host equivalents)

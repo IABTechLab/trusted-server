@@ -61,7 +61,11 @@ Everything in this spec follows from that.
    enough to set identity. Requests with no `Origin` and no valid token are
    rejected.
 2. **Verify the payload cryptographically per provider — including against
-   replay.** The provider's `resolve_from_client` accepts only payloads
+   replay.** `resolve_from_client` is the client-resolve acquisition mode
+   of the provider contract (providers spec §4
+   `Acquisition::ClientResolve`, which also carries the JS module the
+   page leg needs) — no longer an undeclared method this spec invents. It
+   accepts only payloads
    that are signed by an expected party, **audience-bound** to this
    publisher, and **expiring**. Audience binding and expiry alone do not
    mitigate replay — a captured token installs in another browser for the
@@ -85,14 +89,20 @@ Everything in this spec follows from that.
    wiring; the parity suite asserts the endpoint's presence and behavior on
    all four adapters. (PR #838 registered it on Fastly only, so the same
    config on the Axum dev server proxied the POST to the publisher origin.)
-6. **Be uncacheable and permission-gated.** `Cache-Control: no-store`;
-   the same `store-on-device` permission gate as organic EC creation runs
-   before any cookie is set.
+6. **Be uncacheable and permission-gated on the provider's full
+   declaration.** `Cache-Control: no-store`; before any cookie is set,
+   the endpoint enforces the selected provider's complete
+   `required_permissions()` — not a hard-coded `store-on-device` check; a
+   client-resolve provider declaring more than P1 gets all of it
+   enforced, exactly as organic minting does (providers spec §5).
 7. **Bound every input — exact values, testable boundaries.** Request
    body: at most **65,536 bytes** (inclusive; byte 65,537 → `413`),
    enforced by a bounded read independent of `Content-Length` — a
    missing, false, or chunked length must not bypass it. `Content-Type`
-   allowlist: `text/plain` and `application/json`; anything else → `415`.
+   allowlist: `text/plain` and `application/json`, matched on the media
+   type alone — case-insensitively, ignoring parameters, so the browser's
+   default `text/plain;charset=UTF-8` passes; duplicate `Content-Type`
+   headers → `400`; anything else → `415`.
    The resulting identifier: at most **256 bytes**, cookie-safe alphabet
    (providers spec §3 global bounds); violation → `400`. Reservation key
    (payload unique id): at most **128 bytes**. Status codes are part of
@@ -124,8 +134,16 @@ Everything in this spec follows from that.
    its epoch no longer matches. `failed` is retryable: the same owner may
    supersede it with a fresh `pending` at a higher epoch. The graph write
    happens under the reservation and is deterministic under its key, so
-   any retry converges on the same row; reservations are retained at least
-   through the token's expiry.
+   any retry converges on the same row; reservations are retained at
+   least through the token's expiry. Reservation keys are **namespaced**
+   per the providers spec §6.3 grammar
+   (`resv/<publisher-origin-hash>/<provider>/<version>/<payload-id>`), so
+   payloads cannot collide across publishers, providers, or versions.
+   Ownership conflicts are terminal per state: a non-owner hitting
+   `pending` gets `409` (retry only after lease expiry); a non-owner
+   hitting `committed`/`failed` gets the no-cookie terminal response; an
+   owner hitting `failed` may supersede it (higher epoch); cleanup
+   deletes reservations after retention, never before token expiry.
 
    **A duplicate must never receive the cookie unless it proves the
    original session binding.** "Duplicates observe the recorded outcome"
@@ -139,9 +157,13 @@ Everything in this spec follows from that.
    explicitly-accepted at-most-once posture (no owner hash), a lost
    response is an **orphan row** handled by the specified cleanup path.
    The **same-identity no-op of §3.8 first checks the family revocation
-   record** (permission model spec §4.3): a resolve against a revoked
-   family is rejected, never refreshed, and a create racing a revocation
-   loses — revocation wins. Tests cover crash-between-steps, lease
+   record** (permission model spec §4.3), and it does so **through the
+   linearizable primitive class this feature already requires** for
+   reservations (providers spec §7 matrix) — which is what makes
+   "revocation wins" true rather than aspirational: on an eventually
+   consistent read, a racing create could observe a stale absence and
+   emit a cookie for a revoked family. A resolve against a revoked family
+   is rejected, never refreshed, and a create racing a revocation loses. Tests cover crash-between-steps, lease
    takeover with a stale-epoch commit attempt, two concurrent requests
    with the same payload, a duplicate from a second client receiving no
    cookie, owner-hash recovery receiving the cookie, and

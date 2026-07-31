@@ -54,6 +54,7 @@ discoverable only because a deleted test had pinned the old behavior.
 | 11a | Raw EC egress on paths gated by the jurisdiction gate today (OpenRTB `user.id`, derived request IDs, page bids, EIDs, identify, pull sync — pull checks the live `EcContext` today) | Gated by the egress inventory (permission spec §7): bidstream and partner egress require both purposes, revocation exempt — at least as strict as today for every path                                                                                            | Preserved (strengthened); **must not regress** — PR #838 gated only EIDs and left `user.id` reachable |
 | 11b | Proxy / click / Testlight forwarding extract the raw EC cookie/header **without** today's jurisdiction gate                                                                         | Gated by the egress inventory (both purposes)                                                                                                                                                                                                                     | **New privacy hardening, declared change** — not preservation                                         |
 | 11c | Batch sync today only authenticates the S2S caller and checks live/tombstoned row state — it is **not** jurisdiction-gated                                                          | Gated by stored-provenance recompute (permission spec §7); legacy rows fail closed until backfilled                                                                                                                                                               | **New privacy hardening, declared change** — not preservation                                         |
+| 12  | EC generation succeeds without a configured identity-graph store                                                                                                                    | A minting provider requires an openable graph store at startup (providers spec §5, §6); pre-N+1 readiness step provisions it                                                                                                                                      | **Breaking, declared** — graphless deployments must provision storage before upgrading                |
 
 Rows 3, 4, and 7 are policy decisions, not code decisions: they belong in
 the `[permissions]` policy review, made explicitly by maintainers — not
@@ -118,16 +119,32 @@ Requirements:
      after **fleet convergence on N+1 is confirmed** — binaries first,
      convergence gate, then `ts config push`. A config mixing old and new
      fields (`[ec] passphrase` alongside `[ec] provider`) is **rejected**
-     by N+1, not reconciled. Rollback runs the sequence in reverse: config
-     back to the old shape first, binaries only after config convergence.
-     Every new config section introduced by the epic follows this same
-     compatibility rule, not only `[ec]`.
+     by N+1, not reconciled. **Rollback is binaries-first too, in the
+     other direction**: N+2 → N+1 binaries roll back **keeping the new
+     config** (N+1 reads it fully — reverting config first would hand the
+     old shape to N+2 binaries that reject it). N+1 additionally
+     **rejects provider or version selections whose provenance it cannot
+     yet encode** — new-provider adoption waits for N+2, so no row is
+     minted that N+2 would misclassify. Every new config section
+     introduced by the epic follows this same compatibility rule, not
+     only `[ec]`.
    - **Release N+2:** rejects `[ec] passphrase` at startup with a message
      naming the new location — not a generic unknown-field error
      (implementation note: producing the actionable message means keeping
      a deprecated `passphrase` field whose presence triggers the custom
      error).
-2. **The graph schema change is expand-contract, in lockstep with the
+2. **Graph-store readiness precedes everything.** Today the graph store
+   is optional and EC generation succeeds without one; the epic's
+   no-active-until-commit invariant (providers spec §5) makes it
+   mandatory wherever a minting provider is configured — so a currently
+   valid graphless HMAC deployment would **startup-fail on N+1's
+   dual-read mapping** without a preparatory step. The migration
+   therefore begins with a **pre-N+1 readiness step**: provision and
+   verify an openable graph store (and confirm the adapter's capability
+   row supports the features in use, providers spec §7) _before_ rolling
+   N+1. This is a **declared breaking change** for graphless deployments
+   (matrix row 12), not a side effect discovered at boot.
+3. **The graph schema change is expand-contract, in lockstep with the
    binary sequence.** New rows carry fields v1 rows never had — provider/
    version, per-permission grant evidence, policy revision, family ID,
    rewrite links — and two failure modes must be engineered away: a naive
@@ -153,49 +170,62 @@ Requirements:
    new fields untouched if read-only, preserved semantically if
    read-modify-write on N+1, **test-proven lost on pre-N+1** (documenting
    why the floor is a floor); N+2-reader/N+1-written-row → full function.
-3. **Half-migrated fails loud.** A `[ec.providers.hmac]` block with no
+4. **Half-migrated fails loud.** A `[ec.providers.hmac]` block with no
    `provider = "hmac"` selector is a startup error (providers spec §6). In
    PR #838 this configuration — the exact state an operator following the
    docs reaches if they miss one line — validated green and silently minted
    zero ECs.
-4. **PR #838-era keys fail loud.** `provider = "host-signals"` (shipped by
+5. **PR #838-era keys fail loud.** `provider = "host-signals"` (shipped by
    PR #838, deliberately not carried into this epic — providers spec §2)
    and `provider = "client-fixed"` are unknown keys and rejected like any
    other, so a config written against the PR #838 example cannot silently
    select a provider that no longer exists.
-5. **Provider switches go through legacy readers.** Changing
+6. **Provider switches go through legacy readers.** Changing
    `[ec] provider` on a deployment with live identities requires listing
    the outgoing provider in `[ec] legacy_providers` (providers spec §6.1)
    so existing cookies keep resolving and stay withdrawable; the guide
    documents the switch sequence and the retirement/cleanup step that ends
    it.
-6. **The example config ships the migrated happy path**, uncommented:
+7. **The example config ships the migrated happy path**, uncommented:
    `provider = "hmac"` with its block, `[geo] default_country`, and (for
    Fastly) the behavior-preserving `[device] provider = "fastly"` and
    `[geo] provider = "platform"` lines present with a comment stating what
    removing them changes. PR #838's example shipped the passphrase block
    uncommented with the selector commented out — steering operators directly
    into the silent-stateless state.
-7. Every misconfiguration in the providers spec §6 table fails at
+8. Every misconfiguration in the providers spec §6 table fails at
    **startup**. Request-time failure for a configuration error is a defect.
-8. Config-store payload validation (`ts config push`) applies the same
+9. Config-store payload validation (`ts config push`) applies the same
    rules — including `[permissions]` policy validation (permission spec
    §3.3) — so a bad config is rejected at push time, before any instance
    restarts into it.
 
-## 5. Behavior-preserving migration recipe (operator-facing)
+## 5. Minimal-divergence migration recipe (operator-facing)
+
+"Keep exactly today's behavior" is not fully achievable, and the recipe's
+name says so. The unavoidable divergences, enumerated (each also a matrix
+row): global opt-out honoring (row 8); refusal blocking new grants
+everywhere (row 6); newly enforced GPP sharing/targeted fields, which can
+also **grant** P4 where nothing granted before (row 3e); the FR
+unresolved-geo fallback, where valid TCF consent can grant while today's
+unresolved-geo path always denies (row 5); malformed-present blocking
+acquisition (§4.4); proxy-mode opt-out extraction; and the batch-sync
+provenance gate (row 11c). Everything else the recipe preserves.
 
 The migration guide (a new `docs/guide/` page, linked from the release notes)
-gives one copy-pasteable recipe per adapter for "keep exactly today's
-behavior":
+gives one copy-pasteable recipe per adapter for the minimal-divergence
+posture:
 
 The recipe is a **complete, valid TOML fixture per adapter, committed to
 the repository** (e.g. `docs/guide/fixtures/migration-preserving-fastly.toml`
 and siblings) and included in the guide verbatim — never described as a
 textual delta against the example file. Per-adapter because a single
-fixture cannot be: `[device] provider = "fastly"` and
-`[geo] provider = "platform"` are capability-gated selections that the
-Axum/Cloudflare/Spin adapters reject at startup (providers spec §6); each
+fixture cannot be: `[device] provider = "fastly"` is Fastly-only, and
+`[geo] provider = "platform"` varies by host — Cloudflare **does**
+support platform geo but resolves **country only, no region** (per the
+providers spec adapter matrix), which changes state-level US privacy
+outcomes and engages the declared regionless degradation; Axum and Spin
+have no platform geo and reject the selection (providers spec §6). Each
 adapter's fixture carries the selections valid for it, and each is
 CI-validated against its adapter. (An earlier draft said "copy the example table,
 then set `[permissions.rules] default`" — but the copied table already
@@ -266,16 +296,24 @@ global honoring of opt-out signals is unconditional.
 3. Startup logs always print: selected provider per concern, whether geo is
    live, the effective default baseline, and the count of granted-without-
    signal permissions. One line, greppable, stable format.
-4. **The batch-sync coverage dip is operationalized, not discovered.**
+4. **The batch-sync coverage dip is a gated rollout stage, not a
+   notification.** Provenance-coverage thresholds are normative gate
+   criteria: the guide defines a target coverage level and evaluation
+   window; recovery stalling below threshold for the window triggers the
+   **pause action** — investigate backfill (traffic mix, dormant rows),
+   never disable the gate; and staging is explicit: provenance
+   **writing** begins the moment N+2 activates, enforcement is already
+   in force (there is no fail-open stage), so the only stageable knob is
+   partner communication and the cleanup cadence for rows that never
+   recover.
    Because legacy rows fail closed for batch updates until backfilled
    (permission spec §7), batch-sync acceptance drops toward zero at
    cutover and recovers along the live-traffic backfill curve. The
    **provenance-coverage metric** (share of active rows carrying
-   provenance) is the tracking signal; the migration guide states the
-   expected recovery shape, tells operators to notify batch-sync partners
-   of the transient rejection rate, and defines no fail-open shortcut —
-   the alternative (grandfathering pre-epic identities past the
-   permission model) is rejected in the permission spec.
+   provenance) is the gate signal; operators notify batch-sync partners
+   of the transient rejection rate. There is no fail-open shortcut — the
+   alternative (grandfathering pre-epic identities past the permission
+   model) is rejected in the permission spec.
 5. Rollback is config-only where possible: reverting to the previous
    config version restores the previous behavior on the previous binary. The
    one irreversible artifact is withdrawal tombstones — which is why the
@@ -301,3 +339,32 @@ global honoring of opt-out signals is unconditional.
   spec verbatim — operator docs and normative spec must not diverge on
   precedence, and prose like "signals are mapped as a grant or a revoke"
   without stating which wins is insufficient.
+
+## 8. Product decisions requiring explicit sign-off
+
+These are decisions this spec set makes that #838 had not already made (or
+made differently). Each must be ratified by maintainers before
+implementation — an unratified row reverts to open, not to silently
+implemented:
+
+1. Opt-outs are honored globally and destructive ones irreversibly
+   withdraw identities outside the jurisdiction defining the signal
+   (permission spec §4, §4.2).
+2. Sale opt-outs (GPP and USP) control both P1 and P4 and destroy the
+   identity (§4.5).
+3. Sharing / targeted-advertising opt-outs remove P4 but intentionally
+   retain the stored identity (§4.5).
+4. US contextual auctions continue during opt-out, with identity removed
+   (permission spec §7 dispatch matrix).
+5. Regionless US traffic is treated as non-regulated unless the operator
+   chooses country-wide gating (permission spec §3.4).
+6. Full consent strings continue downstream, and raw consent snapshots
+   are retained in graph rows for audit (providers spec §6.3).
+7. Legacy batch-sync traffic is rejected until live-browser provenance
+   backfill occurs (§6.4 of this spec; permission spec §7).
+8. Proxy / click / Testlight forwarding becomes newly gated by P1 ∧ P4
+   (§2 row 11b).
+9. Integration-owned response cookies are inside the permission model:
+   persistent cookies require `store-on-device` at apply time and a
+   declared registration; session cookies are the narrow exemption
+   (response-hook spec §3).

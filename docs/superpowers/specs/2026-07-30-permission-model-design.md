@@ -251,9 +251,12 @@ Signals are classified into three classes — a two-class model (TCF grant /
 opt-out) cannot reproduce today's US behavior, where no-signal traffic is
 blocked but an **explicit non-opt-out** value grants:
 
-- **Opt-out signals** (affirmative withdrawal): GPC header; GPP sections
-  carrying a sale/sharing opt-out; US Privacy opt-out. Opt-out signals are
-  honored **globally**, not only in the jurisdictions whose law defines
+- **Opt-out signals**, in two subclasses assigned by the §4.5 mapping:
+  **destructive** opt-outs (GPC; sale opt-outs; USP opt-out) revoke and
+  trigger withdrawal; **non-destructive** opt-outs (sharing,
+  targeted-advertising) revoke the permissions they map to but never
+  destroy the stored identity — a targeted-ads choice must not tombstone.
+  Both subclasses are honored **globally**, not only in the jurisdictions whose law defines
   them — a deliberate, more-protective simplification: scoping a browser's
   explicit opt-out to a geolocation guess would honor it for some visitors
   and ignore it for others based on IP evidence. (For jurisdictions outside
@@ -347,9 +350,12 @@ group label, since a group can mix rules across permissions.
 
 The triggers, exhaustively — nothing else withdraws:
 
-1. **An opt-out signal withdraws in every jurisdiction, whatever the
-   baseline.** (For US states this preserves today's behavior; elsewhere it
-   is the declared change of §4's global-opt-out rule.)
+1. **A destructive opt-out signal (per §4.5's destructive column: GPC,
+   sale opt-outs, USP opt-out) withdraws in every jurisdiction, whatever
+   the baseline.** Non-destructive opt-outs (sharing,
+   targeted-advertising) never trigger this — they revoke acquisition
+   only. (For US states this preserves today's behavior; elsewhere it is
+   the declared change of §4's global-opt-out rule.)
 2. **A TCF record refusing `store-on-device` withdraws iff the baseline is
    `requires_signal` or `denied`.** Where the baseline is `granted`,
    refusal blocks _new_ grants but never tombstones: tombstones are
@@ -445,19 +451,19 @@ valid sources.** Current runtime resolves conflicts first and can select
 an expired record before clearing both sources; expiry-first is a
 **declared change** (migration matrix) that removes that path:
 
-| Input state                                                      | Effective record / outcome                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Status                                                                                                           |
-| ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| Standalone TCF and GPP-embedded TCF disagree, mode `restrictive` | Whole-record selection over the **(P1, P4) outcome tuple, compared lexicographically with P1 first** (refusal < grant): the lesser tuple governs in full. Split-purpose records are thereby decided — (grant P1, refuse P4) vs (refuse P1, grant P4) selects the latter. Identical tuples → outcomes are identical; the GPP-embedded record is named for determinism. (An earlier draft specified per-purpose synthesis, which is _not_ what the code does; the tuple order is decided here and pinned against current tests) | Preserved — pinned against current tests                                                                         |
-| Same, mode `permissive`                                          | Same tuple comparison; the **greater** tuple governs in full                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | Preserved — same pinning                                                                                         |
-| Same, mode `newest`                                              | Whole-record selection by **`LastUpdated`** (not `Created`), subject to the existing freshness threshold; a tie, an incomparable pair, or timestamps inside the threshold fall back to the fully deterministic `restrictive` rule above                                                                                                                                                                                                                                                                                       | Preserved — same pinning                                                                                         |
-| Expired consent record                                           | Treated as **absent entirely** — grants nothing, refuses nothing, withdraws nothing; the baseline applies. Under a `granted` baseline that means the grant stands: an expired refusal is not current evidence and must not revoke indefinitely                                                                                                                                                                                                                                                                                | Preserved                                                                                                        |
-| One valid record + a second malformed record of the same family  | The **valid record governs**; the malformed one is ignored with a `warn` log. Fail-closed-on-malformed (below) applies only when no valid record of that family exists                                                                                                                                                                                                                                                                                                                                                        | Decided here                                                                                                     |
-| One valid record + one **expired** record of the same family     | The valid record governs — the expired one dropped at pipeline step 2, before conflict resolution ever saw it                                                                                                                                                                                                                                                                                                                                                                                                                 | **Changed (declared)** — current runtime resolves the conflict first and can select the expired record           |
-| Persisted-KV consent record, live record present                 | **Live wins**, always; the stored record is never consulted                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Preserved                                                                                                        |
-| Persisted-KV consent record, no live record                      | Substitutes as the effective record **iff within the same TTL as a live record**; staler → absent. This narrow read is exempt from the graph-read permission gate (§7) — determining `store-on-device` cannot itself require `store-on-device`                                                                                                                                                                                                                                                                                | Preserved, circularity resolved                                                                                  |
-| Proxy/mirror mode                                                | **Syntax validation still runs; semantic decoding is skipped.** A present record (well- or mal-formed) is _present, undecoded_: it blocks grants (a record TS will not read cannot vouch for consent) and never withdraws; absent → baseline. Header-carried opt-outs (GPC) are unaffected — they need no decoding. Without the syntax pass, malformed-present would be indistinguishable from absent, contradicting the fail-closed rule below                                                                               | **Changed (declared)**: today proxy mode skips decoding entirely, which under a permissive baseline is fail-open |
-| GPP / US Privacy fields                                          | Per the normative field mapping of §4.5 — fields are not interchangeable signals, and absent/N-A fields grant nothing                                                                                                                                                                                                                                                                                                                                                                                                         | Decided here (§4.5)                                                                                              |
-| Malformed-but-present record, no valid record of that family     | **Blocks grants** (fail-closed acquisition — it does not degrade to "absent", which under a `granted` baseline would turn garbage into a grant, the fail-open path in both #838 and the first draft of this spec). Never triggers withdrawal — destruction requires an affirmative, decodable signal (§4.2)                                                                                                                                                                                                                   | Changed (declared)                                                                                               |
+| Input state                                                      | Effective record / outcome                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | Status                                                                                                                            |
+| ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| Standalone TCF and GPP-embedded TCF disagree, mode `restrictive` | **Whole-record selection comparing the P1 ∧ P4 conjunction only** — today's algorithm, preserved (an earlier draft's lexicographic (P1, P4) tuple would have changed split-purpose outcomes): if exactly one record's conjunction is false, `restrictive` selects it; **equal conjunctions — including split-purpose disagreements — keep the standalone record**, as current code does                                                                                                                                                                   | Preserved — pinned against current tests                                                                                          |
+| Same, mode `permissive`                                          | Same conjunction comparison, selecting the record whose conjunction is true; equal conjunctions keep the standalone record                                                                                                                                                                                                                                                                                                                                                                                                                                | Preserved — same pinning                                                                                                          |
+| Same, mode `newest`                                              | Whole-record selection by **`LastUpdated`** subject to the existing freshness threshold; a tie, an incomparable pair, or timestamps inside the threshold fall back to the `restrictive` rule above (itself deterministic)                                                                                                                                                                                                                                                                                                                                 | Preserved — same pinning                                                                                                          |
+| Expired consent record                                           | Treated as **absent entirely** — grants nothing, refuses nothing, withdraws nothing; the baseline applies. Under a `granted` baseline that means the grant stands: an expired refusal is not current evidence and must not revoke indefinitely                                                                                                                                                                                                                                                                                                            | Preserved                                                                                                                         |
+| One valid record + a second malformed record of the same family  | The **valid record governs**; the malformed one is ignored with a `warn` log. Fail-closed-on-malformed (below) applies only when no valid record of that family exists                                                                                                                                                                                                                                                                                                                                                                                    | Decided here                                                                                                                      |
+| One valid record + one **expired** record of the same family     | The valid record governs — the expired one dropped at pipeline step 2, before conflict resolution ever saw it                                                                                                                                                                                                                                                                                                                                                                                                                                             | **Changed (declared)** — current runtime resolves the conflict first and can select the expired record                            |
+| Persisted-KV consent record, live record present                 | **Live wins**, always; the stored record is never consulted                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | Preserved                                                                                                                         |
+| Persisted-KV consent record, no live record                      | Substitutes as the effective record **iff within the same TTL as a live record**, then flows through the full normalization pipeline (syntax, expiry, conflict) like any live record; staler → absent. This narrow read is exempt from the graph-read permission gate (§7) — determining `store-on-device` cannot itself require `store-on-device`                                                                                                                                                                                                        | **Changed (declared)**: current code returns immediately after the KV load, bypassing expiry and conflict normalization           |
+| Proxy/mirror mode                                                | **Minimal opt-out extraction still runs; full semantic decoding is skipped.** Because opt-outs are globally authoritative (§4), proxy mode must not suppress them: the §4.5-mapped opt-out fields (GPP US sections) and the US Privacy string are decoded — nothing else — alongside syntax validation, so a valid SaleOptOut or USP opt-out revokes and withdraws exactly as outside proxy mode. No grants are ever derived from records in proxy mode; a present record otherwise blocks grants (fail-closed); absent → baseline. GPC needs no decoding | **Changed (declared)**: today proxy mode skips decoding entirely — fail-open under permissive baselines and, worse, opt-out-blind |
+| GPP / US Privacy fields                                          | Per the normative field mapping of §4.5 — fields are not interchangeable signals, and absent/N-A fields grant nothing                                                                                                                                                                                                                                                                                                                                                                                                                                     | Decided here (§4.5)                                                                                                               |
+| Malformed-but-present record, no valid record of that family     | **Blocks grants** (fail-closed acquisition — it does not degrade to "absent", which under a `granted` baseline would turn garbage into a grant, the fail-open path in both #838 and the first draft of this spec). Never triggers withdrawal — destruction requires an affirmative, decodable signal (§4.2)                                                                                                                                                                                                                                               | Changed (declared)                                                                                                                |
 
 ### 4.5 US signal field mapping — normative
 
@@ -480,13 +486,36 @@ a change to this table.
 | US Privacy · present, `N` or N/A             | —             | grant                  | grant                          | — (today's tests pin N/A as allowing; USP carries no distinct targeted-advertising field, so it never maps to one) |
 | Any field                                    | absent / N-A  | —                      | —                              | —                                                                                                                  |
 
-**Multi-section aggregation:** when both a national and an applicable
-state section are present, the state section governs for the fields it
-carries; across whatever sections apply, **an opt-out in any applicable
-section beats a grant in another** (restrictive aggregation). `SharingOptOut`
-and `TargetedAdvertisingOptOut` are new enforcement inputs — current code
-consults only the sale field — and are declared as such in the migration
-matrix.
+**N/A vs absent:** a field explicitly set to _Not Applicable_ is treated
+as not-opted-out (grant-class) — pinned by today's USP tests and matching
+current GPP `NotApplicable` handling, and declared as such since an
+earlier draft said N/A contributes nothing. A field **absent** from an
+applicable section, or any field of a non-applicable section, contributes
+nothing.
+
+**Applicability and aggregation — ordered algorithm:**
+
+1. **Section map (normative, pinned here — not "whatever GPP is current"):**
+   `US` national ↔ GPP section 7 (usnat); `US/CA` ↔ 8 (usca); `US/VA` ↔ 9
+   (usva); `US/CO` ↔ 10 (usco); `US/UT` ↔ 11 (usut); `US/CT` ↔ 12 (usct).
+   Section versions are those published at this spec's date; adding a
+   section or version is a change to this map.
+2. **Determine applicability from the resolved jurisdiction:** the
+   national section is applicable to any `us-privacy`-regime request; a
+   state section is applicable iff it maps to the resolved `US/<state>`.
+   Foreign-state sections (a `usca` string on a `US/CO` request) and all
+   sections on non-`us-privacy` requests are **not applicable** and
+   contribute nothing. Regionless US traffic: national section only.
+3. **State-over-national, per field:** where an applicable state section
+   carries a field, it governs that field; the national section fills only
+   fields the state section lacks.
+4. **Aggregate across what remains applicable:** an opt-out (of either
+   subclass) in any applicable field beats a grant from another —
+   restrictive aggregation.
+
+`SharingOptOut` and `TargetedAdvertisingOptOut` are new enforcement
+inputs — current code consults only the sale field — and are declared as
+such in the migration matrix.
 
 ## 5. Jurisdiction resolution
 
@@ -548,6 +577,22 @@ this request" and "we placed it somewhere we have no rule for" are
 different states, and pre-epic behavior treated them differently (fail
 closed vs. non-regulated) — collapsing them is what made PR #838's
 migration story unresolvable (migration spec §2, rows 5 and 7).
+
+### 5.5 Policy revision activation
+
+A policy edit propagates through the config store, so a fleet briefly
+mixes revisions. The contract: instances stamp every resolution and every
+provenance write with the policy revision they used (already required by
+§7); the mixing window is bounded by config propagation and observable via
+the config-version metric; and mixed revisions cannot cause irreversible
+harm, because **destructive withdrawal triggers are user signals, never
+policy** (§4.2 trigger 3) — the one revision-sensitive destructive case
+(trigger 2 under a now-`denied` baseline) requires an affirmative user
+refusal at the evaluating instance, which is safe under either revision.
+S2S recomputation always evaluates against the instance's current
+revision and records it. Rolling a policy revision back restores
+acquisition rules but **cannot resurrect tombstoned identities**; the
+migration guide says so where operators will read it.
 
 ## 6. Failure-mode matrix — normative
 
@@ -620,13 +665,21 @@ Consumers of the resolved set in this epic:
    (which signal class granted, per permission), the evidence's
    **authoritative timestamp and `valid_until`** (per evidence class),
    resolved jurisdiction, policy revision, and provider/version (providers
-   spec §6.1). Two aging rules prevent perpetual renewal: **re-presenting
-   an unchanged signal does not reset evidence age** — only a record
-   carrying a newer authoritative timestamp (e.g. TCF `LastUpdated`) does;
-   and every live resolution **atomically replaces the complete
-   per-permission snapshot**, never merges — a refusal, opt-out, malformed
-   or absent state in the fresh resolution clears prior positive authority
-   for its scope, so an old P4 grant cannot survive a later P4 refusal. A sync request performs a **full recompute of both
+   spec §6.1). Freshness is a **per-evidence-class contract**, because not
+   every source carries a timestamp:
+
+   | Evidence class                                    | Authoritative timestamp                                                                                   | Age reset                                                                                                                    | Max age                   |
+   | ------------------------------------------------- | --------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- | ------------------------- |
+   | TCF consent                                       | The record's `LastUpdated`                                                                                | Only a record with a **newer** `LastUpdated`                                                                                 | Existing TCF expiry TTL   |
+   | GPP / USP values (no intrinsic timestamp)         | **First-seen**: when TS first observed this exact normalized value (equality digest stored in provenance) | Re-presenting an identical digest **keeps the original first-seen**; a different value is new evidence with a new first-seen | Consent TTL (same as TCF) |
+   | Policy-baseline grant (`granted` rule, no signal) | The policy revision that granted                                                                          | Re-derived on every recompute against the current revision — policy is not user evidence and does not age; it changes        | n/a                       |
+
+   Timestamps are compared with bounded clock-skew tolerance and
+   future-dated values are clamped to receipt time. And every live
+   resolution **atomically replaces the complete per-permission
+   snapshot**, never merges — a refusal, opt-out, malformed or absent
+   state in the fresh resolution clears prior positive authority for its
+   scope, so an old P4 grant cannot survive a later P4 refusal. A sync request performs a **full recompute of both
    permissions** from that stored evidence against the _current_ policy:
    it fails closed when the stored jurisdiction's rule is now `denied`,
    when a `granted` baseline tightened to `requires_signal` and the stored
@@ -688,7 +741,12 @@ further consumer if and when it proceeds.
   reset), and legacy-row fail-closed-then-backfill.
 - The full cross-product **regime × permission × evidence source** from
   §4's acceptance table and §4.5's field mapping, including multi-section
-  aggregation conflicts.
+  aggregation conflicts and the applicability algorithm's foreign-section
+  and regionless rows.
+- Provenance snapshot-replacement transitions per permission: prior grant
+  → refusal, → opt-out, → malformed, → absent — plus a mid-replacement
+  fault proving the surviving state is the complete old **or** complete
+  new snapshot, never a merged mixture.
 - Legacy-row withdrawal end to end (§4.3's derived family ID).
 - §4.3 fault-injection cases.
 - Policy validation tests for every §3.3 rejection, exercised through both
