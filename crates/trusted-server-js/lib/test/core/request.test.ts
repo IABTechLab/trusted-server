@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any -- mocks and private state are poked via `any`; the file-level opt-out is deliberate */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 async function flushRequestAds(): Promise<void> {

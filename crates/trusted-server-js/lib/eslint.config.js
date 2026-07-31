@@ -57,11 +57,4 @@ export default [
       globals: globals.nodeBuiltin,
     },
   },
-  // Tests routinely poke at private state and mock boundaries via `any`
-  {
-    files: ['test/**/*.ts', 'test/**/*.tsx'],
-    rules: {
-      '@typescript-eslint/no-explicit-any': 'off',
-    },
-  },
 ];

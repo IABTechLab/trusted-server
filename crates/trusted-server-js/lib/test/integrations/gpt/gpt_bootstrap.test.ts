@@ -20,6 +20,7 @@ const BOOTSTRAP_SOURCE = readFileSync(
   'utf8'
 );
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- bootstrap pokes arbitrary window surfaces
 type AnyRecord = Record<string, any>;
 
 type TestWindow = Window & {
