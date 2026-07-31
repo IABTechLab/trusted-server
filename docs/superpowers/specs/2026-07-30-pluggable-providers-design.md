@@ -122,8 +122,17 @@ Three global rules sit above every provider:
   characters) and a global maximum length — for the identifier itself, not
   only the graph key — enforced by core at mint and at parse, so no
   provider can emit a value the cookie layer or logs cannot carry.
+- **Namespaces are declarative and core-proven.** Disjointness of two
+  opaque `parse` functions is not provable, so every provider declares a
+  **static namespace descriptor** in a core-owned declarative form — a set
+  of literal prefixes and/or fixed-shape grammars (alphabet + length
+  segments), never arbitrary parser logic. Core proves pairwise
+  disjointness of all configured descriptors at startup (§6.1), and the
+  conformance suite asserts each provider's `parse` accepts **only**
+  values matching its declared descriptor — so the declaration, not the
+  parser, is the authority the overlap check rests on.
 - **Namespace reservation.** The legacy HMAC grammar `{64hex}.{6alnum}` is
-  formally **reserved as the `hmac` provider's namespace**. `hmac`'s graph
+  formally **reserved as the `hmac` provider's namespace descriptor**. `hmac`'s graph
   key is the identifier verbatim and its cluster prefix is the 64-hex
   prefix, so every pre-epic row stays reachable and every prefix listing
   intact (migration spec §3) — and **no other provider may mint
@@ -228,7 +237,17 @@ structural:
   device provider whose data use goes beyond security classification (for
   example feeding fingerprints into targeting or identity) is **not
   authorized by selection alone** and requires a vocabulary extension plus
-  a gate before it may ship.
+  a gate before it may ship. This bites immediately, not hypothetically:
+  today's graph rows persist the JA4 class, an HTTP/2 fingerprint hash,
+  and buyer-facing quality metadata — persistence and scoring that exceed
+  security classification. The epic therefore **stops writing
+  fingerprint-derived buyer-facing fields into new rows** (a declared
+  change, migration spec §2); the boolean security classification outcome
+  may be persisted. Re-adding them is the vocabulary-extension route.
+  Relatedly, the implementation PR must deliver a **field-level graph
+  contract table** — for every persisted row field: purpose, source,
+  gating permission, TTL, rewrite behavior, egress paths, and tombstone
+  scrubbing — reviewed against the egress inventory.
 
 PR #838 declared `required_permissions` on all three traits but consulted
 it only for the EC provider; the geo and device declarations were
@@ -273,31 +292,44 @@ The contract:
   block, validated like the active one (§6 table).
 - **Parse order and ambiguity.** The active writer parses first; the first
   match wins. Overlapping recognition is not resolved at request time but
-  **forbidden at startup**: provider namespaces (§3) may not overlap, and
-  configuring an active/legacy pair whose grammars intersect is a
-  validation error.
+  **forbidden at startup**: the declared namespace descriptors (§3) of the
+  active writer and every legacy reader must be pairwise disjoint — a
+  check core can actually perform, because descriptors are declarative;
+  configuring a pair whose descriptors intersect is a validation error.
 - **The recognizing provider governs.** A legacy-owned identity is gated
   by the **legacy provider's** `required_permissions()` for identity use —
   the provider that minted under a declared data-use contract is the one
   whose contract applies.
-- **Provenance is provider- and version-tagged.** Every graph row carries
-  the minting provider id and its configuration version (this is the same
-  provenance record the S2S sync authority reads, permission model spec
-  §7). Same-provider key/passphrase rotation is a version entry, not a
-  provider switch: parse consults all configured versions of the active
-  provider.
+- **Provenance is provider- and version-tagged, with a defined rotation
+  schema.** Every graph row carries the minting provider id, its
+  configuration version, and the per-permission grant evidence (grant
+  basis, evidence timestamp, resolved jurisdiction, policy revision) that
+  the S2S sync authority recomputes from (permission model spec §7).
+  Same-provider key/passphrase rotation is configuration, not a provider
+  switch: a provider block may hold multiple `versions` entries
+  (`[ec.providers.hmac.versions.v2] passphrase = …`) with
+  `mint_version = "v2"` selecting the writer; `parse` consults versions in
+  declared order, newest first; removing a version entry is a retirement
+  subject to the same evidence rules as retiring a legacy reader
+  (migration spec §6).
 - A cookie recognized by a legacy reader is a live identity for
   read/withdrawal purposes; whether it is transparently re-minted under the
   active writer is a per-deployment choice
   (`[ec] rewrite_legacy = true|false`), and re-minting is subject to the
   full minting gate of §5.
-- **Rewrite is transactional and linking, not fire-and-forget.** Order:
-  new row commits first, carrying a link to the old row and a copy of the
-  old row's consent metadata and partner mappings; only then does the
-  cookie swap; the old row is tombstoned (or link-retired) only after the
-  new row and cookie are in place. An interrupted rewrite leaves the old
-  cookie valid and simply retries — no state in which neither identity
-  works. **Withdrawal of either linked row tombstones both.**
+- **Rewrite is transactional, linking, and confirmed by presentation.**
+  Order: new row commits first, carrying a link to the old row (sharing
+  its revocation family ID, permission model spec §4.3) and a copy of the
+  old row's consent metadata and partner mappings; then the new cookie is
+  emitted. The server only emits `Set-Cookie` — it cannot observe delivery
+  or acceptance, so **both linked rows stay live** until a later request
+  **presents the new cookie** (confirmation by presentation); only then is
+  the old row retired. A deployment may additionally cap the window with a
+  grace period no shorter than the old cookie's maximum lifetime plus
+  rollout skew. An interrupted or unconfirmed rewrite leaves the old
+  cookie fully valid — no state in which neither identity works.
+  **Withdrawal of either linked row revokes the shared family, i.e.
+  both.**
 - Retiring a legacy reader is the explicit end of those identities:
   the migration guide documents the cleanup procedure (migration spec §6).
 - Tests: switch active provider → request with old cookie → identity still
@@ -341,6 +373,16 @@ outcomes.
 
 Requirements:
 
+- **Adapters declare capabilities against an explicit matrix.** The
+  capability set the composition root checks selections against is
+  enumerated, not ad hoc: identity-graph persistence, atomic single-key
+  reservation (CAS — required by the client-cycle reservation and any
+  future compare-and-set use), KV prefix listing (cluster support),
+  platform geo, device host evidence (JA4/HTTP-2), and legacy-rewrite
+  support. Each adapter's declaration is part of its wiring, and the §6
+  capability-mismatch startup error is driven by this matrix. Every §6.2
+  runtime-failure row gets fault-injection coverage on every adapter that
+  declares the corresponding capability.
 - Each adapter's runtime-services setup routes through the shared builders.
 - Providers are constructed **once** per application instance and stored in
   app state; PR #838 rebuilt the provider (cloning the secret into a fresh

@@ -76,7 +76,7 @@ Everything in this spec follows from that.
    the corresponding graph row is written, mirroring the organic path. Graph
    unavailable → no cookie, same as organic generation.
 4. **Round-trip through the lifecycle contract.** The identifier set here
-   must be recognized, hashed, and tombstonable by the selected provider
+   must be parseable, graph-keyed, and tombstonable by the selected provider
    (providers spec §3). The conformance suite runs against every
    client-cycle provider.
 5. **Exist on every adapter.** Route registration goes through shared route
@@ -102,16 +102,30 @@ Everything in this spec follows from that.
    link, vendor migration) is an explicit linking design this spec does
    not authorize (own open question, §7).
 9. **Make replay consumption and graph persistence one idempotent
-   sequence.** Neither naive order works: consume-the-nonce-first makes a
+   sequence — without letting idempotency reinstall the identity
+   elsewhere.** Neither naive order works: consume-the-nonce-first makes a
    subsequent graph failure unretryable (the token is spent, the identity
    never existed); graph-first lets the losers of a replay race leave
    residual rows. Required shape: consumption is an **atomic single-key
-   reservation** keyed by the payload's unique id, recording outcome; the
-   graph write happens under that reservation and is retried under the
-   same key; duplicate or racing requests observe the reservation and
-   receive the original outcome — no second identity, no spent-but-unused
-   token, no orphan row. Tests cover crash-between-steps and two
-   concurrent requests with the same payload.
+   reservation** (CAS — an adapter capability the composition root checks,
+   providers spec §7) keyed by the payload's unique id, with explicit
+   states: `pending` → `committed` | `failed`. The graph write happens
+   under the reservation and is retried under the same key; a `pending`
+   reservation older than its **lease** may be taken over by a retry;
+   reservations are retained at least through the token's expiry; the
+   graph write is deterministic under the reservation key so a retry
+   converges on the same row.
+
+   **A duplicate must never receive the cookie unless the reservation is
+   session-bound.** "Duplicates observe the recorded outcome" cannot mean
+   replaying `Set-Cookie` — that would hand a captured token's identity to
+   a second browser, recreating the fixation §2 exists to prevent. In
+   one-time mode without session binding, a duplicate gets a terminal
+   response with **no cookie**; only a requester that proves the original
+   session binding (the §3.2 nonce) may have the `Set-Cookie` re-emitted.
+   Tests cover crash-between-steps, lease takeover, two concurrent
+   requests with the same payload, and a duplicate from a second client
+   receiving no cookie.
 
 ## 4. Requirements on the page script
 

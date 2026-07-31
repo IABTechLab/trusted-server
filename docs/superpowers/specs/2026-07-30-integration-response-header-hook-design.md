@@ -52,7 +52,14 @@ mutators to the outbound response for HTML document responses it processed.
   a cookie — a hook applied after that recheck could combine an appended
   `Set-Cookie` with a replaced public `Cache-Control` into a
   **shared-cacheable cookie response**. The invariant pass therefore runs
-  after all mutations, unconditionally. Middle-stage placement also keeps
+  after all mutations, unconditionally — and it enforces more than the
+  cookie rule: **any private/no-store classification core assigned before
+  the hook is preserved** (processed auction HTML is marked private even
+  when no cookie is emitted — today's final helper returns early without
+  `Set-Cookie`, so cookie-triggered enforcement alone would let an
+  integration make cookieless personalized HTML publicly cacheable), and
+  every CDN/surrogate cache directive is stripped from any response so
+  classified. Middle-stage placement also keeps
   the earlier property: an integration mutation is not silently stripped
   by ordinary core handling — only by the invariant pass, which logs the
   downgrade it applies.
@@ -81,10 +88,19 @@ mutators to the outbound response for HTML document responses it processed.
   `Set-Cookie` header name outright — cookies go only through
   `append_set_cookie`, so its validation cannot be bypassed by spelling
   the header name in a generic op. Per-integration limits bound total
-  operations, added header count, and added header bytes; exceeding a
-  limit rejects the excess operations (logged, attributed), never the
-  response. A mutator that panics or errors is skipped in full — its
+  operations, added header count, and added header bytes, and a
+  **cumulative final-response budget** (total header count and bytes)
+  bounds the sum across integrations — enforced in registration order, so
+  which operations are rejected when the budget trips is deterministic.
+  Exceeding a limit rejects the excess operations (logged, attributed),
+  never the response. A mutator that returns an error is skipped in full — its
   operations are all-or-nothing — and the response proceeds without it.
+  **Panics are forbidden and fatal, not recoverable**: the primary target
+  (`wasm32-wasip1`) builds with `panic = "abort"`, so there is no unwind
+  boundary to catch at — a spec that promised panic recovery would be
+  unimplementable there. Mutators are infallible-by-construction or
+  return `Result`; a panic is a bug that takes the instance down, same as
+  anywhere else in the request path.
 
 ## 3a. Response eligibility — normative
 
