@@ -137,7 +137,6 @@
     for (var i = 0; i < idElements.length; i++) {
       var candidate = idElements[i];
       if (
-        divId &&
         candidate.id.startsWith(divId) &&
         !candidate.id.endsWith("-container")
       ) {
