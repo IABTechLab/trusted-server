@@ -125,7 +125,7 @@ describe('creative/click.ts', () => {
 
     const originDescriptor = Object.getOwnPropertyDescriptor(window, 'origin');
     Object.defineProperty(window, 'origin', { value: 'null', configurable: true });
-    global.fetch = undefined as any;
+    global.fetch = undefined as unknown as typeof fetch;
 
     try {
       const anchor = document.createElement('a');
