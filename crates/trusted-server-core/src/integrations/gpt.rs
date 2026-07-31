@@ -474,8 +474,7 @@ impl IntegrationHeadInjector for GptIntegration {
     /// ## Scroll / refresh handoff contract (Phase 1)
     ///
     /// `tsjs.adInit` handles **initial render only**: it wires server-side bid
-    /// targeting into GPT slots and replays only publisher requests held until
-    /// that targeting was available. Win/billing beacons fire
+    /// targeting into GPT slots and refreshes them. Win/billing beacons fire
     /// only from the TS render bridge in the JS bundle, where a matching
     /// Prebid Universal Creative request proves the TS creative rendered.
     /// It does **not** trigger refresh auctions or handle GPT slot refresh events.
@@ -1254,7 +1253,7 @@ mod tests {
             "bootstrap should scan ID-bearing elements instead of interpolating div_id into CSS"
         );
         assert!(
-            combined.contains(".startsWith(slot.div_id)"),
+            combined.contains("candidate.id.startsWith(divId)"),
             "bootstrap should match metacharacter-containing div_id prefixes with startsWith"
         );
         assert!(
@@ -1281,10 +1280,6 @@ mod tests {
         assert!(
             combined.contains("__tsSlotHandoffPatched"),
             "bootstrap should install idempotent GPT handoff wrappers"
-        );
-        assert!(
-            combined.contains("gptInitialRequestGate") && combined.contains("pendingDisplays"),
-            "bootstrap should hold configured publisher requests until initial targeting is applied"
         );
         assert!(
             combined.contains("return googletag.defineSlot") && combined.contains("actualDivId"),

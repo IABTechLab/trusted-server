@@ -113,16 +113,13 @@ export interface AuctionBidData {
 export interface GptSlotHandoff {
   gamUnitPath: string;
   formats: Array<[number, number]>;
+  /** Stable configured prefix used to safely bridge framework-generated IDs. */
+  divIdPrefix: string;
+  /** Element ID GPT received when TS created the fallback slot. */
+  slotElementId: string;
   publisherClaimed: boolean;
   suppressPublisherDisplay: boolean;
   suppressPublisherRefresh: boolean;
-}
-
-/** Publisher requests held until initial TS targeting has been applied. */
-export interface GptInitialRequestGate {
-  pendingDisplays: Record<string, boolean>;
-  pendingRefreshes: Record<string, boolean>;
-  released: boolean;
 }
 
 export type GptDiagnosticsCallbackKind =
@@ -287,10 +284,6 @@ export interface TsjsApi {
   gptInitialLoadDisabled?: boolean;
   /** Late publisher claims for TS-created GPT slots, keyed by actual div ID. */
   gptSlotHandoffs?: Record<string, GptSlotHandoff>;
-  /** Publisher initial requests held until TS has applied server-side targeting. */
-  gptInitialRequestGate?: GptInitialRequestGate;
-  /** True after the first page-load `adInit()` has handled publisher slots. */
-  gptInitialAdInitCompleted?: boolean;
   /** True only while TS calls a GPT function that the handoff wrappers observe. */
   gptSlotHandoffInternal?: boolean;
   /** Guards SPA pushState hook installation. */

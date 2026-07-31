@@ -201,66 +201,6 @@ describe('scheduleInitialAdInit', () => {
     expect(adInit).not.toHaveBeenCalled();
   });
 
-  it('applies server targeting before releasing a held publisher display', async () => {
-    // A publisher that defined and displayed its GPT slot before window load
-    // has that initial display held until server-side targeting is available.
-    // The deferred run must apply targeting before replaying the display.
-    const div = document.createElement('div');
-    div.id = 'div-atf-sidebar';
-    document.body.appendChild(div);
-    const mockSlot = {
-      addService: vi.fn().mockReturnThis(),
-      setTargeting: vi.fn().mockReturnThis(),
-      clearTargeting: vi.fn().mockReturnThis(),
-      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
-      getTargeting: vi.fn().mockReturnValue([]),
-    };
-    const mockRefresh = vi.fn();
-    const mockPubads = {
-      enableSingleRequest: vi.fn(),
-      getSlots: vi.fn().mockReturnValue([mockSlot]),
-      addEventListener: vi.fn(),
-      refresh: mockRefresh,
-    };
-    const mockDisplay = vi.fn();
-    (window as TestWindow).googletag = {
-      cmd: { push: vi.fn((fn: () => void) => fn()) },
-      defineSlot: vi.fn(),
-      display: mockDisplay,
-      pubads: vi.fn().mockReturnValue(mockPubads),
-      enableServices: vi.fn(),
-    };
-    await importGptModule();
-    const ts = (window as TestWindow).tsjs!;
-    ts.adSlots = [
-      {
-        id: 'atf_sidebar_ad',
-        gam_unit_path: '/123/atf',
-        div_id: 'div-atf-sidebar',
-        formats: [[300, 250]],
-        targeting: { pos: 'atf' },
-      },
-    ];
-    ts.bids = { atf_sidebar_ad: { hb_pb: '1.00', hb_bidder: 'kargo' } };
-
-    const googletag = (window as TestWindow).googletag as { display: (id: string) => void };
-    googletag.display('div-atf-sidebar');
-    expect(mockDisplay).not.toHaveBeenCalled();
-
-    ts.scheduleInitialAdInit!();
-    window.dispatchEvent(new Event('load'));
-    flushFrame();
-    flushFrame();
-
-    expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_pb', '1.00');
-    expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_initial', '1');
-    expect(mockDisplay).toHaveBeenCalledWith('div-atf-sidebar');
-    expect(mockRefresh).not.toHaveBeenCalled();
-    const targetingOrder = mockSlot.setTargeting.mock.invocationCallOrder[0]!;
-    const displayOrder = mockDisplay.mock.invocationCallOrder[0]!;
-    expect(targetingOrder).toBeLessThan(displayOrder);
-  });
-
   it('drops the SSR payload when a navigation committed before scheduling', async () => {
     // The SPA hook is installed by the synchronous head bundle, so a
     // navigation can commit while the document is still streaming — before
