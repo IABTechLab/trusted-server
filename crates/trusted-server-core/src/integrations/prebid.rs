@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1045,6 +1045,17 @@ impl IntegrationHeadInjector for PrebidIntegration {
     }
 }
 
+/// Returns `true` when `params` is not a usable PBS bidder-params object — an
+/// empty object `{}` or any non-object value such as `null`.
+///
+/// PBS rejects an impression whose `bidder.<name>` carries such a value, and it
+/// cannot distinguish fabricated empty params from explicitly supplied ones.
+/// Callers use this to preserve valid direct params and to omit unusable params
+/// after all override rules have been applied.
+fn is_unusable_bidder_params(params: &Json) -> bool {
+    params.as_object().is_none_or(serde_json::Map::is_empty)
+}
+
 fn expand_trusted_server_bidders(
     configured_bidders: &[String],
     params: &Json,
@@ -1559,40 +1570,87 @@ impl PrebidAuctionProvider {
                     .and_then(|p| p.get(ZONE_KEY))
                     .and_then(Json::as_str);
 
-                // Build the bidder map for PBS.
-                // The JS adapter sends "trustedServer" as the bidder (our orchestrator
-                // adapter name). Replace it with the real PBS bidders from config.
-                // Only pass through keys that are known PBS bidders — skip provider-specific
-                // keys like "aps" which belong to their own separate auction provider.
-                let mut bidder: HashMap<String, Json> = HashMap::new();
+                // Build the bidder map for PBS from two sources: expanded
+                // `trustedServer` params and direct configured-bidder params.
+                // Keep them separate until merging so a HashMap iteration order
+                // cannot let a fabricated empty param overwrite a real direct one.
+                let mut expanded: HashMap<String, Json> = HashMap::new();
+                let mut direct: Vec<(String, Json)> = Vec::new();
                 let mut excluded_aps = false;
                 for (name, params) in &slot.bidders {
                     if name.eq_ignore_ascii_case("aps") {
-                        // Trusted Server APS is a separate OpenRTB provider. Never
-                        // send native APS demand through PBS for the same cohort.
+                        // APS is served by its own OpenRTB provider, never PBS.
                         excluded_aps = true;
                         continue;
                     }
                     if name == TRUSTED_SERVER_BIDDER {
-                        bidder.extend(expand_trusted_server_bidders(&self.config.bidders, params));
-                        bidder.retain(|name, _| {
+                        expanded.extend(expand_trusted_server_bidders(&self.config.bidders, params));
+                        expanded.retain(|name, _| {
                             let keep = !name.eq_ignore_ascii_case("aps");
                             excluded_aps |= !keep;
                             keep
                         });
-                    } else if self.config.bidders.iter().any(|b| b == name) {
-                        bidder.insert(name.clone(), params.clone());
+                    } else if self.config.bidders.iter().any(|bidder| bidder == name) {
+                        direct.push((name.clone(), params.clone()));
                     } else {
-                        // Any other unrecognized key is likely a misconfiguration (a
-                        // slot bidder absent from `config.bidders`) that silently
-                        // yields an empty bidder map and a stored-request no-bid —
-                        // log it so the drop is diagnosable.
                         log::debug!(
                             "prebid: dropping slot '{}' bidder '{}' — not in config.bidders and not a known provider key",
                             slot.id,
                             name
                         );
                     }
+                }
+
+                let mut bidder = expanded;
+                // Track direct entries separately so diagnostics distinguish a
+                // publisher-supplied invalid value from a fabricated expansion.
+                let mut slot_supplied = HashSet::new();
+                for (name, params) in direct {
+                    let clobbers_real = is_unusable_bidder_params(&params)
+                        && bidder
+                            .get(&name)
+                            .is_some_and(|existing| !is_unusable_bidder_params(existing));
+                    if !clobbers_real {
+                        slot_supplied.insert(name.clone());
+                        bidder.insert(name, params);
+                    }
+                }
+
+                // Apply canonical and compatibility-derived rules before
+                // discarding unusable values: an override can populate one.
+                for (name, params) in &mut bidder {
+                    self.bid_param_override_engine
+                        .apply(BidParamOverrideFacts { bidder: name, zone }, params);
+                }
+
+                let mut dropped_slot_supplied = Vec::new();
+                let mut dropped_fabricated = Vec::new();
+                bidder.retain(|name, params| {
+                    if is_unusable_bidder_params(params) {
+                        if slot_supplied.contains(name) {
+                            dropped_slot_supplied.push(name.clone());
+                        } else {
+                            dropped_fabricated.push(name.clone());
+                        }
+                        return false;
+                    }
+                    true
+                });
+                if !dropped_slot_supplied.is_empty() {
+                    dropped_slot_supplied.sort();
+                    log::warn!(
+                        "prebid: dropping slot '{}' bidders [{}] — slot supplied empty or non-object params; slot falls back to its stored request",
+                        slot.id,
+                        dropped_slot_supplied.join(", ")
+                    );
+                }
+                if !dropped_fabricated.is_empty() {
+                    dropped_fabricated.sort();
+                    log::debug!(
+                        "prebid: dropping slot '{}' bidders [{}] — expansion fabricated empty params and no override rule filled them; slot falls back to its stored request",
+                        slot.id,
+                        dropped_fabricated.join(", ")
+                    );
                 }
 
                 if excluded_aps && bidder.is_empty() {
@@ -1604,18 +1662,11 @@ impl PrebidAuctionProvider {
                     return None;
                 }
 
-                // When no inline PBS bidder params exist (e.g. creative-opportunity slots
-                // whose PBS params live in stored requests), tell PBS to resolve bidder
-                // config from the stored request keyed by this slot ID.
+                // With no eligible inline PBS bidder params, PBS resolves the
+                // configured bidder data from the stored request for this slot.
                 let storedrequest = bidder.is_empty().then(|| ImpStoredRequest {
                     id: slot.id.clone(),
                 });
-
-                // Apply canonical and compatibility-derived rules in normalized order.
-                for (name, params) in &mut bidder {
-                    self.bid_param_override_engine
-                        .apply(BidParamOverrideFacts { bidder: name, zone }, params);
-                }
 
                 Some(Imp {
                     id: Some(slot.id.clone()),
@@ -6793,6 +6844,92 @@ set = { placementId = "explicit_header" }
             prebid["bidder"]["kargo"]["placementId"], "client_123",
             "should use inline bidder params from trustedServer expansion"
         );
+    }
+
+    #[test]
+    fn to_openrtb_drops_fabricated_empty_bidder_params() {
+        let mut config = base_config();
+        config.bidders = vec![
+            "kargo".to_string(),
+            "triplelift".to_string(),
+            "criteo".to_string(),
+        ];
+        let slot = make_ts_slot(
+            "ad-header-0",
+            &json!({ "kargo": { "placementId": "kn1" } }),
+            None,
+        );
+
+        let request = make_auction_request(vec![slot]);
+        let ortb = call_to_openrtb(config, &request);
+        let params = bidder_params(&ortb);
+        assert_eq!(params["kargo"]["placementId"], "kn1");
+        assert!(
+            !params.contains_key("triplelift") && !params.contains_key("criteo"),
+            "should omit fabricated empty bidder params PBS rejects"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_direct_params_win_over_fabricated_empty_params() {
+        let mut config = base_config();
+        config.bidders = vec!["kargo".to_string(), "triplelift".to_string()];
+
+        for _ in 0..64 {
+            let slot = make_slot(
+                "ad-header-0",
+                HashMap::from([
+                    ("kargo".to_string(), json!({ "placementId": "direct-1" })),
+                    (
+                        TRUSTED_SERVER_BIDDER.to_string(),
+                        json!({ BIDDER_PARAMS_KEY: { "triplelift": { "inventoryCode": "tl-1" } } }),
+                    ),
+                ]),
+            );
+            let request = make_auction_request(vec![slot]);
+            let ortb = call_to_openrtb(config.clone(), &request);
+            let params = bidder_params(&ortb);
+            assert_eq!(params["kargo"]["placementId"], "direct-1");
+            assert_eq!(params["triplelift"]["inventoryCode"], "tl-1");
+        }
+    }
+
+    #[test]
+    fn to_openrtb_direct_empty_params_do_not_clobber_expanded_params() {
+        let mut config = base_config();
+        config.bidders = vec!["kargo".to_string()];
+
+        for _ in 0..64 {
+            let slot = make_slot(
+                "ad-header-0",
+                HashMap::from([
+                    ("kargo".to_string(), json!({})),
+                    (
+                        TRUSTED_SERVER_BIDDER.to_string(),
+                        json!({ BIDDER_PARAMS_KEY: { "kargo": { "placementId": "ts-1" } } }),
+                    ),
+                ]),
+            );
+            let request = make_auction_request(vec![slot]);
+            let ortb = call_to_openrtb(config.clone(), &request);
+            let params = bidder_params(&ortb);
+            assert_eq!(params["kargo"]["placementId"], "ts-1");
+        }
+    }
+
+    #[test]
+    fn to_openrtb_drops_non_object_bidder_params() {
+        let mut config = base_config();
+        config.bidders = vec!["kargo".to_string()];
+        let slot = make_slot(
+            "ad-header-0",
+            HashMap::from([("kargo".to_string(), Json::Null)]),
+        );
+
+        let ortb = call_to_openrtb(config, &make_auction_request(vec![slot]));
+        let prebid = &ortb.imp[0].ext.as_ref().expect("should have imp ext")["prebid"];
+        assert!(prebid.get("bidder").is_none());
+        assert_eq!(prebid["storedrequest"]["id"], "ad-header-0");
     }
 
     #[test]
