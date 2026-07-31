@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { runtimeUrl } from "../../helpers/state.js";
 
 const RUNNER_URL = "https://client.aps.amazon-adsystem.com/prebid-creative.js";
@@ -18,7 +18,32 @@ function clientAuctionBundlePaths() {
     return {
         gpt: resolve(TSJS_CRATE, "dist/tsjs-gpt.js"),
         prebid: resolve(TSJS_CRATE, "dist/prebid", manifest.filename),
+        shim: resolve(TSJS_CRATE, "dist/tsjs-prebid.js"),
     };
+}
+
+/**
+ * Load the client auction scripts in the order the server serves them.
+ *
+ * A coupled external bundle ships Prebid.js with the tsjs shim (and the
+ * trustedServer adapter) already installed. A decoupled external bundle is
+ * pure Prebid.js and stamps its manifest on `window.__tsjs_prebid_bundle`;
+ * the shim then arrives as the separately served deferred tsjs module, so
+ * this helper loads it whenever the stamp is present.
+ */
+async function loadClientAuctionBundles(page: Page): Promise<void> {
+    const bundles = clientAuctionBundlePaths();
+    await page.addScriptTag({ path: bundles.gpt });
+    await page.addScriptTag({ path: bundles.prebid });
+    const decoupledBundle = await page.evaluate(() =>
+        Boolean(
+            (window as unknown as { __tsjs_prebid_bundle?: unknown })
+                .__tsjs_prebid_bundle,
+        ),
+    );
+    if (decoupledBundle) {
+        await page.addScriptTag({ path: bundles.shim });
+    }
 }
 
 function descriptor(
@@ -210,9 +235,7 @@ test.describe("APS opaque renderer", () => {
         });
 
         await page.goto(runtimeUrl("/aps-prebid-adapter-test"));
-        const bundles = clientAuctionBundlePaths();
-        await page.addScriptTag({ path: bundles.gpt });
-        await page.addScriptTag({ path: bundles.prebid });
+        await loadClientAuctionBundles(page);
 
         const result = await page.evaluate(async () => {
             type PrebidBid = {
