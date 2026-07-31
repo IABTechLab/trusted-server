@@ -6,7 +6,7 @@ until its open questions (§7) are resolved in a dedicated issue**
 **Issue references:** none yet (this spec exists to force one; #778 does not
 cover this feature)
 **Related specs:** `2026-07-30-pluggable-providers-design.md`
-**Last updated:** 2026-07-30
+**Last updated:** 2026-07-31
 
 > **Context.** PR #838 shipped, undeclared and unspec'd, a second provider
 > _type_: a "client-cycle" EC provider whose identifier is established by a
@@ -52,9 +52,10 @@ Everything in this spec follows from that.
 
 1. **Reject cross-site requests.** Require a same-site assertion: `Origin`
    (or `Sec-Fetch-Site: same-origin/same-site`) validated against the
-   publisher's origin set; requests without a validating header are
-   rejected. CSRF-token designs are acceptable but not required if
-   origin-based rejection is enforced.
+   publisher's origin allowlist — configuration that does not exist yet and
+   must be defined by this feature (§7, question 5); requests without a
+   validating header are rejected. CSRF-token designs are acceptable but not
+   required if origin-based rejection is enforced.
 2. **Verify the payload cryptographically per provider.** The provider's
    `resolve_from_client` accepts only payloads that are signed by an
    expected party, **audience-bound** to this publisher, and **expiring**
@@ -83,7 +84,11 @@ Everything in this spec follows from that.
   endpoint is cheap-idempotent and rate-limited per session; the design must
   state which and test it.
 - The JS module ships through the standard integration bundle mechanism,
-  loaded only when a client-cycle provider is the selected EC provider.
+  loaded only when a client-cycle provider is the selected EC provider. Note
+  the consequence: bundle content becomes a function of EC configuration,
+  which interacts with the bundle's content-hash/SRI pinning and caching —
+  the mechanism today keys off the integration registry, not EC provider
+  selection (open question, §7).
 - Any constant shared between Rust and TS (endpoint path, marker name) is
   asserted equal by a test, not "kept in sync by hand".
 
@@ -118,3 +123,10 @@ sentence as the only guardrail.
 3. Rate limiting / abuse posture at the edge for an unauthenticated POST.
 4. Whether the endpoint should be versioned separately from the identify
    API family it sits beside.
+5. The shape of the publisher **origin allowlist** that §3.1 validates
+   against — no such configuration exists today (`publisher.origin_url` is
+   a single upstream and the cookie domain is a cookie scope, not an origin
+   set), so it is new settings surface this feature must define.
+6. How JS module selection keyed off EC provider configuration coexists
+   with content-hashed/SRI-pinned bundles (§4) — per-config hashes, cache
+   keying, and the config-push story for them.

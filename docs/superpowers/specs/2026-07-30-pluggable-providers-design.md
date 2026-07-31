@@ -6,7 +6,7 @@
 **Related specs:** `2026-07-30-permission-model-design.md`,
 `2026-07-30-provider-migration-rollout-design.md`,
 `2026-07-30-client-cycle-ec-resolve-design.md`
-**Last updated:** 2026-07-30
+**Last updated:** 2026-07-31
 
 > **Context.** PR #838 proposed a first implementation of this epic in a single
 > change. Review of that PR surfaced design gaps this spec exists to close
@@ -33,9 +33,11 @@ Goals:
 - Defaults are neutral: with no configuration, no EC is created, device
   classification uses only the User-Agent, and no geolocation is performed. A
   default deployment makes no third-party or host-specific call.
-- A provider **declares** the permissions its data use requires (see the
+- An **EC provider declares** the permissions its data use requires (see the
   permission model spec); **core enforces** that declaration. A provider
-  cannot authorize itself.
+  cannot authorize itself. (Geo and device providers are governed
+  differently — they execute as _inputs_ to permission resolution and cannot
+  be gated on its output; see §5.)
 - All adapters (Fastly, Axum, Cloudflare, Spin) behave identically for
   identical configuration, or fail loudly at startup where a host cannot
   satisfy the selected provider.
@@ -71,6 +73,14 @@ provider = "builtin"
 provider = "platform"
 ```
 
+**Deliberately not carried over from PR #838:** the `host-signals` EC
+provider (identity from HMAC over JA4/HTTP-2 TLS fingerprints plus client
+IP). Minting _identity_ from TLS fingerprints is a different privacy
+proposition from device _classification_ (#780) and was specified by no
+issue; if wanted, it returns with its own spec and its own vocabulary
+discussion. A config selecting `provider = "host-signals"` is rejected at
+startup like any unknown key (migration spec §4).
+
 ## 3. The identity lifecycle contract
 
 This is the section PR #838 lacked, and the source of its most structural
@@ -85,15 +95,17 @@ An `EdgeCookieProvider` owns the **complete lifecycle** of the identifiers it
 mints. Every lifecycle operation core performs on an EC value MUST be routed
 through the selected provider:
 
-| Lifecycle operation  | Where core uses it today                                         | Contract                                                                                                                                          |
-| -------------------- | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Mint**             | EC generation on first eligible request                          | Provider returns the identifier (and only core writes the cookie).                                                                                |
-| **Recognize**        | Reading `ts-ec` back from the request; deciding `ec_was_present` | Provider validates that a returned cookie value is one of its identifiers. A value the selected provider does not recognize is treated as absent. |
-| **Hash / normalize** | KV identity-graph keys, log redaction                            | Provider (or a provider-supplied codec) maps an identifier to its stable KV key form.                                                             |
-| **Tombstone**        | Withdrawal: expiring the cookie and writing revocation markers   | The identifiers eligible for tombstoning are exactly those the provider recognizes — never a shape-gated subset.                                  |
+| Lifecycle operation       | Where core uses it today                                                                      | Contract                                                                                                                                                                                                                                                                                |
+| ------------------------- | --------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Mint**                  | EC generation on first eligible request                                                       | Provider returns the identifier (and only core writes the cookie).                                                                                                                                                                                                                      |
+| **Recognize**             | Reading `ts-ec` back from the request; deciding `ec_was_present`                              | Provider validates that a returned cookie value is one of its identifiers. A value the selected provider does not recognize is treated as absent.                                                                                                                                       |
+| **Key for the graph row** | KV identity-graph row reads/writes                                                            | The row key is the identifier **verbatim**; the provider guarantees its identifiers are stable and KV-safe.                                                                                                                                                                             |
+| **Hash prefix**           | IP-cluster sizing (`cluster_trust_threshold` prefix listing), pull-sync dedupe, log redaction | Provider maps an identifier to its hash prefix. This prefix **deliberately collides** across identifiers minted from the same client evidence — the collision is load-bearing for cluster-trust counting, and a provider that returns a unique-per-identifier value silently breaks it. |
+| **Tombstone**             | Withdrawal: expiring the cookie and writing revocation markers                                | The identifiers eligible for tombstoning are exactly those the provider recognizes — never a shape-gated subset.                                                                                                                                                                        |
 
 **Invariant:** for every provider `P` and every identifier `id` minted by `P`,
-`P.recognize(id)` is true, `P` produces a stable KV key for `id`, and a
+`P.recognize(id)` is true, `P` produces a stable hash prefix for `id` (and
+two identifiers minted from the same client evidence share it), and a
 withdrawal request carrying `id` tombstones it. A conformance test suite MUST
 assert this round-trip for every shipped provider, and the suite MUST be
 written so a future provider crate can run it against its own implementation.
@@ -110,7 +122,8 @@ NOT ship without a caller:
 - `IdentityInput.permissions` / `IdentityInput.consent` (ignored by all
   built-ins),
 - `DeviceProvider::required_permissions` / `GeoProvider::required_permissions`
-  **unless** the enforcement point of §5 lands in the same change.
+  — dropped entirely, not deferred: §5 explains why these two kinds cannot
+  be permission-gated at all.
 
 If a future feature needs one of these, it arrives with that feature.
 
@@ -126,23 +139,35 @@ pub trait EdgeCookieProvider {
     fn generate(&self, input: &IdentityInput<'_>) -> Result<EcId, Report<EcError>>;
     /// Whether `value` is an identifier this provider minted.
     fn recognize(&self, value: &str) -> bool;
-    /// Stable KV key form of a recognized identifier.
-    fn kv_key(&self, id: &EcId) -> KvKey;
+    /// Hash prefix of a recognized identifier (see §3: collides by design
+    /// across identifiers minted from the same client evidence).
+    fn hash_prefix(&self, id: &EcId) -> HashPrefix;
 }
 ```
 
-(Names indicative; the shape is normative.)
+(Names indicative; the shape is normative. `required_permissions` joins the
+trait at step 5 of §11, together with its enforcement point.)
 
-## 5. Permission enforcement is core's job — for all three provider kinds
+## 5. Permission enforcement is core's job — for EC providers
 
-Before executing **any** provider (EC, device, or geo), core resolves the
-request's permission set (see the permission model spec) and refuses to run a
-provider whose `required_permissions()` are not all set. PR #838 declared this
-method on all three traits but consulted it only for the EC provider; the
-device and geo declarations were decorative. That is worse than absent — it
-reads as a gate and is not one. The enforcement point MUST be a single shared
-code path used by all three provider kinds, with a test per kind proving a
-provider declaring an unset permission does not execute.
+Before executing an **EC provider**, core resolves the request's permission
+set (see the permission model spec) and refuses to run a provider whose
+`required_permissions()` are not all set, with a test proving a provider
+declaring an unset permission does not execute.
+
+This gate applies to EC providers **only**, and the reason is structural,
+not convenience: the permission set is resolved _from_ jurisdiction, which
+is resolved _by_ the geo provider — gating geo (or device, which runs in
+the same pre-resolution phase) on the resolved set would be circular.
+PR #838 declared `required_permissions` on all three traits but consulted
+it only for the EC provider; the geo and device declarations were
+decorative — worse than absent, because they read as a gate and are not
+one. This spec resolves that by **not having** the method on those traits
+(§4). Geo and device providers are governed by explicit operator selection,
+the capability checks of §6, and the permission model's vocabulary rule: if
+a future vocabulary adds a purpose covering geolocation or fingerprinting,
+gating those providers will require a two-phase resolution design specified
+at that time (permission model spec §7).
 
 ## 6. Selection, validation, and failure modes
 
@@ -158,9 +183,9 @@ startup error, never a request-time error and never a silent behavior change.
 | No `provider`, no providers block                                                                                                                    | Valid: the neutral default for that concern.                                                                                                                                                                                                |
 
 Unknown fields inside every provider config block are rejected
-(`deny_unknown_fields` on all new settings structs — PR #838 applied it to
-`Ec` but not to `EcProviders`, `DeviceConfig`, or `GeoConfig`, so a typo like
-`providr` was silently ignored).
+(`deny_unknown_fields` on all new settings structs — the pre-existing `Ec`
+struct already has it, but PR #838 shipped `EcProviders`, `DeviceConfig`,
+and `GeoConfig` without it, so a typo like `providr` was silently ignored).
 
 ## 7. Composition root and adapter parity
 
@@ -210,15 +235,16 @@ prominent in release notes:
 "fastly"`; the migration guide lists this as a behavior-preserving step for
   Fastly deployments.
 - **Geo.** With no geo provider, jurisdiction resolution falls to the
-  configured default country. The permission model spec (§5) constrains this
-  combination so it cannot silently grant permissions to mis-attributed
-  traffic.
+  configured default country. The permission model spec (§5.3) constrains
+  this combination so it cannot silently grant permissions to mis-attributed
+  traffic, and §11 below sequences the default flip so the constraint exists
+  before the flip does.
 
 ## 10. Testing strategy
 
 - Provider conformance suite (§3 invariant) run against every shipped
   provider.
-- Enforcement tests per provider kind (§5).
+- EC permission-enforcement tests (§5).
 - Settings validation tests for every row of the §6 table, including the
   block-without-selector rejection.
 - Parity suite additions of §7.
@@ -232,8 +258,19 @@ prominent in release notes:
    ID-stability vectors).
 2. Settings selection + validation table.
 3. Composition root + all four adapters wired through it, parity cases.
-4. Device and geo providers with the shared enforcement point of §5.
+4. Device and geo provider selection. **The geo neutral default does not
+   flip in this step**: under the current jurisdiction gate, absent geo
+   resolves to `Unknown`, which fails closed — flipping the default here
+   would zero EC issuance for every deployment that had not yet opted into
+   `[geo] provider = "platform"`. Until step 5, the Fastly adapter's geo
+   selection defaults to `platform` (today's always-on behavior); the
+   selector exists, only its default is held back.
+5. The permission model PR: flips the geo default to none **in the same
+   change** that introduces the `default_country` fallback and the §5.3
+   acknowledgment guard, and adds the EC permission-enforcement point of
+   §5; `required_permissions()` appears on the EC trait in this step, not
+   before (per the §4 minimalism rule).
 
-Each step is independently reviewable; none depends on the permission model
-landing first (the EC gate keeps its current jurisdiction logic until the
-permission model PR replaces it).
+Steps 1–4 are independently reviewable, behavior-preserving, and do not
+depend on the permission model: the EC gate keeps its current jurisdiction
+logic until the permission model PR replaces it.
