@@ -1949,7 +1949,7 @@ mod tests {
     }
 
     #[test]
-    fn js_module_ids_exclude_prebid_and_include_core_js_only_modules() {
+    fn js_module_ids_defer_prebid_and_include_core_js_only_modules() {
         let settings = crate::test_support::tests::create_test_settings();
         let mut settings_with_prebid = settings;
         settings_with_prebid
@@ -1975,8 +1975,8 @@ mod tests {
         let deferred = registry.js_module_ids_deferred();
 
         assert!(
-            !all.contains(&"prebid"),
-            "should not include prebid in embedded TSJS module IDs"
+            all.contains(&"prebid"),
+            "should include the prebid shim in embedded TSJS module IDs"
         );
         assert!(
             immediate.contains(&"creative"),
@@ -1991,8 +1991,8 @@ mod tests {
             "should not include prebid in immediate IDs"
         );
         assert!(
-            !deferred.contains(&"prebid"),
-            "should not include prebid in deferred IDs"
+            deferred.contains(&"prebid"),
+            "should serve the prebid shim as a deferred module"
         );
     }
 
@@ -2077,7 +2077,7 @@ mod tests {
     }
 
     #[test]
-    fn js_module_ids_exclude_prebid_when_external_bundle_is_configured() {
+    fn js_module_ids_defer_prebid_shim_when_external_bundle_is_configured() {
         let mut settings = crate::test_support::tests::create_test_settings();
         settings
             .integrations
@@ -2094,16 +2094,16 @@ mod tests {
         let registry = IntegrationRegistry::new(&settings).expect("should create registry");
 
         assert!(
-            !registry.js_module_ids().contains(&"prebid"),
-            "external bundle mode should not include prebid in embedded TSJS modules"
+            registry.js_module_ids().contains(&"prebid"),
+            "external bundle mode should include the prebid shim in embedded TSJS modules"
         );
         assert!(
             !registry.js_module_ids_immediate().contains(&"prebid"),
-            "external bundle mode should not include prebid in immediate TSJS modules"
+            "the prebid shim should not load in the immediate TSJS bundle"
         );
         assert!(
-            !registry.js_module_ids_deferred().contains(&"prebid"),
-            "external bundle mode should not include prebid in deferred TSJS modules"
+            registry.js_module_ids_deferred().contains(&"prebid"),
+            "the prebid shim should load as a deferred TSJS module"
         );
         assert!(
             registry.has_route(&Method::GET, "/integrations/prebid/bundle.js"),

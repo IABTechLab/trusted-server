@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
+
 import envelope from '../../fixtures/aps-renderer-v1.json';
 
 function apsRenderer() {

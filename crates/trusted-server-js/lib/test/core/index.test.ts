@@ -1,10 +1,16 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
-declare global {
-  interface Window {
-    tsjs?: any;
-  }
+interface TsjsTestWindow {
+  tsjs?: {
+    que?: Array<() => void>;
+    version?: string;
+    setConfig?: unknown;
+    getConfig?: unknown;
+    log?: unknown;
+  } & Record<string, unknown>;
 }
+
+const testWindow = window as unknown as TsjsTestWindow;
 
 const ORIGINAL_FETCH = global.fetch;
 
@@ -12,7 +18,7 @@ describe('core/index', () => {
   beforeEach(async () => {
     await vi.resetModules();
     document.body.innerHTML = '';
-    delete (window as any).tsjs;
+    delete testWindow.tsjs;
   });
 
   afterEach(() => {
@@ -41,7 +47,7 @@ describe('core/index', () => {
   });
 
   it('preserves edge-injected adSlots and bids set before the bundle loads', async () => {
-    (window as any).tsjs = {
+    testWindow.tsjs = {
       adSlots: [{ id: 'pre-injected' }],
       bids: { 'pre-injected': { hb_pb: '1.00' } },
     };
@@ -56,7 +62,7 @@ describe('core/index', () => {
     const callback = vi.fn(function () {
       expect(this).toBe(window.tsjs);
     });
-    (window as any).tsjs = { que: [callback] };
+    testWindow.tsjs = { que: [callback] };
 
     await import('../../src/core/index');
 

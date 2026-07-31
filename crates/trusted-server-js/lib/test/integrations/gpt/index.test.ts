@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+/** Window properties these tests read and write on the jsdom global. */
+interface GptTestWindow {
+  googletag?: unknown;
+  tsjs?: Record<string, unknown> & { adInit?: () => void };
+}
+
+const gptTestWindow = window as unknown as GptTestWindow;
+
 // We import installGptShim dynamically so each test can control whether the
 // GPT enable flag is present before module evaluation.
 
@@ -219,14 +227,14 @@ describe('GPT – installSlimPrebidLoader', () => {
 describe('GPT – installTsAdInit', () => {
   beforeEach(() => {
     document.body.innerHTML = '';
-    delete (window as any).tsjs;
-    delete (window as any).googletag;
+    delete gptTestWindow.tsjs;
+    delete gptTestWindow.googletag;
   });
 
   afterEach(() => {
     document.body.innerHTML = '';
-    delete (window as any).tsjs;
-    delete (window as any).googletag;
+    delete gptTestWindow.tsjs;
+    delete gptTestWindow.googletag;
   });
 
   it('clears stale TS-managed targeting before applying a new route to a reused GPT slot', async () => {
@@ -240,7 +248,13 @@ describe('GPT – installTsAdInit', () => {
       ['ts_initial', ['1']],
       ['pos', ['old-pos']],
     ]);
-    const gptSlot: any = {
+    interface GptTestSlot {
+      getSlotElementId: () => string;
+      getTargeting: (key: string) => string[];
+      setTargeting: (key: string, value: string | string[]) => GptTestSlot;
+      clearTargeting: (key?: string) => GptTestSlot;
+    }
+    const gptSlot: GptTestSlot = {
       getSlotElementId: vi.fn(() => 'div-ad-homepage-header'),
       getTargeting: vi.fn((key: string) => slotTargeting.get(key) ?? []),
       setTargeting: vi.fn((key: string, value: string | string[]) => {
@@ -269,14 +283,14 @@ describe('GPT – installTsAdInit', () => {
     };
 
     document.body.innerHTML = '<div id="div-ad-homepage-header"></div>';
-    (window as any).googletag = {
+    gptTestWindow.googletag = {
       cmd,
       pubads: () => pubads,
       defineSlot: vi.fn(),
       destroySlots: vi.fn(),
       enableServices: vi.fn(),
     };
-    (window as any).tsjs = {
+    gptTestWindow.tsjs = {
       prevSlotTargetingKeys: {
         'div-ad-homepage-header': ['pos'],
       },
@@ -293,7 +307,7 @@ describe('GPT – installTsAdInit', () => {
     };
 
     installTsAdInit();
-    (window as any).tsjs.adInit();
+    gptTestWindow.tsjs?.adInit?.();
 
     expect(gptSlot.clearTargeting).toHaveBeenCalledWith('hb_pb');
     expect(gptSlot.clearTargeting).toHaveBeenCalledWith('hb_bidder');

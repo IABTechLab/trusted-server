@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+
 import { createBeaconGuard, BeaconGuardConfig } from '../../src/shared/beacon_guard';
 
 describe('Beacon Guard', () => {
@@ -14,12 +15,10 @@ describe('Beacon Guard', () => {
     originalFetch = window.fetch;
 
     // Create spies that simulate real sendBeacon/fetch behaviour
-    sendBeaconSpy = vi.fn((_url: string | URL, _data?: BodyInit | null) => true);
+    sendBeaconSpy = vi.fn(() => true);
     navigator.sendBeacon = sendBeaconSpy;
 
-    fetchSpy = vi.fn((_input: RequestInfo | URL, _init?: RequestInit) =>
-      Promise.resolve(new Response('', { status: 200 }))
-    );
+    fetchSpy = vi.fn(() => Promise.resolve(new Response('', { status: 200 })));
     window.fetch = fetchSpy;
 
     config = {

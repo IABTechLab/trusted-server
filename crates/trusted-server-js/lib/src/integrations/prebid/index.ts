@@ -11,21 +11,7 @@
 // The shim on requestBids injects "trustedServer" into every ad unit so all
 // bids flow through the orchestrator.
 
-import pbjs from 'prebid.js';
-import adapterManager from 'prebid.js/src/adapterManager.js';
-import { markBidAsRendered, markWinner } from 'prebid.js/src/adRendering.js';
-import 'prebid.js/modules/consentManagementTcf.js';
-import 'prebid.js/modules/consentManagementGpp.js';
-import 'prebid.js/modules/consentManagementUsp.js';
-import 'prebid.js/modules/userId.js';
-
-// Client-side bid adapters — self-register with prebid.js on import.
-// The external bundle generator aliases these placeholder modules to temporary
-// modules built from its --adapters and --user-id-modules options. When a bidder
-// is listed in `client_side_bidders` in trusted-server.toml, the requestBids
-// shim leaves its bids untouched and the corresponding adapter handles them
-// natively in the browser.
-import './_adapters.generated';
+import type _pbjsDefault from 'prebid.js';
 
 import { log } from '../../core/log';
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
@@ -33,8 +19,48 @@ import { registerApsPrebidRenderer, validateApsRenderer } from '../aps/render';
 import type { AuctionBid, AuctionEid } from '../../core/auction';
 import type { AuctionSlot } from '../../core/types';
 
-import { INCLUDED_PREBID_USER_ID_MODULES } from './_user_ids.generated';
 import { PREBID_USER_ID_MODULE_REGISTRY } from './user_id_modules';
+
+/**
+ * Prebid.js public API surface (type-only; erased at build time).
+ *
+ * `getUserIdsAsEids` is added by the userId module at runtime, which the base
+ * package typing does not model.
+ */
+type PbjsGlobal = typeof _pbjsDefault & {
+  getUserIdsAsEids?: () => unknown[];
+};
+
+// Prebid.js itself is NOT bundled into this module. It is served as the
+// external bundle configured via `integrations.prebid.external_bundle_url`
+// (required whenever the prebid integration is enabled) and owns the
+// `window.pbjs` global. The Rust head injector emits a stub
+// (`window.pbjs = window.pbjs || {que:[],cmd:[]}`) before any script runs and
+// Prebid.js installs its API onto that same object, so capturing the reference
+// at module scope is safe regardless of evaluation order.
+const pbjs: PbjsGlobal = (
+  typeof window !== 'undefined'
+    ? // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ((window as any).pbjs ??= { que: [], cmd: [] })
+    : { que: [], cmd: [] }
+) as PbjsGlobal;
+
+/**
+ * Manifest stamped on `window.__tsjs_prebid_bundle` by the external Prebid.js
+ * bundle (see build-prebid-external.mjs): which client-side bid adapters and
+ * user ID modules were compiled into it.
+ */
+interface ExternalPrebidBundleManifest {
+  adapters?: string[];
+  userIdModules?: string[];
+}
+
+function getExternalBundleManifest(): ExternalPrebidBundleManifest | undefined {
+  if (typeof window === 'undefined') {
+    return undefined;
+  }
+  return (window as { __tsjs_prebid_bundle?: ExternalPrebidBundleManifest }).__tsjs_prebid_bundle;
+}
 
 const ADAPTER_CODE = 'trustedServer';
 const APS_BIDDER_CODE = 'aps';
@@ -149,10 +175,11 @@ function readConfiguredUserIdNames(): string[] {
 }
 
 function recordUserIdModuleDiagnostics(): PrebidUserIdDiagnostics {
+  const includedUserIdModules = getExternalBundleManifest()?.userIdModules ?? [];
   const configuredUserIdNames = [...new Set(readConfiguredUserIdNames())].sort();
   const coveredConfigNames = new Set(
     PREBID_USER_ID_MODULE_REGISTRY.filter((entry) =>
-      INCLUDED_PREBID_USER_ID_MODULES.includes(entry.moduleName)
+      includedUserIdModules.includes(entry.moduleName)
     ).flatMap((entry) => entry.configNames)
   );
   const missingConfiguredUserIdNames = configuredUserIdNames.filter(
@@ -160,7 +187,7 @@ function recordUserIdModuleDiagnostics(): PrebidUserIdDiagnostics {
   );
 
   const diagnostics: PrebidUserIdDiagnostics = {
-    includedModules: [...INCLUDED_PREBID_USER_ID_MODULES],
+    includedModules: [...includedUserIdModules],
     configuredUserIdNames,
     missingConfiguredUserIdNames,
   };
@@ -888,18 +915,56 @@ function installApsBidResponseRegistry(): void {
       return;
     }
 
-    registerApsPrebidRenderer(bid['adId'], bid['adUnitCode'], renderer, bid['ttl'], {
-      markWinner: () => markWinner(rawBid),
-      markRendered: () => markBidAsRendered(rawBid),
-    });
-    // Keep the executable capability only in the bounded, one-time registry. Prebid
-    // still owns the generated ad ID and ordinary GAM targeting on this bid object.
-    delete bid[APS_RENDERER_FIELD];
+    // Public-API replacement for the prebid.js internals previously imported
+    // from src/adRendering.js: `markWinningBidAsUsed({adId, events:true})`
+    // marks the bid as winning (BID_WON analytics) and as rendered in one call.
+    const markUsed = () => {
+      const marker = (
+        pbjs as unknown as {
+          markWinningBidAsUsed?: (options: { adId: string; events?: boolean }) => void;
+        }
+      ).markWinningBidAsUsed;
+      if (typeof marker === 'function') {
+        marker({ adId: String(bid['adId']), events: true });
+      }
+    };
+    const registered = registerApsPrebidRenderer(
+      bid['adId'],
+      bid['adUnitCode'],
+      renderer,
+      bid['ttl'],
+      {
+        markWinner: markUsed,
+        markRendered: () => {
+          // Rendered state is covered by markWinningBidAsUsed in markWinner;
+          // kept as a distinct callback to satisfy the registry contract.
+        },
+      }
+    );
+    if (registered) {
+      // Keep the executable capability only in the bounded, one-time registry. Prebid
+      // still owns the generated ad ID and ordinary GAM targeting on this bid object.
+      delete bid[APS_RENDERER_FIELD];
+    } else {
+      log.warn('[tsjs-prebid] rejected APS renderer capability that failed registration');
+    }
   });
   prebid[APS_BID_RESPONSE_LISTENER_SENTINEL] = true;
 }
 
 export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs {
+  // The prebid integration requires the external Prebid.js bundle
+  // (integrations.prebid.external_bundle_url). When it failed to load (network
+  // error, SRI mismatch) window.pbjs is still the head-injected stub with no
+  // API — installing the adapter is impossible, so bail out loudly.
+  if (typeof (pbjs as { registerBidAdapter?: unknown }).registerBidAdapter !== 'function') {
+    log.error(
+      '[tsjs-prebid] window.pbjs has no Prebid.js API — the external Prebid bundle ' +
+        'failed to load. Prebid integration disabled.'
+    );
+    return pbjs;
+  }
+
   publisherAdUnitSnapshots = new Map();
   pendingPublisherBids = new Map();
   pendingPublisherCodes = new Map();
@@ -1127,24 +1192,27 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   pbjs.processQueue();
   recordUserIdModuleDiagnostics();
 
-  // Validate that every client-side bidder has its adapter registered.
-  // Adapters self-register on import, so a missing adapter means the bidder
-  // was listed in client_side_bidders but not included in the generated
-  // external Prebid bundle. Without the adapter the bidder is silently dropped
-  // from both server-side and client-side auctions.
-  for (const bidder of clientSideBidders) {
-    try {
-      if (!adapterManager.getBidAdapter(bidder)) {
+  // Validate that every client-side bidder has its adapter compiled into the
+  // external Prebid.js bundle. The bundle stamps its adapter list on
+  // window.__tsjs_prebid_bundle; a missing adapter means the bidder was listed
+  // in client_side_bidders but not included in the generated bundle, so it is
+  // silently dropped from both server-side and client-side auctions.
+  const bundledAdapters = getExternalBundleManifest()?.adapters;
+  if (bundledAdapters === undefined) {
+    if (clientSideBidders.size > 0) {
+      log.warn(
+        '[tsjs-prebid] external Prebid bundle did not stamp an adapter manifest; ' +
+          'cannot verify client_side_bidders adapters'
+      );
+    }
+  } else {
+    for (const bidder of clientSideBidders) {
+      if (!bundledAdapters.includes(bidder)) {
         log.error(
-          `[tsjs-prebid] client-side bidder "${bidder}" has no adapter loaded. ` +
-            `Add it to build-prebid-external.mjs --adapters.`
+          `[tsjs-prebid] client-side bidder "${bidder}" has no adapter in the external ` +
+            `Prebid bundle. Add it to build-prebid-external.mjs --adapters.`
         );
       }
-    } catch {
-      log.error(
-        `[tsjs-prebid] client-side bidder "${bidder}" has no adapter loaded. ` +
-          `Add it to build-prebid-external.mjs --adapters.`
-      );
     }
   }
 

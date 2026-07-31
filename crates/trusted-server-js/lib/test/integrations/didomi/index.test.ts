@@ -5,7 +5,7 @@ import { installDidomiSdkProxy } from '../../../src/integrations/didomi';
 const ORIGINAL_WINDOW = global.window;
 
 type TestDidomiWindow = Window & {
-  didomiConfig?: any;
+  didomiConfig?: Record<string, unknown>;
   __tsjs_didomi?: { proxyPath?: string };
 };
 
@@ -20,11 +20,11 @@ describe('integrations/didomi', () => {
 
   beforeEach(() => {
     testWindow = createWindow('https://example.com/page');
-    Object.assign(globalThis as any, { window: testWindow });
+    Object.assign(globalThis as unknown as { window: unknown }, { window: testWindow });
   });
 
   afterEach(() => {
-    Object.assign(globalThis as any, { window: ORIGINAL_WINDOW });
+    Object.assign(globalThis as unknown as { window: unknown }, { window: ORIGINAL_WINDOW });
   });
 
   it('initializes didomiConfig and forces sdkPath through trusted server proxy', () => {
