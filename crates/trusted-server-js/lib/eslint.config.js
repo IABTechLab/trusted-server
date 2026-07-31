@@ -38,7 +38,7 @@ export default [
     },
   },
   // Honor the `_`-prefix convention for intentionally unused bindings in every
-  // linted file — tseslint recommended enables the rule globally, so scoping
+  // linted file: tseslint recommended enables the rule globally, so scoping
   // this to *.ts(x) would leave .mjs at the pattern-less defaults
   {
     rules: {
@@ -48,7 +48,7 @@ export default [
       ],
     },
   },
-  // Node build scripts and Node-run test harnesses — nodeBuiltin, not node,
+  // Node build scripts and Node-run test harnesses use nodeBuiltin, not node,
   // so CommonJS-only names (__dirname, require, module) still fail no-undef
   // in these ES modules
   {

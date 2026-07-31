@@ -1,12 +1,17 @@
-/* eslint-disable @typescript-eslint/no-explicit-any -- mocks and private state are poked via `any`; the file-level opt-out is deliberate */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { installDidomiSdkProxy } from '../../../src/integrations/didomi';
 
 const ORIGINAL_WINDOW = global.window;
 
+// Mirrors the non-exported DidomiConfig shape in src/integrations/didomi.
+type TestDidomiConfig = {
+  sdkPath?: string;
+  [key: string]: unknown;
+};
+
 type TestDidomiWindow = Window & {
-  didomiConfig?: any;
+  didomiConfig?: TestDidomiConfig;
   __tsjs_didomi?: { proxyPath?: string };
 };
 
@@ -21,18 +26,18 @@ describe('integrations/didomi', () => {
 
   beforeEach(() => {
     testWindow = createWindow('https://example.com/page');
-    Object.assign(globalThis as any, { window: testWindow });
+    Object.assign(globalThis, { window: testWindow });
   });
 
   afterEach(() => {
-    Object.assign(globalThis as any, { window: ORIGINAL_WINDOW });
+    Object.assign(globalThis, { window: ORIGINAL_WINDOW });
   });
 
   it('initializes didomiConfig and forces sdkPath through trusted server proxy', () => {
     installDidomiSdkProxy();
 
     expect(testWindow.didomiConfig).toBeDefined();
-    expect(testWindow.didomiConfig.sdkPath).toBe(
+    expect(testWindow.didomiConfig!.sdkPath).toBe(
       'https://example.com/integrations/didomi/consent/'
     );
   });
@@ -53,6 +58,6 @@ describe('integrations/didomi', () => {
 
     installDidomiSdkProxy();
 
-    expect(testWindow.didomiConfig.sdkPath).toBe('https://example.com/my-custom-consent/');
+    expect(testWindow.didomiConfig!.sdkPath).toBe('https://example.com/my-custom-consent/');
   });
 });
