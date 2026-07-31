@@ -1,10 +1,15 @@
 import type { GptDiagnosticsRequestCycle } from '../../core/types';
 
 import type { GptDiagnosticsBindingManager } from './binding';
-import type { GptDiagnosticsStoreSlotSnapshot, GptDiagnosticsStoreSnapshot } from './store';
+import type {
+  GptDiagnosticsBindingInput,
+  GptDiagnosticsStoreSlotSnapshot,
+  GptDiagnosticsStoreSnapshot,
+} from './store';
 
 interface BadgeStore {
   snapshot(): GptDiagnosticsStoreSnapshot;
+  bindingInputs(): GptDiagnosticsBindingInput[];
   subscribe(listener: () => void): () => void;
 }
 
@@ -17,6 +22,9 @@ type BadgeWindow = Window & {
   MutationObserver?: typeof MutationObserver;
   ResizeObserver?: typeof ResizeObserver;
 };
+
+const BADGE_MAX_WIDTH_PX = 260;
+const BADGE_EDGE_GUTTER_PX = 4;
 
 interface BadgeOptions {
   window?: BadgeWindow;
@@ -43,6 +51,25 @@ function intersectsViewport(rectangle: DOMRect, window: Window): boolean {
   );
 }
 
+function nodeIntersectsSlotIds(node: Node, slotElementIds: Set<string>): boolean {
+  if (!(node instanceof Element)) return false;
+  if (slotElementIds.has(node.id)) return true;
+  return Array.from(node.querySelectorAll('[id]')).some((element) =>
+    slotElementIds.has(element.id)
+  );
+}
+
+function mutationIntersectsSlotIds(record: MutationRecord, slotElementIds: Set<string>): boolean {
+  if (record.type === 'attributes') {
+    if (!(record.target instanceof Element)) return false;
+    return slotElementIds.has(record.target.id) || slotElementIds.has(record.oldValue ?? '');
+  }
+  if (record.target instanceof Element && slotElementIds.has(record.target.id)) return true;
+  return [...record.addedNodes, ...record.removedNodes].some((node) =>
+    nodeIntersectsSlotIds(node, slotElementIds)
+  );
+}
+
 function formatMilliseconds(value: number | undefined): string | undefined {
   if (value === undefined || !Number.isFinite(value) || value < 0) return undefined;
   if (value >= 1000) return `${Math.round(value / 100) / 10} s`;
@@ -53,6 +80,7 @@ function badgeText(cycle: GptDiagnosticsRequestCycle): string {
   const firstLine: string[] = [];
   if (cycle.isEmpty === true) firstLine.push('Empty');
   else if (cycle.isEmpty === false) firstLine.push('Filled');
+  else if (cycle.renderAtMs !== undefined) firstLine.push('Rendered (fill unknown)');
   else firstLine.push('Pending');
   if (cycle.size) firstLine.push(`${cycle.size[0]}×${cycle.size[1]}`);
 
@@ -85,6 +113,8 @@ export class GptDiagnosticsBadgeManager {
   private readonly scheduleFrame: (callback: () => void) => void;
   private readonly unsubscribeStore: () => void;
   private readonly unsubscribeBindings: () => void;
+  private readonly slotElementIds = new Set<string>();
+  private slots: GptDiagnosticsStoreSlotSnapshot[] = [];
   private layer?: HTMLElement;
   private mutationObserver?: MutationObserver;
   private resizeObserver?: ResizeObserver;
@@ -97,7 +127,12 @@ export class GptDiagnosticsBadgeManager {
     this.window = options.window ?? (window as unknown as BadgeWindow);
     this.document = options.document ?? document;
     this.scheduleFrame = options.scheduleFrame ?? defaultScheduleFrame;
-    this.unsubscribeStore = this.store.subscribe(this.scheduleUpdate);
+    this.refreshSlotElementIds();
+    this.unsubscribeStore = this.store.subscribe(() => {
+      this.refreshSlotElementIds();
+      if (this.layer?.isConnected) this.refreshSlots();
+      this.scheduleUpdate();
+    });
     this.unsubscribeBindings = this.bindings.subscribe(this.scheduleUpdate);
     this.window.addEventListener('scroll', this.scheduleUpdate, { passive: true });
     this.window.addEventListener('resize', this.scheduleUpdate, { passive: true });
@@ -108,6 +143,7 @@ export class GptDiagnosticsBadgeManager {
   setLayer(layer: HTMLElement | undefined): void {
     if (this.destroyed) return;
     this.layer = layer;
+    if (layer?.isConnected) this.refreshSlots();
     this.scheduleUpdate();
   }
 
@@ -116,7 +152,7 @@ export class GptDiagnosticsBadgeManager {
     const observedElements: HTMLElement[] = [];
     const badges: HTMLElement[] = [];
 
-    for (const slot of this.store.snapshot().slots) {
+    for (const slot of this.slots) {
       const cycle = latestCycle(slot);
       if (!cycle) continue;
       const binding = this.bindings.get(slot.runtimeSlotNumber);
@@ -131,12 +167,19 @@ export class GptDiagnosticsBadgeManager {
       badge.className = 'tsgd-badge';
       badge.dataset.runtimeSlot = String(slot.runtimeSlotNumber);
       badge.textContent = badgeText(cycle);
-      badge.style.left = `${Math.max(4, Math.min(rectangle.left, this.window.innerWidth - 264))}px`;
+      badge.style.maxWidth = `${BADGE_MAX_WIDTH_PX}px`;
+      badge.style.left = `${Math.max(
+        BADGE_EDGE_GUTTER_PX,
+        Math.min(rectangle.left, this.window.innerWidth - BADGE_MAX_WIDTH_PX - BADGE_EDGE_GUTTER_PX)
+      )}px`;
       if (rectangle.top >= 56) {
         badge.style.top = `${rectangle.top - 8}px`;
         badge.style.transform = 'translateY(-100%)';
       } else {
-        badge.style.top = `${Math.max(4, rectangle.top + 4)}px`;
+        badge.style.top = `${Math.max(
+          BADGE_EDGE_GUTTER_PX,
+          rectangle.top + BADGE_EDGE_GUTTER_PX
+        )}px`;
       }
       badges.push(badge);
     }
@@ -168,26 +211,30 @@ export class GptDiagnosticsBadgeManager {
     });
   };
 
+  private refreshSlots(): void {
+    this.slots = this.store.snapshot().slots;
+  }
+
+  private refreshSlotElementIds(): void {
+    this.slotElementIds.clear();
+    for (const slot of this.store.bindingInputs()) {
+      if (slot.slotElementId) this.slotElementIds.add(slot.slotElementId);
+    }
+  }
+
   private installMutationObserver(): void {
     const Observer = this.window.MutationObserver;
     if (typeof Observer !== 'function' || !this.document.documentElement) return;
     this.mutationObserver = new Observer((records) => {
-      const slotElementIds = new Set(
-        this.store
-          .snapshot()
-          .slots.map((slot) => slot.slotElementId)
-          .filter((slotElementId): slotElementId is string => Boolean(slotElementId))
-      );
-      const relevant = records.some(
-        (record) =>
-          record.type === 'childList' ||
-          (record.target.nodeType === 1 && slotElementIds.has((record.target as Element).id))
-      );
-      if (relevant) this.scheduleUpdate();
+      if (!this.layer?.isConnected || this.slotElementIds.size === 0) return;
+      if (records.some((record) => mutationIntersectsSlotIds(record, this.slotElementIds))) {
+        this.scheduleUpdate();
+      }
     });
     this.mutationObserver.observe(this.document.documentElement, {
       attributes: true,
       attributeFilter: ['id', 'style', 'class'],
+      attributeOldValue: true,
       childList: true,
       subtree: true,
     });

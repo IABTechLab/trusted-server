@@ -42,6 +42,11 @@ export interface GptDiagnosticsStoreSlotSnapshot {
   requests: GptDiagnosticsRequestCycle[];
 }
 
+export interface GptDiagnosticsBindingInput {
+  runtimeSlotNumber: number;
+  slotElementId?: string;
+}
+
 export interface GptDiagnosticsStoreSnapshot {
   gptObserved: boolean;
   slots: GptDiagnosticsStoreSlotSnapshot[];
@@ -128,8 +133,10 @@ export class GptDiagnosticsStore {
   private readonly now: () => number;
   private readonly schedule: (callback: () => void) => void;
   private readonly slotNumbers = new WeakMap<object, number>();
+  private readonly requestNumbers = new WeakMap<object, number>();
   private readonly slots = new Map<number, MutableSlotRecord>();
   private readonly slotOrder: number[] = [];
+  private readonly slotActivityOrder: number[] = [];
   private readonly listeners = new Set<StoreListener>();
   private readonly coverage = emptyCoverage();
   private readonly callbackIssues: GptDiagnosticsCallbackIssue[] = [];
@@ -168,8 +175,10 @@ export class GptDiagnosticsStore {
       this.metadata.evictedRequestCycles += 1;
     }
 
+    const requestNumber = (this.requestNumbers.get(slot) ?? 0) + 1;
+    this.requestNumbers.set(slot, requestNumber);
     record.requests.push({
-      requestNumber: this.nextRequestNumber(record),
+      requestNumber,
       requestedAtMs: timestampMs,
       durations: {},
       incompleteSequence: false,
@@ -242,7 +251,7 @@ export class GptDiagnosticsStore {
       slot,
       timestampMs,
       (cycle) =>
-        cycle.renderAtMs !== undefined && cycle.isEmpty === false && cycle.loadAtMs === undefined,
+        cycle.renderAtMs !== undefined && cycle.isEmpty !== true && cycle.loadAtMs === undefined,
       (record, cycle) => {
         cycle.loadAtMs = timestampMs;
         if (validDuration(cycle.renderAtMs, timestampMs) === undefined) {
@@ -261,7 +270,7 @@ export class GptDiagnosticsStore {
       timestampMs,
       (cycle) =>
         cycle.renderAtMs !== undefined &&
-        cycle.isEmpty === false &&
+        cycle.isEmpty !== true &&
         cycle.viewableAtMs === undefined,
       (record, cycle) => {
         cycle.viewableAtMs = timestampMs;
@@ -306,6 +315,19 @@ export class GptDiagnosticsStore {
     this.notify();
   }
 
+  bindingInputs(): GptDiagnosticsBindingInput[] {
+    return this.slotOrder.flatMap((runtimeSlotNumber) => {
+      const record = this.slots.get(runtimeSlotNumber);
+      if (!record) return [];
+      return [
+        {
+          runtimeSlotNumber: record.runtimeSlotNumber,
+          slotElementId: record.slotElementId,
+        },
+      ];
+    });
+  }
+
   snapshot(): GptDiagnosticsStoreSnapshot {
     return {
       gptObserved: this.gptObserved,
@@ -348,25 +370,30 @@ export class GptDiagnosticsStore {
       const existingRecord = this.slots.get(existingNumber);
       if (existingRecord) {
         this.refreshSlotMetadata(existingRecord, slot);
+        this.markRecentlyActive(existingNumber);
         return existingRecord;
       }
 
-      this.incrementDisposition(kind, 'unmatched');
-      this.addIssue(
-        kind,
-        { runtimeSlotNumber: existingNumber },
-        timestampMs,
-        'unmatched',
-        'evicted_slot'
-      );
-      this.notify();
-      return undefined;
+      if (kind !== 'slotRequested') {
+        this.incrementDisposition(kind, 'unmatched');
+        this.addIssue(
+          kind,
+          { runtimeSlotNumber: existingNumber },
+          timestampMs,
+          'unmatched',
+          'evicted_slot'
+        );
+        this.notify();
+        return undefined;
+      }
     }
 
     if (this.slots.size >= MAX_DIAGNOSTIC_SLOTS) {
-      const evictedNumber = this.slotOrder.shift();
+      const evictedNumber = this.slotActivityOrder.shift();
       if (evictedNumber !== undefined) {
         this.slots.delete(evictedNumber);
+        const slotIndex = this.slotOrder.indexOf(evictedNumber);
+        if (slotIndex >= 0) this.slotOrder.splice(slotIndex, 1);
         this.metadata.evictedSlots += 1;
       }
     }
@@ -381,6 +408,7 @@ export class GptDiagnosticsStore {
     this.refreshSlotMetadata(record, slot);
     this.slots.set(runtimeSlotNumber, record);
     this.slotOrder.push(runtimeSlotNumber);
+    this.slotActivityOrder.push(runtimeSlotNumber);
     return record;
   }
 
@@ -393,9 +421,10 @@ export class GptDiagnosticsStore {
     );
   }
 
-  private nextRequestNumber(record: MutableSlotRecord): number {
-    const latest = record.requests[record.requests.length - 1];
-    return (latest?.requestNumber ?? 0) + 1;
+  private markRecentlyActive(runtimeSlotNumber: number): void {
+    const previousIndex = this.slotActivityOrder.indexOf(runtimeSlotNumber);
+    if (previousIndex >= 0) this.slotActivityOrder.splice(previousIndex, 1);
+    this.slotActivityOrder.push(runtimeSlotNumber);
   }
 
   private matchCycle(

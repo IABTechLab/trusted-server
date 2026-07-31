@@ -92,7 +92,7 @@ Every observed callback is counted. If a callback cannot be matched safely to a 
 
 ### Keep activation local and explicit
 
-Diagnostics are available only when the integration is enabled for the deployment and the current browser tab has been explicitly activated.
+Diagnostics are available only when the integration is enabled for the deployment and the current browser session has been explicitly activated.
 
 ### Do not alter the ad lifecycle
 
@@ -101,7 +101,7 @@ The diagnostic module observes GPT. It does not gate requests, delay publisher c
 ## Primary User Flow
 
 1. A developer opens a publisher page with `?ts_console=true`.
-2. A small early bootstrap enables diagnostics for the current tab and removes only the activation parameter from the visible URL.
+2. The server establishes a host-only session cookie, conditionally delivers diagnostics, and an early bootstrap removes the activation parameter from the visible URL.
 3. GPT listeners install before the first ad request where integration ordering permits.
 4. The data store begins recording GPT callbacks immediately.
 5. The visual overlay mounts after page startup, without participating in framework hydration.
@@ -109,13 +109,13 @@ The diagnostic module observes GPT. It does not gate requests, delay publisher c
 7. Visible, exactly bound slot elements receive concise badges.
 8. Scrolling, lazy loading, and refreshes update the panel and badges.
 9. The developer exports a versioned JSON snapshot if deeper inspection is needed.
-10. `?ts_console=false` disables the console for the tab.
+10. `?ts_console=false` disables the console for the browser session.
 
 ## Scope
 
 ### In scope
 
-- Client-side tab activation using `ts_console`.
+- Browser-session activation and conditional delivery using `ts_console`.
 - Early, idempotent GPT listener installation.
 - GPT slot identity and exact DOM-element binding.
 - Per-slot initial request and refresh cycles.
@@ -142,7 +142,7 @@ The diagnostic module observes GPT. It does not gate requests, delay publisher c
 
 ```mermaid
 flowchart LR
-    A[ts_console activation bootstrap] --> B[Tab-local active state]
+    A[ts_console server activation gate] --> B[Browser-session active state]
     B --> C[GPT callback listeners]
     C --> D[Bounded slot and request-cycle store]
     D --> E[Derived timings and callback coverage]
@@ -155,7 +155,7 @@ flowchart LR
 
 ### Minimal server responsibility
 
-The server is responsible only for making the diagnostics integration available when configured and placing its bootstrap early enough in the document to observe initial GPT activity.
+The server is responsible for configuration gating, exact directive/cookie parsing, stripping private activation inputs before generic handling, cache-safe conditional module delivery, and placing activation/module tags early enough to observe initial GPT activity.
 
 The server must not:
 
@@ -165,13 +165,13 @@ The server must not:
 - Emit diagnostic telemetry.
 - Vary auction behavior when the console is active.
 
-Because the response does not contain user-specific trace data, activation does not require a server session cookie or a special diagnostic response variant.
+Diagnostic records remain client-local, but conditional module delivery requires a server-recognized activation bit. Active/directive HTML therefore uses a host-only HttpOnly session cookie and strict private/no-store cache policy; the standalone static module remains cookie-independent and publicly cacheable.
 
 ### Browser components
 
 The browser implementation consists of four focused components:
 
-1. **Activation bootstrap** — manages tab-local activation and URL cleanup.
+1. **Activation gate** — manages browser-session cookie activation, conditional delivery, and URL cleanup.
 2. **GPT observer** — installs documented event listeners and normalizes callbacks.
 3. **Diagnostics store** — retains bounded slot and request-cycle records and computes timings.
 4. **Presentation layer** — renders the panel and badges from store snapshots.
@@ -195,24 +195,24 @@ The final configuration name may reuse an existing integration registry conventi
 
 ### Query directives
 
-| Directive          | Effect                                  |
-| ------------------ | --------------------------------------- |
-| `ts_console=1`     | Enable diagnostics for the current tab  |
-| `ts_console=true`  | Enable diagnostics for the current tab  |
-| `ts_console=0`     | Disable diagnostics for the current tab |
-| `ts_console=false` | Disable diagnostics for the current tab |
+| Directive          | Effect                                      |
+| ------------------ | ------------------------------------------- |
+| `ts_console=1`     | Enable diagnostics for the browser session  |
+| `ts_console=true`  | Enable diagnostics for the browser session  |
+| `ts_console=0`     | Disable diagnostics for the browser session |
+| `ts_console=false` | Disable diagnostics for the browser session |
 
-Values are case-sensitive. Unrecognized values are ignored.
+Values are case-sensitive. Duplicate or unrecognized directives fail closed for the current response.
 
-### Tab-local persistence
+### Browser-session persistence and delivery
 
-Activation is stored in `sessionStorage`, scoped to the publisher origin and browser tab. This allows normal full-page and SPA navigation in the same tab without a server cookie. A new tab is inactive unless separately activated.
+Activation uses `__Host-ts-console=1; Path=/; Secure; HttpOnly; SameSite=Lax` with no persistent expiry. Exactly one canonical cookie activates clean document navigations across tabs on the same origin. Duplicate cookies fail closed, and every copy is stripped before generic cookie, origin, or auction handling.
 
-If `sessionStorage` is unavailable, the query directive applies to the current document only.
+Inactive HTML omits the diagnostics module. Active HTML injects its content-hashed standalone module synchronously after core so listeners precede publisher GPT code. Active/directive HTML is `private, no-store` without surrogate cache headers; the standalone module is public and does not vary on the cookie.
 
 ### URL cleanup
 
-After reading a recognized directive, the bootstrap removes only `ts_console` from the current URL using `history.replaceState`. All other query parameters, the path, and the fragment are preserved.
+After the server consumes a directive, an early bootstrap removes every reserved `ts_console` pair from the visible URL using `history.replaceState`. The origin sees no reserved directive. All unrelated query parameters, the path, and the fragment are preserved.
 
 This one-time URL cleanup is not a general history patch. The diagnostics module must not wrap `pushState`, `replaceState`, or route-change handlers.
 
@@ -220,6 +220,7 @@ This one-time URL cleanup is not a general history patch. The diagnostics module
 
 When inactive:
 
+- No diagnostics module is delivered.
 - No GPT event listeners are registered.
 - No diagnostics API is exposed.
 - No overlay host is created.
@@ -302,8 +303,8 @@ GPT callbacks identify a slot but do not provide a stable request-cycle identifi
 
 - `slotResponseReceived` can match a cycle with a request timestamp and no response timestamp.
 - `slotRenderEnded` can match a cycle with no render timestamp.
-- `slotOnload` can match a filled rendered cycle with no load timestamp.
-- `impressionViewable` can match a filled rendered cycle with no prior viewable timestamp.
+- `slotOnload` can match a rendered cycle that is not known empty and has no load timestamp.
+- `impressionViewable` can match a rendered cycle that is not known empty and has no prior viewable timestamp.
 - `slotVisibilityChanged` updates slot-level current and maximum visibility and is not required to belong to one request cycle.
 
 A callback is attached only when there is one compatible cycle. If there are no compatible cycles, it is recorded as unmatched. If overlapping cycles make more than one cycle compatible, it is recorded as ambiguous with reason `overlapping_request_cycles`.
@@ -320,20 +321,23 @@ Cycles remain until their callbacks arrive or bounded retention evicts them. The
 
 `slotRenderEnded` determines the directly observed render outcome:
 
-| GPT fact                  | Display outcome           |
-| ------------------------- | ------------------------- |
-| `isEmpty === true`        | Empty                     |
-| `isEmpty === false`       | Filled                    |
-| No render callback yet    | Pending render            |
-| Unmatched render callback | Unmatched render callback |
+| GPT fact                          | Display outcome           |
+| --------------------------------- | ------------------------- |
+| `isEmpty === true`                | Empty                     |
+| `isEmpty === false`               | Filled                    |
+| Render callback, fill unavailable | Rendered (fill unknown)   |
+| No render callback yet            | Pending render            |
+| Unmatched render callback         | Unmatched render callback |
 
 The word **Filled** means only that GPT reported a non-empty render.
 
 ### Load and viewability
 
-Load and viewability are independent flags on a filled cycle:
+Load and viewability are independent observed facts after any render not known empty:
 
 - A filled cycle without `slotOnload` displays **Load not observed**.
+- An unknown-fill render retains observed load/viewability without inferring Filled.
+- A known-empty render never accepts load or viewability callbacks.
 - A load callback does not prove creative provenance.
 - An `impressionViewable` callback displays **Viewable**.
 - Absence of a viewable callback is not classified as failure.
@@ -395,20 +399,21 @@ These exclusions keep the tool focused and reduce privacy and export concerns.
 
 The panel derives a primary lifecycle state from observed GPT facts:
 
-| State               | Meaning                                                 |
-| ------------------- | ------------------------------------------------------- |
-| Waiting for request | Slot observed, but no `slotRequested` callback captured |
-| Requesting          | Request observed; response not yet observed             |
-| Response received   | Response observed; render not yet observed              |
-| Filled              | GPT reported a non-empty render                         |
-| Empty               | GPT reported an empty render                            |
+| State                   | Meaning                                                 |
+| ----------------------- | ------------------------------------------------------- |
+| Waiting for request     | Slot observed, but no `slotRequested` callback captured |
+| Requesting              | Request observed; response not yet observed             |
+| Response received       | Response observed; render not yet observed              |
+| Rendered (fill unknown) | Render observed without a boolean `isEmpty` fact        |
+| Filled                  | GPT reported a non-empty render                         |
+| Empty                   | GPT reported an empty render                            |
 
 The panel augments that primary state with independent facts and issues:
 
 | Augmentation        | Meaning                                                        |
 | ------------------- | -------------------------------------------------------------- |
-| Loaded              | A filled render later produced `slotOnload`                    |
-| Viewable            | A filled render later produced `impressionViewable`            |
+| Loaded              | A render not known empty later produced `slotOnload`           |
+| Viewable            | A render not known empty later produced `impressionViewable`   |
 | Incomplete sequence | Affirmative evidence shows a missing or invalid lifecycle step |
 | Unbound             | No exact current DOM element matches the slot element ID       |
 | Ambiguous binding   | More than one DOM element or GPT slot record claims the ID     |
@@ -559,6 +564,7 @@ interface GptDiagnosticsExportV1 {
         | 'missing_slot_element_id'
         | 'missing_element'
         | 'duplicate_dom_id'
+        | 'dom_uniqueness_unverifiable'
         | 'duplicate_gpt_slot_id'
     }
     currentVisibilityPercentage?: number
@@ -604,12 +610,12 @@ The diagnostics store is memory-only and bounded. Initial limits should be simpl
 
 When a limit is exceeded:
 
-- Evict the oldest eligible record.
+- Evict the least-recently-active slot, or the oldest cycle/issue at those bounds.
 - Increment the corresponding metadata counter.
-- Keep the latest request cycles visible.
-- Do not throw into publisher code.
+- Let an evicted Slot re-enter only on a future `slotRequested`, preserving its monotonic request number; earlier non-request callbacks remain unmatched.
+- Keep the latest request cycles visible and do not throw into publisher code.
 
-The implementation does not use IndexedDB, localStorage for trace data, cookies, or server upload.
+The implementation does not use IndexedDB, localStorage, or sessionStorage for diagnostic records. The HttpOnly session cookie stores only activation; no diagnostic data is uploaded.
 
 ## SPA and Dynamic-Page Behavior
 
@@ -619,7 +625,7 @@ The implementation does not use IndexedDB, localStorage for trace data, cookies,
 - Disconnected elements become unbound while their records remain available.
 - Recreated elements with the same exact ID can be rebound.
 - The overlay remounts if the publisher replaces the UI host.
-- A full document navigation starts a new in-memory store while tab activation persists through `sessionStorage`.
+- A full document navigation starts a new in-memory store while browser-session activation persists through the HttpOnly cookie.
 
 ## Error Handling
 
@@ -635,13 +641,13 @@ The observer must tolerate:
 - Callbacks with no request cycle.
 - Overlapping request cycles.
 - Publisher removal of the overlay host.
-- Missing `ResizeObserver`, `MutationObserver`, or `sessionStorage`.
+- Missing `ResizeObserver` or `MutationObserver`.
 
 A degraded browser may lose optional badge updates, but the GPT callback store should continue operating where event listeners are available.
 
 ## Privacy and Security
 
-- Diagnostics are opt-in and local to the browser tab.
+- Diagnostics are opt-in for a host-scoped browser session; diagnostic records remain document-local.
 - No diagnostic record is automatically transmitted.
 - No user identifier, cookie value, targeting value, bid value, creative markup, or auction payload is collected.
 - The export excludes URL query strings and fragments.
@@ -651,7 +657,7 @@ A degraded browser may lose optional badge updates, but the GPT callback store s
 
 ## Performance and Non-Interference
 
-The inactive path should consist only of the activation check.
+The inactive path omits diagnostics JavaScript entirely after the bounded server activation check.
 
 When active:
 
@@ -668,7 +674,7 @@ When active:
 The implementation PR should be limited to:
 
 - Deployment configuration for the diagnostics integration.
-- Early client activation bootstrap.
+- Server-recognized browser-session activation and conditional module delivery.
 - GPT observer and bounded diagnostics store.
 - Overlay and badge presentation.
 - Focused documentation.
@@ -681,7 +687,7 @@ The PR should not modify:
 - Prebid integration code, except deleting superseded tracing hooks if this replaces PR #961.
 - Creative renderers or acknowledgement protocols.
 - Tinybird schemas or telemetry clients.
-- Adapter middleware for diagnostic session cookies.
+- Unrelated adapter or authentication middleware changes beyond the minimal fallback preparation hook.
 - GPT request gating, slot handoff, display, refresh, or targeting behavior.
 
 Any required change in those excluded areas is a scope expansion and should trigger explicit review of this specification.
@@ -716,7 +722,9 @@ A controlled GPT stub or fixture page must verify:
 - No patched GPT or browser methods.
 - No listeners or overlay when inactive.
 - Query activation, deactivation, and URL cleanup.
-- Tab-local persistence across document navigation.
+- Browser-session persistence across document navigation and tabs.
+- Inactive documents make no standalone diagnostics module request.
+- Active/directive HTML is private no-store while the static module stays public.
 - Panel rendering before and after callbacks.
 - Badge placement on an exact, uniquely bound visible element.
 - No badge for an unbound or ambiguously bound slot.
@@ -743,14 +751,14 @@ The publisher Playwright harness should verify:
 11. The JSON export matches panel counts and status.
 12. `?ts_console=false` leaves no API, overlay, badge, or listeners active on the next document.
 
-A trace-off control should be run in the same valid browser tab when bot-protection access is session-sensitive.
+A trace-off control should clear activation in the same valid browser session when bot-protection access is session-sensitive.
 
 ## Acceptance Criteria
 
 The specification is satisfied when all of the following are true:
 
 - [x] The console can be enabled and disabled using the documented query directives.
-- [x] Activation persists only in the current tab.
+- [x] Activation persists only for the host-scoped browser session and applies across its tabs.
 - [x] The implementation uses documented GPT listeners without patching GPT behavior.
 - [x] Each `slotRequested` creates a distinct initial or refresh request cycle.
 - [x] Filled and empty labels are derived only from `slotRenderEnded.isEmpty`.

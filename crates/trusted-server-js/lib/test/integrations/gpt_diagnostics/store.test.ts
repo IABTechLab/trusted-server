@@ -82,6 +82,45 @@ describe('GptDiagnosticsStore', () => {
     assertCoverageEquation(store);
   });
 
+  it('matches load and viewability after a render with unknown fill state', () => {
+    let now = 1;
+    const store = new GptDiagnosticsStore({ now: () => now });
+    const unknown = fakeSlot('unknown-fill');
+    const empty = fakeSlot('known-empty');
+
+    store.recordSlotRequested(unknown);
+    now = 2;
+    store.recordSlotResponseReceived(unknown);
+    now = 3;
+    store.recordSlotRenderEnded(unknown, {});
+    now = 5;
+    store.recordSlotOnload(unknown);
+    now = 8;
+    store.recordImpressionViewable(unknown);
+
+    store.recordSlotRequested(empty);
+    store.recordSlotResponseReceived(empty);
+    store.recordSlotRenderEnded(empty, { isEmpty: true });
+    store.recordSlotOnload(empty);
+    store.recordImpressionViewable(empty);
+
+    const [unknownCycle, emptyCycle] = store.snapshot().slots.map((slot) => slot.requests[0]);
+    expect(unknownCycle).toMatchObject({
+      isEmpty: undefined,
+      loadAtMs: 5,
+      viewableAtMs: 8,
+      durations: { renderToLoadMs: 2, renderToViewableMs: 5 },
+    });
+    expect(emptyCycle.loadAtMs).toBeUndefined();
+    expect(emptyCycle.viewableAtMs).toBeUndefined();
+    expect(store.snapshot().coverage.slotOnload).toMatchObject({ matched: 1, unmatched: 1 });
+    expect(store.snapshot().coverage.impressionViewable).toMatchObject({
+      matched: 1,
+      unmatched: 1,
+    });
+    assertCoverageEquation(store);
+  });
+
   it('keeps empty and pending cycles truthful without timeout-based incompleteness', () => {
     let now = 1;
     const store = new GptDiagnosticsStore({ now: () => now });
@@ -281,6 +320,55 @@ describe('GptDiagnosticsStore', () => {
     expect(snapshot.callbackIssues).toHaveLength(MAX_CALLBACK_ISSUES);
     expect(snapshot.metadata.droppedCallbacks).toBeGreaterThanOrEqual(2);
     assertCoverageEquation(store);
+  });
+
+  it('evicts least-recently-active slots and re-enters only on a new request', () => {
+    let now = 0;
+    const store = new GptDiagnosticsStore({ now: () => ++now });
+    const slots = Array.from({ length: MAX_DIAGNOSTIC_SLOTS + 1 }, (_, index) =>
+      fakeSlot(`lru-${index}`)
+    );
+    for (const retained of slots.slice(0, MAX_DIAGNOSTIC_SLOTS)) {
+      store.recordSlotRequested(retained);
+    }
+
+    store.recordSlotVisibilityChanged(slots[0], 10);
+    store.recordSlotRequested(slots[MAX_DIAGNOSTIC_SLOTS]);
+    expect(store.snapshot().slots.some((slot) => slot.runtimeSlotNumber === 1)).toBe(true);
+    expect(store.snapshot().slots.some((slot) => slot.runtimeSlotNumber === 2)).toBe(false);
+
+    store.recordSlotResponseReceived(slots[1]);
+    expect(store.snapshot().callbackIssues.at(-1)).toMatchObject({
+      runtimeSlotNumber: 2,
+      reason: 'evicted_slot',
+    });
+
+    store.recordSlotRequested(slots[1]);
+    store.recordSlotResponseReceived(slots[1]);
+    const reentered = store.snapshot().slots.find((slot) => slot.slotElementId === 'lru-1');
+    expect(reentered).toMatchObject({ runtimeSlotNumber: 66 });
+    expect(reentered?.requests[0]).toMatchObject({ requestNumber: 2 });
+    expect(reentered?.requests[0].responseAtMs).toBeDefined();
+    expect(store.snapshot().slots).toHaveLength(MAX_DIAGNOSTIC_SLOTS);
+    expect(store.snapshot().metadata.evictedSlots).toBe(2);
+    assertCoverageEquation(store);
+  });
+
+  it('returns lightweight detached binding inputs in stable slot order', () => {
+    const store = new GptDiagnosticsStore({ now: () => 1 });
+    const first = fakeSlot('first');
+    const second = fakeSlot('second');
+    store.recordSlotRequested(first);
+    store.recordSlotRequested(second);
+    store.recordSlotVisibilityChanged(first, 10);
+
+    const inputs = store.bindingInputs();
+    expect(inputs).toEqual([
+      { runtimeSlotNumber: 1, slotElementId: 'first' },
+      { runtimeSlotNumber: 2, slotElementId: 'second' },
+    ]);
+    inputs[0].slotElementId = 'changed';
+    expect(store.bindingInputs()[0].slotElementId).toBe('first');
   });
 
   it('coalesces notifications and isolates throwing subscribers', () => {
