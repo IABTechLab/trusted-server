@@ -7,7 +7,7 @@ import { GptDiagnosticsStore } from '../../../src/integrations/gpt_diagnostics/s
 class FakeBindings {
   private readonly listeners = new Set<() => void>();
 
-  exportBinding(_runtimeSlotNumber: number): GptDiagnosticsBinding {
+  exportBinding(): GptDiagnosticsBinding {
     return { status: 'bound' };
   }
 

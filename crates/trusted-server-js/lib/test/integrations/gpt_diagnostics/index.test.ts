@@ -12,7 +12,7 @@ interface FakeSlot {
   getAdUnitPath(): string;
 }
 
-type Listener = (event: any) => void;
+type Listener = (event: unknown) => void;
 
 type DiagnosticsTestWindow = NonNullable<Parameters<typeof installGptDiagnosticsRuntime>[0]>;
 
