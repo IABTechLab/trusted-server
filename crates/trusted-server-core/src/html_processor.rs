@@ -13,6 +13,7 @@ use lol_html::{
     text,
 };
 
+use crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision;
 use crate::integrations::{
     AttributeRewriteOutcome, IntegrationAttributeContext, IntegrationDocumentState,
     IntegrationHtmlContext, IntegrationHtmlPostProcessor, IntegrationRegistry,
@@ -172,6 +173,8 @@ pub struct HtmlProcessorConfig {
     /// processor aborts. Mirrors `publisher.max_buffered_body_bytes` so the
     /// full-document buffering done for post-processors is bounded.
     pub max_buffered_body_bytes: usize,
+    /// Request-scoped conditional diagnostics delivery decision.
+    pub gpt_diagnostics: Option<GptDiagnosticsRequestDecision>,
 }
 
 impl HtmlProcessorConfig {
@@ -192,6 +195,7 @@ impl HtmlProcessorConfig {
             ad_slots_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: settings.publisher.max_buffered_body_bytes,
+            gpt_diagnostics: None,
         }
     }
 
@@ -210,6 +214,13 @@ impl HtmlProcessorConfig {
     ) -> Self {
         self.ad_slots_script = ad_slots_script;
         self.ad_bids_state = ad_bids_state;
+        self
+    }
+
+    /// Attach the request-scoped conditional diagnostics decision.
+    #[must_use]
+    pub fn with_gpt_diagnostics(mut self, decision: Option<GptDiagnosticsRequestDecision>) -> Self {
+        self.gpt_diagnostics = decision;
         self
     }
 }
@@ -294,6 +305,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     let script_rewriters = integration_registry.script_rewriters();
     let ad_slots_script = config.ad_slots_script.clone();
     let ad_bids_state = config.ad_bids_state.clone();
+    let gpt_diagnostics = config.gpt_diagnostics.clone();
 
     let mut element_content_handlers = vec![
         // Inject unified tsjs bundle once at the start of <head>
@@ -303,6 +315,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             let patterns = patterns.clone();
             let document_state = document_state.clone();
             let ad_slots_script = ad_slots_script.clone();
+            let gpt_diagnostics = gpt_diagnostics.clone();
             move |el| {
                 if !injected_tsjs.get() {
                     let mut snippet = String::new();
@@ -321,9 +334,23 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     for insert in integrations.head_inserts(&ctx) {
                         snippet.push_str(&insert);
                     }
+                    if let Some(bootstrap) = gpt_diagnostics
+                        .as_ref()
+                        .and_then(GptDiagnosticsRequestDecision::bootstrap_script)
+                    {
+                        snippet.push_str(&bootstrap);
+                    }
                     // Main bundle: core + non-deferred integrations (synchronous).
                     let immediate_ids = integrations.js_module_ids_immediate();
                     snippet.push_str(&tsjs::tsjs_script_tag(&immediate_ids));
+                    // Active diagnostics loads synchronously after core so its
+                    // GPT listeners precede publisher scripts in the origin head.
+                    if let Some(module_tag) = gpt_diagnostics
+                        .as_ref()
+                        .and_then(GptDiagnosticsRequestDecision::module_script_tag)
+                    {
+                        snippet.push_str(&module_tag);
+                    }
                     // Deferred bundles: large modules like prebid loaded after
                     // HTML parsing completes. Empty when none are enabled.
                     let deferred_ids = integrations.js_module_ids_deferred();
@@ -664,6 +691,7 @@ mod tests {
             ad_slots_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            gpt_diagnostics: None,
         }
     }
 
@@ -789,6 +817,80 @@ mod tests {
         assert!(
             tsjs_index < title_index,
             "should prepend all injected content before existing head content"
+        );
+    }
+
+    #[test]
+    fn active_gpt_diagnostics_loads_standalone_after_unified_bundle_once() {
+        let html = "<html><head><title>Test</title></head><body></body></html>";
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config("gpt_diagnostics", &json!({ "enabled": true }))
+            .expect("should insert GPT diagnostics config");
+
+        let mut request = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://publisher.example/page?ts_console=1")
+            .header("sec-fetch-dest", "document")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build activation request");
+        let decision =
+            crate::integrations::gpt_diagnostics::prepare_request(&settings, &mut request)
+                .expect("should prepare diagnostics request");
+        let mut config = create_test_config();
+        config.integrations =
+            IntegrationRegistry::new(&settings).expect("should build integration registry");
+        config.gpt_diagnostics = Some(decision);
+
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+        let mut output = Vec::new();
+
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .expect("should process HTML");
+        let processed = String::from_utf8(output).expect("should produce valid UTF-8");
+        let bootstrap_marker = "__tsjs_gpt_diagnostics_active";
+        let bundle_marker = "id=\"trustedserver-js\"";
+        let diagnostics_marker = "tsjs-gpt_diagnostics.min.js";
+
+        assert_eq!(
+            processed.matches(bootstrap_marker).count(),
+            1,
+            "should inject the diagnostics bootstrap once"
+        );
+        assert_eq!(
+            processed.matches(bundle_marker).count(),
+            1,
+            "should inject the immediate TSJS bundle once"
+        );
+        assert_eq!(
+            processed.matches(diagnostics_marker).count(),
+            1,
+            "should inject one standalone diagnostics module"
+        );
+        let bootstrap_index = processed
+            .find(bootstrap_marker)
+            .expect("should include diagnostics bootstrap");
+        let bundle_index = processed
+            .find(bundle_marker)
+            .expect("should include immediate TSJS bundle");
+        let diagnostics_index = processed
+            .find(diagnostics_marker)
+            .expect("should include standalone diagnostics module");
+        assert!(
+            bootstrap_index < bundle_index,
+            "should activate before core executes"
+        );
+        assert!(
+            bundle_index < diagnostics_index,
+            "should load diagnostics after core"
         );
     }
 
@@ -1436,6 +1538,7 @@ mod tests {
             ),
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            gpt_diagnostics: None,
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1509,6 +1612,7 @@ mod tests {
             ),
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            gpt_diagnostics: None,
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1544,6 +1648,7 @@ mod tests {
             ),
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            gpt_diagnostics: None,
         };
         let mut processor = create_html_processor(config);
         // Malformed HTML with two <body> elements (common in CMS template pages)
@@ -1578,6 +1683,7 @@ mod tests {
             ad_slots_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            gpt_diagnostics: None,
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1630,6 +1736,7 @@ mod tests {
             ),
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            gpt_diagnostics: None,
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1656,6 +1763,7 @@ mod tests {
             ad_slots_script: None,
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
+            gpt_diagnostics: None,
         };
         let mut processor = create_html_processor(config);
         let output = processor
