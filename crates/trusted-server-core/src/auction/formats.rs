@@ -318,9 +318,10 @@ pub(crate) struct OpenRtbResponseConversion {
 ///
 /// # Errors
 ///
-/// Returns an error if:
-/// - A winning bid is missing a price
-/// - The response serialization fails
+/// Returns an error if response serialization fails.
+///
+/// Winners without a decoded price or a deliverable creative are omitted and
+/// recorded in the returned delivery report so other slots can still render.
 pub fn convert_to_openrtb_response(
     result: &OrchestrationResult,
     settings: &Settings,
@@ -344,14 +345,16 @@ pub(crate) fn convert_to_openrtb_response_with_report(
     let mut delivery = AuctionDeliveryReport::default();
 
     for (slot_id, bid) in &result.winning_bids {
-        let price = bid.price.ok_or_else(|| {
-            Report::new(TrustedServerError::Auction {
-                message: format!(
-                    "Winning bid for slot '{}' from '{}' has no decoded price",
-                    slot_id, bid.bidder
-                ),
-            })
-        })?;
+        let Some(price) = bid.price else {
+            log::warn!(
+                "Auction {}: skipping winning bid for slot '{}' from '{}' because it has no decoded price",
+                auction_request.id,
+                slot_id,
+                bid.bidder
+            );
+            delivery.record_drop("no_decoded_price");
+            continue;
+        };
 
         let bid_context = format!(
             "auction {} slot {} bidder {}",
@@ -1325,6 +1328,7 @@ mod tests {
         missing.creative = None;
         let mut whitespace = make_bid("whitespace", "invalid", Some(2.9));
         whitespace.creative = Some(" \n\t ".to_string());
+        let unpriced = make_bid("unpriced", "invalid", None);
         let ordinary = make_bid("ordinary", "appnexus", Some(2.75));
         let mut renderer = make_bid("renderer", "aps", Some(2.5));
         renderer.creative = Some("  ".to_string());
@@ -1347,6 +1351,7 @@ mod tests {
             winning_bids: HashMap::from([
                 (missing.slot_id.clone(), missing),
                 (whitespace.slot_id.clone(), whitespace),
+                (unpriced.slot_id.clone(), unpriced),
                 (ordinary.slot_id.clone(), ordinary),
                 (renderer.slot_id.clone(), renderer),
             ]),
@@ -1362,10 +1367,14 @@ mod tests {
             HashSet::from(["ordinary".to_string(), "renderer".to_string()]),
             "should report only serialized winners as delivered"
         );
-        assert_eq!(conversion.delivery.dropped_winner_count, 2);
+        assert_eq!(conversion.delivery.dropped_winner_count, 3);
         assert_eq!(
             conversion.delivery.dropped_winner_reasons["no_render_source"],
             2
+        );
+        assert_eq!(
+            conversion.delivery.dropped_winner_reasons["no_decoded_price"],
+            1
         );
         let json = response_json(conversion.response);
         let bids: Vec<&JsonValue> = json["seatbid"]
@@ -1376,10 +1385,14 @@ mod tests {
             .collect();
 
         assert_eq!(bids.len(), 2, "should omit only invalid winners");
-        assert_eq!(json["ext"]["orchestrator"]["dropped_winner_count"], 2);
+        assert_eq!(json["ext"]["orchestrator"]["dropped_winner_count"], 3);
         assert_eq!(
             json["ext"]["orchestrator"]["dropped_winner_reasons"]["no_render_source"],
             2
+        );
+        assert_eq!(
+            json["ext"]["orchestrator"]["dropped_winner_reasons"]["no_decoded_price"],
+            1
         );
         let ordinary = bids
             .iter()
@@ -1641,17 +1654,19 @@ mod tests {
     }
 
     #[test]
-    fn convert_to_openrtb_response_errors_when_winning_bid_has_no_price() {
+    fn convert_to_openrtb_response_drops_winning_bid_without_price() {
         let settings = make_settings();
         let auction_request = make_auction_request();
         let result = make_result(make_bid("div-gpt-top", "appnexus", None));
 
-        let err = convert_to_openrtb_response(&result, &settings, &auction_request, false)
-            .expect_err("should reject winning bid without decoded price");
-
-        assert!(
-            format!("{err:?}").contains("has no decoded price"),
-            "should explain missing decoded price"
+        let conversion =
+            convert_to_openrtb_response_with_report(&result, &settings, &auction_request, false)
+                .expect("should omit a winner without a decoded price");
+        assert!(conversion.delivery.delivered_winner_slots.is_empty());
+        assert_eq!(conversion.delivery.dropped_winner_count, 1);
+        assert_eq!(
+            conversion.delivery.dropped_winner_reasons["no_decoded_price"], 1,
+            "should report the omitted malformed winner"
         );
     }
 

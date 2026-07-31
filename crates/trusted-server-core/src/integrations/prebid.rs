@@ -1664,7 +1664,6 @@ impl PrebidAuctionProvider {
                         direct.push((name.clone(), params.clone()));
                     } else {
                         // Any unrecognized key is likely a misconfiguration (a
-                        // other unrecognized key is likely a misconfiguration (a
                         // slot bidder absent from `config.bidders`) that silently
                         // yields an empty bidder map and a stored-request no-bid —
                         // log it so the drop is diagnosable.

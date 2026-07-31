@@ -3,7 +3,7 @@
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::Request;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use web_time::Instant;
@@ -225,6 +225,27 @@ impl AuctionOrchestrator {
             return Ok(());
         }
 
+        let mut configured_providers = HashSet::new();
+        for provider_name in &self.config.providers {
+            if !configured_providers.insert(provider_name.as_str()) {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "Auction provider `{provider_name}` is listed more than once in [auction].providers; each provider may appear at most once"
+                    ),
+                }));
+            }
+        }
+
+        if let Some(mediator_name) = &self.config.mediator
+            && configured_providers.contains(mediator_name.as_str())
+        {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "Auction mediator `{mediator_name}` is also listed in [auction].providers; a provider may not mediate its own auction"
+                ),
+            }));
+        }
+
         for provider_name in self
             .config
             .providers
@@ -310,10 +331,15 @@ impl AuctionOrchestrator {
 
             // Give the mediator only the remaining time from the auction
             // deadline, not the full timeout — the bidding phase already
-            // consumed part of it.
+            // consumed part of it. Canonicalize the transport timeout so the
+            // backend name remains stable across equivalent budget values.
             let remaining_ms = remaining_budget_ms(mediation_start, context.timeout_ms);
+            let mediator_timeout = context
+                .services
+                .backend()
+                .canonicalize_transport_timeout_ms(remaining_ms, mediator.timeout_ms());
 
-            if remaining_ms == 0 {
+            if mediator_timeout == 0 {
                 log::warn!("Auction timeout exhausted during bidding phase; skipping mediator");
                 let winning = self.select_winning_bids(&provider_responses, &floor_prices);
                 return Ok(OrchestrationResult {
@@ -328,9 +354,7 @@ impl AuctionOrchestrator {
             let mediator_context = AuctionContext {
                 settings: context.settings,
                 request: context.request,
-                // Bound by both the remaining auction budget and the mediator's
-                // own configured timeout, matching the dispatched collect path.
-                timeout_ms: remaining_ms.min(mediator.timeout_ms()),
+                timeout_ms: mediator_timeout,
                 provider_responses: Some(&provider_responses),
                 services: context.services,
             };
@@ -497,13 +521,31 @@ impl AuctionOrchestrator {
 
             // Give each provider only the remaining time from the auction
             // deadline so that backend transport timeouts do not extend past
-            // the overall budget. Also respect the provider's own configured
-            // timeout when it is tighter than the remaining budget.
+            // the overall budget. Canonicalizing keeps backend names stable.
             let remaining_ms = remaining_budget_ms(auction_start, context.timeout_ms);
-            let effective_timeout = remaining_ms.min(provider.timeout_ms());
+            let effective_timeout = context
+                .services
+                .backend()
+                .canonicalize_transport_timeout_ms(remaining_ms, provider.timeout_ms());
 
             if effective_timeout == 0 {
                 log::warn!("Auction timeout exhausted before launching provider request; skipping");
+                continue;
+            }
+
+            // Immediate providers have no backend name and must remain eligible
+            // to return a synchronous result. Pending providers are still
+            // guarded before dispatch when their name can be predicted.
+            let predicted_backend_name = provider.backend_name(context.services, effective_timeout);
+            if let Some(backend_name) = predicted_backend_name.as_ref()
+                && backend_to_provider.contains_key(backend_name)
+            {
+                log::warn!(
+                    "Provider '{}' predicted backend name '{}' already belongs to another provider; skipping launch",
+                    provider.provider_name(),
+                    backend_name,
+                );
+                responses.push(provider_launch_failed_response(provider.provider_name(), 0));
                 continue;
             }
 
@@ -528,13 +570,14 @@ impl AuctionOrchestrator {
                     parse_state,
                 }) => {
                     let request_backend_name = pending.backend_name().map(str::to_string).or_else(|| {
-                        provider.backend_name(context.services, effective_timeout).inspect(|name| {
+                        if let Some(backend_name) = predicted_backend_name.as_ref() {
                             log::warn!(
                                 "Provider '{}' pending request returned no backend name; using predicted name '{}'",
                                 provider.provider_name(),
-                                name,
+                                backend_name,
                             );
-                        })
+                        }
+                        predicted_backend_name.clone()
                     });
                     let Some(request_backend_name) = request_backend_name else {
                         log::warn!(
@@ -547,6 +590,18 @@ impl AuctionOrchestrator {
                         ));
                         continue;
                     };
+                    if backend_to_provider.contains_key(&request_backend_name) {
+                        log::warn!(
+                            "Provider '{}' resolved backend name '{}' already belongs to another provider; skipping launch",
+                            provider.provider_name(),
+                            request_backend_name,
+                        );
+                        responses.push(provider_launch_failed_response(
+                            provider.provider_name(),
+                            start_time.elapsed().as_millis() as u64,
+                        ));
+                        continue;
+                    }
                     backend_to_provider.insert(
                         request_backend_name,
                         ProviderLaunchState {
@@ -927,7 +982,10 @@ impl AuctionOrchestrator {
             }
 
             let remaining_ms = remaining_budget_ms(auction_start, context.timeout_ms);
-            let effective_timeout = remaining_ms.min(provider.timeout_ms());
+            let effective_timeout = context
+                .services
+                .backend()
+                .canonicalize_transport_timeout_ms(remaining_ms, provider.timeout_ms());
 
             if effective_timeout == 0 {
                 log::warn!(
@@ -935,6 +993,23 @@ impl AuctionOrchestrator {
                     context.timeout_ms,
                     provider.provider_name()
                 );
+                continue;
+            }
+
+            // Do not require a backend name before dispatch: an immediate
+            // provider intentionally has none. Guard predicted names when
+            // available; pending requests without either name fail below.
+            let predicted_backend_name = provider.backend_name(context.services, effective_timeout);
+            if let Some(backend_name) = predicted_backend_name.as_ref()
+                && backend_to_provider.contains_key(backend_name)
+            {
+                log::warn!(
+                    "Provider '{}' predicted backend name '{}' already belongs to another provider; skipping dispatch",
+                    provider.provider_name(),
+                    backend_name,
+                );
+                completed_responses
+                    .push(provider_launch_failed_response(provider.provider_name(), 0));
                 continue;
             }
 
@@ -952,10 +1027,16 @@ impl AuctionOrchestrator {
                     request: pending,
                     parse_state,
                 }) => {
-                    let backend_name = pending
-                        .backend_name()
-                        .map(str::to_string)
-                        .or_else(|| provider.backend_name(context.services, effective_timeout));
+                    let backend_name = pending.backend_name().map(str::to_string).or_else(|| {
+                        if let Some(backend_name) = predicted_backend_name.as_ref() {
+                            log::warn!(
+                                "Provider '{}' pending request returned no backend name; using predicted name '{}'",
+                                provider.provider_name(),
+                                backend_name,
+                            );
+                        }
+                        predicted_backend_name.clone()
+                    });
                     let Some(backend_name) = backend_name else {
                         log::warn!(
                             "Provider '{}' pending request has no backend name; response cannot be correlated",
@@ -967,6 +1048,18 @@ impl AuctionOrchestrator {
                         ));
                         continue;
                     };
+                    if backend_to_provider.contains_key(&backend_name) {
+                        log::warn!(
+                            "Provider '{}' resolved backend name '{}' already belongs to another provider; skipping dispatch",
+                            provider.provider_name(),
+                            backend_name,
+                        );
+                        completed_responses.push(provider_launch_failed_response(
+                            provider.provider_name(),
+                            start_time.elapsed().as_millis() as u64,
+                        ));
+                        continue;
+                    }
                     log::info!(
                         "Dispatching bid request to '{}' (backend: {}, budget: {}ms)",
                         provider.provider_name(),
@@ -1214,7 +1307,10 @@ impl AuctionOrchestrator {
                     // independently. Giving the mediator an uncapped timeout lets it run
                     // past A_deadline, violating the bounded hold invariant.
                     let remaining = remaining_budget_ms(auction_start, timeout_ms);
-                    if remaining == 0 {
+                    let mediator_timeout = services
+                        .backend()
+                        .canonicalize_transport_timeout_ms(remaining, mediator.timeout_ms());
+                    if mediator_timeout == 0 {
                         log::warn!(
                             "A_deadline exhausted before mediator '{}' — returning {} SSP bids without mediation",
                             mediator.provider_name(),
@@ -1229,7 +1325,6 @@ impl AuctionOrchestrator {
                             metadata: HashMap::new(),
                         };
                     }
-                    let mediator_timeout = remaining.min(mediator.timeout_ms());
                     let mediator_start = Instant::now();
                     log::info!(
                         "Running mediator '{}' with {}ms budget (A_deadline remaining: {}ms, configured: {}ms)",
@@ -2262,6 +2357,86 @@ mod tests {
                 "should explain that no configured provider request launched"
             );
         });
+    }
+
+    #[test]
+    fn rejects_duplicate_configured_providers() {
+        let config = AuctionConfig {
+            enabled: true,
+            providers: vec!["prebid".to_string(), "prebid".to_string()],
+            timeout_ms: 2000,
+            ..Default::default()
+        };
+        let err = AuctionOrchestrator::new(config)
+            .validate_configured_provider_names()
+            .expect_err("should reject a provider listed more than once");
+        assert!(err.to_string().contains("listed more than once"));
+    }
+
+    #[test]
+    fn rejects_mediator_also_listed_as_provider() {
+        let config = AuctionConfig {
+            enabled: true,
+            providers: vec!["prebid".to_string()],
+            mediator: Some("prebid".to_string()),
+            timeout_ms: 2000,
+            ..Default::default()
+        };
+        let err = AuctionOrchestrator::new(config)
+            .validate_configured_provider_names()
+            .expect_err("should reject a mediator also configured as a provider");
+        assert!(err.to_string().contains("may not mediate its own auction"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_backend_name_fails_second_provider_attributably_in_both_paths() {
+        for split in [false, true] {
+            let config = AuctionConfig {
+                enabled: true,
+                providers: vec!["provider-a".to_string(), "provider-b".to_string()],
+                timeout_ms: 2000,
+                ..Default::default()
+            };
+            let mut orchestrator = AuctionOrchestrator::new(config);
+            orchestrator.register_provider(Arc::new(StubAuctionProvider {
+                name: "provider-a",
+                backend: "shared-backend",
+            }));
+            orchestrator.register_provider(Arc::new(StubAuctionProvider {
+                name: "provider-b",
+                backend: "shared-backend",
+            }));
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"{}".to_vec());
+            let services = build_services_with_http_client(stub);
+            let settings = create_test_settings();
+            let downstream = http::Request::new(edgezero_core::body::Body::empty());
+            let context = immediate_test_context(&settings, &downstream, &services);
+            let request = create_test_auction_request();
+
+            let result = if split {
+                let DispatchAuctionOutcome::Dispatched(dispatched) =
+                    orchestrator.dispatch_auction(&request, &context).await
+                else {
+                    panic!("should dispatch the first provider");
+                };
+                orchestrator
+                    .collect_dispatched_auction(dispatched, &services, &context)
+                    .await
+            } else {
+                orchestrator
+                    .run_auction(&request, &context)
+                    .await
+                    .expect("should complete auction despite the collision")
+            };
+
+            assert!(result.provider_responses.iter().any(|response| {
+                response.provider == "provider-a" && response.status == BidStatus::Success
+            }));
+            assert!(result.provider_responses.iter().any(|response| {
+                response.provider == "provider-b" && response.status == BidStatus::Error
+            }));
+        }
     }
 
     #[test]
