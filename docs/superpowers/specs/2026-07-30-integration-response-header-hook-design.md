@@ -42,13 +42,20 @@ mutators to the outbound response for HTML document responses it processed.
   processed documents. The call site lives in shared response-finalization
   code where one exists; where adapters finalize independently, each adapter
   gains the call and a test proving it.
-- Mutators run **after** Trusted Server's own response-header handling
-  (EC Set-Cookie emission, EC header clearing, privacy headers) so a
-  mutation cannot be silently stripped by a later core pass. The ordering is
-  a fresh decision this spec makes — PR #838 never wired the hook, so there
-  is no existing insertion point to inherit; the implementer places the call
-  at the end of each adapter's response finalization, and the §4.3 tests pin
-  it there.
+- **Ordering is three stages, and the last one is inviolable:** core
+  response-header handling (EC Set-Cookie emission, EC header clearing,
+  privacy headers) → integration operations → **final cache/privacy
+  invariant enforcement**, which no integration operation can override.
+  Running the hook dead-last would be wrong: current `main` deliberately
+  runs cookie-cache protection _after_ arbitrary header changes, stripping
+  surrogate caching and forcing private/no-store on any response that sets
+  a cookie — a hook applied after that recheck could combine an appended
+  `Set-Cookie` with a replaced public `Cache-Control` into a
+  **shared-cacheable cookie response**. The invariant pass therefore runs
+  after all mutations, unconditionally. Middle-stage placement also keeps
+  the earlier property: an integration mutation is not silently stripped
+  by ordinary core handling — only by the invariant pass, which logs the
+  downgrade it applies.
 
 ## 3. Collision policy
 
@@ -70,6 +77,14 @@ mutators to the outbound response for HTML document responses it processed.
   header the origin set is a deliberate act, visible in the mutator's code.
 - Later registrations see earlier mutations (order = registration order,
   which is deterministic).
+- **Operation-layer hygiene:** generic `append`/`replace` reject the
+  `Set-Cookie` header name outright — cookies go only through
+  `append_set_cookie`, so its validation cannot be bypassed by spelling
+  the header name in a generic op. Per-integration limits bound total
+  operations, added header count, and added header bytes; exceeding a
+  limit rejects the excess operations (logged, attributed), never the
+  response. A mutator that panics or errors is skipped in full — its
+  operations are all-or-nothing — and the response proceeds without it.
 
 ## 3a. Response eligibility — normative
 
@@ -99,7 +114,14 @@ processed documents (§6).
 3. Every adapter applies mutations on its outbound path, with a per-adapter
    route test asserting an integration-set header appears in the response.
 4. A parity-suite case asserts identical mutation behavior across adapters.
-5. Reserved-header and append/replace semantics covered by unit tests.
+5. Reserved-surface, append/replace, operation-limit, and erroring-mutator
+   semantics covered by unit tests.
+6. **Every row of the §3a eligibility matrix has a test** — streaming,
+   cache-hit, pass-through, redirect, error, and 304 each proven to run or
+   not run the hook — not merely one positive header test per adapter.
+7. The cache/privacy invariant test: an integration appends a cookie and
+   replaces `Cache-Control` with a public/surrogate-cacheable value → the
+   final response is private/no-store with surrogate caching stripped.
 
 ## 5. Size and sequencing
 

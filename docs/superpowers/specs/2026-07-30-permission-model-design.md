@@ -37,6 +37,12 @@ The set is resolved from three inputs:
 3. **Signals** — the request's privacy signals: TCF, GPP, GPC, US Privacy
    (§4).
 
+These are the initial sources. #777/#779 also envision publisher
+interaction and external services as permission sources; that
+source-interface is **explicitly deferred**, not silently dropped — §10
+records the divergence, and adding a source later means adding a grant- or
+opt-out-class input to §4's taxonomy, not a new resolution algorithm.
+
 Scope: the model governs decisions Trusted Server makes. Downstream RTB
 partners receive the full, unmodified regulatory context and make their own
 compliance decisions.
@@ -56,10 +62,10 @@ compatibility.
 
 The initial vocabulary is therefore exactly:
 
-| Identifier                | TCF purpose | Enforcement points                                                   |
-| ------------------------- | ----------- | -------------------------------------------------------------------- |
-| `store-on-device`         | 1           | EC provider execution; EC creation; withdrawal/tombstone eligibility |
-| `select-personalised-ads` | 4           | EID transmission into the bidstream (jointly with `store-on-device`) |
+| Identifier                | TCF purpose | Enforcement points                                                                                                                                                                           |
+| ------------------------- | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `store-on-device`         | 1           | EC provider execution; EC creation; withdrawal/tombstone eligibility                                                                                                                         |
+| `select-personalised-ads` | 4           | All bidstream and partner identity egress — raw EC in `user.id`, derived request IDs, page bids, EIDs, identify, pull/batch sync (jointly with `store-on-device`; the full path table is §7) |
 
 (The identifier strings are the IAB names verbatim, including their original
 spelling.) The extension procedure — add the signal mapping, add the
@@ -97,8 +103,12 @@ git for the file, config-store versions for pushes — is the change log.
 
 **Compiled-in fallback:** when a config has no `[permissions]` section, a
 minimal compiled-in policy applies in which **every permission is
-`requires_signal` for every jurisdiction** — the most protective posture.
-Absence of policy is always safe; there is no fail-open default.
+`requires_signal` for every jurisdiction**, with **`regime = "gdpr"`** so
+auction dispatch (§7) is defined and maximally protective too. (This is
+the most protective posture that still admits consent — `denied` would be
+stricter but would make a signal-carrying deployment inoperable by
+default; the distinction is stated, not glossed.) Absence of policy is
+always safe; there is no fail-open default.
 
 ### 3.2 Format
 
@@ -115,9 +125,13 @@ overrides. Each permission resolves to an **acquisition rule**:
 regime = "gdpr"
 default = "requires_signal"
 
+# Opt-out regime, expressed as requires_signal: explicit non-opt-out
+# values are grant-class signals (§4), so signal-carrying traffic is
+# granted while no-signal traffic stays blocked — matching today's US
+# behavior, which `granted` cannot express.
 [permissions.groups.us-opt-out]
 regime = "us-privacy"
-default = "granted"
+default = "requires_signal"
 
 [permissions.groups.non-regulated]
 regime = "none"
@@ -175,7 +189,10 @@ Validation rejects:
 - an empty `[permissions]` section (ambiguous intent: an operator who wants
   the compiled-in fallback omits the section entirely);
 - duplicate rule keys under case-insensitive comparison (`FR` and `fr`);
-- a `[geo] default_country` that is not an assigned ISO code; it is
+- a `[geo] default_country` whose country part is not an assigned ISO
+  code; it accepts either a country (`FR`) or a country/region key
+  (`US/CA`) — PR #838 supported region defaults, and a no-geo,
+  single-state deployment must be able to select its state rule. It is
   canonicalized to uppercase, and startup logs which rule (or
   `rules.default`) it resolves to.
 
@@ -210,7 +227,9 @@ inline, and ships it as the most protective baseline.
 
 ## 4. Signal precedence — normative
 
-Signals are classified:
+Signals are classified into three classes — a two-class model (TCF grant /
+opt-out) cannot reproduce today's US behavior, where no-signal traffic is
+blocked but an **explicit non-opt-out** value grants:
 
 - **Opt-out signals** (affirmative withdrawal): GPC header; GPP sections
   carrying a sale/sharing opt-out; US Privacy opt-out. Opt-out signals are
@@ -220,8 +239,17 @@ Signals are classified:
   and ignore it for others based on IP evidence. (For jurisdictions outside
   US states this is a declared behavior change; migration spec §2 records
   it.)
-- **Consent records**: a decodable TCF string (standalone or embedded in
-  GPP), which may grant or refuse individual purposes.
+- **Grant signals** (affirmative permission): a decodable TCF record
+  consenting to the purpose; an **explicit GPP non-opt-out value** (e.g.
+  `sale_opt_out = false`); a **US Privacy string present and not opting
+  out** — including the "not applicable" flag, which today's tests pin as
+  allowing. Any grant signal satisfies a `requires_signal` baseline; this
+  is what lets a `requires_signal` US rule preserve today's "no signal →
+  block, explicit non-opt-out → allow" behavior, which neither `granted`
+  nor a TCF-only grant class could express.
+- **Refusals**: a decodable TCF record refusing the purpose. A refusal is
+  neither a grant nor an opt-out — it blocks acquisition (precedence 3)
+  and withdraws only per §4.2.
 
 **Precedence, highest first:**
 
@@ -243,8 +271,11 @@ Signals are classified:
    jurisdictions — the migration spec's matrix (row 6) records it. Refusal
    revokes new grants only; whether it also destroys existing identity is
    governed strictly by §4.2.
-4. Consent record grant — a TCF record present and consenting grants it
-   (subject to 1–2).
+4. Grant signal — any grant-class signal (TCF consent, explicit GPP
+   non-opt-out, present-and-not-opted-out US Privacy) grants the permission
+   (subject to 1–3: a coexisting TCF refusal beats a non-TCF grant signal,
+   matching today's US-state ordering where a present TCF record decides
+   before GPP/USP values are consulted).
 5. No signal — the policy baseline decides: `granted` sets it,
    `requires_signal` leaves it unset.
 
@@ -253,12 +284,12 @@ Signals are classified:
 For each enforced permission, with baseline _B_ ∈ {granted,
 requires_signal, denied}:
 
-| Opt-out present | TCF present | TCF consents | Result                                           |
-| --------------- | ----------- | ------------ | ------------------------------------------------ |
-| yes             | —           | —            | **unset** (and withdrawal semantics apply, §4.2) |
-| no              | yes         | no           | unset (withdrawal per §4.2, trigger 2)           |
-| no              | yes         | yes          | set, unless B = denied                           |
-| no              | no          | —            | set iff B = granted                              |
+| Opt-out present | TCF refusal present | Grant signal present | Result                                           |
+| --------------- | ------------------- | -------------------- | ------------------------------------------------ |
+| yes             | —                   | —                    | **unset** (and withdrawal semantics apply, §4.2) |
+| no              | yes                 | —                    | unset (withdrawal per §4.2, trigger 2)           |
+| no              | no                  | yes                  | set, unless B = denied                           |
+| no              | no                  | no                   | set iff B = granted                              |
 
 ### 4.2 Withdrawal vs. absence
 
@@ -313,38 +344,45 @@ live graph identity with no browser handle pointing at it):
   browser setting, the TCF record lives in the CMP's storage), so the next
   request re-presents the signal and retries the whole withdrawal. No
   quarantine queue is needed; the browser is the retry queue.
-- Identify, batch-sync, and pull-sync treat a tombstone as authoritative
-  revocation (as today); a row whose withdrawal is pending retry is simply
-  still live until the retry lands, and never partially withdrawn.
-- Fault-injection tests cover: tombstone write fails → cookie untouched,
-  error logged; subsequent request with the same signal → withdrawal
+- **Partial progress is explicit, not atomic.** The tombstone writes are a
+  **revocation family**: an enumerable, ordered set of independent KV
+  writes (cookie hash, active-EC hashes), each idempotent, with no
+  multi-key atomicity assumed — the current storage offers none, and the
+  spec does not pretend otherwise. A retry resumes the family from the
+  start (idempotent writes make re-writing completed members harmless).
+  Withdrawal is **complete** only when every family member is committed;
+  the cookie expires only then.
+- **Reads fail closed on partial families**: every consumer (identify,
+  batch-sync, pull-sync, egress gates) treats an identity as revoked when
+  **any** member of its revocation family is present — a partially
+  withdrawn identity is unusable immediately, even before the family
   completes.
+- Fault-injection tests cover failure at the **Nth** family write (not
+  only total failure): first write lands, second fails → cookie untouched,
+  identity already treated as revoked by readers, error logged; subsequent
+  request with the same signal → family completes and the cookie expires.
 
-### 4.4 Signal normalization
+### 4.4 Signal normalization — normative matrix
 
 §4's precedence operates on normalized inputs: one effective consent
 record and one effective opt-out state per request. The normalization
 layer is where today's real-world mess lives, and PR #838 collapsed it
-silently. The implementation ships a **normalization matrix** — a
-table-driven spec-and-test artifact — covering at minimum:
+silently. These are the outcomes — decided here, not delegated to the
+implementation; each row marked **changed** also appears in the migration
+matrix:
 
-- **Dual consent records**: standalone TCF cookie vs. GPP-embedded TCF,
-  including per-purpose disagreement, resolved per the existing configured
-  conflict modes (restrictive / permissive / newest). Each mode is either
-  preserved or explicitly retired in the migration matrix — not dropped.
-- **Record expiry** and the persisted-KV consent fallback: when a stored
-  record substitutes for an absent live one, and how staleness is bounded.
-- **Proxy/mirror mode** (CMP consent mirrored server-side): where the
-  mirrored state enters precedence.
-- **Exact GPP fields**: which section fields constitute a sale/sharing/
-  targeted-advertising opt-out, enumerated per supported section — "GPP
-  opt-out" is not a single bit.
-- **Malformed-but-present records fail closed for acquisition**: a consent
-  record that is present but undecodable blocks grants (it does not
-  degrade to "absent", which under a `granted` baseline would turn garbage
-  into a grant — the fail-open path in both #838 and the first draft of
-  this spec). A malformed record never triggers withdrawal — destruction
-  requires an affirmative, decodable signal (§4.2).
+| Input state                                                                  | Effective record / outcome                                                                                                                                                                                                                                                                                                                                         | Status                                                  |
+| ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------- |
+| Standalone TCF and GPP-embedded TCF disagree per purpose, mode `restrictive` | Per-purpose **synthesis**: a purpose is consented only when **both** records consent (AND)                                                                                                                                                                                                                                                                         | Preserved (mode semantics pinned against current tests) |
+| Same, mode `permissive`                                                      | Per-purpose synthesis: consented when **either** record consents (OR)                                                                                                                                                                                                                                                                                              | Preserved (same pinning)                                |
+| Same, mode `newest`                                                          | **Whole-record selection** by `Created` timestamp; tie → the GPP-embedded record                                                                                                                                                                                                                                                                                   | Preserved (same pinning)                                |
+| Expired consent record                                                       | Treated as **absent entirely** — grants nothing, refuses nothing, withdraws nothing; the baseline applies. Under a `granted` baseline that means the grant stands: an expired refusal is not current evidence and must not revoke indefinitely                                                                                                                     | Preserved                                               |
+| One valid record + a second malformed record of the same family              | The **valid record governs**; the malformed one is ignored with a `warn` log. Fail-closed-on-malformed (below) applies only when no valid record of that family exists                                                                                                                                                                                             | Decided here                                            |
+| Persisted-KV consent record, live record present                             | **Live wins**, always; the stored record is never consulted                                                                                                                                                                                                                                                                                                        | Preserved                                               |
+| Persisted-KV consent record, no live record                                  | Substitutes as the effective record **iff within the same TTL as a live record**; staler → absent. This narrow read is exempt from the graph-read permission gate (§7) — determining `store-on-device` cannot itself require `store-on-device`                                                                                                                     | Preserved, circularity resolved                         |
+| Proxy/mirror mode (CMP state mirrored server-side)                           | Mirror-sourced record enters as a live record; when both the mirror and the request carry records, the **request's record wins** (closer to the user)                                                                                                                                                                                                              | Decided here                                            |
+| GPP opt-out fields                                                           | Enumerated per supported section: the sale, sharing, and targeted-advertising opt-out fields each independently constitute an opt-out signal when set; **all present-and-false** constitutes a grant signal (§4); absent/N-A fields contribute nothing. The exact field list per section ID is an appendix of the implementation PR, reviewed against the GPP spec | Decided here                                            |
+| Malformed-but-present record, no valid record of that family                 | **Blocks grants** (fail-closed acquisition — it does not degrade to "absent", which under a `granted` baseline would turn garbage into a grant, the fail-open path in both #838 and the first draft of this spec). Never triggers withdrawal — destruction requires an affirmative, decodable signal (§4.2)                                                        | Changed (declared)                                      |
 
 ## 5. Jurisdiction resolution
 
@@ -415,63 +453,88 @@ migration story unresolvable (migration spec §2, rows 5 and 7).
 | No geo provider configured                           | `default_country` baseline, guarded by §5.3                                                   |
 | Country resolved, no matching rule                   | Policy `rules.default`                                                                        |
 | Region resolved, no region rule                      | Country rule                                                                                  |
-| No `[permissions]` section                           | Compiled-in fallback: everything `requires_signal`                                            |
+| No `[permissions]` section                           | Compiled-in fallback: everything `requires_signal`, `regime = "gdpr"`                         |
+| S2S sync request (no user signals)                   | Authorized by stored provenance re-validated against current policy (§7)                      |
 | Malformed policy                                     | Rejected at config push / startup (§3.3) — never per request                                  |
 | No `default_country`                                 | Startup failure                                                                               |
 | Undecodable TCF/GPP record (present but malformed)   | Blocks grants (fail-closed acquisition, §4.4); never withdraws; opt-out signals still honored |
 | Signals contradict (opt-out + consent)               | Opt-out wins (§4)                                                                             |
 
-The overall posture is **fail-closed**: every ambiguous state resolves to
-the configured baseline or more restrictive, and the one configuration that
-turns "no information" into a static jurisdiction assertion (§5.3) requires
-an explicit operator acknowledgment to exist.
+The intended posture is fail-closed, with its two exceptions stated rather
+than glossed: geo lookup failure resolves to the configured default (§5.2's
+declared, metered residual — permissive defaults make this path fail-open),
+and the §5.3 static-jurisdiction configuration exists only behind an
+explicit operator acknowledgment. Every other ambiguous state resolves to
+the configured baseline or more restrictive.
 
 ## 7. Enforcement points
 
 Consumers of the resolved set in this epic:
 
 1. **EC provider execution** (providers spec §5) — the provider's declared
-   `required_permissions()` must all be set. This gate applies to EC
-   providers only: geo and device providers execute **before** permission
-   resolution as its inputs, so gating them on its output would be
-   circular. Their governance is explicit selection, the capability checks
-   of providers spec §6, and §2's vocabulary rule — if a future vocabulary
-   adds a purpose covering geolocation or fingerprinting, gating those
-   providers will require a two-phase resolution that must be specified
-   then, not improvised.
+   `required_permissions()` must all be set for minting and identity use.
+   This gate applies to EC providers only. **Geo** is ungated because
+   gating it is circular — jurisdiction is an input to permission
+   resolution. **Device** is ungated by a different, deliberate decision
+   (it is _not_ a resolution input): its security-classification role must
+   run for traffic that has granted nothing, and operator selection is the
+   recorded authorization — providers spec §5 states the decision and its
+   boundary. If a future vocabulary adds a purpose covering geolocation or
+   fingerprinting, gating those providers will require a two-phase
+   resolution specified then, not improvised.
 2. **EC lifecycle** — creation requires `store-on-device`; withdrawal per
    §4.2. Recognition, canonicalization, and revocation of an existing
    identifier are **never** permission-gated — they must run precisely when
    permissions are withdrawn (providers spec §5).
-3. **Every raw-EC egress**, not only EIDs. The raw EC identifier leaves the
-   process today as OpenRTB `user.id`, inside derived auction request IDs,
-   on the page-bids path, on proxied/click/Testlight forwarding, through the
-   identify endpoint, through pull/batch sync, and via identity-graph
-   reads/writes. Gating EIDs alone (PR #838's shape) leaves the raw EC
-   reaching bidders when Purpose 1 is granted and Purpose 4 refused; worse,
-   #838's `ec_allowed` was **vacuously true with no provider configured**
-   (`is_none_or`), so an existing canonical cookie still escaped in
-   stateless mode. The contract:
-   - The implementation maintains an **egress inventory**: every code path
-     where a raw EC (or a value derived from it) leaves the process is
-     enumerated in one table, each mapped to its required permissions, with
-     a test per row.
-   - **Bidstream egress** (`user.id`, EC-derived request IDs, page bids,
-     EIDs) requires `store-on-device` ∧ `select-personalised-ads` — the raw
-     EC is identity in the bidstream and is gated exactly as EIDs are.
-   - **First-party identity operations** (identify, pull/batch sync,
-     graph reads/writes other than revocation) require `store-on-device`.
-   - **Revocation paths are exempt** — tombstoning must work when
-     permissions are unset.
-   - With **no EC provider configured**, identity use fails closed: a
-     cookie value present on the request never egresses anywhere; it is
-     never vacuously allowed.
-4. **Bidstream EIDs** — transmission requires `store-on-device` ∧
-   `select-personalised-ads` (subsumed by point 3's inventory; listed
-   separately because it is the one gate PR #838 had).
-5. **Server-side auction dispatch** — gated on the explicit policy `regime`
-   class (§3.4), a first-class enforcement point, not inferred from purpose
-   flags.
+3. **Every raw-EC egress and identity operation** — the concrete
+   inventory, normative per path (one test per row; a denylist check
+   proves no ungated egress exists):
+
+   | Path                                                             | Required permissions                          | Notes                                                                                                                                        |
+   | ---------------------------------------------------------------- | --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+   | OpenRTB `user.id`                                                | `store-on-device` ∧ `select-personalised-ads` | Raw EC is identity in the bidstream — gated exactly as EIDs. PR #838 gated only EIDs, leaving `user.id` reachable with Purpose 4 refused     |
+   | EC-derived auction request IDs                                   | both purposes                                 | Derived values are identity                                                                                                                  |
+   | Page-bids path                                                   | both purposes                                 |                                                                                                                                              |
+   | Bidstream EIDs                                                   | both purposes                                 | The one gate PR #838 had                                                                                                                     |
+   | Proxy / click / Testlight forwarding of the EC cookie or headers | both purposes                                 | **New hardening, declared change** — these paths extract the raw cookie/header without today's jurisdiction gate (migration spec §2 row 11b) |
+   | Identify endpoint (partner-facing)                               | both purposes                                 | Partner identity exchange, not a first-party lookup — decided here                                                                           |
+   | Pull sync / batch sync (partner identity exchange)               | both purposes                                 | Authority source for S2S requests: stored provenance, below                                                                                  |
+   | Request-scoped graph reads/writes (non-revocation)               | `store-on-device`                             |                                                                                                                                              |
+   | Revocation paths (tombstones, withdrawal reads)                  | **exempt**                                    | Must work when permissions are unset                                                                                                         |
+   | Stored consent-state lookup (§4.4)                               | **exempt**, narrowly scoped                   | Determining `store-on-device` cannot require `store-on-device`                                                                               |
+
+   With **no EC provider configured**, identity use fails closed: a cookie
+   value present on the request never egresses anywhere — never vacuously
+   allowed (#838's `ec_allowed` was `is_none_or`, vacuously true with no
+   provider).
+
+   **S2S authority (batch/pull sync).** A server-to-server request carries
+   no user signals, geo, or `EcContext` to resolve permissions from. Its
+   authority is the identity's **stored provenance**: a record written at
+   mint/update time carrying the resolved jurisdiction, regime, grant
+   basis, and provider/version (providers spec §6.1). A sync request
+   re-validates that provenance against the **current** policy revision:
+   if the stored jurisdiction now resolves to `denied` for the required
+   permission, the row is not updated and is flagged for the operational
+   cleanup of §4.2 trigger 3. Sync never mints authority of its own.
+
+4. **Server-side auction dispatch** — gated on the policy `regime` class,
+   normatively:
+
+   | Regime       | Dispatch rule                                                                                                                                                     | Preserves                 |
+   | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------- |
+   | `gdpr`       | Dispatch only with a decodable, unexpired TCF record consenting to Purpose 1. Malformed, expired, or absent record → **no bid request leaves** (no-bid response). | Today's GDPR/unknown arm  |
+   | `us-privacy` | Dispatch proceeds in every signal state, including opt-out — the opt-out strips identity (rows above) but the contextual auction runs.                            | Today's US-state arm      |
+   | `none`       | Dispatch proceeds.                                                                                                                                                | Today's non-regulated arm |
+
+   The **compiled-in fallback policy has `regime = "gdpr"`** (§3.1) — the
+   no-policy posture must be the most protective for dispatch too, and a
+   regime-less fallback would leave dispatch undefined. When dispatch is
+   blocked, nothing leaves for that request: no PBS/APS call, no UA/IP/geo
+   forwarding to bidders. When dispatch proceeds, what the request may
+   carry is governed row-by-row by the egress inventory; the full
+   regulatory context (consent strings) is always forwarded so downstream
+   partners make their own decisions (§1).
 
 The client-cycle resolve endpoint (own spec, currently on hold) would be a
 further consumer if and when it proceeds.
@@ -488,6 +551,13 @@ further consumer if and when it proceeds.
   configured conflict mode and the malformed-record rows.
 - The §7 raw-EC egress inventory: one test per inventoried egress proving
   the gate, plus a denylist-style check that no ungated egress exists.
+- The §7 auction-dispatch matrix: every regime × signal state
+  (consent, opt-out, malformed, expired, absent), including the
+  no-policy fallback regime, asserting both the dispatch decision and
+  that a blocked dispatch emits no outbound request.
+- The §7 S2S authority path: sync against stored provenance, including
+  the policy-tightened-to-denied case (no update, flagged for cleanup)
+  and the exempt consent-state lookup.
 - §4.3 fault-injection cases.
 - Policy validation tests for every §3.3 rejection, exercised through both
   acceptance paths (push-time and startup).
@@ -513,8 +583,9 @@ This spec supersedes #779 on the following points; the issue is updated to
 reference this spec when the PR merges, so there is one acceptance contract,
 not two:
 
-| #779 says                                     | This spec says                                                                                                           | Why                                                                                                |
-| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------- |
-| Unmatched countries fall to `default_country` | Unmatched-but-resolved countries fall to the policy's `rules.default`; `default_country` covers only unresolved requests | The two states had different pre-epic behavior; collapsing them made migration unresolvable (§5.4) |
-| The full TCF purpose vocabulary is modeled    | Only enforced purposes appear (§2)                                                                                       | Nine inert purposes in a policy file are a compliance hazard, not forward compatibility            |
-| Policy is an embedded file                    | Policy is `[permissions]` in `trusted-server.toml` (§3.1)                                                                | Runtime config-store pipeline; validation at push time                                             |
+| #779 says                                                                                    | This spec says                                                                                                           | Why                                                                                                                                          |
+| -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| Unmatched countries fall to `default_country`                                                | Unmatched-but-resolved countries fall to the policy's `rules.default`; `default_country` covers only unresolved requests | The two states had different pre-epic behavior; collapsing them made migration unresolvable (§5.4)                                           |
+| The full TCF purpose vocabulary is modeled                                                   | Only enforced purposes appear (§2)                                                                                       | Nine inert purposes in a policy file are a compliance hazard, not forward compatibility                                                      |
+| Policy is an embedded file                                                                   | Policy is `[permissions]` in `trusted-server.toml` (§3.1)                                                                | Runtime config-store pipeline; validation at push time                                                                                       |
+| Permission sources are open-ended (#777: publisher interaction, external services may grant) | Sources are jurisdiction, policy, and the §4 signal taxonomy; a pluggable source interface is **deferred** (§1)          | Shipping an interface with no second source repeats the inert-surface mistake; the extension path (a new §4 signal class) is defined instead |

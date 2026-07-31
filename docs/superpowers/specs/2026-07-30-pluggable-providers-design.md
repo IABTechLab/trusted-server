@@ -94,26 +94,49 @@ An `EdgeCookieProvider` owns the **complete lifecycle** of the identifiers it
 mints. Every lifecycle operation core performs on an EC value MUST be routed
 through the selected provider:
 
-| Lifecycle operation                      | Where core uses it today                                                                                               | Contract                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Mint**                                 | EC generation on first eligible request                                                                                | Provider returns the identifier (and only core writes the cookie).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| **Parse / canonicalize**                 | Reading `ts-ec` back from the request; deciding `ec_was_present`; batch-sync ingestion                                 | Provider parses a cookie value into its **canonical** identifier, or rejects it. Canonicalization is provider-owned: case variants and equivalent envelopes of the same identity (per #778) parse to the same canonical identifier. A value the selected provider does not recognize is treated as absent (but see §6.1 legacy readers).                                                                                                                                                                                                                                                                            |
-| **Canonical graph key**                  | KV identity-graph row reads/writes                                                                                     | The provider maps a canonical identifier to its graph key: stable, KV-safe (within KV length and character-set limits), collision-free across the provider's identifier space, and namespaced so two providers' key spaces cannot collide. Two equivalent envelopes of one identity map to one key — verbatim cookie bytes as the key would fork graph rows on canonicalization differences and discard today's batch-sync canonicalization.                                                                                                                                                                        |
-| **Cluster prefix** (optional capability) | IP-cluster sizing (`cluster_trust_threshold`, implemented as a **KV prefix listing**), pull-sync dedupe, log redaction | A provider declaring cluster support returns a prefix that is a **literal byte prefix of the canonical graph key** — the cluster count lists keys by prefix, so an independently derived hash that is not an actual key prefix silently reports the wrong cluster size. The prefix deliberately collides across identifiers minted from the same client evidence. A provider without the capability declares so, and cluster-dependent gating follows a configured degradation policy (treat cluster size as unknown, with the KV-write decision that implies made explicit in config) instead of counting garbage. |
-| **Tombstone**                            | Withdrawal: expiring the cookie and writing revocation markers                                                         | The identifiers eligible for tombstoning are exactly those the provider parses — never a shape-gated subset.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| Lifecycle operation                      | Where core uses it today                                                                                               | Contract                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Mint**                                 | EC generation on first eligible request                                                                                | Provider returns the identifier (and only core writes the cookie).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| **Parse / canonicalize**                 | Reading `ts-ec` back from the request; deciding `ec_was_present`; batch-sync ingestion                                 | Provider parses a cookie value into its **canonical** identifier, or rejects it. Canonicalization and **equivalence are provider-declared, never imposed globally**: each provider ships equivalence fixtures naming exactly which variants are the same identity — case sensitivity is provider-specific (signed/base64-style envelopes are case-sensitive; even the built-in HMAC id is case-insensitive only in its hex prefix, with a case-preserved suffix). Declared-equivalent values parse to the same canonical identifier (satisfying #778). A value the selected provider does not recognize is treated as absent (but see §6.1 legacy readers). |
+| **Canonical graph key**                  | KV identity-graph row reads/writes                                                                                     | The provider maps a canonical identifier to its graph key: stable, KV-safe (within KV length and character-set limits), collision-free across the provider's identifier space, and namespaced so two providers' key spaces cannot collide. Two equivalent envelopes of one identity map to one key — verbatim cookie bytes as the key would fork graph rows on canonicalization differences and discard today's batch-sync canonicalization.                                                                                                                                                                                                                |
+| **Cluster prefix** (optional capability) | IP-cluster sizing (`cluster_trust_threshold`, implemented as a **KV prefix listing**), pull-sync dedupe, log redaction | A provider declaring cluster support returns a prefix that is a **literal byte prefix of the canonical graph key** — the cluster count lists keys by prefix, so an independently derived hash that is not an actual key prefix silently reports the wrong cluster size. The prefix deliberately collides across identifiers minted from the same client evidence. A provider without the capability declares so, and cluster-dependent gating follows a configured degradation policy (treat cluster size as unknown, with the KV-write decision that implies made explicit in config) instead of counting garbage.                                         |
+| **Tombstone**                            | Withdrawal: expiring the cookie and writing revocation markers                                                         | The identifiers eligible for tombstoning are exactly those the provider parses — never a shape-gated subset.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 
 **Invariant:** for every provider `P` and every identifier `id` minted by `P`,
-`P.parse` round-trips `id` (including its case variants and equivalent
-envelopes, which all canonicalize to the same identifier and graph key);
-where `P` declares cluster support, `cluster_prefix(id)` is a literal prefix
-of `graph_key(id)` and is shared by identifiers minted from the same client
-evidence; and a withdrawal request carrying `id` tombstones it. A conformance
-test suite MUST assert this round-trip for every shipped provider — including
-case-variant, equivalent-envelope, cross-provider key-namespace, and KV
-length/charset cases — and the suite MUST be written so a future provider
-crate can run it against its own implementation. Conformance tests inject
-deterministic entropy; probabilistic assertions ("two random suffixes
-differ") are not accepted.
+`P.parse` round-trips `id` — including every variant `P`'s declared
+equivalence fixtures name, all of which canonicalize to the same identifier
+and graph key; where `P` declares cluster support, `cluster_prefix(id)` is a
+literal prefix of `graph_key(id)` and is shared by identifiers minted from
+the same client evidence; and a withdrawal request carrying `id` tombstones
+it. A conformance test suite MUST assert this round-trip for every shipped
+provider — driven by each provider's equivalence fixtures, plus
+cross-provider key-namespace and KV length/charset cases — and the suite
+MUST be written so a future provider crate can run it against its own
+implementation. Conformance tests inject deterministic entropy;
+probabilistic assertions ("two random suffixes differ") are not accepted.
+
+Three global rules sit above every provider:
+
+- **Identifier bounds.** A minted identifier obeys a global cookie-safe
+  alphabet (valid cookie-octets: no separators, whitespace, or control
+  characters) and a global maximum length — for the identifier itself, not
+  only the graph key — enforced by core at mint and at parse, so no
+  provider can emit a value the cookie layer or logs cannot carry.
+- **Namespace reservation.** The legacy HMAC grammar `{64hex}.{6alnum}` is
+  formally **reserved as the `hmac` provider's namespace**. `hmac`'s graph
+  key is the identifier verbatim and its cluster prefix is the 64-hex
+  prefix, so every pre-epic row stays reachable and every prefix listing
+  intact (migration spec §3) — and **no other provider may mint
+  identifiers or produce graph keys matching that grammar**, which is what
+  makes verbatim-compatibility and provider-namespacing coexist.
+  Conformance fixtures include an existing pre-epic row (reachability) and
+  a prefix-listing case. For `hmac`, the equivalence fixtures pin:
+  uppercase/lowercase hex-prefix variants are equivalent; suffix case is
+  preserved and significant.
+- **No-cluster behavior is still defined.** A provider without cluster
+  support deduplicates pull-sync by canonical graph key and redacts logs
+  with a fixed-length hash of the graph key; `cluster_fallback` (§6.1)
+  governs only the trust/write decision, not these.
 
 ## 4. Trait surface: minimalism rule
 
@@ -147,8 +170,8 @@ pub trait EdgeCookieProvider {
     /// Mint an identifier from request evidence.
     fn generate(&self, input: &IdentityInput<'_>) -> Result<EcId, Report<EcError>>;
     /// Parse and canonicalize a cookie value into this provider's
-    /// identifier; None when unrecognized. Equivalent envelopes and case
-    /// variants canonicalize to the same identifier.
+    /// identifier; None when unrecognized. Values the provider's declared
+    /// equivalence fixtures name as equivalent canonicalize identically.
     fn parse(&self, value: &str) -> Option<EcId>;
     /// Canonical KV graph key for a parsed identifier.
     fn graph_key(&self, id: &EcId) -> GraphKey;
@@ -175,6 +198,15 @@ state an opt-out produces, making the withdrawal it demands impossible. A
 spy-provider test pins the split: with `store-on-device` unset, `generate`
 is never called while a withdrawal request still parses the cookie and
 writes tombstones.
+
+**A generated identity is not active until its graph row commits.** No
+cookie write, no egress, no auction use may observe a minted identifier
+before its graph row (with provenance, §6.1) has committed — PR #838 let a
+generated EC reach an auction before finalization refused the cookie,
+producing an identity that existed for one request and nowhere else. The
+normative order is: gate → `generate` → graph-row commit → cookie write →
+eligible for egress. A graph-commit failure means the mint never happened:
+no cookie, no egress, error logged, the next request retries.
 
 The gate applies to EC providers **only**. Geo and device are ungated for
 two _different_ reasons, stated separately because only one of them is
@@ -209,13 +241,15 @@ one. This spec resolves that by **not having** the method on those traits
 All validation happens at **settings construction** — a misconfiguration is a
 startup error, never a request-time error and never a silent behavior change.
 
-| Configuration state                                                                                                                                  | Behavior                                                                                                                                                                                                                                    |
-| ---------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `provider` names an unknown key                                                                                                                      | Startup error listing valid keys.                                                                                                                                                                                                           |
-| `provider` set, its `[ec.providers.<key>]` block missing                                                                                             | Startup error.                                                                                                                                                                                                                              |
-| `[ec.providers.<key>]` block present, `provider` unset                                                                                               | **Startup error.** (In PR #838 this silently ran stateless — the half-migrated config becomes a production identity outage detected by revenue drop. Rejecting it is the fix.) An operator who genuinely wants stateless deletes the block. |
-| `provider` set to an implementation the running adapter cannot satisfy (e.g. a provider requiring host TLS fingerprints on an adapter that has none) | Startup error at adapter wiring time. Adapters declare their host capabilities to the composition root; the root checks the selected provider's needs against them **once**, at startup — not per request.                                  |
-| No `provider`, no providers block                                                                                                                    | Valid: the neutral default for that concern.                                                                                                                                                                                                |
+| Configuration state                                                                                                                                  | Behavior                                                                                                                                                                                                                                                           |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `provider` names an unknown key                                                                                                                      | Startup error listing valid keys.                                                                                                                                                                                                                                  |
+| `provider` set, its `[ec.providers.<key>]` block missing                                                                                             | Startup error.                                                                                                                                                                                                                                                     |
+| `[ec.providers.<key>]` block present, `provider` unset                                                                                               | **Startup error.** (In PR #838 this silently ran stateless — the half-migrated config becomes a production identity outage detected by revenue drop. Rejecting it is the fix.) An operator who genuinely wants stateless deletes the block.                        |
+| `provider` set to an implementation the running adapter cannot satisfy (e.g. a provider requiring host TLS fingerprints on an adapter that has none) | Startup error at adapter wiring time. Adapters declare their host capabilities to the composition root; the root checks the selected provider's needs against them **once**, at startup — not per request.                                                         |
+| No `provider`, no providers block                                                                                                                    | Valid: the neutral default for that concern.                                                                                                                                                                                                                       |
+| `provider = "none"` (explicit stateless)                                                                                                             | Valid, and the only way to combine statelessness with `legacy_providers`: minting stops, legacy readers keep existing identities resolvable and **withdrawable** (§6.1). Without this state, `hmac` → stateless would strand every live row in revoke-proof limbo. |
+| A minting provider (or any `legacy_providers`) configured, but no identity-graph store configured or openable                                        | **Startup error.** The lifecycle contract assumes graph persistence (§5); discovering its absence at first mint would be a request-time config failure, which this table exists to forbid.                                                                         |
 
 Unknown fields inside every provider config block are rejected
 (`deny_unknown_fields` on all new settings structs — the pre-existing `Ec`
@@ -237,21 +271,63 @@ The contract:
   tombstoning when the active writer does not recognize a value. Legacy
   readers never mint. Each listed key must have its `[ec.providers.<key>]`
   block, validated like the active one (§6 table).
+- **Parse order and ambiguity.** The active writer parses first; the first
+  match wins. Overlapping recognition is not resolved at request time but
+  **forbidden at startup**: provider namespaces (§3) may not overlap, and
+  configuring an active/legacy pair whose grammars intersect is a
+  validation error.
+- **The recognizing provider governs.** A legacy-owned identity is gated
+  by the **legacy provider's** `required_permissions()` for identity use —
+  the provider that minted under a declared data-use contract is the one
+  whose contract applies.
+- **Provenance is provider- and version-tagged.** Every graph row carries
+  the minting provider id and its configuration version (this is the same
+  provenance record the S2S sync authority reads, permission model spec
+  §7). Same-provider key/passphrase rotation is a version entry, not a
+  provider switch: parse consults all configured versions of the active
+  provider.
 - A cookie recognized by a legacy reader is a live identity for
   read/withdrawal purposes; whether it is transparently re-minted under the
   active writer is a per-deployment choice
   (`[ec] rewrite_legacy = true|false`), and re-minting is subject to the
   full minting gate of §5.
+- **Rewrite is transactional and linking, not fire-and-forget.** Order:
+  new row commits first, carrying a link to the old row and a copy of the
+  old row's consent metadata and partner mappings; only then does the
+  cookie swap; the old row is tombstoned (or link-retired) only after the
+  new row and cookie are in place. An interrupted rewrite leaves the old
+  cookie valid and simply retries — no state in which neither identity
+  works. **Withdrawal of either linked row tombstones both.**
 - Retiring a legacy reader is the explicit end of those identities:
   the migration guide documents the cleanup procedure (migration spec §6).
 - Tests: switch active provider → request with old cookie → identity still
-  resolves and a withdrawal tombstones it; old cookie with no matching
-  legacy reader → treated as absent and **never egresses**.
+  resolves and a withdrawal tombstones it (both linked rows when
+  rewritten); old cookie with no matching legacy reader → treated as
+  absent and **never egresses**; interrupted rewrite → old cookie still
+  live, retry completes; `provider = "none"` + legacy reader → no mints,
+  withdrawal still works.
 
 Cluster degradation config (referenced from §3): when the active writer
 lacks the cluster capability, `[ec] cluster_fallback = "allow" | "deny"`
 decides whether KV-backed writes gated on cluster trust proceed; there is
 no implicit default — the operator chooses.
+
+### 6.2 Runtime failure matrix — normative
+
+Startup validation (§6) covers configuration; this covers what happens
+when a healthy configuration meets an unhealthy runtime. Every row logs at
+`error` with a metric; none is silent:
+
+| Failure                                                                   | Behavior                                                                                                         |
+| ------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `generate` returns an error                                               | No identity this request; request proceeds stateless; no cookie written                                          |
+| Graph-row commit fails at mint                                            | Mint never happened (§5): no cookie, no egress; next request retries                                             |
+| Graph read fails on an existing identity                                  | Identity unusable this request (fail closed for egress); cookie untouched                                        |
+| Cluster prefix listing fails                                              | Treated as cluster-size-unknown → `cluster_fallback` policy applies                                              |
+| Tombstone write fails                                                     | Permission model spec §4.3: family retries, readers fail closed on partial families                              |
+| Legacy rewrite fails mid-flight                                           | Old cookie remains live; rewrite retries (§6.1)                                                                  |
+| Geo provider returns invalid output (unparseable country) at runtime      | Treated as lookup failure → `default_country` (permission model spec §5.2), counted in the lookup-failure metric |
+| Device provider signals unavailable at runtime (e.g. no JA4 on a request) | Classification degrades per the provider's declared fallback, never silently upgrades `looks_like_browser`       |
 
 ## 7. Composition root and adapter parity
 

@@ -93,6 +93,25 @@ Everything in this spec follows from that.
    the resulting identifier that keeps it cookie-safe and within the KV
    limits of the providers spec §3. Tests exercise the exact 413 boundary
    and the missing/false/chunked-length cases.
+8. **Define behavior against an existing identity — no silent
+   replacement.** When the request already carries a recognized EC:
+   resolving to the **same** identity is an idempotent no-op (cookie
+   refreshed, same response); resolving to a **different** identity is
+   **rejected** — replacing a live identity via an unauthenticated POST is
+   identity takeover, and any legitimate re-identification flow (account
+   link, vendor migration) is an explicit linking design this spec does
+   not authorize (own open question, §7).
+9. **Make replay consumption and graph persistence one idempotent
+   sequence.** Neither naive order works: consume-the-nonce-first makes a
+   subsequent graph failure unretryable (the token is spent, the identity
+   never existed); graph-first lets the losers of a replay race leave
+   residual rows. Required shape: consumption is an **atomic single-key
+   reservation** keyed by the payload's unique id, recording outcome; the
+   graph write happens under that reservation and is retried under the
+   same key; duplicate or racing requests observe the reservation and
+   receive the original outcome — no second identity, no spent-but-unused
+   token, no orphan row. Tests cover crash-between-steps and two
+   concurrent requests with the same payload.
 
 ## 4. Requirements on the page script
 
