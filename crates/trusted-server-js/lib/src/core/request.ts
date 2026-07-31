@@ -85,7 +85,9 @@ export function requestAds(
   }
 }
 
-// Render a creative by writing sanitized, non-executable HTML into a sandboxed iframe.
+// Render a creative by writing its HTML into a sandboxed iframe. The markup may
+// be raw bidder output (server-side sanitization is opt-in); the sandbox's
+// origin isolation is the security boundary.
 function renderCreativeInline({
   slotId,
   creativeHtml,
