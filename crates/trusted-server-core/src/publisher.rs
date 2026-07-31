@@ -3244,29 +3244,28 @@ pub(crate) fn build_bid_map(
                 // — no PBS Cache round trip. The `hb_cache_*` coordinates above
                 // remain as the fallback for an absent `adm`.
                 //
-                // Sanitize dangerous markup first, then rewrite URLs to
-                // first-party proxies — the same creative-processing boundary as
-                // the `/auction` path (see `auction::formats`), except the inline
-                // variant. Unlike `/auction`, this `adm` is rendered by the Prebid
+                // Sanitize dangerous markup first, then optionally rewrite URLs
+                // to first-party proxies — the same creative-processing policy as
+                // the `/auction` path (see `auction::formats`), except for the
+                // inline render context. This `adm` is rendered by the Prebid
                 // Universal Creative inside GAM's iframe (`f.srcdoc = d.ad`), a
                 // foreign origin where root-relative `/first-party/…` URLs resolve
-                // against GAM and 404. `rewrite_inline_creative_html` emits
+                // against GAM and 404. The inline rewriter therefore emits
                 // absolute first-party URLs and omits the tsjs bundle injection.
-                // `sanitize_creative_html` also enforces the 1 MiB creative cap,
-                // returning an empty string for oversized or unparseable markup —
-                // in which case the entry is omitted and the bridge falls back to
-                // the PBS Cache coordinates.
+                // Sanitization also enforces the 1 MiB creative cap, returning an
+                // empty string for oversized or unparseable markup — in which case
+                // the entry is omitted and the bridge falls back to the PBS Cache
+                // coordinates.
                 if let Some(ref raw_creative) = bid.creative {
                     // Resolve ${AUCTION_PRICE} from the exact winning CPM BEFORE
                     // sanitizing, rewriting, and signing — URL rewriting would
                     // otherwise encode the literal macro into the signed proxy/click
                     // URL, and signing would lock that wrong value.
                     let priced = crate::creative::expand_auction_price_macro(raw_creative, cpm);
-                    let sanitized = crate::creative::sanitize_creative_html(&priced);
-                    let adm = crate::creative::rewrite_inline_creative_html(
+                    let adm = crate::creative::process_inline_auction_creative(
                         settings,
                         &base_origin,
-                        &sanitized,
+                        &priced,
                     );
                     if !adm.is_empty() {
                         obj.insert("adm".to_string(), serde_json::Value::String(adm));
@@ -3314,8 +3313,45 @@ pub(crate) fn build_bids_script(bid_map: &serde_json::Map<String, serde_json::Va
     let json = serde_json::to_string(bid_map)
         .expect("serde_json::to_string of Map<String,Value> should be infallible");
     let escaped = html_escape_for_script(&json);
+    // adInit() defines GPT slots on the publisher's `-container` wrappers, which
+    // mutates those ad-slot subtrees. Calling it synchronously here (this script
+    // runs at body-parse time) lands those mutations inside React's hydration
+    // window and trips a #418 hydration mismatch. The deferral — gate on window
+    // `load`, then a double `requestAnimationFrame`, pinned to navigation
+    // generation 0 so a faster SPA navigation cancels it — lives in the GPT
+    // bundle module as `tsjs.scheduleInitialAdInit`
+    // (crates/trusted-server-js/lib/src/integrations/gpt/index.ts), where the
+    // lifecycle is executable under Vitest (schedule_initial_ad_init.test.ts)
+    // and the navigation-generation guard is shared with the SPA auction hook;
+    // gpt_bootstrap.js installs a minimal head-injected fallback so a failed
+    // bundle load still initializes initial ads.
+    //
+    // The deferral is deliberately unconditional — every publisher, every
+    // page — even though only hydrating React publishers exhibit the #418
+    // failure. Uniform behavior keeps one code path to reason about and
+    // avoids a framework-detection or config surface that must be kept
+    // truthful per publisher; the cost is that non-React pages also move the
+    // initial request from parse time to window load. The agreed follow-up
+    // (branch 958-adinit-hydration-chunk-gate, spec in docs/superpowers/
+    // specs/2026-07-24-adinit-hydration-gate-design.md) narrows the gate to
+    // the Next.js hydration chunks with `load` as the can't-hang fallback,
+    // which recovers most of that latency without a new config surface.
+    //
+    // The bids payload is handed to the scheduler instead of being assigned
+    // here: an SPA navigation that committed while this document was still
+    // streaming has already replaced `tsjs.bids`, and an unconditional
+    // assignment would clobber the live route's bids with the stale SSR
+    // payload. Only when no scheduler exists at all (GPT integration active
+    // without its head bootstrap — not an expected deployment) does the script
+    // fall back to a plain assignment, where no SPA hook exists to race with.
     format!(
-        "<script>(window.tsjs=window.tsjs||{{}}).bids=JSON.parse(\"{}\");(function(){{var f=window.tsjs.adInit;if(typeof f===\"function\")f();}})();</script>",
+        "<script>(function(){{\
+var t=window.tsjs=window.tsjs||{{}};\
+var b=JSON.parse(\"{}\");\
+var s=t.scheduleInitialAdInit;\
+if(typeof s===\"function\")s(b);\
+else t.bids=b;\
+}})();</script>",
         escaped
     )
 }
@@ -6050,7 +6086,7 @@ mod tests {
                 "should still inject ad slots. Got: {html}"
             );
             assert!(
-                html.contains(".bids=JSON.parse"),
+                html.contains("var b=JSON.parse("),
                 "should collect auction and inject bids before body close. Got: {html}"
             );
         });
@@ -6116,7 +6152,7 @@ mod tests {
                 "should decode the second gzip member that a single-member decoder drops. Got: {html}"
             );
             assert!(
-                html.contains(".bids=JSON.parse"),
+                html.contains("var b=JSON.parse("),
                 "should inject bids before the </body> carried in the second member. Got: {html}"
             );
         });
@@ -6409,7 +6445,7 @@ mod tests {
             "prefix must carry the injected (rewritten) head before EOF. Got: {html}"
         );
         assert!(
-            !html.contains(".bids=JSON.parse"),
+            !html.contains("var b=JSON.parse("),
             "bids inject only at </body> after collection, which the first poll must not wait for. Got: {html}"
         );
     }
@@ -6451,7 +6487,7 @@ mod tests {
             "first poll must emit the decoded document prefix of a small gzip page. Got: {decoded}"
         );
         assert!(
-            !decoded.contains(".bids=JSON.parse"),
+            !decoded.contains("var b=JSON.parse("),
             "bids inject only at </body> after collection, which the first poll must not wait for. Got: {decoded}"
         );
     }
@@ -6891,7 +6927,7 @@ mod tests {
 
         let html = String::from_utf8(gzip_decode(&output)).expect("should be valid UTF-8");
         assert!(
-            html.contains(".bids=JSON.parse"),
+            html.contains("var b=JSON.parse("),
             "should collect the held auction and inject bids. Got tail: {}",
             &html[html.len().saturating_sub(200)..]
         );
@@ -7501,6 +7537,63 @@ mod tests {
         }
 
         #[test]
+        fn build_bid_map_can_skip_rewriting_but_not_sanitization() {
+            let mut settings = test_settings();
+            settings.auction.rewrite_creatives = false;
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "kargo",
+                "abc123",
+                "https://ssp/win",
+                "https://ssp/bill",
+            );
+            bid.creative = Some(
+                "<div onclick=\"steal()\"><script>marker</script>\
+                 <a href=\"https://click.example/landing\">x</a>\
+                 <img src=\"https://cdn.example/ad.png\"></div>"
+                    .to_string(),
+            );
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &settings,
+                "https://publisher.example",
+                false,
+            );
+            let adm = map
+                .get("atf_sidebar_ad")
+                .and_then(|value| value.as_object())
+                .and_then(|object| object.get("adm"))
+                .and_then(|value| value.as_str())
+                .expect("should include a sanitized adm");
+
+            assert!(
+                adm.contains(r#"href="https://click.example/landing""#),
+                "should keep accepted click URLs direct: {adm}"
+            );
+            assert!(
+                adm.contains(r#"src="https://cdn.example/ad.png""#),
+                "should keep accepted resource URLs direct: {adm}"
+            );
+            assert!(
+                !adm.contains("/first-party/"),
+                "should skip first-party URL rewriting: {adm}"
+            );
+            assert!(
+                !adm.contains("data-tsclick"),
+                "should skip click-guard attributes: {adm}"
+            );
+            assert!(
+                !adm.contains("marker") && !adm.contains("onclick"),
+                "should still sanitize executable markup: {adm}"
+            );
+        }
+
+        #[test]
         fn build_bid_map_omits_oversized_adm() {
             // Creatives larger than the sanitize pass's 1 MiB cap are rejected
             // (empty result), so the inline `adm` is omitted and the pbRender
@@ -8012,15 +8105,15 @@ mod tests {
         }
 
         #[test]
-        fn bids_script_calls_ad_init_without_retry_timer() {
+        fn bids_script_schedules_ad_init_without_retry_timer() {
             let mut map = serde_json::Map::new();
             map.insert("atf".to_string(), serde_json::json!({"hb_pb": "1.00"}));
 
             let script = build_bids_script(&map);
 
             assert!(
-                script.contains("window.tsjs.adInit"),
-                "should hand off bids to adInit"
+                script.contains("t.scheduleInitialAdInit"),
+                "should hand off bids to the deferred adInit scheduler"
             );
             assert!(
                 !script.contains("setTimeout"),
@@ -8029,6 +8122,54 @@ mod tests {
             assert!(
                 !script.contains("prevGptSlots"),
                 "should not use TS-owned slots as adInit success signal"
+            );
+        }
+
+        #[test]
+        fn bids_script_defers_ad_init_until_after_hydration() {
+            let mut map = serde_json::Map::new();
+            map.insert("atf".to_string(), serde_json::json!({"hb_pb": "1.00"}));
+
+            let script = build_bids_script(&map);
+
+            // adInit() mutates ad-slot subtrees (GPT defineSlot on the
+            // `-container` wrapper). Running it synchronously at body-parse time
+            // lands those mutations inside React's hydration window and trips a
+            // #418 hydration mismatch. The deferral lifecycle (window `load`,
+            // double `requestAnimationFrame`, generation-0 pinning via
+            // `tsjs.navGeneration`) lives in the GPT bundle module (with a
+            // head-injected fallback in gpt_bootstrap.js) where it is executable
+            // under Vitest (schedule_initial_ad_init.test.ts); this inline
+            // script must only delegate to that scheduler.
+            assert!(
+                script.contains("var s=t.scheduleInitialAdInit"),
+                "should delegate deferral to the installed scheduler"
+            );
+            // The bids payload is handed to the scheduler (which applies it only
+            // while the page is still on navigation generation 0) instead of
+            // being assigned unconditionally, so a faster SPA navigation's live
+            // bids cannot be clobbered by the stale SSR payload.
+            assert!(
+                script.contains("if(typeof s===\"function\")s(b)"),
+                "should pass the SSR bids payload to the scheduler"
+            );
+            assert!(
+                script.contains("else t.bids=b"),
+                "should fall back to a plain bids assignment without a scheduler"
+            );
+            assert!(
+                !script.contains(".bids=JSON.parse"),
+                "should not assign the SSR payload unconditionally"
+            );
+            // The one hydration-unsafe thing this script could do is invoke
+            // adInit synchronously at body-parse time — it must not.
+            assert!(
+                !script.contains("adInit()"),
+                "should not invoke adInit synchronously at parse time"
+            );
+            assert!(
+                !script.contains("setTimeout"),
+                "should not retry adInit on a timer"
             );
         }
 

@@ -76,9 +76,10 @@ const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
 /// ## Response
 ///
 /// Returns an `OpenRTB 2.x` response. Creative HTML is inlined in each bid's
-/// `adm` field after sanitisation and first-party URL rewriting. Response
-/// headers include `X-TS-EC` (the caller's Edge Cookie ID) and
-/// `X-TS-EC-Fresh` (a freshly generated ID for cookie renewal).
+/// `adm` field after mandatory server-side sanitization. First-party resource
+/// and click URL rewriting plus creative TSJS injection are enabled by default;
+/// setting [`auction.rewrite_creatives`][`crate::auction_config_types::AuctionConfig::rewrite_creatives`]
+/// to `false` skips only that rewrite pass.
 ///
 /// ## Scroll, refresh, and SPA navigation
 ///

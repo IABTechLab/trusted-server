@@ -130,13 +130,40 @@ export interface TsjsApi {
    */
   adInitRefreshInProgress?: boolean;
   /**
-   * True once the publisher has called `googletag.pubads().disableInitialLoad()`.
-   * GPT exposes no getter for this state, so it is tracked by wrapping the
-   * setter. When set, `display()` only registers a slot and the ad request must
-   * come from a `refresh()`; adInit() uses this to refresh its own freshly
-   * defined slots so they are not left blank.
+   * Whether the publisher disabled GPT initial load through
+   * `googletag.setConfig()` or `googletag.pubads().disableInitialLoad()`.
+   * TS synchronizes this from GPT's getter and wraps both configuration APIs as
+   * a fallback when the getter is unavailable.
+   * When set, `display()` only registers a slot and the ad request must come
+   * from a `refresh()`; adInit() uses this to refresh its own freshly defined
+   * slots so they are not left blank.
    */
   gptInitialLoadDisabled?: boolean;
   /** Guards SPA pushState hook installation. */
   spaHookInstalled?: boolean;
+  /**
+   * Monotonic count of committed SPA navigations, incremented synchronously by
+   * the SPA auction hook the moment it accepts a route change. The deferred
+   * initial-adInit bootstrap ([`scheduleInitialAdInit`]) is pinned to
+   * generation 0 (the SSR document) and no-ops when a navigation has
+   * committed — before it was called, or while it was pending. A counter is
+   * used instead of a URL comparison so the guard cannot diverge from the
+   * auction path: a query-only history change (which the hook deliberately
+   * ignores) leaves the counter unchanged, and an `/a → /b → /a` round trip
+   * (where the URL compares equal again) advances it.
+   */
+  navGeneration?: number;
+  /**
+   * Defers the initial `adInit()` until after React hydration: window `load`,
+   * then a double `requestAnimationFrame`. Called by the server-injected
+   * `</body>` bids script with the SSR bids payload. The whole initial pass
+   * is pinned to navigation generation 0 (the SSR document): if an SPA
+   * navigation has already committed — or commits while the deferred callback
+   * is pending — the payload is dropped and `adInit()` is not run, so a stale
+   * SSR bootstrap can neither clobber the live route's bids nor re-run it.
+   * Lives in the bundle so the lifecycle is executable under test and shares
+   * [`navGeneration`] with the SPA auction hook; `gpt_bootstrap.js` installs
+   * a minimal fallback for pages where the bundle fails to load.
+   */
+  scheduleInitialAdInit?: (initialBids?: Record<string, AuctionBidData>) => void;
 }
