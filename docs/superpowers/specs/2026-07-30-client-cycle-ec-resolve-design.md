@@ -50,17 +50,28 @@ Everything in this spec follows from that.
 
 `POST /_ts/api/v1/ec/resolve` (final path TBD) MUST:
 
-1. **Reject cross-site requests.** Require a same-site assertion: `Origin`
-   (or `Sec-Fetch-Site: same-origin/same-site`) validated against the
-   publisher's origin allowlist — configuration that does not exist yet and
-   must be defined by this feature (§7, question 5); requests without a
-   validating header are rejected. CSRF-token designs are acceptable but not
-   required if origin-based rejection is enforced.
-2. **Verify the payload cryptographically per provider.** The provider's
-   `resolve_from_client` accepts only payloads that are signed by an
-   expected party, **audience-bound** to this publisher, and **expiring**
-   (bounded lifetime, single-use where the scheme allows). A provider whose
-   payloads are replayable constants fails this bar by construction.
+1. **Reject cross-site requests with an exact origin check.** The request
+   is authorized only by **exact membership of the `Origin` header value in
+   the publisher's origin allowlist** — configuration that does not exist
+   yet and must be defined by this feature (§7, question 5) — or by a
+   **session-bound CSRF token**. `Sec-Fetch-Site` is **defense-in-depth
+   only, never an authorizing alternative**: it carries no origin value to
+   compare against an allowlist, and `same-site` admits every sibling
+   subdomain — one compromised or attacker-registered subdomain would be
+   enough to set identity. Requests with no `Origin` and no valid token are
+   rejected.
+2. **Verify the payload cryptographically per provider — including against
+   replay.** The provider's `resolve_from_client` accepts only payloads
+   that are signed by an expected party, **audience-bound** to this
+   publisher, and **expiring**. Audience binding and expiry alone do not
+   mitigate replay — a captured token installs in another browser for the
+   whole validity window — so one of the following is additionally
+   required: **binding to the requesting browser session** (a server-issued
+   nonce the payload must embed), or **server-side one-time consumption**
+   (a replay cache on the payload's unique id). A scheme that can support
+   neither may only ship if its residual replay window is quantified and
+   explicitly accepted in the feature's issue — "single-use where the
+   scheme allows" is not a mitigation.
 3. **Preserve the identity-graph invariant.** The cookie is set only after
    the corresponding graph row is written, mirroring the organic path. Graph
    unavailable → no cookie, same as organic generation.
@@ -75,6 +86,13 @@ Everything in this spec follows from that.
 6. **Be uncacheable and permission-gated.** `Cache-Control: no-store`;
    the same `store-on-device` permission gate as organic EC creation runs
    before any cookie is set.
+7. **Bound every input.** A maximum request-body size (order of the 64 KiB
+   limit PR #838 at least had), enforced by a **bounded read independent of
+   `Content-Length`** — a missing, false, or chunked length must not bypass
+   it; a `Content-Type` allowlist; and a length/character-set constraint on
+   the resulting identifier that keeps it cookie-safe and within the KV
+   limits of the providers spec §3. Tests exercise the exact 413 boundary
+   and the missing/false/chunked-length cases.
 
 ## 4. Requirements on the page script
 
@@ -103,8 +121,10 @@ sentence as the only guardrail.
 
 ## 6. Testing
 
-- Endpoint: origin-rejection, expired/replayed/foreign-audience payload
-  rejection, graph-unavailable refusal, permission-gate refusal — each as an
+- Endpoint: origin-rejection (including `Sec-Fetch-Site`-only requests,
+  which must fail), expired/replayed/foreign-audience payload rejection,
+  graph-unavailable refusal, permission-gate refusal, and the §3.7 body /
+  content-type / identifier limits at their exact boundaries — each as an
   integration test, not only unit tests.
 - Browser round trip (JS → POST → Set-Cookie → next request recognized) in
   the integration suite; PR #838 shipped the JS with in-process unit tests
