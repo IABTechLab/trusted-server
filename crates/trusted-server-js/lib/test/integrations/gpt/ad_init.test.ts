@@ -1341,7 +1341,6 @@ describe('installTsRenderBridge', () => {
       .mockImplementation(
         (type: string, handler: EventListenerOrEventListenerObject, opts?: unknown) => {
           if (type === 'message') bridgeListener = handler as (e: MessageEvent) => unknown;
-
           origAdd(type, handler as EventListener, opts as any);
         }
       );
@@ -1371,7 +1370,6 @@ describe('installTsRenderBridge', () => {
       .mockImplementation(
         (type: string, handler: EventListenerOrEventListenerObject, opts?: unknown) => {
           if (type === 'message') bridgeListener = handler as (e: MessageEvent) => unknown;
-
           origAdd(type, handler as EventListener, opts as any);
         }
       );
@@ -1728,7 +1726,6 @@ describe('installTsRenderBridge', () => {
       .mockImplementation(
         (type: string, handler: EventListenerOrEventListenerObject, opts?: unknown) => {
           if (type === 'message') bridgeListener = handler as (e: MessageEvent) => unknown;
-
           origAdd(type, handler as EventListener, opts as any);
         }
       );

@@ -35,17 +35,26 @@ export default [
       'unicorn/prevent-abbreviations': 'off',
       'unicorn/filename-case': 'off',
       'import/order': ['error', { 'newlines-between': 'always' }],
+    },
+  },
+  // Honor the `_`-prefix convention for intentionally unused bindings in every
+  // linted file — tseslint recommended enables the rule globally, so scoping
+  // this to *.ts(x) would leave .mjs at the pattern-less defaults
+  {
+    rules: {
       '@typescript-eslint/no-unused-vars': [
         'error',
         { argsIgnorePattern: '^_', varsIgnorePattern: '^_', caughtErrorsIgnorePattern: '^_' },
       ],
     },
   },
-  // Node build scripts and Node-run test harnesses
+  // Node build scripts and Node-run test harnesses — nodeBuiltin, not node,
+  // so CommonJS-only names (__dirname, require, module) still fail no-undef
+  // in these ES modules
   {
     files: ['*.mjs', 'test/**/*.mjs'],
     languageOptions: {
-      globals: globals.node,
+      globals: globals.nodeBuiltin,
     },
   },
   // Tests routinely poke at private state and mock boundaries via `any`
