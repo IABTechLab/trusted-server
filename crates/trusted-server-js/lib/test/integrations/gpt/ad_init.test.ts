@@ -53,6 +53,22 @@ type TestWindow = Window & {
   tsjs?: any;
 };
 
+type HandoffImplementation = 'bootstrap' | 'bundle';
+
+async function installHandoff(implementation: HandoffImplementation): Promise<void> {
+  if (implementation === 'bootstrap') {
+    const bootstrap = readFileSync(
+      resolve(process.cwd(), '../../trusted-server-core/src/integrations/gpt_bootstrap.js'),
+      'utf8'
+    );
+    window.eval(bootstrap);
+    return;
+  }
+
+  const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+  installTsAdInit();
+}
+
 describe('installTsAdInit', () => {
   beforeEach(() => {
     vi.resetModules();
@@ -77,6 +93,8 @@ describe('installTsAdInit', () => {
 
   afterEach(() => {
     document.getElementById('div-atf-sidebar')?.remove();
+    document.getElementById('div-atf-sidebar-2')?.remove();
+    document.getElementById('div-size-hydrated')?.remove();
     document.getElementById('ad-header-0-_r_1_')?.remove();
     document.getElementById("ad'prefix-real")?.remove();
   });
@@ -710,6 +728,257 @@ describe('installTsAdInit', () => {
     ).not.toThrow();
     expect(nativeDefineSlot).toHaveBeenCalledWith('/123/unrelated', [[728, 90]]);
     expect(handoff.publisherClaimed).toBe(false);
+  });
+
+  it.each(['bootstrap', 'bundle'] as const)(
+    'does not hand a sibling slot to a TS fallback through the %s prefix path',
+    async (implementation) => {
+      const fallbackSlot = {
+        getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+      };
+      const siblingSlot = {
+        getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar-2'),
+      };
+      const nativeDefineSlot = vi.fn().mockReturnValue(siblingSlot);
+      const nativeDisplay = vi.fn();
+      const pubads = {
+        getSlots: vi.fn().mockReturnValue([fallbackSlot]),
+        refresh: vi.fn(),
+      };
+      const googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot: nativeDefineSlot,
+        display: nativeDisplay,
+        pubads: vi.fn().mockReturnValue(pubads),
+      };
+      const handoff = {
+        gamUnitPath: '/123/mpu',
+        formats: [[300, 250]],
+        divIdPrefix: 'div-atf-sidebar',
+        slotElementId: 'div-atf-sidebar',
+        publisherClaimed: false,
+        suppressPublisherDisplay: false,
+        suppressPublisherRefresh: false,
+      };
+      const siblingElement = document.createElement('div');
+      siblingElement.id = 'div-atf-sidebar-2';
+      document.body.appendChild(siblingElement);
+      (window as TestWindow).googletag = googletag;
+      (window as TestWindow).tsjs = {
+        gptSlotHandoffs: { 'div-atf-sidebar': handoff },
+      };
+
+      await installHandoff(implementation);
+
+      const publisherSlot = (
+        googletag.defineSlot as unknown as (
+          adUnitPath: string,
+          formats: number[][],
+          elementId: string
+        ) => typeof siblingSlot
+      )('/123/mpu', [[300, 250]], siblingElement.id);
+      (googletag.display as unknown as (target: string) => void)(siblingElement.id);
+
+      expect(publisherSlot).toBe(siblingSlot);
+      expect(nativeDefineSlot).toHaveBeenCalledOnce();
+      expect(nativeDisplay).toHaveBeenCalledWith(siblingElement.id);
+      expect(handoff.publisherClaimed).toBe(false);
+      expect(handoff.suppressPublisherDisplay).toBe(false);
+    }
+  );
+
+  it.each(['bootstrap', 'bundle'] as const)(
+    'hands a publisher shorthand size to the TS fallback through the %s prefix path',
+    async (implementation) => {
+      const fallbackSlot = {
+        getSlotElementId: vi.fn().mockReturnValue('div-size-original'),
+      };
+      const nativeDefineSlot = vi.fn();
+      const nativeDisplay = vi.fn();
+      const pubads = {
+        getSlots: vi.fn().mockReturnValue([fallbackSlot]),
+        refresh: vi.fn(),
+      };
+      const googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot: nativeDefineSlot,
+        display: nativeDisplay,
+        pubads: vi.fn().mockReturnValue(pubads),
+      };
+      const handoff = {
+        gamUnitPath: '/123/size',
+        formats: [[300, 250]],
+        divIdPrefix: 'div-size-',
+        slotElementId: 'div-size-original',
+        publisherClaimed: false,
+        suppressPublisherDisplay: false,
+        suppressPublisherRefresh: false,
+      };
+      const hydratedElement = document.createElement('div');
+      hydratedElement.id = 'div-size-hydrated';
+      document.body.appendChild(hydratedElement);
+      (window as TestWindow).googletag = googletag;
+      (window as TestWindow).tsjs = {
+        gptSlotHandoffs: { 'div-size-original': handoff },
+      };
+
+      await installHandoff(implementation);
+
+      const publisherSlot = (
+        googletag.defineSlot as unknown as (
+          adUnitPath: string,
+          formats: number[],
+          elementId: string
+        ) => typeof fallbackSlot
+      )('/123/size', [300, 250], hydratedElement.id);
+      (googletag.display as unknown as (target: string) => void)(hydratedElement.id);
+
+      expect(publisherSlot).toBe(fallbackSlot);
+      expect(nativeDefineSlot).not.toHaveBeenCalled();
+      expect(nativeDisplay).not.toHaveBeenCalled();
+      expect(handoff.publisherClaimed).toBe(true);
+      expect(handoff.suppressPublisherDisplay).toBe(false);
+    }
+  );
+
+  it('filters only the claimed slot from the first bootstrap global refresh', () => {
+    const claimedSlot = {
+      getSlotElementId: vi.fn().mockReturnValue('div-claimed'),
+    };
+    const unrelatedSlot = {
+      getSlotElementId: vi.fn().mockReturnValue('div-unrelated'),
+    };
+    const nativeRefresh = vi.fn();
+    const pubads = {
+      getSlots: vi.fn().mockReturnValue([claimedSlot, unrelatedSlot]),
+      refresh: nativeRefresh,
+    };
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn(),
+      display: vi.fn(),
+      pubads: vi.fn().mockReturnValue(pubads),
+    };
+    (window as TestWindow).tsjs = {
+      gptSlotHandoffs: {
+        'div-claimed': {
+          gamUnitPath: '/123/claimed',
+          formats: [[300, 250]],
+          divIdPrefix: 'div-claimed',
+          slotElementId: 'div-claimed',
+          publisherClaimed: true,
+          suppressPublisherDisplay: false,
+          suppressPublisherRefresh: true,
+        },
+      },
+    };
+
+    return installHandoff('bootstrap').then(() => {
+      (pubads.refresh as () => void)();
+
+      expect(nativeRefresh).toHaveBeenCalledWith([unrelatedSlot]);
+      expect((window as TestWindow).tsjs!.gptSlotHandoffs['div-claimed']).toEqual(
+        expect.objectContaining({ suppressPublisherRefresh: false })
+      );
+    });
+  });
+
+  it('preserves refresh options while filtering a claimed bootstrap slot', () => {
+    const claimedSlot = {
+      getSlotElementId: vi.fn().mockReturnValue('div-claimed'),
+    };
+    const unrelatedSlot = {
+      getSlotElementId: vi.fn().mockReturnValue('div-unrelated'),
+    };
+    const nativeRefresh = vi.fn();
+    const pubads = {
+      getSlots: vi.fn().mockReturnValue([claimedSlot, unrelatedSlot]),
+      refresh: nativeRefresh,
+    };
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn(),
+      display: vi.fn(),
+      pubads: vi.fn().mockReturnValue(pubads),
+    };
+    (window as TestWindow).tsjs = {
+      gptSlotHandoffs: {
+        'div-claimed': {
+          gamUnitPath: '/123/claimed',
+          formats: [[300, 250]],
+          divIdPrefix: 'div-claimed',
+          slotElementId: 'div-claimed',
+          publisherClaimed: true,
+          suppressPublisherDisplay: false,
+          suppressPublisherRefresh: true,
+        },
+      },
+    };
+    const refreshOptions = { changeCorrelator: false };
+
+    return installHandoff('bootstrap').then(() => {
+      (pubads.refresh as (slots: (typeof claimedSlot)[], options: typeof refreshOptions) => void)(
+        [claimedSlot, unrelatedSlot],
+        refreshOptions
+      );
+
+      expect(nativeRefresh).toHaveBeenCalledWith([unrelatedSlot], refreshOptions);
+    });
+  });
+
+  it('does not transfer an ambiguous hydrated publisher definition through bootstrap', () => {
+    const firstSlot = {
+      getSlotElementId: vi.fn().mockReturnValue('div-prefix-original-a'),
+    };
+    const secondSlot = {
+      getSlotElementId: vi.fn().mockReturnValue('div-prefix-original-b'),
+    };
+    const nativeDefineSlot = vi.fn().mockReturnValue(null);
+    const pubads = {
+      getSlots: vi.fn().mockReturnValue([firstSlot, secondSlot]),
+      refresh: vi.fn(),
+    };
+    const firstHandoff = {
+      gamUnitPath: '/123/prefix',
+      formats: [[300, 250]],
+      divIdPrefix: 'div-prefix-',
+      slotElementId: 'div-prefix-original-a',
+      publisherClaimed: false,
+      suppressPublisherDisplay: false,
+      suppressPublisherRefresh: false,
+    };
+    const secondHandoff = {
+      ...firstHandoff,
+      slotElementId: 'div-prefix-original-b',
+    };
+    const googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: nativeDefineSlot,
+      display: vi.fn(),
+      pubads: vi.fn().mockReturnValue(pubads),
+    };
+    (window as TestWindow).googletag = googletag;
+    (window as TestWindow).tsjs = {
+      gptSlotHandoffs: {
+        'div-prefix-original-a': firstHandoff,
+        'div-prefix-original-b': secondHandoff,
+      },
+    };
+
+    return installHandoff('bootstrap').then(() => {
+      const defined = (
+        googletag.defineSlot as unknown as (
+          adUnitPath: string,
+          formats: number[][],
+          elementId: string
+        ) => null
+      )('/123/prefix', [[300, 250]], 'div-prefix-hydrated');
+
+      expect(defined).toBeNull();
+      expect(nativeDefineSlot).toHaveBeenCalledOnce();
+      expect(firstHandoff.publisherClaimed).toBe(false);
+      expect(secondHandoff.publisherClaimed).toBe(false);
+    });
   });
 
   it('preserves refresh options while filtering a claimed disabled-load slot', async () => {

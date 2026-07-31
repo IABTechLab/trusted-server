@@ -478,6 +478,16 @@ function displayTargetElementId(target: GoogleTagDisplayTarget): string | undefi
   return (target as Element).id || undefined;
 }
 
+function normalizedGptFormats(formats: Array<number | number[]>): Array<number | number[]> {
+  return formats.length === 2 && formats.every((format) => typeof format === 'number')
+    ? [formats as number[]]
+    : formats;
+}
+
+function handoffFormatsMatch(handoff: GptSlotHandoff, formats: Array<number | number[]>): boolean {
+  return JSON.stringify(handoff.formats) === JSON.stringify(normalizedGptFormats(formats));
+}
+
 function matchingHandoff(
   ts: TsjsApi,
   pubads: GoogleTagPubAdsService,
@@ -492,9 +502,10 @@ function matchingHandoff(
   const matching = Array.from(candidates).filter(
     (handoff) =>
       !handoff.publisherClaimed &&
+      !document.getElementById(handoff.slotElementId) &&
       elementId.startsWith(handoff.divIdPrefix) &&
       handoff.gamUnitPath === adUnitPath &&
-      JSON.stringify(handoff.formats) === JSON.stringify(formats) &&
+      handoffFormatsMatch(handoff, formats) &&
       findGptSlotByElementId(pubads, handoff.slotElementId)
   );
   return matching.length === 1 ? matching[0] : undefined;
@@ -520,8 +531,9 @@ function withGptSlotHandoffInternal<T>(ts: TsjsApi, callback: () => T): T {
  * TS cannot wait an arbitrary amount of time for framework hydration: doing so
  * would leave placements blank when no publisher slot is ever defined. Instead,
  * TS creates its fallback on the publisher's actual div and aliases only a later
- * `defineSlot()` for that exact div. The first duplicate publisher request is
- * suppressed because TS has already issued the initial request with TS targeting.
+ * `defineSlot()` for that exact div, or for a hydration-renamed replacement after
+ * the original div is gone. The first duplicate publisher request is suppressed
+ * because TS has already issued the initial request with TS targeting.
  */
 function installLatePublisherSlotHandoff(ts: TsjsApi): void {
   const win = window as GptWindow;
@@ -555,10 +567,7 @@ function installLatePublisherSlotHandoff(ts: TsjsApi): void {
               ts.prevGptSlots = (ts.prevGptSlots ?? []).filter(
                 (ownedSlot) => ownedSlot !== existingSlot
               );
-              if (
-                handoff.gamUnitPath !== adUnitPath ||
-                JSON.stringify(handoff.formats) !== JSON.stringify(formats)
-              ) {
+              if (handoff.gamUnitPath !== adUnitPath || !handoffFormatsMatch(handoff, formats)) {
                 log.warn('GPT slot handoff: publisher definition differs from TS configuration', {
                   elementId,
                   tsGamUnitPath: handoff.gamUnitPath,
