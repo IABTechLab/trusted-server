@@ -18,8 +18,9 @@ use crate::error::TrustedServerError;
 use crate::integrations::{
     adserver_mock::AdServerMockConfig, aps::ApsConfig, datadome::DataDomeConfig,
     didomi::DidomiIntegrationConfig, google_tag_manager::GoogleTagManagerConfig, gpt::GptConfig,
-    lockr::LockrConfig, nextjs::NextJsIntegrationConfig, osano::OsanoConfig,
-    permutive::PermutiveConfig, prebid, sourcepoint::SourcepointConfig, testlight::TestlightConfig,
+    gpt_diagnostics::GptDiagnosticsConfig, lockr::LockrConfig, nextjs::NextJsIntegrationConfig,
+    osano::OsanoConfig, permutive::PermutiveConfig, prebid, sourcepoint::SourcepointConfig,
+    testlight::TestlightConfig,
 };
 use crate::settings::{IntegrationConfig, Settings};
 
@@ -39,6 +40,7 @@ const DEPLOY_VALIDATED_INTEGRATION_IDS: &[&str] = &[
     "google_tag_manager",
     "datadome",
     "gpt",
+    "gpt_diagnostics",
 ];
 
 /// Typed app-config root used by the `ts` CLI.
@@ -155,6 +157,7 @@ fn validate_enabled_integrations(
     validate_integration::<GoogleTagManagerConfig>(settings, "google_tag_manager")?;
     validate_integration::<DataDomeConfig>(settings, "datadome")?;
     validate_integration::<GptConfig>(settings, "gpt")?;
+    validate_integration::<GptDiagnosticsConfig>(settings, "gpt_diagnostics")?;
 
     Ok(enabled_auction_providers)
 }

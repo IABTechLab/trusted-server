@@ -16,7 +16,7 @@ describe('config', () => {
     setConfig({ debug: true });
     expect(log.getLevel()).toBe('debug');
 
-    setConfig({ logLevel: 'info' } as Parameters<typeof setConfig>[0]);
+    setConfig({ logLevel: 'info' });
     expect(log.getLevel()).toBe('info');
   });
 });

@@ -1,10 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-/** Test view of the global scope with a mockable `fetch`. */
-const testGlobal = globalThis as unknown as { fetch: ReturnType<typeof vi.fn> };
-
-type AddAdUnitsArg = Parameters<typeof addAdUnits>[0];
-
 async function flushRequestAds(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
@@ -26,7 +21,7 @@ describe('request.requestAds', () => {
   it('sends fetch and renders creatives via iframe from response', async () => {
     // mock fetch - returns creative HTML inline in adm field
     const creativeHtml = '<div>Test Creative</div>';
-    testGlobal.fetch = vi.fn().mockResolvedValue({
+    globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
       headers: { get: () => 'application/json' },
@@ -46,15 +41,12 @@ describe('request.requestAds', () => {
     const infoSpy = vi.spyOn(log, 'info').mockImplementation(() => undefined);
 
     document.body.innerHTML = '<div id="slot1"></div>';
-    addAdUnits({
-      code: 'slot1',
-      mediaTypes: { banner: { sizes: [[300, 250]] } },
-    } as unknown as AddAdUnitsArg);
+    addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } });
 
     requestAds();
     await flushRequestAds();
 
-    expect(testGlobal.fetch).toHaveBeenCalled();
+    expect(globalThis.fetch).toHaveBeenCalled();
 
     // Verify iframe was created with creative HTML in srcdoc
     const iframe = document.querySelector('#slot1 iframe') as HTMLIFrameElement | null;
@@ -75,7 +67,7 @@ describe('request.requestAds', () => {
   });
 
   it('does not render on non-JSON response', async () => {
-    testGlobal.fetch = vi.fn().mockResolvedValue({
+    globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
       headers: { get: () => 'text/plain' },
@@ -86,41 +78,35 @@ describe('request.requestAds', () => {
     const { requestAds } = await import('../../src/core/request');
 
     document.body.innerHTML = '<div id="slot1"></div>';
-    addAdUnits({
-      code: 'slot1',
-      mediaTypes: { banner: { sizes: [[300, 250]] } },
-    } as unknown as AddAdUnitsArg);
+    addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } });
 
     requestAds();
     await flushRequestAds();
 
-    expect(testGlobal.fetch).toHaveBeenCalled();
+    expect(globalThis.fetch).toHaveBeenCalled();
     expect(document.querySelector('iframe')).toBeNull();
   });
 
   it('ignores fetch rejection gracefully', async () => {
-    testGlobal.fetch = vi.fn().mockRejectedValue(new Error('network-error'));
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error('network-error'));
 
     const { addAdUnits } = await import('../../src/core/registry');
     const { requestAds } = await import('../../src/core/request');
 
     document.body.innerHTML = '<div id="slot1"></div>';
-    addAdUnits({
-      code: 'slot1',
-      mediaTypes: { banner: { sizes: [[300, 250]] } },
-    } as unknown as AddAdUnitsArg);
+    addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } });
 
     requestAds();
     await flushRequestAds();
 
-    expect(testGlobal.fetch).toHaveBeenCalled();
+    expect(globalThis.fetch).toHaveBeenCalled();
     expect(document.querySelector('iframe')).toBeNull();
   });
 
   it('inserts an iframe with creative HTML from unified auction', async () => {
     // mock fetch for unified auction endpoint - returns inline HTML
     const creativeHtml = '<img src="/first-party/proxy?tsurl=...">Ad</img>';
-    testGlobal.fetch = vi.fn().mockResolvedValue({
+    globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
       headers: { get: () => 'application/json' },
@@ -143,10 +129,7 @@ describe('request.requestAds', () => {
     document.body.appendChild(div);
 
     // Add an ad unit and request
-    addAdUnits({
-      code: 'slot1',
-      mediaTypes: { banner: { sizes: [[300, 250]] } },
-    } as unknown as AddAdUnitsArg);
+    addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } });
     requestAds();
 
     await flushRequestAds();
@@ -161,7 +144,7 @@ describe('request.requestAds', () => {
   it('renders creatives with safe URI markup', async () => {
     const creativeHtml =
       '<a href="mailto:test@example.com">Contact</a><img src="https://example.com/ad.png" alt="ad">';
-    testGlobal.fetch = vi.fn().mockResolvedValue({
+    globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
       headers: { get: () => 'application/json' },
@@ -179,10 +162,7 @@ describe('request.requestAds', () => {
     const { requestAds } = await import('../../src/core/request');
 
     document.body.innerHTML = '<div id="slot1"></div>';
-    addAdUnits({
-      code: 'slot1',
-      mediaTypes: { banner: { sizes: [[300, 250]] } },
-    } as unknown as AddAdUnitsArg);
+    addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } });
 
     requestAds();
     await flushRequestAds();
@@ -194,7 +174,7 @@ describe('request.requestAds', () => {
   });
 
   it('rejects malformed non-string creative HTML without blanking the slot', async () => {
-    testGlobal.fetch = vi.fn().mockResolvedValue({
+    globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
       headers: { get: () => 'application/json' },
@@ -214,10 +194,7 @@ describe('request.requestAds', () => {
     const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
 
     document.body.innerHTML = '<div id="slot1"><span>existing</span></div>';
-    addAdUnits({
-      code: 'slot1',
-      mediaTypes: { banner: { sizes: [[300, 250]] } },
-    } as unknown as AddAdUnitsArg);
+    addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } });
 
     requestAds();
     await flushRequestAds();
@@ -244,7 +221,7 @@ describe('request.requestAds', () => {
     // Regression: multi-bid scenario where a rejected bid must not erase an earlier
     // successful render into the same slot.
     const goodCreative = '<div>Safe Ad</div>';
-    testGlobal.fetch = vi.fn().mockResolvedValue({
+    globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
       headers: { get: () => 'application/json' },
@@ -267,10 +244,7 @@ describe('request.requestAds', () => {
     const { requestAds } = await import('../../src/core/request');
 
     document.body.innerHTML = '<div id="slot1"></div>';
-    addAdUnits({
-      code: 'slot1',
-      mediaTypes: { banner: { sizes: [[300, 250]] } },
-    } as unknown as AddAdUnitsArg);
+    addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } });
 
     requestAds();
     await flushRequestAds();
@@ -282,7 +256,7 @@ describe('request.requestAds', () => {
   });
 
   it('rejects creatives that sanitize to empty markup', async () => {
-    testGlobal.fetch = vi.fn().mockResolvedValue({
+    globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
       headers: { get: () => 'application/json' },
@@ -302,10 +276,7 @@ describe('request.requestAds', () => {
     const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
 
     document.body.innerHTML = '<div id="slot1"></div>';
-    addAdUnits({
-      code: 'slot1',
-      mediaTypes: { banner: { sizes: [[300, 250]] } },
-    } as unknown as AddAdUnitsArg);
+    addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } });
 
     requestAds();
     await flushRequestAds();
@@ -327,7 +298,7 @@ describe('request.requestAds', () => {
 
   it('skips iframe insertion when slot is missing', async () => {
     // mock fetch for unified auction endpoint - returns inline HTML
-    testGlobal.fetch = vi.fn().mockResolvedValue({
+    globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
       headers: { get: () => 'application/json' },
@@ -343,10 +314,7 @@ describe('request.requestAds', () => {
     const { addAdUnits } = await import('../../src/core/registry');
     const { requestAds } = await import('../../src/core/request');
 
-    addAdUnits({
-      code: 'missing-slot',
-      mediaTypes: { banner: { sizes: [[300, 250]] } },
-    } as unknown as AddAdUnitsArg);
+    addAdUnits({ code: 'missing-slot', mediaTypes: { banner: { sizes: [[300, 250]] } } });
     requestAds();
 
     await flushRequestAds();
