@@ -150,7 +150,12 @@ Three global rules sit above every provider:
   trips the trust threshold toward denial, never toward extra writes);
   the listing filters by the value's `kind`/liveness within the existing
   list limit where the backend returns values, and the residual
-  over-count where it cannot is declared. Aliases are reserved-future
+  over-count where it cannot is declared. A computed cluster size is
+  **not persisted beyond its inputs' lifetime**: today's code stores the
+  calculated `cluster_size` in the row and reuses it for the row's full
+  TTL, which would freeze a tombstone-inflated count for up to a year —
+  stored values carry a short validity (within the tombstone-TTL
+  horizon) or are recomputed on use. Aliases are reserved-future
   (§6.1) and excluded by `kind` when they exist.
 - **No-cluster behavior is still defined.** A provider without cluster
   support deduplicates pull-sync by canonical graph key and redacts logs
@@ -201,25 +206,19 @@ pub trait EdgeCookieProvider {
     /// key, shared across identifiers minted from the same client
     /// evidence. None when the provider lacks IP-cluster semantics (§3).
     fn cluster_prefix(&self, id: &EcId) -> Option<HashPrefix>;
-    /// Acquisition mode — exactly one:
-    fn acquisition(&self) -> Acquisition<'_>;
+    /// Cryptographic verification of a parsed identifier against request
+    /// evidence — recognition (`parse`) is not authentication; adoption
+    /// (§5) and any rowless acceptance require this.
+    fn verify(&self, id: &EcId, input: &IdentityInput<'_>) -> bool;
 }
-
-/// How a provider's identifiers come into being. Server-mint providers
-/// generate from request evidence; client-resolve providers verify a
-/// browser-posted payload (client-cycle spec) and declare the JS module
-/// their page leg needs. One provider implements exactly one mode.
-pub enum Acquisition<'a> {
-    ServerMint(&'a dyn ServerMint),      // fn generate(&IdentityInput) -> EcId
-    ClientResolve(&'a dyn ClientResolve),
-}
-// ClientResolve::resolve_from_client(&ClientResolveContext) -> Result<VerifiedIdentity>
-//   ctx is core-built: canonical publisher audience, verified session
-//   owner hash, clock, and the bounded payload — a bare payload could
-//   not verify audience binding, session binding, or expiry.
-//   VerifiedIdentity carries the identifier, reservation id, and expiry.
-// ClientResolve::js_module_id() -> &str
 ```
+
+The acquisition-mode enum (`ServerMint` / `ClientResolve`), the
+`ClientResolveContext` contract, replay-reservation schemas, and the
+reservation capability rows are **not part of this normative surface** —
+they live in the deferred client-cycle document and return with that
+feature, per this spec's own minimalism rule (§4): the epic's only
+acquisition mode is server mint, expressed directly as `generate`.
 
 (Names indicative; the shape is normative. `required_permissions` joins the
 trait at step 5 of §11, together with its enforcement point.)
@@ -251,19 +250,40 @@ header emission; the identity exists durably from that moment. A
 graph-commit failure means the mint never happened: no cookie, no egress,
 error logged, the next request retries.
 
-**Pre-existing cookies without rows are adopted, not orphaned.** Current
-graphless deployments have minted cookies with no row; under
-no-active-until-commit those identities could never be used again and —
-without care — never withdrawn. The contract: a recognized legacy cookie
-with no reachable row triggers a **permission-gated, race-safe adoption**
-on a live request — gated exactly like minting (`store-on-device`),
-implemented as create-if-absent on the verbatim key (concurrent adopters
-converge: same key, same deterministic family ID), provenance from the
-live resolution. Until adoption succeeds the cookie **never egresses**;
-**withdrawal works without adoption** — the deterministic family ID
-(permission model spec §4.3) needs no row, so a first post-upgrade
-request that is an opt-out revokes and expires the cookie with zero
-migrated state. Migration matrix row 13 declares this path.
+**Pre-existing cookies without rows are verified, then adopted — parse
+is recognition, not authentication.** A syntactically valid
+`{64hex}.{6alnum}` string is constructible by anyone; adopting it on
+shape alone would let an attacker mint durable rows. The contract:
+
+- ServerMint providers implement `verify(id, &IdentityInput) -> bool` —
+  cryptographic verification against **request evidence** (for `hmac`:
+  recompute over the request's evidence with each configured version's
+  passphrase and compare to the 64-hex prefix). A recognized rowless
+  cookie that fails verification is **expired, not adopted** — including
+  the honest false-negative: a legitimate cookie presented from a
+  changed network no longer verifies and is expired; the affected
+  population is graphless deployments only, declared in migration row 13.
+- Adoption is gated on the provider's **complete
+  `required_permissions()`** — exactly like minting, not a hard-coded
+  `store-on-device`.
+- The row write is **atomic create-if-absent** — a distinct capability
+  row in the §7 matrix (strong class; Workers KV's concurrent same-key
+  writes can overwrite each other, so it is ineligible, consistent with
+  its revocation ineligibility).
+- **Read errors are not "not found"**: adoption proceeds only on an
+  authoritative not-found; a failed graph read means no adoption this
+  request, fail closed.
+- Adopted rows do **not** get a fresh full TTL — a nearly expired legacy
+  identity must not gain a year (the exact rejuvenation problem that
+  deferred rewrite). Expiry is `min(adopted_at + standard TTL,
+migration_cutoff + grace)` with the cutoff configured; sign-off
+  item 21.
+
+Until adoption succeeds the cookie **never egresses**; **withdrawal
+works without adoption** — the deterministic family ID (permission model
+spec §4.3) needs no row, so a first post-upgrade opt-out revokes and
+expires the cookie with zero migrated state. Migration matrix row 13
+declares this path.
 
 **Egress is typed, not policed.** The inventory-and-denylist test
 (permission model spec §7) is a backstop, but conventions do not survive
@@ -279,12 +299,20 @@ and nothing weaker — an unparameterized wrapper would let a P1-only
 identity flow into an ORTB request. A future bypass then
 requires deliberately reconstructing the raw string — visible in review —
 rather than passing along what was already in hand. The same boundary
-applies **request-side**: integration-facing request views (proxy
-interfaces, filter inputs, forwarded header/cookie maps) receive
-**identity-redacted** views — the EC cookie and identity headers are
-stripped unless the path holds `AuthorizedIdentity<PartnerEgress>` —
-because the ungated forwarding paths of PR #838 were exactly integrations
-reading the raw request.
+applies **request-side, as a concrete API transition, not an
+assertion**: the current filter/proxy inputs expose the raw request
+(cookies included), so a filter can read `ts-ec`, copy it into
+`X-Vendor-Identity`, and return it through response effects — response
+snapshot redaction cannot undo that. The contract: integration-facing
+request access moves to a typed **`RedactedRequestView`** whose stripped
+set is enumerated — the `ts-ec` cookie and every `ts-*` cookie, `x-ts-*`
+identity/consent headers, and the EIDs header — with identity reachable
+only through a scoped `AuthorizedIdentity` parameter; the raw-request
+filter/proxy interfaces are migrated in the **same PR** as the typed
+egress boundary (they are the same boundary), and the tests are
+enumerated: a denied/withdrawn request through a filter, a proxy, and a
+forwarding path, each asserting no identity value is readable or
+emittable.
 
 The gate applies to EC providers **only**. Geo and device are ungated for
 two _different_ reasons, stated separately because only one of them is
@@ -406,12 +434,11 @@ The contract:
   reserved-for-future — nothing in the epic writes one.
 - Retiring a legacy reader is the explicit end of those identities:
   the migration guide documents the cleanup procedure (migration spec §6).
-- Tests: switch active provider → request with old cookie → identity still
-  resolves and a withdrawal tombstones it (both linked rows when
-  rewritten); old cookie with no matching legacy reader → treated as
-  absent and **never egresses**; interrupted rewrite → old cookie still
-  live, retry completes; `provider = "none"` + legacy reader → no mints,
-  withdrawal still works.
+- Tests: switch active provider → request with old cookie → identity
+  still resolves and a withdrawal tombstones it; old cookie with no
+  matching legacy reader → treated as absent and **never egresses**;
+  `provider = "none"` + legacy reader → no mints, withdrawal still
+  works. (Rewrite-specific tests left with the rewrite deferral.)
 
 Cluster degradation config (referenced from §3): when the active writer
 lacks the cluster capability, `[ec] cluster_fallback = "allow" | "deny"`
@@ -431,7 +458,6 @@ when a healthy configuration meets an unhealthy runtime. Every row logs at
 | Graph read fails on an existing identity                                  | Identity unusable this request (fail closed for egress); cookie untouched                                        |
 | Cluster prefix listing fails                                              | Treated as cluster-size-unknown → `cluster_fallback` policy applies                                              |
 | Tombstone write fails                                                     | Permission model spec §4.3: family retries, readers fail closed on partial families                              |
-| Legacy rewrite fails mid-flight                                           | Old cookie remains live; rewrite retries (§6.1)                                                                  |
 | Geo provider returns invalid output (unparseable country) at runtime      | Treated as lookup failure → `default_country` (permission model spec §5.2), counted in the lookup-failure metric |
 | Device provider signals unavailable at runtime (e.g. no JA4 on a request) | Classification degrades per the provider's declared fallback, never silently upgrades `looks_like_browser`       |
 
@@ -476,19 +502,23 @@ the reserved hmac grammar), and every record value carries a `kind`
 discriminator alongside its schema version — so a reader always knows
 what it fetched, including where two classes deliberately share an
 address (row vs. alias). The `/` shown in key sketches is **notation,
-not the wire byte**: the physical segment delimiter is a
-**backend-safe character validated per adapter** — Fastly permits `/` in
-keys but not in prefix _queries_, so a slash-delimited `id/<provider>/…`
-key could never be cluster-listed there despite the matrix marking
-prefix listing supported. The reference delimiter is `:`; each adapter's
-capability declaration includes which delimiter its prefix queries
-accept, and cluster-capability eligibility for a provider requires its
-physical prefix to be queryable on that backend — checked at startup,
-not discovered at the first cluster count. (hmac verbatim keys contain
-no delimiter before the 64-hex prefix and are unaffected.)
+not the wire byte** — and the wire form is **one portable grammar, not
+per-adapter delimiters** (per-adapter delimiters would give the same
+logical identity different physical keys on different adapters, breaking
+migration, shared storage, and parity; and Fastly's prefix queries
+reject both `/` and `:`, so no delimiter character is safely portable).
+Physical keys are **delimiter-free with fixed-width segments**: a
+1-character class tag (`i` row, `f` family, `s` suppression, `x`
+transaction), a **4-character registry-assigned provider code**
+(zero-padded, `[a-z0-9]`), then the suffix — segment boundaries are
+positional, so no segment can contain or escape a delimiter, prefix
+queries are plain string prefixes on every backend, and cluster
+eligibility needs no per-adapter delimiter negotiation. (hmac verbatim
+keys remain the reserved exception, with the 64-hex cluster prefix at
+position zero.)
 
 **Wire schemas** (JSON, like identity rows; every class carries a schema
-version): the **alias record** holds target key, created-at, retirement
+version): the **alias record** (reserved-future, with rewrite) holds target key, created-at, retirement
 deadline, and fencing epoch; the **family revocation record** holds the
 family ID, revoked-at, triggering signal class (§4.5 destructive column),
 and a **family epoch** bumped on every revocation-state change (the
@@ -573,14 +603,14 @@ Requirements:
   them is how a "yes" cell hides an unusable feature. Feature eligibility
   requires wired, not merely available:
 
-  | Capability                                            | Fastly                                                                          | Axum (dev)                                                                                                        | Cloudflare                                                                                                                                                                 | Spin                                                                                             |
-  | ----------------------------------------------------- | ------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-  | Graph persistence (eventual OK)                       | KV Store: available + wired                                                     | Local store: available + wired (dev-grade)                                                                        | Workers KV: available + wired (eventually consistent)                                                                                                                      | Key-value: **available, not wired** — Spin config is embedded and EC KV routes are unwired today |
-  | Prefix listing (cluster)                              | Yes (used today)                                                                | Yes                                                                                                               | Yes (eventual)                                                                                                                                                             | _verify_                                                                                         |
-  | Strongly consistent revocation reads                  | _verify_ against Fastly KV semantics                                            | Yes (in-process)                                                                                                  | **Workers KV: no** — needs Durable Objects, not currently wired                                                                                                            | _verify_                                                                                         |
-  | Linearizable fenced CAS (reservations, alias/rewrite) | **Not currently available** — the client-cycle feature (deferred) would need it | Yes — in-process only: linearizable but **non-durable**, dev-eligibility only, not a production persistence claim | Durable Objects: possible, not wired                                                                                                                                       | **No**                                                                                           |
-  | Platform geo                                          | Yes — country + region                                                          | No                                                                                                                | **Yes — country only, no region** (`cf-ipcountry`): regionless US traffic degrades per the permission spec's declared rule, which directly changes state-level US outcomes | No                                                                                               |
-  | Device host evidence (JA4/H2)                         | Yes                                                                             | No                                                                                                                | No                                                                                                                                                                         | No                                                                                               |
+  | Capability                                            | Fastly                                                                          | Axum (dev)                                                                                                                    | Cloudflare                                                                                                                                                                 | Spin                                                                                             |
+  | ----------------------------------------------------- | ------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+  | Graph persistence (eventual OK)                       | KV Store: available + wired                                                     | **Not wired** — the current adapter installs `UnavailableKvStore`; an in-process store is dev-feasible but does not exist yet | Workers KV: available + wired (eventually consistent)                                                                                                                      | Key-value: **available, not wired** — Spin config is embedded and EC KV routes are unwired today |
+  | Prefix listing (cluster)                              | Yes (used today)                                                                | Yes                                                                                                                           | Yes (eventual)                                                                                                                                                             | _verify_                                                                                         |
+  | Strongly consistent revocation reads                  | _verify_ against Fastly KV semantics                                            | Yes (in-process)                                                                                                              | **Workers KV: no** — needs Durable Objects, not currently wired                                                                                                            | _verify_                                                                                         |
+  | Linearizable fenced CAS (reservations, alias/rewrite) | **Not currently available** — the client-cycle feature (deferred) would need it | Yes — in-process only: linearizable but **non-durable**, dev-eligibility only, not a production persistence claim             | Durable Objects: possible, not wired                                                                                                                                       | **No**                                                                                           |
+  | Platform geo                                          | Yes — country + region                                                          | No                                                                                                                            | **Yes — country only, no region** (`cf-ipcountry`): regionless US traffic degrades per the permission spec's declared rule, which directly changes state-level US outcomes | No                                                                                               |
+  | Device host evidence (JA4/H2)                         | Yes                                                                             | No                                                                                                                            | No                                                                                                                                                                         | No                                                                                               |
 
 - Each adapter's runtime-services setup routes through the shared builders.
 - Providers are constructed **once** per application instance and stored in

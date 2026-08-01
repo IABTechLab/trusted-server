@@ -129,34 +129,52 @@ Requirements:
      the rewrite deferral, providers spec §6.1). N+1 must also **write**
      the safety-critical record kinds — family revocation and
      suppression — not only read them: a withdrawal arriving on a
-     rolled-back N+1 fleet must still revoke; only provenance _writing_
-     is deferred to N+2, which is what makes the boundary safe in both
-     directions. N+1 further **accepts an N+2-only provider in the
-     `legacy_providers` position** (parse/withdraw need no provenance
-     encoding) while rejecting it as active writer — otherwise the
-     rollback rule "retain the new provider as a legacy reader" would be
-     unsatisfiable on the very release it targets. Rollback tests
-     therefore run the family-revocation, suppression, and provenance
-     paths — read **and write** — on N+1 against N+2-written data. **Rollback is binaries-first too, in the other direction** —
+     rolled-back N+1 fleet must still revoke.
+
+     **N+1's identity-write behavior is v1, explicitly** — this resolves
+     what was an impossible trilemma (write rows without provenance,
+     violating active-after-commit; write provenance, violating the
+     N+2-only writer boundary; or stop minting, an undeclared outage):
+     N+1 **keeps minting v1 rows with today's semantics**, and the new
+     active-after-commit/provenance contract activates **with the N+2
+     writer**, not before. Likewise the permission model itself:
+     **old-shape config on N+1 runs the pre-epic consent gate
+     unchanged** — dual-read means dual-behavior — so the compiled
+     protective fallback cannot flip behavior mid-convergence before the
+     operator pushes the new-shape policy; the new model engages only
+     with new-shape config. The interim (N+1 minting v1 rows, S2S
+     running today's checks) is declared as sign-off item 20, not
+     discovered.
+
+     Rollback tests therefore run the family-revocation and suppression
+     paths — read **and write** — plus v1-minting behavior, on N+1
+     against N+2-written data. **Rollback is binaries-first too, in the other direction** —
      N+2 → N+1 binaries roll back keeping the new config (N+1 reads it
      fully; reverting config first would hand the old shape to N+2
-     binaries that reject it) — **with one precondition**: if an
-     N+2-only provider or version has been adopted, the fleet must first
-     converge on an N+1-compatible new-shape config (deselecting what
-     N+1 rejects, retaining the new provider's secrets as a **legacy
-     reader** so its minted identities keep resolving and stay
-     withdrawable until they expire — never "revert to the previous
-     config", which would strand them); only then do binaries roll back.
-     N+1 additionally **rejects provider or version selections whose
-     provenance it cannot yet encode** — new-provider adoption waits for
-     N+2, so no row is minted that N+2 would misclassify. Every new
+     binaries that reject it) — **with one structural rule that makes it possible at all**:
+     providers are compiled into the composition root — there is no
+     dynamic provider ABI — so an N+1 binary can only read what it
+     shipped with. Therefore **every provider selectable in release R
+     must ship compiled-in (dormant: registered, parseable,
+     configurable, not selectable as writer) in R−1**; adopting a
+     genuinely new provider gets its own reader-first rollout, exactly
+     like the epic itself. With that rule, rolling N+2 → N+1 keeps the
+     new provider's identities resolvable and withdrawable through the
+     dormant registration ("retain as legacy reader" is now satisfiable
+     because N+1 physically contains the code); the fleet still first
+     converges on a config selecting only what N+1 accepts as writer.
+     N+1 additionally **rejects writer selections whose provenance it
+     cannot yet encode** — new-writer adoption waits for N+2, so no row
+     is minted that N+2 would misclassify. Every new
      config section introduced by the epic follows this same
      compatibility rule, not only `[ec]`.
+
    - **Release N+2:** rejects `[ec] passphrase` at startup with a message
      naming the new location — not a generic unknown-field error
      (implementation note: producing the actionable message means keeping
      a deprecated `passphrase` field whose presence triggers the custom
      error).
+
 2. **Revocation-eligible storage is a per-adapter gate, and ungated
    adapters migrate stateless.** Identity features require the adapter's
    strong-consistency rows in the capability matrix (providers spec §7)
@@ -194,8 +212,11 @@ Requirements:
    genuinely pre-N+1 worker cannot preserve at all, which is exactly why
    the floor exists); after the **fleet-convergence gate**, **N+2
    activates the writer** and begins emitting the new fields. **The rollback floor is crossed at N+2 writer activation itself** — an
-   observable deploy event, recorded as a durable schema-floor marker in
-   the config store before writes enable — not at "any new-format row
+   observable deploy event, recorded as a durable schema-floor marker
+   **in write-once/CAS deployment metadata that ordinary config rollback
+   cannot touch** — floor-in-rollbackable-config would let "restore the
+   previous config version" erase the floor after new-format rows exist,
+   which is exactly the state it guards — not at "any new-format row
    exists", which no operator can disprove. Below-floor rollback is
    prohibited from that marker on; a pre-floor binary would silently
    strip the new fields from every row it touches.
@@ -323,14 +344,13 @@ global honoring of opt-out signals is unconditional.
    silent grant to everyone), not an error rate. The full metric set, each
    with a stated healthy range: geo lookup-failure/fallback rate (permission
    spec §5.2), raw-egress denials by path, tombstone family retries,
-   legacy-reader hit rate, rewrite failures, and cluster-fallback
-   engagements. Two of these carry thresholds, not just ranges:
+   legacy-reader hit rate, and cluster-fallback engagements. Two of these carry thresholds, not just ranges:
    legacy-reader hits at zero for a **quiet period no shorter than the
    maximum cookie/row lifetime plus rollout skew** — or provable
    rewrite/backfill completion — is the **retirement-readiness** bar for a
    legacy provider ("trending to ~zero" is not evidence; a yearly visitor
-   is not churn), and a nonzero rewrite-failure rate blocks retirement
-   outright. The telemetry set also includes: graph read/commit failures,
+   is not churn), (rewrite-based backfill and its metrics left with the rewrite
+   deferral). The telemetry set also includes: graph read/commit failures,
    stored-provenance denials, schema-migration failures, and
    replay-reservation recoveries. **Each rollout-gate metric ships with a
    threshold, an evaluation window, and a named action** (pause rollout /
@@ -392,20 +412,26 @@ made differently). **Implementation is blocked while any row is `open`**;
 each row needs an owner, a status, and a link to its decision record —
 an unratified row reverts to open, not to silently implemented.
 
-| #   | Decision                                                                                                                                                | Where                                       | Owner                 | Status                                      |
-| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- | --------------------- | ------------------------------------------- |
-| 1   | Opt-outs honored globally; destructive ones irreversibly withdraw outside the defining jurisdiction                                                     | permission §4, §4.2                         | maintainers + legal   | open                                        |
-| 2   | Sale opt-outs (GPP, USP) control both P1 and P4 and destroy the identity                                                                                | permission §4.5                             | maintainers + legal   | open                                        |
-| 3   | Sharing / targeted-advertising opt-outs remove P4 but retain the stored identity                                                                        | permission §4.5                             | maintainers + legal   | open                                        |
-| 4   | US contextual auctions continue during opt-out, identity removed                                                                                        | permission §7                               | maintainers + product | open                                        |
-| 5   | Regionless US traffic treated as non-regulated unless the operator opts into country-wide gating                                                        | permission §3.4                             | maintainers + legal   | open                                        |
-| 6   | Full consent strings continue downstream; raw consent snapshots retained in rows for audit                                                              | providers §6.3                              | maintainers + legal   | open                                        |
-| 7   | Legacy batch-sync traffic rejected until live-browser provenance backfill                                                                               | this spec §6.4; permission §7               | maintainers + product | open                                        |
-| 8   | Proxy / click / Testlight forwarding newly gated by P1 ∧ P4                                                                                             | §2 row 11b                                  | maintainers           | open                                        |
-| 9   | Integration cookie operations — deferred out of the v1 hook with the full read/use/withdraw model as entry bar                                          | hook §3                                     | maintainers           | superseded by descope (ratify the deferral) |
-| 10  | Session-cookie exemption question                                                                                                                       | hook §3                                     | maintainers + legal   | deferred with item 9                        |
-| 11  | A single failed destructive withdrawal may leave S2S identity use live **indefinitely** for a never-returning visitor (no durable external retry queue) | permission §4.3                             | maintainers + legal   | open                                        |
-| 12  | Adapters without revocation-eligible storage migrate **stateless** rather than blocking the release                                                     | §4.2 of this spec                           | maintainers + product | open                                        |
-| 13  | Batch-sync acceptance dropping toward zero at cutover, with dormant identities having no automatic recovery path                                        | §6.4 of this spec                           | maintainers + product | open                                        |
-| 15  | **Epic descope**: client-cycle spec demoted to deferred-informative; `rewrite_legacy` cut to a recorded deferral; hook ships headers-only               | client spec status; providers §6.1; hook §3 | maintainers + product | open                                        |
-| 14  | Policy tightening never reuses stored refusals destructively — a fresh, live post-change refusal is required (the spec decides this; ratify it)         | permission §4.2 trigger 2                   | maintainers + legal   | open                                        |
+| #   | Decision                                                                                                                                                                         | Where                                       | Owner                 | Status                                      |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- | --------------------- | ------------------------------------------- |
+| 1   | Opt-outs honored globally; destructive ones irreversibly withdraw outside the defining jurisdiction                                                                              | permission §4, §4.2                         | maintainers + legal   | open                                        |
+| 2   | Sale opt-outs (GPP, USP) control both P1 and P4 and destroy the identity                                                                                                         | permission §4.5                             | maintainers + legal   | open                                        |
+| 3   | Sharing / targeted-advertising fields: opt-outs remove P4 and retain the stored identity; the same fields' not-opted-out values **newly grant P4**                               | permission §4.5                             | maintainers + legal   | open                                        |
+| 4   | US contextual auctions continue during opt-out, identity removed                                                                                                                 | permission §7                               | maintainers + product | open                                        |
+| 5   | Regionless US traffic treated as non-regulated unless the operator opts into country-wide gating                                                                                 | permission §3.4                             | maintainers + legal   | open                                        |
+| 6   | Full consent strings continue downstream; raw consent snapshots retained in rows for audit                                                                                       | providers §6.3                              | maintainers + legal   | open                                        |
+| 7   | Legacy batch-sync traffic rejected until live-browser provenance backfill                                                                                                        | this spec §6.4; permission §7               | maintainers + product | open                                        |
+| 8   | Proxy / click / Testlight forwarding newly gated by P1 ∧ P4                                                                                                                      | §2 row 11b                                  | maintainers           | open                                        |
+| 9   | Integration cookie operations — deferred out of the v1 hook with the full read/use/withdraw model as entry bar                                                                   | hook §3                                     | maintainers           | superseded by descope (ratify the deferral) |
+| 10  | Session-cookie exemption question                                                                                                                                                | hook §3                                     | maintainers + legal   | deferred with item 9                        |
+| 11  | A single failed destructive-revocation **or suppression** write may leave S2S identity use live **indefinitely** for a never-returning visitor (no durable external retry queue) | permission §4.3                             | maintainers + legal   | open                                        |
+| 12  | Adapters without revocation-eligible storage migrate **stateless** rather than blocking the release                                                                              | §4.2 of this spec                           | maintainers + product | open                                        |
+| 13  | Batch-sync acceptance dropping toward zero at cutover, with dormant identities having no automatic recovery path                                                                 | §6.4 of this spec                           | maintainers + product | open                                        |
+| 15  | **Epic descope**: client-cycle spec demoted to deferred-informative; `rewrite_legacy` cut to a recorded deferral; hook ships headers-only                                        | client spec status; providers §6.1; hook §3 | maintainers + product | open                                        |
+| 16  | Sticky opt-out for timestamp-less sources: a GPP/USP-only re-consent does not restore authority without a timestamped grant                                                      | permission §4.3                             | maintainers + legal   | open                                        |
+| 17  | Explicit N/A values are grant-class and can newly authorize personalized advertising                                                                                             | permission §4.5                             | maintainers + legal   | open                                        |
+| 18  | Permissive `default_country` remains in effect during prolonged geo-provider failure (metered residual)                                                                          | permission §5.2                             | maintainers + legal   | open                                        |
+| 19  | Mixed policy revisions during rollout can produce irreversible destructive outcomes on part of the fleet                                                                         | permission §5.5                             | maintainers + product | open                                        |
+| 20  | N+1 interim: v1 minting semantics and pre-epic gating persist under old-shape config until N+2/new-shape                                                                         | migration §4.4                              | maintainers + product | open                                        |
+| 21  | Adopted legacy rows are bounded by a migration cutoff, not a fresh full TTL                                                                                                      | providers §5                                | maintainers + product | open                                        |
+| 14  | Policy tightening never reuses stored refusals destructively — a fresh, live post-change refusal is required (the spec decides this; ratify it)                                  | permission §4.2 trigger 2                   | maintainers + legal   | open                                        |

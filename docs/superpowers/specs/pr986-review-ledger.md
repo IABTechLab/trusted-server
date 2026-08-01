@@ -103,30 +103,60 @@ the R7 table below). Sign-off table with owners/status introduced R6.
 
 ## Round 7 — current
 
-| Finding                                           | Status                                                                             |
-| ------------------------------------------------- | ---------------------------------------------------------------------------------- |
-| Client page leg pre-gate                          | fixed (page-leg gating; deferred with client spec)                                 |
-| Cookie read/use/withdraw unmodeled                | **cookie ops deferred out of v1 hook** (entry bar recorded; sign-off 9/10 updated) |
-| Ownerless mode reintroduces fixation              | fixed — ownerless mode removed outright                                            |
-| Graphless cookie adoption                         | fixed (adoption transaction, matrix row 13)                                        |
-| Rewrite retention lineage                         | superseded — rewrite_legacy cut; finding recorded as entry bar                     |
-| Unreferenced provider blocks                      | fixed (startup error)                                                              |
-| Fastly prefix-query delimiter                     | fixed (backend-safe delimiter, per-adapter query validation)                       |
-| P2 alias/tombstone cluster counting               | fixed (liveness/kind filtering; aliases reserved-future)                           |
-| P2 push-vs-deploy validation                      | fixed (two named layers, capability profile)                                       |
-| P2 rollback floor unobservable                    | fixed (floor = writer activation, durable marker)                                  |
-| P2 cookie ownership uniqueness                    | integration-ID uniqueness kept; cookie ownership deferred with cookie ops          |
-| Still-open: GPP 6/24–27                           | fixed (registry-complete map)                                                      |
-| Still-open: state-over-national opt-out erasure   | fixed (grants-only precedence)                                                     |
-| Still-open: suppression completeness              | fixed (monotonic ordering, re-consent clear, write-failure semantics)              |
-| Still-open: family-epoch cross-key CAS            | recorded as client-spec open question 0; deferred                                  |
-| Still-open: eventual rows vs alias guarantees     | superseded (rewrite cut)                                                           |
-| Still-open: 4-hop stranding                       | superseded (rewrite cut)                                                           |
-| Still-open: N+1 enforce vs N+2 write boundary     | fixed (N+1 writes safety-critical records)                                         |
-| Still-open: N+2-only legacy reader on N+1         | fixed (accepted in legacy position)                                                |
-| Still-open: no-geo guard cookie consumers         | deferred with cookie ops (inventory row updated)                                   |
-| Still-open: persisted TCF in raw arm              | fixed (TCF-sourced effective record triggers arm)                                  |
-| Still-open: request-side raw identity             | fixed (identity-redacted integration request views)                                |
-| Still-open: RequestFilterEffects.response_headers | fixed (folded into hook, done-when item)                                           |
-| Still-open: must-understand                       | fixed (sticky set extended)                                                        |
-| Still-open: Axum persistence overstated           | fixed (in-process, non-durable, dev-only cell)                                     |
+| Finding                                           | Status                                                                                                                                                               |
+| ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Client page leg pre-gate                          | fixed (page-leg gating; deferred with client spec)                                                                                                                   |
+| Cookie read/use/withdraw unmodeled                | **cookie ops deferred out of v1 hook** (entry bar recorded; sign-off 9/10 updated)                                                                                   |
+| Ownerless mode reintroduces fixation              | fixed — ownerless mode removed outright                                                                                                                              |
+| Graphless cookie adoption                         | fixed (adoption transaction, matrix row 13)                                                                                                                          |
+| Rewrite retention lineage                         | superseded — rewrite_legacy cut; finding recorded as entry bar                                                                                                       |
+| Unreferenced provider blocks                      | fixed (startup error)                                                                                                                                                |
+| Fastly prefix-query delimiter                     | R7's per-adapter `:` delimiter was itself Fastly-rejected and non-portable → **refixed R8**: delimiter-free fixed-width grammar (class tag + registry provider code) |
+| P2 alias/tombstone cluster counting               | fixed (liveness/kind filtering; aliases reserved-future)                                                                                                             |
+| P2 push-vs-deploy validation                      | fixed (two named layers, capability profile)                                                                                                                         |
+| P2 rollback floor unobservable                    | fixed (floor = writer activation, durable marker)                                                                                                                    |
+| P2 cookie ownership uniqueness                    | integration-ID uniqueness kept; cookie ownership deferred with cookie ops                                                                                            |
+| Still-open: GPP 6/24–27                           | fixed (registry-complete map)                                                                                                                                        |
+| Still-open: state-over-national opt-out erasure   | fixed (grants-only precedence)                                                                                                                                       |
+| Still-open: suppression completeness              | partial R7 (ordering claimed without CAS; cause-list coverage; timestamp-less unrealizable) → **refixed R8** (CAS + version counter, delta coverage, sticky opt-out) |
+| Still-open: family-epoch cross-key CAS            | recorded as client-spec open question 0; deferred                                                                                                                    |
+| Still-open: eventual rows vs alias guarantees     | superseded (rewrite cut)                                                                                                                                             |
+| Still-open: 4-hop stranding                       | superseded (rewrite cut)                                                                                                                                             |
+| Still-open: N+1 enforce vs N+2 write boundary     | fixed (N+1 writes safety-critical records)                                                                                                                           |
+| Still-open: N+2-only legacy reader on N+1         | fixed (accepted in legacy position)                                                                                                                                  |
+| Still-open: no-geo guard cookie consumers         | deferred with cookie ops (inventory row updated)                                                                                                                     |
+| Still-open: persisted TCF in raw arm              | fixed (TCF-sourced effective record triggers arm)                                                                                                                    |
+| Still-open: request-side raw identity             | asserted R7 without API/tests → **specified R8** (`RedactedRequestView`, enumerated strip set, same-PR migration, denied/withdrawn tests)                            |
+| Still-open: RequestFilterEffects.response_headers | R7 fold-in would have **broken DataDome** (302/401/403/429 + cookies) → **refixed R8**: distinct core-owned security channel sharing validation + invariant layers   |
+| Still-open: must-understand                       | fixed (sticky set extended)                                                                                                                                          |
+| Still-open: Axum persistence overstated           | partial R7 (still marked wired; head installs `UnavailableKvStore`) → **refixed R8** (not wired)                                                                     |
+
+## Round 8 — re-review at 09e54e96
+
+| Finding                                     | Status                                                                                                                                              |
+| ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| P1.1 suppression monotonicity unprovidable  | fixed (linearizable CAS + record version counter; sticky opt-out for timestamp-less sources — sign-off 16; race fixtures)                           |
+| P1.2 malformed/absent leave stale authority | fixed (suppression on every positive→unset delta, cause-agnostic)                                                                                   |
+| P1.3 suppression-write failure "transient"  | fixed (unbounded residual, shares sign-off 11, fault test)                                                                                          |
+| P1.4 N/A double meaning                     | fixed (single rule: explicit N/A = grant-class, absent = nothing; sign-off 17)                                                                      |
+| P1.5 adoption = syntax-as-authentication    | fixed (`verify` against request evidence; expire on failure; full required_permissions; atomic create-if-absent capability; read-error ≠ not-found) |
+| P1.6 N+1 impossible write behavior          | fixed (N+1 mints v1 with today's semantics; old-shape config runs pre-epic gate; new contracts activate at N+2/new-shape — sign-off 20)             |
+| P1.7 N+2-only provider readable by N+1      | fixed (providers ship compiled-in dormant one release early; reader-first per provider)                                                             |
+| P1.8 cookie deferral contradictions         | fixed (ops list, reserved remnant, generic-op wording, core-owned-cookie test)                                                                      |
+| P1.9 DataDome fold-in breakage              | fixed (distinct security channel, shared validation/invariant layers, core-mediated security cookies)                                               |
+| P1.10 freshness metadata weakening          | fixed (`Age`/`Date`/`Expires` reserved, rationale in-spec)                                                                                          |
+| P1.11 client-cycle in normative core        | fixed (Acquisition enum/ClientResolve/reservations removed from trait surface; `verify` added; deferred doc holds the rest)                         |
+| P1.12 redaction unspecified                 | fixed (see corrected R7 row above)                                                                                                                  |
+| P2.1 rewrite residue                        | fixed (tests, runtime row, metrics/retirement swept; alias schema marked reserved)                                                                  |
+| P2.2 delimiter portability                  | fixed (see corrected R7 row above)                                                                                                                  |
+| P2.3 Axum matrix                            | fixed (see corrected R7 row above)                                                                                                                  |
+| P2.4 adoption rejuvenation                  | fixed (migration-cutoff-bounded TTL; sign-off 21)                                                                                                   |
+| P2.5 stored cluster overcount               | fixed (no persistence beyond inputs' lifetime)                                                                                                      |
+| P2.6 GPP applicability leftovers            | fixed (MD/IN/KY/RI sentence removed; section-6 grants defined; regime-`none` row reconciled with applicability)                                     |
+| P2.7 mixed-revision divergence              | accepted explicitly (sign-off 19)                                                                                                                   |
+| P2.8 floor marker rollbackable              | fixed (write-once/CAS deployment metadata)                                                                                                          |
+| P2.9 sign-off gaps                          | fixed (rows 16–21 added; rows 3 and 11 amended)                                                                                                     |
+| P2.10 duplicate integration IDs             | fixed (startup rejection + test; current silent coalescing named)                                                                                   |
+| P3 GPP version pinning                      | fixed (accepted versions enumerated; unknown version = malformed-present)                                                                           |
+| P3 geo region vocabulary                    | fixed (ISO output or declared canonical mapping)                                                                                                    |
+| P3 stale fragments + ledger overstatement   | fixed (this ledger corrected; hook remnants swept)                                                                                                  |

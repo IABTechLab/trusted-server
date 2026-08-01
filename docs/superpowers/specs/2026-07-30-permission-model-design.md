@@ -187,7 +187,7 @@ Validation rejects:
 - rule keys whose country part is not in the embedded **assigned** ISO
   3166-1 alpha-2 list (not merely `[A-Z]{2}` — an unassigned code is
   almost certainly a typo silently diverting a country to the fallback);
-  the region part must be an assigned ISO 3166-2 subdivision of that country (not merely a shape check — `US/ZZ` would parse but can never match a request), unless the selected geo provider declares its own region vocabulary, in which case validation uses that declaration. The `US/CA` slash form is the
+  the region part must be an assigned ISO 3166-2 subdivision of that country (not merely a shape check — `US/ZZ` would parse but can never match a request), unless the selected geo provider declares its own region vocabulary **together with a canonical mapping to ISO subdivisions** — §4.5 applicability and policy rule keys operate on canonical `US/CA`-form keys, so a provider emitting anything else must declare the translation, validated at startup. The `US/CA` slash form is the
   house rule-key format corresponding to ISO 3166-2 `US-CA`;
 - references to permissions outside the enforced vocabulary (§2);
 - references to undefined groups, and groups missing the `regime` class;
@@ -273,11 +273,11 @@ blocked but an **explicit non-opt-out** value grants:
   permission-scoped** — grant signals are NOT interchangeable across
   regimes:
 
-  | Regime of the resolved rule | Evidence accepted as a grant for a `requires_signal` permission                                                                  |
-  | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-  | `gdpr`                      | **Only** a TCF record consenting to that specific purpose                                                                        |
-  | `us-privacy`                | TCF consent for the purpose, or GPP/USP evidence **per the §4.5 field mapping** — a field grants only the permissions it maps to |
-  | `none`                      | Any grant-class signal                                                                                                           |
+  | Regime of the resolved rule | Evidence accepted as a grant for a `requires_signal` permission                                                                                                                                                                       |
+  | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+  | `gdpr`                      | **Only** a TCF record consenting to that specific purpose                                                                                                                                                                             |
+  | `us-privacy`                | TCF consent for the purpose, or GPP/USP evidence **per the §4.5 field mapping** — a field grants only the permissions it maps to                                                                                                      |
+  | `none`                      | TCF consent; GPP/USP grants only where §4.5 applicability yields one (the national section applies under `us-privacy` regimes, so in practice `none` grants via TCF — moot in the shipped policy, whose `none` baseline is `granted`) |
 
   Without this scoping, a US-style `sale_opt_out = false` would satisfy a
   French `requires_signal` rule — no TCF, both purposes granted, EC minted,
@@ -423,23 +423,48 @@ and the fail-closed marker:
   which the refusal just unset, and identity rows may be eventually
   consistent, so a stale replica could resurrect a P4 grant after a
   targeted-advertising opt-out. The fix is a **suppression record** in
-  the strongly consistent class (providers spec §6.3: `sup/<family-id>`).
-  Its semantics are complete, not sketched: entries are **per permission**
-  with the triggering state (refusal or non-destructive opt-out — the
-  full negative-state coverage; absence writes nothing) and an
-  authoritative timestamp; ordering is **monotonic per permission** —
-  a write with an older timestamp than the stored entry is a no-op, so
-  replays cannot regress the state; **re-consent clears**: a live
-  resolution carrying an accepted grant with a newer authoritative
-  timestamp than the suppression entry supersedes it (recorded as a
-  clear entry in the same record — still an exempt write, since it only
-  ever reflects the live resolution); and **write failure fails closed
-  for the live request** (the refusal's effect stands for this response)
-  while S2S may transiently honor prior authority until the retry lands —
-  logged, metered, and covered by the degraded-mode rule. Every S2S
-  recompute and partner-egress check consults the record: a suppressed
-  permission is unset whatever the row's provenance says, so no
-  eventual-consistency edge can restore it.
+  the strongly consistent class, and — because monotonicity is a
+  read-modify-write property, not a read property — suppression writes
+  require **linearizable per-key CAS** (providers spec §6.3
+  `sup/<family-id>`, §7 matrix): with plain read-after-write, two
+  writers can both read the record and an older clear can overwrite a
+  newer suppress. The record carries its own **version counter,
+  incremented through the CAS**, so transitions are ordered by
+  serialization, not by comparing wall-clock timestamps.
+
+  Coverage is **every authority-clearing delta, not an enumerated cause
+  list**: after each live resolution, any permission whose new state is
+  unset while its stored provenance is positive gets a suppression
+  entry — refusal, non-destructive opt-out, malformed-present, and
+  applicable absence alike. (The earlier refusal/opt-out-only list left
+  a hole: a malformed record unsets P1, the P1-gated row update is
+  thereby forbidden, no suppression is written, and batch sync later
+  honors the stale grant.)
+
+  **Timestamp-less sources get sticky opt-out.** GPP/USP values carry no
+  intrinsic timestamp, and opt-out → consent → opt-out(same value) is
+  information-theoretically indistinguishable from a replay of the first
+  opt-out. Latest-observation semantics would let a replayed old consent
+  string clear a newer opt-out, so: a suppression from a timestamp-less
+  source is cleared **only** by a grant carrying an authoritative
+  timestamp newer than the suppression's observation (TCF
+  `LastUpdated`) — a timestamp-less re-consent alone does not clear it.
+  The consequence (a genuine GPP-only re-consent does not restore
+  authority until a timestamped source or policy provides it) is
+  declared and is sign-off item 16. Fixtures: suppress-vs-clear race
+  under concurrent writers; repeated-value opt-out/consent/opt-out.
+
+  **Write failure fails closed for the live request** (the refusal's
+  effect stands for this response), but the S2S residual is **unbounded
+  for a never-returning visitor** — exactly like a failed destructive
+  revocation, not "transient": other instances continue honoring old
+  provenance, the breaker is per-instance, and no durable retry exists.
+  This shares sign-off item 11 (extended to cover suppression) and gets
+  its own fault test. Every S2S recompute and partner-egress check
+  consults the record: a suppressed permission is unset whatever the
+  row's provenance says, so no eventual-consistency edge can restore
+  it.
+
 - **The cookie expires only after the family record commits.**
 - **If the family-record write itself fails, nothing durable exists** —
   the cookie stays and the durable client-side signal (GPC, CMP-stored
@@ -498,14 +523,19 @@ an expired record before clearing both sources; expiry-first is a
 | Persisted-KV consent record, live record present                 | **Live wins**, always; the stored record is never consulted                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | Preserved                                                                                                                         |
 | Persisted-KV consent record, no live record                      | Substitutes as the effective record **iff within the same TTL as a live record**, then flows through the full normalization pipeline (syntax, expiry, conflict) like any live record; staler → absent. This narrow read is exempt from the graph-read permission gate (§7) — determining `store-on-device` cannot itself require `store-on-device`                                                                                                                                                                                                        | **Changed (declared)**: current code returns immediately after the KV load, bypassing expiry and conflict normalization           |
 | Proxy/mirror mode                                                | **Minimal opt-out extraction still runs; full semantic decoding is skipped.** Because opt-outs are globally authoritative (§4), proxy mode must not suppress them: the §4.5-mapped opt-out fields (GPP US sections) and the US Privacy string are decoded — nothing else — alongside syntax validation, so a valid SaleOptOut or USP opt-out revokes and withdraws exactly as outside proxy mode. No grants are ever derived from records in proxy mode; a present record otherwise blocks grants (fail-closed); absent → baseline. GPC needs no decoding | **Changed (declared)**: today proxy mode skips decoding entirely — fail-open under permissive baselines and, worse, opt-out-blind |
-| GPP / US Privacy fields                                          | Per the normative field mapping of §4.5 — fields are not interchangeable signals, and absent/N-A fields grant nothing                                                                                                                                                                                                                                                                                                                                                                                                                                     | Decided here (§4.5)                                                                                                               |
+| GPP / US Privacy fields                                          | Per the normative field mapping of §4.5 — fields are not interchangeable signals; **explicit N/A is grant-class (not-opted-out), absent grants nothing** — one meaning, everywhere                                                                                                                                                                                                                                                                                                                                                                        | Decided here (§4.5)                                                                                                               |
 | Malformed-but-present record, no valid record of that family     | **Blocks grants** (fail-closed acquisition — it does not degrade to "absent", which under a `granted` baseline would turn garbage into a grant, the fail-open path in both #838 and the first draft of this spec). Never triggers withdrawal — destruction requires an affirmative, decodable signal (§4.2)                                                                                                                                                                                                                                               | Changed (declared)                                                                                                                |
 
 ### 4.5 US signal field mapping — normative
 
 GPP and US Privacy fields map to specific permissions with specific
 effects; they are never interchangeable, a field's absence or N/A value
-contributes nothing, and only the fields marked destructive trigger
+behaves per its table row — **explicit _Not Applicable_ is grant-class
+(not-opted-out), preserving current USP tests and GPP `NotApplicable`
+handling; only a genuinely absent field contributes nothing** (this is
+the single normative statement; an earlier "N/A contributes nothing"
+rule is dead, and the P4-authorizing consequence is sign-off item 17) —
+and only the fields marked destructive trigger
 withdrawal. Section IDs and versions are those of the IAB GPP
 specification current at implementation time; adding a section or field is
 a change to this table.
@@ -523,19 +553,17 @@ a change to this table.
 | Any field                                    | explicitly _Not Applicable_ | as the field's not-opted-out row above | as the field's not-opted-out row above | —                                                                                                                  |
 | Any field                                    | absent                      | —                                      | —                                      | —                                                                                                                  |
 
-**N/A vs absent:** a field explicitly set to _Not Applicable_ is treated
-as not-opted-out (grant-class) — pinned by today's USP tests and matching
-current GPP `NotApplicable` handling, and declared as such since an
-earlier draft said N/A contributes nothing. A field **absent** from an
-applicable section, or any field of a non-applicable section, contributes
-nothing.
+**N/A vs absent (restating the single rule):** explicit _Not
+Applicable_ = grant-class; absent = nothing; a non-applicable section's
+fields grant nothing (their opt-outs still count, per step 2).
 
 **Applicability and aggregation — ordered algorithm:**
 
 1. **Section map (normative, pinned here — not "whatever GPP is
    current"), matching the official IAB registry in full:** section 6 ↔
-   the **US Privacy string carried as a GPP section** (it maps to the USP
-   rows of the field table, not to nothing); `US` national ↔ 7 (usnat);
+   the **US Privacy string carried as a GPP section** — it maps to the USP
+   rows of the field table in full, opt-outs _and_ grant-class values,
+   under the same applicability rules as the national section; `US` national ↔ 7 (usnat);
    the state sections — `US/CA` ↔ 8, `US/VA` ↔ 9, `US/CO` ↔ 10,
    `US/UT` ↔ 11, `US/CT` ↔ 12, `US/FL` ↔ 13, `US/MT` ↔ 14, `US/OR` ↔ 15,
    `US/TX` ↔ 16, `US/DE` ↔ 17, `US/IA` ↔ 18, `US/NE` ↔ 19, `US/NH` ↔ 20,
@@ -544,8 +572,11 @@ nothing.
    claimed MD/IN/KY/RI had no section). A truncated map silently loses
    opt-outs — a Texas (16) or Maryland (24) sale opt-out must not vanish.
    The implementation PR cross-checks this list against both the current
-   decoder's section set and the official registry; adding a section or
-   version is a change to this map.
+   decoder's section set and the official registry, and **enumerates the
+   accepted version per section**; a mapped section carrying an unknown
+   version is treated as malformed-present (blocks grants, never
+   withdraws — §4.4), not as absent. Adding a section or version is a
+   change to this map.
 2. **Applicability gates grants only — never opt-outs.** A mapped
    **opt-out** field (either subclass) is honored from **any** section on
    **any** request, whatever the regime — this is §4's global-opt-out
@@ -556,8 +587,7 @@ nothing.
    to the resolved `US/<state>`; foreign-state sections and all sections
    on non-`us-privacy` requests grant nothing. Regionless US traffic:
    national section only. A configured privacy state with no
-   state-specific section (e.g. MD, IN, KY, RI today) uses the national
-   section alone.
+   state-specific section uses the national section alone.
 3. **State-over-national, per field — for grants only:** where an
    applicable state section carries a field, its value governs that
    field's **grant** derivation; the national section fills only fields
@@ -647,9 +677,16 @@ policy** (§4.2 trigger 3) — the one revision-sensitive destructive case
 (trigger 2 under a now-`denied` baseline) requires an affirmative user
 refusal at the evaluating instance, which is safe under either revision.
 S2S recomputation always evaluates against the instance's current
-revision and records it. Rolling a policy revision back restores
-acquisition rules but **cannot resurrect tombstoned identities**; the
-migration guide says so where operators will read it.
+revision and records it. One divergence is explicitly accepted rather
+than fenced: during convergence, a live refusal under a
+`granted`-revision instance suppresses while the same refusal under a
+tightened-revision instance destroys (trigger 2) — the destructive
+outcome is the target revision's intended behavior arriving early on
+part of the fleet, coordinated activation fencing is not worth its
+machinery, and the acceptance is sign-off item 19. Rolling a policy
+revision back restores acquisition rules but **cannot resurrect
+tombstoned identities**; the migration guide says so where operators
+will read it.
 
 ## 6. Failure-mode matrix — normative
 

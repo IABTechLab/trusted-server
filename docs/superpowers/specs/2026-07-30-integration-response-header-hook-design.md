@@ -31,8 +31,9 @@ mutators to the outbound response for HTML document responses it processed.
   registered mutators in registration order.
 - **The mutator API is structured operations, not header-map access.** A
   mutator returns (or is handed a recorder for) typed operations —
-  `append(name, value)`, `replace(name, value)`,
-  `append_set_cookie(cookie)` — which **core validates and applies**,
+  `append(name, value)` and `replace(name, value)` (v1 is headers-only;
+  the cookie operation arrives with the deferred cookie surface, §3) —
+  which **core validates and applies**,
   attributing each to its integration id. PR #838's shape handed the
   integration an unrestricted `&mut HeaderMap`, which makes §3's collision
   policy unenforceable by construction: core cannot validate or attribute
@@ -88,9 +89,14 @@ mutators to the outbound response for HTML document responses it processed.
   granularities because `Set-Cookie` is multi-valued: (a) reserved header
   _names_ — HTTP framing and hop-by-hop headers (`Content-Length`,
   `Transfer-Encoding`, `Connection`, `Trailer`, `Upgrade`, `TE`,
-  `Keep-Alive`), **representation headers coupled to body bytes the hook
-  cannot see** (`Content-Encoding`, `Content-Range`, `Content-Type`,
-  `ETag`, `Last-Modified`, `Accept-Ranges`, and digest headers —
+  `Keep-Alive`), **freshness metadata** (`Age`, `Date`, `Expires` — replacing `Age: 59`
+  with `Age: 0` on a cached `max-age=60` response, or pushing `Expires`
+  into the future, extends downstream freshness in exactly the way the
+  monotonic merge forbids for `max-age`, so these are reserved outright
+  rather than merged), **representation headers coupled to body bytes
+  the hook cannot see** (`Content-Encoding`, `Content-Range`,
+  `Content-Type`, `ETag`, `Last-Modified`, `Accept-Ranges`, and digest
+  headers —
   relabeling uncompressed bytes as Brotli, or advertising a validator or
   digest for bytes the hook never saw, corrupts responses or poisons
   caches), the `x-ts-*` namespace, and the
@@ -108,9 +114,14 @@ mutators to the outbound response for HTML document responses it processed.
   permissions, a typed authorized request-side view, stripping from
   unauthorized integration/proxy inputs, mandatory expiry on destructive
   P1 withdrawal, and startup-unique (name, domain, path) ownership.
-  Integration IDs are startup-unique regardless. Until then the
+  Integration IDs are **startup-unique, enforced**: registry
+  construction rejects a duplicate ID (current code silently coalesces,
+  which corrupts attribution and budgets), with a duplicate-ID test in
+  the done-when. Until then the
   operation set is headers-only, and `Set-Cookie` is fully reserved.
-  reserved cookie name. Violations are rejected at the operation layer (§2) and
+  reserved cookie name — in v1 that is every cookie name, since
+  `Set-Cookie` is fully reserved (§3 deferral). Violations are rejected
+  at the operation layer (§2) and
   logged at `warn` with the integration id. The reserved lists are single
   constants next to the definitions they protect, not duplicated in the
   hook.
@@ -125,7 +136,8 @@ mutators to the outbound response for HTML document responses it processed.
   which is deterministic).
 - **Operation-layer hygiene:** generic `append`/`replace` reject the
   `Set-Cookie` header name outright — cookies go only through
-  `append_set_cookie`, so its validation cannot be bypassed by spelling
+  the deferred cookie builder (when it exists), so cookie validation
+  cannot be bypassed by spelling
   the header name in a generic op. Per-integration limits bound total
   operations (≤ 32), added headers (≤ 16), and added bytes (≤ 8 KiB), and
   a **cumulative final-response budget** (≤ 128 headers / ≤ 32 KiB total,
@@ -174,11 +186,20 @@ processed documents (§6).
 ## 4. Done-when (from #782, sharpened)
 
 1. Trait + builder + registry application, each public item documented.
-2. **The pre-existing `RequestFilterEffects.response_headers` channel is
-   folded into the hook in the same PR** — its outputs become hook
-   operations subject to the same validation, reserved surface, budgets,
-   and invariant pass, or the channel is removed; a second, unvalidated
-   header path bypassing the hook defeats every rule above.
+2. **The pre-existing `RequestFilterEffects.response_headers` channel
+   remains a distinct, core-owned security channel — not folded in, and
+   not left unvalidated.** Folding it into this hook would break its one
+   real consumer: DataDome sets headers **and cookies** on 200, 301/302,
+   401, 403, and 429 responses — challenge and deny flows on exactly the
+   response classes (§3a) this hook never runs on, and with cookie
+   emission v1 reserves. Instead, the channel keeps its own eligibility
+   (security-integration responses of any status), its cookies are
+   **core-mediated security cookies** (explicitly outside the deferred
+   integration-cookie surface, migrated deliberately when that surface
+   lands), and it adopts the **shared validation layers**: the
+   structured-operation checks, reserved header names, budgets, and the
+   final cache/privacy invariant pass. One invariant enforcer, two
+   eligibility domains.
 3. **At least one real consumer ships in the same PR** — an existing
    integration registering a mutator for a real need (or, failing a real
    need, the feature waits; scaffolding with only self-referential tests is
@@ -192,7 +213,8 @@ processed documents (§6).
    cache-hit, pass-through, redirect, error, and 304 each proven to run or
    not run the hook — not merely one positive header test per adapter.
 8. Cache/privacy invariant tests, one per restriction source and shape:
-   cookie appended + public `Cache-Control` replacement → private/no-store,
+   a **core-owned** cookie already queued before the hook + an
+   integration's public `Cache-Control` replacement → private/no-store,
    surrogate stripped; **core-private cookieless** processed HTML +
    public replacement → restriction preserved; **origin-private cookieless** processed HTML that retained the
    origin's cache restrictions + public replacement → restriction
