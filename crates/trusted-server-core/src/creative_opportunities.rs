@@ -253,6 +253,12 @@ impl CreativeOpportunitiesConfig {
 
         for slot in &self.slot {
             slot.validate_runtime()?;
+            if slot.providers.aps.is_some() {
+                log::warn!(
+                    "creative opportunity slot '{}': providers.aps is retained only for configuration compatibility and is ignored by APS OpenRTB",
+                    slot.id
+                );
+            }
         }
 
         if self

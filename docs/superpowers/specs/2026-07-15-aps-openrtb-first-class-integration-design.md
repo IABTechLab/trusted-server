@@ -673,11 +673,9 @@ validation also passes.
 
 ## 12. Sanitization and security invariants
 
-- Ordinary `Bid.creative`/`adm` values are always sanitized; the default-true
-  `[auction].rewrite_creatives` control determines whether accepted URLs are
-  rewritten to first-party endpoints.
-- Sanitization's element, attribute, URI, size, and fail-closed rules do not
-  change.
+- `sanitize_creative_html` remains mandatory for every ordinary
+  `Bid.creative`/`adm` value.
+- Its element, attribute, URI, size, and fail-closed rules do not change.
 - APS executable rendering is a separate typed capability; it is never disguised as
   sanitized `adm`.
 - Only a server-validated APS descriptor with an exact browser-validated envelope can

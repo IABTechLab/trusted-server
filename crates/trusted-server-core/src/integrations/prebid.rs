@@ -19,7 +19,7 @@ use url::{Url, Url as ParsedUrl};
 use validator::{Validate, ValidationError};
 
 use crate::auction::orchestrator::ERROR_TYPE_HTTP_STATUS;
-use crate::auction::provider::AuctionProvider;
+use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
 use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid, MediaType,
 };
@@ -38,9 +38,7 @@ use crate::openrtb::{
     OpenRtbRequest, PrebidExt, PrebidImpExt, Publisher, Regs, RegsExt, RequestExt, Site, ToExt,
     TrustedServerExt, User, UserExt, to_openrtb_i32,
 };
-use crate::platform::{
-    PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, RuntimeServices,
-};
+use crate::platform::{PlatformHttpRequest, PlatformResponse, RuntimeServices};
 use crate::proxy::{ProxyRequestConfig, is_host_allowed, proxy_request};
 use crate::request_signing::{RequestSigner, SIGNING_VERSION, SigningParams};
 use crate::settings::{IntegrationConfig, Settings};
@@ -952,6 +950,7 @@ fn build(
     canonicalize_excluded_gam_ad_unit_path_suffixes(&mut config);
     remove_aps_bidders(&mut config);
 
+    remove_aps_bidders(&mut config);
     validate_external_bundle_config(&config, &settings.proxy.allowed_domains)?;
 
     // Warn about bidders that appear in both lists — this is likely a config
@@ -1465,12 +1464,23 @@ fn copy_request_headers(
     to: &mut http::Request<EdgeBody>,
     consent_forwarding: ConsentForwardingMode,
     client_ip: Option<std::net::IpAddr>,
+    sanitized_referer: Option<&str>,
 ) {
-    let headers_to_copy = [header::USER_AGENT, header::REFERER, header::ACCEPT_LANGUAGE];
+    let headers_to_copy = [header::USER_AGENT, header::ACCEPT_LANGUAGE];
 
     for header_name in &headers_to_copy {
         if let Some(value) = from.headers().get(header_name) {
             to.headers_mut().insert(header_name, value.clone());
+        }
+    }
+    if let Some(referer) = sanitized_referer {
+        match HeaderValue::from_str(referer) {
+            Ok(value) => {
+                to.headers_mut().insert(header::REFERER, value);
+            }
+            Err(error) => {
+                log::warn!("Prebid: sanitized Referer could not be encoded as a header: {error}");
+            }
         }
     }
 
@@ -1532,6 +1542,17 @@ pub struct PrebidAuctionProvider {
     bid_param_override_engine: Arc<BidParamOverrideEngine>,
 }
 
+#[derive(Default)]
+struct PrebidImpressionDisposition {
+    aps_only: usize,
+    invalid: usize,
+}
+
+struct PrebidRequestBuild {
+    request: OpenRtbRequest,
+    disposition: PrebidImpressionDisposition,
+}
+
 impl PrebidAuctionProvider {
     #[cfg(test)]
     fn new(config: PrebidIntegrationConfig) -> Self {
@@ -1565,14 +1586,15 @@ impl PrebidAuctionProvider {
         }
     }
 
-    /// Convert auction request to `OpenRTB` format with all enrichments.
-    fn to_openrtb(
+    /// Build an enriched `OpenRTB` request and retain impression drop provenance.
+    fn build_openrtb(
         &self,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
         signer: Option<(&RequestSigner, String, &SigningParams)>,
         request_info: RequestInfo,
-    ) -> OpenRtbRequest {
+    ) -> PrebidRequestBuild {
+        let mut disposition = PrebidImpressionDisposition::default();
         let imps = request
             .slots
             .iter()
@@ -1598,6 +1620,7 @@ impl PrebidAuctionProvider {
                     .collect();
 
                 if formats.is_empty() {
+                    disposition.invalid += 1;
                     log::warn!(
                         "prebid: dropping imp '{}' — no valid banner formats after filtering",
                         slot.id
@@ -1739,6 +1762,7 @@ impl PrebidAuctionProvider {
                 }
 
                 if excluded_aps && bidder.is_empty() {
+                    disposition.aps_only += 1;
                     log::warn!(
                         "prebid: dropping imp '{}' because it contains only APS demand; refusing PBS stored-request fallback",
                         slot.id
@@ -1952,6 +1976,12 @@ impl PrebidAuctionProvider {
         }
         .to_ext();
 
+        // The browser Referer identifies the current publisher page for the
+        // same-origin `/auction` request, not the page that referred the user to
+        // the publisher. `request.publisher.page_url` is already sanitized and
+        // is carried as `site.page`, so do not duplicate the raw header in
+        // `site.ref`.
+
         // Advertise the effective auction budget, not the raw provider config:
         // the orchestrator caps `context.timeout_ms` to the remaining auction
         // budget, and the edge backend stops waiting after that long. Telling
@@ -1959,12 +1989,13 @@ impl PrebidAuctionProvider {
         // edge timeouts.
         let tmax = to_openrtb_i32(context.timeout_ms, "tmax", "request");
 
-        OpenRtbRequest {
+        let request = OpenRtbRequest {
             id: Some(request.id.clone()),
             imp: imps,
             site: Some(Site {
                 domain: Some(request.publisher.domain.clone()),
                 page: page_url,
+                r#ref: None,
                 publisher: Some(Publisher {
                     domain: Some(request.publisher.domain.clone()),
                     ..Default::default()
@@ -1979,7 +2010,25 @@ impl PrebidAuctionProvider {
             cur: vec![DEFAULT_CURRENCY.to_string()],
             ext,
             ..Default::default()
+        };
+
+        PrebidRequestBuild {
+            request,
+            disposition,
         }
+    }
+
+    /// Convert an auction request to `OpenRTB` format with all enrichments.
+    #[cfg(test)]
+    fn to_openrtb(
+        &self,
+        request: &AuctionRequest,
+        context: &AuctionContext<'_>,
+        signer: Option<(&RequestSigner, String, &SigningParams)>,
+        request_info: RequestInfo,
+    ) -> OpenRtbRequest {
+        self.build_openrtb(request, context, signer, request_info)
+            .request
     }
 
     /// Builds the `regs` object from a [`ConsentContext`].
@@ -2413,7 +2462,8 @@ impl AuctionProvider for PrebidAuctionProvider {
         &self,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
-    ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+    ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
+        let request_start = web_time::Instant::now();
         log::info!("Prebid: requesting bids for {} slots", request.slots.len());
 
         // `ext.trusted_server.request_host` must be the publisher's own domain
@@ -2452,8 +2502,10 @@ impl AuctionProvider for PrebidAuctionProvider {
                 None
             };
 
-        // Convert to OpenRTB with all enrichments
-        let openrtb = self.to_openrtb(
+        let PrebidRequestBuild {
+            request: openrtb,
+            disposition,
+        } = self.build_openrtb(
             request,
             context,
             signer_with_signature
@@ -2462,10 +2514,21 @@ impl AuctionProvider for PrebidAuctionProvider {
             request_info,
         );
 
-        // An empty `imp` array violates the OpenRTB spec and wastes a network
-        // round-trip. This can happen when all slots are non-Banner or all
-        // banner dimensions overflow `i32::MAX`.
         if openrtb.imp.is_empty() {
+            let all_slots_are_aps_only = !request.slots.is_empty()
+                && disposition.invalid == 0
+                && disposition.aps_only == request.slots.len();
+            if all_slots_are_aps_only {
+                log::info!(
+                    "Prebid: returning no-bid because all {} valid impressions are APS-only",
+                    disposition.aps_only
+                );
+                return Ok(ProviderRequestOutcome::Immediate(AuctionResponse::no_bid(
+                    PREBID_INTEGRATION_ID,
+                    request_start.elapsed().as_millis() as u64,
+                )));
+            }
+
             log::info!("Prebid: skipping request — no valid impressions after filtering");
             return Err(Report::new(TrustedServerError::Prebid {
                 message: "No valid impressions after filtering".to_string(),
@@ -2499,6 +2562,7 @@ impl AuctionProvider for PrebidAuctionProvider {
             &mut pbs_req,
             self.config.consent_forwarding,
             context.services.client_info().client_ip,
+            request.publisher.page_url.as_deref(),
         );
 
         let pbs_body = serde_json::to_vec(&openrtb).change_context(TrustedServerError::Prebid {
@@ -2534,7 +2598,7 @@ impl AuctionProvider for PrebidAuctionProvider {
                 message: "Failed to send async request to Prebid Server".to_string(),
             })?;
 
-        Ok(pending)
+        Ok(ProviderRequestOutcome::pending(pending))
     }
 
     async fn parse_response(
@@ -2630,7 +2694,8 @@ mod tests {
     use crate::auction::orchestrator::OrchestrationResult;
     use crate::auction::test_support::create_test_auction_context as shared_test_auction_context;
     use crate::auction::types::{
-        AdFormat, AdSlot, AuctionContext, AuctionRequest, DeviceInfo, PublisherInfo, UserInfo,
+        AdFormat, AdSlot, AuctionContext, AuctionRequest, BidStatus, DeviceInfo, PublisherInfo,
+        UserInfo,
     };
 
     use crate::consent::{ConsentContext, ConsentSource};
@@ -2859,12 +2924,15 @@ mod tests {
             services: &services,
         };
 
-        let pending =
+        let outcome =
             futures::executor::block_on(provider.request_bids(&auction_request, &context))
                 .expect("should start request");
+        let ProviderRequestOutcome::Pending { request, .. } = outcome else {
+            panic!("should return a pending Prebid request");
+        };
 
         assert!(
-            pending.backend_name().is_some(),
+            request.backend_name().is_some(),
             "should preserve backend correlation"
         );
         assert_eq!(
@@ -5190,7 +5258,12 @@ external_bundle_sri = "sha384-AAAA"
 
         assert!(
             site.r#ref.is_none(),
-            "should not duplicate the raw browser Referer in site.ref"
+            "should not forward the raw browser Referer into site.ref"
+        );
+        assert_eq!(
+            site.page.as_deref(),
+            auction_request.publisher.page_url.as_deref(),
+            "should retain the sanitized publisher page URL"
         );
     }
 
@@ -5807,6 +5880,37 @@ external_bundle_sri = "sha384-AAAA"
         };
         let request_info = make_request_info(&context);
         provider.to_openrtb(request, &context, None, request_info)
+    }
+
+    fn call_request_bids(
+        config: PrebidIntegrationConfig,
+        request: &AuctionRequest,
+    ) -> (
+        Result<ProviderRequestOutcome, Report<TrustedServerError>>,
+        Arc<StubHttpClient>,
+    ) {
+        let provider = PrebidAuctionProvider::new(config);
+        let settings = make_settings();
+        let http_req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://example.com/auction")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        let stub = Arc::new(StubHttpClient::new());
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let context = AuctionContext {
+            settings: &settings,
+            request: &http_req,
+            timeout_ms: 1000,
+            provider_responses: None,
+            services: &services,
+        };
+        (
+            futures::executor::block_on(provider.request_bids(request, &context)),
+            stub,
+        )
     }
 
     fn bidder_params(ortb: &OpenRtbRequest) -> &serde_json::Map<String, Json> {
@@ -6880,18 +6984,68 @@ set = { placementId = "explicit_header" }
 
     #[test]
     fn to_openrtb_drops_aps_only_slots_instead_of_using_stored_requests() {
-        let slot = make_slot(
-            "atf_sidebar_ad",
-            HashMap::from([("aps".to_string(), json!({"slotID": "aps-slot-atf-sidebar"}))]),
-        );
-        let request = make_auction_request(vec![slot]);
+        for bidder in ["aps", "APS", "Aps"] {
+            let slot = make_slot(
+                "atf_sidebar_ad",
+                HashMap::from([(
+                    bidder.to_string(),
+                    json!({"slotID": "aps-slot-atf-sidebar"}),
+                )]),
+            );
+            let request = make_auction_request(vec![slot]);
 
-        let ortb = call_to_openrtb(base_config(), &request);
+            let openrtb = call_to_openrtb(base_config(), &request);
+            assert!(
+                openrtb.imp.is_empty(),
+                "should drop APS-only slot for case variant {bidder}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_bids_returns_no_bid_without_pbs_for_aps_only_slots() {
+        for bidder in ["aps", "APS", "Aps"] {
+            let slot = make_slot(
+                "atf_sidebar_ad",
+                HashMap::from([(
+                    bidder.to_string(),
+                    json!({"slotID": "aps-slot-atf-sidebar"}),
+                )]),
+            );
+            let request = make_auction_request(vec![slot]);
+            let (outcome, stub) = call_request_bids(base_config(), &request);
+            let ProviderRequestOutcome::Immediate(response) =
+                outcome.expect("APS-only request should be a normal outcome")
+            else {
+                panic!("APS-only request should complete immediately");
+            };
+
+            assert_eq!(response.status, BidStatus::NoBid);
+            assert!(response.bids.is_empty());
+            assert!(response.metadata.is_empty());
+            assert!(
+                stub.recorded_backend_names().is_empty(),
+                "APS-only variant {bidder} should not contact PBS"
+            );
+        }
+    }
+
+    #[test]
+    fn request_bids_keeps_mixed_aps_only_and_invalid_slots_as_an_error() {
+        let aps_slot = make_slot(
+            "aps-slot",
+            HashMap::from([("aps".to_string(), json!({"slotID": "aps-slot"}))]),
+        );
+        let mut invalid_slot = make_slot("invalid-slot", HashMap::new());
+        invalid_slot.formats[0].width = u32::MAX;
+        let request = make_auction_request(vec![aps_slot, invalid_slot]);
+        let (outcome, stub) = call_request_bids(base_config(), &request);
 
         assert!(
-            ortb.imp.is_empty(),
-            "should not route APS-only demand through a PBS stored request"
+            outcome.is_err(),
+            "mixed invalid input should remain an error"
         );
+        assert!(stub.recorded_backend_names().is_empty());
     }
 
     #[test]
@@ -7225,30 +7379,51 @@ bidders = ["kargo", "triplelift"]
     #[test]
     fn to_openrtb_drops_aps_only_trusted_server_expansion() {
         let mut config = base_config();
-        config.bidders.push("aps".to_string());
-        let slot = make_slot(
+        config.bidders = vec!["APS".to_string()];
+        let slot = make_ts_slot(
             "atf_sidebar_ad",
-            HashMap::from([("aps".to_string(), json!({"slotID": "aps-slot-atf-sidebar"}))]),
+            &json!({"APS": {"slotID": "aps-slot-atf-sidebar"}}),
+            None,
         );
         let request = make_auction_request(vec![slot]);
 
-        let ortb = call_to_openrtb(config, &request);
-
+        let openrtb = call_to_openrtb(config, &request);
         assert!(
-            ortb.imp.is_empty(),
-            "should not re-enable APS through PBS expansion or stored-request fallback"
+            openrtb.imp.is_empty(),
+            "should not fall back to a stored request after excluding APS expansion"
         );
+    }
+
+    #[test]
+    fn request_bids_returns_no_bid_for_aps_only_trusted_server_expansion() {
+        let mut config = base_config();
+        config.bidders = vec!["APS".to_string()];
+        let slot = make_ts_slot(
+            "atf_sidebar_ad",
+            &json!({"APS": {"slotID": "aps-slot-atf-sidebar"}}),
+            None,
+        );
+        let request = make_auction_request(vec![slot]);
+        let (outcome, stub) = call_request_bids(config, &request);
+        let ProviderRequestOutcome::Immediate(response) =
+            outcome.expect("APS-only expansion should be a normal outcome")
+        else {
+            panic!("APS-only expansion should complete immediately");
+        };
+
+        assert_eq!(response.status, BidStatus::NoBid);
+        assert!(stub.recorded_backend_names().is_empty());
     }
 
     #[test]
     fn trusted_server_expansion_never_enables_aps_through_pbs() {
         let mut config = base_config();
-        config.bidders = vec!["kargo".to_string(), "aps".to_string()];
+        config.bidders = vec!["kargo".to_string(), "APS".to_string()];
         let slot = make_ts_slot(
             "in_content_ad",
             &json!({
                 "kargo": {"placementId": "client_123"},
-                "aps": {"slotID": "legacy-aps-slot"}
+                "APS": {"slotID": "legacy-aps-slot"}
             }),
             None,
         );
@@ -7258,9 +7433,32 @@ bidders = ["kargo", "triplelift"]
         let bidder = &ortb.imp[0].ext.as_ref().expect("should have imp ext")["prebid"]["bidder"];
         assert_eq!(bidder["kargo"]["placementId"], "client_123");
         assert!(
-            bidder.get("aps").is_none(),
+            bidder
+                .as_object()
+                .expect("should serialize bidder map")
+                .keys()
+                .all(|name| !name.eq_ignore_ascii_case("aps")),
             "Trusted Server APS cohorts must not also send APS through PBS"
         );
+    }
+
+    #[test]
+    fn config_accepts_aps_in_prebid_bidder_lists_for_upgrade_compatibility() {
+        for (field, bidder) in [
+            ("bidders", "aps"),
+            ("bidders", "APS"),
+            ("client_side_bidders", "Aps"),
+        ] {
+            let result = parse_prebid_toml_result(&format!(
+                r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+{field} = ["{bidder}"]
+"#
+            ));
+            assert!(result.is_ok(), "should accept legacy APS in {field}");
+        }
     }
 
     #[test]
@@ -7557,6 +7755,10 @@ set = { networkId = 42 }
         let from = http::Request::builder()
             .uri("https://publisher.example.com/")
             .header("x-forwarded-for", "6.6.6.6")
+            .header(
+                header::REFERER,
+                "https://publisher.example.com/article?email=private#fragment",
+            )
             .header(header::USER_AGENT, "test-agent")
             .body(EdgeBody::empty())
             .expect("should build inbound request");
@@ -7570,6 +7772,7 @@ set = { networkId = 42 }
             &mut to,
             ConsentForwardingMode::Both,
             Some(std::net::IpAddr::from([203, 0, 113, 7])),
+            Some("https://publisher.example.com/article"),
         );
 
         assert_eq!(
@@ -7586,6 +7789,13 @@ set = { networkId = 42 }
             Some("test-agent"),
             "should still copy the browser User-Agent"
         );
+        assert_eq!(
+            to.headers()
+                .get(header::REFERER)
+                .and_then(|value| value.to_str().ok()),
+            Some("https://publisher.example.com/article"),
+            "should replace the raw browser Referer with the sanitized page URL"
+        );
     }
 
     #[test]
@@ -7600,7 +7810,7 @@ set = { networkId = 42 }
             .body(EdgeBody::empty())
             .expect("should build outbound request");
 
-        copy_request_headers(&from, &mut to, ConsentForwardingMode::Both, None);
+        copy_request_headers(&from, &mut to, ConsentForwardingMode::Both, None, None);
 
         assert!(
             !to.headers().contains_key("x-forwarded-for"),

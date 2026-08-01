@@ -9,7 +9,7 @@ use error_stack::{Report, ResultExt, ensure};
 use http::{HeaderValue, Request, Response, StatusCode, header};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use url::Url;
 use uuid::Uuid;
 
@@ -90,29 +90,62 @@ pub struct BannerUnit {
 
 const MAX_PUBLISHER_PAGE_URL_BYTES: usize = 8192;
 
-fn publisher_page_url(req: &Request<EdgeBody>, publisher_domain: &str) -> String {
+/// Sanitize publisher page identity before forwarding it into the bidstream.
+///
+/// The candidate must be credential-free HTTP(S) on the configured publisher
+/// host or a DNS-boundary subdomain. Query and fragment components are always
+/// removed to prevent client-controlled private data from reaching providers.
+/// Accepting publisher subdomains is deliberate; deployments with delegated or
+/// user-content subdomains should account for that inventory trust boundary.
+pub(crate) fn sanitize_publisher_page_url(
+    candidate: Option<&str>,
+    publisher_domain: &str,
+) -> String {
     let fallback = format!("https://{publisher_domain}");
-    let Some(candidate) = req
-        .headers()
-        .get(header::REFERER)
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| value.len() <= MAX_PUBLISHER_PAGE_URL_BYTES)
+    let Some(candidate) = candidate.filter(|value| value.len() <= MAX_PUBLISHER_PAGE_URL_BYTES)
     else {
+        log::debug!("Auction page URL: using publisher origin because input is absent or invalid");
         return fallback;
     };
-    let Ok(parsed) = Url::parse(candidate) else {
+    let Ok(mut parsed) = Url::parse(candidate) else {
+        log::debug!("Auction page URL: using publisher origin because input is not a URL");
         return fallback;
     };
+    let publisher_domain = publisher_domain.trim_end_matches('.').to_ascii_lowercase();
+    let host_matches = !publisher_domain.is_empty()
+        && parsed.host_str().is_some_and(|host| {
+            let host = host.trim_end_matches('.').to_ascii_lowercase();
+            host == publisher_domain
+                || host
+                    .strip_suffix(&publisher_domain)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        });
     if !matches!(parsed.scheme(), "http" | "https")
-        || !parsed
-            .host_str()
-            .is_some_and(|host| host.eq_ignore_ascii_case(publisher_domain))
+        || !host_matches
         || !parsed.username().is_empty()
         || parsed.password().is_some()
     {
+        log::debug!(
+            "Auction page URL: using publisher origin because input is not publisher-owned HTTP(S)"
+        );
         return fallback;
     }
+    parsed.set_query(None);
+    parsed.set_fragment(None);
     parsed.to_string()
+}
+
+fn publisher_page_url(req: &Request<EdgeBody>, publisher_domain: &str) -> String {
+    let candidate = req.headers().get(header::REFERER).and_then(|value| {
+        value.to_str().map_or_else(
+            |_| {
+                log::debug!("Auction page URL: ignoring non-ASCII Referer header");
+                None
+            },
+            Some,
+        )
+    });
+    sanitize_publisher_page_url(candidate, publisher_domain)
 }
 
 /// Convert tsjs/Prebid.js request format to internal [`AuctionRequest`].
@@ -248,6 +281,35 @@ pub fn convert_tsjs_to_auction_request(
     })
 }
 
+/// Delivery facts produced while serializing winning bids.
+#[derive(Debug, Default)]
+pub(crate) struct AuctionDeliveryReport {
+    /// Winning slot IDs included in the serialized response.
+    pub delivered_winner_slots: HashSet<String>,
+    /// Winners omitted because they could not be delivered safely.
+    pub dropped_winner_count: usize,
+    /// Machine-readable reasons for omitted winners.
+    pub dropped_winner_reasons: BTreeMap<String, usize>,
+}
+
+impl AuctionDeliveryReport {
+    fn record_drop(&mut self, reason: &str) {
+        self.dropped_winner_count += 1;
+        *self
+            .dropped_winner_reasons
+            .entry(reason.to_string())
+            .or_default() += 1;
+    }
+}
+
+/// Serialized response and the delivery facts used to produce it.
+pub(crate) struct OpenRtbResponseConversion {
+    /// HTTP response returned to the auction client.
+    pub response: Response<EdgeBody>,
+    /// Delivery facts for telemetry and diagnostics.
+    pub delivery: AuctionDeliveryReport,
+}
+
 /// Convert `OrchestrationResult` to `OpenRTB` response format.
 ///
 /// Creative HTML in the `adm` field is optionally sanitized and optionally
@@ -271,8 +333,20 @@ pub fn convert_to_openrtb_response(
     auction_request: &AuctionRequest,
     ec_allowed: bool,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    // Build OpenRTB-style seatbid array
+    Ok(
+        convert_to_openrtb_response_with_report(result, settings, auction_request, ec_allowed)?
+            .response,
+    )
+}
+
+pub(crate) fn convert_to_openrtb_response_with_report(
+    result: &OrchestrationResult,
+    settings: &Settings,
+    auction_request: &AuctionRequest,
+    ec_allowed: bool,
+) -> Result<OpenRtbResponseConversion, Report<TrustedServerError>> {
     let mut seatbids = Vec::with_capacity(result.winning_bids.len());
+    let mut delivery = AuctionDeliveryReport::default();
 
     for (slot_id, bid) in &result.winning_bids {
         let price = bid.price.ok_or_else(|| {
@@ -291,9 +365,9 @@ pub fn convert_to_openrtb_response(
         let width = to_openrtb_i32(bid.width, "width", &bid_context);
         let height = to_openrtb_i32(bid.height, "height", &bid_context);
 
-        // Ordinary markup is sanitized and optionally rewritten. A typed renderer
-        // is serialized separately and never enters the HTML sanitizer.
-        let (adm, renderer) = if let Some(raw_creative) = bid
+        // Ordinary markup remains on the mandatory sanitize/rewrite path. A
+        // typed renderer is serialized separately and never enters the HTML sanitizer.
+        let (adm, ext) = if let Some(raw_creative) = bid
             .creative
             .as_deref()
             .filter(|creative| !creative.trim().is_empty())
@@ -321,7 +395,20 @@ pub fn convert_to_openrtb_response(
 
             (Some(processed), None)
         } else if let Some(renderer) = bid.renderer.as_ref() {
-            (None, Some(renderer))
+            let Some(ext) = (BidExt {
+                trusted_server: BidTrustedServerExt { renderer },
+            })
+            .to_ext() else {
+                log::warn!(
+                    "Auction {}: skipping winning bid for slot '{}' from '{}' because its renderer extension could not be serialized",
+                    auction_request.id,
+                    slot_id,
+                    bid.bidder
+                );
+                delivery.record_drop("renderer_extension_serialization_failed");
+                continue;
+            };
+            (None, Some(ext))
         } else {
             log::warn!(
                 "Auction {}: skipping winning bid for slot '{}' from '{}' because it has no render source",
@@ -329,24 +416,9 @@ pub fn convert_to_openrtb_response(
                 slot_id,
                 bid.bidder
             );
+            delivery.record_drop("no_render_source");
             continue;
         };
-
-        let ext = renderer.and_then(|renderer| {
-            BidExt {
-                trusted_server: BidTrustedServerExt { renderer },
-            }
-            .to_ext()
-        });
-        if ext.is_none() && renderer.is_some() {
-            log::warn!(
-                "Auction {}: skipping winning bid for slot '{}' from '{}' because its renderer extension could not be serialized",
-                auction_request.id,
-                slot_id,
-                bid.bidder
-            );
-            continue;
-        }
 
         let openrtb_bid = OpenRtbBid {
             id: bid
@@ -370,6 +442,7 @@ pub fn convert_to_openrtb_response(
             bid: vec![openrtb_bid],
             ..Default::default()
         });
+        delivery.delivered_winner_slots.insert(slot_id.clone());
     }
 
     // Determine strategy name for response metadata
@@ -396,6 +469,8 @@ pub fn convert_to_openrtb_response(
                 total_bids: result.total_bids(),
                 time_ms: result.total_time_ms,
                 provider_details,
+                dropped_winner_count: delivery.dropped_winner_count,
+                dropped_winner_reasons: delivery.dropped_winner_reasons.clone(),
             },
         }
         .to_ext(),
@@ -437,7 +512,7 @@ pub fn convert_to_openrtb_response(
         }
     }
 
-    Ok(response)
+    Ok(OpenRtbResponseConversion { response, delivery })
 }
 
 #[cfg(test)]
@@ -607,6 +682,28 @@ mod tests {
     }
 
     #[test]
+    fn response_serializes_prebid_immediate_no_bid_without_error_metadata() {
+        let request = make_auction_request();
+        let settings = make_settings();
+        let mut result = make_empty_result();
+        result.provider_responses = vec![AuctionResponse::no_bid("prebid", 0)];
+
+        let response = convert_to_openrtb_response(&result, &settings, &request, false)
+            .expect("should serialize immediate no-bid response");
+        let json = response_json(response);
+        let details = &json["ext"]["orchestrator"]["provider_details"][0];
+
+        assert_eq!(details["name"], "prebid");
+        assert_eq!(details["status"], "nobid");
+        assert_eq!(details["bid_count"], 0);
+        assert_eq!(details["bidders"], json!([]));
+        assert!(
+            details.get("metadata").is_none(),
+            "should omit empty launch/error metadata"
+        );
+    }
+
+    #[test]
     fn response_includes_eid_headers_when_eids_present() {
         let mut request = make_auction_request();
         request.user.eids = Some(vec![Eid {
@@ -705,30 +802,48 @@ mod tests {
     }
 
     #[test]
-    fn publisher_page_url_accepts_only_same_publisher_http_urls() {
-        let request = Request::builder()
-            .uri("https://publisher.example.com/auction")
-            .header(
-                header::REFERER,
-                "https://publisher.example.com/article?id=1",
-            )
-            .body(EdgeBody::empty())
-            .expect("should build request");
-        assert_eq!(
-            publisher_page_url(&request, "publisher.example.com"),
-            "https://publisher.example.com/article?id=1"
-        );
-        assert_eq!(
-            publisher_page_url(&request, "Publisher.Example.Com"),
-            "https://publisher.example.com/article?id=1",
-            "DNS host comparison should be case-insensitive"
-        );
+    fn publisher_page_url_accepts_publisher_hosts_and_strips_private_components() {
+        for (candidate, expected) in [
+            (
+                "https://publisher.example.com/article?id=1#comments",
+                "https://publisher.example.com/article",
+            ),
+            (
+                "http://news.publisher.example.com/nested/story?token=secret",
+                "http://news.publisher.example.com/nested/story",
+            ),
+            (
+                "https://www.publisher.example.com/",
+                "https://www.publisher.example.com/",
+            ),
+        ] {
+            let request = Request::builder()
+                .uri("https://publisher.example.com/auction")
+                .header(header::REFERER, candidate)
+                .body(EdgeBody::empty())
+                .expect("should build request");
+            assert_eq!(
+                publisher_page_url(&request, "Publisher.Example.Com"),
+                expected,
+                "should sanitize publisher-owned Referer"
+            );
+        }
+    }
 
+    #[test]
+    fn publisher_page_url_rejects_untrusted_or_oversized_referers() {
+        let oversized = format!(
+            "https://publisher.example.com/{}",
+            "x".repeat(MAX_PUBLISHER_PAGE_URL_BYTES)
+        );
         for candidate in [
             "https://other.example/article",
+            "https://publisher.example.com.evil.example/article",
+            "https://evilpublisher.example.com/article",
             "javascript:alert(1)",
             "https://user:password@publisher.example.com/article",
             "not a url",
+            &oversized,
         ] {
             let request = Request::builder()
                 .uri("https://publisher.example.com/auction")
@@ -1307,18 +1422,33 @@ mod tests {
             width: 300,
             height: 250,
         }));
-        let mut result = make_empty_result();
-        result.winning_bids = HashMap::from([
-            (missing.slot_id.clone(), missing),
-            (whitespace.slot_id.clone(), whitespace),
-            (ordinary.slot_id.clone(), ordinary),
-            (renderer.slot_id.clone(), renderer),
-        ]);
-        result.total_time_ms = 50;
+        let result = OrchestrationResult {
+            provider_responses: vec![],
+            mediator_response: None,
+            winning_bids: HashMap::from([
+                (missing.slot_id.clone(), missing),
+                (whitespace.slot_id.clone(), whitespace),
+                (ordinary.slot_id.clone(), ordinary),
+                (renderer.slot_id.clone(), renderer),
+            ]),
+            total_time_ms: 50,
+            metadata: HashMap::new(),
+        };
 
-        let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
-            .expect("should omit invalid winners and preserve valid slots");
-        let json = response_json(response);
+        let conversion =
+            convert_to_openrtb_response_with_report(&result, &settings, &auction_request, false)
+                .expect("should omit invalid winners and preserve valid slots");
+        assert_eq!(
+            conversion.delivery.delivered_winner_slots,
+            HashSet::from(["ordinary".to_string(), "renderer".to_string()]),
+            "should report only serialized winners as delivered"
+        );
+        assert_eq!(conversion.delivery.dropped_winner_count, 2);
+        assert_eq!(
+            conversion.delivery.dropped_winner_reasons["no_render_source"],
+            2
+        );
+        let json = response_json(conversion.response);
         let bids: Vec<&JsonValue> = json["seatbid"]
             .as_array()
             .expect("should include valid seatbids")
@@ -1327,6 +1457,11 @@ mod tests {
             .collect();
 
         assert_eq!(bids.len(), 2, "should omit only invalid winners");
+        assert_eq!(json["ext"]["orchestrator"]["dropped_winner_count"], 2);
+        assert_eq!(
+            json["ext"]["orchestrator"]["dropped_winner_reasons"]["no_render_source"],
+            2
+        );
         let ordinary = bids
             .iter()
             .find(|bid| bid["impid"] == "ordinary")
@@ -1371,7 +1506,7 @@ mod tests {
         assert_eq!(bid["adm"], "<div>Ad</div>");
         assert!(
             bid.get("ext").is_none(),
-            "should omit the renderer extension when creative markup wins precedence"
+            "should omit renderer extension when creative markup wins precedence"
         );
     }
 

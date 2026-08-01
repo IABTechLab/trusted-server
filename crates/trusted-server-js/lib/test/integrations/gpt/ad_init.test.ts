@@ -2101,7 +2101,16 @@ describe('installTsRenderBridge', () => {
     }) as unknown as MessageEvent;
 
     bridgeListener(event);
-    bridgeListener(event);
+    const foreignIframe = document.createElement('iframe');
+    document.body.appendChild(foreignIframe);
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+        source: foreignIframe.contentWindow,
+        stopImmediatePropagation: stopSpy,
+      }) as unknown as MessageEvent
+    );
 
     expect(stopSpy).toHaveBeenCalledTimes(2);
     expect(portMessages).toHaveLength(1);
@@ -2119,6 +2128,7 @@ describe('installTsRenderBridge', () => {
     expect(renderer.bidId).not.toBe(prebidAdId);
     expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeUndefined();
     expect(fetchStub).not.toHaveBeenCalled();
+    foreignIframe.remove();
   });
 
   it('does not expose a registered Prebid APS renderer to another slot iframe', async () => {
@@ -2153,7 +2163,7 @@ describe('installTsRenderBridge', () => {
       }) as unknown as MessageEvent
     );
 
-    expect(stopSpy).not.toHaveBeenCalled();
+    expect(stopSpy).toHaveBeenCalledTimes(1);
     expect(portMessages).toEqual([]);
     expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeDefined();
     footer.remove();
@@ -2214,6 +2224,64 @@ describe('installTsRenderBridge', () => {
     expect(stopSpy).not.toHaveBeenCalled();
     expect(portMessages).toEqual([]);
     expect(fetchStub).not.toHaveBeenCalled();
+  });
+
+  it('accepts an APS request from a dynamic slot root resolved from its configured prefix', async () => {
+    const renderer = apsRenderer();
+    (window as TestWindow).tsjs.bids.homepage_header = {
+      hb_adid: renderer.bidId,
+      hb_bidder: 'aps',
+      renderer,
+    };
+    (window as TestWindow).tsjs.adSlots[0].div_id = 'div-header-';
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe('div-header-dynamic');
+    const portMessages: string[] = [];
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
+        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+        source,
+        stopImmediatePropagation: vi.fn(),
+      }) as unknown as MessageEvent
+    );
+
+    expect(portMessages).toHaveLength(1);
+    document.getElementById('div-header-dynamic')?.remove();
+  });
+
+  it('does not let an overlapping slot prefix claim another slot iframe', async () => {
+    const renderer = apsRenderer();
+    (window as TestWindow).tsjs.bids.homepage_header = {
+      hb_adid: renderer.bidId,
+      hb_bidder: 'aps',
+      renderer,
+    };
+    (window as TestWindow).tsjs.adSlots.push({
+      id: 'homepage_header_mobile',
+      formats: [[320, 50]],
+      gam_unit_path: '/a/b/mobile',
+      div_id: 'div-header-mobile',
+      targeting: {},
+    });
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe('div-header-mobile');
+    const portMessages: string[] = [];
+    const stopSpy = vi.fn();
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
+        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+        source,
+        stopImmediatePropagation: stopSpy,
+      }) as unknown as MessageEvent
+    );
+
+    expect(stopSpy).not.toHaveBeenCalled();
+    expect(portMessages).toEqual([]);
+    document.getElementById('div-header-mobile')?.remove();
   });
 
   it('ignores an APS ad ID requested by another configured slot', async () => {

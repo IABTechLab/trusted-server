@@ -117,7 +117,7 @@ When a request arrives at the `/auction` endpoint, it goes through the following
                               ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │  9. Each Provider Processes Request                                  │
-│     - Transform AuctionRequest → Provider OpenRTB request           │
+│     - Transform AuctionRequest → Provider OpenRTB request            │
 │     - Send HTTP request to provider endpoint                         │
 │     - Parse provider response                                        │
 │     - Transform → AuctionResponse with Bid[]                         │
@@ -202,7 +202,7 @@ For example, APS provider:
 // - banner slots become secure impressions with matching formats/floors
 // - existing consent, identity, device, and geo privacy gates apply
 
-// HTTP POST to https://web.ads.aps.amazon-adsystem.com/e/pb/bid
+// HTTP POST to https://aps.example.com/e/pb/bid
 // Parse decoded-price response → AuctionResponse with a typed renderer
 ```
 
@@ -490,9 +490,9 @@ timeout_ms = 500
 
 ```rust
 use async_trait::async_trait;
-use crate::auction::provider::AuctionProvider;
+use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
 use crate::auction::types::{AuctionContext, AuctionRequest, AuctionResponse};
-use crate::platform::{PlatformPendingRequest, PlatformResponse};
+use crate::platform::PlatformResponse;
 
 pub struct YourAuctionProvider {
     config: YourConfig,
@@ -508,10 +508,10 @@ impl AuctionProvider for YourAuctionProvider {
         &self,
         request: &AuctionRequest,
         _context: &AuctionContext<'_>,
-    ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+    ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
         // 1. Transform AuctionRequest to your provider's format
-        // 2. Launch HTTP request through services.http_client().send_async(...)
-        // 3. Return PlatformPendingRequest for the orchestrator to await
+        // 2. Launch through services.http_client().send_async(...)
+        // 3. Wrap the handle with ProviderRequestOutcome::pending(...)
         todo!()
     }
 

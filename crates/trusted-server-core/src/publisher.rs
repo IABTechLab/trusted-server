@@ -37,6 +37,7 @@ use http::{HeaderValue, Method, Request, Response, StatusCode, Uri, header};
 use crate::auction::endpoints::{
     merge_auction_eids, resolve_auction_eids, resolve_client_auction_eids,
 };
+use crate::auction::formats::sanitize_publisher_page_url;
 use crate::auction::orchestrator::{
     AuctionOrchestrator, DispatchAuctionOutcome, DispatchedAuction,
 };
@@ -1773,7 +1774,7 @@ pub(crate) fn write_bids_to_state(
     settings: &Settings,
     request_origin: &str,
     include_debug_bid: bool,
-) {
+) -> std::collections::HashSet<String> {
     log::debug!(
         "write_bids_to_state: {} winning bid(s): [{}]",
         winning_bids.len(),
@@ -1786,8 +1787,10 @@ pub(crate) fn write_bids_to_state(
         request_origin,
         include_debug_bid,
     );
+    let delivered_winner_slots = bid_map.keys().cloned().collect();
     let bids_script = build_bids_script(&bid_map);
     *ad_bids_state.lock().expect("should lock bid state") = Some(bids_script);
+    delivered_winner_slots
 }
 
 /// Maximum serialized size (in bytes) of a dump embedded in the `ts-debug`
@@ -2380,6 +2383,14 @@ async fn collect_non_html_auction(
             &make_collect_context(settings, services, &placeholder),
         )
         .await;
+    let delivered_winner_slots = write_bids_to_state(
+        &result.winning_bids,
+        params.price_granularity,
+        &params.ad_bids_state,
+        settings,
+        &request_origin(&params.request_scheme, &params.request_host),
+        settings.debug.inject_adm_for_testing,
+    );
     if let (Some(observation), Some(auction_request)) =
         (telemetry.observation, telemetry.auction_request.as_ref())
     {
@@ -2389,19 +2400,12 @@ async fn collect_non_html_auction(
                 AuctionTerminalOutcome::Completed {
                     request: auction_request,
                     result: &result,
+                    delivered_winner_slots: Some(&delivered_winner_slots),
                 },
             )
         })
         .await;
     }
-    write_bids_to_state(
-        &result.winning_bids,
-        params.price_granularity,
-        &params.ad_bids_state,
-        settings,
-        &request_origin(&params.request_scheme, &params.request_host),
-        settings.debug.inject_adm_for_testing,
-    );
 }
 
 // Private orchestration helper called only from `body_close_hold_loop`.
@@ -2426,6 +2430,18 @@ async fn collect_stream_auction(
     let result = orchestrator
         .collect_dispatched_auction(dispatched, services, &collect_ctx)
         .await;
+    log::info!(
+        "body_close_hold_loop: collect complete - {} winning bid(s)",
+        result.winning_bids.len()
+    );
+    let delivered_winner_slots = write_bids_to_state(
+        &result.winning_bids,
+        *price_granularity,
+        ad_bids_state,
+        settings,
+        request_origin,
+        settings.debug.inject_adm_for_testing,
+    );
     if let (Some(observation), Some(auction_request)) =
         (telemetry.observation, telemetry.auction_request.as_ref())
     {
@@ -2435,23 +2451,12 @@ async fn collect_stream_auction(
                 AuctionTerminalOutcome::Completed {
                     request: auction_request,
                     result: &result,
+                    delivered_winner_slots: Some(&delivered_winner_slots),
                 },
             )
         })
         .await;
     }
-    log::info!(
-        "body_close_hold_loop: collect complete - {} winning bid(s)",
-        result.winning_bids.len()
-    );
-    write_bids_to_state(
-        &result.winning_bids,
-        *price_granularity,
-        ad_bids_state,
-        settings,
-        request_origin,
-        settings.debug.inject_adm_for_testing,
-    );
 
     if settings.debug.auction_html_comment {
         prepend_auction_debug_comment("stream", &result, ad_bids_state);
@@ -3145,10 +3150,11 @@ pub(crate) fn build_auction_request(
     // so SSPs, injected creatives, and brand-safety pixels see the publisher's
     // own origin. On the SSAT proxy path `request_info.host` is the trusted
     // server edge host, which must not leak into the bid request.
-    let page_url = format!(
+    let page_candidate = format!(
         "{}://{}{}",
         request_info.scheme, publisher_domain, slots_ctx.request_path_and_query
     );
+    let page_url = sanitize_publisher_page_url(Some(&page_candidate), publisher_domain);
     let ec_id = ec_id.filter(|id| !id.is_empty());
     let request_id = ec_id.map_or_else(
         || format!("ts-req-{}", uuid::Uuid::new_v4().simple()),
@@ -3250,8 +3256,8 @@ pub(crate) fn build_bid_map(
                 if bid.height > 0 {
                     obj.insert("h".to_string(), serde_json::Value::from(bid.height));
                 }
-                // PBS Cache remains highest priority. Renderer bids use the generic
-                // upstream bid ID; ordinary providers retain the ad-ID fallback.
+                // PBS Cache remains highest priority. Typed renderer bids use
+                // their selected upstream bid ID as the Universal Creative key.
                 let renderer_bid_id = bid.renderer.as_ref().and(bid.bid_id.as_deref());
                 let hb_adid = bid
                     .cache_id
@@ -3800,8 +3806,8 @@ pub async fn handle_page_bids(
     // skip the live auction, matching the existing bot/prefetch behaviour.
     let ad_stack_enabled = auction_enabled && consent_allows_auction;
 
-    let winning_bids = if matched_slots.is_empty() {
-        std::collections::HashMap::new()
+    let (winning_bids, prebuilt_bid_map) = if matched_slots.is_empty() {
+        (std::collections::HashMap::new(), None)
     } else {
         // Same publisher identity as the outbound bid request — see the
         // matching note on the initial-navigation observation above.
@@ -3857,17 +3863,26 @@ pub async fn handle_page_bids(
             {
                 Ok(result) => {
                     let winning_bids = result.winning_bids.clone();
+                    let bid_map = build_bid_map(
+                        &winning_bids,
+                        co_config.price_granularity,
+                        settings,
+                        &page_bids_request_origin,
+                        settings.debug.inject_adm_for_testing,
+                    );
+                    let delivered_winner_slots = bid_map.keys().cloned().collect();
                     emit_auction_events_best_effort_lazy(services, || {
                         build_auction_events(
                             observation,
                             AuctionTerminalOutcome::Completed {
                                 request: &auction_request,
                                 result: &result,
+                                delivered_winner_slots: Some(&delivered_winner_slots),
                             },
                         )
                     })
                     .await;
-                    winning_bids
+                    (winning_bids, Some(bid_map))
                 }
                 Err(e) => {
                     log::warn!("page-bids auction failed: {e:?}");
@@ -3884,7 +3899,7 @@ pub async fn handle_page_bids(
                         )
                     })
                     .await;
-                    std::collections::HashMap::new()
+                    (std::collections::HashMap::new(), None)
                 }
             }
         } else {
@@ -3910,17 +3925,19 @@ pub async fn handle_page_bids(
                 )
             })
             .await;
-            std::collections::HashMap::new()
+            (std::collections::HashMap::new(), None)
         }
     };
 
-    let bid_map = build_bid_map(
-        &winning_bids,
-        co_config.price_granularity,
-        settings,
-        &page_bids_request_origin,
-        settings.debug.inject_adm_for_testing,
-    );
+    let bid_map = prebuilt_bid_map.unwrap_or_else(|| {
+        build_bid_map(
+            &winning_bids,
+            co_config.price_granularity,
+            settings,
+            &page_bids_request_origin,
+            settings.debug.inject_adm_for_testing,
+        )
+    });
 
     // Gate slots on the ad-stack kill switch / consent: when disabled, return no
     // slots so the SPA hook does not call `adInit()` / create GPT slots.
@@ -4447,13 +4464,13 @@ mod tests {
 
     mod ssat_cache_policy_tests {
         use super::*;
-        use crate::auction::provider::AuctionProvider;
+        use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
         use crate::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink};
         use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
         use crate::platform::test_support::{
             NoopConfigStore, NoopGeo, NoopSecretStore, StubBackend,
         };
-        use crate::platform::{ClientInfo, PlatformPendingRequest, PlatformResponse};
+        use crate::platform::{ClientInfo, PlatformResponse};
         use crate::test_support::tests::crate_test_settings_str;
 
         const ORIGIN_ETAG: &str = "\"origin-tag\"";
@@ -4473,7 +4490,7 @@ mod tests {
                 &self,
                 _request: &AuctionRequest,
                 context: &AuctionContext<'_>,
-            ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+            ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
                 let request = PlatformHttpRequest::new(
                     HttpRequest::builder()
                         .method(Method::POST)
@@ -4490,6 +4507,7 @@ mod tests {
                     .change_context(TrustedServerError::Auction {
                         message: "test provider launch failed".to_string(),
                     })
+                    .map(ProviderRequestOutcome::pending)
             }
 
             async fn parse_response(
@@ -8902,6 +8920,47 @@ mod tests {
         }
 
         #[test]
+        fn bid_map_exposes_aps_renderer_and_selected_bid_id() {
+            let mut bid = make_bid("atf_sidebar_ad", 1.50, "aps", "fallback-ad", "", "");
+            bid.bid_id = Some("selected-bid".to_string());
+            bid.nurl = None;
+            bid.burl = None;
+            bid.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
+                version: 1,
+                account_id: "example-account".to_string(),
+                bid_id: "selected-bid".to_string(),
+                creative_id: None,
+                tag_type: ApsTagType::Iframe,
+                creative_url: "https://creative.example/render".to_string(),
+                aax_response: "fictional-base64</script>".to_string(),
+                width: 300,
+                height: 250,
+            }));
+            let winning_bids = HashMap::from([("atf_sidebar_ad".to_string(), bid)]);
+
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                "",
+                false,
+            );
+            let obj = map["atf_sidebar_ad"]
+                .as_object()
+                .expect("should include APS bid");
+
+            assert_eq!(obj["hb_bidder"], "aps");
+            assert_eq!(obj["hb_adid"], "selected-bid");
+            assert_eq!(obj["renderer"]["type"], "aps");
+            assert_eq!(obj["renderer"]["bidId"], "selected-bid");
+            assert!(obj.get("adm").is_none());
+
+            let script = build_bids_script(&map);
+            assert!(!script.contains("</script></script>"));
+            assert!(script.contains("\\u003C/script\\u003E"));
+        }
+
+        #[test]
         fn bid_map_omits_hb_adid_when_both_cache_id_and_ad_id_absent() {
             let mut winning_bids = HashMap::new();
             winning_bids.insert(
@@ -9095,8 +9154,8 @@ mod tests {
             );
             assert_eq!(
                 request.publisher.page_url.as_deref(),
-                Some("https://publisher.example.com/2024/01/my-article/?edition=fictional"),
-                "should preserve the page path and query for auction providers"
+                Some("https://publisher.example.com/2024/01/my-article/"),
+                "should preserve the page path but strip client query data for auction providers"
             );
         }
 
@@ -9137,12 +9196,12 @@ mod tests {
             );
             assert_eq!(
                 request.publisher.page_url.as_deref(),
-                Some("https://www.example.com/2024/01/my-article/?edition=fictional"),
-                "page_url host should be the configured publisher domain, not the edge host"
+                Some("https://www.example.com/2024/01/my-article/"),
+                "page_url should use configured publisher identity without client query data"
             );
             assert_eq!(
-                site.page, "https://www.example.com/2024/01/my-article/?edition=fictional",
-                "site.page host should be the configured publisher domain, not the edge host"
+                site.page, "https://www.example.com/2024/01/my-article/",
+                "site.page should use configured publisher identity without client query data"
             );
         }
 
@@ -9858,7 +9917,7 @@ mod tests {
     /// the handler emitted.
     mod navigation_publisher_domain_tests {
         use super::*;
-        use crate::auction::provider::AuctionProvider;
+        use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
         use crate::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink};
         use crate::auction::types::AuctionRequest;
         use crate::auction::{AuctionContext, AuctionOrchestrator};
@@ -9866,7 +9925,7 @@ mod tests {
         use crate::platform::test_support::{
             NoopConfigStore, NoopGeo, NoopSecretStore, StubBackend,
         };
-        use crate::platform::{ClientInfo, PlatformPendingRequest, PlatformResponse};
+        use crate::platform::{ClientInfo, PlatformResponse};
         use crate::test_support::tests::crate_test_settings_str;
         use std::sync::Mutex;
 
@@ -9895,7 +9954,7 @@ mod tests {
                 &self,
                 request: &AuctionRequest,
                 _context: &AuctionContext<'_>,
-            ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+            ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
                 *self.captured.lock().expect("should lock captured request") =
                     Some(request.clone());
                 Err(Report::new(TrustedServerError::Auction {

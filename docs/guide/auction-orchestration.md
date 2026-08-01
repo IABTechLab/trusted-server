@@ -143,7 +143,7 @@ sequenceDiagram
     Note over Client,Mock: Response Assembly
     activate TS
     activate Client
-    Orch->>Orch: Transform to OpenRTB response<br/>Optionally sanitize creative HTML<br/>Optionally rewrite creative URLs<br/>Add orchestrator metadata
+    Orch->>Orch: Transform to OpenRTB response<br/>Preserve typed render source<br/>Optionally sanitize and rewrite ordinary creatives<br/>Add orchestrator metadata
 
     Orch-->>TS: OpenRTB BidResponse
     Note right of Orch: APS winner carries ext.trusted_server.renderer<br/>with no adm; ordinary winners retain sanitized adm/cache data
@@ -156,13 +156,8 @@ sequenceDiagram
   %% === Creative Rendering ===
   rect rgb(239,246,255)
     Note over Client,Mock: Creative Rendering
-    alt APS winner
-      Client->>Client: Validate renderer descriptor<br/>Create opaque sandbox iframe<br/>Load /integrations/aps/renderer
-      Note right of Client: Fragment-bound nonce and one-time acknowledgement<br/>No allow-same-origin on the outer frame
-    else Ordinary creative
-      Client->>Client: Inject winning creative<br/>Render iframe<br/>Load creative resources
-      Note right of Client: Markup is sanitized and uses first-party URLs by default<br/>rewrite_creatives=false retains sanitizer-accepted external URLs
-    end
+    Client->>Client: Validate renderer descriptor<br/>Create opaque sandbox iframe<br/>Load /integrations/aps/renderer
+    Note right of Client: Fragment-bound nonce and one-time acknowledgement<br/>No allow-same-origin on the outer frame
     deactivate Client
   end
 ```
@@ -366,7 +361,6 @@ Builds an independent banner OpenRTB request for Amazon Publisher Services.
 [integrations.aps]
 enabled = true
 account_id = "example-account"
-endpoint = "https://web.ads.aps.amazon-adsystem.com/e/pb/bid"
 timeout_ms = 800
 debug = false
 allow_script_creatives = false
@@ -673,7 +667,6 @@ debug = false
 [integrations.aps]
 enabled = true
 account_id = "example-account"
-endpoint = "https://web.ads.aps.amazon-adsystem.com/e/pb/bid"
 timeout_ms = 800
 debug = false
 allow_script_creatives = false
@@ -711,14 +704,16 @@ price_floor = 0.50
 
 #### `[integrations.aps]`
 
-| Field                    | Type   | Default                                            | Description                                                       |
-| ------------------------ | ------ | -------------------------------------------------- | ----------------------------------------------------------------- |
-| `enabled`                | bool   | `false`                                            | Enable APS provider                                               |
-| `account_id`             | string | —                                                  | APS account ID (required; `pub_id` is an alias)                   |
-| `endpoint`               | string | `https://web.ads.aps.amazon-adsystem.com/e/pb/bid` | APS OpenRTB endpoint                                              |
-| `timeout_ms`             | u32    | `800`                                              | Request timeout                                                   |
-| `debug`                  | bool   | `false`                                            | Include the raw APS HTTP exchange in `/auction` provider metadata |
-| `allow_script_creatives` | bool   | `false`                                            | Admit script bids before APS candidate reduction                  |
+| Field                    | Type   | Default                       | Description                                                       |
+| ------------------------ | ------ | ----------------------------- | ----------------------------------------------------------------- |
+| `enabled`                | bool   | `false`                       | Enable APS provider                                               |
+| `account_id`             | string | —                             | APS account ID (required; `pub_id` is an alias)                   |
+| `endpoint`               | string | Built-in APS OpenRTB endpoint | Optional APS OpenRTB endpoint override                            |
+| `timeout_ms`             | u32    | `800`                         | Request timeout                                                   |
+| `debug`                  | bool   | `false`                       | Include the raw APS HTTP exchange in `/auction` provider metadata |
+| `inventory_domain`       | string | —                             | Override `site.domain` for APS-authorized inventory               |
+| `inventory_page_origin`  | string | —                             | HTTPS origin paired with `inventory_domain` for `site.page`       |
+| `allow_script_creatives` | bool   | `false`                       | Admit script bids before APS candidate reduction                  |
 
 #### `[integrations.adserver_mock]`
 
@@ -798,11 +793,11 @@ The orchestrator is designed to be resilient:
 
 The auction system logs at multiple levels throughout execution:
 
-| Level   | Examples                                                                                |
-| ------- | --------------------------------------------------------------------------------------- |
-| `info`  | Auction request received, provider launch, bid counts, winner selection, total timing   |
-| `debug` | Bid-drop reasons, mediation restoration notes, creative processing mode and byte counts |
-| `warn`  | Provider launch failures, parse failures, mediator bids without decoded prices          |
+| Level   | Examples                                                                              |
+| ------- | ------------------------------------------------------------------------------------- |
+| `info`  | Auction request received, provider launch, bid counts, winner selection, total timing |
+| `debug` | Bid-drop reasons, mediation restoration notes, creative rewrite sizes                 |
+| `warn`  | Provider launch failures, parse failures, mediator bids without decoded prices        |
 
 ### Response Metadata
 
