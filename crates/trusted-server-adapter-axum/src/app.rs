@@ -129,7 +129,13 @@ where
     Fut: Future<Output = Result<Response, Report<TrustedServerError>>>,
 {
     let services = build_runtime_services(&ctx);
-    let req = ctx.into_request();
+    let mut req = ctx.into_request();
+    if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+        &state.settings,
+        &mut req,
+    ) {
+        return Ok(http_error(&error));
+    }
     Ok(handler(state, services, req)
         .await
         .unwrap_or_else(|e| http_error(&e)))
@@ -170,8 +176,9 @@ fn build_ec_context(state: &AppState, services: &RuntimeServices, req: &Request)
 async fn dispatch_fallback(
     state: &AppState,
     services: &RuntimeServices,
-    req: Request,
+    mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
+    trusted_server_core::integrations::gpt_diagnostics::prepare_request(&state.settings, &mut req)?;
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
