@@ -1,9 +1,9 @@
 import type { GptDiagnosticsBinding, GptDiagnosticsSlotExport } from '../../core/types';
 
-import type { GptDiagnosticsStoreSnapshot } from './store';
+import type { GptDiagnosticsBindingInput } from './store';
 
 interface BindingStore {
-  snapshot(): GptDiagnosticsStoreSnapshot;
+  bindingInputs(): GptDiagnosticsBindingInput[];
   subscribe(listener: () => void): () => void;
 }
 
@@ -47,6 +47,26 @@ function isVisibleInViewport(element: HTMLElement, window: BindingWindow): boole
   );
 }
 
+function nodeIntersectsSlotIds(node: Node, slotElementIds: Set<string>): boolean {
+  if (!(node instanceof Element)) return false;
+  if (slotElementIds.has(node.id)) return true;
+  return Array.from(node.querySelectorAll('[id]')).some((element) =>
+    slotElementIds.has(element.id)
+  );
+}
+
+function mutationIntersectsSlotIds(record: MutationRecord, slotElementIds: Set<string>): boolean {
+  if (record.type === 'attributes') {
+    if (!(record.target instanceof Element)) return false;
+    return slotElementIds.has(record.target.id) || slotElementIds.has(record.oldValue ?? '');
+  }
+
+  if (record.target instanceof Element && slotElementIds.has(record.target.id)) return true;
+  return [...record.addedNodes, ...record.removedNodes].some((node) =>
+    nodeIntersectsSlotIds(node, slotElementIds)
+  );
+}
+
 function bindingEquals(
   previous: GptDiagnosticsBindingView | undefined,
   next: GptDiagnosticsBindingView
@@ -67,6 +87,7 @@ export class GptDiagnosticsBindingManager {
   private readonly scheduleFrame: (callback: () => void) => void;
   private readonly bindings = new Map<number, GptDiagnosticsBindingView>();
   private readonly listeners = new Set<BindingListener>();
+  private readonly slotElementIds = new Set<string>();
   private readonly unsubscribeStore: () => void;
   private mutationObserver?: MutationObserver;
   private refreshScheduled = false;
@@ -106,10 +127,12 @@ export class GptDiagnosticsBindingManager {
   refresh(): void {
     if (this.destroyed) return;
 
-    const slots = this.store.snapshot().slots;
+    const slots = this.store.bindingInputs();
+    this.slotElementIds.clear();
     const claimCounts = new Map<string, number>();
     for (const slot of slots) {
       if (!slot.slotElementId) continue;
+      this.slotElementIds.add(slot.slotElementId);
       claimCounts.set(slot.slotElementId, (claimCounts.get(slot.slotElementId) ?? 0) + 1);
     }
 
@@ -179,7 +202,7 @@ export class GptDiagnosticsBindingManager {
     const escape = this.window.CSS?.escape;
     if (typeof escape !== 'function') {
       return {
-        binding: { status: 'ambiguous', reason: 'duplicate_dom_id' },
+        binding: { status: 'ambiguous', reason: 'dom_uniqueness_unverifiable' },
         visible: false,
       };
     }
@@ -194,7 +217,7 @@ export class GptDiagnosticsBindingManager {
       }
     } catch {
       return {
-        binding: { status: 'ambiguous', reason: 'duplicate_dom_id' },
+        binding: { status: 'ambiguous', reason: 'dom_uniqueness_unverifiable' },
         visible: false,
       };
     }
@@ -210,11 +233,19 @@ export class GptDiagnosticsBindingManager {
     const Observer = this.window.MutationObserver;
     if (typeof Observer !== 'function' || !this.document.documentElement) return;
 
-    const observer = new Observer(() => this.scheduleRefresh());
+    const observer = new Observer((records) => {
+      if (
+        this.slotElementIds.size > 0 &&
+        records.some((record) => mutationIntersectsSlotIds(record, this.slotElementIds))
+      ) {
+        this.scheduleRefresh();
+      }
+    });
     this.mutationObserver = observer;
     observer.observe(this.document.documentElement, {
       attributes: true,
       attributeFilter: ['id'],
+      attributeOldValue: true,
       childList: true,
       subtree: true,
     });

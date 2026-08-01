@@ -3,6 +3,8 @@ import path from 'node:path';
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+import type { TsjsApi } from '../../../src/core/types';
+
 /**
  * Executable coverage for the edge-injected `gpt_bootstrap.js` — the
  * head-inline fallback that keeps initial server-side ads working when the
@@ -20,12 +22,24 @@ const BOOTSTRAP_SOURCE = readFileSync(
   'utf8'
 );
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type AnyRecord = Record<string, any>;
+// The command queue the bootstrap pushes into: a real array once GPT has
+// loaded, or the bare `push`-only stub GPT installs before then.
+type MockCommandQueue = Array<() => void> | { push: (fn: () => void) => unknown };
 
-type TestWindow = Window & {
-  googletag?: AnyRecord;
-  tsjs?: AnyRecord;
+// Minimal googletag surface the bootstrap touches.
+interface MockGoogleTag {
+  cmd: MockCommandQueue;
+  defineSlot: (adUnitPath: string, sizes: Array<[number, number]>, divId: string) => unknown;
+  pubads: () => unknown;
+  enableServices: () => void;
+  display: (divId: string) => void;
+}
+
+// `tsjs` is declared globally as the full `TsjsApi`; `Omit` drops it from
+// `Window` so the fixtures below only have to satisfy the fields they set.
+type TestWindow = Omit<Window, 'tsjs'> & {
+  googletag?: MockGoogleTag;
+  tsjs?: Partial<TsjsApi>;
 };
 
 function runBootstrap(): void {

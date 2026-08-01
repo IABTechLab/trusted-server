@@ -7,23 +7,25 @@
 > Follow `CLAUDE.md`; in particular, use the target-matched Cargo aliases rather
 > than bare workspace commands.
 
-**Goal:** Add an opt-in, tab-local browser console that observes documented
+**Goal:** Add an opt-in, browser-session console that observes documented
 Google Publisher Tag lifecycle callbacks, organizes them into bounded per-slot
 request cycles, displays a hydration-safe panel and exact-binding badges, and
 exports the same GPT-observed facts without claiming creative provenance.
 
-**Architecture:** A dedicated `gpt_diagnostics` integration injects a small
-activation bootstrap before the synchronous TSJS bundle. The bootstrap owns only
-query parsing, `sessionStorage`, document-local activation, and one-time URL
-cleanup. When active, the integration module creates an observer, bounded store,
+**Architecture:** A dedicated `gpt_diagnostics` integration parses exact
+activation directives before generic cookie handling, stores activation in a
+host-only HttpOnly session cookie, and cleans the browser-visible URL. Inactive
+HTML omits diagnostics; active HTML injects a content-hashed standalone module
+synchronously after core. When active, the module creates an observer, bounded store,
 exact binding manager, read-only browser API, and presentation controller. Data
 capture does not depend on the overlay. The observer uses only documented
 `googletag.cmd` and PubAdsService event listeners; it never patches GPT,
 publisher, networking, or history behavior.
 
-**Tech stack:** Rust 2024 (`trusted-server-core` integration registration and
-head injection), TypeScript (`trusted-server-js`), Vitest/jsdom, Playwright,
-closed Shadow DOM, documented GPT PubAdsService callbacks.
+**Tech stack:** Rust 2024 (`trusted-server-core` integration registration,
+request activation, cache policy, and conditional HTML injection), TypeScript
+(`trusted-server-js`), Vitest/jsdom, Playwright, closed Shadow DOM, and
+documented GPT PubAdsService callbacks.
 
 **Spec:**
 `docs/superpowers/specs/2026-07-28-gpt-runtime-diagnostics-overlay-design.md`
@@ -59,8 +61,8 @@ later merge.
 
 ### In scope
 
-- Dedicated deployment configuration and immediate JS module registration.
-- Early activation bootstrap and tab-local persistence.
+- Dedicated deployment configuration and conditional standalone JS delivery.
+- Browser-session activation, URL cleanup, and strict active-HTML cache privacy.
 - Six documented GPT lifecycle listeners.
 - Bounded slot, cycle, and callback-issue storage.
 - Conservative cycle matching, timings, coverage, and issue reporting.
@@ -74,8 +76,9 @@ later merge.
 ### Explicitly out of scope
 
 - Auction, bid, winner, bidder, targeting, or creative provenance.
-- OpenRTB, `/auction`, Prebid, creative renderer, telemetry, Tinybird, cookies,
-  or server response variants.
+- OpenRTB, `/auction`, Prebid, creative renderer, telemetry, Tinybird, or
+  diagnostic-record upload. The activation-bit cookie and cache policy are the
+  only server response behavior in scope.
 - Patching `display`, `defineSlot`, `refresh`, `fetch`, XHR, publisher callbacks,
   `pushState`, or route handlers.
 - Resource Timing inference or diagnostic network upload.
@@ -93,14 +96,14 @@ area.
 
 - The dedicated integration is absent unless configured and enabled.
 - Recognized `ts_console` values are exactly `1`, `true`, `0`, and `false`.
-- A recognized directive updates tab-local `sessionStorage`, sets a private
-  document activation flag, and removes all `ts_console` parameters while
-  preserving path, other parameters, and fragment.
-- An unrecognized value is ignored and remains in the URL.
-- If storage throws or is unavailable, a recognized directive applies only to
-  the current document.
-- Inactive module evaluation installs no GPT listeners, API, overlay host, DOM
-  observer, or network activity.
+- One exact directive establishes or clears `__Host-ts-console`, a host-only,
+  Secure, HttpOnly, SameSite=Lax browser-session cookie, then removes all
+  reserved pairs from origin handling and the visible URL while preserving the
+  path, unrelated parameters, and fragment.
+- Invalid/duplicate directives and duplicate cookies fail closed for the current response.
+- Inactive HTML contains no diagnostics module request. Active/directive HTML is
+  `private, no-store`; the cookie-independent standalone module remains public.
+- Active module evaluation installs no non-diagnostic network behavior.
 
 ### Coverage and issues
 
@@ -120,9 +123,9 @@ category. `callbackIssues` may therefore include:
 ### Lifecycle state
 
 Primary state is one of Waiting for request, Requesting, Response received,
-Filled, or Empty. Loaded, Viewable, Incomplete sequence, Unbound, and Ambiguous
-binding are independent facts or issues. Pending work is never converted to
-Incomplete by a timer.
+Rendered (fill unknown), Filled, or Empty. Loaded, Viewable, Incomplete sequence,
+Unbound, and Ambiguous binding are independent facts or issues. Pending work is
+never converted to Incomplete by a timer.
 
 ### API
 
@@ -152,32 +155,32 @@ Paths under the new TypeScript integration may be consolidated if doing so
 makes the code materially simpler, but the observer, store, and presentation
 must remain independently testable.
 
-| File                                                                                              | Action            | Responsibility                                                                           |
-| ------------------------------------------------------------------------------------------------- | ----------------- | ---------------------------------------------------------------------------------------- |
-| `crates/trusted-server-core/src/integrations/gpt_diagnostics.rs`                                  | Create            | Config, registration, and head injector for the dedicated integration                    |
-| `crates/trusted-server-core/src/integrations/gpt_diagnostics_bootstrap.js`                        | Create            | Early activation, storage, document flag, and URL cleanup only                           |
-| `crates/trusted-server-core/src/integrations/mod.rs`                                              | Modify            | Export and register `gpt_diagnostics` builder                                            |
-| `crates/trusted-server-core/src/config.rs`                                                        | Modify            | Include diagnostics in deploy-time typed integration validation                          |
-| `crates/trusted-server-core/src/migration_guards.rs`                                              | Modify            | Include the new platform-neutral Rust source in migration guards                         |
-| `crates/trusted-server-core/src/html_processor.rs`                                                | Modify tests only | Pin bootstrap-before-bundle ordering when diagnostics is enabled                         |
-| `trusted-server.example.toml`                                                                     | Modify            | Add disabled-by-default diagnostics example                                              |
-| `crates/trusted-server-js/lib/src/core/types.ts`                                                  | Modify            | Public V1 export/API types and optional `TsjsApi.gptDiagnostics`                         |
-| `crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/index.ts`                          | Create            | Active-path composition and idempotent installation                                      |
-| `crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/store.ts`                          | Create            | Slot identity, cycles, matching, timings, coverage, issues, bounds, subscriptions        |
-| `crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/observer.ts`                       | Create            | Narrow GPT interfaces, command-queue installation, normalized callbacks, safety boundary |
-| `crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/binding.ts`                        | Create            | Exact lookup, uniqueness checks, rebinding, visibility, binding snapshots                |
-| `crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/api.ts`                            | Create            | Snapshot composition, subscription, JSON download, show/hide wiring                      |
-| `crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/overlay.ts`                        | Create            | Closed shadow host, panel, filters, controls, lifecycle/remount manager                  |
-| `crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/badges.ts`                         | Create            | Non-layout-changing badges and scheduled geometry updates                                |
-| `crates/trusted-server-js/lib/test/integrations/gpt_diagnostics/*.test.ts`                        | Create            | Activation, store, observer, binding, API, panel, badge, and composition tests           |
-| `crates/trusted-server-integration-tests/fixtures/configs/trusted-server.integration.toml`        | Modify            | Enable module availability for browser tests; activation remains query-gated             |
-| `crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/app/gpt-diagnostics/page.tsx` | Create            | Controlled slot DOM, hydration, replacement, scrolling, and refresh fixture              |
-| `crates/trusted-server-integration-tests/browser/helpers/gpt-stub.ts`                             | Create            | Pre-document deterministic GPT command queue and event bus                               |
-| `crates/trusted-server-integration-tests/browser/tests/nextjs/gpt-diagnostics.spec.ts`            | Create            | Real-browser activation, lifecycle, UI lifecycle, binding, export, and non-interference  |
-| `crates/trusted-server-integration-tests/README.md`                                               | Modify            | Document the new browser scenario                                                        |
-| `docs/guide/integrations/gpt-diagnostics.md`                                                      | Create            | Operator activation, UI, export, limits, privacy, and troubleshooting guide              |
-| `docs/guide/integrations-overview.md`                                                             | Modify            | Add the diagnostics integration                                                          |
-| `docs/.vitepress/config.mts`                                                                      | Modify            | Add diagnostics guide navigation                                                         |
+| File                                                                                              | Action  | Responsibility                                                                           |
+| ------------------------------------------------------------------------------------------------- | ------- | ---------------------------------------------------------------------------------------- |
+| `crates/trusted-server-core/src/integrations/gpt_diagnostics.rs`                                  | Create  | Config, request activation/cookie gate, cache policy, and standalone tag                 |
+| `crates/trusted-server-core/src/integrations/gpt_diagnostics_bootstrap.js`                        | Removed | Superseded by server-recognized activation and request-scoped inline cleanup             |
+| `crates/trusted-server-core/src/integrations/mod.rs`                                              | Modify  | Export and register `gpt_diagnostics` builder                                            |
+| `crates/trusted-server-core/src/config.rs`                                                        | Modify  | Include diagnostics in deploy-time typed integration validation                          |
+| `crates/trusted-server-core/src/migration_guards.rs`                                              | Modify  | Include the new platform-neutral Rust source in migration guards                         |
+| `crates/trusted-server-core/src/html_processor.rs`                                                | Modify  | Inject request-scoped activation and standalone module tags in early synchronous order   |
+| `trusted-server.example.toml`                                                                     | Modify  | Add disabled-by-default diagnostics example                                              |
+| `crates/trusted-server-js/lib/src/core/types.ts`                                                  | Modify  | Public V1 export/API types and optional `TsjsApi.gptDiagnostics`                         |
+| `crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/index.ts`                          | Create  | Active-path composition and idempotent installation                                      |
+| `crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/store.ts`                          | Create  | Slot identity, cycles, matching, timings, coverage, issues, bounds, subscriptions        |
+| `crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/observer.ts`                       | Create  | Narrow GPT interfaces, command-queue installation, normalized callbacks, safety boundary |
+| `crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/binding.ts`                        | Create  | Exact lookup, uniqueness checks, rebinding, visibility, binding snapshots                |
+| `crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/api.ts`                            | Create  | Snapshot composition, subscription, JSON download, show/hide wiring                      |
+| `crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/overlay.ts`                        | Create  | Closed shadow host, panel, filters, controls, lifecycle/remount manager                  |
+| `crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/badges.ts`                         | Create  | Non-layout-changing badges and scheduled geometry updates                                |
+| `crates/trusted-server-js/lib/test/integrations/gpt_diagnostics/*.test.ts`                        | Create  | Activation, store, observer, binding, API, panel, badge, and composition tests           |
+| `crates/trusted-server-integration-tests/fixtures/configs/trusted-server.integration.toml`        | Modify  | Enable module availability for browser tests; activation remains query-gated             |
+| `crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/app/gpt-diagnostics/page.tsx` | Create  | Controlled slot DOM, hydration, replacement, scrolling, and refresh fixture              |
+| `crates/trusted-server-integration-tests/browser/helpers/gpt-stub.ts`                             | Create  | Pre-document deterministic GPT command queue and event bus                               |
+| `crates/trusted-server-integration-tests/browser/tests/nextjs/gpt-diagnostics.spec.ts`            | Create  | Real-browser activation, lifecycle, UI lifecycle, binding, export, and non-interference  |
+| `crates/trusted-server-integration-tests/README.md`                                               | Modify  | Document the new browser scenario                                                        |
+| `docs/guide/integrations/gpt-diagnostics.md`                                                      | Create  | Operator activation, UI, export, limits, privacy, and troubleshooting guide              |
+| `docs/guide/integrations-overview.md`                                                             | Modify  | Add the diagnostics integration                                                          |
+| `docs/.vitepress/config.mts`                                                                      | Modify  | Add diagnostics guide navigation                                                         |
 
 Generated `crates/trusted-server-js/dist/` output is build evidence, not a
 hand-edited source. Follow the repository's existing tracked/ignored behavior;
@@ -185,44 +188,44 @@ do not manually edit generated bundles.
 
 ---
 
-## Task 1: Add Deployment Configuration and the Early Activation Bootstrap
+## Task 1: Add Deployment Configuration and Conditional Activation Delivery
 
-**Files:** Rust integration/config files, bootstrap JS, example TOML, and a
-minimal diagnostics `index.ts` so build discovery remains green.
+**Files:** Rust integration/config and request-delivery files, example TOML, and
+a minimal diagnostics `index.ts` so build discovery remains green.
 
 - [x] **Step 1: Add failing Rust registration/configuration tests.** Cover:
   - no `gpt_diagnostics` section → no registration;
   - `enabled = false` → no registration;
-  - `enabled = true` → one head injector and immediate JS module ID;
-  - the module is not deferred and has no proxy/routes/rewriters;
+  - `enabled = true` → standalone conditional module availability;
+  - the module is excluded from immediate/deferred unified sets and has no proxy/routes/rewriters;
   - deploy validation recognizes every registered builder, including
     `gpt_diagnostics`.
-- [x] **Step 2: Add a failing HTML processor ordering test.** Process an HTML
-      document with diagnostics enabled and assert the activation bootstrap appears
-      before `script#trustedserver-js`, and each appears exactly once.
+- [x] **Step 2: Add a failing HTML processor ordering test.** Process active HTML
+      and assert activation precedes `script#trustedserver-js`, followed by one
+      synchronous content-hashed standalone diagnostics module. Assert inactive HTML omits it.
 - [x] **Step 3: Define `GptDiagnosticsConfig`.** Use a boolean `enabled` with a
       false default, implement `IntegrationConfig`, and keep the integration
       independent of `[integrations.gpt]`.
 - [x] **Step 4: Register the integration.** Add the module and builder entry in
-      `integrations/mod.rs`; return an `IntegrationRegistration` containing only the
-      head injector and the immediate JS module.
-- [x] **Step 5: Add the bootstrap source and include it from the head injector.**
-      The bootstrap must:
-  - parse only `ts_console`;
-  - apply the exact recognized values;
-  - tolerate storage and history failures;
+      `integrations/mod.rs`; mark its JS as standalone so ordinary unified and deferred
+      bundles never include it.
+- [x] **Step 5: Add the server activation gate and early bootstrap.** It must:
+  - parse only exact, single `ts_console` directives and fail closed otherwise;
+  - establish/clear only the host-only HttpOnly browser-session activation cookie;
+  - strip the directive and cookie before generic request handling;
   - write one private document activation flag without exposing the public API;
-  - call `history.replaceState` once only for recognized directives;
-  - preserve `history.state`, pathname, unrelated parameters, and fragment;
+  - clean the visible URL while preserving state, pathname, unrelated parameters, and fragment;
+  - keep active/directive HTML private no-store while standalone static JS stays public;
   - avoid wrapping or retaining any history method.
 - [x] **Step 6: Add a minimal `gpt_diagnostics/index.ts`.** It should perform
       only the private activation-flag check and otherwise have no active behavior.
       Later tasks replace the active branch with composition code.
-- [x] **Step 7: Add bootstrap behavior tests.** In Vitest/jsdom, load the actual
-      bootstrap source and execute it against controlled URL/storage state. Cover
-      enable, disable, persistence without a directive, all four recognized values,
-      case-sensitive rejection, preservation of query/fragment, storage failure,
-      history failure, and idempotent re-execution.
+- [x] **Step 7: Add request-gate and browser behavior tests.** In Rust, cover
+      enable, disable, clean-cookie persistence, all four recognized values,
+      case-sensitive and duplicate rejection, URI sanitation, cookie stripping,
+      cache privacy, and idempotent preparation. In Playwright, cover visible URL
+      cleanup, query/fragment preservation, cross-tab browser-session persistence,
+      deactivation, and a separate browser context starting inactive.
 - [x] **Step 8: Add `[integrations.gpt_diagnostics] enabled = false` to
       `trusted-server.example.toml`.** Place it near the existing GPT configuration.
 - [x] **Step 9: Add the new Rust source and config validation coverage.** Update
@@ -234,12 +237,12 @@ minimal diagnostics `index.ts` so build discovery remains green.
 cargo fmt --all -- --check
 cargo test-fastly gpt_diagnostics
 cd crates/trusted-server-js/lib
-npx vitest run test/integrations/gpt_diagnostics/bootstrap.test.ts
+npx vitest run test/integrations/gpt_diagnostics
 node build-all.mjs
 ```
 
 - [ ] **Step 11: Commit.** Suggested message:
-      `Register GPT diagnostics and add tab activation bootstrap`.
+      `Register GPT diagnostics browser-session activation`.
 
 ---
 
@@ -301,10 +304,10 @@ node build-all.mjs
       exactly one of matched/unmatched/ambiguous and matched invalid-order issues do
       not break the coverage equation.
 - [x] **Step 5: Write failing retention tests.** Pin constants at 64 slots, 10
-      cycles per slot, and 128 callback issues. Verify deterministic oldest-record
+      cycles per slot, and 128 callback issues. Verify least-recently-active slot
       eviction, latest-cycle retention, monotonic numbering, and metadata counters.
-      Keep any WeakMap tombstone/value strategy bounded even when an evicted Slot
-      later emits another callback.
+      An evicted Slot re-enters only on a future `slotRequested`; earlier non-request
+      callbacks remain unmatched without creating a synthetic cycle.
 - [x] **Step 6: Implement the store with an injected clock.** Production uses
       `performance.now`; tests use a deterministic clock. Callback mutation is
       synchronous and bounded. Subscriber notifications are scheduled/coalesced,
@@ -576,8 +579,9 @@ Playwright spec, and integration-test README.
       API, host, listener registrations, diagnostics-created `googletag`, or
       diagnostic request.
 - [x] **Step 5: Test activation/deactivation and URL cleanup.** Cover true/false,
-      unrelated query/fragment preservation, same-tab persistence across full
-      navigation and SPA navigation, and a separately opened tab starting inactive.
+      unrelated query/fragment preservation, persistence across full navigation,
+      SPA navigation, and another tab in the same browser context, plus a separate
+      browser context starting inactive.
 - [x] **Step 6: Test listener and lifecycle behavior.** Emit initial and refresh
       callbacks, assert request numbering, direct render facts, non-negative
       timings, load/viewability augmentations, coverage equation, and panel host
@@ -595,8 +599,9 @@ Playwright spec, and integration-test README.
       hidden.
 - [x] **Step 10: Test JSON export and non-interference.** Capture the download,
       parse V1, compare counts/status with `snapshot()`, and assert captured GPT,
-      browser networking, and history method references remain unchanged except for
-      the one allowed bootstrap `replaceState` invocation.
+      browser networking, and history method references remain unchanged. The
+      one-time cleanup may invoke `replaceState` but must never replace or wrap the
+      method reference.
 - [x] **Step 11: Test page errors and diagnostic networking.** Collect console
       and page errors, ignore only existing documented fixture noise, and assert no
       diagnostics endpoint/request exists.
@@ -629,7 +634,7 @@ possibly the existing GPT guide for one cross-link only.
 
 - [x] **Step 1: Add the operator guide.** Document:
   - deployment configuration and independence from `[integrations.gpt]`;
-  - all activation/deactivation directives and tab-local behavior;
+  - all activation/deactivation directives and browser-session behavior;
   - Filled/Empty semantics and explicit non-provenance warning;
   - callback coverage, pending/incomplete distinction, bindings, refresh
     numbering, and badges;
@@ -750,7 +755,7 @@ Playwright script outside source control and attach sanitized counts/results to
 the PR.
 
 - [ ] Open a valid publisher session with `?ts_console=true` and a trace-off
-      control in the same tab when access is session-sensitive.
+      control in the same browser session when access is session-sensitive.
 - [ ] Confirm the normal page loads and diagnostics creates no attributable page
       error.
 - [ ] Confirm API and host survive load, hydration, scrolling, and a settle
@@ -777,8 +782,9 @@ the PR.
 ## Suggested Review Checkpoints
 
 - [x] **After Task 1:** Review activation and cache behavior before building the
-      larger browser feature. Confirm no user-specific server response variant was
-      introduced.
+      larger browser feature. Confirm the active HTML variant is private/no-store,
+      inactive HTML omits diagnostics, and the standalone static module remains
+      public and cookie-independent.
 - [x] **After Task 4:** Review callback matching and listener non-interference.
       This is the data-truth boundary.
 - [x] **After Task 6:** Review V1 export for privacy and schema stability.
@@ -793,21 +799,21 @@ the PR.
 
 ## Risks and Mitigations
 
-| Risk                                                                 | Mitigation                                                                                                                                              |
-| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Initial GPT callback occurs before diagnostics listener installation | Inject activation before the synchronous immediate bundle at `<head>` start; document ordering limits rather than patching GPT                          |
-| Overlapping refreshes cannot be correlated                           | Preserve ambiguous callbacks with `overlapping_request_cycles`; never guess                                                                             |
-| Out-of-order callbacks create negative timings                       | Keep matched disposition, add `invalid_event_order`, and suppress invalid durations                                                                     |
-| Framework removes the overlay                                        | Keep capture independent; use a debounced document-level lifecycle manager and distinguish external removal from dismissal                              |
-| Duplicate IDs point at the wrong slot                                | Require unique DOM and retained-slot claims; report ambiguous and omit badge                                                                            |
-| Closed Shadow DOM is hard to inspect in Playwright                   | Keep production closed; unit-test rendering through retained internal test handles and use public API/geometry/screenshot evidence in browser tests     |
-| Mutation/scroll work affects publisher performance                   | Inspect observed exact IDs only; debounce mutations and coalesce layout work to one animation frame                                                     |
-| Optional browser APIs are missing                                    | Degrade badge/remount updates without stopping GPT capture                                                                                              |
-| Diagnostics accidentally affects auction behavior                    | No GPT/browser method replacement, no request gating, no targeting reads/writes, and explicit identity tests for publisher/GPT methods                  |
-| Export leaks sensitive data                                          | Versioned allowlist schema, origin/pathname only, banned-field tests, explicit local download only                                                      |
-| Retention churn becomes unbounded                                    | Fixed limits, deterministic eviction, weak slot identity mapping, bounded callback issues, and counters                                                 |
-| Inline bootstrap conflicts with CSP                                  | Use the existing integration head-injector pattern; validate on the live environment and report CSP limitations without adding a server session variant |
-| Dedicated module increases every enabled deployment's bundle         | Include it only when `gpt_diagnostics` is configured; measure built module size and keep inactive execution to the activation check                     |
+| Risk                                                                 | Mitigation                                                                                                                                          |
+| -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Initial GPT callback occurs before diagnostics listener installation | Inject activation before core and the standalone diagnostics module synchronously after core at `<head>` start; never patch GPT                     |
+| Overlapping refreshes cannot be correlated                           | Preserve ambiguous callbacks with `overlapping_request_cycles`; never guess                                                                         |
+| Out-of-order callbacks create negative timings                       | Keep matched disposition, add `invalid_event_order`, and suppress invalid durations                                                                 |
+| Framework removes the overlay                                        | Keep capture independent; use a debounced document-level lifecycle manager and distinguish external removal from dismissal                          |
+| Duplicate IDs point at the wrong slot                                | Require unique DOM and retained-slot claims; report ambiguous and omit badge                                                                        |
+| Closed Shadow DOM is hard to inspect in Playwright                   | Keep production closed; unit-test rendering through retained internal test handles and use public API/geometry/screenshot evidence in browser tests |
+| Mutation/scroll work affects publisher performance                   | Inspect observed exact IDs only; debounce mutations and coalesce layout work to one animation frame                                                 |
+| Optional browser APIs are missing                                    | Degrade badge/remount updates without stopping GPT capture                                                                                          |
+| Diagnostics accidentally affects auction behavior                    | No GPT/browser method replacement, no request gating, no targeting reads/writes, and explicit identity tests for publisher/GPT methods              |
+| Export leaks sensitive data                                          | Versioned allowlist schema, origin/pathname only, banned-field tests, explicit local download only                                                  |
+| Retention churn becomes unbounded                                    | Fixed limits, deterministic eviction, weak slot identity mapping, bounded callback issues, and counters                                             |
+| Inline cleanup/bootstrap conflicts with CSP                          | Keep it minimal and request-scoped; validate on the live environment and report CSP limitations without weakening cookie or cache safety            |
+| Diagnostics payload reaches inactive visitors                        | Exclude it from the unified bundle and inject the content-hashed standalone module only into active documents; keep the static response public      |
 
 ---
 
@@ -815,8 +821,8 @@ the PR.
 
 - [ ] All spec acceptance criteria are covered by an automated test or explicit
       live acceptance evidence.
-- [x] The integration is deployment-disabled by default and tab-inactive by
-      default.
+- [x] The integration is deployment-disabled by default and browser-session
+      inactive by default.
 - [x] No callback is silently forced into a request cycle.
 - [x] Store, observer, binding, API, panel, and badge behavior are bounded and
       independently tested.

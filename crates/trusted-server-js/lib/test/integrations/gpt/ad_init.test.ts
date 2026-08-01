@@ -61,14 +61,23 @@ interface SlotRenderEvent {
   };
 }
 
-type TestWindow = Window & {
+// The `Prebid Response` payload the render bridge posts back to the Prebid
+// Universal Creative over the message port.
+interface PrebidResponseMessage {
+  message?: string;
+  adId?: string;
+  ad?: string;
+  width?: number;
+  height?: number;
+}
+
+// `tsjs` is declared globally as the full `TsjsApi` (core/types.ts). Omitting
+// it from `Window` before re-adding it as a `Partial` avoids the intersection
+// that would force every fixture below to satisfy the whole `TsjsApi` shape.
+type TestWindow = Omit<Window, 'tsjs'> & {
   googletag?: unknown;
   apstag?: { setDisplayBids?: () => void };
-  // Typed as `any` to avoid the TypeScript intersection with the global
-  // Window.tsjs declaration (TsjsApi from core/types.ts), which would require
-  // every test fixture to satisfy the full TsjsApi shape.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  tsjs?: any;
+  tsjs?: Partial<TsjsApi>;
 };
 
 function appendResponsiveSlotElement(
@@ -177,8 +186,7 @@ describe('installTsAdInit', () => {
           burl: 'https://ssp/bill',
         },
       },
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any;
+    };
 
     const fetchSpy = vi.spyOn(global, 'fetch');
 
@@ -233,8 +241,7 @@ describe('installTsAdInit', () => {
         },
       ],
       bids: {},
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any;
+    };
 
     const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
@@ -750,8 +757,7 @@ describe('installTsAdInit', () => {
         },
       ],
       bids: {},
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any;
+    };
 
     const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
@@ -805,8 +811,7 @@ describe('installTsAdInit', () => {
         },
       ],
       bids: {},
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any;
+    };
 
     runGptBootstrap();
 
@@ -863,8 +868,7 @@ describe('installTsAdInit', () => {
         },
       ],
       bids: {},
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any;
+    };
 
     runGptBootstrap();
 
@@ -957,8 +961,7 @@ describe('installTsAdInit', () => {
         },
       ],
       bids: {},
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any;
+    };
 
     const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
@@ -1068,8 +1071,7 @@ describe('installTsAdInit', () => {
         },
       ],
       bids: {},
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any;
+    };
 
     const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
@@ -1118,8 +1120,7 @@ describe('installTsAdInit', () => {
         },
       ],
       bids: {},
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any;
+    };
 
     const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
@@ -1158,8 +1159,7 @@ describe('installTsAdInit', () => {
       // Previous route touched the publisher-owned slot on div-old-route.
       divToSlotId: { 'div-old-route': 'old_slot' },
       prevSlotTargetingKeys: { 'div-old-route': ['pos'] },
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any;
+    };
 
     const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
@@ -1198,8 +1198,7 @@ describe('installTsAdInit', () => {
     (window as TestWindow).tsjs = {
       adSlots: [],
       bids: {},
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any;
+    };
 
     const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
@@ -1608,8 +1607,7 @@ describe('installTsAdInit', () => {
           renderer: apsRenderer(),
         },
       },
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any;
+    };
 
     const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
@@ -1656,8 +1654,7 @@ describe('installTsAdInit', () => {
       bids: {
         atf_sidebar_ad: { hb_pb: '1.00', hb_bidder: 'kargo' },
       },
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any;
+    };
 
     const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
@@ -1968,8 +1965,11 @@ describe('installTsRenderBridge', () => {
       .mockImplementation(
         (type: string, handler: EventListenerOrEventListenerObject, opts?: unknown) => {
           if (type === 'message') bridgeListener = handler as (e: MessageEvent) => unknown;
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          origAdd(type, handler as EventListener, opts as any);
+          origAdd(
+            type,
+            handler as EventListener,
+            opts as boolean | AddEventListenerOptions | undefined
+          );
         }
       );
     await import('../../../src/integrations/gpt/index');
@@ -2341,8 +2341,11 @@ describe('installTsRenderBridge', () => {
       .mockImplementation(
         (type: string, handler: EventListenerOrEventListenerObject, opts?: unknown) => {
           if (type === 'message') bridgeListener = handler as (e: MessageEvent) => unknown;
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          origAdd(type, handler as EventListener, opts as any);
+          origAdd(
+            type,
+            handler as EventListener,
+            opts as boolean | AddEventListenerOptions | undefined
+          );
         }
       );
     await import('../../../src/integrations/gpt/index');
@@ -2375,8 +2378,8 @@ describe('installTsRenderBridge', () => {
     );
     expect(stopSpy).toHaveBeenCalled();
     expect(portMessages).toHaveLength(1);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const parsed = JSON.parse(portMessages[0]) as Record<string, any>;
+
+    const parsed = JSON.parse(portMessages[0]) as PrebidResponseMessage;
     expect(parsed.message).toBe('Prebid Response');
     expect(parsed.adId).toBe('test-cache-uuid');
     expect(parsed.ad).toBe(mockAd);
@@ -2458,8 +2461,8 @@ describe('installTsRenderBridge', () => {
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
 
     expect(portMessages).toHaveLength(1);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const parsed = JSON.parse(portMessages[0]) as Record<string, any>;
+
+    const parsed = JSON.parse(portMessages[0]) as PrebidResponseMessage;
     expect(parsed.ad).toBe(rawAd);
     expect(beaconSpy).toHaveBeenCalledTimes(2);
     beaconSpy.mockRestore();
@@ -2490,8 +2493,8 @@ describe('installTsRenderBridge', () => {
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
 
     expect(portMessages).toHaveLength(1);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const parsed = JSON.parse(portMessages[0]) as Record<string, any>;
+
+    const parsed = JSON.parse(portMessages[0]) as PrebidResponseMessage;
     expect(parsed.width).toBe(300);
     expect(parsed.height).toBe(250);
     beaconSpy.mockRestore();
@@ -2526,8 +2529,8 @@ describe('installTsRenderBridge', () => {
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
 
     expect(portMessages).toHaveLength(1);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const parsed = JSON.parse(portMessages[0]) as Record<string, any>;
+
+    const parsed = JSON.parse(portMessages[0]) as PrebidResponseMessage;
     expect(parsed.ad).toContain('p=2.5');
     expect(parsed.ad).not.toContain('${AUCTION_PRICE}');
     beaconSpy.mockRestore();
@@ -2698,8 +2701,11 @@ describe('installTsRenderBridge', () => {
       .mockImplementation(
         (type: string, handler: EventListenerOrEventListenerObject, opts?: unknown) => {
           if (type === 'message') bridgeListener = handler as (e: MessageEvent) => unknown;
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          origAdd(type, handler as EventListener, opts as any);
+          origAdd(
+            type,
+            handler as EventListener,
+            opts as boolean | AddEventListenerOptions | undefined
+          );
         }
       );
     await import('../../../src/integrations/gpt/index');
@@ -2726,8 +2732,8 @@ describe('installTsRenderBridge', () => {
     expect(fetchStub).not.toHaveBeenCalled();
     expect(stopSpy).toHaveBeenCalled();
     expect(portMessages).toHaveLength(1);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const parsed = JSON.parse(portMessages[0]) as Record<string, any>;
+
+    const parsed = JSON.parse(portMessages[0]) as PrebidResponseMessage;
     expect(parsed.message).toBe('Prebid Response');
     expect(parsed.adId).toBe('debug-adid');
     expect(parsed.ad).toBe(inlineAdm);
@@ -2787,8 +2793,8 @@ describe('installTsRenderBridge', () => {
       await new Promise<void>((resolve) => setTimeout(resolve, 50));
 
       expect(portMessages).toHaveLength(1);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const parsed = JSON.parse(portMessages[0]) as Record<string, any>;
+
+      const parsed = JSON.parse(portMessages[0]) as PrebidResponseMessage;
       expect(parsed.width).toBe(300);
       expect(parsed.height).toBe(250);
     } finally {
@@ -2862,8 +2868,8 @@ describe('installTsRenderBridge', () => {
       await new Promise<void>((resolve) => setTimeout(resolve, 50));
 
       expect(portMessages).toHaveLength(1);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const parsed = JSON.parse(portMessages[0]) as Record<string, any>;
+
+      const parsed = JSON.parse(portMessages[0]) as PrebidResponseMessage;
       // The requesting slot's own creative and dimensions, not the first match's.
       expect(parsed.ad).toBe(inContentAdm);
       expect(parsed.width).toBe(300);
@@ -2883,7 +2889,7 @@ describe('installTsRenderBridge', () => {
     });
 
     try {
-      (window as TestWindow).tsjs.bids.homepage_header = {
+      (window as TestWindow).tsjs!.bids!.homepage_header = {
         hb_adid: 'debug-no-beacon',
         hb_bidder: 'mocktioneer',
         hb_pb: '0.20',
@@ -2929,7 +2935,7 @@ describe('installTsRenderBridge', () => {
 
   it('falls back to keepalive fetch when sendBeacon rejects the payload', async () => {
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(false);
-    (window as TestWindow).tsjs.bids.homepage_header = {
+    (window as TestWindow).tsjs!.bids!.homepage_header = {
       hb_adid: 'debug-rejected-beacon',
       hb_bidder: 'mocktioneer',
       hb_pb: '0.20',
@@ -3012,7 +3018,7 @@ describe('installTsRenderBridge', () => {
   it('ignores a request whose source slot does not own the resolved adId', async () => {
     // Two configured slots; slot A's iframe requests slot B's hb_adid. The
     // bridge must not return slot B's creative or fire slot B's beacons.
-    (window as TestWindow).tsjs.bids.homepage_footer = {
+    (window as TestWindow).tsjs!.bids!.homepage_footer = {
       hb_adid: 'footer-uuid',
       hb_bidder: 'kargo',
       hb_pb: '2.00',
@@ -3021,7 +3027,7 @@ describe('installTsRenderBridge', () => {
       nurl: 'https://ssp.example/footer-win',
       burl: 'https://ssp.example/footer-bill',
     };
-    (window as TestWindow).tsjs.adSlots.push({
+    (window as TestWindow).tsjs!.adSlots!.push({
       id: 'homepage_footer',
       formats: [[300, 250]] as [number, number][],
       gam_unit_path: '/a/b/footer',

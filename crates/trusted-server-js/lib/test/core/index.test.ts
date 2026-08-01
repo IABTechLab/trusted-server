@@ -1,16 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
-interface TsjsTestWindow {
-  tsjs?: {
-    que?: Array<() => void>;
-    version?: string;
-    setConfig?: unknown;
-    getConfig?: unknown;
-    log?: unknown;
-  } & Record<string, unknown>;
-}
-
-const testWindow = window as unknown as TsjsTestWindow;
+import type { AuctionBidData, AuctionSlot, TsjsApi } from '../../src/core/types';
 
 const ORIGINAL_FETCH = global.fetch;
 
@@ -18,7 +8,7 @@ describe('core/index', () => {
   beforeEach(async () => {
     await vi.resetModules();
     document.body.innerHTML = '';
-    delete testWindow.tsjs;
+    delete window.tsjs;
   });
 
   afterEach(() => {
@@ -27,7 +17,7 @@ describe('core/index', () => {
 
   it('initializes tsjs API with expected surface', async () => {
     await import('../../src/core/index');
-    const api = window.tsjs;
+    const api = window.tsjs as TsjsApi;
     expect(api).toBeDefined();
     expect(typeof api.version).toBe('string');
     expect(Array.isArray(api.que)).toBe(true);
@@ -41,28 +31,28 @@ describe('core/index', () => {
 
   it('defaults adSlots and bids so gated-off pages never see undefined', async () => {
     await import('../../src/core/index');
-    const api = window.tsjs;
+    const api = window.tsjs as TsjsApi;
     expect(api.adSlots).toEqual([]);
     expect(api.bids).toEqual({});
   });
 
   it('preserves edge-injected adSlots and bids set before the bundle loads', async () => {
-    testWindow.tsjs = {
-      adSlots: [{ id: 'pre-injected' }],
-      bids: { 'pre-injected': { hb_pb: '1.00' } },
-    };
+    window.tsjs = {
+      adSlots: [{ id: 'pre-injected' } as AuctionSlot],
+      bids: { 'pre-injected': { hb_pb: '1.00' } } as Record<string, AuctionBidData>,
+    } as TsjsApi;
 
     await import('../../src/core/index');
 
-    expect(window.tsjs.adSlots).toEqual([{ id: 'pre-injected' }]);
-    expect(window.tsjs.bids).toEqual({ 'pre-injected': { hb_pb: '1.00' } });
+    expect(window.tsjs!.adSlots).toEqual([{ id: 'pre-injected' }]);
+    expect(window.tsjs!.bids).toEqual({ 'pre-injected': { hb_pb: '1.00' } });
   });
 
   it('flushes queued callbacks that existed before initialization', async () => {
-    const callback = vi.fn(function () {
+    const callback = vi.fn(function (this: TsjsApi) {
       expect(this).toBe(window.tsjs);
     });
-    testWindow.tsjs = { que: [callback] };
+    window.tsjs = { que: [callback] as Array<() => void> } as TsjsApi;
 
     await import('../../src/core/index');
 
@@ -71,7 +61,7 @@ describe('core/index', () => {
 
   it('installs queue that executes callbacks immediately with api context', async () => {
     await import('../../src/core/index');
-    const api = window.tsjs;
+    const api = window.tsjs as TsjsApi;
     const fn = vi.fn();
 
     api.que.push(fn);
@@ -82,7 +72,7 @@ describe('core/index', () => {
 
   it('renders registered ad units using core rendering helpers', async () => {
     await import('../../src/core/index');
-    const api = window.tsjs;
+    const api = window.tsjs as TsjsApi;
 
     api.addAdUnits([
       { code: 'slot-1', mediaTypes: { banner: { sizes: [[300, 250]] } } },
@@ -98,7 +88,7 @@ describe('core/index', () => {
   it('exposes requestAds from the core request module', async () => {
     const { requestAds } = await import('../../src/core/request');
     await import('../../src/core/index');
-    const api = window.tsjs;
+    const api = window.tsjs as TsjsApi;
 
     expect(api.requestAds).toBe(requestAds);
   });

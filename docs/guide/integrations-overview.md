@@ -190,7 +190,8 @@ enabled = true
 
 **Key Features:**
 
-- Explicit, tab-local `ts_console` activation
+- Explicit browser-session `ts_console` activation through a host-only HttpOnly cookie
+- Conditional standalone delivery only on active HTML documents
 - Initial and refresh request-cycle history
 - Conservative unmatched and ambiguous callback reporting
 - Exact DOM binding and non-layout-changing viewport badges
@@ -306,14 +307,14 @@ Are you developing/testing integrations?
 
 ## Performance Considerations
 
-| Integration         | Performance Impact | Caching Strategy            | Notes                                        |
-| ------------------- | ------------------ | --------------------------- | -------------------------------------------- |
-| **Prebid**          | Medium             | Response caching possible   | Timeout configurable (default 1s)            |
-| **Next.js**         | Low                | N/A (streaming rewrite)     | Minimal overhead, runs during HTML streaming |
-| **Permutive**       | Low                | SDK cached (1 hour default) | API calls proxied in real-time               |
-| **Sourcepoint**     | Low                | CDN cached (1 hour default) | JS rewriting adds minor overhead             |
-| **GPT Diagnostics** | Low when active    | N/A                         | Inactive without explicit tab activation     |
-| **Testlight**       | Low                | No caching                  | Development use only                         |
+| Integration         | Performance Impact | Caching Strategy              | Notes                                           |
+| ------------------- | ------------------ | ----------------------------- | ----------------------------------------------- |
+| **Prebid**          | Medium             | Response caching possible     | Timeout configurable (default 1s)               |
+| **Next.js**         | Low                | N/A (streaming rewrite)       | Minimal overhead, runs during HTML streaming    |
+| **Permutive**       | Low                | SDK cached (1 hour default)   | API calls proxied in real-time                  |
+| **Sourcepoint**     | Low                | CDN cached (1 hour default)   | JS rewriting adds minor overhead                |
+| **GPT Diagnostics** | Low when active    | Static module publicly cached | Module omitted until browser-session activation |
+| **Testlight**       | Low                | No caching                    | Development use only                            |
 
 ## Environment Variables
 

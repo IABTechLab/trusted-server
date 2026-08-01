@@ -136,6 +136,7 @@ export type GptDiagnosticsBindingReason =
   | 'missing_slot_element_id'
   | 'missing_element'
   | 'duplicate_dom_id'
+  | 'dom_uniqueness_unverifiable'
   | 'duplicate_gpt_slot_id';
 
 export interface GptDiagnosticsBinding {
