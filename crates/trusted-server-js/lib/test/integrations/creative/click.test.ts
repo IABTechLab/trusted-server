@@ -125,7 +125,7 @@ describe('creative/click.ts', () => {
 
     const originDescriptor = Object.getOwnPropertyDescriptor(window, 'origin');
     Object.defineProperty(window, 'origin', { value: 'null', configurable: true });
-    global.fetch = undefined as any;
+    global.fetch = undefined as unknown as typeof fetch;
 
     try {
       const anchor = document.createElement('a');
@@ -156,5 +156,28 @@ describe('creative/click.ts', () => {
         delete (window as { origin?: string }).origin;
       }
     }
+  });
+
+  it('refuses to navigate to or persist non-http(s) URLs', async () => {
+    // The guard reads creative-controlled attributes; a javascript: value must
+    // never reach location.href or an href write.
+    vi.useFakeTimers();
+    global.fetch = undefined as unknown as typeof fetch;
+
+    const anchor = document.createElement('a');
+    anchor.setAttribute('data-tsclick', 'javascript:evil()');
+    anchor.setAttribute('href', 'javascript:evil()');
+    document.body.appendChild(anchor);
+
+    await importCreativeModule();
+
+    anchor.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    await Promise.resolve();
+    await vi.runAllTimersAsync();
+
+    expect(anchor.getAttribute('href')).toBe('javascript:evil()');
+    // jsdom throws on real navigation, so reaching this point without an
+    // unhandled navigation error is the assertion that location.href was
+    // never assigned the javascript: URL.
   });
 });

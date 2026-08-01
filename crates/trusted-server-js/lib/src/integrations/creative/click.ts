@@ -252,17 +252,31 @@ async function computeFinalUrl(a: AnchorLike, tsClickStr: string): Promise<strin
   return rebuildClick(a, tsClickStr, diff);
 }
 
+// Resolve a click URL against the pinned trusted base and require an http(s)
+// scheme. The inputs (anchor href / data-tsclick attributes) are
+// creative-controlled DOM text, so anything else — javascript:, data:, vbscript:
+// — must never reach a navigation sink or an href write. Returns null for
+// unparseable or non-http(s) URLs so callers fail closed.
+function resolveSafeNavigationUrl(url: string): string | null {
+  try {
+    const resolved = new URL(url, TRUSTED_BASE_URL);
+    if (resolved.protocol === 'http:' || resolved.protocol === 'https:') {
+      return resolved.toString();
+    }
+    log.warn('tsjs-creative:click: refusing non-http(s) navigation', resolved.protocol);
+  } catch (err) {
+    log.debug('tsjs-creative:click: could not resolve navigation URL', err);
+  }
+  return null;
+}
+
 // Send the user to the resolved URL while respecting middle clicks and targets.
 // Root-relative URLs are absolutized against the pinned trusted base first: in
 // the sandboxed srcdoc iframe there is no usable document URL for the
 // navigation APIs to resolve them against.
 function navigate(a: AnchorLike, url: string, isMiddle: boolean): void {
-  let resolved = url;
-  try {
-    resolved = new URL(url, TRUSTED_BASE_URL).toString();
-  } catch (err) {
-    log.debug('tsjs-creative:click: could not absolutize navigation URL', err);
-  }
+  const resolved = resolveSafeNavigationUrl(url);
+  if (!resolved) return;
   const target = a.getAttribute('target') || (isMiddle ? '_blank' : '_self');
   if (target === '_blank' || isMiddle) {
     window.open(resolved, target, 'noopener,noreferrer');
@@ -277,6 +291,7 @@ function navigate(a: AnchorLike, url: string, isMiddle: boolean): void {
 // /first-party/click URL. Writing the GET proxy-rebuild fallback there would
 // make every later canonicalization fail and lose subsequent mutations.
 function persistRebuiltClick(anchor: AnchorLike, finalUrl: string): void {
+  if (!resolveSafeNavigationUrl(finalUrl)) return;
   try {
     const el = anchor as Element;
     if (canonFromFirstPartyClick(finalUrl)) {
