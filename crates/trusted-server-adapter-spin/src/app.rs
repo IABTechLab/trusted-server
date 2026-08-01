@@ -20,8 +20,9 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, PublisherResponse, buffer_publisher_response_async, handle_page_bids,
-    handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
+    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, PublisherResponse,
+    buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
+    handle_tsjs_dynamic, page_bids_preflight_denied,
 };
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
@@ -141,7 +142,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 12] {
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 13] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
@@ -150,7 +151,8 @@ fn named_fallback_paths() -> [(&'static str, &'static [Method]); 12] {
         ("/admin/keys/rotate", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/deactivate", LEGACY_ADMIN_DENY_METHODS),
         ("/auction", &[Method::POST]),
-        ("/__ts/page-bids", &[Method::GET, Method::OPTIONS]),
+        (PAGE_BIDS_PATH, &[Method::GET, Method::OPTIONS]),
+        (PAGE_BIDS_LEGACY_PATH, &[Method::GET, Method::OPTIONS]),
         ("/first-party/proxy", &[Method::GET]),
         ("/first-party/click", &[Method::GET]),
         ("/first-party/sign", &[Method::GET, Method::POST]),
@@ -322,7 +324,7 @@ fn health_response() -> Response {
 }
 
 /// Builds the geo-aware [`EcContext`] for consent-gated endpoints (`/auction`,
-/// `/__ts/page-bids`, and the publisher fallback).
+/// `/_ts/page-bids`, and the publisher fallback).
 ///
 /// Mirrors the Fastly entry point: `EcContext::default()` leaves jurisdiction
 /// Unknown, which fails the auction consent gate closed even for consented
@@ -522,7 +524,15 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 // `NormalizeMiddleware` before this handler runs, so the signed
                 // OpenRTB metadata that auction signing derives from
                 // `RequestInfo::from_request` uses the trusted runtime authority.
-                let req = ctx.into_request();
+                let mut req = ctx.into_request();
+                if let Err(error) =
+                    trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+                        &s.settings,
+                        &mut req,
+                    )
+                {
+                    return Ok(http_error(&error));
+                }
                 // Build the geo-aware EC context so the auction consent gate sees
                 // the caller's jurisdiction — `EcContext::default()` fails it
                 // closed for consented users.
@@ -541,13 +551,21 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             }
         };
 
-        // GET /__ts/page-bids — SPA re-auction endpoint.
+        // GET /_ts/page-bids — SPA re-auction endpoint.
         let s = Arc::clone(&state);
         let page_bids_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
                 let services = build_runtime_services(&ctx);
-                let req = ctx.into_request();
+                let mut req = ctx.into_request();
+                if let Err(error) =
+                    trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+                        &s.settings,
+                        &mut req,
+                    )
+                {
+                    return Ok(http_error(&error));
+                }
                 let ec_context = build_ec_context(&s.settings, &services, &req);
                 let auction = AuctionDispatch {
                     orchestrator: &s.orchestrator,
@@ -562,7 +580,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             }
         };
 
-        // OPTIONS /__ts/page-bids — deny the CORS preflight for this
+        // OPTIONS /_ts/page-bids — deny the CORS preflight for this
         // side-effecting GET so the `X-TSJS-Page-Bids` gate stays trustworthy.
         let page_bids_options_handler = |_ctx: RequestContext| async {
             Ok::<Response, EdgeError>(page_bids_preflight_denied())
@@ -629,7 +647,13 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             ctx: RequestContext,
         ) -> Result<Response, EdgeError> {
             let services = build_runtime_services(&ctx);
-            let req = ctx.into_request();
+            let mut req = ctx.into_request();
+            if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+                &state.settings,
+                &mut req,
+            ) {
+                return Ok(http_error(&error));
+            }
 
             let path = req.uri().path().to_owned();
             let method = req.method().clone();
@@ -731,9 +755,15 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .post("/_ts/admin/keys/rotate", admin_not_supported_handler)
             .post("/_ts/admin/keys/deactivate", admin_not_supported_handler)
             .post("/auction", auction_handler)
-            .get("/__ts/page-bids", page_bids_handler)
+            .get(PAGE_BIDS_PATH, page_bids_handler.clone())
+            .route(PAGE_BIDS_PATH, Method::OPTIONS, page_bids_options_handler)
+            // Deprecated double-underscore alias, kept so tsjs bundles served
+            // before the `/_ts/page-bids` rename keep getting ads on SPA
+            // navigations until they age out of browser caches. See
+            // `PAGE_BIDS_LEGACY_PATH`.
+            .get(PAGE_BIDS_LEGACY_PATH, page_bids_handler)
             .route(
-                "/__ts/page-bids",
+                PAGE_BIDS_LEGACY_PATH,
                 Method::OPTIONS,
                 page_bids_options_handler,
             )

@@ -1,4 +1,9 @@
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
+
 import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
+
+import type { TsjsApi } from '../../../src/core/types';
 
 // Track every 'message' EventListener added to window across the entire test
 // file.  This lets the installTsRenderBridge suite remove all accumulated
@@ -40,15 +45,46 @@ interface SlotRenderEvent {
   };
 }
 
-type TestWindow = Window & {
+// The `Prebid Response` payload the render bridge posts back to the Prebid
+// Universal Creative over the message port.
+interface PrebidResponseMessage {
+  message?: string;
+  adId?: string;
+  ad?: string;
+  width?: number;
+  height?: number;
+}
+
+// `tsjs` is declared globally as the full `TsjsApi` (core/types.ts). Omitting
+// it from `Window` before re-adding it as a `Partial` avoids the intersection
+// that would force every fixture below to satisfy the whole `TsjsApi` shape.
+type TestWindow = Omit<Window, 'tsjs'> & {
   googletag?: unknown;
   apstag?: { setDisplayBids?: () => void };
-  // Typed as `any` to avoid the TypeScript intersection with the global
-  // Window.tsjs declaration (TsjsApi from core/types.ts), which would require
-  // every test fixture to satisfy the full TsjsApi shape.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  tsjs?: any;
+  tsjs?: Partial<TsjsApi>;
 };
+
+async function runGptBootstrap(googletag: object): Promise<void> {
+  const bootstrapUrl = new URL(
+    '../../../../../trusted-server-core/src/integrations/gpt_bootstrap.js',
+    import.meta.url
+  );
+  const urlPath = decodeURIComponent(bootstrapUrl.pathname);
+  let bootstrapPath: string;
+  if (urlPath.startsWith('/@fs/')) {
+    bootstrapPath = urlPath.slice('/@fs'.length);
+  } else if (bootstrapUrl.protocol === 'file:') {
+    bootstrapPath = urlPath;
+  } else {
+    bootstrapPath = path.resolve(process.cwd(), `.${urlPath}`);
+  }
+  const bootstrap = await readFile(bootstrapPath, 'utf8');
+  const runBootstrap = new Function('window', 'googletag', bootstrap) as (
+    window: Window,
+    googletag: object
+  ) => void;
+  runBootstrap(window, googletag);
+}
 
 describe('installTsAdInit', () => {
   beforeEach(() => {
@@ -117,8 +153,7 @@ describe('installTsAdInit', () => {
           burl: 'https://ssp/bill',
         },
       },
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any;
+    };
 
     const fetchSpy = vi.spyOn(global, 'fetch');
 
@@ -133,6 +168,7 @@ describe('installTsAdInit', () => {
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_cache_host', 'cache.example.com');
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_cache_path', '/pbc/v1/cache');
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_initial', '1');
+    expect(mockPubads.enableSingleRequest).toHaveBeenCalledOnce();
     expect(mockPubads.refresh).toHaveBeenCalled();
 
     fetchSpy.mockRestore();
@@ -172,8 +208,7 @@ describe('installTsAdInit', () => {
         },
       ],
       bids: {},
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any;
+    };
 
     const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
@@ -205,6 +240,7 @@ describe('installTsAdInit', () => {
       refresh: vi.fn(),
       disableInitialLoad: vi.fn(),
     };
+    const getConfigMock = vi.fn().mockReturnValue(undefined);
     const displayMock = vi.fn();
     (window as TestWindow).googletag = {
       cmd: { push: vi.fn((fn: () => void) => fn()) },
@@ -212,6 +248,8 @@ describe('installTsAdInit', () => {
       display: displayMock,
       pubads: vi.fn().mockReturnValue(mockPubads),
       enableServices: vi.fn(),
+      // Exercise the wrapper fallback used when the getter has no value.
+      getConfig: getConfigMock,
     };
     (window as TestWindow).tsjs = {
       adSlots: [
@@ -224,8 +262,7 @@ describe('installTsAdInit', () => {
         },
       ],
       bids: {},
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any;
+    };
 
     const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
@@ -239,6 +276,312 @@ describe('installTsAdInit', () => {
 
     // The slot is still registered via display(), and additionally refreshed so
     // it actually requests an ad under disableInitialLoad().
+    expect(displayMock).toHaveBeenCalledWith('div-atf-sidebar');
+    expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
+  });
+
+  it('preserves legacy state in the edge bootstrap when getConfig does not report it', async () => {
+    const mockSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+    };
+    const disableInitialLoadMock = vi.fn();
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([]),
+      refresh: vi.fn(),
+      disableInitialLoad: disableInitialLoadMock,
+    };
+    const displayMock = vi.fn();
+    const getConfigMock = vi.fn().mockReturnValue(undefined);
+    const googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(mockSlot),
+      display: displayMock,
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+      getConfig: getConfigMock,
+    };
+    (window as TestWindow).googletag = googletag;
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {},
+    };
+
+    await runGptBootstrap(googletag);
+
+    mockPubads.disableInitialLoad();
+    expect(disableInitialLoadMock).toHaveBeenCalledOnce();
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(true);
+
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(displayMock).toHaveBeenCalledWith('div-atf-sidebar');
+    expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
+  });
+
+  it('tracks setConfig state and re-enabling in the edge bootstrap', async () => {
+    const mockSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+    };
+    type InitialLoadConfig = {
+      disableInitialLoad?: boolean | null;
+    };
+    let effectiveConfig: { disableInitialLoad?: boolean } = {};
+    const setConfigMock = vi.fn((config: InitialLoadConfig) => {
+      if ('disableInitialLoad' in config) {
+        effectiveConfig = { disableInitialLoad: config.disableInitialLoad === true };
+      }
+    });
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([]),
+      refresh: vi.fn(),
+    };
+    const displayMock = vi.fn();
+    const googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(mockSlot),
+      display: displayMock,
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+      getConfig: undefined as undefined | (() => { disableInitialLoad?: boolean }),
+      setConfig: setConfigMock,
+    };
+    (window as TestWindow).googletag = googletag;
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {},
+    };
+
+    await runGptBootstrap(googletag);
+
+    // Older GPT runtimes may expose setConfig without getConfig. In that case,
+    // the wrapper tracks explicit initial-load updates directly.
+    googletag.setConfig({ disableInitialLoad: true });
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(true);
+    googletag.setConfig({ disableInitialLoad: false });
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(false);
+
+    googletag.getConfig = vi.fn(() => effectiveConfig);
+    setConfigMock.mockClear();
+    googletag.setConfig({ disableInitialLoad: true });
+    expect(setConfigMock).toHaveBeenCalledOnce();
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(true);
+
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(displayMock).toHaveBeenCalledWith('div-atf-sidebar');
+    expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
+
+    mockPubads.refresh.mockClear();
+    googletag.setConfig({ disableInitialLoad: false });
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(false);
+
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(mockPubads.refresh).not.toHaveBeenCalled();
+
+    googletag.setConfig({ disableInitialLoad: true });
+    googletag.setConfig({ disableInitialLoad: null });
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(false);
+
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(mockPubads.refresh).not.toHaveBeenCalled();
+  });
+
+  it('tracks the effective initial-load state from setConfig', async () => {
+    // Modern GPT configuration uses googletag.setConfig() rather than the
+    // legacy pubads().disableInitialLoad() method. TS must detect both forms.
+    const mockSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
+    type InitialLoadConfig = {
+      disableInitialLoad?: boolean | null;
+      singleRequest?: boolean;
+    };
+    let effectiveConfig: { disableInitialLoad?: boolean } = {};
+    const setConfigMock = vi.fn((config: InitialLoadConfig) => {
+      if ('disableInitialLoad' in config) {
+        effectiveConfig = { disableInitialLoad: config.disableInitialLoad === true };
+      }
+    });
+    const disableInitialLoadMock = vi.fn(() => {
+      effectiveConfig = { disableInitialLoad: true };
+    });
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      // Publisher has not defined this slot, so TS defines (owns) it.
+      getSlots: vi.fn().mockReturnValue([]),
+      addEventListener: vi.fn(),
+      refresh: vi.fn(),
+      disableInitialLoad: disableInitialLoadMock,
+    };
+    const displayMock = vi.fn();
+    const getConfigMock = vi.fn(() => effectiveConfig);
+    const googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(mockSlot),
+      display: displayMock,
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+      getConfig: undefined as undefined | typeof getConfigMock,
+      setConfig: setConfigMock,
+    };
+    (window as TestWindow).googletag = googletag;
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {},
+    };
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    installTsAdInit();
+
+    const gpt = (window as TestWindow).googletag as {
+      setConfig(config: InitialLoadConfig): void;
+    };
+    gpt.setConfig({ singleRequest: true });
+    expect(setConfigMock).toHaveBeenCalledOnce();
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).not.toBe(true);
+
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(displayMock).toHaveBeenCalledWith('div-atf-sidebar');
+    expect(mockPubads.refresh).not.toHaveBeenCalled();
+
+    // Fall back to the explicit setConfig value when getConfig is unavailable.
+    gpt.setConfig({ disableInitialLoad: true });
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(true);
+    gpt.setConfig({ disableInitialLoad: false });
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(false);
+
+    googletag.getConfig = getConfigMock;
+    setConfigMock.mockClear();
+    const config = { disableInitialLoad: true, singleRequest: true };
+    gpt.setConfig(config);
+    expect(setConfigMock).toHaveBeenCalledOnce();
+    expect(setConfigMock).toHaveBeenLastCalledWith(config);
+    expect(getConfigMock).toHaveBeenCalledWith('disableInitialLoad');
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(true);
+
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
+
+    mockPubads.refresh.mockClear();
+    gpt.setConfig({ disableInitialLoad: false });
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(false);
+    gpt.setConfig({ disableInitialLoad: null });
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(false);
+
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(mockPubads.refresh).not.toHaveBeenCalled();
+
+    // GPT exposes one effective setting across the modern and legacy APIs.
+    // A legacy call made after setConfig(false) disables initial load.
+    mockPubads.disableInitialLoad();
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(true);
+
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
+
+    // A later modern call can re-enable initial load after the legacy API.
+    mockPubads.refresh.mockClear();
+    gpt.setConfig({ disableInitialLoad: false });
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(false);
+
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(mockPubads.refresh).not.toHaveBeenCalled();
+
+    // Resetting the setting to its default has the same effective result.
+    mockPubads.disableInitialLoad();
+    gpt.setConfig({ disableInitialLoad: null });
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(false);
+
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(mockPubads.refresh).not.toHaveBeenCalled();
+  });
+
+  it('reads initial-load configuration effective before detector installation', async () => {
+    const mockSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([]),
+      addEventListener: vi.fn(),
+      refresh: vi.fn(),
+    };
+    const displayMock = vi.fn();
+    const getConfigMock = vi.fn().mockReturnValue({ disableInitialLoad: true });
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(mockSlot),
+      display: displayMock,
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+      getConfig: getConfigMock,
+    };
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {},
+    };
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+
+    expect(getConfigMock).toHaveBeenCalledWith('disableInitialLoad');
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(true);
+
+    (window as TestWindow).tsjs!.adInit!();
+
     expect(displayMock).toHaveBeenCalledWith('div-atf-sidebar');
     expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
   });
@@ -278,8 +621,7 @@ describe('installTsAdInit', () => {
         },
       ],
       bids: {},
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any;
+    };
 
     const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
@@ -318,8 +660,7 @@ describe('installTsAdInit', () => {
       // Previous route touched the publisher-owned slot on div-old-route.
       divToSlotId: { 'div-old-route': 'old_slot' },
       prevSlotTargetingKeys: { 'div-old-route': ['pos'] },
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any;
+    };
 
     const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
@@ -358,8 +699,7 @@ describe('installTsAdInit', () => {
     (window as TestWindow).tsjs = {
       adSlots: [],
       bids: {},
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any;
+    };
 
     const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
@@ -371,7 +711,7 @@ describe('installTsAdInit', () => {
     expect(mockPubads.refresh).not.toHaveBeenCalled();
   });
 
-  it('keeps the GAM path when debug adm is present', async () => {
+  it('keeps the GAM path when a bid carries inline adm (adInit does not inject)', async () => {
     const slotEl = document.getElementById('div-atf-sidebar')!;
     const mockSlot = {
       addService: vi.fn().mockReturnThis(),
@@ -408,7 +748,7 @@ describe('installTsAdInit', () => {
           hb_pb: '0.20',
           hb_bidder: 'mocktioneer',
           hb_adid: 'debug-uuid',
-          adm: '<div>Debug creative</div>',
+          adm: '<div>Inline creative</div>',
         },
       },
     };
@@ -424,6 +764,80 @@ describe('installTsAdInit', () => {
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_adid', 'debug-uuid');
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_initial', '1');
     expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
+  });
+
+  // Helper: full adInit setup for a single slot whose bid carries an iframe adm.
+  // `debugBid` toggles the per-bid `debug_bid` field that gates the testing bypass.
+  async function fireSlotRenderWithAdm(debugBid: boolean): Promise<HTMLIFrameElement> {
+    let capturedListener: ((e: SlotRenderEvent) => void) | undefined;
+    const mockSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+      getTargeting: vi.fn().mockReturnValue(['abc']),
+    };
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([mockSlot]),
+      refresh: vi.fn(),
+      addEventListener: vi.fn((event: string, fn: (e: SlotRenderEvent) => void) => {
+        if (event === 'slotRenderEnded') capturedListener = fn;
+      }),
+    };
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(mockSlot),
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+    };
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {
+        atf_sidebar_ad: {
+          hb_pb: '1.00',
+          hb_bidder: 'kargo',
+          hb_adid: 'abc',
+          adm: '<iframe src="https://cdn.example/creative.html"></iframe>',
+          ...(debugBid ? { debug_bid: { slot_id: 'atf_sidebar_ad' } } : {}),
+        },
+      },
+    };
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    // A pre-existing GAM iframe; the bypass, if it runs, rewrites its src.
+    const slotEl = document.getElementById('div-atf-sidebar')!;
+    const gamIframe = document.createElement('iframe');
+    gamIframe.src = 'about:blank';
+    slotEl.appendChild(gamIframe);
+
+    expect(capturedListener).toBeDefined();
+    capturedListener!({ isEmpty: false, slot: mockSlot });
+    return gamIframe;
+  }
+
+  it('does not run the GAM-replace bypass without debug_bid (production)', async () => {
+    const gamIframe = await fireSlotRenderWithAdm(false);
+    // No debug_bid ⇒ testing bypass is off; the render bridge handles the creative
+    // and GAM stays in the loop, so the GAM iframe src is untouched.
+    expect(gamIframe.src).toBe('about:blank');
+  });
+
+  it('runs the GAM-replace bypass when debug_bid is present (testing)', async () => {
+    const gamIframe = await fireSlotRenderWithAdm(true);
+    // debug_bid present ⇒ inject_adm_for_testing on ⇒ direct GAM replace fires,
+    // rewriting the iframe to the creative URL from the adm.
+    expect(gamIframe.src).toBe('https://cdn.example/creative.html');
   });
 
   it('does not fire win/billing beacons from slotRenderEnded targeting alone', async () => {
@@ -689,8 +1103,7 @@ describe('installTsAdInit', () => {
       bids: {
         atf_sidebar_ad: { hb_pb: '1.50', hb_bidder: 'aps', nurl: '', burl: '' },
       },
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any;
+    };
 
     const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
@@ -736,8 +1149,7 @@ describe('installTsAdInit', () => {
       bids: {
         atf_sidebar_ad: { hb_pb: '1.00', hb_bidder: 'kargo' },
       },
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any;
+    };
 
     const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
@@ -834,6 +1246,44 @@ describe('installTsAdInit', () => {
   });
 });
 
+describe('parseCachedBid', () => {
+  async function parseCachedBid(body: string) {
+    const mod = await import('../../../src/integrations/gpt/index');
+    return mod.parseCachedBid(body);
+  }
+
+  it('decodes adm, dimensions, and price from a PBS Cache bid object', async () => {
+    const bid = await parseCachedBid(
+      JSON.stringify({ adm: '<div>cached</div>', w: 300, h: 250, price: 1.23 })
+    );
+    expect(bid).toEqual({ adm: '<div>cached</div>', width: 300, height: 250, price: 1.23 });
+  });
+
+  it('accepts width/height as an alternate dimension spelling', async () => {
+    const bid = await parseCachedBid(
+      JSON.stringify({ adm: '<div>cached</div>', width: 728, height: 90 })
+    );
+    expect(bid?.width).toBe(728);
+    expect(bid?.height).toBe(90);
+  });
+
+  it('treats zero dimensions as absent so the caller falls back', async () => {
+    const bid = await parseCachedBid(JSON.stringify({ adm: '<div>cached</div>', w: 0, h: 0 }));
+    expect(bid?.width).toBeUndefined();
+    expect(bid?.height).toBeUndefined();
+  });
+
+  it('treats a non-JSON body as raw creative markup with no metadata', async () => {
+    const bid = await parseCachedBid('<div>raw</div>');
+    expect(bid).toEqual({ adm: '<div>raw</div>' });
+  });
+
+  it('returns undefined when the JSON payload carries no usable adm', async () => {
+    expect(await parseCachedBid(JSON.stringify({ w: 300, h: 250 }))).toBeUndefined();
+    expect(await parseCachedBid('   ')).toBeUndefined();
+  });
+});
+
 describe('installTsRenderBridge', () => {
   let fetchStub: ReturnType<typeof vi.fn>;
 
@@ -903,8 +1353,11 @@ describe('installTsRenderBridge', () => {
       .mockImplementation(
         (type: string, handler: EventListenerOrEventListenerObject, opts?: unknown) => {
           if (type === 'message') bridgeListener = handler as (e: MessageEvent) => unknown;
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          origAdd(type, handler as EventListener, opts as any);
+          origAdd(
+            type,
+            handler as EventListener,
+            opts as boolean | AddEventListenerOptions | undefined
+          );
         }
       );
     await import('../../../src/integrations/gpt/index');
@@ -917,9 +1370,12 @@ describe('installTsRenderBridge', () => {
   it('calls stopImmediatePropagation and fetches PBS Cache for a TS bid', async () => {
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
     const mockAd = '<div>Test Creative</div>';
+    // PBS Cache (returnCreative=false) returns the cached bid as a JSON object;
+    // the creative lives under `adm`, not as the raw response body. The bridge
+    // must parse it and forward `adm`, mirroring the Prebid Universal Creative.
     fetchStub.mockResolvedValue({
       ok: true,
-      text: () => Promise.resolve(mockAd),
+      text: () => Promise.resolve(JSON.stringify({ adm: mockAd, width: 728, height: 90 })),
     } as Response);
 
     // Capture the bridge's 'message' listener at module-init time.
@@ -930,8 +1386,11 @@ describe('installTsRenderBridge', () => {
       .mockImplementation(
         (type: string, handler: EventListenerOrEventListenerObject, opts?: unknown) => {
           if (type === 'message') bridgeListener = handler as (e: MessageEvent) => unknown;
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          origAdd(type, handler as EventListener, opts as any);
+          origAdd(
+            type,
+            handler as EventListener,
+            opts as boolean | AddEventListenerOptions | undefined
+          );
         }
       );
     await import('../../../src/integrations/gpt/index');
@@ -964,8 +1423,8 @@ describe('installTsRenderBridge', () => {
     );
     expect(stopSpy).toHaveBeenCalled();
     expect(portMessages).toHaveLength(1);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const parsed = JSON.parse(portMessages[0]) as Record<string, any>;
+
+    const parsed = JSON.parse(portMessages[0]) as PrebidResponseMessage;
     expect(parsed.message).toBe('Prebid Response');
     expect(parsed.adId).toBe('test-cache-uuid');
     expect(parsed.ad).toBe(mockAd);
@@ -983,6 +1442,142 @@ describe('installTsRenderBridge', () => {
     );
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
     expect(beaconSpy).toHaveBeenCalledTimes(2);
+    beaconSpy.mockRestore();
+  });
+
+  it('declines to render when the PBS Cache response carries no adm', async () => {
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    // A returnCreative=false JSON entry with no `adm` (VAST-only, or malformed).
+    // The bridge must NOT forward the serialized bid document to PUC.
+    fetchStub.mockResolvedValue({
+      ok: true,
+      text: () => Promise.resolve(JSON.stringify({ width: 728, height: 90 })),
+    } as Response);
+
+    const bridgeListener = await captureBridgeListener();
+    const stopSpy = vi.fn();
+    const portMessages: string[] = [];
+    const fakePort = { postMessage: (s: string) => portMessages.push(s) };
+    const source = createTrustedSlotIframe();
+
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+        ports: [fakePort],
+        source,
+        stopImmediatePropagation: stopSpy,
+      }) as unknown as MessageEvent
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    // TS owns the adId so Prebid is still stopped, but with nothing renderable
+    // the bridge sends no Prebid Response and fires no win/billing beacons.
+    expect(fetchStub).toHaveBeenCalled();
+    expect(stopSpy).toHaveBeenCalled();
+    expect(portMessages).toHaveLength(0);
+    expect(beaconSpy).not.toHaveBeenCalled();
+    beaconSpy.mockRestore();
+  });
+
+  it('renders a non-JSON PBS Cache body as raw creative markup', async () => {
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    const rawAd = '<div>Raw Cached Creative</div>';
+    // Backward compatibility: a cache that returns the creative markup directly
+    // (not a JSON bid object) is still rendered as-is.
+    fetchStub.mockResolvedValue({
+      ok: true,
+      text: () => Promise.resolve(rawAd),
+    } as Response);
+
+    const bridgeListener = await captureBridgeListener();
+    const stopSpy = vi.fn();
+    const portMessages: string[] = [];
+    const fakePort = { postMessage: (s: string) => portMessages.push(s) };
+    const source = createTrustedSlotIframe();
+
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+        ports: [fakePort],
+        source,
+        stopImmediatePropagation: stopSpy,
+      }) as unknown as MessageEvent
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    expect(portMessages).toHaveLength(1);
+
+    const parsed = JSON.parse(portMessages[0]) as PrebidResponseMessage;
+    expect(parsed.ad).toBe(rawAd);
+    expect(beaconSpy).toHaveBeenCalledTimes(2);
+    beaconSpy.mockRestore();
+  });
+
+  it('sizes a PBS Cache render from the cached bid dimensions', async () => {
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    // Cached bid is 300x250 while the slot's first format is 728x90 (from the
+    // default setup). The response must use the cached dimensions.
+    fetchStub.mockResolvedValue({
+      ok: true,
+      text: () => Promise.resolve(JSON.stringify({ adm: '<div>cached</div>', w: 300, h: 250 })),
+    } as Response);
+
+    const bridgeListener = await captureBridgeListener();
+    const portMessages: string[] = [];
+    const fakePort = { postMessage: (s: string) => portMessages.push(s) };
+    const source = createTrustedSlotIframe();
+
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+        ports: [fakePort],
+        source,
+        stopImmediatePropagation: vi.fn(),
+      }) as unknown as MessageEvent
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    expect(portMessages).toHaveLength(1);
+
+    const parsed = JSON.parse(portMessages[0]) as PrebidResponseMessage;
+    expect(parsed.width).toBe(300);
+    expect(parsed.height).toBe(250);
+    beaconSpy.mockRestore();
+  });
+
+  it('expands ${AUCTION_PRICE} from the cached bid price before responding', async () => {
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    fetchStub.mockResolvedValue({
+      ok: true,
+      text: () =>
+        Promise.resolve(
+          JSON.stringify({
+            adm: '<a href="https://t.example/win?p=${AUCTION_PRICE}">go</a>',
+            price: 2.5,
+          })
+        ),
+    } as Response);
+
+    const bridgeListener = await captureBridgeListener();
+    const portMessages: string[] = [];
+    const fakePort = { postMessage: (s: string) => portMessages.push(s) };
+    const source = createTrustedSlotIframe();
+
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+        ports: [fakePort],
+        source,
+        stopImmediatePropagation: vi.fn(),
+      }) as unknown as MessageEvent
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    expect(portMessages).toHaveLength(1);
+
+    const parsed = JSON.parse(portMessages[0]) as PrebidResponseMessage;
+    expect(parsed.ad).toContain('p=2.5');
+    expect(parsed.ad).not.toContain('${AUCTION_PRICE}');
     beaconSpy.mockRestore();
   });
 
@@ -1039,18 +1634,98 @@ describe('installTsRenderBridge', () => {
     beaconSpy.mockRestore();
   });
 
-  it('responds with adm without fetching PBS Cache when debug adm is available', async () => {
+  it('does not let one slot block a PBS Cache render for another slot sharing an adId', async () => {
+    // The in-flight guard must be scoped to the requesting slot, not the shared
+    // adId: two distinct slots sharing one hb_adid must each fetch and render.
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
-    const debugAdm = '<div>Debug Creative</div>';
+    // Deferred fetch that stays pending, so both messages are in flight when we
+    // assert the launched-fetch count.
+    fetchStub.mockReturnValue(new Promise<Response>(() => {}));
+    (window as TestWindow).tsjs = {
+      bids: {
+        slot_a: {
+          hb_adid: 'shared-uuid',
+          hb_bidder: 'ix',
+          hb_pb: '1.00',
+          hb_cache_host: 'cache.example.com',
+          hb_cache_path: '/cache',
+        },
+        slot_b: {
+          hb_adid: 'shared-uuid',
+          hb_bidder: 'ix',
+          hb_pb: '1.00',
+          hb_cache_host: 'cache.example.com',
+          hb_cache_path: '/cache',
+        },
+      },
+      adSlots: [
+        {
+          id: 'slot_a',
+          formats: [[728, 90]] as [number, number][],
+          gam_unit_path: '/a',
+          div_id: 'div-a',
+          targeting: {},
+        },
+        {
+          id: 'slot_b',
+          formats: [[300, 250]] as [number, number][],
+          gam_unit_path: '/a',
+          div_id: 'div-b',
+          targeting: {},
+        },
+      ],
+    };
+
+    const bridgeListener = await captureBridgeListener();
+
+    const mkIframe = (divId: string): Window => {
+      const slot = document.createElement('div');
+      slot.id = divId;
+      const iframe = document.createElement('iframe');
+      slot.appendChild(iframe);
+      document.body.appendChild(slot);
+      return iframe.contentWindow!;
+    };
+    const sourceA = mkIframe('div-a');
+    const sourceB = mkIframe('div-b');
+
+    try {
+      for (const source of [sourceA, sourceB]) {
+        bridgeListener(
+          Object.assign(new Event('message'), {
+            data: JSON.stringify({ message: 'Prebid Request', adId: 'shared-uuid' }),
+            ports: [{ postMessage: () => {} }],
+            source,
+            stopImmediatePropagation: vi.fn(),
+          }) as unknown as MessageEvent
+        );
+      }
+
+      // Each slot launches its own fetch — the shared adId does not cross-block.
+      expect(fetchStub).toHaveBeenCalledTimes(2);
+    } finally {
+      document.getElementById('div-a')?.remove();
+      document.getElementById('div-b')?.remove();
+      beaconSpy.mockRestore();
+    }
+  });
+
+  it('serves inline adm without fetching PBS Cache even when cache coords are present', async () => {
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    const inlineAdm = '<div>Inline Creative</div>';
     (window as TestWindow).tsjs = {
       bids: {
         homepage_header: {
           hb_adid: 'debug-adid',
           hb_bidder: 'mocktioneer',
           hb_pb: '0.20',
+          // Production shape: cache coordinates ARE present, but the bridge must
+          // prefer the local inline adm and skip the PBS Cache fetch.
+          hb_cache_host: 'cache.example.com',
+          hb_cache_path: '/pbc/v1/cache',
           nurl: 'https://debug.example/win',
           burl: 'https://debug.example/bill',
-          adm: debugAdm,
+          adm: inlineAdm,
         },
       },
       adSlots: [
@@ -1071,8 +1746,11 @@ describe('installTsRenderBridge', () => {
       .mockImplementation(
         (type: string, handler: EventListenerOrEventListenerObject, opts?: unknown) => {
           if (type === 'message') bridgeListener = handler as (e: MessageEvent) => unknown;
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          origAdd(type, handler as EventListener, opts as any);
+          origAdd(
+            type,
+            handler as EventListener,
+            opts as boolean | AddEventListenerOptions | undefined
+          );
         }
       );
     await import('../../../src/integrations/gpt/index');
@@ -1099,17 +1777,152 @@ describe('installTsRenderBridge', () => {
     expect(fetchStub).not.toHaveBeenCalled();
     expect(stopSpy).toHaveBeenCalled();
     expect(portMessages).toHaveLength(1);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const parsed = JSON.parse(portMessages[0]) as Record<string, any>;
+
+    const parsed = JSON.parse(portMessages[0]) as PrebidResponseMessage;
     expect(parsed.message).toBe('Prebid Response');
     expect(parsed.adId).toBe('debug-adid');
-    expect(parsed.ad).toBe(debugAdm);
+    expect(parsed.ad).toBe(inlineAdm);
     expect(parsed.width).toBe(728);
     expect(parsed.height).toBe(90);
     expect(beaconSpy).toHaveBeenCalledWith('https://debug.example/win');
     expect(beaconSpy).toHaveBeenCalledWith('https://debug.example/bill');
     expect(beaconSpy).toHaveBeenCalledTimes(2);
     beaconSpy.mockRestore();
+  });
+
+  it('sizes the inline response from the winning bid, not the first slot format', async () => {
+    // Multi-size slot whose winner is the SECOND configured format. Sizing from
+    // slot.formats[0] would render the 300x250 winner in a 728x90 box.
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    const winnerAdm = '<div>Winner 300x250</div>';
+    (window as TestWindow).tsjs = {
+      bids: {
+        homepage_header: {
+          hb_adid: 'winner-adid',
+          hb_bidder: 'ix',
+          hb_pb: '2.00',
+          w: 300,
+          h: 250,
+          adm: winnerAdm,
+        },
+      },
+      adSlots: [
+        {
+          id: 'homepage_header',
+          formats: [
+            [728, 90],
+            [300, 250],
+          ] as [number, number][],
+          gam_unit_path: '/a/b/c',
+          div_id: 'div-header',
+          targeting: {},
+        },
+      ],
+    };
+
+    const bridgeListener = await captureBridgeListener();
+    const stopSpy = vi.fn();
+    const portMessages: string[] = [];
+    const fakePort = { postMessage: (s: string) => portMessages.push(s) };
+    const source = createTrustedSlotIframe();
+
+    try {
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: 'winner-adid' }),
+          ports: [fakePort],
+          source,
+          stopImmediatePropagation: stopSpy,
+        }) as unknown as MessageEvent
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+      expect(portMessages).toHaveLength(1);
+
+      const parsed = JSON.parse(portMessages[0]) as PrebidResponseMessage;
+      expect(parsed.width).toBe(300);
+      expect(parsed.height).toBe(250);
+    } finally {
+      beaconSpy.mockRestore();
+    }
+  });
+
+  it('resolves the requesting slot bid when two slots share one hb_adid', async () => {
+    // Duplicate hb_adid across slots: PBS Cache is absent, so hb_adid falls back
+    // to a creative id that a bidder reuses across slots. The bridge must resolve
+    // the bid by the requesting slot, not the first bid whose hb_adid matches —
+    // otherwise every slot but the first renders blank.
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    const headerAdm = '<div>Header Creative</div>';
+    const inContentAdm = '<div>In-Content Creative</div>';
+    (window as TestWindow).tsjs = {
+      bids: {
+        homepage_header: {
+          hb_adid: 'shared-creative-id',
+          hb_bidder: 'ix',
+          hb_pb: '0.53',
+          adm: headerAdm,
+        },
+        homepage_in_content: {
+          hb_adid: 'shared-creative-id',
+          hb_bidder: 'ix',
+          hb_pb: '0.40',
+          adm: inContentAdm,
+        },
+      },
+      adSlots: [
+        {
+          id: 'homepage_header',
+          formats: [[728, 90]] as [number, number][],
+          gam_unit_path: '/a/b/c',
+          div_id: 'div-header',
+          targeting: {},
+        },
+        {
+          id: 'homepage_in_content',
+          formats: [[300, 250]] as [number, number][],
+          gam_unit_path: '/a/b/c',
+          div_id: 'div-in-content',
+          targeting: {},
+        },
+      ],
+    };
+
+    const bridgeListener = await captureBridgeListener();
+    const stopSpy = vi.fn();
+    const portMessages: string[] = [];
+    const fakePort = { postMessage: (s: string) => portMessages.push(s) };
+
+    // Iframe belongs to the SECOND slot, whose bid is not the first hb_adid match.
+    const slot = document.createElement('div');
+    slot.id = 'div-in-content';
+    const iframe = document.createElement('iframe');
+    slot.appendChild(iframe);
+    document.body.appendChild(slot);
+    const source = iframe.contentWindow!;
+
+    try {
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: 'shared-creative-id' }),
+          ports: [fakePort],
+          source,
+          stopImmediatePropagation: stopSpy,
+        }) as unknown as MessageEvent
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+      expect(portMessages).toHaveLength(1);
+
+      const parsed = JSON.parse(portMessages[0]) as PrebidResponseMessage;
+      // The requesting slot's own creative and dimensions, not the first match's.
+      expect(parsed.ad).toBe(inContentAdm);
+      expect(parsed.width).toBe(300);
+      expect(parsed.height).toBe(250);
+    } finally {
+      slot.remove();
+      beaconSpy.mockRestore();
+    }
   });
 
   it('falls back to keepalive fetch when sendBeacon is unavailable', async () => {
@@ -1121,7 +1934,7 @@ describe('installTsRenderBridge', () => {
     });
 
     try {
-      (window as TestWindow).tsjs.bids.homepage_header = {
+      (window as TestWindow).tsjs!.bids!.homepage_header = {
         hb_adid: 'debug-no-beacon',
         hb_bidder: 'mocktioneer',
         hb_pb: '0.20',
@@ -1167,7 +1980,7 @@ describe('installTsRenderBridge', () => {
 
   it('falls back to keepalive fetch when sendBeacon rejects the payload', async () => {
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(false);
-    (window as TestWindow).tsjs.bids.homepage_header = {
+    (window as TestWindow).tsjs!.bids!.homepage_header = {
       hb_adid: 'debug-rejected-beacon',
       hb_bidder: 'mocktioneer',
       hb_pb: '0.20',
@@ -1250,7 +2063,7 @@ describe('installTsRenderBridge', () => {
   it('ignores a request whose source slot does not own the resolved adId', async () => {
     // Two configured slots; slot A's iframe requests slot B's hb_adid. The
     // bridge must not return slot B's creative or fire slot B's beacons.
-    (window as TestWindow).tsjs.bids.homepage_footer = {
+    (window as TestWindow).tsjs!.bids!.homepage_footer = {
       hb_adid: 'footer-uuid',
       hb_bidder: 'kargo',
       hb_pb: '2.00',
@@ -1259,7 +2072,7 @@ describe('installTsRenderBridge', () => {
       nurl: 'https://ssp.example/footer-win',
       burl: 'https://ssp.example/footer-bill',
     };
-    (window as TestWindow).tsjs.adSlots.push({
+    (window as TestWindow).tsjs!.adSlots!.push({
       id: 'homepage_footer',
       formats: [[300, 250]] as [number, number][],
       gam_unit_path: '/a/b/footer',
