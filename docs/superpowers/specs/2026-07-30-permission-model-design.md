@@ -210,7 +210,7 @@ Validation rejects:
 ### 3.4 One source of jurisdiction truth
 
 Today, `detect_jurisdiction` — driven by the runtime lists
-`consent.gdpr.applies_in` and `consent.us_privacy.states` — is the sole
+`consent.gdpr.applies_in` and `consent.us_states.privacy_states` — is the sole
 jurisdiction source for **both** the auction consent gate and the EC gate.
 The permission model replaces the EC side; if the auction gate keeps reading
 the old lists while EC reads policy rules, the two will drift (adding a
@@ -225,7 +225,7 @@ survive an interim period, a CI test asserts consistency between each list
 and the policy's regime classes, with deliberate divergences recorded as
 explicit, commented exceptions in the test — never silent. Both legacy
 lists are in scope, not only the GDPR one — and the US check is
-region-shaped: **every configured `consent.us_privacy.states` entry must
+region-shaped: **every configured `consent.us_states.privacy_states` entry must
 have a matching `US/<state>` rule**, and the country-level `US` rule must
 resolve non-regulated (today applies privacy gating only to the configured
 states), or the divergence is an explicit commented exception. An adapter
@@ -356,8 +356,15 @@ The triggers, exhaustively — nothing else withdraws:
    targeted-advertising) never trigger this — they revoke acquisition
    only. (For US states this preserves today's behavior; elsewhere it is
    the declared change of §4's global-opt-out rule.)
-2. **A TCF record refusing `store-on-device` withdraws iff the baseline is
-   `requires_signal` or `denied`.** Where the baseline is `granted`,
+2. **A TCF record refusing `store-on-device` withdraws iff the baseline
+   is `requires_signal` or `denied` — and only when the refusal is
+   carried by the live request.** A persisted-KV consent record
+   participates in acquisition only and **never triggers withdrawal**:
+   without this, a refusal stored years ago under a `granted` policy
+   would destructively fire on the first signal-less request after the
+   policy tightens to `denied` — a policy edit tombstoning by proxy,
+   which trigger 3 forbids, and the counterexample to §5.5's
+   mixed-revision safety claim. Where the baseline is `granted`,
    refusal blocks _new_ grants but never tombstones: tombstones are
    irreversible, and PR #838 wrote them for visitors in unregulated
    jurisdictions whose global CMP emitted a purpose-refusing string —
@@ -410,25 +417,43 @@ and the fail-closed marker:
   discoverable from every member, and the record survives member-tombstone
   replacement (which today discards the original row's identity and
   metadata, making sibling discovery impossible).
+- **Negative authority has its own permission-exempt record.** A live
+  refusal or non-destructive opt-out must clear prior positive
+  provenance — but the row write that would do it requires `store-on-device`,
+  which the refusal just unset, and identity rows may be eventually
+  consistent, so a stale replica could resurrect a P4 grant after a
+  targeted-advertising opt-out. The fix is a **suppression record** in
+  the strongly consistent class (providers spec §6.3: `sup/<family-id>`),
+  carrying per-permission suppression entries with timestamps. Writing it
+  is **permission-exempt** (clearing authority is protective, like
+  revocation), and **every S2S recompute and partner-egress check
+  consults it**: a suppressed permission is unset whatever the row's
+  provenance says, so no eventual-consistency edge can restore it.
 - **The cookie expires only after the family record commits.**
 - **If the family-record write itself fails, nothing durable exists** —
-  the cookie stays and the durable client-side signal (GPC, CMP-stored TCF)
-  retries the whole withdrawal on the next request. Two mitigations bound
-  the S2S residual in the meantime: while graph **writes are degraded**
-  (health signal), S2S partner egress and sync updates fail closed
-  (providers spec §6.2); and the failure is logged at `error` with a
-  metric feeding the operational repair path. The residual that remains —
-  a single failed write on an otherwise healthy graph, for a user who
-  never returns — is declared here, not hidden.
-- **Consistency and retention are backend contracts**, defined in the
-  providers spec consistency matrix (§7): revocation-record reads use the
-  strongest read the backend offers, adapters declare a bounded
-  revocation-visibility lag (an eventually-consistent store that cannot
-  bound it fails startup for identity features), a **failed family-record
+  the cookie stays and the durable client-side signal (GPC, CMP-stored
+  TCF) retries the whole withdrawal on the next request. Mitigations:
+  while graph **writes are degraded** (health signal), S2S partner egress
+  and sync updates fail closed on that instance (providers spec §6.2);
+  the failure is logged at `error` with a metric feeding the operational
+  repair path. The residual that remains — a single failed write on an
+  otherwise healthy graph, for a visitor who **never returns** — is
+  **unbounded**, not "bounded by return latency": return latency has no
+  bound for a non-returning visitor, and the per-instance breaker does
+  not reach other instances. Accepting this residual instead of building
+  a durable external retry queue is **product sign-off item 11**
+  (migration spec §8), not a footnote.
+- **Consistency and retention are backend contracts with a single
+  normative home**: the providers spec consistency matrix (§7). It — not
+  this spec — states the requirement, and it requires a **strongly
+  consistent (read-after-write) primitive** for revocation records; no
+  bounded-lag alternative exists (an earlier draft here permitted one,
+  which contradicted the matrix — an adapter with a two-second lag would
+  have passed one spec and failed the other). A **failed family-record
   read fails closed** for egress (revoked-unknown ≠ live), and revocation
   records are retained beyond the maximum of cookie lifetime, row TTL,
-  rewrite grace, and downstream retry horizon — note today's 24-hour
-  tombstone TTL is far below this bar and does not carry over.
+  rewrite grace, and downstream retry horizon — today's 24-hour tombstone
+  TTL is far below this bar and does not carry over.
 - Fault-injection tests cover: family-record write fails → cookie
   untouched, S2S behavior per degraded mode, retry completes; member
   tombstone N fails after the family record → identity already revoked for
@@ -474,17 +499,18 @@ withdrawal. Section IDs and versions are those of the IAB GPP
 specification current at implementation time; adding a section or field is
 a change to this table.
 
-| Source · field                               | Value         | `store-on-device` (P1) | `select-personalised-ads` (P4) | Destructive withdrawal?                                                                                            |
-| -------------------------------------------- | ------------- | ---------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
-| GPP US section · `SaleOptOut`                | opted out     | opt-out                | opt-out                        | **Yes** (preserves today)                                                                                          |
-| GPP US section · `SaleOptOut`                | not opted out | grant                  | grant                          | —                                                                                                                  |
-| GPP US section · `SharingOptOut`             | opted out     | —                      | opt-out                        | No                                                                                                                 |
-| GPP US section · `SharingOptOut`             | not opted out | —                      | grant                          | —                                                                                                                  |
-| GPP US section · `TargetedAdvertisingOptOut` | opted out     | —                      | opt-out                        | **No** — a targeted-advertising choice must never destroy the stored identity                                      |
-| GPP US section · `TargetedAdvertisingOptOut` | not opted out | —                      | grant                          | —                                                                                                                  |
-| US Privacy · `opt_out_sale`                  | `Y`           | opt-out                | opt-out                        | **Yes** (preserves today)                                                                                          |
-| US Privacy · present, `N` or N/A             | —             | grant                  | grant                          | — (today's tests pin N/A as allowing; USP carries no distinct targeted-advertising field, so it never maps to one) |
-| Any field                                    | absent / N-A  | —                      | —                              | —                                                                                                                  |
+| Source · field                               | Value                       | `store-on-device` (P1)                 | `select-personalised-ads` (P4)         | Destructive withdrawal?                                                                                            |
+| -------------------------------------------- | --------------------------- | -------------------------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| GPP US section · `SaleOptOut`                | opted out                   | opt-out                                | opt-out                                | **Yes** (preserves today)                                                                                          |
+| GPP US section · `SaleOptOut`                | not opted out               | grant                                  | grant                                  | —                                                                                                                  |
+| GPP US section · `SharingOptOut`             | opted out                   | —                                      | opt-out                                | No                                                                                                                 |
+| GPP US section · `SharingOptOut`             | not opted out               | —                                      | grant                                  | —                                                                                                                  |
+| GPP US section · `TargetedAdvertisingOptOut` | opted out                   | —                                      | opt-out                                | **No** — a targeted-advertising choice must never destroy the stored identity                                      |
+| GPP US section · `TargetedAdvertisingOptOut` | not opted out               | —                                      | grant                                  | —                                                                                                                  |
+| US Privacy · `opt_out_sale`                  | `Y`                         | opt-out                                | opt-out                                | **Yes** (preserves today)                                                                                          |
+| US Privacy · present, `N` or N/A             | —                           | grant                                  | grant                                  | — (today's tests pin N/A as allowing; USP carries no distinct targeted-advertising field, so it never maps to one) |
+| Any field                                    | explicitly _Not Applicable_ | as the field's not-opted-out row above | as the field's not-opted-out row above | —                                                                                                                  |
+| Any field                                    | absent                      | —                                      | —                                      | —                                                                                                                  |
 
 **N/A vs absent:** a field explicitly set to _Not Applicable_ is treated
 as not-opted-out (grant-class) — pinned by today's USP tests and matching
@@ -495,17 +521,29 @@ nothing.
 
 **Applicability and aggregation — ordered algorithm:**
 
-1. **Section map (normative, pinned here — not "whatever GPP is current"):**
-   `US` national ↔ GPP section 7 (usnat); `US/CA` ↔ 8 (usca); `US/VA` ↔ 9
-   (usva); `US/CO` ↔ 10 (usco); `US/UT` ↔ 11 (usut); `US/CT` ↔ 12 (usct).
-   Section versions are those published at this spec's date; adding a
-   section or version is a change to this map.
-2. **Determine applicability from the resolved jurisdiction:** the
-   national section is applicable to any `us-privacy`-regime request; a
-   state section is applicable iff it maps to the resolved `US/<state>`.
-   Foreign-state sections (a `usca` string on a `US/CO` request) and all
-   sections on non-`us-privacy` requests are **not applicable** and
-   contribute nothing. Regionless US traffic: national section only.
+1. **Section map (normative, pinned here — not "whatever GPP is
+   current"), covering every section current code recognizes (7–23), not
+   a subset:** `US` national ↔ 7 (usnat); then the state sections —
+   `US/CA` ↔ 8, `US/VA` ↔ 9, `US/CO` ↔ 10, `US/UT` ↔ 11, `US/CT` ↔ 12,
+   `US/FL` ↔ 13, `US/MT` ↔ 14, `US/OR` ↔ 15, `US/TX` ↔ 16, `US/DE` ↔ 17,
+   `US/IA` ↔ 18, `US/NE` ↔ 19, `US/NH` ↔ 20, `US/NJ` ↔ 21, `US/TN` ↔ 22,
+   `US/MN` ↔ 23. Dropping to 7–12 would silently lose, e.g., a Texas
+   (section 16) sale opt-out. The implementation PR cross-checks this
+   list against the current decoder's section set; versions are those
+   published at this spec's date; adding a section or version is a change
+   to this map.
+2. **Applicability gates grants only — never opt-outs.** A mapped
+   **opt-out** field (either subclass) is honored from **any** section on
+   **any** request, whatever the regime — this is §4's global-opt-out
+   rule, and filtering it by jurisdiction would make a French visitor's
+   `usnat SaleOptOut` simultaneously mandatory (§4) and ignored (here).
+   For **grants**: the national section is applicable to any
+   `us-privacy`-regime request; a state section is applicable iff it maps
+   to the resolved `US/<state>`; foreign-state sections and all sections
+   on non-`us-privacy` requests grant nothing. Regionless US traffic:
+   national section only. A configured privacy state with no
+   state-specific section (e.g. MD, IN, KY, RI today) uses the national
+   section alone.
 3. **State-over-national, per field:** where an applicable state section
    carries a field, it governs that field; the national section fills only
    fields the state section lacks.
@@ -652,6 +690,8 @@ Consumers of the resolved set in this epic:
    | Request-scoped graph reads/writes (non-revocation)               | `store-on-device`                                   |                                                                                                                                                                                                                                           |
    | Revocation paths (tombstones, withdrawal reads)                  | **exempt**                                          | Must work when permissions are unset                                                                                                                                                                                                      |
    | Stored consent-state lookup (§4.4)                               | **exempt**, narrowly scoped                         | Determining `store-on-device` cannot require `store-on-device`                                                                                                                                                                            |
+   | Integration persistent response cookies (hook spec §3)           | `store-on-device`                                   | Applied at mutation time from the request's resolved permissions; session cookies are the declared exemption (sign-off items 9–10)                                                                                                        |
+   | Suppression-record writes (§4.3)                                 | **exempt**                                          | Clearing authority is protective, like revocation                                                                                                                                                                                         |
 
    With **no EC provider configured**, identity use fails closed: a cookie
    value present on the request never egresses anywhere — never vacuously
@@ -668,11 +708,11 @@ Consumers of the resolved set in this epic:
    spec §6.1). Freshness is a **per-evidence-class contract**, because not
    every source carries a timestamp:
 
-   | Evidence class                                    | Authoritative timestamp                                                                                   | Age reset                                                                                                                    | Max age                   |
-   | ------------------------------------------------- | --------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- | ------------------------- |
-   | TCF consent                                       | The record's `LastUpdated`                                                                                | Only a record with a **newer** `LastUpdated`                                                                                 | Existing TCF expiry TTL   |
-   | GPP / USP values (no intrinsic timestamp)         | **First-seen**: when TS first observed this exact normalized value (equality digest stored in provenance) | Re-presenting an identical digest **keeps the original first-seen**; a different value is new evidence with a new first-seen | Consent TTL (same as TCF) |
-   | Policy-baseline grant (`granted` rule, no signal) | The policy revision that granted                                                                          | Re-derived on every recompute against the current revision — policy is not user evidence and does not age; it changes        | n/a                       |
+   | Evidence class                                    | Authoritative timestamp                                                                                                                                                                                                                                                                                                | Age reset                                                                                                                    | Max age                   |
+   | ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- | ------------------------- |
+   | TCF consent                                       | The record's `LastUpdated`                                                                                                                                                                                                                                                                                             | Only a record with a **newer** `LastUpdated`                                                                                 | Existing TCF expiry TTL   |
+   | GPP / USP values (no intrinsic timestamp)         | **First-seen**: when TS first observed this exact normalized value (a **per-permission equality digest computed over only the applicable, aggregated §4.5 fields for that permission** — never the whole GPP record, or a CMP touching an unrelated notice field would mint a new digest and reset first-seen forever) | Re-presenting an identical digest **keeps the original first-seen**; a different value is new evidence with a new first-seen | Consent TTL (same as TCF) |
+   | Policy-baseline grant (`granted` rule, no signal) | The policy revision that granted                                                                                                                                                                                                                                                                                       | Re-derived on every recompute against the current revision — policy is not user evidence and does not age; it changes        | n/a                       |
 
    Timestamps are compared with bounded clock-skew tolerance and
    future-dated values are clamped to receipt time. And every live

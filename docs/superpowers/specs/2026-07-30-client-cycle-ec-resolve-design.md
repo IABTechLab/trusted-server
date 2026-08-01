@@ -85,10 +85,15 @@ Everything in this spec follows from that.
    must be parseable, graph-keyed, and tombstonable by the selected provider
    (providers spec §3). The conformance suite runs against every
    client-cycle provider.
-5. **Exist on every adapter.** Route registration goes through shared route
-   wiring; the parity suite asserts the endpoint's presence and behavior on
-   all four adapters. (PR #838 registered it on Fastly only, so the same
-   config on the Axum dev server proxied the POST to the publisher origin.)
+5. **Exist on every adapter — where parity means identical behavior,
+   including identical refusal.** Route registration goes through shared
+   route wiring. On adapters whose capability matrix rows are green
+   (today only the dev adapter has the required CAS class — providers
+   spec §7), the parity suite asserts identical endpoint behavior; on
+   adapters without them, parity means **identical startup rejection of
+   the client-cycle selection** — not a proxied 404 (PR #838's failure
+   mode: Fastly-only registration let the Axum dev server proxy the POST
+   to the publisher origin), and not a silently absent route.
 6. **Be uncacheable and permission-gated on the provider's full
    declaration.** `Cache-Control: no-store`; before any cookie is set,
    the endpoint enforces the selected provider's complete
@@ -157,13 +162,18 @@ Everything in this spec follows from that.
    explicitly-accepted at-most-once posture (no owner hash), a lost
    response is an **orphan row** handled by the specified cleanup path.
    The **same-identity no-op of §3.8 first checks the family revocation
-   record** (permission model spec §4.3), and it does so **through the
-   linearizable primitive class this feature already requires** for
-   reservations (providers spec §7 matrix) — which is what makes
-   "revocation wins" true rather than aspirational: on an eventually
-   consistent read, a racing create could observe a stale absence and
-   emit a cookie for a revoked family. A resolve against a revoked family
-   is rejected, never refreshed, and a create racing a revocation loses. Tests cover crash-between-steps, lease
+   record**, and "revocation wins" is enforced by an explicit
+   linearization point, not by read strength alone — a linearizable read
+   followed by a separate commit still loses the race (read "not
+   revoked" → withdrawal commits → resolve emits a cookie for a revoked
+   family). The family record carries an **epoch** (providers spec
+   §6.3), bumped by every revocation-state change; the resolve reads
+   epoch _e_ at the start, and its cookie-emitting commit is a **CAS in
+   the strong class conditioned on the family epoch still being _e_**.
+   A withdrawal landing between read and commit bumps the epoch, the
+   commit fails, and the resolve is rejected — the CAS is the
+   linearization point. A resolve against an already-revoked family is
+   rejected, never refreshed. Tests cover crash-between-steps, lease
    takeover with a stale-epoch commit attempt, two concurrent requests
    with the same payload, a duplicate from a second client receiving no
    cookie, owner-hash recovery receiving the cookie, and

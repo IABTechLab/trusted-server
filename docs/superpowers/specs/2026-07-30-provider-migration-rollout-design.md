@@ -32,29 +32,29 @@ and whether that is a preservation or a declared change. **Silent changes are
 defects.** PR #838 changed six of these without declaring any; each was
 discoverable only because a deleted test had pinned the old behavior.
 
-| #   | Decision (today)                                                                                                                                                                    | After epic                                                                                                                                                                                                                                                        | Status                                                                                                |
-| --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| 1   | EU/GDPR request, no TCF consent → no EC                                                                                                                                             | Same (opt-in baseline)                                                                                                                                                                                                                                            | Preserved                                                                                             |
-| 2   | US-state request, GPC/GPP/USP opt-out → no EC, existing EC expired + tombstoned, **even when a consenting TCF string is present**                                                   | Same (precedence §4 of permission spec)                                                                                                                                                                                                                           | Preserved — **must not regress**                                                                      |
-| 3   | US-state request, no signals at all → no EC (fail-closed)                                                                                                                           | Preserved by the recipe: the US rule is `requires_signal`, and the extended grant-signal class (permission spec §4) is what makes that possible — `granted` would allow no-signal traffic; a TCF-only grant class could not grant from GPP/USP values             | Preserved under the recipe                                                                            |
-| 3a  | US-state request, explicit GPP `sale_opt_out = false` or a US Privacy string that is present and not opting out (including "not applicable") → EC allowed                           | Same: these are grant-class signals satisfying `requires_signal` (permission spec §4)                                                                                                                                                                             | Preserved — **must not regress**                                                                      |
-| 3b  | US-state request, TCF record present and refusing Purpose 1 (no US opt-out signal) → no EC                                                                                          | Same: refusal beats coexisting non-TCF grant signals (permission spec §4, precedence 3–4)                                                                                                                                                                         | Preserved                                                                                             |
-| 3c  | Consent-record conflict modes (restrictive/permissive/newest), expiry, KV fallback, proxy mode                                                                                      | Each row of the normalization matrix (permission spec §4.4) is individually marked preserved or changed there; changed rows: malformed-present now blocks acquisition                                                                                             | Per §4.4 matrix                                                                                       |
-| 3d  | Valid + expired consent records: conflict resolution runs first and can select the expired record                                                                                   | Expired sources drop **before** conflict resolution (permission spec §4.4 pipeline)                                                                                                                                                                               | **Changed (declared)**                                                                                |
-| 3e  | Only the GPP sale field (and USP) is consulted; `SharingOptOut` / `TargetedAdvertisingOptOut` are ignored                                                                           | All three fields enforced per the §4.5 mapping (targeted-advertising affects P4 only, never destructive)                                                                                                                                                          | **New enforcement, declared** — strictly more protective                                              |
-| 3f  | Non-privacy-state US traffic (e.g. Wyoming) is non-regulated → EC allowed                                                                                                           | Same: policy enumerates `US/<state>` rules for configured privacy states; country-level `US` resolves non-regulated (permission spec §3.4)                                                                                                                        | Preserved — **must not regress** (a country-wide `US = "us-opt-out"` rule would deny all of it)       |
-| 3g  | Graph rows persist JA4 class, H2 fingerprint hash, and buyer-facing quality metadata                                                                                                | Discontinued for new rows; v1 values retained read-only, never egressed, dropped at rewrite (providers spec §6.3)                                                                                                                                                 | **Changed (declared)** — more protective                                                              |
-| 4   | UK request, no TCF record → no EC                                                                                                                                                   | Same, unless the policy deliberately adopts a `granted` storage baseline for GB, with citation and sign-off                                                                                                                                                       | Declared change (if made)                                                                             |
-| 5   | No country resolvable (geo unavailable) → no EC (fail-closed)                                                                                                                       | `default_country` baseline, constrained by permission spec §5.3 so the fail-open combination cannot occur silently                                                                                                                                                | Declared change, guarded                                                                              |
-| 6   | Non-regulated country, TCF record refusing Purpose 1 → EC still created, existing identity never tombstoned                                                                         | Refusal now blocks _new_ grants everywhere (permission spec §4, precedence 3) — a declared, more-protective change. Existing identity is still **never tombstoned** where the baseline is `granted` (permission spec §4.2)                                        | Split: creation is a declared change; no-tombstone is preserved                                       |
-| 7   | Country resolved but not in any regulation list ("non-regulated") → EC created, EIDs pass through                                                                                   | Governed by the policy's `rules.default` entry (permission spec §5.4). The §5 recipe sets it to a `granted` baseline to preserve today's behavior; the protective example policy instead requires a signal worldwide — a declared operator choice between the two | Preserved under the recipe; declared change under the protective default                              |
-| 8   | Opt-out signal (GPC/GPP/USP) **outside** US states → ignored today                                                                                                                  | Revokes and withdraws globally (permission spec §4 and §4.2 trigger 1) — including tombstoning, which is irreversible                                                                                                                                             | Declared change, more protective, **irreversible** — see §6.4                                         |
-| 9   | Fastly bot gate requires JA4 + platform class before KV-backed EC writes                                                                                                            | Only with `[device] provider = "fastly"`; the `builtin` default is UA-only                                                                                                                                                                                        | Declared change with a documented restore step (§5)                                                   |
-| 10  | Fastly always resolves geo per request                                                                                                                                              | Only with `[geo] provider = "platform"`. The neutral geo default flips **only** in the permission model PR, together with the §5.3 guard — never in an intermediate step where absent geo would fail closed and zero EC issuance (providers spec §11)             | Declared change, sequenced, with a documented restore step (§5)                                       |
-| 11a | Raw EC egress on paths gated by the jurisdiction gate today (OpenRTB `user.id`, derived request IDs, page bids, EIDs, identify, pull sync — pull checks the live `EcContext` today) | Gated by the egress inventory (permission spec §7): bidstream and partner egress require both purposes, revocation exempt — at least as strict as today for every path                                                                                            | Preserved (strengthened); **must not regress** — PR #838 gated only EIDs and left `user.id` reachable |
-| 11b | Proxy / click / Testlight forwarding extract the raw EC cookie/header **without** today's jurisdiction gate                                                                         | Gated by the egress inventory (both purposes)                                                                                                                                                                                                                     | **New privacy hardening, declared change** — not preservation                                         |
-| 11c | Batch sync today only authenticates the S2S caller and checks live/tombstoned row state — it is **not** jurisdiction-gated                                                          | Gated by stored-provenance recompute (permission spec §7); legacy rows fail closed until backfilled                                                                                                                                                               | **New privacy hardening, declared change** — not preservation                                         |
-| 12  | EC generation succeeds without a configured identity-graph store                                                                                                                    | A minting provider requires an openable graph store at startup (providers spec §5, §6); pre-N+1 readiness step provisions it                                                                                                                                      | **Breaking, declared** — graphless deployments must provision storage before upgrading                |
+| #   | Decision (today)                                                                                                                                                                    | After epic                                                                                                                                                                                                                                                        | Status                                                                                                                                                                                                 |
+| --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 1   | EU/GDPR request, no TCF consent → no EC                                                                                                                                             | Same (opt-in baseline)                                                                                                                                                                                                                                            | Preserved                                                                                                                                                                                              |
+| 2   | US-state request, GPC/GPP/USP opt-out → no EC, existing EC expired + tombstoned, **even when a consenting TCF string is present**                                                   | Same (precedence §4 of permission spec)                                                                                                                                                                                                                           | Preserved — **must not regress**                                                                                                                                                                       |
+| 3   | US-state request, no signals at all → no EC (fail-closed)                                                                                                                           | Preserved by the recipe: the US rule is `requires_signal`, and the extended grant-signal class (permission spec §4) is what makes that possible — `granted` would allow no-signal traffic; a TCF-only grant class could not grant from GPP/USP values             | Preserved under the recipe                                                                                                                                                                             |
+| 3a  | US-state request, explicit GPP `sale_opt_out = false` or a US Privacy string that is present and not opting out (including "not applicable") → EC allowed                           | Same: these are grant-class signals satisfying `requires_signal` (permission spec §4)                                                                                                                                                                             | Preserved — **must not regress**                                                                                                                                                                       |
+| 3b  | US-state request, TCF record present and refusing Purpose 1 (no US opt-out signal) → no EC                                                                                          | Same: refusal beats coexisting non-TCF grant signals (permission spec §4, precedence 3–4)                                                                                                                                                                         | Preserved                                                                                                                                                                                              |
+| 3c  | Consent-record conflict modes (restrictive/permissive/newest), expiry, KV fallback, proxy mode                                                                                      | Each row of the normalization matrix (permission spec §4.4) is individually marked preserved or changed there; changed rows: malformed-present now blocks acquisition                                                                                             | Per §4.4 matrix                                                                                                                                                                                        |
+| 3d  | Valid + expired consent records: conflict resolution runs first and can select the expired record                                                                                   | Expired sources drop **before** conflict resolution (permission spec §4.4 pipeline)                                                                                                                                                                               | **Changed (declared)**                                                                                                                                                                                 |
+| 3e  | Only the GPP sale field (and USP) is consulted; `SharingOptOut` / `TargetedAdvertisingOptOut` are ignored                                                                           | All three fields enforced per the §4.5 mapping (targeted-advertising affects P4 only, never destructive)                                                                                                                                                          | **New enforcement, declared** — opt-out effects are more protective; the same fields' not-opted-out values can also **newly grant P4**, which is not (both effects classified in permission spec §4.5) |
+| 3f  | Non-privacy-state US traffic (e.g. Wyoming) is non-regulated → EC allowed                                                                                                           | Same: policy enumerates `US/<state>` rules for configured privacy states; country-level `US` resolves non-regulated (permission spec §3.4)                                                                                                                        | Preserved — **must not regress** (a country-wide `US = "us-opt-out"` rule would deny all of it)                                                                                                        |
+| 3g  | Graph rows persist JA4 class, H2 fingerprint hash, and buyer-facing quality metadata                                                                                                | Discontinued for new rows; v1 values retained read-only, never egressed, dropped at rewrite (providers spec §6.3)                                                                                                                                                 | **Changed (declared)** — more protective                                                                                                                                                               |
+| 4   | UK request, no TCF record → no EC                                                                                                                                                   | Same, unless the policy deliberately adopts a `granted` storage baseline for GB, with citation and sign-off                                                                                                                                                       | Declared change (if made)                                                                                                                                                                              |
+| 5   | No country resolvable (geo unavailable) → no EC (fail-closed)                                                                                                                       | `default_country` baseline, constrained by permission spec §5.3 so the fail-open combination cannot occur silently                                                                                                                                                | Declared change, guarded                                                                                                                                                                               |
+| 6   | Non-regulated country, TCF record refusing Purpose 1 → EC still created, existing identity never tombstoned                                                                         | Refusal now blocks _new_ grants everywhere (permission spec §4, precedence 3) — a declared, more-protective change. Existing identity is still **never tombstoned** where the baseline is `granted` (permission spec §4.2)                                        | Split: creation is a declared change; no-tombstone is preserved                                                                                                                                        |
+| 7   | Country resolved but not in any regulation list ("non-regulated") → EC created, EIDs pass through                                                                                   | Governed by the policy's `rules.default` entry (permission spec §5.4). The §5 recipe sets it to a `granted` baseline to preserve today's behavior; the protective example policy instead requires a signal worldwide — a declared operator choice between the two | Preserved under the recipe; declared change under the protective default                                                                                                                               |
+| 8   | Opt-out signal (GPC/GPP/USP) **outside** US states → ignored today                                                                                                                  | Revokes and withdraws globally (permission spec §4 and §4.2 trigger 1) — including tombstoning, which is irreversible                                                                                                                                             | Declared change, more protective, **irreversible** — see §6.4                                                                                                                                          |
+| 9   | Fastly bot gate requires JA4 + platform class before KV-backed EC writes                                                                                                            | Only with `[device] provider = "fastly"`; the `builtin` default is UA-only                                                                                                                                                                                        | Declared change with a documented restore step (§5)                                                                                                                                                    |
+| 10  | Fastly always resolves geo per request                                                                                                                                              | Only with `[geo] provider = "platform"`. The neutral geo default flips **only** in the permission model PR, together with the §5.3 guard — never in an intermediate step where absent geo would fail closed and zero EC issuance (providers spec §11)             | Declared change, sequenced, with a documented restore step (§5)                                                                                                                                        |
+| 11a | Raw EC egress on paths gated by the jurisdiction gate today (OpenRTB `user.id`, derived request IDs, page bids, EIDs, identify, pull sync — pull checks the live `EcContext` today) | Gated by the egress inventory (permission spec §7): bidstream and partner egress require both purposes, revocation exempt — at least as strict as today for every path                                                                                            | Preserved (strengthened); **must not regress** — PR #838 gated only EIDs and left `user.id` reachable                                                                                                  |
+| 11b | Proxy / click / Testlight forwarding extract the raw EC cookie/header **without** today's jurisdiction gate                                                                         | Gated by the egress inventory (both purposes)                                                                                                                                                                                                                     | **New privacy hardening, declared change** — not preservation                                                                                                                                          |
+| 11c | Batch sync today only authenticates the S2S caller and checks live/tombstoned row state — it is **not** jurisdiction-gated                                                          | Gated by stored-provenance recompute (permission spec §7); legacy rows fail closed until backfilled                                                                                                                                                               | **New privacy hardening, declared change** — not preservation                                                                                                                                          |
+| 12  | EC generation succeeds without a configured identity-graph store                                                                                                                    | A minting provider requires an openable graph store at startup (providers spec §5, §6); pre-N+1 readiness step provisions it                                                                                                                                      | **Breaking, declared** — graphless deployments must provision storage before upgrading                                                                                                                 |
 
 Rows 3, 4, and 7 are policy decisions, not code decisions: they belong in
 the `[permissions]` policy review, made explicitly by maintainers — not
@@ -119,21 +119,47 @@ Requirements:
      after **fleet convergence on N+1 is confirmed** — binaries first,
      convergence gate, then `ts config push`. A config mixing old and new
      fields (`[ec] passphrase` alongside `[ec] provider`) is **rejected**
-     by N+1, not reconciled. **Rollback is binaries-first too, in the
-     other direction**: N+2 → N+1 binaries roll back **keeping the new
-     config** (N+1 reads it fully — reverting config first would hand the
-     old shape to N+2 binaries that reject it). N+1 additionally
-     **rejects provider or version selections whose provenance it cannot
-     yet encode** — new-provider adoption waits for N+2, so no row is
-     minted that N+2 would misclassify. Every new config section
-     introduced by the epic follows this same compatibility rule, not
-     only `[ec]`.
+     by N+1, not reconciled. **N+1 is a full semantic reader and
+     enforcer for every N+2 record kind — not a field preserver.**
+     Preserving unknown JSON does not chase aliases, consult family
+     revocations, honor suppression records, or fail closed on
+     provenance; an N+1 that merely preserved would, after rollback,
+     treat aliased rows as missing and revoked identities as live.
+     Rollback tests therefore run the alias, family-revocation,
+     suppression, and provenance paths **on N+1** against N+2-written
+     data. **Rollback is binaries-first too, in the other direction** —
+     N+2 → N+1 binaries roll back keeping the new config (N+1 reads it
+     fully; reverting config first would hand the old shape to N+2
+     binaries that reject it) — **with one precondition**: if an
+     N+2-only provider or version has been adopted, the fleet must first
+     converge on an N+1-compatible new-shape config (deselecting what
+     N+1 rejects, retaining the new provider's secrets as a **legacy
+     reader** so its minted identities keep resolving and stay
+     withdrawable until they expire — never "revert to the previous
+     config", which would strand them); only then do binaries roll back.
+     N+1 additionally **rejects provider or version selections whose
+     provenance it cannot yet encode** — new-provider adoption waits for
+     N+2, so no row is minted that N+2 would misclassify. Every new
+     config section introduced by the epic follows this same
+     compatibility rule, not only `[ec]`.
    - **Release N+2:** rejects `[ec] passphrase` at startup with a message
      naming the new location — not a generic unknown-field error
      (implementation note: producing the actionable message means keeping
      a deprecated `passphrase` field whose presence triggers the custom
      error).
-2. **Graph-store readiness precedes everything.** Today the graph store
+2. **Revocation-eligible storage is a per-adapter gate, and ungated
+   adapters migrate stateless.** Identity features require the adapter's
+   strong-consistency rows in the capability matrix (providers spec §7)
+   to be green: today that means Fastly must _verify_ its KV read
+   semantics, Cloudflare must wire a Durable-Object-class primitive, and
+   Spin must wire storage at all. Until an adapter passes the gate, its
+   migration fixture is **explicitly stateless** (`provider = "none"`,
+   no `[permissions]`-gated identity features) — calling an HMAC fixture
+   "valid" on an adapter that must reject identity features at startup
+   would make the required fixtures self-contradictory. Whether ungated
+   adapters go stateless or block the release is product sign-off
+   item 12.
+3. **Graph-store readiness precedes everything.** Today the graph store
    is optional and EC generation succeeds without one; the epic's
    no-active-until-commit invariant (providers spec §5) makes it
    mandatory wherever a minting provider is configured — so a currently
@@ -144,7 +170,7 @@ Requirements:
    row supports the features in use, providers spec §7) _before_ rolling
    N+1. This is a **declared breaking change** for graphless deployments
    (matrix row 12), not a side effect discovered at boot.
-3. **The graph schema change is expand-contract, in lockstep with the
+4. **The graph schema change is expand-contract, in lockstep with the
    binary sequence.** New rows carry fields v1 rows never had — provider/
    version, per-permission grant evidence, policy revision, family ID,
    rewrite links — and two failure modes must be engineered away: a naive
@@ -170,35 +196,35 @@ Requirements:
    new fields untouched if read-only, preserved semantically if
    read-modify-write on N+1, **test-proven lost on pre-N+1** (documenting
    why the floor is a floor); N+2-reader/N+1-written-row → full function.
-4. **Half-migrated fails loud.** A `[ec.providers.hmac]` block with no
+5. **Half-migrated fails loud.** A `[ec.providers.hmac]` block with no
    `provider = "hmac"` selector is a startup error (providers spec §6). In
    PR #838 this configuration — the exact state an operator following the
    docs reaches if they miss one line — validated green and silently minted
    zero ECs.
-5. **PR #838-era keys fail loud.** `provider = "host-signals"` (shipped by
+6. **PR #838-era keys fail loud.** `provider = "host-signals"` (shipped by
    PR #838, deliberately not carried into this epic — providers spec §2)
    and `provider = "client-fixed"` are unknown keys and rejected like any
    other, so a config written against the PR #838 example cannot silently
    select a provider that no longer exists.
-6. **Provider switches go through legacy readers.** Changing
+7. **Provider switches go through legacy readers.** Changing
    `[ec] provider` on a deployment with live identities requires listing
    the outgoing provider in `[ec] legacy_providers` (providers spec §6.1)
    so existing cookies keep resolving and stay withdrawable; the guide
    documents the switch sequence and the retirement/cleanup step that ends
    it.
-7. **The example config ships the migrated happy path**, uncommented:
+8. **The example config ships the migrated happy path**, uncommented:
    `provider = "hmac"` with its block, `[geo] default_country`, and (for
    Fastly) the behavior-preserving `[device] provider = "fastly"` and
    `[geo] provider = "platform"` lines present with a comment stating what
    removing them changes. PR #838's example shipped the passphrase block
    uncommented with the selector commented out — steering operators directly
    into the silent-stateless state.
-8. Every misconfiguration in the providers spec §6 table fails at
+9. Every misconfiguration in the providers spec §6 table fails at
    **startup**. Request-time failure for a configuration error is a defect.
-9. Config-store payload validation (`ts config push`) applies the same
-   rules — including `[permissions]` policy validation (permission spec
-   §3.3) — so a bad config is rejected at push time, before any instance
-   restarts into it.
+10. Config-store payload validation (`ts config push`) applies the same
+    rules — including `[permissions]` policy validation (permission spec
+    §3.3) — so a bad config is rejected at push time, before any instance
+    restarts into it.
 
 ## 5. Minimal-divergence migration recipe (operator-facing)
 
@@ -343,28 +369,23 @@ global honoring of opt-out signals is unconditional.
 ## 8. Product decisions requiring explicit sign-off
 
 These are decisions this spec set makes that #838 had not already made (or
-made differently). Each must be ratified by maintainers before
-implementation — an unratified row reverts to open, not to silently
-implemented:
+made differently). **Implementation is blocked while any row is `open`**;
+each row needs an owner, a status, and a link to its decision record —
+an unratified row reverts to open, not to silently implemented.
 
-1. Opt-outs are honored globally and destructive ones irreversibly
-   withdraw identities outside the jurisdiction defining the signal
-   (permission spec §4, §4.2).
-2. Sale opt-outs (GPP and USP) control both P1 and P4 and destroy the
-   identity (§4.5).
-3. Sharing / targeted-advertising opt-outs remove P4 but intentionally
-   retain the stored identity (§4.5).
-4. US contextual auctions continue during opt-out, with identity removed
-   (permission spec §7 dispatch matrix).
-5. Regionless US traffic is treated as non-regulated unless the operator
-   chooses country-wide gating (permission spec §3.4).
-6. Full consent strings continue downstream, and raw consent snapshots
-   are retained in graph rows for audit (providers spec §6.3).
-7. Legacy batch-sync traffic is rejected until live-browser provenance
-   backfill occurs (§6.4 of this spec; permission spec §7).
-8. Proxy / click / Testlight forwarding becomes newly gated by P1 ∧ P4
-   (§2 row 11b).
-9. Integration-owned response cookies are inside the permission model:
-   persistent cookies require `store-on-device` at apply time and a
-   declared registration; session cookies are the narrow exemption
-   (response-hook spec §3).
+| #   | Decision                                                                                                                                                | Where                         | Owner                 | Status |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------- | --------------------- | ------ |
+| 1   | Opt-outs honored globally; destructive ones irreversibly withdraw outside the defining jurisdiction                                                     | permission §4, §4.2           | maintainers + legal   | open   |
+| 2   | Sale opt-outs (GPP, USP) control both P1 and P4 and destroy the identity                                                                                | permission §4.5               | maintainers + legal   | open   |
+| 3   | Sharing / targeted-advertising opt-outs remove P4 but retain the stored identity                                                                        | permission §4.5               | maintainers + legal   | open   |
+| 4   | US contextual auctions continue during opt-out, identity removed                                                                                        | permission §7                 | maintainers + product | open   |
+| 5   | Regionless US traffic treated as non-regulated unless the operator opts into country-wide gating                                                        | permission §3.4               | maintainers + legal   | open   |
+| 6   | Full consent strings continue downstream; raw consent snapshots retained in rows for audit                                                              | providers §6.3                | maintainers + legal   | open   |
+| 7   | Legacy batch-sync traffic rejected until live-browser provenance backfill                                                                               | this spec §6.4; permission §7 | maintainers + product | open   |
+| 8   | Proxy / click / Testlight forwarding newly gated by P1 ∧ P4                                                                                             | §2 row 11b                    | maintainers           | open   |
+| 9   | Integration persistent cookies inside the permission model (P1-gated, declared registration)                                                            | hook §3; permission §7        | maintainers           | open   |
+| 10  | Session cookies exempt from `store-on-device` even when they carry a stable identifier                                                                  | hook §3                       | maintainers + legal   | open   |
+| 11  | A single failed destructive withdrawal may leave S2S identity use live **indefinitely** for a never-returning visitor (no durable external retry queue) | permission §4.3               | maintainers + legal   | open   |
+| 12  | Adapters without revocation-eligible storage migrate **stateless** rather than blocking the release                                                     | §4.2 of this spec             | maintainers + product | open   |
+| 13  | Batch-sync acceptance dropping toward zero at cutover, with dormant identities having no automatic recovery path                                        | §6.4 of this spec             | maintainers + product | open   |
+| 14  | Policy tightening never reuses stored refusals destructively — a fresh, live post-change refusal is required (the spec decides this; ratify it)         | permission §4.2 trigger 2     | maintainers + legal   | open   |

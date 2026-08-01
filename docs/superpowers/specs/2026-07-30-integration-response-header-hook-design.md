@@ -61,17 +61,22 @@ mutators to the outbound response for HTML document responses it processed.
   merely passed through) — and the post-hook response may only be
   **equal or stronger** on the privacy axis: integrations can tighten
   caching, never loosen it, regardless of which header they replaced.
-  "Equal or stronger" is a defined merge, not a vibe: restriction
-  strength is ordered `no-store` > `no-cache` > `private` > `public`,
-  and the final value per axis is the **stronger of snapshot and
-  mutation**; `max-age`/`s-maxage` may only shrink relative to the
-  snapshot; `stale-while-revalidate`/`stale-if-error` may appear only if
-  the snapshot had them; every CDN/surrogate directive
-  (`Surrogate-Control`, `CDN-Cache-Control`, host-specific equivalents)
-  is stripped from any restricted response; and **core-required `Vary`
-  members are protected in the contract, not just the tests** — the
-  final `Vary` is the union of the snapshot's required members and the
-  mutation. Middle-stage placement also keeps
+  "Equal or stronger" is a defined merge over **independent sticky
+  directives, not a totally ordered lattice** — `no-cache` and `private`
+  are orthogonal constraints (RFC 9111: `no-cache` permits shared
+  storage subject to revalidation; `private` forbids shared storage), so
+  "replace `private` with the stronger `no-cache`" would make a
+  personalized response shared-storable. The merge: each of `no-store`,
+  `no-cache`, `private` is **sticky** — present in the snapshot or the
+  mutation ⇒ present in the final response, independently; `public` is
+  dropped whenever any restriction is present; `max-age`/`s-maxage` may
+  only shrink relative to the snapshot; `stale-while-revalidate`/
+  `stale-if-error` may appear only if the snapshot had them; every
+  CDN/surrogate directive (`Surrogate-Control`, `CDN-Cache-Control`,
+  host equivalents) is stripped from any restricted response; and the
+  final `Vary` is the **union of the complete snapshot `Vary` set** —
+  origin-supplied members included, not only core-required ones — and
+  the mutation. Middle-stage placement also keeps
   the earlier property: an integration mutation is not silently stripped
   by ordinary core handling — only by the invariant pass, which logs the
   downgrade it applies.
@@ -98,8 +103,14 @@ mutators to the outbound response for HTML document responses it processed.
   (any `Max-Age`/`Expires`) is applied only when the request's resolved
   permissions include `store-on-device`, while **session cookies** (no
   persistence attributes) are the narrow, documented exemption.
-  Undeclared cookie names are rejected like reserved ones. An integration
-  may never set or expire a reserved cookie name. Violations are rejected at the operation layer (§2) and
+  Cookie operations go through a **typed cookie builder** that enforces
+  the declared lifetime ceiling, domain/path scope, and security
+  attributes (`Secure`, `SameSite`) — not a free-form string; **deletion
+  cookies (expiry of the integration's own declared names) remain
+  possible when `store-on-device` is denied**, since removing state must
+  never require the permission to keep it. Undeclared cookie names are
+  rejected like reserved ones. An integration may never set or expire a
+  reserved cookie name. Violations are rejected at the operation layer (§2) and
   logged at `warn` with the integration id. The reserved lists are single
   constants next to the definitions they protect, not duplicated in the
   hook.
@@ -121,10 +132,17 @@ mutators to the outbound response for HTML document responses it processed.
   counting `name: value` plus separators, within any lower adapter
   ceiling) bounds the sum across integrations — enforced in registration
   order, so which operations are rejected when a budget trips is
-  deterministic. Each mutator receives an **immutable snapshot of the
+  deterministic. Each mutator receives an **immutable, redacted snapshot of the
   response head** (status and headers as of its turn, prior integrations'
   accepted operations applied) as its read context; it never holds a
-  mutable reference (§2).
+  mutable reference (§2). Redaction is a security boundary, not
+  tidiness: the hook runs after core queues the EC `Set-Cookie`, so an
+  unredacted view would hand a mutator the raw EC to copy into
+  `X-Vendor-Identity` or its own cookie — walking around
+  `AuthorizedIdentity<PartnerEgress>` entirely. The snapshot therefore
+  **excludes every `Set-Cookie` value and every reserved identity,
+  consent, and privacy header value** (names may be listed as present;
+  values are withheld).
   Exceeding a limit rejects the excess operations (logged, attributed),
   never the response. A mutator that returns an error is skipped in full — its
   operations are all-or-nothing — and the response proceeds without it.
@@ -181,10 +199,13 @@ processed documents (§6).
 
 ## 5. Size and sequencing
 
-This is a ~150-line feature plus tests, with zero coupling to the provider
-architecture or the permission model. It lands as its own small PR **when
-its first real consumer is identified** (§4.2) — at any point in the epic's
-sequence, blocking nothing and blocked by nothing. If no consumer
+This is a modest feature plus tests, with zero coupling to the provider
+architecture — but its **cookie operations are coupled to the permission
+model** (§3; the gate is a listed enforcement point in the permission
+spec §7 inventory), so the claim of total independence is retired: the
+header-mutation portion may land whenever its first real consumer is
+identified (§4.2), while `append_set_cookie` activates only **after** the
+permission model PR, and registers as unavailable before it. If no consumer
 materializes, it does not land; being unblocked is not a reason to ship
 scaffolding.
 
