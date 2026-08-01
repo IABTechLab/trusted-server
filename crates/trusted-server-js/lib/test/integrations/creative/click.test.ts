@@ -4,6 +4,11 @@ import { FIRST_PARTY_CLICK, MUTATED_CLICK, PROXY_RESPONSE, importCreativeModule 
 
 const ORIGINAL_FETCH = global.fetch;
 
+// The guard persists validated, absolutized URLs (resolved against the pinned
+// trusted base), so expectations compare against the absolute forms.
+const absolute = (url: string): string => new URL(url, location.href).toString();
+const REBUILD_PREFIX = absolute('/first-party/proxy-rebuild?');
+
 describe('creative/click.ts', () => {
   beforeEach(() => {
     vi.resetModules();
@@ -32,7 +37,7 @@ describe('creative/click.ts', () => {
     await vi.runAllTimersAsync();
 
     const finalHref = anchor.getAttribute('href') ?? '';
-    expect(finalHref.startsWith('/first-party/proxy-rebuild?')).toBe(true);
+    expect(finalHref.startsWith(REBUILD_PREFIX)).toBe(true);
     expect(finalHref).toContain('add=%7B%22bar%22%3A%222%22%7D');
     expect(finalHref).toContain('del=%5B%22foo%22%5D');
   });
@@ -68,8 +73,8 @@ describe('creative/click.ts', () => {
       del: ['foo'],
     });
 
-    expect(anchor.getAttribute('href')).toBe(PROXY_RESPONSE);
-    expect(anchor.getAttribute('data-tsclick')).toBe(PROXY_RESPONSE);
+    expect(anchor.getAttribute('href')).toBe(absolute(PROXY_RESPONSE));
+    expect(anchor.getAttribute('data-tsclick')).toBe(absolute(PROXY_RESPONSE));
   });
 
   it('skips the doomed POST and uses the GET fallback in an opaque origin', async () => {
@@ -102,7 +107,7 @@ describe('creative/click.ts', () => {
 
       expect(fetchMock).not.toHaveBeenCalled();
       const finalHref = anchor.getAttribute('href') ?? '';
-      expect(finalHref.startsWith('/first-party/proxy-rebuild?')).toBe(true);
+      expect(finalHref.startsWith(REBUILD_PREFIX)).toBe(true);
       expect(finalHref).toContain('add=%7B%22bar%22%3A%222%22%7D');
       expect(finalHref).toContain('del=%5B%22foo%22%5D');
       // The fallback must never become the canonical click: data-tsclick is
@@ -146,7 +151,7 @@ describe('creative/click.ts', () => {
       await vi.runAllTimersAsync();
 
       const finalHref = anchor.getAttribute('href') ?? '';
-      expect(finalHref.startsWith('/first-party/proxy-rebuild?')).toBe(true);
+      expect(finalHref.startsWith(REBUILD_PREFIX)).toBe(true);
       expect(finalHref).toContain('baz');
       expect(anchor.getAttribute('data-tsclick')).toBe(FIRST_PARTY_CLICK);
     } finally {

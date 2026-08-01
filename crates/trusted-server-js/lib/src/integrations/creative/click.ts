@@ -291,13 +291,18 @@ function navigate(a: AnchorLike, url: string, isMiddle: boolean): void {
 // /first-party/click URL. Writing the GET proxy-rebuild fallback there would
 // make every later canonicalization fail and lose subsequent mutations.
 function persistRebuiltClick(anchor: AnchorLike, finalUrl: string): void {
-  if (!resolveSafeNavigationUrl(finalUrl)) return;
+  // Persist the validated, absolutized URL — never the raw input. Beyond
+  // enforcing the http(s) allowlist, an absolute URL keeps the anchor's
+  // default navigation working inside the srcdoc iframe, where a relative
+  // href would resolve against about:srcdoc.
+  const resolved = resolveSafeNavigationUrl(finalUrl);
+  if (!resolved) return;
   try {
     const el = anchor as Element;
-    if (canonFromFirstPartyClick(finalUrl)) {
-      el.setAttribute('data-tsclick', finalUrl);
+    if (canonFromFirstPartyClick(resolved)) {
+      el.setAttribute('data-tsclick', resolved);
     }
-    el.setAttribute('href', finalUrl);
+    el.setAttribute('href', resolved);
   } catch (err) {
     log.debug('tsjs-creative:click: failed to persist rebuilt href', err);
   }
