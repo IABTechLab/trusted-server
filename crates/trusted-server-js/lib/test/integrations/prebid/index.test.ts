@@ -7,6 +7,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
  */
 const DEFAULT_BUNDLE_MANIFEST = {
   adapters: ['rubicon', 'openx', 'exampleBrowser', 'appnexus'],
+  bidderCodes: ['rubicon', 'openx', 'exampleBrowser', 'appnexus'],
   userIdModules: ['sharedIdSystem'],
 };
 
@@ -28,7 +29,8 @@ interface PrebidTestWindow {
   tsjs?: unknown;
   googletag?: unknown;
   __tsjs_prebid?: Record<string, unknown>;
-  __tsjs_prebid_bundle?: { adapters?: string[]; userIdModules?: string[] };
+  __tsjsPrebidShimInstalled?: boolean;
+  __tsjs_prebid_bundle?: unknown;
   __tsjs_prebid_diagnostics?: {
     userIdModules?: {
       includedModules: string[];
@@ -128,6 +130,7 @@ const {
   w.pbjs = mockPbjs;
   w.__tsjs_prebid_bundle = {
     adapters: ['rubicon', 'openx', 'exampleBrowser', 'appnexus'],
+    bidderCodes: ['rubicon', 'openx', 'exampleBrowser', 'appnexus'],
     userIdModules: ['sharedIdSystem'],
   };
 
@@ -152,6 +155,12 @@ import {
 } from '../../../src/integrations/prebid/index';
 import type { AuctionBid } from '../../../src/core/auction';
 import { log } from '../../../src/core/log';
+
+// installPrebidNpm is a per-page no-op once the sentinel is set (the module
+// self-init above already set it), so every test starts from a clean page.
+beforeEach(() => {
+  delete testWindow.__tsjsPrebidShimInstalled;
+});
 
 describe('prebid/collectBidders', () => {
   it('returns empty array for empty ad units', () => {
@@ -377,6 +386,44 @@ describe('prebid/installPrebidNpm', () => {
   it('returns the pbjs instance', () => {
     const result = installPrebidNpm();
     expect(result).toBe(mockPbjs);
+  });
+
+  it('installs only once per page via the __tsjsPrebidShimInstalled sentinel', () => {
+    const first = installPrebidNpm();
+    const wrappedRequestBids = mockPbjs.requestBids;
+    const second = installPrebidNpm();
+
+    expect(second).toBe(first);
+    expect(mockRegisterBidAdapter).toHaveBeenCalledTimes(1);
+    expect(mockPbjs.requestBids).toBe(wrappedRequestBids);
+    expect(testWindow.__tsjsPrebidShimInstalled).toBe(true);
+  });
+
+  it('warns once about an unstamped User ID manifest instead of once per module', () => {
+    delete testWindow.__tsjs_prebid_bundle;
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [{ name: 'sharedId' }, { name: 'pairId' }] : {}
+    );
+    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
+
+    installPrebidNpm();
+    mockPbjs.requestBids({ adUnits: [] });
+
+    expect(testWindow.__tsjs_prebid_diagnostics.userIdModules).toEqual({
+      includedModules: [],
+      configuredUserIdNames: ['pairId', 'sharedId'],
+      missingConfiguredUserIdNames: [],
+    });
+    const manifestWarnings = warnSpy.mock.calls.filter(([message]) =>
+      String(message).includes('did not stamp a User ID module manifest')
+    );
+    expect(manifestWarnings).toHaveLength(1);
+    const moduleWarnings = warnSpy.mock.calls.filter(([message]) =>
+      String(message).includes('is not included in the external bundle')
+    );
+    expect(moduleWarnings).toHaveLength(0);
+
+    testWindow.__tsjs_prebid_bundle = DEFAULT_BUNDLE_MANIFEST;
   });
 
   describe('adapter spec', () => {
@@ -2972,6 +3019,7 @@ describe('prebid/client-side bidders', () => {
     testWindow.__tsjs_prebid_bundle = {
       ...DEFAULT_BUNDLE_MANIFEST,
       adapters: ['rubicon'],
+      bidderCodes: ['rubicon'],
     };
     testWindow.__tsjs_prebid = { clientSideBidders: ['rubicon', 'openx'] };
 
@@ -2992,6 +3040,13 @@ describe('prebid/client-side bidders', () => {
     );
     expect(hasOpenxError).toBe(true);
 
+    // The error should point at the operator surface: the CLI config key,
+    // not the internal build script.
+    const pointsAtBundleConfig = errorCalls.some((args) =>
+      args.some((a) => typeof a === 'string' && a.includes('[integrations.prebid.bundle].adapters'))
+    );
+    expect(pointsAtBundleConfig).toBe(true);
+
     // Should NOT log an error for the compiled-in adapter
     const hasRubiconError = errorCalls.some((args) =>
       args.some((a) => typeof a === 'string' && a.includes('client-side bidder "rubicon"'))
@@ -2999,6 +3054,76 @@ describe('prebid/client-side bidders', () => {
     expect(hasRubiconError).toBe(false);
 
     errorSpy.mockRestore();
+    testWindow.__tsjs_prebid_bundle = DEFAULT_BUNDLE_MANIFEST;
+  });
+
+  it('accepts alias bidder codes stamped in bidderCodes', () => {
+    // The adf module registers adf plus the adform/adformOpenRTB aliases;
+    // the module-name list alone would flag them as missing.
+    testWindow.__tsjs_prebid_bundle = {
+      ...DEFAULT_BUNDLE_MANIFEST,
+      adapters: ['adf'],
+      bidderCodes: ['adf', 'adform', 'adformOpenRTB'],
+    };
+    testWindow.__tsjs_prebid = { clientSideBidders: ['adform'] };
+
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    installPrebidNpm();
+
+    const hasAdapterError = errorSpy.mock.calls.some((args) =>
+      args.some(
+        (a) => typeof a === 'string' && a.includes('has no adapter in the external Prebid bundle')
+      )
+    );
+    expect(hasAdapterError).toBe(false);
+
+    errorSpy.mockRestore();
+    testWindow.__tsjs_prebid_bundle = DEFAULT_BUNDLE_MANIFEST;
+  });
+
+  it('rejects a module file stem that is not a registered bidder code', () => {
+    // a1MediaBidAdapter.js registers a1media — configuring the file stem
+    // must be flagged even though the module itself is compiled in.
+    testWindow.__tsjs_prebid_bundle = {
+      ...DEFAULT_BUNDLE_MANIFEST,
+      adapters: ['a1Media'],
+      bidderCodes: ['a1media'],
+    };
+    testWindow.__tsjs_prebid = { clientSideBidders: ['a1Media'] };
+
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    installPrebidNpm();
+
+    const hasAdapterError = errorSpy.mock.calls.some((args) =>
+      args.some(
+        (a) =>
+          typeof a === 'string' &&
+          a.includes('client-side bidder "a1Media" has no adapter in the external Prebid bundle')
+      )
+    );
+    expect(hasAdapterError).toBe(true);
+
+    errorSpy.mockRestore();
+    testWindow.__tsjs_prebid_bundle = DEFAULT_BUNDLE_MANIFEST;
+  });
+
+  it('treats a malformed manifest as unstamped instead of throwing', () => {
+    // The manifest is a plain window global any page script can overwrite.
+    testWindow.__tsjs_prebid_bundle = { adapters: 'rubicon', userIdModules: 42 };
+    testWindow.__tsjs_prebid = { clientSideBidders: ['rubicon'] };
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    expect(() => installPrebidNpm()).not.toThrow();
+
+    const hasManifestWarn = warnSpy.mock.calls.some((args) =>
+      args.some((a) => typeof a === 'string' && a.includes('did not stamp an adapter manifest'))
+    );
+    expect(hasManifestWarn).toBe(true);
+
+    warnSpy.mockRestore();
     testWindow.__tsjs_prebid_bundle = DEFAULT_BUNDLE_MANIFEST;
   });
 
@@ -3032,6 +3157,55 @@ describe('prebid/client-side bidders', () => {
       )
     );
     expect(hasAdapterError).toBe(false);
+
+    errorSpy.mockRestore();
+  });
+});
+
+describe('prebid/self-init without the external bundle', () => {
+  afterEach(() => {
+    // Restore the module registry and the full mock global for later suites.
+    testWindow.pbjs = mockPbjs;
+    delete testWindow.googletag;
+    vi.resetModules();
+  });
+
+  it('disables the integration and leaves pbjs and GPT untouched', async () => {
+    // Simulate a failed external bundle load: window.pbjs is still the
+    // head-injected stub with no Prebid.js API. The module captures the
+    // global at evaluation time, so reset the registry and re-import.
+    vi.resetModules();
+    const barePbjs: {
+      que: Array<() => void>;
+      cmd: Array<() => void>;
+      requestBids?: unknown;
+    } = { que: [], cmd: [] };
+    testWindow.pbjs = barePbjs;
+    const pubads = { refresh: vi.fn() };
+    const cmdPush = vi.fn((callback: () => void) => callback());
+    testWindow.googletag = { cmd: { push: cmdPush }, pubads: () => pubads };
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await import('../../../src/integrations/prebid/index');
+
+    // The bail-out is logged loudly.
+    const hasBailOutError = errorSpy.mock.calls.some((args) =>
+      args.some((a) => typeof a === 'string' && a.includes('has no Prebid.js API'))
+    );
+    expect(hasBailOutError).toBe(true);
+
+    // requestBids is left unwrapped and no adapter registration was attempted.
+    expect(barePbjs.requestBids).toBeUndefined();
+
+    // The refresh handler must not install: a wrapped googletag refresh
+    // would clear TS-applied targeting and then fail to run any auction.
+    expect(cmdPush).not.toHaveBeenCalled();
+    expect(
+      (pubads as { refresh: unknown; __tsRefreshWrapped?: boolean }).__tsRefreshWrapped
+    ).toBeUndefined();
+
+    // The sentinel stays unset so a later successful install can still run.
+    expect(testWindow.__tsjsPrebidShimInstalled).toBeUndefined();
 
     errorSpy.mockRestore();
   });
