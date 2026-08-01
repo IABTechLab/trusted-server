@@ -1767,14 +1767,12 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     const firstRefreshBids = refreshAdUnitFromLastRequest().bids;
     expect(firstRefreshBids).toEqual(expectedBids);
 
-    (
-      firstRefreshBids[0].params as NestedServerParams
-    ).bidderParams.exampleServer.placement.rules[0].label = 'changed-refresh-rule';
-    (
-      firstRefreshBids[0].params as NestedServerParams
-    ).bidderParams.exampleServer.placement.sizes.push(777);
-    (firstRefreshBids[1].params as NestedBrowserParams).groups[0].values[0] =
-      'changed-refresh-value';
+    const refreshServerParams = firstRefreshBids[0].params as NestedServerParams;
+    refreshServerParams.bidderParams.exampleServer.placement.rules[0].label =
+      'changed-refresh-rule';
+    refreshServerParams.bidderParams.exampleServer.placement.sizes.push(777);
+    const refreshBrowserParams = firstRefreshBids[1].params as NestedBrowserParams;
+    refreshBrowserParams.groups[0].values[0] = 'changed-refresh-value';
     pubads.refresh([slot]);
 
     expect(refreshAdUnitFromLastRequest().bids).toEqual(expectedBids);
@@ -2907,7 +2905,7 @@ describe('prebid/client-side bidders', () => {
 
     const tsBid = adUnits[0].bids.find((b) => b.bidder === 'trustedServer') as TrustedServerTestBid;
     expect(tsBid).toBeDefined();
-    // rubicon should NOT be in bidderParams — it runs client-side
+    // rubicon should NOT be in bidderParams because it runs client-side
     expect(tsBid.params.bidderParams).toEqual({
       appnexus: { placementId: 123 },
       kargo: { placementId: 'k1' },
@@ -2965,7 +2963,7 @@ describe('prebid/client-side bidders', () => {
   });
 
   it('behaves normally when no client-side bidders are configured', () => {
-    // No __tsjs_prebid at all — all bidders go server-side
+    // No __tsjs_prebid at all, so all bidders go server-side
     const pbjs = installPrebidNpm() as TestPbjs;
 
     const adUnits = [
@@ -3101,7 +3099,7 @@ describe('prebid self-init user ID module timing', () => {
 
   it('installs user ID modules immediately when the bundle loads after window load', async () => {
     // The GPT slim loader appends this bundle from a window.load handler, so
-    // the document is already complete — a load listener would never fire.
+    // the document is already complete and a load listener would never fire.
     setReadyState('complete');
 
     await import('../../../src/integrations/prebid/index');
@@ -3119,7 +3117,7 @@ describe('prebid self-init user ID module timing', () => {
     window.dispatchEvent(new Event('load'));
     expect(userSyncCallCount()).toBe(1);
 
-    // { once: true } — a second load event must not reinstall.
+    // { once: true }: a second load event must not reinstall.
     window.dispatchEvent(new Event('load'));
     expect(userSyncCallCount()).toBe(1);
   });
