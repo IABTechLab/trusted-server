@@ -516,7 +516,7 @@ pub fn sanitize_creative_html(markup: &str) -> String {
 /// disabled the creative is returned exactly as the bidder sent it. In every
 /// mode, input over the 1 MiB per-creative cap is rejected (empty string).
 #[must_use]
-pub fn process_auction_creative(settings: &Settings, raw: &str) -> String {
+pub(crate) fn process_auction_creative(settings: &Settings, raw: &str) -> String {
     process_auction_creative_with_rewriter(settings, raw, |sanitized| {
         rewrite_creative_html(settings, sanitized)
     })

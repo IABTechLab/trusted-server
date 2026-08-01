@@ -524,7 +524,15 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 // `NormalizeMiddleware` before this handler runs, so the signed
                 // OpenRTB metadata that auction signing derives from
                 // `RequestInfo::from_request` uses the trusted runtime authority.
-                let req = ctx.into_request();
+                let mut req = ctx.into_request();
+                if let Err(error) =
+                    trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+                        &s.settings,
+                        &mut req,
+                    )
+                {
+                    return Ok(http_error(&error));
+                }
                 // Build the geo-aware EC context so the auction consent gate sees
                 // the caller's jurisdiction — `EcContext::default()` fails it
                 // closed for consented users.
@@ -549,7 +557,15 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let s = Arc::clone(&s);
             async move {
                 let services = build_runtime_services(&ctx);
-                let req = ctx.into_request();
+                let mut req = ctx.into_request();
+                if let Err(error) =
+                    trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+                        &s.settings,
+                        &mut req,
+                    )
+                {
+                    return Ok(http_error(&error));
+                }
                 let ec_context = build_ec_context(&s.settings, &services, &req);
                 let auction = AuctionDispatch {
                     orchestrator: &s.orchestrator,
@@ -635,7 +651,13 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             ctx: RequestContext,
         ) -> Result<Response, EdgeError> {
             let services = build_runtime_services(&ctx);
-            let req = ctx.into_request();
+            let mut req = ctx.into_request();
+            if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+                &state.settings,
+                &mut req,
+            ) {
+                return Ok(http_error(&error));
+            }
 
             let path = req.uri().path().to_owned();
             let method = req.method().clone();

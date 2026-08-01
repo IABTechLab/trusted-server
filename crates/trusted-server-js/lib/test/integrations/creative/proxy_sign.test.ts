@@ -47,7 +47,7 @@ describe('creative/proxy_sign.ts', () => {
   });
 
   it('returns null when fetch is unavailable', async () => {
-    global.fetch = undefined as any;
+    global.fetch = undefined as unknown as typeof fetch;
     const result = await signProxyUrl('https://cdn.example/asset.js');
     expect(result).toBeNull();
   });

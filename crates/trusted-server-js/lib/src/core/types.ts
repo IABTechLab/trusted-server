@@ -79,6 +79,102 @@ export interface AuctionBidData {
   debug_bid?: AuctionDebugBidData;
 }
 
+export type GptDiagnosticsCallbackKind =
+  | 'slotRequested'
+  | 'slotResponseReceived'
+  | 'slotRenderEnded'
+  | 'slotOnload'
+  | 'impressionViewable'
+  | 'slotVisibilityChanged';
+
+export type GptDiagnosticsCallbackDisposition = 'matched' | 'unmatched' | 'ambiguous';
+
+export type GptDiagnosticsBindingReason =
+  | 'missing_slot_element_id'
+  | 'missing_element'
+  | 'duplicate_dom_id'
+  | 'dom_uniqueness_unverifiable'
+  | 'duplicate_gpt_slot_id';
+
+export interface GptDiagnosticsBinding {
+  status: 'bound' | 'unbound' | 'ambiguous';
+  reason?: GptDiagnosticsBindingReason;
+}
+
+export interface GptDiagnosticsDurations {
+  requestToResponseMs?: number;
+  responseToRenderMs?: number;
+  requestToRenderMs?: number;
+  renderToLoadMs?: number;
+  renderToViewableMs?: number;
+}
+
+export interface GptDiagnosticsRequestCycle {
+  requestNumber: number;
+  requestedAtMs?: number;
+  responseAtMs?: number;
+  renderAtMs?: number;
+  loadAtMs?: number;
+  viewableAtMs?: number;
+  durations: GptDiagnosticsDurations;
+  isEmpty?: boolean;
+  size?: Size;
+  isBackfill?: boolean;
+  slotContentChanged?: boolean;
+  incompleteSequence: boolean;
+}
+
+export interface GptDiagnosticsSlotExport {
+  runtimeSlotNumber: number;
+  slotElementId?: string;
+  adUnitPath?: string;
+  binding: GptDiagnosticsBinding;
+  currentVisibilityPercentage?: number;
+  maximumVisibilityPercentage?: number;
+  requests: GptDiagnosticsRequestCycle[];
+}
+
+export interface GptDiagnosticsCallbackIssue {
+  kind: GptDiagnosticsCallbackKind;
+  runtimeSlotNumber: number;
+  slotElementId?: string;
+  timestampMs: number;
+  disposition: GptDiagnosticsCallbackDisposition;
+  reason: string;
+}
+
+export interface GptDiagnosticsCoverageCounters {
+  observed: number;
+  matched: number;
+  unmatched: number;
+  ambiguous: number;
+}
+
+export interface GptDiagnosticsExportV1 {
+  version: 1;
+  capturedAt: string;
+  page: {
+    origin: string;
+    pathname: string;
+  };
+  slots: GptDiagnosticsSlotExport[];
+  callbackIssues: GptDiagnosticsCallbackIssue[];
+  coverage: Record<GptDiagnosticsCallbackKind, GptDiagnosticsCoverageCounters>;
+  metadata: {
+    droppedCallbacks: number;
+    evictedSlots: number;
+    evictedRequestCycles: number;
+  };
+}
+
+export interface GptDiagnosticsApi {
+  snapshot(): GptDiagnosticsExportV1;
+  export(): void;
+  subscribe(listener: (snapshot: GptDiagnosticsExportV1) => void): () => void;
+  show(): void;
+  hide(): void;
+}
+
 export interface TsjsApi {
   version: string;
   que: Array<() => void>;
@@ -130,13 +226,42 @@ export interface TsjsApi {
    */
   adInitRefreshInProgress?: boolean;
   /**
-   * True once the publisher has called `googletag.pubads().disableInitialLoad()`.
-   * GPT exposes no getter for this state, so it is tracked by wrapping the
-   * setter. When set, `display()` only registers a slot and the ad request must
-   * come from a `refresh()`; adInit() uses this to refresh its own freshly
-   * defined slots so they are not left blank.
+   * Whether the publisher disabled GPT initial load through
+   * `googletag.setConfig()` or `googletag.pubads().disableInitialLoad()`.
+   * TS synchronizes this from GPT's getter and wraps both configuration APIs as
+   * a fallback when the getter is unavailable.
+   * When set, `display()` only registers a slot and the ad request must come
+   * from a `refresh()`; adInit() uses this to refresh its own freshly defined
+   * slots so they are not left blank.
    */
   gptInitialLoadDisabled?: boolean;
   /** Guards SPA pushState hook installation. */
   spaHookInstalled?: boolean;
+  /**
+   * Monotonic count of committed SPA navigations, incremented synchronously by
+   * the SPA auction hook the moment it accepts a route change. The deferred
+   * initial-adInit bootstrap ([`scheduleInitialAdInit`]) is pinned to
+   * generation 0 (the SSR document) and no-ops when a navigation has
+   * committed — before it was called, or while it was pending. A counter is
+   * used instead of a URL comparison so the guard cannot diverge from the
+   * auction path: a query-only history change (which the hook deliberately
+   * ignores) leaves the counter unchanged, and an `/a → /b → /a` round trip
+   * (where the URL compares equal again) advances it.
+   */
+  navGeneration?: number;
+  /**
+   * Defers the initial `adInit()` until after React hydration: window `load`,
+   * then a double `requestAnimationFrame`. Called by the server-injected
+   * `</body>` bids script with the SSR bids payload. The whole initial pass
+   * is pinned to navigation generation 0 (the SSR document): if an SPA
+   * navigation has already committed — or commits while the deferred callback
+   * is pending — the payload is dropped and `adInit()` is not run, so a stale
+   * SSR bootstrap can neither clobber the live route's bids nor re-run it.
+   * Lives in the bundle so the lifecycle is executable under test and shares
+   * [`navGeneration`] with the SPA auction hook; `gpt_bootstrap.js` installs
+   * a minimal fallback for pages where the bundle fails to load.
+   */
+  scheduleInitialAdInit?: (initialBids?: Record<string, AuctionBidData>) => void;
+  /** Read-only GPT lifecycle diagnostics API, present only in an activated tab. */
+  gptDiagnostics?: GptDiagnosticsApi;
 }
