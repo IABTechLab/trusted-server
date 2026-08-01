@@ -423,12 +423,23 @@ and the fail-closed marker:
   which the refusal just unset, and identity rows may be eventually
   consistent, so a stale replica could resurrect a P4 grant after a
   targeted-advertising opt-out. The fix is a **suppression record** in
-  the strongly consistent class (providers spec §6.3: `sup/<family-id>`),
-  carrying per-permission suppression entries with timestamps. Writing it
-  is **permission-exempt** (clearing authority is protective, like
-  revocation), and **every S2S recompute and partner-egress check
-  consults it**: a suppressed permission is unset whatever the row's
-  provenance says, so no eventual-consistency edge can restore it.
+  the strongly consistent class (providers spec §6.3: `sup/<family-id>`).
+  Its semantics are complete, not sketched: entries are **per permission**
+  with the triggering state (refusal or non-destructive opt-out — the
+  full negative-state coverage; absence writes nothing) and an
+  authoritative timestamp; ordering is **monotonic per permission** —
+  a write with an older timestamp than the stored entry is a no-op, so
+  replays cannot regress the state; **re-consent clears**: a live
+  resolution carrying an accepted grant with a newer authoritative
+  timestamp than the suppression entry supersedes it (recorded as a
+  clear entry in the same record — still an exempt write, since it only
+  ever reflects the live resolution); and **write failure fails closed
+  for the live request** (the refusal's effect stands for this response)
+  while S2S may transiently honor prior authority until the retry lands —
+  logged, metered, and covered by the degraded-mode rule. Every S2S
+  recompute and partner-egress check consults the record: a suppressed
+  permission is unset whatever the row's provenance says, so no
+  eventual-consistency edge can restore it.
 - **The cookie expires only after the family record commits.**
 - **If the family-record write itself fails, nothing durable exists** —
   the cookie stays and the durable client-side signal (GPC, CMP-stored
@@ -522,16 +533,19 @@ nothing.
 **Applicability and aggregation — ordered algorithm:**
 
 1. **Section map (normative, pinned here — not "whatever GPP is
-   current"), covering every section current code recognizes (7–23), not
-   a subset:** `US` national ↔ 7 (usnat); then the state sections —
-   `US/CA` ↔ 8, `US/VA` ↔ 9, `US/CO` ↔ 10, `US/UT` ↔ 11, `US/CT` ↔ 12,
-   `US/FL` ↔ 13, `US/MT` ↔ 14, `US/OR` ↔ 15, `US/TX` ↔ 16, `US/DE` ↔ 17,
-   `US/IA` ↔ 18, `US/NE` ↔ 19, `US/NH` ↔ 20, `US/NJ` ↔ 21, `US/TN` ↔ 22,
-   `US/MN` ↔ 23. Dropping to 7–12 would silently lose, e.g., a Texas
-   (section 16) sale opt-out. The implementation PR cross-checks this
-   list against the current decoder's section set; versions are those
-   published at this spec's date; adding a section or version is a change
-   to this map.
+   current"), matching the official IAB registry in full:** section 6 ↔
+   the **US Privacy string carried as a GPP section** (it maps to the USP
+   rows of the field table, not to nothing); `US` national ↔ 7 (usnat);
+   the state sections — `US/CA` ↔ 8, `US/VA` ↔ 9, `US/CO` ↔ 10,
+   `US/UT` ↔ 11, `US/CT` ↔ 12, `US/FL` ↔ 13, `US/MT` ↔ 14, `US/OR` ↔ 15,
+   `US/TX` ↔ 16, `US/DE` ↔ 17, `US/IA` ↔ 18, `US/NE` ↔ 19, `US/NH` ↔ 20,
+   `US/NJ` ↔ 21, `US/TN` ↔ 22, `US/MN` ↔ 23, **`US/MD` ↔ 24,
+   `US/IN` ↔ 25, `US/KY` ↔ 26, `US/RI` ↔ 27** (an earlier draft wrongly
+   claimed MD/IN/KY/RI had no section). A truncated map silently loses
+   opt-outs — a Texas (16) or Maryland (24) sale opt-out must not vanish.
+   The implementation PR cross-checks this list against both the current
+   decoder's section set and the official registry; adding a section or
+   version is a change to this map.
 2. **Applicability gates grants only — never opt-outs.** A mapped
    **opt-out** field (either subclass) is honored from **any** section on
    **any** request, whatever the regime — this is §4's global-opt-out
@@ -544,9 +558,14 @@ nothing.
    national section only. A configured privacy state with no
    state-specific section (e.g. MD, IN, KY, RI today) uses the national
    section alone.
-3. **State-over-national, per field:** where an applicable state section
-   carries a field, it governs that field; the national section fills only
-   fields the state section lacks.
+3. **State-over-national, per field — for grants only:** where an
+   applicable state section carries a field, its value governs that
+   field's **grant** derivation; the national section fills only fields
+   the state section lacks. This precedence **never suppresses an
+   opt-out**: a national-section opt-out stands even where the state
+   section's same field says not-opted-out — step 2's global rule wins,
+   or a state string could erase a globally authoritative national
+   opt-out.
 4. **Aggregate across what remains applicable:** an opt-out (of either
    subclass) in any applicable field beats a grant from another —
    restrictive aggregation.
@@ -677,21 +696,21 @@ Consumers of the resolved set in this epic:
    inventory, normative per path (one test per row; a denylist check
    proves no ungated egress exists):
 
-   | Path                                                             | Required permissions                                | Notes                                                                                                                                                                                                                                     |
-   | ---------------------------------------------------------------- | --------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-   | OpenRTB `user.id`                                                | `store-on-device` ∧ `select-personalised-ads`       | Raw EC is identity in the bidstream — gated exactly as EIDs. PR #838 gated only EIDs, leaving `user.id` reachable with Purpose 4 refused                                                                                                  |
-   | EC-derived auction request IDs                                   | both purposes                                       | Derived values are identity                                                                                                                                                                                                               |
-   | Page-bids path                                                   | both purposes                                       |                                                                                                                                                                                                                                           |
-   | Bidstream EIDs                                                   | both purposes                                       | The one gate PR #838 had                                                                                                                                                                                                                  |
-   | Proxy / click / Testlight forwarding of the EC cookie or headers | both purposes                                       | **New hardening, declared change** — these paths extract the raw cookie/header without today's jurisdiction gate (migration spec §2 row 11b)                                                                                              |
-   | Identify endpoint (partner-facing)                               | both purposes                                       | Partner identity exchange, not a first-party lookup — decided here                                                                                                                                                                        |
-   | Pull sync (browser-request-scoped partner exchange)              | both purposes, from the **live** request resolution | Pull sync is created from a browser request and checks the live `EcContext` today — it keeps using the live P1 ∧ P4 decision plus the family revocation state (§4.3); stored provenance is never a substitute for available live evidence |
-   | Batch sync (context-free S2S partner exchange)                   | both purposes, from **stored provenance**           | The only truly signal-less path; authority rules below. Today's handler only authenticates and checks row state, so this gate is **declared hardening** (migration spec §2)                                                               |
-   | Request-scoped graph reads/writes (non-revocation)               | `store-on-device`                                   |                                                                                                                                                                                                                                           |
-   | Revocation paths (tombstones, withdrawal reads)                  | **exempt**                                          | Must work when permissions are unset                                                                                                                                                                                                      |
-   | Stored consent-state lookup (§4.4)                               | **exempt**, narrowly scoped                         | Determining `store-on-device` cannot require `store-on-device`                                                                                                                                                                            |
-   | Integration persistent response cookies (hook spec §3)           | `store-on-device`                                   | Applied at mutation time from the request's resolved permissions; session cookies are the declared exemption (sign-off items 9–10)                                                                                                        |
-   | Suppression-record writes (§4.3)                                 | **exempt**                                          | Clearing authority is protective, like revocation                                                                                                                                                                                         |
+   | Path                                                             | Required permissions                                                   | Notes                                                                                                                                                                                                                                                                                                                                                                                             |
+   | ---------------------------------------------------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+   | OpenRTB `user.id`                                                | `store-on-device` ∧ `select-personalised-ads`                          | Raw EC is identity in the bidstream — gated exactly as EIDs. PR #838 gated only EIDs, leaving `user.id` reachable with Purpose 4 refused                                                                                                                                                                                                                                                          |
+   | EC-derived auction request IDs                                   | both purposes                                                          | Derived values are identity                                                                                                                                                                                                                                                                                                                                                                       |
+   | Page-bids path                                                   | both purposes                                                          |                                                                                                                                                                                                                                                                                                                                                                                                   |
+   | Bidstream EIDs                                                   | both purposes                                                          | The one gate PR #838 had                                                                                                                                                                                                                                                                                                                                                                          |
+   | Proxy / click / Testlight forwarding of the EC cookie or headers | both purposes                                                          | **New hardening, declared change** — these paths extract the raw cookie/header without today's jurisdiction gate (migration spec §2 row 11b)                                                                                                                                                                                                                                                      |
+   | Identify endpoint (partner-facing)                               | both purposes                                                          | Partner identity exchange, not a first-party lookup — decided here                                                                                                                                                                                                                                                                                                                                |
+   | Pull sync (browser-request-scoped partner exchange)              | both purposes, from the **live** request resolution                    | Pull sync is created from a browser request and checks the live `EcContext` today — it keeps using the live P1 ∧ P4 decision plus the family revocation state (§4.3); stored provenance is never a substitute for available live evidence                                                                                                                                                         |
+   | Batch sync (context-free S2S partner exchange)                   | both purposes, from **stored provenance**                              | The only truly signal-less path; authority rules below. Today's handler only authenticates and checks row state, so this gate is **declared hardening** (migration spec §2)                                                                                                                                                                                                                       |
+   | Request-scoped graph reads/writes (non-revocation)               | `store-on-device`                                                      |                                                                                                                                                                                                                                                                                                                                                                                                   |
+   | Revocation paths (tombstones, withdrawal reads)                  | **exempt**                                                             | Must work when permissions are unset                                                                                                                                                                                                                                                                                                                                                              |
+   | Stored consent-state lookup (§4.4)                               | **exempt**, narrowly scoped                                            | Determining `store-on-device` cannot require `store-on-device`                                                                                                                                                                                                                                                                                                                                    |
+   | Integration persistent response cookies                          | `store-on-device` (+ P4 where the cookie is an advertising identifier) | **Deferred with the hook's cookie surface** — the write-side gate alone was insufficient (read/use/forward/withdrawal unmodeled), so cookie operations ship only with the full model; this row and the client-cycle **page leg** (module injection gated on the provider's full declaration) join the inventory when their features do, and the §5.3 no-geo guard's consumer list grows with them |
+   | Suppression-record writes (§4.3)                                 | **exempt**                                                             | Clearing authority is protective, like revocation                                                                                                                                                                                                                                                                                                                                                 |
 
    With **no EC provider configured**, identity use fails closed: a cookie
    value present on the request never egresses anywhere — never vacuously
@@ -739,12 +758,12 @@ Consumers of the resolved set in this epic:
 4. **Server-side auction dispatch** — gated on the policy `regime` class,
    normatively:
 
-   | Regime                                                                                                                    | Dispatch rule                                                                                                                                                                                                                                                                                                                                                                       | Preserves                                     |
-   | ------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
-   | `gdpr`                                                                                                                    | Dispatch only with a decodable, unexpired TCF record consenting to Purpose 1. Malformed, expired, or absent record → **no bid request leaves** (no-bid response).                                                                                                                                                                                                                   | Today's GDPR/unknown arm                      |
-   | `us-privacy`                                                                                                              | Dispatch proceeds in every signal state, including opt-out — the opt-out strips identity (rows above) but the contextual auction runs.                                                                                                                                                                                                                                              | Today's US-state arm                          |
-   | `none`                                                                                                                    | Dispatch proceeds.                                                                                                                                                                                                                                                                                                                                                                  | Today's non-regulated arm                     |
-   | **Any regime, raw TCF signal present** — a TC string on the request or a GPP section-2 hint, detected **before decoding** | The `gdpr` row applies: dispatch requires the _effective_ record to be decodable, unexpired, and consenting to Purpose 1. A **malformed or expired** raw signal therefore blocks dispatch — today a malformed raw TCF blocks, and gating this arm on decodability would have silently relaxed that. A US or non-regulated request carrying a Purpose 1 refusal is likewise blocked. | Today's raw-signal arm — **must not regress** |
+   | Regime                                                                                                                                                                                          | Dispatch rule                                                                                                                                                                                                                                                                                                                                                                       | Preserves                                     |
+   | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
+   | `gdpr`                                                                                                                                                                                          | Dispatch only with a decodable, unexpired TCF record consenting to Purpose 1. Malformed, expired, or absent record → **no bid request leaves** (no-bid response).                                                                                                                                                                                                                   | Today's GDPR/unknown arm                      |
+   | `us-privacy`                                                                                                                                                                                    | Dispatch proceeds in every signal state, including opt-out — the opt-out strips identity (rows above) but the contextual auction runs.                                                                                                                                                                                                                                              | Today's US-state arm                          |
+   | `none`                                                                                                                                                                                          | Dispatch proceeds.                                                                                                                                                                                                                                                                                                                                                                  | Today's non-regulated arm                     |
+   | **Any regime, TCF-sourced effective record** — a raw TC string on the request, a GPP section-2 hint (both detected **before decoding**), or a persisted-KV fallback record of TCF origin (§4.4) | The `gdpr` row applies: dispatch requires the _effective_ record to be decodable, unexpired, and consenting to Purpose 1. A **malformed or expired** raw signal therefore blocks dispatch — today a malformed raw TCF blocks, and gating this arm on decodability would have silently relaxed that. A US or non-regulated request carrying a Purpose 1 refusal is likewise blocked. | Today's raw-signal arm — **must not regress** |
 
    The **compiled-in fallback policy has `regime = "gdpr"`** (§3.1) — the
    no-policy posture must be the most protective for dispatch too, and a

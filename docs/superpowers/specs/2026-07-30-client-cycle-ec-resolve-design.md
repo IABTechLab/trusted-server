@@ -1,7 +1,12 @@
 # Design Spec: Client-Cycle Edge Cookie Providers and the Resolve Endpoint
 
-**Status:** Draft — **prerequisites unmet; do not implement against this spec
-until its open questions (§7) are resolved in a dedicated issue**
+**Status:** **Deferred — informative draft, not part of the epic's
+normative set.** No production adapter has the required CAS-class
+primitive (providers spec §7 matrix), the feature has no concrete
+consumer, and successive reviews keep finding open protocol questions
+(§7). It re-enters the epic only through its own dedicated issue, with
+this document as the starting bar — findings against this spec do not
+block ratification of the core specs.
 **Author:** Engineering
 **Issue references:** none yet (this spec exists to force one; #778 does not
 cover this feature)
@@ -69,15 +74,19 @@ Everything in this spec follows from that.
    that are signed by an expected party, **audience-bound** to this
    publisher, and **expiring**. Audience binding and expiry alone do not
    mitigate replay — a captured token installs in another browser for the
-   whole validity window. **Production schemes require session binding**
-   (a server-issued nonce the payload must embed): one-time consumption
-   alone limits multiplicity but proves nothing about _which_ browser
-   redeems first — a captured bearer payload can simply win the race — so
-   it is defense-in-depth, not the mitigation. First-presenter
-   at-most-once semantics may ship **only** as an explicitly accepted
-   posture recorded in the feature's issue, together with a specified
-   orphan-row cleanup path. "Single-use where the scheme allows" is not a
-   mitigation.
+   whole validity window. **Session binding is required, with no ownerless
+   escape hatch** (a server-issued nonce the payload must embed):
+   one-time consumption alone limits multiplicity but proves nothing
+   about _which_ browser redeems first — a captured bearer payload can
+   simply win the race — so it is defense-in-depth, not the mitigation.
+   An earlier draft allowed a "first-presenter, product-accepted"
+   ownerless mode; it is **removed**: risk acceptance does not make a
+   security invariant true, and the promised orphan cleanup was
+   unimplementable anyway — the server cannot observe `Set-Cookie`
+   acceptance, so it cannot distinguish a lost-response orphan from a
+   successful-but-dormant identity. A scheme that cannot embed the
+   session nonce cannot ship. "Single-use where the scheme allows" is
+   not a mitigation.
 3. **Preserve the identity-graph invariant.** The cookie is set only after
    the corresponding graph row is written, mirroring the organic path. Graph
    unavailable → no cookie, same as organic generation.
@@ -158,10 +167,7 @@ Everything in this spec follows from that.
    have the `Set-Cookie` re-emitted — which is precisely how a legitimate
    browser whose original response was lost recovers on retry, so a
    committed graph row never strands as an orphan for the intended
-   browser; anyone else gets a terminal response with no cookie. In the
-   explicitly-accepted at-most-once posture (no owner hash), a lost
-   response is an **orphan row** handled by the specified cleanup path.
-   The **same-identity no-op of §3.8 first checks the family revocation
+   browser; anyone else gets a terminal response with no cookie. The **same-identity no-op of §3.8 first checks the family revocation
    record**, and "revocation wins" is enforced by an explicit
    linearization point, not by read strength alone — a linearizable read
    followed by a separate commit still loses the race (read "not
@@ -180,6 +186,16 @@ Everything in this spec follows from that.
    resolve-vs-revocation races.
 
 ## 4. Requirements on the page script
+
+**The page leg is permission-gated before it executes.** The browser
+module obtains or derives a vendor identity — vendor contact, stable
+identifier in hand — so injecting it whenever the provider is merely
+_selected_ would run identity code for a visitor who denied everything,
+with only the later POST refused. The module is injected/activated only
+when the request's resolved permissions already satisfy the provider's
+complete `required_permissions()`, and the page leg is a listed row in
+the permission spec's §7 enforcement inventory (deferred alongside this
+feature).
 
 - The re-post guard must not depend on reading an HttpOnly cookie. Either
   the server injects a "resolved" marker the script _can_ read (a
@@ -218,6 +234,11 @@ sentence as the only guardrail.
 - Parity: all four adapters.
 
 ## 7. Open questions — to be settled in the feature's issue before any code
+
+0. The commit path spans keys (reservation, identity row, family-epoch
+   CAS): the cross-key atomicity or saga/compensation design is
+   **undefined** — the single-key CAS steps are specified, their
+   composition is not.
 
 1. Which concrete vendor scheme is the first real consumer, and does its
    envelope format satisfy §3.2 (audience binding, expiry)? If no concrete

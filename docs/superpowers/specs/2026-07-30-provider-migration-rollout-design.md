@@ -55,6 +55,7 @@ discoverable only because a deleted test had pinned the old behavior.
 | 11b | Proxy / click / Testlight forwarding extract the raw EC cookie/header **without** today's jurisdiction gate                                                                         | Gated by the egress inventory (both purposes)                                                                                                                                                                                                                     | **New privacy hardening, declared change** — not preservation                                                                                                                                          |
 | 11c | Batch sync today only authenticates the S2S caller and checks live/tombstoned row state — it is **not** jurisdiction-gated                                                          | Gated by stored-provenance recompute (permission spec §7); legacy rows fail closed until backfilled                                                                                                                                                               | **New privacy hardening, declared change** — not preservation                                                                                                                                          |
 | 12  | EC generation succeeds without a configured identity-graph store                                                                                                                    | A minting provider requires an openable graph store at startup (providers spec §5, §6); pre-N+1 readiness step provisions it                                                                                                                                      | **Breaking, declared** — graphless deployments must provision storage before upgrading                                                                                                                 |
+| 13  | Cookies minted by graphless deployments have no graph row                                                                                                                           | Recognized rowless legacy cookies are adopted via a permission-gated, race-safe create-if-absent on a live request (providers spec §5); never egress before adoption; withdrawal works without adoption via the derived family ID                                 | **Declared** — identity use of pre-existing cookies pauses until adopted                                                                                                                               |
 
 Rows 3, 4, and 7 are policy decisions, not code decisions: they belong in
 the `[permissions]` policy review, made explicitly by maintainers — not
@@ -124,10 +125,19 @@ Requirements:
      Preserving unknown JSON does not chase aliases, consult family
      revocations, honor suppression records, or fail closed on
      provenance; an N+1 that merely preserved would, after rollback,
-     treat aliased rows as missing and revoked identities as live.
-     Rollback tests therefore run the alias, family-revocation,
-     suppression, and provenance paths **on N+1** against N+2-written
-     data. **Rollback is binaries-first too, in the other direction** —
+     treat revoked identities as live (aliases are reserved-future with
+     the rewrite deferral, providers spec §6.1). N+1 must also **write**
+     the safety-critical record kinds — family revocation and
+     suppression — not only read them: a withdrawal arriving on a
+     rolled-back N+1 fleet must still revoke; only provenance _writing_
+     is deferred to N+2, which is what makes the boundary safe in both
+     directions. N+1 further **accepts an N+2-only provider in the
+     `legacy_providers` position** (parse/withdraw need no provenance
+     encoding) while rejecting it as active writer — otherwise the
+     rollback rule "retain the new provider as a legacy reader" would be
+     unsatisfiable on the very release it targets. Rollback tests
+     therefore run the family-revocation, suppression, and provenance
+     paths — read **and write** — on N+1 against N+2-written data. **Rollback is binaries-first too, in the other direction** —
      N+2 → N+1 binaries roll back keeping the new config (N+1 reads it
      fully; reverting config first would hand the old shape to N+2
      binaries that reject it) — **with one precondition**: if an
@@ -183,9 +193,12 @@ Requirements:
    required nor achievable through a structured serializer — and a
    genuinely pre-N+1 worker cannot preserve at all, which is exactly why
    the floor exists); after the **fleet-convergence gate**, **N+2
-   activates the writer** and begins emitting the new fields. **Rollback
-   below N+1 is prohibited once any new-format row exists** — a pre-floor
-   binary would silently strip the new fields from every row it touches.
+   activates the writer** and begins emitting the new fields. **The rollback floor is crossed at N+2 writer activation itself** — an
+   observable deploy event, recorded as a durable schema-floor marker in
+   the config store before writes enable — not at "any new-format row
+   exists", which no operator can disprove. Below-floor rollback is
+   prohibited from that marker on; a pre-floor binary would silently
+   strip the new fields from every row it touches.
    Rows carry the existing `v` schema discriminator; backfill is lazy via
    live requests (the same pass that backfills legacy provenance,
    permission spec §7) — and, critically, **withdrawal never depends on
@@ -221,10 +234,16 @@ Requirements:
    into the silent-stateless state.
 9. Every misconfiguration in the providers spec §6 table fails at
    **startup**. Request-time failure for a configuration error is a defect.
-10. Config-store payload validation (`ts config push`) applies the same
-    rules — including `[permissions]` policy validation (permission spec
-    §3.3) — so a bad config is rejected at push time, before any instance
-    restarts into it.
+10. Validation is split into two named layers, because "the same
+    validation at push and startup" is not implementable: **structural
+    validation** (schema, types, `[permissions]` policy — permission
+    spec §3.3) runs at `ts config push` and again at startup;
+    **deployment validation** (adapter capabilities, store bindings,
+    store openability — a structurally valid selection can still be one
+    an adapter must reject) runs at startup, where those facts exist.
+    Push may additionally pre-check deployment facts when given a
+    **machine-readable adapter capability profile** (the providers §7
+    matrix, serialized), but startup remains the authority.
 
 ## 5. Minimal-divergence migration recipe (operator-facing)
 
@@ -373,19 +392,20 @@ made differently). **Implementation is blocked while any row is `open`**;
 each row needs an owner, a status, and a link to its decision record —
 an unratified row reverts to open, not to silently implemented.
 
-| #   | Decision                                                                                                                                                | Where                         | Owner                 | Status |
-| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------- | --------------------- | ------ |
-| 1   | Opt-outs honored globally; destructive ones irreversibly withdraw outside the defining jurisdiction                                                     | permission §4, §4.2           | maintainers + legal   | open   |
-| 2   | Sale opt-outs (GPP, USP) control both P1 and P4 and destroy the identity                                                                                | permission §4.5               | maintainers + legal   | open   |
-| 3   | Sharing / targeted-advertising opt-outs remove P4 but retain the stored identity                                                                        | permission §4.5               | maintainers + legal   | open   |
-| 4   | US contextual auctions continue during opt-out, identity removed                                                                                        | permission §7                 | maintainers + product | open   |
-| 5   | Regionless US traffic treated as non-regulated unless the operator opts into country-wide gating                                                        | permission §3.4               | maintainers + legal   | open   |
-| 6   | Full consent strings continue downstream; raw consent snapshots retained in rows for audit                                                              | providers §6.3                | maintainers + legal   | open   |
-| 7   | Legacy batch-sync traffic rejected until live-browser provenance backfill                                                                               | this spec §6.4; permission §7 | maintainers + product | open   |
-| 8   | Proxy / click / Testlight forwarding newly gated by P1 ∧ P4                                                                                             | §2 row 11b                    | maintainers           | open   |
-| 9   | Integration persistent cookies inside the permission model (P1-gated, declared registration)                                                            | hook §3; permission §7        | maintainers           | open   |
-| 10  | Session cookies exempt from `store-on-device` even when they carry a stable identifier                                                                  | hook §3                       | maintainers + legal   | open   |
-| 11  | A single failed destructive withdrawal may leave S2S identity use live **indefinitely** for a never-returning visitor (no durable external retry queue) | permission §4.3               | maintainers + legal   | open   |
-| 12  | Adapters without revocation-eligible storage migrate **stateless** rather than blocking the release                                                     | §4.2 of this spec             | maintainers + product | open   |
-| 13  | Batch-sync acceptance dropping toward zero at cutover, with dormant identities having no automatic recovery path                                        | §6.4 of this spec             | maintainers + product | open   |
-| 14  | Policy tightening never reuses stored refusals destructively — a fresh, live post-change refusal is required (the spec decides this; ratify it)         | permission §4.2 trigger 2     | maintainers + legal   | open   |
+| #   | Decision                                                                                                                                                | Where                                       | Owner                 | Status                                      |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- | --------------------- | ------------------------------------------- |
+| 1   | Opt-outs honored globally; destructive ones irreversibly withdraw outside the defining jurisdiction                                                     | permission §4, §4.2                         | maintainers + legal   | open                                        |
+| 2   | Sale opt-outs (GPP, USP) control both P1 and P4 and destroy the identity                                                                                | permission §4.5                             | maintainers + legal   | open                                        |
+| 3   | Sharing / targeted-advertising opt-outs remove P4 but retain the stored identity                                                                        | permission §4.5                             | maintainers + legal   | open                                        |
+| 4   | US contextual auctions continue during opt-out, identity removed                                                                                        | permission §7                               | maintainers + product | open                                        |
+| 5   | Regionless US traffic treated as non-regulated unless the operator opts into country-wide gating                                                        | permission §3.4                             | maintainers + legal   | open                                        |
+| 6   | Full consent strings continue downstream; raw consent snapshots retained in rows for audit                                                              | providers §6.3                              | maintainers + legal   | open                                        |
+| 7   | Legacy batch-sync traffic rejected until live-browser provenance backfill                                                                               | this spec §6.4; permission §7               | maintainers + product | open                                        |
+| 8   | Proxy / click / Testlight forwarding newly gated by P1 ∧ P4                                                                                             | §2 row 11b                                  | maintainers           | open                                        |
+| 9   | Integration cookie operations — deferred out of the v1 hook with the full read/use/withdraw model as entry bar                                          | hook §3                                     | maintainers           | superseded by descope (ratify the deferral) |
+| 10  | Session-cookie exemption question                                                                                                                       | hook §3                                     | maintainers + legal   | deferred with item 9                        |
+| 11  | A single failed destructive withdrawal may leave S2S identity use live **indefinitely** for a never-returning visitor (no durable external retry queue) | permission §4.3                             | maintainers + legal   | open                                        |
+| 12  | Adapters without revocation-eligible storage migrate **stateless** rather than blocking the release                                                     | §4.2 of this spec                           | maintainers + product | open                                        |
+| 13  | Batch-sync acceptance dropping toward zero at cutover, with dormant identities having no automatic recovery path                                        | §6.4 of this spec                           | maintainers + product | open                                        |
+| 15  | **Epic descope**: client-cycle spec demoted to deferred-informative; `rewrite_legacy` cut to a recorded deferral; hook ships headers-only               | client spec status; providers §6.1; hook §3 | maintainers + product | open                                        |
+| 14  | Policy tightening never reuses stored refusals destructively — a fresh, live post-change refusal is required (the spec decides this; ratify it)         | permission §4.2 trigger 2                   | maintainers + legal   | open                                        |

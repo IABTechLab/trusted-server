@@ -142,6 +142,16 @@ Three global rules sit above every provider:
   a prefix-listing case. For `hmac`, the equivalence fixtures pin:
   uppercase/lowercase hex-prefix variants are equivalent; suffix case is
   preserved and significant.
+- **Cluster size means live identity rows.** Prefix counting lists
+  identity-row keys; family, suppression, reservation, and transaction
+  records live in other namespaces and never inflate a count. Member
+  tombstones share the identity key but carry the short cleanup TTL, so
+  their inflation is transient and biases conservative (an over-count
+  trips the trust threshold toward denial, never toward extra writes);
+  the listing filters by the value's `kind`/liveness within the existing
+  list limit where the backend returns values, and the residual
+  over-count where it cannot is declared. Aliases are reserved-future
+  (§6.1) and excluded by `kind` when they exist.
 - **No-cluster behavior is still defined.** A provider without cluster
   support deduplicates pull-sync by canonical graph key and redacts logs
   with a fixed-length hash of the graph key; `cluster_fallback` (§6.1)
@@ -241,6 +251,20 @@ header emission; the identity exists durably from that moment. A
 graph-commit failure means the mint never happened: no cookie, no egress,
 error logged, the next request retries.
 
+**Pre-existing cookies without rows are adopted, not orphaned.** Current
+graphless deployments have minted cookies with no row; under
+no-active-until-commit those identities could never be used again and —
+without care — never withdrawn. The contract: a recognized legacy cookie
+with no reachable row triggers a **permission-gated, race-safe adoption**
+on a live request — gated exactly like minting (`store-on-device`),
+implemented as create-if-absent on the verbatim key (concurrent adopters
+converge: same key, same deterministic family ID), provenance from the
+live resolution. Until adoption succeeds the cookie **never egresses**;
+**withdrawal works without adoption** — the deterministic family ID
+(permission model spec §4.3) needs no row, so a first post-upgrade
+request that is an opt-out revokes and expires the cookie with zero
+migrated state. Migration matrix row 13 declares this path.
+
 **Egress is typed, not policed.** The inventory-and-denylist test
 (permission model spec §7) is a backstop, but conventions do not survive
 new code — the ungated proxy/click/Testlight paths happened precisely
@@ -254,7 +278,13 @@ bids, sync, identify, forwarding) accept `AuthorizedIdentity<PartnerEgress>`
 and nothing weaker — an unparameterized wrapper would let a P1-only
 identity flow into an ORTB request. A future bypass then
 requires deliberately reconstructing the raw string — visible in review —
-rather than passing along what was already in hand.
+rather than passing along what was already in hand. The same boundary
+applies **request-side**: integration-facing request views (proxy
+interfaces, filter inputs, forwarded header/cookie maps) receive
+**identity-redacted** views — the EC cookie and identity headers are
+stripped unless the path holds `AuthorizedIdentity<PartnerEgress>` —
+because the ungated forwarding paths of PR #838 were exactly integrations
+reading the raw request.
 
 The gate applies to EC providers **only**. Geo and device are ungated for
 two _different_ reasons, stated separately because only one of them is
@@ -300,16 +330,17 @@ one. This spec resolves that by **not having** the method on those traits
 All validation happens at **settings construction** — a misconfiguration is a
 startup error, never a request-time error and never a silent behavior change.
 
-| Configuration state                                                                                                                                  | Behavior                                                                                                                                                                                                                                                                            |
-| ---------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `provider` names an unknown key                                                                                                                      | Startup error listing valid keys.                                                                                                                                                                                                                                                   |
-| `provider` set, its `[ec.providers.<key>]` block missing                                                                                             | Startup error.                                                                                                                                                                                                                                                                      |
-| `[ec.providers.<key>]` block present, `provider` unset                                                                                               | **Startup error.** (In PR #838 this silently ran stateless — the half-migrated config becomes a production identity outage detected by revenue drop. Rejecting it is the fix.) An operator who genuinely wants stateless deletes the block.                                         |
-| `provider` set to an implementation the running adapter cannot satisfy (e.g. a provider requiring host TLS fingerprints on an adapter that has none) | Startup error at adapter wiring time. Adapters declare their host capabilities to the composition root; the root checks the selected provider's needs against them **once**, at startup — not per request.                                                                          |
-| No `provider`, no providers block                                                                                                                    | Valid: the neutral default for that concern.                                                                                                                                                                                                                                        |
-| `rewrite_legacy = true` with a **client-resolve** active writer                                                                                      | **Startup error.** An organic request carries no signed client payload to mint from, and a later resolve POST meeting a different existing identity is a `409` by the client-cycle spec — the combination is incoherent until an authenticated linking/migration flow is specified. |
-| `provider = "none"` (explicit stateless)                                                                                                             | Valid, and the only way to combine statelessness with `legacy_providers`: minting stops, legacy readers keep existing identities resolvable and **withdrawable** (§6.1). Without this state, `hmac` → stateless would strand every live row in revoke-proof limbo.                  |
-| A minting provider (or any `legacy_providers`) configured, but no identity-graph store configured or openable                                        | **Startup error.** The lifecycle contract assumes graph persistence (§5); discovering its absence at first mint would be a request-time config failure, which this table exists to forbid.                                                                                          |
+| Configuration state                                                                                                                                  | Behavior                                                                                                                                                                                                                                                           |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `provider` names an unknown key                                                                                                                      | Startup error listing valid keys.                                                                                                                                                                                                                                  |
+| `provider` set, its `[ec.providers.<key>]` block missing                                                                                             | Startup error.                                                                                                                                                                                                                                                     |
+| `[ec.providers.<key>]` block present, `provider` unset                                                                                               | **Startup error.** (In PR #838 this silently ran stateless — the half-migrated config becomes a production identity outage detected by revenue drop. Rejecting it is the fix.) An operator who genuinely wants stateless deletes the block.                        |
+| `provider` set to an implementation the running adapter cannot satisfy (e.g. a provider requiring host TLS fingerprints on an adapter that has none) | Startup error at adapter wiring time. Adapters declare their host capabilities to the composition root; the root checks the selected provider's needs against them **once**, at startup — not per request.                                                         |
+| A `[ec.providers.<key>]` block referenced by neither `provider`, `legacy_providers`, nor a `versions`/`mint_version` chain                           | **Startup error.** An unreferenced block is almost always a dropped `legacy_providers` entry — accepted silently, it strands every identity that provider minted: unresolvable and, worse, non-withdrawable.                                                       |
+| No `provider`, no providers block                                                                                                                    | Valid: the neutral default for that concern.                                                                                                                                                                                                                       |
+| `rewrite_legacy` present at all (deferred out of the epic, §6.1)                                                                                     | **Startup error** — unknown key; transparent re-mint returns only with its own spec.                                                                                                                                                                               |
+| `provider = "none"` (explicit stateless)                                                                                                             | Valid, and the only way to combine statelessness with `legacy_providers`: minting stops, legacy readers keep existing identities resolvable and **withdrawable** (§6.1). Without this state, `hmac` → stateless would strand every live row in revoke-proof limbo. |
+| A minting provider (or any `legacy_providers`) configured, but no identity-graph store configured or openable                                        | **Startup error.** The lifecycle contract assumes graph persistence (§5); discovering its absence at first mint would be a request-time config failure, which this table exists to forbid.                                                                         |
 
 Unknown fields inside every provider config block are rejected
 (`deny_unknown_fields` on all new settings structs — the pre-existing `Ec`
@@ -357,56 +388,22 @@ The contract:
   unavailable (a cookie with no reachable row). Removing a version entry
   is a retirement subject to the same evidence rules as retiring a legacy
   reader (migration spec §6).
-- A cookie recognized by a legacy reader is a live identity for
-  read/withdrawal purposes; whether it is transparently re-minted under the
-  active writer is a per-deployment choice
-  (`[ec] rewrite_legacy = true|false`), and re-minting is subject to the
-  full minting gate of §5.
-- **Rewrite is a persistent fenced transaction aliasing to one canonical
-  row — no dual-write window, no duplicate targets, no lost updates.**
-  The steps, each resumable because the transaction record (its own
-  linearizable record class, §7 matrix) is written **first** and pins the
-  chosen target key and fencing epoch:
-  1. **Transaction record** commits: source key, target key, epoch,
-     state. A crashed rewrite retried later reads it and resumes with
-     the **same** target — a fresh random target (and an orphaned first
-     one) cannot exist, and any target row without a committed transaction
-     pointing at it is garbage-collectable by that absence.
-  2. **Canonical row** commits under the pinned target key, sharing the
-     old row's revocation family ID (permission model spec §4.3);
-     provenance is the **current live resolution** (copying old consent
-     evidence would rejuvenate stale authority); partner mappings copy
-     with their **original per-field timestamps and expiry**, and the
-     copy point is recorded in the transaction.
-  3. **A per-key CAS on the source identity key replaces the row value
-     with the alias** (same address, `kind` discriminator — §6.3). This
-     is why rewrite requires the row store itself to offer CAS with
-     read-your-writes (§7 matrix): the participants must share
-     transactional primitives, or a source update landing through an
-     eventual replica after the copy could be silently dropped. If the
-     CAS loses to a concurrent pull/batch/identify update, the rewrite
-     **re-runs a reconciliation pass** under its epoch — re-reading the
-     source with the store's strongest read, merging updates newer than
-     the recorded copy point into the canonical — and retries; an update
-     that won the old row is therefore never lost.
-  4. The new cookie is emitted; the transaction marks complete.
-
-  From step 3 on, every read or update through either cookie chases the
-  alias to the single canonical row. Chains are handled by **bounded
-  traversal with path compression**, not an inbound-alias index (an
-  index would need its own fenced schema, bounds, and concurrency rules
-  that nothing defined): traversal follows at most **4** hops with
-  visited-set cycle detection (deeper or cyclic → treated as row-read
-  failure, fail closed per §6.2); whenever a traversal crosses more than
-  one hop, it opportunistically CASes the first alias to point at the
-  final canonical, so chains converge to one hop without coordination. The server
-  cannot observe `Set-Cookie` acceptance, so the alias stays live until a
-  later request **presents the new cookie**, and in any case until a
-  **finite retirement deadline** no shorter than the old cookie's maximum
-  lifetime plus rollout skew. An interrupted rewrite at any step leaves
-  the old cookie resolving — no state in which neither identity works.
-  **Withdrawal through either cookie revokes the shared family.**
-
+- **`rewrite_legacy` is deferred out of the epic.** Transparent re-mint
+  under the active writer required primitives no production adapter has
+  (row-store CAS with read-your-writes plus a linearizable transaction
+  class — §7 matrix), and successive reviews kept surfacing open protocol
+  problems: retention lineage (a rewritten 364-day-old row either
+  rejuvenates the identity or leaves a year-long cookie pointing at an
+  expiring row — a lineage expiry must be pinned across canonical row,
+  alias, family record, and emitted cookie), alias visibility under
+  eventual stores, chain stranding after repeated migrations, and
+  cluster-count inflation by alias keys. Those are recorded here as the
+  entry bar for a future `rewrite_legacy` spec. Within the epic, provider
+  switching is served by **legacy readers alone**: old identities keep
+  resolving and stay withdrawable; they are never transparently
+  re-minted. The `rewrite_legacy` key is rejected at startup as unknown,
+  and the alias record class exists in the key grammar (§6.3) only as
+  reserved-for-future — nothing in the epic writes one.
 - Retiring a legacy reader is the explicit end of those identities:
   the migration guide documents the cleanup procedure (migration spec §6).
 - Tests: switch active provider → request with old cookie → identity still
@@ -478,7 +475,17 @@ Grammars are pairwise non-intersecting by their literal prefixes (plus
 the reserved hmac grammar), and every record value carries a `kind`
 discriminator alongside its schema version — so a reader always knows
 what it fetched, including where two classes deliberately share an
-address (row vs. alias).
+address (row vs. alias). The `/` shown in key sketches is **notation,
+not the wire byte**: the physical segment delimiter is a
+**backend-safe character validated per adapter** — Fastly permits `/` in
+keys but not in prefix _queries_, so a slash-delimited `id/<provider>/…`
+key could never be cluster-listed there despite the matrix marking
+prefix listing supported. The reference delimiter is `:`; each adapter's
+capability declaration includes which delimiter its prefix queries
+accept, and cluster-capability eligibility for a provider requires its
+physical prefix to be queryable on that backend — checked at startup,
+not discovered at the first cluster count. (hmac verbatim keys contain
+no delimiter before the 64-hex prefix and are unaffected.)
 
 **Wire schemas** (JSON, like identity rows; every class carries a schema
 version): the **alias record** holds target key, created-at, retirement
@@ -550,7 +557,7 @@ Requirements:
   | Family revocation records          | **Strongly consistent (read-after-write) primitive required.** Cloudflare Workers KV is **not eligible** — its documentation says propagation may take "60 seconds or more", an expectation, not a bound; on Cloudflare this record class needs a Durable-Object-class primitive. An adapter without an eligible primitive fails startup for identity features. A **failed or erroring revocation-record read fails closed** for egress |
   | Family suppression records         | Same strong class as family revocation — negative authority must not lose races to stale replicas                                                                                                                                                                                                                                                                                                                                       |
   | Rewrite transactions               | **Linearizable fenced CAS required** (same primitive class as reservations)                                                                                                                                                                                                                                                                                                                                                             |
-  | Alias installs                     | Row-store **per-key CAS with read-your-writes** — the alias lives at the source identity key (§6.3), so the _row store itself_ must supply the CAS; a purely eventual row store cannot host rewrite. `rewrite_legacy = true` is rejected at startup unless both this and the transaction class are available (§6)                                                                                                                       |
+  | Alias installs (reserved)          | Row-store **per-key CAS with read-your-writes** — recorded for the future `rewrite_legacy` spec; nothing in the epic writes an alias                                                                                                                                                                                                                                                                                                    |
   | Identity rows                      | Eventual consistency acceptable — rows are accretive, and the family-record check (strong, per above) governs use                                                                                                                                                                                                                                                                                                                       |
 
   Each adapter's declaration is part of its wiring, drives the §6
@@ -566,14 +573,14 @@ Requirements:
   them is how a "yes" cell hides an unusable feature. Feature eligibility
   requires wired, not merely available:
 
-  | Capability                                            | Fastly                                                                                                | Axum (dev)                                 | Cloudflare                                                                                                                                                                 | Spin                                                                                             |
-  | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------- | ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-  | Graph persistence (eventual OK)                       | KV Store: available + wired                                                                           | Local store: available + wired (dev-grade) | Workers KV: available + wired (eventually consistent)                                                                                                                      | Key-value: **available, not wired** — Spin config is embedded and EC KV routes are unwired today |
-  | Prefix listing (cluster)                              | Yes (used today)                                                                                      | Yes                                        | Yes (eventual)                                                                                                                                                             | _verify_                                                                                         |
-  | Strongly consistent revocation reads                  | _verify_ against Fastly KV semantics                                                                  | Yes (in-process)                           | **Workers KV: no** — needs Durable Objects, not currently wired                                                                                                            | _verify_                                                                                         |
-  | Linearizable fenced CAS (reservations, alias/rewrite) | **Not currently available** — client-cycle and `rewrite_legacy` unselectable until a primitive exists | Yes (in-process)                           | Durable Objects: possible, not wired                                                                                                                                       | **No**                                                                                           |
-  | Platform geo                                          | Yes — country + region                                                                                | No                                         | **Yes — country only, no region** (`cf-ipcountry`): regionless US traffic degrades per the permission spec's declared rule, which directly changes state-level US outcomes | No                                                                                               |
-  | Device host evidence (JA4/H2)                         | Yes                                                                                                   | No                                         | No                                                                                                                                                                         | No                                                                                               |
+  | Capability                                            | Fastly                                                                          | Axum (dev)                                                                                                        | Cloudflare                                                                                                                                                                 | Spin                                                                                             |
+  | ----------------------------------------------------- | ------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+  | Graph persistence (eventual OK)                       | KV Store: available + wired                                                     | Local store: available + wired (dev-grade)                                                                        | Workers KV: available + wired (eventually consistent)                                                                                                                      | Key-value: **available, not wired** — Spin config is embedded and EC KV routes are unwired today |
+  | Prefix listing (cluster)                              | Yes (used today)                                                                | Yes                                                                                                               | Yes (eventual)                                                                                                                                                             | _verify_                                                                                         |
+  | Strongly consistent revocation reads                  | _verify_ against Fastly KV semantics                                            | Yes (in-process)                                                                                                  | **Workers KV: no** — needs Durable Objects, not currently wired                                                                                                            | _verify_                                                                                         |
+  | Linearizable fenced CAS (reservations, alias/rewrite) | **Not currently available** — the client-cycle feature (deferred) would need it | Yes — in-process only: linearizable but **non-durable**, dev-eligibility only, not a production persistence claim | Durable Objects: possible, not wired                                                                                                                                       | **No**                                                                                           |
+  | Platform geo                                          | Yes — country + region                                                          | No                                                                                                                | **Yes — country only, no region** (`cf-ipcountry`): regionless US traffic degrades per the permission spec's declared rule, which directly changes state-level US outcomes | No                                                                                               |
+  | Device host evidence (JA4/H2)                         | Yes                                                                             | No                                                                                                                | No                                                                                                                                                                         | No                                                                                               |
 
 - Each adapter's runtime-services setup routes through the shared builders.
 - Providers are constructed **once** per application instance and stored in

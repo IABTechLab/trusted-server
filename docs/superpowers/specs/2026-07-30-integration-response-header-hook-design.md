@@ -67,7 +67,8 @@ mutators to the outbound response for HTML document responses it processed.
   storage subject to revalidation; `private` forbids shared storage), so
   "replace `private` with the stronger `no-cache`" would make a
   personalized response shared-storable. The merge: each of `no-store`,
-  `no-cache`, `private` is **sticky** — present in the snapshot or the
+  `no-cache`, `private`, `must-revalidate`, `proxy-revalidate`,
+  `must-understand`, and `no-transform` is **sticky** — present in the snapshot or the
   mutation ⇒ present in the final response, independently; `public` is
   dropped whenever any restriction is present; `max-age`/`s-maxage` may
   only shrink relative to the snapshot; `stale-while-revalidate`/
@@ -94,22 +95,21 @@ mutators to the outbound response for HTML document responses it processed.
   digest for bytes the hook never saw, corrupts responses or poisons
   caches), the `x-ts-*` namespace, and the
   consent/privacy headers core emits; (b) reserved cookie _names_ within `Set-Cookie` — `ts-ec`,
-  `ts-eids`, and the other `ts-*` cookies core owns. Integration cookies are **inside the permission model, not beside it**
-  (product sign-off item 9, migration spec §8) — otherwise the hook is a
-  door around the EC gate: an integration could write a durable
-  identifier while `store-on-device` is denied. `append_set_cookie`
-  therefore requires the cookie name to be **declared at registration**
-  with a stated purpose and maximum retention; a **persistent** cookie
-  (any `Max-Age`/`Expires`) is applied only when the request's resolved
-  permissions include `store-on-device`, while **session cookies** (no
-  persistence attributes) are the narrow, documented exemption.
-  Cookie operations go through a **typed cookie builder** that enforces
-  the declared lifetime ceiling, domain/path scope, and security
-  attributes (`Secure`, `SameSite`) — not a free-form string; **deletion
-  cookies (expiry of the integration's own declared names) remain
-  possible when `store-on-device` is denied**, since removing state must
-  never require the permission to keep it. Undeclared cookie names are
-  rejected like reserved ones. An integration may never set or expire a
+  `ts-eids`, and the other `ts-*` cookies core owns. **Cookie operations are deferred out of the v1 hook — headers only.**
+  The write-side gate alone ("persistent cookies require P1") was shown
+  insufficient: it never modeled reading, using, forwarding, or
+  withdrawing the cookie — a P1-granted-then-withdrawn integration
+  cookie would keep arriving on every request with nothing required to
+  expire, hide, or stop egressing it, and an advertising-identifier
+  cookie needs P4 the contract never expressed. Rather than ship
+  "inside the permission model" as a claim the model does not back,
+  `append_set_cookie` and the typed cookie builder are **deferred** to a
+  follow-up spec whose entry bar is: declared per-cookie required
+  permissions, a typed authorized request-side view, stripping from
+  unauthorized integration/proxy inputs, mandatory expiry on destructive
+  P1 withdrawal, and startup-unique (name, domain, path) ownership.
+  Integration IDs are startup-unique regardless. Until then the
+  operation set is headers-only, and `Set-Cookie` is fully reserved.
   reserved cookie name. Violations are rejected at the operation layer (§2) and
   logged at `warn` with the integration id. The reserved lists are single
   constants next to the definitions they protect, not duplicated in the
@@ -174,19 +174,24 @@ processed documents (§6).
 ## 4. Done-when (from #782, sharpened)
 
 1. Trait + builder + registry application, each public item documented.
-2. **At least one real consumer ships in the same PR** — an existing
+2. **The pre-existing `RequestFilterEffects.response_headers` channel is
+   folded into the hook in the same PR** — its outputs become hook
+   operations subject to the same validation, reserved surface, budgets,
+   and invariant pass, or the channel is removed; a second, unvalidated
+   header path bypassing the hook defeats every rule above.
+3. **At least one real consumer ships in the same PR** — an existing
    integration registering a mutator for a real need (or, failing a real
    need, the feature waits; scaffolding with only self-referential tests is
    dead code and will be removed).
-3. Every adapter applies mutations on its outbound path, with a per-adapter
+4. Every adapter applies mutations on its outbound path, with a per-adapter
    route test asserting an integration-set header appears in the response.
-4. A parity-suite case asserts identical mutation behavior across adapters.
-5. Reserved-surface, append/replace, operation-limit, and erroring-mutator
+5. A parity-suite case asserts identical mutation behavior across adapters.
+6. Reserved-surface, append/replace, operation-limit, and erroring-mutator
    semantics covered by unit tests.
-6. **Every row of the §3a eligibility matrix has a test** — streaming,
+7. **Every row of the §3a eligibility matrix has a test** — streaming,
    cache-hit, pass-through, redirect, error, and 304 each proven to run or
    not run the hook — not merely one positive header test per adapter.
-7. Cache/privacy invariant tests, one per restriction source and shape:
+8. Cache/privacy invariant tests, one per restriction source and shape:
    cookie appended + public `Cache-Control` replacement → private/no-store,
    surrogate stripped; **core-private cookieless** processed HTML +
    public replacement → restriction preserved; **origin-private cookieless** processed HTML that retained the
@@ -199,13 +204,11 @@ processed documents (§6).
 
 ## 5. Size and sequencing
 
-This is a modest feature plus tests, with zero coupling to the provider
-architecture — but its **cookie operations are coupled to the permission
-model** (§3; the gate is a listed enforcement point in the permission
-spec §7 inventory), so the claim of total independence is retired: the
-header-mutation portion may land whenever its first real consumer is
-identified (§4.2), while `append_set_cookie` activates only **after** the
-permission model PR, and registers as unavailable before it. If no consumer
+This is a modest feature plus tests with zero coupling to the provider
+architecture or, in its v1 headers-only form (§3), to the permission
+model. It lands whenever its first real consumer is identified (§4.2);
+cookie operations arrive only with their own follow-up spec (§3) and its
+permission-model coupling. If no consumer
 materializes, it does not land; being unblocked is not a reason to ship
 scaffolding.
 
