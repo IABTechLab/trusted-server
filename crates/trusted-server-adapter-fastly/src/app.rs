@@ -65,10 +65,10 @@
 //!   run on these responses. Legacy ran EC finalization on its own auth
 //!   challenges. Like the 401 geo-skip, this is privacy-conservative: no EC
 //!   cookies are issued to unauthenticated callers.
-//! - **Publisher responses** are buffered (bounded by
-//!   `publisher.max_buffered_body_bytes`) instead of streamed to the client.
-//!   Asset responses are streamed straight to the client (see
-//!   [`dispatch_asset_fallback`]), matching legacy.
+//! - **Publisher responses** keep Fastly origin bodies streaming through the
+//!   `EdgeZero` response body when the body is processable or pass-through.
+//!   Adapters without streaming-body support still use the bounded buffered
+//!   finalizer.
 //! - **Router-level 405s** (unregistered verbs) skip EC finalization along
 //!   with the middleware chain; the entry point still adds TS headers.
 //!
@@ -116,8 +116,9 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
-    handle_tsjs_dynamic, page_bids_preflight_denied,
+    AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, handle_page_bids,
+    handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
+    publisher_response_into_streaming_response,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
@@ -523,6 +524,13 @@ async fn execute_named(
         return Ok(run_batch_sync(&state, &services, req));
     }
 
+    if let Err(report) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+        &state.settings,
+        &mut req,
+    ) {
+        return Ok(http_error(&report));
+    }
+
     let mut ec = build_ec_request_state(&state.settings, &services, &req);
     // EcContext creation errors short-circuit before filters, mirroring legacy:
     // the legacy path returns its error response before running filter_request.
@@ -702,6 +710,13 @@ async fn dispatch_fallback(
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
+    if let Err(report) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+        &state.settings,
+        &mut req,
+    ) {
+        return http_error(&report);
+    }
+
     let mut ec = build_ec_request_state(&state.settings, services, &req);
     if let Some(report) = ec.setup_error.take() {
         let response = http_error(&report);
@@ -721,10 +736,9 @@ async fn dispatch_fallback(
     let result = if uses_dynamic_tsjs_fallback(&method, &path) {
         handle_tsjs_dynamic(&req, &state.registry)
     } else if state.registry.has_route(&method, &path) {
-        // Integration-proxy responses are not bounded by publisher.max_buffered_body_bytes.
-        // Only the handle_publisher_request branch below routes through
-        // buffer_publisher_response_async. Integration responses are small in practice
-        // and the EdgeZero flag is off by default; extend the cap here if that changes.
+        // Integration-proxy responses are not bounded by
+        // publisher.max_buffered_body_bytes. Publisher fallback below uses the
+        // publisher-specific streaming finalizer instead.
         state
             .registry
             .handle_proxy(ProxyDispatchInput {
@@ -773,9 +787,8 @@ async fn dispatch_fallback(
         match runtime_services_for_consent_route(&state.settings, services) {
             Ok(publisher_services) => {
                 // Run the server-side auction with the configured creative-
-                // opportunity slots and collect the dispatched bids in the
-                // buffered finalize (`buffer_publisher_response_async`), matching
-                // the legacy streaming path. `handle_publisher_request` matches the
+                // opportunity slots and collect dispatched bids from the lazy
+                // publisher body stream. `handle_publisher_request` matches the
                 // slots against the request path. The partner registry plus the
                 // EC identity-graph KV (`ec.kv_graph`) enrich the bid request with
                 // server-side EIDs, same as the legacy auction.
@@ -798,13 +811,13 @@ async fn dispatch_fallback(
                         .await
                         {
                             Ok(pub_response) => {
-                                buffer_publisher_response_async(
+                                publisher_response_into_streaming_response(
                                     pub_response,
                                     &method,
-                                    &state.settings,
-                                    &state.registry,
-                                    &state.orchestrator,
-                                    &publisher_services,
+                                    Arc::clone(&state.settings),
+                                    state.registry.as_ref(),
+                                    Arc::clone(&state.orchestrator),
+                                    publisher_services.clone(),
                                 )
                                 .await
                             }
@@ -1083,7 +1096,17 @@ const NAMED_ROUTES: &[NamedRoute] = &[
     // GET runs the SPA re-auction; OPTIONS is denied in-handler as a CORS
     // preflight guard for this side-effecting endpoint.
     NamedRoute {
-        path: "/__ts/page-bids",
+        path: PAGE_BIDS_PATH,
+        primary_methods: &[Method::GET, Method::OPTIONS],
+        handler: NamedRouteHandler::PageBids,
+    },
+    // Deprecated double-underscore alias. tsjs bundles served before the
+    // `/_ts/page-bids` rename keep requesting this path from already-loaded
+    // pages and browser caches; dropping it would strand SPA navigations
+    // without ads until those bundles age out. See `PAGE_BIDS_LEGACY_PATH`;
+    // removal is tracked by IABTechLab/trusted-server#970.
+    NamedRoute {
+        path: PAGE_BIDS_LEGACY_PATH,
         primary_methods: &[Method::GET, Method::OPTIONS],
         handler: NamedRouteHandler::PageBids,
     },
@@ -1211,8 +1234,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        AppState, NAMED_ROUTES, NamedRouteHandler, TrustedServerApp, build_state_from_settings,
-        startup_error_router,
+        AppState, NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH,
+        TrustedServerApp, build_state_from_settings, startup_error_router,
     };
     use bytes::Bytes;
     use edgezero_core::body::Body;
@@ -1621,6 +1644,48 @@ mod tests {
                     "legacy {method} {path} must route to the local deny handler, not publisher fallback"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn page_bids_serves_canonical_path_and_deprecated_alias() {
+        // The SPA re-auction endpoint lives at the canonical single-underscore
+        // `/_ts/page-bids`, matching every other internal route. The deprecated
+        // `/__ts/page-bids` alias must stay registered to the same handler with
+        // the same methods until pre-rename tsjs bundles age out of browser
+        // caches — dropping it would leave those clients without ads on SPA
+        // navigations.
+        //
+        // The paths are literals, not `PAGE_BIDS_PATH` / `PAGE_BIDS_LEGACY_PATH`.
+        // Looking a route up by the same const it was registered with is
+        // tautological: it keeps passing if the const's value changes, which is
+        // exactly the break that would silently desync the server from the tsjs
+        // client's hardcoded fetch path. Pin the consts to their literals too so
+        // a rename has to be deliberate.
+        assert_eq!(
+            PAGE_BIDS_PATH, "/_ts/page-bids",
+            "canonical page-bids path must match the path tsjs fetches"
+        );
+        assert_eq!(
+            PAGE_BIDS_LEGACY_PATH, "/__ts/page-bids",
+            "legacy alias must match the path pre-rename tsjs bundles fetch"
+        );
+
+        for path in ["/_ts/page-bids", "/__ts/page-bids"] {
+            let route = NAMED_ROUTES
+                .iter()
+                .find(|route| route.path == path)
+                .unwrap_or_else(|| panic!("{path} should be registered"));
+
+            assert!(
+                matches!(route.handler, NamedRouteHandler::PageBids),
+                "{path} must map to the page-bids handler"
+            );
+            assert_eq!(
+                route.primary_methods,
+                &[Method::GET, Method::OPTIONS],
+                "{path} must handle GET and OPTIONS directly, not fall through to the publisher"
+            );
         }
     }
 
@@ -2158,6 +2223,10 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl PlatformHttpClient for StreamingHttpClient {
+        fn supports_streaming_responses(&self) -> bool {
+            true
+        }
+
         async fn send(
             &self,
             request: PlatformHttpRequest,
@@ -2265,6 +2334,36 @@ mod tests {
         assert!(
             matches!(response.body(), Body::Stream(_)),
             "EdgeZero asset dispatch must stream the origin body, not buffer it"
+        );
+    }
+
+    #[test]
+    fn dispatch_fallback_streams_publisher_body_without_buffering() {
+        // Regression guard for the publisher streaming cutover (#849): a
+        // successful publisher origin fetch must hand `edgezero_main` a lazy
+        // streaming body (`Body::Stream`) so headers commit at origin first
+        // byte, rather than draining the processed page into a buffered
+        // `Body::Once`. Core tests cover the rewrite pipeline itself; this
+        // guards the adapter wiring that could silently re-buffer.
+        let settings = test_settings();
+        let state = build_state_from_settings(settings).expect("should build state");
+        let services = streaming_runtime_services();
+        let req = empty_request(Method::GET, "/article");
+
+        let response = block_on(super::dispatch_fallback(&state, &services, req));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "publisher proxy should succeed against the streaming origin stub"
+        );
+        assert!(
+            matches!(response.body(), Body::Stream(_)),
+            "EdgeZero publisher dispatch must attach the lazy streaming body, not buffer it"
+        );
+        assert!(
+            !response.headers().contains_key(header::CONTENT_LENGTH),
+            "processed streaming publisher responses must not carry a stale Content-Length"
         );
     }
 

@@ -109,6 +109,14 @@ interface GoogleTagPubAdsService {
   disableInitialLoad?(): void;
 }
 
+interface GoogleTagConfig extends Record<string, unknown> {
+  disableInitialLoad?: boolean | null;
+}
+
+interface GoogleTagEffectiveConfig {
+  disableInitialLoad?: boolean;
+}
+
 interface GoogleTag {
   cmd: Array<() => void>;
   pubads(): GoogleTagPubAdsService;
@@ -120,6 +128,8 @@ interface GoogleTag {
   destroySlots(slots?: GoogleTagSlot[]): boolean;
   enableServices(): void;
   display(elementId: string): void;
+  setConfig?(config: GoogleTagConfig): void;
+  getConfig?(keys: string | string[]): GoogleTagEffectiveConfig | undefined;
   _loaded_?: boolean;
 }
 
@@ -281,7 +291,11 @@ export function safeAdmIframeSrc(src: string): string | undefined {
  *
  * Adapted from PR #241 (github.com/IABTechLab/trusted-server/pull/241).
  * Instead of reading from pbjs, reads adm directly from window.tsjs.bids.
- * Only active when inject_adm_for_testing injects adm server-side.
+ *
+ * This is the testing-only direct-replace path that bypasses GAM entirely. The
+ * sanitized `adm` now ships in production for the pbRender bridge, so `adm`
+ * presence no longer gates it; the caller gates on the per-bid `debug_bid`
+ * signal (present only under `inject_adm_for_testing`) instead.
  *
  * Strategy:
  * 1. If adm contains an <iframe src="..."> with a safe http(s) src, set that
@@ -409,15 +423,16 @@ function queueWinBillingBeacon(url: string): boolean {
 /**
  * Track whether the publisher disabled GPT initial load.
  *
- * GPT exposes no getter for the initial-load-disabled flag, so wrap
- * `pubads().disableInitialLoad()` to record it on `window.tsjs`. With initial
- * load disabled, `display()` only registers a slot — the ad request must come
- * from a later `refresh()`. adInit() reads this to refresh its own freshly
- * defined slots so they are not left blank.
+ * Read GPT's effective state through `getConfig()` when available and wrap both
+ * configuration APIs so changes are synchronized immediately. The wrappers also
+ * provide a fallback for runtimes where the getter is unavailable. With initial
+ * load disabled, `display()` only registers a slot — the ad request
+ * must come from a later `refresh()`. adInit() reads this to refresh its own
+ * freshly defined slots so they are not left blank.
  *
- * Installed via the command queue so it runs before the publisher's own
- * `disableInitialLoad()` call (the TS core script is injected ahead of the
- * publisher's GPT setup). Idempotent per pubads service.
+ * Installed via the command queue so it runs before the publisher's own GPT
+ * configuration (the TS core script is injected ahead of the publisher's GPT
+ * setup). Idempotent per googletag object and pubads service.
  *
  * Only hooks an existing `googletag` stub — it never creates one. A plain module
  * import that does not activate the GPT integration must not touch
@@ -425,39 +440,142 @@ function queueWinBillingBeacon(url: string): boolean {
  * `installTsAdInit` runs, so the detector is still queued ahead of the
  * publisher's GPT setup.
  */
+function syncInitialLoadDisabled(gpt: Partial<GoogleTag>, ts: TsjsApi): boolean {
+  if (typeof gpt.getConfig !== 'function') return false;
+
+  const config = gpt.getConfig('disableInitialLoad');
+  if (!config || config.disableInitialLoad === undefined) return false;
+
+  ts.gptInitialLoadDisabled = config.disableInitialLoad === true;
+  return true;
+}
+
 function installInitialLoadDetector(ts: TsjsApi): void {
   const win = window as GptWindow;
   const cmd = win.googletag?.cmd;
   if (!cmd) return;
   cmd.push(() => {
-    const pubads = win.googletag?.pubads?.();
+    const gpt = win.googletag as
+      | (Partial<GoogleTag> & { __tsInitialLoadConfigHooked?: boolean })
+      | undefined;
+    if (!gpt) return;
+
+    syncInitialLoadDisabled(gpt, ts);
+
+    if (typeof gpt.setConfig === 'function' && !gpt.__tsInitialLoadConfigHooked) {
+      const originalSetConfig = gpt.setConfig.bind(gpt);
+      gpt.setConfig = function (...args: Parameters<typeof originalSetConfig>) {
+        const config = args[0];
+        const result = originalSetConfig(...args);
+        if (!syncInitialLoadDisabled(gpt, ts) && config && 'disableInitialLoad' in config) {
+          ts.gptInitialLoadDisabled = config.disableInitialLoad === true;
+        }
+        return result;
+      };
+      gpt.__tsInitialLoadConfigHooked = true;
+    }
+
+    const pubads = gpt.pubads?.();
     if (!pubads) return;
     const service = pubads as GoogleTagPubAdsService & { __tsInitialLoadHooked?: boolean };
     if (typeof service.disableInitialLoad !== 'function' || service.__tsInitialLoadHooked) {
       return;
     }
-    const original = service.disableInitialLoad.bind(service);
+    const originalDisableInitialLoad = service.disableInitialLoad.bind(service);
     service.disableInitialLoad = function () {
-      ts.gptInitialLoadDisabled = true;
-      return original();
+      const result = originalDisableInitialLoad();
+      if (!syncInitialLoadDisabled(gpt, ts)) {
+        ts.gptInitialLoadDisabled = true;
+      }
+      return result;
     };
     service.__tsInitialLoadHooked = true;
   });
 }
 
+/**
+ * Install `window.tsjs.scheduleInitialAdInit`.
+ *
+ * The server-injected `</body>` bids script calls this to run the initial
+ * `adInit()` after React hydration instead of synchronously at body-parse
+ * time. `adInit()` defines GPT slots on the publisher's `-container`
+ * wrappers, mutating those ad-slot subtrees; on a Next.js App Router page a
+ * synchronous call lands that mutation inside React's hydration window and
+ * trips a #418 hydration mismatch. Deferral: gate on window `load` (the
+ * client bundles that hydrate the tree have executed by then), then a double
+ * `requestAnimationFrame` so the call runs after React has committed. A
+ * single deferred call — no retry timer.
+ *
+ * The SSR document is navigation generation 0 by definition, so the scheduler
+ * pins the whole initial pass to generation 0 rather than capturing whatever
+ * the counter reads when the `</body>` script runs: the SPA hook is installed
+ * by the synchronous head bundle, so a navigation can commit while the HTML
+ * is still streaming, and capturing that advanced value would adopt the stale
+ * SSR bootstrap as current. For the same reason the initial bids payload is
+ * passed in and applied here, generation-guarded — assigning it
+ * unconditionally at body end would clobber the live bids a faster SPA
+ * navigation already applied. When a navigation has committed since — or
+ * commits while the deferred callback is pending — the SSR payload is
+ * dropped and `adInit()` is not run: running anyway would re-run the newer
+ * route's live slots/bids, destroying and redefining that route's TS slots
+ * and double-refreshing it. The generation counter (not a URL comparison)
+ * keeps this guard aligned with the SPA auction hook's own navigation
+ * identity: a query-only history change the hook ignores must not cancel the
+ * initial call, while an `/a → /b → /a` round trip — where the URL compares
+ * equal again — must.
+ *
+ * Hidden documents: browsers do not service `requestAnimationFrame` while a
+ * document is hidden, so a background-tab load (Cmd+click, open-in-new-tab)
+ * holds the initial `adInit()` until the tab is first viewed. This is
+ * intended, not an oversight: the initial ad request then spends its
+ * impression on a tab someone is actually looking at instead of firing —
+ * unviewable — at parse time in a tab that may never be foregrounded, and
+ * riding rAF keeps a single code path whose post-hydration-commit guarantee
+ * holds whenever the request is actually issued.
+ */
+function installScheduleInitialAdInit(ts: TsjsApi): void {
+  ts.scheduleInitialAdInit = function (initialBids?: Record<string, AuctionBidData>) {
+    if ((ts.navGeneration ?? 0) !== 0) return;
+    if (initialBids) ts.bids = initialBids;
+    const runUnlessNavigated = (): void => {
+      if ((ts.navGeneration ?? 0) !== 0) return;
+      ts.adInit?.();
+    };
+    const afterHydrationFrames = (): void => {
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(runUnlessNavigated);
+      });
+    };
+    if (document.readyState === 'complete') {
+      afterHydrationFrames();
+    } else {
+      window.addEventListener('load', afterHydrationFrames, { once: true });
+    }
+  };
+}
+
 export function installTsAdInit(): void {
   const ts = (window.tsjs ??= {} as TsjsApi);
   installInitialLoadDetector(ts);
+  installScheduleInitialAdInit(ts);
   ts.adInit = function () {
     const slots = ts.adSlots ?? [];
     // Snapshot bids at adInit() call time — correct for targeting setup.
     // The slotRenderEnded listener below reads ts.bids live so SPA navigation
     // updates (new ts.bids injected before </body>) are picked up at render time.
     const bids = ts.bids ?? {};
+    // Generation this invocation belongs to. The destructive slot work below
+    // is queued on googletag.cmd, which only drains when GPT itself loads —
+    // possibly much later (e.g. consent-gated GPT). A navigation can commit
+    // in that gap, so the queued callback rechecks the generation as its
+    // first act and stands down rather than applying this invocation's
+    // slots/bids to the newer route's DOM and double-requesting it.
+    const generation = ts.navGeneration ?? 0;
     const g = (window as GptWindow).googletag;
     if (!g) return;
 
     g.cmd?.push(() => {
+      if ((ts.navGeneration ?? 0) !== generation) return;
       // Destroy previously defined TS slots before redefining for the new page.
       if (ts.prevGptSlots && ts.prevGptSlots.length > 0) {
         g.destroySlots?.(ts.prevGptSlots as GoogleTagSlot[]);
@@ -593,10 +711,13 @@ export function installTsAdInit(): void {
           // Read ts.bids live (not the snapshot above) so post-navigation bid data is used.
           const bid = (ts.bids ?? {})[slotId] ?? {};
 
-          // GAM interceptor (testing): when adm is present, replace the GAM creative.
-          // Adapted from PR #241 — uses window.tsjs.bids[slotId].adm instead of pbjs.
-          // Only active when inject_adm_for_testing injects adm into bids server-side.
-          if (bid.adm) {
+          // GAM interceptor (testing bypass): directly replace the GAM creative.
+          // `adm` is now always injected in production, so it can no longer gate
+          // this path. `debug_bid` is present only when inject_adm_for_testing is
+          // on, so it is the per-bid signal that the testing bypass is enabled.
+          // In production the render bridge serves the creative and GAM stays in
+          // the loop; this direct replace stays testing-only.
+          if (bid.adm && bid.debug_bid) {
             injectAdmIntoSlot(divId, bid.adm);
           }
         });
@@ -612,12 +733,13 @@ export function installTsAdInit(): void {
       // Slots needing an explicit ad request via refresh(). Reused
       // publisher-owned slots always need one to pick up the just-applied
       // server-side targeting. TS-defined slots are normally fetched by the
-      // display() above — but when the publisher called
-      // pubads().disableInitialLoad(), display() only registers the slot and the
-      // ad request must come from refresh(). Without this, a TS-owned
+      // display() above — but when the publisher disabled initial load through
+      // setConfig() or the legacy pubads() method, display() only registers the
+      // slot and the ad request must come from refresh(). Without this, a TS-owned
       // first-impression slot renders blank on initial-load-disabled pages. Only
       // add them in that case; otherwise display() + refresh() would
       // double-request the impression.
+      syncInitialLoadDisabled(g, ts);
       const slotsNeedingRefresh = ts.gptInitialLoadDisabled
         ? slotsToRefresh.concat(newSlots)
         : slotsToRefresh;
@@ -642,6 +764,77 @@ export function installTsAdInit(): void {
 interface PageBidsResponse {
   slots: AuctionSlot[];
   bids: Record<string, AuctionBidData>;
+}
+
+/** Canonical SPA re-auction endpoint. Mirrors `PAGE_BIDS_PATH` in Rust. */
+const PAGE_BIDS_PATH = '/_ts/page-bids';
+
+/**
+ * Deprecated alias of {@link PAGE_BIDS_PATH}, kept registered server-side so
+ * pre-rename bundles keep working. This bundle falls back to it when the
+ * canonical path does not serve page-bids: a server rolled back to before the
+ * rename does not register the canonical path, and an operator `[[handlers]]`
+ * auth regex broad enough to cover `/_ts` answers it with `401` that no
+ * anonymous browser fetch can satisfy. Without the fallback either case
+ * silently drops ads on every SPA navigation.
+ *
+ * Removed together with the server-side alias in IABTechLab/trusted-server#970.
+ */
+const PAGE_BIDS_LEGACY_PATH = '/__ts/page-bids';
+
+/**
+ * `X-TSJS-Page-Bids` value sent on a fallback request, so the server can tell
+ * a current bundle that could not use the canonical path from a pre-rename
+ * bundle that only knows the alias. Only the former signals a deployment that
+ * needs fixing. Mirrors `PAGE_BIDS_FALLBACK_MARKER` in Rust.
+ */
+const PAGE_BIDS_FALLBACK_MARKER = 'fallback';
+
+/** Outcome of one page-bids request against a specific endpoint path. */
+interface PageBidsAttempt {
+  /** Parsed payload, or `null` when this endpoint did not serve one. */
+  data: PageBidsResponse | null;
+  /**
+   * The response says this path does not serve page-bids on this deployment,
+   * so the other registered path is worth trying. Transient failures and the
+   * endpoint's own cross-site denial apply equally to both paths and do not
+   * set this.
+   */
+  wrongEndpoint: boolean;
+}
+
+async function fetchPageBids(
+  endpoint: string,
+  path: string,
+  signal: AbortSignal
+): Promise<PageBidsAttempt> {
+  const res = await fetch(`${endpoint}?path=${encodeURIComponent(path)}`, {
+    credentials: 'include',
+    // Non-simple header doubles as a CSRF token: the server rejects
+    // requests that carry neither same-origin Fetch Metadata nor this
+    // header, and cross-origin pages cannot send it without a CORS
+    // preflight the endpoint never grants. The server checks presence, not
+    // value, so the value carries the fallback diagnostic.
+    headers: {
+      'X-TSJS-Page-Bids': endpoint === PAGE_BIDS_LEGACY_PATH ? PAGE_BIDS_FALLBACK_MARKER : '1',
+    },
+    signal,
+  });
+  if (!res.ok) {
+    // 401: an operator auth handler regex covers this path. 404: this server
+    // does not know the route. Either way the other path may still answer.
+    // 403 (cross-site gate) and 5xx would repeat on both, so they do not.
+    return { data: null, wrongEndpoint: res.status === 401 || res.status === 404 };
+  }
+  try {
+    return { data: (await res.json()) as PageBidsResponse, wrongEndpoint: false };
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') throw err;
+    // A server with no route for this path proxies it to the publisher origin,
+    // which answers 200 HTML. An unparseable body is the wrong endpoint, not a
+    // transient failure.
+    return { data: null, wrongEndpoint: true };
+  }
 }
 
 /**
@@ -696,7 +889,7 @@ function waitForSlotElements(slots: AuctionSlot[], signal: AbortSignal): Promise
  *
  * Patches `history.pushState` and `history.replaceState`, and listens to
  * `popstate`, so that after each client-side route change the trusted server
- * fetches fresh slots + bids from `/__ts/page-bids?path=<new_path>`, updates
+ * fetches fresh slots + bids from `/_ts/page-bids?path=<new_path>`, updates
  * `window.tsjs.adSlots` / `window.tsjs.bids`, and calls `window.tsjs.adInit()`.
  *
  * Idempotent: guarded by `window.tsjs.spaHookInstalled` so multiple calls are safe.
@@ -706,6 +899,13 @@ export function installSpaAuctionHook(): void {
   const ts = (window.tsjs ??= {} as TsjsApi);
   if (ts.spaHookInstalled) return;
   ts.spaHookInstalled = true;
+  // Navigation identity for the deferred initial-adInit bootstrap (see
+  // installScheduleInitialAdInit). Initialized here, and incremented
+  // synchronously in onNavigate the moment a route change is accepted, so the
+  // counter can never lag the auction decision. Deliberately NOT rolled back
+  // when a navigation later fails: the framework has already swapped the
+  // route's DOM by then, so a pending initial callback must still stand down.
+  ts.navGeneration ??= 0;
 
   let inflight: AbortController | null = null;
   // Last path an auction was run for. popstate fires for hash-only and
@@ -719,25 +919,41 @@ export function installSpaAuctionHook(): void {
   // mid-flight and B then fails, rolling back to A (never loaded) would strand
   // it behind the no-op guard, so we roll back to the last applied route instead.
   let lastAppliedPath = location.pathname;
+  // Endpoint this session requests. Starts canonical; if the deployment does
+  // not serve page-bids there, one navigation retries on the deprecated alias
+  // and the session stays on it rather than re-probing every navigation.
+  let pageBidsEndpoint = PAGE_BIDS_PATH;
+
+  async function requestPageBids(
+    path: string,
+    signal: AbortSignal
+  ): Promise<PageBidsResponse | null> {
+    const attempt = await fetchPageBids(pageBidsEndpoint, path, signal);
+    if (attempt.data || !attempt.wrongEndpoint || pageBidsEndpoint !== PAGE_BIDS_PATH) {
+      return attempt.data;
+    }
+
+    const fallback = await fetchPageBids(PAGE_BIDS_LEGACY_PATH, path, signal);
+    if (!fallback.data) return null;
+    log.warn(
+      `SPA auction hook: ${PAGE_BIDS_PATH} does not serve page-bids here, ` +
+        `falling back to ${PAGE_BIDS_LEGACY_PATH}`
+    );
+    pageBidsEndpoint = PAGE_BIDS_LEGACY_PATH;
+    return fallback.data;
+  }
 
   async function onNavigate(path: string): Promise<void> {
     if (path === currentPath) return;
     currentPath = path;
+    ts.navGeneration = (ts.navGeneration ?? 0) + 1;
     inflight?.abort();
     const controller = new AbortController();
     inflight = controller;
 
     try {
-      const res = await fetch(`/__ts/page-bids?path=${encodeURIComponent(path)}`, {
-        credentials: 'include',
-        // Non-simple header doubles as a CSRF token: the server rejects
-        // requests that carry neither same-origin Fetch Metadata nor this
-        // header, and cross-origin pages cannot send it without a CORS
-        // preflight the endpoint never grants.
-        headers: { 'X-TSJS-Page-Bids': '1' },
-        signal: controller.signal,
-      });
-      if (!res.ok) {
+      const data = await requestPageBids(path, controller.signal);
+      if (!data) {
         // A transient page-bids failure must not strand this route: roll the
         // committed path back so a later navigation here retries instead of
         // being skipped by the no-op guard at the top. Only roll back when no
@@ -745,7 +961,6 @@ export function installSpaAuctionHook(): void {
         if (inflight === controller) currentPath = lastAppliedPath;
         return;
       }
-      const data = (await res.json()) as PageBidsResponse;
       if (inflight !== controller) return;
       // Defer applying bids until the new route's ad containers exist, so a
       // fast edge response cannot beat the DOM and drop server-side bids.
@@ -819,6 +1034,79 @@ const TS_DISPLAY_RENDERER =
   'if(d.adUrl&&!d.ad){f.src=d.adUrl;}else{f.srcdoc=d.ad;}' +
   'w.document.body.appendChild(f);};})();';
 
+/** The clear-price auction macro DSPs embed in creative markup and tracking URLs. */
+const AUCTION_PRICE_MACRO = '${AUCTION_PRICE}';
+
+/**
+ * Substitute the `${AUCTION_PRICE}` macro with a clearing price. Mirrors the
+ * server-side `expand_auction_price_macro`: only the exact clear-price token is
+ * replaced, so the encrypted `${AUCTION_PRICE:B64}` variant is left intact.
+ */
+function expandAuctionPriceMacro(markup: string, cpm: number): string {
+  return markup.includes(AUCTION_PRICE_MACRO)
+    ? markup.split(AUCTION_PRICE_MACRO).join(String(cpm))
+    : markup;
+}
+
+/** A decoded PBS Cache bid: the renderable creative plus its render metadata. */
+export interface CachedBid {
+  adm: string;
+  width?: number;
+  height?: number;
+  price?: number;
+}
+
+/**
+ * Decode a PBS Cache GET response into a renderable bid.
+ *
+ * Prebid Cache entries are JSON bid objects (`{ "adm": "<div…>", "w": …, … }`);
+ * the Prebid Universal Creative's own cache path `JSON.parse`s the response and
+ * renders `bidObject.adm`, sizing from the cached dimensions. This mirrors that,
+ * retaining the fields the fallback render needs — creative dimensions (`w`/`h`
+ * or `width`/`height`) and clearing `price` for macro expansion — rather than
+ * reducing the payload to a bare `adm` string that forces the first slot format
+ * and leaves price macros unresolved.
+ *
+ * A non-JSON body is treated as raw creative markup (the `{ adm }`-only variant)
+ * for backward compatibility with caches that store the creative directly.
+ * Returns `undefined` when the JSON payload carries no usable string `adm`, so
+ * the caller can decline to render instead of injecting a serialized object.
+ */
+export function parseCachedBid(body: string): CachedBid | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    // Not JSON — a cache that returned the creative markup directly. No render
+    // metadata is available, so only the raw markup variant is returned.
+    return body.trim().length > 0 ? { adm: body } : undefined;
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    // A JSON primitive (string/number/bool) is not a valid cached bid object.
+    return undefined;
+  }
+  const obj = parsed as Record<string, unknown>;
+  const adm = obj.adm;
+  if (typeof adm !== 'string' || adm.length === 0) return undefined;
+
+  const num = (v: unknown): number | undefined =>
+    typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+  // A zero (or missing) dimension is not usable render metadata; treat it as
+  // absent so the caller falls back to the slot format rather than sizing to 0.
+  const dim = (v: unknown): number | undefined => {
+    const n = num(v);
+    return n !== undefined && n > 0 ? n : undefined;
+  };
+
+  return {
+    adm,
+    // PBS OpenRTB bids carry w/h; the Prebid.js cache format uses width/height.
+    width: dim(obj.w) ?? dim(obj.width),
+    height: dim(obj.h) ?? dim(obj.height),
+    price: num(obj.price),
+  };
+}
+
 /**
  * Install the TS → pbRender bridge.
  *
@@ -828,7 +1116,9 @@ const TS_DISPLAY_RENDERER =
  *
  * When `adId` matches a TS server-side bid in `window.tsjs.bids` AND the bid
  * has renderable markup, the bridge:
- *   1. Uses debug `adm` directly when present, otherwise fetches from PBS Cache.
+ *   1. Uses the inline `adm` directly when present (the sanitized winning
+ *      creative, now shipped in production), otherwise fetches from PBS Cache
+ *      and extracts `adm` from the cached bid JSON (see `extractCachedAdm`).
  *   2. Replies via the MessageChannel port with a `"Prebid Response"`.
  *   3. Calls `stopImmediatePropagation()` so Prebid.js does not also process
  *      the message and log spurious failures.
@@ -839,12 +1129,14 @@ const TS_DISPLAY_RENDERER =
 export function installTsRenderBridge(): void {
   if (typeof window === 'undefined') return;
 
-  // adIds whose PBS Cache render is in flight. `fireWinBillingBeacons` only
-  // dedups after the async cache fetch resolves, so two Prebid Request messages
-  // for the same adId arriving before the first fetch settles would both fetch
-  // and both fire the nurl/burl beacons. Tracking in-flight adIds prevents the
-  // concurrent double-fire; the entry is cleared once the fetch settles.
-  const renderingAdIds = new Set<string>();
+  // `slotId|adId` renders whose PBS Cache fetch is in flight. `fireWinBillingBeacons`
+  // only dedups after the async fetch resolves, so two Prebid Request messages for
+  // the same render arriving before the first fetch settles would both fetch and
+  // both fire the nurl/burl beacons. Tracking the in-flight render prevents the
+  // concurrent double-fire; the entry is cleared once the fetch settles. The key
+  // is scoped to the slot, not the bare adId: hb_adid is not unique per bid, so
+  // keying on it alone would let one slot block a distinct slot's render.
+  const renderingKeys = new Set<string>();
 
   window.addEventListener('message', (e: MessageEvent) => {
     let data: Record<string, unknown>;
@@ -866,28 +1158,26 @@ export function installTsRenderBridge(): void {
     const sourceSlotId = slotIdForMessageSource(e.source);
     if (!sourceSlotId) return;
 
-    // Build reverse map adId → slotId from live window.tsjs.bids.
+    // Resolve the bid by the requesting slot, not by the first bid whose hb_adid
+    // matches. hb_adid is not unique per bid: absent PBS Cache, it falls back to a
+    // creative id a bidder may reuse across slots. A first-match-by-adId lookup
+    // would resolve every duplicate to one slot, so all but that slot render blank.
     const bids = window.tsjs?.bids ?? {};
-    let slotId: string | undefined;
-    let matchedBid: (typeof bids)[string] | undefined;
-    for (const [sid, bid] of Object.entries(bids)) {
-      if (bid.hb_adid === adId) {
-        slotId = sid;
-        matchedBid = bid;
-        break;
-      }
-    }
+    const slotId = sourceSlotId;
+    const matchedBid = bids[slotId];
 
-    // Not a TS bid — let Prebid.js handle it.
-    if (!slotId || !matchedBid) return;
-
-    // The requesting iframe's slot must own the resolved adId. Without this an
-    // iframe under slot A could request slot B's hb_adid and receive slot B's
-    // creative/dimensions while firing slot B's win/billing beacons.
-    if (slotId !== sourceSlotId) return;
+    // Not a TS bid, or the requesting slot's bid does not own this adId — let
+    // Prebid.js handle it. The adId guard also prevents an iframe under slot A from
+    // pulling slot B's creative and firing slot B's win/billing beacons.
+    if (!matchedBid || matchedBid.hb_adid !== adId) return;
 
     const slot = window.tsjs?.adSlots?.find((s) => s.id === slotId);
-    const [width, height] = slot?.formats?.[0] ?? [728, 90];
+    // Prefer the winning creative's own dimensions; the first configured slot
+    // format is only a fallback and mis-sizes a multi-size slot whose winner is
+    // not the first format.
+    const [fallbackWidth, fallbackHeight] = slot?.formats?.[0] ?? [728, 90];
+    const width = matchedBid.w ?? fallbackWidth;
+    const height = matchedBid.h ?? fallbackHeight;
 
     if (matchedBid.adm) {
       e.stopImmediatePropagation();
@@ -902,7 +1192,7 @@ export function installTsRenderBridge(): void {
         })
       );
       fireWinBillingBeacons(slotId, matchedBid);
-      log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from debug adm`);
+      log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from inline adm`);
       return;
     }
 
@@ -912,26 +1202,49 @@ export function installTsRenderBridge(): void {
     // TS owns this adId — stop Prebid from also processing it.
     e.stopImmediatePropagation();
 
-    // Skip a concurrent re-render of the same adId so its win/billing beacons
-    // fire at most once even before the first cache fetch resolves.
-    if (renderingAdIds.has(adId)) return;
-    renderingAdIds.add(adId);
+    // Skip a concurrent re-render of the same slot's adId so its win/billing
+    // beacons fire at most once even before the first cache fetch resolves.
+    const renderingKey = `${slotId}|${adId}`;
+    if (renderingKeys.has(renderingKey)) return;
+    renderingKeys.add(renderingKey);
 
     const cacheUrl = `https://${matchedBid.hb_cache_host}${matchedBid.hb_cache_path}?uuid=${encodeURIComponent(adId)}`;
 
     fetch(cacheUrl, { mode: 'cors' })
       .then((res) => (res.ok ? res.text() : Promise.reject(res.status)))
-      .then((ad) => {
+      .then((body) => {
+        // PBS Cache returns the cached bid as a JSON object; decode its creative
+        // and render metadata the same way the Prebid Universal Creative does.
+        const cached = parseCachedBid(body);
+        if (!cached) {
+          // No renderable creative in the cache payload — decline rather than
+          // ship a serialized bid document to PUC. Beacons stay unfired.
+          log.warn(
+            `[tsjs-gpt] pbRender bridge: PBS Cache response for '${slotId}' had no renderable adm`
+          );
+          return;
+        }
+        // Resolve the auction-price macro from the cached clearing price, and
+        // size from the cached bid's own dimensions, falling back to the slot
+        // format only when the cache omits them.
+        const ad =
+          cached.price !== undefined
+            ? expandAuctionPriceMacro(cached.adm, cached.price)
+            : cached.adm;
         port.postMessage(
           JSON.stringify({
             message: 'Prebid Response',
             adId,
             ad,
             renderer: TS_DISPLAY_RENDERER,
-            width,
-            height,
+            width: cached.width ?? width,
+            height: cached.height ?? height,
           })
         );
+        // Beacons carry the server-expanded ${AUCTION_PRICE} from the auction's
+        // clearing price, not `cached.price` — the auction result is the
+        // authoritative clearing price, and the cached copy is only the render
+        // source. Do not re-expand them here.
         fireWinBillingBeacons(slotId, matchedBid);
         log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from PBS Cache`);
       })
@@ -939,7 +1252,7 @@ export function installTsRenderBridge(): void {
         log.warn(`[tsjs-gpt] pbRender bridge: PBS Cache fetch failed for '${slotId}'`, err);
       })
       .finally(() => {
-        renderingAdIds.delete(adId);
+        renderingKeys.delete(renderingKey);
       });
   });
 }

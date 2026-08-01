@@ -158,11 +158,19 @@ impl PlatformBackend for AxumPlatformBackend {
         let port = spec
             .port
             .unwrap_or(if spec.scheme == "https" { 443 } else { 80 });
+        // Keep two providers that share an origin on distinct names so auction
+        // response correlation cannot cross providers.
+        let discriminator = spec
+            .discriminator
+            .as_deref()
+            .map(|d| format!("_p_{}", normalize_env_segment(d)))
+            .unwrap_or_default();
         Ok(format!(
-            "{}_{}_{}",
+            "{}_{}_{}{}",
             normalize_env_segment(&spec.scheme),
             normalize_env_segment(&spec.host),
             port,
+            discriminator,
         ))
     }
 
@@ -644,6 +652,7 @@ mod tests {
             first_byte_timeout: Duration::from_secs(15),
             between_bytes_timeout: Duration::from_secs(15),
             host_header_override: None,
+            discriminator: None,
         };
         let name1 = backend.predict_name(&spec).expect("should return a name");
         let name2 = backend
@@ -664,6 +673,7 @@ mod tests {
             first_byte_timeout: Duration::from_secs(15),
             between_bytes_timeout: Duration::from_secs(15),
             host_header_override: None,
+            discriminator: None,
         };
         assert_eq!(
             backend.predict_name(&spec).expect("should return name"),

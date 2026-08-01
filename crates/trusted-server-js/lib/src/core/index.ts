@@ -1,5 +1,11 @@
 // Public tsjs core bundle: sets up the global API, queue, and default methods.
-export type { AdUnit, TsjsApi } from './types';
+export type {
+  AdUnit,
+  GptDiagnosticsApi,
+  GptDiagnosticsExportV1,
+  GptDiagnosticsRequestCycle,
+  TsjsApi,
+} from './types';
 import type { TsjsApi } from './types';
 import { addAdUnits } from './registry';
 import { renderAdUnit, renderAllAdUnits } from './render';

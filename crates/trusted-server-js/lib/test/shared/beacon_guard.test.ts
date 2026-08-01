@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+
 import { createBeaconGuard, BeaconGuardConfig } from '../../src/shared/beacon_guard';
 
 describe('Beacon Guard', () => {

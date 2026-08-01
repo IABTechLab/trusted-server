@@ -110,6 +110,28 @@ pub trait PlatformBackend: Send + Sync {
     /// Returns [`PlatformError::Backend`] when the backend cannot be
     /// registered on the platform.
     fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>>;
+
+    /// Canonicalize a per-provider transport timeout for backend-name stability.
+    ///
+    /// `remaining_ms` is the wall-clock budget left in the auction and
+    /// `configured_ms` is the provider's own configured timeout. The returned
+    /// value is used both to derive the dynamic backend name and as the
+    /// provider's request deadline, so it must be identical for prediction and
+    /// registration of the same launch.
+    ///
+    /// Adapters that embed the transport timeout in the dynamic backend name
+    /// (Fastly) override this to round budget-derived values to a coarse
+    /// ladder, so per-request wall-clock jitter neither defeats cross-request
+    /// connection pooling nor accumulates registrations toward the per-service
+    /// dynamic backend limit.
+    ///
+    /// The default returns the exact budget-bound value
+    /// (`remaining_ms.min(configured_ms)`): adapters that neither register nor
+    /// enforce a backend-name transport timeout gain nothing from rounding and
+    /// must not shorten bidder deadlines for no benefit.
+    fn canonicalize_transport_timeout_ms(&self, remaining_ms: u32, configured_ms: u32) -> u32 {
+        remaining_ms.min(configured_ms)
+    }
 }
 
 /// Synchronous, object-safe geo lookup.

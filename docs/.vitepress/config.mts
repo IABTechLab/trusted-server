@@ -155,7 +155,13 @@ export default withMermaid(
             },
             {
               text: 'Ad Serving',
-              items: [{ text: 'GAM', link: '/guide/integrations/gam' }],
+              items: [
+                { text: 'GAM', link: '/guide/integrations/gam' },
+                {
+                  text: 'GPT Runtime Diagnostics',
+                  link: '/guide/integrations/gpt-diagnostics',
+                },
+              ],
             },
             {
               text: 'Demand Wrapper',

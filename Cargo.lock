@@ -6390,6 +6390,7 @@ dependencies = [
  "log-fastly",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "trusted-server-core",
  "url",
  "urlencoding",
@@ -6463,6 +6464,7 @@ dependencies = [
 name = "trusted-server-core"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "async-trait",
  "base64",
  "brotli",

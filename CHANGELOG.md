@@ -10,14 +10,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Breaking** — `bid_param_zone_overrides` inner values must now be JSON objects; previously non-object or empty values (`"header" = "x"`, `"header" = {}`) were accepted and silently produced a dead rule at runtime. They now fail at startup with a configuration error. Operators upgrading should audit their `bid_param_zone_overrides` config for non-object zone entries.
+- **Breaking** — Integration configuration strings are no longer globally reinterpreted as JSON scalars. Operators upgrading should audit `[integrations.*]` settings and use native TOML/typed-config booleans and numbers (for example, `enabled = true`, not `enabled = "true"`); quoted numeric and boolean scalars now fail validation instead of silently converting.
 - **Breaking** — Sourcepoint browser module inclusion now requires explicit `[integrations.sourcepoint].enabled = true`; operators relying on the previous unconditional Sourcepoint module should enable the integration before upgrading.
+- The SPA re-auction endpoint moved from `/__ts/page-bids` to `/_ts/page-bids`, joining every other internal route in the `/_ts/` namespace. The old path stays registered as a deprecated alias so already-loaded bundles keep serving ads, and responses on it carry a `Link: …; rel="deprecation"` header so remaining traffic is measurable from edge logs; removal is tracked in [#970](https://github.com/IABTechLab/trusted-server/issues/970). Two deployment notes: audit `[[handlers]]` for patterns broad enough to cover `/_ts` (for example `^/_ts`), which would put this browser-facing endpoint behind Basic Auth and return `401` to every visitor — scope them to `^/_ts/admin`; and prefer rolling forward over rolling back, since a server reverted past this release does not register the canonical path. In both cases the shipped client falls back to the deprecated alias, so the exposure is bounded until that alias is removed.
 
 ### Security
 
 - Validate synthetic ID format on inbound values from the `x-synthetic-id` header and `synthetic_id` cookie; values that do not match the expected format (`64-hex-hmac.6-alphanumeric-suffix`) are discarded and a fresh ID is generated rather than forwarded to response headers, cookies, or third-party APIs
 
+### Fixed
+
+- Protocol-relative creative URLs now honor `rewrite.exclude_domains`, so excluded creative assets stay direct and excluded absolute or protocol-relative URLs submitted to `/first-party/sign` are rejected.
+
 ### Added
 
+- Added the default-true `[auction].rewrite_creatives` option. Setting it to `false` preserves mandatory creative sanitization across `POST /auction` and publisher SSAT/page-bids delivery while skipping first-party resource/click URL rewriting; it also skips creative TSJS injection on `POST /auction`.
 - Added Osano consent mirror integration docs and public enablement guidance.
 - Implemented basic authentication for configurable endpoint paths (#73)
 - Added integrations guide with example `testlight` integration

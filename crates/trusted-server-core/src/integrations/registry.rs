@@ -1104,6 +1104,12 @@ impl IntegrationRegistry {
         map.into_values().collect()
     }
 
+    /// Return whether an integration is enabled in this registry.
+    #[must_use]
+    pub fn integration_enabled(&self, integration_id: &str) -> bool {
+        self.inner.enabled_integration_ids.contains(&integration_id)
+    }
+
     /// Return JS module IDs that should be included in the tsjs bundle.
     ///
     /// Always includes JS-only modules with no Rust-side registration.

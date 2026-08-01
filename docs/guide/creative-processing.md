@@ -1,12 +1,12 @@
 # Creative Processing
 
-Learn how Trusted Server automatically rewrites ad creative HTML and CSS to route all resources through first-party domains.
+Learn how Trusted Server rewrites ad creative HTML and CSS to route resources through first-party domains.
 
 ## Overview
 
-Creative processing transforms third-party ad creatives by rewriting URLs to go through your first-party domain. This provides:
+Creative processing has separate auction-response and proxied-response paths. When rewriting is enabled for a path, it transforms third-party ad creatives by rewriting URLs to go through your first-party domain. This provides:
 
-- **Privacy Control** - All resources load through your domain
+- **Privacy Control** - Eligible, non-excluded external resources load through your domain
 - **First-Party Context** - Cookies and storage use your domain
 - **EC ID Integration** - Automatic ID forwarding to trackers
 - **Security** - Validated, signed URLs prevent tampering
@@ -23,12 +23,12 @@ Creative processing transforms third-party ad creatives by rewriting URLs to go 
 └──────────────────────────────────────────────────────┘
                         ↓
 ┌──────────────────────────────────────────────────────┐
-│  Trusted Server Processing                           │
-│  1. Parse HTML with streaming processor              │
-│  2. Detect absolute/protocol-relative URLs           │
-│  3. Generate signed proxy URLs                       │
-│  4. Rewrite in-place                                 │
-│  5. Inject TSJS library                              │
+│  Trusted Server Processing (rewrite-enabled)         │
+│  1. Sanitize first for POST /auction adm             │
+│  2. Parse HTML with streaming processor              │
+│  3. Detect absolute/protocol-relative URLs           │
+│  4. Generate signed proxy URLs                       │
+│  5. Rewrite in-place and inject TSJS                  │
 └──────────────────────────────────────────────────────┘
                         ↓
 ┌──────────────────────────────────────────────────────┐
@@ -41,15 +41,49 @@ Creative processing transforms third-party ad creatives by rewriting URLs to go 
 
 ## Processing Triggers
 
-Creative processing is automatically triggered when:
+The creative rewriters are invoked by independent delivery paths:
 
-1. **Content-Type Header**: Response is `text/html` or `text/css`
-2. **Proxy Mode**: Request goes through `/first-party/proxy` (not streaming)
-3. **Integration Response**: Integration returns HTML content
+1. **Auction `adm`**: Winning-bid HTML returned by `POST /auction` is always sanitized, then rewritten by default. This pass is controlled by `[auction].rewrite_creatives`.
+2. **First-party proxy**: Non-streaming `text/html` and `text/css` responses fetched through `/first-party/proxy` are rewritten independently of the auction setting.
+3. **Integration processing**: Publisher HTML integrations use their own registration and configuration controls.
 
 ::: info Streaming Mode
-When `with_streaming()` is enabled in `ProxyRequestConfig`, HTML/CSS processing is **skipped** to preserve origin compression and reduce latency. Use for binary files, large responses, or when rewriting isn't needed.
+When `with_streaming()` is enabled in `ProxyRequestConfig`, proxied HTML/CSS processing is **skipped** to preserve origin compression and reduce latency. This does not change the `POST /auction` sanitizer or rewrite setting.
 :::
+
+## Auction Rewrite Control
+
+Use the default-true auction setting to control the rewrite pass applied to
+winning-bid `adm` returned by `POST /auction` and delivered through the publisher
+SSAT/page-bids path:
+
+```toml
+[auction]
+rewrite_creatives = true
+```
+
+| Setting           | Auction winning-bid `adm` behavior                                                                                                                                                                                                                                          |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Omitted or `true` | Sanitize and rewrite eligible resource/CSS and click URLs to signed first-party endpoints. `POST /auction` emits root-relative endpoints and injects creative TSJS; SSAT/page-bids emits absolute endpoints for its foreign-origin renderer and does not inject the bundle. |
+| `false`           | Sanitize, then deliver the sanitized HTML without rewriting in either path. Sanitizer-accepted external resource, click, and inline CSS URLs remain direct.                                                                                                                 |
+
+::: warning Sanitization remains mandatory
+Setting `rewrite_creatives = false` returns sanitized but not rewritten HTML,
+not byte-for-byte upstream markup. It does not restore scripts, stylesheets,
+style blocks, forms, event handlers, or other content removed by sanitization.
+The client render bridge still creates and sizes its sandboxed iframe from bid
+or ad-unit dimensions. On `POST /auction`, the creative TSJS runtime and its
+click/resource protections are not injected. The SSAT renderer never injects
+that bundle and continues to render the sanitized inline `adm`. Sanitizer
+acceptance is not a host allowlist; ordinary accepted HTTP(S) URLs may cause the
+browser to contact external creative hosts directly.
+:::
+
+This setting does not affect HTML/CSS response rewriting under
+`/first-party/proxy`. The publisher SSAT/page-bids path is a production creative
+path and follows this setting. `[debug].inject_adm_for_testing` controls only the
+additional `debug_bid` diagnostic blob and testing-only direct GAM replacement;
+it does not control whether the sanitized `adm` is present.
 
 ## Rewritten Elements
 

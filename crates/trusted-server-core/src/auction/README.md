@@ -136,7 +136,8 @@ When a request arrives at the `/auction` endpoint, it goes through the following
 ┌──────────────────────────────────────────────────────────────────────┐
 │  11. Transform to OpenRTB Response (mod.rs:274-322)                  │
 │      - Build seatbid array (one per winning bid)                     │
-│      - Rewrite creative HTML for first-party proxy                   │
+│      - Always sanitize creative HTML                                 │
+│      - Rewrite creative HTML when enabled (default)                  │
 │      - Add orchestrator metadata (timing, strategy, bid count)       │
 └──────────────────────────────────────────────────────────────────────┘
                               │
@@ -248,7 +249,12 @@ The orchestrator collects all bids and creates an OpenRTB response:
 }
 ```
 
-Note that creative HTML is rewritten to use the first-party proxy (`/first-party/proxy`) for privacy and security.
+Creative HTML is always sanitized. By default, each auction delivery path then
+rewrites eligible URLs through the first-party proxy (`/first-party/proxy`). The
+`POST /auction` response also injects the creative runtime; the publisher SSAT
+inline path uses absolute first-party URLs without injecting that bundle. Setting
+`[auction].rewrite_creatives = false` skips rewriting in both paths and runtime
+injection on `POST /auction`.
 
 ## Route Registration & Endpoints
 
@@ -379,7 +385,8 @@ The `/auction` endpoint is the primary entry point for auctions:
 **Key Transformations:**
 - `adUnits[].code` → `seatbid[].bid[].impid` (slot identifier)
 - `mediaTypes.banner.sizes` → evaluated by providers, winning size in `bid.w` and `bid.h`
-- Creative HTML is rewritten to use `/first-party/proxy` URLs
+- Creative HTML is always sanitized, then rewritten to use `/first-party/proxy` URLs by default
+- `[auction].rewrite_creatives = false` skips rewriting in both delivery paths and `POST /auction` creative runtime injection, not sanitization
 - Multiple bids per slot become separate `seatbid` entries
 - Orchestrator metadata added in `ext.orchestrator`
 

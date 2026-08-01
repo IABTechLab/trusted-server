@@ -217,7 +217,8 @@ pub fn convert_tsjs_to_auction_request(
 
 /// Convert `OrchestrationResult` to `OpenRTB` response format.
 ///
-/// Returns rewritten creative HTML directly in the `adm` field for inline delivery.
+/// Always sanitizes creative HTML in the `adm` field and optionally rewrites it
+/// according to the auction configuration.
 ///
 /// # Errors
 ///
@@ -232,6 +233,7 @@ pub fn convert_to_openrtb_response(
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     // Build OpenRTB-style seatbid array
     let mut seatbids = Vec::with_capacity(result.winning_bids.len());
+    let rewrite_creatives = settings.auction.rewrite_creatives;
 
     for (slot_id, bid) in &result.winning_bids {
         let price = bid.price.ok_or_else(|| {
@@ -250,21 +252,21 @@ pub fn convert_to_openrtb_response(
         let width = to_openrtb_i32(bid.width, "width", &bid_context);
         let height = to_openrtb_i32(bid.height, "height", &bid_context);
 
-        // Process creative HTML if present - — sanitize dangerous markup first, then rewrite URLs.
+        // Process creative HTML if present — always sanitize dangerous markup first.
         let creative_html = if let Some(ref raw_creative) = bid.creative {
-            let sanitized = creative::sanitize_creative_html(raw_creative);
-            let rewritten = creative::rewrite_creative_html(settings, &sanitized);
+            let processed = creative::process_auction_creative(settings, raw_creative);
 
             log::debug!(
-                "Processed creative for auction {} slot {} ({} → {} → {} bytes)",
+                "Processed creative for auction {} slot {} bidder {} (rewrite {}, raw {} bytes, output {} bytes)",
                 auction_request.id,
                 slot_id,
+                bid.bidder,
+                rewrite_creatives,
                 raw_creative.len(),
-                sanitized.len(),
-                rewritten.len()
+                processed.len()
             );
 
-            rewritten
+            processed
         } else {
             // No creative provided (e.g., from mediation layer that returns iframe URLs)
             log::warn!(
@@ -445,6 +447,15 @@ mod tests {
         }
     }
 
+    fn make_complete_creative_bid() -> Bid {
+        let mut bid = make_bid("div-gpt-top", "appnexus", Some(2.75));
+        bid.creative = Some(
+            r#"<html><body><a href="https://advertiser.example.com/landing"><img src="https://cdn.example.com/ad.png" style="background-image:url(https://styles.example.com/bg.png)" onerror="auction-handler-marker()"></a><script>auction-script-marker</script></body></html>"#
+                .to_string(),
+        );
+        bid
+    }
+
     fn make_result(bid: Bid) -> OrchestrationResult {
         OrchestrationResult {
             provider_responses: vec![AuctionResponse {
@@ -464,6 +475,13 @@ mod tests {
     fn response_json(response: Response<EdgeBody>) -> JsonValue {
         serde_json::from_slice(&response.into_body().into_bytes().unwrap_or_default())
             .expect("should parse JSON response")
+    }
+
+    fn response_adm(response: Response<EdgeBody>) -> String {
+        response_json(response)["seatbid"][0]["bid"][0]["adm"]
+            .as_str()
+            .expect("should serialize adm as a string")
+            .to_string()
     }
 
     fn make_banner_body(config: Option<JsonValue>) -> AdRequest {
@@ -929,6 +947,103 @@ mod tests {
             json["ext"]["orchestrator"]["provider_details"][0]["name"],
             json!("prebid"),
             "should include provider summary details"
+        );
+    }
+
+    #[test]
+    fn convert_to_openrtb_response_rewrites_sanitized_creative_by_default() {
+        let settings = make_settings();
+        let auction_request = make_auction_request();
+        let result = make_result(make_complete_creative_bid());
+
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
+            .expect("should convert creative with rewriting enabled");
+        let adm = response_adm(response);
+
+        assert!(
+            adm.matches("/first-party/proxy?tsurl=").count() >= 2,
+            "should rewrite image and inline CSS URLs through the proxy: {adm}"
+        );
+        assert!(
+            adm.contains("/first-party/click?tsurl="),
+            "should rewrite click URLs: {adm}"
+        );
+        assert!(
+            adm.contains("data-tsclick"),
+            "should add the click guard attribute: {adm}"
+        );
+        assert!(
+            adm.contains("tsjs-unified.min.js"),
+            "should inject the unified creative runtime: {adm}"
+        );
+        assert!(
+            !adm.contains(r#"src="https://cdn.example.com/ad.png""#),
+            "should not retain the image URL as a direct attribute: {adm}"
+        );
+        assert!(
+            !adm.contains(r#"href="https://advertiser.example.com/landing""#),
+            "should not retain the click URL as a direct attribute: {adm}"
+        );
+        assert!(
+            !adm.contains("url(https://styles.example.com/bg.png)"),
+            "should not retain the CSS URL as a direct value: {adm}"
+        );
+        assert!(
+            !adm.contains("auction-script-marker"),
+            "should remove malicious script content before rewriting: {adm}"
+        );
+        assert!(
+            !adm.contains("auction-handler-marker") && !adm.contains("onerror"),
+            "should remove event handlers before rewriting: {adm}"
+        );
+    }
+
+    #[test]
+    fn convert_to_openrtb_response_can_skip_rewriting_but_not_sanitization() {
+        let mut settings = make_settings();
+        settings.auction.rewrite_creatives = false;
+        let auction_request = make_auction_request();
+        let result = make_result(make_complete_creative_bid());
+
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
+            .expect("should convert creative with rewriting disabled");
+        let adm = response_adm(response);
+
+        assert!(
+            adm.contains(r#"src="https://cdn.example.com/ad.png""#),
+            "should retain the sanitizer-accepted image URL: {adm}"
+        );
+        assert!(
+            adm.contains(r#"href="https://advertiser.example.com/landing""#),
+            "should retain the sanitizer-accepted click URL: {adm}"
+        );
+        assert!(
+            adm.contains("url(https://styles.example.com/bg.png)"),
+            "should retain the sanitizer-accepted CSS URL: {adm}"
+        );
+        assert!(
+            !adm.contains("/first-party/proxy"),
+            "should not rewrite resource URLs: {adm}"
+        );
+        assert!(
+            !adm.contains("/first-party/click"),
+            "should not rewrite click URLs: {adm}"
+        );
+        assert!(
+            !adm.contains("data-tsclick"),
+            "should not add the click guard attribute: {adm}"
+        );
+        assert!(
+            !adm.contains("tsjs-unified.min.js"),
+            "should not inject the unified creative runtime: {adm}"
+        );
+        assert!(
+            !adm.contains("auction-script-marker"),
+            "should still remove malicious script content: {adm}"
+        );
+        assert!(
+            !adm.contains("auction-handler-marker") && !adm.contains("onerror"),
+            "should still remove event handlers: {adm}"
         );
     }
 

@@ -483,7 +483,7 @@ impl IntegrationHeadInjector for GptIntegration {
     /// for GPT refresh events, runs client-side auctions, and sets targeting for
     /// subsequent impressions. SPA navigation is handled separately by
     /// `installSpaAuctionHook()` in the GPT bundle, which re-runs the server-side
-    /// auction via `GET /__ts/page-bids` on pushState / replaceState / popstate
+    /// auction via `GET /_ts/page-bids` on pushState / replaceState / popstate
     /// route changes (see `auction/endpoints.rs`).
     /// The `POST /auction` endpoint is not involved in scroll or refresh flows.
     fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
@@ -1197,6 +1197,46 @@ mod tests {
     }
 
     #[test]
+    fn head_inserts_bootstrap_installs_fallback_scheduler() {
+        // The `</body>` bids script hands its payload to
+        // `tsjs.scheduleInitialAdInit`. The bundle installs the real scheduler,
+        // but when the bundle fails to load this head bootstrap must provide
+        // the degradation path — otherwise a failed bundle request would leave
+        // initial server-side ads uninitialized. Executable coverage of the
+        // fallback lives in the Vitest suite (gpt_bootstrap.test.ts).
+        let config = test_config();
+        let integration = GptIntegration::new(config);
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+        let combined = integration.head_inserts(&ctx).join("");
+        assert!(
+            combined.contains("ts.scheduleInitialAdInit"),
+            "should install the fallback scheduler for bundle-load failures"
+        );
+        assert!(
+            combined.contains("navGeneration"),
+            "fallback scheduler should honor the navigation-generation guard"
+        );
+        assert!(
+            combined.contains("requestAnimationFrame"),
+            "fallback scheduler should defer past hydration frames"
+        );
+        assert!(
+            combined.contains("\"load\""),
+            "fallback scheduler should gate on window load"
+        );
+        // The no-retry-timer property is owned by the executable suite
+        // (gpt_bootstrap.test.ts asserts adInit runs exactly once); a
+        // `!contains("setTimeout")` over the whole joined head-insert output
+        // would misattribute any future unrelated timer to the scheduler.
+    }
+
+    #[test]
     fn head_inserts_bootstrap_uses_css_safe_div_prefix_lookup() {
         let config = test_config();
         let integration = GptIntegration::new(config);
@@ -1247,9 +1287,10 @@ mod tests {
 
     #[test]
     fn head_inserts_bootstrap_refreshes_ts_slots_when_initial_load_disabled() {
-        // Mirrors the bundle: when the publisher calls disableInitialLoad(),
-        // display() only registers a TS-defined slot, so the bootstrap must also
-        // refresh those slots or they render blank.
+        // Mirrors the bundle: when the publisher disables initial load through
+        // setConfig() or the legacy disableInitialLoad() method, display() only
+        // registers a TS-defined slot, so the bootstrap must also refresh those
+        // slots or they render blank.
         let config = test_config();
         let integration = GptIntegration::new(config);
         let doc_state = IntegrationDocumentState::default();
@@ -1261,8 +1302,16 @@ mod tests {
         };
         let combined = integration.head_inserts(&ctx).join("");
         assert!(
-            combined.contains("disableInitialLoad"),
-            "bootstrap should wrap disableInitialLoad() to detect the disabled state"
+            combined.contains("gpt.setConfig"),
+            "bootstrap should wrap googletag.setConfig() to detect the disabled state"
+        );
+        assert!(
+            combined.contains("gpt.getConfig"),
+            "bootstrap should read GPT's modern initial-load configuration"
+        );
+        assert!(
+            combined.contains("pubads.disableInitialLoad"),
+            "bootstrap should wrap legacy disableInitialLoad() calls"
         );
         assert!(
             combined.contains("gptInitialLoadDisabled"),

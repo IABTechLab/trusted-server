@@ -19,14 +19,48 @@
   var ts = (window.tsjs = window.tsjs || {});
   if (ts.adInit) return;
 
-  // Track whether the publisher disabled GPT initial load. GPT exposes no
-  // getter for this, so wrap pubads().disableInitialLoad() to record it. With
-  // initial load disabled, display() only registers a slot and the ad request
-  // must come from a later refresh(); adInit() reads this to refresh its own
-  // freshly defined slots so they are not left blank. Pushed onto the command
-  // queue so it runs before the publisher's own disableInitialLoad() call.
+  // Track whether the publisher disabled GPT initial load. Read the effective
+  // googletag.getConfig() value when available, and wrap googletag.setConfig()
+  // and the legacy pubads().disableInitialLoad() method so changes are
+  // synchronized immediately and still detected when getConfig() is
+  // unavailable. With initial load disabled, display() only registers a slot
+  // and the ad request must come from a later refresh(); adInit() reads this to
+  // refresh its own freshly defined
+  // slots so they are not left blank. Pushed onto the command queue so it runs
+  // before the publisher's own GPT configuration.
+  function syncInitialLoadDisabled(gpt) {
+    if (typeof gpt.getConfig !== "function") return false;
+    var config = gpt.getConfig("disableInitialLoad");
+    if (!config || typeof config.disableInitialLoad === "undefined") {
+      return false;
+    }
+    ts.gptInitialLoadDisabled = config.disableInitialLoad === true;
+    return true;
+  }
+
   (window.googletag = window.googletag || { cmd: [] }).cmd.push(function () {
-    var pubads = googletag.pubads && googletag.pubads();
+    var gpt = window.googletag;
+    syncInitialLoadDisabled(gpt);
+    if (
+      typeof gpt.setConfig === "function" &&
+      !gpt.__tsInitialLoadConfigHooked
+    ) {
+      var originalSetConfig = gpt.setConfig.bind(gpt);
+      gpt.setConfig = function (config) {
+        var result = originalSetConfig.apply(gpt, arguments);
+        if (
+          !syncInitialLoadDisabled(gpt) &&
+          config &&
+          "disableInitialLoad" in config
+        ) {
+          ts.gptInitialLoadDisabled = config.disableInitialLoad === true;
+        }
+        return result;
+      };
+      gpt.__tsInitialLoadConfigHooked = true;
+    }
+
+    var pubads = gpt.pubads && gpt.pubads();
     if (
       !pubads ||
       typeof pubads.disableInitialLoad !== "function" ||
@@ -34,20 +68,60 @@
     ) {
       return;
     }
-    var original = pubads.disableInitialLoad.bind(pubads);
+    var originalDisableInitialLoad = pubads.disableInitialLoad.bind(pubads);
     pubads.disableInitialLoad = function () {
-      ts.gptInitialLoadDisabled = true;
-      return original();
+      var result = originalDisableInitialLoad.apply(pubads, arguments);
+      if (!syncInitialLoadDisabled(gpt)) {
+        ts.gptInitialLoadDisabled = true;
+      }
+      return result;
     };
     pubads.__tsInitialLoadHooked = true;
   });
+
+  // Minimal fallback for tsjs.scheduleInitialAdInit, mirroring the bundle's
+  // hydration-safe scheduler in
+  // crates/trusted-server-js/lib/src/integrations/gpt/index.ts: the </body>
+  // bids script hands the SSR bids payload to this scheduler, which applies
+  // it and runs adInit only while the page is still on navigation
+  // generation 0 (the SSR document), after window load plus a double
+  // requestAnimationFrame so the call lands outside React's hydration
+  // window. Keeps initial server-side ads working when the main TSJS bundle
+  // fails to load; the bundle overwrites this with the full implementation.
+  //
+  // Hidden documents: rAF is not serviced while the document is hidden, so a
+  // background-tab load holds the initial adInit until first view. Intended,
+  // and deliberately identical to the bundle scheduler — the impression is
+  // spent on a viewed tab, and the post-hydration guarantee holds whenever
+  // the request is actually issued.
+  ts.scheduleInitialAdInit = function (initialBids) {
+    if ((ts.navGeneration || 0) !== 0) return;
+    if (initialBids) ts.bids = initialBids;
+    var fire = function () {
+      if ((ts.navGeneration || 0) !== 0) return;
+      if (typeof ts.adInit === "function") ts.adInit();
+    };
+    var afterFrames = function () {
+      window.requestAnimationFrame(function () {
+        window.requestAnimationFrame(fire);
+      });
+    };
+    if (document.readyState === "complete") afterFrames();
+    else window.addEventListener("load", afterFrames, { once: true });
+  };
 
   ts.adInit = function () {
     var slots = ts.adSlots || [];
     var bids = ts.bids || {};
     var divToSlotId = {};
+    // Generation this invocation belongs to. The slot work below is queued on
+    // googletag.cmd, which drains only when GPT loads; recheck first inside
+    // the queued callback so a navigation committed in the gap cancels the
+    // stale mutation — mirrors the bundle's adInit.
+    var generation = ts.navGeneration || 0;
 
     googletag.cmd.push(function () {
+      if ((ts.navGeneration || 0) !== generation) return;
       // Slots TS defined itself — tracked for SPA destroy. Publisher-owned
       // slots are reused but never destroyed by TS on navigation.
       var newSlots = [];
@@ -150,6 +224,7 @@
       // unless the publisher disabled initial load, in which case display() only
       // registers them and refresh() must request the ad — otherwise they render
       // blank. Only add them in that case to avoid double-requesting.
+      syncInitialLoadDisabled(window.googletag);
       var slotsNeedingRefresh = ts.gptInitialLoadDisabled
         ? slotsToRefresh.concat(newSlots)
         : slotsToRefresh;

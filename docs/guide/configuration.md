@@ -7,7 +7,7 @@ Learn how to configure Trusted Server for your deployment.
 Trusted Server uses a flexible configuration system based on:
 
 1. **TOML Files** - `trusted-server.toml` for base configuration
-2. **Environment Variables** - Build-time overrides with `TRUSTED_SERVER__` prefix (baked into the binary by `build.rs`)
+2. **Environment Variables** - Typed CLI overrides with the `TRUSTED_SERVER__` prefix
 3. **Fastly Stores** - KV/Config/Secret stores for runtime data
 
 ## Quick Start
@@ -29,15 +29,18 @@ passphrase = "replace-with-32-plus-byte-random-secret"
 
 ### Environment Variable Overrides
 
-Override any setting at build time. Environment variables are merged into the
-config by `build.rs` and baked into the compiled binary — they are **not** read
-at runtime.
+Environment variables are merged into existing TOML values by the typed
+`ts config validate`, `ts config diff`, and `ts config push` flows. They are not
+read by the deployed application at request time.
 
 ```bash
 # Format: TRUSTED_SERVER__SECTION__FIELD
 export TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
 export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
 export TRUSTED_SERVER__EC__PASSPHRASE=replace-with-32-plus-byte-random-secret
+
+ts config validate
+ts config push --adapter fastly
 ```
 
 ### Generate Secure Secrets
@@ -103,11 +106,18 @@ client_side_bidders = ["rubicon"]
 
 The sections below consolidate the full configuration reference on this page.
 
-## Environment Variable Overrides (Build-Time)
+## Environment Variable Overrides (Typed CLI)
 
 Environment variables with the `TRUSTED_SERVER__` prefix are merged into the
-base TOML configuration by `build.rs` at compile time. The resulting config is
-embedded in the binary. Changing an environment variable requires a rebuild.
+base TOML configuration by `ts config validate`, `ts config diff`, and
+`ts config push`. The resolved values are validated and, for `config push`,
+stored in the app-config blob. Changing an environment variable requires
+rerunning validation and pushing the resolved config, not rebuilding the binary.
+
+EdgeZero v0.0.4 only overrides leaves that already exist in the parsed TOML; it
+does not create missing fields. Add newly introduced defaulted fields to an
+existing config before relying on their environment overrides. Pass `--no-env`
+to use file values without the overlay.
 
 ### Format
 
@@ -161,14 +171,14 @@ Core publisher settings for domain, origin, and proxy configuration.
 
 ### `[publisher]`
 
-| Field                         | Type    | Required | Description                                                                             |
-| ----------------------------- | ------- | -------- | --------------------------------------------------------------------------------------- |
-| `domain`                      | String  | Yes      | Publisher's apex domain name                                                            |
-| `cookie_domain`               | String  | Yes      | Domain for non-EC cookies (typically with leading dot)                                  |
-| `origin_url`                  | String  | Yes      | Full URL of publisher origin server                                                     |
-| `origin_host_header_override` | String  | No       | Outbound Host header to send while connecting to `origin_url`                           |
-| `proxy_secret`                | String  | Yes      | Secret key for encrypting/signing proxy URLs                                            |
-| `max_buffered_body_bytes`     | Integer | No       | Max bytes buffered when a publisher response is post-processed in full (default 16 MiB) |
+| Field                         | Type    | Required | Description                                                                 |
+| ----------------------------- | ------- | -------- | --------------------------------------------------------------------------- |
+| `domain`                      | String  | Yes      | Publisher's apex domain name                                                |
+| `cookie_domain`               | String  | Yes      | Domain for non-EC cookies (typically with leading dot)                      |
+| `origin_url`                  | String  | Yes      | Full URL of publisher origin server                                         |
+| `origin_host_header_override` | String  | No       | Outbound Host header to send while connecting to `origin_url`               |
+| `proxy_secret`                | String  | Yes      | Secret key for encrypting/signing proxy URLs                                |
+| `max_buffered_body_bytes`     | Integer | No       | Buffered-body cap / Fastly stream raw+decoded byte ceiling (default 16 MiB) |
 
 > **Note:** EC cookies (`ts-ec`) derive their domain automatically as `.{domain}` and
 > do not use `cookie_domain`. The `cookie_domain` field is used by other cookie helpers.
@@ -300,29 +310,41 @@ Changing `proxy_secret` invalidates all existing signed URLs. Plan rotations car
 
 #### `max_buffered_body_bytes`
 
-**Purpose**: Upper bound on the in-memory buffer used when a publisher origin
-response must be processed in full (HTML rewriting and integration injection)
-instead of streamed.
+**Purpose**: Upper bound on how much of a publisher origin body the rewrite
+pipeline holds in memory — the post-rewrite output buffer on buffered adapters,
+and the per-stream raw/decoded byte ceiling on the Fastly streaming path.
 
 **Usage**:
 
-- Caps the _decoded, post-rewrite_ output buffer for any buffered publisher
-  response on both the legacy and EdgeZero paths.
-- Exceeding the cap fails the response (mapped to a 5xx proxy error) rather than
-  allocating past the limit, preventing Wasm-heap exhaustion on highly
-  compressible documents.
+- On **buffered adapters** (Axum, Cloudflare, Spin) it caps the _decoded,
+  post-rewrite_ output buffer for a publisher response processed in full. It
+  also bounds how much decoded gzip output may sit in the heap at any one
+  moment, so a decompression bomb is rejected mid-decode rather than after its
+  full expansion. That second bound is per-step, not a total: a gzip-encoded
+  response passes or fails on the same post-rewrite output size as the identity,
+  deflate and brotli versions of the same body.
+- On the **Fastly streaming path** the origin body is preserved as a stream, so
+  the same value caps the stream twice over: the cumulative _raw_ (still
+  compressed) bytes pulled from origin, and the cumulative _decoded_ bytes
+  emitted by the decompressor. The decoded cap is enforced _during_
+  decompression, so a decompression bomb is rejected before its expansion is
+  materialized rather than after.
 
-**Default**: `16777216` (16 MiB).
+**Behavior when exceeded**:
 
-**Effective Fastly limit**: On Fastly the practical ceiling for a publisher page
-is lower. The platform HTTP client rejects any origin response whose raw (still
-compressed) body exceeds **10 MiB** before this buffer is filled, so raising the
-value only helps highly compressible pages whose decoded size exceeds 16 MiB
-while their compressed origin body stays under 10 MiB. Raising it above ~10 MiB
-does not lift the platform cap for uncompressed pages.
+- On **buffered adapters** the response fails before any bytes are committed.
+- On the **streaming path** the response headers are already committed when
+  either cap trips, so the body is **truncated mid-stream** and the error is
+  logged — the client receives a short (incomplete) body rather than a `5xx`.
+  Size the cap above your largest expected decoded page so legitimate responses
+  are never truncated.
+
+**Default**: `16777216` (16 MiB). On the Fastly streaming path this is now the
+sole ceiling: origin bodies are streamed rather than materialized in full, so
+the previous ~10 MiB raw-body limit no longer applies.
 
 **Minimum**: Must be at least `1`. A value of `0` is rejected at startup because
-a zero-byte cap fails every non-empty buffered response.
+a zero-byte cap fails every non-empty publisher response.
 
 **Environment Override**:
 
@@ -622,6 +644,31 @@ path = "^/api/v[0-9]+/private"  # /api/v1/private, /api/v2/private
 ```
 
 **Validation**: Application startup fails if regex is invalid.
+
+::: warning Scope patterns to the paths you mean
+
+Handler patterns are matched against the full request path, so a broad pattern
+covers everything beneath it. The `/_ts/` namespace holds both admin routes and
+browser-facing endpoints that anonymous visitors must be able to reach:
+
+| Path                     | Called by                            |
+| ------------------------ | ------------------------------------ |
+| `/_ts/page-bids`         | Trusted Server JS, on SPA navigation |
+| `/_ts/api/v1/identify`   | Trusted Server JS, in the browser    |
+| `/_ts/api/v1/batch-sync` | Trusted Server JS, in the browser    |
+
+A pattern such as `path = "^/_ts"` puts those behind Basic Auth. Browser
+fetches never carry Basic credentials, so every visitor gets `401` — on
+`/_ts/page-bids` that means no ads after any client-side navigation. Match the
+admin routes specifically (`^/_ts/admin`) instead.
+
+Upgrading from a release before `/_ts/page-bids` existed: if any handler
+pattern covers it, narrow the pattern. The Trusted Server JS bundle falls back
+to the deprecated `/__ts/page-bids` alias in the meantime, but that alias is
+scheduled for removal
+([#970](https://github.com/IABTechLab/trusted-server/issues/970)).
+
+:::
 
 ### Security Considerations
 
@@ -1191,19 +1238,46 @@ Settings for the auction orchestrator that coordinates multiple bid providers.
 
 ### `[auction]`
 
-| Field            | Type          | Default            | Description                                                 |
-| ---------------- | ------------- | ------------------ | ----------------------------------------------------------- |
-| `enabled`        | Boolean       | `false`            | Enable the auction orchestrator                             |
-| `providers`      | Array[String] | `[]`               | Provider names that participate (e.g., `["prebid", "aps"]`) |
-| `mediator`       | String        | Optional           | Mediator provider name (runs parallel mediation when set)   |
-| `timeout_ms`     | Integer       | `2000`             | Auction timeout in milliseconds                             |
-| `creative_store` | String        | `"creative_store"` | Deprecated; creatives are now delivered inline              |
+| Field               | Type          | Default            | Description                                                       |
+| ------------------- | ------------- | ------------------ | ----------------------------------------------------------------- |
+| `enabled`           | Boolean       | `false`            | Enable the auction orchestrator                                   |
+| `rewrite_creatives` | Boolean       | `true`             | Rewrite sanitized winning-bid `adm` through first-party endpoints |
+| `providers`         | Array[String] | `[]`               | Provider names that participate (e.g., `["prebid", "aps"]`)       |
+| `mediator`          | String        | Optional           | Mediator provider name (runs parallel mediation when set)         |
+| `timeout_ms`        | Integer       | `2000`             | Auction timeout in milliseconds                                   |
+| `creative_store`    | String        | `"creative_store"` | Deprecated; creatives are now delivered inline                    |
+
+Creative markup delivered by `POST /auction` and the publisher SSAT/page-bids
+path is always server-sanitized. With `rewrite_creatives = true` (the default),
+eligible absolute or protocol-relative resource and click URLs not excluded by
+rewrite configuration are converted to signed first-party endpoints. The
+`POST /auction` path emits root-relative endpoints and injects the creative TSJS
+runtime when a `<body>` exists; the foreign-origin SSAT renderer emits absolute
+endpoints and does not inject that bundle. Setting the option to `false` returns
+sanitized but not rewritten `adm` from both paths. Accepted external URLs remain
+direct and are not host allowlisted by the sanitizer. The setting does not
+affect HTML or CSS fetched through `/first-party/proxy`. See
+[Creative Processing](/guide/creative-processing#auction-rewrite-control).
+
+::: warning Existing configs and rollback
+Configs created before `rewrite_creatives` was introduced must first add
+`rewrite_creatives = true` under `[auction]`. After adding the leaf, set
+`TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES`, run `ts config validate`, and push
+the resolved config.
+
+The default `true` is omitted from stored JSON so older binaries can read the
+blob during rollback. An explicit `false` must remain serialized. Before rolling
+back to a binary without this field, remove the `false` environment override (or
+set the file value to `true`), push the resulting default-compatible blob, and
+only then roll back the binary.
+:::
 
 **Example**:
 
 ```toml
 [auction]
 enabled = true
+rewrite_creatives = true
 providers = ["aps", "prebid"]
 timeout_ms = 2000
 
@@ -1221,6 +1295,7 @@ server_url = "https://prebid-server.example.com/openrtb2/auction"
 
 ```bash
 TRUSTED_SERVER__AUCTION__ENABLED=true
+TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES=true
 TRUSTED_SERVER__AUCTION__PROVIDERS=aps,prebid
 TRUSTED_SERVER__AUCTION__PROVIDERS__0=aps
 TRUSTED_SERVER__AUCTION__PROVIDERS__1=prebid
@@ -1404,10 +1479,12 @@ trusted-server.dev.toml      # Development overrides
 
 **Environment Variables Not Applied**:
 
-- Env vars are applied at **build time** only — rebuild after changing them
+- Run the override through `ts config validate`, `ts config diff`, or `ts config push`
+- Verify the target leaf already exists in `trusted-server.toml`; EdgeZero v0.0.4 does not create missing fields
 - Verify prefix: `TRUSTED_SERVER__`
 - Check separator: `__` (double underscore)
-- Confirm variable is exported: `echo $VARIABLE_NAME`
+- Confirm the variable is exported: `echo $VARIABLE_NAME`
+- Rerun `ts config push` after changing a deploy-time override
 - Try explicit string: `VARIABLE='value'` not `VARIABLE=value`
 
 ### Debug Configuration

@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Mock } from 'vitest';
+
+import type { TsjsApi } from '../../../src/core/types';
 
 // We import installGptShim dynamically so each test can control whether the
 // GPT enable flag is present before module evaluation.
@@ -9,10 +12,9 @@ async function importGuardModule() {
 
 type GptWindow = Window & {
   googletag?: {
-    cmd: Array<() => void> & {
-      push: (...items: Array<() => void>) => number;
-      __tsPushed?: boolean;
-    };
+    // The shim marks the queue it patched; `push` itself comes from `Array`,
+    // which GPT replaces with its own execute-immediately implementation.
+    cmd: Array<() => void> & { __tsPushed?: boolean };
     _loaded_?: boolean;
   };
 };
@@ -217,16 +219,48 @@ describe('GPT – installSlimPrebidLoader', () => {
 });
 
 describe('GPT – installTsAdInit', () => {
+  // GPT slot mock: setTargeting/clearTargeting are chainable, so both return
+  // the slot itself.
+  interface MockGptSlot {
+    getSlotElementId: Mock<() => string>;
+    getTargeting: Mock<(key: string) => string[]>;
+    setTargeting: Mock<(key: string, value: string | string[]) => MockGptSlot>;
+    clearTargeting: Mock<(key?: string) => MockGptSlot>;
+  }
+
+  // Minimal pubads surface adInit() drives.
+  interface MockPubAds {
+    getSlots: () => MockGptSlot[];
+    enableSingleRequest: () => void;
+    addEventListener: (event: string, fn: (e: unknown) => void) => void;
+    refresh: (slots?: MockGptSlot[]) => void;
+  }
+
+  interface MockGoogleTag {
+    cmd: Array<() => void>;
+    pubads: () => MockPubAds;
+    defineSlot: Mock;
+    destroySlots: Mock;
+    enableServices: Mock;
+  }
+
+  // `tsjs` is declared globally as the full `TsjsApi`; `Omit` drops it from
+  // `Window` so the fixture below only has to satisfy the fields it sets.
+  type AdInitWindow = Omit<Window, 'tsjs'> & {
+    tsjs?: Partial<TsjsApi>;
+    googletag?: MockGoogleTag;
+  };
+
   beforeEach(() => {
     document.body.innerHTML = '';
-    delete (window as any).tsjs;
-    delete (window as any).googletag;
+    delete (window as AdInitWindow).tsjs;
+    delete (window as AdInitWindow).googletag;
   });
 
   afterEach(() => {
     document.body.innerHTML = '';
-    delete (window as any).tsjs;
-    delete (window as any).googletag;
+    delete (window as AdInitWindow).tsjs;
+    delete (window as AdInitWindow).googletag;
   });
 
   it('clears stale TS-managed targeting before applying a new route to a reused GPT slot', async () => {
@@ -240,7 +274,7 @@ describe('GPT – installTsAdInit', () => {
       ['ts_initial', ['1']],
       ['pos', ['old-pos']],
     ]);
-    const gptSlot: any = {
+    const gptSlot: MockGptSlot = {
       getSlotElementId: vi.fn(() => 'div-ad-homepage-header'),
       getTargeting: vi.fn((key: string) => slotTargeting.get(key) ?? []),
       setTargeting: vi.fn((key: string, value: string | string[]) => {
@@ -269,14 +303,14 @@ describe('GPT – installTsAdInit', () => {
     };
 
     document.body.innerHTML = '<div id="div-ad-homepage-header"></div>';
-    (window as any).googletag = {
+    (window as AdInitWindow).googletag = {
       cmd,
       pubads: () => pubads,
       defineSlot: vi.fn(),
       destroySlots: vi.fn(),
       enableServices: vi.fn(),
     };
-    (window as any).tsjs = {
+    (window as AdInitWindow).tsjs = {
       prevSlotTargetingKeys: {
         'div-ad-homepage-header': ['pos'],
       },
@@ -293,7 +327,7 @@ describe('GPT – installTsAdInit', () => {
     };
 
     installTsAdInit();
-    (window as any).tsjs.adInit();
+    (window as AdInitWindow).tsjs!.adInit!();
 
     expect(gptSlot.clearTargeting).toHaveBeenCalledWith('hb_pb');
     expect(gptSlot.clearTargeting).toHaveBeenCalledWith('hb_bidder');
@@ -317,6 +351,8 @@ describe('GPT shim – runtime gating', () => {
   type GatedWindow = Window & {
     __tsjs_gpt_enabled?: boolean;
     googletag?: { cmd: Array<() => void> };
+    // Activation hook the module registers; the tests only assert its typeof.
+    __tsjs_installGptShim?: unknown;
   };
 
   let win: GatedWindow;
@@ -334,7 +370,7 @@ describe('GPT shim – runtime gating', () => {
     guard.resetGuardState();
     delete (window as GatedWindow).googletag;
     delete (window as GatedWindow).__tsjs_gpt_enabled;
-    delete (window as Record<string, unknown>).__tsjs_installGptShim;
+    delete (window as GatedWindow).__tsjs_installGptShim;
   });
 
   it('installs the shim when activation function is called (simulates server inline script)', async () => {
@@ -354,7 +390,7 @@ describe('GPT shim – runtime gating', () => {
     vi.resetModules();
     await import('../../../src/integrations/gpt/index');
 
-    expect(typeof (window as Record<string, unknown>).__tsjs_installGptShim).toBe('function');
+    expect(typeof (window as GatedWindow).__tsjs_installGptShim).toBe('function');
   });
 
   it('auto-installs the shim when the enable flag is set before import', async () => {

@@ -265,7 +265,7 @@ pub(crate) fn validated_stored_domain(domain: &str) -> Option<String> {
 impl KvEntry {
     /// Creates a new live entry from the current request context.
     ///
-    /// `domain` is the publisher's apex domain (e.g. `"autoblog.com"`),
+    /// `domain` is the publisher's apex domain (e.g. `"example.com"`),
     /// used to initialize the [`KvPubProperties`] origin and first visit.
     #[must_use]
     pub fn new(consent: &ConsentContext, geo: Option<&GeoInfo>, now: u64, domain: &str) -> Self {
@@ -960,7 +960,7 @@ mod tests {
     fn pub_properties_roundtrip() {
         let consent = sample_consent_context();
         let geo = sample_geo_info();
-        let entry = KvEntry::new(&consent, Some(&geo), 1000, "autoblog.com");
+        let entry = KvEntry::new(&consent, Some(&geo), 1000, "example.com");
 
         let json = serde_json::to_string(&entry).expect("should serialize");
         let deserialized: KvEntry = serde_json::from_str(&json).expect("should deserialize");
@@ -968,10 +968,10 @@ mod tests {
         let props = deserialized
             .pub_properties
             .expect("should have pub_properties");
-        assert_eq!(props.origin_domain, "autoblog.com");
+        assert_eq!(props.origin_domain, "example.com");
         assert_eq!(props.seen_domains.len(), 1);
         assert!(
-            props.seen_domains.contains("autoblog.com"),
+            props.seen_domains.contains("example.com"),
             "should have origin domain"
         );
     }
@@ -1008,17 +1008,17 @@ mod tests {
     #[test]
     fn pub_properties_deserializes_new_seen_domains_list_shape() {
         let json = r#"{
-            "origin_domain": "autoblog.com",
-            "seen_domains": ["autoblog.com"]
+            "origin_domain": "example.com",
+            "seen_domains": ["example.com"]
         }"#;
 
         let props: KvPubProperties =
             serde_json::from_str(json).expect("should deserialize new seen_domains list shape");
 
-        assert_eq!(props.origin_domain, "autoblog.com");
+        assert_eq!(props.origin_domain, "example.com");
         assert_eq!(props.seen_domains.len(), 1);
         assert!(
-            props.seen_domains.contains("autoblog.com"),
+            props.seen_domains.contains("example.com"),
             "should include listed domain"
         );
     }

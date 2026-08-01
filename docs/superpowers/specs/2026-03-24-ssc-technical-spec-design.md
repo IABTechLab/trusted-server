@@ -602,8 +602,8 @@ Partners are defined in config (`[[ec.partners]]` in TOML) and loaded into an in
     "known_browser": true
   },
   "pub_properties": {
-    "origin_domain": "autoblog.com",
-    "seen_domains": ["autoblog.com"]
+    "origin_domain": "example.com",
+    "seen_domains": ["example.com"]
   },
   "network": {
     "cluster_size": 2

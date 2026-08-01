@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
 import { buildAdRequest, parseAuctionResponse, sendAuction } from '../../src/core/auction';
 
 describe('auction/buildAdRequest', () => {
@@ -247,7 +248,7 @@ describe('auction/sendAuction', () => {
         ],
       }),
     };
-    globalThis.fetch = vi.fn().mockResolvedValue(mockResponse) as any;
+    globalThis.fetch = vi.fn().mockResolvedValue(mockResponse) as unknown as typeof fetch;
 
     const request = {
       adUnits: [
@@ -274,7 +275,9 @@ describe('auction/sendAuction', () => {
   });
 
   it('returns empty array on network error', async () => {
-    globalThis.fetch = vi.fn().mockRejectedValue(new Error('network error')) as any;
+    globalThis.fetch = vi
+      .fn()
+      .mockRejectedValue(new Error('network error')) as unknown as typeof fetch;
 
     const bids = await sendAuction('/auction', { adUnits: [] });
     expect(bids).toEqual([]);
@@ -286,7 +289,7 @@ describe('auction/sendAuction', () => {
       status: 200,
       headers: { get: () => 'text/html' },
       json: async () => ({}),
-    }) as any;
+    }) as unknown as typeof fetch;
 
     const bids = await sendAuction('/auction', { adUnits: [] });
     expect(bids).toEqual([]);
@@ -298,7 +301,7 @@ describe('auction/sendAuction', () => {
       status: 500,
       headers: { get: () => 'application/json' },
       json: async () => ({}),
-    }) as any;
+    }) as unknown as typeof fetch;
 
     const bids = await sendAuction('/auction', { adUnits: [] });
     expect(bids).toEqual([]);

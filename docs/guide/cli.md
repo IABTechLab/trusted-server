@@ -63,9 +63,13 @@ Push Trusted Server config through EdgeZero:
 ts config push --adapter fastly
 ```
 
-`config validate` and `config push` use EdgeZero's typed app-config loader. By
-default that loader applies `TRUSTED_SERVER__...` environment overlays before
-validation and blob creation. Pass `--no-env` for file-only operation.
+`config validate`, `config diff`, and `config push` use EdgeZero's typed
+app-config loader. By default that loader applies `TRUSTED_SERVER__...`
+environment overlays before validation, comparison, and blob creation. EdgeZero
+v0.0.4 only overrides leaves already present in the TOML; add newly introduced
+fields to existing configs before relying on their overrides. Pass `--no-env`
+for file-only operation. See [Configuration](/guide/configuration#environment-variable-overrides-typed-cli)
+for migration and rollback guidance.
 
 `config push` publishes a single EdgeZero `BlobEnvelope` containing the validated
 Trusted Server settings JSON. This blob model is intentional because full
