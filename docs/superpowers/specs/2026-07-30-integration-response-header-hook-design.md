@@ -73,9 +73,13 @@ mutators to the outbound response for HTML document responses it processed.
   mutation ⇒ present in the final response, independently; `public` is
   dropped whenever any restriction is present; `max-age`/`s-maxage` may
   only shrink relative to the snapshot; `stale-while-revalidate`/
-  `stale-if-error` may appear only if the snapshot had them; every
-  CDN/surrogate directive (`Surrogate-Control`, `CDN-Cache-Control`,
-  host equivalents) is stripped from any restricted response; and the
+  `stale-if-error` may appear only if the snapshot had them **and their
+  durations may only shrink** (present-at-1s must not become
+  present-at-1y); CDN-specific cache fields (`Surrogate-Control`,
+  `CDN-Cache-Control`, host equivalents) are **reserved outright** —
+  merging them per-directive on unrestricted responses was a hole (an
+  unrestricted `CDN-Cache-Control: max-age=60` could become a year), and
+  they are additionally stripped from any restricted response; and the
   final `Vary` is the **union of the complete snapshot `Vary` set** —
   origin-supplied members included, not only core-required ones — and
   the mutation. Middle-stage placement also keeps
@@ -126,11 +130,13 @@ mutators to the outbound response for HTML document responses it processed.
   constants next to the definitions they protect, not duplicated in the
   hook.
 - For non-reserved headers, the mutator API distinguishes **append** from
-  **replace** explicitly; **append is valid only for genuinely
-  list-valued headers** (a singleton header accepts only replace — two
-  values of a singleton header by append is a malformed response, not a
-  merge); the default is append where legal (for `Set-Cookie`, append is
-  the only non-reserved operation — replace is not offered). Replacing a
+  **replace** explicitly; append/replace legality comes from a **core-owned field registry**,
+  not adapter judgment: each known field is classified
+  append-legal (genuinely list-valued: `Link`, CSP report groups, …),
+  replace-only (singletons: `Content-Language`, …), or rejected;
+  **unknown extension fields reject append by default** (replace only) —
+  "genuinely list-valued" is not a decision four adapters can make
+  independently and identically (`Set-Cookie` is fully reserved in v1 — neither append nor replace). Replacing a
   header the origin set is a deliberate act, visible in the mutator's code.
 - Later registrations see earlier mutations (order = registration order,
   which is deterministic).
@@ -155,8 +161,16 @@ mutators to the outbound response for HTML document responses it processed.
   **excludes every `Set-Cookie` value and every reserved identity,
   consent, and privacy header value** (names may be listed as present;
   values are withheld).
-  Exceeding a limit rejects the excess operations (logged, attributed),
-  never the response. A mutator that returns an error is skipped in full — its
+  Operations arrive as **attributed batches bound to a registration
+  ID** — one batch per integration per response, ordered by
+  registration, with the security channel's batch (§4a) ordered before
+  response mutators; the current flat effects vector satisfies neither
+  attribution nor budgets and is restructured accordingly. Validation
+  and budgeting are **atomic per batch**: a batch that exceeds its
+  budget is rejected whole (logged, attributed), never partially
+  applied — item-by-item rejection could apply a security 302's
+  `Set-Cookie` while dropping its `Location`. The response itself is
+  never rejected. A mutator that returns an error is skipped in full — its
   operations are all-or-nothing — and the response proceeds without it.
   **Panics are forbidden and fatal, not recoverable**: the primary target
   (`wasm32-wasip1`) builds with `panic = "abort"`, so there is no unwind
@@ -170,36 +184,73 @@ mutators to the outbound response for HTML document responses it processed.
 Which responses the hook runs on, enumerated so two implementations cannot
 diverge silently:
 
-| Response                                      | Hook runs?                                                   |
-| --------------------------------------------- | ------------------------------------------------------------ |
-| Processed HTML document (rewritten by TS)     | Yes                                                          |
-| Streamed processed document                   | Yes — operations apply to the header block before first byte |
-| Pass-through proxy response (not processed)   | No — TS is a transparent proxy for it                        |
-| Served-from-cache processed document          | Yes, applied at serve time (mutations are not cached)        |
-| Redirect (3xx)                                | No                                                           |
-| Error responses TS itself generates (4xx/5xx) | No                                                           |
-| `304 Not Modified`                            | No                                                           |
+| Response                                      | Hook runs?                                                                                                                                                      |
+| --------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Processed HTML document (rewritten by TS)     | Yes                                                                                                                                                             |
+| Streamed processed document                   | Yes — operations apply to the header block before first byte                                                                                                    |
+| Pass-through proxy response (not processed)   | No — TS is a transparent proxy for it                                                                                                                           |
+| Served-from-cache processed document          | Yes, applied at serve time (mutations are not cached)                                                                                                           |
+| Redirect (3xx)                                | No                                                                                                                                                              |
+| Error responses TS itself generates (4xx/5xx) | No                                                                                                                                                              |
+| `304 Not Modified`                            | No                                                                                                                                                              |
+| `HEAD` of a processed document                | **Yes — header parity with GET is mandatory** (a cache may refresh stored GET metadata from HEAD, and divergent CSP/privacy metadata between the two is a leak) |
+| Informational `1xx`, `204`, `205`, `206`      | No — enumerated so adapters do not infer independently                                                                                                          |
 
 This deliberately narrows #782's general "outbound response" phrasing to
 processed documents (§6).
+
+## 4a. The security channel — normative closed boundary
+
+The security channel (today: DataDome) is not a general exception; every
+degree of freedom is closed:
+
+- **Typed security-cookie operation, not header strings.** The channel
+  emits cookies only through a typed operation whose cookie **names come
+  from the integration's registered ownership list** (for DataDome, its
+  documented cookie); every `ts-*` name is rejected; domain/path scope,
+  attributes, size, and lifetime are constrained by the registration.
+  Read/vendor-egress/withdrawal semantics of the resulting identifier
+  are a ratified security-purpose carve-out — **sign-off item 23** —
+  because the tag-injection → cookie/ClientID read → vendor-send
+  lifecycle otherwise hands a permission-denied visitor a stable,
+  exported identifier. No other request filter inherits the cookie
+  capability.
+- **Request-header pointers are direction-scoped allowlists.** Values a
+  security response names for copying into the request (DataDome's
+  header-pointer mechanism) are accepted only from a **documented
+  enrichment-header allowlist**; authentication, `Cookie`,
+  `Forwarded`/`X-Forwarded-*`, identity, consent, and routing-authority
+  fields are rejected by name and by class — a compromised endpoint must
+  not replace origin credentials, inject `ts-ec`, or spoof client
+  location — and accepted values apply to a **narrowly scoped upstream
+  overlay**, never the shared request that later integrations read.
+- **Representation rules are decision-scoped.** A _Respond_ decision
+  (challenge/deny) **owns its body** and may set representation headers
+  (`Content-Type`, encoding, validators) for it — the hook's
+  representation reservation exists because ordinary mutators do not own
+  the body, and this one does. A _Continue_ decision may not touch
+  representation metadata of publisher bytes.
+- **One global order, no "wins" exception:** core finalization →
+  hook/security effects → **final cache/privacy invariant pass,
+  unconditionally last**. The prior DataDome contract's "applies last
+  and wins" holds only _within_ the effects layer; nothing outranks the
+  invariant pass, or a challenge could combine `Set-Cookie` with public
+  caching.
+- The channel adopts the shared layers: structured attributed batches
+  (§3, atomic per batch — a 302 must never lose `Location` to a budget
+  while keeping its cookie; on rejection the channel follows DataDome's
+  specified fail-open), reserved header names, budgets, and the
+  invariant pass.
 
 ## 4. Done-when (from #782, sharpened)
 
 1. Trait + builder + registry application, each public item documented.
 2. **The pre-existing `RequestFilterEffects.response_headers` channel
-   remains a distinct, core-owned security channel — not folded in, and
-   not left unvalidated.** Folding it into this hook would break its one
-   real consumer: DataDome sets headers **and cookies** on 200, 301/302,
-   401, 403, and 429 responses — challenge and deny flows on exactly the
-   response classes (§3a) this hook never runs on, and with cookie
-   emission v1 reserves. Instead, the channel keeps its own eligibility
-   (security-integration responses of any status), its cookies are
-   **core-mediated security cookies** (explicitly outside the deferred
-   integration-cookie surface, migrated deliberately when that surface
-   lands), and it adopts the **shared validation layers**: the
-   structured-operation checks, reserved header names, budgets, and the
-   final cache/privacy invariant pass. One invariant enforcer, two
-   eligibility domains.
+   remains a distinct, core-owned security channel — §4a defines its
+   closed boundary.** Folding it into this hook would break its one real
+   consumer: DataDome sets headers **and cookies** on 200, 301/302, 401,
+   403, and 429 responses — response classes (§3a) this hook never runs
+   on, with cookie emission v1 reserves.
 3. **At least one real consumer ships in the same PR** — an existing
    integration registering a mutator for a real need (or, failing a real
    need, the feature waits; scaffolding with only self-referential tests is

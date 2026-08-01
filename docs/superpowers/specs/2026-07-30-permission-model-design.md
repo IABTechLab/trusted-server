@@ -417,53 +417,76 @@ and the fail-closed marker:
   discoverable from every member, and the record survives member-tombstone
   replacement (which today discards the original row's identity and
   metadata, making sibling discovery impossible).
-- **Negative authority has its own permission-exempt record.** A live
-  refusal or non-destructive opt-out must clear prior positive
-  provenance — but the row write that would do it requires `store-on-device`,
-  which the refusal just unset, and identity rows may be eventually
-  consistent, so a stale replica could resurrect a P4 grant after a
-  targeted-advertising opt-out. The fix is a **suppression record** in
-  the strongly consistent class, and — because monotonicity is a
-  read-modify-write property, not a read property — suppression writes
-  require **linearizable per-key CAS** (providers spec §6.3
-  `sup/<family-id>`, §7 matrix): with plain read-after-write, two
-  writers can both read the record and an older clear can overwrite a
-  newer suppress. The record carries its own **version counter,
-  incremented through the CAS**, so transitions are ordered by
-  serialization, not by comparing wall-clock timestamps.
+- **Negative authority has its own permission-exempt record, with a
+  complete transition contract.** A live refusal or opt-out must clear
+  prior positive provenance, but the row write that would do it requires
+  `store-on-device` — which the refusal just unset — and identity rows
+  may be eventually consistent. The **suppression record**
+  (`s`-class key per family, providers spec §6.3) resolves this. Its
+  contract:
 
-  Coverage is **every authority-clearing delta, not an enumerated cause
-  list**: after each live resolution, any permission whose new state is
-  unset while its stored provenance is positive gets a suppression
-  entry — refusal, non-destructive opt-out, malformed-present, and
-  applicable absence alike. (The earlier refusal/opt-out-only list left
-  a hole: a malformed record unsets P1, the P1-gated row update is
-  thereby forbidden, no suppression is written, and batch sync later
-  honors the stale grant.)
+  **Creation is cause-aware and mostly read-free.** A live resolution
+  whose outcome for a permission is unset writes suppression when the
+  cause is a **signal state** — refusal, non-destructive opt-out,
+  malformed-present — **unconditionally**, with no row read: conditioning
+  on observing positive provenance through an eventually consistent row
+  loses the race where a stale replica hides a just-committed grant. The
+  one cause that inherently needs prior state — applicable **absence**
+  clearing a previously positive permission — uses a narrow
+  **permission-exempt suppression-decision read** exposing only the
+  family ID and authority metadata (an undeclared exempt read was the
+  alternative, and skipping it leaves stale S2S authority).
+  **Policy-only tightening writes nothing**: a policy edit is not a user
+  signal (§4.2 trigger 3), and a signal-less request after
+  granted→denied must not create sticky user suppression that a policy
+  rollback cannot undo.
 
-  **Timestamp-less sources get sticky opt-out.** GPP/USP values carry no
-  intrinsic timestamp, and opt-out → consent → opt-out(same value) is
-  information-theoretically indistinguishable from a replay of the first
-  opt-out. Latest-observation semantics would let a replayed old consent
-  string clear a newer opt-out, so: a suppression from a timestamp-less
-  source is cleared **only** by a grant carrying an authoritative
-  timestamp newer than the suppression's observation (TCF
-  `LastUpdated`) — a timestamp-less re-consent alone does not clear it.
-  The consequence (a genuine GPP-only re-consent does not restore
-  authority until a timestamped source or policy provides it) is
-  declared and is sign-off item 16. Fixtures: suppress-vs-clear race
-  under concurrent writers; repeated-value opt-out/consent/opt-out.
+  **Writes are CAS-fenced; evidence recency decides semantics.** The
+  record requires linearizable per-key CAS (providers spec §7): CAS
+  serialization prevents lost updates, but arrival order does **not**
+  decide outcomes — each per-permission entry stores its cause, source
+  class, and authoritative evidence timestamp (first-seen normalization
+  for timestamp-less sources), and an incoming transition applies only
+  when its evidence timestamp is **newer than or equal to** the stored
+  entry's; ties resolve to the more restrictive state. So a delayed
+  grant with `LastUpdated = 100` never clears a suppression whose
+  refusal carried `200`, while a genuine re-consent at `300` does. The
+  transition table, by stored cause: **opt-out from a timestamp-less
+  source** — cleared only by a grant with an authoritative timestamp
+  newer than the suppression's observation (sticky opt-out, sign-off
+  16); **TCF refusal** — cleared by any regime-accepted grant with newer
+  authoritative evidence; **malformed-present / absence** — cleared by
+  any regime-accepted valid grant with newer evidence, including a
+  timestamp-less grant whose first-seen is newer (these causes are not
+  user opt-outs, so stickiness does not apply — without this rule, one
+  truncated request would permanently deny a GPP-only user). Policy
+  changes never clear user-signal suppressions.
 
-  **Write failure fails closed for the live request** (the refusal's
-  effect stands for this response), but the S2S residual is **unbounded
-  for a never-returning visitor** — exactly like a failed destructive
-  revocation, not "transient": other instances continue honoring old
-  provenance, the breaker is per-instance, and no durable retry exists.
-  This shares sign-off item 11 (extended to cover suppression) and gets
-  its own fault test. Every S2S recompute and partner-egress check
-  consults the record: a suppressed permission is unset whatever the
-  row's provenance says, so no eventual-consistency edge can restore
-  it.
+  **Anti-replay for timestamps.** A future-dated record is rejected as
+  malformed beyond the skew window; within it, the record's digest is
+  stored with its **first normalized timestamp, which re-presentation
+  never advances** — otherwise a future-dated TCF string replayed after
+  an opt-out would keep re-normalizing to "now" and clear it. Equality
+  digests are computed over the **canonical per-permission semantic
+  result** of §4.5 aggregation, not the raw encoding — two encodings
+  (or `N` vs explicit N/A) with the same meaning are the same evidence
+  and keep the original first-seen, so alternating equivalent values
+  cannot renew authority.
+
+  **Boundary, retention, ordering.** Suppression is checked by **every
+  `AuthorizedIdentity` constructor** (both scopes), by pull sync's live
+  path, and by every S2S recompute — not only "partner egress" prose; a
+  suppression read failure **fails closed** like a revocation read
+  failure; retention must outlive the positive authority it masks
+  (providers spec durability/retention capability); and **clearing is
+  fenced on provenance visibility**: a clear entry records the
+  provenance generation it reflects, and S2S honors the clear only when
+  it can read that generation or newer — clearing first would expose the
+  _older_ positive snapshot through an eventual read. **Write failure
+  fails closed for the live request**, and the S2S residual is unbounded
+  for a never-returning visitor (sign-off 11), with fault tests for
+  suppress-vs-clear races, repeated-value sequences, and the
+  stale-provenance-read case.
 
 - **The cookie expires only after the family record commits.**
 - **If the family-record write itself fails, nothing durable exists** —
@@ -572,10 +595,13 @@ fields grant nothing (their opt-outs still count, per step 2).
    claimed MD/IN/KY/RI had no section). A truncated map silently loses
    opt-outs — a Texas (16) or Maryland (24) sale opt-out must not vanish.
    The implementation PR cross-checks this list against both the current
-   decoder's section set and the official registry, and **enumerates the
-   accepted version per section**; a mapped section carrying an unknown
-   version is treated as malformed-present (blocks grants, never
-   withdraws — §4.4), not as absent. Adding a section or version is a
+   decoder's section set and the official registry, and the accepted version per
+   section is **pinned normatively to the named IAB GPP registry
+   revision current at this spec's date (2026-08-01)** — "enumerated by
+   the implementation PR" was two-implementations-diverge territory; a
+   mapped section carrying a version outside the pinned revision is
+   treated as malformed-present (blocks grants, never withdraws — §4.4),
+   not as absent. Adding a section or version is a
    change to this map.
 2. **Applicability gates grants only — never opt-outs.** A mapped
    **opt-out** field (either subclass) is honored from **any** section on
@@ -671,9 +697,9 @@ A policy edit propagates through the config store, so a fleet briefly
 mixes revisions. The contract: instances stamp every resolution and every
 provenance write with the policy revision they used (already required by
 §7); the mixing window is bounded by config propagation and observable via
-the config-version metric; and mixed revisions cannot cause irreversible
-harm, because **destructive withdrawal triggers are user signals, never
-policy** (§4.2 trigger 3) — the one revision-sensitive destructive case
+the config-version metric; and mixed-revision irreversibility is bounded and **accepted, not
+denied** (sign-off 19): destructive withdrawal triggers are user
+signals, never policy (§4.2 trigger 3) — the one revision-sensitive destructive case
 (trigger 2 under a now-`denied` baseline) requires an affirmative user
 refusal at the evaluating instance, which is safe under either revision.
 S2S recomputation always evaluates against the instance's current
@@ -770,8 +796,12 @@ Consumers of the resolved set in this epic:
    | GPP / USP values (no intrinsic timestamp)         | **First-seen**: when TS first observed this exact normalized value (a **per-permission equality digest computed over only the applicable, aggregated §4.5 fields for that permission** — never the whole GPP record, or a CMP touching an unrelated notice field would mint a new digest and reset first-seen forever) | Re-presenting an identical digest **keeps the original first-seen**; a different value is new evidence with a new first-seen | Consent TTL (same as TCF) |
    | Policy-baseline grant (`granted` rule, no signal) | The policy revision that granted                                                                                                                                                                                                                                                                                       | Re-derived on every recompute against the current revision — policy is not user evidence and does not age; it changes        | n/a                       |
 
-   Timestamps are compared with bounded clock-skew tolerance and
-   future-dated values are clamped to receipt time. And every live
+   Timestamps are compared with bounded clock-skew tolerance;
+   beyond-window future-dated records are **rejected as malformed**, and
+   within the window a record's first normalized timestamp is pinned to
+   its digest and never advanced by re-presentation (§4.3's anti-replay
+   rule — clamping every presentation to "now" would make a future-dated
+   string perpetually fresh). And every live
    resolution **atomically replaces the complete per-permission
    snapshot**, never merges — a refusal, opt-out, malformed or absent
    state in the fresh resolution clears prior positive authority for its

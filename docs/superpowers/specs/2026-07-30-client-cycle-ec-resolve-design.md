@@ -66,10 +66,13 @@ Everything in this spec follows from that.
    enough to set identity. Requests with no `Origin` and no valid token are
    rejected.
 2. **Verify the payload cryptographically per provider — including against
-   replay.** `resolve_from_client` is the client-resolve acquisition mode
-   of the provider contract (providers spec §4
-   `Acquisition::ClientResolve`, which also carries the JS module the
-   page leg needs) — no longer an undeclared method this spec invents. It
+   replay.** `resolve_from_client` belongs to the client-resolve acquisition
+   surface that was **removed from the normative provider contract with
+   this feature's deferral** (providers spec §4) — it, the acquisition
+   enum, and the reservation schemas live only in this informative
+   draft, to be renormalized (against the current trait and the
+   delimiter-free key grammar, which superseded the `resv/…` sketch
+   here) when the feature gets its issue. It
    accepts only payloads
    that are signed by an expected party, **audience-bound** to this
    publisher, and **expiring**. Audience binding and expiry alone do not
@@ -195,7 +198,13 @@ with only the later POST refused. The module is injected/activated only
 when the request's resolved permissions already satisfy the provider's
 complete `required_permissions()`, and the page leg is a listed row in
 the permission spec's §7 enforcement inventory (deferred alongside this
-feature).
+feature). Injection-time gating alone has a TOCTOU gap: consent can be
+withdrawn between document delivery and asynchronous vendor contact, or
+the document can be restored from BFCache long after its permissions
+were resolved — so the module must additionally perform a **live
+CMP/permission check immediately before vendor contact** and abort on
+permission change or BFCache restoration; endpoint rejection is too late
+to undo browser-side identity derivation or vendor egress.
 
 - The re-post guard must not depend on reading an HttpOnly cookie. Either
   the server injects a "resolved" marker the script _can_ read (a
