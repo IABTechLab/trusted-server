@@ -502,7 +502,15 @@ and the fail-closed marker:
   **The strong record carries positive-authority state too.** The
   per-family record doubles as the **authority-state record**: alongside
   negative entries it stores a per-permission positive-authority summary
-  (revision, evidence timestamp), CAS-updated by every provenance write.
+  — **kind** (user evidence vs. policy-baseline), grant basis / source
+  class, policy revision, `valid_until`, provenance revision, and
+  evidence timestamp — CAS-updated by every provenance write. The kind
+  and policy revision are load-bearing: the absence decision must
+  distinguish vanished _user_ evidence (suppress) from a
+  policy-baseline grant that disappeared because the _policy_ changed
+  (never suppress — trigger 3), and a revision-and-timestamp-only
+  summary would force exactly the eventual row read this record exists
+  to eliminate.
   The **absence decision reads this strong summary, never the eventual
   identity row** — deciding "no prior authority" from an eventual
   not-found loses the race where a just-committed grant is invisible on
@@ -510,8 +518,23 @@ and the fail-closed marker:
   like a revocation read failure; retention must outlive the positive
   authority it masks (providers spec durability/retention capability).
 
-  _older_ positive snapshot through an eventual read. **Write failure
-  fails closed for the live request**, and the S2S residual is unbounded
+  **The strong record is the commit point — the two-record protocol is
+  explicit.** Every provenance-bearing write spans the eventual identity
+  row and the strong authority-state record, in a fixed order with
+  defined intermediate states: (1) the row commits at revision _r_
+  (generation-CAS); (2) the authority-state record CAS-updates its
+  summary to _r_. **Revision _r_ is committed — usable by S2S, visible
+  to the absence decision — only when the strong record reports it**; a
+  row at _r_ whose summary still reads _r−1_ is simply uncommitted
+  detail, and a crash between the writes leaves a recoverable state (the
+  next live resolution re-runs step 2 via `AuthorityRefresh`), never a
+  divergent one. This ordering is why the absence decision can trust the
+  summary: there is no state in which the row authorizes something the
+  strong record has never heard of. Minting follows the same rule —
+  see the providers spec §5 order, where eligibility begins at the
+  **authority-state commit**, not the row commit.
+
+  **Write failure fails closed for the live request**, and the S2S residual is unbounded
   for a never-returning visitor (sign-off 11), with fault tests for
   suppress-vs-clear races, repeated-value sequences, and the
   stale-provenance-read case.
@@ -532,9 +555,12 @@ and the fail-closed marker:
   (migration spec §8), not a footnote.
 - **Consistency and retention are backend contracts with a single
   normative home**: the providers spec consistency matrix (§7). It — not
-  this spec — states the requirement, and it requires a **strongly
-  consistent (read-after-write) primitive** for revocation records; no
-  bounded-lag alternative exists (an earlier draft here permitted one,
+  this spec — states the requirement, and it requires **globally observable
+  strong consistency** for revocation records — every instance's read
+  observes a committed revocation, never merely the writer's own
+  session (this spec deliberately repeats the provider contract's exact
+  wording rather than paraphrasing it into the weaker "read-after-write");
+  no bounded-lag alternative exists (an earlier draft here permitted one,
   which contradicted the matrix — an adapter with a two-second lag would
   have passed one spec and failed the other). A **failed family-record
   read fails closed** for egress (revoked-unknown ≠ live), and revocation
@@ -624,8 +650,8 @@ fields grant nothing (their opt-outs still count, per step 2).
    opt-outs — a Texas (16) or Maryland (24) sale opt-out must not vanish.
    The implementation PR cross-checks this list against both the current
    decoder's section set and the official registry, and the accepted version per
-   section is **pinned to a registry snapshot vendored into this
-   repository** — a checked-in file enumerating, per mapped section, the
+   section is **pinned to the vendored registry snapshot
+   `docs/superpowers/specs/gpp-registry-snapshot.md`** — a checked-in file enumerating, per mapped section, the
    accepted version(s), taken from the IAB registry at ratification (a
    date is not an immutable identifier, and "enumerated by the
    implementation PR" was two-implementations-diverge territory; the
@@ -832,7 +858,12 @@ Consumers of the resolved set in this epic:
    | GPP / USP values (no intrinsic timestamp)         | **First-seen**: when TS first observed this exact normalized value (a **per-permission equality digest computed over only the applicable, aggregated §4.5 fields for that permission** — never the whole GPP record, or a CMP touching an unrelated notice field would mint a new digest and reset first-seen forever) | Re-presenting an identical digest **keeps the original first-seen**; a different value is new evidence with a new first-seen | Consent TTL (same as TCF) |
    | Policy-baseline grant (`granted` rule, no signal) | The policy revision that granted                                                                                                                                                                                                                                                                                       | Re-derived on every recompute against the current revision — policy is not user evidence and does not age; it changes        | n/a                       |
 
-   Timestamps are compared with bounded clock-skew tolerance;
+   Timestamps are compared with a bounded clock-skew tolerance that is a
+   **normative constant — 300 seconds** (five minutes, applied
+   symmetrically; a spec-level value because suppression precedence,
+   malformed classification, and future-date handling all hinge on it,
+   and per-deployment values would give the same input different privacy
+   outcomes);
    beyond-window future-dated records are **rejected as malformed**, and
    within the window a record's first normalized timestamp is pinned to
    its digest and never advanced by re-presentation (§4.3's anti-replay

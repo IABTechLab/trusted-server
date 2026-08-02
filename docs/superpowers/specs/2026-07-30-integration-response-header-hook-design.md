@@ -126,8 +126,8 @@ mutators to the outbound response for HTML document responses it processed.
   which corrupts attribution and budgets), with a duplicate-ID test in
   the done-when. Until then the
   operation set is headers-only, and `Set-Cookie` is fully reserved.
-  reserved cookie name — in v1 that is every cookie name, since
-  `Set-Cookie` is fully reserved (§3 deferral). Violations are rejected
+  cookie via any operation — `Set-Cookie` is fully reserved in v1 (§3
+  deferral). Violations are rejected
   at the operation layer (§2) and
   logged at `warn` with the integration id. The reserved lists are single
   constants next to the definitions they protect, not duplicated in the
@@ -145,7 +145,13 @@ mutators to the outbound response for HTML document responses it processed.
   replace-only (true singletons — e.g. `Content-Location`, `Retry-After`;
   an earlier draft miscited `Content-Language`, which is list-valued),
   or rejected; **unknown extension fields are rejected entirely in v1**
-  (neither append nor replace — their side-effect class is unknowable) (`Set-Cookie` is fully reserved in v1 — neither append nor replace). Replacing a
+  (neither append nor replace — their side-effect class is unknowable).
+  The v1 registry is enumerated here, not delegated: **admitted** —
+  `Cache-Control` (monotonic merge per this section), `Vary` (union
+  merge), `Content-Language` (append), `X-Robots-Tag` (append),
+  `Retry-After` (replace-only), `Content-Location` (replace-only);
+  everything else known is classified reserved or rejected by the rules
+  above, and growing the admitted set is a spec change to this list (`Set-Cookie` is fully reserved in v1 — neither append nor replace). Replacing a
   header the origin set is a deliberate act, visible in the mutator's code.
 - Later registrations see earlier mutations (order = registration order,
   which is deterministic).
@@ -196,17 +202,17 @@ mutators to the outbound response for HTML document responses it processed.
 Which responses the hook runs on, enumerated so two implementations cannot
 diverge silently:
 
-| Response                                          | Hook runs?                                                                                                                                                                                                                                                                                         |
-| ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Processed HTML document (rewritten by TS)         | Yes                                                                                                                                                                                                                                                                                                |
-| Streamed processed document                       | Yes — operations apply to the header block before first byte                                                                                                                                                                                                                                       |
-| Pass-through proxy response (not processed)       | No — TS is a transparent proxy for it                                                                                                                                                                                                                                                              |
-| Served-from-cache processed document              | Yes, applied at serve time (mutations are not cached)                                                                                                                                                                                                                                              |
-| Redirect (3xx)                                    | No                                                                                                                                                                                                                                                                                                 |
-| Error responses TS itself generates (4xx/5xx)     | No                                                                                                                                                                                                                                                                                                 |
-| `304 Not Modified` for a processed representation | **304-safe metadata pass**: the hook's header mutations for the corresponding processed 200 are re-applied (a 304 updates stored `Cache-Control`/`Vary` — excluding it while running on HEAD contradicted the cache-metadata rationale); where mutations cannot be reproduced, respond 200 instead |
-| `HEAD` of a processed document                    | **Yes — header parity with GET is mandatory** (a cache may refresh stored GET metadata from HEAD, and divergent CSP/privacy metadata between the two is a leak)                                                                                                                                    |
-| Informational `1xx`, `204`, `205`, `206`          | No — enumerated so adapters do not infer independently                                                                                                                                                                                                                                             |
+| Response                                          | Hook runs?                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Processed HTML document (rewritten by TS)         | Yes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| Streamed processed document                       | Yes — operations apply to the header block before first byte                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| Pass-through proxy response (not processed)       | No — TS is a transparent proxy for it                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| Served-from-cache processed document              | Yes, applied at serve time (mutations are not cached)                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| Redirect (3xx)                                    | No                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| Error responses TS itself generates (4xx/5xx)     | No                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `304 Not Modified` for a processed representation | **Persisted-metadata pass**: when the processed 200 was cached, its **final post-hook header set** (the cache-relevant fields) was persisted alongside the representation; a 304 re-emits those persisted finals — deterministic, no mutator re-run, no representation reconstruction. If no persisted metadata exists, the conditional request is treated as a **cache miss** (full 200 fetched and processed); the earlier "respond 200 instead" without saying whence was not implementable |
+| `HEAD` of a processed document                    | **Yes — header parity with GET is mandatory** (a cache may refresh stored GET metadata from HEAD, and divergent CSP/privacy metadata between the two is a leak)                                                                                                                                                                                                                                                                                                                                |
+| Informational `1xx`, `204`, `205`, `206`          | No — enumerated so adapters do not infer independently                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 
 This deliberately narrows #782's general "outbound response" phrasing to
 processed documents (§6).
@@ -219,13 +225,21 @@ degree of freedom is closed:
 - **Typed security-cookie operation with a concrete lifecycle, not
   header strings.** The channel emits cookies only through a typed
   operation, and the registration is not a placeholder — for DataDome
-  it pins: cookie name exactly `datadome`; scope the publisher apex,
-  path `/`; mandatory `Secure` and `SameSite=Lax`; lifetime at most
-  DataDome's documented maximum (thirteen months ceiling); size ≤ 4 KiB;
+  it pins: cookie name exactly `datadome`; `Domain` set to the
+  registrable domain computed against the **Mozilla Public Suffix List**
+  (vendored revision named by the implementation; host-only is not used
+  because DataDome requires site-wide scope), path `/`; mandatory
+  `Secure` and `SameSite=Lax`; `Max-Age` at most **34,214,400 seconds**
+  (396 days — the thirteen-month ceiling, as an exact number); size ≤
+  4 KiB;
   a violating operation is rejected whole (the batch rule). Every
-  `ts-*` name is rejected. **Read is owner-only** — the cookie is
-  visible to the security channel and stripped from every other
-  integration's request view; vendor egress goes only to DataDome
+  `ts-*` name is rejected. **Read is owner-only, and the strip inventory is exhaustive, not
+  integration-scoped** — the browser sends `datadome` in the ordinary
+  `Cookie` header, so it is removed from **every non-DataDome surface**:
+  other integrations' request views, publisher-origin proxy forwarding,
+  proxy/click/Testlight upstreams, auction/page-bids request
+  serialization, and logs (redaction list) — each surface a tested row
+  of the inventory; only the security channel itself observes it; vendor egress goes only to DataDome
   endpoints; deletion is always possible; and whether TS's own
   destructive withdrawal also expires it is exactly the open half of
   **sign-off item 23** — the carve-out is _pending ratification_, not
@@ -233,9 +247,13 @@ degree of freedom is closed:
   it closes. No other request filter inherits the cookie capability.
 - **Request-header pointers are a positive, enumerated allowlist.**
   "Documented enrichment headers" is not enforceable; the registration
-  enumerates the exact names — for DataDome today that is
-  **`X-DataDome-ClientID` and the documented `X-DataDome-*` enrichment
-  set, listed one by one** — resolving what was a contradiction:
+  enumerates the exact names from the **checked-in allowlist file
+  `docs/superpowers/specs/datadome-header-allowlist.md`** — spec-pinned
+  today to exactly **`X-DataDome-ClientID`**; every other `X-DataDome-*`
+  field is rejected until a reviewed commit adds it to that file
+  ("documented enrichment set, listed one by one" without an actual list
+  was a wildcard whose contents could change outside the spec) —
+  resolving what was a contradiction:
   ClientID propagation is required by the existing DataDome contract
   and test, and its identity-class nature is precisely why it applies
   only to an **owner-scoped publisher-upstream overlay**, never the
