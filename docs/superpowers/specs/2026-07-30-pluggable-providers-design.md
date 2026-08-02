@@ -205,7 +205,8 @@ pub trait EdgeCookieProvider {
     /// Canonical graph-key SUFFIX (bounded length, KV-safe). Core — not
     /// the provider — constructs the physical key (§6.3 key grammar), so
     /// cross-provider and cross-record-kind isolation is structural.
-    /// Sole exception: hmac v0 keys are the identifier verbatim.
+    /// Sole exception: hmac keys (every version) are the identifier
+    /// verbatim — the reserved legacy grammar.
     fn graph_key_suffix(&self, id: &EcId) -> GraphKeySuffix;
     /// Cluster capability: a literal byte prefix of the physical graph
     /// key, shared across identifiers minted from the same client
@@ -213,10 +214,12 @@ pub trait EdgeCookieProvider {
     fn cluster_prefix(&self, id: &EcId) -> Option<HashPrefix>;
     /// Mint an identifier from request evidence. The one acquisition
     /// operation of the epic (server mint); failure means no identity
-    /// this request (§6.2). Lost from an earlier revision by editing
-    /// accident — its absence made the required gate → generate →
-    /// graph-commit sequence unimplementable.
-    fn generate(&self, input: &IdentityInput<'_>) -> Result<EcId, Report<EcError>>;
+    /// this request (§6.2). Returns the identifier WITH the active
+    /// configuration version — the immutable mint tag needs it and core
+    /// cannot reach into provider-specific configuration to learn it.
+    fn generate(&self, input: &IdentityInput<'_>)
+        -> Result<GeneratedIdentity, Report<EcError>>;
+    // GeneratedIdentity { id: EcId, mint_version: ProviderVersion }
     /// Cryptographic verification of a parsed identifier against request
     /// evidence. Recognition (`parse`) is not authentication; rowless
     /// handling (§5) requires this. Returns the matched configuration
@@ -272,23 +275,34 @@ present `H.aaaaab`, `H.aaaaac`, … — every variant prefix-verifies, and
 an adopt path would mint a **separate durable row and family per
 variant**. Therefore:
 
-- A recognized rowless cookie whose prefix verifies
-  (`verify → VerifiedIdentity`, carrying the matched version for
-  provenance) is **expired and replaced by a fresh mint through the
-  ordinary graph-backed path** (gate → `generate` → commit) when the
-  request's permissions allow one; continuity with the old identifier is
-  deliberately not preserved (migration matrix row 13, sign-off 21). A
-  cookie whose prefix does not verify (including the declared roaming
-  false-negative) is simply expired.
-- **Rowless withdrawal cannot be a row/family-minting oracle**: for
-  rowless legacy HMAC cookies the derived family ID is a function of the
-  **authenticated 64-hex prefix only**, so every suffix variant maps to
-  the _same_ family — one family record withdraws them all, and
-  attacker-generated variants create nothing new.
-- Read errors are still not "not found": a failed graph read means the
-  cookie is treated as absent this request, fail closed, no expiry
-  emitted (the row may exist).
-  declares this path.
+- **"Rowless" requires an authoritative not-found, and only in
+  migration mode.** Identity-row visibility may be eventual, so a plain
+  not-found proves nothing — a just-minted row invisible on a stale
+  replica would classify its own cookie as rowless and expire/re-mint
+  it, forking the identity. The rowless path therefore activates only
+  when the deployment-metadata **graphless-migration flag** is set (set
+  by the §4.2 readiness step for deployments that actually ran
+  graphless; permanently-graphed deployments never classify anything
+  rowless), and the existence check uses the backend's strongest read.
+  Outside migration mode, or on any read error, the state is
+  **indeterminate**: no identity use, no mint, no cookie expiry —
+  "treated as absent" was the wrong contract, since absence feeds the
+  fresh-mint path.
+- A verified rowless cookie (`verify → VerifiedIdentity`, carrying the
+  matched version) is **expired and replaced by a fresh mint through the
+  ordinary graph-backed path** when permissions allow; continuity is
+  deliberately not preserved (migration matrix row 13, sign-off 21). An
+  unverifiable cookie (including the declared roaming false-negative) is
+  simply expired.
+- **Rowless withdrawal writes nothing** — there is no server-side state
+  to revoke: no row, no partner mappings, no S2S surface. The cookie is
+  expired, and that is the entire withdrawal. (An earlier prefix-derived
+  family record was over-engineering with two defects: unauthenticated
+  suffix variants could mint records, and — because the HMAC prefix is
+  per-IP — one visitor's withdrawal would have revoked every identity
+  behind the same IP. Family records exist only for row-backed
+  identities, derived from the full graph key, one derivation
+  everywhere.)
 
 **Egress is typed, not policed.** The inventory-and-denylist test
 (permission model spec §7) is a backstop, but conventions do not survive
@@ -541,9 +555,15 @@ deadline, and fencing epoch; the **family revocation record** holds the
 family ID, revoked-at, triggering signal class (§4.5 destructive column),
 and a **family epoch** bumped on every revocation-state change (the
 client-cycle commit CAS is conditioned on it) — deliberately no identity
-data, so it can outlive its members; the **suppression record** holds
-per-permission suppression entries with timestamps (strong class,
-permission-exempt writes, permission model spec §4.3);
+data, so it can outlive its members; the **authority-state (suppression) record** holds, per permission:
+state (`suppressed`/`cleared`), cause, source class, authoritative or
+observation evidence timestamp, the **application-level provenance
+revision** a clear references, and the positive-authority summary
+(revision + evidence timestamp) — plus the record-level CAS version
+counter and schema version; unknown-field and range validation apply
+like every class (strong class, permission-exempt writes per the
+permission spec's inventory; revisions are app-level counters because
+backend generation markers detect change without ordering);
 the **rewrite transaction** holds source key, target key, copy point,
 state, and epoch; the **reservation** holds state, owner hash, lease
 epoch, outcome, and created-at (client-cycle spec). Field validation and
@@ -611,7 +631,7 @@ Requirements:
   | Deployment metadata (schema floor) | **Write-once/CAS**, outside ordinary config storage (migration spec §4)                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
   | Rewrite transactions               | **Linearizable fenced CAS required** (same primitive class as reservations)                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
   | Alias installs (reserved)          | Row-store **per-key CAS with read-your-writes** — recorded for the future `rewrite_legacy` spec; nothing in the epic writes an alias                                                                                                                                                                                                                                                                                                                                                                                                         |
-  | Identity rows                      | Eventual consistency acceptable — rows are accretive, and the family-record check (strong, per above) governs use                                                                                                                                                                                                                                                                                                                                                                                                                            |
+  | Identity rows                      | Eventual **visibility** acceptable _after_ a generation-CAS mutation commits (see Identity-row mutation above) — the earlier "rows are accretive" claim is deleted: rows replace snapshots, merge partner IDs, and refresh derived state, and unordered last-writer-wins loses newer evidence                                                                                                                                                                                                                                                |
 
   Every record class additionally declares **durability and maximum
   retention**: a store passing the consistency check but capping TTLs
@@ -632,14 +652,19 @@ Requirements:
   them is how a "yes" cell hides an unusable feature. Feature eligibility
   requires wired, not merely available:
 
-  | Capability                                            | Fastly                                                                          | Axum (dev)                                                                                                                    | Cloudflare                                                                                                                                                                 | Spin                                                                                             |
-  | ----------------------------------------------------- | ------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-  | Graph persistence (eventual OK)                       | KV Store: available + wired                                                     | **Not wired** — the current adapter installs `UnavailableKvStore`; an in-process store is dev-feasible but does not exist yet | Workers KV: available + wired (eventually consistent)                                                                                                                      | Key-value: **available, not wired** — Spin config is embedded and EC KV routes are unwired today |
-  | Prefix listing (cluster)                              | Yes (used today)                                                                | Yes                                                                                                                           | Yes (eventual)                                                                                                                                                             | _verify_                                                                                         |
-  | Strongly consistent revocation reads                  | _verify_ against Fastly KV semantics                                            | Yes (in-process)                                                                                                              | **Workers KV: no** — needs Durable Objects, not currently wired                                                                                                            | _verify_                                                                                         |
-  | Linearizable fenced CAS (reservations, alias/rewrite) | **Not currently available** — the client-cycle feature (deferred) would need it | Yes — in-process only: linearizable but **non-durable**, dev-eligibility only, not a production persistence claim             | Durable Objects: possible, not wired                                                                                                                                       | **No**                                                                                           |
-  | Platform geo                                          | Yes — country + region                                                          | No                                                                                                                            | **Yes — country only, no region** (`cf-ipcountry`): regionless US traffic degrades per the permission spec's declared rule, which directly changes state-level US outcomes | No                                                                                               |
-  | Device host evidence (JA4/H2)                         | Yes                                                                             | No                                                                                                                            | No                                                                                                                                                                         | No                                                                                               |
+  | Capability                                                  | Fastly                                                               | Axum (dev)                                                                                                                    | Cloudflare                                                                                                                                                                 | Spin                                                                                             |
+  | ----------------------------------------------------------- | -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+  | Graph persistence (eventual OK)                             | KV Store: available + wired                                          | **Not wired** — the current adapter installs `UnavailableKvStore`; an in-process store is dev-feasible but does not exist yet | Workers KV: available + wired (eventually consistent)                                                                                                                      | Key-value: **available, not wired** — Spin config is embedded and EC KV routes are unwired today |
+  | Prefix listing (cluster)                                    | Yes (used today)                                                     | **Unavailable** (no store wired — in-process feasibility is a note, not a cell)                                               | Yes (eventual)                                                                                                                                                             | _verify_                                                                                         |
+  | Strongly consistent revocation reads                        | _verify_ against Fastly KV semantics                                 | **Unavailable** (no store wired)                                                                                              | **Workers KV: no** — needs Durable Objects, not currently wired                                                                                                            | _verify_                                                                                         |
+  | Linearizable fenced CAS _(informative — deferred features)_ | **Not currently available**                                          | **Unavailable** (no store wired)                                                                                              | Durable Objects: possible, not wired                                                                                                                                       | **No**                                                                                           |
+  | Platform geo                                                | Yes — country + region                                               | No                                                                                                                            | **Yes — country only, no region** (`cf-ipcountry`): regionless US traffic degrades per the permission spec's declared rule, which directly changes state-level US outcomes | No                                                                                               |
+  | Device host evidence (JA4/H2)                               | Yes                                                                  | No                                                                                                                            | No                                                                                                                                                                         | No                                                                                               |
+  | Suppression / authority-state CAS                           | Generation-marker conditional write: available, **wiring to verify** | **Unavailable** (no store wired)                                                                                              | Workers KV: **ineligible** (last-write-wins); Durable Objects: feasible, not wired                                                                                         | **Unavailable**                                                                                  |
+  | Identity-row generation-CAS mutation                        | Same primitive as above                                              | **Unavailable**                                                                                                               | Workers KV: **ineligible**; DO: feasible, not wired                                                                                                                        | **Unavailable**                                                                                  |
+  | Row create-if-absent                                        | Generation-marker create: available, **wiring to verify**            | **Unavailable**                                                                                                               | Workers KV: **ineligible**; DO: feasible, not wired                                                                                                                        | **Unavailable**                                                                                  |
+  | Deployment metadata (write-once/CAS)                        | **Not wired** — needs a primitive distinct from the config store     | **Unavailable**                                                                                                               | DO: feasible, not wired                                                                                                                                                    | **Unavailable**                                                                                  |
+  | Durability / max-retention proof                            | KV durable; TTL ceilings **to verify** against computed horizons     | **Unavailable**                                                                                                               | Workers KV TTLs: to verify; DO storage: feasible                                                                                                                           | **Unavailable**                                                                                  |
 
 - Each adapter's runtime-services setup routes through the shared builders.
 - Providers are constructed **once** per application instance and stored in

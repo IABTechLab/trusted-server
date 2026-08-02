@@ -332,13 +332,13 @@ defined over those states, so no input state is unmapped.
 For each enforced permission, with baseline _B_ ∈ {granted,
 requires_signal, denied}:
 
-| Opt-out present | TCF refusal present | Accepted grant present (regime-scoped) | Malformed-present | Result                                           |
-| --------------- | ------------------- | -------------------------------------- | ----------------- | ------------------------------------------------ |
-| yes             | —                   | —                                      | —                 | **unset** (and withdrawal semantics apply, §4.2) |
-| no              | yes                 | —                                      | —                 | unset (withdrawal per §4.2, trigger 2)           |
-| no              | no                  | yes                                    | —                 | set, unless B = denied                           |
-| no              | no                  | no                                     | yes               | **unset** (precedence 5 — blocks baseline grant) |
-| no              | no                  | no                                     | no                | set iff B = granted                              |
+| Opt-out present | TCF refusal present | Accepted grant present (regime-scoped) | Malformed-present | Result                                                                                                                                                                                                                                                                                                                                      |
+| --------------- | ------------------- | -------------------------------------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| yes             | —                   | —                                      | —                 | **unset** (and withdrawal semantics apply, §4.2)                                                                                                                                                                                                                                                                                            |
+| no              | yes                 | —                                      | —                 | unset (withdrawal per §4.2, trigger 2)                                                                                                                                                                                                                                                                                                      |
+| no              | no                  | yes                                    | —                 | set, unless B = denied                                                                                                                                                                                                                                                                                                                      |
+| no              | no                  | no                                     | yes               | **unset** (precedence 5 — blocks baseline grant)                                                                                                                                                                                                                                                                                            |
+| no              | no                  | no                                     | no                | set iff B = granted **and no suppression entry stands** — an active suppression (§4.3) beats the baseline, so one malformed request denies later no-signal requests under `granted` until newer valid grant evidence clears it; a policy-baseline grant alone does **not** clear non-user suppression (sign-off 24 covers this consequence) |
 
 ### 4.2 Withdrawal vs. absence
 
@@ -451,7 +451,12 @@ and the fail-closed marker:
   entry's; ties resolve to the more restrictive state. So a delayed
   grant with `LastUpdated = 100` never clears a suppression whose
   refusal carried `200`, while a genuine re-consent at `300` does. The
-  transition table, by stored cause: **opt-out from a timestamp-less
+  transition table (causes without an intrinsic timestamp — malformed
+  records decode no `LastUpdated`, absence has no source — use their
+  **observation timestamp**, server receipt on the shared clock basis
+  within the skew window; cross-source comparison uses the authoritative
+  timestamp where one exists, else the observation timestamp, ties
+  restrictive), by stored cause: **opt-out from a timestamp-less
   source** — cleared only by a grant with an authoritative timestamp
   newer than the suppression's observation (sticky opt-out, sign-off
   16); **TCF refusal** — cleared by any regime-accepted grant with newer
@@ -466,22 +471,45 @@ and the fail-closed marker:
   malformed beyond the skew window; within it, the record's digest is
   stored with its **first normalized timestamp, which re-presentation
   never advances** — otherwise a future-dated TCF string replayed after
-  an opt-out would keep re-normalizing to "now" and clear it. Equality
-  digests are computed over the **canonical per-permission semantic
-  result** of §4.5 aggregation, not the raw encoding — two encodings
-  (or `N` vs explicit N/A) with the same meaning are the same evidence
-  and keep the original first-seen, so alternating equivalent values
-  cannot renew authority.
+  an opt-out would keep re-normalizing to "now" and clear it. Equality is
+  **source-specific**: for GPP/USP the digest is the **canonical
+  per-permission semantic result** of §4.5 aggregation alone — two
+  encodings (or `N` vs explicit N/A) with the same meaning are the same
+  evidence and keep the original first-seen, so alternating equivalent
+  values cannot renew authority; for TCF the digest is the semantic
+  result **plus the authoritative `LastUpdated`** — a genuine CMP
+  renewal with unchanged purposes carries a newer `LastUpdated` and
+  legitimately refreshes authority age, which a semantics-only digest
+  would wrongly ignore.
 
-  **Boundary, retention, ordering.** Suppression is checked by **every
-  `AuthorizedIdentity` constructor** (both scopes), by pull sync's live
-  path, and by every S2S recompute — not only "partner egress" prose; a
-  suppression read failure **fails closed** like a revocation read
-  failure; retention must outlive the positive authority it masks
-  (providers spec durability/retention capability); and **clearing is
-  fenced on provenance visibility**: a clear entry records the
-  provenance generation it reflects, and S2S honors the clear only when
-  it can read that generation or newer — clearing first would expose the
+  **Boundary, retention, ordering — without deadlocking recovery.**
+  Suppression is checked by **every `AuthorizedIdentity` constructor**
+  (both scopes), by pull sync's live path, and by every S2S recompute.
+  That gate plus clear-after-provenance would deadlock re-consent —
+  fresh P1 provenance cannot be written while P1 suppression blocks
+  `GraphOps`, and clearing first is forbidden — so recovery has its own
+  narrow write path: **`AuthorityRefresh`**, permission-exempt but
+  strictly scoped to committing provenance from the _current live
+  resolution_ (nothing else: no partner writes, no egress, no reads
+  beyond the row being refreshed) while suppression remains effective;
+  the clear then references that provenance's revision. Revisions are an
+  **application-level monotonic counter written with the row** — never
+  backend generation markers, which (per Fastly's own contract) only
+  detect change and carry no order — and S2S honors a clear only when it
+  can read that revision or newer; clearing first would expose the
+  _older_ positive snapshot through an eventual read.
+
+  **The strong record carries positive-authority state too.** The
+  per-family record doubles as the **authority-state record**: alongside
+  negative entries it stores a per-permission positive-authority summary
+  (revision, evidence timestamp), CAS-updated by every provenance write.
+  The **absence decision reads this strong summary, never the eventual
+  identity row** — deciding "no prior authority" from an eventual
+  not-found loses the race where a just-committed grant is invisible on
+  a stale replica. A suppression/authority read failure **fails closed**
+  like a revocation read failure; retention must outlive the positive
+  authority it masks (providers spec durability/retention capability).
+
   _older_ positive snapshot through an eventual read. **Write failure
   fails closed for the live request**, and the S2S residual is unbounded
   for a never-returning visitor (sign-off 11), with fault tests for
@@ -596,9 +624,13 @@ fields grant nothing (their opt-outs still count, per step 2).
    opt-outs — a Texas (16) or Maryland (24) sale opt-out must not vanish.
    The implementation PR cross-checks this list against both the current
    decoder's section set and the official registry, and the accepted version per
-   section is **pinned normatively to the named IAB GPP registry
-   revision current at this spec's date (2026-08-01)** — "enumerated by
-   the implementation PR" was two-implementations-diverge territory; a
+   section is **pinned to a registry snapshot vendored into this
+   repository** — a checked-in file enumerating, per mapped section, the
+   accepted version(s), taken from the IAB registry at ratification (a
+   date is not an immutable identifier, and "enumerated by the
+   implementation PR" was two-implementations-diverge territory; the
+   vendored file is the single reproducible authority, and updating it
+   is a reviewed spec change); a
    mapped section carrying a version outside the pinned revision is
    treated as malformed-present (blocks grants, never withdraws — §4.4),
    not as absent. Adding a section or version is a
@@ -774,6 +806,8 @@ Consumers of the resolved set in this epic:
    | Stored consent-state lookup (§4.4)                               | **exempt**, narrowly scoped                                            | Determining `store-on-device` cannot require `store-on-device`                                                                                                                                                                                                                                                                                                                                    |
    | Integration persistent response cookies                          | `store-on-device` (+ P4 where the cookie is an advertising identifier) | **Deferred with the hook's cookie surface** — the write-side gate alone was insufficient (read/use/forward/withdrawal unmodeled), so cookie operations ship only with the full model; this row and the client-cycle **page leg** (module injection gated on the provider's full declaration) join the inventory when their features do, and the §5.3 no-geo guard's consumer list grows with them |
    | Suppression-record writes (§4.3)                                 | **exempt**                                                             | Clearing authority is protective, like revocation                                                                                                                                                                                                                                                                                                                                                 |
+   | Authority-state / suppression-decision read (§4.3)               | **exempt**, narrowly scoped                                            | Returns only family ID, per-permission authority summary, and suppression entries — no identity values, no partner data; a test proves nothing else escapes                                                                                                                                                                                                                                       |
+   | `AuthorityRefresh` provenance write (§4.3)                       | **exempt**, strictly scoped                                            | Commits current-live-resolution provenance only; enables suppression recovery without reopening `GraphOps`                                                                                                                                                                                                                                                                                        |
 
    With **no EC provider configured**, identity use fails closed: a cookie
    value present on the request never egresses anywhere — never vacuously
@@ -786,7 +820,9 @@ Consumers of the resolved set in this epic:
    written at mint and replaced on later live requests — grant basis
    (which signal class granted, per permission), the evidence's
    **authoritative timestamp and `valid_until`** (per evidence class),
-   resolved jurisdiction, policy revision, and provider/version (providers
+   resolved jurisdiction, and policy revision — **not** provider/version,
+   which lives only in the immutable mint tag, or a post-rotation visit
+   would restamp a v1 identity as v2 (providers
    spec §6.1). Freshness is a **per-evidence-class contract**, because not
    every source carries a timestamp:
 
