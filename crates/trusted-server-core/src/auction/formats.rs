@@ -940,7 +940,18 @@ mod tests {
         assert_eq!(bid["id"], json!("appnexus-div-gpt-top"));
         assert_eq!(bid["impid"], json!("div-gpt-top"));
         assert_eq!(bid["price"], json!(2.75));
-        assert_eq!(bid["adm"], json!("<div>Ad</div>"));
+        // Rewriting is on by default, and a body-less fragment still receives
+        // the creative runtime (prepended), so the markup is carried rather
+        // than returned verbatim.
+        let adm = bid["adm"].as_str().expect("should serialize adm");
+        assert!(
+            adm.contains("<div>Ad</div>"),
+            "should carry the creative: {adm}"
+        );
+        assert!(
+            adm.contains("/static/tsjs=tsjs-unified.min.js"),
+            "should inject the creative runtime into a body-less fragment: {adm}"
+        );
         assert_eq!(bid["crid"], json!("appnexus-creative"));
         assert_eq!(bid["w"], json!(300));
         assert_eq!(bid["h"], json!(250));
@@ -1259,10 +1270,12 @@ mod tests {
             "should preserve top slot impid"
         );
         assert_eq!(top_bid["price"], json!(2.75), "should preserve top price");
-        assert_eq!(
-            top_bid["adm"],
-            json!("<div>Ad</div>"),
-            "should preserve top creative"
+        assert!(
+            top_bid["adm"]
+                .as_str()
+                .is_some_and(|adm| adm.contains("<div>Ad</div>")),
+            "should preserve top creative: {}",
+            top_bid["adm"]
         );
 
         let sidebar_seatbid = seatbids
@@ -1290,10 +1303,12 @@ mod tests {
             json!(1.25),
             "should preserve sidebar price"
         );
-        assert_eq!(
-            sidebar_bid["adm"],
-            json!("<div>Sidebar</div>"),
-            "should preserve sidebar creative"
+        assert!(
+            sidebar_bid["adm"]
+                .as_str()
+                .is_some_and(|adm| adm.contains("<div>Sidebar</div>")),
+            "should preserve sidebar creative: {}",
+            sidebar_bid["adm"]
         );
         assert_eq!(
             json["ext"]["orchestrator"]["total_bids"],

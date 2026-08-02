@@ -657,6 +657,27 @@ fn finalize_proxied_response_streaming(
     beresp
 }
 
+/// Allow proxied assets to load into opaque-origin creative frames.
+///
+/// Creative iframes are sandboxed without `allow-same-origin`, so their requests
+/// to `/first-party/proxy` are cross-origin with `Origin: null`. CORS-mode
+/// subresources — ES modules, `crossorigin` fonts, `fetch`/XHR — are blocked
+/// without an allow header, even though plain `<img>`/`<script src>` loads are
+/// unaffected.
+///
+/// `*` is sound here and no wider than the upstream already is: the target must
+/// carry a valid HMAC to be proxied at all, and asset requests are made as
+/// Trusted Server with client cookies and forwarding headers stripped
+/// (see [`ASSET_PROXY_FORWARD_HEADERS`]), so a response can never contain
+/// credentialed or user-specific upstream content. Credentials are deliberately
+/// not allowed, which the wildcard also forbids at the browser level.
+fn allow_cross_origin_asset_use(response: &mut Response<EdgeBody>) {
+    response.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
+}
+
 /// Finalize a proxied response, choosing between streaming passthrough and full
 /// content processing based on the `stream_passthrough` flag.
 fn finalize_response(
@@ -666,11 +687,13 @@ fn finalize_response(
     beresp: Response<EdgeBody>,
     stream_passthrough: bool,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    if stream_passthrough {
-        Ok(finalize_proxied_response_streaming(req, url, beresp))
+    let mut response = if stream_passthrough {
+        finalize_proxied_response_streaming(req, url, beresp)
     } else {
-        finalize_proxied_response(settings, req, url, beresp)
-    }
+        finalize_proxied_response(settings, req, url, beresp)?
+    };
+    allow_cross_origin_asset_use(&mut response);
+    Ok(response)
 }
 
 /// Bundles per-request header configuration and [`RuntimeServices`] for the proxy redirect loop.
@@ -1623,9 +1646,7 @@ pub async fn handle_first_party_proxy_sign(
             message: "invalid JSON".to_string(),
         })?
     } else {
-        let parsed = url::Url::parse(&req_url).change_context(TrustedServerError::Proxy {
-            message: "Invalid URL".to_string(),
-        })?;
+        let parsed = parse_request_target(&req_url)?;
         let url = parsed
             .query_pairs()
             .find(|(k, _)| k == "url")
@@ -1640,7 +1661,7 @@ pub async fn handle_first_party_proxy_sign(
 
     let trimmed = payload.url.trim();
     let abs = if trimmed.starts_with("//") {
-        let default_scheme = url::Url::parse(&req_url)
+        let default_scheme = parse_request_target(&req_url)
             .ok()
             .map(|u| u.scheme().to_ascii_lowercase())
             .filter(|scheme| !scheme.is_empty())
@@ -1943,6 +1964,39 @@ struct SignedTarget {
     had_params: bool,
 }
 
+/// Placeholder authority used to parse origin-form request targets.
+///
+/// Only the path and query of the parsed value are ever read, so the authority
+/// is irrelevant to behaviour; `.invalid` is reserved by RFC 2606 and can never
+/// resolve.
+const REQUEST_TARGET_BASE: &str = "https://request.invalid";
+
+/// Parse a request target that may be either an absolute URL or origin-form.
+///
+/// Adapters differ in what `Request::uri()` carries: Fastly and the normalized
+/// Spin path expose an absolute URL, while browsers send origin-form targets
+/// (`/path?query`) that the Axum adapter passes through verbatim. Joining a
+/// fixed placeholder origin lets one parser serve both, so first-party
+/// endpoints behave identically across adapters.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Proxy`] when the target parses as neither form.
+fn parse_request_target(req_url: &str) -> Result<url::Url, Report<TrustedServerError>> {
+    match url::Url::parse(req_url) {
+        Ok(url) => Ok(url),
+        Err(url::ParseError::RelativeUrlWithoutBase) => url::Url::parse(REQUEST_TARGET_BASE)
+            .and_then(|base| base.join(req_url))
+            .change_context(TrustedServerError::Proxy {
+                message: "Invalid URL".to_string(),
+            }),
+        Err(error) => Err(Report::new(TrustedServerError::Proxy {
+            message: "Invalid URL".to_string(),
+        })
+        .attach(error.to_string())),
+    }
+}
+
 /// Validate a `/first-party/proxy|click` request and reconstruct the clear target URL.
 ///
 /// The first-party URL encodes the clear target in `tsurl=...` along with any
@@ -1961,9 +2015,7 @@ fn reconstruct_and_validate_signed_target(
     settings: &Settings,
     req_url: &str,
 ) -> Result<SignedTarget, Report<TrustedServerError>> {
-    let parsed = url::Url::parse(req_url).change_context(TrustedServerError::Proxy {
-        message: "Invalid URL".to_string(),
-    })?;
+    let parsed = parse_request_target(req_url)?;
 
     // Extract tsurl and tstoken while preserving original param order for others
     let mut tsurl: Option<String> = None;
@@ -2672,6 +2724,126 @@ mod tests {
             );
             assert!(json.contains("\"added\":{\"y\":\"2\"}"), "{}", json);
             assert!(json.contains("\"removed\":[\"x\"]"), "{}", json);
+        });
+    }
+
+    // Build a signed `/first-party/click` target with one extra param.
+    fn signed_click_target(settings: &crate::settings::Settings) -> String {
+        let tsurl = "https://cdn.example/landing.html";
+        let full_for_token = format!("{}?x=1", tsurl);
+        let token = crate::http_util::compute_encrypted_sha256_token(settings, &full_for_token);
+        format!(
+            "/first-party/click?tsurl={}&x=1&tstoken={}",
+            url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
+            token,
+        )
+    }
+
+    #[test]
+    fn proxied_responses_allow_opaque_origin_use() {
+        // Creative iframes are sandboxed without `allow-same-origin`, so their
+        // module/font/fetch requests to the proxy are cross-origin with
+        // `Origin: null` and need an explicit allow header.
+        let settings = create_test_settings();
+        let req = build_http_request(Method::GET, "https://edge.example/first-party/proxy");
+        let beresp = build_http_response(StatusCode::OK, EdgeBody::from("body{}"));
+
+        let out = super::finalize_response(
+            &settings,
+            &req,
+            "https://cdn.example/app.mjs",
+            beresp,
+            false,
+        )
+        .expect("finalize should succeed");
+
+        assert_eq!(
+            response_header(&out, header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some("*"),
+            "proxied assets must be loadable from an opaque creative origin"
+        );
+
+        // Streaming passthrough takes a different branch and must agree.
+        let streamed = super::finalize_response(
+            &settings,
+            &build_http_request(Method::GET, "https://edge.example/first-party/proxy"),
+            "https://cdn.example/font.woff2",
+            build_http_response(StatusCode::OK, EdgeBody::from("font")),
+            true,
+        )
+        .expect("streaming finalize should succeed");
+
+        assert_eq!(
+            response_header(&streamed, header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some("*"),
+            "streamed proxied assets must carry the same allow header"
+        );
+    }
+
+    #[test]
+    fn first_party_click_accepts_origin_form_uri() {
+        // Browsers send origin-form request targets and the Axum adapter passes
+        // them through verbatim, so the shared signed-target parser must accept
+        // both forms — otherwise the second hop of the rebuild redirect chain
+        // fails instead of reaching the advertiser.
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(signed_click_target(&settings))
+                .body(EdgeBody::empty())
+                .expect("should build origin-form click request");
+
+            let resp = handle_first_party_click(&settings, &noop_services(), req)
+                .await
+                .expect("origin-form click should succeed");
+
+            assert_eq!(
+                resp.status(),
+                StatusCode::FOUND,
+                "should redirect to the advertiser"
+            );
+            let location = resp
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .expect("should carry a Location header");
+            assert!(
+                location.starts_with("https://cdn.example/landing.html"),
+                "should redirect to the signed target: {location}"
+            );
+        });
+    }
+
+    #[test]
+    fn first_party_proxy_accepts_origin_form_uri() {
+        // Same parser, reached through the proxy endpoint: an origin-form target
+        // must validate rather than fail as a relative URL.
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let tsurl = "https://cdn.example/pixel.png";
+            let token = crate::http_util::compute_encrypted_sha256_token(&settings, tsurl);
+            let uri = format!(
+                "/first-party/proxy?tsurl={}&tstoken={}",
+                url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
+                token,
+            );
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(&uri)
+                .body(EdgeBody::empty())
+                .expect("should build origin-form proxy request");
+
+            // The signature check runs before any upstream fetch; reaching a
+            // non-"Invalid URL" outcome proves origin-form parsing succeeded.
+            let result = handle_first_party_proxy(&settings, &noop_services(), req).await;
+            if let Err(err) = result {
+                let rendered = format!("{err:?}");
+                assert!(
+                    !rendered.contains("Invalid URL"),
+                    "origin-form proxy target must parse: {rendered}"
+                );
+            }
         });
     }
 

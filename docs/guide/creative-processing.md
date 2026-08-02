@@ -90,15 +90,32 @@ directly.
 Creatives rendered by Trusted Server's own path run in a sandboxed iframe
 **without** `allow-same-origin`, i.e. an opaque origin. The injected creative
 runtime's click guard recovers mutated clicks there via a GET
-`/first-party/proxy-rebuild` navigation (302 chain). Its **dynamic** resource
-protection is currently unavailable in that context: runtime-inserted
-`<img>`/`<iframe>` URLs cannot be signed from an opaque origin (the signing
-request is blocked by CORS), so they load directly from third parties — the
-sandbox still isolates them from the publisher origin, but they are not
-first-party proxied. A same-origin parent postMessage broker restoring dynamic
-signing is tracked in
+`/first-party/proxy-rebuild` navigation (302 chain), and proxied assets carry
+`Access-Control-Allow-Origin: *` so CORS-mode subresources (ES modules,
+`crossorigin` fonts) still load.
+
+One capability is unavailable in that context: **dynamic** resource signing,
+which rewrites URLs on elements a creative inserts at runtime. It is installed
+only when `renderGuard` is enabled in `tsCreativeConfig`, and that is `false`
+by default — deployments using the default configuration are unaffected. Where
+it is enabled, runtime-inserted `<img>`/`<iframe>` URLs cannot be signed from an
+opaque origin (the signing request is blocked by CORS), so they load directly
+from third parties; the sandbox still isolates them from the publisher origin,
+but they are not first-party proxied. A same-origin parent postMessage broker
+restoring dynamic signing is tracked in
 [#982](https://github.com/IABTechLab/trusted-server/issues/982). URLs rewritten
 server-side are unaffected.
+:::
+
+::: warning PBS Cache coordinates and processing
+On the publisher SSAT/page-bids path, `hb_cache_host`/`hb_cache_path` let the
+client fetch and render the **cached** bid, whose `adm` is the bidder's original
+markup and therefore bypasses every server-side processing policy. They are
+emitted only for bids that supplied no creative of their own, where the cache is
+the sole render source. A bid that supplied a creative — whether processing
+accepted it, or rejected it as empty, unparseable, or over the size limit —
+ships without them, so a processed or refused creative can never be re-fetched
+raw.
 :::
 
 Neither setting affects HTML/CSS response rewriting under

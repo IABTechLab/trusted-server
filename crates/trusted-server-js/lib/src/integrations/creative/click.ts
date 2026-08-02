@@ -9,6 +9,15 @@ type AnchorLike = HTMLAnchorElement | HTMLAreaElement;
 type Canon = { base: string; params: Record<string, string> };
 type Diff = { add: Record<string, string>; del: string[] };
 
+// Rebuild URLs already written to an anchor's href by an earlier repair pass
+// (the opaque-origin GET fallback). They are not `/first-party/click` URLs, so
+// they cannot be canonicalized and deliberately never replace the canonical
+// `data-tsclick`. Without remembering them, a later click would canonicalize
+// the fallback against the original signed click, fail the base comparison, and
+// navigate the pre-mutation URL — silently dropping the mutation the fallback
+// exists to carry.
+const pendingRebuilds = new WeakMap<AnchorLike, string>();
+
 // Allow query/localStorage flag to crank logging when debugging creatives.
 function enableDebugFromEnv(): void {
   try {
@@ -226,6 +235,12 @@ async function computeFinalUrl(a: AnchorLike, tsClickStr: string): Promise<strin
   const currentHref = rawHref || a.href || '';
   if (!currentHref) return tsClickStr;
 
+  // The href is a rebuild URL this guard wrote during an earlier repair pass and
+  // the creative has not touched it since. It already carries that pass's
+  // mutation; canonicalizing it against the original signed click would compare
+  // two different bases, fail the diff, and navigate the pre-mutation URL.
+  if (pendingRebuilds.get(a) === currentHref) return currentHref;
+
   const mutated = canonFromAnyHref(currentHref);
   if (!mutated) return tsClickStr;
 
@@ -297,6 +312,16 @@ function persistRebuiltClick(anchor: AnchorLike, finalUrl: string): void {
   // href would resolve against about:srcdoc.
   const resolved = resolveSafeNavigationUrl(finalUrl);
   if (!resolved) return;
+  if (canonFromFirstPartyClick(resolved)) {
+    pendingRebuilds.delete(anchor);
+  } else {
+    // Not a signed click (the GET rebuild fallback): remember it so a later
+    // click navigates this repaired URL rather than the canonical original.
+    pendingRebuilds.set(anchor, resolved);
+  }
+  // Writing an unchanged value still emits a mutation record, which would wake
+  // the observer, recompute the same URL, and write again forever.
+  if (anchor.getAttribute('href') === resolved) return;
   try {
     const el = anchor as Element;
     if (canonFromFirstPartyClick(resolved)) {

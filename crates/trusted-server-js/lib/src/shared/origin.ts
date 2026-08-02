@@ -14,23 +14,42 @@ export function hasOpaqueOrigin(): boolean {
   }
 }
 
-// Base URL for resolving root-relative first-party URLs. Inside the sandboxed
-// `srcdoc` creative iframe `location.href` is `about:srcdoc`, which `new URL`
-// rejects as a base; `document.baseURI` inherits the parent document's URL
-// instead. The value is pinned at module-load time so a bidder script that
-// later injects a `<base>` element cannot redirect resolution (the server-side
-// rewriter also strips `<base>` from creative markup before injecting this
-// runtime).
+// Base URL for resolving the root-relative first-party URLs the server-side
+// rewriter emits. Pinned at module-load time, in descending order of trust:
+//
+//  1. `window.__tsCreativeOrigin` — stamped into the srcdoc document by the
+//     first-party parent page before any creative markup (see
+//     `core/render.ts`). This is the only source that is neither inherited nor
+//     `<base>`-sensitive, so it wins wherever present.
+//  2. `location.origin` — correct and `<base>`-immune whenever the document has
+//     a real origin (creatives rendered outside the sandboxed srcdoc path).
+//  3. `document.baseURI` — last resort inside an unstamped `srcdoc`, where
+//     `location.href` is `about:srcdoc` and `new URL` rejects it as a base.
+//     Inherited from the embedder and therefore honours a publisher `<base>`.
+//
+// Pinning at load time means bidder script cannot redirect resolution later by
+// injecting `<base>`; the server-side rewriter also strips `<base>` from
+// creative markup whenever rewriting is enabled.
 export const TRUSTED_BASE_URL: string = (() => {
+  try {
+    const stamped = (window as { __tsCreativeOrigin?: unknown }).__tsCreativeOrigin;
+    if (typeof stamped === 'string' && /^https?:\/\/[a-z0-9.-]+(:\d+)?$/i.test(stamped)) {
+      return stamped;
+    }
+  } catch {
+    // fall through
+  }
+  try {
+    const origin = location.origin;
+    if (origin && origin !== 'null') return origin;
+  } catch {
+    // fall through
+  }
   try {
     const base = typeof document !== 'undefined' ? document.baseURI : '';
     if (base && base !== 'about:srcdoc') return base;
   } catch {
-    // fall through to location
+    // fall through
   }
-  try {
-    return location.href;
-  } catch {
-    return '';
-  }
+  return '';
 })();

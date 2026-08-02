@@ -163,6 +163,60 @@ describe('creative/click.ts', () => {
     }
   });
 
+  it('navigates the observer-repaired fallback, not the pre-mutation click', async () => {
+    // Mutations made before any user interaction are repaired by the mutation
+    // observer, which writes the GET fallback to href while keeping the
+    // canonical signed click in data-tsclick. A later click must navigate the
+    // repaired URL — canonicalizing the fallback against the canonical click
+    // would fail the base comparison and silently navigate the original.
+    vi.useFakeTimers();
+
+    const originDescriptor = Object.getOwnPropertyDescriptor(window, 'origin');
+    Object.defineProperty(window, 'origin', { value: 'null', configurable: true });
+    global.fetch = undefined as unknown as typeof fetch;
+    const openMock = vi.fn();
+    const originalOpen = window.open;
+    window.open = openMock as unknown as typeof window.open;
+
+    try {
+      const anchor = document.createElement('a');
+      anchor.setAttribute('data-tsclick', FIRST_PARTY_CLICK);
+      anchor.setAttribute('href', FIRST_PARTY_CLICK);
+      // Force the middle-click branch so navigation lands in window.open,
+      // which jsdom can observe.
+      anchor.setAttribute('target', '_blank');
+      document.body.appendChild(anchor);
+
+      await importCreativeModule();
+
+      // Wave 1: creative mutates the link, observer repairs it.
+      anchor.setAttribute('href', MUTATED_CLICK);
+      await Promise.resolve();
+      await vi.runAllTimersAsync();
+
+      const repaired = anchor.getAttribute('href') ?? '';
+      expect(repaired.startsWith(REBUILD_PREFIX)).toBe(true);
+
+      // Now the user clicks.
+      anchor.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      await Promise.resolve();
+      await vi.runAllTimersAsync();
+
+      expect(openMock).toHaveBeenCalled();
+      const navigated = String(openMock.mock.calls[0][0]);
+      expect(navigated.startsWith(REBUILD_PREFIX)).toBe(true);
+      expect(navigated).toContain('add=%7B%22bar%22%3A%222%22%7D');
+      expect(navigated).not.toBe(absolute(FIRST_PARTY_CLICK));
+    } finally {
+      window.open = originalOpen;
+      if (originDescriptor) {
+        Object.defineProperty(window, 'origin', originDescriptor);
+      } else {
+        delete (window as { origin?: string }).origin;
+      }
+    }
+  });
+
   it('refuses to navigate to or persist non-http(s) URLs', async () => {
     // The guard reads creative-controlled attributes; a javascript: value must
     // never reach location.href or an href write.

@@ -3265,34 +3265,35 @@ pub(crate) fn build_bid_map(
                 // against GAM and 404. The inline rewriter therefore emits
                 // absolute first-party URLs and omits the tsjs bundle injection.
                 //
-                // Processing may reject the creative outright (empty output from
-                // non-empty input): sanitization can strip everything, parsing can
-                // fail, or the 1 MiB per-creative cap can trip. `None` = no
-                // creative supplied; `Some("")` = supplied but rejected.
-                let processed_adm = bid.creative.as_ref().and_then(|raw_creative| {
-                    if raw_creative.is_empty() {
-                        return None;
-                    }
+                // `None` means the bid carried no `creative` field at all; every
+                // `Some(raw)` — including an explicit empty string, which PBS can
+                // return — is a supplied creative and goes through processing, so
+                // an empty `adm` cannot masquerade as "absent" and re-enable the
+                // raw cache fallback below. Processing may reject the creative
+                // outright (empty output): sanitization can strip everything,
+                // parsing can fail, or the size cap can trip.
+                let processed_adm = bid.creative.as_ref().map(|raw_creative| {
                     // Resolve ${AUCTION_PRICE} from the exact winning CPM BEFORE
                     // sanitizing, rewriting, and signing — URL rewriting would
                     // otherwise encode the literal macro into the signed proxy/click
                     // URL, and signing would lock that wrong value.
                     let priced = crate::creative::expand_auction_price_macro(raw_creative, cpm);
-                    Some(crate::creative::process_inline_auction_creative(
+                    crate::creative::process_inline_auction_creative(
                         settings,
                         &base_origin,
                         &priced,
-                    ))
+                    )
                 });
                 // Cache endpoint coordinates — only present for PBS bids with
                 // Prebid Cache enabled, and only when the bid supplied no creative
                 // of its own. The Prebid Universal Creative constructs:
                 //   https://<hb_cache_host><hb_cache_path>?uuid=<hb_adid>
                 // and renders the cached bid's ORIGINAL adm, bypassing every
-                // server-side processing policy. A supplied creative that
-                // processing REJECTED must therefore also suppress the cache
-                // fallback — otherwise sanitization and the size cap could be
-                // undone by re-fetching the raw creative from PBS Cache.
+                // server-side processing policy. Emitting them alongside a
+                // supplied creative would therefore hand the client an
+                // unprocessed copy of markup we just sanitized, rewrote, or
+                // rejected — so they ship only for genuinely absent creatives,
+                // where they are the sole render source.
                 match processed_adm {
                     Some(adm) if !adm.is_empty() => {
                         obj.insert("adm".to_string(), serde_json::Value::String(adm));
@@ -7836,6 +7837,9 @@ mod tests {
                 format!("<div>{}</div>", "a".repeat(1024 * 1024 + 1)),
                 "oversized",
             );
+            // An explicit empty `adm` is a supplied creative, not an absent one:
+            // classifying it as absent would re-enable the raw cache fallback.
+            assert_no_render_source(&test_settings(), String::new(), "explicit-empty");
         }
 
         #[test]
