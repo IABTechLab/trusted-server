@@ -412,55 +412,6 @@ impl StreamProcessor for PublisherBodyProcessor {
     }
 }
 
-struct PublisherBodyProcessor {
-    inner: Box<dyn StreamProcessor>,
-}
-
-impl PublisherBodyProcessor {
-    fn new(
-        params: &OwnedProcessResponseParams,
-        settings: &Settings,
-        integration_registry: &IntegrationRegistry,
-    ) -> Result<Self, Report<TrustedServerError>> {
-        let is_html = is_html_content_type(&params.content_type);
-        let is_rsc_flight =
-            content_type_contains_ascii_case_insensitive(&params.content_type, "text/x-component");
-        let inner: Box<dyn StreamProcessor> = if is_html {
-            Box::new(create_html_stream_processor(
-                &params.origin_host,
-                &params.request_host,
-                &params.request_scheme,
-                settings,
-                integration_registry,
-                params.ad_slots_script.as_deref().map(str::to_string),
-                Arc::clone(&params.ad_bids_state),
-            )?)
-        } else if is_rsc_flight {
-            Box::new(RscFlightUrlRewriter::new(
-                &params.origin_host,
-                &params.origin_url,
-                &params.request_host,
-                &params.request_scheme,
-            ))
-        } else {
-            Box::new(create_url_replacer(
-                &params.origin_host,
-                &params.origin_url,
-                &params.request_host,
-                &params.request_scheme,
-            ))
-        };
-
-        Ok(Self { inner })
-    }
-}
-
-impl StreamProcessor for PublisherBodyProcessor {
-    fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, std::io::Error> {
-        self.inner.process_chunk(chunk, is_last)
-    }
-}
-
 /// Process response body through the streaming pipeline.
 ///
 /// Selects the appropriate processor based on content type (HTML rewriter,
@@ -3235,9 +3186,9 @@ pub(crate) fn build_auction_request(
     // so SSPs, injected creatives, and brand-safety pixels see the publisher's
     // own origin. On the SSAT proxy path `request_info.host` is the trusted
     // server edge host, which must not leak into the bid request.
-    let page_url = format!(
+    let page_candidate = format!(
         "{}://{}{}",
-        request_info.scheme, publisher_domain, slots_ctx.request_path_and_query
+        request_info.scheme, publisher_domain, slots_ctx.request_path
     );
     let page_url = sanitize_publisher_page_url(Some(&page_candidate), publisher_domain);
     let ec_id = ec_id.filter(|id| !id.is_empty());
@@ -3465,18 +3416,9 @@ pub(crate) fn build_bid_map_with_auction_id(
                 // — no PBS Cache round trip. The `hb_cache_*` coordinates above
                 // remain as the fallback for an absent `adm`.
                 //
-                // Sanitize dangerous markup first, then rewrite URLs to
-                // first-party proxies — the same creative-processing boundary as
-                // the `/auction` path (see `auction::formats`), except the inline
-                // variant. Unlike `/auction`, this `adm` is rendered by the Prebid
-                // Universal Creative inside GAM's iframe (`f.srcdoc = d.ad`), a
-                // foreign origin where root-relative `/first-party/…` URLs resolve
-                // against GAM and 404. `rewrite_inline_creative_html` emits
-                // absolute first-party URLs and omits the tsjs bundle injection.
-                // `sanitize_creative_html` also enforces the 1 MiB creative cap,
-                // returning an empty string for oversized or unparseable markup —
-                // in which case the entry is omitted and the bridge falls back to
-                // the PBS Cache coordinates.
+                // Sanitize dangerous markup first, then optionally rewrite URLs
+                // to first-party proxies. The inline processor emits absolute URLs
+                // and omits the tsjs bundle injection because GAM owns the frame.
                 if let Some(ref renderer) = bid.renderer {
                     let renderer = match serde_json::to_value(renderer) {
                         Ok(renderer) => renderer,
@@ -3496,11 +3438,10 @@ pub(crate) fn build_bid_map_with_auction_id(
                     // otherwise encode the literal macro into the signed proxy/click
                     // URL, and signing would lock that wrong value.
                     let priced = crate::creative::expand_auction_price_macro(raw_creative, cpm);
-                    let sanitized = crate::creative::sanitize_creative_html(&priced);
-                    let adm = crate::creative::rewrite_inline_creative_html(
+                    let adm = crate::creative::process_inline_auction_creative(
                         settings,
                         &base_origin,
-                        &sanitized,
+                        &priced,
                     );
                     if !adm.is_empty() {
                         obj.insert("adm".to_string(), serde_json::Value::String(adm));
@@ -4661,7 +4602,7 @@ mod tests {
 
     mod ssat_cache_policy_tests {
         use super::*;
-        use crate::auction::provider::AuctionProvider;
+        use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
         use crate::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink};
         use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
         use crate::platform::test_support::{
@@ -4742,7 +4683,7 @@ mod tests {
                 &self,
                 _request: &AuctionRequest,
                 context: &AuctionContext<'_>,
-            ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+            ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
                 let request = PlatformHttpRequest::new(
                     HttpRequest::builder()
                         .method(Method::POST)
@@ -4759,6 +4700,7 @@ mod tests {
                     .change_context(TrustedServerError::Auction {
                         message: "test provider launch failed".to_string(),
                     })
+                    .map(ProviderRequestOutcome::pending)
             }
 
             async fn parse_response(
@@ -8225,7 +8167,7 @@ mod tests {
             MatchedSlotsContext, build_ad_slots_script, build_auction_request, build_bid_map,
             build_bids_script, diagnostics_auction_id, html_escape_for_script, write_bids_to_state,
         };
-        use crate::auction::types::{Bid, MediaType};
+        use crate::auction::types::{ApsRendererV1, ApsTagType, Bid, BidRenderer, MediaType};
         use crate::consent::ConsentContext;
         use crate::creative_opportunities::{
             CreativeOpportunitiesConfig, CreativeOpportunityFormat, CreativeOpportunitySlot,
@@ -8293,6 +8235,9 @@ mod tests {
                 height: 250,
                 nurl: Some(nurl.to_string()),
                 burl: Some(burl.to_string()),
+                bid_id: None,
+                creative_id: None,
+                renderer: None,
                 ad_id: Some(ad_id.to_string()),
                 cache_id: None,
                 cache_host: None,
@@ -9164,6 +9109,9 @@ mod tests {
                     height: 250,
                     nurl: None,
                     burl: None,
+                    bid_id: None,
+                    creative_id: None,
+                    renderer: None,
                     ad_id: Some("bid-impression-id".to_string()),
                     cache_id: Some("f47447a0-b759-4f2f-9887-af458b79b570".to_string()),
                     cache_host: Some("openads.adsrvr.org".to_string()),
@@ -9310,6 +9258,9 @@ mod tests {
                     height: 250,
                     nurl: None,
                     burl: None,
+                    bid_id: None,
+                    creative_id: None,
+                    renderer: None,
                     ad_id: None,
                     cache_id: None,
                     cache_host: None,
@@ -9351,6 +9302,9 @@ mod tests {
                     height: 250,
                     nurl: None,
                     burl: None,
+                    bid_id: None,
+                    creative_id: None,
+                    renderer: None,
                     ad_id: None,
                     cache_id: None,
                     cache_host: None,
@@ -9529,7 +9483,7 @@ mod tests {
         }
 
         #[test]
-        fn auction_request_uses_configured_publisher_domain_not_edge_host() {
+        fn auction_request_preserves_configured_publisher_domain_with_query() {
             // On the SSAT proxy path the browser addresses the trusted-server
             // edge host, but the auction must advertise the configured
             // publisher domain to SSPs — otherwise injected creatives and the
@@ -9565,12 +9519,12 @@ mod tests {
             );
             assert_eq!(
                 request.publisher.page_url.as_deref(),
-                Some("https://www.example.com/2024/01/my-article/?edition=fictional"),
-                "page_url host should be the configured publisher domain, not the edge host"
+                Some("https://www.example.com/2024/01/my-article/"),
+                "page_url should remove client query data"
             );
             assert_eq!(
-                site.page, "https://www.example.com/2024/01/my-article/?edition=fictional",
-                "site.page host should be the configured publisher domain, not the edge host"
+                site.page, "https://www.example.com/2024/01/my-article/",
+                "site.page should remove client query data"
             );
         }
 
@@ -10716,6 +10670,7 @@ mod tests {
                 targeting: Default::default(),
                 providers: Default::default(),
                 compiled_patterns: Vec::new(),
+                compiled_unit: None,
             }]
         }
 
