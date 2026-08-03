@@ -27,6 +27,12 @@ pub(crate) enum UnitTemplatePart {
     SlotId,
 }
 
+impl UnitTemplatePart {
+    fn is_placeholder(&self) -> bool {
+        !matches!(self, Self::Literal(_))
+    }
+}
+
 /// Parses a `gam_unit_path` template into an ordered list of parts.
 ///
 /// Supported placeholders: `{network_id}`, `{section}`, `{slot_id}`. A template
@@ -219,6 +225,14 @@ impl CreativeOpportunitiesConfig {
     pub fn compile_unit_templates(&mut self) -> Result<(), String> {
         for slot in &mut self.slot {
             slot.compile_unit_template()?;
+        }
+        if self.section_segment.is_none()
+            && self
+                .slot
+                .iter()
+                .any(CreativeOpportunitySlot::template_is_dynamic)
+        {
+            self.section_segment = Some(0);
         }
         Ok(())
     }
@@ -496,6 +510,16 @@ impl CreativeOpportunitySlot {
             None => None,
         };
         Ok(())
+    }
+
+    fn template_is_dynamic(&self) -> bool {
+        let is_dynamic =
+            |parts: &[UnitTemplatePart]| parts.iter().any(UnitTemplatePart::is_placeholder);
+        match (&self.compiled_unit, &self.gam_unit_path) {
+            (Some(parts), _) => is_dynamic(parts),
+            (None, Some(raw)) => parse_unit_template(raw).is_ok_and(|parts| is_dynamic(&parts)),
+            (None, None) => false,
+        }
     }
 
     /// Renders the resolved GAM unit path for a given network id and section.
