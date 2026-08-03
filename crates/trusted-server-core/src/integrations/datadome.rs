@@ -841,10 +841,9 @@ fn build(
     };
 
     log::info!(
-        "[datadome] Registering integration (sdk_origin: {}, rewrite_sdk: {}, enable_protection: {})",
+        "[datadome] Registering integration (sdk_origin: {}, rewrite_sdk: {})",
         config.sdk_origin,
-        config.rewrite_sdk,
-        config.enable_protection
+        config.rewrite_sdk
     );
 
     Ok(Some(DataDomeIntegration::try_new(config)?))

@@ -98,13 +98,7 @@ impl DataDomeIntegration {
             .change_context(Self::error("Failed to call DataDome Protection API"))
             .map_err(ProtectionRequestError::Runtime)?;
 
-        let status = platform_response.response.status();
-        let datadome_status = datadome_response_status(platform_response.response.headers());
-        let decision =
-            self.classify_protection_response(platform_response.response, input.request.method());
-        log_protection_result(&input, status, datadome_status, &decision);
-
-        Ok(decision)
+        Ok(self.classify_protection_response(platform_response.response, input.request.method()))
     }
 
     fn is_request_protected(&self, input: &RequestFilterInput<'_>) -> bool {
@@ -132,7 +126,7 @@ impl DataDomeIntegration {
         match self.protection_scope.evaluate(&facts, input.services) {
             ProtectionScopeDecision::Protect => {}
             ProtectionScopeDecision::Skip { rule_id, reason } => {
-                log_protection_skip(input, &rule_id, reason);
+                log::debug!("[datadome] Skipping Protection API for rule {rule_id} ({reason})");
                 return false;
             }
         }
@@ -417,77 +411,6 @@ impl DataDomeIntegration {
         );
         RequestFilterDecision::Continue(RequestFilterEffects::default())
     }
-}
-
-fn log_protection_skip(input: &RequestFilterInput<'_>, rule_id: &str, reason: &str) {
-    if matches!(
-        reason,
-        "client_ip" | "client_ip_source" | "ip_cidr" | "ip_cidr_source"
-    ) {
-        log::info!(
-            "[datadome] protection decision=skipped rule={} reason={} method={} host={} path={} client_ip={}",
-            rule_id,
-            reason,
-            input.request.method(),
-            request_host(input.request),
-            input.request.uri().path(),
-            client_ip_for_log(input),
-        );
-    } else {
-        log::debug!(
-            "[datadome] protection decision=skipped rule={} reason={} method={} host={} path={} client_ip={}",
-            rule_id,
-            reason,
-            input.request.method(),
-            request_host(input.request),
-            input.request.uri().path(),
-            client_ip_for_log(input),
-        );
-    }
-}
-
-fn log_protection_result(
-    input: &RequestFilterInput<'_>,
-    status: StatusCode,
-    datadome_status: Option<u16>,
-    decision: &RequestFilterDecision,
-) {
-    let method = input.request.method();
-    let host = request_host(input.request);
-    let path = input.request.uri().path();
-    let client_ip = client_ip_for_log(input);
-
-    match decision {
-        RequestFilterDecision::Respond { .. } => log::info!(
-            "[datadome] protection decision=blocked status={} method={} host={} path={} client_ip={} route=short_circuit",
-            status.as_u16(),
-            method,
-            host,
-            path,
-            client_ip,
-        ),
-        RequestFilterDecision::Continue(_)
-            if status == StatusCode::OK && datadome_status == Some(status.as_u16()) =>
-        {
-            log::info!(
-                "[datadome] protection decision=allowed status={} method={} host={} path={} client_ip={} route=continue",
-                status.as_u16(),
-                method,
-                host,
-                path,
-                client_ip,
-            );
-        }
-        RequestFilterDecision::Continue(_) => {}
-    }
-}
-
-fn client_ip_for_log(input: &RequestFilterInput<'_>) -> String {
-    input
-        .services
-        .client_info()
-        .client_ip
-        .map_or_else(|| "unknown".to_string(), |ip| ip.to_string())
 }
 
 struct ProtectionPayload {
