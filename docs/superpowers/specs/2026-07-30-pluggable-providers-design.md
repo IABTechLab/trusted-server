@@ -310,7 +310,16 @@ variant**. Therefore:
   this migration), then scan repeatedly until **two consecutive full
   passes discover zero unstubbed rows**; the flag value attests the
   watermark, pass count, and settle window. Rows minted after T carry
-  records by protocol. And because no scan over an eventual store is
+  records by protocol — **and rollback cannot silently break that
+  invariant**: an N+1 binary mints v1 rows with no records, so any N+1
+  instance that starts while the flag is active **CASes it to
+  `suspended` at startup** (N+1 reads deployment metadata; this is one
+  of its reader duties). Suspended = rowless classification off
+  fleet-wide; re-activation after roll-forward requires a **complete
+  re-attestation** (a fresh scan to two idle passes covering the
+  rollback window's mints). The N+2 → rollback-to-N+1 → mint →
+  roll-forward-to-N+2 schedule is a named test proving those rows are
+  never classified rowless. And because no scan over an eventual store is
   provably perfect, misses are **reconciled, not fatal**: a per-prefix
   withdrawal entry (below) doubles as pending intent — if a real row for
   a withdrawn suffix ever surfaces, core **promotes** the entry to a
@@ -320,7 +329,11 @@ variant**. Therefore:
   every row-backed identity has an authority-state record under its
   derivable family ID, in the globally-strong class — so _rowless_ =
   flag set AND the strong read finds **no record** for the cookie's
-  derived family ID. Graphless-era cookies never got a stub because
+  derived family ID — and, while the flag is active, **every HMAC row
+  discovery consults the prefix's `w` state before any live or S2S
+  use** (a pending or saturated entry means promotion-then-denial per
+  the runtime matrix, §6.2), so a withdrawn suffix cannot slip into use
+  through the row path during the window. Graphless-era cookies never got a stub because
   they have no row for the scan to find; no eventual read participates. The flag itself is specified: a named
   deployment-metadata key (write-once/CAS class), set by the §4.2
   readiness step only on deployments that actually ran graphless
@@ -360,9 +373,18 @@ variant**. Therefore:
   everywhere.
 - **Negative-record creation has admission rules everywhere — and
   rowless identifiers get no per-family records at all.** Durable
-  suppression and family-revocation records may be written only for an
+  suppression and family-revocation records may be written for an
   **existing, row-backed family** (authority-state record present on a
-  strong read). A rowless identifier — even a _verified_ one — creates
+  strong read) — **or for a positively observed real row**: a successful
+  row read is safe admission evidence (an eventual not-found is not),
+  and without this arm the first post-upgrade GPC request could not
+  revoke an untouched v1 row, and the promotion path could not promote a
+  late-surfacing row (neither has a stub by definition). The
+  permission-exempt sequence for an observed row: derive the family ID →
+  **create-if-absent a minimal strong stub carrying no positive
+  authority** → commit the family revocation → the identity is denied
+  all use between discovery and revocation commit → only then expire the
+  browser cookie. A rowless identifier — even a _verified_ one — creates
   none: verification authenticates only the prefix, so per-identifier
   records would let one prefix-holder fabricate unlimited suffixes into
   unlimited strong-storage records (rate limits slow creation; they do
@@ -543,16 +565,20 @@ Startup validation (§6) covers configuration; this covers what happens
 when a healthy configuration meets an unhealthy runtime. Every row logs at
 `error` with a metric; none is silent:
 
-| Failure                                                                   | Behavior                                                                                                                                                       |
-| ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `generate` returns an error                                               | No identity this request; request proceeds stateless; no cookie written                                                                                        |
-| Graph-row commit fails at mint                                            | Mint never happened (§5): no cookie, no egress; next request retries                                                                                           |
-| Authority-state commit fails after the row commit at mint                 | No cookie, no eligibility (the strong record never reported the revision); the orphan row expires by TTL; counted — **no recovery claim**, nothing can find it |
-| Graph read fails on an existing identity                                  | Identity unusable this request (fail closed for egress); cookie untouched                                                                                      |
-| Cluster prefix listing fails                                              | Treated as cluster-size-unknown → `cluster_fallback` policy applies                                                                                            |
-| Tombstone write fails                                                     | Permission model spec §4.3: family retries, readers fail closed on partial families                                                                            |
-| Geo provider returns invalid output (unparseable country) at runtime      | Treated as lookup failure → `default_country` (permission model spec §5.2), counted in the lookup-failure metric                                               |
-| Device provider signals unavailable at runtime (e.g. no JA4 on a request) | Classification degrades per the provider's declared fallback, never silently upgrades `looks_like_browser`                                                     |
+| Failure                                                                   | Behavior                                                                                                                                                                                                                                                                 |
+| ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `generate` returns an error                                               | No identity this request; request proceeds stateless; no cookie written                                                                                                                                                                                                  |
+| Graph-row commit fails at mint                                            | Mint never happened (§5): no cookie, no egress; next request retries                                                                                                                                                                                                     |
+| Authority-state commit fails after the row commit at mint                 | No cookie, no eligibility (the strong record never reported the revision); the orphan row expires by TTL; counted — **no recovery claim**, nothing can find it                                                                                                           |
+| `w` read fails (rowless path or migration-window row discovery)           | Fail closed: the cookie/row is **indeterminate** — no use, no mint, no expiry this request                                                                                                                                                                               |
+| `w` write fails at rowless withdrawal                                     | Cookie retained (withdrawal did not durably occur); durable client signal retries next presentation                                                                                                                                                                      |
+| `w` saturation encountered                                                | Rowless cookies under the prefix are treated withdrawn (§5); later-discovered **real rows** promote only on a listed suffix-hash match — saturation never blanket-revokes row-backed identities, and overflow suffixes beyond the cap lose promotion (declared residual) |
+| Promotion (listed suffix-hash matches a discovered row) fails             | The row is denied all use until the promoted family revocation commits; retried on next observation                                                                                                                                                                      |
+| Graph read fails on an existing identity                                  | Identity unusable this request (fail closed for egress); cookie untouched                                                                                                                                                                                                |
+| Cluster prefix listing fails                                              | Treated as cluster-size-unknown → `cluster_fallback` policy applies                                                                                                                                                                                                      |
+| Tombstone write fails                                                     | Permission model spec §4.3: family retries, readers fail closed on partial families                                                                                                                                                                                      |
+| Geo provider returns invalid output (unparseable country) at runtime      | Treated as lookup failure → `default_country` (permission model spec §5.2), counted in the lookup-failure metric                                                                                                                                                         |
+| Device provider signals unavailable at runtime (e.g. no JA4 on a request) | Classification degrades per the provider's declared fallback, never silently upgrades `looks_like_browser`                                                                                                                                                               |
 
 The **degraded-graph health signal** referenced above and by the
 withdrawal contract is a defined state machine, not a vibe: it is
@@ -605,8 +631,10 @@ logical identity different physical keys on different adapters, breaking
 migration, shared storage, and parity; and Fastly's prefix queries
 reject both `/` and `:`, so no delimiter character is safely portable).
 Physical keys are **delimiter-free with fixed-width segments**: a
-1-character class tag — `i` row, `r` family revocation, `s` suppression,
-`x` transaction, every tag chosen **outside the hex alphabet** so no
+1-character class tag — `i` row, `r` family revocation, `s`
+authority-state, `x` transaction, `w` rowless prefix-withdrawal, `m`
+deployment metadata (the full enumeration; earlier lists omitted `w` and
+`m`), every tag chosen **outside the hex alphabet** so no
 generated key can begin with 64 hex characters, which is what makes
 disjointness from the legacy `{64hex}.{6alnum}` grammar _provable_
 rather than asserted (an earlier `f` tag was itself a hex digit) — then
@@ -615,12 +643,20 @@ never-reused registry `docs/superpowers/specs/provider-code-registry.md`** (allo
 codes are immutable and never recycled, including for retired
 providers), then the suffix. The **complete physical constructor set** (logical
 `fam/`-style sketches elsewhere are notation for these): `i` +
-provider-code(4) + suffix(≤123) for rows; `r`/`s` + family-id(64
-lowercase hex — family IDs are canonically SHA-256 over the derivation
-input) for revocation/authority records (no provider code: the family id
+provider-code(4) + suffix(≤123 — the 128-byte total minus tag and code;
+an earlier "suffix ≤128" was inconsistent with its own cap) for rows; `r`/`s` + family-id(64
+lowercase hex — family IDs are canonically
+SHA-256 over a **defined derivation input**: the domain tag `tsfam1|`,
+then the record-kind byte, then the provider code (4 bytes), then the
+canonical graph-key bytes — concatenated in that order, UTF-8, no
+separators beyond the tag's `|`; cross-language test vectors are a
+conformance requirement) for revocation/authority records (no provider code: the family id
 already encodes derivation); `w` + provider-code(4) + prefix(64 hex) for
-rowless withdrawal; `x` + family-id(64) for transactions; `m` +
-name(16, `[a-z0-9-]`, right-padded `-`) for deployment metadata. Maximum
+rowless withdrawal; `x` + family-id(64) for transactions; `m` + a **2-digit
+registry-assigned index** for deployment metadata (a closed name
+registry in this spec: `00` schema floor, `01` graphless-migration
+flag — padding-based names aliased `foo` and `foo-`, so names are not
+encoded in keys at all). Maximum
 physical key length **128 bytes**; every class has a total parser, and
 segment boundaries are positional, so no segment can contain or escape a
 delimiter, prefix queries are plain string prefixes on every backend,
@@ -643,15 +679,25 @@ spec's absence/replay decisions consume — a reduced schema cannot
 reproduce them**): kind (user evidence vs policy baseline), grant
 basis/source class, policy revision (digest + activation generation),
 `valid_until`, provenance revision, evidence timestamp, and the
-— because a _single current_ digest cannot uphold
-"re-presentation never advances first-seen" (grant A → refusal B →
-replayed A would look novel once B displaced A's slot) — a **bounded
-replay history keyed by (source class, semantic digest)**: pinned
-first-seen/first-normalized entries retained for at least the maximum
-evidence/suppression horizon, capacity-capped at 16 per
-permission·source (in-horizon entries are never evicted; cap saturation
-fails restrictive — novel values cannot grant until the horizon
-passes); record level: family ID,
+and a **bounded replay history**, record-level, keyed by (source
+class, semantic digest) — because a _single current_ digest cannot
+uphold "re-presentation never advances first-seen" (grant A → refusal
+B → replayed A would look novel once B displaced A's slot). Entries pin
+first-seen/first-normalized timestamps, retained for at least the
+maximum evidence/suppression horizon. Capacity and saturation are a
+**serialized state machine, not a shrug**: 16 slots per
+permission·source, each holding a _semantic state_ — a TCF renewal with
+the same semantic result and newer `LastUpdated` **updates its slot in
+place** (ordinary repeated renewals never consume capacity; replays
+cannot advance the slot, their `LastUpdated` is not newer) — plus one
+dedicated **rolling restrictive slot** outside the 16, so a seventeenth
+refusal is stored under normal recency rules, never dropped and never
+replay-advanceable. All slots holding distinct in-horizon states sets
+`saturated: true` with `saturated_until` = the earliest slot
+`valid_until`: while saturated, novel values cannot grant (fail
+restrictive), restrictive evidence still lands in the rolling slot,
+recovery is automatic as slots expire, and saturation is a first-class
+metric — the cap and its denial behavior are **sign-off item 31**; record level: family ID,
 CAS version counter, schema version, stub marker (backfill, §5); unknown-field and range validation apply
 like every class (strong class, permission-exempt writes per the
 permission spec's inventory; revisions are app-level counters because
@@ -723,6 +769,7 @@ Requirements:
   | Row creation                                             | **Atomic create-if-absent** (fresh mints), same primitive family                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
   | Deployment metadata (schema floor)                       | **Write-once/CAS**, outside ordinary config storage (migration spec §4)                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
   | Rewrite transactions                                     | **Linearizable fenced CAS required** (same primitive class as reservations)                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+  | Rowless prefix-withdrawal (`w`) records                  | **Globally strong reads + linearizable CAS** (same bar as authority-state), plus the **bounded listing-visibility window** the backfill scan depends on — all three are eligibility gates for the graphless migration; retention ≥ maximum cookie lifetime                                                                                                                                                                                                                                                                                   |
   | Alias installs (reserved)                                | Row-store **per-key CAS with read-your-writes** — recorded for the future `rewrite_legacy` spec; nothing in the epic writes an alias                                                                                                                                                                                                                                                                                                                                                                                                         |
   | Identity rows                                            | Eventual **visibility** acceptable _after_ a generation-CAS mutation commits (see Identity-row mutation above) — the earlier "rows are accretive" claim is deleted: rows replace snapshots, merge partner IDs, and refresh derived state, and unordered last-writer-wins loses newer evidence                                                                                                                                                                                                                                                |
 

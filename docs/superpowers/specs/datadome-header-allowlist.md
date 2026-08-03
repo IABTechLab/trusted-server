@@ -20,3 +20,7 @@ set mean: nothing else is accepted until a reviewed commit adds it.
 | `Location`                | Respond (3xx) only           | replace                                     |
 | `Content-Type`            | Respond only (owns its body) | replace                                     |
 | `Cache-Control`, `Pragma` | Respond only                 | restricted merge; invariant pass still last |
+
+Note: the vendor's `X-Set-Cookie` response field is **not** a
+forwardable header — it lowers into the typed `datadome` cookie
+operation (hook spec §4a) and never reaches the browser as a header.

@@ -30,6 +30,9 @@ here is treated as malformed-present (permission spec §4.4).
 | 26             | usky                                                | 1                   |
 | 27             | usri                                                | 1                   |
 
-Version values were captured from the IAB registry at the time of
-writing and are re-verified against the official registry as part of
-ratification review; any correction is a change to this file.
+Version values for sections 6–23 were captured from the IAB registry at
+the time of writing and are re-verified against the official registry as
+part of ratification review. Sections 24–27 have assigned IDs but no
+reproducibly published binary layouts in the official sources as of this
+snapshot; they are reserved and inert until an official layout can be
+vendored here. Any change is a reviewed change to this file.

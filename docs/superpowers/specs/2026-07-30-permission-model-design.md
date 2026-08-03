@@ -406,7 +406,12 @@ and the fail-closed marker:
   GPC-carrying visitor whose v1 row has no family field and has never been
   backfilled — computes the same family ID that every future reader of
   that row computes, so the revocation record is discoverable even if the
-  writer crashes before ever touching the member row. A **random** ID
+  writer crashes before ever touching the member row — and the write is
+  admitted through the **observed-row sequence** (providers spec §5:
+  successful row read → create-if-absent stub with no positive
+  authority → family revocation → use denied in between), since an
+  untouched v1 row has no authority-state record for the plain
+  admission arm to find. A **random** ID
   would recreate the exact partial-withdrawal orphan this design exists to
   eliminate. Revocation writes one record keyed by the family ID; that
   single write is the withdrawal. Per-member tombstones are cleanup that
@@ -697,9 +702,15 @@ section malformed-present (blocks grants, never withdraws).
    the state sections — `US/CA` ↔ 8, `US/VA` ↔ 9, `US/CO` ↔ 10,
    `US/UT` ↔ 11, `US/CT` ↔ 12, `US/FL` ↔ 13, `US/MT` ↔ 14, `US/OR` ↔ 15,
    `US/TX` ↔ 16, `US/DE` ↔ 17, `US/IA` ↔ 18, `US/NE` ↔ 19, `US/NH` ↔ 20,
-   `US/NJ` ↔ 21, `US/TN` ↔ 22, `US/MN` ↔ 23, **`US/MD` ↔ 24,
-   `US/IN` ↔ 25, `US/KY` ↔ 26, `US/RI` ↔ 27** (an earlier draft wrongly
-   claimed MD/IN/KY/RI had no section). A truncated map silently loses
+   `US/NJ` ↔ 21, `US/TN` ↔ 22, `US/MN` ↔ 23; **IDs 24–27 (MD/IN/KY/RI) are mapped as
+   _reserved-pending-official-schema_** — the public official registries
+   currently expose sections only through 23, so 24–27 have IDs but no
+   reproducible published binary layout; until the vendored snapshot can
+   carry an official layout, those four states behave as
+   no-section states (national section only) and the map does **not**
+   claim official-registry coverage for them (an earlier revision
+   claimed both "no section" and later "official through 27" — each
+   wrong in its own direction). A truncated map silently loses
    opt-outs — a Texas (16) or Maryland (24) sale opt-out must not
    vanish. **The current decoder is an explicit prerequisite gap**: it
    (and `iab_gpp` 0.1.2) supports sections 7–23 only and models `usnat`
@@ -810,7 +821,10 @@ migration story unresolvable (migration spec §2, rows 5 and 7).
 ### 5.5 Policy revision activation
 
 A **policy revision** has a defined identity: the canonical content
-digest of the `[permissions]` section (identity — republishing identical
+digest of the `[permissions]` section — **defined**: SHA-256 with domain
+tag `tspol1|` over the canonical JSON of the parsed policy (keys sorted,
+UTF-8, defaults materialized, no insignificant whitespace), with
+cross-language test vectors a conformance requirement (identity — republishing identical
 policy yields the same digest) paired with the **config-store's globally assigned activation
 version** (the `ts config push` version — one fleet-wide ordered
 sequence, not a per-instance counter: "monotonic per instance" gave
@@ -934,8 +948,13 @@ Consumers of the resolved set in this epic:
    clamped — clamping re-freshens replays); expiry checks grant a grace
    of S (`expired` means `valid_until < now − S`); and two evidence
    timestamps within S of each other **compare equal**, which routes
-   the comparison to the tie rule (restrictive) — so a slightly
-   future-dated consent cannot out-order a just-observed opt-out;
+   the comparison to the tie rule (restrictive) — and the tie winner's
+   **complete tuple survives unchanged** (state, source, timestamp,
+   digest, `valid_until`): the losing grant's timestamp is never merged
+   into the surviving refusal, or a sequence of near-window grants would
+   ratchet the refusal's effective age forward and prolong it
+   indefinitely. A slightly future-dated consent cannot out-order a
+   just-observed opt-out;
    beyond-window future-dated records are **rejected as malformed**, and
    within the window a record's first normalized timestamp is pinned to
    its digest and never advanced by re-presentation (§4.3's anti-replay
