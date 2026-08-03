@@ -239,29 +239,27 @@ impl CreativeOpportunitiesConfig {
 
     /// Validate all slot definitions after runtime preparation.
     ///
-    /// Call [`compile_unit_templates`](Self::compile_unit_templates) first: the
-    /// `{section}` → [`section_root`](Self::section_root) requirement is keyed off
-    /// each slot's compiled template, so an uncompiled config silently skips that
-    /// check. [`Settings::prepare_runtime`](crate::settings::Settings) enforces
-    /// this order.
+    /// Call [`compile_unit_templates`](Self::compile_unit_templates) first so
+    /// malformed templates fail at startup. Validation also reads raw templates
+    /// when their cache is absent. [`Settings::prepare_runtime`](crate::settings::Settings)
+    /// enforces this order.
     ///
     /// # Errors
     ///
-    /// Returns an error string when [`gam_network_id`](Self::gam_network_id) is
-    /// blank while slots are configured, when a slot has an invalid identifier,
-    /// page pattern set, format list, or dimensions, or when a slot's
+    /// Returns an error string when a consumed [`gam_network_id`](Self::gam_network_id)
+    /// is blank, when a slot has an invalid identifier, page pattern set, format
+    /// list, or dimensions, or when a slot's
     /// `gam_unit_path` template uses `{section}` without a valid
     /// [`section_root`](Self::section_root).
     pub fn validate_runtime(&self) -> Result<(), String> {
-        // Every rendered unit path either substitutes `{network_id}` or uses the
-        // `/<network_id>/<slot_id>` default, so a blank network id produces a
-        // path GAM cannot resolve (`""` or `//slot`). Reject at startup rather
-        // than shipping it to `googletag.defineSlot`.
-        //
-        // Gated on a non-empty slot list: an empty list disables the feature, so
-        // no path is ever rendered and the id is inert. Failing startup there
-        // would take a site down over a value it does not use.
-        if !self.slot.is_empty() && self.gam_network_id.trim().is_empty() {
+        // A network ID is required only when a slot renders the default
+        // `/<network_id>/<slot_id>` path or substitutes `{network_id}`. Static
+        // and `{slot_id}`/`{section}`-only templates leave it inert.
+        let network_id_consumed = self
+            .slot
+            .iter()
+            .any(|slot| slot.gam_unit_path.is_none() || slot.template_uses_network_id());
+        if network_id_consumed && self.gam_network_id.trim().is_empty() {
             return Err("gam_network_id must not be empty".to_string());
         }
 
@@ -579,6 +577,26 @@ impl CreativeOpportunitySlot {
         match (&self.compiled_unit, &self.gam_unit_path) {
             (Some(parts), _) => uses_section(parts),
             (None, Some(raw)) => parse_unit_template(raw).is_ok_and(|parts| uses_section(&parts)),
+            (None, None) => false,
+        }
+    }
+
+    /// Returns `true` if this slot's `gam_unit_path` template contains `{network_id}`.
+    ///
+    /// Reads the raw template when [`compiled_unit`](Self::compiled_unit) is
+    /// empty so validation cannot silently skip the network ID requirement for
+    /// an uncompiled config.
+    fn template_uses_network_id(&self) -> bool {
+        let uses_network_id = |parts: &[UnitTemplatePart]| {
+            parts
+                .iter()
+                .any(|part| matches!(part, UnitTemplatePart::NetworkId))
+        };
+        match (&self.compiled_unit, &self.gam_unit_path) {
+            (Some(parts), _) => uses_network_id(parts),
+            (None, Some(raw)) => {
+                parse_unit_template(raw).is_ok_and(|parts| uses_network_id(&parts))
+            }
             (None, None) => false,
         }
     }
@@ -1122,7 +1140,53 @@ mod tests {
     }
 
     #[test]
-    fn validate_runtime_rejects_blank_network_id() {
+    fn validate_runtime_allows_blank_network_id_with_static_paths() {
+        let mut config = make_config_with_section_template(Some("home"));
+        config.slot[0].gam_unit_path = Some("/12345/example/homepage".to_string());
+        config.gam_network_id = "   ".to_string();
+        config.compile_slots();
+        config
+            .compile_unit_templates()
+            .expect("should compile static template");
+        config
+            .validate_runtime()
+            .expect("should allow a blank unused network id");
+    }
+
+    #[test]
+    fn validate_runtime_allows_blank_network_id_with_slot_id_template() {
+        let mut config = make_config_with_section_template(Some("home"));
+        config.slot[0].gam_unit_path = Some("/example/{slot_id}".to_string());
+        config.gam_network_id = String::new();
+        config.compile_slots();
+        config
+            .compile_unit_templates()
+            .expect("should compile slot-id template");
+        config
+            .validate_runtime()
+            .expect("should allow a blank unused network id");
+    }
+
+    #[test]
+    fn validate_runtime_rejects_blank_network_id_when_default_path_uses_it() {
+        let mut config = make_config_with_section_template(Some("home"));
+        config.slot[0].gam_unit_path = None;
+        config.gam_network_id = String::new();
+        config.compile_slots();
+        config
+            .compile_unit_templates()
+            .expect("should compile default path");
+        let err = config
+            .validate_runtime()
+            .expect_err("blank network id should fail when the default path uses it");
+        assert_eq!(
+            err, "gam_network_id must not be empty",
+            "should report the blank network id"
+        );
+    }
+
+    #[test]
+    fn validate_runtime_rejects_blank_network_id_when_compiled_template_uses_it() {
         // `gam_unit_path = "{network_id}"` renders to an empty string with a
         // blank network id, which reaches googletag.defineSlot as an invalid path.
         let mut config = make_config_with_section_template(Some("home"));
@@ -1138,6 +1202,25 @@ mod tests {
         assert!(
             err.contains("gam_network_id"),
             "error should name gam_network_id, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_runtime_rejects_blank_network_id_when_raw_template_uses_it() {
+        let mut config = make_config_with_section_template(Some("home"));
+        config.slot[0].gam_unit_path = Some("/{network_id}/example".to_string());
+        config.gam_network_id = String::new();
+        config.compile_slots();
+        assert!(
+            config.slot[0].compiled_unit.is_none(),
+            "test precondition: template cache is empty"
+        );
+        let err = config
+            .validate_runtime()
+            .expect_err("blank network id should fail when a raw template uses it");
+        assert_eq!(
+            err, "gam_network_id must not be empty",
+            "should report the blank network id"
         );
     }
 
