@@ -1202,6 +1202,205 @@ describe('installTsRenderBridge', () => {
     foreignIframe.remove();
   });
 
+  it('still serves the APS renderer when markWinner throws', async () => {
+    const renderer = apsRenderer();
+    const prebidAdId = 'throwing-mark-winner-ad-id';
+    const markWinner = vi.fn(() => {
+      throw new Error('fictional markWinner failure');
+    });
+    const markRendered = vi.fn();
+    (window as TestWindow).tsjs.apsPrebidRenderers = {
+      [prebidAdId]: {
+        adUnitCode: 'div-header',
+        renderer,
+        registeredAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+        markWinner,
+        markRendered,
+      },
+    };
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const portMessages: string[] = [];
+
+    expect(() =>
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+          ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+          source,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      )
+    ).not.toThrow();
+
+    expect(portMessages).toHaveLength(1);
+    expect(JSON.parse(portMessages[0])).toEqual(
+      expect.objectContaining({
+        message: 'Prebid Response',
+        adId: prebidAdId,
+        apsRenderer: renderer,
+      })
+    );
+    expect(markWinner).toHaveBeenCalledTimes(1);
+    expect(markRendered).toHaveBeenCalledTimes(1);
+  });
+
+  it('still completes the APS render when markRendered throws', async () => {
+    const renderer = apsRenderer();
+    const prebidAdId = 'throwing-mark-rendered-ad-id';
+    const markWinner = vi.fn();
+    const markRendered = vi.fn(() => {
+      throw new Error('fictional markRendered failure');
+    });
+    (window as TestWindow).tsjs.apsPrebidRenderers = {
+      [prebidAdId]: {
+        adUnitCode: 'div-header',
+        renderer,
+        registeredAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+        markWinner,
+        markRendered,
+      },
+    };
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const portMessages: string[] = [];
+
+    expect(() =>
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+          ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+          source,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      )
+    ).not.toThrow();
+
+    expect(portMessages).toHaveLength(1);
+    expect(JSON.parse(portMessages[0])).toEqual(
+      expect.objectContaining({
+        message: 'Prebid Response',
+        adId: prebidAdId,
+        apsRenderer: renderer,
+      })
+    );
+    expect(markWinner).toHaveBeenCalledTimes(1);
+    expect(markRendered).toHaveBeenCalledTimes(1);
+  });
+
+  it('prunes expired consumed APS renderer IDs', async () => {
+    vi.useFakeTimers();
+    try {
+      const renderer = apsRenderer();
+      const prebidAdId = 'expiring-consumed-ad-id';
+      const start = Date.now();
+      const firstMarkWinner = vi.fn();
+      const firstMarkRendered = vi.fn();
+      const secondMarkWinner = vi.fn();
+      const secondMarkRendered = vi.fn();
+      (window as TestWindow).tsjs.apsPrebidRenderers = {
+        [prebidAdId]: {
+          adUnitCode: 'div-header',
+          renderer,
+          registeredAt: start,
+          expiresAt: start + 60_000,
+          markWinner: firstMarkWinner,
+          markRendered: firstMarkRendered,
+        },
+      };
+
+      const bridgeListener = await captureBridgeListener();
+      const source = createTrustedSlotIframe();
+      const stopImmediatePropagation = vi.fn();
+      const portMessages: string[] = [];
+      const sendRequest = (): void => {
+        bridgeListener(
+          Object.assign(new Event('message'), {
+            data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+            ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+            source,
+            stopImmediatePropagation,
+          }) as unknown as MessageEvent
+        );
+      };
+
+      sendRequest();
+      vi.advanceTimersByTime(60_001);
+      (window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId] = {
+        adUnitCode: 'div-header',
+        renderer,
+        registeredAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+        markWinner: secondMarkWinner,
+        markRendered: secondMarkRendered,
+      };
+      sendRequest();
+
+      expect(portMessages).toHaveLength(2);
+      expect(stopImmediatePropagation).toHaveBeenCalledTimes(2);
+      expect(firstMarkWinner).toHaveBeenCalledTimes(1);
+      expect(firstMarkRendered).toHaveBeenCalledTimes(1);
+      expect(secondMarkWinner).toHaveBeenCalledTimes(1);
+      expect(secondMarkRendered).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('fails closed when consumed APS renderer tombstones reach capacity', async () => {
+    const renderer = apsRenderer();
+    const capacity = 256;
+    const callbacks = Array.from({ length: capacity + 1 }, () => ({
+      markWinner: vi.fn(),
+      markRendered: vi.fn(),
+    }));
+    const entries = Object.fromEntries(
+      callbacks.map((lifecycle, index) => [
+        `capacity-ad-${index}`,
+        {
+          adUnitCode: 'div-header',
+          renderer,
+          registeredAt: Date.now(),
+          expiresAt: Date.now() + 60_000,
+          ...lifecycle,
+        },
+      ])
+    );
+    (window as TestWindow).tsjs.apsPrebidRenderers = entries;
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const stopImmediatePropagation = vi.fn();
+    const portMessages: string[] = [];
+    const sendRequest = (adId: string): void => {
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId }),
+          ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+          source,
+          stopImmediatePropagation,
+        }) as unknown as MessageEvent
+      );
+    };
+
+    for (let index = 0; index < capacity; index += 1) {
+      sendRequest(`capacity-ad-${index}`);
+    }
+    sendRequest(`capacity-ad-${capacity}`);
+    sendRequest('capacity-ad-0');
+
+    expect(portMessages).toHaveLength(capacity);
+    expect(callbacks[capacity].markWinner).not.toHaveBeenCalled();
+    expect(callbacks[capacity].markRendered).not.toHaveBeenCalled();
+    expect(entries[`capacity-ad-${capacity}`]).toBeDefined();
+    expect(callbacks[0].markWinner).toHaveBeenCalledTimes(1);
+    expect(stopImmediatePropagation).toHaveBeenCalledTimes(capacity + 2);
+  });
+
   it('does not expose a registered Prebid APS renderer to another slot iframe', async () => {
     const renderer = apsRenderer();
     const prebidAdId = 'prebid-generated-ad-id';

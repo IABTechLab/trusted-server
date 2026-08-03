@@ -1012,6 +1012,36 @@ export function parseCachedBid(body: string): CachedBid | undefined {
   };
 }
 
+/** Maximum number of consumed APS Prebid IDs retained as security tombstones. */
+const MAX_CONSUMED_PREBID_APS_IDS = 256;
+
+function pruneConsumedPrebidApsIds(
+  consumedIds: Map<string, { expiresAt: number }>,
+  now: number
+): void {
+  for (const [adId, consumed] of consumedIds) {
+    if (consumed.expiresAt <= now) consumedIds.delete(adId);
+  }
+}
+
+function hasConsumedPrebidApsIdCapacity(
+  consumedIds: Map<string, { expiresAt: number }>,
+  adId: string
+): boolean {
+  if (consumedIds.has(adId) || consumedIds.size < MAX_CONSUMED_PREBID_APS_IDS) return true;
+
+  log.warn(`[tsjs-gpt] APS Prebid renderer tombstone capacity reached; declining '${adId}'`);
+  return false;
+}
+
+function recordConsumedPrebidApsId(
+  consumedIds: Map<string, { expiresAt: number }>,
+  adId: string,
+  expiresAt: number
+): void {
+  consumedIds.set(adId, { expiresAt });
+}
+
 /**
  * Install the TS → pbRender bridge.
  *
@@ -1063,9 +1093,7 @@ export function installTsRenderBridge(): void {
     if (!port) return;
 
     const now = Date.now();
-    for (const [consumedAdId, consumed] of consumedPrebidApsIds) {
-      if (consumed.expiresAt <= now) consumedPrebidApsIds.delete(consumedAdId);
-    }
+    pruneConsumedPrebidApsIds(consumedPrebidApsIds, now);
     const consumedPrebidAps = consumedPrebidApsIds.get(adId);
     if (consumedPrebidAps) {
       // Once TS claims an APS capability, keep the ad ID unavailable to every
@@ -1084,11 +1112,17 @@ export function installTsRenderBridge(): void {
       if (!messageSourceBelongsToAdUnit(e.source, prebidRendererEntry.adUnitCode)) return;
       const renderer = validateApsRenderer(prebidRendererEntry.renderer);
       const rendererUrl = apsRendererUrl();
-      if (!renderer || !rendererUrl || !consumeApsPrebidRenderer(adId, prebidRendererEntry)) return;
-      consumedPrebidApsIds.set(adId, {
-        expiresAt: prebidRendererEntry.expiresAt,
-      });
-      prebidRendererEntry.markWinner();
+      if (!renderer || !rendererUrl) return;
+      if (!hasConsumedPrebidApsIdCapacity(consumedPrebidApsIds, adId)) return;
+      if (!consumeApsPrebidRenderer(adId, prebidRendererEntry)) return;
+      recordConsumedPrebidApsId(consumedPrebidApsIds, adId, prebidRendererEntry.expiresAt);
+
+      try {
+        prebidRendererEntry.markWinner();
+      } catch (err) {
+        log.warn(`[tsjs-gpt] APS Prebid markWinner callback threw for '${adId}'`, err);
+      }
+
       port.postMessage(
         JSON.stringify({
           message: 'Prebid Response',
@@ -1101,7 +1135,12 @@ export function installTsRenderBridge(): void {
           height: renderer.height,
         })
       );
-      prebidRendererEntry.markRendered();
+
+      try {
+        prebidRendererEntry.markRendered();
+      } catch (err) {
+        log.warn(`[tsjs-gpt] APS Prebid markRendered callback threw for '${adId}'`, err);
+      }
       return;
     }
 
