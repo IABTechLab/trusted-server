@@ -1301,11 +1301,11 @@ expresses that in **one** slot rule instead of one rule per (slot × section).
 
 Supported placeholders:
 
-| Placeholder    | Resolves to                                                     |
-| -------------- | --------------------------------------------------------------- |
-| `{network_id}` | `gam_network_id`                                                |
-| `{slot_id}`    | the slot's `id`                                                 |
-| `{section}`    | non-empty request-path segment at `section_segment` (see below) |
+| Placeholder    | Resolves to                                                             |
+| -------------- | ----------------------------------------------------------------------- |
+| `{network_id}` | `gam_network_id`                                                        |
+| `{slot_id}`    | the slot's `id`                                                         |
+| `{section}`    | non-empty path segment at `section_segment` (default: first; see below) |
 
 A template with **no** placeholders is used verbatim. A slot with **no**
 `gam_unit_path` falls back to `/<network_id>/<slot_id>`. Both preserve the
