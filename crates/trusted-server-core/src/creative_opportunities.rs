@@ -1049,6 +1049,41 @@ mod tests {
     }
 
     #[test]
+    fn derive_section_caps_disallowed_run_to_one_underscore() {
+        let path = format!("/{}%!?z", "a".repeat(99));
+
+        let section = derive_section(&path, "home", 0);
+
+        assert_eq!(
+            section,
+            format!("{}_", "a".repeat(99)),
+            "a disallowed run at the cap should emit one underscore and stop"
+        );
+        assert_eq!(section.len(), 100, "section should stop at the byte cap");
+        assert!(
+            !section.contains('z'),
+            "a safe character beyond the cap should not leak into the section"
+        );
+    }
+
+    #[test]
+    fn derive_section_stops_before_disallowed_run_when_cap_is_full() {
+        let path = format!("/{}%!?z", "a".repeat(100));
+
+        let section = derive_section(&path, "home", 0);
+
+        assert_eq!(
+            section,
+            "a".repeat(100),
+            "a full safe prefix should prevent scanning or emitting the later run"
+        );
+        assert!(
+            !section.contains('_') && !section.contains('z'),
+            "nothing beyond the full safe prefix should be emitted"
+        );
+    }
+
+    #[test]
     fn section_for_path_applies_both_policy_knobs() {
         let mut config = make_config_with_section_template(Some("home"));
         assert_eq!(
@@ -1144,6 +1179,75 @@ mod tests {
             rendered, None,
             "a raw dynamic path over 100 bytes should be omitted"
         );
+    }
+
+    #[test]
+    fn render_gam_unit_path_accepts_exact_multibyte_byte_limit() {
+        let expected = format!("{}ax", "é".repeat(49));
+        assert_eq!(
+            expected.len(),
+            100,
+            "test fixture should render to exactly 100 UTF-8 bytes"
+        );
+
+        for compile_template in [true, false] {
+            let cache_kind = if compile_template { "compiled" } else { "raw" };
+            let mut slot = make_slot("x", vec!["/"]);
+            slot.gam_unit_path = Some(format!("{}a{{slot_id}}", "é".repeat(49)));
+            if compile_template {
+                slot.compile_unit_template()
+                    .expect("should compile multibyte template");
+            }
+            assert_eq!(
+                slot.compiled_unit.is_some(),
+                compile_template,
+                "test should exercise the {cache_kind} template path"
+            );
+
+            let rendered = slot.render_gam_unit_path("unused", "unused");
+
+            assert_eq!(
+                rendered,
+                Some(expected.clone()),
+                "{cache_kind} dynamic template should accept exactly 100 UTF-8 bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn render_gam_unit_path_rejects_multibyte_byte_limit_plus_one() {
+        let hypothetical_render = format!("{}abx", "é".repeat(49));
+        assert_eq!(
+            hypothetical_render.len(),
+            101,
+            "test fixture should render to 101 UTF-8 bytes"
+        );
+        assert!(
+            hypothetical_render.chars().count() < 100,
+            "fixture should fail if rendering counts characters instead of UTF-8 bytes"
+        );
+
+        for compile_template in [true, false] {
+            let cache_kind = if compile_template { "compiled" } else { "raw" };
+            let mut slot = make_slot("x", vec!["/"]);
+            slot.gam_unit_path = Some(format!("{}ab{{slot_id}}", "é".repeat(49)));
+            if compile_template {
+                slot.compile_unit_template()
+                    .expect("should compile multibyte template");
+            }
+            assert_eq!(
+                slot.compiled_unit.is_some(),
+                compile_template,
+                "test should exercise the {cache_kind} template path"
+            );
+
+            let rendered = slot.render_gam_unit_path("unused", "unused");
+
+            assert_eq!(
+                rendered, None,
+                "{cache_kind} dynamic template should reject 101 UTF-8 bytes"
+            );
+        }
     }
 
     #[test]
