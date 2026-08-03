@@ -59,6 +59,7 @@ use crate::http_util::{RequestInfo, is_navigation_request, serve_static_with_eta
 use crate::integrations::IntegrationRegistry;
 use crate::platform::{GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices};
 use crate::price_bucket::{PriceGranularity, price_bucket};
+use crate::response_privacy::CDN_CACHE_HEADERS;
 use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::Settings;
 use crate::streaming_processor::{
@@ -2835,6 +2836,8 @@ pub async fn handle_publisher_request(
     if should_run_ad_stack {
         req.headers_mut().remove(header::IF_NONE_MATCH);
         req.headers_mut().remove(header::IF_MODIFIED_SINCE);
+        req.headers_mut().remove(header::RANGE);
+        req.headers_mut().remove(header::IF_RANGE);
     }
 
     // Only advertise encodings the rewrite pipeline can decode and re-encode.
@@ -2861,9 +2864,6 @@ pub async fn handle_publisher_request(
     // without streaming support may reject the flag outright rather than
     // silently buffering, which would fail every publisher fetch.
     let mut platform_request = PlatformHttpRequest::new(req, backend_name);
-    if should_run_ad_stack {
-        platform_request = platform_request.with_cache_bypass();
-    }
     if services.http_client().supports_streaming_responses() {
         platform_request = platform_request.with_stream_response();
     }
@@ -2961,13 +2961,8 @@ pub async fn handle_publisher_request(
         // and `Cloudflare-CDN-Cache-Control` is the Cloudflare-specific field
         // that overrides it there, so both are needed to close the gap on the
         // Cloudflare adapter.
-        for directive in [
-            "surrogate-control",
-            "fastly-surrogate-control",
-            "cdn-cache-control",
-            "cloudflare-cdn-cache-control",
-        ] {
-            response.headers_mut().remove(directive);
+        for directive in CDN_CACHE_HEADERS {
+            response.headers_mut().remove(*directive);
         }
     }
 
@@ -4543,7 +4538,10 @@ mod tests {
         use crate::platform::test_support::{
             NoopConfigStore, NoopGeo, NoopSecretStore, StubBackend,
         };
-        use crate::platform::{ClientInfo, PlatformResponse};
+        use crate::platform::{
+            ClientInfo, PlatformError, PlatformHttpClient, PlatformPendingRequest,
+            PlatformResponse, PlatformSelectResult,
+        };
         use crate::test_support::tests::crate_test_settings_str;
 
         const ORIGIN_ETAG: &str = "\"origin-tag\"";
@@ -4552,6 +4550,58 @@ mod tests {
         const UNEXPECTED_304_BACKEND: &str = "example-navigation-bidder-backend";
 
         struct DispatchingTestProvider;
+
+        struct RangeAwareHttpClient {
+            stub: StubHttpClient,
+        }
+
+        impl RangeAwareHttpClient {
+            fn new() -> Self {
+                Self {
+                    stub: StubHttpClient::new(),
+                }
+            }
+        }
+
+        #[async_trait::async_trait(?Send)]
+        impl PlatformHttpClient for RangeAwareHttpClient {
+            async fn send(
+                &self,
+                request: PlatformHttpRequest,
+            ) -> Result<PlatformResponse, Report<PlatformError>> {
+                if request.request.headers().contains_key(header::RANGE) {
+                    self.stub.push_response_with_headers(
+                        206,
+                        b"<html><body>partial".to_vec(),
+                        vec![
+                            ("content-type", "text/html; charset=utf-8"),
+                            ("content-range", "bytes 0-18/39"),
+                        ],
+                    );
+                } else {
+                    self.stub.push_response_with_headers(
+                        200,
+                        b"<html><body>origin</body></html>".to_vec(),
+                        vec![("content-type", "text/html; charset=utf-8")],
+                    );
+                }
+                self.stub.send(request).await
+            }
+
+            async fn send_async(
+                &self,
+                request: PlatformHttpRequest,
+            ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+                self.stub.send_async(request).await
+            }
+
+            async fn select(
+                &self,
+                pending_requests: Vec<PlatformPendingRequest>,
+            ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+                self.stub.select(pending_requests).await
+            }
+        }
 
         #[async_trait::async_trait(?Send)]
         impl AuctionProvider for DispatchingTestProvider {
@@ -4823,6 +4873,44 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn eligible_range_navigation_fetches_complete_html() {
+            // Arrange
+            let settings = settings_with_enabled_auction_and_creative_opportunities();
+            let http_client = Arc::new(RangeAwareHttpClient::new());
+            let services = build_services_with_http_client(
+                Arc::clone(&http_client) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let slots = [article_slot()];
+            let mut req = conditional_navigation_request();
+            req.headers_mut()
+                .insert(header::RANGE, HeaderValue::from_static("bytes=0-18"));
+            req.headers_mut()
+                .insert(header::IF_RANGE, HeaderValue::from_static(ORIGIN_ETAG));
+
+            // Act
+            let response = run_with_slots(&settings, &services, &slots, req).await;
+            let response_head = response_head(response);
+
+            // Assert
+            assert_eq!(
+                response_head.status,
+                StatusCode::OK,
+                "eligible range navigation should fetch the complete origin document"
+            );
+            let recorded_requests = http_client.stub.recorded_request_headers();
+            let outbound_headers = recorded_requests
+                .first()
+                .expect("should record the outbound publisher request");
+            for header_name in [header::RANGE, header::IF_RANGE] {
+                assert_eq!(
+                    recorded_header(outbound_headers, header_name.as_str()),
+                    None,
+                    "eligible publisher request should not forward {header_name}"
+                );
+            }
+        }
+
+        #[tokio::test]
         async fn navigation_without_matched_slots_preserves_origin_cache_policy() {
             // Arrange
             let settings = settings_with_enabled_auction_and_creative_opportunities();
@@ -4831,7 +4919,11 @@ mod tests {
             let services = build_services_with_http_client(
                 Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
             );
-            let req = conditional_navigation_request();
+            let mut req = conditional_navigation_request();
+            req.headers_mut()
+                .insert(header::RANGE, HeaderValue::from_static("bytes=0-18"));
+            req.headers_mut()
+                .insert(header::IF_RANGE, HeaderValue::from_static(ORIGIN_ETAG));
 
             // Act
             let response = run_with_slots(&settings, &services, &[], req).await;
@@ -4856,6 +4948,16 @@ mod tests {
                 recorded_header(outbound_headers, header::IF_MODIFIED_SINCE.as_str()),
                 Some(ORIGIN_LAST_MODIFIED),
                 "publisher request without matched slots should preserve If-Modified-Since"
+            );
+            assert_eq!(
+                recorded_header(outbound_headers, header::RANGE.as_str()),
+                Some("bytes=0-18"),
+                "publisher request without matched slots should preserve Range"
+            );
+            assert_eq!(
+                recorded_header(outbound_headers, header::IF_RANGE.as_str()),
+                Some(ORIGIN_ETAG),
+                "publisher request without matched slots should preserve If-Range"
             );
 
             for (header_name, expected) in [
