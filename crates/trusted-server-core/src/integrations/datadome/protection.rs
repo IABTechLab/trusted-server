@@ -36,6 +36,16 @@ impl DataDomeIntegration {
         &self,
         input: RequestFilterInput<'_>,
     ) -> RequestFilterDecision {
+        if self.config.enable_protection {
+            log::info!(
+                "[datadome] protection incoming client_ip={} method={} host={} path={}",
+                client_ip_for_log(&input),
+                input.request.method(),
+                request_host(input.request),
+                input.request.uri().path(),
+            );
+        }
+
         if !self.config.enable_protection || !self.is_request_protected(&input) {
             return RequestFilterDecision::Continue(RequestFilterEffects::default());
         }
