@@ -3334,17 +3334,14 @@ pub(crate) fn build_empty_bids_script() -> String {
 /// [`handle_page_bids`] (SPA navigation) so the slot wire shape has a single
 /// definition and the two paths cannot silently diverge. Property names match
 /// what the client-side TSJS bundle expects: `gam_unit_path`, `div_id`,
-/// `formats`, and `targeting`.
+/// `formats`, and `targeting`. Returns `None` when the slot's dynamic GAM unit
+/// path exceeds its rendering limit.
 pub(crate) fn build_slot_json(
     slot: &crate::creative_opportunities::CreativeOpportunitySlot,
     co_config: &crate::creative_opportunities::CreativeOpportunitiesConfig,
-    request_path: &str,
-) -> serde_json::Value {
-    // `{section}` derives from the same raw path `page_patterns` matched
-    // against; `section_root` covers the no-segment case (`/`) and paths shorter
-    // than the configured `section_segment`.
-    let section = co_config.section_for_path(request_path);
-    let gam_path = slot.render_gam_unit_path(&co_config.gam_network_id, &section);
+    section: &str,
+) -> Option<serde_json::Value> {
+    let gam_path = slot.render_gam_unit_path(&co_config.gam_network_id, section)?;
     let div_id = slot.resolved_div_id();
     let formats: Vec<serde_json::Value> = slot
         .formats
@@ -3356,13 +3353,13 @@ pub(crate) fn build_slot_json(
         .iter()
         .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
         .collect();
-    serde_json::json!({
+    Some(serde_json::json!({
         "id": slot.id,
         "gam_unit_path": gam_path,
         "div_id": div_id,
         "formats": formats,
         "targeting": targeting,
-    })
+    }))
 }
 
 /// Build the `tsjs.adSlots` `<script>` tag from matched slots.
@@ -3374,9 +3371,12 @@ pub(crate) fn build_ad_slots_script(
     co_config: &crate::creative_opportunities::CreativeOpportunitiesConfig,
     request_path: &str,
 ) -> String {
+    // `{section}` derives from the same raw path `page_patterns` matched
+    // against; derive it once for every slot on this request.
+    let section = co_config.section_for_path(request_path);
     let slots: Vec<serde_json::Value> = matched_slots
         .iter()
-        .map(|slot| build_slot_json(slot, co_config, request_path))
+        .filter_map(|slot| build_slot_json(slot, co_config, &section))
         .collect();
     let json = serde_json::to_string(&slots)
         .expect("serde_json::to_string of Vec<Value> should be infallible");
@@ -3790,9 +3790,10 @@ pub async fn handle_page_bids(
     // Gate slots on the ad-stack kill switch / consent: when disabled, return no
     // slots so the SPA hook does not call `adInit()` / create GPT slots.
     let slots_json: Vec<serde_json::Value> = if ad_stack_enabled {
+        let section = co_config.section_for_path(&path_param);
         matched_slots
             .iter()
-            .map(|slot| build_slot_json(slot, co_config, &path_param))
+            .filter_map(|slot| build_slot_json(slot, co_config, &section))
             .collect()
     } else {
         Vec::new()
@@ -7291,6 +7292,33 @@ mod tests {
         }
 
         #[test]
+        fn ad_slots_script_omits_only_over_limit_dynamic_slot() {
+            let mut over_limit = make_slot();
+            over_limit.id = "over_limit_dynamic".to_string();
+            over_limit.gam_unit_path = Some("/{section}/{section}".to_string());
+            over_limit
+                .compile_unit_template()
+                .expect("template should compile");
+            let mut valid_static = make_slot();
+            valid_static.id = "valid_static_sibling".to_string();
+            valid_static.gam_unit_path = Some("/12345/example/static".to_string());
+            let slots = vec![over_limit, valid_static];
+            let config = make_config();
+            let request_path = format!("/{}", "a".repeat(60));
+
+            let script = build_ad_slots_script(&slots, &config, &request_path);
+
+            assert!(
+                !script.contains("over_limit_dynamic"),
+                "should omit the over-limit dynamic slot"
+            );
+            assert!(
+                script.contains("valid_static_sibling"),
+                "should retain the valid static sibling"
+            );
+        }
+
+        #[test]
         fn build_slot_json_renders_section_from_request_path() {
             let mut config = make_config();
             config.gam_network_id = "99999".to_string();
@@ -7300,13 +7328,17 @@ mod tests {
             slot.compile_unit_template()
                 .expect("template should compile");
 
-            let news = crate::publisher::build_slot_json(&slot, &config, "/news/article-123");
+            let news_section = config.section_for_path("/news/article-123");
+            let news = crate::publisher::build_slot_json(&slot, &config, &news_section)
+                .expect("should render slot");
             assert_eq!(
                 news["gam_unit_path"], "/99999/example/news",
                 "section should derive from the first path segment"
             );
 
-            let home = crate::publisher::build_slot_json(&slot, &config, "/");
+            let home_section = config.section_for_path("/");
+            let home = crate::publisher::build_slot_json(&slot, &config, &home_section)
+                .expect("should render slot");
             assert_eq!(
                 home["gam_unit_path"], "/99999/example/homepage",
                 "root path should use section_root"
@@ -7326,13 +7358,18 @@ mod tests {
             slot.compile_unit_template()
                 .expect("template should compile");
 
-            let news = crate::publisher::build_slot_json(&slot, &config, "/en/news/article-123");
+            let news_section = config.section_for_path("/en/news/article-123");
+            let news = crate::publisher::build_slot_json(&slot, &config, &news_section)
+                .expect("should render slot");
             assert_eq!(
                 news["gam_unit_path"], "/99999/example/news",
                 "section should derive from the configured segment index"
             );
 
-            let locale_root = crate::publisher::build_slot_json(&slot, &config, "/en");
+            let locale_root_section = config.section_for_path("/en");
+            let locale_root =
+                crate::publisher::build_slot_json(&slot, &config, &locale_root_section)
+                    .expect("should render slot");
             assert_eq!(
                 locale_root["gam_unit_path"], "/99999/example/homepage",
                 "a path with no segment at the configured index should use section_root"
@@ -8692,6 +8729,46 @@ mod tests {
                     .len(),
                 0,
                 "prefetch request must not run an auction"
+            );
+        }
+
+        #[tokio::test]
+        async fn page_bids_omits_only_over_limit_dynamic_slot() {
+            let settings = settings_with_co();
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let mut over_limit = article_slot()
+                .into_iter()
+                .next()
+                .expect("should build over-limit slot");
+            over_limit.id = "over_limit_dynamic".to_string();
+            over_limit.page_patterns = vec!["/*".to_string()];
+            over_limit.gam_unit_path = Some("/{section}/{section}".to_string());
+            over_limit
+                .compile_unit_template()
+                .expect("template should compile");
+            let mut valid_static = article_slot()
+                .into_iter()
+                .next()
+                .expect("should build valid static slot");
+            valid_static.id = "valid_static_sibling".to_string();
+            valid_static.page_patterns = vec!["/*".to_string()];
+            valid_static.gam_unit_path = Some("/12345/example/static".to_string());
+            let slots = vec![over_limit, valid_static];
+            let request_path = format!("/{}", "a".repeat(60));
+            let mut req = make_page_bids_request(&request_path);
+            set_test_header(&mut req, "sec-purpose", "prefetch");
+
+            let body = run_page_bids_consent_allowed(&settings, &orchestrator, &slots, req).await;
+            let returned_slots = body["slots"].as_array().expect("slots should be array");
+
+            assert_eq!(
+                returned_slots.len(),
+                1,
+                "should omit only the over-limit dynamic slot"
+            );
+            assert_eq!(
+                returned_slots[0]["id"], "valid_static_sibling",
+                "should retain the valid static sibling"
             );
         }
 
