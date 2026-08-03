@@ -1125,7 +1125,8 @@ mod tests {
 
     #[test]
     fn convert_to_openrtb_response_serializes_winning_bid_and_orchestrator_ext() {
-        let settings = make_settings();
+        let mut settings = make_settings();
+        settings.auction.rewrite_creatives = false;
         let auction_request = make_auction_request();
         let result = make_result(make_bid("div-gpt-top", "appnexus", Some(2.75)));
 
@@ -1400,7 +1401,8 @@ mod tests {
 
     #[test]
     fn convert_to_openrtb_response_skips_invalid_winners_without_dropping_valid_slots() {
-        let settings = make_settings();
+        let mut settings = make_settings();
+        settings.auction.rewrite_creatives = false;
         let auction_request = make_auction_request();
         let mut missing = make_bid("missing", "invalid", Some(3.0));
         missing.creative = None;
@@ -1482,7 +1484,8 @@ mod tests {
 
     #[test]
     fn convert_to_openrtb_response_prefers_creative_when_both_render_sources_exist() {
-        let settings = make_settings();
+        let mut settings = make_settings();
+        settings.auction.rewrite_creatives = false;
         let auction_request = make_auction_request();
         let mut bid = make_bid("div-gpt-top", "aps", Some(2.75));
         bid.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
@@ -1608,7 +1611,8 @@ mod tests {
 
     #[test]
     fn convert_to_openrtb_response_serializes_multiple_winning_bids() {
-        let settings = make_settings();
+        let mut settings = make_settings();
+        settings.auction.rewrite_creatives = false;
         let auction_request = make_auction_request();
         let top_bid = make_bid("div-gpt-top", "appnexus", Some(2.75));
         let mut sidebar_bid = make_bid("div-gpt-sidebar", "rubicon", Some(1.25));
