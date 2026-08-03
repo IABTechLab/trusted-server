@@ -217,9 +217,11 @@ pub struct CreativeOpportunitiesConfig {
     /// template contains `{section}`. No default — a home-section name is
     /// publisher-specific, so it stays in config, not core.
     ///
-    /// Skipped when absent so a config blob pushed by a newer binary stays
-    /// readable by an older one: these structs use `deny_unknown_fields`, so
-    /// emitting `"section_root": null` would make a rollback fail at startup.
+    /// Static and absent [`gam_unit_path`](CreativeOpportunitySlot::gam_unit_path)
+    /// configurations remain compatible with the legacy schema only when both
+    /// this key and [`section_segment`](Self::section_segment) are omitted.
+    /// These structs use `deny_unknown_fields`, so any pushed new key makes an
+    /// older binary fail configuration load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub section_root: Option<String>,
     /// Index of the path segment `{section}` is taken from, 0-based over
@@ -231,13 +233,15 @@ pub struct CreativeOpportunitiesConfig {
     /// [`section_root`](Self::section_root), so on `/en` a config with
     /// `section_segment = 1` renders the root section.
     ///
-    /// Static and absent [`gam_unit_path`](CreativeOpportunitySlot::gam_unit_path)
-    /// configurations keep this `None`, preserving their legacy serialized
-    /// shape. After successfully parsing any placeholder-bearing template,
+    /// During typed/startup finalization, after successfully parsing any
+    /// placeholder-bearing template,
     /// [`compile_unit_templates`](Self::compile_unit_templates) materializes
     /// `Some(0)` when this is unset as an automatic compatibility marker: an
     /// older `deny_unknown_fields` binary then fails loudly rather than silently
-    /// accepting a dynamic configuration it does not understand.
+    /// accepting a dynamic configuration it does not understand. Static and
+    /// absent [`gam_unit_path`](CreativeOpportunitySlot::gam_unit_path)
+    /// configurations remain legacy-compatible only when both this key and
+    /// [`section_root`](Self::section_root) are omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub section_segment: Option<usize>,
     /// Slot templates. Empty vec = feature disabled (no auction fired, no globals injected).
@@ -278,10 +282,11 @@ impl CreativeOpportunitiesConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error string when any slot's template is malformed. After all
-    /// templates parse successfully, materializes `section_segment = Some(0)`
-    /// for a placeholder-bearing template that omitted it, so rollback to an
-    /// older `deny_unknown_fields` binary fails loudly.
+    /// Returns an error string when any slot's template is malformed. During
+    /// typed/startup finalization, after all templates parse successfully,
+    /// materializes `section_segment = Some(0)` for a placeholder-bearing
+    /// template that omitted it, so rollback to an older `deny_unknown_fields`
+    /// binary fails loudly.
     pub fn compile_unit_templates(&mut self) -> Result<(), String> {
         for slot in &mut self.slot {
             slot.compile_unit_template()?;
@@ -303,7 +308,7 @@ impl CreativeOpportunitiesConfig {
     /// malformed templates fail at startup. When the cache is absent, validation
     /// also reads a valid raw template so placeholder-dependent requirements are
     /// still enforced; compilation remains required to reject malformed raw
-    /// templates. [`Settings::prepare_runtime`](crate::settings::Settings)
+    /// templates. [`Settings::prepare_runtime`](crate::settings::Settings::prepare_runtime)
     /// enforces this order.
     ///
     /// # Errors

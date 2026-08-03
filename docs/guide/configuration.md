@@ -1311,12 +1311,13 @@ A template with **no** placeholders is used verbatim. A slot with **no**
 `gam_unit_path` falls back to `/<network_id>/<slot_id>`. Both preserve the
 pre-templating behavior, so existing static configs are unchanged.
 
-Dynamic template results are limited to 100 UTF-8 bytes. See Google's
-[100-character GAM limit](https://support.google.com/admanager/answer/1628457?hl=en).
-If a request-specific substitution would exceed the dynamic limit, only that
-slot is omitted from the response; the response itself still succeeds. Explicit
-static paths and absent/default paths retain legacy behavior and are not subject
-to this dynamic-only limit.
+Trusted Server conservatively caps the whole rendered dynamic path at 100 UTF-8
+bytes, informed by Google's [100-character per-ad-unit-code
+limit](https://support.google.com/admanager/answer/1628457?hl=en). If a
+request-specific substitution would exceed the dynamic limit, only that slot is
+omitted from the response; the response itself still succeeds. Explicit static
+paths and absent/default paths retain legacy behavior and are not subject to
+this dynamic-only limit.
 
 ### `{section}` derivation
 
@@ -1352,11 +1353,14 @@ Both knobs are config-driven, so the URL→section convention stays with the
 publisher: `section_segment` selects which segment names the section, and
 `section_root` names the section when there is none.
 
-Static and absent paths omit this automatic compatibility marker and remain
-compatible with the legacy config schema. Every placeholder-bearing dynamic
-template automatically serializes `section_segment = 0` when it was omitted,
-so an older binary rejects the pushed blob loudly. Before rolling back below
-this feature, revert dynamic paths to static or absent paths.
+During typed/startup finalization, after templates parse successfully, every
+placeholder-bearing dynamic template that omits `section_segment` has
+`section_segment = 0` materialized, so an older binary rejects the pushed blob
+loudly. Static and absent paths remain compatible with the legacy config schema
+only when both `section_root` and `section_segment` are omitted. Before rolling
+back below this feature, replace or remove dynamic paths, remove both
+`section_root` and `section_segment`, re-push and finalize the config, then
+roll back the binary.
 
 Example resolution for `gam_unit_path = "/{network_id}/example/{section}"` with
 `gam_network_id = "123456789"`, `section_root = "home"`, and the

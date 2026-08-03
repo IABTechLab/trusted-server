@@ -4957,6 +4957,13 @@ passphrase = "test-secret-key-32-bytes-minimum"
 [creative_opportunities]
 gam_network_id = "21765378893"
 auction_timeout_ms = 500
+section_root = "home"
+
+[[creative_opportunities.slot]]
+id = "atf"
+gam_unit_path = "/{network_id}/example/{section}"
+page_patterns = ["/"]
+formats = [{ width = 300, height = 250 }]
 "#;
         let settings = Settings::from_toml(toml).expect("should parse");
         let co = settings
@@ -4964,6 +4971,11 @@ auction_timeout_ms = 500
             .expect("should have creative_opportunities");
         assert_eq!(co.gam_network_id, "21765378893");
         assert_eq!(co.auction_timeout_ms, Some(500));
+        assert_eq!(
+            co.section_segment,
+            Some(0),
+            "startup finalization should materialize the dynamic-template compatibility marker"
+        );
     }
 
     #[test]
