@@ -558,8 +558,8 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         let backend_name = request.backend_name.clone();
         let image_optimizer = request.image_optimizer;
         let stream_response = request.stream_response;
-        let request_is_head = request.request.method() == edgezero_core::http::Method::HEAD;
         let bypass_cache = request.bypass_cache;
+        let request_is_head = request.request.method() == edgezero_core::http::Method::HEAD;
         let mut fastly_req = edge_request_to_fastly(request.request)?;
         if let Some(options) = image_optimizer {
             apply_fastly_image_optimizer(&mut fastly_req, options)?;
@@ -914,6 +914,26 @@ mod tests {
     // --- FastlyPlatformHttpClient -------------------------------------------
 
     #[test]
+    fn apply_fastly_cache_bypass_sets_pass_when_enabled() {
+        let mut request = fastly::Request::get("https://example.com/");
+        apply_fastly_cache_bypass(&mut request, true);
+        assert!(
+            format!("{request:?}").contains("cache_override: Pass"),
+            "enabled bypass should select Fastly pass mode"
+        );
+    }
+
+    #[test]
+    fn apply_fastly_cache_bypass_preserves_default_when_disabled() {
+        let mut request = fastly::Request::get("https://example.com/");
+        apply_fastly_cache_bypass(&mut request, false);
+        assert!(
+            format!("{request:?}").contains("cache_override: None"),
+            "disabled bypass should preserve Fastly read-through caching"
+        );
+    }
+
+    #[test]
     fn fastly_response_to_platform_allows_oversized_bodiless_content_length() {
         let oversized_content_length = (MAX_PLATFORM_RESPONSE_BODY_BYTES + 1).to_string();
         for (request_is_head, status) in [
@@ -967,26 +987,6 @@ mod tests {
         assert!(
             format!("{error:?}").contains(&expected_error),
             "should retain the buffered response size limit: {error:?}"
-        );
-    }
-
-    #[test]
-    fn apply_fastly_cache_bypass_sets_pass_when_enabled() {
-        let mut request = fastly::Request::get("https://example.com/");
-        apply_fastly_cache_bypass(&mut request, true);
-        assert!(
-            format!("{request:?}").contains("cache_override: Pass"),
-            "enabled bypass should select Fastly pass mode"
-        );
-    }
-
-    #[test]
-    fn apply_fastly_cache_bypass_preserves_default_when_disabled() {
-        let mut request = fastly::Request::get("https://example.com/");
-        apply_fastly_cache_bypass(&mut request, false);
-        assert!(
-            format!("{request:?}").contains("cache_override: None"),
-            "disabled bypass should preserve Fastly read-through caching"
         );
     }
 

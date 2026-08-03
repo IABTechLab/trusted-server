@@ -14,7 +14,7 @@ use edgezero_core::body::Body as EdgeBody;
 
 use crate::error::TrustedServerError;
 use crate::http_util::is_navigation_request;
-use crate::response_privacy::SURROGATE_CACHE_HEADERS;
+use crate::response_privacy::CDN_CACHE_HEADERS;
 use crate::settings::{IntegrationConfig, Settings};
 use crate::tsjs;
 
@@ -242,7 +242,7 @@ pub fn finalize_response(
             header::CACHE_CONTROL,
             HeaderValue::from_static("private, no-store"),
         );
-        for name in SURROGATE_CACHE_HEADERS {
+        for name in CDN_CACHE_HEADERS {
             response.headers_mut().remove(*name);
         }
     }
