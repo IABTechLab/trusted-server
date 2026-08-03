@@ -88,18 +88,35 @@
     );
   }
 
+  function normalizedGptFormats(formats) {
+    return formats.length === 2 &&
+      formats.every(function (format) {
+        return typeof format === "number";
+      })
+      ? [formats]
+      : formats;
+  }
+
+  function handoffFormatsMatch(handoff, formats) {
+    return (
+      JSON.stringify(handoff.formats) ===
+      JSON.stringify(normalizedGptFormats(formats))
+    );
+  }
+
   function matchingHandoff(pubads, adUnitPath, formats, elementId) {
     var exact = ts.gptSlotHandoffs && ts.gptSlotHandoffs[elementId];
-    if (exact) return exact;
+    if (exact) return exact.publisherClaimed ? null : exact;
 
     var candidates = Object.values(ts.gptSlotHandoffs || {}).filter(
       function (handoff, index, allHandoffs) {
         return (
           allHandoffs.indexOf(handoff) === index &&
           !handoff.publisherClaimed &&
+          !document.getElementById(handoff.slotElementId) &&
           elementId.startsWith(handoff.divIdPrefix) &&
           handoff.gamUnitPath === adUnitPath &&
-          JSON.stringify(handoff.formats) === JSON.stringify(formats) &&
+          handoffFormatsMatch(handoff, formats) &&
           findSlotByElementId(pubads, handoff.slotElementId)
         );
       },
@@ -185,7 +202,8 @@
   // TS cannot wait an arbitrary amount of time for a framework to define a
   // slot: publishers that never define one would render blank. Instead, TS
   // defines its fallback on the actual inner div and aliases only a later
-  // publisher defineSlot() for that exact div to the same GPT slot.
+  // publisher defineSlot() for that exact div, or a hydration-renamed replacement
+  // after the original div is gone, to the same GPT slot.
   function installSlotHandoff() {
     window.googletag.cmd.push(function () {
       var tag = window.googletag;
@@ -195,13 +213,23 @@
       if (!tag.defineSlot.__tsSlotHandoffPatched) {
         var originalDefineSlot = tag.defineSlot.bind(tag);
         var patchedDefineSlot = function (adUnitPath, formats, elementId) {
-          var handoff = matchingHandoff(pubads, adUnitPath, formats, elementId);
-          if (!ts.gptSlotHandoffInternal && handoff) {
-            var existingSlot = findSlotByElementId(pubads, handoff.slotElementId);
-            if (existingSlot) {
-              if (!handoff.publisherClaimed) {
+          if (!ts.gptSlotHandoffInternal && typeof elementId === "string") {
+            var handoff = matchingHandoff(
+              pubads,
+              adUnitPath,
+              formats,
+              elementId,
+            );
+            if (handoff) {
+              var existingSlot = findSlotByElementId(
+                pubads,
+                handoff.slotElementId,
+              );
+              if (existingSlot) {
                 ts.gptSlotHandoffs[elementId] = handoff;
                 handoff.publisherClaimed = true;
+                // The supported publisher lifecycle is defineSlot → addService → display.
+                // Intentionally wait for that display instead of applying a time heuristic.
                 handoff.suppressPublisherDisplay = true;
                 handoff.suppressPublisherRefresh =
                   ts.gptInitialLoadDisabled === true;
@@ -212,7 +240,7 @@
                 );
                 if (
                   handoff.gamUnitPath !== adUnitPath ||
-                  JSON.stringify(handoff.formats) !== JSON.stringify(formats)
+                  !handoffFormatsMatch(handoff, formats)
                 ) {
                   ts.log &&
                     ts.log.warn &&
@@ -221,11 +249,13 @@
                       elementId,
                     );
                 }
+                return existingSlot;
               }
-              return existingSlot;
             }
           }
-          return originalDefineSlot(adUnitPath, formats, elementId);
+          return elementId === undefined
+            ? originalDefineSlot(adUnitPath, formats)
+            : originalDefineSlot(adUnitPath, formats, elementId);
         };
         patchedDefineSlot.__tsSlotHandoffPatched = true;
         tag.defineSlot = patchedDefineSlot;
