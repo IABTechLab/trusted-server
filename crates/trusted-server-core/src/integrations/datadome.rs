@@ -88,7 +88,12 @@ pub use protection_scope::{
 
 use protection_scope::ProtectionScope;
 
-pub(super) const DATADOME_INTEGRATION_ID: &str = "datadome";
+pub(crate) const DATADOME_INTEGRATION_ID: &str = "datadome";
+
+/// Request marker indicating that Trusted Server should omit its automatic
+/// `DataDome` client-side tag for the current response.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DataDomeClientTagSuppressed;
 
 /// Regex pattern for matching and rewriting `DataDome` URLs in script content.
 ///
@@ -765,7 +770,15 @@ impl IntegrationHeadInjector for DataDomeIntegration {
         DATADOME_INTEGRATION_ID
     }
 
-    fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+    fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        if ctx
+            .document_state
+            .get::<DataDomeClientTagSuppressed>(DATADOME_INTEGRATION_ID)
+            .is_some()
+        {
+            return Vec::new();
+        }
+
         if !self.config.inject_client_side_tag || self.config.client_side_key.trim().is_empty() {
             return Vec::new();
         }
@@ -1249,6 +1262,20 @@ mod tests {
 
     #[test]
     fn head_injector_omits_client_side_tag_when_disabled_or_blank() {
+        let mut suppressed = test_config();
+        suppressed.client_side_key = "test-client-key".to_string();
+        let suppressed_integration = DataDomeIntegration::new(suppressed);
+        let suppressed_state = crate::integrations::IntegrationDocumentState::default();
+        suppressed_state
+            .get_or_insert_with(DATADOME_INTEGRATION_ID, || DataDomeClientTagSuppressed);
+        let suppressed_ctx = html_context_for_tests(&suppressed_state);
+        assert!(
+            suppressed_integration
+                .head_inserts(&suppressed_ctx)
+                .is_empty(),
+            "should omit the tag when the request is IP-excluded"
+        );
+
         let mut blank_key = test_config();
         blank_key.client_side_key = " ".to_string();
         let integration = DataDomeIntegration::new(blank_key);

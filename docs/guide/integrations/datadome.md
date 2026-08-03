@@ -173,6 +173,33 @@ Static assets are excluded by default using a case-insensitive file-extension re
 
 Auction traffic at `/auction` is protected by default.
 
+### IP-excluded client-side tag behavior
+
+On the Fastly adapter, a request that matches an IP-based DataDome exclusion
+also omits Trusted Server's automatically injected client-side DataDome tag
+from processed HTML. This keeps the client-side layer consistent with the
+server-side Protection API skip.
+
+This behavior applies to:
+
+- `protection_excluded_ip_cidrs`;
+- `protection_excluded_ip_cidr_sources`;
+- structured `ip_cidr` rules; and
+- structured `ip_cidr_source` rules.
+
+ASN, method, path, query-parameter, static-asset, and internal-route
+exclusions do not automatically suppress the client-side tag. DataDome tags
+already present in publisher HTML are not removed or changed by this behavior,
+and `/integrations/datadome/tags.js` remains available when requested directly.
+
+Because the processed HTML differs by client IP, tag-suppressed HTML is marked
+`private, max-age=0` and removed from shared surrogate caches. The decision is
+reported in the existing protection log, for example:
+
+```text
+[datadome] protection decision=skipped rule=excluded-ip-cidrs reason=client_ip client_tag=omitted method=GET host=example.com path=/page
+```
+
 ### Structured exclusion rules
 
 Use structured rules for all DataDome protection exclusions. Each rule has an `id`, optional `methods`, and a typed matcher. The default configuration includes a `path_regex` rule for common static assets.

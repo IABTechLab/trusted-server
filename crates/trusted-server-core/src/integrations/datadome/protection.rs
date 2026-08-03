@@ -34,19 +34,18 @@ enum ProtectionRequestError {
 impl DataDomeIntegration {
     pub(super) async fn filter_protection_request(
         &self,
-        input: RequestFilterInput<'_>,
+        mut input: RequestFilterInput<'_>,
     ) -> RequestFilterDecision {
         if self.config.enable_protection {
             log::info!(
-                "[datadome] protection incoming client_ip={} method={} host={} path={}",
-                client_ip_for_log(&input),
+                "[datadome] protection incoming method={} host={} path={}",
                 input.request.method(),
                 request_host(input.request),
                 input.request.uri().path(),
             );
         }
 
-        if !self.config.enable_protection || !self.is_request_protected(&input) {
+        if !self.config.enable_protection || !self.is_request_protected(&mut input) {
             return RequestFilterDecision::Continue(RequestFilterEffects::default());
         }
 
@@ -117,8 +116,8 @@ impl DataDomeIntegration {
         Ok(decision)
     }
 
-    fn is_request_protected(&self, input: &RequestFilterInput<'_>) -> bool {
-        let req = input.request;
+    fn is_request_protected(&self, input: &mut RequestFilterInput<'_>) -> bool {
+        let req = &*input.request;
         if req.method() == Method::OPTIONS {
             return false;
         }
@@ -142,6 +141,13 @@ impl DataDomeIntegration {
         match self.protection_scope.evaluate(&facts, input.services) {
             ProtectionScopeDecision::Protect => {}
             ProtectionScopeDecision::Skip { rule_id, reason } => {
+                let client_tag_omitted = is_ip_exclusion_reason(reason);
+                if client_tag_omitted {
+                    input
+                        .request
+                        .extensions_mut()
+                        .insert(super::DataDomeClientTagSuppressed);
+                }
                 log_protection_skip(input, &rule_id, reason);
                 return false;
             }
@@ -210,7 +216,7 @@ impl DataDomeIntegration {
         input: &RequestFilterInput<'_>,
         server_side_key: &Redacted<String>,
     ) -> ProtectionPayload {
-        let req = input.request;
+        let req = &*input.request;
         let client_info = input.services.client_info();
         let mut fields = Vec::new();
         let header_client_id = header_value(req, HEADER_DATADOME_CLIENT_ID);
@@ -429,29 +435,31 @@ impl DataDomeIntegration {
     }
 }
 
-fn log_protection_skip(input: &RequestFilterInput<'_>, rule_id: &str, reason: &str) {
-    if matches!(
+fn is_ip_exclusion_reason(reason: &str) -> bool {
+    matches!(
         reason,
         "client_ip" | "client_ip_source" | "ip_cidr" | "ip_cidr_source"
-    ) {
+    )
+}
+
+fn log_protection_skip(input: &RequestFilterInput<'_>, rule_id: &str, reason: &str) {
+    if is_ip_exclusion_reason(reason) {
         log::info!(
-            "[datadome] protection decision=skipped rule={} reason={} method={} host={} path={} client_ip={}",
+            "[datadome] protection decision=skipped rule={} reason={} client_tag=omitted method={} host={} path={}",
             rule_id,
             reason,
             input.request.method(),
             request_host(input.request),
             input.request.uri().path(),
-            client_ip_for_log(input),
         );
     } else {
         log::debug!(
-            "[datadome] protection decision=skipped rule={} reason={} method={} host={} path={} client_ip={}",
+            "[datadome] protection decision=skipped rule={} reason={} method={} host={} path={}",
             rule_id,
             reason,
             input.request.method(),
             request_host(input.request),
             input.request.uri().path(),
-            client_ip_for_log(input),
         );
     }
 }
@@ -465,39 +473,28 @@ fn log_protection_result(
     let method = input.request.method();
     let host = request_host(input.request);
     let path = input.request.uri().path();
-    let client_ip = client_ip_for_log(input);
 
     match decision {
         RequestFilterDecision::Respond { .. } => log::info!(
-            "[datadome] protection decision=blocked status={} method={} host={} path={} client_ip={} route=short_circuit",
+            "[datadome] protection decision=blocked status={} method={} host={} path={} route=short_circuit",
             status.as_u16(),
             method,
             host,
             path,
-            client_ip,
         ),
         RequestFilterDecision::Continue(_)
             if status == StatusCode::OK && datadome_status == Some(status.as_u16()) =>
         {
             log::info!(
-                "[datadome] protection decision=allowed status={} method={} host={} path={} client_ip={} route=continue",
+                "[datadome] protection decision=allowed status={} method={} host={} path={} route=continue",
                 status.as_u16(),
                 method,
                 host,
                 path,
-                client_ip,
             );
         }
         RequestFilterDecision::Continue(_) => {}
     }
-}
-
-fn client_ip_for_log(input: &RequestFilterInput<'_>) -> String {
-    input
-        .services
-        .client_info()
-        .client_ip
-        .map_or_else(|| "unknown".to_string(), |ip| ip.to_string())
 }
 
 struct ProtectionPayload {
@@ -732,11 +729,17 @@ fn truncate_utf8(value: &str, limit: i32) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
 
-    use crate::integrations::datadome::DataDomeConfig;
+    use crate::integrations::datadome::{
+        DataDomeConfig, ProtectionExclusionRuleConfig, ProtectionMatcherConfig,
+    };
+    use crate::platform::GeoInfo;
     use crate::platform::test_support::{
-        HashMapSecretStore, NoopConfigStore, NoopSecretStore, build_services_with_config_and_secret,
+        HashMapConfigStore, HashMapSecretStore, NoopConfigStore, NoopSecretStore,
+        build_services_with_config_and_secret, build_services_with_config_and_secret_and_client_ip,
+        noop_services_with_client_ip,
     };
     use crate::settings::Settings;
 
@@ -749,6 +752,210 @@ mod tests {
             ..DataDomeConfig::default()
         };
         DataDomeIntegration::try_new(config).expect("should create integration")
+    }
+
+    fn request_for_filter() -> Request<EdgeBody> {
+        request_builder()
+            .method(Method::GET.as_str())
+            .uri("https://publisher.example/page")
+            .body(EdgeBody::empty())
+            .expect("should build filter request")
+    }
+
+    fn filter_marks_request(
+        config: DataDomeConfig,
+        services: &RuntimeServices,
+    ) -> Request<EdgeBody> {
+        filter_marks_request_with_geo(config, services, None)
+    }
+
+    fn filter_marks_request_with_geo(
+        config: DataDomeConfig,
+        services: &RuntimeServices,
+        geo_info: Option<&GeoInfo>,
+    ) -> Request<EdgeBody> {
+        let integration =
+            DataDomeIntegration::try_new(config).expect("should create DataDome integration");
+        let settings = Settings::default();
+        let mut request = request_for_filter();
+        let decision = futures::executor::block_on(integration.filter_protection_request(
+            RequestFilterInput {
+                settings: &settings,
+                services,
+                request: &mut request,
+                geo_info,
+                is_integration_route: false,
+            },
+        ));
+        assert!(
+            matches!(decision, RequestFilterDecision::Continue(_)),
+            "an excluded request should continue without a Protection API response"
+        );
+        request
+    }
+
+    fn has_client_tag_suppression_marker(request: &Request<EdgeBody>) -> bool {
+        request
+            .extensions()
+            .get::<super::super::DataDomeClientTagSuppressed>()
+            .is_some()
+    }
+
+    #[test]
+    fn ip_exclusions_mark_requests_for_client_tag_suppression() {
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        let mut inline = DataDomeConfig {
+            enabled: true,
+            enable_protection: true,
+            protection_excluded_ip_cidrs: vec!["192.0.2.0/24".to_string()],
+            ..DataDomeConfig::default()
+        };
+        let inline_request =
+            filter_marks_request(inline.clone(), &noop_services_with_client_ip(ip));
+        assert!(
+            has_client_tag_suppression_marker(&inline_request),
+            "inline IP exclusions should mark the request"
+        );
+
+        inline.protection_excluded_ip_cidrs.clear();
+        inline.protection_excluded_ip_cidr_sources =
+            vec![super::super::ProtectionIpCidrSourceConfig {
+                config_store: "datadome-test-source".to_string(),
+                key: "inline-source".to_string(),
+            }];
+        let mut source_values = HashMap::new();
+        source_values.insert("inline-source".to_string(), "192.0.2.0/24".to_string());
+        let source_services = build_services_with_config_and_secret_and_client_ip(
+            HashMapConfigStore::new(source_values),
+            NoopSecretStore,
+            ip,
+        );
+        let source_request = filter_marks_request(inline, &source_services);
+        assert!(
+            has_client_tag_suppression_marker(&source_request),
+            "Config Store IP exclusions should mark the request"
+        );
+
+        let structured_ip = DataDomeConfig {
+            enabled: true,
+            enable_protection: true,
+            protection_exclusion_rules: vec![ProtectionExclusionRuleConfig {
+                id: "structured-ip".to_string(),
+                enabled: true,
+                methods: Vec::new(),
+                matcher: ProtectionMatcherConfig::IpCidr {
+                    cidrs: vec!["192.0.2.0/24".to_string()],
+                },
+            }],
+            ..DataDomeConfig::default()
+        };
+        let structured_request =
+            filter_marks_request(structured_ip, &noop_services_with_client_ip(ip));
+        assert!(
+            has_client_tag_suppression_marker(&structured_request),
+            "structured IP exclusions should mark the request"
+        );
+
+        let structured_source = DataDomeConfig {
+            enabled: true,
+            enable_protection: true,
+            protection_exclusion_rules: vec![ProtectionExclusionRuleConfig {
+                id: "structured-ip-source".to_string(),
+                enabled: true,
+                methods: Vec::new(),
+                matcher: ProtectionMatcherConfig::IpCidrSource {
+                    config_store: "datadome-test-source".to_string(),
+                    key: "structured-source".to_string(),
+                },
+            }],
+            ..DataDomeConfig::default()
+        };
+        let mut structured_values = HashMap::new();
+        structured_values.insert("structured-source".to_string(), "192.0.2.0/24".to_string());
+        let structured_services = build_services_with_config_and_secret_and_client_ip(
+            HashMapConfigStore::new(structured_values),
+            NoopSecretStore,
+            ip,
+        );
+        let structured_source_request =
+            filter_marks_request(structured_source, &structured_services);
+        assert!(
+            has_client_tag_suppression_marker(&structured_source_request),
+            "structured Config Store IP exclusions should mark the request"
+        );
+    }
+
+    #[test]
+    fn non_ip_exclusions_do_not_mark_requests_for_client_tag_suppression() {
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        let cases = [DataDomeConfig {
+            enabled: true,
+            enable_protection: true,
+            protection_exclusion_rules: vec![ProtectionExclusionRuleConfig {
+                id: "path".to_string(),
+                enabled: true,
+                methods: Vec::new(),
+                matcher: ProtectionMatcherConfig::PathExact {
+                    paths: vec!["/page".to_string()],
+                },
+            }],
+            ..DataDomeConfig::default()
+        }];
+
+        for config in cases {
+            let request = filter_marks_request(config, &noop_services_with_client_ip(ip));
+            assert!(
+                !has_client_tag_suppression_marker(&request),
+                "non-IP exclusions should not mark the request"
+            );
+        }
+    }
+
+    #[test]
+    fn asn_exclusions_do_not_mark_requests_for_client_tag_suppression() {
+        let config = DataDomeConfig {
+            enabled: true,
+            enable_protection: true,
+            protection_excluded_asns: vec![64500],
+            ..DataDomeConfig::default()
+        };
+        let geo_info = GeoInfo {
+            city: String::new(),
+            country: String::new(),
+            continent: String::new(),
+            latitude: 0.0,
+            longitude: 0.0,
+            metro_code: 0,
+            region: None,
+            asn: Some(64500),
+        };
+        let request = filter_marks_request_with_geo(
+            config,
+            &noop_services_with_client_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))),
+            Some(&geo_info),
+        );
+        assert!(
+            !has_client_tag_suppression_marker(&request),
+            "ASN exclusions should not mark the request"
+        );
+    }
+
+    #[test]
+    fn non_matching_ip_does_not_mark_request_for_client_tag_suppression() {
+        let config = DataDomeConfig {
+            enabled: true,
+            enable_protection: true,
+            protection_excluded_ip_cidrs: vec!["192.0.2.0/24".to_string()],
+            ..DataDomeConfig::default()
+        };
+        let request = filter_marks_request(
+            config,
+            &noop_services_with_client_ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10))),
+        );
+        assert!(
+            !has_client_tag_suppression_marker(&request),
+            "a non-matching IP should not mark the request"
+        );
     }
 
     #[test]
@@ -835,7 +1042,7 @@ mod tests {
         // the Protection API.
         let services = build_services_with_config_and_secret(NoopConfigStore, NoopSecretStore);
         let settings = Settings::default();
-        let request = request_builder()
+        let mut request = request_builder()
             .method(Method::OPTIONS.as_str())
             .uri("https://publisher.example/_ts/api/v1/identify")
             .body(EdgeBody::empty())
@@ -846,7 +1053,7 @@ mod tests {
             RequestFilterInput {
                 settings: &settings,
                 services: &services,
-                request: &request,
+                request: &mut request,
                 geo_info: None,
                 is_integration_route: false,
             },
