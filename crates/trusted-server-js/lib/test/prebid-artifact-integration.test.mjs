@@ -46,6 +46,17 @@ beforeAll(async () => {
   await build({
     configFile: false,
     root: libDir,
+    resolve: {
+      alias: [
+        {
+          find: 'prebid.js/src/adRendering.js',
+          replacement: path.resolve(
+            libDir,
+            'node_modules/prebid.js/dist/src/src/adRendering.js'
+          ),
+        },
+      ],
+    },
     build: {
       emptyOutDir: false,
       outDir: outputDirectory,
