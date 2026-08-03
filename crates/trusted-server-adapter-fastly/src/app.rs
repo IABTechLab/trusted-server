@@ -524,6 +524,13 @@ async fn execute_named(
         return Ok(run_batch_sync(&state, &services, req));
     }
 
+    if let Err(report) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+        &state.settings,
+        &mut req,
+    ) {
+        return Ok(http_error(&report));
+    }
+
     let mut ec = build_ec_request_state(&state.settings, &services, &req);
     // EcContext creation errors short-circuit before filters, mirroring legacy:
     // the legacy path returns its error response before running filter_request.
@@ -702,6 +709,13 @@ async fn dispatch_fallback(
 ) -> Response {
     let path = req.uri().path().to_string();
     let method = req.method().clone();
+
+    if let Err(report) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
+        &state.settings,
+        &mut req,
+    ) {
+        return http_error(&report);
+    }
 
     let mut ec = build_ec_request_state(&state.settings, services, &req);
     if let Some(report) = ec.setup_error.take() {

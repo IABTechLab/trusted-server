@@ -187,6 +187,9 @@ mod tests {
             ("set-cookie", "operator=abc"),
             ("cache-control", "public, max-age=600"),
             ("surrogate-control", "max-age=600"),
+            ("fastly-surrogate-control", "max-age=600"),
+            ("cdn-cache-control", "public, max-age=600"),
+            ("cloudflare-cdn-cache-control", "public, max-age=600"),
         ]);
         let mut response = response_builder()
             .body(edgezero_core::body::Body::empty())
@@ -202,14 +205,45 @@ mod tests {
             Some("private, max-age=0"),
             "operator Set-Cookie plus public Cache-Control must be re-downgraded to private"
         );
-        assert!(
-            !response.headers().contains_key("surrogate-control"),
-            "surrogate cache headers must be stripped when operator headers add Set-Cookie"
-        );
+        for header_name in CDN_CACHE_HEADERS {
+            assert!(
+                !response.headers().contains_key(*header_name),
+                "CDN cache header {header_name} must be stripped when operator headers add Set-Cookie"
+            );
+        }
         assert!(
             response.headers().contains_key(header::SET_COOKIE),
             "the operator Set-Cookie itself should still be applied"
         );
+    }
+
+    #[test]
+    fn preserves_private_no_store_against_operator_cache_headers_without_cookie() {
+        let settings = settings_with_response_headers(&[
+            ("cache-control", "public, max-age=600"),
+            ("surrogate-control", "max-age=600"),
+            ("fastly-surrogate-control", "max-age=600"),
+            ("cdn-cache-control", "public, max-age=600"),
+            ("cloudflare-cdn-cache-control", "public, max-age=600"),
+        ]);
+        let mut response = response_builder()
+            .header(header::CACHE_CONTROL, "private, no-store")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build response");
+
+        apply_response_headers_with_cache_privacy(&settings, &mut response);
+
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, no-store",
+            "operator cache headers must not weaken an existing private response"
+        );
+        for header_name in CDN_CACHE_HEADERS {
+            assert!(
+                !response.headers().contains_key(*header_name),
+                "operator headers must not restore shared caching through {header_name}"
+            );
+        }
     }
 
     #[test]

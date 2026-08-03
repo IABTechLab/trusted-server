@@ -4,14 +4,15 @@ Trusted Server provides built-in integrations with popular third-party services,
 
 ## Quick Comparison
 
-| Integration     | Type             | Endpoints  | HTML Rewriting               | Primary Use Case            | Status      |
-| --------------- | ---------------- | ---------- | ---------------------------- | --------------------------- | ----------- |
-| **Prebid**      | Proxy + Rewriter | 2-3 routes | Removes Prebid.js scripts    | Server-side header bidding  | Production  |
-| **Next.js**     | Script Rewriter  | None       | Rewrites Next.js data        | First-party Next.js routing | Production  |
-| **Permutive**   | Proxy + Rewriter | 6 routes   | Rewrites SDK URLs            | First-party audience data   | Production  |
-| **Sourcepoint** | Proxy + Rewriter | 2 routes   | Rewrites CMP asset URLs      | First-party CMP delivery    | Development |
-| **Osano**       | Browser Mirror   | None       | Consent cookie mirroring     | First-party consent signals | Development |
-| **Testlight**   | Proxy + Rewriter | 1 route    | Rewrites integration scripts | Testing/development         | Development |
+| Integration         | Type                | Endpoints  | HTML Rewriting               | Primary Use Case            | Status      |
+| ------------------- | ------------------- | ---------- | ---------------------------- | --------------------------- | ----------- |
+| **Prebid**          | Proxy + Rewriter    | 2-3 routes | Removes Prebid.js scripts    | Server-side header bidding  | Production  |
+| **Next.js**         | Script Rewriter     | None       | Rewrites Next.js data        | First-party Next.js routing | Production  |
+| **Permutive**       | Proxy + Rewriter    | 6 routes   | Rewrites SDK URLs            | First-party audience data   | Production  |
+| **Sourcepoint**     | Proxy + Rewriter    | 2 routes   | Rewrites CMP asset URLs      | First-party CMP delivery    | Development |
+| **Osano**           | Browser Mirror      | None       | Consent cookie mirroring     | First-party consent signals | Development |
+| **GPT Diagnostics** | Browser Diagnostics | None       | Closed-shadow local console  | GPT lifecycle debugging     | Development |
+| **Testlight**       | Proxy + Rewriter    | 1 route    | Rewrites integration scripts | Testing/development         | Development |
 
 ## Integration Details
 
@@ -183,6 +184,35 @@ enabled = true
 
 ---
 
+### GPT Runtime Diagnostics
+
+**What it does:** Observes documented GPT lifecycle callbacks and presents directly observed slot, timing, coverage, binding, and visibility facts in a local browser console.
+
+**Key Features:**
+
+- Explicit browser-session `ts_console` activation through a host-only HttpOnly cookie
+- Conditional standalone delivery only on active HTML documents
+- Initial and refresh request-cycle history
+- Conservative unmatched and ambiguous callback reporting
+- Exact DOM binding and non-layout-changing viewport badges
+- Versioned local JSON export with no diagnostic upload
+- No creative-provenance or auction attribution claims
+
+**Configuration:**
+
+```toml
+[integrations.gpt_diagnostics]
+enabled = true
+```
+
+**Endpoints:** None. The feature observes GPT in the browser and makes no diagnostic network request.
+
+**When to use:** You need to debug GPT request, response, render, load, viewability, refresh, and slot-binding behavior without changing ad delivery.
+
+**Learn more:** [GPT Runtime Diagnostics](./integrations/gpt-diagnostics.md)
+
+---
+
 ### Testlight
 
 **What it does:** Testing/development integration for validating the integration system with OpenRTB-like auctions.
@@ -277,13 +307,14 @@ Are you developing/testing integrations?
 
 ## Performance Considerations
 
-| Integration     | Performance Impact | Caching Strategy            | Notes                                        |
-| --------------- | ------------------ | --------------------------- | -------------------------------------------- |
-| **Prebid**      | Medium             | Response caching possible   | Timeout configurable (default 1s)            |
-| **Next.js**     | Low                | N/A (streaming rewrite)     | Minimal overhead, runs during HTML streaming |
-| **Permutive**   | Low                | SDK cached (1 hour default) | API calls proxied in real-time               |
-| **Sourcepoint** | Low                | CDN cached (1 hour default) | JS rewriting adds minor overhead             |
-| **Testlight**   | Low                | No caching                  | Development use only                         |
+| Integration         | Performance Impact | Caching Strategy              | Notes                                           |
+| ------------------- | ------------------ | ----------------------------- | ----------------------------------------------- |
+| **Prebid**          | Medium             | Response caching possible     | Timeout configurable (default 1s)               |
+| **Next.js**         | Low                | N/A (streaming rewrite)       | Minimal overhead, runs during HTML streaming    |
+| **Permutive**       | Low                | SDK cached (1 hour default)   | API calls proxied in real-time                  |
+| **Sourcepoint**     | Low                | CDN cached (1 hour default)   | JS rewriting adds minor overhead                |
+| **GPT Diagnostics** | Low when active    | Static module publicly cached | Module omitted until browser-session activation |
+| **Testlight**       | Low                | No caching                    | Development use only                            |
 
 ## Environment Variables
 
