@@ -1369,7 +1369,6 @@ export function installRefreshHandler(timeoutMs = 1500): void {
       if (!auctionSlots.length) {
         return originalRefresh(slots, opts);
       }
-      }
 
       const adUnits = auctionSlots.map((slot) => {
         const injectedSlot = findInjectedSlotForRefresh(slot);

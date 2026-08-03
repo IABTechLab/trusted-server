@@ -1981,7 +1981,7 @@ describe('prebid/installRefreshHandler', () => {
       })
     );
     expect(setTargetingForGPTAsync).toHaveBeenCalledWith(['div-ad-display']);
-    expect(originalRefresh).toHaveBeenCalledWith(undefined, undefined);
+    expect(originalRefresh).toHaveBeenCalledWith(targetSlots, undefined);
 
     mockPbjs.setTargetingForGPTAsync = undefined;
   });
