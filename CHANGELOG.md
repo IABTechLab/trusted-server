@@ -18,8 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Validate synthetic ID format on inbound values from the `x-synthetic-id` header and `synthetic_id` cookie; values that do not match the expected format (`64-hex-hmac.6-alphanumeric-suffix`) are discarded and a fresh ID is generated rather than forwarded to response headers, cookies, or third-party APIs
 
+### Fixed
+
+- Protocol-relative creative URLs now honor `rewrite.exclude_domains`, so excluded creative assets stay direct and excluded absolute or protocol-relative URLs submitted to `/first-party/sign` are rejected.
+
 ### Added
 
+- Added the default-true `[auction].rewrite_creatives` option. Setting it to `false` preserves mandatory creative sanitization across `POST /auction` and publisher SSAT/page-bids delivery while skipping first-party resource/click URL rewriting; it also skips creative TSJS injection on `POST /auction`.
 - `creative_opportunities.slot.gam_unit_path` is now a template supporting `{network_id}`, `{slot_id}`, and `{section}`, so a publisher whose ad unit varies by site section expresses it in one slot rule instead of one per (slot × section). `{section}` derives from the request path: `[creative_opportunities].section_segment` selects which path segment names the section (0-based, default `0`; set `1` for locale-prefixed URLs), and `section_root` supplies the value for paths with no such segment. `section_root` is required when a template uses `{section}`. Existing static and absent `gam_unit_path` configs are unchanged. Startup rejects a blank `gam_network_id` only when an absent/default path or `{network_id}` template consumes it. Trusted Server conservatively caps whole rendered dynamic paths at 100 UTF-8 bytes, informed by Google's 100-character per-ad-unit-code limit; an over-limit request-specific path omits that slot without failing the response. During typed/startup finalization, every placeholder-bearing template that omits `section_segment` materializes `section_segment = 0`, so an older binary rejects the blob loudly. Static and absent paths remain legacy-schema compatible only when both `section_root` and `section_segment` are omitted. Before rolling back below this feature, replace or remove dynamic paths, remove both keys, re-push and finalize the config, then roll back the binary.
 - Added Osano consent mirror integration docs and public enablement guidance.
 - Implemented basic authentication for configurable endpoint paths (#73)
