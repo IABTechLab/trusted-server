@@ -52,14 +52,43 @@ const pbjs: PbjsGlobal = (
  */
 interface ExternalPrebidBundleManifest {
   adapters?: string[];
+  bidderCodes?: string[];
   userIdModules?: string[];
+}
+
+function sanitizeManifestList(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  return value.filter((entry): entry is string => typeof entry === 'string');
 }
 
 function getExternalBundleManifest(): ExternalPrebidBundleManifest | undefined {
   if (typeof window === 'undefined') {
     return undefined;
   }
-  return (window as { __tsjs_prebid_bundle?: ExternalPrebidBundleManifest }).__tsjs_prebid_bundle;
+  // The manifest is a plain window global any page script can overwrite, so
+  // validate its shape instead of trusting the declared type: a non-array
+  // field must degrade to "not stamped" diagnostics, not a TypeError.
+  const raw = (window as { __tsjs_prebid_bundle?: unknown }).__tsjs_prebid_bundle;
+  if (raw === null || typeof raw !== 'object') {
+    return undefined;
+  }
+  const manifest = raw as Record<string, unknown>;
+  return {
+    adapters: sanitizeManifestList(manifest.adapters),
+    bidderCodes: sanitizeManifestList(manifest.bidderCodes),
+    userIdModules: sanitizeManifestList(manifest.userIdModules),
+  };
+}
+
+/**
+ * Whether the captured `window.pbjs` carries the real Prebid.js API rather
+ * than the head-injected `{ que, cmd }` stub left behind when the external
+ * bundle fails to load.
+ */
+function hasPrebidJsApi(): boolean {
+  return typeof (pbjs as { registerBidAdapter?: unknown }).registerBidAdapter === 'function';
 }
 
 const ADAPTER_CODE = 'trustedServer';
@@ -190,17 +219,36 @@ function readConfiguredUserIdNames(): string[] {
   );
 }
 
+/** Warn-once flag for an unstamped User ID manifest; reset by installPrebidNpm. */
+let warnedMissingUserIdManifest = false;
+
 function recordUserIdModuleDiagnostics(): PrebidUserIdDiagnostics {
-  const includedUserIdModules = getExternalBundleManifest()?.userIdModules ?? [];
+  const manifestUserIdModules = getExternalBundleManifest()?.userIdModules;
+  const includedUserIdModules = manifestUserIdModules ?? [];
   const configuredUserIdNames = [...new Set(readConfiguredUserIdNames())].sort();
   const coveredConfigNames = new Set(
     PREBID_USER_ID_MODULE_REGISTRY.filter((entry) =>
       includedUserIdModules.includes(entry.moduleName)
     ).flatMap((entry) => entry.configNames)
   );
-  const missingConfiguredUserIdNames = configuredUserIdNames.filter(
-    (name) => !coveredConfigNames.has(name)
-  );
+  // An older or unstamped bundle must not make every configured module look
+  // absent: warn once about the missing manifest instead of once per module,
+  // mirroring the client-side adapter validation in installPrebidNpm.
+  const missingConfiguredUserIdNames =
+    manifestUserIdModules === undefined
+      ? []
+      : configuredUserIdNames.filter((name) => !coveredConfigNames.has(name));
+  if (
+    manifestUserIdModules === undefined &&
+    configuredUserIdNames.length > 0 &&
+    !warnedMissingUserIdManifest
+  ) {
+    warnedMissingUserIdManifest = true;
+    log.warn(
+      '[tsjs-prebid] external Prebid bundle did not stamp a User ID module manifest; ' +
+        'cannot verify configured User ID modules'
+    );
+  }
 
   const diagnostics: PrebidUserIdDiagnostics = {
     includedModules: [...includedUserIdModules],
@@ -887,6 +935,10 @@ function collectAuctionEids(): AuctionEid[] | undefined {
  * Config resolution (values from later sources override earlier ones):
  * 1. `window.__tsjs_prebid` — injected by the server from trusted-server.toml
  * 2. `config` argument — explicit overrides from the publisher's JS
+ *
+ * Idempotent per page: a `window.__tsjsPrebidShimInstalled` sentinel makes
+ * repeat calls (double script inclusion, a bundle that still carries a
+ * baked-in shim) a no-op instead of a double adapter registration.
  */
 function installApsBidResponseRegistry(): void {
   const prebid = pbjs as typeof pbjs & Record<string, unknown>;
@@ -961,7 +1013,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   // (integrations.prebid.external_bundle_url). When it failed to load (network
   // error, SRI mismatch) window.pbjs is still the head-injected stub with no
   // API — installing the adapter is impossible, so bail out loudly.
-  if (typeof (pbjs as { registerBidAdapter?: unknown }).registerBidAdapter !== 'function') {
+  if (!hasPrebidJsApi()) {
     log.error(
       '[tsjs-prebid] window.pbjs has no Prebid.js API — the external Prebid bundle ' +
         'failed to load. Prebid integration disabled.'
@@ -969,6 +1021,16 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     return pbjs;
   }
 
+  const sentinelWindow =
+    typeof window === 'undefined' ? undefined : (window as { __tsjsPrebidShimInstalled?: boolean });
+  if (sentinelWindow?.__tsjsPrebidShimInstalled) {
+    return pbjs;
+  }
+  if (sentinelWindow) {
+    sentinelWindow.__tsjsPrebidShimInstalled = true;
+  }
+
+  warnedMissingUserIdManifest = false;
   publisherAdUnitSnapshots = new Map();
   pendingPublisherBids = new Map();
   pendingPublisherCodes = new Map();
@@ -1197,12 +1259,15 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   recordUserIdModuleDiagnostics();
 
   // Validate that every client-side bidder has its adapter compiled into the
-  // external Prebid.js bundle. The bundle stamps its adapter list on
-  // window.__tsjs_prebid_bundle; a missing adapter means the bidder was listed
+  // external Prebid.js bundle. The bundle stamps the registered bidder codes
+  // (including aliases such as adform/adformOpenRTB for the adf module) on
+  // window.__tsjs_prebid_bundle; a missing code means the bidder was listed
   // in client_side_bidders but not included in the generated bundle, so it is
-  // silently dropped from both server-side and client-side auctions.
-  const bundledAdapters = getExternalBundleManifest()?.adapters;
-  if (bundledAdapters === undefined) {
+  // silently dropped from both server-side and client-side auctions. Fall
+  // back to the module-name list for bundles stamped before bidderCodes.
+  const manifest = getExternalBundleManifest();
+  const bundledBidderCodes = manifest?.bidderCodes ?? manifest?.adapters;
+  if (bundledBidderCodes === undefined) {
     if (clientSideBidders.size > 0) {
       log.warn(
         '[tsjs-prebid] external Prebid bundle did not stamp an adapter manifest; ' +
@@ -1211,10 +1276,11 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     }
   } else {
     for (const bidder of clientSideBidders) {
-      if (!bundledAdapters.includes(bidder)) {
+      if (!bundledBidderCodes.includes(bidder)) {
         log.error(
           `[tsjs-prebid] client-side bidder "${bidder}" has no adapter in the external ` +
-            `Prebid bundle. Add it to build-prebid-external.mjs --adapters.`
+            'Prebid bundle. Add its adapter to [integrations.prebid.bundle].adapters in ' +
+            'trusted-server.toml and rebuild it with `ts prebid bundle`.'
         );
       }
     }
@@ -1397,8 +1463,8 @@ export function installRefreshHandler(timeoutMs = 1500): void {
 /**
  * Configure identity sync behavior for the generated Prebid User ID modules.
  *
- * The external bundle generator statically imports the selected modules through
- * `_user_ids.generated.ts`. This post-window-load configuration controls when
+ * The external bundle generator statically imports the selected modules into
+ * its generated entry. This post-window-load configuration controls when
  * those modules synchronize identities; it does not select or register modules.
  */
 export function installUserIdModules(): void {
@@ -1496,20 +1562,26 @@ function syncPrebidEidsCookie(): void {
 // Self-initialize when loaded in a browser (same pattern as other integrations).
 if (typeof window !== 'undefined') {
   installPrebidNpm();
-  installRefreshHandler();
-  // The slim-Prebid lazy loader appends this bundle from a window.load
-  // handler, so `load` may already have fired by the time this code runs —
-  // waiting for it again would skip user ID setup entirely on that path.
-  if (document.readyState === 'complete') {
-    installUserIdModules();
-  } else {
-    window.addEventListener(
-      'load',
-      () => {
-        installUserIdModules();
-      },
-      { once: true }
-    );
+  // When the external bundle failed to load, installPrebidNpm bailed out and
+  // pbjs.requestBids is undefined. Installing the refresh handler anyway
+  // would clear TS-applied GPT targeting on every publisher refresh and then
+  // fail to run the replacement auction — leave GPT untouched instead.
+  if (hasPrebidJsApi()) {
+    installRefreshHandler();
+    // The slim-Prebid lazy loader appends this bundle from a window.load
+    // handler, so `load` may already have fired by the time this code runs —
+    // waiting for it again would skip user ID setup entirely on that path.
+    if (document.readyState === 'complete') {
+      installUserIdModules();
+    } else {
+      window.addEventListener(
+        'load',
+        () => {
+          installUserIdModules();
+        },
+        { once: true }
+      );
+    }
   }
 }
 

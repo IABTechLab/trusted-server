@@ -107,6 +107,17 @@ the generated manifest. Upload the generated JavaScript file manually, set
 any redirect targets) in `proxy.allowed_domains` before running
 `ts config validate` or `ts config push`.
 
+The generated bundle is pure Prebid.js — core, consent modules, User ID
+modules, and the selected bid adapters. The Trusted Server shim
+(`tsjs-prebid`) is served separately by the server as a deferred script and
+installs itself onto the `window.pbjs` global the bundle populates. The two
+artifacts ship in lockstep: a bundle generated before the shim was split out
+still carries a baked-in copy of the shim, so upgrading the server requires
+regenerating and re-uploading the bundle (and pushing the updated
+`external_bundle_sha256`/`external_bundle_sri` config) as part of the same
+rollout. The shim refuses to install twice on one page via the
+`window.__tsjsPrebidShimInstalled` sentinel.
+
 ## Debug Mode
 
 When `debug = true`, the Prebid integration enables additional diagnostics on both the outgoing OpenRTB request and the incoming response.

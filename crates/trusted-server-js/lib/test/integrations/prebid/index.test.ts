@@ -23,6 +23,7 @@ function apsRenderer() {
  */
 const DEFAULT_BUNDLE_MANIFEST = {
   adapters: ['rubicon', 'openx', 'exampleBrowser', 'appnexus'],
+  bidderCodes: ['rubicon', 'openx', 'exampleBrowser', 'appnexus'],
   userIdModules: ['sharedIdSystem'],
 };
 
@@ -44,7 +45,8 @@ interface PrebidTestWindow {
   tsjs?: unknown;
   googletag?: unknown;
   __tsjs_prebid?: Record<string, unknown>;
-  __tsjs_prebid_bundle?: { adapters?: string[]; userIdModules?: string[] };
+  __tsjsPrebidShimInstalled?: boolean;
+  __tsjs_prebid_bundle?: unknown;
   __tsjs_prebid_diagnostics?: {
     userIdModules?: {
       includedModules: string[];
@@ -102,11 +104,7 @@ const {
   const mockMarkWinningBidAsUsed = vi.fn();
   const mockOnEvent = vi.fn();
   const mockGetUserIdsAsEids = vi.fn(
-    () =>
-      [] as Array<{
-        source: string;
-        uids?: Array<{ id: string; atype?: number; ext?: Record<string, unknown> }>;
-      }>
+    () => [] as Array<{ source: string; uids?: Array<{ id: string; atype?: number }> }>
   );
   const mockGetConfig = vi.fn();
   const mockRemoveAdUnit = vi.fn((adUnitCode?: string | string[]) => {
@@ -153,6 +151,7 @@ const {
   w.pbjs = mockPbjs;
   w.__tsjs_prebid_bundle = {
     adapters: ['rubicon', 'openx', 'exampleBrowser', 'appnexus'],
+    bidderCodes: ['rubicon', 'openx', 'exampleBrowser', 'appnexus'],
     userIdModules: ['sharedIdSystem'],
   };
 
@@ -180,6 +179,11 @@ import {
 import type { AuctionBid } from '../../../src/core/auction';
 import { log } from '../../../src/core/log';
 import envelope from '../../fixtures/aps-renderer-v1.json';
+
+// installPrebidNpm is idempotent per page; reset its sentinel for each test.
+beforeEach(() => {
+  delete testWindow.__tsjsPrebidShimInstalled;
+});
 
 describe('prebid/collectBidders', () => {
   it('returns empty array for empty ad units', () => {
@@ -754,6 +758,44 @@ describe('prebid/installPrebidNpm', () => {
     expect(result).toBe(mockPbjs);
   });
 
+  it('installs only once per page via the __tsjsPrebidShimInstalled sentinel', () => {
+    const first = installPrebidNpm();
+    const wrappedRequestBids = mockPbjs.requestBids;
+    const second = installPrebidNpm();
+
+    expect(second).toBe(first);
+    expect(mockRegisterBidAdapter).toHaveBeenCalledTimes(1);
+    expect(mockPbjs.requestBids).toBe(wrappedRequestBids);
+    expect(testWindow.__tsjsPrebidShimInstalled).toBe(true);
+  });
+
+  it('warns once about an unstamped User ID manifest instead of once per module', () => {
+    delete testWindow.__tsjs_prebid_bundle;
+    mockGetConfig.mockImplementation((key?: string) =>
+      key === 'userSync.userIds' ? [{ name: 'sharedId' }, { name: 'pairId' }] : {}
+    );
+    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
+
+    installPrebidNpm();
+    mockPbjs.requestBids({ adUnits: [] });
+
+    expect(testWindow.__tsjs_prebid_diagnostics.userIdModules).toEqual({
+      includedModules: [],
+      configuredUserIdNames: ['pairId', 'sharedId'],
+      missingConfiguredUserIdNames: [],
+    });
+    const manifestWarnings = warnSpy.mock.calls.filter(([message]) =>
+      String(message).includes('did not stamp a User ID module manifest')
+    );
+    expect(manifestWarnings).toHaveLength(1);
+    const moduleWarnings = warnSpy.mock.calls.filter(([message]) =>
+      String(message).includes('is not included in the external bundle')
+    );
+    expect(moduleWarnings).toHaveLength(0);
+
+    testWindow.__tsjs_prebid_bundle = DEFAULT_BUNDLE_MANIFEST;
+  });
+
   describe('adapter spec', () => {
     function getAdapterSpec(): TestAdapterSpec {
       installPrebidNpm();
@@ -1029,7 +1071,7 @@ describe('prebid/installPrebidNpm', () => {
 
   describe('requestBids shim', () => {
     it('injects trustedServer bidder into every ad unit', () => {
-      const pbjs = installPrebidNpm() as TestPbjs;
+      const pbjs = installPrebidNpm();
 
       const adUnits = [
         { bids: [{ bidder: 'appnexus', params: {} }] },
@@ -1053,7 +1095,7 @@ describe('prebid/installPrebidNpm', () => {
     });
 
     it('does not duplicate trustedServer if already present', () => {
-      const pbjs = installPrebidNpm() as TestPbjs;
+      const pbjs = installPrebidNpm();
 
       const adUnits = [{ bids: [{ bidder: 'trustedServer', params: {} }] }];
       pbjs.requestBids({ adUnits } as unknown as RequestBidsArg);
@@ -1063,7 +1105,7 @@ describe('prebid/installPrebidNpm', () => {
     });
 
     it('captures per-bidder params on trustedServer bid', () => {
-      const pbjs = installPrebidNpm() as TestPbjs;
+      const pbjs = installPrebidNpm();
 
       const adUnits = [
         {
@@ -1085,7 +1127,7 @@ describe('prebid/installPrebidNpm', () => {
     });
 
     it('preserves captured bidder params when requestBids runs twice on the same ad unit', () => {
-      const pbjs = installPrebidNpm() as TestPbjs;
+      const pbjs = installPrebidNpm();
 
       // First auction: inline server-side params supplied by the publisher.
       const adUnits = [
@@ -1114,13 +1156,13 @@ describe('prebid/installPrebidNpm', () => {
     });
 
     it('adds bids array to ad units that have none', () => {
-      const pbjs = installPrebidNpm() as TestPbjs;
+      const pbjs = installPrebidNpm();
 
       const adUnits = [{ code: 'div-1' }] as TestAdUnit[];
       pbjs.requestBids({ adUnits } as unknown as RequestBidsArg);
 
       expect(adUnits[0].bids).toHaveLength(1);
-      expect(adUnits[0].bids![0].bidder).toBe('trustedServer');
+      expect(adUnits[0].bids[0].bidder).toBe('trustedServer');
     });
 
     it('normalizes a truthy non-array bids value without throwing', () => {
@@ -1135,7 +1177,7 @@ describe('prebid/installPrebidNpm', () => {
     });
 
     it('includes zone from mediaTypes.banner.name in trustedServer params', () => {
-      const pbjs = installPrebidNpm() as TestPbjs;
+      const pbjs = installPrebidNpm();
 
       const adUnits = [
         {
@@ -1159,7 +1201,7 @@ describe('prebid/installPrebidNpm', () => {
     });
 
     it('omits zone when mediaTypes.banner.name is not set', () => {
-      const pbjs = installPrebidNpm() as TestPbjs;
+      const pbjs = installPrebidNpm();
 
       const adUnits = [
         {
@@ -1175,7 +1217,7 @@ describe('prebid/installPrebidNpm', () => {
     });
 
     it('omits zone when ad unit has no mediaTypes', () => {
-      const pbjs = installPrebidNpm() as TestPbjs;
+      const pbjs = installPrebidNpm();
 
       const adUnits = [{ bids: [{ bidder: 'rubicon', params: {} }] }];
       pbjs.requestBids({ adUnits } as unknown as RequestBidsArg);
@@ -1185,7 +1227,7 @@ describe('prebid/installPrebidNpm', () => {
     });
 
     it('clears stale zone when existing trustedServer bid is reused', () => {
-      const pbjs = installPrebidNpm() as TestPbjs;
+      const pbjs = installPrebidNpm();
 
       const adUnits = [
         {
@@ -1213,7 +1255,7 @@ describe('prebid/installPrebidNpm', () => {
     });
 
     it('falls back to pbjs.adUnits when requestObj has no adUnits', () => {
-      const pbjs = installPrebidNpm() as TestPbjs;
+      const pbjs = installPrebidNpm();
 
       mockPbjs.adUnits = [{ bids: [{ bidder: 'openx', params: {} }] }] as TestAdUnit[];
       pbjs.requestBids({} as RequestBidsArg);
@@ -2161,7 +2203,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
       clearTargeting: vi.fn(),
     };
     const { pubads } = installGpt([slot]);
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
     const firstParams = { placement: 'first' };
     const effectiveParams = { placement: 'effective' };
 
@@ -2212,7 +2254,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
       clearTargeting: vi.fn(),
     };
     const { pubads } = installGpt([slot]);
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
     const serverParams = {
       placement: {
         rules: [{ label: 'original-rule' }],
@@ -2262,12 +2304,10 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     const firstRefreshBids = refreshAdUnitFromLastRequest().bids;
     expect(firstRefreshBids).toEqual(expectedBids);
 
-    const refreshServerParams = firstRefreshBids[0].params as NestedServerParams;
-    refreshServerParams.bidderParams.exampleServer.placement.rules[0].label =
+    firstRefreshBids[0].params.bidderParams.exampleServer.placement.rules[0].label =
       'changed-refresh-rule';
-    refreshServerParams.bidderParams.exampleServer.placement.sizes.push(777);
-    const refreshBrowserParams = firstRefreshBids[1].params as NestedBrowserParams;
-    refreshBrowserParams.groups[0].values[0] = 'changed-refresh-value';
+    firstRefreshBids[0].params.bidderParams.exampleServer.placement.sizes.push(777);
+    firstRefreshBids[1].params.groups[0].values[0] = 'changed-refresh-value';
     pubads.refresh([slot]);
 
     expect(refreshAdUnitFromLastRequest().bids).toEqual(expectedBids);
@@ -2282,7 +2322,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
       clearTargeting: vi.fn(),
     };
     const { pubads } = installGpt([slot]);
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
 
     pbjs.requestBids({
       adUnits: [
@@ -2342,7 +2382,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
       clearTargeting: vi.fn(),
     };
     const { pubads } = installGpt([slotOne, slotTwo, globalSlot]);
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
 
     pbjs.requestBids({
       adUnits: [
@@ -2395,7 +2435,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
       ],
     };
     mockPbjs.adUnits = [liveUnit];
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
 
     pbjs.requestBids();
     pbjs.requestBids({ adUnits: [{ code, bids: [] }] } as unknown as RequestBidsArg);
@@ -2419,7 +2459,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
       clearTargeting: vi.fn(),
     };
     const { pubads } = installGpt([slot]);
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
 
     pbjs.requestBids({
       adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: { placement: 'snapshot' } }] }],
@@ -2441,7 +2481,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
       clearTargeting: vi.fn(),
     }));
     const { pubads } = installGpt(slots);
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
 
     pbjs.requestBids({
       adUnits: codes.map((code) => ({
@@ -2487,7 +2527,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
       clearTargeting: vi.fn(),
     };
     const { pubads } = installGpt([oldestSlot, activeSlot]);
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
 
     for (let index = 0; index < capacity; index += 1) {
       pbjs.requestBids({
@@ -2534,7 +2574,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     };
     const { originalRefresh, pubads } = installGpt([slotOne, slotTwo]);
     mockRequestBids.mockImplementation((opts) => completePublisherAuction(opts));
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
 
     pbjs.requestBids({
       adUnits: [
@@ -2564,7 +2604,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     };
     const { originalRefresh, pubads } = installGpt([slot]);
     mockRequestBids.mockImplementation((opts) => completePublisherAuction(opts));
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
 
     pbjs.requestBids({
       adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
@@ -2597,7 +2637,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
         syntheticBidsBackHandler = opts.bidsBackHandler;
       }
     });
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
 
     pbjs.requestBids({
       adUnits: [{ code: 'example-sra-delivery', bids: [{ bidder: 'exampleServer', params: {} }] }],
@@ -2626,7 +2666,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     };
     const { originalRefresh, pubads } = installGpt([coveredSlot, gamOnlySlot]);
     mockRequestBids.mockImplementation((opts) => completePublisherAuction(opts));
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
 
     pbjs.requestBids({
       adUnits: [{ code: 'example-covered', bids: [{ bidder: 'exampleServer', params: {} }] }],
@@ -2655,7 +2695,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     };
     const { originalRefresh, pubads } = installGpt([coveredSlot, unrelatedSlot]);
     mockRequestBids.mockImplementation((opts) => completePublisherAuction(opts));
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
 
     pbjs.requestBids({
       adUnits: [{ code: 'example-covered', bids: [{ bidder: 'exampleServer', params: {} }] }],
@@ -2694,7 +2734,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     const refreshSlots = [...coveredSlots, gamOnlySlot];
     const { originalRefresh, pubads } = installGpt(refreshSlots);
     mockRequestBids.mockImplementation((opts) => completePublisherAuction(opts));
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
 
     pbjs.requestBids({
       adUnits: coveredSlots.map((_, index) => ({
@@ -2725,7 +2765,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
       mockRequestBids.mockImplementation((opts) =>
         completePublisherAuction(opts, { applyTargeting: false })
       );
-      const pbjs = installPrebidNpm() as TestPbjs;
+      const pbjs = installPrebidNpm();
 
       pbjs.requestBids({
         adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
@@ -2754,7 +2794,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
       };
       const { originalRefresh, pubads } = installGpt([slot]);
       mockRequestBids.mockImplementation((opts) => completePublisherAuction(opts));
-      const pbjs = installPrebidNpm() as TestPbjs;
+      const pbjs = installPrebidNpm();
 
       pbjs.requestBids({
         adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
@@ -2786,7 +2826,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
       mockRequestBids.mockImplementation((opts) =>
         completePublisherAuction(opts, { auctionId, applyTargeting: false })
       );
-      const pbjs = installPrebidNpm() as TestPbjs;
+      const pbjs = installPrebidNpm();
 
       pbjs.requestBids({
         adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
@@ -2831,7 +2871,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     mockRequestBids.mockImplementation((opts) =>
       completePublisherAuction(opts, { auctionId, applyTargeting: false })
     );
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
 
     pbjs.requestBids({
       adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
@@ -2902,7 +2942,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     mockRequestBids.mockImplementation((opts) =>
       completePublisherAuction(opts, { applyTargeting: false })
     );
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
 
     // Model an initial impression rendered with display() after an auction
     // that did not apply hb_adid targeting. Its code-only state is unconsumed.
@@ -2933,7 +2973,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     mockRequestBids.mockImplementation((opts) =>
       completePublisherAuction(opts, { applyTargeting: false })
     );
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
 
     pbjs.requestBids({
       adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
@@ -2970,7 +3010,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
       }
       completePublisherAuction(opts);
     });
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
 
     pbjs.requestBids({
       adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
@@ -3002,7 +3042,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     const refreshSlots = [innerSlot, outerSlot, gamOnlySlot];
     const { originalRefresh, pubads } = installGpt(refreshSlots);
     mockRequestBids.mockImplementation((opts) => completePublisherAuction(opts));
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
 
     pbjs.requestBids({
       adUnits: [
@@ -3037,7 +3077,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     mockRequestBids.mockImplementation((opts) =>
       completePublisherAuction(opts, { applyTargeting: false })
     );
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
     let deferredRefresh: Promise<void> | undefined;
 
     pbjs.requestBids({
@@ -3069,7 +3109,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     mockRequestBids.mockImplementation((opts) =>
       completePublisherAuction(opts, { auctionId, applyTargeting: false })
     );
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
     let deferredRefresh: Promise<void> | undefined;
 
     pbjs.requestBids({
@@ -3098,7 +3138,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     };
     const { originalRefresh, pubads } = installGpt([slot]);
     mockRequestBids.mockImplementation((opts) => completePublisherAuction(opts));
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
 
     pbjs.requestBids({
       adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
@@ -3132,7 +3172,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     };
     const { originalRefresh, pubads } = installGpt([slot]);
     mockRequestBids.mockImplementation((opts) => completePublisherAuction(opts));
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
 
     pbjs.requestBids({
       adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
@@ -3158,7 +3198,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     };
     const { originalRefresh, pubads } = installGpt([slot]);
     mockRequestBids.mockImplementation((opts) => completePublisherAuction(opts));
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
     const request = {
       adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
     };
@@ -3277,7 +3317,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
   });
 
   it('does not stack the removeAdUnit lifecycle wrapper across installation', () => {
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
     installPrebidNpm();
 
     (pbjs as unknown as { removeAdUnit: (adUnitCode?: string | string[]) => void }).removeAdUnit(
@@ -3300,7 +3340,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     };
     const { originalRefresh, pubads } = installGpt([outerSlot, innerSlot]);
     mockRequestBids.mockImplementation((opts) => completePublisherAuction(opts));
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
 
     pbjs.requestBids({
       adUnits: [
@@ -3335,7 +3375,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     mockRequestBids.mockImplementation((opts) =>
       completePublisherAuction(opts, { applyTargeting: false })
     );
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
 
     expect(() =>
       pbjs.requestBids({
@@ -3411,7 +3451,7 @@ describe('prebid/client-side bidders', () => {
 
     const tsBid = adUnits[0].bids.find((b: TestBid) => b.bidder === 'trustedServer') as TestBid;
     expect(tsBid).toBeDefined();
-    // rubicon should NOT be in bidderParams because it runs client-side
+    // rubicon should NOT be in bidderParams — it runs client-side
     expect(tsBid.params.bidderParams).toEqual({
       appnexus: { placementId: 123 },
       kargo: { placementId: 'k1' },
@@ -3421,7 +3461,7 @@ describe('prebid/client-side bidders', () => {
   it('preserves client-side bidder bids as standalone entries', () => {
     testWindow.__tsjs_prebid = { clientSideBidders: ['rubicon'] };
 
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
 
     const adUnits = [
       {
@@ -3469,8 +3509,8 @@ describe('prebid/client-side bidders', () => {
   });
 
   it('behaves normally when no client-side bidders are configured', () => {
-    // No __tsjs_prebid at all, so all bidders go server-side
-    const pbjs = installPrebidNpm() as TestPbjs;
+    // No __tsjs_prebid at all — all bidders go server-side
+    const pbjs = installPrebidNpm();
 
     const adUnits = [
       {
@@ -3492,7 +3532,7 @@ describe('prebid/client-side bidders', () => {
   it('behaves normally when client-side bidders list is empty', () => {
     testWindow.__tsjs_prebid = { clientSideBidders: [] };
 
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
 
     const adUnits = [
       {
@@ -3514,7 +3554,7 @@ describe('prebid/client-side bidders', () => {
   it('still injects trustedServer when all bidders are client-side', () => {
     testWindow.__tsjs_prebid = { clientSideBidders: ['rubicon', 'appnexus'] };
 
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
 
     const adUnits = [
       {
@@ -3537,6 +3577,7 @@ describe('prebid/client-side bidders', () => {
     testWindow.__tsjs_prebid_bundle = {
       ...DEFAULT_BUNDLE_MANIFEST,
       adapters: ['rubicon'],
+      bidderCodes: ['rubicon'],
     };
     testWindow.__tsjs_prebid = { clientSideBidders: ['rubicon', 'openx'] };
 
@@ -3557,6 +3598,13 @@ describe('prebid/client-side bidders', () => {
     );
     expect(hasOpenxError).toBe(true);
 
+    // The error should point at the operator surface: the CLI config key,
+    // not the internal build script.
+    const pointsAtBundleConfig = errorCalls.some((args) =>
+      args.some((a) => typeof a === 'string' && a.includes('[integrations.prebid.bundle].adapters'))
+    );
+    expect(pointsAtBundleConfig).toBe(true);
+
     // Should NOT log an error for the compiled-in adapter
     const hasRubiconError = errorCalls.some((args) =>
       args.some((a) => typeof a === 'string' && a.includes('client-side bidder "rubicon"'))
@@ -3564,6 +3612,76 @@ describe('prebid/client-side bidders', () => {
     expect(hasRubiconError).toBe(false);
 
     errorSpy.mockRestore();
+    testWindow.__tsjs_prebid_bundle = DEFAULT_BUNDLE_MANIFEST;
+  });
+
+  it('accepts alias bidder codes stamped in bidderCodes', () => {
+    // The adf module registers adf plus the adform/adformOpenRTB aliases;
+    // the module-name list alone would flag them as missing.
+    testWindow.__tsjs_prebid_bundle = {
+      ...DEFAULT_BUNDLE_MANIFEST,
+      adapters: ['adf'],
+      bidderCodes: ['adf', 'adform', 'adformOpenRTB'],
+    };
+    testWindow.__tsjs_prebid = { clientSideBidders: ['adform'] };
+
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    installPrebidNpm();
+
+    const hasAdapterError = errorSpy.mock.calls.some((args) =>
+      args.some(
+        (a) => typeof a === 'string' && a.includes('has no adapter in the external Prebid bundle')
+      )
+    );
+    expect(hasAdapterError).toBe(false);
+
+    errorSpy.mockRestore();
+    testWindow.__tsjs_prebid_bundle = DEFAULT_BUNDLE_MANIFEST;
+  });
+
+  it('rejects a module file stem that is not a registered bidder code', () => {
+    // a1MediaBidAdapter.js registers a1media — configuring the file stem
+    // must be flagged even though the module itself is compiled in.
+    testWindow.__tsjs_prebid_bundle = {
+      ...DEFAULT_BUNDLE_MANIFEST,
+      adapters: ['a1Media'],
+      bidderCodes: ['a1media'],
+    };
+    testWindow.__tsjs_prebid = { clientSideBidders: ['a1Media'] };
+
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    installPrebidNpm();
+
+    const hasAdapterError = errorSpy.mock.calls.some((args) =>
+      args.some(
+        (a) =>
+          typeof a === 'string' &&
+          a.includes('client-side bidder "a1Media" has no adapter in the external Prebid bundle')
+      )
+    );
+    expect(hasAdapterError).toBe(true);
+
+    errorSpy.mockRestore();
+    testWindow.__tsjs_prebid_bundle = DEFAULT_BUNDLE_MANIFEST;
+  });
+
+  it('treats a malformed manifest as unstamped instead of throwing', () => {
+    // The manifest is a plain window global any page script can overwrite.
+    testWindow.__tsjs_prebid_bundle = { adapters: 'rubicon', userIdModules: 42 };
+    testWindow.__tsjs_prebid = { clientSideBidders: ['rubicon'] };
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    expect(() => installPrebidNpm()).not.toThrow();
+
+    const hasManifestWarn = warnSpy.mock.calls.some((args) =>
+      args.some((a) => typeof a === 'string' && a.includes('did not stamp an adapter manifest'))
+    );
+    expect(hasManifestWarn).toBe(true);
+
+    warnSpy.mockRestore();
     testWindow.__tsjs_prebid_bundle = DEFAULT_BUNDLE_MANIFEST;
   });
 
@@ -3602,6 +3720,55 @@ describe('prebid/client-side bidders', () => {
   });
 });
 
+describe('prebid/self-init without the external bundle', () => {
+  afterEach(() => {
+    // Restore the module registry and the full mock global for later suites.
+    testWindow.pbjs = mockPbjs;
+    delete testWindow.googletag;
+    vi.resetModules();
+  });
+
+  it('disables the integration and leaves pbjs and GPT untouched', async () => {
+    // Simulate a failed external bundle load: window.pbjs is still the
+    // head-injected stub with no Prebid.js API. The module captures the
+    // global at evaluation time, so reset the registry and re-import.
+    vi.resetModules();
+    const barePbjs: {
+      que: Array<() => void>;
+      cmd: Array<() => void>;
+      requestBids?: unknown;
+    } = { que: [], cmd: [] };
+    testWindow.pbjs = barePbjs;
+    const pubads = { refresh: vi.fn() };
+    const cmdPush = vi.fn((callback: () => void) => callback());
+    testWindow.googletag = { cmd: { push: cmdPush }, pubads: () => pubads };
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await import('../../../src/integrations/prebid/index');
+
+    // The bail-out is logged loudly.
+    const hasBailOutError = errorSpy.mock.calls.some((args) =>
+      args.some((a) => typeof a === 'string' && a.includes('has no Prebid.js API'))
+    );
+    expect(hasBailOutError).toBe(true);
+
+    // requestBids is left unwrapped and no adapter registration was attempted.
+    expect(barePbjs.requestBids).toBeUndefined();
+
+    // The refresh handler must not install: a wrapped googletag refresh
+    // would clear TS-applied targeting and then fail to run any auction.
+    expect(cmdPush).not.toHaveBeenCalled();
+    expect(
+      (pubads as { refresh: unknown; __tsRefreshWrapped?: boolean }).__tsRefreshWrapped
+    ).toBeUndefined();
+
+    // The sentinel stays unset so a later successful install can still run.
+    expect(testWindow.__tsjsPrebidShimInstalled).toBeUndefined();
+
+    errorSpy.mockRestore();
+  });
+});
+
 describe('prebid self-init user ID module timing', () => {
   const userSyncCallCount = () =>
     mockSetConfig.mock.calls.filter(([arg]) => arg && typeof arg === 'object' && 'userSync' in arg)
@@ -3622,7 +3789,7 @@ describe('prebid self-init user ID module timing', () => {
 
   it('installs user ID modules immediately when the bundle loads after window load', async () => {
     // The GPT slim loader appends this bundle from a window.load handler, so
-    // the document is already complete and a load listener would never fire.
+    // the document is already complete — a load listener would never fire.
     setReadyState('complete');
 
     await import('../../../src/integrations/prebid/index');
@@ -3640,7 +3807,7 @@ describe('prebid self-init user ID module timing', () => {
     window.dispatchEvent(new Event('load'));
     expect(userSyncCallCount()).toBe(1);
 
-    // { once: true }: a second load event must not reinstall.
+    // { once: true } — a second load event must not reinstall.
     window.dispatchEvent(new Event('load'));
     expect(userSyncCallCount()).toBe(1);
   });
