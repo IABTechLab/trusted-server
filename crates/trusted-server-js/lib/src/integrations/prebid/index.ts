@@ -1289,6 +1289,8 @@ export function installRefreshHandler(timeoutMs = 1500): void {
         return originalRefresh(slots, opts);
       }
 
+      // Clear stale Trusted Server/Prebid targeting from independent slots before
+      // filtering so excluded slots still receive a clean GAM refresh.
       independentSlots.forEach(clearRefreshTargeting);
 
       const excludedGamAdUnitPathSuffixes = new Set(
@@ -1297,8 +1299,10 @@ export function installRefreshHandler(timeoutMs = 1500): void {
       const auctionSlots = independentSlots.filter(
         (slot) => !isExcludedFromRefreshAuction(slot, excludedGamAdUnitPathSuffixes)
       );
+      const hasExcludedSlots = auctionSlots.length < independentSlots.length;
       if (!auctionSlots.length) {
         return originalRefresh(slots, opts);
+      }
       }
 
       const adUnits = auctionSlots.map((slot) => {
@@ -1361,7 +1365,11 @@ export function installRefreshHandler(timeoutMs = 1500): void {
             log.error('[tsjs-prebid] refresh targeting failed', error);
           }
         }
-        originalRefresh(slots, opts);
+        // A bare refresh that filters slots must pass the resolved complete list
+        // to GPT; otherwise the excluded slots would be refreshed implicitly but
+        // would not be represented by the wrapper's concrete target set. Keep
+        // the existing bare-refresh delivery behavior when no filtering occurs.
+        originalRefresh(slots === undefined && hasExcludedSlots ? targetSlots : slots, opts);
       }
 
       try {
