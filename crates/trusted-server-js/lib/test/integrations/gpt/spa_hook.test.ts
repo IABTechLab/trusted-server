@@ -19,6 +19,12 @@ async function flushAsync(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+/** Allow a MutationObserver-scheduled slot check to run. */
+async function flushAnimationFrame(): Promise<void> {
+  await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+  await Promise.resolve();
+}
+
 describe('installSpaAuctionHook', () => {
   let fetchStub: ReturnType<typeof vi.fn>;
   // popstate listeners registered by each module import. In production the hook
@@ -178,7 +184,7 @@ describe('installSpaAuctionHook', () => {
 
     // Container commits — the hook should now apply bids exactly once.
     document.body.innerHTML = '<div id="div-late"></div>';
-    await flushAsync();
+    await flushAnimationFrame();
 
     expect(ts.adSlots).toEqual([{ id: 'late', div_id: 'div-late' }]);
     expect(ts.bids).toEqual({ late: { hb_pb: '2.00' } });
@@ -215,7 +221,7 @@ describe('installSpaAuctionHook', () => {
     const second = document.createElement('div');
     second.id = 'div-second';
     document.body.appendChild(second);
-    await flushAsync();
+    await flushAnimationFrame();
 
     expect(ts.adSlots).toEqual([
       { id: 'first', div_id: 'div-first' },

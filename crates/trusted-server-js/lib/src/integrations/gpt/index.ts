@@ -90,7 +90,10 @@ function findSlotElementByDivId(divId: string): HTMLElement | null {
   // Geometry is only needed to disambiguate multiple responsive siblings.
   if (prefixMatches.length === 1) return prefixMatches[0] ?? null;
 
-  const activeMatches = prefixMatches.filter(slotElementHasLayout);
+  const visibleMatches = prefixMatches.filter(isElementVisible);
+  if (visibleMatches.length === 1) return visibleMatches[0] ?? null;
+
+  const activeMatches = visibleMatches.filter(slotElementHasLayout);
   if (activeMatches.length === 1) return activeMatches[0] ?? null;
 
   if (prefixMatches.length > 1) {
@@ -1147,16 +1150,26 @@ function waitForSlotElements(slots: AuctionSlot[], signal: AbortSignal): Promise
 
   return new Promise<void>((resolve) => {
     let settled = false;
+    let animationFrame: number | undefined;
     const finish = (): void => {
       if (settled) return;
       settled = true;
+      if (animationFrame !== undefined) cancelAnimationFrame(animationFrame);
       observer.disconnect();
       clearTimeout(timer);
       signal.removeEventListener('abort', finish);
       resolve();
     };
     const observer = new MutationObserver(() => {
-      if (allPresent()) finish();
+      if (animationFrame !== undefined) return;
+      if (typeof requestAnimationFrame === 'undefined') {
+        if (allPresent()) finish();
+        return;
+      }
+      animationFrame = requestAnimationFrame(() => {
+        animationFrame = undefined;
+        if (allPresent()) finish();
+      });
     });
     observer.observe(document.documentElement, { childList: true, subtree: true });
     const timer = setTimeout(finish, SPA_SLOT_WAIT_MS);
