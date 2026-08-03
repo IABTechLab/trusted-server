@@ -135,7 +135,8 @@ fn is_section_char(ch: char) -> bool {
 
 /// Collapses each run of characters outside `[A-Za-z0-9_-]` to a single `_`.
 ///
-/// Returns a non-empty string for any non-empty input.
+/// Returns a non-empty, request-derived ASCII string for any non-empty input,
+/// capped at 100 ASCII (and therefore UTF-8) bytes.
 fn sanitize_section(segment: &str) -> String {
     let mut out = String::with_capacity(segment.len().min(MAX_SECTION_BYTES));
     let mut in_bad_run = false;
@@ -158,9 +159,10 @@ fn sanitize_section(segment: &str) -> String {
 /// Derives the `{section}` value from a request path.
 ///
 /// Takes the non-empty path segment at `section_segment` (0-based, counting
-/// only non-empty segments), sanitized to `[A-Za-z0-9_-]`. Falls back to
-/// `section_root` when the path has no such segment — the site root (`/`,
-/// repeated slashes), or a path shorter than the configured index.
+/// only non-empty segments), sanitizes it to `[A-Za-z0-9_-]`, and caps the
+/// request-derived result at 100 ASCII/UTF-8 bytes. Falls back to `section_root`
+/// when the path has no such segment — the site root (`/`), repeated slashes,
+/// or a path shorter than the configured index.
 ///
 /// `section_segment` exists because the URL→section convention is
 /// publisher-specific: a site that prefixes a locale (`/en/news/article`) sets
@@ -170,7 +172,7 @@ fn sanitize_section(segment: &str) -> String {
 /// how [`page_patterns`](CreativeOpportunitySlot::page_patterns) glob-match the
 /// same path — e.g. `/new%20s` yields `new_20s`, never the decoded `new_s`.
 #[must_use]
-pub fn derive_section(path: &str, section_root: &str, section_segment: usize) -> String {
+fn derive_section(path: &str, section_root: &str, section_segment: usize) -> String {
     match path
         .split('/')
         .filter(|segment| !segment.is_empty())
@@ -207,8 +209,9 @@ pub struct CreativeOpportunitiesConfig {
     /// Price granularity for header-bidding price bucketing. Defaults to `Dense`.
     #[serde(default)]
     pub price_granularity: PriceGranularity,
-    /// Value substituted for `{section}` when the request path has no first
-    /// segment (e.g. `/`).
+    /// Value substituted for `{section}` when the request path has no segment
+    /// at [`section_segment`](Self::section_segment), such as `/` or a path
+    /// shorter than that configured index.
     ///
     /// Required when any slot's [`gam_unit_path`](CreativeOpportunitySlot::gam_unit_path)
     /// template contains `{section}`. No default — a home-section name is
@@ -228,9 +231,13 @@ pub struct CreativeOpportunitiesConfig {
     /// [`section_root`](Self::section_root), so on `/en` a config with
     /// `section_segment = 1` renders the root section.
     ///
-    /// `Option` rather than a plain `usize` with a serde default for the same
-    /// rollback reason as [`section_root`](Self::section_root): an unset key
-    /// must not appear in the serialized config blob.
+    /// Static and absent [`gam_unit_path`](CreativeOpportunitySlot::gam_unit_path)
+    /// configurations keep this `None`, preserving their legacy serialized
+    /// shape. After successfully parsing any placeholder-bearing template,
+    /// [`compile_unit_templates`](Self::compile_unit_templates) materializes
+    /// `Some(0)` when this is unset as an automatic compatibility marker: an
+    /// older `deny_unknown_fields` binary then fails loudly rather than silently
+    /// accepting a dynamic configuration it does not understand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub section_segment: Option<usize>,
     /// Slot templates. Empty vec = feature disabled (no auction fired, no globals injected).
@@ -243,9 +250,8 @@ impl CreativeOpportunitiesConfig {
     /// policy ([`section_root`](Self::section_root) and
     /// [`section_segment`](Self::section_segment)).
     ///
-    /// Prefer this over calling [`derive_section`] directly: it keeps both
-    /// policy knobs together so a call site cannot apply one and forget the
-    /// other.
+    /// This keeps both policy knobs together so callers consistently apply the
+    /// configured section-selection and fallback rules.
     ///
     /// An unset [`section_root`](Self::section_root) yields an empty section for
     /// a path with no matching segment. [`validate_runtime`](Self::validate_runtime)
@@ -272,7 +278,10 @@ impl CreativeOpportunitiesConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error string when any slot's template is malformed.
+    /// Returns an error string when any slot's template is malformed. After all
+    /// templates parse successfully, materializes `section_segment = Some(0)`
+    /// for a placeholder-bearing template that omitted it, so rollback to an
+    /// older `deny_unknown_fields` binary fails loudly.
     pub fn compile_unit_templates(&mut self) -> Result<(), String> {
         for slot in &mut self.slot {
             slot.compile_unit_template()?;
@@ -291,17 +300,20 @@ impl CreativeOpportunitiesConfig {
     /// Validate all slot definitions after runtime preparation.
     ///
     /// Call [`compile_unit_templates`](Self::compile_unit_templates) first so
-    /// malformed templates fail at startup. Validation also reads raw templates
-    /// when their cache is absent. [`Settings::prepare_runtime`](crate::settings::Settings)
+    /// malformed templates fail at startup. When the cache is absent, validation
+    /// also reads a valid raw template so placeholder-dependent requirements are
+    /// still enforced; compilation remains required to reject malformed raw
+    /// templates. [`Settings::prepare_runtime`](crate::settings::Settings)
     /// enforces this order.
     ///
     /// # Errors
     ///
-    /// Returns an error string when a consumed [`gam_network_id`](Self::gam_network_id)
-    /// is blank, when a slot has an invalid identifier, page pattern set, format
-    /// list, or dimensions, or when a slot's
-    /// `gam_unit_path` template uses `{section}` without a valid
-    /// [`section_root`](Self::section_root).
+    /// Returns an error string when [`gam_network_id`](Self::gam_network_id) is
+    /// blank but consumed by a default path or `{network_id}` template; when a
+    /// slot has an invalid identifier, page pattern set, format list, or
+    /// dimensions; when a `{section}` template lacks a valid
+    /// [`section_root`](Self::section_root); or when configured values make a
+    /// dynamic path exceed 100 UTF-8 bytes.
     pub fn validate_runtime(&self) -> Result<(), String> {
         // A network ID is required only when a slot renders the default
         // `/<network_id>/<slot_id>` path or substitutes `{network_id}`. Static

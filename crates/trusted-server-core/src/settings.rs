@@ -5142,6 +5142,24 @@ formats = [{ width = 300, height = 250 }]
     }
 
     #[test]
+    fn settings_rejects_dynamic_gam_unit_path_over_byte_limit_using_configured_values() {
+        let gam_unit_path = "{network_id}".repeat(10);
+        let slot_body = format!(
+            r#"
+id = "atf"
+gam_unit_path = "{gam_unit_path}"
+page_patterns = ["/"]
+formats = [{{ width = 300, height = 250 }}]
+"#
+        );
+
+        assert_creative_opportunity_slot_config_rejected(
+            &slot_body,
+            "must render to at most 100 UTF-8 bytes",
+        );
+    }
+
+    #[test]
     fn admin_endpoints_match_fastly_router() {
         let router_source = include_str!("../../trusted-server-adapter-fastly/src/app.rs");
 

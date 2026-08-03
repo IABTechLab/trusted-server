@@ -1301,15 +1301,22 @@ expresses that in **one** slot rule instead of one rule per (slot × section).
 
 Supported placeholders:
 
-| Placeholder    | Resolves to                                                    |
-| -------------- | -------------------------------------------------------------- |
-| `{network_id}` | `gam_network_id`                                               |
-| `{slot_id}`    | the slot's `id`                                                |
-| `{section}`    | first path segment of the request (see derivation rules below) |
+| Placeholder    | Resolves to                                                     |
+| -------------- | --------------------------------------------------------------- |
+| `{network_id}` | `gam_network_id`                                                |
+| `{slot_id}`    | the slot's `id`                                                 |
+| `{section}`    | non-empty request-path segment at `section_segment` (see below) |
 
 A template with **no** placeholders is used verbatim. A slot with **no**
 `gam_unit_path` falls back to `/<network_id>/<slot_id>`. Both preserve the
 pre-templating behavior, so existing static configs are unchanged.
+
+Dynamic template results are limited to 100 UTF-8 bytes. See Google's
+[100-character GAM limit](https://support.google.com/admanager/answer/1628457?hl=en).
+If a request-specific substitution would exceed the dynamic limit, only that
+slot is omitted from the response; the response itself still succeeds. Explicit
+static paths and absent/default paths retain legacy behavior and are not subject
+to this dynamic-only limit.
 
 ### `{section}` derivation
 
@@ -1319,7 +1326,10 @@ pre-templating behavior, so existing static configs are unchanged.
   With the default, `/news/article-123` → `news`. A site that prefixes a locale
   sets `section_segment = 1`, so `/en/news/article` → `news` rather than `en`.
 - It is sanitized: each run of characters outside `[A-Za-z0-9_-]` becomes a
-  single `_`.
+  single `_`, and the request-derived result is capped at 100 ASCII bytes.
+- Casing is preserved. [Google documents GAM ad-unit codes as
+  case-insensitive](https://support.google.com/admanager/answer/10477476?hl=en),
+  so do not lowercase the value.
 - The path is used **raw — it is not percent-decoded**. So `/new%20s` →
   `new_20s` (only `%` is disallowed; `2` and `0` are kept), never the decoded
   `new_s`. This keeps `{section}` consistent with how `page_patterns` match the
@@ -1332,18 +1342,21 @@ pre-templating behavior, so existing static configs are unchanged.
 `section_root` is **required** whenever any slot's template uses `{section}`,
 and must match `[A-Za-z0-9_-]+`. There is no default: the home-section name is
 publisher-specific. Startup fails if `{section}` is used without a valid
-`section_root`, and also if `gam_network_id` is blank while any slot is
-configured (a template referencing `{network_id}` would otherwise render an
-unusable path). A `[creative_opportunities]` block with no slots is disabled, so
-its `gam_network_id` is not checked.
+`section_root`. Startup rejects a blank `gam_network_id` only when an absent
+path/default or a `{network_id}` template consumes it; static paths and
+templates without `{network_id}` do not consume it. A
+`[creative_opportunities]` block with no slots is disabled, so its
+`gam_network_id` is not checked.
 
 Both knobs are config-driven, so the URL→section convention stays with the
 publisher: `section_segment` selects which segment names the section, and
 `section_root` names the section when there is none.
 
-Leave both keys out when no template uses `{section}`. The pushed config blob
-carries only the keys your config sets, and a binary older than these keys
-rejects a blob containing them — so an unused key would block a rollback.
+Static and absent paths omit this automatic compatibility marker and remain
+compatible with the legacy config schema. Every placeholder-bearing dynamic
+template automatically serializes `section_segment = 0` when it was omitted,
+so an older binary rejects the pushed blob loudly. Before rolling back below
+this feature, revert dynamic paths to static or absent paths.
 
 Example resolution for `gam_unit_path = "/{network_id}/example/{section}"` with
 `gam_network_id = "123456789"`, `section_root = "home"`, and the
