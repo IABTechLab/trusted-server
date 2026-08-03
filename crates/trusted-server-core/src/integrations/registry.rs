@@ -327,7 +327,7 @@ pub trait IntegrationProxy: Send + Sync {
 pub struct RequestFilterInput<'a> {
     pub settings: &'a Settings,
     pub services: &'a RuntimeServices,
-    pub request: &'a Request<EdgeBody>,
+    pub request: &'a mut Request<EdgeBody>,
     pub geo_info: Option<&'a GeoInfo>,
     /// Whether the request matches a registered integration proxy route.
     pub is_integration_route: bool,
@@ -1345,6 +1345,8 @@ mod tests {
     }
 
     struct EnrichingRequestFilter;
+    #[derive(Clone, Copy)]
+    struct RequestAnnotation;
 
     #[async_trait(?Send)]
     impl IntegrationRequestFilter for EnrichingRequestFilter {
@@ -1354,8 +1356,9 @@ mod tests {
 
         async fn filter_request(
             &self,
-            _input: RequestFilterInput<'_>,
+            input: RequestFilterInput<'_>,
         ) -> Result<RequestFilterDecision, Report<TrustedServerError>> {
+            input.request.extensions_mut().insert(RequestAnnotation);
             Ok(RequestFilterDecision::Continue(RequestFilterEffects {
                 request_headers: vec![HeaderMutation::set("x-datadome-isbot", "1")],
                 response_headers: vec![HeaderMutation::set("x-dd-b", "allowed")],
@@ -1486,6 +1489,10 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("1"),
             "should apply DataDome-style request enrichment before routing"
+        );
+        assert!(
+            req.extensions().get::<RequestAnnotation>().is_some(),
+            "should preserve private request annotations for downstream routing"
         );
         match outcome {
             RequestFilterRegistryOutcome::Continue(effects) => {

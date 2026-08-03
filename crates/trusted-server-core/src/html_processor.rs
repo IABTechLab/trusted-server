@@ -13,6 +13,7 @@ use lol_html::{
     text,
 };
 
+use crate::integrations::datadome::{DATADOME_INTEGRATION_ID, DataDomeClientTagSuppressed};
 use crate::integrations::gpt_diagnostics::GptDiagnosticsRequestDecision;
 use crate::integrations::{
     AttributeRewriteOutcome, IntegrationAttributeContext, IntegrationDocumentState,
@@ -175,6 +176,8 @@ pub struct HtmlProcessorConfig {
     pub max_buffered_body_bytes: usize,
     /// Request-scoped conditional diagnostics delivery decision.
     pub gpt_diagnostics: Option<GptDiagnosticsRequestDecision>,
+    /// Whether to omit Trusted Server's automatic `DataDome` client-side tag.
+    pub suppress_datadome_client_side_tag: bool,
 }
 
 impl HtmlProcessorConfig {
@@ -196,6 +199,7 @@ impl HtmlProcessorConfig {
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: settings.publisher.max_buffered_body_bytes,
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
         }
     }
 
@@ -223,6 +227,13 @@ impl HtmlProcessorConfig {
         self.gpt_diagnostics = decision;
         self
     }
+
+    /// Attach the request-scoped `DataDome` client-tag suppression decision.
+    #[must_use]
+    pub fn with_datadome_client_tag_suppression(mut self, suppress: bool) -> Self {
+        self.suppress_datadome_client_side_tag = suppress;
+        self
+    }
 }
 
 /// Create an HTML processor with URL replacement and integration hooks.
@@ -235,6 +246,9 @@ impl HtmlProcessorConfig {
 pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
     let post_processors = config.integrations.html_post_processors();
     let document_state = IntegrationDocumentState::default();
+    if config.suppress_datadome_client_side_tag {
+        document_state.get_or_insert_with(DATADOME_INTEGRATION_ID, || DataDomeClientTagSuppressed);
+    }
 
     // Simplified URL patterns structure - stores only core data and generates variants on-demand
     struct UrlPatterns {
@@ -692,6 +706,7 @@ mod tests {
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
         }
     }
 
@@ -948,6 +963,46 @@ mod tests {
         assert_eq!(config.origin_host, "origin.test-publisher.com");
         assert_eq!(config.request_host, "proxy.example.com");
         assert_eq!(config.request_scheme, "https");
+    }
+
+    #[test]
+    fn suppressed_datadome_tag_is_not_injected_into_processed_html() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "datadome",
+                &json!({
+                    "enabled": true,
+                    "client_side_key": "test-client-key",
+                }),
+            )
+            .expect("should configure DataDome integration");
+        let registry = IntegrationRegistry::new(&settings)
+            .expect("should create integration registry with DataDome");
+        let config = HtmlProcessorConfig::from_settings(
+            &settings,
+            &registry,
+            "origin.example.com",
+            "test.example.com",
+            "https",
+        )
+        .with_datadome_client_tag_suppression(true);
+        let mut processor = create_html_processor(config);
+
+        let output = processor
+            .process_chunk(b"<html><head></head><body>content</body></html>", true)
+            .expect("should process HTML");
+        let html = String::from_utf8(output).expect("should produce UTF-8 HTML");
+
+        assert!(
+            !html.contains("window.ddjskey"),
+            "should omit the DataDome client configuration"
+        );
+        assert!(
+            !html.contains("/integrations/datadome/tags.js"),
+            "should omit the DataDome client tag URL"
+        );
     }
 
     #[test]
@@ -1539,6 +1594,7 @@ mod tests {
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1613,6 +1669,7 @@ mod tests {
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1649,6 +1706,7 @@ mod tests {
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
         // Malformed HTML with two <body> elements (common in CMS template pages)
@@ -1684,6 +1742,7 @@ mod tests {
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1737,6 +1796,7 @@ mod tests {
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1764,6 +1824,7 @@ mod tests {
             ad_bids_state: state,
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
+            suppress_datadome_client_side_tag: false,
         };
         let mut processor = create_html_processor(config);
         let output = processor
