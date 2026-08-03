@@ -1795,18 +1795,20 @@ pub(crate) fn write_bids_to_state(
     settings: &Settings,
     request_origin: &str,
     include_debug_bid: bool,
+    auction_id: Option<&str>,
 ) -> std::collections::HashSet<String> {
     log::debug!(
         "write_bids_to_state: {} winning bid(s): [{}]",
         winning_bids.len(),
         winning_bids.keys().cloned().collect::<Vec<_>>().join(", ")
     );
-    let bid_map = build_bid_map(
+    let bid_map = build_bid_map_with_auction_id(
         winning_bids,
         price_granularity,
         settings,
         request_origin,
         include_debug_bid,
+        auction_id,
     );
     let delivered_winner_slots = bid_map.keys().cloned().collect();
     let bids_script = build_bids_script(&bid_map);
@@ -2411,6 +2413,10 @@ async fn collect_non_html_auction(
         settings,
         &request_origin(&params.request_scheme, &params.request_host),
         settings.debug.inject_adm_for_testing,
+        telemetry
+            .auction_request
+            .as_ref()
+            .map(|request| request.id.as_str()),
     );
     if let (Some(observation), Some(auction_request)) =
         (telemetry.observation, telemetry.auction_request.as_ref())
@@ -2462,6 +2468,10 @@ async fn collect_stream_auction(
         settings,
         request_origin,
         settings.debug.inject_adm_for_testing,
+        telemetry
+            .auction_request
+            .as_ref()
+            .map(|request| request.id.as_str()),
     );
     if let (Some(observation), Some(auction_request)) =
         (telemetry.observation, telemetry.auction_request.as_ref())
@@ -3247,6 +3257,24 @@ pub(crate) fn build_bid_map(
     request_origin: &str,
     include_debug_bid: bool,
 ) -> serde_json::Map<String, serde_json::Value> {
+    build_bid_map_with_auction_id(
+        winning_bids,
+        granularity,
+        settings,
+        request_origin,
+        include_debug_bid,
+        None,
+    )
+}
+
+fn build_bid_map_with_auction_id(
+    winning_bids: &std::collections::HashMap<String, Bid>,
+    granularity: crate::price_bucket::PriceGranularity,
+    settings: &Settings,
+    request_origin: &str,
+    include_debug_bid: bool,
+    auction_id: Option<&str>,
+) -> serde_json::Map<String, serde_json::Value> {
     // Inline creatives render in a foreign origin (PUC's srcdoc under GAM), so
     // their proxy/click URLs must be absolute against the origin the visitor is
     // actually on — scheme, host, and port. Fall back to the configured publisher
@@ -3287,6 +3315,24 @@ pub(crate) fn build_bid_map(
                     .as_deref()
                     .or(renderer_bid_id)
                     .or(bid.ad_id.as_deref());
+                if let Some(auction_id) = auction_id.filter(|id| !id.is_empty()) {
+                    obj.insert(
+                        "hb_auction_id".to_string(),
+                        serde_json::Value::String(auction_id.to_string()),
+                    );
+                }
+                if let Some(bid_id) = bid.bid_id.as_ref() {
+                    obj.insert(
+                        "hb_bid_id".to_string(),
+                        serde_json::Value::String(bid_id.clone()),
+                    );
+                }
+                if let Some(creative_id) = bid.creative_id.as_ref() {
+                    obj.insert(
+                        "hb_crid".to_string(),
+                        serde_json::Value::String(creative_id.clone()),
+                    );
+                }
                 if let Some(id) = hb_adid {
                     obj.insert(
                         "hb_adid".to_string(),
@@ -3358,6 +3404,10 @@ pub(crate) fn build_bid_map(
                 // where they are the sole render source.
                 match processed_adm {
                     Some(adm) if !adm.is_empty() => {
+                        obj.insert(
+                            "hb_adm_hash".to_string(),
+                            serde_json::Value::String(crate::auction::types::adm_trace_hash(&adm)),
+                        );
                         obj.insert("adm".to_string(), serde_json::Value::String(adm));
                     }
                     Some(_) => {
@@ -3887,12 +3937,13 @@ pub async fn handle_page_bids(
             {
                 Ok(result) => {
                     let winning_bids = result.winning_bids.clone();
-                    let bid_map = build_bid_map(
+                    let bid_map = build_bid_map_with_auction_id(
                         &winning_bids,
                         co_config.price_granularity,
                         settings,
                         &page_bids_request_origin,
                         settings.debug.inject_adm_for_testing,
+                        Some(auction_request.id.as_str()),
                     );
                     let delivered_winner_slots = bid_map.keys().cloned().collect();
                     emit_auction_events_best_effort_lazy(services, || {

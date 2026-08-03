@@ -28,6 +28,7 @@ use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
+use trusted_server_core::trace_cookie::handle_trace_mode;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, NormalizeMiddleware};
 use crate::platform::build_runtime_services;
@@ -142,7 +143,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 13] {
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 14] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
@@ -150,6 +151,7 @@ fn named_fallback_paths() -> [(&'static str, &'static [Method]); 13] {
         ("/_ts/admin/keys/deactivate", &[Method::POST]),
         ("/admin/keys/rotate", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/deactivate", LEGACY_ADMIN_DENY_METHODS),
+        ("/_ts/trace", &[Method::GET]),
         ("/auction", &[Method::POST]),
         (PAGE_BIDS_PATH, &[Method::GET, Method::OPTIONS]),
         (PAGE_BIDS_LEGACY_PATH, &[Method::GET, Method::OPTIONS]),
@@ -551,6 +553,21 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             }
         };
 
+        // GET /_ts/trace — render-trace toggle: arms/disarms the ts-trace
+        // cookie and redirects to `/`. Gated by [debug] trace_route_enabled
+        // (404 when off).
+        let s = Arc::clone(&state);
+        let trace_mode_handler = move |ctx: RequestContext| {
+            let s = Arc::clone(&s);
+            async move {
+                let req = ctx.into_request();
+                Ok::<Response, EdgeError>(
+                    handle_trace_mode(&s.settings, req.uri().query())
+                        .unwrap_or_else(|e| http_error(&e)),
+                )
+            }
+        };
+
         // GET /_ts/page-bids — SPA re-auction endpoint.
         let s = Arc::clone(&state);
         let page_bids_handler = move |ctx: RequestContext| {
@@ -758,6 +775,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // credentials and key-management payloads to the origin.
             .post("/_ts/admin/keys/rotate", admin_not_supported_handler)
             .post("/_ts/admin/keys/deactivate", admin_not_supported_handler)
+            .get("/_ts/trace", trace_mode_handler)
             .post("/auction", auction_handler)
             .get(PAGE_BIDS_PATH, page_bids_handler.clone())
             .route(PAGE_BIDS_PATH, Method::OPTIONS, page_bids_options_handler)

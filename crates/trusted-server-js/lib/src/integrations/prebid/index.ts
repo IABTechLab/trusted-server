@@ -14,10 +14,11 @@
 import type _pbjsDefault from 'prebid.js';
 
 import { log } from '../../core/log';
+import { isEffectivelyVisible, recordRender, stampCreativeTrace } from '../../core/trace';
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
 import { registerApsPrebidRenderer, validateApsRenderer } from '../aps/render';
 import type { AuctionBid, AuctionEid } from '../../core/auction';
-import type { AuctionSlot } from '../../core/types';
+import type { AuctionSlot, RenderRecord } from '../../core/types';
 
 import { PREBID_USER_ID_MODULE_REGISTRY } from './user_id_modules';
 
@@ -332,6 +333,9 @@ export function auctionBidsToPrebidBids(auctionBids: AuctionBid[], bidRequests: 
         bidderCode: bid.seat,
         meta: {
           advertiserDomains: bid.adomain,
+          tsAuctionId: bid.auctionId,
+          tsBidId: bid.bidId,
+          tsAdmHash: bid.admHash,
           // Second descriptor carrier — see APS_RENDERER_FIELD for the rationale.
           ...(renderer ? { [APS_RENDERER_FIELD]: renderer } : {}),
         },
@@ -1558,6 +1562,84 @@ function syncPrebidEidsCookie(): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Render trace (client-side /auction path)
+// ---------------------------------------------------------------------------
+
+interface PrebidRenderedBid {
+  adUnitCode?: string;
+  bidderCode?: string;
+  bidder?: string;
+  creativeId?: string;
+  meta?: {
+    tsAuctionId?: unknown;
+    tsBidId?: unknown;
+    tsAdmHash?: unknown;
+    [key: string]: unknown;
+  };
+}
+
+interface PrebidRenderEvent {
+  bid?: PrebidRenderedBid;
+  adId?: string;
+  reason?: string;
+  message?: string;
+}
+
+function findAuctionSlotElement(adUnitCode: string): HTMLElement | null {
+  if (typeof document === 'undefined') return null;
+  return (document.getElementById(adUnitCode) ??
+    document.getElementById(`${adUnitCode}-container`)) as HTMLElement | null;
+}
+
+export function recordPrebidAdRender(
+  bid: PrebidRenderedBid | undefined,
+  outcome: 'succeeded' | 'failed'
+): RenderRecord | undefined {
+  if (!bid || typeof bid.adUnitCode !== 'string' || bid.adUnitCode === '') return undefined;
+  const meta = bid.meta ?? {};
+  if (typeof meta.tsAuctionId !== 'string') return undefined;
+  const succeeded = outcome === 'succeeded';
+  const el = findAuctionSlotElement(bid.adUnitCode);
+  const record = recordRender({
+    slotId: bid.adUnitCode,
+    path: 'auction',
+    rendered: succeeded,
+    injected: succeeded,
+    visible: succeeded ? isEffectivelyVisible(el) : false,
+    elementId: el?.id,
+    auctionId: meta.tsAuctionId,
+    bidId: typeof meta.tsBidId === 'string' ? meta.tsBidId : undefined,
+    admHash: typeof meta.tsAdmHash === 'string' ? meta.tsAdmHash : undefined,
+    bidder: bid.bidderCode ?? bid.bidder,
+    creativeId: bid.creativeId,
+    servedFrom: 'prebid',
+  });
+  if (el) stampCreativeTrace(el, record);
+  return record;
+}
+
+export function installPrebidRenderTrace(): void {
+  if (typeof window === 'undefined') return;
+  const p = pbjs as unknown as {
+    onEvent?: (event: string, handler: (event: PrebidRenderEvent) => void) => void;
+    __tsRenderTraceInstalled?: boolean;
+  };
+  if (typeof p.onEvent !== 'function' || p.__tsRenderTraceInstalled) return;
+  p.__tsRenderTraceInstalled = true;
+  const listen = (name: string, outcome: 'succeeded' | 'failed'): void => {
+    p.onEvent!(name, (event) => {
+      try {
+        recordPrebidAdRender(event?.bid, outcome);
+      } catch (err) {
+        log.warn(`[tsjs-prebid] render-trace ${name} failed`, err);
+      }
+    });
+  };
+  listen('adRenderSucceeded', 'succeeded');
+  listen('adRenderFailed', 'failed');
+}
+
 // Self-initialize when loaded in a browser (same pattern as other integrations).
 if (typeof window !== 'undefined') {
   installPrebidNpm();
@@ -1567,6 +1649,7 @@ if (typeof window !== 'undefined') {
   // fail to run the replacement auction — leave GPT untouched instead.
   if (hasPrebidJsApi()) {
     installRefreshHandler();
+    installPrebidRenderTrace();
     // The slim-Prebid lazy loader appends this bundle from a window.load
     // handler, so `load` may already have fired by the time this code runs —
     // waiting for it again would skip user ID setup entirely on that path.

@@ -5,6 +5,7 @@ pub const COOKIE_TS_EC: &str = "ts-ec";
 /// JSON array of Extended User IDs (`[{ source, uids }]`) from identity providers.
 pub const COOKIE_TS_EIDS: &str = "ts-eids";
 pub const COOKIE_TS_TESTER: &str = "ts-tester";
+pub const COOKIE_TS_TRACE: &str = "ts-trace";
 pub const COOKIE_SHAREDID: &str = "sharedId";
 
 pub const HEADER_X_PUB_USER_ID: HeaderName = HeaderName::from_static("x-pub-user-id");

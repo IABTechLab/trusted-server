@@ -60,6 +60,12 @@ export interface AuctionBid {
   creativeId: string;
   /** Advertiser domains. */
   adomain: string[];
+  /** Server-side auction ID used for render tracing. */
+  auctionId?: string;
+  /** Upstream OpenRTB bid ID used for render tracing. */
+  bidId?: string;
+  /** Trace hash of the delivered creative markup. */
+  admHash?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -128,6 +134,8 @@ export function parseAuctionResponse(body: any): AuctionBid[] {
   const bids: AuctionBid[] = [];
   const seatbids = body?.seatbid;
   if (!Array.isArray(seatbids)) return bids;
+  const responseAuctionId =
+    typeof body?.id === 'string' && body.id !== '' ? body.id : undefined;
 
   for (const seatbid of seatbids) {
     const seat: string = typeof seatbid?.seat === 'string' ? seatbid.seat : 'unknown';
@@ -141,6 +149,7 @@ export function parseAuctionResponse(body: any): AuctionBid[] {
       const height = typeof bid?.h === 'number' ? bid.h : (renderer?.height ?? 250);
       const creativeId =
         typeof bid?.crid === 'string' ? bid.crid : (renderer?.creativeId ?? `${seat}-${impid}`);
+      const tsExt = bid?.ext?.ts;
 
       bids.push({
         impid,
@@ -157,6 +166,13 @@ export function parseAuctionResponse(body: any): AuctionBid[] {
         adomain: Array.isArray(bid?.adomain)
           ? bid.adomain.filter((domain: unknown): domain is string => typeof domain === 'string')
           : [],
+        auctionId:
+          typeof tsExt?.auction_id === 'string' && tsExt.auction_id !== ''
+            ? tsExt.auction_id
+            : responseAuctionId,
+        bidId: typeof bid?.id === 'string' && bid.id !== '' ? bid.id : undefined,
+        admHash:
+          typeof tsExt?.adm_hash === 'string' && tsExt.adm_hash !== '' ? tsExt.adm_hash : undefined,
       });
     }
   }

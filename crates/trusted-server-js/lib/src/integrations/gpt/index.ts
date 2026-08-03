@@ -1,5 +1,11 @@
 import { log } from '../../core/log';
-import type { AuctionSlot, AuctionBidData, GptSlotHandoff, TsjsApi } from '../../core/types';
+import { isEffectivelyVisible, recordRender, stampCreativeTrace } from '../../core/trace';
+import type {
+  AuctionSlot,
+  AuctionBidData,
+  GptSlotHandoff,
+  TsjsApi,
+} from '../../core/types';
 import {
   APS_UNIVERSAL_CREATIVE_RENDERER,
   APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
@@ -41,6 +47,36 @@ const TS_BID_TARGETING_KEYS = [
   'hb_cache_path',
 ] as const;
 const TS_BASE_TARGETING_KEYS = [...TS_BID_TARGETING_KEYS, TS_INITIAL_TARGETING_KEY] as const;
+
+function bumpRenderGeneration(ts: TsjsApi): number {
+  const next = (ts.renderGeneration ?? 0) + 1;
+  ts.renderGeneration = next;
+  return next;
+}
+
+function recordGptBridgeRender(
+  slotId: string,
+  bid: AuctionBidData,
+  servedFrom: 'inline' | 'pbs-cache',
+  element: HTMLElement | null
+): void {
+  const record = recordRender({
+    slotId,
+    path: 'ssat',
+    auctionId: bid.hb_auction_id,
+    bidder: bid.hb_bidder,
+    adId: bid.hb_adid,
+    bidId: bid.hb_bid_id,
+    creativeId: bid.hb_crid,
+    admHash: bid.hb_adm_hash,
+    rendered: true,
+    injected: true,
+    visible: isEffectivelyVisible(element),
+    elementId: element?.id,
+    servedFrom,
+  });
+  if (element) stampCreativeTrace(element, record);
+}
 
 // ------------------------------------------------------------------
 // googletag type stubs (minimal surface needed by the shim)
@@ -833,6 +869,7 @@ export function installTsAdInit(): void {
     // first act and stands down rather than applying this invocation's
     // slots/bids to the newer route's DOM and double-requesting it.
     const generation = ts.navGeneration ?? 0;
+    const renderGeneration = bumpRenderGeneration(ts);
     const g = (window as GptWindow).googletag;
     if (!g) return;
 
@@ -1003,6 +1040,24 @@ export function installTsAdInit(): void {
           if (bid.adm && bid.debug_bid) {
             injectAdmIntoSlot(divId, bid.adm);
           }
+          const element = findSlotElementByDivId(divId);
+          const record = recordRender({
+            slotId,
+            path: 'ssat',
+            auctionId: bid.hb_auction_id,
+            bidder: bid.hb_bidder,
+            adId: bid.hb_adid,
+            bidId: bid.hb_bid_id,
+            creativeId: bid.hb_crid,
+            admHash: bid.hb_adm_hash,
+            rendered: !event.isEmpty,
+            gamEmpty: event.isEmpty,
+            injected: Boolean(bid.adm && bid.debug_bid),
+            visible: !event.isEmpty && isEffectivelyVisible(element),
+            elementId: element?.id,
+            servedFrom: bid.adm && bid.debug_bid ? 'debug-adm' : 'gam',
+          });
+          if (element) stampCreativeTrace(element, record);
         });
       }
 
@@ -1028,6 +1083,16 @@ export function installTsAdInit(): void {
         : slotsToRefresh;
 
       if (slotsNeedingRefresh.length > 0) {
+        slotsNeedingRefresh.forEach((slotToRefresh) => {
+          const slotId = (ts.divToSlotId ?? {})[slotToRefresh.getSlotElementId()];
+          const pending = slotId ? (ts.bids ?? {})[slotId] : undefined;
+          if (slotId) {
+            // Capture the bid/generation before the asynchronous GPT event.
+            // The event handler still records the live slot state below.
+            (slotToRefresh as GoogleTagSlot & { __tsRenderGeneration?: number }).__tsRenderGeneration = renderGeneration;
+            (slotToRefresh as GoogleTagSlot & { __tsRenderBid?: AuctionBidData }).__tsRenderBid = pending;
+          }
+        });
         // One-shot bypass: this internal refresh delivers the just-applied
         // server-side targeting to GAM. If slim-Prebid has wrapped refresh(), it
         // must pass this call straight through — not clear the targeting and run
@@ -1239,6 +1304,7 @@ export function installSpaAuctionHook(): void {
     if (path === currentPath) return;
     currentPath = path;
     ts.navGeneration = (ts.navGeneration ?? 0) + 1;
+    bumpRenderGeneration(ts);
     inflight?.abort();
     const controller = new AbortController();
     inflight = controller;
@@ -1622,6 +1688,12 @@ export function installTsRenderBridge(): void {
         })
       );
       fireWinBillingBeacons(slotId, matchedBid);
+      recordGptBridgeRender(
+        slotId,
+        matchedBid,
+        'inline',
+        findSlotElementByDivId(slotId)
+      );
       log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from inline adm`);
       return;
     }
@@ -1676,6 +1748,12 @@ export function installTsRenderBridge(): void {
         // authoritative clearing price, and the cached copy is only the render
         // source. Do not re-expand them here.
         fireWinBillingBeacons(slotId, matchedBid);
+        recordGptBridgeRender(
+          slotId,
+          matchedBid,
+          'pbs-cache',
+          findSlotElementByDivId(slotId)
+        );
         log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from PBS Cache`);
       })
       .catch((err) => {

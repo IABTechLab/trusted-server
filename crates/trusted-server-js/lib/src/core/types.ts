@@ -87,6 +87,14 @@ export interface AuctionBidData {
   hb_adid?: string;
   hb_cache_host?: string;
   hb_cache_path?: string;
+  /** Trace-only OpenRTB bid identifier. */
+  hb_bid_id?: string;
+  /** Trace-only server-side auction identifier. */
+  hb_auction_id?: string;
+  /** Trace-only OpenRTB creative identifier. */
+  hb_crid?: string;
+  /** Trace hash of delivered creative markup. */
+  hb_adm_hash?: string;
   nurl?: string;
   burl?: string;
   /** Typed winning-bid renderer capability. */
@@ -106,6 +114,30 @@ export interface AuctionBidData {
   adm?: string;
   /** Debug-only bid field mirror. Only present when `[debug] inject_adm_for_testing = true`. */
   debug_bid?: AuctionDebugBidData;
+}
+
+/** How a creative reached the page for a [`RenderRecord`]. */
+export type RenderServedFrom = 'inline' | 'gam' | 'debug-adm' | 'pbs-cache' | 'prebid';
+
+/** Client-side record joining a rendered creative to its auction winner. */
+export interface RenderRecord {
+  slotId: string;
+  path: 'auction' | 'ssat' | 'gam-refresh';
+  rendered: boolean;
+  elementId?: string;
+  auctionId?: string;
+  bidder?: string;
+  adId?: string;
+  bidId?: string;
+  creativeId?: string;
+  admHash?: string;
+  servedFrom?: RenderServedFrom;
+  gamEmpty?: boolean;
+  injected?: boolean;
+  visible?: boolean;
+  count: number;
+  seq: number;
+  at: number;
 }
 
 /**
@@ -256,6 +288,14 @@ export interface TsjsApi {
   apsPrebidRenderers?: Record<string, ApsPrebidRendererEntry>;
   /** Initialises GPT slots with server-side bid targeting and calls refresh(). */
   adInit?: () => void;
+  /** Render-trace registry: latest render per slot. */
+  renders?: Record<string, RenderRecord>;
+  /** Append-only history of every render. */
+  renderLog?: RenderRecord[];
+  /** Monotonic render generation for cancelling stale async work. */
+  renderGeneration?: number;
+  /** Page-global render sequence counter. */
+  renderSeq?: number;
   /** GPT slot objects TS defined — used to destroy stale slots on SPA navigation. */
   prevGptSlots?: unknown[];
   /** Guards one-time-per-page enableSingleRequest/enableServices calls. */

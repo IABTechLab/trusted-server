@@ -254,6 +254,7 @@ pub struct Bid {
     /// Billing notification URL
     pub burl: Option<String>,
     /// `OpenRTB` bid identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bid_id: Option<String>,
     /// Ad ID from the bidder.
     pub ad_id: Option<String>,
@@ -280,6 +281,28 @@ pub struct Bid {
     pub cache_path: Option<String>,
     /// Provider-specific bid metadata.
     pub metadata: HashMap<String, serde_json::Value>,
+}
+
+/// Length of the hex-encoded creative trace hash.
+const ADM_TRACE_HASH_LEN: usize = 16;
+
+/// Compute the trace hash for delivered creative markup.
+#[must_use]
+pub fn adm_trace_hash(adm: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    let digest = Sha256::digest(adm.as_bytes());
+    let mut hex = hex::encode(digest);
+    hex.truncate(ADM_TRACE_HASH_LEN);
+    hex
+}
+
+impl Bid {
+    /// Trace hash of this bid's creative markup, when present.
+    #[must_use]
+    pub fn creative_trace_hash(&self) -> Option<String> {
+        self.creative.as_deref().map(adm_trace_hash)
+    }
 }
 
 /// Per-provider summary included in the auction response.

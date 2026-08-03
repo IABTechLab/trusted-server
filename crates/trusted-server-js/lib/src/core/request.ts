@@ -6,6 +6,7 @@ import { collectContext } from './context';
 import { log } from './log';
 import { getAllUnits, firstSize } from './registry';
 import { createAdIframe, findSlot, buildCreativeDocument, sanitizeCreativeHtml } from './render';
+import { isEffectivelyVisible, recordRender, stampCreativeTrace } from './trace';
 
 export type RequestAdsCallback = () => void;
 export interface RequestAdsOptions {
@@ -21,6 +22,9 @@ type RenderCreativeInlineOptions = {
   creativeHeight?: number;
   seat: string;
   creativeId: string;
+  auctionId?: string;
+  bidId?: string;
+  admHash?: string;
 };
 
 // Entry point matching Prebid's requestBids signature; uses unified /auction endpoint.
@@ -66,6 +70,9 @@ export function requestAds(
             creativeHeight: bid.height,
             seat: bid.seat,
             creativeId: bid.creativeId,
+            auctionId: bid.auctionId,
+            bidId: bid.bidId,
+            admHash: bid.admHash,
           });
         }
         log.info('requestAds: rendered creatives from response');
@@ -95,7 +102,20 @@ function renderCreativeInline({
   creativeHeight,
   seat,
   creativeId,
+  auctionId,
+  bidId,
+  admHash,
 }: RenderCreativeInlineOptions): void {
+  const trace = {
+    slotId,
+    path: 'auction' as const,
+    auctionId,
+    bidId,
+    bidder: seat,
+    creativeId,
+    admHash,
+    servedFrom: 'inline' as const,
+  };
   const container = findSlot(slotId) as HTMLElement | null;
   if (!container) {
     log.warn('renderCreativeInline: slot not found; skipping render', { slotId, seat, creativeId });
@@ -112,6 +132,14 @@ function renderCreativeInline({
         originalLength: sanitization.originalLength,
         rejectionReason: sanitization.rejectionReason,
       });
+      const record = recordRender({
+        ...trace,
+        rendered: false,
+        injected: false,
+        visible: false,
+        elementId: container.id || undefined,
+      });
+      stampCreativeTrace(container, record);
       return;
     }
 
@@ -142,6 +170,16 @@ function renderCreativeInline({
     });
 
     iframe.srcdoc = buildCreativeDocument(sanitization.sanitizedHtml);
+
+    const record = recordRender({
+      ...trace,
+      rendered: true,
+      injected: true,
+      visible: isEffectivelyVisible(container),
+      elementId: container.id || undefined,
+    });
+    stampCreativeTrace(container, record);
+    stampCreativeTrace(iframe, record);
 
     log.info('renderCreativeInline: rendered', {
       slotId,
