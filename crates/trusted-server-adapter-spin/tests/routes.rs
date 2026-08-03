@@ -520,8 +520,10 @@ async fn first_party_proxy_rebuild_is_routed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_party_proxy_rebuild_get_is_routed() {
     // The opaque-origin creative click guard recovers via GET navigation, so the
-    // route must be registered for GET (the handler 302s) and must not fall
-    // through to the publisher origin.
+    // route must be registered for GET and must not fall through to the
+    // publisher origin. This asserts routing only; the 302 and its rebuilt
+    // Location are covered by `proxy_rebuild_get_with_origin_form_uri_redirects`
+    // in the core crate, which can sign a real `tsclick`.
     let router = test_router();
     let req = request_builder()
         .method("GET")

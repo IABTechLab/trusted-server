@@ -652,7 +652,16 @@ fn rewrite_creative_html_impl(
 ) -> String {
     // No size parsing needed now; all absolute/protocol-relative URLs are proxied uniformly.
     let mut out = Vec::with_capacity(markup.len() + 64);
-    let injected_ts_creative = std::cell::Cell::new(false);
+    // Shared with the `body` handler through an `Rc` so the outcome is readable
+    // here after rewriting: cloning a bare `Cell` would hand the handler an
+    // independent copy and always report "not injected".
+    let injected_ts_creative = std::rc::Rc::new(std::cell::Cell::new(false));
+    // Rewriting amplifies: every short URL becomes a signed proxy/click URL and
+    // anchors gain a `data-tsclick` copy, so an input comfortably under the cap
+    // can expand well past it. Bound the OUTPUT too, and stop accumulating once
+    // the limit trips, so a bidder cannot drive unbounded allocation in the
+    // WASM runtime by packing a creative with URL-bearing elements.
+    let overflowed = std::cell::Cell::new(false);
     let mut rewriter = HtmlRewriter::new(
         HtmlSettings {
             element_content_handlers: vec![
@@ -668,7 +677,7 @@ fn rewrite_creative_html_impl(
                 }),
                 // Inject unified tsjs bundle at the top of body once
                 element!("body", {
-                    let injected = injected_ts_creative.clone();
+                    let injected = std::rc::Rc::clone(&injected_ts_creative);
                     move |el| {
                         if inject_tsjs && !injected.get() {
                             let script_tag = tsjs::tsjs_unified_script_tag();
@@ -842,12 +851,62 @@ fn rewrite_creative_html_impl(
             ],
             ..HtmlSettings::default()
         },
-        |c: &[u8]| out.extend_from_slice(c),
+        |c: &[u8]| {
+            if overflowed.get() {
+                return;
+            }
+            if out.len() + c.len() > MAX_CREATIVE_SIZE {
+                overflowed.set(true);
+                out.clear();
+                out.shrink_to_fit();
+                return;
+            }
+            out.extend_from_slice(c);
+        },
     );
 
-    let _ = rewriter.write(markup.as_bytes());
-    let _ = rewriter.end();
-    String::from_utf8(out).unwrap_or_else(|_| markup.to_owned())
+    // Fail closed on parser or output-limit failures, matching the sanitizer:
+    // a partially rewritten document has an unknown mix of mediated and direct
+    // URLs, and truncated markup can reopen tags the rewriter had closed.
+    // Do not call end() after a failed write — lol_html's rewriter is in an
+    // error state and may emit garbage.
+    if rewriter.write(markup.as_bytes()).is_err() || rewriter.end().is_err() {
+        log::warn!("rewrite_creative_html: html rewrite failed; rejecting creative");
+        return String::new();
+    }
+    if overflowed.get() {
+        log::warn!(
+            "rewrite_creative_html: rewritten creative exceeds {} byte cap; rejecting",
+            MAX_CREATIVE_SIZE
+        );
+        return String::new();
+    }
+
+    let mut rewritten = match String::from_utf8(out) {
+        Ok(rewritten) => rewritten,
+        Err(_) => {
+            log::warn!("rewrite_creative_html: rewriter emitted non-UTF-8 output; rejecting");
+            return String::new();
+        }
+    };
+
+    // Creative `adm` is frequently a bare fragment (`<a>…</a><script>…</script>`)
+    // with no `<body>` token for the handler above to match, and lol_html does
+    // not synthesize one. Without this fallback such fragments would ship
+    // without the click guard, leaving rewritten links unmediated once bidder
+    // script mutates them.
+    if inject_tsjs && !injected_ts_creative.get() {
+        rewritten.insert_str(0, &tsjs::tsjs_unified_script_tag());
+        if rewritten.len() > MAX_CREATIVE_SIZE {
+            log::warn!(
+                "rewrite_creative_html: creative exceeds {} byte cap after runtime injection; rejecting",
+                MAX_CREATIVE_SIZE
+            );
+            return String::new();
+        }
+    }
+
+    rewritten
 }
 
 /// Stream processor for creative HTML that rewrites URLs to first-party proxy.
@@ -1685,6 +1744,71 @@ mod tests {
         assert!(
             processed.contains("/first-party/proxy?tsurl="),
             "should still rewrite resource URLs: {processed}"
+        );
+    }
+
+    #[test]
+    fn rewrite_injects_runtime_into_body_less_fragment() {
+        // Bidder `adm` is commonly a bare fragment with no <body> token, and
+        // lol_html does not synthesize one. Without the runtime the click guard
+        // never installs, so rewritten links lose first-party mediation as soon
+        // as surviving bidder script mutates them.
+        let settings = crate::test_support::tests::create_test_settings();
+        let fragment = r#"<a href="https://click.example/landing">x</a><script>marker</script>"#;
+
+        let out = rewrite_creative_html(&settings, fragment);
+
+        assert!(
+            out.contains("/static/tsjs=tsjs-unified.min.js"),
+            "should inject the creative runtime without a body token: {out}"
+        );
+        assert_eq!(
+            out.matches("/static/tsjs=tsjs-unified.min.js").count(),
+            1,
+            "should inject exactly once: {out}"
+        );
+        assert!(
+            out.contains("/first-party/click?tsurl="),
+            "should still rewrite click URLs: {out}"
+        );
+    }
+
+    #[test]
+    fn inline_rewrite_does_not_inject_runtime_into_fragment() {
+        // The foreign-origin inline path deliberately omits the bundle; the
+        // body-less fallback must not reintroduce it there.
+        let settings = crate::test_support::tests::create_test_settings();
+        let fragment = r#"<a href="https://click.example/landing">x</a>"#;
+
+        let out =
+            rewrite_inline_creative_html(&settings, "https://news.publisher.example", fragment);
+
+        assert!(
+            !out.contains("/static/tsjs="),
+            "inline rewriting must not inject the bundle: {out}"
+        );
+    }
+
+    #[test]
+    fn rewrite_rejects_output_exceeding_the_cap() {
+        // Rewriting amplifies: each short URL becomes a signed proxy/click URL
+        // and anchors gain a data-tsclick copy. An input under the cap can
+        // therefore expand past it, so the OUTPUT is bounded too.
+        let settings = crate::test_support::tests::create_test_settings();
+        let anchor = r#"<a href="https://click.example/landing?q=0123456789">x</a>"#;
+        let repeats = (super::MAX_CREATIVE_SIZE / anchor.len()) / 2;
+        let input = anchor.repeat(repeats);
+        assert!(
+            input.len() < super::MAX_CREATIVE_SIZE,
+            "test input must start under the cap"
+        );
+
+        let out = rewrite_creative_html(&settings, &input);
+
+        assert!(
+            out.is_empty(),
+            "should reject a creative whose rewritten output exceeds the cap (got {} bytes)",
+            out.len()
         );
     }
 

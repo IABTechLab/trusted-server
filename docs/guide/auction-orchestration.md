@@ -189,8 +189,8 @@ AuctionOrchestrator.run_auction()
   ▼
 Convert OrchestrationResult → OpenRTB 2.x Response
   │
-  ├─ Sanitize creative HTML
-  ├─[rewrite_creatives=true (default)] Rewrite URLs and inject creative TSJS
+  ├─[sanitize_creatives=true] Strip executable markup
+  ├─[rewrite_creatives=true] Rewrite URLs and inject creative TSJS
   ├─ Add ext.orchestrator metadata
   └─ Set consent and optional EID response headers
 ```
@@ -651,6 +651,7 @@ Each proxied URL includes a `tstoken` HMAC signature for tamper protection. See 
 ```toml
 [auction]
 enabled = true
+sanitize_creatives = false     # Opt-in; blanks script-based creatives when enabled
 rewrite_creatives = true
 providers = ["prebid", "aps"]
 mediator = "adserver_mock"    # Remove for parallel_only strategy
@@ -682,13 +683,18 @@ price_floor = 0.50
 
 #### `[auction]`
 
-| Field               | Type     | Default | Description                                                       |
-| ------------------- | -------- | ------- | ----------------------------------------------------------------- |
-| `enabled`           | bool     | `false` | Enable the auction system                                         |
-| `rewrite_creatives` | bool     | `true`  | Rewrite sanitized winning-bid `adm` through first-party endpoints |
-| `providers`         | string[] | `[]`    | Ordered list of provider names to call                            |
-| `mediator`          | string?  | `null`  | Provider name to use as mediator (enables `parallel_mediation`)   |
-| `timeout_ms`        | u32      | `2000`  | Overall auction timeout in milliseconds                           |
+| Field                | Type     | Default | Description                                                     |
+| -------------------- | -------- | ------- | --------------------------------------------------------------- |
+| `enabled`            | bool     | `false` | Enable the auction system                                       |
+| `sanitize_creatives` | bool     | `false` | Strip executable markup from winning-bid `adm` before delivery  |
+| `rewrite_creatives`  | bool     | `true`  | Rewrite winning-bid `adm` through first-party endpoints         |
+| `providers`          | string[] | `[]`    | Ordered list of provider names to call                          |
+| `mediator`           | string?  | `null`  | Provider name to use as mediator (enables `parallel_mediation`) |
+| `timeout_ms`         | u32      | `2000`  | Overall auction timeout in milliseconds                         |
+
+Both creative-processing fields must be present in the TOML for their
+environment overrides to apply; see
+[Environment Variable Overrides](#environment-variable-overrides).
 
 #### `[integrations.prebid]`
 

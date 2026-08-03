@@ -218,10 +218,29 @@ export function createAdIframe(
   return iframe;
 }
 
-// Build a complete HTML document for a sanitized creative fragment, suitable for iframe.srcdoc.
+// Origin the creative runtime resolves root-relative first-party URLs against.
+//
+// The srcdoc document has an opaque origin and an `about:srcdoc` location, so it
+// has no usable origin of its own; `document.baseURI` would work but is
+// inherited and honours a publisher `<base>`, i.e. it is not a trustworthy
+// security boundary. This page — first-party, non-opaque — knows the real
+// origin, so it stamps it into the document ahead of any creative markup.
+//
+// Only an exact `scheme://host[:port]` shape is emitted, so the value cannot
+// break out of the quoted string it is written into.
+function trustedCreativeOrigin(): string {
+  try {
+    const origin = location.origin;
+    if (/^https?:\/\/[a-z0-9.-]+(:\d+)?$/i.test(origin)) return origin;
+  } catch {
+    // fall through to an empty stamp; the runtime degrades to document.baseURI
+  }
+  return '';
+}
+
+// Build a complete HTML document for a creative fragment, suitable for iframe.srcdoc.
 export function buildCreativeDocument(creativeHtml: string): string {
-  return IFRAME_TEMPLATE.replace('%NORMALIZE_CSS%', () => NORMALIZE_CSS).replace(
-    '%CREATIVE_HTML%',
-    () => creativeHtml
-  );
+  return IFRAME_TEMPLATE.replace('%NORMALIZE_CSS%', () => NORMALIZE_CSS)
+    .replace('%TRUSTED_ORIGIN%', () => trustedCreativeOrigin())
+    .replace('%CREATIVE_HTML%', () => creativeHtml);
 }

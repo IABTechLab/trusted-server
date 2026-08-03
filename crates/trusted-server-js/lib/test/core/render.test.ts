@@ -47,6 +47,21 @@ describe('render', () => {
     expect(documentHtml).toContain(creativeHtml);
   });
 
+  it('stamps the first-party origin ahead of the creative markup', async () => {
+    // The srcdoc document has an opaque origin and an about:srcdoc location, so
+    // the creative runtime has no trustworthy origin of its own. This page —
+    // first-party and non-opaque — stamps the real one before any bidder markup
+    // can install a <base> or otherwise influence resolution.
+    const { buildCreativeDocument } = await import('../../src/core/render');
+    const creativeHtml = '<div>creative</div>';
+    const documentHtml = buildCreativeDocument(creativeHtml);
+
+    expect(documentHtml).toContain(`window.__tsCreativeOrigin = '${location.origin}'`);
+    expect(documentHtml.indexOf('__tsCreativeOrigin')).toBeLessThan(
+      documentHtml.indexOf(creativeHtml)
+    );
+  });
+
   it('accepts safe static markup during sanitization', async () => {
     const { sanitizeCreativeHtml } = await import('../../src/core/render');
     const sanitization = sanitizeCreativeHtml(
