@@ -631,6 +631,25 @@ pub(crate) fn build_services_with_config_and_secret(
         .build()
 }
 
+pub(crate) fn build_services_with_config_and_secret_and_client_ip(
+    config_store: impl PlatformConfigStore + 'static,
+    secret_store: impl PlatformSecretStore + 'static,
+    client_ip: IpAddr,
+) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(config_store))
+        .secret_store(Arc::new(secret_store))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(NoopBackend))
+        .http_client(Arc::new(NoopHttpClient))
+        .geo(Arc::new(NoopGeo))
+        .client_info(ClientInfo {
+            client_ip: Some(client_ip),
+            ..ClientInfo::default()
+        })
+        .build()
+}
+
 pub(crate) fn build_request_signing_services() -> RuntimeServices {
     let signing_key = SigningKey::generate(&mut OsRng);
     let key_b64 = general_purpose::STANDARD.encode(signing_key.as_bytes());
