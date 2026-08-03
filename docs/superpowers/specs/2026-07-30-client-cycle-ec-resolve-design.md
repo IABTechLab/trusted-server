@@ -153,8 +153,9 @@ Everything in this spec follows from that.
    happens under the reservation and is deterministic under its key, so
    any retry converges on the same row; reservations are retained at
    least through the token's expiry. Reservation keys are **namespaced**
-   per the providers spec §6.3 grammar
-   (`resv/<publisher-origin-hash>/<provider>/<version>/<payload-id>`), so
+   (illustrated here with the superseded slash notation; the actual
+   grammar at revival follows the providers spec's delimiter-free
+   fixed-width scheme), so
    payloads cannot collide across publishers, providers, or versions.
    Ownership conflicts are terminal per state: a non-owner hitting
    `pending` gets `409` (retry only after lease expiry); a non-owner

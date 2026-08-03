@@ -1,5 +1,16 @@
 # DataDome Server-Side Protection API Integration
 
+> **Supersession note (PR #986):** the response-effects portions of this
+> document — in particular "DataDome headers/cookies apply last and win"
+> and any post-finalization ordering — are **superseded** by the
+> response-header hook spec's §4a security-channel contract
+> (`2026-07-30-integration-response-header-hook-design.md`): one global
+> order applies (core finalization → ordinary mutators → security
+> effects → final cache/privacy invariant pass, unconditionally last),
+> with typed cookie/header operations, enumerated allowlists
+> (`datadome-header-allowlist.md`), and owner-only identifier
+> boundaries. Where this document conflicts, the hook spec governs.
+
 **Issue:** #317
 **Date:** 2026-06-11
 **Status:** In Progress

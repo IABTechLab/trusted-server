@@ -182,8 +182,9 @@ NOT ship without a caller:
 - `IdentityInput.permissions` / `IdentityInput.consent` (ignored by all
   built-ins),
 - `DeviceProvider::required_permissions` / `GeoProvider::required_permissions`
-  — dropped entirely, not deferred: §5 explains why these two kinds cannot
-  be permission-gated at all.
+  — dropped entirely, not deferred: §5 explains why — geo _cannot_ be
+  gated (circular), and device _could_ be but deliberately is not (a
+  recorded decision, not an impossibility).
 
 If a future feature needs one of these, it arrives with that feature.
 
@@ -254,9 +255,10 @@ spy-provider test pins the split: with `store-on-device` unset, `generate`
 is never called while a withdrawal request still parses the cookie and
 writes tombstones.
 
-**A generated identity is not active until its graph row commits.** No
-cookie write, no egress, no auction use may observe a minted identifier
-before its graph row (with provenance, §6.1) has committed — PR #838 let a
+**A generated identity is not active until its authority-state record
+commits** (the two-record commit point — the graph row alone is not
+activation). No cookie write, no egress, no auction use may observe a
+minted identifier before both writes have committed — PR #838 let a
 generated EC reach an auction before finalization refused the cookie,
 producing an identity that existed for one request and nowhere else. The
 normative order is: gate → `generate` → graph-row commit →
@@ -300,7 +302,21 @@ variant**. Therefore:
   anywhere — an N+1 fleet must never run rowless classification), and
   (2) an idempotent **stub-backfill scan** has stamped a minimal
   authority-state existence stub onto **every existing identity row**
-  (legacy and N+1-minted alike). Only then does the invariant hold:
+  (legacy and N+1-minted alike) — and "every" is established by an
+  actual algorithm over an eventual store, not asserted: after N+2
+  convergence at time T, wait the backend's **documented listing settle
+  window** (a listing-completeness bound is a declared adapter
+  capability; a backend that cannot bound listing visibility cannot host
+  this migration), then scan repeatedly until **two consecutive full
+  passes discover zero unstubbed rows**; the flag value attests the
+  watermark, pass count, and settle window. Rows minted after T carry
+  records by protocol. And because no scan over an eventual store is
+  provably perfect, misses are **reconciled, not fatal**: a per-prefix
+  withdrawal entry (below) doubles as pending intent — if a real row for
+  a withdrawn suffix ever surfaces, core **promotes** the entry to a
+  full family revocation on that row's family at first sight, so a
+  missed row cannot quietly keep S2S egress after its cookie was
+  withdrawn. Only then does the invariant hold:
   every row-backed identity has an authority-state record under its
   derivable family ID, in the globally-strong class — so _rowless_ =
   flag set AND the strong read finds **no record** for the cookie's
@@ -319,8 +335,13 @@ variant**. Therefore:
   matched version) is **expired and replaced by a fresh mint through the
   ordinary graph-backed path** when permissions allow; continuity is
   deliberately not preserved (migration matrix row 13, sign-off 21). An
-  unverifiable cookie (including the declared roaming false-negative) is
-  simply expired.
+  unverifiable cookie (including the declared roaming false-negative)
+  gets **cookie-only expiry — a disclosed best-effort residual, not a
+  buried one**: admission rules forbid durable records for unverified
+  values, so if the expiry response is lost the cookie survives and may
+  resurface on the old network; every re-presentation re-attempts
+  expiry. The residual is bounded to graphless-era cookies from changed
+  networks and is **sign-off item 29**.
 - **Rowless withdrawal writes into one capped per-prefix record, then
   expires the cookie** — durable (cookie-only expiry is best-effort: a
   lost response leaves the "withdrawn" cookie usable), and **bounded in
@@ -337,13 +358,18 @@ variant**. Therefore:
   entry (or the saturated record) and stays dead. Row-backed
   withdrawal is untouched: full-graph-key family records, one derivation
   everywhere.
-- **Negative-record creation has admission rules everywhere**:
-  suppression and family records may be written only for (a) an
-  existing family — the authority-state record exists on a strong
-  read — or (b) a **verified** identifier (`verify`); a fabricated,
-  unverifiable cookie writes nothing. This bounds record creation to
-  real identities plus the writer's own evidence, and per-prefix
-  rate limits apply to the rowless path above.
+- **Negative-record creation has admission rules everywhere — and
+  rowless identifiers get no per-family records at all.** Durable
+  suppression and family-revocation records may be written only for an
+  **existing, row-backed family** (authority-state record present on a
+  strong read). A rowless identifier — even a _verified_ one — creates
+  none: verification authenticates only the prefix, so per-identifier
+  records would let one prefix-holder fabricate unlimited suffixes into
+  unlimited strong-storage records (rate limits slow creation; they do
+  not bound cardinality), and a rowless identity has no authority to
+  suppress anyway. **The capped per-prefix withdrawal record is the
+  entirety of rowless negative state.** Fabricated, unverifiable
+  cookies write nothing anywhere.
 
 **Egress is typed, not policed.** The inventory-and-denylist test
 (permission model spec §7) is a backstop, but conventions do not survive
@@ -368,7 +394,7 @@ assertion**: the current filter/proxy inputs expose the raw request
 snapshot redaction cannot undo that. The contract: integration-facing
 request access moves to a typed **`RedactedRequestView`** whose stripped
 set is enumerated — the `ts-ec` cookie and every `ts-*` cookie, `x-ts-*`
-identity/consent headers, and the EIDs header — with identity reachable
+identity/consent headers, the incoming `X-DataDome-ClientID` header (owner-only, hook spec §4a), and the EIDs header — with identity reachable
 only through a scoped `AuthorizedIdentity` parameter; the raw-request
 filter/proxy interfaces are migrated in the **same PR** as the typed
 egress boundary (they are the same boundary), and the tests are
@@ -563,6 +589,7 @@ the bounded suffix:
 | Alias                                                                                  | **The source identity key itself** — the alias is a value written _at_ the replaced row's address, distinguished by a `kind` discriminator in the JSON envelope | A separate `alias/…` address could never work: lookups by the old cookie hit the source key, and a single-key CAS cannot install a record at a different address                                                                                                                                                                                                          |
 | Family revocation                                                                      | `fam/<family-id>`                                                                                                                                               | Family ID from mint or the deterministic legacy derivation (permission spec §4.3)                                                                                                                                                                                                                                                                                         |
 | Authority-state (suppression + positive-authority summary)                             | `s` + family ID (fixed-width grammar)                                                                                                                           | Per-permission negative entries **and** the positive summary (permission spec §4.3); permission-exempt writes; consulted by every constructor and S2S recompute                                                                                                                                                                                                           |
+| Rowless prefix-withdrawal record                                                       | `w` + provider code + 64-hex prefix                                                                                                                             | Strong class, **linearizable CAS** (concurrent suffix withdrawals must not overwrite each other's entries); value: bounded suffix-hash list (cap 8), saturation flag, CAS version, created-at, `valid_until` ≥ the maximum cookie lifetime; readable fail-closed by N+1 after rollback (the flag implies N+2 had converged)                                               |
 | Deployment metadata                                                                    | `m` + fixed metadata name (fixed-width grammar; schema floor, graphless-migration flag)                                                                         | Write-once/CAS class; value carries schema version, state, epoch, set-at; the graphless flag's lifecycle: created by the migration readiness step **after** N+2 convergence + stub-backfill completion (both attested in the value), cleared by explicit operator CAS with the quiet-period criterion recorded                                                            |
 | Rewrite transaction _(informative — deferred)_                                         | `rwx/<family-id>`                                                                                                                                               | One in-flight rewrite per family                                                                                                                                                                                                                                                                                                                                          |
 | Replay reservation _(informative — deferred with client-cycle; not normative surface)_ | `resv/…`                                                                                                                                                        | Deferred client-cycle draft                                                                                                                                                                                                                                                                                                                                               |
@@ -586,10 +613,19 @@ rather than asserted (an earlier `f` tag was itself a hex digit) — then
 a **4-character provider code from the checked-in, append-only,
 never-reused registry `docs/superpowers/specs/provider-code-registry.md`** (allocation is a reviewed commit;
 codes are immutable and never recycled, including for retired
-providers), then the suffix. Segment boundaries are positional, so no
-segment can contain or escape a delimiter, prefix queries are plain
-string prefixes on every backend, and a grammar-disjointness test covers
-every class against the legacy grammar. (hmac verbatim keys remain the
+providers), then the suffix. The **complete physical constructor set** (logical
+`fam/`-style sketches elsewhere are notation for these): `i` +
+provider-code(4) + suffix(≤123) for rows; `r`/`s` + family-id(64
+lowercase hex — family IDs are canonically SHA-256 over the derivation
+input) for revocation/authority records (no provider code: the family id
+already encodes derivation); `w` + provider-code(4) + prefix(64 hex) for
+rowless withdrawal; `x` + family-id(64) for transactions; `m` +
+name(16, `[a-z0-9-]`, right-padded `-`) for deployment metadata. Maximum
+physical key length **128 bytes**; every class has a total parser, and
+segment boundaries are positional, so no segment can contain or escape a
+delimiter, prefix queries are plain string prefixes on every backend,
+and a grammar-disjointness test covers every class pair plus the legacy
+grammar. (hmac verbatim keys remain the
 reserved exception, with the 64-hex cluster prefix at position zero.)
 
 **Wire schemas** (JSON, like identity rows; every class carries a schema
@@ -607,8 +643,15 @@ spec's absence/replay decisions consume — a reduced schema cannot
 reproduce them**): kind (user evidence vs policy baseline), grant
 basis/source class, policy revision (digest + activation generation),
 `valid_until`, provenance revision, evidence timestamp, and the
-per-permission **semantic digest with its pinned first-seen/
-first-normalized timestamps** (anti-replay); record level: family ID,
+— because a _single current_ digest cannot uphold
+"re-presentation never advances first-seen" (grant A → refusal B →
+replayed A would look novel once B displaced A's slot) — a **bounded
+replay history keyed by (source class, semantic digest)**: pinned
+first-seen/first-normalized entries retained for at least the maximum
+evidence/suppression horizon, capacity-capped at 16 per
+permission·source (in-horizon entries are never evicted; cap saturation
+fails restrictive — novel values cannot grant until the horizon
+passes); record level: family ID,
 CAS version counter, schema version, stub marker (backfill, §5); unknown-field and range validation apply
 like every class (strong class, permission-exempt writes per the
 permission spec's inventory; revisions are app-level counters because

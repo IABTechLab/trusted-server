@@ -435,7 +435,14 @@ and the fail-closed marker:
   clearing a previously positive permission — uses a narrow
   **permission-exempt suppression-decision read** exposing only the
   family ID and authority metadata (an undeclared exempt read was the
-  alternative, and skipping it leaves stale S2S authority).
+  alternative, and skipping it leaves stale S2S authority). Absence is
+  **one-shot per positive summary**: writing the entry also retires the
+  summary that justified it (recorded as retired-at), so later
+  signal-less requests find no positive authority and write nothing —
+  otherwise each would re-observe and extend the denial forever — and
+  the entry's `valid_until` is capped by the retired authority's own
+  original `valid_until` (absence retires an authority horizon; it does
+  not outlive it).
   **Policy-only tightening writes nothing**: a policy edit is not a user
   signal (§4.2 trigger 3), and a signal-less request after
   granted→denied must not create sticky user suppression that a policy
@@ -450,8 +457,7 @@ and the fail-closed marker:
   when its evidence timestamp is **newer than or equal to** the stored
   entry's; ties resolve to the more restrictive state. So a delayed
   grant with `LastUpdated = 100` never clears a suppression whose
-  refusal carried `200`, while a genuine re-consent at `300` does. The
-  **Every suppression entry carries its own `valid_until`, derived from
+  refusal carried `200`, while a genuine re-consent at `300` does. **Every suppression entry carries its own `valid_until`, derived from
   its evidence class's TTL, and an expired entry is inert** — treated as
   cleared without a write, lazily garbage-collected. Without this, an
   expired TCF refusal under a `granted` baseline would deny forever:
@@ -467,9 +473,14 @@ and the fail-closed marker:
   within the skew window; cross-source comparison uses the authoritative
   timestamp where one exists, else the observation timestamp, ties
   restrictive), by stored cause: **opt-out from a timestamp-less
-  source** — cleared only by a grant with an authoritative timestamp
-  newer than the suppression's observation (sticky opt-out, sign-off
-  16); **TCF refusal** — cleared by any regime-accepted grant with newer
+  source** — within its lifetime, cleared only by a grant with an
+  authoritative timestamp newer than its observation; its lifetime is
+  the ordinary consent-TTL `valid_until`, at which it goes inert
+  automatically (**TTL-sticky** — the one rule chosen among three that
+  circulated: not user-sticky-forever, and not the migration spec's
+  former "irreversible artifact requiring administrative clear", which
+  is superseded; administrative clear remains an optional early exit —
+  sign-off 16); **TCF refusal** — cleared by any regime-accepted grant with newer
   authoritative evidence; **malformed-present / absence** — cleared by
   any regime-accepted valid grant with newer evidence, including a
   timestamp-less grant whose first-seen is newer (these causes are not
@@ -537,7 +548,13 @@ and the fail-closed marker:
   row and the strong authority-state record, in a fixed order with
   defined intermediate states: (1) the row commits at revision _r_
   (generation-CAS); (2) the authority-state record CAS-updates its
-  summary to _r_. **Revision _r_ is committed — usable by S2S, visible
+  summary to _r_ — and that transition **rejects regression**: an
+  incoming revision lower than the stored one is refused (a delayed
+  commit for r2 arriving after r3's must not restore older authority or
+  an older `valid_until`), and an equal revision is idempotent and must
+  be payload-equivalent (a mismatch at equal revision is a hard error,
+  not a merge). The r2-row → r3-row → r3-authority → delayed
+  r2-authority schedule is a named test. **Revision _r_ is committed — usable by S2S, visible
   to the absence decision — only when the strong record reports it**; a
   row at _r_ whose summary still reads _r−1_ is simply uncommitted
   detail, and a crash between the writes leaves a recoverable state (the
@@ -648,6 +665,17 @@ a change to this table.
 **N/A vs absent (restating the single rule):** explicit _Not
 Applicable_ = grant-class; absent = nothing; a non-applicable section's
 fields grant nothing (their opt-outs still count, per step 2).
+
+**Unknown section IDs contribute nothing — and bound what
+embedded-GPC scanning can promise.** A section ID outside the pinned map
+is ignored (its fields neither grant nor revoke; known sections in the
+same string remain valid — an unknown _section_ is not a malformed
+_family_, unlike a mapped section at an unpinned version). Consequence,
+stated honestly: an embedded GPC bit inside an unknown section is
+undetectable by a decoder that cannot parse it — global-GPC coverage is
+bounded by the pinned map's currency, which is one reason snapshot
+updates are reviewed spec changes. Mixed known/unknown strings resolve
+per-section by these rules.
 
 **Embedded GPC is mapped, not ignored.** The US sections carry
 `GpcSegmentIncluded` and `Gpc` fields; a request with embedded
@@ -783,8 +811,11 @@ migration story unresolvable (migration spec §2, rows 5 and 7).
 
 A **policy revision** has a defined identity: the canonical content
 digest of the `[permissions]` section (identity — republishing identical
-policy yields the same digest) paired with the config-store activation
-generation (ordering — strictly monotonic per instance). Provenance
+policy yields the same digest) paired with the **config-store's globally assigned activation
+version** (the `ts config push` version — one fleet-wide ordered
+sequence, not a per-instance counter: "monotonic per instance" gave
+generation 12 on one instance no relation to 12 on another, making
+cross-instance provenance comparison undefined). Provenance
 stores both; comparisons order by generation and equate by digest, so a
 rollback is a _new_ generation carrying an _old_ digest, with defined
 semantics on both axes.

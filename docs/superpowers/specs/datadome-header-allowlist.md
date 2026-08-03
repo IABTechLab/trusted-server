@@ -8,3 +8,15 @@ name is a reviewed commit to this file and a spec change.
 | Header                | Direction                   | Scope                                                                                                |
 | --------------------- | --------------------------- | ---------------------------------------------------------------------------------------------------- |
 | `X-DataDome-ClientID` | response → upstream overlay | Owner-scoped overlay only; never the shared request view; vendor egress governed by sign-off item 23 |
+
+## Response-direction allowlist (browser-response pointers)
+
+Headers a DataDome decision may set on the outgoing response, beyond
+the typed security cookie (hook spec §4a). Empty rows below the base
+set mean: nothing else is accepted until a reviewed commit adds it.
+
+| Header                    | Decision                     | Semantics                                   |
+| ------------------------- | ---------------------------- | ------------------------------------------- |
+| `Location`                | Respond (3xx) only           | replace                                     |
+| `Content-Type`            | Respond only (owns its body) | replace                                     |
+| `Cache-Control`, `Pragma` | Respond only                 | restricted merge; invariant pass still last |
