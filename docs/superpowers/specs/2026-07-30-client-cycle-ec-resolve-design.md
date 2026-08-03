@@ -100,8 +100,8 @@ Everything in this spec follows from that.
 5. **Exist on every adapter — where parity means identical behavior,
    including identical refusal.** Route registration goes through shared
    route wiring. On adapters whose capability matrix rows are green
-   (today only the dev adapter has the required CAS class — providers
-   spec §7), the parity suite asserts identical endpoint behavior; on
+   (today **no adapter** has the required CAS class — the normative
+   matrix marks even Axum's storage unavailable; providers spec §7), the parity suite asserts identical endpoint behavior; on
    adapters without them, parity means **identical startup rejection of
    the client-cycle selection** — not a proxied 404 (PR #838's failure
    mode: Fastly-only registration let the Axum dev server proxy the POST

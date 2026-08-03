@@ -451,6 +451,16 @@ and the fail-closed marker:
   entry's; ties resolve to the more restrictive state. So a delayed
   grant with `LastUpdated = 100` never clears a suppression whose
   refusal carried `200`, while a genuine re-consent at `300` does. The
+  **Every suppression entry carries its own `valid_until`, derived from
+  its evidence class's TTL, and an expired entry is inert** — treated as
+  cleared without a write, lazily garbage-collected. Without this, an
+  expired TCF refusal under a `granted` baseline would deny forever:
+  normalization says an expired record is absent and "must not revoke
+  indefinitely", yet the surviving suppression would block the baseline
+  grant that same table promises — the two contracts now agree, in the
+  normalization table's favor. (Destructive opt-outs tombstone and need
+  no suppression longevity; non-destructive opt-out entries expire on
+  the consent-TTL horizon of the evidence that created them.) The
   transition table (causes without an intrinsic timestamp — malformed
   records decode no `LastUpdated`, absence has no source — use their
   **observation timestamp**, server receipt on the shared clock basis
@@ -490,8 +500,12 @@ and the fail-closed marker:
   `GraphOps`, and clearing first is forbidden — so recovery has its own
   narrow write path: **`AuthorityRefresh`**, permission-exempt but
   strictly scoped to committing provenance from the _current live
-  resolution_ (nothing else: no partner writes, no egress, no reads
-  beyond the row being refreshed) while suppression remains effective;
+  resolution_ — its exact access set: **read + generation-CAS of the row
+  being refreshed, and read + CAS of the family's authority-state
+  record** (its own clearing protocol requires both; the earlier "no
+  reads beyond the row" wording forbade a read its own CAS needs);
+  nothing else — no partner writes, no egress — while suppression
+  remains effective;
   the clear then references that provenance's revision. Revisions are an
   **application-level monotonic counter written with the row** — never
   backend generation markers, which (per Fastly's own contract) only
@@ -597,6 +611,7 @@ an expired record before clearing both sources; expiry-first is a
 | Expired consent record                                           | Treated as **absent entirely** — grants nothing, refuses nothing, withdraws nothing; the baseline applies. Under a `granted` baseline that means the grant stands: an expired refusal is not current evidence and must not revoke indefinitely                                                                                                                                                                                                                                                                                                            | Preserved                                                                                                                         |
 | One valid record + a second malformed record of the same family  | The **valid record governs**; the malformed one is ignored with a `warn` log. Fail-closed-on-malformed (below) applies only when no valid record of that family exists                                                                                                                                                                                                                                                                                                                                                                                    | Decided here                                                                                                                      |
 | One valid record + one **expired** record of the same family     | The valid record governs — the expired one dropped at pipeline step 2, before conflict resolution ever saw it                                                                                                                                                                                                                                                                                                                                                                                                                                             | **Changed (declared)** — current runtime resolves the conflict first and can select the expired record                            |
+| **Expired** live record + still-valid persisted-KV record        | The expired live record is absent entirely (step 2), so it does **not** suppress the fallback: the persisted record substitutes, subject to its own TTL and the full pipeline — "live wins" applies to live records that still exist after expiry filtering                                                                                                                                                                                                                                                                                               | Decided here                                                                                                                      |
 | Persisted-KV consent record, live record present                 | **Live wins**, always; the stored record is never consulted                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | Preserved                                                                                                                         |
 | Persisted-KV consent record, no live record                      | Substitutes as the effective record **iff within the same TTL as a live record**, then flows through the full normalization pipeline (syntax, expiry, conflict) like any live record; staler → absent. This narrow read is exempt from the graph-read permission gate (§7) — determining `store-on-device` cannot itself require `store-on-device`                                                                                                                                                                                                        | **Changed (declared)**: current code returns immediately after the KV load, bypassing expiry and conflict normalization           |
 | Proxy/mirror mode                                                | **Minimal opt-out extraction still runs; full semantic decoding is skipped.** Because opt-outs are globally authoritative (§4), proxy mode must not suppress them: the §4.5-mapped opt-out fields (GPP US sections) and the US Privacy string are decoded — nothing else — alongside syntax validation, so a valid SaleOptOut or USP opt-out revokes and withdraws exactly as outside proxy mode. No grants are ever derived from records in proxy mode; a present record otherwise blocks grants (fail-closed); absent → baseline. GPC needs no decoding | **Changed (declared)**: today proxy mode skips decoding entirely — fail-open under permissive baselines and, worse, opt-out-blind |
@@ -614,7 +629,7 @@ the single normative statement; an earlier "N/A contributes nothing"
 rule is dead, and the P4-authorizing consequence is sign-off item 17) —
 and only the fields marked destructive trigger
 withdrawal. Section IDs and versions are those of the IAB GPP
-specification current at implementation time; adding a section or field is
+specification pinned by the vendored snapshot; adding a section or field is
 a change to this table.
 
 | Source · field                               | Value                       | `store-on-device` (P1)                 | `select-personalised-ads` (P4)         | Destructive withdrawal?                                                                                            |
@@ -634,6 +649,16 @@ a change to this table.
 Applicable_ = grant-class; absent = nothing; a non-applicable section's
 fields grant nothing (their opt-outs still count, per step 2).
 
+**Embedded GPC is mapped, not ignored.** The US sections carry
+`GpcSegmentIncluded` and `Gpc` fields; a request with embedded
+`Gpc = true` and no `Sec-GPC` header was previously unspecified despite
+the global-GPC rule. Normatively: embedded `Gpc = true` in **any**
+section is the same **destructive global opt-out** as the header
+(aggregated with it by OR — opt-outs are never jurisdiction-filtered);
+`GpcSegmentIncluded = false`, an absent segment, or `Gpc = false`
+contributes nothing; a malformed optional GPC segment renders that
+section malformed-present (blocks grants, never withdraws).
+
 **Applicability and aggregation — ordered algorithm:**
 
 1. **Section map (normative, pinned here — not "whatever GPP is
@@ -647,7 +672,12 @@ fields grant nothing (their opt-outs still count, per step 2).
    `US/NJ` ↔ 21, `US/TN` ↔ 22, `US/MN` ↔ 23, **`US/MD` ↔ 24,
    `US/IN` ↔ 25, `US/KY` ↔ 26, `US/RI` ↔ 27** (an earlier draft wrongly
    claimed MD/IN/KY/RI had no section). A truncated map silently loses
-   opt-outs — a Texas (16) or Maryland (24) sale opt-out must not vanish.
+   opt-outs — a Texas (16) or Maryland (24) sale opt-out must not
+   vanish. **The current decoder is an explicit prerequisite gap**: it
+   (and `iab_gpp` 0.1.2) supports sections 7–23 only and models `usnat`
+   v2 while the snapshot pins v1 — implementation must extend or replace
+   the decoder for 24–27 _and_ reject versions the library happens to
+   decode but the snapshot disallows.
    The implementation PR cross-checks this list against both the current
    decoder's section set and the official registry, and the accepted version per
    section is **pinned to the vendored registry snapshot
@@ -751,6 +781,14 @@ migration story unresolvable (migration spec §2, rows 5 and 7).
 
 ### 5.5 Policy revision activation
 
+A **policy revision** has a defined identity: the canonical content
+digest of the `[permissions]` section (identity — republishing identical
+policy yields the same digest) paired with the config-store activation
+generation (ordering — strictly monotonic per instance). Provenance
+stores both; comparisons order by generation and equate by digest, so a
+rollback is a _new_ generation carrying an _old_ digest, with defined
+semantics on both axes.
+
 A policy edit propagates through the config store, so a fleet briefly
 mixes revisions. The contract: instances stamp every resolution and every
 provenance write with the policy revision they used (already required by
@@ -817,23 +855,24 @@ Consumers of the resolved set in this epic:
    inventory, normative per path (one test per row; a denylist check
    proves no ungated egress exists):
 
-   | Path                                                             | Required permissions                                                   | Notes                                                                                                                                                                                                                                                                                                                                                                                             |
-   | ---------------------------------------------------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-   | OpenRTB `user.id`                                                | `store-on-device` ∧ `select-personalised-ads`                          | Raw EC is identity in the bidstream — gated exactly as EIDs. PR #838 gated only EIDs, leaving `user.id` reachable with Purpose 4 refused                                                                                                                                                                                                                                                          |
-   | EC-derived auction request IDs                                   | both purposes                                                          | Derived values are identity                                                                                                                                                                                                                                                                                                                                                                       |
-   | Page-bids path                                                   | both purposes                                                          |                                                                                                                                                                                                                                                                                                                                                                                                   |
-   | Bidstream EIDs                                                   | both purposes                                                          | The one gate PR #838 had                                                                                                                                                                                                                                                                                                                                                                          |
-   | Proxy / click / Testlight forwarding of the EC cookie or headers | both purposes                                                          | **New hardening, declared change** — these paths extract the raw cookie/header without today's jurisdiction gate (migration spec §2 row 11b)                                                                                                                                                                                                                                                      |
-   | Identify endpoint (partner-facing)                               | both purposes                                                          | Partner identity exchange, not a first-party lookup — decided here                                                                                                                                                                                                                                                                                                                                |
-   | Pull sync (browser-request-scoped partner exchange)              | both purposes, from the **live** request resolution                    | Pull sync is created from a browser request and checks the live `EcContext` today — it keeps using the live P1 ∧ P4 decision plus the family revocation state (§4.3); stored provenance is never a substitute for available live evidence                                                                                                                                                         |
-   | Batch sync (context-free S2S partner exchange)                   | both purposes, from **stored provenance**                              | The only truly signal-less path; authority rules below. Today's handler only authenticates and checks row state, so this gate is **declared hardening** (migration spec §2)                                                                                                                                                                                                                       |
-   | Request-scoped graph reads/writes (non-revocation)               | `store-on-device`                                                      |                                                                                                                                                                                                                                                                                                                                                                                                   |
-   | Revocation paths (tombstones, withdrawal reads)                  | **exempt**                                                             | Must work when permissions are unset                                                                                                                                                                                                                                                                                                                                                              |
-   | Stored consent-state lookup (§4.4)                               | **exempt**, narrowly scoped                                            | Determining `store-on-device` cannot require `store-on-device`                                                                                                                                                                                                                                                                                                                                    |
-   | Integration persistent response cookies                          | `store-on-device` (+ P4 where the cookie is an advertising identifier) | **Deferred with the hook's cookie surface** — the write-side gate alone was insufficient (read/use/forward/withdrawal unmodeled), so cookie operations ship only with the full model; this row and the client-cycle **page leg** (module injection gated on the provider's full declaration) join the inventory when their features do, and the §5.3 no-geo guard's consumer list grows with them |
-   | Suppression-record writes (§4.3)                                 | **exempt**                                                             | Clearing authority is protective, like revocation                                                                                                                                                                                                                                                                                                                                                 |
-   | Authority-state / suppression-decision read (§4.3)               | **exempt**, narrowly scoped                                            | Returns only family ID, per-permission authority summary, and suppression entries — no identity values, no partner data; a test proves nothing else escapes                                                                                                                                                                                                                                       |
-   | `AuthorityRefresh` provenance write (§4.3)                       | **exempt**, strictly scoped                                            | Commits current-live-resolution provenance only; enables suppression recovery without reopening `GraphOps`                                                                                                                                                                                                                                                                                        |
+   | Path                                                               | Required permissions                                                   | Notes                                                                                                                                                                                                                                                                                                                                                                                             |
+   | ------------------------------------------------------------------ | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+   | OpenRTB `user.id`                                                  | `store-on-device` ∧ `select-personalised-ads`                          | Raw EC is identity in the bidstream — gated exactly as EIDs. PR #838 gated only EIDs, leaving `user.id` reachable with Purpose 4 refused                                                                                                                                                                                                                                                          |
+   | EC-derived auction request IDs                                     | both purposes                                                          | Derived values are identity                                                                                                                                                                                                                                                                                                                                                                       |
+   | Page-bids path                                                     | both purposes                                                          |                                                                                                                                                                                                                                                                                                                                                                                                   |
+   | Bidstream EIDs                                                     | both purposes                                                          | The one gate PR #838 had                                                                                                                                                                                                                                                                                                                                                                          |
+   | Proxy / click / Testlight forwarding of the EC cookie or headers   | both purposes                                                          | **New hardening, declared change** — these paths extract the raw cookie/header without today's jurisdiction gate (migration spec §2 row 11b)                                                                                                                                                                                                                                                      |
+   | Identify endpoint (partner-facing)                                 | both purposes                                                          | Partner identity exchange, not a first-party lookup — decided here                                                                                                                                                                                                                                                                                                                                |
+   | Pull sync (browser-request-scoped partner exchange)                | both purposes, from the **live** request resolution                    | Pull sync is created from a browser request and checks the live `EcContext` today — it keeps using the live P1 ∧ P4 decision plus the family revocation state (§4.3); stored provenance is never a substitute for available live evidence                                                                                                                                                         |
+   | Batch sync (context-free S2S partner exchange)                     | both purposes, from **stored provenance**                              | The only truly signal-less path; authority rules below. Today's handler only authenticates and checks row state, so this gate is **declared hardening** (migration spec §2)                                                                                                                                                                                                                       |
+   | Request-scoped graph reads/writes (non-revocation)                 | `store-on-device`                                                      |                                                                                                                                                                                                                                                                                                                                                                                                   |
+   | Revocation paths (tombstones, withdrawal reads)                    | **exempt**                                                             | Must work when permissions are unset                                                                                                                                                                                                                                                                                                                                                              |
+   | **Observability sinks — logs, traces, metrics, error attachments** | Never — no permission authorizes them                                  | Raw EC values (and derived URLs embedding them) must not reach any observability sink: logging boundaries accept redacted/hash-only types, not `&str` (PR #838 logs a redirect URL containing the EC and the raw `ec_id` field — the motivating counterexample); a log-schema denylist test enforces the row                                                                                      |
+   | Stored consent-state lookup (§4.4)                                 | **exempt**, narrowly scoped                                            | Determining `store-on-device` cannot require `store-on-device`                                                                                                                                                                                                                                                                                                                                    |
+   | Integration persistent response cookies                            | `store-on-device` (+ P4 where the cookie is an advertising identifier) | **Deferred with the hook's cookie surface** — the write-side gate alone was insufficient (read/use/forward/withdrawal unmodeled), so cookie operations ship only with the full model; this row and the client-cycle **page leg** (module injection gated on the provider's full declaration) join the inventory when their features do, and the §5.3 no-geo guard's consumer list grows with them |
+   | Suppression-record writes (§4.3)                                   | **exempt**                                                             | Clearing authority is protective, like revocation                                                                                                                                                                                                                                                                                                                                                 |
+   | Authority-state / suppression-decision read (§4.3)                 | **exempt**, narrowly scoped                                            | Returns only family ID, per-permission authority summary, and suppression entries — no identity values, no partner data; a test proves nothing else escapes                                                                                                                                                                                                                                       |
+   | `AuthorityRefresh` provenance write (§4.3)                         | **exempt**, strictly scoped                                            | Commits current-live-resolution provenance only; enables suppression recovery without reopening `GraphOps`                                                                                                                                                                                                                                                                                        |
 
    With **no EC provider configured**, identity use fails closed: a cookie
    value present on the request never egresses anywhere — never vacuously
@@ -858,12 +897,14 @@ Consumers of the resolved set in this epic:
    | GPP / USP values (no intrinsic timestamp)         | **First-seen**: when TS first observed this exact normalized value (a **per-permission equality digest computed over only the applicable, aggregated §4.5 fields for that permission** — never the whole GPP record, or a CMP touching an unrelated notice field would mint a new digest and reset first-seen forever) | Re-presenting an identical digest **keeps the original first-seen**; a different value is new evidence with a new first-seen | Consent TTL (same as TCF) |
    | Policy-baseline grant (`granted` rule, no signal) | The policy revision that granted                                                                                                                                                                                                                                                                                       | Re-derived on every recompute against the current revision — policy is not user evidence and does not age; it changes        | n/a                       |
 
-   Timestamps are compared with a bounded clock-skew tolerance that is a
-   **normative constant — 300 seconds** (five minutes, applied
-   symmetrically; a spec-level value because suppression precedence,
-   malformed classification, and future-date handling all hinge on it,
-   and per-deployment values would give the same input different privacy
-   outcomes);
+   Timestamp handling is an **algorithm, not just a constant**: with
+   skew S = 300 s (normative), a timestamp `t > now + S` renders its
+   record malformed-present; `t` in `(now, now + S]` is used as-is (not
+   clamped — clamping re-freshens replays); expiry checks grant a grace
+   of S (`expired` means `valid_until < now − S`); and two evidence
+   timestamps within S of each other **compare equal**, which routes
+   the comparison to the tie rule (restrictive) — so a slightly
+   future-dated consent cannot out-order a just-observed opt-out;
    beyond-window future-dated records are **rejected as malformed**, and
    within the window a record's first normalized timestamp is pinned to
    its digest and never advanced by re-presentation (§4.3's anti-replay
@@ -880,7 +921,15 @@ Consumers of the resolved set in this epic:
    stored evidence has **expired**, or when the regime no longer accepts
    the stored grant's source class (§4's regime-scoped table). Any of
    these → no update, row flagged for the operational cleanup of §4.2
-   trigger 3. Sync never mints authority of its own.
+   trigger 3. Sync never mints authority of its own. **Stored
+   jurisdiction ages too**: batch sync has no live geo, so the
+   jurisdiction it recomputes against is the one from the last browser
+   visit — and a visitor who moved from a permissive into a GDPR
+   jurisdiction would otherwise keep old-rule egress for up to the row
+   lifetime. A stored jurisdiction older than the **consent-TTL
+   horizon** fails closed pending a live refresh (the inverse — denying
+   a visitor who moved the other way — is the accepted cost); the
+   horizon choice and its legal trade-off are **sign-off item 25**.
 
    **Legacy (pre-epic) rows** carry none of these fields. They are treated
    as reserved `hmac-v0` provenance with **no stored grant evidence**, so

@@ -263,12 +263,18 @@ normative order is: gate → `generate` → graph-row commit →
 **authority-state commit** (the strong record reporting the row's
 revision — the commit point of the two-record protocol, permission model
 spec §4.3) → cookie scheduled → eligible for egress. Eligibility begins
-at the authority-state commit, not the row commit: a row whose revision
-the strong record has not reported is uncommitted detail, which is what
-keeps S2S authorization and the absence decision consistent. "Cookie scheduled" means queued onto the
+at the authority-state commit and nowhere earlier. **Mint-path failure
+between the two writes is declared, not "recovered"**: no cookie was
+emitted, so no later request can identify the orphan — the earlier
+claim that recovery "re-runs step 2" is false for the mint path (it
+holds only for _presented_ identities via `AuthorityRefresh`). An
+orphaned row (or orphaned pending record, if the order's first write
+succeeded alone) authorizes nothing — the strong record never reported
+it — and is bounded by its `expires_at`/retention TTL; the failure is
+counted (a first-class metric) and appears in the §6.2 runtime matrix. "Cookie scheduled" means queued onto the
 final response — `Set-Cookie` is physically emitted after first-request
-processing, so egress eligibility begins at **graph commit**, not at
-header emission; the identity exists durably from that moment. A
+processing, so egress eligibility begins at the **authority-state commit**
+(§5 mint order — not graph commit, and not header emission). A
 graph-commit failure means the mint never happened: no cookie, no egress,
 error logged, the next request retries.
 
@@ -285,14 +291,21 @@ variant**. Therefore:
   not-found proves nothing — a just-minted row invisible on a stale
   replica would classify its own cookie as rowless and fork the
   identity, and "the backend's strongest read" over eventual storage is
-  not an authoritative primitive. The proof uses what the protocol
-  already guarantees: **every post-upgrade identity has an
-  authority-state record** (the commit point, §5 mint order) under its
+  not an authoritative primitive. The proof needs more than the flag —
+  a per-deployment flag cannot prove a per-cookie fact, and "no
+  authority-state record" alone would misclassify every graph-backed
+  legacy row and every N+1-minted v1 row (neither has one). The
+  protocol closes both gaps with **prerequisites for setting the
+  flag**: (1) the fleet has fully converged on **N+2** (no v1 minting
+  anywhere — an N+1 fleet must never run rowless classification), and
+  (2) an idempotent **stub-backfill scan** has stamped a minimal
+  authority-state existence stub onto **every existing identity row**
+  (legacy and N+1-minted alike). Only then does the invariant hold:
+  every row-backed identity has an authority-state record under its
   derivable family ID, in the globally-strong class — so _rowless_ =
-  the deployment-metadata **graphless-migration flag** is set AND the
-  strong read finds **no authority-state record** for the cookie's
-  derived family ID. Graphless-era cookies never had one; no eventual
-  read participates. The flag itself is specified: a named
+  flag set AND the strong read finds **no record** for the cookie's
+  derived family ID. Graphless-era cookies never got a stub because
+  they have no row for the scan to find; no eventual read participates. The flag itself is specified: a named
   deployment-metadata key (write-once/CAS class), set by the §4.2
   readiness step only on deployments that actually ran graphless
   (requires the deployment-metadata capability), surviving binary
@@ -308,19 +321,29 @@ variant**. Therefore:
   deliberately not preserved (migration matrix row 13, sign-off 21). An
   unverifiable cookie (including the declared roaming false-negative) is
   simply expired.
-- **Rowless withdrawal writes an exact-cookie family record, then
-  expires the cookie** — one contract, aligned with the family-first
-  rule of the permission spec (cookie-only expiry would be best-effort:
-  a lost response leaves the "withdrawn" cookie usable on its next
-  presentation). The family ID uses the **same full-graph-key derivation
-  as row-backed identities** — one derivation everywhere — so the record
-  revokes exactly the presented cookie value: no per-IP blast (the
-  earlier prefix derivation would have revoked every identity behind one
-  IP), and bounded minting, because only **prefix-verified** cookies may
-  write one — an attacker can fabricate suffix variants only for their
-  own evidence's prefix, spending their own withdrawal on themselves.
-  A re-presented withdrawn variant finds its family record and stays
-  dead.
+- **Rowless withdrawal writes into one capped per-prefix record, then
+  expires the cookie** — durable (cookie-only expiry is best-effort: a
+  lost response leaves the "withdrawn" cookie usable), and **bounded in
+  storage**, which separate exact-cookie records were not: a holder of
+  one valid prefix can fabricate billions of suffix variants, and
+  per-variant records would be attacker-priced strong storage. The
+  record (strong class, keyed on the verified prefix) holds a bounded
+  list (cap 8) of withdrawn-suffix hashes; writes are admitted only for
+  **prefix-verified** cookies; **saturation escalates to prefix-wide
+  rowless revocation** — every rowless cookie under that prefix is
+  treated withdrawn, which harms only the abuser's own same-IP graphless
+  cohort and is the declared abuse response (legitimate users hold one
+  or two variants ever). A re-presented withdrawn variant finds its
+  entry (or the saturated record) and stays dead. Row-backed
+  withdrawal is untouched: full-graph-key family records, one derivation
+  everywhere.
+- **Negative-record creation has admission rules everywhere**:
+  suppression and family records may be written only for (a) an
+  existing family — the authority-state record exists on a strong
+  read — or (b) a **verified** identifier (`verify`); a fabricated,
+  unverifiable cookie writes nothing. This bounds record creation to
+  real identities plus the writer's own evidence, and per-prefix
+  rate limits apply to the rowless path above.
 
 **Egress is typed, not policed.** The inventory-and-denylist test
 (permission model spec §7) is a backstop, but conventions do not survive
@@ -494,15 +517,16 @@ Startup validation (§6) covers configuration; this covers what happens
 when a healthy configuration meets an unhealthy runtime. Every row logs at
 `error` with a metric; none is silent:
 
-| Failure                                                                   | Behavior                                                                                                         |
-| ------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `generate` returns an error                                               | No identity this request; request proceeds stateless; no cookie written                                          |
-| Graph-row commit fails at mint                                            | Mint never happened (§5): no cookie, no egress; next request retries                                             |
-| Graph read fails on an existing identity                                  | Identity unusable this request (fail closed for egress); cookie untouched                                        |
-| Cluster prefix listing fails                                              | Treated as cluster-size-unknown → `cluster_fallback` policy applies                                              |
-| Tombstone write fails                                                     | Permission model spec §4.3: family retries, readers fail closed on partial families                              |
-| Geo provider returns invalid output (unparseable country) at runtime      | Treated as lookup failure → `default_country` (permission model spec §5.2), counted in the lookup-failure metric |
-| Device provider signals unavailable at runtime (e.g. no JA4 on a request) | Classification degrades per the provider's declared fallback, never silently upgrades `looks_like_browser`       |
+| Failure                                                                   | Behavior                                                                                                                                                       |
+| ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `generate` returns an error                                               | No identity this request; request proceeds stateless; no cookie written                                                                                        |
+| Graph-row commit fails at mint                                            | Mint never happened (§5): no cookie, no egress; next request retries                                                                                           |
+| Authority-state commit fails after the row commit at mint                 | No cookie, no eligibility (the strong record never reported the revision); the orphan row expires by TTL; counted — **no recovery claim**, nothing can find it |
+| Graph read fails on an existing identity                                  | Identity unusable this request (fail closed for egress); cookie untouched                                                                                      |
+| Cluster prefix listing fails                                              | Treated as cluster-size-unknown → `cluster_fallback` policy applies                                                                                            |
+| Tombstone write fails                                                     | Permission model spec §4.3: family retries, readers fail closed on partial families                                                                            |
+| Geo provider returns invalid output (unparseable country) at runtime      | Treated as lookup failure → `default_country` (permission model spec §5.2), counted in the lookup-failure metric                                               |
+| Device provider signals unavailable at runtime (e.g. no JA4 on a request) | Classification degrades per the provider's declared fallback, never silently upgrades `looks_like_browser`                                                     |
 
 The **degraded-graph health signal** referenced above and by the
 withdrawal contract is a defined state machine, not a vibe: it is
@@ -539,7 +563,8 @@ the bounded suffix:
 | Alias                                                                                  | **The source identity key itself** — the alias is a value written _at_ the replaced row's address, distinguished by a `kind` discriminator in the JSON envelope | A separate `alias/…` address could never work: lookups by the old cookie hit the source key, and a single-key CAS cannot install a record at a different address                                                                                                                                                                                                          |
 | Family revocation                                                                      | `fam/<family-id>`                                                                                                                                               | Family ID from mint or the deterministic legacy derivation (permission spec §4.3)                                                                                                                                                                                                                                                                                         |
 | Authority-state (suppression + positive-authority summary)                             | `s` + family ID (fixed-width grammar)                                                                                                                           | Per-permission negative entries **and** the positive summary (permission spec §4.3); permission-exempt writes; consulted by every constructor and S2S recompute                                                                                                                                                                                                           |
-| Rewrite transaction                                                                    | `rwx/<family-id>`                                                                                                                                               | One in-flight rewrite per family                                                                                                                                                                                                                                                                                                                                          |
+| Deployment metadata                                                                    | `m` + fixed metadata name (fixed-width grammar; schema floor, graphless-migration flag)                                                                         | Write-once/CAS class; value carries schema version, state, epoch, set-at; the graphless flag's lifecycle: created by the migration readiness step **after** N+2 convergence + stub-backfill completion (both attested in the value), cleared by explicit operator CAS with the quiet-period criterion recorded                                                            |
+| Rewrite transaction _(informative — deferred)_                                         | `rwx/<family-id>`                                                                                                                                               | One in-flight rewrite per family                                                                                                                                                                                                                                                                                                                                          |
 | Replay reservation _(informative — deferred with client-cycle; not normative surface)_ | `resv/…`                                                                                                                                                        | Deferred client-cycle draft                                                                                                                                                                                                                                                                                                                                               |
 
 Grammars are pairwise non-intersecting by their literal prefixes (plus
@@ -558,8 +583,8 @@ Physical keys are **delimiter-free with fixed-width segments**: a
 generated key can begin with 64 hex characters, which is what makes
 disjointness from the legacy `{64hex}.{6alnum}` grammar _provable_
 rather than asserted (an earlier `f` tag was itself a hex digit) — then
-a **4-character provider code from a checked-in, append-only,
-never-reused registry file** (allocation is a reviewed commit;
+a **4-character provider code from the checked-in, append-only,
+never-reused registry `docs/superpowers/specs/provider-code-registry.md`** (allocation is a reviewed commit;
 codes are immutable and never recycled, including for retired
 providers), then the suffix. Segment boundaries are positional, so no
 segment can contain or escape a delimiter, prefix queries are plain
@@ -573,12 +598,18 @@ deadline, and fencing epoch; the **family revocation record** holds the
 family ID, revoked-at, triggering signal class (§4.5 destructive column),
 and a **family epoch** bumped on every revocation-state change (the
 client-cycle commit CAS is conditioned on it) — deliberately no identity
-data, so it can outlive its members; the **authority-state (suppression) record** holds, per permission:
+data, so it can outlive its members; the **authority-state record** holds, per permission — negative side:
 state (`suppressed`/`cleared`), cause, source class, authoritative or
-observation evidence timestamp, the **application-level provenance
-revision** a clear references, and the positive-authority summary
-(revision + evidence timestamp) — plus the record-level CAS version
-counter and schema version; unknown-field and range validation apply
+observation evidence timestamp, entry `valid_until` (evidence-class TTL;
+expired entries are inert), and the provenance revision a clear
+references; positive side (the summary, **every field the permission
+spec's absence/replay decisions consume — a reduced schema cannot
+reproduce them**): kind (user evidence vs policy baseline), grant
+basis/source class, policy revision (digest + activation generation),
+`valid_until`, provenance revision, evidence timestamp, and the
+per-permission **semantic digest with its pinned first-seen/
+first-normalized timestamps** (anti-replay); record level: family ID,
+CAS version counter, schema version, stub marker (backfill, §5); unknown-field and range validation apply
 like every class (strong class, permission-exempt writes per the
 permission spec's inventory; revisions are app-level counters because
 backend generation markers detect change without ordering);
@@ -608,7 +639,7 @@ achievable through a structured serializer).
 | `consent.ok` / `consent.updated`                                                                                                                                                                                                        | v1 liveness flag — **superseded by the family revocation record**; written during member cleanup for v1-reader benefit through the transition                                                                                                                                        | Core                                                    | —                                         | —                                                                                  | Fresh                                      | `ok = false` written as cleanup; the family record is authoritative (v1's 24 h tombstone TTL does not bound revocation) |
 | New: **immutable mint tag** (`mint_provider`, `mint_version`)                                                                                                                                                                           | Credential retirement and audit — write-once at mint (legacy backfill may populate a missing tag once); **never part of the replaceable snapshot**, or a v1 identity revisited after rotation would be restamped v2                                                                  | Mint (or one-time backfill)                             | —                                         | Immutable                                                                          | —                                          | Retained                                                                                                                |
 | New: **provenance revision** (application-level monotonic counter, u64, initialized at 1, incremented by every provenance-bearing write, CAS'd with the row generation, serialized as an integer; overflow is a hard error, not a wrap) | Orders clears vs. snapshots (permission spec §4.3)                                                                                                                                                                                                                                   | Core                                                    | Read by S2S/clears                        | Monotonic                                                                          | —                                          | Retained                                                                                                                |
-| New: per-permission provenance (grant basis, authoritative timestamp, `valid_until`, jurisdiction, policy revision, )                                                                                                                   | S2S authority                                                                                                                                                                                                                                                                        | Live resolution only                                    | Read by S2S recompute                     | `valid_until` per evidence class; replaced atomically, never merged                | **Fresh live resolution** — never copied   | Scrubbed                                                                                                                |
+| New: per-permission provenance (grant basis, authoritative timestamp, `valid_until`, jurisdiction, policy revision)                                                                                                                     | S2S authority                                                                                                                                                                                                                                                                        | Live resolution only                                    | Read by S2S recompute                     | `valid_until` per evidence class; replaced atomically, never merged                | **Fresh live resolution** — never copied   | Scrubbed                                                                                                                |
 | New: `family_id`                                                                                                                                                                                                                        | Revocation discovery                                                                                                                                                                                                                                                                 | Core at mint (derived for legacy, permission spec §4.3) | —                                         | Immutable                                                                          | Shared across linked rows                  | Is the revocation key                                                                                                   |
 | `geo.country` / `geo.region`                                                                                                                                                                                                            | Jurisdiction snapshot                                                                                                                                                                                                                                                                | Geo provider at mint                                    | P1                                        | Written at mint                                                                    | Fresh                                      | Scrubbed                                                                                                                |
 | `geo.asn` / `geo.dma`                                                                                                                                                                                                                   | Cluster disambiguation / market signal                                                                                                                                                                                                                                               | Platform at mint                                        | P1; DMA additionally P4 for bidstream use | Written at mint                                                                    | Fresh                                      | Scrubbed                                                                                                                |
