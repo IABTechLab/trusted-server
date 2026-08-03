@@ -78,8 +78,10 @@ do not consume the network ID and remain valid when it is blank.
 
 ### Bounded dynamic rendering
 
-Define a 100-character limit for a rendered dynamic GAM unit path, matching the
-documented Google Ad Manager ad-unit-code limit. The compatibility promise for
+Define a 100-byte limit for a rendered dynamic GAM unit path, conservatively
+enforcing the documented 100-character Google Ad Manager ad-unit-code limit.
+The byte limit directly bounds allocation; validated substitutions are ASCII,
+and non-ASCII template literals consume their UTF-8 byte length. The compatibility promise for
 pre-existing static and absent paths takes precedence, so those two legacy
 cases keep their current string-returning behavior even if their configured
 values exceed the new dynamic limit.
@@ -90,7 +92,7 @@ sanitized output is ASCII-only.
 
 Before allocating a rendered dynamic path, the renderer computes the exact
 length of literals and substituted values with checked arithmetic. If addition
-overflows or the total exceeds 100 characters, rendering returns `None`.
+overflows or the total exceeds 100 bytes, rendering returns `None`.
 Otherwise it allocates once with the computed capacity and appends each part.
 
 Startup validation renders each dynamic template with `section_root` when it
@@ -166,7 +168,7 @@ Implementation follows test-driven development.
 - [ ] Blank `gam_network_id` is rejected exactly when a rendered slot consumes
       it.
 - [ ] Dynamic rendered length is checked before final allocation and cannot
-      exceed 100 characters.
+      exceed 100 bytes.
 - [ ] Request-time overflow omits the affected slot without failing the
       response.
 - [ ] Static and absent paths retain their pre-template behavior.
