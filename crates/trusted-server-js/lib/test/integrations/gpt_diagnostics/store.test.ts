@@ -5,6 +5,7 @@ import {
   MAX_CALLBACK_ISSUES,
   MAX_DIAGNOSTIC_SLOTS,
   MAX_REQUEST_CYCLES_PER_SLOT,
+  TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS,
   type GptDiagnosticsSlotLike,
 } from '../../../src/integrations/gpt_diagnostics/store';
 
@@ -394,6 +395,154 @@ describe('GptDiagnosticsStore', () => {
     store.recordSlotVisibilityChanged(fakeSlot('other'), 10);
     scheduled.shift()!();
     expect(goodListener).toHaveBeenCalledTimes(1);
+  });
+
+  it('retains the Ad Manager identifiers GPT reported for the delivered ad', () => {
+    const store = new GptDiagnosticsStore({ now: () => 10 });
+    const slot = fakeSlot('ad-slot-identity');
+
+    store.recordSlotRequested(slot);
+    store.recordSlotResponseReceived(slot);
+    store.recordSlotRenderEnded(slot, {
+      isEmpty: false,
+      adManager: {
+        lineItemId: 6543210987,
+        creativeId: 1234567890,
+        campaignId: 2345678901,
+        advertiserId: 3456789012,
+      },
+    });
+
+    const cycle = store.snapshot().slots[0].requests[0];
+    expect(cycle.adManager, 'should keep every reported identifier').toEqual({
+      lineItemId: 6543210987,
+      creativeId: 1234567890,
+      campaignId: 2345678901,
+      advertiserId: 3456789012,
+    });
+    expect(cycle.responseClass).toBe('reservation');
+  });
+
+  it('separates a fill without Ad Manager identifiers from a reservation', () => {
+    const store = new GptDiagnosticsStore({ now: () => 10 });
+    const slot = fakeSlot('ad-slot-default');
+
+    store.recordSlotRequested(slot);
+    store.recordSlotRenderEnded(slot, { isEmpty: false });
+
+    const cycle = store.snapshot().slots[0].requests[0];
+    expect(cycle.responseClass).toBe('unclassified_non_empty');
+    expect(cycle.adManager).toBeUndefined();
+  });
+
+  it('confirms a Trusted Server render when the creative requests markup', () => {
+    let now = 10;
+    const store = new GptDiagnosticsStore({ now: () => now });
+    const slot = fakeSlot('ad-slot-claimed');
+
+    store.recordTrustedServerCandidate(slot, 'slot-a');
+    store.recordSlotRequested(slot);
+    now = 30;
+    store.recordSlotRenderEnded(slot, { isEmpty: false, adManager: { lineItemId: 6543210987 } });
+    now = 45;
+    store.recordTrustedServerClaim('slot-a');
+
+    const cycle = store.snapshot().slots[0].requests[0];
+    expect(cycle.delivery).toBe('trusted_server');
+    expect(cycle.trustedServerClaimAtMs).toBe(45);
+  });
+
+  it('resolves an unclaimed candidate render to other demand once the window closes', () => {
+    let now = 10;
+    const deferred: Array<() => void> = [];
+    const store = new GptDiagnosticsStore({
+      now: () => now,
+      defer: (callback) => deferred.push(callback),
+    });
+    const slot = fakeSlot('ad-slot-unclaimed');
+
+    store.recordTrustedServerCandidate(slot, 'slot-a');
+    store.recordSlotRequested(slot);
+    now = 30;
+    store.recordSlotRenderEnded(slot, { isEmpty: false, adManager: { lineItemId: 111222333 } });
+
+    expect(
+      store.snapshot().slots[0].requests[0].delivery,
+      'should stay pending inside the window'
+    ).toBe('pending');
+    expect(deferred, 'should schedule one notification at the window boundary').toHaveLength(1);
+
+    now = 30 + TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS;
+    expect(store.snapshot().slots[0].requests[0].delivery).toBe('other_demand');
+
+    // A late claim still corrects the verdict.
+    store.recordTrustedServerClaim('slot-a');
+    expect(store.snapshot().slots[0].requests[0].delivery).toBe('trusted_server');
+  });
+
+  it('never claims a slot Trusted Server had no candidate on', () => {
+    let now = 10;
+    const store = new GptDiagnosticsStore({ now: () => now, defer: () => undefined });
+    const slot = fakeSlot('ad-slot-publisher');
+
+    store.recordSlotRequested(slot);
+    now = 30;
+    store.recordSlotRenderEnded(slot, { isEmpty: false });
+    now = 30 + TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS;
+
+    expect(store.snapshot().slots[0].requests[0].delivery).toBe('no_candidate');
+  });
+
+  it('reports an empty render as not applicable regardless of candidacy', () => {
+    let now = 10;
+    const store = new GptDiagnosticsStore({ now: () => now, defer: () => undefined });
+    const slot = fakeSlot('ad-slot-empty');
+
+    store.recordTrustedServerCandidate(slot, 'slot-a');
+    store.recordSlotRequested(slot);
+    now = 30;
+    store.recordSlotRenderEnded(slot, { isEmpty: true });
+    now = 30 + TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS;
+
+    expect(store.snapshot().slots[0].requests[0].delivery).toBe('not_applicable');
+  });
+
+  it('preserves an unattributable claim as an issue instead of guessing', () => {
+    const store = new GptDiagnosticsStore({ now: () => 10 });
+    const slot = fakeSlot('ad-slot-no-render');
+
+    store.recordTrustedServerClaim('slot-unknown');
+    store.recordTrustedServerCandidate(slot, 'slot-a');
+    store.recordSlotRequested(slot);
+    store.recordTrustedServerClaim('slot-a');
+
+    const issues = store.snapshot().callbackIssues;
+    expect(issues.map((issue) => issue.reason)).toEqual([
+      'trusted_server_claim_without_slot',
+      'trusted_server_claim_without_render',
+    ]);
+    expect(store.snapshot().slots[0].requests[0].trustedServerClaimAtMs).toBeUndefined();
+  });
+
+  it('applies a candidate only to the request cycle it was declared for', () => {
+    let now = 10;
+    const store = new GptDiagnosticsStore({ now: () => now, defer: () => undefined });
+    const slot = fakeSlot('ad-slot-refresh');
+
+    store.recordTrustedServerCandidate(slot, 'slot-a');
+    store.recordSlotRequested(slot);
+    now = 30;
+    store.recordSlotRenderEnded(slot, { isEmpty: false });
+    now = 100;
+    // A later publisher refresh carries no Trusted Server targeting.
+    store.recordSlotRequested(slot);
+    now = 120;
+    store.recordSlotRenderEnded(slot, { isEmpty: false });
+    now = 120 + TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS;
+
+    const cycles = store.snapshot().slots[0].requests;
+    expect(cycles[0].delivery).toBe('other_demand');
+    expect(cycles[1].delivery).toBe('no_candidate');
   });
 
   it('returns detached snapshot data', () => {

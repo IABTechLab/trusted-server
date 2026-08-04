@@ -113,6 +113,88 @@ describe('installTsAdInit', () => {
     document.getElementById("ad'prefix-real")?.remove();
   });
 
+  it('associates the GPT slot with its auction slot for GPT diagnostics', async () => {
+    const mockSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([mockSlot]),
+      addEventListener: vi.fn(),
+      refresh: vi.fn(),
+    };
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(mockSlot),
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+    };
+    const recordTrustedServerCandidate = vi.fn();
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: { atf_sidebar_ad: { hb_adid: 'abc-uuid', hb_pb: '1.00' } },
+      gptDiagnostics: { recordTrustedServerCandidate },
+    };
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(recordTrustedServerCandidate).toHaveBeenCalledWith(mockSlot, 'atf_sidebar_ad');
+  });
+
+  it('reports no diagnostics candidate for a slot without a Trusted Server bid', async () => {
+    const mockSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([mockSlot]),
+      addEventListener: vi.fn(),
+      refresh: vi.fn(),
+    };
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(mockSlot),
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+    };
+    const recordTrustedServerCandidate = vi.fn();
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {},
+      gptDiagnostics: { recordTrustedServerCandidate },
+    };
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(recordTrustedServerCandidate).not.toHaveBeenCalled();
+  });
+
   it('reads window.tsjs.bids synchronously and applies bid targeting before refresh', async () => {
     const mockSlot = {
       addService: vi.fn().mockReturnThis(),
@@ -1366,6 +1448,48 @@ describe('installTsRenderBridge', () => {
     expect(bridgeListener, 'bridge listener should be registered').toBeDefined();
     return bridgeListener!;
   }
+
+  it('reports the creative markup request to GPT diagnostics when activated', async () => {
+    const recordTrustedServerClaim = vi.fn();
+    const tsjs = (window as TestWindow).tsjs!;
+    tsjs.gptDiagnostics = { recordTrustedServerClaim };
+    // Serve from inline adm so the claim is asserted without a cache fetch
+    // whose fire-and-forget continuation would outlive this test.
+    tsjs.bids.homepage_header.adm = '<div>Creative</div>';
+    delete tsjs.bids.homepage_header.nurl;
+    delete tsjs.bids.homepage_header.burl;
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+        ports: [{ postMessage: vi.fn() }],
+        source,
+        stopImmediatePropagation: vi.fn(),
+      }) as unknown as MessageEvent
+    );
+
+    expect(recordTrustedServerClaim).toHaveBeenCalledWith('homepage_header');
+  });
+
+  it('reports no claim for an ad ID the requesting slot does not own', async () => {
+    const recordTrustedServerClaim = vi.fn();
+    (window as TestWindow).tsjs!.gptDiagnostics = { recordTrustedServerClaim };
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'someone-elses-ad-id' }),
+        ports: [{ postMessage: vi.fn() }],
+        source,
+        stopImmediatePropagation: vi.fn(),
+      }) as unknown as MessageEvent
+    );
+
+    expect(recordTrustedServerClaim).not.toHaveBeenCalled();
+  });
 
   it('calls stopImmediatePropagation and fetches PBS Cache for a TS bid', async () => {
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);

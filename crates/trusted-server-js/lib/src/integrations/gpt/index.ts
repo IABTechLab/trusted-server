@@ -659,6 +659,12 @@ export function installTsAdInit(): void {
           if (bid[key]) gptSlot.setTargeting(key, String(bid[key]!));
         });
         gptSlot.setTargeting(TS_INITIAL_TARGETING_KEY, '1');
+        // Diagnostics can only tell a Trusted Server render from other Ad
+        // Manager demand if it knows which GPT slot carries this bid. Present
+        // only in a tab with diagnostics activated; a no-op otherwise.
+        if (bid.hb_adid) {
+          ts.gptDiagnostics?.recordTrustedServerCandidate?.(gptSlot, slot.id);
+        }
         // Map both inner div and container div → slot ID so slotRenderEnded
         // (which reports the GPT slot's div, i.e. slotDivId/container) can look up
         // the slot, while adm injection (which targets the inner div) also works.
@@ -1170,6 +1176,11 @@ export function installTsRenderBridge(): void {
     // Prebid.js handle it. The adId guard also prevents an iframe under slot A from
     // pulling slot B's creative and firing slot B's win/billing beacons.
     if (!matchedBid || matchedBid.hb_adid !== adId) return;
+
+    // Only the creative of the line item carrying this bid's targeting asks
+    // Trusted Server for markup, so this message settles which demand Ad
+    // Manager selected for the slot — independently of what is served below.
+    window.tsjs?.gptDiagnostics?.recordTrustedServerClaim?.(slotId);
 
     const slot = window.tsjs?.adSlots?.find((s) => s.id === slotId);
     // Prefer the winning creative's own dimensions; the first configured slot

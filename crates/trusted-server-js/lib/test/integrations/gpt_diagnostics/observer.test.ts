@@ -183,6 +183,65 @@ describe('GptDiagnosticsObserver', () => {
     expect(store.recordSlotVisibilityChanged).toHaveBeenCalledWith(slot, 42);
   });
 
+  it('forwards the Ad Manager identifiers GPT reports for the delivered ad', () => {
+    const store = fakeStore();
+    const gpt = controlledGpt();
+    const slot = fakeSlot();
+    const observer = new GptDiagnosticsObserver(store, { window: gpt.window });
+    observer.install();
+    gpt.googletag.cmd[0]();
+
+    gpt.emit('slotRenderEnded', {
+      slot,
+      isEmpty: false,
+      lineItemId: 6543210987,
+      creativeId: 1234567890,
+      campaignId: 2345678901,
+      advertiserId: 3456789012,
+      sourceAgnosticLineItemId: 6543210987,
+      yieldGroupIds: [11, 12],
+      companyIds: [],
+    });
+
+    expect(store.recordSlotRenderEnded).toHaveBeenCalledWith(
+      slot,
+      expect.objectContaining({
+        adManager: {
+          lineItemId: 6543210987,
+          creativeId: 1234567890,
+          campaignId: 2345678901,
+          advertiserId: 3456789012,
+          sourceAgnosticLineItemId: 6543210987,
+          yieldGroupIds: [11, 12],
+        },
+      })
+    );
+  });
+
+  it('drops malformed Ad Manager identifiers instead of reporting them', () => {
+    const store = fakeStore();
+    const gpt = controlledGpt();
+    const slot = fakeSlot();
+    const observer = new GptDiagnosticsObserver(store, { window: gpt.window });
+    observer.install();
+    gpt.googletag.cmd[0]();
+
+    gpt.emit('slotRenderEnded', {
+      slot,
+      isEmpty: false,
+      lineItemId: null,
+      creativeId: '1234567890',
+      campaignId: 0,
+      advertiserId: 1.5,
+      yieldGroupIds: 'not-a-list',
+    });
+
+    expect(store.recordSlotRenderEnded).toHaveBeenCalledWith(
+      slot,
+      expect.objectContaining({ adManager: undefined })
+    );
+  });
+
   it('drops unsupported or invalid rendered sizes', () => {
     const store = fakeStore();
     const gpt = controlledGpt();

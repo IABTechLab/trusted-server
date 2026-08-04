@@ -76,12 +76,23 @@ function formatMilliseconds(value: number | undefined): string | undefined {
   return `${Math.round(value)} ms`;
 }
 
+function deliveryLabel(cycle: GptDiagnosticsRequestCycle): string | undefined {
+  if (cycle.delivery === 'trusted_server') return 'TS creative';
+  if (cycle.delivery === 'pending') return 'TS candidate';
+  if (cycle.delivery !== 'other_demand') return undefined;
+
+  const lineItem = cycle.adManager?.lineItemId ?? cycle.adManager?.sourceAgnosticLineItemId;
+  return lineItem ? `GAM line item ${lineItem}` : 'Other GAM demand';
+}
+
 function badgeText(cycle: GptDiagnosticsRequestCycle): string {
   const firstLine: string[] = [];
   if (cycle.isEmpty === true) firstLine.push('Empty');
   else if (cycle.isEmpty === false) firstLine.push('Filled');
   else if (cycle.renderAtMs !== undefined) firstLine.push('Rendered (fill unknown)');
   else firstLine.push('Pending');
+  const delivery = deliveryLabel(cycle);
+  if (delivery) firstLine.push(delivery);
   if (cycle.size) firstLine.push(`${cycle.size[0]}×${cycle.size[1]}`);
 
   const timingLine: string[] = [];

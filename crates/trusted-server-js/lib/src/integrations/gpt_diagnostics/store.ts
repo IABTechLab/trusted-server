@@ -1,16 +1,29 @@
 import type {
+  GptDiagnosticsAdManagerIdentity,
   GptDiagnosticsCallbackDisposition,
   GptDiagnosticsCallbackIssue,
   GptDiagnosticsCallbackKind,
   GptDiagnosticsCoverageCounters,
+  GptDiagnosticsDelivery,
   GptDiagnosticsDurations,
   GptDiagnosticsRequestCycle,
+  GptDiagnosticsResponseClass,
   Size,
 } from '../../core/types';
 
 export const MAX_DIAGNOSTIC_SLOTS = 64;
 export const MAX_REQUEST_CYCLES_PER_SLOT = 10;
 export const MAX_CALLBACK_ISSUES = 128;
+export const MAX_TRUSTED_SERVER_CANDIDATE_SLOTS = 64;
+
+/**
+ * How long a filled Trusted Server candidate waits for its creative to request
+ * markup before the cycle is reported as other Ad Manager demand.
+ *
+ * The Prebid Universal Creative requests markup as soon as Ad Manager writes it
+ * into the slot. A later claim still upgrades the cycle.
+ */
+export const TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS = 5_000;
 
 const CALLBACK_KINDS: GptDiagnosticsCallbackKind[] = [
   'slotRequested',
@@ -31,6 +44,7 @@ export interface GptRenderFacts {
   size?: Size;
   isBackfill?: boolean;
   slotContentChanged?: boolean;
+  adManager?: GptDiagnosticsAdManagerIdentity;
 }
 
 export interface GptDiagnosticsStoreSlotSnapshot {
@@ -73,6 +87,8 @@ interface MutableSlotRecord {
 interface StoreOptions {
   now?: () => number;
   schedule?: (callback: () => void) => void;
+  /** Deferred re-notification, used only to close an attribution window. */
+  defer?: (callback: () => void, delayMs: number) => void;
 }
 
 type StoreListener = () => void;
@@ -120,11 +136,42 @@ function derivedDurations(cycle: MutableRequestCycle): GptDiagnosticsDurations {
   };
 }
 
-function copyCycle(cycle: MutableRequestCycle): GptDiagnosticsRequestCycle {
+function responseClass(cycle: MutableRequestCycle): GptDiagnosticsResponseClass | undefined {
+  if (cycle.renderAtMs === undefined) return undefined;
+  if (cycle.isEmpty === true) return 'empty';
+  if (cycle.isBackfill === true) return 'backfill';
+  return cycle.adManager?.lineItemId !== undefined ||
+    cycle.adManager?.creativeId !== undefined ||
+    cycle.adManager?.sourceAgnosticLineItemId !== undefined
+    ? 'reservation'
+    : 'unclassified_non_empty';
+}
+
+/**
+ * Resolve who delivered the ad from observed evidence only.
+ *
+ * A claim proves Ad Manager selected the Trusted Server creative, because no
+ * other creative asks Trusted Server for markup. Absence of a claim proves the
+ * opposite only once the attribution window has elapsed, and only for a slot
+ * Trusted Server actually had a candidate on.
+ */
+function delivery(cycle: MutableRequestCycle, nowMs: number): GptDiagnosticsDelivery {
+  if (cycle.trustedServerClaimAtMs !== undefined) return 'trusted_server';
+  if (cycle.renderAtMs === undefined || cycle.isEmpty !== false) return 'not_applicable';
+  if (!cycle.trustedServerCandidate) return 'no_candidate';
+  return nowMs - cycle.renderAtMs >= TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS
+    ? 'other_demand'
+    : 'pending';
+}
+
+function copyCycle(cycle: MutableRequestCycle, nowMs: number): GptDiagnosticsRequestCycle {
   return {
     ...cycle,
     durations: derivedDurations(cycle),
     size: cycle.size ? ([...cycle.size] as Size) : undefined,
+    adManager: cycle.adManager ? { ...cycle.adManager } : undefined,
+    responseClass: responseClass(cycle),
+    delivery: delivery(cycle, nowMs),
   };
 }
 
@@ -132,6 +179,11 @@ function copyCycle(cycle: MutableRequestCycle): GptDiagnosticsRequestCycle {
 export class GptDiagnosticsStore {
   private readonly now: () => number;
   private readonly schedule: (callback: () => void) => void;
+  private readonly defer: (callback: () => void, delayMs: number) => void;
+  /** Auction slot ID → GPT slot, established by the Trusted Server integration. */
+  private readonly trustedServerSlots = new Map<string, GptDiagnosticsSlotLike>();
+  /** Slots carrying Trusted Server targeting that has not yet been requested. */
+  private readonly pendingCandidates = new WeakSet<object>();
   private readonly slotNumbers = new WeakMap<object, number>();
   private readonly requestNumbers = new WeakMap<object, number>();
   private readonly slots = new Map<number, MutableSlotRecord>();
@@ -152,6 +204,81 @@ export class GptDiagnosticsStore {
   constructor(options: StoreOptions = {}) {
     this.now = options.now ?? (() => performance.now());
     this.schedule = options.schedule ?? ((callback) => queueMicrotask(callback));
+    this.defer = options.defer ?? ((callback, delayMs) => setTimeout(callback, delayMs));
+  }
+
+  /**
+   * Associate a GPT slot with the auction slot whose targeting Trusted Server
+   * applied to it.
+   *
+   * The association is keyed by GPT slot object identity, the same key every
+   * other correlation in this store uses, so no element ID is guessed.
+   */
+  recordTrustedServerCandidate(slot: GptDiagnosticsSlotLike, auctionSlotId: string): void {
+    if (!slot || typeof auctionSlotId !== 'string' || auctionSlotId.length === 0) return;
+
+    this.trustedServerSlots.delete(auctionSlotId);
+    this.trustedServerSlots.set(auctionSlotId, slot);
+    while (this.trustedServerSlots.size > MAX_TRUSTED_SERVER_CANDIDATE_SLOTS) {
+      const oldest = this.trustedServerSlots.keys().next().value;
+      if (oldest === undefined) break;
+      this.trustedServerSlots.delete(oldest);
+    }
+
+    const record = this.slots.get(this.slotNumbers.get(slot) ?? -1);
+    const pending = record?.requests[record.requests.length - 1];
+    // A candidate declared before the request cycle exists is carried by the
+    // association above and applied when the cycle opens.
+    if (pending && pending.renderAtMs === undefined) {
+      pending.trustedServerCandidate = true;
+      this.notify();
+    }
+    this.pendingCandidates.add(slot);
+  }
+
+  /**
+   * Record that the rendered creative requested its markup from Trusted Server.
+   *
+   * Attributed to the auction slot's most recent rendered cycle. An unknown
+   * slot or a cycle that never rendered is preserved as an issue rather than
+   * attached to a guess.
+   */
+  recordTrustedServerClaim(auctionSlotId: string): void {
+    const timestampMs = this.now();
+    const slot = this.trustedServerSlots.get(auctionSlotId);
+    const record = slot ? this.slots.get(this.slotNumbers.get(slot) ?? -1) : undefined;
+    if (!record) {
+      this.addIssue(
+        'slotRenderEnded',
+        { runtimeSlotNumber: 0 },
+        timestampMs,
+        'unmatched',
+        'trusted_server_claim_without_slot'
+      );
+      this.notify();
+      return;
+    }
+
+    const candidates = record.requests.filter(
+      (cycle) => cycle.isEmpty === false && cycle.trustedServerClaimAtMs === undefined
+    );
+    if (candidates.length !== 1) {
+      this.addIssue(
+        'slotRenderEnded',
+        record,
+        timestampMs,
+        candidates.length === 0 ? 'unmatched' : 'ambiguous',
+        candidates.length === 0
+          ? 'trusted_server_claim_without_render'
+          : 'trusted_server_claim_ambiguous_cycle'
+      );
+      this.notify();
+      return;
+    }
+
+    candidates[0].trustedServerClaimAtMs = timestampMs;
+    candidates[0].trustedServerCandidate = true;
+    this.notify();
   }
 
   markGptObserved(): void {
@@ -177,11 +304,14 @@ export class GptDiagnosticsStore {
 
     const requestNumber = (this.requestNumbers.get(slot) ?? 0) + 1;
     this.requestNumbers.set(slot, requestNumber);
+    const trustedServerCandidate = this.pendingCandidates.has(slot);
+    this.pendingCandidates.delete(slot);
     record.requests.push({
       requestNumber,
       requestedAtMs: timestampMs,
       durations: {},
       incompleteSequence: false,
+      ...(trustedServerCandidate ? { trustedServerCandidate: true } : {}),
     });
     this.incrementDisposition('slotRequested', 'matched');
     this.notify();
@@ -226,6 +356,13 @@ export class GptDiagnosticsStore {
         cycle.size = facts.size ? ([...facts.size] as Size) : undefined;
         cycle.isBackfill = facts.isBackfill;
         cycle.slotContentChanged = facts.slotContentChanged;
+        cycle.adManager = facts.adManager ? { ...facts.adManager } : undefined;
+
+        // A filled candidate resolves to other demand once its window closes,
+        // so the panel needs one notification at that boundary.
+        if (facts.isEmpty === false && cycle.trustedServerCandidate) {
+          this.defer(() => this.notify(), TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS);
+        }
 
         if (cycle.responseAtMs === undefined) {
           cycle.incompleteSequence = true;
@@ -329,6 +466,7 @@ export class GptDiagnosticsStore {
   }
 
   snapshot(): GptDiagnosticsStoreSnapshot {
+    const nowMs = this.now();
     return {
       gptObserved: this.gptObserved,
       slots: this.slotOrder.flatMap((runtimeSlotNumber) => {
@@ -342,7 +480,7 @@ export class GptDiagnosticsStore {
             adUnitPath: record.adUnitPath,
             currentVisibilityPercentage: record.currentVisibilityPercentage,
             maximumVisibilityPercentage: record.maximumVisibilityPercentage,
-            requests: record.requests.map(copyCycle),
+            requests: record.requests.map((cycle) => copyCycle(cycle, nowMs)),
           },
         ];
       }),
