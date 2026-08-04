@@ -1,4 +1,4 @@
-# DataDome request-header allowlist (normative, checked-in)
+# DataDome header allowlist (normative, checked-in — request and response directions)
 
 The complete set of response-named header pointers the security channel
 (hook spec §4a) may copy into the owner-scoped publisher-upstream

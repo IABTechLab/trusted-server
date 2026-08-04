@@ -68,8 +68,13 @@ mutators to the outbound response for HTML document responses it processed.
   storage subject to revalidation; `private` forbids shared storage), so
   "replace `private` with the stronger `no-cache`" would make a
   personalized response shared-storable. The merge: each of `no-store`,
-  `no-cache`, `private`, `must-revalidate`, `proxy-revalidate`,
-  `must-understand`, and `no-transform` is **sticky** — present in the snapshot or the
+  `no-cache`, `private`, `must-revalidate`, `proxy-revalidate`, and
+  `no-transform` is **sticky** — and `must-understand` is the deliberate
+  exception: **mutation-introduced `must-understand` is rejected**
+  (snapshot-present survives untouched), because under RFC 9111
+  §5.2.2.3 a cache that understands the status may then ignore an
+  accompanying `no-store` — "adding" it can _weaken_ a stored `no-store`
+  response, so it is not an additive restriction at all — present in the snapshot or the
   mutation ⇒ present in the final response, independently; `public` is
   dropped whenever any restriction is present; `max-age`/`s-maxage` may
   only shrink relative to the snapshot; `stale-while-revalidate`/
@@ -94,9 +99,14 @@ mutators to the outbound response for HTML document responses it processed.
   unknown directives already in the snapshot are preserved verbatim** (a
   downstream cache may honor a restrictive extension TS does not
   recognize; dropping it would weaken origin policy, RFC 9111 §5.2.3);
-  `Expires` participates in the freshness bound (effective freshness =
-  the minimum across `max-age`, `s-maxage`, and the `Expires`-derived
-  lifetime) and a mutation may **not introduce `max-age`/`s-maxage`
+  `Expires` participates in the freshness bound via **RFC 9111 §4.2.1's
+  freshness-lifetime algorithm, referenced directly**: the
+  `Expires`-derived lifetime is `Expires − Date` (absent `Date` →
+  response receipt time), invalid or duplicate date values are treated
+  as already expired (the RFC's conservative option, chosen
+  normatively), and `Age` is handled per the RFC — effective freshness
+  is the minimum across `max-age`, `s-maxage`, and that derived
+  lifetime and a mutation may **not introduce `max-age`/`s-maxage`
   where the snapshot supplied no upper bound** — HTTP prefers `max-age`
   over `Expires` (RFC 9111 §5.3), so introducing one would override an
   origin's shorter or already-expired `Expires`; and `Vary: *` is
@@ -140,7 +150,15 @@ mutators to the outbound response for HTML document responses it processed.
   Integration IDs are **startup-unique, enforced**: registry
   construction rejects a duplicate ID (current code silently coalesces,
   which corrupts attribution and budgets), with a duplicate-ID test in
-  the done-when. Until then the
+  the done-when. The registration also carries the **version the cache
+  tuple consumes, with a bump contract**: the version MUST change with
+  every output-semantic change of the mutator (review-checklist item;
+  where the mutator's behavior is fully declared configuration, the
+  version is a content hash of that declaration, making the bump
+  automatic), and the build-time invariant revision MUST bump with any
+  parser or merge-rule change — otherwise a deploy silently reuses old
+  post-hook finals and a new privacy restriction waits for cache
+  expiry. Until then the
   operation set is headers-only, and `Set-Cookie` is fully reserved.
   `Set-Cookie` is fully reserved in v1 (§3 deferral). Violations are
   rejected
@@ -294,13 +312,16 @@ degree of freedom is closed:
   spec) — and only DataDome-returned overlay data reaches the
   publisher, never the raw browser-supplied header.
 - **The pointer protocol has a total parser contract** — adapters
-  cannot differ where malformed batches fail open: pointer names
-  compare case-insensitively with OWS/tab trimmed; duplicate pointer
-  names, invalid names, more than 16 pointers, or more than 4 KiB of
-  pointer payload render the batch invalid (→ Continue, the vendor's
-  fail-open); when both cookie sources arrive (header form and
-  `Set-Cookie`), the header form wins, matching the vendor's documented
-  priority.
+  cannot differ where malformed batches fail open: the pointer list is
+  tokenized by the vendor's documented space separation — repeated
+  pointer header fields are concatenated with a single SP before
+  tokenizing, tokens split on runs of SP/HTAB, empty tokens ignored —
+  then names are ASCII-lowercased before duplicate detection; duplicate
+  names after normalization, invalid names, more than 16 pointers, or
+  more than 4 KiB of pointer payload render the batch invalid
+  (→ Continue, the vendor's fail-open); when both cookie sources arrive
+  (header form and `Set-Cookie`), the header form wins, matching the
+  vendor's documented priority.
 - **Request-header pointers are a positive, enumerated allowlist.**
   "Documented enrichment headers" is not enforceable; the registration
   enumerates the exact names from the **checked-in allowlist file
@@ -326,8 +347,17 @@ degree of freedom is closed:
   a _Respond_ (challenge/deny) may set exactly `Location` (replace;
   3xx only), `Content-Type` (its own body, per the representation rule
   below), `Cache-Control` (through the restricted merge; the invariant pass
-  still runs last — `Pragma` is dropped from the allowlist: response
-  `Pragma: no-cache` has no standardized meaning, RFC 9111 §5.4), the typed security cookie (above),
+  still runs last). **`Pragma` and its kin get a defined middle path**:
+  allowlist-absent fields that are known-harmless standard cache
+  metadata (`Pragma` is the enumerated case — response `Pragma:
+no-cache` has no standardized meaning, RFC 9111 §5.4) are **dropped
+  individually and logged**, never batch-invalidating; genuinely
+  unknown or active fields still invalidate the batch (→ Continue).
+  Without this split, DataDome's own documented response — which points
+  at `Set-Cookie`, `Pragma`, `X-DataDome`, and `Cache-Control` — would
+  fail every challenge open; that documented vendor response is a
+  **verbatim test fixture**, and the fail-open consequence of
+  batch-invalidation is explicitly within sign-off 28's scope, the typed security cookie (above),
   and the vendor response headers enumerated in the **response section
   of `datadome-header-allowlist.md`**; a _Continue_ may set only the
   typed cookie and those enumerated vendor headers. Everything else is

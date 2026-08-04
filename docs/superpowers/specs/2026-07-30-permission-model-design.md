@@ -401,7 +401,7 @@ and the fail-closed marker:
   a stable **family ID**: minted rows store it, and — the case that makes
   or breaks the protocol — **rows that lack the field derive it
   deterministically** as a function of (record kind, provider namespace,
-  canonical graph key), e.g. `fam:v0:hmac:<graph-key>`. Determinism is the
+  canonical graph key), per the providers spec §6.3 derivation (`tsfam1|` + record-kind byte + provider code + graph key). Determinism is the
   point: a withdrawal arriving on the **first post-upgrade request** — a
   GPC-carrying visitor whose v1 row has no family field and has never been
   backfilled — computes the same family ID that every future reader of
@@ -433,7 +433,7 @@ and the fail-closed marker:
   **Creation is cause-aware and mostly read-free.** A live resolution
   whose outcome for a permission is unset writes suppression when the
   cause is a **signal state** — refusal, non-destructive opt-out,
-  malformed-present — **unconditionally**, with no row read: conditioning
+  malformed-present — **unconditionally** — meaning independent of _prior positive authority_, never independent of **family admission** (every durable write still passes the providers spec §5 admission arms; for an observed v1 row the non-destructive sequence applies) — with no row read needed for the decision itself: conditioning
   on observing positive provenance through an eventually consistent row
   loses the race where a stale replica hides a just-committed grant. The
   one cause that inherently needs prior state — applicable **absence**
@@ -711,12 +711,15 @@ section malformed-present (blocks grants, never withdraws).
    claim official-registry coverage for them (an earlier revision
    claimed both "no section" and later "official through 27" — each
    wrong in its own direction). A truncated map silently loses
-   opt-outs — a Texas (16) or Maryland (24) sale opt-out must not
-   vanish. **The current decoder is an explicit prerequisite gap**: it
+   opt-outs — a Texas (16) sale opt-out must not vanish. **The current decoder is an explicit prerequisite gap**: it
    (and `iab_gpp` 0.1.2) supports sections 7–23 only and models `usnat`
-   v2 while the snapshot pins v1 — implementation must extend or replace
-   the decoder for 24–27 _and_ reject versions the library happens to
-   decode but the snapshot disallows.
+   v2 while the snapshot pins v1 — implementation must reject versions
+   the library happens to decode but the snapshot disallows. Sections
+   24–27 are **not** a decoder work item: with no reproducible official
+   layout they are reserved and inert (national-only for those states —
+   an accepted limitation, sign-off 32); the earlier "Maryland opt-out
+   must not vanish / extend the decoder for 24–27" reading is withdrawn
+   as incompatible with reserved status.
    The implementation PR cross-checks this list against both the current
    decoder's section set and the official registry, and the accepted version per
    section is **pinned to the vendored registry snapshot
