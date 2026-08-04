@@ -154,32 +154,106 @@ function candidateSlotRoots(divId: string): HTMLElement[] {
   return roots;
 }
 
-function slotIdForMessageSource(source: MessageEventSource | null): string | undefined {
-  if (!source) return undefined;
+type MessageSourceFrame = {
+  iframe: HTMLIFrameElement;
+  root: HTMLElement;
+};
 
-  const slots = window.tsjs?.adSlots ?? [];
-  const ownsSource = (roots: HTMLElement[]): boolean =>
-    roots.some((root) =>
-      Array.from(root.querySelectorAll('iframe')).some((iframe) => iframe.contentWindow === source)
+type MessageSourceSlotFrame = MessageSourceFrame & {
+  slotId: string;
+};
+
+function sourceFrameInRoots(
+  source: MessageEventSource | null,
+  roots: readonly HTMLElement[]
+): MessageSourceFrame | undefined {
+  if (!source) return undefined;
+  for (const root of roots) {
+    const iframe = Array.from(root.querySelectorAll('iframe')).find(
+      (candidate) => candidate.contentWindow === source
     );
-  // Prefer exact configured IDs before prefix/container fallbacks so a nested
-  // dynamic slot cannot be claimed by an overlapping parent slot.
-  return (
-    slots.find((slot) => {
-      const root = document.getElementById(slot.div_id);
-      return root !== null && ownsSource([root]);
-    }) ?? slots.find((slot) => ownsSource(candidateSlotRoots(slot.div_id)))
-  )?.id;
+    if (iframe) return { iframe, root };
+  }
+  return undefined;
 }
 
-function messageSourceBelongsToAdUnit(
+function slotFrameForMessageSource(
+  source: MessageEventSource | null
+): MessageSourceSlotFrame | undefined {
+  const slots = window.tsjs?.adSlots ?? [];
+  // Prefer exact configured IDs before prefix/container fallbacks so a nested
+  // dynamic slot cannot be claimed by an overlapping parent slot.
+  for (const slot of slots) {
+    const root = document.getElementById(slot.div_id);
+    const frame = root ? sourceFrameInRoots(source, [root]) : undefined;
+    if (frame) return { ...frame, slotId: slot.id };
+  }
+  for (const slot of slots) {
+    const frame = sourceFrameInRoots(source, candidateSlotRoots(slot.div_id));
+    if (frame) return { ...frame, slotId: slot.id };
+  }
+  return undefined;
+}
+
+function sourceFrameForAdUnit(
   source: MessageEventSource | null,
   adUnitCode: string
-): boolean {
-  if (!source) return false;
-  return candidateSlotRoots(adUnitCode).some((root) =>
-    Array.from(root.querySelectorAll('iframe')).some((iframe) => iframe.contentWindow === source)
-  );
+): MessageSourceFrame | undefined {
+  return sourceFrameInRoots(source, candidateSlotRoots(adUnitCode));
+}
+
+function hasOnePixelDimension(element: HTMLElement, dimension: 'width' | 'height'): boolean {
+  const computedDimension = window.getComputedStyle(element)[dimension];
+  const match = /^(\d+(?:\.\d+)?)px$/.exec(computedDimension);
+  return match !== null && Number(match[1]) <= 1;
+}
+
+function usesFixedPositioning(element: HTMLElement): boolean {
+  const position = window.getComputedStyle(element).position;
+  return position === 'fixed' || position === 'sticky';
+}
+
+/** Resize only an authenticated, still-collapsed ordinary display-creative shell. */
+function resizeCollapsedCreativeFrame(
+  source: MessageEventSource | null,
+  frame: MessageSourceFrame,
+  width: number,
+  height: number
+): void {
+  if (
+    !Number.isFinite(width) ||
+    !Number.isFinite(height) ||
+    width <= 0 ||
+    height <= 0 ||
+    !frame.iframe.isConnected ||
+    frame.iframe.contentWindow !== source ||
+    frame.iframe.getAttribute('width') !== '1' ||
+    frame.iframe.getAttribute('height') !== '1' ||
+    !hasOnePixelDimension(frame.iframe, 'width') ||
+    !hasOnePixelDimension(frame.iframe, 'height') ||
+    usesFixedPositioning(frame.iframe) ||
+    frame.iframe.closest('ins[data-anchor-status]')
+  ) {
+    return;
+  }
+
+  const wrapper = frame.iframe.parentElement;
+  if (
+    !wrapper ||
+    wrapper === document.body ||
+    wrapper === document.documentElement ||
+    !frame.root.contains(wrapper) ||
+    usesFixedPositioning(wrapper)
+  ) {
+    return;
+  }
+
+  frame.iframe.style.width = `${width}px`;
+  frame.iframe.style.height = `${height}px`;
+  if (hasOnePixelDimension(wrapper, 'width') && hasOnePixelDimension(wrapper, 'height')) {
+    wrapper.style.width = `${width}px`;
+    wrapper.style.height = `${height}px`;
+  }
 }
 
 function clearTargetingKeys(slot: GoogleTagSlot, keys: Iterable<string>): void {
@@ -1561,7 +1635,8 @@ export function installTsRenderBridge(): void {
       // Prebid handles ad IDs globally and would otherwise answer a request from
       // an unrelated iframe when this slot-bound capability rejects it.
       e.stopImmediatePropagation();
-      if (!messageSourceBelongsToAdUnit(e.source, prebidRendererEntry.adUnitCode)) return;
+      const sourceFrame = sourceFrameForAdUnit(e.source, prebidRendererEntry.adUnitCode);
+      if (!sourceFrame) return;
       const renderer = validateApsRenderer(prebidRendererEntry.renderer);
       const rendererUrl = apsRendererUrl();
       if (!renderer || !rendererUrl) return;
@@ -1574,83 +1649,6 @@ export function installTsRenderBridge(): void {
       } catch (err) {
         log.warn(`[tsjs-gpt] APS Prebid markWinner callback threw for '${adId}'`, err);
       }
-
-      port.postMessage(
-        JSON.stringify({
-          message: 'Prebid Response',
-          adId,
-          renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
-          rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
-          rendererUrl,
-          apsRenderer: renderer,
-          width: renderer.width,
-          height: renderer.height,
-        })
-      );
-
-      try {
-        prebidRendererEntry.markRendered();
-      } catch (err) {
-        log.warn(`[tsjs-gpt] APS Prebid markRendered callback threw for '${adId}'`, err);
-      }
-      return;
-    }
-
-    const sourceSlotId = slotIdForMessageSource(e.source);
-    if (!sourceSlotId) return;
-
-    // Resolve the bid by the requesting slot, not by the first bid whose hb_adid
-    // matches. hb_adid is not unique per bid: absent PBS Cache, it falls back to a
-    // creative id a bidder may reuse across slots. A first-match-by-adId lookup
-    // would resolve every duplicate to one slot, so all but that slot render blank.
-    const bids = window.tsjs?.bids ?? {};
-    const slotId = sourceSlotId;
-    const matchedBid = bids[slotId];
-
-    // Not a TS bid, or the requesting slot's bid does not own this adId — let
-    // Prebid.js handle it. The adId guard also prevents an iframe under slot A from
-    // pulling slot B's creative and firing slot B's win/billing beacons.
-    if (!matchedBid || matchedBid.hb_adid !== adId) return;
-
-    if (matchedBid.renderer !== undefined) {
-      const renderer = validateApsRenderer(matchedBid.renderer);
-      const rendererUrl = apsRendererUrl();
-      if (!renderer || !rendererUrl) return;
-      e.stopImmediatePropagation();
-      port.postMessage(
-        JSON.stringify({
-          message: 'Prebid Response',
-          adId,
-          renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
-          rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
-          rendererUrl,
-          apsRenderer: renderer,
-          width: renderer.width,
-          height: renderer.height,
-        })
-      );
-      return;
-    }
-
-    const slot = window.tsjs?.adSlots?.find((s) => s.id === slotId);
-    // Prefer the winning creative's own dimensions; the first configured slot
-    // format is only a fallback and mis-sizes a multi-size slot whose winner is
-    // not the first format.
-    const [fallbackWidth, fallbackHeight] = slot?.formats?.[0] ?? [728, 90];
-    const width = matchedBid.w ?? fallbackWidth;
-    const height = matchedBid.h ?? fallbackHeight;
-
-    if (matchedBid.renderer !== undefined) {
-      const renderer = validateApsRenderer(matchedBid.renderer);
-      const rendererUrl = apsRendererUrl();
-      if (!renderer || !rendererUrl) return;
-
-      // Ownership and the complete consumed envelope are valid before this
-      // handler claims the message or suppresses another legitimate handler.
-      e.stopImmediatePropagation();
-      const rendererKey = `${slotId}|${adId}`;
-      if (renderingKeys.has(rendererKey)) return;
-      renderingKeys.add(rendererKey);
 
       try {
         port.postMessage(
@@ -1665,9 +1663,71 @@ export function installTsRenderBridge(): void {
             height: renderer.height,
           })
         );
+      } catch (err) {
+        log.warn('[tsjs-gpt] APS Prebid response failed', err);
+        return;
+      }
+      resizeCollapsedCreativeFrame(e.source, sourceFrame, renderer.width, renderer.height);
+
+      try {
+        prebidRendererEntry.markRendered();
+      } catch (err) {
+        log.warn(`[tsjs-gpt] APS Prebid markRendered callback threw for '${adId}'`, err);
+      }
+      return;
+    }
+
+    const sourceSlotFrame = slotFrameForMessageSource(e.source);
+    if (!sourceSlotFrame) return;
+    const sourceSlotId = sourceSlotFrame.slotId;
+
+    // Resolve the bid by the requesting slot, not by the first bid whose hb_adid
+    // matches. hb_adid is not unique per bid: absent PBS Cache, it falls back to a
+    // creative id a bidder may reuse across slots. A first-match-by-adId lookup
+    // would resolve every duplicate to one slot, so all but that slot render blank.
+    const bids = window.tsjs?.bids ?? {};
+    const slotId = sourceSlotId;
+    const matchedBid = bids[slotId];
+
+    // Not a TS bid, or the requesting slot's bid does not own this adId — let
+    // Prebid.js handle it. The adId guard also prevents an iframe under slot A from
+    // pulling slot B's creative and firing slot B's win/billing beacons.
+    if (!matchedBid || matchedBid.hb_adid !== adId) return;
+
+    const slot = window.tsjs?.adSlots?.find((s) => s.id === slotId);
+    // Prefer the winning creative's own dimensions; the first configured slot
+    // format is only a fallback and mis-sizes a multi-size slot whose winner is
+    // not the first format.
+    const [fallbackWidth, fallbackHeight] = slot?.formats?.[0] ?? [728, 90];
+    const width = matchedBid.w ?? fallbackWidth;
+    const height = matchedBid.h ?? fallbackHeight;
+
+    if (matchedBid.renderer !== undefined) {
+      const renderer = validateApsRenderer(matchedBid.renderer);
+      const rendererUrl = apsRendererUrl();
+      if (!renderer || !rendererUrl) return;
+
+      // Ownership and the complete validated envelope are valid before this
+      // handler claims the message or suppresses another legitimate handler.
+      // GAM may ask PUC to render the same server-side APS capability again.
+      e.stopImmediatePropagation();
+
+      try {
+        port.postMessage(
+          JSON.stringify({
+            message: 'Prebid Response',
+            adId,
+            renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
+            rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+            rendererUrl,
+            apsRenderer: renderer,
+            width: renderer.width,
+            height: renderer.height,
+          })
+        );
+        resizeCollapsedCreativeFrame(e.source, sourceSlotFrame, renderer.width, renderer.height);
         log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' through APS renderer`);
       } catch (err) {
-        renderingKeys.delete(rendererKey);
         log.warn('[tsjs-gpt] pbRender bridge: APS response failed', err);
       }
       return;
@@ -1675,16 +1735,22 @@ export function installTsRenderBridge(): void {
 
     if (matchedBid.adm) {
       e.stopImmediatePropagation();
-      port.postMessage(
-        JSON.stringify({
-          message: 'Prebid Response',
-          adId,
-          ad: matchedBid.adm,
-          renderer: TS_DISPLAY_RENDERER,
-          width,
-          height,
-        })
-      );
+      try {
+        port.postMessage(
+          JSON.stringify({
+            message: 'Prebid Response',
+            adId,
+            ad: matchedBid.adm,
+            renderer: TS_DISPLAY_RENDERER,
+            width,
+            height,
+          })
+        );
+      } catch (err) {
+        log.warn('[tsjs-gpt] pbRender bridge: inline response failed', err);
+        return;
+      }
+      resizeCollapsedCreativeFrame(e.source, sourceSlotFrame, width, height);
       fireWinBillingBeacons(slotId, matchedBid);
       recordGptBridgeRender(slotId, matchedBid, 'inline', findSlotElementByDivId(slotId));
       log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from inline adm`);
@@ -1726,16 +1792,19 @@ export function installTsRenderBridge(): void {
           cached.price !== undefined
             ? expandAuctionPriceMacro(cached.adm, cached.price)
             : cached.adm;
+        const cachedWidth = cached.width ?? width;
+        const cachedHeight = cached.height ?? height;
         port.postMessage(
           JSON.stringify({
             message: 'Prebid Response',
             adId,
             ad,
             renderer: TS_DISPLAY_RENDERER,
-            width: cached.width ?? width,
-            height: cached.height ?? height,
+            width: cachedWidth,
+            height: cachedHeight,
           })
         );
+        resizeCollapsedCreativeFrame(e.source, sourceSlotFrame, cachedWidth, cachedHeight);
         // Beacons carry the server-expanded ${AUCTION_PRICE} from the auction's
         // clearing price, not `cached.price` — the auction result is the
         // authoritative clearing price, and the cached copy is only the render

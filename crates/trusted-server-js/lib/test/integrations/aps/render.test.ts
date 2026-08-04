@@ -474,8 +474,10 @@ describe('Universal Creative APS source', () => {
 
       const postMessage = vi.spyOn(iframe.contentWindow!, 'postMessage');
       iframe.dispatchEvent(new Event('load'));
-      const sent = postMessage.mock.calls[0][0] as { nonce: string; renderer: ApsRendererV1 };
-      expect(sent.renderer).toEqual(renderer);
+      const bootstrap = postMessage.mock.calls[0][0] as { nonce: string };
+      const transferredPort = postMessage.mock.calls[0][2]?.[0] as MessagePort | undefined;
+      expect(bootstrap).toEqual({ nonce: expect.stringMatching(/^[A-Za-z0-9_-]{22}$/) });
+      expect(transferredPort).toBeDefined();
 
       let settled = false;
       void rendered.then(() => {
@@ -484,12 +486,16 @@ describe('Universal Creative APS source', () => {
       await Promise.resolve();
       expect(settled).toBe(false);
 
-      window.dispatchEvent(
-        new MessageEvent('message', {
-          data: { message: 'trusted-server/aps/renderer-ready', nonce: sent.nonce },
-          source: iframe.contentWindow,
-        })
-      );
+      await new Promise<void>((resolve) => {
+        transferredPort!.onmessage = (event) => {
+          expect(event.data).toEqual({ renderer });
+          transferredPort!.postMessage({
+            message: 'trusted-server/aps/renderer-ready',
+            nonce: bootstrap.nonce,
+          });
+          resolve();
+        };
+      });
       await expect(rendered).resolves.toBeUndefined();
     } finally {
       delete dynamicWindow.render;

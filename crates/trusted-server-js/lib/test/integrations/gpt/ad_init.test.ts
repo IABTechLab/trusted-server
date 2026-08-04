@@ -2557,19 +2557,112 @@ describe('installTsRenderBridge', () => {
 
       const rendererPost = vi.spyOn(outerFrame.contentWindow!, 'postMessage');
       outerFrame.dispatchEvent(new Event('load'));
-      const sent = rendererPost.mock.calls[0][0] as { nonce: string };
-      window.dispatchEvent(
-        new MessageEvent('message', {
-          data: { message: 'trusted-server/aps/renderer-ready', nonce: sent.nonce },
-          source: outerFrame.contentWindow,
-        })
-      );
+      const bootstrap = rendererPost.mock.calls[0][0] as { nonce: string };
+      const transferredPort = rendererPost.mock.calls[0][2]?.[0] as MessagePort | undefined;
+      expect(transferredPort).toBeDefined();
+      await new Promise<void>((resolve) => {
+        transferredPort!.onmessage = (message) => {
+          expect(message.data).toEqual({ renderer });
+          transferredPort!.postMessage({
+            message: 'trusted-server/aps/renderer-ready',
+            nonce: bootstrap.nonce,
+          });
+          resolve();
+        };
+      });
       await expect(rendered).resolves.toBeUndefined();
       outerFrame.remove();
     } finally {
       delete dynamicWindow.render;
     }
     beaconSpy.mockRestore();
+  });
+
+  it('resizes only the authenticated collapsed 1x1 creative shell after responding', async () => {
+    (window as TestWindow).tsjs.bids.homepage_header = {
+      hb_adid: 'collapsed-inline-ad-id',
+      hb_bidder: 'fictional',
+      hb_pb: '1.23',
+      adm: '<div>fictional creative</div>',
+      w: 300,
+      h: 250,
+    };
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const slot = document.getElementById('div-header')!;
+    const selectedFrame = slot.querySelector<HTMLIFrameElement>('iframe')!;
+    slot.style.width = '1px';
+    slot.style.height = '1px';
+    selectedFrame.width = '1';
+    selectedFrame.height = '1';
+    selectedFrame.style.width = '1px';
+    selectedFrame.style.height = '1px';
+
+    const siblingSlot = document.createElement('div');
+    siblingSlot.style.width = '1px';
+    siblingSlot.style.height = '1px';
+    const siblingFrame = document.createElement('iframe');
+    siblingFrame.width = '1';
+    siblingFrame.height = '1';
+    siblingFrame.style.width = '1px';
+    siblingFrame.style.height = '1px';
+    siblingSlot.appendChild(siblingFrame);
+    document.body.appendChild(siblingSlot);
+
+    try {
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: 'collapsed-inline-ad-id' }),
+          ports: [{ postMessage: vi.fn() }],
+          source,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+
+      expect(selectedFrame.style.width).toBe('300px');
+      expect(selectedFrame.style.height).toBe('250px');
+      expect(slot.style.width).toBe('300px');
+      expect(slot.style.height).toBe('250px');
+      expect(siblingFrame.style.width).toBe('1px');
+      expect(siblingFrame.style.height).toBe('1px');
+    } finally {
+      siblingSlot.remove();
+    }
+  });
+
+  it('does not resize an authenticated shell whose computed dimensions are not pixels', async () => {
+    (window as TestWindow).tsjs.bids.homepage_header = {
+      hb_adid: 'relative-inline-ad-id',
+      hb_bidder: 'fictional',
+      hb_pb: '1.23',
+      adm: '<div>fictional creative</div>',
+      w: 300,
+      h: 250,
+    };
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const slot = document.getElementById('div-header')!;
+    const frame = slot.querySelector<HTMLIFrameElement>('iframe')!;
+    slot.style.width = '1vw';
+    slot.style.height = '1vh';
+    frame.width = '1';
+    frame.height = '1';
+    frame.style.width = '1vw';
+    frame.style.height = '1vh';
+
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'relative-inline-ad-id' }),
+        ports: [{ postMessage: vi.fn() }],
+        source,
+        stopImmediatePropagation: vi.fn(),
+      }) as unknown as MessageEvent
+    );
+
+    expect(frame.style.width).toBe('1vw');
+    expect(frame.style.height).toBe('1vh');
+    expect(slot.style.width).toBe('1vw');
+    expect(slot.style.height).toBe('1vh');
   });
 
   it('serves a registered Prebid APS renderer when its generated ad ID differs from the APS bid ID', async () => {

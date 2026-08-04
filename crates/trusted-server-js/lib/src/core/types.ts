@@ -76,7 +76,7 @@ export interface ApsPrebidRendererEntry {
   expiresAt: number;
   /** Notify Prebid that GAM selected this bid before replying to Universal Creative. */
   markWinner(): void;
-  /** Mark Prebid's bid rendered after the Universal Creative response is posted. */
+  /** Mark Prebid's bid used after response dispatch; PUC terminal events determine creative success. */
   markRendered(): void;
 }
 

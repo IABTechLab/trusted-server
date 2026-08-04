@@ -415,16 +415,18 @@ export const APS_UNIVERSAL_CREATIVE_RENDERER = String.raw`(function(){window.ren
 try{var r=d&&d.apsRenderer,u=d&&d.rendererUrl;if(!r||typeof u!=="string")throw new Error("invalid APS renderer data");
 var p=new URL(u);if((p.protocol!=="https:"&&p.protocol!=="http:")||p.username||p.password||p.pathname!=="${APS_RENDERER_PATH}"||p.search||p.hash)throw new Error("invalid APS renderer URL");
 var c=w.crypto;if(!c||typeof c.getRandomValues!=="function")throw new Error("APS renderer randomness unavailable");
+if(typeof MessageChannel!=="function")throw new Error("APS renderer channel unavailable");
 var b=new Uint8Array(16);c.getRandomValues(b);var s="";for(var i=0;i<b.length;i++)s+=String.fromCharCode(b[i]);
 var n=w.btoa(s).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/g,"");
-var f=w.document.createElement("iframe"),done=false,t;
-function clean(){w.removeEventListener("message",receive);if(t)w.clearTimeout(t);}
+var f=w.document.createElement("iframe"),q=new MessageChannel(),done=false,sent=false,t;
+function exact(m){if(!m||typeof m!=="object"||Array.isArray(m))return false;var k=Object.keys(m).sort();return k.length===2&&k[0]==="message"&&k[1]==="nonce";}
+function clean(){if(t)w.clearTimeout(t);q.port1.onmessage=null;q.port1.close();if(!sent)q.port2.close();}
 function fail(){if(done)return;done=true;clean();f.remove();reject(new Error("APS renderer frame failed"));}
-function receive(e){var m=e.data;if(e.source!==f.contentWindow||!m||m.nonce!==n)return;
+q.port1.onmessage=function(e){var m=e.data;if(!exact(m)||e.ports.length!==0||m.nonce!==n)return;
 if(m.message==="${RENDERER_READY_MESSAGE}"){done=true;clean();resolve();}
-else if(m.message==="${RENDERER_FAILED_MESSAGE}")fail();}
+else if(m.message==="${RENDERER_FAILED_MESSAGE}")fail();};
 f.width=String(r.width);f.height=String(r.height);f.style.border="0";
 f.setAttribute("sandbox","${APS_RENDERER_SANDBOX}");
-f.src=p.href+"#tsaps="+n;f.onload=function(){if(!done&&f.contentWindow)f.contentWindow.postMessage({nonce:n,renderer:r},"*");};
-f.onerror=fail;w.addEventListener("message",receive);t=w.setTimeout(fail,${RENDERER_READY_TIMEOUT_MS});w.document.body.appendChild(f);
+f.src=p.href+"#tsaps="+n;f.onload=function(){if(done||sent||!f.contentWindow)return;try{f.contentWindow.postMessage({nonce:n},"*",[q.port2]);sent=true;q.port1.postMessage({renderer:r});}catch(e){fail();}};
+f.onerror=fail;t=w.setTimeout(fail,${RENDERER_READY_TIMEOUT_MS});w.document.body.appendChild(f);
 }catch(e){reject(e);}});};})();`;
