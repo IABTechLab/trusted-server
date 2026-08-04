@@ -559,8 +559,15 @@ and the fail-closed marker:
   an older `valid_until`), and an equal revision is idempotent and must
   be payload-equivalent (a mismatch at equal revision is a hard error,
   not a merge). The r2-row → r3-row → r3-authority → delayed
-  r2-authority schedule is a named test. **Revision _r_ is committed — usable by S2S, visible
-  to the absence decision — only when the strong record reports it**; a
+  r2-authority schedule is a named test. **Revision _r_ is committed — usable by S2S, visible to the absence
+  decision — only when the strong record reports it, and identity/S2S
+  use requires `row.provenance_revision == authority.summary_revision`,
+  failing closed in _both_ mismatch directions** (row r2 + summary r1 is
+  the ordinary uncommitted case; summary r2 + eventually-stale row r1 is
+  the inverse another region can strongly read — so the recompute takes
+  **every** input, jurisdiction included, from the strong summary, never
+  the row, and refuses on any revision mismatch, closing the
+  wrong-jurisdiction egress). A
   row at _r_ whose summary still reads _r−1_ is simply uncommitted
   detail, and a crash between the writes leaves a recoverable state (the
   next live resolution re-runs step 2 via `AuthorityRefresh`), never a
@@ -715,11 +722,16 @@ section malformed-present (blocks grants, never withdraws).
    (and `iab_gpp` 0.1.2) supports sections 7–23 only and models `usnat`
    v2 while the snapshot pins v1 — implementation must reject versions
    the library happens to decode but the snapshot disallows. Sections
-   24–27 are **not** a decoder work item: with no reproducible official
-   layout they are reserved and inert (national-only for those states —
-   an accepted limitation, sign-off 32); the earlier "Maryland opt-out
-   must not vanish / extend the decoder for 24–27" reading is withdrawn
-   as incompatible with reserved status.
+   24–27 are **not** a decoder work item and carry **no accepted
+   version** (the snapshot lists them in a separate _reserved_ table,
+   not the accepted-version table — an accepted-version entry plus
+   "inert" prose let two implementations diverge): with no reproducible
+   official layout they are reserved and inert (national-only for those
+   states — sign-off 32). Their **presence differs from an unknown
+   section only in logging**: both contribute nothing, but a reserved
+   ID is expected-inert while an unknown ID is flagged for snapshot
+   review. The earlier "Maryland opt-out must not vanish / extend the
+   decoder" reading is withdrawn.
    The implementation PR cross-checks this list against both the current
    decoder's section set and the official registry, and the accepted version per
    section is **pinned to the vendored registry snapshot
@@ -825,21 +837,15 @@ migration story unresolvable (migration spec §2, rows 5 and 7).
 
 A **policy revision** has a defined identity: the canonical content
 digest of the `[permissions]` section — **defined**: SHA-256 with domain
-tag `tspol1|` over the canonical JSON of the parsed policy (keys sorted,
-UTF-8, defaults materialized, no insignificant whitespace), with
-cross-language test vectors a conformance requirement (identity — republishing identical
-policy yields the same digest) paired with the **config-store's globally assigned activation
-version** (the `ts config push` version — one fleet-wide ordered
-sequence, not a per-instance counter: "monotonic per instance" gave
-generation 12 on one instance no relation to 12 on another, making
-cross-instance provenance comparison undefined). Provenance
-stores both; comparisons order by generation and equate by digest, so a
-rollback is a _new_ generation carrying an _old_ digest, with defined
-semantics on both axes.
-
-A policy edit propagates through the config store, so a fleet briefly
-mixes revisions. The contract: instances stamp every resolution and every
-provenance write with the policy revision they used (already required by
+tag `tspol1|` over the canonical JSON of the parsed policy (keys sorted
+lexicographically by UTF-8 code unit, numbers shortest round-trip,
+defaults materialized, no insignificant whitespace), cross-language
+vectors required. **The other cache-tuple inputs are domain-separated
+hashes of effective configuration, adapter-independent**:
+integration-registry revision = `tsreg1|` over the canonical-JSON
+`(id, version)` list; config revision = `tscfg1|` over the effective
+config blob — so adapters without a native push version still derive
+identical revisions from identical configuration by
 §7); the mixing window is bounded by config propagation and observable via
 the config-version metric; and mixed-revision irreversibility is bounded and **accepted, not
 denied** (sign-off 19): destructive withdrawal triggers are user

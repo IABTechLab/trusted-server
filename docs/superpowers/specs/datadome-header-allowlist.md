@@ -24,3 +24,19 @@ set mean: nothing else is accepted until a reviewed commit adds it.
 Note: the vendor's `X-Set-Cookie` response field is **not** a
 forwardable header — it lowers into the typed `datadome` cookie
 operation (hook spec §4a) and never reaches the browser as a header.
+
+## Pointer outcome table (every documented pointer, exactly one outcome)
+
+| Pointer                      | Outcome                                              |
+| ---------------------------- | ---------------------------------------------------- |
+| `Set-Cookie`, `X-Set-Cookie` | typed `datadome` cookie operation (§4a)              |
+| `Location`                   | forward (Respond, 3xx only)                          |
+| `Content-Type`               | forward (Respond only)                               |
+| `Cache-Control`              | restricted merge                                     |
+| `Pragma`                     | drop-individually (logged), never batch-invalidating |
+| `X-DataDome`, `X-DD-*`       | forward as owner-scoped typed telemetry headers      |
+| anything unclassified        | invalidate the batch → Continue                      |
+
+The documented vendor response (`Set-Cookie`, `Pragma`, `X-DataDome`,
+`Cache-Control`) is a verbatim fixture asserting the decision stays
+**Respond** and the mapped fields are emitted exactly.
