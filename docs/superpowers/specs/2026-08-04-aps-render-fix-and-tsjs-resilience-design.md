@@ -107,7 +107,9 @@ time; a bid that never painted is byte-identical to one that painted.
 ### 2.5 Failure → signal mapping (normative)
 
 Every section-2 failure maps to a distinct observable **failure class** (not
-a claim to distinguish unknowable root causes):
+a claim to distinguish unknowable root causes). The operator query for each
+row is the §5.6 canonical join filtered by that row's event/reason or
+counter; the console column is what diagnostic mode mirrors on-page:
 
 | Failure | Client event/reason (§5.1)                   | Server counter/row (§5.6)              | Console      |
 | ------- | -------------------------------------------- | -------------------------------------- | ------------ |
@@ -368,6 +370,11 @@ configured flow" in the success criteria includes this one.
 ] }
 ```
 
+Every G4c observation is a **wire event** in this enum (internal state
+transitions map to them one-to-one; nothing observable is state-only).
+`gam_empty` additionally appears as a `render_fail` reason when it is the
+terminal outcome of an attributed attempt.
+
 The `t` enum now **contains every G4c observation**, so Phase-3 stage rates
 (renderer-document load rate, runner load/failure, GAM fill) are queryable.
 Reason enum (closed): `renderer_document_no_load`, `runner_no_load`,
@@ -392,7 +399,10 @@ fetch/pagehide races are expected and handled at the sink (§5.5).
 Format `v1.<kid>.<exp>.<mode>.<sig>`:
 
 - `kid`: key id; **active and previous keys** live in the platform secret
-  store; rotation = introduce new key as active, demote, retire.
+  store; keys are ≥ 256-bit CSPRNG values; rotation = introduce new key as
+  active, demote, retire. **Missing-key startup behavior:** if the beacon is
+  enabled and no signing key resolves at startup, startup fails loudly
+  (config error) — traces are never issued unsigned.
 - `exp`: unix epoch seconds; verifier allows ±60 s skew; maximum future
   15 minutes from issuance.
 - `mode`: `sampled` | `diagnostic`. Sampling is server-decided (G1);
@@ -443,7 +453,13 @@ id_kind (Enum), matched (UInt8), source (Enum), reason (Enum §5.1)`.
   Sorting key `(publisher, ts, trace_id, seq)`; 30-day TTL; its own ingest
   token, configured via new `TinybirdSettings` fields
   (`client_events_dataset`, `client_events_token_secret`) — today's settings
-  configure only the auction dataset (`settings.rs:1752`).
+  configure only the auction dataset (`settings.rs:1752`). Sink batch cap:
+  512 rows per dispatch (matching the auction sink). Startup validation:
+  when client events are enabled, the dataset name and token secret must
+  resolve or startup fails. Sink-unavailable behavior at runtime:
+  accept-count-drop (ingest still answers `204`). Canonical join:
+  `ts_client_events` ⋈ auction rows on `(publisher, trace_id)`; dashboards
+  and alerts are owned by the release owner and defined with the datasource.
 - **Auction rows** (`AuctionEventRow`, `telemetry.rs:262`, and
   `auction_events_raw.datasource`): add nullable `trace_id (FixedString 32)`
   and `mode`; add a bounded **`bid_drop` row type**
@@ -564,23 +580,27 @@ render.
 - Server route counters (requests, unknown-version, auth-blocked) are
   **aggregate only** — the document request carries no trace (the nonce
   rides the URL fragment and never reaches the server).
-- **CSP rollout that cannot false-pass:** discovery uses the **currently
-  enforced** policy with reporting attached (report-only alone cannot reveal
-  what the enforced policy already blocks). Candidate relaxations are tested
-  in a small enforced cohort under a short-lived canary document version;
-  once frozen, a new immutable `/v2` ships with the final policy. Reports:
-  dedicated `POST /_ts/csp-reports` accepting **both**
-  `application/csp-report` (legacy) and `application/reports+json`
-  (Reporting API), each with its own payload validator; §5.4 caps and
-  rate-limit rules; **origin rules account for the renderer's opaque
-  sandbox** (reports may carry `null` origin — validated by document URL /
-  policy version instead of the beacon's same-origin rule); stored as
-  aggregate counters with blocked sources bucketed into
-  `https-host | data | blob | inline | eval | other` (no arbitrary host
-  labels — cardinality abuse is otherwise trivial). Browser coverage for
-  opaque-renderer reports runs on **Chromium, Firefox, and WebKit** (CI is
-  Chromium-only today, `playwright.config.ts:16`; the matrix extends for
-  this suite).
+- **CSP rollout that cannot false-pass.** Three distinct uses, each with its
+  own instrument: **discovery** uses the **currently enforced** policy with
+  reporting attached (report-only alone cannot reveal what the enforced
+  policy already blocks); **tightening** candidates run report-only;
+  **relaxation** candidates are tested in a small enforced cohort under a
+  short-lived canary document version, gated on runner acceptance rate, CSP
+  violation rate, render-failure rate, and a kill switch that reverts the
+  cohort to the frozen policy. Once frozen, a new immutable `/v2` ships with
+  the final enforced headers. Reports: dedicated `POST /_ts/csp-reports`
+  accepting **both** `application/csp-report` (legacy) and
+  `application/reports+json` (Reporting API), each with its own payload
+  validator; §5.4 caps and rate-limit rules; **origin rules account for the
+  renderer's opaque sandbox** (reports may carry `null` origin — validated
+  by document URL / policy version instead of the beacon's same-origin
+  rule); unused report fields are **discarded before logging or
+  aggregation**; stored as aggregate counters with blocked sources bucketed
+  into `https-host (allowlisted) | data | blob | inline | eval | other` (no
+  arbitrary host labels — cardinality abuse is otherwise trivial). Browser
+  coverage for opaque-renderer reports runs on **Chromium, Firefox, and
+  WebKit** (CI is Chromium-only today, `playwright.config.ts:16`; the matrix
+  extends for this suite).
 
 ### 6.7 One descriptor schema — generation covers all three implementations
 
@@ -747,10 +767,13 @@ services are not already enabled; ambiguous responsive resolution emits
   `brotli -q 11`), compared to checked-in baseline artifacts
   (`perf/baselines/*.json`); baseline updates are explicit reviewed diffs.
   Tolerance +5% bytes.
-- Browser timing (bids-script-to-first-`display()`): pinned CI runner class
-  (the repository's standard Linux runner image) and the
-  Playwright-pinned browser build; 5 warm-up runs discarded, 50 samples,
-  gate p90 ≤ baseline × 1.10.
+- Browser timing (bids-script-to-first-`display()`): named runner image
+  `ubuntu-24.04` (the CI image already used by this repository's workflows)
+  and the Chromium build bundled with the pinned `@playwright/test` version
+  from `package.json`; 5 warm-up runs discarded, 50 samples, gate p90 ≤
+  baseline × 1.10. The baseline artifact records image, browser, and tool
+  versions alongside the numbers; a baseline update is invalid if any of
+  those differ from the pinned set.
 - Server (precomputed concatenation): one-sided gates, CPU and heap ≤
   baseline × 1.10; improvements always pass. Tool versions pinned in
   `.tool-versions`.
@@ -803,14 +826,17 @@ stated), and action (hold cutover / rollback switch):
   _Gate (canary cohort vs simultaneous control cohort, 24 h, minimum 10,000
   sampled attempts each):_ APS `render_accepted` / attributable APS attempts
   ≥ 95%; renderer-document load rate ≥ 99%; runner failure+timeout ≤ 1%; GAM
-  fill, p90 latency, and billing volume deltas within ±2% of control
+  fill, p95 latency, and billing volume deltas within ±2% of control
   (billing measured against GAM/server-side reporting, not the beacon);
   real-GAM overlap test green. Action on breach: hold cutover.
 - **Phase 4 — Structure.** Full layering + boundary lint; transactional
   plugin lifecycle; adapters; full slot registry; full messaging migration;
   final namespace (7.4).
   _Gate:_ boundary lint zero exceptions; disposal-inventory leak tests
-  green; pre-cutover page smoke on the final namespace.
+  green; pre-cutover page smoke on the final namespace; **behavioral-parity
+  suite green across all four flows** (SSAT, client-Prebid, page-bids,
+  direct `/auction`) comparing pre- and post-restructure event sequences on
+  the reference page.
 - **Phase 5 — Decomposition + cutover.** File splits; script-guard
   consolidation; bootstrap stub + generated fallback; then the §0 runbook.
   _Gate:_ bundle budgets + timing assertions hold; cutover checklist signed
