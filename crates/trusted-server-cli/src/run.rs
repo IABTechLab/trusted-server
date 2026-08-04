@@ -290,13 +290,13 @@ mod tests {
             "fastly",
             "--service-id",
             "service-123",
-            "--stage",
+            "--staging",
         ]);
         let Command::Deploy(deploy) = args.command else {
             panic!("expected deploy command");
         };
         assert_eq!(deploy.service_id, Some("service-123".to_owned()));
-        assert!(deploy.stage);
+        assert!(deploy.staging);
     }
 
     #[test]
