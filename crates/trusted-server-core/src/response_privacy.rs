@@ -13,13 +13,14 @@ use edgezero_core::http::{HeaderName, HeaderValue, Response, header};
 
 use crate::settings::Settings;
 
-/// Surrogate cache headers stripped from every cookie-bearing response.
+/// CDN-targeted cache headers stripped from every cookie-bearing response.
 ///
 /// A single source of truth so the adapter copies of the privacy downgrade
 /// cannot drift apart.
-pub const SURROGATE_CACHE_HEADERS: &[&str] = &[
+pub const CDN_CACHE_HEADERS: &[&str] = &[
     "surrogate-control",
     "fastly-surrogate-control",
+    "cdn-cache-control",
     "cloudflare-cdn-cache-control",
 ];
 
@@ -40,7 +41,7 @@ pub fn enforce_set_cookie_cache_privacy(response: &mut Response) {
     // one already carrying a stricter `no-store`/`private` directive — they are
     // independent of Cache-Control and would otherwise let a shared cache store
     // and replay one visitor's Set-Cookie.
-    for name in SURROGATE_CACHE_HEADERS {
+    for name in CDN_CACHE_HEADERS {
         response.headers_mut().remove(*name);
     }
     // Cache-Control directives are case-insensitive (RFC 9111 §5.2), so match
@@ -86,9 +87,9 @@ pub fn apply_response_headers_with_cache_privacy(settings: &Settings, response: 
     for (key, value) in &settings.response_headers {
         if response_is_uncacheable
             && (key.eq_ignore_ascii_case(header::CACHE_CONTROL.as_str())
-                || key.eq_ignore_ascii_case("surrogate-control")
-                || key.eq_ignore_ascii_case("fastly-surrogate-control")
-                || key.eq_ignore_ascii_case("cloudflare-cdn-cache-control"))
+                || CDN_CACHE_HEADERS
+                    .iter()
+                    .any(|name| key.eq_ignore_ascii_case(name)))
         {
             continue;
         }
@@ -154,7 +155,9 @@ mod tests {
         let mut response = response_builder()
             .header(header::SET_COOKIE, "id=abc")
             .header("surrogate-control", "max-age=600")
-            .header("cloudflare-cdn-cache-control", "public, max-age=600")
+            .header("fastly-surrogate-control", "max-age=600")
+            .header("cdn-cache-control", "max-age=600")
+            .header("cloudflare-cdn-cache-control", "max-age=600")
             .body(edgezero_core::body::Body::empty())
             .expect("should build response");
 
@@ -168,16 +171,12 @@ mod tests {
             Some("private, max-age=0"),
             "operator public Cache-Control must not override cookie privacy downgrade"
         );
-        assert!(
-            !response.headers().contains_key("surrogate-control"),
-            "surrogate cache headers must be stripped on cookie responses"
-        );
-        assert!(
-            !response
-                .headers()
-                .contains_key("cloudflare-cdn-cache-control"),
-            "Cloudflare cache policy must be stripped on cookie responses"
-        );
+        for header_name in CDN_CACHE_HEADERS {
+            assert!(
+                !response.headers().contains_key(*header_name),
+                "CDN cache header {header_name} must be stripped on cookie responses"
+            );
+        }
     }
 
     #[test]
@@ -188,6 +187,8 @@ mod tests {
             ("set-cookie", "operator=abc"),
             ("cache-control", "public, max-age=600"),
             ("surrogate-control", "max-age=600"),
+            ("fastly-surrogate-control", "max-age=600"),
+            ("cdn-cache-control", "public, max-age=600"),
             ("cloudflare-cdn-cache-control", "public, max-age=600"),
         ]);
         let mut response = response_builder()
@@ -204,16 +205,12 @@ mod tests {
             Some("private, max-age=0"),
             "operator Set-Cookie plus public Cache-Control must be re-downgraded to private"
         );
-        assert!(
-            !response.headers().contains_key("surrogate-control"),
-            "surrogate cache headers must be stripped when operator headers add Set-Cookie"
-        );
-        assert!(
-            !response
-                .headers()
-                .contains_key("cloudflare-cdn-cache-control"),
-            "Cloudflare cache policy must be stripped when operator headers add Set-Cookie"
-        );
+        for header_name in CDN_CACHE_HEADERS {
+            assert!(
+                !response.headers().contains_key(*header_name),
+                "CDN cache header {header_name} must be stripped when operator headers add Set-Cookie"
+            );
+        }
         assert!(
             response.headers().contains_key(header::SET_COOKIE),
             "the operator Set-Cookie itself should still be applied"
@@ -225,6 +222,8 @@ mod tests {
         let settings = settings_with_response_headers(&[
             ("cache-control", "public, max-age=600"),
             ("surrogate-control", "max-age=600"),
+            ("fastly-surrogate-control", "max-age=600"),
+            ("cdn-cache-control", "public, max-age=600"),
             ("cloudflare-cdn-cache-control", "public, max-age=600"),
         ]);
         let mut response = response_builder()
@@ -239,12 +238,12 @@ mod tests {
             "private, no-store",
             "operator cache headers must not weaken an existing private response"
         );
-        assert!(!response.headers().contains_key("surrogate-control"));
-        assert!(
-            !response
-                .headers()
-                .contains_key("cloudflare-cdn-cache-control")
-        );
+        for header_name in CDN_CACHE_HEADERS {
+            assert!(
+                !response.headers().contains_key(*header_name),
+                "operator headers must not restore shared caching through {header_name}"
+            );
+        }
     }
 
     #[test]
@@ -264,5 +263,26 @@ mod tests {
             Some("value"),
             "operator headers should still apply to cacheable responses"
         );
+    }
+
+    #[test]
+    fn uncacheable_response_rejects_operator_cdn_cache_headers() {
+        let settings = settings_with_response_headers(&[
+            ("cdn-cache-control", "public, max-age=600"),
+            ("cloudflare-cdn-cache-control", "public, max-age=600"),
+        ]);
+        let mut response = response_builder()
+            .header(header::CACHE_CONTROL, "private, no-store")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build response");
+
+        apply_response_headers_with_cache_privacy(&settings, &mut response);
+
+        for header_name in ["cdn-cache-control", "cloudflare-cdn-cache-control"] {
+            assert!(
+                !response.headers().contains_key(header_name),
+                "operator headers must not restore shared caching through {header_name}"
+            );
+        }
     }
 }
