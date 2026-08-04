@@ -245,8 +245,10 @@ following rules:
    creative correlation once more than
    `CREATIVE_ATTEMPT_WINDOW_MS = 30_000` has elapsed since its `slotRequested`
    timestamp.
-2. The greatest request cycle is compatible when it has rendered non-empty. It
-   is provisionally compatible before `slotRenderEnded` only when no earlier
+2. The greatest request cycle is compatible after render whenever it is not
+   explicitly empty (`isEmpty !== true`). A positive PUC request can therefore
+   resolve a render whose GPT callback omitted `isEmpty`. The cycle is
+   provisionally compatible before `slotRenderEnded` only when no earlier
    retained non-empty cycle is still inside the 30-second window. This preserves
    an initial PUC request that races GPT's render callback, but rejects a request
    during the ambiguous interval between a refresh request and its render event.
@@ -279,9 +281,11 @@ following rules:
 Before admitting an attempt at the 128-record cap, the store removes the oldest
 completed, expired, or evicted tombstone. It never evicts a live attempt to make
 room. If all 128 records are live, admission records
-`creative_attempt_capacity` and returns no attempt ID. A successful response
-makes an attempt completed; repeat calls through a retained completed record are
-idempotent no-ops.
+`creative_attempt_capacity`, retains the cycle's first positive creative-request
+timestamp, and returns no attempt ID. A later duplicate may retry admission only
+because no attempt ID has ever existed for that cycle; it never replaces an
+expired or evicted ID. A successful response makes an attempt completed; repeat
+calls through a retained completed record are idempotent no-ops.
 
 When a pre-render request was provisionally attached, `slotRenderEnded` closes
 the check. A non-empty event confirms compatibility. An empty event records an
@@ -336,6 +340,10 @@ The delivery observation window is
 `TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS = 5_000` and starts at the cycle's
 `slotRenderEnded` timestamp. A late positive signal always upgrades the state.
 A timeout never blocks or changes ad delivery.
+
+For the same reason, `responseClass` remains absent when `slotRenderEnded`
+omits `isEmpty`; `unclassified_non_empty` is emitted only after an explicit
+`isEmpty === false` observation.
 
 ## Correlation and Ambiguity
 
