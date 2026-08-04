@@ -160,6 +160,10 @@ const FAKE_RUNNER = `(function(){
       var bid = response.seatbid[0].bid[0];
       if (bid.ext.tagtype === 'iframe') {
         var frame = document.createElement('iframe');
+        frame.width = String(bid.w);
+        frame.height = String(bid.h);
+        frame.style.border = '0';
+        frame.style.display = 'block';
         frame.setAttribute('sandbox', 'allow-scripts allow-same-origin');
         frame.src = bid.ext.creativeurl;
         document.body.appendChild(frame);
@@ -172,7 +176,9 @@ const FAKE_RUNNER = `(function(){
   });
 })();`;
 
-const IFRAME_CREATIVE = `<!doctype html><script>
+const IFRAME_CREATIVE = `<!doctype html>
+<style>html,body{margin:0;width:300px;height:250px;background:#198754}</style>
+<script>
 var creativeRead = false;
 var creativeWrite = false;
 try { void top.document.body; creativeRead = true; } catch (_error) {}
@@ -340,6 +346,66 @@ window.ucTag.renderAd(document, { adId: ${JSON.stringify(apsRenderer.bidId)}, pu
             .toEqual({
                 clientWidth: 300,
                 clientHeight: 250,
+                scrollWidth: 300,
+                scrollHeight: 250,
+            });
+        const rendererFrame = page
+            .frames()
+            .find(
+                (frame) =>
+                    new URL(frame.url()).pathname ===
+                    "/integrations/aps/renderer",
+            );
+        expect(rendererFrame).toBeDefined();
+        await expect
+            .poll(() =>
+                rendererFrame!.evaluate(() => ({
+                    bodyMargin: getComputedStyle(document.body).margin,
+                    bodyPadding: getComputedStyle(document.body).padding,
+                    bodyOverflow: getComputedStyle(document.body).overflow,
+                    rootOverflow: getComputedStyle(document.documentElement)
+                        .overflow,
+                    clientWidth: document.documentElement.clientWidth,
+                    clientHeight: document.documentElement.clientHeight,
+                    scrollWidth: document.documentElement.scrollWidth,
+                    scrollHeight: document.documentElement.scrollHeight,
+                })),
+            )
+            .toEqual({
+                bodyMargin: "0px",
+                bodyPadding: "0px",
+                bodyOverflow: "hidden",
+                rootOverflow: "hidden",
+                clientWidth: 300,
+                clientHeight: 250,
+                scrollWidth: 300,
+                scrollHeight: 250,
+            });
+        const creativeFrame = page
+            .frames()
+            .find((frame) => frame.url() === IFRAME_CREATIVE_URL);
+        expect(creativeFrame).toBeDefined();
+        await expect
+            .poll(() =>
+                creativeFrame!.evaluate(() => ({
+                    backgroundColor: getComputedStyle(document.body)
+                        .backgroundColor,
+                    viewportWidth: window.innerWidth,
+                    viewportHeight: window.innerHeight,
+                    scrollWidth: Math.max(
+                        document.body.scrollWidth,
+                        document.documentElement.scrollWidth,
+                    ),
+                    scrollHeight: Math.max(
+                        document.body.scrollHeight,
+                        document.documentElement.scrollHeight,
+                    ),
+                })),
+            )
+            .toEqual({
+                backgroundColor: "rgb(25, 135, 84)",
+                viewportWidth: 300,
+                viewportHeight: 250,
                 scrollWidth: 300,
                 scrollHeight: 250,
             });

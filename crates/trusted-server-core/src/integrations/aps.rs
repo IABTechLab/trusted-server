@@ -50,6 +50,7 @@ const APS_RENDERER_CSP: &str = "default-src 'none'; sandbox allow-forms allow-po
 
 const APS_RENDERER_DOCUMENT: &str = r#"<!doctype html>
 <meta charset="utf-8">
+<style>html,body{margin:0;padding:0;overflow:hidden}</style>
 <script>
 (function(){
 'use strict';
@@ -2414,6 +2415,7 @@ mod tests {
     #[test]
     fn renderer_document_is_static_and_nonce_bound() {
         assert!(APS_RENDERER_DOCUMENT.contains("^#tsaps="));
+        assert!(APS_RENDERER_DOCUMENT.contains("html,body{margin:0;padding:0;overflow:hidden}"));
         assert!(APS_RENDERER_DOCUMENT.contains("event.source!==parent||event.ports.length!==0"));
         assert!(APS_RENDERER_DOCUMENT.contains("event.ports.length!==1"));
         assert!(APS_RENDERER_DOCUMENT.contains("portEvent.ports.length!==0"));
