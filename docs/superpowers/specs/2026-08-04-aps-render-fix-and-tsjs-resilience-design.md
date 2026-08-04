@@ -1,695 +1,921 @@
 # APS Render Fix and TSJS Resilience Architecture — Design
 
-- **Status:** revision 4 — reworked after the third design review round.
+- **Status:** revision 5 — rewritten for the coordinated hard-cutover policy
+  adopted in the fourth review round, and made fully self-contained (no
+  contract is defined by reference to an earlier revision).
 - **Date:** 2026-08-04
-- **Baseline:** `rc/july` @ `541298695` — the full merged state (everything
-  merged from `main` plus every rc-only merge), not just the delta pending
-  against `main`.
-- **Inputs:** three code audits performed against this baseline; design
-  reviews of revisions 1–3; open issues #926, #941, #944, #962, #964, #977,
-  #983, #989, #993; open PR #997.
-- **Terminology:** the per-refresh counter is `refresh_gen` everywhere. The
-  event previously named `render_confirmed` is removed (see G4c).
+- **Baseline:** `rc/july` @ `541298695` — the full merged state.
+- **Inputs:** three code audits against this baseline; design reviews of
+  revisions 1–4; open issues #926, #941, #944, #962, #964, #977, #983, #989,
+  #993; open PR #997.
 
----
+## 0. Release policy: coordinated hard cutover
+
+This design targets a **single coordinated release**. Explicitly:
+
+- Server, TSJS bundles, config format, and page HTML ship together as one
+  release with one **release id** (`release_id`: the git tag / build hash).
+- **No N/N−1 support.** Old pages, old bundles, old config blobs, old
+  globals, and old URLs may stop working at cutover. In-flight clients (pages
+  loaded before the switch) may fail; this is accepted and stated, not
+  mitigated.
+- **Exact release matching only.** The kernel, every service, every plugin,
+  and the install manifest carry the same `release_id`; any mismatch is a
+  refusal, never a negotiation. There are no version ranges.
+- **Config format version:** the config blob gains a top-level
+  `format_version`; the binary rejects any other value. No
+  omit-default-for-rollback serialization rules; rollback means redeploying
+  the previous release with its own config.
+- **Assets:** binaries embed only their own release's artifacts. Hashed
+  pathnames are kept **for cache identity only** (correct caching and
+  dedup), not for retention: an unknown hash answers `410 Gone`,
+  `Cache-Control: no-store`. No shared artifact store — no separate
+  requirement for one was established.
+- **Cutover runbook (normative):** (1) deploy the release to all instances
+  dark (flagged off); (2) verify instance health and config
+  `format_version`; (3) switch traffic atomically at the routing/CDN layer;
+  (4) purge the CDN of prior HTML and assets; (5) monitor the Phase gates
+  (§8); rollback = switch traffic back to the previous release and re-purge.
+
+Everything that revisions 3–4 built for mixed-version tolerance is removed:
+no ABI version ranges, no retained-artifact storage, no legacy query-hash
+sunset, no dual-name global window, no adoption gates.
 
 ## 1. Problem statement
 
-APS (Amazon Publisher Services) demand is fully integrated server-side — the
-edge server runs the APS OpenRTB auction, wins bids, and ships a typed renderer
-descriptor to the page — yet APS creatives still do not appear for real users.
-Every previous fix (the `bid.meta` carrier, the decoupled prebid shim, the
-`hb_adid` fallback) addressed a real defect, and APS still does not render.
-That pattern is itself the finding: the APS pipeline has **multiple independent
-failure points, most of which fail silently**, and the client library has **no
-way to tell the server (or the operator) which one fired**.
+APS demand is fully integrated server-side — the edge runs the APS OpenRTB
+auction, wins bids, and ships a typed renderer descriptor to the page — yet
+APS creatives do not appear for real users. Serial single-cause fixes (the
+`bid.meta` carrier, the decoupled prebid shim, the `hb_adid` fallback) each
+survived review and still did not produce ads. That pattern is the finding:
+the APS pipeline has **multiple independent failure points, most of which
+fail silently**, and the client cannot tell the server which one fired.
 
-At the same time, the TSJS client library has grown organically to 56 files /
-~11,900 lines with two ~1,700-line monoliths, duplicated logic maintained by
-hand in two languages, inverted layering, and roughly one hundred `catch`
-blocks that discard failures. The APS outage and the library's shape are the
-same problem seen from two sides.
-
-This design covers both: (a) the specific fixes that make APS render, and (b)
-the target architecture that makes TSJS a clean, resilient library.
+The TSJS library (56 files, ~11,900 lines, two ~1,700-line monoliths,
+duplicated ES5/TS logic, inverted layering, ~100 error-swallowing `catch`
+blocks) is the same problem structurally. This design fixes APS delivery and
+rebuilds TSJS so the next integration cannot reproduce this failure class.
 
 ### Non-goals
 
 - No change to the APS OpenRTB endpoint contract or Amazon-side configuration
-  (including its deliberate absence of `nurl`/`burl` — see G4d).
-- No rewrite of Prebid.js integration strategy (the decoupled shim stays).
-- No behavior change for publishers whose pages work today. Public-surface
-  migrations happen behind a bounded compatibility window (7.4), never by
-  immediate removal.
+  (including its deliberate absence of `nurl`/`burl`, §G4d).
+- No rewrite of the decoupled Prebid.js strategy.
+- **No backward compatibility** (§0). Publisher-visible surfaces change at
+  cutover; the replacement shapes are in §7.4.
 
----
+## 2. Why APS does not render — evidence
 
-## 2. Why APS still does not render — the evidence
+Flows: (a) SSAT via `window.tsjs.bids`; (b) GAM + client `trustedServer`
+Prebid adapter; (c) SPA `/_ts/page-bids`; (d) direct `/auction`
+`tsjs.requestAds`. Only (d) — unused in production — renders an APS
+descriptor without GAM.
 
-The audit traced all four delivery flows: (a) SSAT server-side ad template via
-`window.tsjs.bids`, (b) GAM + client-side `trustedServer` Prebid adapter, (c)
-SPA `/_ts/page-bids` re-auction, (d) direct `/auction` via `tsjs.requestAds`.
-Only flow (d) — the demo path nobody runs in production — can render an APS
-descriptor without GAM's cooperation.
+### 2.1 Admission
 
-### 2.1 Admission: APS bids are eliminated before they can win
+| #   | Failure                                                                                                                                                              | Where                                            |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------ |
+| A1  | A configured `[auction].mediator` discards every direct-provider bid; winners come only from the mediator response. APS reports `success, bid_count: N`, never wins. | `orchestrator.rs:412-431`                        |
+| A2  | `allow_script_creatives` defaults `false`, dropping every `tagtype: "script"` APS bid; the drop is counted but invisible (A4).                                       | `aps.rs:141-143`, `:773-778`                     |
+| A3  | Strict gates: exact `w`×`h` membership; required `ext.creativeurl`; any top-level `contextual` key rejects the whole response.                                       | `aps.rs:657-668`, `:745-778`, `:838-846`         |
+| A4  | Drop reasons reach only `/auction` `ext.orchestrator`; SSAT/page-bids discard them; logs and the `ts-debug` allowlist exclude them.                                  | `publisher.rs:1866-1875`, `telemetry.rs:808-826` |
 
-| #   | Failure                                                                                                                                                                                                                                                                        | Where                                            |
-| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------ |
-| A1  | **A configured `[auction].mediator` discards every direct-provider bid.** Winners come exclusively from the mediator response; APS bids (with their renderers) are used only as mediator input and reporting. APS shows `status: success, bid_count: N` yet never wins a slot. | `orchestrator.rs:412-431`                        |
-| A2  | **`allow_script_creatives` defaults to `false`**, dropping every `tagtype: "script"` APS bid — a large share of TAM demand. The drop is counted but invisible (see A4).                                                                                                        | `aps.rs:141-143`, `:773-778`                     |
-| A3  | **Strict per-bid gates**: exact `w`×`h` membership in the slot's configured formats, required `ext.creativeurl`, and any top-level `contextual` key rejects the entire response.                                                                                               | `aps.rs:657-668`, `:745-778`, `:838-846`         |
-| A4  | **Drop reasons never reach an operator on the production paths.** `drop_reasons` counters surface only in `/auction` `ext.orchestrator`; the SSAT and page-bids paths discard them, server logs do not carry them, and the `ts-debug` comment allowlist excludes them.         | `publisher.rs:1866-1875`, `telemetry.rs:808-826` |
+### 2.2 Identity
 
-### 2.2 Identity: the `hb_adid` contract with GAM is unproven
+| #   | Failure                                                                                                                | Where                                         |
+| --- | ---------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
+| B1  | GAM caps key-value values at 40 chars; the raw APS bid id as `hb_adid` can fail the bridge equality check with no log. | `publisher.rs:3366-3372`, `gpt/index.ts:1613` |
+| B2  | Two id universes: SSAT keys on the APS bid id, the client adapter on Prebid's generated `adId`.                        | `publisher.rs:3366`, `prebid/index.ts:982`    |
 
-| #   | Failure                                                                                                                                                                                                                                                                                     | Where                                         |
-| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
-| B1  | **GAM key-value values are capped at 40 characters.** The new fallback emits the raw APS OpenRTB bid `id` (a long opaque string) as `hb_adid`. If GAM truncates or rejects it, `%%PATTERN:hb_adid%%` comes back different, the bridge's equality check fails, and it bails **with no log**. | `publisher.rs:3366-3372`, `gpt/index.ts:1613` |
-| B2  | **Two id universes for the same bid.** SSAT keys the bridge on the APS bid id; the client-side Prebid adapter keys on Prebid's generated `adId`. A page running both paths registers the same slot under different ids.                                                                     | `publisher.rs:3366`, `prebid/index.ts:982`    |
+### 2.3 Render
 
-### 2.3 Render: the client has one narrow happy path and no fallback
+| #   | Failure                                                                                                                    | Where                                                     |
+| --- | -------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
+| C1  | If GAM never serves the PUC, nothing renders and nothing is recorded; `renderApsCreative` is reachable only from flow (d). | `gpt/index.ts:854-1107`, `core/request.ts:59`             |
+| C2  | A renderer endpoint that never answers is a silent 10 s death (opaque iframe cannot read HTTP status).                     | `aps.rs:1188-1245`, `aps/render.ts:384-404`               |
+| C3  | SafeFrame breaks slot attribution (top-document iframe walk cannot see nested creative windows).                           | `gpt/index.ts:157-183`, `:1599-1600`                      |
+| C4  | Three hand-maintained schema copies with exact-key rejection: a server field addition blanks every APS ad.                 | `types.rs:188-211`, `aps/render.ts:60-93`, `aps.rs:65-73` |
+| C5  | A dead duplicate renderer branch holds the debug log and dedup logic; it can never execute.                                | `gpt/index.ts:1643-1674`                                  |
+| C6  | The renderer CSP can kill creatives after "ready" (no `object-src`, workers, `blob:`/`data:` frames).                      | `aps.rs:49`                                               |
+| C7  | Renderer branches record nothing: no trace record, no notifications.                                                       | `gpt/index.ts:1558-1632`                                  |
 
-| #   | Failure                                                                                                                                                                                                                     | Where                                                     |
-| --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
-| C1  | **If GAM never serves the Prebid Universal Creative, nothing renders and nothing is recorded.** The renderer descriptor sits unused in `window.tsjs.bids`; `renderApsCreative` is reachable only from the unused flow (d).  | `gpt/index.ts:854-1107`, `core/request.ts:59`             |
-| C2  | **A renderer endpoint that never answers is a silent 10-second death.** The sandboxed iframe cannot read an HTTP status from its opaque origin; a 404/401/misrouted document simply never posts `renderer-ready`.           | `aps.rs:1188-1245`, `aps/render.ts:384-404`               |
-| C3  | **SafeFrame breaks slot attribution.** The bridge resolves a message source by walking top-document iframes under the slot div; a nested SafeFrame creative window is invisible to that walk, so the bridge bails silently. | `gpt/index.ts:157-183`, `:1599-1600`                      |
-| C4  | **Three hand-maintained copies of the descriptor schema** (Rust struct, TS validator, inline renderer-document validator) with exact-key rejection: any server-side field addition instantly blanks every APS ad.           | `types.rs:188-211`, `aps/render.ts:60-93`, `aps.rs:65-73` |
-| C5  | **A dead duplicate renderer branch in the bridge** contains the debug log and dedup logic people would look for while debugging; it can never execute.                                                                      | `gpt/index.ts:1643-1674`                                  |
-| C6  | **The renderer CSP may kill creatives after success is reported** (`object-src`, workers, `blob:`/`data:` frames are blocked; `renderer-ready` fires before the creative actually paints).                                  | `aps.rs:49`                                               |
-| C7  | **The renderer branches record nothing**: no `recordRender`, no win/billing beacons, no `stampCreativeTrace` — an APS win looks "never rendered" in every trace whether or not it painted.                                  | `gpt/index.ts:1558-1632`                                  |
+### 2.4 Observability
 
-### 2.4 Observability: the common factor
+Zero client→server reporting. Server telemetry marks `is_win=1` at auction
+time; a bid that never painted is byte-identical to one that painted.
 
-There is **zero client→server reporting**. Server telemetry marks `is_win=1`
-at auction time and goes quiet; a bid that never painted is byte-identical to
-one that painted perfectly. Client-side evidence dies with the tab.
+### 2.5 Failure → signal mapping (normative)
 
----
+Every section-2 failure maps to a distinct observable **failure class** (not
+a claim to distinguish unknowable root causes):
+
+| Failure | Client event/reason (§5.1)                   | Server counter/row (§5.6)              | Console      |
+| ------- | -------------------------------------------- | -------------------------------------- | ------------ |
+| A1      | —                                            | selection report `mediator_superseded` | startup warn |
+| A2      | —                                            | `bid_drop{script_rendering_disabled}`  | startup warn |
+| A3      | —                                            | `bid_drop{invalid_dimensions, w, h}`   | warn         |
+| A4      | — (fixed by §5.6 itself)                     | `bid_drop` rows exist on all paths     | `ts-debug`   |
+| B1/B2   | `bridge_request{matched: false}`             | join via `trace_id`                    | warn         |
+| C1      | `gam_empty` then no `bridge_request`         | join via `trace_id`                    | warn         |
+| C2      | `render_fail{renderer_document_no_load}`     | renderer route counters                | warn         |
+| C3      | `render_fail{bridge_id_mismatch}`            | join via `trace_id`                    | warn         |
+| C4      | `render_fail{descriptor_invalid}`            | schema corpus CI                       | warn         |
+| C5      | — (branch deleted)                           | —                                      | —            |
+| C6      | `runner_failed` + CSP report buckets         | CSP aggregate counters                 | warn         |
+| C7      | renderer branch emits the full §5.1 sequence | join via `trace_id`                    | debug/warn   |
 
 ## 3. The GPT reality this design must respect
 
-1. **Bootstrap-first hybrid:** the server injects a 495-line ES5
-   `gpt_bootstrap.js` before the bundle; shared monkeypatch sentinels mean the
-   bundle's handoff and initial-load code is dead in production.
-2. **The #922 merge loss:** orphan-slot recovery and `updateRender` enrichment
-   are gone (`0dc9b19a9`); `__tsRenderGeneration`/`__tsRenderBid` are dead
-   writes; bridge-served impressions double-count. PR #997 appears to be the
-   reworked replacement.
-3. **TS refreshes never pass `changeCorrelator: false`.**
-4. **`enableSingleRequest()` is called blind** after the publisher's own
-   `enableServices()` has almost always run.
-5. Responsive resolution is a DOM-element-selection ladder; ambiguity silently
-   skips the slot.
-6. Three independent wrappers on `pubads().refresh` coordinate via
-   window-global booleans.
-7. **GPT offers no request cancellation** (`gpt/index.ts:1080`), and its event
-   contract identifies only the slot: Google documents no per-refresh
-   identifier and no completion-order guarantee for overlapping requests, and
-   `slotRenderEnded` means creative code was injected, not that its resources
-   loaded. Publisher code can refresh an adopted slot while a TS cycle is
-   pending. Any attribution scheme must survive all of that (G4a).
-8. **The bundle's `slotRenderEnded` registration is gated behind
-   `!ts.servicesEnabled`** (`gpt/index.ts:1017`), so bootstrap-first or
-   services-enabled pages can miss the listener entirely — G4a requires
-   unconditional early subscription.
+1. Bootstrap-first hybrid: server-injected ES5 `gpt_bootstrap.js` wins the
+   sentinel race; the bundle's handoff/initial-load code is dead in
+   production.
+2. The #922 merge loss: orphan recovery and `updateRender` are gone
+   (`0dc9b19a9`); `__tsRenderGeneration`/`__tsRenderBid` are dead writes;
+   bridge impressions double-count. PR #997 is the apparent replacement.
+3. TS refreshes never pass `changeCorrelator: false`.
+4. `enableSingleRequest()` is called blind after publisher `enableServices()`.
+5. Responsive resolution ambiguity silently skips slots.
+6. Three independent `pubads().refresh` wrappers coordinate via window-global
+   booleans.
+7. **GPT has no request cancellation, no documented per-refresh identity, no
+   overlapping-completion order.** `slotRenderEnded` means creative code was
+   injected, not that resources loaded. The April 2025 `responseIdentifier`
+   identifies the ad **response** — usable for response dedup/drain, not for
+   attributing which caller initiated a request.
+8. **With initial load disabled, `display()` creates no request** — the
+   subsequent `refresh()` does (`gpt/index.ts:1059`, `ad_init.test.ts:1201`).
+   Any cycle protocol must model physical requests, not API calls.
+9. The bundle's `slotRenderEnded` registration is gated behind
+   `!ts.servicesEnabled` (`gpt/index.ts:1017`); G4a needs unconditional early
+   subscription.
 
----
-
-## 4. Design gates — the five contracts
+## 4. Design gates
 
 ### G1 — Trace identity and correlation
 
-**The client-visible auction id must never be ingested** (EC-derived:
-`publisher.rs:3237`). **Initial-HTML auction telemetry is emitted before page
-JavaScript exists** (`telemetry.rs:148`, `publisher.rs:2452`), so correlation
-is minted by whoever acts first:
+The client-visible auction id is EC-derived (`publisher.rs:3237`) and is
+never ingested. Initial-HTML auction telemetry is emitted before page JS
+exists (`telemetry.rs:148`, `publisher.rs:2452`), so correlation is minted by
+whoever acts first:
 
-- **Initial navigation (`nav_gen = 0`):** the server mints `trace_id`
-  (128-bit CSPRNG, `^[0-9a-f]{32}$`), writes it into that response's auction
-  telemetry rows at emit time (a new nullable `trace_id` column on the
-  existing auction datasource; the independent telemetry `auction_id` UUID
-  remains and remains separate), and injects it into the page as a `tsjs`
-  boot field with the sampling decision and, when the tester gate is active,
-  the diagnostic capability (5.3).
-- **Cache-privacy invariant:** a trace or capability is injected **only** into
-  responses that ran a per-request auction, and any trace-bearing HTML MUST be
-  shared-cache-ineligible: `Cache-Control: private, no-store` and no
-  validators that could revalidate a shared copy. This is enforced by
-  construction (the injection site is the auction-bearing render path) and by
-  test. A shared-cached page would have no per-visitor auction to correlate
-  anyway; the invariant makes that alignment explicit.
-- **SPA navigations (`nav_gen > 0`):** `/_ts/page-bids` **stays GET** (it is
-  GET in `publisher.rs:3815` and the client issues GET at
-  `gpt/index.ts:1152`; a browser GET cannot carry a body). The client mints
-  the `trace_id` and sends it in a validated **`X-TSJS-Trace-Id`** request
-  header — the request already carries a non-simple TSJS header, so CORS
-  preflight behavior is unchanged. The server records it contemporaneously in
-  that auction's telemetry rows and the JSON response **echoes the accepted
-  trace id** and returns a capability bound to it when the tester gate is
-  active.
-- **Envelope:** every event carries
-  `{trace_id, sampled, nav_gen, refresh_gen, seq}`; `seq` is per-trace
-  monotonic.
-- **Sampling is trace-sticky** (decided once per trace; server-decided for
-  `nav_gen 0`, client-decided from the injected rate afterwards). Transport is
-  best-effort, so a sampled trace may still arrive partial; partiality is
-  detectable via `seq` gaps and is not treated as a contract violation.
+- **Initial navigation (`nav_gen 0`):** the server mints `trace_id` (128-bit
+  CSPRNG, `^[0-9a-f]{32}$`), writes it into that response's auction rows
+  (§5.6 schema), and injects it into `tsjs.boot` with a **signed trace
+  authorization** (§5.3). It is never `AuctionRequest.id`.
+- **Cache privacy invariant:** traces/authorizations are injected only into
+  responses that ran a per-request auction; such HTML is
+  `Cache-Control: private, no-store` with no validators. Enforced by
+  construction and by test.
+- **SPA navigations:** `/_ts/page-bids` stays GET; the client mints
+  `trace_id` and sends it in a validated `X-TSJS-Trace-Id` header (the
+  request already carries a non-simple TSJS header). The server records it in
+  that auction's rows; the JSON response echoes the accepted trace and
+  returns its signed authorization.
+- **Envelope:** every event carries `{nav_gen, refresh_gen, seq}` inside a
+  per-trace group `{trace_id, auth, events[]}` (§5.1). `seq` is per-trace
+  monotonic. Transport is best-effort: gaps (loss) and duplicates
+  (fetch/pagehide races) are both expected; §5.5 defines dedup.
+- **Sampling is server-decided for every trace** — initial via boot, SPA via
+  the page-bids response — and carried **inside the signed authorization**
+  (§5.3 `mode`). The client never asserts its own sampling; an unsigned or
+  missing authorization means the trace group is rejected at ingest.
 
-### G2 — Render identity: `hb_adid`, the APS token, and the PBS Cache UUID
+### G2 — Render identity
 
-Unchanged from revision 3 (review-accepted): cache-backed bids keep the cache
-UUID as `hb_adid` byte-for-byte; renderer-only bids get a server-minted token
-`^[a-z0-9]{12}$` (CSPRNG; in-auction collision retry; cross-auction uniqueness
-probabilistic with the birthday bound documented; harmless via per-
-`(trace_id, nav_gen)` registry scoping); TTL 15 minutes; one-time consumption;
-client-Prebid keeps Prebid's `adId`; non-APS cache-path regression tests.
+- Cache-backed bids: `hb_adid` = the PBS Cache UUID, byte-for-byte as today
+  (`publisher.rs:3355`; the PUC fetches `?uuid=<hb_adid>`,
+  `publisher.rs:3450`, `gpt/index.ts:1700`). Markup bids without cache ids:
+  today's fallback chain unchanged.
+- **Renderer-only bids: `hb_adid` = a server-minted render token**,
+  `^[a-z0-9]{12}$` exactly, CSPRNG, collision-retried within the minting
+  auction. Cross-auction uniqueness is probabilistic (36¹² ≈ 4.7×10¹⁸;
+  birthday-bound negligible at realistic volumes) and made harmless by
+  registry scoping.
+- **Registry scope and bounds:** the client bridge registry keys tokens by
+  `(trace_id, nav_gen, refresh_gen)` — refresh auctions within one
+  navigation cannot collide, closing the revision-4 gap. Capacity: 64 live
+  entries per navigation; at capacity a new registration is refused with
+  disposition `registry_full`; unexpired entries are evicted only by
+  navigation disposal. Token TTL 15 minutes; one-time consumption.
+- The client-Prebid path keeps Prebid's generated `adId`; both paths register
+  into the one registry keyed by whichever id that path observes.
+- Regression tests: non-APS cache-backed bids byte-identical.
 
-### G3 — Runtime ABI: how code shares state under the IIFE build
+### G3 — Runtime ABI under the IIFE build (exact-release model)
 
 IIFE-per-bundle with inlined imports (`build-all.mjs:46`, `bundle.rs:23`)
-means module imports never share state across bundles (live proof:
+means imports never share state across bundles (live defect:
 `core/context.ts:11` vs `permutive/index.ts:102`).
 
-Contract — a versioned registration ABI on `window.tsjs._internal`:
-
-- Kernel ships only in `tsjs-core`, publishes
-  `tsjs._internal = { abi: 1, registry }` once (window sentinel). The kernel
-  constructs and registers core service instances during boot; integrations
-  register integration-scoped services during `install()`.
-- **Version semantics (settling the mixed-version gap):** every service
-  registers with `(major, minor)`. `registry.get(name, {major, minMinor})`
-  succeeds iff an implementation with the same `major` and `minor ≥ minMinor`
-  is registered. The install manifest's plugin versions are **ranges with the
-  same semantics** (required major, minimum minor), not exact pins.
-  An incompatible service registration is **quarantined** — recorded, not
-  installed — and surfaced as `abi_mismatch`; an incompatible plugin as
-  `bundle_partial`. **First-wins applies only among compatible
-  registrations.** The old-deferred-bundle + new-core scenario therefore has a
-  deterministic verdict: the old plugin either satisfies the manifest range
-  and runs, or is quarantined loudly.
-- Stateful services only via the registry at call time; stateless helpers may
-  be imported and inlined. Single-module-graph builds remain the successor
-  option behind the same surface.
+- The kernel ships only in `tsjs-core`, publishes
+  `tsjs._internal = { release_id, registry }` once (window sentinel), and
+  **freezes** `_internal` after boot. The kernel constructs and registers
+  core services (event bus, beacon queue, sessions, slot registry, render
+  state machine) during boot; integrations register integration-scoped
+  services during `install()`.
+- **Exact release matching:** every service and plugin registration carries
+  `release_id`; `registry.get(name)` succeeds only when the registrant's
+  `release_id` equals the kernel's. A mismatch quarantines the registration
+  and emits `abi_mismatch` (service) / `bundle_partial` (plugin) with a
+  console error. No ranges, no minors, no first-wins tiers — under §0 a
+  mismatch is a deployment error to surface, not tolerate.
+- Stateful access only through the registry at call time; stateless helpers
+  may be imported and inlined. Single-module-graph builds remain the
+  recorded successor option behind the same surface.
 
 ### G4 — Render lifecycle
 
-**G4a — Request-cycle protocol (no ordering assumptions).** GPT documents no
-per-refresh identity and no completion-order guarantee, so the protocol
-assumes neither:
+**G4a — Physical request-cycle protocol.** Two separated notions:
 
-- Every observable request initiation is classified `ts | publisher`: TS's own
-  `display()`/`refresh()` calls open TS cycles; the wrapped publisher
-  entry-points and `slotRequested` events that match no TS cycle are recorded
-  as publisher-initiated.
-- **TS serializes itself to at most one outstanding cycle per slot** — a new
-  TS refresh for a slot with a pending cycle waits or supersedes explicitly;
-  it is never concurrently pending.
-- With ≤1 TS cycle outstanding, a `slotRenderEnded` is attributable iff no
-  untracked or publisher-initiated request overlaps it. **Any overlap marks
-  the slot `cycle_unattributable` and fails closed** (no fallback, no state
-  transition, console warning + disposition).
-- `slotRenderEnded` is treated as "creative code injected", not "resources
-  loaded" — it can confirm delivery, never paint.
-- The deterministic PUC/message harness exercises the protocol in CI, and a
-  **release-gating real-GAM overlap test** (publisher refresh racing a TS
-  cycle) validates the contract against actual GPT, since a FIFO-assuming
-  stub proves nothing.
+- **Intent:** a TS `display()`/`refresh()` call (or an observed publisher
+  entry) targeting a slot. Intents are classified `ts | publisher` at the
+  wrapped entry points. An intent may produce zero physical requests
+  (initial-load-disabled `display()`; `refresh()` on a never-displayed
+  adopted slot); an intent that produces no `slotRequested` within its bound
+  (2 s) expires with disposition `intent_no_request` — diagnostics only.
+- **Cycle (outstanding physical request):** opened **only by
+  `slotRequested`**, matched to the oldest unexpired TS intent for that slot,
+  else classified publisher-initiated. SRA batching yields one `slotRequested`
+  per slot per batch — one cycle each, all matched to the intents of the
+  batch call. A cycle closes on its `slotRenderEnded` (matched by slot; GPT's
+  `responseIdentifier`, where present, deduplicates responses during drain —
+  it never attributes initiation).
+- **Serialization:** TS keeps at most one outstanding TS cycle per slot. A TS
+  intent arriving while a TS cycle is outstanding **queues** (bounded: 1
+  queued replacement; further intents coalesce into it).
+- **Attribution:** a `slotRenderEnded` is attributable iff exactly one
+  TS cycle is outstanding for the slot and no publisher-initiated or
+  untracked request overlaps it. Any overlap → the slot enters
+  **quarantine**: `cycle_unattributable`, fail closed (no fallback, no state
+  transition), and the drain rule applies.
+- **Drain/re-arm (supersession and SPA):** physical cycle state lives in the
+  **RuntimeSession-owned slot record**, not the NavigationSession — adopted
+  slots outlive navigations. On navigation or supersession, outstanding
+  cycles are marked stale; their late events are **matched and discarded**
+  with disposition `stale_navigation` (never misattributed); a quarantined or
+  stale slot re-arms only after every outstanding request/render pair has
+  drained (or its 60 s drain bound elapses, which keeps the slot
+  fallback-ineligible for that navigation). Queued TS intents dispatch only
+  after re-arm. A timeout never makes an old event disappear — drain-by-match
+  does.
+- CI exercises the protocol on the deterministic harness; a **release-gating
+  real-GAM overlap test** (publisher refresh racing a TS cycle;
+  initial-load-disabled cycle formation) validates it against actual GPT.
 
-**G4b — Acknowledgement path.** Unchanged from revision 3 (review-accepted):
-per-attempt CSPRNG nonce in the bridge response; the dynamic renderer posts
-versioned accepted/failed messages to the kernel; the kernel validates source
-ownership, nonce, token, `nav_gen`, `refresh_gen` before any transition or
-callback; pinned for SSAT, client-Prebid, and nested SafeFrame flows.
+**G4b — Acknowledgement protocol.** The renderer document currently posts
+"ready" only to its immediate parent (`aps.rs:105`); in the PUC path the
+top-level kernel cannot observe it, and callbacks fire on send
+(`gpt/index.ts:1572`, `:1620`). Contract: the bridge response embeds a
+**per-attempt 128-bit CSPRNG acknowledgement nonce**; the renderer document
+posts versioned `{t: "render_accepted" | "render_failed", nonce, reason?}`
+to the top window; the kernel validates, in order: source ownership (§6.8
+walk), nonce equality, token binding, `nav_gen`, `refresh_gen` — all five —
+before any state transition or notification. Pinned by tests for SSAT,
+client-Prebid, and nested SafeFrame flows, including stale and replayed
+acks.
 
-**G4c — Honest observations, `render_confirmed` removed.** The inline-adm
-frames are sandboxed `srcdoc` documents with `allow-same-origin` deliberately
-omitted (`gpt/index.ts:358`) — their origins are opaque, so revision 3's
-"same-origin observable" premise was false. The event is removed entirely.
-The taxonomy is now: `gam_nonempty`, `gam_empty`, `renderer_document_loaded`,
-`runner_loaded`, `runner_failed`, `adm_document_loaded` (the iframe `load`
-event for TS-written adm frames — document delivery, not paint). **Every
-render path terminates at `render_accepted`** (authenticated per G4b where
-the renderer protocol exists; `adm_document_loaded` for adm frames). No
-observation claims paint. A future trusted completion acknowledgement (open
-question 6) may reintroduce a confirmed state under a new name.
+**G4c — Honest observations.** Inline-adm frames are sandboxed `srcdoc`
+without `allow-same-origin` (`gpt/index.ts:358`) — opaque origins; geometry
+proves nothing. Observations: `gam_nonempty`, `gam_empty`,
+`renderer_document_loaded`, `runner_loaded`, `runner_failed`,
+`adm_document_loaded`. Every path terminates at `render_accepted`
+(authenticated per G4b where the renderer protocol exists;
+`adm_document_loaded` stands in for adm frames). **No observation claims
+paint**; there is no `render_confirmed`. A future trusted completion ack
+(OQ6) may add a new state under a new name.
 
-**G4d — Win/billing notifications, scoped to paths that have them.** APS
-**intentionally carries neither** `nurl` nor `burl` (`aps.rs:812` sets both
-`None`; the minimized AAX envelope excludes notifications; the integration
-guide documents that generic win/billing beacons are not fired for APS). APS
-billing runs entirely inside the Amazon runner lifecycle, and this design
-does not change the APS wire contract.
+**G4d — Win/billing notifications.** APS intentionally carries neither
+`nurl` nor `burl` (`aps.rs:812`; the minimized AAX envelope excludes them;
+the integration guide documents no generic APS beacons). APS billing lives in
+the Amazon runner lifecycle; unchanged.
 
-For bid paths that do carry the URLs (PBS and other OpenRTB providers):
+For carrying paths (PBS and other OpenRTB providers), **bind is defined per
+flow and is never selection or targeting** (targeting-only firing is
+explicitly prevented today, `ad_init.test.ts:1824`):
 
-- **Trigger semantics, published explicitly:** `nurl` fires when the render
-  attempt binds the bid to a cycle (Trusted Server's selection produced the
-  candidate GAM will render — the earliest point at which "win" is
-  meaningful for this pipeline); `burl` fires at the attempt's
-  `render_accepted`. Both are **attempt-scoped**, keyed by
-  `(trace_id, nav_gen, slot, refresh_gen, hb_adid)` as the idempotency key —
-  fired at most once per attempt, not page-wide.
-- **Owner and mechanics:** the client render pipeline owns firing (as today,
-  `gpt/index.ts:459`), via `sendBeacon`/`no-cors fetch`, no retries (a beacon
-  either queues or is lost; retrying risks double-billing).
-- Terminal failure after acceptance is labeled `billed_then_failed`; no
-  un-firing.
+- PUC/GAM flow: bind = an owned, slot-and-ad-id-matched bridge claim.
+- Direct `/auction` flow: bind = validated render start (slot resolved,
+  descriptor/markup validated, attempt created).
+- Fallback flow: bind = attributed `gam_empty`, immediately before the
+  fallback render starts.
 
-**G4e — Fallback trigger.** The opt-in fallback
-(`[auction].client_render_fallback = "renderer"`) renders only after a
-**terminal `gam_empty` unambiguously attributed to a TS-initiated cycle**
-(G4a). Timeouts are diagnostics-only and never render. Revision 3 disabled
-fallback for adopted slots entirely, which — as the review noted — excludes
-the common production path (pre-existing publisher slots are adopted and
-refreshed, `gpt/index.ts:925`). Revised: **ownership does not gate the
-fallback; attribution does.** An adopted slot whose attributed TS cycle ends
-in `gam_empty` may fall back; any publisher-initiated or unattributable cycle
-never triggers it. The success criteria and browser specs cover the adopted
-case explicitly.
+`nurl` fires at bind; `burl` at `render_accepted`; both attempt-scoped
+(idempotency key `(trace_id, nav_gen, slot, refresh_gen, hb_adid)`), fired at
+most once, via `sendBeacon`/`no-cors fetch`, no retries. Terminal failure
+after acceptance → `billed_then_failed` label; no un-firing.
 
-### G5 — Deployment contracts
+**G4e — Fallback trigger.** Opt-in
+(`[auction].client_render_fallback = "renderer"`). Renders only after a
+terminal `gam_empty` **unambiguously attributed to a TS cycle** (G4a) —
+ownership does not gate it (adopted slots are the common path and are
+eligible); publisher-initiated or unattributable cycles never trigger it;
+timeouts never render. The direct renderer is converted to an awaitable API
+with cancellation and terminal reasons before the fallback lands.
 
-- **Config rollback:** new config fields are default-valued and omitted from
-  serialization at defaults. **Rollback runbook rule:** after an operator has
-  opted into a new field, rolling the binary back requires restoring the
-  default and pushing the default-compatible blob first (this mirrors the
-  project's existing rollback guidance).
-- **Asset identity and the artifact source (settling "not realizable"):**
-  hash in the pathname; and artifacts are **published to shared immutable
-  platform storage (KV/config store) as deploy stage 1, before any HTML
-  references them** — binaries serve the current vector from embedded bytes
-  (fast path) and everything else by hash lookup in shared storage. This
-  answers all four skew cases: new HTML hash `B` reaching an old instance
-  (lookup serves `B` from storage), a miss for retained `A` after only `B` is
-  embedded (lookup), already-issued legacy query-hash URLs (the legacy path
-  keeps serving current bytes with short-TTL, non-immutable caching through a
-  documented sunset), and renderer `/v2` reaching a `/v1`-era instance
-  (versioned renderer documents are published to the same storage in
-  stage 1). Two-stage deployment is the contract: **stage 1 publish
-  artifacts, stage 2 roll binaries/HTML.** Both rolling directions and the
-  legacy URL are tested. Retention: ≥ 7 days, which must exceed the HTML
-  cache lifetime — itself now bounded by contract (auction-bearing HTML is
-  `no-store` per G1; any cacheable non-auction HTML referencing tsjs sets
-  `max-age ≤ 300`). `Cache-Control: immutable` only on exact hash matches;
-  unknown hashes → `410 Gone`, `no-store`. Concatenations are keyed by the
-  **ordered module-ID vector**, precomputed in Phase 0 (which owns asset
-  identity).
-- **Ingest routing:** the beacon route exists in all four adapters as an
-  early, EC-free, filter-free route; only Fastly has a real sink; others
-  accept-count-drop by explicit contract.
-- **Storage:** datasource `ts_client_events`; retention 30 days; production
-  sampling 10%. These are **adopted defaults** (operator-tunable), no longer
-  open questions; the remaining open question is only whether non-Fastly
-  adapters get sinks (OQ5).
-- **Phase gates are phase-specific** (section 8) — the render-fail canary
-  applies only from Phase 3 onward, because earlier phases don't create that
-  metric.
+**G4f — Direct `/auction` lifecycle.** The non-GPT path
+(`core/request.ts:52`) gets the same discipline: a `RenderAttempt` keyed
+`(trace_id, nav_gen, refresh_gen, slot)` where `refresh_gen` increments per
+`requestAds` invocation for the same slot within a navigation; exactly-once
+terminal state; G4b acknowledgement validation; G4d direct-flow bind;
+cancellation and disposal on navigation; the same §5.1 event sequence. "Every
+configured flow" in the success criteria includes this one.
 
----
+### G5 — Deployment contracts (hard cutover)
 
-## 5. Workstream 1 — Observability
+- **Config:** top-level `format_version`; exact match required; mismatch is a
+  startup error. No default-omission rollback rules.
+- **Assets:** hash-in-pathname (`/static/tsjs/<hash>/<name>.js`) for cache
+  identity; binaries serve only embedded current-release artifacts; unknown
+  hash → `410 Gone`, `no-store`; `Cache-Control: immutable` on exact matches.
+  Concatenations precomputed per **ordered module-ID vector** at build time.
+  The cutover runbook (§0) owns HTML/asset consistency; the CDN purge step is
+  what retires old references.
+- **Internal route isolation (all adapters):** the renderer, client-events,
+  and CSP-report route families (a) dispatch **before** auth, EC setup, and
+  publisher/integration filters (today the renderer can traverse EC setup and
+  pre-route filters, `app.rs:709` in the Fastly adapter); (b) reserve **all
+  methods and all version prefixes** locally — unsupported method →
+  deterministic `405` with `Allow` and `no-store`; unknown version → `404`
+  `no-store`; never the publisher fall-through some adapters use today
+  (`adapter-spin app.rs:804`); (c) never forward bodies, cookies, or
+  authorization headers to publisher origins; (d) compare origins as
+  normalized scheme + host + port, not host-only.
+- **Ingest routing:** client-events in all four adapters; Fastly has the real
+  sink; others accept-count-drop by contract (OQ5).
+- **Storage:** §5.6 schemas deploy and validate **before** any writer
+  enables.
 
-### 5.1 Event payload — minimized, grouped per trace
+## 5. Observability
+
+### 5.1 Wire payload
 
 ```
 { v: 1, traces: [
-  { trace_id, sampled, capability?,        // capability: only in diagnostic mode
+  { trace_id, auth,                      // auth: signed authorization (§5.3)
     events: [
       { nav_gen, refresh_gen, seq,
         t: "bid_received" | "targeting_set" | "bridge_request" |
            "bridge_response_sent" | "render_attempt" | "render_accepted" |
-           "render_fail",
-        slot,       // configured slot id if in the injected set, else "s<ordinal>"
-        id_kind,    // "cache_uuid" | "render_token" | "prebid_adid" | "bid_id" | "none"
-        matched,    // bridge_request only
-        source,     // "renderer" | "adm" | "pbs-cache" | "gam"
-        reason,     // render_fail only: closed enum below
-        width, height }  // invalid_dimensions context only: bounded ints [0, 8192]
+           "render_fail" | "gam_nonempty" | "gam_empty" |
+           "renderer_document_loaded" | "runner_loaded" | "runner_failed" |
+           "adm_document_loaded" | "fallback_start",
+        slot,        // configured slot id if in the injected set, else "s<ordinal>"
+        id_kind,     // "cache_uuid" | "render_token" | "prebid_adid" | "bid_id" | "none"
+        matched,     // bridge_request only
+        source,      // "renderer" | "adm" | "pbs-cache" | "gam"
+        reason }     // render_fail only
     ] }
 ] }
 ```
 
-- **Events are grouped per trace, and the diagnostic capability is a per-trace
-  field** — a navigation-spanning batch carries one group per trace, so one
-  batch-level capability can never be ambiguous, and an initial-navigation
-  capability never authorizes a client-minted SPA trace (that trace's
-  capability comes from the page-bids response, G1).
-- Reason enum (closed; no interpolation — dimension context travels in the
-  bounded numeric fields): `renderer_document_no_load`, `runner_no_load`,
-  `runner_failed`, `descriptor_invalid`, `invalid_dimensions`,
-  `bridge_id_mismatch`, `cycle_unattributable`, `bridge_claim_timeout`,
-  `gam_empty`, `no_render_source`, `slot_unresolved`, `gpt_absent`,
-  `pbjs_absent`, `bundle_partial`, `fallback_cancelled`, `abi_mismatch`.
+The `t` enum now **contains every G4c observation**, so Phase-3 stage rates
+(renderer-document load rate, runner load/failure, GAM fill) are queryable.
+Reason enum (closed): `renderer_document_no_load`, `runner_no_load`,
+`runner_failed`, `descriptor_invalid`, `invalid_dimensions`,
+`dimensions_out_of_range`, `bridge_id_mismatch`, `cycle_unattributable`,
+`intent_no_request`, `stale_navigation`, `bridge_claim_timeout`, `gam_empty`,
+`no_render_source`, `slot_unresolved`, `gpt_absent`, `pbjs_absent`,
+`bundle_partial`, `fallback_cancelled`, `abi_mismatch`, `registry_full`.
 
 ### 5.2 Transport
 
-`fetch(..., {keepalive: true, credentials: "omit"})` primary. The `pagehide`
-fallback is `navigator.sendBeacon(url, new Blob([json], {type:
-"application/json"}))` — the Blob type satisfies the ingest media-type
-contract (a bare string would arrive as text); it is credentialed by platform
-design and its `true` means queued, not received; the handler ignores
-credentials either way. Flush on `visibilitychange`/`pagehide` and every 5 s.
+`fetch(..., {keepalive: true, credentials: "omit"})` primary; `pagehide`
+fallback `navigator.sendBeacon(url, new Blob([json], {type:
+"application/json"}))`. Flush every 5 s and on `visibilitychange`/`pagehide`.
+**Client queue bound:** 256 events; overflow drops oldest, increments a
+counter, and the final flushed batch carries one `render_fail{...}`-class
+overflow marker event so truncation is visible. Duplicates from
+fetch/pagehide races are expected and handled at the sink (§5.5).
 
-### 5.3 Ingest wire contract
+### 5.3 Signed trace authorization
 
-- `POST /_ts/client-events` in all four adapters, before auth/EC/filters.
-  `Content-Type: application/json` only; no `Content-Encoding`. Responds
-  `204 Cache-Control: no-store`; never echoes input.
+Format `v1.<kid>.<exp>.<mode>.<sig>`:
+
+- `kid`: key id; **active and previous keys** live in the platform secret
+  store; rotation = introduce new key as active, demote, retire.
+- `exp`: unix epoch seconds; verifier allows ±60 s skew; maximum future
+  15 minutes from issuance.
+- `mode`: `sampled` | `diagnostic`. Sampling is server-decided (G1);
+  diagnostic is a distinct authenticated mode gated by the tester cookie at
+  issuance — not an overloaded "sampling off" bit.
+- `sig`: HMAC-SHA-256 over the **domain-separated, length-prefixed** input
+  `"ts-trace-auth-v1" || len(origin) || origin || len(trace_id) || trace_id
+|| len(mode) || mode || u64(exp)`, where `origin` is the externally visible
+  scheme+host+port. Constant-time comparison.
+- Ingest verifies per trace group; a missing key id, expired, future-dated,
+  or invalid signature → that **group** is dropped-and-counted (other groups
+  in the batch survive). An unsigned `sampled` claim does not exist in the
+  wire format, so it cannot be asserted.
+
+### 5.4 Ingest contract
+
+- `POST /_ts/client-events`; `Content-Type: application/json` only; no
+  `Content-Encoding`; responds `204`, `no-store`; never echoes input.
 - Pre-parse limits: body ≤ 16 KiB; ≤ 64 events; strings ≤ 64 chars;
-  `trace_id ^[0-9a-f]{32}$`; integers in `[0, 2³¹)`; width/height in
-  `[0, 8192]`. Violation → drop-and-count with `204`.
-- Same-origin: `Sec-Fetch-Site: same-origin` when present, else `Origin`
-  matching the serving host; **absent both → drop-and-count**.
-- **Rate limiting fails closed for telemetry:** when the limiter denies, or
-  when a portable adapter's best-effort limiter is unavailable or errors, the
-  request is dropped early with `204` (count only, no parse, no sink). Ad
-  delivery is unaffected by construction because this route serves nothing.
-- **Trusted client address, per adapter, concretely:** Fastly — the
-  platform's client IP API; Axum — the rightmost `X-Forwarded-For` entry
-  beyond `trusted_proxy_hops` (a required config value when the beacon is
-  enabled; without it, the socket peer address is used and forwarded headers
-  are ignored); Cloudflare — `CF-Connecting-IP`; Spin — the platform client
-  address. Spoofable headers are never trusted beyond the configured hop
-  count.
-- **Diagnostic capability:** server-issued, HMAC over
-  `trace_id + expiry` (≤ 15 min), delivered via the G1 boot field (initial
-  trace) or the page-bids response (SPA traces), echoed per trace group.
-  Signature verification is what switches a trace to unsampled — a public
-  query flag alone never does.
+  `trace_id ^[0-9a-f]{32}$`; integers in `[0, 2³¹)`.
+- Same-origin: `Sec-Fetch-Site: same-origin` when present, else normalized
+  `Origin` equality; absent both → drop-and-count.
+- **Rate limiting (numeric, fail-closed for telemetry):** token bucket per
+  client address, **10 requests/min, burst 20**; limiter map ≤ 65,536
+  entries, entry TTL 10 min, LRU eviction; limiter unavailable/errored →
+  drop early with `204` (count only). Trusted client address per adapter:
+  Fastly — platform client IP; Axum — rightmost `X-Forwarded-For` entry
+  beyond required `trusted_proxy_hops` (absent config → socket peer only);
+  Cloudflare — `CF-Connecting-IP`; Spin — platform client address.
 
-### 5.4 Two modes, honestly separated
+### 5.5 Sink and deduplication
 
-- **Production telemetry** (sink-backed deployments only — today Fastly):
-  sticky-sampled (10%). SLO, fully parameterized: a failure mode affecting
-  ≥ 1% of **sampled render attempts** is visible in `ts_client_events` within
-  one hour, evaluated only when the deployment produced ≥ 10,000 sampled
-  render attempts in that hour, with sink ingestion freshness ≤ 5 minutes;
-  sink outages pause the SLO clock and are alarmed separately. Non-sink
-  adapters are explicitly out of SLO scope, and no global gate depends on
-  their beacon data.
-- **Diagnostic mode:** capability-gated, unsampled, full stream + console
-  mirroring — the "one page load names the failing reason" tool.
+- Stable event key `(publisher, trace_id, seq)`; deduplication at the sink
+  or query layer (Tinybird: latest-write or `GROUP BY` on the key), covering
+  fetch/pagehide double-delivery.
+- The Fastly sink is fire-and-forget after dispatch (`tinybird.rs:153`) and
+  cannot observe downstream schema/auth rejection — therefore
+  **datasource-side freshness monitoring is mandatory** (§8 gates alarm on
+  ingestion lag and row-rejection metrics from the datasource side).
 
-### 5.5 Server-side drop-reason surfacing
+### 5.6 Physical schemas (deployed before writers)
 
-- Bounded structured summary whenever **any** bid is dropped (per-slot reason
-  counts, capped); `drop_reasons` added to auction telemetry rows; drop
-  summary in the initial-HTML `ts-debug` comment; `/_ts/page-bids` gains a
-  tester-gated structured `debug` field.
-- Startup warnings: APS enabled with `allow_script_creatives = false`; direct
-  provider configured alongside a mediator without 6.1's merge strategy.
+- **New datasource `ts_client_events`** (flattened rows):
+  `ts (DateTime64), publisher (LowCardinality String), release_id (String),
+trace_id (FixedString 32), mode (Enum sampled|diagnostic), nav_gen UInt32,
+refresh_gen UInt32, seq UInt32, event (Enum §5.1), slot (String ≤64),
+id_kind (Enum), matched (UInt8), source (Enum), reason (Enum §5.1)`.
+  Sorting key `(publisher, ts, trace_id, seq)`; 30-day TTL; its own ingest
+  token, configured via new `TinybirdSettings` fields
+  (`client_events_dataset`, `client_events_token_secret`) — today's settings
+  configure only the auction dataset (`settings.rs:1752`).
+- **Auction rows** (`AuctionEventRow`, `telemetry.rs:262`, and
+  `auction_events_raw.datasource`): add nullable `trace_id (FixedString 32)`
+  and `mode`; add a bounded **`bid_drop` row type**
+  `{provider, slot, reason (Enum), width UInt16?, height UInt16?, count
+UInt32}` with per-auction row cap 32 and an `overflow` bucket row.
+- APS parsing returns a **structured drop observation**
+  `{reason, slot, width?, height?}` instead of a bare reason string
+  (`aps.rs:722`); dimensions above 8192 use `dimensions_out_of_range` with
+  dimensions omitted, never clamped.
 
----
+### 5.7 Modes and SLOs
 
-## 6. Workstream 2 — APS delivery fixes
+- **Production (sink-backed only):** server-decided 10% sampling.
+  Two separated objectives: **pipeline availability** — ingestion freshness
+  ≤ 5 min and datasource rejection rate < 0.1%, alarmed on breach (fails
+  during sink outages, by design); **failure detection** — a failure mode
+  affecting ≥ 1% of sampled render attempts is visible within one hour,
+  evaluated only at ≥ 10,000 sampled render attempts/hour.
+- **Diagnostic:** authenticated mode (§5.3), unsampled, full stream +
+  console mirroring; one page load names the failing class.
 
-### 6.1 Mediation: opt-in merge, `mediator_only` stays the default
+### 5.8 Server-side drop surfacing
 
-As revision 3 (review-accepted), with one tightening: a mediator bid whose id
-the provenance map cannot resolve, **for a slot where the same provider had
-forwarded candidates**, is counted under a dedicated
-`mediator_provenance_unresolved` metric and logged at `warn` — surfacing
-possible self-competition instead of silently treating it as distinct demand.
-Deal priority remains out of scope (the `Bid` model carries no deal identity;
-recorded as follow-up). Currency mismatch remains rejection. One selection
-helper serves both mediation lifecycles, with tests for each.
+Bounded structured summary whenever any bid is dropped; `bid_drop` rows
+(§5.6); drop summary in the initial-HTML `ts-debug` comment; page-bids gains
+a tester-gated structured `debug` field. Startup warnings: APS +
+`allow_script_creatives = false`; mediator + direct providers without an
+explicit `winner_selection` (§6.1 makes that a hard error).
 
-### 6.2 Dimensions: the contract is "request what you accept"
+## 6. APS delivery fixes
 
-Exact size membership stays. The fix is visibility plus configuration: the
-drop summary names the rejected size per slot via
-`reason: invalid_dimensions` with bounded numeric `width`/`height` fields
-(closed enum preserved), and documentation gains "sizing your slots for APS."
+### 6.1 Mediation: complete inline algorithm
+
+Current mediation cannot support merging: it forwards no stable candidate id;
+restores fields via a lossy last-write-wins `(provider, slot, bidder)` index
+(`adserver_mock.rs:95`); breaks equal-price ties by response arrival order
+(`orchestrator.rs:827`); and assigns parsed Prebid bids USD without
+validating response currency (`prebid.rs:2318`). The algorithm below replaces
+that, identically in the synchronous and split dispatch/collect paths, via
+one shared candidate-selection helper.
+
+1. **Candidate registration.** Every direct-provider bid admitted by parsing
+   becomes a candidate with a **server-minted candidate id** (`c` +
+   11-char CSPRNG, unique per auction). The full candidate (renderer, cache
+   coordinates, notification URLs, currency, provenance
+   `(provider, upstream_bid_id)`) is stored by candidate id. Winners are
+   selected **by candidate id** and their fields read from the stored
+   candidate — the lossy index is deleted.
+2. **Currency.** The auction has one configured currency. A provider response
+   that declares another currency, or a path that cannot prove its currency
+   (the Prebid parse point must validate, not assume USD), rejects that bid
+   at parse with `bid_drop{currency_mismatch}`. No conversion.
+3. **Mediator exchange.** Forwarded candidates carry their candidate id; the
+   mediator is required (wire contract, including `adserver_mock`) to echo it
+   on any bid derived from a forwarded candidate. A mediator bid **without**
+   an echoed id is mediator-native. A mediator bid with an id that does not
+   resolve → **the slot fails closed** for merging
+   (`mediation_provenance_invalid`: mediator-native bids for that slot still
+   compete; unresolvable forwarded claims are discarded and counted — a
+   warning alone is insufficient).
+4. **Floors.** Slot floors filter both populations before selection.
+5. **Dedup.** A mediator bid that echoes candidate id X removes direct
+   candidate X from the pool (it is the same demand, provenance `mediator`).
+6. **Selection.** Per slot, the winner is the maximum under the **total
+   deterministic order**: decoded CPM desc → provenance rank (mediator
+   before direct) → provider name asc → candidate id asc. Response arrival
+   order can never matter.
+7. **Strategy config.** `[auction].winner_selection` is **required whenever a
+   mediator and direct providers coexist** — startup error if absent (no
+   silent default; §0 removes the compatibility rationale for one):
+   `mediator_only` (mediator bids only, direct providers are signal) or
+   `merge_highest_cpm` (the algorithm above). A mediator timeout degrades to
+   direct-only selection and is reported.
+8. **Reporting.** A selection report per auction: `winner_source`,
+   `mediator_superseded`, `currency_mismatch`, `dedup_hits`,
+   `mediation_provenance_invalid` — separate from delivery `bid_drop` rows.
+
+Deal priority remains out of scope: the `Bid` model carries no deal identity
+(`types.rs:231`); a rule the model cannot express would be fiction. Recorded
+as follow-up requiring a bid-model extension.
+
+### 6.2 Dimensions
+
+Exact size membership stays (`aps.rs:657-668`). The fix is visibility
+(structured `bid_drop{invalid_dimensions, w, h}`, §5.6) plus documentation
+("sizing your slots for APS"): if a size is acceptable, request it in the
+slot's `formats` — accepting unrequested sizes would conceal an upstream
+protocol violation.
 
 ### 6.3 Script creatives
 
-Secure default kept; consequence made loud (5.5); enablement path documented.
+`allow_script_creatives` stays default-`false` (defensible sandbox posture);
+the consequence becomes loud (§5.8) and the enablement path documented.
 
 ### 6.4 Render identity
 
-As G2.
+As G2, including the `(trace_id, nav_gen, refresh_gen)` registry scope and
+capacity rules.
 
-### 6.5 Fallback rendering
+### 6.5 Fallback
 
-As G4e — attribution-gated, not ownership-gated; timeouts never render; the
-renderer is converted to an awaitable API with cancellation and terminal
-reasons before the fallback lands.
+As G4e/G4a; awaitable renderer first; attribution-gated; timeouts never
+render.
 
-### 6.6 Renderer endpoint — unconditional, versioned, observable
+### 6.6 Renderer endpoint
 
-- The static renderer document route registers unconditionally in every
-  adapter (the APS provider stays config-gated). Startup validation fails
-  loudly if an auth handler pattern covers it.
-- **Caching matches immutability:** `/integrations/aps/renderer/v1` is an
-  immutable artifact — its bytes change only by shipping `/v2` — so it is
-  served with `Cache-Control: immutable` (long max-age), published to shared
-  artifact storage in deploy stage 1 like every versioned asset (G5), which
-  also answers version-skew (`/v2` requests reaching older instances are
-  served from storage). Revision 3's `no-store` contradicted the versioning
-  and is corrected.
-- Two-stage acknowledgement (G4b): authenticated `document_loaded`, then the
-  runner-load result — splitting `renderer_document_no_load` from
-  `runner_no_load`/`runner_failed`.
-- **Server route counters are aggregate** (requests, unknown-version,
-  auth-blocked): the document request carries no trace (the nonce travels in
-  the URL fragment, which never reaches the server), so no row-level join is
-  claimed.
-- **CSP report-only canary, fully specified:** reports go to a dedicated
-  `POST /_ts/csp-reports` route (same pre-parse caps and same-origin rules as
-  5.3; credentials ignored; rate-limited fail-closed); stored as **aggregate
-  counters only** (directive, blocked-origin **host only** — full URLs
-  redacted) on sink-backed adapters, count-and-drop elsewhere; enforcement
-  follows only after a clean canary window.
+- The static renderer document route registers **unconditionally in every
+  adapter** (the APS provider stays config-gated); startup validation fails
+  if an auth handler pattern covers it; §G5 route-isolation rules apply
+  (early dispatch, all methods reserved, no publisher fall-through).
+- Path `/integrations/aps/renderer/v1`, embedded in the binary, served
+  `Cache-Control: immutable` (its bytes change only by shipping `/v2` in a
+  new release; §0's purge retires the old). Unknown versions → `404`
+  `no-store`.
+- **Two-stage acknowledgement:** authenticated `document_loaded` (proves
+  route + auth + document CSP), then the runner-load result — splitting
+  `renderer_document_no_load` from `runner_no_load`/`runner_failed`.
+- Server route counters (requests, unknown-version, auth-blocked) are
+  **aggregate only** — the document request carries no trace (the nonce
+  rides the URL fragment and never reaches the server).
+- **CSP rollout that cannot false-pass:** discovery uses the **currently
+  enforced** policy with reporting attached (report-only alone cannot reveal
+  what the enforced policy already blocks). Candidate relaxations are tested
+  in a small enforced cohort under a short-lived canary document version;
+  once frozen, a new immutable `/v2` ships with the final policy. Reports:
+  dedicated `POST /_ts/csp-reports` accepting **both**
+  `application/csp-report` (legacy) and `application/reports+json`
+  (Reporting API), each with its own payload validator; §5.4 caps and
+  rate-limit rules; **origin rules account for the renderer's opaque
+  sandbox** (reports may carry `null` origin — validated by document URL /
+  policy version instead of the beacon's same-origin rule); stored as
+  aggregate counters with blocked sources bucketed into
+  `https-host | data | blob | inline | eval | other` (no arbitrary host
+  labels — cardinality abuse is otherwise trivial). Browser coverage for
+  opaque-renderer reports runs on **Chromium, Firefox, and WebKit** (CI is
+  Chromium-only today, `playwright.config.ts:16`; the matrix extends for
+  this suite).
 
-### 6.7 One descriptor schema
+### 6.7 One descriptor schema — generation covers all three implementations
 
-As revision 3 (review-accepted): tagged-envelope schema generated from a
-separate wire-schema crate/xtask; semantic validators hand-written on both
-sides; outer-tolerance only, exact AAX projection; shared
-positive + adversarial corpus across Rust, TS, and the inline document;
-staleness CI.
+- Wire truth: the tagged `BidRenderer` envelope (discriminator on the enum,
+  `types.rs:188-211`).
+- A wire-schema crate/xtask (separate from `trusted-server-js`; core already
+  depends on that crate, `Cargo.toml:45`) generates: the JSON-Schema
+  artifact, the **TS structural parser**, the **ES5-compatible inline
+  validator fragment** embedded in the renderer document, and shared
+  fixtures — all checked in with staleness CI. Only environment-specific
+  semantic checks (URL/origin policy, canonical base64, length bounds, the
+  exact one-bid AAX projection, cross-field equality) stay handwritten.
+- Tolerance only on the outer versioned descriptor; the decoded AAX envelope
+  remains an exact projection. A shared positive + adversarial corpus runs
+  through the Rust validator, the generated TS parser, and the generated
+  inline fragment in CI.
 
 ### 6.8 Bridge hardening
 
-As revision 3 (review-accepted): source-first ownership with the bounded
-parent-chain SafeFrame walk (depth 5, known slot-root `WindowProxy` map, no
-tree scans); adversarial test set; top-of-listener hygiene; dead branch
-deleted; renderer branches emit trace records under G4's taxonomy, with G4d
-notifications only where the bid path carries them (never APS).
+Processing order (normative — preserves the existing stolen-capability
+defense that suppresses propagation before source validation,
+`gpt/index.ts:1547`):
 
----
+1. parse `e.data` (bare `catch` → return);
+2. identify a TS-reserved ad id (registry lookup);
+3. if TS-reserved: `stopImmediatePropagation()` **before** any validation —
+   a rejected foreign frame must not be answerable by Prebid's native
+   handler either;
+4. validate source ownership via the bounded walk: known slot-root
+   `WindowProxy` map, sender's own parent chain (`event.source.parent`, …)
+   to depth 5 — never scanning an attacker-controllable frame tree;
+5. validate nonce, token, `nav_gen`, `refresh_gen` (G4b);
+6. respond, or refuse with `bridge_id_mismatch`.
 
-## 7. Workstream 3 — TSJS target architecture
+Non-TS ad ids are untouched (no propagation suppression). The stolen-token
+browser test asserts **neither TS nor the native Prebid listener responds**;
+listener-registration ordering has a real-browser assertion. The dead
+duplicate renderer branch (C5) is deleted; renderer branches emit the full
+§5.1 sequence with G4d notifications only on carrying paths.
+
+## 7. TSJS target architecture
 
 ### 7.1 Layering
 
-Kernel / adapters / services / integrations exactly as revision 3, with the
-boundary lint in CI. Stateful services via the G3 ABI only.
+```
+kernel/          boot, config, queue, event bus, log, beacon, sessions
+adapters/        googletag.ts, pbjs.ts, messaging.ts   ← the ONLY window.* access
+services/        slots (registry+handoff), auction client, render engine, consent
+integrations/    gpt, prebid, aps, creative, datadome, …  (plugins over services)
+```
+
+Boundary lint in CI (`import/no-restricted-paths`): kernel imports nothing
+above it; adapters import kernel only; services import kernel + adapters;
+integrations import kernel + services, never each other. This dissolves the
+audited inversions (`core/auction.ts` and `core/request.ts` importing
+`integrations/aps/render`; `gpt` and `prebid` importing `aps`; `prebid`
+owning the GPT refresh wrapper). Stateful services via the G3 registry only.
 
 ### 7.2 Adapters
 
-`present | pending | timed_out` with non-terminal `timed_out` (late loaders
-transition to `present`); per-operation timeouts with disposition reasons.
+Per external global: `present | pending | timed_out`, `timed_out`
+non-terminal (late loaders transition to `present` and drain what is still
+valid); queued operations carry their own timeouts and expire with
+disposition reasons.
 
 ### 7.3 Slot registry service
 
-Kernel-owned registry (`WeakMap<googletag.Slot, SlotRecord>` + div-id index)
-holding ownership, adoption, handoff claims, responsive resolution, pending
-request cycles (G4a), and targeting-key history. No expandos on GPT objects.
+Kernel-owned; `WeakMap<googletag.Slot, SlotRecord>` + div-id index; holds
+ownership (ts/publisher/adopted), handoff claims, responsive resolution,
+G4a intent queue + cycle state (RuntimeSession-scoped), targeting-key
+history. No expandos on GPT objects (`__tsRenderGeneration`/`__tsRenderBid`
+deleted).
 
-### 7.4 Global namespace policy — with a compatibility window
+### 7.4 Final global surface (hard cutover — no dual names)
 
-As revision 3 (review-accepted): `window.tsjs` + `tsjs._internal`; the public
-queue keeps its real name **`tsjs.que`**; public globals
-(`tscreative`, `tsCreativeConfig`, `tsjs.que`) get dual-read/write for two
-release cycles / ≥ 60 days, closing only on the adoption gate (old-name usage
-< 0.1% of traces for 14 days, measured on sink-backed deployments);
-`requestAds` keeps its void signature; `requestAdsAsync` is the new versioned
-API; private globals migrate immediately.
+| Legacy surface (removed at cutover)          | Final shape                                                                   |
+| -------------------------------------------- | ----------------------------------------------------------------------------- |
+| `window.tsjs.que`                            | `window.tsjs.que` — unchanged, the one public queue                           |
+| `globalThis.tscreative` (API)                | `tsjs.creative.*` (same methods, namespaced)                                  |
+| `globalThis.tsCreativeConfig` (pre-load)     | `tsjs.boot.creative` inside the boot container (below)                        |
+| `requestAds` (void) — and rev-4's dual API   | **one** async contract: `tsjs.requestAds(options): Promise<RequestAdsResult>` |
+| `window.__tsjs_*` flags, integration configs | `tsjs.boot.*` fields written by server-injected scripts before the bundle     |
+| server install manifest                      | `tsjs.boot.manifest` (`{release_id, plugins: [{id, order}]}`)                 |
+| expandos / function sentinels                | `SlotRecord` fields / kernel `WeakSet`                                        |
+| `tsjs._internal`                             | kernel-owned registry (G3), **frozen after boot**                             |
+
+Boot container lifecycle: pre-core scripts write
+`window.tsjs = window.tsjs || {que: [], boot: {}}` fields; the kernel
+**consumes `boot` at boot, deep-freezes the retained copy, and deletes
+consumed one-shot secrets** (the trace authorization moves into the sealed
+NavigationSession). Old pages referencing removed names fail at cutover —
+accepted per §0.
 
 ### 7.5 Messaging module
 
-All `postMessage` through one module: versioned envelopes, name constants,
-G4b nonces, 6.8 source validation. A **minimal** messaging module (envelope +
-constants + validation helpers used by the bridge) lands early (Phase 1) so
-Phase 3 does not depend on Phase-4 structure; the full migration of every
-legacy call site completes in Phase 4.
+All `postMessage` through one module: versioned envelopes, name constants
+(the `'Prebid Request'` literal exists at six sites today; the APS handshake
+in three copies), G4b nonces, §6.8 validation. The minimal module (envelope +
+constants + validators used by the bridge) lands in Phase 1; full call-site
+migration completes in Phase 4.
 
-### 7.6 Plugin lifecycle and session model
+### 7.6 Plugin lifecycle — transactional — and sessions
 
-As revision 3 (review-accepted), with G3's sharpened version semantics:
-manifest versions are ranges (major + minMinor); quarantine on
-incompatibility; first-wins only among compatible. Sessions:
-`RuntimeSession` / `NavigationSession` / `RenderAttempt` with enumerable
-disposal inventories. Error policy: no empty `catch`; auction fetch gets
-timeout + `AbortController`. **Console logging retained, not replaced**
-(paired `warn` with the beacon's reason code; `debug`-level
-delivery/security failures promoted to `warn`).
+`tsjs.definePlugin(id, install, dispose?)` with `install(ctx)`:
 
-### 7.7 The bootstrap problem
+- `ctx.signal` (aborted on quarantine/disposal); synchronous
+  `ctx.onDispose(fn)` registration; effects must be registered as they are
+  made.
+- **Unwind on failure:** a throw, rejection, or abort triggers automatic
+  reverse-order invocation of the disposers registered so far — partial
+  installs cannot leak effects. Per-disposer exception isolation (one
+  throwing disposer cannot stop the rest).
+- A disposer registered (or returned) **after** the owning session was
+  disposed is invoked immediately.
+- Pending late registrations (manifest requested, bundle not yet evaluated):
+  capacity 16, bound 10 s, then `bundle_partial`.
+- Release matching per G3: a plugin whose `release_id` differs from the
+  kernel's is quarantined before `install` runs.
+- Sessions: `RuntimeSession` (page lifetime: bridge listener, history hook,
+  pbjs subscriptions, adapters, beacon queue, **slot cycle state**);
+  `NavigationSession` (per navigation: trace + authorization, render
+  attempts, slot aliases, targeting history); `RenderAttempt` (per G4a cycle
+  or G4f attempt). Each owns an enumerable disposal inventory; navigation
+  disposes only NavigationSession children.
+- Error policy: no empty `catch` — handle, log with context, or emit a
+  disposition. The auction fetch gains timeout + `AbortController`.
+- **Console logging retained:** every issue-surfacing condition keeps or
+  gains a `log.warn` carrying the same reason code as its beacon event;
+  `debug`-level delivery/security failures are promoted to `warn`.
 
-As revision 3: queue-and-flags stub + bundle replay behind its own flag with
-replay-timing specs; the no-bundle fallback generated from the TypeScript
-source.
+### 7.7 Bootstrap
 
-### 7.8 GPT correctness fixes carried with the restructure
+`gpt_bootstrap.js` (495 ES5 lines duplicating handoff/initial-load/hydration
+logic, with the live `servicesEnabled` divergence) shrinks to a
+queue-and-flags stub; the bundle replays recorded early calls on install.
+Replay changes observable ordering — it ships inside the cutover with
+browser specs covering replay timing. The no-bundle fallback ("ads render if
+the bundle fails", pinned by `gpt.rs:1174-1179`) is **generated from the
+same TypeScript source** at build time.
 
-- **Unconditional early GPT event subscription:** the `slotRenderEnded`
-  (and `slotRequested`) listeners register on the command queue at install,
-  no longer gated behind `!ts.servicesEnabled` (`gpt/index.ts:1017`) — G4a
-  cannot work on bootstrap-first pages otherwise. Recording is idempotent so
-  double-registration cannot double-count.
-- Restore #922/#997 attribution and orphan recovery.
-- `changeCorrelator: false` on TS-initiated refreshes (configurable).
-- `enableSingleRequest()` only when GPT services are not already enabled.
-- Ambiguous responsive resolution emits `render_fail{slot_unresolved}`.
+### 7.8 GPT correctness carried with the restructure
+
+Unconditional early `slotRequested`/`slotRenderEnded` subscription (replacing
+the `!servicesEnabled` gate, `gpt/index.ts:1017`; recording idempotent);
+restore #922/#997 attribution and orphan recovery; `changeCorrelator: false`
+on TS refreshes (configurable); `enableSingleRequest()` only when GPT
+services are not already enabled; ambiguous responsive resolution emits
+`render_fail{slot_unresolved}` alongside its warning.
 
 ### 7.9 Decomposition targets
 
-As revision 3 (gpt/prebid splits, script-guard consolidation, trace model/UI
-split, `global.d.ts` fix).
+| Today                                | Target                                                                                                             |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
+| `gpt/index.ts` (1777 LOC, 20 jobs)   | `slot_resolution`, `handoff`, `initial_load`, `ad_init`, `render_bridge`, `spa_navigation`, `beacons` + thin index |
+| `prebid/index.ts` (1671 LOC)         | adapter, shim, refresh handler (onto the slot registry), eids, diagnostics                                         |
+| `gpt/script_guard.ts` (634 LOC)      | folded onto the 170-LOC `shared/script_guard.ts` factory                                                           |
+| `core/trace.ts` (model + UI)         | `services/trace` (model) + `integrations/trace_overlay` (UI)                                                       |
+| `core/global.d.ts` (`pbjs: TsjsApi`) | real Prebid types; `TsjsApi` split public vs internal                                                              |
 
-### 7.10 Performance
+### 7.10 Performance (reproducible)
 
-Budgets tightened per review: per-bundle raw/gzip/Brotli for the exact
-ordered module vector vs a checked-in baseline, **+5% byte tolerance**;
-browser timing assertion (bids-script-to-first-`display()`) on a **pinned CI
-runner class and pinned browser version**, **5 warm-up runs discarded, 50
-measured samples, gate on p90 with +10% latency tolerance**; server bench
-(precomputed concatenation) gates CPU and heap at **±10% vs baseline** with
-pinned tool versions. Precompute lands in Phase 0 with asset identity (G5).
+- Bundle budgets: raw/gzip/Brotli per bundle for **three module vectors**
+  (minimal, reference, maximal), compressors pinned (`gzip -9`,
+  `brotli -q 11`), compared to checked-in baseline artifacts
+  (`perf/baselines/*.json`); baseline updates are explicit reviewed diffs.
+  Tolerance +5% bytes.
+- Browser timing (bids-script-to-first-`display()`): pinned CI runner class
+  (the repository's standard Linux runner image) and the
+  Playwright-pinned browser build; 5 warm-up runs discarded, 50 samples,
+  gate p90 ≤ baseline × 1.10.
+- Server (precomputed concatenation): one-sided gates, CPU and heap ≤
+  baseline × 1.10; improvements always pass. Tool versions pinned in
+  `.tool-versions`.
 
-### 7.11 Toolchain and dependency currency
+### 7.11 Toolchain
 
-As revision 3 (review-accepted): raise the TypeScript floor to the resolved
-5.9 line, then evaluate the next major separately; strictness flags on; dev
-toolchain bumps as individual CI-gated PRs; `prebid.js` excluded from casual
-bumps; monthly review policy.
-
----
+Raise the TypeScript floor to the resolved 5.9 line (lockfile already
+resolves 5.9.3 under the stale `^5.5.4` manifest); adopt
+`noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`,
+`verbatimModuleSyntax`; dev-toolchain bumps (eslint, prettier, jsdom,
+`@playwright/test`, `@types/node`) as individual CI-gated PRs with changelog
+review (this library monkeypatches `fetch`/`sendBeacon`/DOM prototypes —
+jsdom/Playwright changes are real risks); `prebid.js` excluded from casual
+bumps (runtime Prebid is the manifest-locked external bundle; the npm pin
+and deployed bundle version documented together); monthly review; no phase
+starts more than one minor behind stable.
 
 ## 8. Migration plan
 
-Each phase ships behind a feature flag with **phase-specific gates** (the
-render-fail canary cannot evaluate phases that predate the metric):
+Phases are internal build milestones of **one coordinated release** (§0):
+each lands behind a flag in the dark deployment; the cutover switches them
+on together. Gates are executable — every gate names query, cohort,
+denominator, minimum sample, threshold, window, owner (release owner unless
+stated), and action (hold cutover / rollback switch):
 
-- **Phase 0 — Asset identity, contracts, toolchain.** Two-stage artifact
-  publishing (shared immutable storage) + path-based identity + ordered-vector
-  precompute + rolling-deploy tests in both directions + legacy-URL test;
-  toolchain floors; contracts G1–G5 as code-adjacent docs; delete dead expando
-  writes; server drop-reason surfacing.
-  _Gate:_ zero unexpected `410`s and zero legacy-URL breakage on canary; asset
-  hit/miss counters nominal.
-- **Phase 1 — Kernel ABI, sessions, minimal messaging, minimal cycle
-  registry.** Versioned registry with `(major, minor)` semantics;
-  `RuntimeSession`/`NavigationSession`; install manifest; the minimal
-  messaging module (7.5) and the cycle-aware slot-record core (G4a's queue)
-  land here so Phase 3 has its dependencies; unconditional early GPT
-  subscriptions (7.8).
-  _Gate:_ ABI install-success counters clean; zero `abi_mismatch` on canary;
-  no listener regression in browser specs.
-- **Phase 2 — Trace and beacon.** Server-minted initial trace + page-bids
-  `X-TSJS-Trace-Id` echo + capability issuance (G1, 5.3); beacon service;
-  four-adapter ingest; `ts_client_events`.
-  _Gate:_ ingest acceptance/drop/abuse counters nominal; trace join rate on
-  sink-backed canary ≥ 95% of sampled traces.
-- **Phase 3 — APS delivery.** Wire-schema crate + corpus; mediation helper +
-  opt-in merge; render token; unconditional versioned renderer route +
-  two-stage ack; bridge hardening; request-cycle protocol + render state
-  machine + awaitable renderer + scoped notifications (G4a–G4d); the opt-in
-  fallback (G4e); restore #922/#997; correlator and SRA fixes.
-  _Gate:_ `render_fail` rate within +0.5% absolute of pre-flag baseline over
-  24 h on canary; fill/latency/billing volume deltas within agreed bounds
+- **Phase 0 — Identity, schemas, toolchain.** Path-hashed embedded assets +
+  410 semantics + ordered-vector precompute; `format_version`; §5.6 schemas
+  deployed and validated (writer-off); toolchain floors; dead expando writes
+  deleted; §5.8 server drop surfacing.
+  _Gate:_ dark-instance health 100%; datasource validation green (rejection
+  rate < 0.1% on synthetic writes, freshness ≤ 5 min); asset `410` rate on
+  dark probes = 0 for known hashes.
+- **Phase 1 — Kernel, sessions, minimal messaging, cycle registry.** G3
+  registry (exact release ids); RuntimeSession/NavigationSession; install
+  manifest; minimal messaging module; G4a intent/cycle records; unconditional
+  GPT subscriptions.
+  _Gate:_ browser-spec suite green incl. listener-order assertions; zero
+  `abi_mismatch`/`bundle_partial` on dark probes.
+- **Phase 2 — Trace + beacon.** Server-minted initial trace + page-bids
+  header echo + signed authorizations; beacon service; four-adapter ingest;
+  `ts_client_events` writers on.
+  _Gate:_ on dark probes: ingest acceptance ≥ 99%, group auth-rejection
+  < 0.5%, dedup query returns exactly-once per `(trace, seq)`; freshness
+  ≤ 5 min over a 24 h window.
+- **Phase 3 — APS delivery.** Schema crate + corpus (6.7); mediation
+  algorithm + required `winner_selection` (6.1); render token (G2);
+  renderer route + two-stage ack + CSP report route (6.6); bridge order
+  (6.8); G4a–G4f state machines, awaitable renderer, scoped notifications,
+  fallback; #922/#997 restoration; correlator + SRA fixes.
+  _Gate (canary cohort vs simultaneous control cohort, 24 h, minimum 10,000
+  sampled attempts each):_ APS `render_accepted` / attributable APS attempts
+  ≥ 95%; renderer-document load rate ≥ 99%; runner failure+timeout ≤ 1%; GAM
+  fill, p90 latency, and billing volume deltas within ±2% of control
   (billing measured against GAM/server-side reporting, not the beacon);
-  release-gating real-GAM overlap test green.
-- **Phase 4 — Structure.** Full layering + boundary lint; plugin lifecycle
-  completion; adapters; full slot registry; full messaging migration;
-  namespace window (7.4).
-  _Gate:_ boundary lint zero exceptions; disposal-inventory leak tests green.
-- **Phase 5 — Decomposition.** File splits; script-guard consolidation;
-  bootstrap shrink (own flag, replay-timing specs); compatibility-window
-  close (adoption-gated).
-  _Gate:_ bundle budgets and timing assertions hold; adoption gate met before
-  any removal.
-
----
+  real-GAM overlap test green. Action on breach: hold cutover.
+- **Phase 4 — Structure.** Full layering + boundary lint; transactional
+  plugin lifecycle; adapters; full slot registry; full messaging migration;
+  final namespace (7.4).
+  _Gate:_ boundary lint zero exceptions; disposal-inventory leak tests
+  green; pre-cutover page smoke on the final namespace.
+- **Phase 5 — Decomposition + cutover.** File splits; script-guard
+  consolidation; bootstrap stub + generated fallback; then the §0 runbook.
+  _Gate:_ bundle budgets + timing assertions hold; cutover checklist signed
+  off; post-switch monitor window 24 h on the §5.7 objectives; rollback =
+  traffic switch back.
 
 ## 9. Test acceptance matrix
 
-Blocking CI is hermetic; the staged smoke suite (real GAM line items,
-including the G4a overlap test) is release-gating.
+Hermetic CI (deterministic PUC/message harness) blocks PRs; the staged
+real-GAM suite is release-gating. Rows added this revision are marked •.
 
-| Area              | Must cover                                                                                                                                                                                                                          |
-| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Mediation         | both lifecycles; ties, floors, currency rejection; provenance dedup; transformed ids → `mediator_provenance_unresolved`; `mediator_only` default; rollback blob round-trip                                                          |
-| Cache identity    | non-APS cache-backed bids byte-identical; PUC `?uuid=` path                                                                                                                                                                         |
-| Render token      | format/CSPRNG/in-auction retry/TTL/one-time/per-`(trace, nav_gen)` scoping                                                                                                                                                          |
-| Request cycles    | ts-vs-publisher classification; one-outstanding-TS-cycle serialization; publisher refresh overlapping TS cycle → `cycle_unattributable` fail-closed; late events; **real-GAM overlap (release gate)**                               |
-| Ack protocol      | nonce validation (source, token, nav_gen, refresh_gen); SSAT + client-Prebid + nested SafeFrame; stale/replayed acks                                                                                                                |
-| Render semantics  | notifications only on carrying paths (never APS); `nurl` at bind, `burl` at accepted, attempt-scoped idempotency; `billed_then_failed`; no paint claims (`adm_document_loaded` labeling); accepted-but-blank                        |
-| Fallback          | renders only on attributed `gam_empty` (adopted **and** TS-owned); publisher-initiated cycles never trigger; timeout diagnostics-only; SPA cancellation; destruction; exactly-once terminal                                         |
-| Bridge security   | wrong-slot/stolen/replayed/prior-navigation tokens; nested foreign frames; bounded parent-chain walk; SafeFrame positive                                                                                                            |
-| Beacon            | initial-trace join; page-bids header echo + response trace/capability; per-trace grouping across navigation-spanning batches; `seq`-gap partial traces; ingest abuse incl. absent Origin; capability signature; sendBeacon Blob     |
-| Schema            | staleness; adversarial corpus ×3 validators; outer-tolerance vs exact AAX projection                                                                                                                                                |
-| Runtime ABI       | one kernel under concatenation; deferred late registration; failure isolation; **mixed-version verdicts (compatible-range install vs quarantine)**; first-wins among compatible only                                                |
-| Lifecycle         | `timed_out → present`; session disposal inventories; stale async install; pre-init `tsCreativeConfig` + `tsjs.que`; dual-name window                                                                                                |
-| Delivery          | two-stage deploy simulation **both rolling directions**; new-HTML-hash on old instance (storage lookup); retained-hash miss; legacy query-hash sunset path; unknown hash 410 `no-store`; immutable exact-match only; ordered vector |
-| Renderer endpoint | route in all adapters; auth-pattern startup failure; `/v1` immutable caching; version-skew via storage; `document_loaded` vs runner split; CSP report route caps/redaction                                                          |
-| Adapter parity    | ingest, CSP-report, renderer routes and drop-reason surfacing equivalent across Fastly/Viceroy, Axum, Cloudflare, Spin                                                                                                              |
-| Policy            | script-creative warning; `invalid_dimensions` + bounded width/height; page-bids `debug` gating; diagnostic unsampled completeness; trace-bearing HTML `private, no-store` invariant                                                 |
-
----
+| Area              | Must cover                                                                                                                                                                                                                                                               |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Request cycles    | intent-vs-request separation; • initial-load-disabled cycle formation (display creates no request); SRA batching; `intent_no_request`; publisher overlap → quarantine; • old-navigation completion before and after replacement; drain/re-arm; real-GAM overlap (gate)   |
+| Ack protocol      | five-field validation; SSAT/client-Prebid/SafeFrame; stale + replayed acks; • acks after navigation disposal                                                                                                                                                             |
+| Bridge security   | • TS-reserved id rejected with propagation stopped — neither TS nor native Prebid responds; wrong-slot/stolen/prior-navigation tokens; bounded parent-chain walk; listener-order real-browser assertion; SafeFrame positive                                              |
+| Render semantics  | notifications only on carrying paths (never APS); bind per flow (PUC claim / direct render-start / fallback pre-render); `burl` at `render_accepted`; attempt-scoped idempotency; `billed_then_failed`; accepted-but-blank                                               |
+| Direct `/auction` | • full G4f lifecycle: attempt keys, refresh_gen increments, cancellation on navigation, exactly-once terminal, same event sequence                                                                                                                                       |
+| Fallback          | only attributed `gam_empty` (adopted + TS-owned); publisher-initiated never; timeout never renders; SPA cancellation; • flag change during an active attempt                                                                                                             |
+| Mediation         | • candidate-id echo; • transformed/unresolvable provenance → slot fails closed for merging; • duplicate candidates dedup; • deterministic ties independent of arrival order; currency validation at the Prebid parse point; both lifecycles; required `winner_selection` |
+| Render token      | format/CSPRNG/in-auction retry/TTL/one-time; `(trace, nav_gen, refresh_gen)` scoping; • registry capacity → `registry_full`                                                                                                                                              |
+| Trace auth        | • HMAC verification: expiry, skew, max-future, missing kid, rotation (previous key), constant-time path; per-group rejection; cache-privacy invariant (`private, no-store`)                                                                                              |
+| Beacon            | initial + SPA trace joins; per-trace grouping; seq gaps; • duplicate fetch/pagehide delivery deduped at sink; queue overflow marker; ingest abuse; sendBeacon Blob type                                                                                                  |
+| Ingest/limits     | • token-bucket rate + burst; • limiter saturation and address churn; • map capacity/TTL/eviction; fail-closed drop with 204                                                                                                                                              |
+| Internal routes   | • wrong-method → 405 + Allow + no-store on every adapter; • unknown version → 404 no-store; • no publisher fall-through; • dispatch before auth/EC/filters; • no body/cookie/authorization forwarding                                                                    |
+| CSP               | • both media types with separate validators; • opaque/null-origin renderer reports accepted; • bucketed aggregation only; • Chromium/Firefox/WebKit capture; • enforced-policy discovery vs canary-cohort relaxation                                                     |
+| Schema            | staleness; adversarial corpus through Rust + generated TS + generated inline fragment; outer tolerance vs exact AAX projection                                                                                                                                           |
+| Runtime ABI       | one kernel under concatenation; exact-release verdicts (match runs, mismatch quarantines); late registration; failure isolation                                                                                                                                          |
+| Plugins           | • partial synchronous install unwound in reverse order; • async rejection; • abort while pending; • disposer-after-disposal invoked immediately; per-disposer isolation                                                                                                  |
+| Lifecycle         | `timed_out → present`; session disposal inventories; boot container consume/freeze/delete; final-namespace smoke (`tsjs.que`, `tsjs.creative`, async `requestAds`)                                                                                                       |
+| Delivery          | unknown hash 410 no-store; immutable on exact match; ordered-vector precompute; cutover runbook rehearsal (switch + purge + rollback switch)                                                                                                                             |
+| Sink              | • datasource-side freshness + rejection monitoring (sink is fire-and-forget); • sink auth/schema rejection surfaced by monitor                                                                                                                                           |
+| Failure injection | • Amazon runner redirect, network hang, CSP block, script error → distinct §5.1 outcomes                                                                                                                                                                                 |
+| Adapter parity    | ingest, CSP-report, renderer routes and drop surfacing equivalent across Fastly/Viceroy, Axum, Cloudflare, Spin                                                                                                                                                          |
+| Policy            | script-creative warning; `invalid_dimensions` + bounded w/h; `dimensions_out_of_range` unclamped; page-bids `debug` gating; diagnostic completeness                                                                                                                      |
 
 ## 10. Alternatives considered
 
-Unchanged from revision 3 (patching without telemetry; always-direct-render;
-single module graph; big-bang rewrite; dropping the bootstrap;
-timeout-triggered fallback — all rejected for the recorded reasons).
+1. **Patching APS point-failures without telemetry** — rejected: three
+   correct fixes produced no ads; the next fix would be another guess.
+2. **Always direct-render APS (skip GAM/PUC)** — rejected: unilaterally
+   changes GAM reporting/pacing; kept only as the attributed-`gam_empty`
+   fallback.
+3. **Single module graph / shared chunks now** — rejected for this release:
+   changes the delivery pipeline while everything else changes; recorded as
+   the successor behind the same registry surface.
+4. **Full rewrite in one branch without phases** — rejected: the browser-spec
+   safety net is thinnest exactly where behavior changes.
+5. **Dropping the ES5 bootstrap** — rejected: loses the pinned no-bundle
+   guarantee; generation from TS keeps it without dual maintenance.
+6. **Timeout-triggered fallback** — rejected: GPT requests cannot be
+   cancelled; a timeout race can double-render and double-bill.
+7. **N/N−1 compatibility machinery** (revisions 3–4) — removed by the §0
+   policy decision: version ranges, retained artifacts, legacy URLs, and
+   dual-name globals deleted in favor of exact release matching and a
+   coordinated switch.
 
 ## 11. Risks
 
-Revision 3's list, plus: **shared-storage dependency for assets** (stage-1
-publish becomes a deploy prerequisite; mitigated by the embedded fast path
-for the current vector and deploy-time verification that storage matches the
-embedded hashes); **notification-trigger semantics** are now a published
-contract for PBS-path demand — changing them later is a breaking change for
-SSP reporting expectations.
+- **Hard cutover blast radius:** in-flight pages fail at switch; accepted by
+  policy (§0); bounded by the purge + 24 h monitored window + traffic-switch
+  rollback.
+- **Mediator wire-contract change** (candidate-id echo) requires
+  coordinating the mediator implementation; until echoed ids exist,
+  `merge_highest_cpm` cannot be enabled (config validation enforces this).
+- **Notification triggers become a published contract** for PBS-path demand;
+  changing them later is a breaking change for SSP reporting.
+- **Beacon abuse:** bounded by pre-parse caps, origin checks, fail-closed
+  numeric rate limits, server-decided sampling, signed authorizations.
+- **Registry/limiter memory:** all client and server maps carry explicit
+  capacities, TTLs, and eviction rules (G2, §5.4).
+- **CSP relaxation:** enforced-cohort canary + new immutable version prevent
+  false-clean canaries; bucketed aggregation prevents cardinality abuse.
+- **Sink blindness:** fire-and-forget dispatch is compensated by mandatory
+  datasource-side freshness/rejection monitoring.
 
 ## 12. Success criteria
 
-1. APS creatives render on a reference page in each configured flow,
-   hermetically in CI and via the staged smoke suite (including the real-GAM
-   overlap test).
-2. Every failure point in section 2 maps to a distinct observable signal;
-   diagnostic mode names the failing reason from one page load; production
-   telemetry meets the 5.4 SLO on sink-backed deployments.
-3. Boundary lint zero exceptions; stateful sharing only via the versioned
-   ABI; mixed-version delivery resolves to the G3 verdicts.
-4. No file in `src/` exceeds ~500 lines; `gpt_bootstrap.js` is a stub or
+1. APS creatives render in each configured flow — SSAT, client-Prebid,
+   page-bids, and direct `/auction` (G4f) — hermetically in CI and in the
+   release-gating real-GAM suite.
+2. Every §2 failure maps to its §2.5 signal; diagnostic mode names the
+   failing class from one page load; §5.7 objectives hold on sink-backed
+   deployments.
+3. Boundary lint zero exceptions; stateful sharing only via the G3 registry;
+   exact-release mismatches quarantine loudly.
+4. No `src/` file exceeds ~500 lines; `gpt_bootstrap.js` is a stub or
    generated.
 5. Trace counts are per-impression; orphan recovery has a non-vacuous test;
-   cycle attribution follows G4a including the publisher-overlap fail-closed
-   rule.
-6. The only TSJS-owned global is `window.tsjs` (public globals only inside
-   their window, closed by the 7.4 adoption gate); no expandos on GPT slots,
-   GPT functions, or `pbjs`.
-7. Bundle budgets (+5% bytes) and the pinned-environment p90 timing assertion
-   (50 samples, +10% tolerance) hold; server concatenation is precomputed
-   within ±10% CPU/heap of baseline.
-8. No existing warning is lost; every issue-surfacing condition logs at
-   `warn` or above with the beacon's reason code.
+   cycle attribution follows G4a (physical requests, publisher-overlap
+   quarantine, drain/re-arm).
+6. The only TSJS-owned global is `window.tsjs` with the §7.4 final shape; no
+   expandos on GPT slots, GPT functions, or `pbjs`; legacy names are gone at
+   cutover.
+7. §7.10 budgets hold (three vectors, pinned tools, one-sided server gates).
+8. No existing warning is lost; every issue-surfacing condition logs `warn`+
+   with the beacon's reason code.
 9. TypeScript floor matches the resolved 5.9 line with strictness flags on;
-   `prebid.js` pin matches the documented deployed bundle; monthly review
-   policy in CI docs.
-10. Rolling-deploy tests pass in both directions; legacy URLs serve through
-    their sunset; unknown hashes 410 `no-store`; immutable only on exact
-    match.
-11. `nurl`/`burl` fire only on carrying paths, on their G4d transitions,
+   `prebid.js` pin matches the documented deployed bundle.
+10. `nurl`/`burl` fire only on carrying paths at their G4d binds,
     attempt-scoped and idempotent; APS fires neither.
-12. Trace-bearing responses are `private, no-store` by test; capabilities are
-    per-trace and never authorize a trace they were not bound to.
+11. Trace-bearing responses are `private, no-store` by test; authorizations
+    are per-trace, signed, mode-carrying, and never accepted unsigned.
+12. The cutover runbook has been rehearsed (switch, purge, rollback switch)
+    before the production switch.
 
 ## 13. Open questions
 
@@ -701,8 +927,7 @@ SSP reporting expectations.
    should the original be re-merged?
 5. Do Axum/Cloudflare/Spin get real client-event sinks, or keep
    accept-count-drop?
-6. Does Amazon expose any creative-completion acknowledgement that could
-   reintroduce a confirmed state (G4c) under a new name?
-7. Which shared storage backs stage-1 artifact publishing per platform (KV
-   store vs config store vs CDN), and who owns the publish step in the deploy
-   pipeline?
+6. Does Amazon expose any creative-completion acknowledgement that could add
+   a confirmed state beyond `render_accepted` under a new name?
+7. Who implements and owns the mediator-side candidate-id echo (6.1), and on
+   what timeline relative to this release?
