@@ -116,6 +116,10 @@ fn checked_sources() -> &'static [(&'static str, &'static str)] {
         ),
         ("integrations/gpt.rs", include_str!("integrations/gpt.rs")),
         (
+            "integrations/gpt_diagnostics.rs",
+            include_str!("integrations/gpt_diagnostics.rs"),
+        ),
+        (
             "integrations/lockr.rs",
             include_str!("integrations/lockr.rs"),
         ),

@@ -38,11 +38,17 @@ pub fn tsjs_unified_script_tag() -> String {
     tsjs_script_tag(&ids)
 }
 
+/// `/static` URL for one module with its own cache-busting hash.
+#[must_use]
+pub fn tsjs_single_module_script_src(module_id: &str) -> String {
+    let hash = single_module_hash(module_id).unwrap_or_default();
+    format!("/static/tsjs=tsjs-{module_id}.min.js?v={hash}")
+}
+
 /// `/static` URL for a single deferred module with its own cache-busting hash.
 #[must_use]
 pub fn tsjs_deferred_script_src(module_id: &str) -> String {
-    let hash = single_module_hash(module_id).unwrap_or_default();
-    format!("/static/tsjs=tsjs-{module_id}.min.js?v={hash}")
+    tsjs_single_module_script_src(module_id)
 }
 
 /// `<script defer>` tag for a single deferred module.
@@ -181,8 +187,8 @@ mod tests {
     }
 
     #[test]
-    fn tsjs_deferred_script_src_formats_known_module_url_with_hash() {
-        let src = tsjs_deferred_script_src("creative");
+    fn tsjs_single_module_script_src_formats_known_module_url_with_hash() {
+        let src = tsjs_single_module_script_src("creative");
 
         assert!(
             src.starts_with("/static/tsjs=tsjs-creative.min.js?v="),
@@ -192,12 +198,13 @@ mod tests {
     }
 
     #[test]
-    fn tsjs_deferred_script_src_uses_empty_hash_for_external_or_unknown_module() {
-        assert_eq!(
-            tsjs_deferred_script_src("prebid"),
-            "/static/tsjs=tsjs-prebid.min.js?v=",
-            "prebid now ships as an external bundle and has no local hash"
+    fn tsjs_deferred_script_src_hashes_prebid_shim_and_empties_unknown_module() {
+        let prebid_src = tsjs_deferred_script_src("prebid");
+        assert!(
+            prebid_src.starts_with("/static/tsjs=tsjs-prebid.min.js?v="),
+            "prebid shim should be served from the deferred tsjs route"
         );
+        assert_sha256_hex_hash(hash_query_value(&prebid_src));
         assert_eq!(
             tsjs_deferred_script_src("unknown-module"),
             "/static/tsjs=tsjs-unknown-module.min.js?v=",

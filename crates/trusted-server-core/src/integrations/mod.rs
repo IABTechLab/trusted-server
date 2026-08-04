@@ -17,6 +17,7 @@ pub mod datadome;
 pub mod didomi;
 pub mod google_tag_manager;
 pub mod gpt;
+pub mod gpt_diagnostics;
 pub mod lockr;
 pub mod nextjs;
 pub mod osano;
@@ -331,6 +332,10 @@ pub(crate) fn builders() -> &'static [IntegrationBuilder] {
         IntegrationBuilder {
             id: "gpt",
             build: gpt::register,
+        },
+        IntegrationBuilder {
+            id: "gpt_diagnostics",
+            build: gpt_diagnostics::register,
         },
     ]
 }

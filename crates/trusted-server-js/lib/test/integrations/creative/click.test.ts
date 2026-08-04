@@ -17,7 +17,7 @@ describe('creative/click.ts', () => {
 
   it('repairs anchors via proxy rebuild fallback when fetch is unavailable', async () => {
     vi.useFakeTimers();
-    global.fetch = undefined as any;
+    global.fetch = undefined as unknown as typeof fetch;
 
     const anchor = document.createElement('a');
     anchor.setAttribute('data-tsclick', FIRST_PARTY_CLICK);
