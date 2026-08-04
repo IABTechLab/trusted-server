@@ -1167,6 +1167,11 @@ export function installSpaAuctionHook(): void {
     if (path === currentPath) return;
     currentPath = path;
     ts.navGeneration = (ts.navGeneration ?? 0) + 1;
+    // A route change invalidates hydration aliases before the new route's
+    // publisher can define a same-prefix slot while page-bids is in flight.
+    for (const [elementId, handoff] of Object.entries(ts.gptSlotHandoffs ?? {})) {
+      if (!handoff.publisherClaimed) delete ts.gptSlotHandoffs![elementId];
+    }
     inflight?.abort();
     const controller = new AbortController();
     inflight = controller;
