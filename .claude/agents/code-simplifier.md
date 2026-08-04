@@ -18,7 +18,7 @@ Find overly complex code and suggest simpler alternatives.
 ## Rules
 
 - Read the code before suggesting changes.
-- Respect the project's conventions (see `CLAUDE.md`).
+- Respect the project's conventions (see `AGENTS.md`).
 - Ensure suggestions maintain correctness — simplification must not break behavior.
 - Consider WASM constraints when suggesting alternatives.
 
