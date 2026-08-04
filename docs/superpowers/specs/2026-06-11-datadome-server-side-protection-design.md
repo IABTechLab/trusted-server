@@ -9,7 +9,11 @@
 > effects → final cache/privacy invariant pass, unconditionally last),
 > with typed cookie/header operations, enumerated allowlists
 > (`datadome-header-allowlist.md`), and owner-only identifier
-> boundaries. Where this document conflicts, the hook spec governs.
+> boundaries. Where this document conflicts, the hook spec governs. Additionally, this document's sessionByHeader requirement ("always
+> send `X-DataDome-X-Set-Cookie` when the header ID is used") is
+> **superseded for v1**: header-session mode is startup-rejected (hook
+> spec §4a); TS never requests it and does not forward incoming header
+> ClientIDs to the vendor.
 
 **Issue:** #317
 **Date:** 2026-06-11

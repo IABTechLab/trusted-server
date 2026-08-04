@@ -835,34 +835,45 @@ migration story unresolvable (migration spec §2, rows 5 and 7).
 
 ### 5.5 Policy revision activation
 
-A **policy revision** has a defined identity: the canonical content
-digest of the `[permissions]` section — **defined**: SHA-256 with domain
-tag `tspol1|` over the canonical JSON of the parsed policy (keys sorted
-lexicographically by UTF-8 code unit, numbers shortest round-trip,
-defaults materialized, no insignificant whitespace), cross-language
-vectors required. **The other cache-tuple inputs are domain-separated
-hashes of effective configuration, adapter-independent**:
+A **policy revision** has one identity used everywhere: the pair
+**(content digest, activation ordinal)**. The digest is SHA-256 with
+domain tag `tspol1|` over the canonical JSON of the parsed policy (keys
+sorted lexicographically by UTF-8 code unit, numbers shortest
+round-trip, defaults materialized, no insignificant whitespace;
+cross-language vectors required) — identity, so an A→B→A rollback
+yields A's digest again. The ordinal is a **globally ordered activation
+counter, CAS-incremented in the deployment-metadata primitive on each
+config activation** — order, adapter-independent (not every adapter has
+a native push version, and per-instance counters ordered nothing across
+a fleet). Authority wire records, the S2S recompute, and the hook cache
+tuple all use this same pair; the hook's earlier "config-store push
+version" and any digest-only usage are superseded. The other cache-tuple
+inputs are likewise domain-separated hashes of effective configuration:
 integration-registry revision = `tsreg1|` over the canonical-JSON
 `(id, version)` list; config revision = `tscfg1|` over the effective
-config blob — so adapters without a native push version still derive
-identical revisions from identical configuration by
-§7); the mixing window is bounded by config propagation and observable via
-the config-version metric; and mixed-revision irreversibility is bounded and **accepted, not
-denied** (sign-off 19): destructive withdrawal triggers are user
-signals, never policy (§4.2 trigger 3) — the one revision-sensitive destructive case
-(trigger 2 under a now-`denied` baseline) requires an affirmative user
-refusal at the evaluating instance, which is safe under either revision.
-S2S recomputation always evaluates against the instance's current
-revision and records it. One divergence is explicitly accepted rather
-than fenced: during convergence, a live refusal under a
-`granted`-revision instance suppresses while the same refusal under a
-tightened-revision instance destroys (trigger 2) — the destructive
-outcome is the target revision's intended behavior arriving early on
-part of the fleet, coordinated activation fencing is not worth its
-machinery, and the acceptance is sign-off item 19. Rolling a policy
-revision back restores acquisition rules but **cannot resurrect
-tombstoned identities**; the migration guide says so where operators
-will read it.
+config blob — so adapters derive identical revisions from identical
+configuration.
+
+A policy edit propagates through the config store, so a fleet briefly
+mixes revisions. The contract: instances stamp every resolution and
+every provenance write with the (digest, ordinal) they used (already
+required by §7); the mixing window is bounded by config propagation and
+observable via the activation-ordinal metric; and mixed-revision
+irreversibility is bounded and **accepted, not denied** (sign-off 19):
+destructive withdrawal triggers are user signals, never policy (§4.2
+trigger 3) — the one revision-sensitive destructive case (trigger 2
+under a now-`denied` baseline) requires an affirmative user refusal at
+the evaluating instance, which is safe under either revision. S2S
+recomputation always evaluates against the instance's current revision
+and records it. One divergence is explicitly accepted rather than
+fenced: during convergence, a live refusal under a `granted`-revision
+instance suppresses while the same refusal under a tightened-revision
+instance destroys (trigger 2) — the destructive outcome is the target
+revision's intended behavior arriving early on part of the fleet,
+coordinated activation fencing is not worth its machinery, and the
+acceptance is sign-off item 19. Rolling a policy revision back restores
+acquisition rules but **cannot resurrect tombstoned identities**; the
+migration guide says so where operators will read it.
 
 ## 6. Failure-mode matrix — normative
 
@@ -935,8 +946,12 @@ Consumers of the resolved set in this epic:
 
    **S2S authority (batch sync).** A context-free server-to-server request
    carries no user signals, geo, or `EcContext`. Its authority is the
-   identity's **stored provenance**: per-permission, time-bounded evidence
-   written at mint and replaced on later live requests — grant basis
+   **strong authority-state summary — the sole decision input** (the
+   identity row's provenance fields are an audit mirror; reading
+   decision inputs from an eventually consistent row was the two-source
+   bug the revision fence exists to prevent): per-permission,
+   time-bounded evidence written at mint and replaced on later live
+   requests — grant basis
    (which signal class granted, per permission), the evidence's
    **authoritative timestamp and `valid_until`** (per evidence class),
    resolved jurisdiction, and policy revision — **not** provider/version,
@@ -972,8 +987,10 @@ Consumers of the resolved set in this epic:
    resolution **atomically replaces the complete per-permission
    snapshot**, never merges — a refusal, opt-out, malformed or absent
    state in the fresh resolution clears prior positive authority for its
-   scope, so an old P4 grant cannot survive a later P4 refusal. A sync request performs a **full recompute of both
-   permissions** from that stored evidence against the _current_ policy:
+   scope, so an old P4 grant cannot survive a later P4 refusal. A sync request performs a **full recompute of both permissions from
+   the strong summary alone** against the _current_ policy — the row
+   contributes identity and partner data only after the
+   `row.provenance_revision == summary_revision` fence passes:
    it fails closed when the stored jurisdiction's rule is now `denied`,
    when a `granted` baseline tightened to `requires_signal` and the stored
    evidence contains no accepted grant for that permission, when the

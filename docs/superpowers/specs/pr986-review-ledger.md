@@ -342,7 +342,10 @@ left open:**
   every Respond ends `private, no-store` with CDN fields stripped.
 - GPP 24–27 fully reserved: removed from the accepted-version table into
   a separate reserved table; presence-vs-unknown defined; supported
-  sections pin to an immutable registry commit with vendored vectors.
+  sections **must** pin to an immutable registry commit with vendored
+  vectors — the snapshot and PSL files remain placeholders until
+  ratification records the commits (a named ratification gate, not a
+  closed item).
 - P2/P3: HEAD-only distinct artifact type with validator/Content-Length
   update rules; Vary→cache-key ordering; canonical `state_key`/evidence
   digest construction (`tsstk1|`/`tsevd1|`) with a vector; non-HMAC
@@ -361,3 +364,66 @@ family non-HMAC `tsfam1|i|vend|abcdef` →
 suffix `tswsx1|AbC123` → `08cb55acf42929772862e82b0960c134`;
 state_key `tsstk1|tcf|p1=grant,p4=refuse` →
 `a49148a0e3b486fd93a141404857868871319a7e1f2ef85b5499aed80c7e59df`.
+
+## Round 18 — review at 184c9d9b (prose; text-added pending next review)
+
+- N+1's rollback **tests** now mirror the one contract (stubs + negative
+  writes read-and-write; positive commits/clears asserted forbidden) —
+  the contract/test contradiction is gone.
+- The graphless migration has a **total state table** (semantics × flag ×
+  strong record × row read × `w` → outcome), with the declared v1
+  exception (v1 semantics use recognized cookies row-lessly until the
+  new model activates — matrix row 14), strong-record-present +
+  successful stale not-found defined as visibility lag → indeterminate,
+  and the "while the flag is active" `w` scope leftover replaced by
+  valid_until keying.
+- The suspension barrier is skew-safe: `not_before` from store-issued
+  time or committer + L + S (S = 300 s), with `not_before` and L
+  serialized in the metadata schema; clock-skew and suspender-restart
+  tests named.
+- The strong summary is the **sole S2S decision source** — the §7
+  authority paragraph and the row-schema provenance row (now "audit
+  mirror only") no longer describe a second source.
+- The saturation restrictive marker pins to the **first restrictive
+  overflow's own timestamp with a full TTL** (later overflows inherit —
+  bounded shortening, ratified in the rewritten sign-off 31), replacing
+  the epoch-entry pinning that back-dated genuinely new opt-outs.
+- Revision identity is one pair everywhere: (tspol1| content digest,
+  deployment-metadata activation ordinal); the hook's push-version and
+  digest-only variants are superseded; §5.5 rebuilt (also repairing a
+  paragraph corrupted by an earlier scripted edit).
+- Cache stickiness is form-preserving: unqualified directives never
+  become qualified, qualified field sets never shrink; the contradictory
+  must-understand tail is gone.
+- Overlay cache identity: matching on the exact final publisher request,
+  digest-only storage of sensitive Vary values, and identity-bearing TS
+  overlays force private, no-store.
+- sessionByHeader is startup-rejected in v1 (never requested,
+  X-Set-Cookie unclassified, incoming header ClientIDs not forwarded);
+  the R16 cookie-translation is retracted as not equivalent; the old
+  DataDome spec's banner now supersedes its header-mode requirement.
+- One pointer matrix (decision × session mode × pointer) lives in the
+  allowlist file with X-DD-B enumerated and no wildcard; both documented
+  vendor responses are decision-asserting fixtures.
+- Browser trust boundary ratified, not implied: non-HttpOnly cookie
+  readable by every same-origin script, vendor challenge HTML with
+  publisher-origin access, CSP interaction — sign-offs 23/28 rewritten.
+- HEAD/304 store separate origin-side and processed-side metadata;
+  byte-coupled representation updates invalidate and refetch (RFC 9111
+  §3.2); changed Vary evicts/rekeys.
+- P2s: per-entry `w` horizons (record expires with its last entry);
+  state_key/evidence digests hash the ASCII source token (prose aligned
+  to the published vector; slots are per source; evidence-digest vector
+  embedded: `tsevd1|tcf|p1=grant,p4=refuse|lu=1690000000000` →
+  `67259c0247ae2b33c52d9f18193bcd622f48ad4754ffbab6998d7c293b0143b4`);
+  schema-floor value encoded (writer version + minimum-reader, numeric
+  order — N+1 with N+2-reader capability is permitted); DataDome
+  complete-response deadline 3000 ms monotonic (1500 ms stays
+  first-byte), encoded responses batch-invalid; total cookie parser
+  (repeated Cookie joined, Set-Cookie never combined, strict attribute
+  rejection, 512-byte serialized measure); adapter header ceilings are
+  enumerated capability cells validated against core's budget at
+  startup; GPP/PSL placeholder status stated honestly here and above.
+- P3s: §5.5 grammar dangler repaired with the section rebuild; the
+  remaining "and the and a" occurrence fixed; the duplicated
+  Set-Cookie-reserved sentence deduplicated.
