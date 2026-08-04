@@ -253,7 +253,12 @@ pub struct Bid {
     pub nurl: Option<String>,
     /// Billing notification URL
     pub burl: Option<String>,
-    /// `OpenRTB` bid identifier.
+    /// `OpenRTB` bid identifier — the `id` of the bid object itself.
+    ///
+    /// Distinct from [`ad_id`](Self::ad_id): unique per bid instance rather
+    /// than a creative identifier. Always present per the `OpenRTB` spec, so it
+    /// is the last-resort `hb_adid` source for bidders that return neither a
+    /// Prebid Cache UUID nor `adid`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bid_id: Option<String>,
     /// Ad ID from the bidder.
