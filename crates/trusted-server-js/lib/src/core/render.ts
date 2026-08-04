@@ -1,5 +1,7 @@
 // Rendering utilities for Trusted Server demo placements: find slots, seed placeholders,
 // and inject creatives into sandboxed iframes.
+import { normalizeTrustedOrigin } from '../shared/origin';
+
 import { log } from './log';
 import type { AdUnit } from './types';
 import { getUnit, getAllUnits, firstSize } from './registry';
@@ -230,8 +232,7 @@ export function createAdIframe(
 // break out of the quoted string it is written into.
 function trustedCreativeOrigin(): string {
   try {
-    const origin = location.origin;
-    if (/^https?:\/\/[a-z0-9.-]+(:\d+)?$/i.test(origin)) return origin;
+    return normalizeTrustedOrigin(location.origin);
   } catch {
     // fall through to an empty stamp; the runtime degrades to document.baseURI
   }
