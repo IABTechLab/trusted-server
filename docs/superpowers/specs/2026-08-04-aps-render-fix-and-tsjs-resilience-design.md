@@ -1,16 +1,17 @@
 # APS Render Fix and TSJS Resilience Architecture — Design
 
-- **Status:** revision 2 — reworked after design review (review verdict:
-  request changes). The five architectural contracts the review required are
-  settled in section 4.
+- **Status:** revision 3 — reworked after the second design review round.
 - **Date:** 2026-08-04
 - **Baseline:** `rc/july` @ `541298695` — the full merged state (everything
   merged from `main` plus every rc-only merge), not just the delta pending
   against `main`.
 - **Inputs:** three code audits performed against this baseline (APS end-to-end
-  trace, TSJS architecture audit, GPT integration map); design review of
-  revision 1; open issues #926, #941, #944, #962, #964, #977, #983, #989,
-  #993; open PR #997.
+  trace, TSJS architecture audit, GPT integration map); design reviews of
+  revisions 1 and 2; open issues #926, #941, #944, #962, #964, #977, #983,
+  #989, #993; open PR #997.
+- **Terminology:** the per-refresh counter is `refresh_gen` everywhere in this
+  document (revision 2 used `render_gen` in some places; that name is
+  retired).
 
 ---
 
@@ -55,8 +56,6 @@ The audit traced all four delivery flows: (a) SSAT server-side ad template via
 SPA `/_ts/page-bids` re-auction, (d) direct `/auction` via `tsjs.requestAds`.
 Only flow (d) — the demo path nobody runs in production — can render an APS
 descriptor without GAM's cooperation.
-
-The failure points, ranked by likelihood and blast radius:
 
 ### 2.1 Admission: APS bids are eliminated before they can win
 
@@ -105,253 +104,291 @@ deciding the winner. The audit's key facts:
 1. **The bundle's handoff and initial-load code is dead in production.** The
    bootstrap installs its wrappers first and sets the same sentinels the bundle
    checks; ~200 lines of the TypeScript the test suite exercises most heavily
-   never run on a real page. A fix landed only in `gpt/index.ts` has no
-   production effect.
+   never run on a real page.
 2. **The slot handoff can alias a publisher's new div to a GPT slot bound to a
    dead element** — and the orphan-recovery watcher built to repair exactly that
    was **lost in the #922 merge** (`0dc9b19a9` resolved `gpt/index.ts` to the rc
-   side). `updateRender` (one impression, one row) now has no production
-   caller, `__tsRenderGeneration` / `__tsRenderBid` are dead writes, and every
+   side). `updateRender` now has no production caller,
+   `__tsRenderGeneration` / `__tsRenderBid` are dead writes, and every
    bridge-served impression double-counts in the trace. Open PR #997 appears to
-   be the reworked replacement; restoring this is a correctness prerequisite,
-   not a refactor.
-3. **TS refreshes never pass `changeCorrelator: false`**, so every TS-driven
-   refresh starts a new GAM page-view correlator — silently changing roadblock,
-   competitive-exclusion, and frequency-capping behavior.
+   be the reworked replacement.
+3. **TS refreshes never pass `changeCorrelator: false`**, silently changing
+   roadblock, competitive-exclusion, and frequency-capping behavior.
 4. **`enableSingleRequest()` is called blind** after the publisher's own
-   `enableServices()` has almost always run (post-#945 deferral), so SRA intent
-   is asserted but not real — and on pages where TS wins the race, it forces
-   SRA onto publishers who chose otherwise.
-5. Responsive resolution is a DOM-element-selection ladder (not GPT size
-   mapping); ambiguity silently skips the slot for the whole pass.
-6. Three independent wrappers on `pubads().refresh` (bootstrap, bundle, prebid)
-   coordinate via window-global booleans that async wrappers observe already
-   reset.
+   `enableServices()` has almost always run.
+5. Responsive resolution is a DOM-element-selection ladder; ambiguity silently
+   skips the slot for the whole pass.
+6. Three independent wrappers on `pubads().refresh` coordinate via
+   window-global booleans that async wrappers observe already reset.
+7. **GPT refresh is asynchronous and offers no request-cancellation
+   primitive** (`gpt/index.ts:1080`): once a refresh is issued, a response can
+   arrive arbitrarily late. Any fallback design must treat an issued GPT
+   request as uncancelable.
 
 ---
 
-## 4. Design gates — the five contracts settled before implementation
+## 4. Design gates — the five contracts
 
-The design review identified five architectural contracts every later section
-depends on. This revision settles them; changing any of these later reopens the
-review.
-
-### G1 — Trace identity and event envelope
+### G1 — Trace identity and correlation
 
 **The client-visible auction id must never be ingested.** It is EC-derived by
-construction (`publisher.rs:3237`: `ts-{ec_id}` when an EC exists), and server
-telemetry already uses a deliberately unrelated fresh UUID
-(`telemetry.rs:94-97`), so a join on it is both a privacy violation and
-impossible.
+construction (`publisher.rs:3237`: `ts-{ec_id}` when an EC exists). Server
+telemetry uses an independent fresh UUID (`telemetry.rs:94-97`) — and, decisive
+for the design: **initial-HTML auction telemetry is emitted before page
+JavaScript exists** (`telemetry.rs:148`, `publisher.rs:2452`), so a
+client-minted trace can never retroactively join it.
 
-Contract:
+Contract — correlation is minted by whoever acts first:
 
-- A **`trace_id`** is minted client-side per navigation: 128-bit CSPRNG
-  (`crypto.getRandomValues`), hex-encoded, held in `PageSession`, never
-  persisted, never derived from any identity.
-- Every event carries the envelope `{trace_id, nav_gen, render_gen, seq}`.
-  `seq` is a per-trace monotonic counter (ordering + deduplication);
-  `nav_gen`/`render_gen` scope events to a navigation and a refresh cycle, so a
-  batch that spans SPA navigations remains attributable per event, not per
-  batch.
-- The **server** stamps the same `trace_id` into its own telemetry rows by
-  reading it from the beacon, never the reverse: server auction rows keep their
-  independent telemetry UUID, and correlation happens only where the client
-  reported a `trace_id` alongside the events it observed. Failures with no
-  winning bid therefore still have a trace: the trace is client-born, not
-  auction-born.
-- **Sampling is sticky per trace** (decided once at trace mint, recorded in the
-  envelope), never per event — a sampled trace is complete or absent.
+- **Initial navigation (`nav_gen = 0`):** the **server** mints a
+  `trace_id` — 128-bit CSPRNG, hex (`^[0-9a-f]{32}$`), derived from nothing —
+  per HTML response, writes it into that response's auction telemetry rows at
+  emit time, and injects it into the page as a `tsjs` boot field alongside the
+  sampling decision. The client's `NavigationSession` adopts it. It is a new
+  value, never `AuctionRequest.id`.
+- **SPA navigations (`nav_gen > 0`):** the **client** mints the `trace_id` for
+  the navigation and sends it in the `/_ts/page-bids` request body; the server
+  records it contemporaneously in that auction's telemetry rows. No
+  retroactive joining anywhere.
+- **Envelope:** every event carries
+  `{trace_id, sampled, nav_gen, refresh_gen, seq}` — per event, not per batch,
+  so a transport batch may span navigations without ambiguity. `seq` is a
+  per-trace monotonic counter for ordering and deduplication.
+- **Sampling** is decided once per trace (server-decided for `nav_gen 0`,
+  client-decided from the injected rate for later navigations) and recorded in
+  the envelope; a sampled trace is complete or absent.
 
 ### G2 — Render identity: `hb_adid`, the APS token, and the PBS Cache UUID
 
-**The PBS Cache contract stays untouched.** Today `hb_adid` deliberately
-prefers the Prebid Cache UUID (`publisher.rs:3355`), and both the emitted cache
-coordinates and the bridge's cache fetch assume `?uuid=<hb_adid>`
-(`publisher.rs:3450`, `gpt/index.ts:1700`) — that is the Prebid Universal
-Creative's documented contract. Revision 1's "token for every SSAT bid" would
-have broken every cache-backed render and is withdrawn.
+**The PBS Cache contract stays untouched.** `hb_adid` deliberately prefers the
+Prebid Cache UUID (`publisher.rs:3355`), and both the emitted cache coordinates
+and the bridge's cache fetch assume `?uuid=<hb_adid>` (`publisher.rs:3450`,
+`gpt/index.ts:1700`).
 
 Contract:
 
-- Bids with a cache id: `hb_adid` = cache UUID, exactly as today.
-- Bids with markup and no cache id: `hb_adid` = existing fallback chain
-  (`ad_id`, then bid id), exactly as today.
+- Bids with a cache id: `hb_adid` = cache UUID, exactly as today. Bids with
+  markup and no cache id: existing fallback chain, exactly as today.
 - **Renderer-only bids (APS): `hb_adid` = a server-minted render token**,
-  format `^[a-z0-9]{12}$` (12 chars exactly), CSPRNG-generated with collision
-  retry within the auction, unique across slots and auctions, one-time
-  consumption in the bridge registry, TTL-bounded. Twelve characters sit well
-  inside GAM's documented 40-character targeting-value limit.
-- The client-side Prebid adapter path keeps Prebid's generated `adId` (that is
-  Prebid's own contract); both paths register into one bridge registry keyed by
-  whichever id that path will observe.
+  format `^[a-z0-9]{12}$` (12 chars exactly, 36¹² ≈ 4.7 × 10¹⁸ values),
+  CSPRNG-generated. Collision handling is honest about its scope: retry on
+  collision **within the minting auction** (the only scope the server can
+  check without storage); cross-auction uniqueness is **probabilistic**, with
+  the birthday bound documented (at 10⁶ live tokens the collision probability
+  is ~10⁻⁷) and made harmless by scoping: the client registry keys tokens per
+  `(trace_id, nav_gen)`, so a cross-page collision cannot cross wires.
+- Token lifecycle: TTL **15 minutes** from mint, one-time consumption in the
+  bridge registry, invalidated by navigation.
+- The client-side Prebid adapter path keeps Prebid's generated `adId`; both
+  paths register into one bridge registry keyed by whichever id that path
+  observes.
 - Regression tests: non-APS cache-backed bids keep byte-identical `hb_adid`
-  and cache coordinates; the token property test asserts `^[a-z0-9]{12}$`,
-  uniqueness, one-time consumption, and TTL expiry.
+  and cache coordinates.
 
 ### G3 — Runtime ABI: how code shares state under the IIFE build
 
 Every entry point is built as a self-contained IIFE with dynamic imports
 inlined (`build-all.mjs:46`), and the server concatenates already-closed IIFEs
-(`bundle.rs:23`). **A module `import` therefore never shares state across
-bundles** — an `aps/index.ts` alone would just mint another private copy. This
-is already a live defect beyond APS: `core/context.ts:11` holds a private
-context-provider `Map` while `permutive/index.ts:102` registers into its own
-independently bundled copy.
+(`bundle.rs:23`) — a module `import` never shares state across bundles. Live
+proof: `core/context.ts:11` holds a private context-provider `Map` while
+`permutive/index.ts:102` registers into its own copy.
 
 Contract — **a versioned registration ABI on `window.tsjs._internal`**:
 
 - The kernel ships **only** in `tsjs-core` (always first in the concatenated
   unified bundle) and publishes `tsjs._internal = { abi: 1, registry }` exactly
   once, guarded by a window-level sentinel.
-- All **stateful** services (slot registry, render state machine, APS renderer
-  registry, context providers, event bus, beacon queue) exist once, owned by
-  the kernel, and are reached **only** through
-  `tsjs._internal.registry.get(name, minVersion)` at call time — never through
-  imported module state. Pure stateless helpers may still be imported and
-  inlined freely.
-- Deferred bundles (prebid) and later scripts interact through the same ABI;
-  `abi` majors are checked at lookup and a mismatch is a logged, telemetered
-  refusal, not a silent no-op.
-- The alternative (single module graph / shared chunks emitted by the build and
-  loaded as real modules) is recorded as the long-term option; the ABI is
-  chosen now because it works under today's concatenation and deferred
-  loading without changing the delivery pipeline.
-- This gate precedes and unblocks: the event bus, the slot registry, the
-  install registry, `PageSession`, the messaging service, and fixes the
-  context-provider split as its first proof.
+- **Construction ownership:** the kernel constructs and registers the core
+  service instances (event bus, beacon queue, session objects, slot registry,
+  render state machine) during its own boot; integrations construct only
+  integration-scoped services and register them during their `install()`.
+- All **stateful** services are reached only through
+  `tsjs._internal.registry.get(name, minVersion)` at call time. Pure stateless
+  helpers may be imported and inlined freely.
+- `abi` majors are checked at lookup; a mismatch is a logged, telemetered
+  refusal, not a silent no-op. Mixed-version delivery (old deferred bundle,
+  new core) is a tested scenario, not an accident.
+- The single-module-graph build is recorded as the successor option behind the
+  same ABI surface.
 
-### G4 — Exactly-once render state machine, and honest success semantics
+### G4 — Render lifecycle: cycles, acknowledgements, and honest states
 
-**Absence of a bridge request is not proof GAM failed** — GAM may legitimately
-serve a different, higher-priority creative without ever invoking the TS
-bridge. And **`renderer-ready` means Amazon's runner script loaded, not that an
-ad painted** (`aps.rs:105`); the current direct renderer returns `true`
-immediately while the real outcome settles asynchronously for up to ten
-seconds (`render.ts:318`).
+Four sub-contracts, each fixing a hole the reviews identified.
 
-Contract:
+**G4a — GPT request-cycle protocol.** `slotRenderEnded` identifies a slot, not
+a request, and the bridge currently reads live `window.tsjs.bids`
+(`gpt/index.ts:1606`) while the generation snapshots are dead writes
+(`gpt/index.ts:1085`). Contract: every TS-issued `display()`/`refresh()` opens
+a **cycle** `(slot, refresh_gen)` pushed onto a per-slot pending-cycle queue;
+`slotRequested` confirms it; GPT fires slot events in order per slot, so
+`slotRenderEnded` is attributed to the oldest confirmed pending cycle for the
+slot. Each bridge token and each render attempt binds to exactly one cycle. If
+attribution is ambiguous (overlapping cycles the queue cannot separate, or an
+event with no pending cycle), the state machine for that slot **fails closed**:
+no fallback, `render_fail{cycle_unattributable}`, console warning.
 
-- One render state machine per placement instance, keyed by
-  `(trace_id, nav_gen, slot, refresh_gen, render_token)`, with exactly-once
-  terminal transition. States:
-  `targeting_set → bridge_claimed | gam_filled_other | fallback_running →
-render_accepted → render_confirmed | render_failed(reason)`.
-- **The fallback never replaces a nonempty GAM render.** Any bridge claim or
-  nonempty `slotRenderEnded` cancels a pending fallback; an **empty**
-  `slotRenderEnded` may trigger it; navigation, refresh, handoff, and slot
-  destruction invalidate stale attempts.
-- The renderer API becomes awaitable with cancellation and an explicit
-  terminal reason; no fire-and-forget `true`.
-- Event taxonomy replaces the single `render_ok`:
-  - `bridge_response_sent` — the bridge handed a payload to the PUC;
-  - `render_accepted` — the renderer document loaded Amazon's runner
-    (today's "ready");
-  - `render_confirmed` — observed evidence of a paint (nonempty
-    `slotRenderEnded` for GAM fills; for the sandboxed renderer, iframe
-    load + non-collapsed geometry where observable).
-- **Billing/win callbacks fire no earlier than `render_accepted`, and
-  `render_confirmed` is the only state reported as success.** Where APS
-  provides no paint acknowledgement, the design says so plainly: telemetry can
-  distinguish "runner loaded" from "nothing loaded," but **cannot distinguish
-  a painted ad from a blank one** inside the opaque frame — rows terminate at
-  `render_accepted` and are labeled as such, not upgraded.
+**G4b — Acknowledgement path.** Today the renderer document posts ready only
+to its immediate parent (`aps.rs:105`); in the PUC path that parent is the
+nested renderer frame, which resolves a local promise (`render.ts:423`) the
+top-level kernel cannot observe — and callbacks currently fire right after the
+bridge posts its response (`gpt/index.ts:1572`, `:1620`). Contract: the bridge
+response carries a **per-attempt CSPRNG acknowledgement nonce**; the dynamic
+renderer posts versioned `render_accepted` / `render_failed{reason}` messages
+**to the kernel** (top window), carrying the nonce; the kernel validates
+source ownership, nonce, token, `nav_gen`, and `refresh_gen` before any state
+transition or callback. This protocol is pinned by tests for all three flows:
+SSAT, client-Prebid, and nested SafeFrame.
+
+**G4c — Honest observation names.** The browser cannot see inside an opaque
+APS frame, and the iframe's geometry is assigned by our own renderer — it
+proves nothing about content. A nonempty `slotRenderEnded` proves GAM
+delivered a creative container, not that the nested runner painted. The state
+machine therefore records observations under accurate names —
+`gam_nonempty`, `gam_empty`, `renderer_document_loaded`, `runner_loaded`,
+`runner_failed` — and **APS attempts terminate at `render_accepted`**
+(= authenticated `runner_loaded` ack) unless Amazon provides a real completion
+acknowledgement. `render_confirmed` exists only for paths with same-origin
+observable content (inline adm frames TS itself writes); it is never derived
+from geometry or from PUC container delivery. Tests: accepted-but-blank, and
+nonempty-`slotRenderEnded`-before-bridge-claim.
+
+**G4d — `nurl`/`burl` are separate business events.** OpenRTB 2.6
+distinguishes them: `nurl` is the win notice (implies neither delivery nor
+billability); `burl` is the billable-event notice under exchange policy.
+Today both fire together (`gpt/index.ts:459`). Contract — independent,
+idempotent transitions:
+
+1. winner selection → fire `nurl`;
+2. `render_accepted` (authenticated) → fire `burl` — this is the **declared
+   commercial policy** for APS given no paint acknowledgement exists, recorded
+   here explicitly rather than implied;
+3. terminal failure after acceptance → no un-firing; the row is labeled
+   `billed_then_failed` so the policy's cost is measurable.
+
+**G4e — Fallback trigger.** GPT offers no cancellation (section 3.7), so a
+timeout can race a late fill that arrives after a fallback has rendered and
+billed. Contract: the opt-in direct fallback
+(`[auction].client_render_fallback = "renderer"`) renders **only after an
+explicit terminal empty event for the bound cycle** (`gam_empty` from G4a
+attribution). A timeout emits diagnostics (`render_fail{bridge_claim_timeout}`)
+and **never renders**. For publisher-owned (adopted) slots, fallback is
+disabled entirely. TS-owned-slot timeout rendering is admitted only as a
+possible future extension that must first destroy the slot to retire the
+request, and is out of scope here.
 
 ### G5 — Deployment contracts
 
 - **Config rollback:** every new auction/config field is default-valued and
-  **omitted from serialization at its default** (`AuctionConfig` denies
-  unknown fields, `auction_config_types.rs:7`), so blobs written by a new
-  binary remain readable by the previous one unless an operator opts in.
-- **Ingest routing:** the beacon route exists in **all four adapters**
-  (Fastly, Axum, Cloudflare, Spin) as an early, EC-free, filter-free route.
-  Only Fastly has a real telemetry sink today; the no-sink behavior elsewhere
-  is "accept, count, drop" — defined, not accidental.
-- **Storage:** a new dedicated datasource for client events (the existing
-  auction datasource cannot hold the shape without migration); schema,
-  retention, and sampling documented with the datasource definition.
-- **Asset content-addressing is fixed, not assumed.** Script URLs embed a
-  content hash but the handler ignores the query and serves current registry
-  bytes from the path alone (`tsjs.rs:3`, `publisher.rs:294`) — during a
-  rolling deploy an old `?v=A` request can receive bytes `B` and cache them
-  under `A`. The handler must validate the requested hash and serve the
-  matching immutable artifact (or answer with the current hash's redirect);
-  rolling-deploy cache tests pin this.
-- **Phase ordering** follows section 9; every phase ships behind a feature
-  flag with canary thresholds and rollback criteria.
+  omitted from serialization at its default (`auction_config_types.rs:7`
+  denies unknown fields), so blobs written by a new binary remain readable by
+  the previous one unless an operator opts in.
+- **Asset identity is path-based and retained.** A query hash the handler
+  ignores (`tsjs.rs:3`, `publisher.rs:294`) is not content addressing, and
+  redirecting an old hash to current bytes just executes new code under old
+  HTML, bootstrap flags, and ABI expectations. Contract: the content hash
+  moves into the **pathname** (`/static/tsjs/<hash>/<name>.js`); the server
+  serves through a hash→bytes manifest that **retains prior artifacts** beyond
+  the maximum HTML cache lifetime plus the deferred-load window (retention
+  floor: 7 days); `Cache-Control: immutable` only on exact hash matches;
+  unknown hashes answer `410 Gone` with `no-store` — never a redirect to
+  different bytes. Precomputed concatenations are keyed by the **ordered
+  module-ID vector** (order affects side effects), not the set.
+- **Ingest routing:** the beacon route exists in all four adapters (Fastly,
+  Axum, Cloudflare, Spin) as an early, EC-free, filter-free route. Only Fastly
+  has a real sink today; the others accept-count-drop by explicit contract.
+- **Storage:** a new dedicated datasource named `ts_client_events`; retention
+  **30 days**; production sampling default **10%** (operator-tunable);
+  schema versioned with the event enum.
+- **Phase ordering** is section 8's; each phase ships behind a feature flag
+  with the named canary thresholds and rollback criteria in section 8.
 
 ---
 
 ## 5. Workstream 1 — Observability
 
-### 5.1 Client disposition beacon
+### 5.1 Event payload — minimized by design
 
-A kernel module batches disposition events to `POST /_ts/client-events`:
+High-cardinality identifiers stay out of the beacon: no raw `hb_adid`, no raw
+Prebid `adId`, no free-form slot strings.
 
 ```
-{ v: 1, trace: {trace_id, sampled}, events: [
-  { seq, nav_gen, render_gen, t: "bid_received",         slot, bidder, source }
-  { seq, nav_gen, render_gen, t: "targeting_set",        slot, hbAdid }
-  { seq, nav_gen, render_gen, t: "bridge_request",       slot, adId, matched }
-  { seq, nav_gen, render_gen, t: "bridge_response_sent", slot, source }
-  { seq, nav_gen, render_gen, t: "render_attempt",       slot, source }
-  { seq, nav_gen, render_gen, t: "render_accepted",      slot, source }
-  { seq, nav_gen, render_gen, t: "render_confirmed",     slot, source }
-  { seq, nav_gen, render_gen, t: "render_fail",          slot, source, reason }
+{ v: 1, events: [
+  { trace_id, sampled, nav_gen, refresh_gen, seq,
+    t: "bid_received" | "targeting_set" | "bridge_request" |
+       "bridge_response_sent" | "render_attempt" | "render_accepted" |
+       "render_confirmed" | "render_fail",
+    slot,          // configured slot id if in the injected slot set, else "s<ordinal>"
+    id_kind,       // "cache_uuid" | "render_token" | "prebid_adid" | "bid_id" | "none"
+    matched,       // bridge_request only: token/id equality result
+    source,        // "renderer" | "adm" | "pbs-cache" | "gam"
+    reason }       // render_fail only: closed enum below
 ] }
 ```
 
-- **Transport:** `fetch(..., {keepalive: true, credentials: "omit"})` is the
-  primary transport, because `sendBeacon` always sends credentials and its
-  `true` return only means "queued," not "received." `sendBeacon` remains the
-  documented last-resort fallback on `pagehide` where keepalive is
-  unavailable, and the ingest handler ignores credentials in all cases.
-- **Batching:** flush on `visibilitychange`/`pagehide` and every 5 s; each
-  event self-describes its navigation via the envelope, so batches spanning
-  SPA navigations stay attributable.
-- **Reasons are a closed enum**, structurally serialized (never interpolated
-  into log lines): `renderer_no_ready`, `descriptor_invalid`,
-  `bridge_id_mismatch`, `gam_empty`, `gam_filled_other`, `no_render_source`,
-  `slot_unresolved`, `gpt_absent`, `pbjs_absent`, `bundle_partial`,
-  `fallback_cancelled`, `timeout`. `renderer_no_ready` (not
-  `renderer_endpoint_404`) is deliberate: the opaque iframe cannot read an
-  HTTP status, so the observable fact is "no ready message before timeout."
+- Every stored string is either a member of a server-known allowlist (slot ids
+  from the injected config, enum members) or a bounded ordinal — nothing free
+  .form is persisted.
+- Reason enum: `renderer_document_no_load`, `runner_no_load`, `runner_failed`,
+  `descriptor_invalid`, `bridge_id_mismatch`, `cycle_unattributable`,
+  `bridge_claim_timeout`, `gam_empty`, `no_render_source`, `slot_unresolved`,
+  `gpt_absent`, `pbjs_absent`, `bundle_partial`, `fallback_cancelled`,
+  `abi_mismatch`. (`renderer_no_ready` from revision 2 is split by the G4b/6.6
+  protocol into document-load vs runner-load failures.)
 
-### 5.2 Ingest contract
+### 5.2 Transport
 
-- Registered in all four adapters before auth/EC/filters (G5); same-origin
-  enforced via `Origin`/`Sec-Fetch-Site` checks; hard caps on body bytes,
-  event count, and string lengths **enforced before parsing or logging**;
-  malformed rows dropped and counted; per-IP rate limiting; responds
-  `204 Cache-Control: no-store`; touches no KV and mints no identity.
-- Server logs a bounded, structured summary per batch; the Fastly sink writes
-  to the new datasource (G5); other adapters count-and-drop until a sink
-  exists.
+`fetch(..., {keepalive: true, credentials: "omit"})` primary; `sendBeacon` as
+the documented last-resort `pagehide` fallback (credentialed by platform
+design, and its `true` means queued, not received — the handler ignores
+credentials either way). Flush on `visibilitychange`/`pagehide` and every 5 s.
 
-### 5.3 Two modes, honestly separated
+### 5.3 Ingest wire contract (numeric, complete)
 
-A sampled, best-effort beacon **cannot** guarantee a complete diagnosis from
-one page load — so the design stops claiming it:
+- Route: `POST /_ts/client-events`, registered in all four adapters before
+  auth/EC/filters. Content type: `application/json` only (no
+  `Content-Encoding`; compressed bodies rejected). Responds
+  `204 Cache-Control: no-store`.
+- Limits enforced **before parse or log**: body ≤ **16 KiB**; ≤ **64** events
+  per batch; any string field ≤ **64** chars; `trace_id` must match
+  `^[0-9a-f]{32}$`; `nav_gen`/`refresh_gen`/`seq` are integers in
+  `[0, 2³¹)`. Violation → `204` (accepted-and-dropped) + abuse counter; the
+  endpoint never echoes input.
+- Same-origin enforcement: `Sec-Fetch-Site: same-origin` when present;
+  otherwise `Origin` must match the serving host; **absent both → reject**
+  (drop-and-count). All strings are structurally serialized (never
+  interpolated into log lines).
+- Client IP for rate limiting is derived per adapter from its documented
+  trusted source (Fastly: the platform client IP; Axum: configured trusted
+  proxy header; Cloudflare/Spin: platform equivalents). Rate limiting uses the
+  platform limiter where one exists (Fastly); portable adapters ship a
+  best-effort in-memory limiter and the policy is **fail-open with an abuse
+  counter** (dropping telemetry must never block ad delivery).
+- **Diagnostic mode is a server-injected capability, not a query flag.** The
+  tester gate (cookie) is evaluated server-side at HTML render; the page
+  receives a short-lived signed capability token (HMAC over
+  `trace_id + expiry`, ≤ 15 minutes) which the client echoes in the batch.
+  The ingest handler verifies the signature — this works with
+  `credentials: "omit"` because the capability travels in the payload, and a
+  public query flag alone can never switch a session to unsampled.
 
-- **Production telemetry:** sticky-sampled traces, SLO "a delivery failure
-  mode occurring on ≥ N% of impressions is visible in the datasource within
-  one hour."
-- **Diagnostic mode:** explicitly enabled (tester cookie / query flag),
-  unsampled, full event stream plus console mirroring — this is the "one page
-  load tells you which failure fired" tool.
+### 5.4 Two modes, honestly separated
 
-### 5.4 Server-side drop-reason surfacing
+- **Production telemetry:** sticky-sampled (default 10%), SLO: **a delivery
+  failure mode affecting ≥ 1% of impressions is visible in `ts_client_events`
+  within one hour**.
+- **Diagnostic mode:** capability-gated, unsampled, full event stream plus
+  console mirroring — the "one page load names the failing reason" tool.
 
-- Emit a bounded structured summary **whenever any bid is dropped** (not only
-  when zero survive): per-slot reason counts, capped.
-- Add `drop_reasons` to auction telemetry rows.
-- The initial-HTML `ts-debug` comment gains the drop summary; `/_ts/page-bids`
-  returns JSON and **cannot carry an HTML comment**, so it gains a gated
-  structured `debug` field instead, enabled by the same tester gate.
-- Startup validation warnings: APS enabled while `allow_script_creatives =
-false` ("script-type APS demand will be dropped"); any direct provider
-  configured alongside a mediator without the merge strategy of 6.1 ("provider
-  bids cannot win as configured").
+### 5.5 Server-side drop-reason surfacing
+
+- Emit a bounded structured summary **whenever any bid is dropped** (per-slot
+  reason counts, capped), not only when zero survive.
+- Add `drop_reasons` to auction telemetry rows; add the drop summary to the
+  initial-HTML `ts-debug` comment; `/_ts/page-bids` (JSON) gains a gated
+  structured `debug` field under the same tester gate.
+- Startup validation warnings: APS enabled while
+  `allow_script_creatives = false`; any direct provider configured alongside a
+  mediator without the 6.1 merge strategy.
 
 ---
 
@@ -359,124 +396,128 @@ false` ("script-type APS demand will be dropped"); any direct provider
 
 ### 6.1 Mediation: opt-in merge, `mediator_only` stays the default
 
-The configured contract today is explicit — the mediator is the final
-decision-maker (`auction_config_types.rs:48`) — and changing that default
-silently would be an economic breaking change with a rollback hazard. So:
-
 - `[auction].winner_selection = "mediator_only"` (default, today's behavior,
-  now explicit) or `"merge_highest_cpm"` (opt-in). The field is omitted from
-  serialized blobs at its default (G5).
-- `merge_highest_cpm` semantics, defined up front: comparison in the auction's
-  decoded CPM currency; slot floors apply to both populations; a bid present
-  in both (a provider bid the mediator also returned) counts once, by
-  provenance `mediator`; deals outrank open bids regardless of CPM; ties break
-  to the mediator; a mediator timeout degrades to direct-provider selection
-  (today's short-circuit) and is reported as such.
-- **One candidate-selection helper serves both mediation lifecycles** — the
-  ordinary/page-bids path (`orchestrator.rs:412-431`) and the initial-SSAT
-  split dispatch/collect path (`orchestrator.rs:1320`) — with tests for each.
-- A **selection report** (`winner_source`, `mediator_superseded` counts) is
-  emitted separately from the delivery-conversion drop reasons, so "lost the
-  merge" is never conflated with "failed to serialize."
+  now explicit) or `"merge_highest_cpm"` (opt-in); omitted from serialized
+  blobs at the default (G5).
+- `merge_highest_cpm` semantics: comparison in decoded CPM; **currency
+  mismatch is a rejection** (the mismatched bid is dropped with a selection
+  reason; no conversion in v1); slot floors apply to both populations; ties
+  break to the mediator; a mediator timeout degrades to direct-provider
+  selection and is reported.
+- **Deduplication key:** the server constructs the mediator's input, so it
+  records provenance at forwarding time — `(provider_name, upstream_bid_id)`
+  per candidate — and carries a provenance map keyed by the id it sent.
+  A mediator bid whose id maps back to a forwarded candidate counts once, as
+  provenance `mediator`. A mediator bid whose id was **transformed beyond the
+  map** is treated as distinct mediator demand (documented limitation).
+- **Deal priority is out of scope for v1.** The internal `Bid`
+  (`types.rs:231`) carries no deal identity; inventing a priority rule the
+  model cannot express would be fiction. Extending the bid model with
+  `deal_id`/deal type and a deal-first rule is recorded as follow-up work;
+  until then deals compete by CPM like everything else and the limitation is
+  documented in the config reference.
+- One candidate-selection helper serves **both** mediation lifecycles
+  (ordinary/page-bids, `orchestrator.rs:412-431`; initial-SSAT split
+  dispatch/collect, `orchestrator.rs:1320`), with tests for each.
+- A **selection report** (`winner_source`, `mediator_superseded`,
+  `currency_rejected`, dedup hits) is emitted separately from
+  delivery-conversion drop reasons.
 
-### 6.2 Dimensions: exact membership stays; flexibility is operator-declared
+### 6.2 Dimensions: the contract is "request what you accept"
 
-Revision 1's containment rule ("never larger on either axis") would still
-reject its own motivating example (a 300×600 answer on a 300×250/728×90 slot)
-while admitting pathological 1×1 sizes — withdrawn. Instead:
+Revision 2's operator `accept_sizes` allow-list is withdrawn on the review's
+sharper observation: if an alternate size is acceptable, it belongs in the
+slot's **requested formats** — APS should be asked for it. Accepting an
+unrequested response size would conceal an upstream protocol violation.
 
-- Exact size membership (`aps.rs:657-668`) remains the default; it is
-  consistent with discrete GAM slot formats.
-- An operator may declare flexibility per slot:
-  `accept_sizes = [[300, 600], …]` (an explicit allow-list of additional
-  creative sizes, with documentation that GAM line items must accept them) —
-  no inference, no aspect heuristics in v1. Admitted alternate sizes set
-  `hb_size` targeting (set and cleared with the other `hb_*` keys) and the
-  served size is reported in the selection report.
+- Exact size membership (`aps.rs:657-668`) remains the admission rule,
+  unchanged.
+- The fix is configuration plus visibility: the drop summary (5.5) names the
+  rejected size per slot (`invalid_dimensions{300x600}`), so an operator sees
+  exactly which format to add to the slot's `formats` if they want that
+  demand. Documentation gains a "sizing your slots for APS" section.
+- No `hb_size` key, no admission relaxation, no new config.
 
 ### 6.3 Script creatives
 
 Keep the secure default (`allow_script_creatives = false`) but make the
-consequence loud (5.4) and document the enablement path for TAM-heavy
-publishers. The renderer sandbox already isolates script tag types; this is a
-policy toggle, not new machinery.
+consequence loud (5.5) and document the enablement path for TAM-heavy
+publishers.
 
 ### 6.4 Render identity
 
-Implemented exactly as G2: cache UUID untouched, render token only for
-renderer-only bids, one registry, token property tests
-(`^[a-z0-9]{12}$`, CSPRNG, collision retry, TTL, one-time consumption,
-cross-slot/auction uniqueness), and a non-APS cache-path regression test.
+Implemented exactly as G2 (token scope, format, TTL, per-navigation registry
+keying, one-time consumption, cache-path regression tests).
 
 ### 6.5 Fallback rendering
 
-Implemented exactly as G4: opt-in
-(`[auction].client_render_fallback = "renderer"`), driven by the render state
-machine, triggered only by an **empty** GAM render or a bridge-claim timeout
-with no fill evidence, cancelled by any bridge claim or nonempty render,
-invalidated by navigation/refresh/destruction, and reported with the G4 event
-taxonomy. The direct renderer is converted to an awaitable API first; the
-fallback lands only after that conversion.
+Implemented exactly as G4e: renders only on an attributed terminal
+`gam_empty`; timeouts are diagnostics-only; disabled for adopted slots. The
+direct renderer is converted to an awaitable API with cancellation and a
+terminal reason first; the fallback lands only after that conversion.
 
-### 6.6 Renderer endpoint
+### 6.6 Renderer endpoint — unconditional, versioned, observable
 
-- Document the topology: within one deployment the renderer route and the APS
-  provider share the same config gate (`aps.rs:1224`, `:1244`), so "server
-  emits descriptors but lacks the route" is a **cross-deployment or stale-CDN
-  problem**, and a 401 most plausibly comes from broad `[[handlers]]` auth
-  patterns matching `/integrations/*` before route dispatch.
-- Therefore: validate at startup that no configured auth handler pattern
-  covers `/integrations/aps/renderer`; make the static renderer document
-  config-independent **iff** the deployment serves multiple origins from one
-  config (recorded as an open question with the operator); version the
-  renderer document and define its cache headers.
-- The client reports `renderer_no_ready` (5.1) — no status probe is added,
-  because a probe would violate the no-new-critical-path-request budget.
-- CSP audit (C6) unchanged from revision 1: extend `APS_RENDERER_CSP` only
-  with sources observed in real Amazon traffic, each justified in a comment
-  and covered by the browser spec.
+Topology is resolved now rather than left conditional:
+
+- **The static renderer document route registers unconditionally in every
+  adapter.** It contains no configuration, no secrets, and validates its input
+  client-side; serving it cannot leak anything, and conditional registration
+  is exactly what created the silent cross-deployment failure class. (The APS
+  _provider_ stays config-gated; only the static document is unconditional.)
+- The document is **versioned in its path**
+  (`/integrations/aps/renderer/v1`) and served `Cache-Control: no-store`;
+  descriptor compatibility across N/N−1 is guaranteed by the outer-tolerant
+  validation of 6.7. The client pins the version it targets.
+- Startup validation fails loudly if any configured auth handler pattern
+  covers `/integrations/aps/renderer`.
+- **Two-stage acknowledgement (with G4b):** the document first posts an
+  authenticated `document_loaded` (proving route + auth + CSP allowed the
+  document itself), then the separate runner-load result. This splits the old
+  blind timeout into `renderer_document_no_load` (route/auth/stale-CDN/network)
+  vs `runner_no_load` / `runner_failed` (Amazon script or CSP) — distinct
+  signals, as the success criteria require.
+- Server-side: route status/version counters (requests, unknown-version,
+  auth-blocked) join the telemetry rows.
+- **CSP changes ship report-only first** (`Content-Security-Policy-Report-Only`
+  canary with a bounded report endpoint), then enforce; each added source is
+  justified in a comment and covered by the browser spec. Tests cover broad
+  auth patterns, stale versions, and CSP failures on all adapters.
 
 ### 6.7 One descriptor schema — structural generation, semantic validators kept
 
-- The wire truth is the **tagged enum** `BidRenderer` (the `type: "aps"`
-  discriminator lives there, not on `ApsRendererV1` — `types.rs:188-211`), so
-  the generated schema is the full tagged envelope.
-- Generation lives in a **separate wire-schema crate** (or a host-side
-  xtask) — it cannot live in `trusted-server-js`'s build because core already
-  depends on that crate (`Cargo.toml:45`) and the reverse edge would be a
-  cycle. Generated TS artifacts are checked in; CI fails on staleness.
-- Generation covers **structure only** (fields, types, discriminator,
-  version). The semantic security checks stay hand-written on both sides:
-  URL/origin policy, canonical base64, length bounds, the exact one-bid
-  envelope projection, cross-field equality. **Unknown-field tolerance applies
-  only to the outer versioned descriptor; the decoded AAX envelope remains an
-  exact projection** so `adm`, notification URLs, or sibling fields can never
-  slip through unexamined.
-- A shared corpus — positive cases plus an adversarial set (extra fields,
-  wrong versions, oversized payloads, URL smuggling, non-canonical base64) —
-  runs through the Rust validator, the TS validator, and the inline renderer
-  document in CI.
+- The wire truth is the tagged enum `BidRenderer` (discriminator lives there,
+  not on `ApsRendererV1` — `types.rs:188-211`); the generated schema is the
+  full tagged envelope.
+- Generation lives in a **separate wire-schema crate** (or host-side xtask) —
+  core already depends on `trusted-server-js` (`Cargo.toml:45`), so the
+  reverse edge would be a cycle. Generated TS artifacts are checked in; CI
+  fails on staleness.
+- Generation covers structure only; the semantic security checks stay
+  hand-written on both sides (URL/origin policy, canonical base64, length
+  bounds, the exact one-bid envelope projection, cross-field equality).
+  **Unknown-field tolerance applies only to the outer versioned descriptor;
+  the decoded AAX envelope remains an exact projection.**
+- A shared positive + adversarial corpus runs through the Rust validator, the
+  TS validator, and the inline renderer document in CI.
 
 ### 6.8 Bridge hardening
 
-- **Ownership proof stays source-first.** The bridge continues to resolve the
-  message source to a slot and only then compares that slot's expected id
-  (`gpt/index.ts:1599` order) — a MessageChannel port plus a token is not
-  ownership proof, because an inbound port has no pre-established slot
-  identity and the token is visible in `window.tsjs.bids`. For SafeFrame,
-  source resolution is extended to walk nested browsing contexts via
-  `window.frames` containment checks rather than DOM `querySelectorAll` only;
-  where the source is unresolvable the bridge refuses (with
-  `bridge_id_mismatch`) instead of trusting the token.
-- Adversarial tests are part of the contract: wrong-slot tokens, nested
-  foreign frames, replayed and duplicated messages, stolen tokens, and
-  previous-navigation tokens — not only the positive SafeFrame case.
-- Blanket top-of-listener hygiene: parse and ownership-check before any
-  branch logic; new branches inherit protection.
-- Delete the dead duplicate renderer branch (C5); move its dedup and debug log
-  into the live branch.
-- Renderer branches emit the same trace records as the adm and cache branches,
-  under G4's event taxonomy and billing rules (C7).
+- **Ownership proof stays source-first**, and the SafeFrame extension is
+  bounded: the kernel maintains a map of known slot-root `WindowProxy` objects
+  (the iframes GPT created under each slot element); on a message, it walks
+  the **sender's own parent chain** (`event.source.parent`, …) up to depth
+  **5**, looking for a known root — it never enumerates or recursively scans
+  an attacker-controllable frame tree. Unresolvable source → refuse with
+  `bridge_id_mismatch`.
+- Adversarial tests: wrong-slot tokens, nested foreign frames, replayed and
+  duplicated messages, stolen tokens, previous-navigation tokens, plus the
+  positive SafeFrame case.
+- Blanket top-of-listener hygiene: parse and ownership-check before branch
+  logic.
+- Delete the dead duplicate renderer branch (C5); renderer branches emit the
+  same trace records as adm/cache branches under G4's taxonomy and the G4d
+  `nurl`/`burl` split (C7).
 
 ---
 
@@ -485,125 +526,113 @@ fallback lands only after that conversion.
 ### 7.1 Layering
 
 ```
-kernel/          boot, config, command queue, event bus, log, telemetry beacon
+kernel/          boot, config, queue, event bus, log, beacon, sessions
 adapters/        googletag.ts, pbjs.ts, messaging.ts   ← the ONLY window.* access
 services/        slots (registry+handoff), auction client, render engine, consent
 integrations/    gpt, prebid, aps, creative, datadome, …  (plugins over services)
 ```
 
-Rules, enforced by an eslint boundary rule in CI (`import/no-restricted-paths`):
-
-- `kernel` imports nothing above it; `adapters` import kernel only; `services`
-  import kernel + adapters; `integrations` import kernel + services, **never
-  each other**.
-- Stateful services are reached through the G3 registration ABI, never through
-  imported module state; stateless helpers may be imported and inlined.
-- This dissolves today's inversions: `core/auction.ts` and `core/request.ts`
-  importing `integrations/aps/render`, `gpt` and `prebid` importing `aps`, and
-  `prebid` owning the GPT refresh wrapper.
+Boundary lint in CI (`import/no-restricted-paths`): `kernel` imports nothing
+above it; `adapters` import kernel only; `services` import kernel + adapters;
+`integrations` import kernel + services, never each other. Stateful services
+via the G3 ABI only.
 
 ### 7.2 Adapters: explicit absence, without giving up on late loaders
 
-Every external global is wrapped once with a state machine
-`present | pending | timed_out`, a queue for `pending`, and per-operation
-bounds. `timed_out` is **not terminal**: publishers legitimately lazy-load
-GPT, Prebid, and CMPs, so a later arrival transitions the adapter to `present`
-and drains what is still valid; individual queued operations carry their own
-timeouts and expire with a disposition reason rather than the adapter
-permanently disabling itself.
+`present | pending | timed_out` per external global; `timed_out` is
+non-terminal (late GPT/pbjs/CMP arrival transitions to `present` and drains
+what is still valid); individual queued operations carry their own timeouts
+and expire with a disposition reason.
 
 ### 7.3 Slot registry service
 
-One registry owns all slot knowledge: publisher-defined vs TS-defined,
-adoption, handoff claims, responsive element resolution, refresh generation,
-targeting-key history — keyed by `WeakMap<googletag.Slot, SlotRecord>` plus a
-div-id index, owned by the kernel via the G3 ABI. Expando properties on live
-GPT objects are eliminated. The GPT integration feeds events in and executes
-registry decisions; the prebid refresh handler consumes the same registry.
+One registry owns slot knowledge (publisher- vs TS-defined, adoption, handoff
+claims, responsive resolution, pending request cycles per G4a, targeting-key
+history), keyed by `WeakMap<googletag.Slot, SlotRecord>` plus a div-id index,
+kernel-owned via the ABI. Expandos on live GPT objects are eliminated.
 
 ### 7.4 Global namespace policy — with a compatibility window
 
-One owned global, `window.tsjs`, public API versioned, coordination state
-under `tsjs._internal` (G3). But the migration must not break published
-contracts:
-
-- **Inventory first:** every current global is classified public
-  (`globalThis.tscreative`, `tsCreativeConfig` — documented, settable
-  pre-load) or private (`__tsjs_*` flags, expandos, sentinels).
-- **Public globals get a bounded dual-read/write window:** old and new names
-  both work for a stated deprecation period, with pre-init compatibility tests
-  (config set before the bundle loads must keep working); removal is its own
-  later, announced change.
-- Private globals migrate immediately: per-slot expandos
-  (`__tsRenderGeneration`, `__tsRenderBid` — dead writes today, delete now)
-  into `SlotRecord`; function-object sentinels into a kernel-held `WeakSet`;
-  boot flags into the `window.tsjs = window.tsjs || {cmd: []}` pattern.
+- One owned global, `window.tsjs`; public API versioned; coordination state
+  under `tsjs._internal` (G3). **The public queue keeps its existing name:
+  `window.tsjs.que`** (`types.ts:259`, drained at `core/index.ts:25`) —
+  revision 2's `cmd` was an error; renaming a public surface silently would
+  violate this very section.
+- Inventory first: every current global classified public
+  (`globalThis.tscreative`, `tsCreativeConfig`, `tsjs.que`) or private
+  (`__tsjs_*` flags, expandos, sentinels).
+- **Public globals: dual-read/write for a bounded window — two release
+  cycles, minimum 60 days — ending only after an adoption gate: beacon-observed
+  old-name usage below 0.1% of traces for 14 consecutive days.** Pre-init
+  compatibility tests pin that config set before the bundle loads keeps
+  working.
+- Private globals migrate immediately: dead expando writes deleted now; slot
+  state into `SlotRecord`; function sentinels into a kernel `WeakSet`; boot
+  flags into `tsjs` boot fields.
+- `requestAds` keeps its void signature; failure surfacing arrives as a **new
+  versioned async API** (`tsjs.requestAdsAsync(...): Promise<RequestAdsResult>`)
+  rather than changing the existing contract.
 
 ### 7.5 Messaging module
 
-All `postMessage` traffic goes through one module: versioned envelopes, message
-name constants (today `'Prebid Request'` appears as a bare literal at six
-sites, and the APS handshake exists in three hand-synced copies), source
-validation per 6.8, and one audit point.
+All `postMessage` traffic through one module: versioned envelopes, message
+name constants, the G4b acknowledgement nonces, source validation per 6.8, one
+audit point.
 
-### 7.6 Plugin lifecycle
+### 7.6 Plugin lifecycle and session model
 
-`install()` replaces import-time side effects, with the semantics the review
-demanded:
-
-- `tsjs.definePlugin(id, version, install, dispose)` registers; the kernel
-  resolves install requests against registrations, so **a deferred bundle that
-  registers after `tsjs.install([...])` was requested is installed on
-  arrival** (pending-install queue), bounded by a missing-module timeout that
-  emits `bundle_partial`.
+- **Activation:** Rust owns integration selection today and continues to — the
+  server injects a **versioned install manifest** (enabled plugin ids +
+  expected versions, in injection order) into the pre-core `tsjs.que`. The
+  kernel executes the manifest on boot; nobody else calls install in
+  production (the API remains callable for tests).
+- `tsjs.definePlugin(id, version, install, dispose)`: synchronous `install`
+  by default; a plugin may return a promise, but anything `adInit` depends on
+  (gpt, prebid shim registration) must complete synchronously and is listed as
+  such in the manifest. Late registration after the manifest requested the id
+  installs on arrival (pending-install queue) bounded by a missing-module
+  timeout emitting `bundle_partial`. A stale async completion (arriving after
+  its `RuntimeSession` was disposed) is discarded. Duplicate `(id, version)`
+  is a no-op; a different version for a registered id: first-wins + loud
+  telemetry. Disposal runs in reverse install order.
+- **Session model, split as the review required:**
+  - `RuntimeSession` (page lifetime): bridge listener, history hook, pbjs
+    subscriptions, adapters, beacon queue.
+  - `NavigationSession` (per SPA navigation): `trace_id`, render attempts,
+    slot aliases, targeting history, navigation-scoped timers/observers.
+  - `RenderAttempt` (per G4a cycle): state machine instance, ack nonce.
+    Each owns an **enumerable** disposal inventory; navigation disposes
+    `NavigationSession` children only.
 - Per-plugin exception isolation: a plugin that throws during install is
-  quarantined and reported; it cannot halt the bundle (today `didomi` can
-  throw during module evaluation and stop everything after it).
-- Duplicate registration of the same `(id, version)` is a no-op; a different
-  version for a registered id follows a declared policy (first-wins + loud
-  telemetry).
-- A `PageSession` object owns an **enumerable** set of listeners, timers,
-  observers, and slot records — registered at creation, disposed on
-  navigation. A `WeakMap` alone cannot dispose anything; the owned-set is the
-  disposal inventory.
-- Error policy: no empty `catch` — every catch handles, logs with context, or
-  emits a disposition reason. The auction fetch gets a timeout +
-  `AbortController`, and `requestAds` surfaces failure to its caller.
-- **Console logging is retained, not replaced.** The beacon is additive: every
-  issue-surfacing condition keeps (or gains) a `log.warn` debuggable from an
-  open DevTools console. Existing warnings survive verbatim or strengthened;
-  failure paths currently at `debug` (invisible at the default `warn` level —
-  the creative `dynamic_src_guard` and click-guard rejection paths) are
-  promoted to `warn` when they indicate a delivery or security-relevant
-  failure; every `render_fail` / dependency-timeout disposition emits a paired
-  `warn` carrying the same reason code, so console and beacon tell one story.
+  quarantined and reported; it cannot halt the bundle.
+- Error policy: no empty `catch`; every catch handles, logs with context, or
+  emits a disposition reason. The auction fetch gets timeout +
+  `AbortController`.
+- **Console logging is retained, not replaced.** Every issue-surfacing
+  condition keeps (or gains) a `log.warn` debuggable from DevTools; existing
+  warnings survive verbatim or strengthened; `debug`-level failure paths that
+  indicate delivery or security-relevant failures are promoted to `warn`;
+  every `render_fail`/dependency-timeout disposition emits a paired `warn`
+  with the same reason code.
 
 ### 7.7 The bootstrap problem
 
-`gpt_bootstrap.js` duplicates ~400 lines of the hardest logic (handoff,
-initial-load detection, hydration deferral) in hand-written ES5, always wins
-the sentinel race, and has one live divergence (its simpler `adInit` can run
-first and permanently suppress the bundle's `slotRenderEnded` listener).
-
-Target: shrink the inline bootstrap to a queue-and-flags stub (create
-`googletag.cmd` interception points, record early publisher calls, expose the
-enable flag), with the bundle replaying recorded calls on install. This is
-**not a pure move** — replay changes observable ordering — so it ships behind
-its own flag with the browser specs extended to cover replay timing, and the
-no-bundle fallback ("ads still render if the bundle fails," pinned by
-`gpt.rs:1174-1179`) is **generated from the same TypeScript source** at build
-time, never hand-maintained.
+Target: shrink the inline `gpt_bootstrap.js` to a queue-and-flags stub with
+the bundle replaying recorded calls on install. This is **not a pure move** —
+replay changes observable ordering — so it ships behind its own flag with
+browser specs extended to cover replay timing, and the no-bundle fallback
+("ads still render if the bundle fails", pinned by `gpt.rs:1174-1179`) is
+**generated from the same TypeScript source** at build time.
 
 ### 7.8 GPT correctness fixes carried with the restructure
 
 - Restore the #922 orphan-slot recovery and `updateRender` enrichment (verify
   against open PR #997; land whichever is canonical).
-- Pass `changeCorrelator: false` on TS-initiated refreshes; correlator
-  behavior becomes a documented, configurable decision.
-- `enableSingleRequest()` only when GPT services are not already enabled;
-  otherwise adopt the publisher's mode and record it.
-- Ambiguous responsive resolution emits `render_fail{slot_unresolved}` in
-  addition to its console warning.
+- `changeCorrelator: false` on TS-initiated refreshes; correlator behavior
+  becomes a documented, configurable decision.
+- `enableSingleRequest()` only when GPT services are not already enabled.
+- Ambiguous responsive resolution emits `render_fail{slot_unresolved}`
+  alongside its console warning.
 
 ### 7.9 Decomposition targets
 
@@ -611,48 +640,38 @@ time, never hand-maintained.
 | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
 | `gpt/index.ts` (1777 LOC, 20 jobs)   | `slot_resolution`, `handoff`, `initial_load`, `ad_init`, `render_bridge`, `spa_navigation`, `beacons` + thin index |
 | `prebid/index.ts` (1671 LOC)         | adapter, shim, refresh handler (moves onto slot registry), eids, diagnostics                                       |
-| `gpt/script_guard.ts` (634 LOC)      | folded onto the 170-LOC `shared/script_guard.ts` factory the other six integrations already use                    |
+| `gpt/script_guard.ts` (634 LOC)      | folded onto the 170-LOC `shared/script_guard.ts` factory                                                           |
 | `core/trace.ts` (record model + UI)  | `services/trace` (model) + `integrations/trace_overlay` (UI)                                                       |
 | `core/global.d.ts` (`pbjs: TsjsApi`) | real Prebid types; `TsjsApi` split into public API vs internal coordination state                                  |
 
 ### 7.10 Performance
 
-Client-side, the design is a net speedup with enforced budgets:
-
-- **Smaller synchronous bundle:** script-guard consolidation, single APS
-  module (via the ABI), dead-code deletion, trace-overlay extraction.
-- **Fewer repeated DOM walks:** slot resolution once per navigation in the
-  registry.
-- **Bounded waits instead of blind ones:** the 10 s silent renderer timeout
-  and forever-queued GPT cases become short, telemetered timeouts.
-- **Budgets in CI, precisely specified:** per-bundle byte sizes measured raw,
-  gzip, and Brotli for an exact named module set, compared against a
-  checked-in baseline artifact with a stated tolerance; the browser-spec
-  timing assertion (bids-script-to-first-`display()`) runs N times and gates
-  on a percentile, not a single sample.
-
-Server-side (new in this revision): each injected page currently concatenates
-and hashes the full immediate bundle, and the asset request concatenates it
-again (`bundle.rs:51`). Precompute bundle bytes + hash per registry module set
-(they change only at deploy/config time), and benchmark server CPU/heap before
-and after.
+Client-side speedups with enforced budgets: smaller synchronous bundle
+(script-guard consolidation, single APS module via the ABI, dead-code
+deletion, trace-overlay extraction); slot resolution once per navigation;
+bounded telemetered waits. Budgets, concretely: per-bundle raw/gzip/Brotli
+bytes for the exact ordered module vector of the reference config, compared
+to a checked-in baseline with **+5% tolerance**; the
+bids-script-to-first-`display()` browser assertion runs **20 iterations** and
+gates on **p90**. Server-side: precompute bundle bytes + hash per ordered
+module vector (deploy/config-time), benchmark server CPU/heap before/after.
 
 ### 7.11 Toolchain and dependency currency
 
-- **TypeScript to latest stable** (library pins `^5.5.4` while vite 7 /
-  vitest 4 / typescript-eslint 8 are current), adopting
+- **TypeScript:** the manifest floor is `^5.5.4` but the lockfile already
+  resolves **5.9.3** (`package-lock.json`), so the code compiles on 5.9 today.
+  Action: raise the manifest floor to the resolved 5.9 line (making the floor
+  honest), then evaluate the next major as its own gated PR; adopt
   `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`,
-  `verbatimModuleSyntax` — these directly serve killing the `as unknown as`
-  escapes and the wrong `global.d.ts` declaration.
+  `verbatimModuleSyntax`.
 - **Dev toolchain to latest stable** (eslint + plugins, prettier, jsdom,
   `@playwright/test`, `@types/node` aligned to the pinned Node), each bump its
-  own mechanical CI-gated PR with changelog review — this library
-  monkeypatches `fetch`, `sendBeacon`, and DOM prototypes, so jsdom and
-  Playwright behavior changes are real risks.
-- **`prebid.js` is excluded from casual bumps:** the runtime Prebid is the
-  external R2 bundle locked by manifest hash and SRI; upgrading it is its own
-  coordinated deploy. The npm pin and the deployed bundle version stay
-  documented together so tests exercise the version production runs.
+  own mechanical CI-gated PR with changelog review — this library monkeypatches
+  `fetch`, `sendBeacon`, and DOM prototypes, so jsdom/Playwright behavior
+  changes are real risks.
+- **`prebid.js` is excluded from casual bumps** (runtime Prebid is the
+  manifest-locked external R2 bundle); the npm pin and deployed bundle version
+  stay documented together.
 - **Standing policy:** monthly dependency review; no migration phase starts
   more than one minor behind latest stable.
 
@@ -660,33 +679,39 @@ and after.
 
 ## 8. Migration plan
 
-Reordered so every phase's prerequisites precede it; each phase ships behind a
-feature flag with canary thresholds and rollback criteria.
+Ordered so every phase's prerequisites precede it (the review's required
+order). Every phase ships behind a feature flag; shared canary criteria: no
+increase in `render_fail` rate beyond **+0.5% absolute** on canary traffic
+over 24 h, no new console errors in the browser-spec run, rollback = flag off
+(phases 0–2 are additive; later phases keep dual paths until their gate).
 
-- **Phase 0 — Contracts and toolchain.** Settle G1–G5 in code-adjacent docs;
-  toolchain upgrades (7.11); the trace envelope + beacon + four-adapter ingest
-  (accept-count-drop outside Fastly) behind a flag; server drop-reason
-  surfacing (5.4); reason codes on today's silent returns; delete the dead
-  expando writes. No runtime behavior change for pages with the flag off.
-- **Phase 1 — Runtime ABI + APS admission/identity.** G3 kernel registry in
-  `tsjs-core` (context-provider fix is the proof); wire-schema crate + shared
-  corpus (6.7); mediation selection helper + opt-in merge (6.1); render token
-  for renderer-only bids (6.4); renderer-endpoint startup validation (6.6);
-  bridge hardening minus fallback (6.8). APS renders after this phase wherever
-  GAM line items and configuration permit — the no-GAM fallback is explicitly
-  Phase 2.
-- **Phase 2 — Render state machine + GPT correctness.** Minimal `SlotRecord`
-  core (just enough for the state machine keys; full registry lands in
-  Phase 3); awaitable renderer conversion; the exactly-once fallback (6.5,
-  G4); restore #922/#997 attribution and orphan recovery; correlator and SRA
-  fixes (7.8).
-- **Phase 3 — Structure.** Full layering + boundary lint, plugin lifecycle +
-  `PageSession` (7.6), adapters (7.2), full slot registry (7.3), messaging
-  module (7.5), namespace migration with its compatibility window (7.4),
-  asset content-addressing fix + server bundle precompute (G5, 7.10).
-- **Phase 4 — Decomposition.** File splits (7.9), script-guard consolidation,
-  bootstrap shrink behind its own flag with replay-timing specs (7.7), and
-  the end of the public-global compatibility window.
+- **Phase 0 — Asset identity, contracts, toolchain.** Path-based immutable
+  asset identity + manifest retention + rolling-deploy tests (G5) — this lands
+  **before** anything makes ABI compatibility load-bearing. Toolchain floors
+  (7.11). Contracts G1–G5 recorded as code-adjacent docs. Delete the dead
+  expando writes. Server drop-reason surfacing (5.5) — server-only, no client
+  dependency.
+- **Phase 1 — Kernel ABI and sessions.** Minimal kernel in `tsjs-core`
+  publishing the versioned registry (G3); `RuntimeSession` /
+  `NavigationSession` scopes (7.6); context-provider fix as the ABI proof;
+  install manifest injection.
+- **Phase 2 — Trace and beacon.** Server correlation nonce for `nav_gen 0` +
+  page-bids trace echo (G1); beacon service on the Phase-1 kernel; ingest
+  route in all four adapters (5.3); diagnostic capability; `ts_client_events`
+  datasource.
+- **Phase 3 — APS delivery.** Wire-schema crate + corpus (6.7); mediation
+  helper + opt-in merge (6.1); render token (6.4); unconditional versioned
+  renderer route + two-stage ack (6.6, G4b); bridge hardening (6.8); GPT
+  request-cycle protocol + render state machine + awaitable renderer +
+  `nurl`/`burl` split (G4a–G4d); the opt-in fallback (G4e); restore #922/#997
+  attribution; correlator and SRA fixes (7.8). APS renders after this phase
+  wherever GAM line items and configuration permit.
+- **Phase 4 — Structure.** Full layering + boundary lint, plugin lifecycle
+  completion, adapters, full slot registry, messaging module, namespace
+  migration window (7.4), server bundle precompute (7.10).
+- **Phase 5 — Decomposition.** File splits (7.9), script-guard consolidation,
+  bootstrap shrink behind its own flag with replay-timing specs (7.7), end of
+  the public-global compatibility window (gated per 7.4).
 
 ---
 
@@ -696,92 +721,98 @@ Blocking CI is hermetic (the deterministic PUC/message harness); a separate
 staged smoke suite covers real GAM line items and is release-gating, not
 PR-gating.
 
-| Area             | Must cover                                                                                                                                                                      |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Mediation        | both lifecycles (ordinary + SSAT split dispatch/collect); ties, floors, deals, duplicate demand; `mediator_only` default preserved; rollback blob round-trip (omitted defaults) |
-| Cache identity   | non-APS cache-backed bids: byte-identical `hb_adid` + cache coordinates (regression); PUC `?uuid=` fetch path                                                                   |
-| Render token     | `^[a-z0-9]{12}$`; CSPRNG source; collision retry; TTL; one-time consumption; cross-slot/auction uniqueness                                                                      |
-| Fallback         | races vs bridge claim; nonempty-GAM protection; repeated refresh; SPA navigation cancellation; slot destruction; exactly-once terminal transition                               |
-| Render semantics | no billing after runner-load failure; `render_accepted` vs `render_confirmed` labeling; opaque-frame honesty (no painted/blank claim)                                           |
-| Bridge security  | wrong-slot tokens; nested foreign frames; replayed + duplicate messages; stolen tokens; previous-navigation tokens; SafeFrame positive case                                     |
-| Beacon           | trace joins; ordering/dedup via `(trace_id, nav_gen, seq)`; batching across navigations; loss tolerance; ingest abuse (oversize, malformed, cross-origin); all-adapter routing  |
-| Schema           | generated-artifact staleness; adversarial corpus through Rust + TS + inline validator; outer-tolerance vs exact AAX projection                                                  |
-| Runtime ABI      | one kernel instance under concatenation; deferred registration after install request; per-plugin failure isolation; abi-version mismatch refusal                                |
-| Lifecycle        | late-loaded GPT/pbjs (`timed_out → present`); `PageSession` disposal inventory; pre-init `tsCreativeConfig` compatibility; dual-name global window                              |
-| Delivery         | immutable-cache behavior across a simulated rolling deploy; deterministic raw/gzip/Brotli bundle budgets vs baseline artifact                                                   |
-| Observability    | drop-reason summary on any partial drop; page-bids structured `debug` field gating; diagnostic mode unsampled completeness                                                      |
+| Area              | Must cover                                                                                                                                                                                                                    |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Mediation         | both lifecycles; ties, floors, currency rejection; duplicate demand via provenance map; transformed mediator ids; `mediator_only` default preserved; rollback blob round-trip (omitted defaults)                              |
+| Cache identity    | non-APS cache-backed bids byte-identical (`hb_adid` + coordinates); PUC `?uuid=` fetch path                                                                                                                                   |
+| Render token      | `^[a-z0-9]{12}$`; CSPRNG source; in-auction collision retry; 15-min TTL; one-time consumption; per-`(trace, nav_gen)` registry scoping                                                                                        |
+| Request cycles    | pending-cycle attribution; overlapping refreshes; late `slotRenderEnded`; nonempty-before-bridge-claim; `cycle_unattributable` fail-closed                                                                                    |
+| Ack protocol      | nonce validation (source, token, nav_gen, refresh_gen); SSAT + client-Prebid + nested SafeFrame flows; stale/replayed acks                                                                                                    |
+| Render semantics  | no `burl` before authenticated `render_accepted`; `nurl` at selection independent of delivery; `billed_then_failed` labeling; accepted-but-blank; no `render_confirmed` from geometry or PUC container                        |
+| Fallback          | renders only on attributed `gam_empty`; timeout is diagnostics-only; adopted-slot fallback disabled; SPA cancellation; slot destruction; exactly-once terminal transition                                                     |
+| Bridge security   | wrong-slot tokens; nested foreign frames; replay + duplicates; stolen tokens; previous-navigation tokens; bounded parent-chain walk (depth 5); SafeFrame positive case                                                        |
+| Beacon            | initial-nav server nonce join; page-bids trace echo; per-event envelope across navigation-spanning batches; `(trace_id, nav_gen, seq)` dedup; ingest abuse (oversize, malformed, cross-origin, absent Origin); capability sig |
+| Schema            | generated-artifact staleness; adversarial corpus through Rust + TS + inline validator; outer-tolerance vs exact AAX projection                                                                                                |
+| Runtime ABI       | one kernel under concatenation; deferred registration after manifest request; per-plugin failure isolation; **mixed-version delivery (old deferred bundle + new core)**; abi-mismatch refusal                                 |
+| Lifecycle         | late-loaded GPT/pbjs (`timed_out → present`); RuntimeSession vs NavigationSession disposal inventories; stale async install completion; pre-init `tsCreativeConfig` and `tsjs.que` compatibility; dual-name global window     |
+| Delivery          | rolling-deploy simulation (old HTML + retained old assets); unknown hash → 410 `no-store`; immutable only on exact match; ordered-module-vector keying; deterministic raw/gzip/Brotli budgets vs baseline                     |
+| Renderer endpoint | route present in all four adapters; auth-pattern startup failure; stale version behavior; CSP report-only canary; `document_loaded` vs runner-result split                                                                    |
+| Adapter parity    | ingest + renderer routes + drop-reason surfacing behave equivalently on Fastly/Viceroy vs Axum vs Cloudflare vs Spin                                                                                                          |
+| Policy            | script-creative startup warning; `invalid_dimensions{WxH}` drop naming; page-bids `debug` field gating; diagnostic-mode unsampled completeness                                                                                |
 
 ---
 
 ## 10. Alternatives considered
 
 1. **Keep patching APS point-failures without telemetry.** Rejected: three
-   consecutive correct fixes have not produced ads; without disposition data
-   the next fix is another guess.
-2. **Direct-render APS always (skip GAM/PUC).** Simplest render path, but
-   changes GAM reporting/pacing semantics unilaterally; kept as the opt-in,
-   state-machine-guarded fallback instead.
+   consecutive correct fixes have not produced ads.
+2. **Direct-render APS always (skip GAM/PUC).** Changes GAM reporting/pacing
+   semantics unilaterally; kept as the opt-in, `gam_empty`-gated fallback.
 3. **Single module graph / shared chunks instead of the registration ABI.**
-   Cleaner long-term, but changes the delivery pipeline (chunk loading) now;
-   recorded as the successor option behind the same ABI surface.
-4. **Full library rewrite in one branch.** Rejected: the browser-spec safety
-   net is thin in exactly the areas being changed.
+   Cleaner long-term; changes the delivery pipeline now; successor option
+   behind the same ABI surface.
+4. **Full library rewrite in one branch.** Rejected: thin browser-spec safety
+   net in exactly the changing areas.
 5. **Drop the ES5 bootstrap entirely.** Loses the pinned "ads render if the
-   bundle fails" guarantee; the generated-fallback approach keeps it without
-   dual maintenance.
+   bundle fails" guarantee; generated fallback keeps it.
+6. **Timeout-triggered fallback rendering.** Rejected (G4e): GPT requests
+   cannot be cancelled, so timeout rendering races late fills; only an
+   attributed terminal empty event may trigger rendering.
 
 ## 11. Risks
 
-- **Merge strategy misconfiguration** changes auction economics; mitigated by
-  keeping `mediator_only` the default, the selection report, and omitted
-  serialization at defaults.
-- **Beacon abuse/volume:** bounded by pre-parse caps, origin checks, rate
-  limits, sticky sampling, and closed enums.
-- **ABI freeze risk:** `tsjs._internal.registry` becomes load-bearing;
-  versioned from day one, majors checked at lookup.
-- **Bootstrap replay** changes observable ordering; own flag, replay-timing
-  specs, staged rollout.
-- **Schema generation** adds a build step; checked-in artifacts + staleness CI.
+- **Merge strategy misconfiguration:** mitigated by `mediator_only` default,
+  the selection report, omitted-default serialization.
+- **Beacon abuse/volume:** pre-parse caps, origin checks, per-adapter rate
+  limiting, sticky sampling, closed enums, capability-gated diagnostics.
+- **ABI freeze risk:** versioned from day one; mixed-version delivery tested.
+- **Ack protocol adds a message round-trip before `burl`:** bounded by the
+  existing renderer timeout; the `billed_then_failed` label measures the
+  policy.
+- **Bootstrap replay:** own flag, replay-timing specs, staged rollout.
+- **Schema generation:** checked-in artifacts + staleness CI.
 
 ## 12. Success criteria
 
 1. APS creatives render on a reference page in each configured flow (SSAT,
-   Prebid adapter, page-bids), proven hermetically in CI and by the staged
-   smoke suite against real GAM line items.
-2. Every failure point in section 2 maps to a distinct observable signal, and
-   **diagnostic mode** yields the failing reason from one page load; production
-   telemetry meets the stated SLO (5.3).
-3. `eslint` boundary rules pass with zero exceptions; no integration imports
-   another integration; stateful sharing goes through the versioned ABI.
+   Prebid adapter, page-bids), hermetically in CI and via the staged smoke
+   suite.
+2. Every failure point in section 2 maps to a distinct observable signal;
+   diagnostic mode names the failing reason from one page load; production
+   telemetry meets the 5.4 SLO (≥ 1% failure modes visible within one hour).
+3. Boundary lint passes with zero exceptions; stateful sharing only via the
+   versioned ABI; mixed-version delivery behaves as specified.
 4. No file in `src/` exceeds ~500 lines; `gpt_bootstrap.js` is a stub or
    generated.
-5. Trace counts are per-impression (no double counting), and orphaned-slot
-   recovery is covered by a non-vacuous test.
+5. Trace counts are per-impression; orphaned-slot recovery has a non-vacuous
+   test; `refresh_gen` attribution follows the G4a cycle protocol.
 6. The only TSJS-owned global is `window.tsjs` (public globals only inside
-   their announced compatibility window); no expandos on GPT slots, GPT
-   functions, or `pbjs`.
-7. Per-bundle raw/gzip/Brotli sizes are at or below the checked-in baseline
-   within stated tolerance, and the percentile-based
-   bids-script-to-first-`display()` assertion does not regress; server-side
-   per-request bundle concatenation/hashing is precomputed.
-8. No existing warning is lost: every issue-surfacing condition logs at `warn`
-   or above with the same reason code the beacon carries.
-9. TypeScript and the dev toolchain are on latest stable with the new
-   strictness flags; `prebid.js`'s npm pin matches the documented deployed
-   bundle version; the monthly review policy is in CI docs.
-10. Rolling-deploy cache tests pass: a `?v=A` request never caches bytes other
-    than `A`.
+   their announced window, which closes per the 7.4 adoption gate); no
+   expandos on GPT slots, GPT functions, or `pbjs`.
+7. Bundle budgets (raw/gzip/Brotli, +5% tolerance vs baseline) and the p90
+   20-run timing assertion hold; server-side per-request concatenation is
+   precomputed.
+8. No existing warning is lost; every issue-surfacing condition logs at `warn`
+   or above with the beacon's reason code.
+9. TypeScript floor matches the resolved 5.9 line with the strictness flags
+   on; `prebid.js` npm pin matches the documented deployed bundle; monthly
+   review policy in CI docs.
+10. Rolling-deploy tests: old HTML always receives its exact old assets during
+    the retention window; unknown hashes 410 with `no-store`; immutable
+    caching only on exact matches.
+11. `nurl` and `burl` fire on their distinct G4d transitions, idempotently,
+    and never before their triggering state.
 
 ## 13. Open questions
 
-1. Is a mediator configured in the affected production deployment? (Decides
-   whether A1 is the primary cause or a latent one.)
+1. Is a mediator configured in the affected production deployment?
 2. What share of live APS demand is `tagtype: "script"`?
 3. Should `client_render_fallback` ever become default-on for publishers
    without GAM line items for `hb_bidder=aps`?
 4. Is PR #997 the intended restoration of the lost #922 attribution core, or
    should the original be re-merged?
-5. Does any deployment serve descriptors for an origin whose config disables
-   APS (decides whether the renderer route becomes config-independent, 6.6)?
-6. Datasource naming/retention for client events, and whether Axum/Cloudflare/
-   Spin get real sinks or keep accept-count-drop.
+5. Do Axum/Cloudflare/Spin get real client-event sinks, or keep
+   accept-count-drop? (Datasource `ts_client_events`, 30-day retention, and
+   10% default sampling are proposed values pending operator sign-off.)
+6. Does Amazon expose any creative-completion acknowledgement we could adopt
+   to move APS beyond `render_accepted` (G4c)?
