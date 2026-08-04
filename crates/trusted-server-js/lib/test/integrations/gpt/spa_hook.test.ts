@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import type { TsjsApi } from '../../../src/core/types';
@@ -82,6 +85,98 @@ describe('installSpaAuctionHook', () => {
     expect(ts.navGeneration).toBe(1);
     await flushAsync();
   });
+
+  it.each(['bootstrap', 'bundle'] as const)(
+    'invalidates unclaimed GPT handoffs before an SPA fetch (%s)',
+    async (implementation) => {
+      let resolveFetch: ((response: unknown) => void) | undefined;
+      fetchStub.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveFetch = resolve;
+          })
+      );
+
+      const routeADiv = document.createElement('div');
+      routeADiv.id = 'div-atf-sidebar';
+      document.body.appendChild(routeADiv);
+      const routeASlot = {
+        getSlotElementId: vi.fn().mockReturnValue(routeADiv.id),
+      };
+      const routeBSlot = {
+        getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar-2'),
+      };
+      const nativeDefineSlot = vi.fn().mockReturnValue(routeBSlot);
+      const nativeDisplay = vi.fn();
+      const pubads = {
+        getSlots: vi.fn().mockReturnValue([routeASlot]),
+        refresh: vi.fn(),
+      };
+      const googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot: nativeDefineSlot,
+        display: nativeDisplay,
+        pubads: vi.fn().mockReturnValue(pubads),
+      };
+      const staleHandoff = {
+        gamUnitPath: '/123/atf',
+        formats: [[300, 250]],
+        divIdPrefix: 'div-atf-sidebar',
+        slotElementId: routeADiv.id,
+        publisherClaimed: false,
+        suppressPublisherDisplay: false,
+        suppressPublisherRefresh: false,
+      };
+      const claimedHandoff = {
+        ...staleHandoff,
+        slotElementId: 'div-claimed',
+        publisherClaimed: true,
+      };
+      (window as TestWindow).googletag = googletag;
+      (window as TestWindow).tsjs = {
+        gptSlotHandoffs: {
+          [staleHandoff.slotElementId]: staleHandoff,
+          'div-atf-sidebar-hydrated': staleHandoff,
+          [claimedHandoff.slotElementId]: claimedHandoff,
+        },
+      };
+
+      if (implementation === 'bootstrap') {
+        const bootstrap = readFileSync(
+          resolve(process.cwd(), '../../trusted-server-core/src/integrations/gpt_bootstrap.js'),
+          'utf8'
+        );
+        window.eval(bootstrap);
+      }
+      await importGptModule();
+
+      routeADiv.remove();
+      const routeBDiv = document.createElement('div');
+      routeBDiv.id = 'div-atf-sidebar-2';
+      document.body.appendChild(routeBDiv);
+      history.pushState({}, '', '/route-b');
+
+      const publisherSlot = (
+        googletag.defineSlot as unknown as (
+          adUnitPath: string,
+          formats: number[][],
+          elementId: string
+        ) => typeof routeBSlot
+      )('/123/atf', [[300, 250]], routeBDiv.id);
+      googletag.display(routeBDiv.id);
+
+      expect(publisherSlot).toBe(routeBSlot);
+      expect(nativeDefineSlot).toHaveBeenCalledWith('/123/atf', [[300, 250]], routeBDiv.id);
+      expect(nativeDisplay).toHaveBeenCalledWith(routeBDiv.id);
+      expect((window as TestWindow).tsjs!.gptSlotHandoffs).toEqual({
+        [claimedHandoff.slotElementId]: claimedHandoff,
+      });
+      expect(resolveFetch).toBeDefined();
+
+      resolveFetch!({ ok: true, json: async () => ({ slots: [], bids: {} }) });
+      await flushAsync();
+    }
+  );
 
   it('fetches page-bids on pushState and applies slots/bids via adInit', async () => {
     // The route's ad container already exists, so bids apply immediately.
