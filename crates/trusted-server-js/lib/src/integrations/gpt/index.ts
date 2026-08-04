@@ -574,11 +574,9 @@ function installScheduleInitialAdInit(ts: TsjsApi): void {
     // The double requestAnimationFrame after the trigger still lands the call
     // after React commits, and runUnlessNavigated still honors navGeneration.
     let fired = false;
-    let poll: ReturnType<typeof setInterval> | undefined;
     const fire = (): void => {
       if (fired) return;
       fired = true;
-      if (poll !== undefined) clearInterval(poll);
       afterHydrationFrames();
     };
     window.addEventListener('load', fire, { once: true });
@@ -595,8 +593,12 @@ function installScheduleInitialAdInit(ts: TsjsApi): void {
       fire();
       return;
     }
-    poll = setInterval(() => {
-      if (nextRuntimeReady()) fire();
+    // The poll stops itself on the first tick after either signal wins, so a
+    // late `__next_f` patch cannot re-run adInit (the `fired` guard also holds).
+    const poll: ReturnType<typeof setInterval> = setInterval(() => {
+      if (!fired && !nextRuntimeReady()) return;
+      clearInterval(poll);
+      fire();
     }, 50);
   };
 }
