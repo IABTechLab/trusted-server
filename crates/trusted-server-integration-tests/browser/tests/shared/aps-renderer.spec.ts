@@ -324,6 +324,25 @@ window.ucTag.renderAd(document, { adId: ${JSON.stringify(apsRenderer.bidId)}, pu
                 ),
             )
             .toBe(true);
+        const outerPucFrame = page
+            .frames()
+            .find((frame) => frame.url() === outerCreativeUrl);
+        expect(outerPucFrame).toBeDefined();
+        await expect
+            .poll(() =>
+                outerPucFrame!.evaluate(() => ({
+                    clientWidth: document.documentElement.clientWidth,
+                    clientHeight: document.documentElement.clientHeight,
+                    scrollWidth: document.documentElement.scrollWidth,
+                    scrollHeight: document.documentElement.scrollHeight,
+                })),
+            )
+            .toEqual({
+                clientWidth: 300,
+                clientHeight: 250,
+                scrollWidth: 300,
+                scrollHeight: 250,
+            });
         await expect(page.locator("#google_ads_iframe_fictional_0")).toHaveCSS(
             "width",
             "300px",
