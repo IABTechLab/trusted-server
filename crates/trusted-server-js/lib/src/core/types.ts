@@ -347,16 +347,19 @@ export interface TsjsApi {
    */
   navGeneration?: number;
   /**
-   * Defers the initial `adInit()` until after React hydration: window `load`,
-   * then a double `requestAnimationFrame`. Called by the server-injected
-   * `</body>` bids script with the SSR bids payload. The whole initial pass
-   * is pinned to navigation generation 0 (the SSR document): if an SPA
-   * navigation has already committed — or commits while the deferred callback
-   * is pending — the payload is dropped and `adInit()` is not run, so a stale
-   * SSR bootstrap can neither clobber the live route's bids nor re-run it.
+   * Defers the initial `adInit()` until after React hydration: the first
+   * hydration signal to arrive — the Next.js App Router runtime patching
+   * `window.__next_f`, or window `load` as the fallback and the only signal on
+   * non-Next publishers — then a double `requestAnimationFrame`. Called by the
+   * server-injected `</body>` bids script with the SSR bids payload. The whole
+   * initial pass is pinned to navigation generation 0 (the SSR document): if an
+   * SPA navigation has already committed — or commits while the deferred
+   * callback is pending — the payload is dropped and `adInit()` is not run, so a
+   * stale SSR bootstrap can neither clobber the live route's bids nor re-run it.
    * Lives in the bundle so the lifecycle is executable under test and shares
    * [`navGeneration`] with the SPA auction hook; `gpt_bootstrap.js` installs
-   * a minimal fallback for pages where the bundle fails to load.
+   * a minimal fallback for pages where the bundle fails to load (that fallback
+   * gates on `load` only — the runtime signal is a bundle-side optimization).
    */
   scheduleInitialAdInit?: (initialBids?: Record<string, AuctionBidData>) => void;
   /** Read-only GPT lifecycle diagnostics API, present only in an activated tab. */

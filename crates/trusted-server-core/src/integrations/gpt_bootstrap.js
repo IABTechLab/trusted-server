@@ -342,6 +342,11 @@
   // and deliberately identical to the bundle scheduler — the impression is
   // spent on a viewed tab, and the post-hydration guarantee holds whenever
   // the request is actually issued.
+  //
+  // This fallback stays on `load` only — it does not poll for the Next.js
+  // runtime signal the bundle scheduler uses. It exists for the
+  // bundle-failed-to-load path, where staying small matters more than being
+  // early.
   ts.scheduleInitialAdInit = function (initialBids) {
     if ((ts.navGeneration || 0) !== 0) return;
     if (initialBids) ts.bids = initialBids;

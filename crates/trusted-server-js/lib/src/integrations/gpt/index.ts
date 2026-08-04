@@ -793,10 +793,11 @@ function installLatePublisherSlotHandoff(ts: TsjsApi): void {
  * time. `adInit()` defines GPT slots on the publisher's `-container`
  * wrappers, mutating those ad-slot subtrees; on a Next.js App Router page a
  * synchronous call lands that mutation inside React's hydration window and
- * trips a #418 hydration mismatch. Deferral: gate on window `load` (the
- * client bundles that hydrate the tree have executed by then), then a double
- * `requestAnimationFrame` so the call runs after React has committed. A
- * single deferred call — no retry timer.
+ * trips a #418 hydration mismatch. Deferral: gate on the first hydration
+ * signal to arrive — the Next.js App Router runtime patching `window.__next_f`
+ * (~9s on heavy publishers) or window `load` (fallback, and the only signal on
+ * non-Next publishers) — then a double `requestAnimationFrame` so the call runs
+ * after React has committed. A single deferred call — no retry timer.
  *
  * The SSR document is navigation generation 0 by definition, so the scheduler
  * pins the whole initial pass to generation 0 rather than capturing whatever
@@ -816,6 +817,18 @@ function installLatePublisherSlotHandoff(ts: TsjsApi): void {
  * fresh page bids, while an `/a → /b → /a` round trip remains
  * distinguishable even though the final URL equals the original.
  *
+ * `window.__next_f` is a Next.js **internal**: the App Router RSC flight-data
+ * global, present only on App Router pages (Next 13+) and observed on the
+ * App Router publisher this gate was measured against. Pages Router
+ * publishers never define it, and a future Next release that renames it would
+ * stop patching the name we poll — in both cases the poll simply never fires
+ * and the publisher takes the `load` path, so the failure mode is slow, not
+ * broken. Worth re-checking this signal on a gated publisher's major Next
+ * upgrade, since nothing else would surface the regression. The head
+ * bootstrap's fallback scheduler in `gpt_bootstrap.js` deliberately stays on
+ * `load` only — it exists for the bundle-failed-to-load path, where being
+ * early matters less than being small.
+ *
  * Hidden documents: browsers do not service `requestAnimationFrame` while a
  * document is hidden, so a background-tab load (Cmd+click, open-in-new-tab)
  * holds the initial `adInit()` until the tab is first viewed. This is
@@ -823,7 +836,9 @@ function installLatePublisherSlotHandoff(ts: TsjsApi): void {
  * impression on a tab someone is actually looking at instead of firing —
  * unviewable — at parse time in a tab that may never be foregrounded, and
  * riding rAF keeps a single code path whose post-hydration-commit guarantee
- * holds whenever the request is actually issued.
+ * holds whenever the request is actually issued. The `__next_f` poll fires
+ * independently of rAF, but `afterHydrationFrames` still gates the call, so
+ * the hidden-tab behavior is unchanged by the runtime signal.
  */
 function installScheduleInitialAdInit(ts: TsjsApi): void {
   ts.scheduleInitialAdInit = function (initialBids?: Record<string, AuctionBidData>) {
@@ -840,9 +855,43 @@ function installScheduleInitialAdInit(ts: TsjsApi): void {
     };
     if (document.readyState === 'complete') {
       afterHydrationFrames();
-    } else {
-      window.addEventListener('load', afterHydrationFrames, { once: true });
+      return;
     }
+    // Fire on whichever hydration signal arrives first, exactly once:
+    //  - Next.js App Router runtime: window.__next_f.push is replaced by the RSC
+    //    runtime once it starts hydrating the streamed tree (~9s on heavy
+    //    publishers, vs ~40s for window.load). Poll for it.
+    //  - window.load: unconditional fallback, and the only signal on non-Next
+    //    publishers (__next_f is never patched there, so the poll never fires).
+    // The double requestAnimationFrame after the trigger still lands the call
+    // after React commits, and runUnlessNavigated still honors navGeneration.
+    let fired = false;
+    const fire = (): void => {
+      if (fired) return;
+      fired = true;
+      afterHydrationFrames();
+    };
+    window.addEventListener('load', fire, { once: true });
+    const nextRuntimeReady = (): boolean => {
+      const flight = (window as unknown as { __next_f?: { push?: unknown } }).__next_f;
+      return !!flight && flight.push !== Array.prototype.push;
+    };
+    // This script runs at `</body>`, and on a streamed App Router page the async
+    // chunks can already have executed by then — so check once synchronously
+    // before installing the interval, rather than idling up to a poll period.
+    // The `load` listener above stays registered; `once: true` plus the `fired`
+    // guard make it inert.
+    if (nextRuntimeReady()) {
+      fire();
+      return;
+    }
+    // The poll stops itself on the first tick after either signal wins, so a
+    // late `__next_f` patch cannot re-run adInit (the `fired` guard also holds).
+    const poll: ReturnType<typeof setInterval> = setInterval(() => {
+      if (!fired && !nextRuntimeReady()) return;
+      clearInterval(poll);
+      fire();
+    }, 50);
   };
 }
 

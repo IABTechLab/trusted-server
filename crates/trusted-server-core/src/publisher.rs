@@ -3534,26 +3534,24 @@ pub(crate) fn build_bids_script(bid_map: &serde_json::Map<String, serde_json::Va
     // adInit() defines GPT slots on the publisher's `-container` wrappers, which
     // mutates those ad-slot subtrees. Calling it synchronously here (this script
     // runs at body-parse time) lands those mutations inside React's hydration
-    // window and trips a #418 hydration mismatch. The deferral — gate on window
-    // `load`, then a double `requestAnimationFrame`, pinned to navigation
-    // generation 0 so a faster SPA navigation cancels it — lives in the GPT
-    // bundle module as `tsjs.scheduleInitialAdInit`
+    // window and trips a #418 hydration mismatch. The deferral — gate on the
+    // first hydration signal to arrive (the Next.js App Router runtime patching
+    // `window.__next_f`, or window `load` as the fallback and the only signal on
+    // non-Next publishers), then a double `requestAnimationFrame`, pinned to
+    // navigation generation 0 so a faster SPA navigation cancels it — lives in
+    // the GPT bundle module as `tsjs.scheduleInitialAdInit`
     // (crates/trusted-server-js/lib/src/integrations/gpt/index.ts), where the
     // lifecycle is executable under Vitest (schedule_initial_ad_init.test.ts)
     // and the navigation-generation guard is shared with the SPA auction hook;
-    // gpt_bootstrap.js installs a minimal head-injected fallback so a failed
-    // bundle load still initializes initial ads.
+    // gpt_bootstrap.js installs a minimal head-injected fallback (gated on
+    // `load` only) so a failed bundle load still initializes initial ads.
     //
     // The deferral is deliberately unconditional — every publisher, every
     // page — even though only hydrating React publishers exhibit the #418
     // failure. Uniform behavior keeps one code path to reason about and
     // avoids a framework-detection or config surface that must be kept
-    // truthful per publisher; the cost is that non-React pages also move the
-    // initial request from parse time to window load. The agreed follow-up
-    // (branch 958-adinit-hydration-chunk-gate, spec in docs/superpowers/
-    // specs/2026-07-24-adinit-hydration-gate-design.md) narrows the gate to
-    // the Next.js hydration chunks with `load` as the can't-hang fallback,
-    // which recovers most of that latency without a new config surface.
+    // truthful per publisher. Non-Next publishers still wait for `load`:
+    // `__next_f` is never patched there, so the poll simply never fires.
     //
     // The bids payload is handed to the scheduler instead of being assigned
     // here: an SPA navigation that committed while this document was still
