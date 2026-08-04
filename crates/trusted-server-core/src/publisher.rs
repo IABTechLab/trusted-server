@@ -3354,12 +3354,22 @@ fn build_bid_map_with_auction_id(
                 }
                 // PBS Cache remains highest priority. Typed renderer bids use
                 // their selected upstream bid ID as the Universal Creative key.
+                //
+                // `bid.bid_id` (the OpenRTB bid's own `id`) is the last resort: it is
+                // always present per spec but only unique per bid instance, not a
+                // creative identifier. It still satisfies what hb_adid needs here —
+                // a stable value GAM's Universal Creative echoes back verbatim so
+                // the render bridge can find this exact winning bid — for bidders
+                // that return neither a cache UUID nor `adid`. Without it those
+                // bids carry no hb_adid at all, so no targeting key reaches GAM and
+                // the render handshake can never start.
                 let renderer_bid_id = bid.renderer.as_ref().and(bid.bid_id.as_deref());
                 let hb_adid = bid
                     .cache_id
                     .as_deref()
                     .or(renderer_bid_id)
-                    .or(bid.ad_id.as_deref());
+                    .or(bid.ad_id.as_deref())
+                    .or(bid.bid_id.as_deref());
                 if let Some(auction_id) = auction_id.filter(|id| !id.is_empty()) {
                     obj.insert(
                         "hb_auction_id".to_string(),
@@ -9349,7 +9359,9 @@ mod tests {
                     height: 250,
                     nurl: None,
                     burl: None,
-                    bid_id: None,
+                    // Present alongside cache_id/ad_id to prove cache_id still wins
+                    // — bid_id is the last resort, not a co-equal fallback.
+                    bid_id: Some("should-be-ignored-bid-id".to_string()),
                     ad_id: Some("bid-impression-id".to_string()),
                     creative_id: None,
                     renderer: None,
@@ -9374,7 +9386,7 @@ mod tests {
             assert_eq!(
                 obj.get("hb_adid").and_then(|v| v.as_str()),
                 Some("f47447a0-b759-4f2f-9887-af458b79b570"),
-                "should use cache_id for hb_adid, not ad_id"
+                "should use cache_id for hb_adid, not ad_id or bid_id"
             );
             assert_eq!(
                 obj.get("hb_cache_host").and_then(|v| v.as_str()),
@@ -9404,7 +9416,9 @@ mod tests {
                     height: 250,
                     nurl: None,
                     burl: None,
-                    bid_id: None,
+                    // Present alongside ad_id to prove ad_id still wins — bid_id
+                    // is the last resort, not a co-equal fallback.
+                    bid_id: Some("should-be-ignored-bid-id".to_string()),
                     ad_id: Some("ordinary-ad-id".to_string()),
                     creative_id: None,
                     renderer: None,
@@ -9429,7 +9443,7 @@ mod tests {
             assert_eq!(
                 obj.get("hb_adid").and_then(|v| v.as_str()),
                 Some("ordinary-ad-id"),
-                "should fall back to ad_id when cache_id absent"
+                "should fall back to ad_id when cache_id absent, ignoring bid_id"
             );
             assert!(
                 obj.get("hb_cache_host").is_none(),
@@ -9483,7 +9497,57 @@ mod tests {
         }
 
         #[test]
-        fn bid_map_omits_hb_adid_when_both_cache_id_and_ad_id_absent() {
+        fn bid_map_falls_back_to_bid_id_when_cache_id_and_ad_id_absent() {
+            // Real shape for bidders that return neither a Prebid Cache UUID nor
+            // `adid` in the OpenRTB response, but always carry `id` (the bid's own
+            // identifier) per spec. Without this fallback the bid reaches the page
+            // with no hb_adid, so no targeting key is set and the render bridge
+            // never receives a matching `Prebid Request`.
+            let mut winning_bids = HashMap::new();
+            winning_bids.insert(
+                "atf_sidebar_ad".to_string(),
+                Bid {
+                    slot_id: "atf_sidebar_ad".to_string(),
+                    price: Some(1.00),
+                    currency: "USD".to_string(),
+                    creative: None,
+                    adomain: None,
+                    bidder: "example-bidder".to_string(),
+                    width: 300,
+                    height: 250,
+                    nurl: None,
+                    burl: None,
+                    bid_id: Some("019f7e2a-b45b-70b0-a2d1-b651c430700b".to_string()),
+                    ad_id: None,
+                    creative_id: None,
+                    renderer: None,
+                    cache_id: None,
+                    cache_host: None,
+                    cache_path: None,
+                    metadata: Default::default(),
+                },
+            );
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                "",
+                false,
+            );
+            let obj = map
+                .get("atf_sidebar_ad")
+                .expect("should have bid entry")
+                .as_object()
+                .expect("should be object");
+            assert_eq!(
+                obj.get("hb_adid").and_then(|v| v.as_str()),
+                Some("019f7e2a-b45b-70b0-a2d1-b651c430700b"),
+                "should fall back to bid_id when cache_id and ad_id are both absent"
+            );
+        }
+
+        #[test]
+        fn bid_map_omits_hb_adid_when_cache_id_ad_id_and_bid_id_all_absent() {
             let mut winning_bids = HashMap::new();
             winning_bids.insert(
                 "atf_sidebar_ad".to_string(),
@@ -9522,7 +9586,7 @@ mod tests {
                 .expect("should be object");
             assert!(
                 obj.get("hb_adid").is_none(),
-                "should omit hb_adid when no cache_id and no ad_id"
+                "should omit hb_adid when no cache_id, ad_id, or bid_id"
             );
         }
 
