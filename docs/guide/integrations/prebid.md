@@ -102,6 +102,17 @@ the generated manifest. Upload the generated JavaScript file manually, set
 any redirect targets) in `proxy.allowed_domains` before running
 `ts config validate` or `ts config push`.
 
+The generated bundle is pure Prebid.js — core, consent modules, User ID
+modules, and the selected bid adapters. The Trusted Server shim
+(`tsjs-prebid`) is served separately by the server as a deferred script and
+installs itself onto the `window.pbjs` global the bundle populates. The two
+artifacts ship in lockstep: a bundle generated before the shim was split out
+still carries a baked-in copy of the shim, so upgrading the server requires
+regenerating and re-uploading the bundle (and pushing the updated
+`external_bundle_sha256`/`external_bundle_sri` config) as part of the same
+rollout. The shim refuses to install twice on one page via the
+`window.__tsjsPrebidShimInstalled` sentinel.
+
 ## Debug Mode
 
 When `debug = true`, the Prebid integration enables additional diagnostics on both the outgoing OpenRTB request and the incoming response.
@@ -374,11 +385,13 @@ available modules and default preset are checked in at
 `--user-id-modules` to `build-prebid-external.mjs` when a publisher needs a
 specific subset; omit it to use the default preset.
 
-This is deliberate: Trusted Server injects a generated Prebid.js bundle so we
-can install the `trustedServer` adapter and route auctions through `/auction`,
-but publishers often need different User ID submodules. Moving that selection to
-the external bundle keeps publisher-specific Prebid choices out of the Trusted
-Server WASM artifact while preserving a manifest and bundle hash for auditing.
+This is deliberate: the external bundle is pure Prebid.js (core, consent and
+User ID modules, and client-side bid adapters) while the server-served TSJS
+prebid shim installs the `trustedServer` adapter onto `window.pbjs` and routes
+auctions through `/auction` — but publishers often need different User ID
+submodules. Moving that selection to the external bundle keeps
+publisher-specific Prebid choices out of the Trusted Server WASM artifact while
+preserving a manifest and bundle hash for auditing.
 
 The current preset includes common ID modules such as Yahoo ConnectID, Criteo,
 LiveIntent, SharedID, UID2, ID5, LiveRamp IdentityLink, PubProvidedID, and
