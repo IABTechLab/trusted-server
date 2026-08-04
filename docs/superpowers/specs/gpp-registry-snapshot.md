@@ -60,5 +60,5 @@ a revision; the commit hash is the reproducible authority.
 **Status: placeholder until ratification.** Neither the immutable
 registry commit nor the conformance vectors are recorded yet; like the
 PSL snapshot, filling them is a pre-ratification prerequisite
-(migration spec §7) — the §4.5 field mappings cannot be reproduced
+(migration spec §4) — the §4.5 field mappings cannot be reproduced
 against a pinned registry until they land.

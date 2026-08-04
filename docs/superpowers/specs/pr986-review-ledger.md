@@ -382,6 +382,11 @@ state_key `tsstk1|tcf|p1=grant,p4=refuse` →
   serialized in the metadata schema; clock-skew and suspender-restart
   tests named.
 - The strong summary is the **sole S2S decision source** — the §7
+  _(correction, R20: text-added, not verified-closed — a
+  provider-switching paragraph still said S2S "recomputes from" row
+  provenance, and the permission-side enumeration omitted
+  `jurisdiction_observed_at`; both fixed in R20 with the providers §6.3
+  record named as the one normative schema)_ —
   authority paragraph and the row-schema provenance row (now "audit
   mirror only") no longer describe a second source.
 - The saturation restrictive marker pins to the **first restrictive
@@ -508,14 +513,21 @@ entirely with an embedded vector (`tsevd1|gpp|p1=grant,p4=refuse` →
 `89b08580…`), and slots gain a per-permission `observed_at` map
 refreshed only for changed tokens; saturation epoch expiry is a
 complete transition (lazy GC, re-saturation opens a new epoch pinned to
-its own first overflow, no cross-epoch inheritance); `w` capability
+its own first overflow) — _correction, R20: R19's "no cross-epoch
+inheritance" contradicted the marker's own full TTL when the first
+overflow arrived late; the marker is now marker-scoped in lifetime,
+outliving its epoch, one live marker per source_; `w` capability
 retention corrected to the per-entry max(cookie, row, S2S) horizon with
 a permanent strong-read obligation for HMAC row discovery (and the §6.2
 "migration-window" label fixed); HEAD updates compare against
 origin-side metadata only and never touch processed-side headers; the
-Vary digest is a full contract (HMAC-SHA-256, `tsvry1|` grammar, comma
-join, secret-store key with versioned id, all values digested, zero-key
-vector `60fdeb3a…`); the adapter ceiling matrix now exists (Axum fixed
+Vary digest was called a full contract (HMAC-SHA-256, `tsvry1|`
+grammar, comma join, secret-store key with versioned id, all values
+digested) — _correction, R20: the R19 grammar had deterministic
+collisions (absent = present-empty; comma-join member ambiguity) and no
+key deployment contract; rebuilt in R20 with presence/count/
+length-prefix encoding, new vectors, and the named setting/startup
+gate_; the adapter ceiling matrix now exists (Axum fixed
 ≥ budget; Fastly/Cloudflare/Spin qualification-pending with fail-closed
 startup) with the exact counted-bytes formula and over-budget-snapshot
 behavior; the cookie parser defines the "; " join, duplicate-datadome
@@ -548,3 +560,74 @@ inline supersession note in place, not only the banner.
 Ratification state is unchanged and user-side: all 32 decision rows
 open, `decisions/` empty beyond the README, no adapter qualified, and
 the PSL and GPP snapshots are placeholders — all named gates.
+
+## Round 20 (at fe4d7bd34)
+
+6 P1, 7 P2, 4 P3, plus declared ratification blockers (unchanged,
+user-side). All addressed. Three prior ledger claims were corrected
+above as text-added-not-verified (R18 S2S sole-source; R19 Vary
+contract; R19 no-cross-epoch-inheritance).
+
+P1: the classification contract is now an **ordered first-match-wins
+procedure** replacing the five-column table that was neither total nor
+disjoint — negative gates run first (w → revocation → suppression, with
+the w/revocation overlap resolved by idempotent promotion), the
+rowless step keys on the strong-class read's authoritative absence
+(the "authoritative not-found" eventual read is called out as a state
+the store cannot produce), and the missing states (absent authority
+record → AuthorityRefresh backfill; nonmatching revisions → fence
+fails, summary-only, refresh realigns) have steps. The
+policy-activation register holds a bounded 16-entry history: exact
+pairs adopt their historical ordinal (the interleaved-eviction
+double-ordinal scenario is closed), same source_version with a
+different digest fails closed as mixed-binary parse divergence, stale
+or window-expired versions are rejected, the digest-only fallback is
+deleted (source_version must be assigned exactly once upstream — push
+version or the ts-config-push envelope sequence), and the register is
+a named capability in both provider matrices. The last row-provenance
+S2S claim is deleted (provider-switching section now says
+audit-mirrored, summary-only) and the permission §7 enumeration
+declares itself a reference to the one normative schema, with
+jurisdiction_observed_at included. The restrictive marker is
+marker-scoped in lifetime — it outlives its epoch (a late first
+overflow keeps its full TTL), one live marker per source, later
+overflows inherit it across epoch boundaries, fresh markers pin only
+after expiry, and the epoch-scoped rule is narrowed to grant-blocking.
+The Vary digest grammar encodes presence, instance count, and
+length-prefixed member octets (absent ≠ present-empty per RFC 9111
+§4.1; list members cannot collide with embedded commas), with new
+zero-key vectors (`c880c5e8…` present, `a2ae26cf…` absent). Origin-304
+re-derivation is defined: replay the persisted mutation IR (accepted
+operation batches — deterministic core-defined semantics) over the
+updated base plus the invariant pass, never re-running mutators;
+IR-less entries force refetch; publication is one atomic entry commit
+with insert-then-index Vary rekeying, both adapter capability cells.
+
+P2: the per-source slot algorithm gains a current_state_key pointer
+with copy-forward from the current slot and full-map replacement on
+A→B→A (named vectors); malformed/absence suppressions gain a scoped
+recovery-observation clearing rule (valid grant presented after the
+suppression clears it without refreshing the grant's age; opt-out
+stickiness untouched); the suspension named test now states the
+branch-appropriate comparison (store_now, or now − S_fleet) and the
+store-clock/S_fleet branches are capability cells; the DataDome matrix
+cells are all terminal (non-3xx Respond Location invalidates; Continue
+Location/Content-Type/Cache-Control invalidate with effects dropped);
+Respond-on-HEAD omits Content-Length (RFC 9110 §9.3.2 — HEAD bytes
+cannot establish the GET length without a vendor equivalence
+guarantee); the Vary HMAC key is a deployable contract
+([cache] vary_digest_key_secret_name, ≥ 32 CSPRNG bytes, key-id
+grammar, fail-closed startup, overlap rotation, capability + gate);
+the 304 row counts four revisions, evaluates the complete RFC 9110
+§13 precondition set (412 included) after recovery, and states the
+safe-update set once as the "cache-relevant fields" definition.
+
+P3: the eligibility table is structurally valid again (the unescaped
+`tscfg1|` pipe had split the 304 row; the row is rebuilt with zero
+content pipes); the GPP snapshot cites migration §4; the ledger
+corrections above; the broken `\_classification*` emphasis is fixed
+and the cookie citations updated to RFC 10025 (obsoleting RFC 6265).
+
+Ratification state: unchanged — 32 open rows, decisions/ empty beyond
+the README, no adapter qualified for the identity protocol or the
+header ceilings, GPP/PSL snapshots placeholders. All user-side gates.

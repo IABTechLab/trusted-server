@@ -24,17 +24,17 @@ column is added by the sign-off-23 opt-in, never implicitly). No
 wildcard rows exist — every accepted name is enumerated, and **every
 cell terminates in exactly one outcome**.
 
-| Pointer             | Respond (cookie mode)                                                                                                                                  | Continue (cookie mode)                     |
-| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------ |
-| `Set-Cookie`        | typed `datadome` cookie operation (hook spec §4a parser; exactly one `datadome` field)                                                                 | typed `datadome` cookie operation          |
-| `X-Set-Cookie`      | **invalidate the batch → Continue** (mode mismatch: TS never requests header sessions in v1; a vendor response asserting one must not half-apply)      | **invalidate the batch** → effects dropped |
-| `Location`          | forward (3xx only), replace                                                                                                                            | rejected                                   |
-| `Content-Type`      | forward (owns its body), replace                                                                                                                       | rejected                                   |
-| `Cache-Control`     | restricted merge; invariant pass last                                                                                                                  | rejected                                   |
-| `Pragma`            | drop-individually, logged (response `Pragma` has no standardized meaning, RFC 9111 §5.4)                                                               | drop-individually, logged                  |
-| `X-DataDome`        | forward, owner-scoped typed telemetry                                                                                                                  | forward, owner-scoped typed telemetry      |
-| `X-DD-B`            | drop-individually, logged (header-session artifact; the vendor's cookie-mode allow example emits it — the drop is the named divergence in sign-off 28) | drop-individually, logged                  |
-| anything not listed | invalidate the batch → Continue                                                                                                                        | invalidate → effects dropped               |
+| Pointer             | Respond (cookie mode)                                                                                                                                              | Continue (cookie mode)                     |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------ |
+| `Set-Cookie`        | typed `datadome` cookie operation (hook spec §4a parser; exactly one `datadome` field)                                                                             | typed `datadome` cookie operation          |
+| `X-Set-Cookie`      | **invalidate the batch → Continue** (mode mismatch: TS never requests header sessions in v1; a vendor response asserting one must not half-apply)                  | **invalidate the batch** → effects dropped |
+| `Location`          | forward on a 3xx Respond, replace; **on a non-3xx Respond → invalidate the batch → Continue** (a redirect field without a redirect status is a malformed decision) | **invalidate the batch** (effects dropped) |
+| `Content-Type`      | forward (owns its body), replace                                                                                                                                   | **invalidate the batch** (effects dropped) |
+| `Cache-Control`     | restricted merge; invariant pass last                                                                                                                              | **invalidate the batch** (effects dropped) |
+| `Pragma`            | drop-individually, logged (response `Pragma` has no standardized meaning, RFC 9111 §5.4)                                                                           | drop-individually, logged                  |
+| `X-DataDome`        | forward, owner-scoped typed telemetry                                                                                                                              | forward, owner-scoped typed telemetry      |
+| `X-DD-B`            | drop-individually, logged (header-session artifact; the vendor's cookie-mode allow example emits it — the drop is the named divergence in sign-off 28)             | drop-individually, logged                  |
+| anything not listed | invalidate the batch → Continue                                                                                                                                    | invalidate → effects dropped               |
 
 Singleton-field multiplicity (`Location`, `Content-Type`, `X-DataDome`,
 `X-DD-B`, `X-Set-Cookie` appearing more than once) invalidates the

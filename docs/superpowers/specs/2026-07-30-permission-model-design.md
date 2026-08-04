@@ -487,17 +487,30 @@ and the fail-closed marker:
   is superseded; administrative clear remains an optional early exit —
   sign-off 16 — **with one declared exception**: an opt-out arriving as
   a restrictive _overflow_ while its source's replay history is
-  saturated inherits the saturation epoch's first-overflow marker and
-  may receive less than a full lifetime, down to nearly zero late in
-  the epoch (providers spec wire schema; the exception is carried by
+  saturated inherits the live restrictive marker (first-overflow-pinned;
+  it outlives its epoch and can span epoch boundaries, providers spec
+  wire schema) and may receive less than a full lifetime, down to
+  nearly zero near the marker's expiry (the exception is carried by
   sign-offs 16 and 31, and the alternatives — per-overflow state,
   marker refresh — were rejected for unbounded storage and
   replay-extension respectively); **TCF refusal** — cleared by any regime-accepted grant with newer
   authoritative evidence; **malformed-present / absence** — cleared by
   any regime-accepted valid grant with newer evidence, including a
-  timestamp-less grant whose first-seen is newer (these causes are not
-  user opt-outs, so stickiness does not apply — without this rule, one
-  truncated request would permanently deny a GPP-only user). Policy
+  timestamp-less grant whose first-seen is newer, **and — recovery
+  observation, scoped to these two causes only — by a regime-accepted
+  valid grant whose _presentation_ is observed after the suppression's
+  observation timestamp, even when its pinned first-seen is older**:
+  the common recovery is the unchanged grant re-presented after one
+  truncated request, whose first-seen predates the malformed event by
+  construction — first-seen comparison alone would deny until the
+  suppression's TTL. The scope is what keeps replay harmless: clearing
+  a malformed/absence suppression asserts only "the CMP currently
+  emits valid state", which any valid presentation proves; the grant's
+  own pinned first-seen and expiry are untouched (no age refresh), and
+  opt-out causes still clear only on strictly newer authoritative
+  evidence (these causes are not user opt-outs, so stickiness does not
+  apply — without recovery, one truncated request would deny a
+  GPP-only user for the suppression's full TTL). Policy
   changes never clear user-signal suppressions.
 
   **Anti-replay for timestamps.** A future-dated record is rejected as
@@ -850,24 +863,42 @@ round-trip, defaults materialized, no insignificant whitespace;
 cross-language vectors required) — identity, so an A→B→A rollback
 yields A's digest again. The ordinal comes from the **policy-activation register** —
 deployment-metadata name `02` (providers spec §6.3), a linearizable
-`{source_version, policy_digest, ordinal}` value with three transition
-rules that make it idempotent and single-source, not merely a counter:
-an activation presenting the register's stored
-`(source_version, policy_digest)` pair **adopts the stored ordinal
-without incrementing** (every instance activating the same push
-converges on one ordinal — the CAS winner assigns, everyone else
-reuses, so assignment is effectively single-actor); a novel pair
-CAS-increments; and an activation whose `source_version` is **older**
-than the stored one is rejected as stale (an instance restarting on old
-config can neither mint a new ordinal nor regress the register).
-`source_version` is the config store's push version where the backend
-assigns an ordered one; a backend without one uses the `tscfg1|`
-config-revision digest as `source_version`, which cannot detect
-staleness — there, a laggard re-activating an older digest mints a new
-ordinal, which is **safe** (revision identity is the pair; fleet order
-stays correct) but visible in the activation-ordinal metric. Order is
-adapter-independent either way (per-instance counters ordered nothing
-across a fleet). Authority wire records, the S2S recompute, and the hook cache
+register holding the current `{source_version, policy_digest, ordinal}`
+**plus a bounded history of the last 16 activations**. Current-value-only
+was shown to break activation identity: an interleaved registration
+evicted the pair, and a same-push latecomer then minted a second
+ordinal for one activation — two `(digest, ordinal)` identities for one
+push. Transition rules, evaluated on a strong read + CAS:
+
+- `(source_version, policy_digest)` **found in the history** → adopt
+  that entry's ordinal, no increment — idempotent for every instance
+  of the same activation however late it arrives within the window, so
+  one activation has exactly one `(digest, ordinal)` fleet-wide.
+- `source_version` found in the history with a **different digest** →
+  **fail closed at startup**: one pushed configuration parsing to two
+  canonical-policy digests is mixed-binary parse divergence — a hard
+  incompatibility, never a novel pair, never a new ordinal.
+- `source_version` **newer** than every history entry → a new
+  activation: CAS-append `(source_version, digest, max_ordinal + 1)`,
+  evicting the oldest history entry.
+- `source_version` older than the newest and absent from the history →
+  **stale, rejected** (an instance restarting on old config can
+  neither mint an ordinal nor regress the register; a laggard older
+  than the 16-entry window is also rejected — it must fetch current
+  config, not activate).
+
+`source_version` must be an **ordered identifier assigned exactly once
+upstream**: the config store's push version where the backend has one,
+else the **monotonic push sequence the `ts config push` envelope stamps
+into the blob**. The earlier digest-only fallback is **deleted** — a
+digest cannot distinguish a deliberate rollback from a stale-instance
+restart, and it re-minted ordinals for a single activation. A
+deployment with neither ordered identifier is not eligible for
+multi-instance policy activation (an adapter capability cell, providers
+spec §7). A→B→A remains a **third activation** — new `source_version`,
+A's digest, a new ordinal — digest for identity, ordinal for order,
+exactly as revision identity requires. Order is adapter-independent
+(per-instance counters ordered nothing across a fleet). Authority wire records, the S2S recompute, and the hook cache
 tuple all use this same pair; the hook's earlier "config-store push
 version" and any digest-only usage are superseded. The other cache-tuple
 inputs are likewise domain-separated hashes of effective configuration:
@@ -976,7 +1007,10 @@ Consumers of the resolved set in this epic:
    requests — grant basis
    (which signal class granted, per permission), the evidence's
    **authoritative timestamp and `valid_until`** (per evidence class),
-   resolved jurisdiction, and policy revision — **not** provider/version,
+   resolved jurisdiction **with `jurisdiction_observed_at`**, and policy
+   revision (the §5.5 pair) — **this list references the one normative
+   summary schema, the providers spec §6.3 authority-state wire record;
+   it is not a second schema** — and **not** provider/version,
    which lives only in the immutable mint tag, or a post-rotation visit
    would restamp a v1 identity as v2 (providers
    spec §6.1). Freshness is a **per-evidence-class contract**, because not
