@@ -14,6 +14,9 @@ use crate::auction::types::{AdFormat, AdSlot, MediaType};
 use crate::price_bucket::PriceGranularity;
 use crate::settings::vec_from_seq_or_map;
 
+const MAX_DYNAMIC_GAM_UNIT_PATH_BYTES: usize = 100;
+const MAX_SECTION_BYTES: usize = 100;
+
 /// A single parsed segment of a [`gam_unit_path`](CreativeOpportunitySlot::gam_unit_path) template.
 #[derive(Debug, Clone)]
 pub(crate) enum UnitTemplatePart {
@@ -25,6 +28,12 @@ pub(crate) enum UnitTemplatePart {
     Section,
     /// `{slot_id}` — replaced with the slot id.
     SlotId,
+}
+
+impl UnitTemplatePart {
+    fn is_placeholder(&self) -> bool {
+        !matches!(self, Self::Literal(_))
+    }
 }
 
 /// Parses a `gam_unit_path` template into an ordered list of parts.
@@ -80,14 +89,63 @@ fn parse_unit_template(raw: &str) -> Result<Vec<UnitTemplatePart>, String> {
     Ok(parts)
 }
 
+fn resolved_unit_template_part<'a>(
+    part: &'a UnitTemplatePart,
+    gam_network_id: &'a str,
+    section: &'a str,
+    slot_id: &'a str,
+) -> &'a str {
+    match part {
+        UnitTemplatePart::Literal(value) => value,
+        UnitTemplatePart::NetworkId => gam_network_id,
+        UnitTemplatePart::Section => section,
+        UnitTemplatePart::SlotId => slot_id,
+    }
+}
+
+fn render_dynamic_unit_path(
+    parts: &[UnitTemplatePart],
+    gam_network_id: &str,
+    section: &str,
+    slot_id: &str,
+) -> Option<String> {
+    let rendered_len = parts.iter().try_fold(0usize, |len, part| {
+        let value = resolved_unit_template_part(part, gam_network_id, section, slot_id);
+        len.checked_add(value.len())
+    })?;
+    if rendered_len > MAX_DYNAMIC_GAM_UNIT_PATH_BYTES {
+        return None;
+    }
+
+    let mut rendered = String::with_capacity(rendered_len);
+    for part in parts {
+        rendered.push_str(resolved_unit_template_part(
+            part,
+            gam_network_id,
+            section,
+            slot_id,
+        ));
+    }
+    Some(rendered)
+}
+
+fn is_section_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'
+}
+
 /// Collapses each run of characters outside `[A-Za-z0-9_-]` to a single `_`.
 ///
-/// Returns a non-empty string for any non-empty input.
+/// Returns a non-empty, request-derived ASCII string for any non-empty input,
+/// capped at 100 ASCII (and therefore UTF-8) bytes.
 fn sanitize_section(segment: &str) -> String {
-    let mut out = String::with_capacity(segment.len());
+    let mut out = String::with_capacity(segment.len().min(MAX_SECTION_BYTES));
     let mut in_bad_run = false;
-    for ch in segment.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+    let mut chars = segment.chars();
+    while out.len() < MAX_SECTION_BYTES {
+        let Some(ch) = chars.next() else {
+            break;
+        };
+        if is_section_char(ch) {
             out.push(ch);
             in_bad_run = false;
         } else if !in_bad_run {
@@ -101,9 +159,10 @@ fn sanitize_section(segment: &str) -> String {
 /// Derives the `{section}` value from a request path.
 ///
 /// Takes the non-empty path segment at `section_segment` (0-based, counting
-/// only non-empty segments), sanitized to `[A-Za-z0-9_-]`. Falls back to
-/// `section_root` when the path has no such segment — the site root (`/`,
-/// repeated slashes), or a path shorter than the configured index.
+/// only non-empty segments), sanitizes it to `[A-Za-z0-9_-]`, and caps the
+/// request-derived result at 100 ASCII/UTF-8 bytes. Falls back to `section_root`
+/// when the path has no such segment — the site root (`/`), repeated slashes,
+/// or a path shorter than the configured index.
 ///
 /// `section_segment` exists because the URL→section convention is
 /// publisher-specific: a site that prefixes a locale (`/en/news/article`) sets
@@ -113,7 +172,7 @@ fn sanitize_section(segment: &str) -> String {
 /// how [`page_patterns`](CreativeOpportunitySlot::page_patterns) glob-match the
 /// same path — e.g. `/new%20s` yields `new_20s`, never the decoded `new_s`.
 #[must_use]
-pub fn derive_section(path: &str, section_root: &str, section_segment: usize) -> String {
+fn derive_section(path: &str, section_root: &str, section_segment: usize) -> String {
     match path
         .split('/')
         .filter(|segment| !segment.is_empty())
@@ -150,16 +209,19 @@ pub struct CreativeOpportunitiesConfig {
     /// Price granularity for header-bidding price bucketing. Defaults to `Dense`.
     #[serde(default)]
     pub price_granularity: PriceGranularity,
-    /// Value substituted for `{section}` when the request path has no first
-    /// segment (e.g. `/`).
+    /// Value substituted for `{section}` when the request path has no segment
+    /// at [`section_segment`](Self::section_segment), such as `/` or a path
+    /// shorter than that configured index.
     ///
     /// Required when any slot's [`gam_unit_path`](CreativeOpportunitySlot::gam_unit_path)
     /// template contains `{section}`. No default — a home-section name is
     /// publisher-specific, so it stays in config, not core.
     ///
-    /// Skipped when absent so a config blob pushed by a newer binary stays
-    /// readable by an older one: these structs use `deny_unknown_fields`, so
-    /// emitting `"section_root": null` would make a rollback fail at startup.
+    /// Static and absent [`gam_unit_path`](CreativeOpportunitySlot::gam_unit_path)
+    /// configurations remain compatible with the legacy schema only when both
+    /// this key and [`section_segment`](Self::section_segment) are omitted.
+    /// These structs use `deny_unknown_fields`, so any pushed new key makes an
+    /// older binary fail configuration load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub section_root: Option<String>,
     /// Index of the path segment `{section}` is taken from, 0-based over
@@ -171,9 +233,15 @@ pub struct CreativeOpportunitiesConfig {
     /// [`section_root`](Self::section_root), so on `/en` a config with
     /// `section_segment = 1` renders the root section.
     ///
-    /// `Option` rather than a plain `usize` with a serde default for the same
-    /// rollback reason as [`section_root`](Self::section_root): an unset key
-    /// must not appear in the serialized config blob.
+    /// During typed/startup finalization, after successfully parsing any
+    /// placeholder-bearing template,
+    /// [`compile_unit_templates`](Self::compile_unit_templates) materializes
+    /// `Some(0)` when this is unset as an automatic compatibility marker: an
+    /// older `deny_unknown_fields` binary then fails loudly rather than silently
+    /// accepting a dynamic configuration it does not understand. Static and
+    /// absent [`gam_unit_path`](CreativeOpportunitySlot::gam_unit_path)
+    /// configurations remain legacy-compatible only when both this key and
+    /// [`section_root`](Self::section_root) are omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub section_segment: Option<usize>,
     /// Slot templates. Empty vec = feature disabled (no auction fired, no globals injected).
@@ -186,9 +254,8 @@ impl CreativeOpportunitiesConfig {
     /// policy ([`section_root`](Self::section_root) and
     /// [`section_segment`](Self::section_segment)).
     ///
-    /// Prefer this over calling [`derive_section`] directly: it keeps both
-    /// policy knobs together so a call site cannot apply one and forget the
-    /// other.
+    /// This keeps both policy knobs together so callers consistently apply the
+    /// configured section-selection and fallback rules.
     ///
     /// An unset [`section_root`](Self::section_root) yields an empty section for
     /// a path with no matching segment. [`validate_runtime`](Self::validate_runtime)
@@ -215,39 +282,52 @@ impl CreativeOpportunitiesConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error string when any slot's template is malformed.
+    /// Returns an error string when any slot's template is malformed. During
+    /// typed/startup finalization, after all templates parse successfully,
+    /// materializes `section_segment = Some(0)` for a placeholder-bearing
+    /// template that omitted it, so rollback to an older `deny_unknown_fields`
+    /// binary fails loudly.
     pub fn compile_unit_templates(&mut self) -> Result<(), String> {
         for slot in &mut self.slot {
             slot.compile_unit_template()?;
+        }
+        if self.section_segment.is_none()
+            && self
+                .slot
+                .iter()
+                .any(CreativeOpportunitySlot::template_is_dynamic)
+        {
+            self.section_segment = Some(0);
         }
         Ok(())
     }
 
     /// Validate all slot definitions after runtime preparation.
     ///
-    /// Call [`compile_unit_templates`](Self::compile_unit_templates) first: the
-    /// `{section}` → [`section_root`](Self::section_root) requirement is keyed off
-    /// each slot's compiled template, so an uncompiled config silently skips that
-    /// check. [`Settings::prepare_runtime`](crate::settings::Settings) enforces
-    /// this order.
+    /// Call [`compile_unit_templates`](Self::compile_unit_templates) first so
+    /// malformed templates fail at startup. When the cache is absent, validation
+    /// also reads a valid raw template so placeholder-dependent requirements are
+    /// still enforced; compilation remains required to reject malformed raw
+    /// templates. [`Settings::prepare_runtime`](crate::settings::Settings::prepare_runtime)
+    /// enforces this order.
     ///
     /// # Errors
     ///
     /// Returns an error string when [`gam_network_id`](Self::gam_network_id) is
-    /// blank while slots are configured, when a slot has an invalid identifier,
-    /// page pattern set, format list, or dimensions, or when a slot's
-    /// `gam_unit_path` template uses `{section}` without a valid
-    /// [`section_root`](Self::section_root).
+    /// blank but consumed by a default path or `{network_id}` template; when a
+    /// slot has an invalid identifier, page pattern set, format list, or
+    /// dimensions; when a `{section}` template lacks a valid
+    /// [`section_root`](Self::section_root); or when configured values make a
+    /// dynamic path exceed 100 UTF-8 bytes.
     pub fn validate_runtime(&self) -> Result<(), String> {
-        // Every rendered unit path either substitutes `{network_id}` or uses the
-        // `/<network_id>/<slot_id>` default, so a blank network id produces a
-        // path GAM cannot resolve (`""` or `//slot`). Reject at startup rather
-        // than shipping it to `googletag.defineSlot`.
-        //
-        // Gated on a non-empty slot list: an empty list disables the feature, so
-        // no path is ever rendered and the id is inert. Failing startup there
-        // would take a site down over a value it does not use.
-        if !self.slot.is_empty() && self.gam_network_id.trim().is_empty() {
+        // A network ID is required only when a slot renders the default
+        // `/<network_id>/<slot_id>` path or substitutes `{network_id}`. Static
+        // and `{slot_id}`/`{section}`-only templates leave it inert.
+        let network_id_consumed = self
+            .slot
+            .iter()
+            .any(|slot| slot.gam_unit_path.is_none() || slot.template_uses_network_id());
+        if network_id_consumed && self.gam_network_id.trim().is_empty() {
             return Err("gam_network_id must not be empty".to_string());
         }
 
@@ -267,16 +347,27 @@ impl CreativeOpportunitiesConfig {
             .any(CreativeOpportunitySlot::template_uses_section)
         {
             match self.section_root.as_deref() {
-                Some(root)
-                    if !root.is_empty()
-                        && root
-                            .chars()
-                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') => {}
+                Some(root) if !root.is_empty() && root.chars().all(is_section_char) => {}
                 _ => {
                     return Err("section_root is required and must match [A-Za-z0-9_-]+ \
                                 when a gam_unit_path template uses {section}"
                         .to_string());
                 }
+            }
+        }
+
+        let configured_section = self.section_root.as_deref().unwrap_or_default();
+        for slot in &self.slot {
+            if slot.template_is_dynamic()
+                && slot
+                    .render_gam_unit_path(&self.gam_network_id, configured_section)
+                    .is_none()
+            {
+                return Err(format!(
+                    "slot `{}` dynamic gam_unit_path must render to at most \
+                     {MAX_DYNAMIC_GAM_UNIT_PATH_BYTES} UTF-8 bytes using configured values",
+                    slot.id
+                ));
             }
         }
 
@@ -504,11 +595,25 @@ impl CreativeOpportunitySlot {
         Ok(())
     }
 
+    fn template_is_dynamic(&self) -> bool {
+        let is_dynamic =
+            |parts: &[UnitTemplatePart]| parts.iter().any(UnitTemplatePart::is_placeholder);
+        match (&self.compiled_unit, &self.gam_unit_path) {
+            (Some(parts), _) => is_dynamic(parts),
+            (None, Some(raw)) => parse_unit_template(raw).is_ok_and(|parts| is_dynamic(&parts)),
+            (None, None) => false,
+        }
+    }
+
     /// Renders the resolved GAM unit path for a given network id and section.
     ///
     /// Substitutes `{network_id}`, `{section}`, and `{slot_id}` in the parsed
     /// template. Falls back to `/<network_id>/<id>` only when the slot has no
     /// [`gam_unit_path`](Self::gam_unit_path) at all.
+    ///
+    /// Returns `None` when a dynamic template would render beyond the 100-byte
+    /// GAM unit-path limit. Explicit static paths and the default path retain
+    /// their pre-template behavior and are not subject to this dynamic limit.
     ///
     /// This is the path-aware replacement for the pre-templating
     /// `resolved_gam_unit_path(&self, gam_network_id)`.
@@ -521,29 +626,36 @@ impl CreativeOpportunitySlot {
     /// re-parses its template on every call — same fallback shape as
     /// [`matches_path`](Self::matches_path). It must never silently degrade to
     /// the default path, which would bid against the wrong inventory.
+    /// Dynamic templates compute their exact UTF-8 byte length with checked
+    /// arithmetic before allocating the final string, then allocate once at
+    /// the exact capacity.
     #[must_use]
-    pub fn render_gam_unit_path(&self, gam_network_id: &str, section: &str) -> String {
-        let render = |parts: &[UnitTemplatePart]| -> String {
-            parts
-                .iter()
-                .map(|part| match part {
-                    UnitTemplatePart::Literal(s) => s.as_str(),
-                    UnitTemplatePart::NetworkId => gam_network_id,
-                    UnitTemplatePart::Section => section,
-                    UnitTemplatePart::SlotId => self.id.as_str(),
-                })
-                .collect()
-        };
-
+    pub fn render_gam_unit_path(&self, gam_network_id: &str, section: &str) -> Option<String> {
+        let is_dynamic =
+            |parts: &[UnitTemplatePart]| parts.iter().any(UnitTemplatePart::is_placeholder);
         match (&self.compiled_unit, &self.gam_unit_path) {
-            (Some(parts), _) => render(parts),
+            (Some(parts), _) if is_dynamic(parts) => {
+                render_dynamic_unit_path(parts, gam_network_id, section, &self.id)
+            }
+            (Some(_), Some(raw)) => Some(raw.clone()),
+            (Some(parts), None) => Some(
+                parts
+                    .iter()
+                    .map(|part| {
+                        resolved_unit_template_part(part, gam_network_id, section, &self.id)
+                    })
+                    .collect(),
+            ),
             // A malformed template cannot reach a compiled config (startup
             // rejects it), so on this path use the raw string verbatim — the
             // pre-templating behaviour — instead of dropping to the default.
-            (None, Some(raw)) => parse_unit_template(raw)
-                .map(|parts| render(&parts))
-                .unwrap_or_else(|_| raw.clone()),
-            (None, None) => format!("/{}/{}", gam_network_id, self.id),
+            (None, Some(raw)) => match parse_unit_template(raw) {
+                Ok(parts) if is_dynamic(&parts) => {
+                    render_dynamic_unit_path(&parts, gam_network_id, section, &self.id)
+                }
+                Ok(_) | Err(_) => Some(raw.clone()),
+            },
+            (None, None) => Some(format!("/{}/{}", gam_network_id, self.id)),
         }
     }
 
@@ -561,6 +673,26 @@ impl CreativeOpportunitySlot {
         match (&self.compiled_unit, &self.gam_unit_path) {
             (Some(parts), _) => uses_section(parts),
             (None, Some(raw)) => parse_unit_template(raw).is_ok_and(|parts| uses_section(&parts)),
+            (None, None) => false,
+        }
+    }
+
+    /// Returns `true` if this slot's `gam_unit_path` template contains `{network_id}`.
+    ///
+    /// Reads the raw template when [`compiled_unit`](Self::compiled_unit) is
+    /// empty so validation cannot silently skip the network ID requirement for
+    /// an uncompiled config.
+    fn template_uses_network_id(&self) -> bool {
+        let uses_network_id = |parts: &[UnitTemplatePart]| {
+            parts
+                .iter()
+                .any(|part| matches!(part, UnitTemplatePart::NetworkId))
+        };
+        match (&self.compiled_unit, &self.gam_unit_path) {
+            (Some(parts), _) => uses_network_id(parts),
+            (None, Some(raw)) => {
+                parse_unit_template(raw).is_ok_and(|parts| uses_network_id(&parts))
+            }
             (None, None) => false,
         }
     }
@@ -919,6 +1051,60 @@ mod tests {
     }
 
     #[test]
+    fn derive_section_caps_safe_segment_at_one_hundred_ascii_bytes() {
+        let path = format!("/{}", "a".repeat(150));
+
+        let section = derive_section(&path, "home", 0);
+
+        assert_eq!(
+            section,
+            "a".repeat(100),
+            "should cap a safe request segment at 100 ASCII bytes"
+        );
+        assert!(section.is_ascii(), "section output should remain ASCII");
+        assert_eq!(
+            section.len(),
+            100,
+            "section should contain exactly 100 bytes"
+        );
+    }
+
+    #[test]
+    fn derive_section_caps_disallowed_run_to_one_underscore() {
+        let path = format!("/{}%!?z", "a".repeat(99));
+
+        let section = derive_section(&path, "home", 0);
+
+        assert_eq!(
+            section,
+            format!("{}_", "a".repeat(99)),
+            "a disallowed run at the cap should emit one underscore and stop"
+        );
+        assert_eq!(section.len(), 100, "section should stop at the byte cap");
+        assert!(
+            !section.contains('z'),
+            "a safe character beyond the cap should not leak into the section"
+        );
+    }
+
+    #[test]
+    fn derive_section_stops_before_disallowed_run_when_cap_is_full() {
+        let path = format!("/{}%!?z", "a".repeat(100));
+
+        let section = derive_section(&path, "home", 0);
+
+        assert_eq!(
+            section,
+            "a".repeat(100),
+            "a full safe prefix should prevent scanning or emitting the later run"
+        );
+        assert!(
+            !section.contains('_') && !section.contains('z'),
+            "nothing beyond the full safe prefix should be emitted"
+        );
+    }
+
+    #[test]
     fn section_for_path_applies_both_policy_knobs() {
         let mut config = make_config_with_section_template(Some("home"));
         assert_eq!(
@@ -980,8 +1166,109 @@ mod tests {
             .expect("should compile template");
         assert_eq!(
             slot.render_gam_unit_path("99999", "news"),
-            "/99999/example/news"
+            Some("/99999/example/news".to_string())
         );
+    }
+
+    #[test]
+    fn render_gam_unit_path_omits_over_limit_compiled_dynamic_template() {
+        let mut slot = make_slot("ad-header-0", vec!["/news/*"]);
+        slot.gam_unit_path = Some("/{section}/{section}".to_string());
+        slot.compile_unit_template()
+            .expect("should compile template");
+
+        let rendered = slot.render_gam_unit_path("99999", &"a".repeat(60));
+
+        assert_eq!(
+            rendered, None,
+            "a compiled dynamic path over 100 bytes should be omitted"
+        );
+    }
+
+    #[test]
+    fn render_gam_unit_path_omits_over_limit_raw_dynamic_template() {
+        let mut slot = make_slot("ad-header-0", vec!["/news/*"]);
+        slot.gam_unit_path = Some("/{section}/{section}".to_string());
+        assert!(
+            slot.compiled_unit.is_none(),
+            "test should exercise the raw parsing fallback"
+        );
+
+        let rendered = slot.render_gam_unit_path("99999", &"a".repeat(60));
+
+        assert_eq!(
+            rendered, None,
+            "a raw dynamic path over 100 bytes should be omitted"
+        );
+    }
+
+    #[test]
+    fn render_gam_unit_path_accepts_exact_multibyte_byte_limit() {
+        let expected = format!("{}ax", "é".repeat(49));
+        assert_eq!(
+            expected.len(),
+            100,
+            "test fixture should render to exactly 100 UTF-8 bytes"
+        );
+
+        for compile_template in [true, false] {
+            let cache_kind = if compile_template { "compiled" } else { "raw" };
+            let mut slot = make_slot("x", vec!["/"]);
+            slot.gam_unit_path = Some(format!("{}a{{slot_id}}", "é".repeat(49)));
+            if compile_template {
+                slot.compile_unit_template()
+                    .expect("should compile multibyte template");
+            }
+            assert_eq!(
+                slot.compiled_unit.is_some(),
+                compile_template,
+                "test should exercise the {cache_kind} template path"
+            );
+
+            let rendered = slot.render_gam_unit_path("unused", "unused");
+
+            assert_eq!(
+                rendered,
+                Some(expected.clone()),
+                "{cache_kind} dynamic template should accept exactly 100 UTF-8 bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn render_gam_unit_path_rejects_multibyte_byte_limit_plus_one() {
+        let hypothetical_render = format!("{}abx", "é".repeat(49));
+        assert_eq!(
+            hypothetical_render.len(),
+            101,
+            "test fixture should render to 101 UTF-8 bytes"
+        );
+        assert!(
+            hypothetical_render.chars().count() < 100,
+            "fixture should fail if rendering counts characters instead of UTF-8 bytes"
+        );
+
+        for compile_template in [true, false] {
+            let cache_kind = if compile_template { "compiled" } else { "raw" };
+            let mut slot = make_slot("x", vec!["/"]);
+            slot.gam_unit_path = Some(format!("{}ab{{slot_id}}", "é".repeat(49)));
+            if compile_template {
+                slot.compile_unit_template()
+                    .expect("should compile multibyte template");
+            }
+            assert_eq!(
+                slot.compiled_unit.is_some(),
+                compile_template,
+                "test should exercise the {cache_kind} template path"
+            );
+
+            let rendered = slot.render_gam_unit_path("unused", "unused");
+
+            assert_eq!(
+                rendered, None,
+                "{cache_kind} dynamic template should reject 101 UTF-8 bytes"
+            );
+        }
     }
 
     #[test]
@@ -992,7 +1279,8 @@ mod tests {
             .expect("should compile (no template)");
         assert_eq!(
             slot.render_gam_unit_path("99999", "ignored"),
-            "/99999/sidebar"
+            Some("/99999/sidebar".to_string()),
+            "an absent template should retain the default path behavior"
         );
     }
 
@@ -1004,7 +1292,24 @@ mod tests {
             .expect("should compile static template");
         assert_eq!(
             slot.render_gam_unit_path("99999", "news"),
-            "/99999/example/homepage"
+            Some("/99999/example/homepage".to_string())
+        );
+    }
+
+    #[test]
+    fn render_gam_unit_path_preserves_over_limit_static_template() {
+        let static_path = format!("/{}", "a".repeat(100));
+        let mut slot = make_slot("atf", vec!["/"]);
+        slot.gam_unit_path = Some(static_path.clone());
+        slot.compile_unit_template()
+            .expect("should compile static template");
+
+        let rendered = slot.render_gam_unit_path("99999", "news");
+
+        assert_eq!(
+            rendered,
+            Some(static_path),
+            "an explicit static path should retain pre-template behavior"
         );
     }
 
@@ -1049,6 +1354,30 @@ mod tests {
     }
 
     #[test]
+    fn validate_runtime_rejects_dynamic_template_over_limit_with_configured_root() {
+        let root = "a".repeat(60);
+        let mut config = make_config_with_section_template(Some(&root));
+        config.slot[0].gam_unit_path = Some("/{section}/{section}".to_string());
+        config.compile_slots();
+        config
+            .compile_unit_templates()
+            .expect("templates should compile");
+
+        let err = config
+            .validate_runtime()
+            .expect_err("should reject a configured dynamic path over 100 bytes");
+
+        assert!(
+            err.contains("ad-header-0"),
+            "error should identify the over-limit slot, got: {err}"
+        );
+        assert!(
+            err.contains("100"),
+            "error should identify the dynamic path byte limit, got: {err}"
+        );
+    }
+
+    #[test]
     fn render_gam_unit_path_honours_raw_template_without_compiled_cache() {
         // A slot deserialized straight from JSON (or built by a test helper)
         // never ran `compile_unit_templates`. It must still render its explicit
@@ -1066,7 +1395,7 @@ mod tests {
         );
         assert_eq!(
             slot.render_gam_unit_path("99999", "news"),
-            "/99999/example/news",
+            Some("/99999/example/news".to_string()),
             "uncompiled slot should still substitute placeholders"
         );
     }
@@ -1077,8 +1406,22 @@ mod tests {
         slot.gam_unit_path = Some("/99999/example/homepage".to_string());
         assert_eq!(
             slot.render_gam_unit_path("99999", "news"),
-            "/99999/example/homepage",
+            Some("/99999/example/homepage".to_string()),
             "uncompiled static path should render verbatim, not the default"
+        );
+    }
+
+    #[test]
+    fn render_gam_unit_path_preserves_malformed_raw_template() {
+        let mut slot = make_slot("atf", vec!["/"]);
+        slot.gam_unit_path = Some("/{unknown}".to_string());
+
+        let rendered = slot.render_gam_unit_path("99999", "news");
+
+        assert_eq!(
+            rendered,
+            Some("/{unknown}".to_string()),
+            "a malformed raw template should retain direct-caller compatibility"
         );
     }
 
@@ -1102,7 +1445,53 @@ mod tests {
     }
 
     #[test]
-    fn validate_runtime_rejects_blank_network_id() {
+    fn validate_runtime_allows_blank_network_id_with_static_paths() {
+        let mut config = make_config_with_section_template(Some("home"));
+        config.slot[0].gam_unit_path = Some("/12345/example/homepage".to_string());
+        config.gam_network_id = "   ".to_string();
+        config.compile_slots();
+        config
+            .compile_unit_templates()
+            .expect("should compile static template");
+        config
+            .validate_runtime()
+            .expect("should allow a blank unused network id");
+    }
+
+    #[test]
+    fn validate_runtime_allows_blank_network_id_with_slot_id_template() {
+        let mut config = make_config_with_section_template(Some("home"));
+        config.slot[0].gam_unit_path = Some("/example/{slot_id}".to_string());
+        config.gam_network_id = String::new();
+        config.compile_slots();
+        config
+            .compile_unit_templates()
+            .expect("should compile slot-id template");
+        config
+            .validate_runtime()
+            .expect("should allow a blank unused network id");
+    }
+
+    #[test]
+    fn validate_runtime_rejects_blank_network_id_when_default_path_uses_it() {
+        let mut config = make_config_with_section_template(Some("home"));
+        config.slot[0].gam_unit_path = None;
+        config.gam_network_id = String::new();
+        config.compile_slots();
+        config
+            .compile_unit_templates()
+            .expect("should compile default path");
+        let err = config
+            .validate_runtime()
+            .expect_err("blank network id should fail when the default path uses it");
+        assert_eq!(
+            err, "gam_network_id must not be empty",
+            "should report the blank network id"
+        );
+    }
+
+    #[test]
+    fn validate_runtime_rejects_blank_network_id_when_compiled_template_uses_it() {
         // `gam_unit_path = "{network_id}"` renders to an empty string with a
         // blank network id, which reaches googletag.defineSlot as an invalid path.
         let mut config = make_config_with_section_template(Some("home"));
@@ -1118,6 +1507,25 @@ mod tests {
         assert!(
             err.contains("gam_network_id"),
             "error should name gam_network_id, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_runtime_rejects_blank_network_id_when_raw_template_uses_it() {
+        let mut config = make_config_with_section_template(Some("home"));
+        config.slot[0].gam_unit_path = Some("/{network_id}/example".to_string());
+        config.gam_network_id = String::new();
+        config.compile_slots();
+        assert!(
+            config.slot[0].compiled_unit.is_none(),
+            "test precondition: template cache is empty"
+        );
+        let err = config
+            .validate_runtime()
+            .expect_err("blank network id should fail when a raw template uses it");
+        assert_eq!(
+            err, "gam_network_id must not be empty",
+            "should report the blank network id"
         );
     }
 
@@ -1194,7 +1602,7 @@ mod tests {
             );
             assert_eq!(
                 matched[0].render_gam_unit_path("123456789", &derive_section(path, "home", 0)),
-                expected,
+                Some(expected.to_string()),
                 "`{path}` should render the documented unit path"
             );
         }

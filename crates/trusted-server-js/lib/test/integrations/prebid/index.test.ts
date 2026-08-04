@@ -180,7 +180,8 @@ import type { AuctionBid } from '../../../src/core/auction';
 import { log } from '../../../src/core/log';
 import envelope from '../../fixtures/aps-renderer-v1.json';
 
-// installPrebidNpm is idempotent per page; reset its sentinel for each test.
+// installPrebidNpm is a per-page no-op once the sentinel is set (the module
+// self-init above already set it), so every test starts from a clean page.
 beforeEach(() => {
   delete testWindow.__tsjsPrebidShimInstalled;
 });
@@ -3436,7 +3437,7 @@ describe('prebid/client-side bidders', () => {
   it('excludes client-side bidders from trustedServer bidderParams', () => {
     testWindow.__tsjs_prebid = { clientSideBidders: ['rubicon'] };
 
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
 
     const adUnits = [
       {
@@ -3483,7 +3484,7 @@ describe('prebid/client-side bidders', () => {
   it('handles multiple client-side bidders', () => {
     testWindow.__tsjs_prebid = { clientSideBidders: ['rubicon', 'openx'] };
 
-    const pbjs = installPrebidNpm() as TestPbjs;
+    const pbjs = installPrebidNpm();
 
     const adUnits = [
       {

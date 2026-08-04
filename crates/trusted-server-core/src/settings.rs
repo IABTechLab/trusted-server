@@ -5431,6 +5431,13 @@ passphrase = "test-secret-key-32-bytes-minimum"
 [creative_opportunities]
 gam_network_id = "21765378893"
 auction_timeout_ms = 500
+section_root = "home"
+
+[[creative_opportunities.slot]]
+id = "atf"
+gam_unit_path = "/{network_id}/example/{section}"
+page_patterns = ["/"]
+formats = [{ width = 300, height = 250 }]
 "#;
         let settings = Settings::from_toml(toml).expect("should parse");
         let co = settings
@@ -5438,6 +5445,11 @@ auction_timeout_ms = 500
             .expect("should have creative_opportunities");
         assert_eq!(co.gam_network_id, "21765378893");
         assert_eq!(co.auction_timeout_ms, Some(500));
+        assert_eq!(
+            co.section_segment,
+            Some(0),
+            "startup finalization should materialize the dynamic-template compatibility marker"
+        );
     }
 
     #[test]
@@ -5612,6 +5624,24 @@ page_patterns = ["/"]
 formats = [{ width = 300, height = 250 }]
 "#,
             "gam_unit_path template must not be empty",
+        );
+    }
+
+    #[test]
+    fn settings_rejects_dynamic_gam_unit_path_over_byte_limit_using_configured_values() {
+        let gam_unit_path = "{network_id}".repeat(10);
+        let slot_body = format!(
+            r#"
+id = "atf"
+gam_unit_path = "{gam_unit_path}"
+page_patterns = ["/"]
+formats = [{{ width = 300, height = 250 }}]
+"#
+        );
+
+        assert_creative_opportunity_slot_config_rejected(
+            &slot_body,
+            "must render to at most 100 UTF-8 bytes",
         );
     }
 
