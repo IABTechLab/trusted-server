@@ -397,6 +397,18 @@ fn canonicalize_excluded_gam_ad_unit_path_suffixes(config: &mut PrebidIntegratio
     config.excluded_gam_ad_unit_path_suffixes = canonical;
 }
 
+fn load_config(
+    settings: &Settings,
+) -> Result<Option<PrebidIntegrationConfig>, Report<TrustedServerError>> {
+    let Some(mut config) =
+        settings.integration_config::<PrebidIntegrationConfig>(PREBID_INTEGRATION_ID)?
+    else {
+        return Ok(None);
+    };
+    canonicalize_excluded_gam_ad_unit_path_suffixes(&mut config);
+    Ok(Some(config))
+}
+
 /// Validate enabled Prebid config using the same startup-only checks as runtime registration.
 ///
 /// # Errors
@@ -406,12 +418,9 @@ fn canonicalize_excluded_gam_ad_unit_path_suffixes(config: &mut PrebidIntegratio
 pub fn validate_config_for_startup(
     settings: &Settings,
 ) -> Result<Option<PrebidIntegrationConfig>, Report<TrustedServerError>> {
-    let Some(mut config) =
-        settings.integration_config::<PrebidIntegrationConfig>(PREBID_INTEGRATION_ID)?
-    else {
+    let Some(config) = load_config(settings)? else {
         return Ok(None);
     };
-    canonicalize_excluded_gam_ad_unit_path_suffixes(&mut config);
     BidParamOverrideEngine::try_from_config(&config)?;
     validate_external_bundle_config(&config, &settings.proxy.allowed_domains)?;
     Ok(Some(config))
@@ -929,12 +938,9 @@ fn escape_html_attr(value: &str) -> String {
 fn build(
     settings: &Settings,
 ) -> Result<Option<Arc<PrebidIntegration>>, Report<TrustedServerError>> {
-    let Some(mut config) =
-        settings.integration_config::<PrebidIntegrationConfig>(PREBID_INTEGRATION_ID)?
-    else {
+    let Some(config) = load_config(settings)? else {
         return Ok(None);
     };
-    canonicalize_excluded_gam_ad_unit_path_suffixes(&mut config);
 
     validate_external_bundle_config(&config, &settings.proxy.allowed_domains)?;
 
@@ -2965,7 +2971,7 @@ server_url = "https://prebid.example/openrtb2/auction"
     }
 
     #[test]
-    fn startup_validation_canonicalizes_excluded_gam_ad_unit_path_suffixes() {
+    fn startup_validation_and_runtime_build_canonicalize_excluded_gam_ad_unit_path_suffixes() {
         let mut settings = make_settings();
         settings
             .integrations
@@ -2994,7 +3000,9 @@ server_url = "https://prebid.example/openrtb2/auction"
             "should retain only the first declaration of each suffix"
         );
 
-        let integration = PrebidIntegration::new(config);
+        let integration = build(&settings)
+            .expect("should build Prebid integration")
+            .expect("should return enabled Prebid integration");
         let document_state = IntegrationDocumentState::default();
         let ctx = IntegrationHtmlContext {
             request_host: "pub.example",

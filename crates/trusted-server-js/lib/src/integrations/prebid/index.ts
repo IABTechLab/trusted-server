@@ -693,17 +693,25 @@ function publisherZoneForRefresh(candidateCodes: Array<string | undefined>): str
   return match ? match.mediaTypes?.banner?.name : findRefreshSnapshot(candidateCodes)?.zone;
 }
 
+function isUsableRefreshAuctionExclusionSuffix(suffix: unknown): suffix is string {
+  return typeof suffix === 'string' && suffix.startsWith('/') && suffix.length > 1;
+}
+
+function refreshAuctionExclusionSuffixes(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter(isUsableRefreshAuctionExclusionSuffix) : [];
+}
+
 function isExcludedFromRefreshAuction(
   slot: RefreshGptSlot,
-  excludedGamAdUnitPathSuffixes: Set<string>
+  excludedGamAdUnitPathSuffixes: readonly string[]
 ): boolean {
-  if (excludedGamAdUnitPathSuffixes.size === 0) return false;
+  if (excludedGamAdUnitPathSuffixes.length === 0) return false;
 
   try {
     const adUnitPath = slot.getAdUnitPath?.();
     return (
       typeof adUnitPath === 'string' &&
-      [...excludedGamAdUnitPathSuffixes].some((suffix) => adUnitPath.endsWith(suffix))
+      excludedGamAdUnitPathSuffixes.some((suffix) => adUnitPath.endsWith(suffix))
     );
   } catch {
     // GPT path metadata is optional for this optimization. If it is unavailable,
@@ -1255,15 +1263,14 @@ export function installRefreshHandler(timeoutMs = 1500): void {
       // filtering so excluded slots still receive a clean GAM refresh.
       independentSlots.forEach(clearRefreshTargeting);
 
-      const excludedGamAdUnitPathSuffixes = new Set(
-        getInjectedConfig()?.excludedGamAdUnitPathSuffixes ?? []
+      const excludedGamAdUnitPathSuffixes = refreshAuctionExclusionSuffixes(
+        getInjectedConfig()?.excludedGamAdUnitPathSuffixes
       );
       const auctionSlots = independentSlots.filter(
         (slot) => !isExcludedFromRefreshAuction(slot, excludedGamAdUnitPathSuffixes)
       );
-      const hasExcludedSlots = auctionSlots.length < independentSlots.length;
       if (!auctionSlots.length) {
-        return originalRefresh(targetSlots, opts);
+        return originalRefresh(slots, opts);
       }
 
       const adUnits = auctionSlots.map((slot) => {
@@ -1326,11 +1333,10 @@ export function installRefreshHandler(timeoutMs = 1500): void {
             log.error('[tsjs-prebid] refresh targeting failed', error);
           }
         }
-        // A bare refresh that filters slots must pass the resolved complete list
-        // to GPT; otherwise the excluded slots would be refreshed implicitly but
-        // would not be represented by the wrapper's concrete target set. Keep
-        // the existing bare-refresh delivery behavior when no filtering occurs.
-        originalRefresh(slots === undefined && hasExcludedSlots ? targetSlots : slots, opts);
+        // Preserve the publisher's original refresh form. In particular, a bare
+        // GPT refresh remains bare so GPT resolves its registered slot set when
+        // the auction completes.
+        originalRefresh(slots, opts);
       }
 
       try {
