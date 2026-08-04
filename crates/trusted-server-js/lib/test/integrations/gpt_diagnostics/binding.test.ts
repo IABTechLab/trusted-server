@@ -219,8 +219,66 @@ describe('GptDiagnosticsBindingManager', () => {
 
     expect(manager.get(1).binding).toEqual({
       status: 'ambiguous',
-      reason: 'duplicate_dom_id',
+      reason: 'dom_uniqueness_unverifiable',
     });
+  });
+
+  it.each(['escape', 'selector'] as const)(
+    'reports %s failures as unverifiable rather than an observed duplicate',
+    (failure) => {
+      const element = document.createElement('div');
+      element.id = 'throws';
+      document.body.append(element);
+      if (failure === 'escape') {
+        vi.spyOn(window.CSS, 'escape').mockImplementation(() => {
+          throw new Error('escape failed');
+        });
+      } else {
+        vi.spyOn(document, 'querySelectorAll').mockImplementation(() => {
+          throw new Error('selector failed');
+        });
+      }
+      const store = createStore();
+      store.recordSlotRequested(fakeSlot('throws'));
+
+      const manager = createManager(store);
+
+      expect(manager.get(1)).toMatchObject({
+        binding: { status: 'ambiguous', reason: 'dom_uniqueness_unverifiable' },
+        visible: false,
+      });
+      expect(manager.get(1).element).toBeUndefined();
+    }
+  );
+
+  it('ignores unrelated mutations and refreshes for known-ID replacements', async () => {
+    const frames: Array<() => void> = [];
+    const element = document.createElement('div');
+    element.id = 'observed';
+    document.body.append(element);
+    const store = createStore();
+    store.recordSlotRequested(fakeSlot('observed'));
+    const manager = createManager(store, (callback) => frames.push(callback));
+
+    const unrelated = document.createElement('div');
+    unrelated.id = 'unrelated';
+    document.body.append(unrelated);
+    await Promise.resolve();
+    expect(frames).toEqual([]);
+
+    const replacement = document.createElement('div');
+    replacement.id = 'observed';
+    element.replaceWith(replacement);
+    await Promise.resolve();
+    expect(frames).toHaveLength(1);
+    frames.shift()!();
+    expect(manager.get(1).element).toBe(replacement);
+
+    replacement.id = 'renamed';
+    await Promise.resolve();
+    expect(frames).toHaveLength(1);
+    frames.shift()!();
+    expect(manager.get(1).binding).toEqual({ status: 'unbound', reason: 'missing_element' });
   });
 
   it('coalesces store-driven refreshes to one animation frame', () => {

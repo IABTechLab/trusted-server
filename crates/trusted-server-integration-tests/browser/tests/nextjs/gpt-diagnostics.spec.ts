@@ -43,9 +43,15 @@ async function emit(
 }
 
 test.describe("GPT runtime diagnostics", () => {
-    test("is completely inactive without a tab directive", async ({ page }) => {
+    test("is completely inactive without a browser-session directive", async ({
+        page,
+    }) => {
         const diagnosticNetworkRequests: string[] = [];
+        const diagnosticModuleRequests: string[] = [];
         page.on("request", (request) => {
+            if (/tsjs-gpt_diagnostics/i.test(request.url())) {
+                diagnosticModuleRequests.push(request.url());
+            }
             if (
                 ["fetch", "xhr", "beacon"].includes(request.resourceType()) &&
                 /diagnostic|trace/i.test(request.url())
@@ -68,13 +74,20 @@ test.describe("GPT runtime diagnostics", () => {
             })),
         ).toEqual({ api: false, host: false, listenerCounts: {} });
         expect(diagnosticNetworkRequests).toEqual([]);
+        expect(diagnosticModuleRequests).toEqual([]);
     });
 
-    test("activates, cleans the URL, persists in the tab, and deactivates", async ({
+    test("activates, cleans the URL, persists in the browser session, and deactivates", async ({
         browser,
         page,
     }) => {
-        await page.goto(
+        const moduleRequests: string[] = [];
+        page.on("request", (request) => {
+            if (/tsjs-gpt_diagnostics/i.test(request.url())) {
+                moduleRequests.push(request.url());
+            }
+        });
+        const activationResponse = await page.goto(
             runtimeUrl(
                 "/gpt-diagnostics?unrelated=kept&ts_console=true#fixture",
             ),
@@ -82,6 +95,14 @@ test.describe("GPT runtime diagnostics", () => {
         );
         await waitForApi(page);
 
+        expect(activationResponse?.headers()["cache-control"]).toContain(
+            "no-store",
+        );
+        expect(moduleRequests).toHaveLength(1);
+        const activationCookie = (await page.context().cookies()).find(
+            (cookie) => cookie.name === "__Host-ts-console",
+        );
+        expect(activationCookie).toMatchObject({ value: "1", httpOnly: true });
         expect(new URL(page.url()).search).toBe("?unrelated=kept");
         expect(new URL(page.url()).hash).toBe("#fixture");
         const listenerCounts = await page.evaluate(() =>
@@ -104,6 +125,14 @@ test.describe("GPT runtime diagnostics", () => {
         await page.waitForURL("**/gpt-diagnostics?unrelated=kept#fixture");
         await waitForApi(page);
 
+        const sameSessionPage = await page.context().newPage();
+        await installGptStub(sameSessionPage);
+        await sameSessionPage.goto(runtimeUrl("/gpt-diagnostics"), {
+            waitUntil: "load",
+        });
+        await waitForApi(sameSessionPage);
+        await sameSessionPage.close();
+
         await page.goto(
             runtimeUrl("/gpt-diagnostics?unrelated=second#persisted"),
             {
@@ -122,6 +151,11 @@ test.describe("GPT runtime diagnostics", () => {
         );
         expect(new URL(page.url()).search).toBe("?unrelated=kept");
         expect(new URL(page.url()).hash).toBe("#disabled");
+        expect(
+            (await page.context().cookies()).some(
+                (cookie) => cookie.name === "__Host-ts-console",
+            ),
+        ).toBe(false);
         expect(
             await page.evaluate(() => ({
                 api: Boolean((window as any).tsjs?.gptDiagnostics),

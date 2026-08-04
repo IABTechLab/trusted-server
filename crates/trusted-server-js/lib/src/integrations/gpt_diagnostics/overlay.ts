@@ -1,3 +1,4 @@
+import { log } from '../../core/log';
 import type { GptDiagnosticsRequestCycle } from '../../core/types';
 
 import type { GptDiagnosticsBindingManager } from './binding';
@@ -86,7 +87,6 @@ const PANEL_STYLES = `
   .tsgd-badge-layer { position: fixed; z-index: 2147483646; inset: 0; pointer-events: none; }
   .tsgd-badge {
     position: fixed;
-    max-width: 260px;
     padding: 5px 7px;
     color: #fff;
     background: rgb(15 23 42 / 94%);
@@ -116,7 +116,7 @@ function primaryState(cycle: GptDiagnosticsRequestCycle | undefined): string {
   if (!cycle) return 'Waiting for request';
   if (cycle.isEmpty === true) return 'Empty';
   if (cycle.isEmpty === false) return 'Filled';
-  if (cycle.renderAtMs !== undefined) return 'Pending render';
+  if (cycle.renderAtMs !== undefined) return 'Rendered (fill unknown)';
   if (cycle.responseAtMs !== undefined) return 'Response received';
   return 'Requesting';
 }
@@ -126,57 +126,8 @@ function formatMilliseconds(value: number | undefined): string | undefined {
   return `${Math.round(value * 10) / 10} ms`;
 }
 
-function deliveryFact(cycle: GptDiagnosticsRequestCycle): string | undefined {
-  switch (cycle.delivery) {
-    case 'trusted_server':
-      return 'Trusted Server creative rendered — it requested its markup';
-    case 'other_demand':
-      return 'Other Ad Manager demand rendered — no Trusted Server creative ran';
-    case 'no_candidate':
-      return 'No Trusted Server candidate on this slot';
-    case 'pending':
-      return 'Trusted Server candidate — waiting for the creative';
-    default:
-      return undefined;
-  }
-}
-
-function adManagerFact(cycle: GptDiagnosticsRequestCycle): string | undefined {
-  const identity = cycle.adManager;
-  if (!identity) return undefined;
-
-  const parts: string[] = [];
-  const lineItem = identity.lineItemId ?? identity.sourceAgnosticLineItemId;
-  const creative = identity.creativeId ?? identity.sourceAgnosticCreativeId;
-  if (lineItem) parts.push(`line item ${lineItem}`);
-  if (identity.campaignId) parts.push(`order ${identity.campaignId}`);
-  if (identity.advertiserId) parts.push(`advertiser ${identity.advertiserId}`);
-  if (creative) parts.push(`creative ${creative}`);
-  if (identity.yieldGroupIds?.length)
-    parts.push(`yield group ${identity.yieldGroupIds.join(', ')}`);
-  if (identity.companyIds?.length) parts.push(`company ${identity.companyIds.join(', ')}`);
-  return parts.length > 0 ? `Ad Manager reported ${parts.join(' · ')}` : undefined;
-}
-
-function responseClassFact(cycle: GptDiagnosticsRequestCycle): string | undefined {
-  switch (cycle.responseClass) {
-    case 'reservation':
-      return 'Ad Manager reservation line item';
-    case 'unclassified_non_empty':
-      return 'Filled without Ad Manager identifiers — default, backup, or another service';
-    default:
-      return undefined;
-  }
-}
-
 function cycleFacts(cycle: GptDiagnosticsRequestCycle): string[] {
   const facts: string[] = [];
-  const deliveryLine = deliveryFact(cycle);
-  if (deliveryLine) facts.push(deliveryLine);
-  const responseClassLine = responseClassFact(cycle);
-  if (responseClassLine) facts.push(responseClassLine);
-  const adManagerLine = adManagerFact(cycle);
-  if (adManagerLine) facts.push(adManagerLine);
   if (cycle.loadAtMs !== undefined) facts.push('Loaded');
   else if (cycle.isEmpty === false) facts.push('Load not observed');
   if (cycle.viewableAtMs !== undefined) facts.push('Viewable');
@@ -324,6 +275,9 @@ export class GptDiagnosticsOverlay {
 
     const existing = this.document.getElementById(GPT_DIAGNOSTICS_HOST_ID);
     if (existing) {
+      if (!this.hostCollision) {
+        log.warn('gpt diagnostics: host element ID collision; panel not mounted');
+      }
       this.hostCollision = true;
       return;
     }
@@ -401,6 +355,13 @@ export class GptDiagnosticsOverlay {
     if (!this.panel || !this.host?.isConnected) return;
     const snapshot = this.store.snapshot();
     const panel = this.panel;
+    const previousContent = panel.querySelector<HTMLElement>('.tsgd-content');
+    const previousScrollTop = previousContent?.scrollTop ?? 0;
+    const openHistorySlots = new Set(
+      Array.from(panel.querySelectorAll<HTMLDetailsElement>('.tsgd-slot details[open]'))
+        .map((details) => details.closest<HTMLElement>('.tsgd-slot')?.dataset.runtimeSlot)
+        .filter((runtimeSlot): runtimeSlot is string => runtimeSlot !== undefined)
+    );
     panel.replaceChildren();
 
     const header = this.document.createElement('header');
@@ -478,12 +439,15 @@ export class GptDiagnosticsOverlay {
         snapshot.slots.length === 0 ? 'No GPT slots observed yet.' : 'No slots match.';
       content.append(empty);
     } else {
-      for (const slot of filteredSlots) content.append(this.renderSlot(slot));
+      for (const slot of filteredSlots) {
+        content.append(this.renderSlot(slot, openHistorySlots.has(String(slot.runtimeSlotNumber))));
+      }
     }
     panel.append(content);
+    content.scrollTop = previousScrollTop;
   }
 
-  private renderSlot(slot: GptDiagnosticsStoreSlotSnapshot): HTMLElement {
+  private renderSlot(slot: GptDiagnosticsStoreSlotSnapshot, historyOpen: boolean): HTMLElement {
     const container = this.document.createElement('article');
     container.className = 'tsgd-slot';
     container.dataset.runtimeSlot = String(slot.runtimeSlotNumber);
@@ -516,6 +480,7 @@ export class GptDiagnosticsOverlay {
 
     if (slot.requests.length > 1) {
       const history = this.document.createElement('details');
+      history.open = historyOpen;
       const summary = this.document.createElement('summary');
       summary.textContent = `Previous requests (${slot.requests.length - 1})`;
       history.append(summary);

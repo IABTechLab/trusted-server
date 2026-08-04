@@ -2034,6 +2034,12 @@ impl Settings {
         settings.validate_admin_coverage()?;
         settings.validate_admin_handler_passwords()?;
 
+        if settings.auction.enabled && !settings.auction.rewrite_creatives {
+            log::warn!(
+                "Auction creative rewriting disabled; creative assets and clicks may contact third-party hosts directly"
+            );
+        }
+
         Ok(settings)
     }
 
@@ -2056,6 +2062,13 @@ impl Settings {
 
         if let Some(co) = &mut self.creative_opportunities {
             co.compile_slots();
+            // Parse `gam_unit_path` templates once here (mirrors the compiled
+            // glob cache) so request-time rendering is substitution-only.
+            co.compile_unit_templates().map_err(|err| {
+                Report::new(TrustedServerError::Configuration {
+                    message: format!("Invalid creative opportunity gam_unit_path template: {err}"),
+                })
+            })?;
             // Slots flow into injected HTML/JS, provider payloads, and GPT
             // calls. Env/private config can bypass static review, so validate
             // the full runtime shape on every load path.
@@ -3908,6 +3921,41 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     #[test]
+    fn test_auction_rewrite_creatives_defaults_to_true_when_omitted() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [auction]
+            enabled = true
+            providers = []
+            "#;
+
+        let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
+
+        assert!(
+            settings.auction.rewrite_creatives,
+            "should preserve creative rewriting when the setting is omitted"
+        );
+    }
+
+    #[test]
+    fn test_auction_rewrite_creatives_accepts_explicit_false() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [auction]
+            enabled = true
+            providers = []
+            rewrite_creatives = false
+            "#;
+
+        let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
+
+        assert!(
+            !settings.auction.rewrite_creatives,
+            "should disable creative rewriting when explicitly configured"
+        );
+    }
+
+    #[test]
     fn test_auction_allowed_context_keys_defaults_to_empty() {
         let settings = create_test_settings();
         assert!(
@@ -4950,6 +4998,13 @@ passphrase = "test-secret-key-32-bytes-minimum"
 [creative_opportunities]
 gam_network_id = "21765378893"
 auction_timeout_ms = 500
+section_root = "home"
+
+[[creative_opportunities.slot]]
+id = "atf"
+gam_unit_path = "/{network_id}/example/{section}"
+page_patterns = ["/"]
+formats = [{ width = 300, height = 250 }]
 "#;
         let settings = Settings::from_toml(toml).expect("should parse");
         let co = settings
@@ -4957,6 +5012,11 @@ auction_timeout_ms = 500
             .expect("should have creative_opportunities");
         assert_eq!(co.gam_network_id, "21765378893");
         assert_eq!(co.auction_timeout_ms, Some(500));
+        assert_eq!(
+            co.section_segment,
+            Some(0),
+            "startup finalization should materialize the dynamic-template compatibility marker"
+        );
     }
 
     #[test]
@@ -5130,7 +5190,25 @@ gam_unit_path = ""
 page_patterns = ["/"]
 formats = [{ width = 300, height = 250 }]
 "#,
-            "resolved GAM unit path must not be empty",
+            "gam_unit_path template must not be empty",
+        );
+    }
+
+    #[test]
+    fn settings_rejects_dynamic_gam_unit_path_over_byte_limit_using_configured_values() {
+        let gam_unit_path = "{network_id}".repeat(10);
+        let slot_body = format!(
+            r#"
+id = "atf"
+gam_unit_path = "{gam_unit_path}"
+page_patterns = ["/"]
+formats = [{{ width = 300, height = 250 }}]
+"#
+        );
+
+        assert_creative_opportunity_slot_config_rejected(
+            &slot_body,
+            "must render to at most 100 UTF-8 bytes",
         );
     }
 

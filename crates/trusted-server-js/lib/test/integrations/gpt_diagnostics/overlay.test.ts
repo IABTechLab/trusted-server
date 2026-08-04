@@ -1,15 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { log } from '../../../src/core/log';
 import type { GptDiagnosticsBinding } from '../../../src/core/types';
 import type { GptDiagnosticsBindingView } from '../../../src/integrations/gpt_diagnostics/binding';
 import {
   GPT_DIAGNOSTICS_HOST_ID,
   GptDiagnosticsOverlay,
 } from '../../../src/integrations/gpt_diagnostics/overlay';
-import {
-  GptDiagnosticsStore,
-  TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS,
-} from '../../../src/integrations/gpt_diagnostics/store';
+import { GptDiagnosticsStore } from '../../../src/integrations/gpt_diagnostics/store';
 
 class FakeBindings {
   private readonly listeners = new Set<() => void>();
@@ -93,51 +91,6 @@ describe('GptDiagnosticsOverlay', () => {
     expect(host).not.toBeNull();
     expect(host!.shadowRoot).toBeNull();
     expect(root?.textContent).toContain('early-slot');
-    overlay.destroy();
-  });
-
-  it('states who delivered the ad and names other Ad Manager demand', () => {
-    const frames: Array<() => void> = [];
-    let now = 10;
-    const store = new GptDiagnosticsStore({
-      now: () => now,
-      schedule: (callback) => callback(),
-      defer: () => undefined,
-    });
-    const bindings = new FakeBindings();
-
-    const claimedSlot = slot('claimed-slot');
-    store.recordTrustedServerCandidate(claimedSlot, 'slot-a');
-    store.recordSlotRequested(claimedSlot);
-    now = 25;
-    store.recordSlotRenderEnded(claimedSlot, { isEmpty: false });
-    store.recordTrustedServerClaim('slot-a');
-
-    const lostSlot = slot('lost-slot');
-    store.recordTrustedServerCandidate(lostSlot, 'slot-b');
-    store.recordSlotRequested(lostSlot);
-    now = 30;
-    store.recordSlotRenderEnded(lostSlot, {
-      isEmpty: false,
-      adManager: { lineItemId: 6543210987, campaignId: 2345678901 },
-    });
-    now = 30 + TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS;
-
-    let root: ShadowRoot | undefined;
-    const overlay = new GptDiagnosticsOverlay(store, bindings, {
-      scheduleFrame: (callback) => frames.push(callback),
-      onShadowRoot: (createdRoot) => {
-        root = createdRoot;
-      },
-    });
-    runNextFrame(frames);
-    runNextFrame(frames);
-
-    const text = root!.textContent ?? '';
-    expect(text).toContain('Trusted Server creative rendered — it requested its markup');
-    expect(text).toContain('Other Ad Manager demand rendered — no Trusted Server creative ran');
-    expect(text).toContain('Ad Manager reported line item 6543210987 · order 2345678901');
-    expect(text).toContain('Ad Manager reservation line item');
     overlay.destroy();
   });
 
@@ -260,6 +213,7 @@ describe('GptDiagnosticsOverlay', () => {
     publisherElement.id = GPT_DIAGNOSTICS_HOST_ID;
     publisherElement.textContent = 'Publisher element';
     document.body.append(publisherElement);
+    const warn = vi.spyOn(log, 'warn');
     const overlay = new GptDiagnosticsOverlay(new GptDiagnosticsStore(), new FakeBindings(), {
       scheduleFrame: (callback) => frames.push(callback),
     });
@@ -269,11 +223,45 @@ describe('GptDiagnosticsOverlay', () => {
     expect(document.getElementById(GPT_DIAGNOSTICS_HOST_ID)).toBe(publisherElement);
     expect(publisherElement.textContent).toBe('Publisher element');
     expect(publisherElement.shadowRoot).toBeNull();
+    expect(warn).toHaveBeenCalledTimes(1);
+    overlay.show();
+    expect(warn).toHaveBeenCalledTimes(1);
 
     publisherElement.remove();
     await Promise.resolve();
     runNextFrame(frames);
     expect(document.getElementById(GPT_DIAGNOSTICS_HOST_ID)).not.toBeNull();
+    overlay.destroy();
+  });
+
+  it('labels completed renders with unknown fill and preserves live panel state', () => {
+    const frames: Array<() => void> = [];
+    const store = new GptDiagnosticsStore({ schedule: (callback) => callback() });
+    const diagnosticSlot = slot('unknown-render');
+    store.recordSlotRequested(diagnosticSlot);
+    store.recordSlotResponseReceived(diagnosticSlot);
+    store.recordSlotRenderEnded(diagnosticSlot, {});
+    store.recordSlotRequested(diagnosticSlot);
+    let root: ShadowRoot | undefined;
+    const overlay = new GptDiagnosticsOverlay(store, new FakeBindings(), {
+      scheduleFrame: (callback) => frames.push(callback),
+      onShadowRoot: (createdRoot) => {
+        root = createdRoot;
+      },
+    });
+    runNextFrame(frames);
+    runNextFrame(frames);
+
+    const content = root!.querySelector<HTMLElement>('.tsgd-content')!;
+    const history = root!.querySelector<HTMLDetailsElement>('details')!;
+    history.open = true;
+    content.scrollTop = 42;
+    store.recordSlotResponseReceived(diagnosticSlot);
+    runNextFrame(frames);
+
+    expect(root!.textContent).toContain('Rendered (fill unknown)');
+    expect(root!.querySelector<HTMLDetailsElement>('details')?.open).toBe(true);
+    expect(root!.querySelector<HTMLElement>('.tsgd-content')?.scrollTop).toBe(42);
     overlay.destroy();
   });
 

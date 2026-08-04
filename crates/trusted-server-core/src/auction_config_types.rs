@@ -11,6 +11,18 @@ pub struct AuctionConfig {
     #[serde(default)]
     pub enabled: bool,
 
+    /// Rewrite sanitized winning-bid creative HTML to first-party endpoints.
+    ///
+    /// The default must stay omitted from serialized config blobs: older
+    /// [`AuctionConfig`] schemas reject unknown fields during binary rollback.
+    /// An explicit `false` remains serialized and requires restoring a
+    /// compatible blob before rolling back.
+    #[serde(
+        default = "default_rewrite_creatives",
+        skip_serializing_if = "is_default_rewrite_creatives"
+    )]
+    pub rewrite_creatives: bool,
+
     /// Provider names that participate in bidding
     /// Simply list the provider names (e.g., ["prebid", "aps"])
     #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
@@ -41,6 +53,7 @@ impl Default for AuctionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            rewrite_creatives: default_rewrite_creatives(),
             providers: Vec::new(),
             mediator: None,
             timeout_ms: default_timeout(),
@@ -52,6 +65,15 @@ impl Default for AuctionConfig {
 
 fn default_timeout() -> u32 {
     2000
+}
+
+fn default_rewrite_creatives() -> bool {
+    true
+}
+
+// This predicate preserves rollback compatibility by omitting the default field.
+fn is_default_rewrite_creatives(value: &bool) -> bool {
+    *value == default_rewrite_creatives()
 }
 
 fn default_creative_store() -> String {
@@ -77,5 +99,47 @@ impl AuctionConfig {
     #[must_use]
     pub fn has_mediator(&self) -> bool {
         self.mediator.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rewrite_creatives_defaults_to_true() {
+        let config: AuctionConfig =
+            serde_json::from_value(serde_json::json!({})).expect("should deserialize defaults");
+
+        assert!(
+            config.rewrite_creatives,
+            "should enable creative rewriting by default"
+        );
+    }
+
+    #[test]
+    fn default_rewrite_creatives_is_not_serialized() {
+        let serialized =
+            serde_json::to_value(AuctionConfig::default()).expect("should serialize defaults");
+
+        assert!(
+            serialized.get("rewrite_creatives").is_none(),
+            "should omit the default rewrite setting"
+        );
+    }
+
+    #[test]
+    fn disabled_rewrite_creatives_is_serialized() {
+        let config = AuctionConfig {
+            rewrite_creatives: false,
+            ..AuctionConfig::default()
+        };
+        let serialized = serde_json::to_value(config).expect("should serialize disabled rewriting");
+
+        assert_eq!(
+            serialized.get("rewrite_creatives"),
+            Some(&serde_json::Value::Bool(false)),
+            "should preserve an explicit rewrite opt-out"
+        );
     }
 }

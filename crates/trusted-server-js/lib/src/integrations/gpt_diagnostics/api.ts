@@ -1,8 +1,4 @@
-import type {
-  GptDiagnosticsApi,
-  GptDiagnosticsExportV1,
-  GptDiagnosticsSlotHandle,
-} from '../../core/types';
+import type { GptDiagnosticsApi, GptDiagnosticsExportV1 } from '../../core/types';
 
 import type { GptDiagnosticsBindingManager } from './binding';
 import type { GptDiagnosticsStoreSnapshot } from './store';
@@ -10,8 +6,6 @@ import type { GptDiagnosticsStoreSnapshot } from './store';
 interface ApiStore {
   snapshot(): GptDiagnosticsStoreSnapshot;
   subscribe(listener: () => void): () => void;
-  recordTrustedServerCandidate(slot: GptDiagnosticsSlotHandle, auctionSlotId: string): void;
-  recordTrustedServerClaim(auctionSlotId: string): void;
 }
 
 interface ApiBindingManager {
@@ -77,12 +71,6 @@ export class GptDiagnosticsApiController {
       subscribe: (listener) => this.subscribe(listener),
       show: () => this.presentation.show(),
       hide: () => this.presentation.hide(),
-      recordTrustedServerCandidate: (slot, auctionSlotId) => {
-        this.store.recordTrustedServerCandidate(slot, auctionSlotId);
-      },
-      recordTrustedServerClaim: (auctionSlotId) => {
-        this.store.recordTrustedServerClaim(auctionSlotId);
-      },
     };
   }
 

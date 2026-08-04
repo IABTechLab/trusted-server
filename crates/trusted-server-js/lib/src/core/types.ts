@@ -93,6 +93,7 @@ export type GptDiagnosticsBindingReason =
   | 'missing_slot_element_id'
   | 'missing_element'
   | 'duplicate_dom_id'
+  | 'dom_uniqueness_unverifiable'
   | 'duplicate_gpt_slot_id';
 
 export interface GptDiagnosticsBinding {
@@ -108,59 +109,6 @@ export interface GptDiagnosticsDurations {
   renderToViewableMs?: number;
 }
 
-/**
- * Ad Manager's own identifiers for the delivered ad, as reported by
- * `slotRenderEnded`.
- *
- * These are documented GPT callback fields carrying the publisher's own Ad
- * Manager data — the same values `?google_console=1` shows. They name what Ad
- * Manager delivered; they claim nothing about which demand source supplied it.
- */
-export interface GptDiagnosticsAdManagerIdentity {
-  lineItemId?: number;
-  creativeId?: number;
-  campaignId?: number;
-  advertiserId?: number;
-  sourceAgnosticLineItemId?: number;
-  sourceAgnosticCreativeId?: number;
-  yieldGroupIds?: number[];
-  companyIds?: number[];
-}
-
-/**
- * How Ad Manager classified the delivered ad, derived only from the render
- * facts GPT reported.
- */
-export type GptDiagnosticsResponseClass =
-  | 'empty'
-  | 'backfill'
-  | 'reservation'
-  | 'unclassified_non_empty';
-
-/**
- * Whether the Trusted Server creative is the one that ran in this cycle.
- *
- * Every state is evidence-based and never inferred from targeting alone:
- *
- * - `trusted_server`: the rendered creative asked Trusted Server for its
- *   markup. Only the creative of the line item carrying Trusted Server's
- *   targeting does that, so Ad Manager selected it.
- * - `other_demand`: Trusted Server had a candidate on the slot and Ad Manager
- *   filled it, but no creative asked for markup within the attribution window.
- *   Ad Manager delivered something else — house, direct-sold, or its own
- *   default.
- * - `no_candidate`: Trusted Server had nothing on this slot, so the render was
- *   never Trusted Server's to win.
- * - `pending`: a candidate render is still inside its attribution window.
- * - `not_applicable`: the cycle was empty or has not rendered.
- */
-export type GptDiagnosticsDelivery =
-  | 'trusted_server'
-  | 'other_demand'
-  | 'no_candidate'
-  | 'pending'
-  | 'not_applicable';
-
 export interface GptDiagnosticsRequestCycle {
   requestNumber: number;
   requestedAtMs?: number;
@@ -174,14 +122,6 @@ export interface GptDiagnosticsRequestCycle {
   isBackfill?: boolean;
   slotContentChanged?: boolean;
   incompleteSequence: boolean;
-  adManager?: GptDiagnosticsAdManagerIdentity;
-  responseClass?: GptDiagnosticsResponseClass;
-  /** Trusted Server applied bid targeting to this slot before the request. */
-  trustedServerCandidate?: boolean;
-  /** When the rendered creative requested its markup from Trusted Server. */
-  trustedServerClaimAtMs?: number;
-  /** Derived on every snapshot; absent only on a cycle read before derivation. */
-  delivery?: GptDiagnosticsDelivery;
 }
 
 export interface GptDiagnosticsSlotExport {
@@ -227,31 +167,12 @@ export interface GptDiagnosticsExportV1 {
   };
 }
 
-/** GPT slot object identity, the only key diagnostics correlates slots by. */
-export interface GptDiagnosticsSlotHandle {
-  getSlotElementId?(): string;
-  getAdUnitPath?(): string;
-}
-
 export interface GptDiagnosticsApi {
   snapshot(): GptDiagnosticsExportV1;
   export(): void;
   subscribe(listener: (snapshot: GptDiagnosticsExportV1) => void): () => void;
   show(): void;
   hide(): void;
-  /**
-   * Report that Trusted Server applied bid targeting to a GPT slot, naming the
-   * auction slot the targeting came from.
-   *
-   * Called by the Trusted Server GPT integration, which is the only component
-   * that knows both identities. Diagnostics never infers this association.
-   */
-  recordTrustedServerCandidate(slot: GptDiagnosticsSlotHandle, auctionSlotId: string): void;
-  /**
-   * Report that the creative Ad Manager rendered requested its markup from
-   * Trusted Server for the named auction slot.
-   */
-  recordTrustedServerClaim(auctionSlotId: string): void;
 }
 
 export interface TsjsApi {
@@ -305,15 +226,42 @@ export interface TsjsApi {
    */
   adInitRefreshInProgress?: boolean;
   /**
-   * True once the publisher has called `googletag.pubads().disableInitialLoad()`.
-   * GPT exposes no getter for this state, so it is tracked by wrapping the
-   * setter. When set, `display()` only registers a slot and the ad request must
-   * come from a `refresh()`; adInit() uses this to refresh its own freshly
-   * defined slots so they are not left blank.
+   * Whether the publisher disabled GPT initial load through
+   * `googletag.setConfig()` or `googletag.pubads().disableInitialLoad()`.
+   * TS synchronizes this from GPT's getter and wraps both configuration APIs as
+   * a fallback when the getter is unavailable.
+   * When set, `display()` only registers a slot and the ad request must come
+   * from a `refresh()`; adInit() uses this to refresh its own freshly defined
+   * slots so they are not left blank.
    */
   gptInitialLoadDisabled?: boolean;
   /** Guards SPA pushState hook installation. */
   spaHookInstalled?: boolean;
+  /**
+   * Monotonic count of committed SPA navigations, incremented synchronously by
+   * the SPA auction hook the moment it accepts a route change. The deferred
+   * initial-adInit bootstrap ([`scheduleInitialAdInit`]) is pinned to
+   * generation 0 (the SSR document) and no-ops when a navigation has
+   * committed — before it was called, or while it was pending. A counter is
+   * used instead of a URL comparison so the guard cannot diverge from the
+   * auction path: a query-only history change (which the hook deliberately
+   * ignores) leaves the counter unchanged, and an `/a → /b → /a` round trip
+   * (where the URL compares equal again) advances it.
+   */
+  navGeneration?: number;
+  /**
+   * Defers the initial `adInit()` until after React hydration: window `load`,
+   * then a double `requestAnimationFrame`. Called by the server-injected
+   * `</body>` bids script with the SSR bids payload. The whole initial pass
+   * is pinned to navigation generation 0 (the SSR document): if an SPA
+   * navigation has already committed — or commits while the deferred callback
+   * is pending — the payload is dropped and `adInit()` is not run, so a stale
+   * SSR bootstrap can neither clobber the live route's bids nor re-run it.
+   * Lives in the bundle so the lifecycle is executable under test and shares
+   * [`navGeneration`] with the SPA auction hook; `gpt_bootstrap.js` installs
+   * a minimal fallback for pages where the bundle fails to load.
+   */
+  scheduleInitialAdInit?: (initialBids?: Record<string, AuctionBidData>) => void;
   /** Read-only GPT lifecycle diagnostics API, present only in an activated tab. */
   gptDiagnostics?: GptDiagnosticsApi;
 }

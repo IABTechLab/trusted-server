@@ -115,47 +115,6 @@ describe('GptDiagnosticsBadgeManager', () => {
     manager.destroy();
   });
 
-  it('names the delivered demand in badge text when it is settled', () => {
-    expect(
-      gptDiagnosticsBadgeTextForTest({
-        requestNumber: 1,
-        isEmpty: false,
-        incompleteSequence: false,
-        durations: {},
-        delivery: 'trusted_server',
-      })
-    ).toBe('Filled · TS creative');
-    expect(
-      gptDiagnosticsBadgeTextForTest({
-        requestNumber: 1,
-        isEmpty: false,
-        incompleteSequence: false,
-        durations: {},
-        delivery: 'other_demand',
-        adManager: { lineItemId: 6543210987 },
-      })
-    ).toBe('Filled · GAM line item 6543210987');
-    expect(
-      gptDiagnosticsBadgeTextForTest({
-        requestNumber: 1,
-        isEmpty: false,
-        incompleteSequence: false,
-        durations: {},
-        delivery: 'other_demand',
-      })
-    ).toBe('Filled · Other GAM demand');
-    expect(
-      gptDiagnosticsBadgeTextForTest({
-        requestNumber: 1,
-        isEmpty: false,
-        incompleteSequence: false,
-        durations: {},
-        delivery: 'no_candidate',
-      }),
-      'should stay silent when Trusted Server had nothing on the slot'
-    ).toBe('Filled');
-  });
-
   it('uses only GPT-observed lifecycle facts in badge text', () => {
     expect(
       gptDiagnosticsBadgeTextForTest({
@@ -182,6 +141,14 @@ describe('GptDiagnosticsBadgeManager', () => {
         durations: {},
       })
     ).toBe('Empty');
+    expect(
+      gptDiagnosticsBadgeTextForTest({
+        requestNumber: 1,
+        renderAtMs: 5,
+        incompleteSequence: false,
+        durations: {},
+      })
+    ).toBe('Rendered (fill unknown)');
     expect(
       gptDiagnosticsBadgeTextForTest({
         requestNumber: 1,
@@ -222,6 +189,7 @@ describe('GptDiagnosticsBadgeManager', () => {
     const firstBadge = layer.querySelector<HTMLElement>('.tsgd-badge')!;
     expect(firstBadge.style.left).toBe('100px');
     expect(firstBadge.style.top).toBe('112px');
+    expect(firstBadge.style.maxWidth).toBe('260px');
 
     currentRectangle = rectangle(220, 260, 300, 250);
     window.dispatchEvent(new Event('scroll'));
@@ -234,6 +202,47 @@ describe('GptDiagnosticsBadgeManager', () => {
     expect(element.getAttributeNames().map((name) => [name, element.getAttribute(name)])).toEqual(
       originalAttributes
     );
+    manager.destroy();
+  });
+
+  it('ignores unrelated and hidden-layer mutations but tracks known slot subtrees', async () => {
+    const frames: Array<() => void> = [];
+    const store = new GptDiagnosticsStore({ schedule: (callback) => callback() });
+    const bindings = new FakeBindings();
+    const element = document.createElement('div');
+    element.id = 'mutation-slot';
+    document.body.append(element);
+    vi.spyOn(element, 'getBoundingClientRect').mockReturnValue(rectangle(10, 100, 300, 250));
+    store.recordSlotRequested(slot('mutation-slot'));
+    bindings.set(1, { status: 'bound' }, element, true);
+    const layer = document.createElement('div');
+    document.body.append(layer);
+    const manager = new GptDiagnosticsBadgeManager(store, bindings, {
+      scheduleFrame: (callback) => frames.push(callback),
+    });
+    manager.setLayer(layer);
+    runFrame(frames);
+    const snapshot = vi.spyOn(store, 'snapshot');
+    snapshot.mockClear();
+
+    document.body.append(document.createElement('div'));
+    await Promise.resolve();
+    expect(frames).toEqual([]);
+    expect(snapshot).not.toHaveBeenCalled();
+
+    element.append(document.createElement('span'));
+    await Promise.resolve();
+    expect(frames).toHaveLength(1);
+    runFrame(frames);
+    expect(snapshot).not.toHaveBeenCalled();
+
+    manager.setLayer(undefined);
+    runFrame(frames);
+    snapshot.mockClear();
+    element.append(document.createElement('span'));
+    await Promise.resolve();
+    expect(frames).toEqual([]);
+    expect(snapshot).not.toHaveBeenCalled();
     manager.destroy();
   });
 

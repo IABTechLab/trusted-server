@@ -1,4 +1,9 @@
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
+
 import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
+
+import type { TsjsApi } from '../../../src/core/types';
 
 // Track every 'message' EventListener added to window across the entire test
 // file.  This lets the installTsRenderBridge suite remove all accumulated
@@ -40,15 +45,46 @@ interface SlotRenderEvent {
   };
 }
 
-type TestWindow = Window & {
+// The `Prebid Response` payload the render bridge posts back to the Prebid
+// Universal Creative over the message port.
+interface PrebidResponseMessage {
+  message?: string;
+  adId?: string;
+  ad?: string;
+  width?: number;
+  height?: number;
+}
+
+// `tsjs` is declared globally as the full `TsjsApi` (core/types.ts). Omitting
+// it from `Window` before re-adding it as a `Partial` avoids the intersection
+// that would force every fixture below to satisfy the whole `TsjsApi` shape.
+type TestWindow = Omit<Window, 'tsjs'> & {
   googletag?: unknown;
   apstag?: { setDisplayBids?: () => void };
-  // Typed as `any` to avoid the TypeScript intersection with the global
-  // Window.tsjs declaration (TsjsApi from core/types.ts), which would require
-  // every test fixture to satisfy the full TsjsApi shape.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  tsjs?: any;
+  tsjs?: Partial<TsjsApi>;
 };
+
+async function runGptBootstrap(googletag: object): Promise<void> {
+  const bootstrapUrl = new URL(
+    '../../../../../trusted-server-core/src/integrations/gpt_bootstrap.js',
+    import.meta.url
+  );
+  const urlPath = decodeURIComponent(bootstrapUrl.pathname);
+  let bootstrapPath: string;
+  if (urlPath.startsWith('/@fs/')) {
+    bootstrapPath = urlPath.slice('/@fs'.length);
+  } else if (bootstrapUrl.protocol === 'file:') {
+    bootstrapPath = urlPath;
+  } else {
+    bootstrapPath = path.resolve(process.cwd(), `.${urlPath}`);
+  }
+  const bootstrap = await readFile(bootstrapPath, 'utf8');
+  const runBootstrap = new Function('window', 'googletag', bootstrap) as (
+    window: Window,
+    googletag: object
+  ) => void;
+  runBootstrap(window, googletag);
+}
 
 describe('installTsAdInit', () => {
   beforeEach(() => {
@@ -75,88 +111,6 @@ describe('installTsAdInit', () => {
   afterEach(() => {
     document.getElementById('div-atf-sidebar')?.remove();
     document.getElementById("ad'prefix-real")?.remove();
-  });
-
-  it('associates the GPT slot with its auction slot for GPT diagnostics', async () => {
-    const mockSlot = {
-      addService: vi.fn().mockReturnThis(),
-      setTargeting: vi.fn().mockReturnThis(),
-      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
-      getTargeting: vi.fn().mockReturnValue([]),
-    };
-    const mockPubads = {
-      enableSingleRequest: vi.fn(),
-      getSlots: vi.fn().mockReturnValue([mockSlot]),
-      addEventListener: vi.fn(),
-      refresh: vi.fn(),
-    };
-    (window as TestWindow).googletag = {
-      cmd: { push: vi.fn((fn: () => void) => fn()) },
-      defineSlot: vi.fn().mockReturnValue(mockSlot),
-      pubads: vi.fn().mockReturnValue(mockPubads),
-      enableServices: vi.fn(),
-    };
-    const recordTrustedServerCandidate = vi.fn();
-    (window as TestWindow).tsjs = {
-      adSlots: [
-        {
-          id: 'atf_sidebar_ad',
-          gam_unit_path: '/123/atf',
-          div_id: 'div-atf-sidebar',
-          formats: [[300, 250]],
-          targeting: {},
-        },
-      ],
-      bids: { atf_sidebar_ad: { hb_adid: 'abc-uuid', hb_pb: '1.00' } },
-      gptDiagnostics: { recordTrustedServerCandidate },
-    };
-
-    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
-    installTsAdInit();
-    (window as TestWindow).tsjs!.adInit!();
-
-    expect(recordTrustedServerCandidate).toHaveBeenCalledWith(mockSlot, 'atf_sidebar_ad');
-  });
-
-  it('reports no diagnostics candidate for a slot without a Trusted Server bid', async () => {
-    const mockSlot = {
-      addService: vi.fn().mockReturnThis(),
-      setTargeting: vi.fn().mockReturnThis(),
-      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
-      getTargeting: vi.fn().mockReturnValue([]),
-    };
-    const mockPubads = {
-      enableSingleRequest: vi.fn(),
-      getSlots: vi.fn().mockReturnValue([mockSlot]),
-      addEventListener: vi.fn(),
-      refresh: vi.fn(),
-    };
-    (window as TestWindow).googletag = {
-      cmd: { push: vi.fn((fn: () => void) => fn()) },
-      defineSlot: vi.fn().mockReturnValue(mockSlot),
-      pubads: vi.fn().mockReturnValue(mockPubads),
-      enableServices: vi.fn(),
-    };
-    const recordTrustedServerCandidate = vi.fn();
-    (window as TestWindow).tsjs = {
-      adSlots: [
-        {
-          id: 'atf_sidebar_ad',
-          gam_unit_path: '/123/atf',
-          div_id: 'div-atf-sidebar',
-          formats: [[300, 250]],
-          targeting: {},
-        },
-      ],
-      bids: {},
-      gptDiagnostics: { recordTrustedServerCandidate },
-    };
-
-    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
-    installTsAdInit();
-    (window as TestWindow).tsjs!.adInit!();
-
-    expect(recordTrustedServerCandidate).not.toHaveBeenCalled();
   });
 
   it('reads window.tsjs.bids synchronously and applies bid targeting before refresh', async () => {
@@ -199,8 +153,7 @@ describe('installTsAdInit', () => {
           burl: 'https://ssp/bill',
         },
       },
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any;
+    };
 
     const fetchSpy = vi.spyOn(global, 'fetch');
 
@@ -215,6 +168,7 @@ describe('installTsAdInit', () => {
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_cache_host', 'cache.example.com');
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_cache_path', '/pbc/v1/cache');
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_initial', '1');
+    expect(mockPubads.enableSingleRequest).toHaveBeenCalledOnce();
     expect(mockPubads.refresh).toHaveBeenCalled();
 
     fetchSpy.mockRestore();
@@ -254,8 +208,7 @@ describe('installTsAdInit', () => {
         },
       ],
       bids: {},
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any;
+    };
 
     const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
@@ -287,6 +240,7 @@ describe('installTsAdInit', () => {
       refresh: vi.fn(),
       disableInitialLoad: vi.fn(),
     };
+    const getConfigMock = vi.fn().mockReturnValue(undefined);
     const displayMock = vi.fn();
     (window as TestWindow).googletag = {
       cmd: { push: vi.fn((fn: () => void) => fn()) },
@@ -294,6 +248,8 @@ describe('installTsAdInit', () => {
       display: displayMock,
       pubads: vi.fn().mockReturnValue(mockPubads),
       enableServices: vi.fn(),
+      // Exercise the wrapper fallback used when the getter has no value.
+      getConfig: getConfigMock,
     };
     (window as TestWindow).tsjs = {
       adSlots: [
@@ -306,8 +262,7 @@ describe('installTsAdInit', () => {
         },
       ],
       bids: {},
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any;
+    };
 
     const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
@@ -321,6 +276,312 @@ describe('installTsAdInit', () => {
 
     // The slot is still registered via display(), and additionally refreshed so
     // it actually requests an ad under disableInitialLoad().
+    expect(displayMock).toHaveBeenCalledWith('div-atf-sidebar');
+    expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
+  });
+
+  it('preserves legacy state in the edge bootstrap when getConfig does not report it', async () => {
+    const mockSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+    };
+    const disableInitialLoadMock = vi.fn();
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([]),
+      refresh: vi.fn(),
+      disableInitialLoad: disableInitialLoadMock,
+    };
+    const displayMock = vi.fn();
+    const getConfigMock = vi.fn().mockReturnValue(undefined);
+    const googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(mockSlot),
+      display: displayMock,
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+      getConfig: getConfigMock,
+    };
+    (window as TestWindow).googletag = googletag;
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {},
+    };
+
+    await runGptBootstrap(googletag);
+
+    mockPubads.disableInitialLoad();
+    expect(disableInitialLoadMock).toHaveBeenCalledOnce();
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(true);
+
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(displayMock).toHaveBeenCalledWith('div-atf-sidebar');
+    expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
+  });
+
+  it('tracks setConfig state and re-enabling in the edge bootstrap', async () => {
+    const mockSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+    };
+    type InitialLoadConfig = {
+      disableInitialLoad?: boolean | null;
+    };
+    let effectiveConfig: { disableInitialLoad?: boolean } = {};
+    const setConfigMock = vi.fn((config: InitialLoadConfig) => {
+      if ('disableInitialLoad' in config) {
+        effectiveConfig = { disableInitialLoad: config.disableInitialLoad === true };
+      }
+    });
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([]),
+      refresh: vi.fn(),
+    };
+    const displayMock = vi.fn();
+    const googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(mockSlot),
+      display: displayMock,
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+      getConfig: undefined as undefined | (() => { disableInitialLoad?: boolean }),
+      setConfig: setConfigMock,
+    };
+    (window as TestWindow).googletag = googletag;
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {},
+    };
+
+    await runGptBootstrap(googletag);
+
+    // Older GPT runtimes may expose setConfig without getConfig. In that case,
+    // the wrapper tracks explicit initial-load updates directly.
+    googletag.setConfig({ disableInitialLoad: true });
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(true);
+    googletag.setConfig({ disableInitialLoad: false });
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(false);
+
+    googletag.getConfig = vi.fn(() => effectiveConfig);
+    setConfigMock.mockClear();
+    googletag.setConfig({ disableInitialLoad: true });
+    expect(setConfigMock).toHaveBeenCalledOnce();
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(true);
+
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(displayMock).toHaveBeenCalledWith('div-atf-sidebar');
+    expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
+
+    mockPubads.refresh.mockClear();
+    googletag.setConfig({ disableInitialLoad: false });
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(false);
+
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(mockPubads.refresh).not.toHaveBeenCalled();
+
+    googletag.setConfig({ disableInitialLoad: true });
+    googletag.setConfig({ disableInitialLoad: null });
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(false);
+
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(mockPubads.refresh).not.toHaveBeenCalled();
+  });
+
+  it('tracks the effective initial-load state from setConfig', async () => {
+    // Modern GPT configuration uses googletag.setConfig() rather than the
+    // legacy pubads().disableInitialLoad() method. TS must detect both forms.
+    const mockSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
+    type InitialLoadConfig = {
+      disableInitialLoad?: boolean | null;
+      singleRequest?: boolean;
+    };
+    let effectiveConfig: { disableInitialLoad?: boolean } = {};
+    const setConfigMock = vi.fn((config: InitialLoadConfig) => {
+      if ('disableInitialLoad' in config) {
+        effectiveConfig = { disableInitialLoad: config.disableInitialLoad === true };
+      }
+    });
+    const disableInitialLoadMock = vi.fn(() => {
+      effectiveConfig = { disableInitialLoad: true };
+    });
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      // Publisher has not defined this slot, so TS defines (owns) it.
+      getSlots: vi.fn().mockReturnValue([]),
+      addEventListener: vi.fn(),
+      refresh: vi.fn(),
+      disableInitialLoad: disableInitialLoadMock,
+    };
+    const displayMock = vi.fn();
+    const getConfigMock = vi.fn(() => effectiveConfig);
+    const googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(mockSlot),
+      display: displayMock,
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+      getConfig: undefined as undefined | typeof getConfigMock,
+      setConfig: setConfigMock,
+    };
+    (window as TestWindow).googletag = googletag;
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {},
+    };
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    installTsAdInit();
+
+    const gpt = (window as TestWindow).googletag as {
+      setConfig(config: InitialLoadConfig): void;
+    };
+    gpt.setConfig({ singleRequest: true });
+    expect(setConfigMock).toHaveBeenCalledOnce();
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).not.toBe(true);
+
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(displayMock).toHaveBeenCalledWith('div-atf-sidebar');
+    expect(mockPubads.refresh).not.toHaveBeenCalled();
+
+    // Fall back to the explicit setConfig value when getConfig is unavailable.
+    gpt.setConfig({ disableInitialLoad: true });
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(true);
+    gpt.setConfig({ disableInitialLoad: false });
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(false);
+
+    googletag.getConfig = getConfigMock;
+    setConfigMock.mockClear();
+    const config = { disableInitialLoad: true, singleRequest: true };
+    gpt.setConfig(config);
+    expect(setConfigMock).toHaveBeenCalledOnce();
+    expect(setConfigMock).toHaveBeenLastCalledWith(config);
+    expect(getConfigMock).toHaveBeenCalledWith('disableInitialLoad');
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(true);
+
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
+
+    mockPubads.refresh.mockClear();
+    gpt.setConfig({ disableInitialLoad: false });
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(false);
+    gpt.setConfig({ disableInitialLoad: null });
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(false);
+
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(mockPubads.refresh).not.toHaveBeenCalled();
+
+    // GPT exposes one effective setting across the modern and legacy APIs.
+    // A legacy call made after setConfig(false) disables initial load.
+    mockPubads.disableInitialLoad();
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(true);
+
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
+
+    // A later modern call can re-enable initial load after the legacy API.
+    mockPubads.refresh.mockClear();
+    gpt.setConfig({ disableInitialLoad: false });
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(false);
+
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(mockPubads.refresh).not.toHaveBeenCalled();
+
+    // Resetting the setting to its default has the same effective result.
+    mockPubads.disableInitialLoad();
+    gpt.setConfig({ disableInitialLoad: null });
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(false);
+
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(mockPubads.refresh).not.toHaveBeenCalled();
+  });
+
+  it('reads initial-load configuration effective before detector installation', async () => {
+    const mockSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([]),
+      addEventListener: vi.fn(),
+      refresh: vi.fn(),
+    };
+    const displayMock = vi.fn();
+    const getConfigMock = vi.fn().mockReturnValue({ disableInitialLoad: true });
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(mockSlot),
+      display: displayMock,
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+      getConfig: getConfigMock,
+    };
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {},
+    };
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+
+    expect(getConfigMock).toHaveBeenCalledWith('disableInitialLoad');
+    expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(true);
+
+    (window as TestWindow).tsjs!.adInit!();
+
     expect(displayMock).toHaveBeenCalledWith('div-atf-sidebar');
     expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
   });
@@ -360,8 +621,7 @@ describe('installTsAdInit', () => {
         },
       ],
       bids: {},
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any;
+    };
 
     const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
@@ -400,8 +660,7 @@ describe('installTsAdInit', () => {
       // Previous route touched the publisher-owned slot on div-old-route.
       divToSlotId: { 'div-old-route': 'old_slot' },
       prevSlotTargetingKeys: { 'div-old-route': ['pos'] },
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any;
+    };
 
     const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
@@ -440,8 +699,7 @@ describe('installTsAdInit', () => {
     (window as TestWindow).tsjs = {
       adSlots: [],
       bids: {},
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any;
+    };
 
     const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
@@ -845,8 +1103,7 @@ describe('installTsAdInit', () => {
       bids: {
         atf_sidebar_ad: { hb_pb: '1.50', hb_bidder: 'aps', nurl: '', burl: '' },
       },
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any;
+    };
 
     const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
@@ -892,8 +1149,7 @@ describe('installTsAdInit', () => {
       bids: {
         atf_sidebar_ad: { hb_pb: '1.00', hb_bidder: 'kargo' },
       },
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any;
+    };
 
     const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
@@ -1097,8 +1353,11 @@ describe('installTsRenderBridge', () => {
       .mockImplementation(
         (type: string, handler: EventListenerOrEventListenerObject, opts?: unknown) => {
           if (type === 'message') bridgeListener = handler as (e: MessageEvent) => unknown;
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          origAdd(type, handler as EventListener, opts as any);
+          origAdd(
+            type,
+            handler as EventListener,
+            opts as boolean | AddEventListenerOptions | undefined
+          );
         }
       );
     await import('../../../src/integrations/gpt/index');
@@ -1107,48 +1366,6 @@ describe('installTsRenderBridge', () => {
     expect(bridgeListener, 'bridge listener should be registered').toBeDefined();
     return bridgeListener!;
   }
-
-  it('reports the creative markup request to GPT diagnostics when activated', async () => {
-    const recordTrustedServerClaim = vi.fn();
-    const tsjs = (window as TestWindow).tsjs!;
-    tsjs.gptDiagnostics = { recordTrustedServerClaim };
-    // Serve from inline adm so the claim is asserted without a cache fetch
-    // whose fire-and-forget continuation would outlive this test.
-    tsjs.bids.homepage_header.adm = '<div>Creative</div>';
-    delete tsjs.bids.homepage_header.nurl;
-    delete tsjs.bids.homepage_header.burl;
-
-    const bridgeListener = await captureBridgeListener();
-    const source = createTrustedSlotIframe();
-    bridgeListener(
-      Object.assign(new Event('message'), {
-        data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
-        ports: [{ postMessage: vi.fn() }],
-        source,
-        stopImmediatePropagation: vi.fn(),
-      }) as unknown as MessageEvent
-    );
-
-    expect(recordTrustedServerClaim).toHaveBeenCalledWith('homepage_header');
-  });
-
-  it('reports no claim for an ad ID the requesting slot does not own', async () => {
-    const recordTrustedServerClaim = vi.fn();
-    (window as TestWindow).tsjs!.gptDiagnostics = { recordTrustedServerClaim };
-
-    const bridgeListener = await captureBridgeListener();
-    const source = createTrustedSlotIframe();
-    bridgeListener(
-      Object.assign(new Event('message'), {
-        data: JSON.stringify({ message: 'Prebid Request', adId: 'someone-elses-ad-id' }),
-        ports: [{ postMessage: vi.fn() }],
-        source,
-        stopImmediatePropagation: vi.fn(),
-      }) as unknown as MessageEvent
-    );
-
-    expect(recordTrustedServerClaim).not.toHaveBeenCalled();
-  });
 
   it('calls stopImmediatePropagation and fetches PBS Cache for a TS bid', async () => {
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
@@ -1169,8 +1386,11 @@ describe('installTsRenderBridge', () => {
       .mockImplementation(
         (type: string, handler: EventListenerOrEventListenerObject, opts?: unknown) => {
           if (type === 'message') bridgeListener = handler as (e: MessageEvent) => unknown;
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          origAdd(type, handler as EventListener, opts as any);
+          origAdd(
+            type,
+            handler as EventListener,
+            opts as boolean | AddEventListenerOptions | undefined
+          );
         }
       );
     await import('../../../src/integrations/gpt/index');
@@ -1203,8 +1423,8 @@ describe('installTsRenderBridge', () => {
     );
     expect(stopSpy).toHaveBeenCalled();
     expect(portMessages).toHaveLength(1);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const parsed = JSON.parse(portMessages[0]) as Record<string, any>;
+
+    const parsed = JSON.parse(portMessages[0]) as PrebidResponseMessage;
     expect(parsed.message).toBe('Prebid Response');
     expect(parsed.adId).toBe('test-cache-uuid');
     expect(parsed.ad).toBe(mockAd);
@@ -1286,8 +1506,8 @@ describe('installTsRenderBridge', () => {
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
 
     expect(portMessages).toHaveLength(1);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const parsed = JSON.parse(portMessages[0]) as Record<string, any>;
+
+    const parsed = JSON.parse(portMessages[0]) as PrebidResponseMessage;
     expect(parsed.ad).toBe(rawAd);
     expect(beaconSpy).toHaveBeenCalledTimes(2);
     beaconSpy.mockRestore();
@@ -1318,8 +1538,8 @@ describe('installTsRenderBridge', () => {
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
 
     expect(portMessages).toHaveLength(1);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const parsed = JSON.parse(portMessages[0]) as Record<string, any>;
+
+    const parsed = JSON.parse(portMessages[0]) as PrebidResponseMessage;
     expect(parsed.width).toBe(300);
     expect(parsed.height).toBe(250);
     beaconSpy.mockRestore();
@@ -1354,8 +1574,8 @@ describe('installTsRenderBridge', () => {
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
 
     expect(portMessages).toHaveLength(1);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const parsed = JSON.parse(portMessages[0]) as Record<string, any>;
+
+    const parsed = JSON.parse(portMessages[0]) as PrebidResponseMessage;
     expect(parsed.ad).toContain('p=2.5');
     expect(parsed.ad).not.toContain('${AUCTION_PRICE}');
     beaconSpy.mockRestore();
@@ -1526,8 +1746,11 @@ describe('installTsRenderBridge', () => {
       .mockImplementation(
         (type: string, handler: EventListenerOrEventListenerObject, opts?: unknown) => {
           if (type === 'message') bridgeListener = handler as (e: MessageEvent) => unknown;
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          origAdd(type, handler as EventListener, opts as any);
+          origAdd(
+            type,
+            handler as EventListener,
+            opts as boolean | AddEventListenerOptions | undefined
+          );
         }
       );
     await import('../../../src/integrations/gpt/index');
@@ -1554,8 +1777,8 @@ describe('installTsRenderBridge', () => {
     expect(fetchStub).not.toHaveBeenCalled();
     expect(stopSpy).toHaveBeenCalled();
     expect(portMessages).toHaveLength(1);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const parsed = JSON.parse(portMessages[0]) as Record<string, any>;
+
+    const parsed = JSON.parse(portMessages[0]) as PrebidResponseMessage;
     expect(parsed.message).toBe('Prebid Response');
     expect(parsed.adId).toBe('debug-adid');
     expect(parsed.ad).toBe(inlineAdm);
@@ -1615,8 +1838,8 @@ describe('installTsRenderBridge', () => {
       await new Promise<void>((resolve) => setTimeout(resolve, 50));
 
       expect(portMessages).toHaveLength(1);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const parsed = JSON.parse(portMessages[0]) as Record<string, any>;
+
+      const parsed = JSON.parse(portMessages[0]) as PrebidResponseMessage;
       expect(parsed.width).toBe(300);
       expect(parsed.height).toBe(250);
     } finally {
@@ -1690,8 +1913,8 @@ describe('installTsRenderBridge', () => {
       await new Promise<void>((resolve) => setTimeout(resolve, 50));
 
       expect(portMessages).toHaveLength(1);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const parsed = JSON.parse(portMessages[0]) as Record<string, any>;
+
+      const parsed = JSON.parse(portMessages[0]) as PrebidResponseMessage;
       // The requesting slot's own creative and dimensions, not the first match's.
       expect(parsed.ad).toBe(inContentAdm);
       expect(parsed.width).toBe(300);
@@ -1711,7 +1934,7 @@ describe('installTsRenderBridge', () => {
     });
 
     try {
-      (window as TestWindow).tsjs.bids.homepage_header = {
+      (window as TestWindow).tsjs!.bids!.homepage_header = {
         hb_adid: 'debug-no-beacon',
         hb_bidder: 'mocktioneer',
         hb_pb: '0.20',
@@ -1757,7 +1980,7 @@ describe('installTsRenderBridge', () => {
 
   it('falls back to keepalive fetch when sendBeacon rejects the payload', async () => {
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(false);
-    (window as TestWindow).tsjs.bids.homepage_header = {
+    (window as TestWindow).tsjs!.bids!.homepage_header = {
       hb_adid: 'debug-rejected-beacon',
       hb_bidder: 'mocktioneer',
       hb_pb: '0.20',
@@ -1840,7 +2063,7 @@ describe('installTsRenderBridge', () => {
   it('ignores a request whose source slot does not own the resolved adId', async () => {
     // Two configured slots; slot A's iframe requests slot B's hb_adid. The
     // bridge must not return slot B's creative or fire slot B's beacons.
-    (window as TestWindow).tsjs.bids.homepage_footer = {
+    (window as TestWindow).tsjs!.bids!.homepage_footer = {
       hb_adid: 'footer-uuid',
       hb_bidder: 'kargo',
       hb_pb: '2.00',
@@ -1849,7 +2072,7 @@ describe('installTsRenderBridge', () => {
       nurl: 'https://ssp.example/footer-win',
       burl: 'https://ssp.example/footer-bill',
     };
-    (window as TestWindow).tsjs.adSlots.push({
+    (window as TestWindow).tsjs!.adSlots!.push({
       id: 'homepage_footer',
       formats: [[300, 250]] as [number, number][],
       gam_unit_path: '/a/b/footer',
