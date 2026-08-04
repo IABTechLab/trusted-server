@@ -402,9 +402,13 @@ state_key `tsstk1|tcf|p1=grant,p4=refuse` →
   X-Set-Cookie unclassified, incoming header ClientIDs not forwarded);
   the R16 cookie-translation is retracted as not equivalent; the old
   DataDome spec's banner now supersedes its header-mode requirement.
-- One pointer matrix (decision × session mode × pointer) lives in the
+- One pointer matrix (decision × session mode × pointer) added to the
   allowlist file with X-DD-B enumerated and no wildcard; both documented
-  vendor responses are decision-asserting fixtures.
+  vendor responses made decision-asserting fixtures. **Correction
+  (R19): text-added, not verified-closed** — R19 found the predecessor
+  tables (request-note, response-direction table) and the hook's inline
+  decision list still present and contradictory; they were physically
+  removed in R19.
 - Browser trust boundary ratified, not implied: non-HttpOnly cookie
   readable by every same-origin script, vendor challenge HTML with
   publisher-origin access, CSP interaction — sign-offs 23/28 rewritten.
@@ -421,9 +425,126 @@ state_key `tsstk1|tcf|p1=grant,p4=refuse` →
   complete-response deadline 3000 ms monotonic (1500 ms stays
   first-byte), encoded responses batch-invalid; total cookie parser
   (repeated Cookie joined, Set-Cookie never combined, strict attribute
-  rejection, 512-byte serialized measure); adapter header ceilings are
-  enumerated capability cells validated against core's budget at
-  startup; GPP/PSL placeholder status stated honestly here and above.
+  rejection, 512-byte serialized measure); adapter header ceilings were claimed as
+  enumerated capability cells validated at startup — **correction
+  (R19): overstated; the sentence existed, the matrix did not** (added
+  in R19 with per-adapter cells and the exact counting rule); GPP/PSL placeholder status stated honestly here and above.
 - P3s: §5.5 grammar dangler repaired with the section rebuild; the
   remaining "and the and a" occurrence fixed; the duplicated
   Set-Cookie-reserved sentence deduplicated.
+
+## Round 19 (at 1a15575a4)
+
+12 P1 (reviewer numbered 11 with one two-part item), 14 P2, 6 P3. All
+addressed; dispositions below use the text-added vs verified-closed
+vocabulary. Two R18 closure claims above were corrected as overstated
+(pointer-matrix single-sourcing; ceiling cells).
+
+P1 dispositions:
+
+- v1/N+1 bypass of negative gates: the total state table now opens with
+  "negative gates are release-, config-, and flag-invariant" and splits
+  the v1 catch-all into three rows (positive relaxation; revocation or
+  suppression present → denied; live `w` → withdrawn) — the
+  rollback-to-N+1 reproducer lands on the `w` row, not the catch-all.
+  The migration rollback contract cross-references the invariance.
+- Missing row-backed and legacy rows: the table adds "normal use in
+  every flag state" (row-backed operation unaffected by
+  active/suspended) and a stub-only row that routes to the live
+  `AuthorityRefresh` backfill; the permission spec's legacy paragraph
+  states that path is reachable because AuthorityRefresh admits on the
+  observed row + live resolution, never a prior summary.
+- Error row suppressing admitted destructive withdrawal: the default is
+  now "no writes whose admission depended on the failed read" — with
+  strong family admission already proven, family revocation and
+  suppression CAS proceed; only the cookie expiry waits.
+- Shared-clock suspension deadline: store-time branch re-reads store
+  current time at every check (one clock domain); the fallback defines
+  S_fleet as a declared, monitored maximum pairwise fleet skew — a
+  separate qualification from the evidence tolerance S — subtracted
+  again at comparison; clock domain serialized in the metadata value;
+  fastest-observer/slowest-committer tests named; a deployment with
+  neither store time nor a skew bound cannot host the migration.
+- Activation ordinal: deployment-metadata name `02` is the
+  policy-activation register — linearizable {source_version,
+  policy_digest, ordinal} with idempotent same-activation reuse and
+  stale-source_version rejection; §5.5 rewritten around it; the hook's
+  "globally assigned push version" wording replaced with the
+  `tscfg1|` digest + §5.5 pair.
+- Jurisdiction expiry: the summary gains `jurisdiction_observed_at`,
+  written only by live geo resolution; decision 25's age gate measures
+  against it (evidence timestamps explicitly disqualified as proxies).
+- Saturation vs per-signal lifetime: product choice made and declared —
+  the bounded shortening stands (first-overflow-pinned marker
+  inherited by later overflows), now stated as a declared exception in
+  permission §4.3 and carried by decisions 16 AND 31, with the
+  rejected alternatives (per-overflow state; marker refresh) recorded
+  in both.
+- Pointer-matrix predecessors: the allowlist file was rewritten — the
+  old response-direction table and both cookie-translation notes are
+  gone; the hook's inline decision list bullet was replaced by a
+  deferral to the matrix; the `X-Set-Cookie` cell now terminates in
+  one exact outcome (invalidate the batch → Continue, mode mismatch)
+  and the hook's "unclassified → batch handling" phrase was aligned.
+- Incoming header ClientID: one v1 path — stripped from the shared
+  request AND never used for the vendor payload (ClientID derives only
+  from the `datadome` cookie; forwarding a header ClientID would
+  require declaring X-DataDome-X-Set-Cookie per the vendor contract);
+  the "header form wins" priority rule deleted as unreachable; a
+  both-sources fixture pins cookie-only derivation.
+- 304 atomicity: staged off-record diff → (a) byte-coupled field
+  changed (changed, not present) → invalidate + full 200 before any
+  serve; (b) safe changes → one atomic cache commit (old-bytes-under-
+  new-metadata impossible); (c) no change → local-hit re-emit.
+- Recovery conditionals: artifact-absence/revision-mismatch recovery
+  strips every conditional field (client's and internal), processes
+  the full 200, then evaluates the client condition against the new
+  processed validator.
+
+P2 dispositions: N+1 interim reduced to one release × config-shape
+matrix (policy resolution / live gating / negative gates / row writes /
+positive commits / batch egress); GPP-USP evidence digests omit `|lu=`
+entirely with an embedded vector (`tsevd1|gpp|p1=grant,p4=refuse` →
+`89b08580…`), and slots gain a per-permission `observed_at` map
+refreshed only for changed tokens; saturation epoch expiry is a
+complete transition (lazy GC, re-saturation opens a new epoch pinned to
+its own first overflow, no cross-epoch inheritance); `w` capability
+retention corrected to the per-entry max(cookie, row, S2S) horizon with
+a permanent strong-read obligation for HMAC row discovery (and the §6.2
+"migration-window" label fixed); HEAD updates compare against
+origin-side metadata only and never touch processed-side headers; the
+Vary digest is a full contract (HMAC-SHA-256, `tsvry1|` grammar, comma
+join, secret-store key with versioned id, all values digested, zero-key
+vector `60fdeb3a…`); the adapter ceiling matrix now exists (Axum fixed
+≥ budget; Fastly/Cloudflare/Spin qualification-pending with fail-closed
+startup) with the exact counted-bytes formula and over-budget-snapshot
+behavior; the cookie parser defines the "; " join, duplicate-datadome
+ambiguity (request: cookie-absent + counted; response: batch reject),
+non-`datadome` Set-Cookie rejection, HttpOnly rejection, floor-based
+Expires→Max-Age conversion, and normalized-form size measurement;
+pointed-field multiplicity is closed (singletons atomically
+batch-invalid on duplication, list fields joined per RFC 9110 §5.3);
+Respond on HEAD validates the body but emits none with recomputed
+Content-Length; the 3000 ms deadline has measurement points (pre-
+acquisition → final byte; cancellation async, never delaying); malformed
+Cache-Control has an enumerated result (uncacheable + merging batch
+rejected — "most restrictive reading" deleted); sign-off 28 names the
+exact X-DD-B divergence; the GPP snapshot joins the PSL snapshot as a
+named pre-ratification gate and the snapshot file itself states its
+placeholder status.
+
+P3 dispositions: the state table's stray separator column and absorbed
+prose are gone (table rebuilt); the deployment-metadata row is a single
+proper table row with the floor encoding inside its cell; the authority
+row's gating column now reads "not read for gating — audit and cleanup
+only" and "activation generation" was renamed to the §5.5 ordinal; the
+hook's "ratified in sign-offs 23/28" now reads "enter sign-offs 23/28
+for ratification (both records still open)"; the two R18 ledger
+overclaims are corrected above; the old DataDome spec's superseded
+steps (timeout, post-finalization ordering, X-DataDome-X-Set-Cookie
+wire example and rules, implementation clarification 1) each carry an
+inline supersession note in place, not only the banner.
+
+Ratification state is unchanged and user-side: all 32 decision rows
+open, `decisions/` empty beyond the README, no adapter qualified, and
+the PSL and GPP snapshots are placeholders — all named gates.

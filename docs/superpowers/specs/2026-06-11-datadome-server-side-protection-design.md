@@ -79,6 +79,9 @@ JavaScript SDK.
    Store using configured store/name fields. Do not store the literal key in
    `trusted-server.toml`.
 8. **Timeout:** use `1500ms` as the default Protection API timeout for v1.
+   _(Superseded: `1500 ms` is the **first-byte** bound only; the
+   complete-response deadline is 3000 ms with defined measurement
+   points — hook spec §4a.)_
 9. **Duplicate tag handling:** do not attempt automatic duplicate-tag
    detection in v1; operators can disable injection with
    `inject_client_side_tag = false`.
@@ -215,6 +218,9 @@ Important behavior:
 - Response header mutations are accumulated and applied to the final response.
 - On `Respond`, routing short-circuits with that response while preserving any
   downstream response header effects that must be applied after finalization.
+  _(Superseded: one global order applies — core finalization → ordinary
+  mutators → security effects → invariant pass unconditionally last;
+  nothing applies after the invariant pass — hook spec §4a.)_
 - DataDome transport/API failures should not bubble out as registry errors;
   DataDome should convert them to `Continue(Default::default())` to preserve
   fail-open behavior.
@@ -447,7 +453,7 @@ Request headers:
 ```text
 Content-Type: application/x-www-form-urlencoded
 Content-Length: <encoded body length>
-X-DataDome-X-Set-Cookie: true  # only when X-DataDome-ClientID is used
+X-DataDome-X-Set-Cookie: true  # only when X-DataDome-ClientID is used — SUPERSEDED for v1: never sent (hook spec §4a)
 ```
 
 Payload fields should include the core fields from DataDome's official module:
@@ -494,6 +500,9 @@ Payload fields should include the core fields from DataDome's official module:
 
 When `X-DataDome-ClientID` is used, send
 `X-DataDome-X-Set-Cookie: true` to the Protection API.
+_(Superseded for v1: header-supplied ClientIDs are not forwarded at
+all — the vendor payload's ClientID derives only from the `datadome`
+cookie, so this header is never sent — hook spec §4a.)_
 
 Encoding and size rules:
 
@@ -722,7 +731,10 @@ Update after implementation to describe:
 - form encoding is correct
 - empty fields are omitted
 - `ClientID` comes from `X-DataDome-ClientID` before cookie
+  _(superseded for v1: cookie-only — the header is stripped and never
+  used for the vendor payload, hook spec §4a)_
 - `X-DataDome-X-Set-Cookie` is sent when header-based ClientID is used
+  _(superseded for v1: never sent, hook spec §4a)_
 - `datadome` cookie is parsed safely
 - long fields are truncated according to configured limits
 - request headers list is generated deterministically enough for tests
@@ -788,7 +800,9 @@ passes.
    methods, including `HEAD`, are eligible when the URL is otherwise in scope.
 2. The DataDome server-side key is loaded from runtime Secret Store in v1. The
    config contains only the secret store and secret name.
-3. The default Protection API timeout is `1500ms` for v1.
+3. The default Protection API timeout is `1500ms` for v1. _(Superseded:
+   first-byte bound only; 3000 ms complete-response deadline — hook
+   spec §4a.)_
 4. Auto-injection does not attempt duplicate-tag detection in v1. The explicit
    `inject_client_side_tag = false` escape hatch is sufficient.
 
@@ -796,7 +810,9 @@ passes.
 
 1. **Timeout semantics:** `timeout_ms = 1500` is the v1 default and maps to the
    dynamic backend first-byte timeout. It is not a full end-to-end response-body
-   deadline in v1.
+   deadline in v1. _(The hook spec §4a now adds the 3000 ms
+   complete-response deadline on the monotonic clock with defined
+   measurement points; both bounds apply.)_
 2. **Client metadata scope:** JA4 and H2 fingerprint values are sent only in the
    form-encoded Protection API payload to DataDome. They are not forwarded to
    the publisher origin or returned to the browser unless DataDome independently

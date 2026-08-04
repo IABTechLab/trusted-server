@@ -56,3 +56,9 @@ Supported sections (6–23) pin to the official IAB GPP registry revision
 recorded by the implementation PR (immutable upstream commit hash), with
 per-section encoded conformance vectors vendored alongside. A date is not
 a revision; the commit hash is the reproducible authority.
+
+**Status: placeholder until ratification.** Neither the immutable
+registry commit nor the conformance vectors are recorded yet; like the
+PSL snapshot, filling them is a pre-ratification prerequisite
+(migration spec §7) — the §4.5 field mappings cannot be reproduced
+against a pinned registry until they land.

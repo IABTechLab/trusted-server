@@ -485,7 +485,14 @@ and the fail-closed marker:
   circulated: not user-sticky-forever, and not the migration spec's
   former "irreversible artifact requiring administrative clear", which
   is superseded; administrative clear remains an optional early exit —
-  sign-off 16); **TCF refusal** — cleared by any regime-accepted grant with newer
+  sign-off 16 — **with one declared exception**: an opt-out arriving as
+  a restrictive _overflow_ while its source's replay history is
+  saturated inherits the saturation epoch's first-overflow marker and
+  may receive less than a full lifetime, down to nearly zero late in
+  the epoch (providers spec wire schema; the exception is carried by
+  sign-offs 16 and 31, and the alternatives — per-overflow state,
+  marker refresh — were rejected for unbounded storage and
+  replay-extension respectively); **TCF refusal** — cleared by any regime-accepted grant with newer
   authoritative evidence; **malformed-present / absence** — cleared by
   any regime-accepted valid grant with newer evidence, including a
   timestamp-less grant whose first-seen is newer (these causes are not
@@ -841,11 +848,26 @@ domain tag `tspol1|` over the canonical JSON of the parsed policy (keys
 sorted lexicographically by UTF-8 code unit, numbers shortest
 round-trip, defaults materialized, no insignificant whitespace;
 cross-language vectors required) — identity, so an A→B→A rollback
-yields A's digest again. The ordinal is a **globally ordered activation
-counter, CAS-incremented in the deployment-metadata primitive on each
-config activation** — order, adapter-independent (not every adapter has
-a native push version, and per-instance counters ordered nothing across
-a fleet). Authority wire records, the S2S recompute, and the hook cache
+yields A's digest again. The ordinal comes from the **policy-activation register** —
+deployment-metadata name `02` (providers spec §6.3), a linearizable
+`{source_version, policy_digest, ordinal}` value with three transition
+rules that make it idempotent and single-source, not merely a counter:
+an activation presenting the register's stored
+`(source_version, policy_digest)` pair **adopts the stored ordinal
+without incrementing** (every instance activating the same push
+converges on one ordinal — the CAS winner assigns, everyone else
+reuses, so assignment is effectively single-actor); a novel pair
+CAS-increments; and an activation whose `source_version` is **older**
+than the stored one is rejected as stale (an instance restarting on old
+config can neither mint a new ordinal nor regress the register).
+`source_version` is the config store's push version where the backend
+assigns an ordered one; a backend without one uses the `tscfg1|`
+config-revision digest as `source_version`, which cannot detect
+staleness — there, a laggard re-activating an older digest mints a new
+ordinal, which is **safe** (revision identity is the pair; fleet order
+stays correct) but visible in the activation-ordinal metric. Order is
+adapter-independent either way (per-instance counters ordered nothing
+across a fleet). Authority wire records, the S2S recompute, and the hook cache
 tuple all use this same pair; the hook's earlier "config-store push
 version" and any digest-only usage are superseded. The other cache-tuple
 inputs are likewise domain-separated hashes of effective configuration:
@@ -1003,7 +1025,12 @@ Consumers of the resolved set in this epic:
    visit — and a visitor who moved from a permissive into a GDPR
    jurisdiction would otherwise keep old-rule egress for up to the row
    lifetime. A stored jurisdiction older than the **consent-TTL
-   horizon** fails closed pending a live refresh (the inverse — denying
+   horizon** — age measured as now − `jurisdiction_observed_at`, the
+   summary's dedicated field written **only by live geo resolution**
+   (providers spec §6.3; evidence timestamps are not a proxy: TCF
+   `LastUpdated` can predate the live lookup, and a policy-baseline
+   grant has no wall-clock evidence timestamp at all) — fails closed
+   pending a live refresh (the inverse — denying
    a visitor who moved the other way — is the accepted cost); the
    horizon choice and its legal trade-off are **sign-off item 25**.
 
@@ -1011,7 +1038,13 @@ Consumers of the resolved set in this epic:
    as reserved `hmac-v0` provenance with **no stored grant evidence**, so
    they **fail closed for partner egress and batch updates** until a live
    browser request lazily backfills provenance from a fresh resolution.
-   Failing open here would grandfather every pre-epic identity past the
+   That path is reachable by construction: a found legacy/v1 row whose
+   authority record is a stub (or absent) is **denied egress but not
+   indeterminate** — the permission-exempt `AuthorityRefresh` admits on
+   the observed row plus the live resolution, never on a prior positive
+   summary or matching revision, commits the summary, and the revision
+   fence then opens use (providers spec §5 total state table). Failing
+   open here would grandfather every pre-epic identity past the
    permission model indefinitely.
 
 4. **Server-side auction dispatch** — gated on the policy `regime` class,
