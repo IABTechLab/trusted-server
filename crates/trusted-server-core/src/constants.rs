@@ -44,9 +44,9 @@ pub const HEADER_REFERER: HeaderName = HeaderName::from_static("referer");
 
 /// TS-internal header names that must NOT be forwarded to downstream third-party services.
 ///
-/// These headers are used internally by Trusted Server for identity, geo-enrichment,
+/// These headers are used internally by Trusted Server for identification, geo-enrichment,
 /// debugging, and compression hints. Leaking them to external origins could expose
-/// user identity, geo data, and internal implementation details.
+/// data and internal implementation details.
 ///
 /// Uses `&str` slices because `HeaderName` has interior mutability and cannot appear
 /// in `const` context.

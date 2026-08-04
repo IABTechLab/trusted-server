@@ -38,8 +38,7 @@ if !validate_consent(&request, &policy) {
 Trusted Server can interoperate with multiple consent signal formats:
 
 - TCF v2 format (the IAB Transparency and Consent Framework encoded string)
-- Global Privacy Platform (GPP)
-- US Privacy String
+- Global Privacy Protocol (GPP)
 - Global Privacy Control (GPC) request header
 - Publisher-defined custom signals
 - First-party consent cookies

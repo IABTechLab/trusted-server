@@ -7,7 +7,7 @@ A real-time publisher transparency dashboard providing visibility into ad moneti
 ## Business Value
 
 - **Revenue Optimization**: Identify underperforming exchanges, timeout issues, and bid density gaps
-- **Policy Monitoring**: Detect calls outside the configured allowlist, consent mismatches, and policy breaches
+- **Policy Monitoring**: Detect calls outside the configured allowlist, consent mismatches, and policy issues
 - **Operational Visibility**: Debug issues faster with real-time data on all ad-related activity
 - **Vendor Accountability**: Hold partners accountable with data on their behavior
 
