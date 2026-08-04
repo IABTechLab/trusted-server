@@ -2632,11 +2632,13 @@ pub async fn handle_publisher_request(
     let is_prefetch = is_prefetch_request(&req);
     let is_bot = is_bot_user_agent(&req);
 
-    let matched_slots: Vec<_> = if settings.creative_opportunities.is_some() && is_get {
-        crate::creative_opportunities::match_slots(auction.slots, &request_path)
-            .into_iter()
-            .cloned()
-            .collect()
+    let matched_slots = if is_get {
+        settings
+            .creative_opportunities
+            .as_ref()
+            .map_or_else(Vec::new, |co_config| {
+                match_renderable_slots(auction.slots, co_config, &request_path)
+            })
     } else {
         Vec::new()
     };
@@ -3471,6 +3473,33 @@ pub(crate) fn build_slot_json(
     }))
 }
 
+/// Match creative-opportunity slots and omit dynamic GAM paths that cannot be
+/// rendered for this request before they can enter an auction.
+fn match_renderable_slots(
+    slots: &[crate::creative_opportunities::CreativeOpportunitySlot],
+    co_config: &crate::creative_opportunities::CreativeOpportunitiesConfig,
+    request_path: &str,
+) -> Vec<crate::creative_opportunities::CreativeOpportunitySlot> {
+    let section = co_config.section_for_path(request_path);
+    crate::creative_opportunities::match_slots(slots, request_path)
+        .into_iter()
+        .filter_map(|slot| {
+            if slot
+                .render_gam_unit_path(&co_config.gam_network_id, &section)
+                .is_none()
+            {
+                log::warn!(
+                    "Omitting slot `{}`: dynamic gam_unit_path exceeds the render limit for path `{}`",
+                    slot.id,
+                    request_path
+                );
+                return None;
+            }
+            Some(slot.clone())
+        })
+        .collect()
+}
+
 /// Build the `tsjs.adSlots` `<script>` tag from matched slots.
 ///
 /// Property names match what the client-side TSJS bundle expects:
@@ -3726,11 +3755,7 @@ pub async fn handle_page_bids(
         })
         .unwrap_or_else(|| "/".to_string());
 
-    let matched_slots: Vec<_> =
-        crate::creative_opportunities::match_slots(auction.slots, &path_param)
-            .into_iter()
-            .cloned()
-            .collect();
+    let matched_slots = match_renderable_slots(auction.slots, co_config, &path_param);
 
     let request_info = crate::http_util::RequestInfo::from_request(&req, services.client_info());
     let ec_id = ec_context.ec_value().filter(|_| ec_context.ec_allowed());
@@ -10005,6 +10030,45 @@ mod tests {
             }]
         }
 
+        fn slots_with_over_limit_dynamic_sibling() -> Vec<CreativeOpportunitySlot> {
+            let mut over_limit = article_slot()
+                .into_iter()
+                .next()
+                .expect("should build over-limit slot");
+            over_limit.id = "over_limit_dynamic".to_string();
+            over_limit.page_patterns = vec!["/*".to_string()];
+            over_limit.gam_unit_path = Some("/{section}/{section}".to_string());
+            over_limit
+                .compile_unit_template()
+                .expect("should compile dynamic GAM unit template");
+
+            let mut valid_static = article_slot()
+                .into_iter()
+                .next()
+                .expect("should build valid static slot");
+            valid_static.id = "valid_static_sibling".to_string();
+            valid_static.page_patterns = vec!["/*".to_string()];
+            valid_static.gam_unit_path = Some("/12345/example/static".to_string());
+
+            vec![over_limit, valid_static]
+        }
+
+        fn assert_only_renderable_slot_was_auctioned(
+            captured: &Arc<Mutex<Option<AuctionRequest>>>,
+        ) {
+            let request = captured
+                .lock()
+                .expect("should lock captured request")
+                .clone()
+                .expect("should dispatch an auction request");
+            let slot_ids: Vec<_> = request.slots.iter().map(|slot| slot.id.as_str()).collect();
+            assert_eq!(
+                slot_ids,
+                ["valid_static_sibling"],
+                "auction request should exclude the over-limit dynamic slot"
+            );
+        }
+
         /// [`EcContext`] whose consent context permits the server-side auction.
         fn consent_allowing_ec_context() -> EcContext {
             let consent = crate::consent::ConsentContext {
@@ -10178,6 +10242,91 @@ mod tests {
             .expect("should return ok response");
 
             assert_configured_domain(&captured, &telemetry_sink);
+        }
+
+        #[tokio::test]
+        async fn initial_navigation_auctions_only_renderable_slots() {
+            let settings = settings_with_capturing_provider();
+            let captured = Arc::new(Mutex::new(None));
+            let orchestrator = orchestrator_capturing_request(&settings, &captured);
+            let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"<html><head></head><body>ok</body></html>".to_vec());
+            let services = services_with(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+                telemetry_sink,
+            );
+            let mut ec_context = consent_allowing_ec_context();
+            let request_path = format!("/{}", "a".repeat(60));
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(format!("https://{EDGE_HOST}{request_path}"))
+                .header(header::HOST, EDGE_HOST)
+                .header("sec-fetch-dest", "document")
+                .body(EdgeBody::empty())
+                .expect("should build test request");
+            let slots = slots_with_over_limit_dynamic_sibling();
+
+            let _ = handle_publisher_request(
+                &settings,
+                &services,
+                None,
+                &mut ec_context,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &slots,
+                    registry: None,
+                },
+                req,
+            )
+            .await
+            .expect("should proxy publisher request");
+
+            assert_only_renderable_slot_was_auctioned(&captured);
+        }
+
+        #[tokio::test]
+        async fn page_bids_auctions_only_renderable_slots() {
+            let settings = settings_with_capturing_provider();
+            let captured = Arc::new(Mutex::new(None));
+            let orchestrator = orchestrator_capturing_request(&settings, &captured);
+            let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
+            let services = services_with(
+                Arc::new(crate::platform::test_support::NoopHttpClient),
+                telemetry_sink,
+            );
+            let ec_context = consent_allowing_ec_context();
+            let request_path = format!("/{}", "a".repeat(60));
+            let mut req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "https://{EDGE_HOST}/_ts/page-bids?path={request_path}"
+                ))
+                .header(header::HOST, EDGE_HOST)
+                .body(EdgeBody::empty())
+                .expect("should build test request");
+            req.headers_mut().insert(
+                header::HeaderName::from_static("sec-fetch-site"),
+                HeaderValue::from_static("same-origin"),
+            );
+            let slots = slots_with_over_limit_dynamic_sibling();
+
+            let _ = handle_page_bids(
+                &settings,
+                &services,
+                None,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &slots,
+                    registry: None,
+                },
+                &ec_context,
+                req,
+            )
+            .await
+            .expect("should return ok response");
+
+            assert_only_renderable_slot_was_auctioned(&captured);
         }
     }
 }

@@ -1353,9 +1353,10 @@ Trusted Server conservatively caps the whole rendered dynamic path at 100 UTF-8
 bytes, informed by Google's [100-character per-ad-unit-code
 limit](https://support.google.com/admanager/answer/1628457?hl=en). If a
 request-specific substitution would exceed the dynamic limit, only that slot is
-omitted from the response; the response itself still succeeds. Explicit static
-paths and absent/default paths retain legacy behavior and are not subject to
-this dynamic-only limit.
+omitted before auction dispatch; the response itself still succeeds. Trusted
+Server logs a warning containing the slot ID and request path. Explicit static
+paths and absent/default paths retain legacy behavior and are not subject to this
+dynamic-only limit.
 
 ### `{section}` derivation
 
