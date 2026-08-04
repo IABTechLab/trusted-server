@@ -4,7 +4,12 @@ main = "build/index.js"
 # integration tests to pick up free runtime fixes. Keep in sync with the
 # minimum date supported by the worker crate version in Cargo.toml.
 compatibility_date = "2024-09-23"
-compatibility_flags = ["nodejs_compat"]
+# `cache_option_enabled` is on by default from compatibility date 2024-11-11.
+# The pinned date predates it, so the flag must be set explicitly: without it
+# the runtime throws when a subrequest sets the `cache` field on `RequestInit`.
+# The outbound HTTP client sets `CacheMode::NoStore` for cache-bypass requests
+# (auction-eligible publisher navigations), so this is a hard requirement.
+compatibility_flags = ["nodejs_compat", "cache_option_enabled"]
 
 [build]
 command = "bash build.sh"
