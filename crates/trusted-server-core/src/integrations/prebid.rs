@@ -911,7 +911,7 @@ pub fn register(
             .with_proxy(integration.clone())
             .with_attribute_rewriter(integration.clone())
             .with_head_injector(integration)
-            .without_js()
+            .with_deferred_js()
             .build(),
     ))
 }
@@ -3016,13 +3016,18 @@ passphrase = "test-secret-key-32-bytes-minimum"
             !processed.contains("cdn.prebid.org/prebid.js"),
             "Prebid preload should be removed when auto-config is enabled"
         );
+        // Both scripts are `defer`, so they execute in document order. The
+        // bundle must run first: the shim disables the whole integration when
+        // it finds no Prebid.js API on window.pbjs.
+        let bundle_index = processed
+            .find(PREBID_BUNDLE_ROUTE)
+            .expect("should inject external prebid bundle route");
+        let shim_index = processed
+            .find("tsjs-prebid.min.js")
+            .expect("should inject deferred tsjs prebid shim");
         assert!(
-            processed.contains(PREBID_BUNDLE_ROUTE),
-            "External prebid bundle route should be injected"
-        );
-        assert!(
-            !processed.contains("tsjs-prebid.min.js"),
-            "Embedded deferred prebid bundle should not be injected"
+            bundle_index < shim_index,
+            "external prebid bundle must execute before the deferred tsjs shim"
         );
     }
 
