@@ -1,11 +1,6 @@
 import { log } from '../../core/log';
 import { isEffectivelyVisible, recordRender, stampCreativeTrace } from '../../core/trace';
-import type {
-  AuctionSlot,
-  AuctionBidData,
-  GptSlotHandoff,
-  TsjsApi,
-} from '../../core/types';
+import type { AuctionSlot, AuctionBidData, GptSlotHandoff, TsjsApi } from '../../core/types';
 import {
   APS_UNIVERSAL_CREATIVE_RENDERER,
   APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
@@ -1089,8 +1084,11 @@ export function installTsAdInit(): void {
           if (slotId) {
             // Capture the bid/generation before the asynchronous GPT event.
             // The event handler still records the live slot state below.
-            (slotToRefresh as GoogleTagSlot & { __tsRenderGeneration?: number }).__tsRenderGeneration = renderGeneration;
-            (slotToRefresh as GoogleTagSlot & { __tsRenderBid?: AuctionBidData }).__tsRenderBid = pending;
+            (
+              slotToRefresh as GoogleTagSlot & { __tsRenderGeneration?: number }
+            ).__tsRenderGeneration = renderGeneration;
+            (slotToRefresh as GoogleTagSlot & { __tsRenderBid?: AuctionBidData }).__tsRenderBid =
+              pending;
           }
         });
         // One-shot bypass: this internal refresh delivers the just-applied
@@ -1688,12 +1686,7 @@ export function installTsRenderBridge(): void {
         })
       );
       fireWinBillingBeacons(slotId, matchedBid);
-      recordGptBridgeRender(
-        slotId,
-        matchedBid,
-        'inline',
-        findSlotElementByDivId(slotId)
-      );
+      recordGptBridgeRender(slotId, matchedBid, 'inline', findSlotElementByDivId(slotId));
       log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from inline adm`);
       return;
     }
@@ -1748,12 +1741,7 @@ export function installTsRenderBridge(): void {
         // authoritative clearing price, and the cached copy is only the render
         // source. Do not re-expand them here.
         fireWinBillingBeacons(slotId, matchedBid);
-        recordGptBridgeRender(
-          slotId,
-          matchedBid,
-          'pbs-cache',
-          findSlotElementByDivId(slotId)
-        );
+        recordGptBridgeRender(slotId, matchedBid, 'pbs-cache', findSlotElementByDivId(slotId));
         log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from PBS Cache`);
       })
       .catch((err) => {

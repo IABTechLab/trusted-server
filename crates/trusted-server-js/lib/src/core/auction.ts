@@ -134,8 +134,7 @@ export function parseAuctionResponse(body: any): AuctionBid[] {
   const bids: AuctionBid[] = [];
   const seatbids = body?.seatbid;
   if (!Array.isArray(seatbids)) return bids;
-  const responseAuctionId =
-    typeof body?.id === 'string' && body.id !== '' ? body.id : undefined;
+  const responseAuctionId = typeof body?.id === 'string' && body.id !== '' ? body.id : undefined;
 
   for (const seatbid of seatbids) {
     const seat: string = typeof seatbid?.seat === 'string' ? seatbid.seat : 'unknown';

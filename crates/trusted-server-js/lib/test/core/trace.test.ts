@@ -1,5 +1,7 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
+
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
 import {
   recordRender,
   updateRender,
