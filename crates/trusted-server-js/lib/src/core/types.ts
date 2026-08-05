@@ -269,19 +269,19 @@ export interface GptDiagnosticsApi {
   show(): void;
   hide(): void;
   /** Record Trusted Server's creative opportunity for an associated GPT slot. */
-  recordTrustedServerOpportunity(
+  recordTrustedServerOpportunity?(
     slot: GptDiagnosticsSlotHandle,
     auctionSlotId: string,
     opportunity: GptDiagnosticsTrustedServerOpportunity
   ): void;
   /** Mark slots whose next observed GPT request follows the Prebid refresh path. */
-  recordPrebidRefresh(slots: GptDiagnosticsSlotHandle[]): void;
+  recordPrebidRefresh?(slots: GptDiagnosticsSlotHandle[]): void;
   /** Record a creative markup request and return its opaque attempt ID. */
-  recordTrustedServerCreativeRequest(auctionSlotId: string): number | undefined;
+  recordTrustedServerCreativeRequest?(auctionSlotId: string): number | undefined;
   /** Record that a creative attempt successfully posted markup. */
-  recordTrustedServerCreativeResponse(attemptId: number): void;
+  recordTrustedServerCreativeResponse?(attemptId: number): void;
   /** Record a safe failure category for a creative attempt. */
-  recordTrustedServerCreativeFailure(
+  recordTrustedServerCreativeFailure?(
     attemptId: number,
     reason: GptDiagnosticsCreativeFailure
   ): void;

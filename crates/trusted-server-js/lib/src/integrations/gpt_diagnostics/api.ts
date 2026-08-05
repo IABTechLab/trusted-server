@@ -50,6 +50,18 @@ interface ApiOptions {
 
 type ApiListener = (snapshot: GptDiagnosticsExportV1) => void;
 
+type InstalledGptDiagnosticsApi = GptDiagnosticsApi &
+  Required<
+    Pick<
+      GptDiagnosticsApi,
+      | 'recordTrustedServerOpportunity'
+      | 'recordPrebidRefresh'
+      | 'recordTrustedServerCreativeRequest'
+      | 'recordTrustedServerCreativeResponse'
+      | 'recordTrustedServerCreativeFailure'
+    >
+  >;
+
 function safelyRecord(action: () => void): void {
   try {
     action();
@@ -68,7 +80,7 @@ function safelyCreateAttempt(action: () => number | undefined): number | undefin
 
 /** Owns the public read-only diagnostics API and its source subscriptions. */
 export class GptDiagnosticsApiController {
-  readonly api: GptDiagnosticsApi;
+  readonly api: InstalledGptDiagnosticsApi;
 
   private readonly store: ApiStore;
   private readonly bindings: ApiBindingManager;

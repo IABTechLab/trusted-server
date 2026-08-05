@@ -435,8 +435,10 @@ function queueWinBillingBeacon(url: string): boolean {
  * Reads `window.tsjs.adSlots` (injected at head-open) and `window.tsjs.bids`
  * (injected before </body>) synchronously — no fetch, no Promise. Applies bid
  * targeting to GPT slots, sets the `ts_initial` sentinel, then calls refresh().
- * Win/billing beacons fire from the TS render bridge, where a matching Prebid
- * Universal Creative request proves the TS creative actually rendered.
+ * Win/billing beacons fire from the TS render bridge after a matching Prebid
+ * Universal Creative request selects the TS bid and markup is successfully posted
+ * to its MessagePort. Neither observation proves that PUC consumed the response or
+ * that the creative rendered pixels.
  *
  * Idempotent: destroys previously created TS-managed slots before redefining them,
  * so it is safe to call again after SPA navigation updates `tsjs.adSlots`/`tsjs.bids`.

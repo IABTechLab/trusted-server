@@ -1,6 +1,7 @@
 import { describe, expect, expectTypeOf, it } from 'vitest';
 
 import type {
+  GptDiagnosticsApi,
   GptDiagnosticsAttributionIssue,
   GptDiagnosticsAttributionIssueReason,
   GptDiagnosticsExportV1,
@@ -9,6 +10,33 @@ import type {
 } from '../../../src/core/types';
 
 describe('GPT diagnostics public types', () => {
+  it('keeps the documented read-only API source-compatible', () => {
+    const readOnlyApi: GptDiagnosticsApi = {
+      snapshot: () => ({
+        version: 1,
+        capturedAt: '2026-08-04T00:00:00.000Z',
+        page: { origin: 'https://example.com', pathname: '/' },
+        slots: [],
+        callbackIssues: [],
+        coverage: {
+          slotRequested: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
+          slotResponseReceived: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
+          slotRenderEnded: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
+          slotOnload: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
+          impressionViewable: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
+          slotVisibilityChanged: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
+        },
+        metadata: { droppedCallbacks: 0, evictedSlots: 0, evictedRequestCycles: 0 },
+      }),
+      export: () => undefined,
+      subscribe: () => () => undefined,
+      show: () => undefined,
+      hide: () => undefined,
+    };
+
+    expectTypeOf(readOnlyApi).toEqualTypeOf<GptDiagnosticsApi>();
+  });
+
   it('represents the versioned allowlist schema', () => {
     const slot: GptDiagnosticsSlotExport = {
       runtimeSlotNumber: 1,
