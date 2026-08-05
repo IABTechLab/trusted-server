@@ -1057,6 +1057,12 @@ export class GptDiagnosticsStore {
   ): void {
     const previous = record.requests.reduce<MutableRequestCycle | undefined>(
       (latest, candidate) => {
+        // The identity check is deliberately redundant with the `renderAtMs`
+        // filter: today the caller derives before assigning `cycle.renderAtMs`,
+        // so an unset render time already excludes this cycle. That ordering is
+        // an invariant of one call site, not of this method. Keep the identity
+        // check so a cycle can never report replacing itself even if the
+        // assignment is ever moved earlier.
         if (
           candidate === cycle ||
           candidate.renderAtMs === undefined ||
