@@ -37,51 +37,119 @@ use serde::Deserialize;
 /// [`Permission::StoreOnDevice`] (Purpose 1) and
 /// [`Permission::SelectPersonalisedAds`] (Purpose 4) are resolved against a
 /// signal today.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, derive_more::Display)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Permission {
     /// TCF Purpose 1, store and/or access information on a device. Resolved
     /// against a session signal today. No IAB Privacy Taxonomy Data Use exists
     /// for device storage yet, so this uses a proposed `necessary.operations`
     /// key pending an upstream addition.
-    #[display("necessary.operations.storage")]
     StoreOnDevice,
     /// TCF Purpose 2, use limited data to select advertising.
-    #[display("advertising_marketing.first_party.contextual")]
     SelectBasicAds,
     /// TCF Purpose 3, create profiles for personalised advertising.
-    #[display("advertising_marketing.profiling")]
     CreateAdsProfile,
     /// TCF Purpose 4, use profiles to select personalised advertising.
-    #[display("advertising_marketing.first_party.targeted")]
     SelectPersonalisedAds,
     /// TCF Purpose 5, create profiles to personalise content.
-    #[display("advertising_marketing.personalize.profiling")]
     CreateContentProfile,
     /// TCF Purpose 6, use profiles to select personalised content.
-    #[display("advertising_marketing.personalize.content")]
     SelectPersonalisedContent,
     /// TCF Purpose 7, measure advertising performance.
-    #[display("analytics.ad_reporting.measure_ad_performance")]
     MeasureAdPerformance,
     /// TCF Purpose 8, measure content performance.
-    #[display("analytics.ad_reporting.content_performance")]
     MeasureContentPerformance,
     /// TCF Purpose 9, understand audiences through statistics.
-    #[display("analytics.ad_reporting.market_research")]
     MarketResearch,
     /// TCF Purpose 10, develop and improve services.
-    #[display("necessary.operations.improve")]
     DevelopServices,
     /// TCF Purpose 11, use limited data to select content. No IAB Privacy
     /// Taxonomy Data Use exists for limited-data content selection yet, so this
     /// keeps its TCF identifier and is proposed upstream. Not gated today.
-    #[display("select-basic-content")]
     SelectBasicContent,
+    /// An IAB Privacy Taxonomy Data Use with no dedicated variant, identified by
+    /// its index into [`EXTRA_DATA_USES`]. These carry a policy flag in
+    /// `permissions.yaml` for completeness; no provider gates on them today.
+    Extra(u8),
 }
 
+/// The Data Use identifiers for the named [`Permission`] variants, in variant
+/// order (bit index 0..11).
+const NAMED_DATA_USES: [&str; 11] = [
+    "necessary.operations.storage",
+    "advertising_marketing.first_party.contextual",
+    "advertising_marketing.profiling",
+    "advertising_marketing.first_party.targeted",
+    "advertising_marketing.personalize.profiling",
+    "advertising_marketing.personalize.content",
+    "analytics.ad_reporting.measure_ad_performance",
+    "analytics.ad_reporting.content_performance",
+    "analytics.ad_reporting.market_research",
+    "necessary.operations.improve",
+    "select-basic-content",
+];
+
+/// Every other IAB Privacy Taxonomy Data Use, carried so `permissions.yaml` can
+/// set a policy flag for the whole taxonomy (bit index 11..). No provider gates
+/// on these today; they exist for completeness, testing, and demonstration.
+const EXTRA_DATA_USES: [&str; 53] = [
+    "advertising_marketing",
+    "advertising_marketing.communications",
+    "advertising_marketing.communications.email",
+    "advertising_marketing.communications.sms",
+    "advertising_marketing.first_party",
+    "advertising_marketing.frequency_capping",
+    "advertising_marketing.negative_targeting",
+    "advertising_marketing.personalize",
+    "advertising_marketing.personalize.system",
+    "advertising_marketing.serving",
+    "advertising_marketing.third_party",
+    "advertising_marketing.third_party.targeted",
+    "analytics",
+    "analytics.ad_reporting",
+    "analytics.ad_reporting.ad_delivery_and_targeting",
+    "analytics.ad_reporting.ad_fraud_detection",
+    "analytics.ad_reporting.ad_viewability",
+    "analytics.ad_reporting.campaign_insights",
+    "analytics.reporting",
+    "analytics.reporting.system",
+    "disclosure",
+    "disclosure.law_enforcement",
+    "disclosure.outside_counsel",
+    "disclosure.sale",
+    "disclosure.share",
+    "disclosure.third_party_sale",
+    "functional",
+    "functional.performance",
+    "functional.personalization",
+    "functional.security",
+    "necessary",
+    "necessary.employment",
+    "necessary.employment.hr",
+    "necessary.employment.hr.hiring",
+    "necessary.fraud_detection",
+    "necessary.legal_obligation",
+    "necessary.legal_obligation.age_verification",
+    "necessary.legal_obligation.content_moderation",
+    "necessary.legal_obligation.dsr",
+    "necessary.legal_obligation.hold",
+    "necessary.operations",
+    "necessary.operations.authentication",
+    "necessary.operations.debugging",
+    "necessary.operations.notifications",
+    "necessary.operations.notifications.email",
+    "necessary.operations.notifications.sms",
+    "necessary.operations.payment_processing",
+    "necessary.operations.quality_assurance",
+    "necessary.operations.security",
+    "necessary.operations.support",
+    "necessary.operations.survey",
+    "necessary.operations.upgrades",
+    "necessary.operations.website_use",
+];
+
 impl Permission {
-    /// Every modeled permission, in TCF purpose order.
-    pub const ALL: [Permission; 11] = [
+    /// The named permission variants, in bit-index order.
+    const NAMED: [Permission; 11] = [
         Permission::StoreOnDevice,
         Permission::SelectBasicAds,
         Permission::CreateAdsProfile,
@@ -95,44 +163,79 @@ impl Permission {
         Permission::SelectBasicContent,
     ];
 
-    /// The IAB TCF Europe purpose number (1 to 11) for this permission.
+    /// Every modeled permission: the named variants, then every other Privacy
+    /// Taxonomy Data Use.
+    pub fn all() -> impl Iterator<Item = Permission> {
+        Self::NAMED
+            .into_iter()
+            .chain((0..EXTRA_DATA_USES.len() as u8).map(Permission::Extra))
+    }
+
+    /// The Data Use identifier for this permission.
     #[must_use]
-    pub const fn tcf_purpose(self) -> u8 {
+    pub fn as_str(self) -> &'static str {
         match self {
-            Permission::StoreOnDevice => 1,
-            Permission::SelectBasicAds => 2,
-            Permission::CreateAdsProfile => 3,
-            Permission::SelectPersonalisedAds => 4,
-            Permission::CreateContentProfile => 5,
-            Permission::SelectPersonalisedContent => 6,
-            Permission::MeasureAdPerformance => 7,
-            Permission::MeasureContentPerformance => 8,
-            Permission::MarketResearch => 9,
-            Permission::DevelopServices => 10,
-            Permission::SelectBasicContent => 11,
+            Permission::Extra(index) => EXTRA_DATA_USES[index as usize],
+            named => NAMED_DATA_USES[named.index() as usize],
+        }
+    }
+
+    /// The stable bit position for this permission within a [`PermissionSet`].
+    #[must_use]
+    const fn index(self) -> u8 {
+        match self {
+            Permission::StoreOnDevice => 0,
+            Permission::SelectBasicAds => 1,
+            Permission::CreateAdsProfile => 2,
+            Permission::SelectPersonalisedAds => 3,
+            Permission::CreateContentProfile => 4,
+            Permission::SelectPersonalisedContent => 5,
+            Permission::MeasureAdPerformance => 6,
+            Permission::MeasureContentPerformance => 7,
+            Permission::MarketResearch => 8,
+            Permission::DevelopServices => 9,
+            Permission::SelectBasicContent => 10,
+            Permission::Extra(index) => 11 + index,
+        }
+    }
+
+    /// The IAB TCF Europe purpose number (1 to 11), or `None` for a Data Use
+    /// with no dedicated variant.
+    #[must_use]
+    pub const fn tcf_purpose(self) -> Option<u8> {
+        match self {
+            Permission::Extra(_) => None,
+            named => Some(named.index() + 1),
         }
     }
 
     /// The single-bit mask for this permission within a [`PermissionSet`].
-    const fn bit(self) -> u16 {
-        1 << (self.tcf_purpose() - 1)
+    const fn bit(self) -> u128 {
+        1 << self.index()
     }
 
-    /// Returns the permission whose IAB TCF identifier matches `id` (for example
-    /// `"necessary.operations.storage"`), or `None` when it is unknown.
+    /// Returns the permission whose Data Use identifier matches `id` (for
+    /// example `"necessary.operations.storage"`), or `None` when it is unknown.
     ///
     /// Used to parse permission names from `permissions.yaml`.
     #[must_use]
     pub fn from_identifier(id: &str) -> Option<Permission> {
-        Permission::ALL.into_iter().find(|p| p.to_string() == id)
+        Permission::all().find(|p| p.as_str() == id)
     }
 }
 
-/// A set of [`Permission`]s, stored as a bitset keyed by TCF purpose number.
+impl core::fmt::Display for Permission {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A set of [`Permission`]s, stored as a bitset keyed by each permission's bit
+/// index.
 ///
 /// Used both for what a provider requires and for what Trusted Server has set.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PermissionSet(u16);
+pub struct PermissionSet(u128);
 
 impl PermissionSet {
     /// The empty set, requiring or containing nothing.
@@ -170,9 +273,7 @@ impl PermissionSet {
     /// The built-ins read nothing from the full set; this serves a provider or
     /// diagnostic path that enumerates what is present.
     pub fn iter(self) -> impl Iterator<Item = Permission> {
-        Permission::ALL
-            .into_iter()
-            .filter(move |p| self.contains(*p))
+        Permission::all().filter(move |p| self.contains(*p))
     }
 }
 
@@ -242,7 +343,7 @@ impl CountryRules {
     /// Sets the acquisition rule for a single permission, overriding the default.
     #[must_use]
     pub fn with_rule(mut self, permission: Permission, acquisition: Acquisition) -> Self {
-        self.overrides.insert(permission.tcf_purpose(), acquisition);
+        self.overrides.insert(permission.index(), acquisition);
         self
     }
 
@@ -250,7 +351,7 @@ impl CountryRules {
     #[must_use]
     pub fn rule_for(&self, permission: Permission) -> Acquisition {
         self.overrides
-            .get(&permission.tcf_purpose())
+            .get(&permission.index())
             .copied()
             .unwrap_or(self.default)
     }
@@ -429,8 +530,7 @@ impl PermissionMaps {
         let rules = self.rules_or_default(country, region, default_country, default_region);
         let acquisition =
             |permission| rules.map_or(Acquisition::RequiresSignal, |r| r.rule_for(permission));
-        let set = Permission::ALL
-            .into_iter()
+        let set = Permission::all()
             .filter(
                 |&permission| match (acquisition(permission), signal(permission)) {
                     (Acquisition::Denied, _) => false,
@@ -590,7 +690,7 @@ fn group_rules(
         listed = listed.with(permission);
     }
     if default.is_none() {
-        for permission in Permission::ALL {
+        for permission in Permission::all() {
             if !listed.contains(permission) {
                 return Err(PermissionsError::IncompleteGroup {
                     group: name.to_owned(),
@@ -703,7 +803,7 @@ mod tests {
         let set = PermissionSet::none()
             .with(Permission::SelectBasicAds)
             .with(Permission::StoreOnDevice);
-        let order: Vec<u8> = set.iter().map(Permission::tcf_purpose).collect();
+        let order: Vec<u8> = set.iter().filter_map(Permission::tcf_purpose).collect();
         assert_eq!(
             order,
             vec![1, 2],
@@ -713,11 +813,13 @@ mod tests {
 
     #[test]
     fn tcf_purpose_numbers_are_one_to_eleven() {
-        let numbers: Vec<u8> = Permission::ALL.iter().map(|p| p.tcf_purpose()).collect();
+        let numbers: Vec<u8> = Permission::all()
+            .filter_map(Permission::tcf_purpose)
+            .collect();
         assert_eq!(
             numbers,
             (1..=11).collect::<Vec<_>>(),
-            "purposes should be 1..=11"
+            "the named purposes should be 1..=11"
         );
     }
 
@@ -1047,7 +1149,7 @@ rules:
     fn from_yaml_accepts_an_explicit_group_listing_every_permission() {
         // The shipped style: no `default`, every permission spelled out.
         let mut group = String::from("groups:\n  everything:\n");
-        for permission in Permission::ALL {
+        for permission in Permission::all() {
             group.push_str(&format!("    {permission}: granted\n"));
         }
         let yaml = format!("{group}rules:\n  US: everything\n");

@@ -87,6 +87,15 @@ resolved against the incoming consent and privacy signals. The remaining
 purposes are modeled for forward compatibility so that later providers can
 advertise them.
 
+`permissions.yaml` carries a policy flag for **every** Data Use in the taxonomy,
+not only the eleven below. The eleven have a dedicated identifier because a
+provider may gate on them. Every other Data Use is listed for completeness and,
+where no informed policy decision has been made, is `denied` by default. Trusted
+Server is not the policy authority, so a deployer sets the flags to match its own
+jurisdiction rules.
+
+The eleven named Data Uses, with the TCF purpose each maps from:
+
 | #   | Data Use identifier           | IAB TCF Europe purpose                          |
 | --- | ----------------------------- | ----------------------------------------------- |
 | 1   | `necessary.operations.storage`             | Store and/or access information on a device     |

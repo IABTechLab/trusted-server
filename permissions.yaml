@@ -25,26 +25,23 @@
 #   requires_signal  set only when a signal grants it (opt-in)
 #   denied           never set, even when a signal grants it
 #
-# Permission names are IAB Privacy Taxonomy Data Uses, mapped from the IAB TCF
-# Europe purposes. Two purposes have no Data Use yet: TCF purpose 1 (device
+# Permission names are the IAB Privacy Taxonomy Data Uses, mapped from the IAB
+# TCF Europe purposes. Every group below lists every Data Use so its policy is
+# fully explicit. Two purposes have no Data Use yet: TCF purpose 1 (device
 # storage) uses a proposed `necessary.operations.storage` key, and TCF purpose
 # 11 (limited-data content selection) keeps its TCF identifier
 # `select-basic-content`. Both are flagged for an upstream taxonomy addition.
-#   necessary.operations.storage,
-#   advertising_marketing.first_party.contextual,
-#   advertising_marketing.profiling, advertising_marketing.first_party.targeted,
-#   advertising_marketing.personalize.profiling,
-#   advertising_marketing.personalize.content,
-#   analytics.ad_reporting.measure_ad_performance,
-#   analytics.ad_reporting.content_performance,
-#   analytics.ad_reporting.market_research, necessary.operations.improve,
-#   select-basic-content
 #
-# Named baselines. Each group lists every permission and its flag, so a group's
+# Trusted Server is not the policy authority. Where no informed policy decision
+# has been made for a Data Use it is `denied`, so a demo or test deployment has
+# a complete, conservative default. A deployer edits this file to set its own
+# policy per jurisdiction.
+#
+# Named baselines. Each group lists every Data Use and its flag, so a group's
 # meaning is explicit. (A `default: <flag>` shorthand is also accepted for any
-# permission a group omits, but the shipped groups spell every one out.)
+# Data Use a group omits.)
 groups:
-  # European Union: opt-in, every purpose requires a signal.
+  # European Union: opt-in; the modeled ad-tech purposes require a signal.
   gdpr-eu:
     necessary.operations.storage: requires_signal
     advertising_marketing.first_party.contextual: requires_signal
@@ -56,11 +53,64 @@ groups:
     analytics.ad_reporting.content_performance: requires_signal
     analytics.ad_reporting.market_research: requires_signal
     necessary.operations.improve: requires_signal
-    # TCF purpose 11: no Data Use yet, keeps its TCF identifier. Not gated today.
     select-basic-content: requires_signal
+    # Remaining Privacy Taxonomy Data Uses: no policy decision made yet,
+    # so denied by default (see the file header).
+    advertising_marketing: denied
+    advertising_marketing.communications: denied
+    advertising_marketing.communications.email: denied
+    advertising_marketing.communications.sms: denied
+    advertising_marketing.first_party: denied
+    advertising_marketing.frequency_capping: denied
+    advertising_marketing.negative_targeting: denied
+    advertising_marketing.personalize: denied
+    advertising_marketing.personalize.system: denied
+    advertising_marketing.serving: denied
+    advertising_marketing.third_party: denied
+    advertising_marketing.third_party.targeted: denied
+    analytics: denied
+    analytics.ad_reporting: denied
+    analytics.ad_reporting.ad_delivery_and_targeting: denied
+    analytics.ad_reporting.ad_fraud_detection: denied
+    analytics.ad_reporting.ad_viewability: denied
+    analytics.ad_reporting.campaign_insights: denied
+    analytics.reporting: denied
+    analytics.reporting.system: denied
+    disclosure: denied
+    disclosure.law_enforcement: denied
+    disclosure.outside_counsel: denied
+    disclosure.sale: denied
+    disclosure.share: denied
+    disclosure.third_party_sale: denied
+    functional: denied
+    functional.performance: denied
+    functional.personalization: denied
+    functional.security: denied
+    necessary: denied
+    necessary.employment: denied
+    necessary.employment.hr: denied
+    necessary.employment.hr.hiring: denied
+    necessary.fraud_detection: denied
+    necessary.legal_obligation: denied
+    necessary.legal_obligation.age_verification: denied
+    necessary.legal_obligation.content_moderation: denied
+    necessary.legal_obligation.dsr: denied
+    necessary.legal_obligation.hold: denied
+    necessary.operations: denied
+    necessary.operations.authentication: denied
+    necessary.operations.debugging: denied
+    necessary.operations.notifications: denied
+    necessary.operations.notifications.email: denied
+    necessary.operations.notifications.sms: denied
+    necessary.operations.payment_processing: denied
+    necessary.operations.quality_assurance: denied
+    necessary.operations.security: denied
+    necessary.operations.support: denied
+    necessary.operations.survey: denied
+    necessary.operations.upgrades: denied
+    necessary.operations.website_use: denied
 
-  # United Kingdom: opt-in, but device storage proceeds without a signal under
-  # the reformed ePrivacy regime.
+  # United Kingdom: device storage proceeds without a signal under the reformed ePrivacy regime.
   gdpr-uk:
     necessary.operations.storage: granted
     advertising_marketing.first_party.contextual: requires_signal
@@ -73,8 +123,63 @@ groups:
     analytics.ad_reporting.market_research: requires_signal
     necessary.operations.improve: requires_signal
     select-basic-content: requires_signal
+    # Remaining Privacy Taxonomy Data Uses: no policy decision made yet,
+    # so denied by default (see the file header).
+    advertising_marketing: denied
+    advertising_marketing.communications: denied
+    advertising_marketing.communications.email: denied
+    advertising_marketing.communications.sms: denied
+    advertising_marketing.first_party: denied
+    advertising_marketing.frequency_capping: denied
+    advertising_marketing.negative_targeting: denied
+    advertising_marketing.personalize: denied
+    advertising_marketing.personalize.system: denied
+    advertising_marketing.serving: denied
+    advertising_marketing.third_party: denied
+    advertising_marketing.third_party.targeted: denied
+    analytics: denied
+    analytics.ad_reporting: denied
+    analytics.ad_reporting.ad_delivery_and_targeting: denied
+    analytics.ad_reporting.ad_fraud_detection: denied
+    analytics.ad_reporting.ad_viewability: denied
+    analytics.ad_reporting.campaign_insights: denied
+    analytics.reporting: denied
+    analytics.reporting.system: denied
+    disclosure: denied
+    disclosure.law_enforcement: denied
+    disclosure.outside_counsel: denied
+    disclosure.sale: denied
+    disclosure.share: denied
+    disclosure.third_party_sale: denied
+    functional: denied
+    functional.performance: denied
+    functional.personalization: denied
+    functional.security: denied
+    necessary: denied
+    necessary.employment: denied
+    necessary.employment.hr: denied
+    necessary.employment.hr.hiring: denied
+    necessary.fraud_detection: denied
+    necessary.legal_obligation: denied
+    necessary.legal_obligation.age_verification: denied
+    necessary.legal_obligation.content_moderation: denied
+    necessary.legal_obligation.dsr: denied
+    necessary.legal_obligation.hold: denied
+    necessary.operations: denied
+    necessary.operations.authentication: denied
+    necessary.operations.debugging: denied
+    necessary.operations.notifications: denied
+    necessary.operations.notifications.email: denied
+    necessary.operations.notifications.sms: denied
+    necessary.operations.payment_processing: denied
+    necessary.operations.quality_assurance: denied
+    necessary.operations.security: denied
+    necessary.operations.support: denied
+    necessary.operations.survey: denied
+    necessary.operations.upgrades: denied
+    necessary.operations.website_use: denied
 
-  # United States: opt-out, every purpose granted by default.
+  # United States: opt-out; the modeled ad-tech purposes granted by default.
   us-opt-out:
     necessary.operations.storage: granted
     advertising_marketing.first_party.contextual: granted
@@ -87,6 +192,61 @@ groups:
     analytics.ad_reporting.market_research: granted
     necessary.operations.improve: granted
     select-basic-content: granted
+    # Remaining Privacy Taxonomy Data Uses: no policy decision made yet,
+    # so denied by default (see the file header).
+    advertising_marketing: denied
+    advertising_marketing.communications: denied
+    advertising_marketing.communications.email: denied
+    advertising_marketing.communications.sms: denied
+    advertising_marketing.first_party: denied
+    advertising_marketing.frequency_capping: denied
+    advertising_marketing.negative_targeting: denied
+    advertising_marketing.personalize: denied
+    advertising_marketing.personalize.system: denied
+    advertising_marketing.serving: denied
+    advertising_marketing.third_party: denied
+    advertising_marketing.third_party.targeted: denied
+    analytics: denied
+    analytics.ad_reporting: denied
+    analytics.ad_reporting.ad_delivery_and_targeting: denied
+    analytics.ad_reporting.ad_fraud_detection: denied
+    analytics.ad_reporting.ad_viewability: denied
+    analytics.ad_reporting.campaign_insights: denied
+    analytics.reporting: denied
+    analytics.reporting.system: denied
+    disclosure: denied
+    disclosure.law_enforcement: denied
+    disclosure.outside_counsel: denied
+    disclosure.sale: denied
+    disclosure.share: denied
+    disclosure.third_party_sale: denied
+    functional: denied
+    functional.performance: denied
+    functional.personalization: denied
+    functional.security: denied
+    necessary: denied
+    necessary.employment: denied
+    necessary.employment.hr: denied
+    necessary.employment.hr.hiring: denied
+    necessary.fraud_detection: denied
+    necessary.legal_obligation: denied
+    necessary.legal_obligation.age_verification: denied
+    necessary.legal_obligation.content_moderation: denied
+    necessary.legal_obligation.dsr: denied
+    necessary.legal_obligation.hold: denied
+    necessary.operations: denied
+    necessary.operations.authentication: denied
+    necessary.operations.debugging: denied
+    necessary.operations.notifications: denied
+    necessary.operations.notifications.email: denied
+    necessary.operations.notifications.sms: denied
+    necessary.operations.payment_processing: denied
+    necessary.operations.quality_assurance: denied
+    necessary.operations.security: denied
+    necessary.operations.support: denied
+    necessary.operations.survey: denied
+    necessary.operations.upgrades: denied
+    necessary.operations.website_use: denied
 
 # Map a country, or a country and state (country/state), to a group. Add explicit
 # per-permission overrides with +permission (granted) or -permission (denied).
