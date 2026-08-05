@@ -287,6 +287,34 @@ describe('installSpaAuctionHook', () => {
     expect(adInit).toHaveBeenCalledTimes(1);
   });
 
+  it('checks for route containers directly in a hidden document', async () => {
+    vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
+    vi.stubGlobal('requestAnimationFrame', undefined);
+    fetchStub.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        slots: [{ id: 'hidden', div_id: 'div-hidden' }],
+        bids: { hidden: { hb_pb: '3.00' } },
+      }),
+    });
+    const { installSpaAuctionHook } = await importGptModule();
+    installSpaAuctionHook();
+    const ts = (window as TestWindow).tsjs!;
+    const adInit = vi.fn();
+    ts.adInit = adInit;
+
+    history.pushState({}, '', '/hidden-route');
+    await flushAsync();
+    expect(adInit).not.toHaveBeenCalled();
+
+    document.body.innerHTML = '<div id="div-hidden"></div>';
+    await flushAsync();
+
+    expect(ts.adSlots).toEqual([{ id: 'hidden', div_id: 'div-hidden' }]);
+    expect(ts.bids).toEqual({ hidden: { hb_pb: '3.00' } });
+    expect(adInit).toHaveBeenCalledTimes(1);
+  });
+
   it('waits for every configured route ad container before applying bids', async () => {
     document.body.innerHTML = '<div id="div-first"></div>';
     fetchStub.mockResolvedValue({

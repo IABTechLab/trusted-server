@@ -164,12 +164,24 @@
   }
 
   function isElementVisible(element) {
-    var style = window.getComputedStyle(element);
-    return (
-      style.display !== "none" &&
-      style.visibility !== "hidden" &&
-      style.visibility !== "collapse"
-    );
+    if (
+      typeof element.checkVisibility === "function" &&
+      !element.checkVisibility()
+    ) {
+      return false;
+    }
+
+    for (var current = element; current; current = current.parentElement) {
+      var style = window.getComputedStyle(current);
+      if (
+        style.display === "none" ||
+        style.visibility === "hidden" ||
+        style.visibility === "collapse"
+      ) {
+        return false;
+      }
+    }
+    return true;
   }
 
   function slotElementHasLayout(element) {
@@ -180,13 +192,17 @@
     var container = document.getElementById(element.id + "-container");
     if (!container || !isElementVisible(container)) return false;
     var containerRect = container.getBoundingClientRect();
-    return containerRect.width > 0 && containerRect.height > 0;
+    return containerRect.width > 0;
   }
 
-  function findSlotElementByDivId(divId) {
-    if (!divId) return null;
+  function resolveSlotElementByDivId(divId) {
+    if (!divId) {
+      return { element: null, prefixMatchCount: 0, activeMatchCount: 0 };
+    }
     var exact = document.getElementById(divId);
-    if (exact) return exact;
+    if (exact) {
+      return { element: exact, prefixMatchCount: 1, activeMatchCount: 1 };
+    }
 
     var idElements = document.querySelectorAll("[id]");
     var prefixMatches = [];
@@ -199,28 +215,31 @@
         prefixMatches.push(candidate);
       }
     }
-    // A unique prefix match may be a lazy slot that has not been sized yet.
-    // Geometry is only needed to disambiguate multiple responsive siblings.
-    if (prefixMatches.length === 1) return prefixMatches[0];
+    // A unique prefix match may be a lazy slot that has not been sized yet,
+    // but it must still be visible through its ancestor containers.
+    if (prefixMatches.length === 1 && isElementVisible(prefixMatches[0])) {
+      return {
+        element: prefixMatches[0],
+        prefixMatchCount: 1,
+        activeMatchCount: 1,
+      };
+    }
 
     var visibleMatches = prefixMatches.filter(isElementVisible);
-    if (visibleMatches.length === 1) return visibleMatches[0];
+    if (visibleMatches.length === 1) {
+      return {
+        element: visibleMatches[0],
+        prefixMatchCount: prefixMatches.length,
+        activeMatchCount: 1,
+      };
+    }
 
     var activeMatches = visibleMatches.filter(slotElementHasLayout);
-    if (activeMatches.length === 1) return activeMatches[0];
-
-    if (
-      prefixMatches.length > 1 &&
-      ts.log &&
-      typeof ts.log.warn === "function"
-    ) {
-      ts.log.warn("GPT slot prefix did not resolve to one active element", {
-        divId: divId,
-        prefixMatchCount: prefixMatches.length,
-        activeMatchCount: activeMatches.length,
-      });
-    }
-    return null;
+    return {
+      element: activeMatches.length === 1 ? activeMatches[0] : null,
+      prefixMatchCount: prefixMatches.length,
+      activeMatchCount: activeMatches.length,
+    };
   }
 
   function runHandoffInternal(callback) {
@@ -367,6 +386,7 @@
     // the queued callback so a navigation committed in the gap cancels the
     // stale mutation — mirrors the bundle's adInit.
     var generation = ts.navGeneration || 0;
+    var warnedResolutionFailures = Object.create(null);
 
     googletag.cmd.push(function () {
       if ((ts.navGeneration || 0) !== generation) return;
@@ -381,11 +401,28 @@
       // slot that was never displayed, so these are display()ed instead.
       var slotsToDisplay = [];
       slots.forEach(function (slot) {
-        // Resolve actual div ID: exact match first, then the one active prefix
-        // match. Responsive publishers may emit several mutually exclusive
-        // siblings for one stable prefix, so document order is not sufficient.
-        var el = findSlotElementByDivId(slot.div_id);
-        if (!el) return;
+        // Resolve actual div ID: exact match first, then the visibility and
+        // geometry tiers for prefix matches. Responsive publishers may emit
+        // several mutually exclusive siblings for one stable prefix, so
+        // document order is not sufficient.
+        var resolution = resolveSlotElementByDivId(slot.div_id);
+        var el = resolution.element;
+        if (!el) {
+          if (
+            resolution.prefixMatchCount > 1 &&
+            !warnedResolutionFailures[slot.div_id]
+          ) {
+            warnedResolutionFailures[slot.div_id] = true;
+            if (ts.log && typeof ts.log.warn === "function") {
+              ts.log.warn("GPT slot prefix did not resolve to one active element", {
+                divId: slot.div_id,
+                prefixMatchCount: resolution.prefixMatchCount,
+                activeMatchCount: resolution.activeMatchCount,
+              });
+            }
+          }
+          return;
+        }
         var actualDivId = el.id;
         var b = bids[slot.id] || {};
 
