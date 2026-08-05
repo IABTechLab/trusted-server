@@ -175,8 +175,14 @@ because no Prebid evidence was recorded for them.
 If publisher code captured a reference to `pubads().refresh` before the Trusted
 Server wrappers were installed, and later calls that retained reference directly, the
 call bypasses every installed boundary. No publisher intent is observable in that
-case, and the request is honestly reported as `unattributed` rather than guessed as
-`publisher_refresh`. Diagnostics do not attempt to detect or compensate for this case.
+case, so the request is never guessed as `publisher_refresh`.
+
+Such a request reports `unattributed` only when no other source recorded fresh
+evidence for the same slot inside the request-path attribution window. If a Trusted
+Server opportunity or a Prebid refresh was observed for that slot within the window,
+the request carries that source's path — or `competing` when more than one did. The
+bypassed call contributes no evidence of its own either way. Diagnostics do not
+attempt to detect or compensate for this case.
 
 ### Trusted Server auction correlation
 
