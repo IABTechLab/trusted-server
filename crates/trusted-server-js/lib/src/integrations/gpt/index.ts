@@ -873,6 +873,20 @@ function installLatePublisherSlotHandoff(ts: TsjsApi): void {
           originalRefresh(slots, options);
         }
       };
+      // Diagnostics are observational only. A missing or throwing diagnostics
+      // implementation must never interrupt refresh delivery. Skip while
+      // Prebid's own dispatch context is active so a Prebid-delivered
+      // request is not double-labeled publisher-initiated merely because
+      // the wrappers are nested, and skip empty lists since there is
+      // nothing concrete to attribute.
+      const recordPublisherRefreshForDiagnostics = (slots: GoogleTagSlot[]): void => {
+        if (ts.prebidRefreshDispatchInProgress || slots.length === 0) return;
+        try {
+          ts.gptDiagnostics?.recordPublisherRefresh?.(slots);
+        } catch {
+          // Diagnostics must not alter ad delivery.
+        }
+      };
       const patchedRefresh = (
         requestedSlots?: GoogleTagSlot[],
         options?: GoogleTagRefreshOptions
@@ -897,8 +911,13 @@ function installLatePublisherSlotHandoff(ts: TsjsApi): void {
           return false;
         });
         if (!suppressed) {
+          // GPT will request `slots`, so record intent for that concrete
+          // list, but still forward `requestedSlots` unchanged — it may be
+          // `undefined` for a bare call, and delivery must not change.
+          recordPublisherRefreshForDiagnostics(slots);
           callRefresh(requestedSlots, options);
         } else if (remainingSlots.length > 0) {
+          recordPublisherRefreshForDiagnostics(remainingSlots);
           callRefresh(remainingSlots, options);
         }
       };
@@ -1098,11 +1117,25 @@ export function installTsAdInit(): void {
         // Diagnostics are observational only. A missing or malformed debug
         // implementation must never interrupt slot mapping or delivery.
         try {
-          ts.gptDiagnostics?.recordTrustedServerOpportunity?.(
-            gptSlot,
-            slot.id,
-            trustedServerOpportunity(bid)
-          );
+          // The auction ID is opaque correlation data forwarded as-is; the
+          // diagnostics store validates and normalizes it, so it is not
+          // re-validated here. Omit a trailing `undefined` fourth argument
+          // entirely rather than forwarding it explicitly.
+          const auctionId = bid.hb_auction_id;
+          if (auctionId === undefined) {
+            ts.gptDiagnostics?.recordTrustedServerOpportunity?.(
+              gptSlot,
+              slot.id,
+              trustedServerOpportunity(bid)
+            );
+          } else {
+            ts.gptDiagnostics?.recordTrustedServerOpportunity?.(
+              gptSlot,
+              slot.id,
+              trustedServerOpportunity(bid),
+              auctionId
+            );
+          }
         } catch {
           // Diagnostics must not alter ad delivery.
         }

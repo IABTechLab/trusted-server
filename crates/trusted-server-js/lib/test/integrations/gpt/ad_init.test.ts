@@ -2626,6 +2626,528 @@ describe('installTsAdInit', () => {
     expect(() => (window as TestWindow).tsjs!.adInit!()).not.toThrow();
     expect(mockPubads.refresh).toHaveBeenCalledWith([dynamicSlot]);
   });
+
+  describe('publisher refresh diagnostics', () => {
+    function makeRefreshSlot(elementId: string): { getSlotElementId: ReturnType<typeof vi.fn> } {
+      return { getSlotElementId: vi.fn().mockReturnValue(elementId) };
+    }
+
+    it('records the exact delegated slot array and preserves array/options identity for an explicit refresh', async () => {
+      const slotA = makeRefreshSlot('div-a');
+      const slotB = makeRefreshSlot('div-b');
+      const nativeRefresh = vi.fn();
+      const recordPublisherRefresh = vi.fn();
+      const pubads = {
+        getSlots: vi.fn(),
+        refresh: nativeRefresh,
+      };
+      (window as TestWindow).googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot: vi.fn(),
+        display: vi.fn(),
+        pubads: vi.fn().mockReturnValue(pubads),
+      };
+      (window as TestWindow).tsjs = {
+        gptDiagnostics: { recordPublisherRefresh } as unknown as TsjsApi['gptDiagnostics'],
+      };
+
+      const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+      installTsAdInit();
+
+      const explicitSlots = [slotA, slotB];
+      const options = { changeCorrelator: false };
+      (pubads.refresh as unknown as (slots: (typeof slotA)[], opts: typeof options) => void)(
+        explicitSlots,
+        options
+      );
+
+      expect(recordPublisherRefresh).toHaveBeenCalledTimes(1);
+      expect(nativeRefresh).toHaveBeenCalledTimes(1);
+      // Exact array and options identity, not merely equal contents — a
+      // fresh array or a cloned options object would silently change
+      // downstream comparisons GPT itself may perform.
+      expect(recordPublisherRefresh.mock.calls[0][0]).toBe(explicitSlots);
+      expect(nativeRefresh.mock.calls[0][0]).toBe(explicitSlots);
+      expect(nativeRefresh.mock.calls[0][1]).toBe(options);
+    });
+
+    it('records resolved slots for a bare refresh while forwarding undefined to the native refresh', async () => {
+      const slotA = makeRefreshSlot('div-a');
+      const slotB = makeRefreshSlot('div-b');
+      const resolvedSlots = [slotA, slotB];
+      const nativeRefresh = vi.fn();
+      const recordPublisherRefresh = vi.fn();
+      const pubads = {
+        getSlots: vi.fn().mockReturnValue(resolvedSlots),
+        refresh: nativeRefresh,
+      };
+      (window as TestWindow).googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot: vi.fn(),
+        display: vi.fn(),
+        pubads: vi.fn().mockReturnValue(pubads),
+      };
+      (window as TestWindow).tsjs = {
+        gptDiagnostics: { recordPublisherRefresh } as unknown as TsjsApi['gptDiagnostics'],
+      };
+
+      const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+      installTsAdInit();
+
+      (pubads.refresh as () => void)();
+
+      expect(recordPublisherRefresh).toHaveBeenCalledTimes(1);
+      expect(recordPublisherRefresh).toHaveBeenCalledWith(resolvedSlots);
+      expect(nativeRefresh).toHaveBeenCalledTimes(1);
+      // A bare call must keep forwarding `undefined` — not the resolved
+      // list — to the native refresh; only diagnostics observes the
+      // concrete slots GPT will actually request.
+      expect(nativeRefresh).toHaveBeenCalledWith(undefined);
+    });
+
+    it('records and forwards only the remaining slots for a filtered refresh', async () => {
+      const claimedSlot = makeRefreshSlot('div-claimed');
+      const unrelatedSlot = makeRefreshSlot('div-unrelated');
+      const nativeRefresh = vi.fn();
+      const recordPublisherRefresh = vi.fn();
+      const pubads = {
+        getSlots: vi.fn(),
+        refresh: nativeRefresh,
+      };
+      (window as TestWindow).googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot: vi.fn(),
+        display: vi.fn(),
+        pubads: vi.fn().mockReturnValue(pubads),
+      };
+      (window as TestWindow).tsjs = {
+        gptSlotHandoffs: {
+          'div-claimed': {
+            gamUnitPath: '/123/claimed',
+            formats: [[300, 250]],
+            divIdPrefix: 'div-claimed',
+            slotElementId: 'div-claimed',
+            publisherClaimed: true,
+            suppressPublisherDisplay: false,
+            suppressPublisherRefresh: true,
+          },
+        },
+        gptDiagnostics: { recordPublisherRefresh } as unknown as TsjsApi['gptDiagnostics'],
+      };
+
+      const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+      installTsAdInit();
+
+      (pubads.refresh as (slots: (typeof claimedSlot)[]) => void)([claimedSlot, unrelatedSlot]);
+
+      expect(recordPublisherRefresh).toHaveBeenCalledTimes(1);
+      expect(recordPublisherRefresh).toHaveBeenCalledWith([unrelatedSlot]);
+      expect(nativeRefresh).toHaveBeenCalledTimes(1);
+      expect(nativeRefresh).toHaveBeenCalledWith([unrelatedSlot]);
+    });
+
+    it('records and calls nothing for a fully suppressed refresh', async () => {
+      const claimedSlot = makeRefreshSlot('div-claimed');
+      const nativeRefresh = vi.fn();
+      const recordPublisherRefresh = vi.fn();
+      const pubads = {
+        getSlots: vi.fn(),
+        refresh: nativeRefresh,
+      };
+      (window as TestWindow).googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot: vi.fn(),
+        display: vi.fn(),
+        pubads: vi.fn().mockReturnValue(pubads),
+      };
+      (window as TestWindow).tsjs = {
+        gptSlotHandoffs: {
+          'div-claimed': {
+            gamUnitPath: '/123/claimed',
+            formats: [[300, 250]],
+            divIdPrefix: 'div-claimed',
+            slotElementId: 'div-claimed',
+            publisherClaimed: true,
+            suppressPublisherDisplay: false,
+            suppressPublisherRefresh: true,
+          },
+        },
+        gptDiagnostics: { recordPublisherRefresh } as unknown as TsjsApi['gptDiagnostics'],
+      };
+
+      const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+      installTsAdInit();
+
+      (pubads.refresh as (slots: (typeof claimedSlot)[]) => void)([claimedSlot]);
+
+      expect(recordPublisherRefresh).not.toHaveBeenCalled();
+      expect(nativeRefresh).not.toHaveBeenCalled();
+    });
+
+    it('records nothing for a bare refresh that cannot resolve a concrete slot list', async () => {
+      const nativeRefresh = vi.fn();
+      const recordPublisherRefresh = vi.fn();
+      const pubads = {
+        // No getSlots implementation — mirrors an environment where pubads
+        // exposes no getter, so the concrete slot list cannot be resolved.
+        refresh: nativeRefresh,
+      };
+      (window as TestWindow).googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot: vi.fn(),
+        display: vi.fn(),
+        pubads: vi.fn().mockReturnValue(pubads),
+      };
+      (window as TestWindow).tsjs = {
+        gptDiagnostics: { recordPublisherRefresh } as unknown as TsjsApi['gptDiagnostics'],
+      };
+
+      const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+      installTsAdInit();
+
+      (pubads.refresh as () => void)();
+
+      expect(recordPublisherRefresh).not.toHaveBeenCalled();
+      expect(nativeRefresh).toHaveBeenCalledTimes(1);
+      expect(nativeRefresh).toHaveBeenCalledWith(undefined);
+    });
+
+    it('records nothing for an empty resolved slot list', async () => {
+      const nativeRefresh = vi.fn();
+      const recordPublisherRefresh = vi.fn();
+      const pubads = {
+        getSlots: vi.fn().mockReturnValue([]),
+        refresh: nativeRefresh,
+      };
+      (window as TestWindow).googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot: vi.fn(),
+        display: vi.fn(),
+        pubads: vi.fn().mockReturnValue(pubads),
+      };
+      (window as TestWindow).tsjs = {
+        gptDiagnostics: { recordPublisherRefresh } as unknown as TsjsApi['gptDiagnostics'],
+      };
+
+      const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+      installTsAdInit();
+
+      (pubads.refresh as () => void)();
+
+      expect(recordPublisherRefresh).not.toHaveBeenCalled();
+      expect(nativeRefresh).toHaveBeenCalledTimes(1);
+      expect(nativeRefresh).toHaveBeenCalledWith(undefined);
+    });
+
+    it('records nothing for the internal Trusted Server refresh and still delegates', async () => {
+      const slotA = makeRefreshSlot('div-a');
+      const nativeRefresh = vi.fn();
+      const recordPublisherRefresh = vi.fn();
+      const pubads = {
+        getSlots: vi.fn(),
+        refresh: nativeRefresh,
+      };
+      (window as TestWindow).googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot: vi.fn(),
+        display: vi.fn(),
+        pubads: vi.fn().mockReturnValue(pubads),
+      };
+      (window as TestWindow).tsjs = {
+        gptSlotHandoffInternal: true,
+        gptDiagnostics: { recordPublisherRefresh } as unknown as TsjsApi['gptDiagnostics'],
+      };
+
+      const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+      installTsAdInit();
+
+      (pubads.refresh as (slots: (typeof slotA)[]) => void)([slotA]);
+
+      expect(recordPublisherRefresh).not.toHaveBeenCalled();
+      expect(nativeRefresh).toHaveBeenCalledTimes(1);
+      expect(nativeRefresh).toHaveBeenCalledWith([slotA]);
+    });
+
+    it('records nothing while the Prebid dispatch context is active and still delegates', async () => {
+      const slotA = makeRefreshSlot('div-a');
+      const nativeRefresh = vi.fn();
+      const recordPublisherRefresh = vi.fn();
+      const pubads = {
+        getSlots: vi.fn(),
+        refresh: nativeRefresh,
+      };
+      (window as TestWindow).googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot: vi.fn(),
+        display: vi.fn(),
+        pubads: vi.fn().mockReturnValue(pubads),
+      };
+      (window as TestWindow).tsjs = {
+        // A later task sets this flag around Prebid's own delegated refresh;
+        // this test only proves the handoff wrapper honors it once set.
+        prebidRefreshDispatchInProgress: true,
+        gptDiagnostics: { recordPublisherRefresh } as unknown as TsjsApi['gptDiagnostics'],
+      };
+
+      const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+      installTsAdInit();
+
+      (pubads.refresh as (slots: (typeof slotA)[]) => void)([slotA]);
+
+      expect(recordPublisherRefresh).not.toHaveBeenCalled();
+      expect(nativeRefresh).toHaveBeenCalledTimes(1);
+      expect(nativeRefresh).toHaveBeenCalledWith([slotA]);
+    });
+
+    it('does not double-wrap the refresh boundary on reinstall, recording intent once per call', async () => {
+      const slotA = makeRefreshSlot('div-a');
+      const nativeRefresh = vi.fn();
+      const recordPublisherRefresh = vi.fn();
+      const pubads = {
+        getSlots: vi.fn(),
+        refresh: nativeRefresh,
+      };
+      (window as TestWindow).googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot: vi.fn(),
+        display: vi.fn(),
+        pubads: vi.fn().mockReturnValue(pubads),
+      };
+      (window as TestWindow).tsjs = {
+        gptDiagnostics: { recordPublisherRefresh } as unknown as TsjsApi['gptDiagnostics'],
+      };
+
+      const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+      installTsAdInit();
+      installTsAdInit();
+
+      (pubads.refresh as (slots: (typeof slotA)[]) => void)([slotA]);
+
+      expect(recordPublisherRefresh).toHaveBeenCalledTimes(1);
+      expect(nativeRefresh).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not throw when the diagnostics recorder is missing', async () => {
+      const slotA = makeRefreshSlot('div-a');
+      const nativeRefresh = vi.fn();
+      const pubads = {
+        getSlots: vi.fn(),
+        refresh: nativeRefresh,
+      };
+      (window as TestWindow).googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot: vi.fn(),
+        display: vi.fn(),
+        pubads: vi.fn().mockReturnValue(pubads),
+      };
+      // No gptDiagnostics at all on window.tsjs.
+      (window as TestWindow).tsjs = {};
+
+      const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+      installTsAdInit();
+
+      expect(() => (pubads.refresh as (slots: (typeof slotA)[]) => void)([slotA])).not.toThrow();
+      expect(nativeRefresh).toHaveBeenCalledTimes(1);
+      expect(nativeRefresh).toHaveBeenCalledWith([slotA]);
+    });
+
+    it('does not throw and still delegates when the diagnostics recorder throws', async () => {
+      const slotA = makeRefreshSlot('div-a');
+      const nativeRefresh = vi.fn();
+      const recordPublisherRefresh = vi.fn(() => {
+        throw new Error('diagnostics unavailable');
+      });
+      const pubads = {
+        getSlots: vi.fn(),
+        refresh: nativeRefresh,
+      };
+      (window as TestWindow).googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot: vi.fn(),
+        display: vi.fn(),
+        pubads: vi.fn().mockReturnValue(pubads),
+      };
+      (window as TestWindow).tsjs = {
+        gptDiagnostics: { recordPublisherRefresh } as unknown as TsjsApi['gptDiagnostics'],
+      };
+
+      const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+      installTsAdInit();
+
+      expect(() => (pubads.refresh as (slots: (typeof slotA)[]) => void)([slotA])).not.toThrow();
+      expect(recordPublisherRefresh).toHaveBeenCalledTimes(1);
+      expect(nativeRefresh).toHaveBeenCalledTimes(1);
+      expect(nativeRefresh).toHaveBeenCalledWith([slotA]);
+    });
+
+    it('propagates a synchronous throw from the native refresh', async () => {
+      const slotA = makeRefreshSlot('div-a');
+      const nativeError = new Error('native refresh failed');
+      const nativeRefresh = vi.fn(() => {
+        throw nativeError;
+      });
+      const recordPublisherRefresh = vi.fn();
+      const pubads = {
+        getSlots: vi.fn(),
+        refresh: nativeRefresh,
+      };
+      (window as TestWindow).googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot: vi.fn(),
+        display: vi.fn(),
+        pubads: vi.fn().mockReturnValue(pubads),
+      };
+      (window as TestWindow).tsjs = {
+        gptDiagnostics: { recordPublisherRefresh } as unknown as TsjsApi['gptDiagnostics'],
+      };
+
+      const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+      installTsAdInit();
+
+      expect(() => (pubads.refresh as (slots: (typeof slotA)[]) => void)([slotA])).toThrow(
+        nativeError
+      );
+      // Diagnostics still observed the concrete slots before the native
+      // refresh threw — the added try/catch wraps only the diagnostics
+      // call, never the delegated refresh itself.
+      expect(recordPublisherRefresh).toHaveBeenCalledTimes(1);
+      expect(recordPublisherRefresh).toHaveBeenCalledWith([slotA]);
+    });
+
+    it('records publisher intent before delegating to the native refresh', async () => {
+      const slotA = makeRefreshSlot('div-a');
+      const nativeRefresh = vi.fn();
+      const recordPublisherRefresh = vi.fn();
+      const pubads = {
+        getSlots: vi.fn(),
+        refresh: nativeRefresh,
+      };
+      (window as TestWindow).googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot: vi.fn(),
+        display: vi.fn(),
+        pubads: vi.fn().mockReturnValue(pubads),
+      };
+      (window as TestWindow).tsjs = {
+        gptDiagnostics: { recordPublisherRefresh } as unknown as TsjsApi['gptDiagnostics'],
+      };
+
+      const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+      installTsAdInit();
+
+      (pubads.refresh as (slots: (typeof slotA)[]) => void)([slotA]);
+
+      expect(recordPublisherRefresh.mock.invocationCallOrder[0]).toBeLessThan(
+        nativeRefresh.mock.invocationCallOrder[0]
+      );
+    });
+  });
+
+  describe('auction ID diagnostics', () => {
+    it('forwards the bid auction ID as the fourth argument to recordTrustedServerOpportunity', async () => {
+      const recordTrustedServerOpportunity = vi.fn();
+      const { mockSlot } = configureOpportunityDiagnostics(
+        {
+          hb_pb: '1.00',
+          hb_adid: 'abc-uuid',
+          adm: '<div>Creative</div>',
+          hb_auction_id: 'auction-from-server',
+        },
+        recordTrustedServerOpportunity
+      );
+
+      const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+      installTsAdInit();
+      (window as TestWindow).tsjs!.adInit!();
+
+      expect(recordTrustedServerOpportunity).toHaveBeenCalledTimes(1);
+      expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
+        mockSlot,
+        'atf_sidebar_ad',
+        'renderable_candidate',
+        'auction-from-server'
+      );
+    });
+
+    it('omits the fourth argument when the bid has no auction ID', async () => {
+      const recordTrustedServerOpportunity = vi.fn();
+      const { mockSlot } = configureOpportunityDiagnostics(
+        { hb_pb: '1.00', hb_adid: 'abc-uuid', adm: '<div>Creative</div>' },
+        recordTrustedServerOpportunity
+      );
+
+      const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+      installTsAdInit();
+      (window as TestWindow).tsjs!.adInit!();
+
+      expect(recordTrustedServerOpportunity).toHaveBeenCalledTimes(1);
+      expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
+        mockSlot,
+        'atf_sidebar_ad',
+        'renderable_candidate'
+      );
+      // Exactly three arguments — no trailing `undefined` fourth argument
+      // when the bid carries no auction ID.
+      expect(recordTrustedServerOpportunity.mock.calls[0]).toHaveLength(3);
+    });
+
+    it('keeps refresh and targeting delivery unaffected when diagnostics throws with an auction ID present', async () => {
+      const existingSlot = {
+        addService: vi.fn().mockReturnThis(),
+        setTargeting: vi.fn().mockReturnThis(),
+        getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+        getTargeting: vi.fn().mockReturnValue([]),
+      };
+      const mockPubads = {
+        enableSingleRequest: vi.fn(),
+        getSlots: vi.fn().mockReturnValue([existingSlot]),
+        addEventListener: vi.fn(),
+        refresh: vi.fn(),
+      };
+      // The handoff wrapper replaces pubads.refresh — hold the spy before install.
+      const refresh = mockPubads.refresh;
+      (window as TestWindow).googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot: vi.fn(),
+        display: vi.fn(),
+        pubads: vi.fn().mockReturnValue(mockPubads),
+        enableServices: vi.fn(),
+      };
+      const recordTrustedServerOpportunity = vi.fn(() => {
+        throw new Error('diagnostics unavailable');
+      });
+      (window as TestWindow).tsjs = {
+        adSlots: [
+          {
+            id: 'atf_sidebar_ad',
+            gam_unit_path: '/123/atf',
+            div_id: 'div-atf-sidebar',
+            formats: [[300, 250]],
+            targeting: {},
+          },
+        ],
+        bids: {
+          atf_sidebar_ad: {
+            hb_pb: '1.00',
+            hb_adid: 'existing-id',
+            adm: '<div>Existing</div>',
+            hb_auction_id: 'auction-throws',
+          },
+        },
+        gptDiagnostics: {
+          recordTrustedServerOpportunity,
+        } as unknown as TsjsApi['gptDiagnostics'],
+      };
+
+      const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+      installTsAdInit();
+      expect(() => (window as TestWindow).tsjs!.adInit!()).not.toThrow();
+
+      expect(recordTrustedServerOpportunity).toHaveBeenCalledTimes(1);
+      expect(existingSlot.setTargeting).toHaveBeenCalledWith('hb_pb', '1.00');
+      expect(refresh).toHaveBeenCalledWith([existingSlot]);
+    });
+  });
 });
 
 describe('parseCachedBid', () => {
