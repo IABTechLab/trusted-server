@@ -25,11 +25,20 @@
 #   requires_signal  set only when a signal grants it (opt-in)
 #   denied           never set, even when a signal grants it
 #
-# Permission names are the IAB TCF Europe purposes:
-#   store-on-device, select-basic-ads, create-ads-profile,
-#   select-personalised-ads, create-content-profile, select-personalised-content,
-#   measure-ad-performance, measure-content-performance, market-research,
-#   develop-services, select-basic-content
+# Permission names are IAB Privacy Taxonomy Data Uses, mapped from the IAB TCF
+# Europe purposes. Two purposes have no Data Use yet: TCF purpose 1 (device
+# storage) uses a proposed `necessary.operations.storage` key, and TCF purpose
+# 11 (limited-data content selection) keeps its TCF identifier
+# `select-basic-content`. Both are flagged for an upstream taxonomy addition.
+#   necessary.operations.storage,
+#   advertising_marketing.first_party.contextual,
+#   advertising_marketing.profiling, advertising_marketing.first_party.targeted,
+#   advertising_marketing.personalize.profiling,
+#   advertising_marketing.personalize.content,
+#   analytics.ad_reporting.measure_ad_performance,
+#   analytics.ad_reporting.content_performance,
+#   analytics.ad_reporting.market_research, necessary.operations.improve,
+#   select-basic-content
 #
 # Named baselines. Each group lists every permission and its flag, so a group's
 # meaning is explicit. (A `default: <flag>` shorthand is also accepted for any
@@ -37,45 +46,46 @@
 groups:
   # European Union: opt-in, every purpose requires a signal.
   gdpr-eu:
-    store-on-device: requires_signal
-    select-basic-ads: requires_signal
-    create-ads-profile: requires_signal
-    select-personalised-ads: requires_signal
-    create-content-profile: requires_signal
-    select-personalised-content: requires_signal
-    measure-ad-performance: requires_signal
-    measure-content-performance: requires_signal
-    market-research: requires_signal
-    develop-services: requires_signal
+    necessary.operations.storage: requires_signal
+    advertising_marketing.first_party.contextual: requires_signal
+    advertising_marketing.profiling: requires_signal
+    advertising_marketing.first_party.targeted: requires_signal
+    advertising_marketing.personalize.profiling: requires_signal
+    advertising_marketing.personalize.content: requires_signal
+    analytics.ad_reporting.measure_ad_performance: requires_signal
+    analytics.ad_reporting.content_performance: requires_signal
+    analytics.ad_reporting.market_research: requires_signal
+    necessary.operations.improve: requires_signal
+    # TCF purpose 11: no Data Use yet, keeps its TCF identifier. Not gated today.
     select-basic-content: requires_signal
 
   # United Kingdom: opt-in, but device storage proceeds without a signal under
   # the reformed ePrivacy regime.
   gdpr-uk:
-    store-on-device: granted
-    select-basic-ads: requires_signal
-    create-ads-profile: requires_signal
-    select-personalised-ads: requires_signal
-    create-content-profile: requires_signal
-    select-personalised-content: requires_signal
-    measure-ad-performance: requires_signal
-    measure-content-performance: requires_signal
-    market-research: requires_signal
-    develop-services: requires_signal
+    necessary.operations.storage: granted
+    advertising_marketing.first_party.contextual: requires_signal
+    advertising_marketing.profiling: requires_signal
+    advertising_marketing.first_party.targeted: requires_signal
+    advertising_marketing.personalize.profiling: requires_signal
+    advertising_marketing.personalize.content: requires_signal
+    analytics.ad_reporting.measure_ad_performance: requires_signal
+    analytics.ad_reporting.content_performance: requires_signal
+    analytics.ad_reporting.market_research: requires_signal
+    necessary.operations.improve: requires_signal
     select-basic-content: requires_signal
 
   # United States: opt-out, every purpose granted by default.
   us-opt-out:
-    store-on-device: granted
-    select-basic-ads: granted
-    create-ads-profile: granted
-    select-personalised-ads: granted
-    create-content-profile: granted
-    select-personalised-content: granted
-    measure-ad-performance: granted
-    measure-content-performance: granted
-    market-research: granted
-    develop-services: granted
+    necessary.operations.storage: granted
+    advertising_marketing.first_party.contextual: granted
+    advertising_marketing.profiling: granted
+    advertising_marketing.first_party.targeted: granted
+    advertising_marketing.personalize.profiling: granted
+    advertising_marketing.personalize.content: granted
+    analytics.ad_reporting.measure_ad_performance: granted
+    analytics.ad_reporting.content_performance: granted
+    analytics.ad_reporting.market_research: granted
+    necessary.operations.improve: granted
     select-basic-content: granted
 
 # Map a country, or a country and state (country/state), to a group. Add explicit

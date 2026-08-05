@@ -5,8 +5,11 @@
 //! *set* from the session's signals and the country it resolves to, and refuses
 //! to execute a provider whose required permissions are not set.
 //!
-//! The vocabulary is the IAB TCF Europe purpose set, used **only** as a technical
-//! identifier for a permission. No CMP or TCF *policy* is implemented here, and
+//! The vocabulary is the IAB Privacy Taxonomy Data Uses, mapped from the IAB TCF
+//! Europe purposes and used **only** as a technical identifier for a permission.
+//! Two purposes have no Data Use yet: TCF purpose 1 (device storage) uses a
+//! proposed `necessary.operations.storage` key and TCF purpose 11 keeps its TCF
+//! identifier. No CMP or TCF *policy* is implemented here, and
 //! only [`Permission::StoreOnDevice`] (TCF Purpose 1) and
 //! [`Permission::SelectPersonalisedAds`] (TCF Purpose 4) are resolved against a
 //! session signal today. The remaining purposes are modeled for forward
@@ -27,47 +30,51 @@ use std::sync::OnceLock;
 
 use serde::Deserialize;
 
-/// A technical permission a provider may require, named by its IAB TCF Europe
-/// purpose.
+/// A technical permission a provider may require, labeled with its IAB Privacy
+/// Taxonomy Data Use, or its IAB TCF Europe purpose where no Data Use exists yet.
 ///
-/// Only the identifier is used, with no TCF policy implemented. Only
+/// Only the identifier is used, with no TCF or taxonomy policy implemented. Only
 /// [`Permission::StoreOnDevice`] (Purpose 1) and
 /// [`Permission::SelectPersonalisedAds`] (Purpose 4) are resolved against a
 /// signal today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, derive_more::Display)]
 pub enum Permission {
     /// TCF Purpose 1, store and/or access information on a device. Resolved
-    /// against a session signal today.
-    #[display("store-on-device")]
+    /// against a session signal today. No IAB Privacy Taxonomy Data Use exists
+    /// for device storage yet, so this uses a proposed `necessary.operations`
+    /// key pending an upstream addition.
+    #[display("necessary.operations.storage")]
     StoreOnDevice,
     /// TCF Purpose 2, use limited data to select advertising.
-    #[display("select-basic-ads")]
+    #[display("advertising_marketing.first_party.contextual")]
     SelectBasicAds,
     /// TCF Purpose 3, create profiles for personalised advertising.
-    #[display("create-ads-profile")]
+    #[display("advertising_marketing.profiling")]
     CreateAdsProfile,
     /// TCF Purpose 4, use profiles to select personalised advertising.
-    #[display("select-personalised-ads")]
+    #[display("advertising_marketing.first_party.targeted")]
     SelectPersonalisedAds,
     /// TCF Purpose 5, create profiles to personalise content.
-    #[display("create-content-profile")]
+    #[display("advertising_marketing.personalize.profiling")]
     CreateContentProfile,
     /// TCF Purpose 6, use profiles to select personalised content.
-    #[display("select-personalised-content")]
+    #[display("advertising_marketing.personalize.content")]
     SelectPersonalisedContent,
     /// TCF Purpose 7, measure advertising performance.
-    #[display("measure-ad-performance")]
+    #[display("analytics.ad_reporting.measure_ad_performance")]
     MeasureAdPerformance,
     /// TCF Purpose 8, measure content performance.
-    #[display("measure-content-performance")]
+    #[display("analytics.ad_reporting.content_performance")]
     MeasureContentPerformance,
     /// TCF Purpose 9, understand audiences through statistics.
-    #[display("market-research")]
+    #[display("analytics.ad_reporting.market_research")]
     MarketResearch,
     /// TCF Purpose 10, develop and improve services.
-    #[display("develop-services")]
+    #[display("necessary.operations.improve")]
     DevelopServices,
-    /// TCF Purpose 11, use limited data to select content.
+    /// TCF Purpose 11, use limited data to select content. No IAB Privacy
+    /// Taxonomy Data Use exists for limited-data content selection yet, so this
+    /// keeps its TCF identifier and is proposed upstream. Not gated today.
     #[display("select-basic-content")]
     SelectBasicContent,
 }
@@ -112,7 +119,7 @@ impl Permission {
     }
 
     /// Returns the permission whose IAB TCF identifier matches `id` (for example
-    /// `"store-on-device"`), or `None` when it is unknown.
+    /// `"necessary.operations.storage"`), or `None` when it is unknown.
     ///
     /// Used to parse permission names from `permissions.yaml`.
     #[must_use]
@@ -723,13 +730,13 @@ mod tests {
         let denied = maps.resolve(Some("GB"), None, |_| false);
         assert!(
             !denied.is_set(Permission::StoreOnDevice),
-            "the floor should not set store-on-device without a signal"
+            "the floor should not set necessary.operations.storage without a signal"
         );
 
         let granted = maps.resolve(Some("GB"), None, |p| p == Permission::StoreOnDevice);
         assert!(
             granted.is_set(Permission::StoreOnDevice),
-            "the floor should set store-on-device once a signal grants it"
+            "the floor should set necessary.operations.storage once a signal grants it"
         );
     }
 
@@ -779,7 +786,7 @@ mod tests {
 
     #[test]
     fn per_permission_override_beats_the_country_default() {
-        // Granted by default, but deny store-on-device specifically.
+        // Granted by default, but deny necessary.operations.storage specifically.
         let rules = CountryRules::with_default(Acquisition::Granted)
             .with_rule(Permission::StoreOnDevice, Acquisition::Denied);
         let maps = PermissionMaps::empty().with_country("zz", rules);
@@ -875,17 +882,17 @@ mod tests {
             !maps
                 .resolve(Some("DE"), None, |_| false)
                 .is_set(Permission::StoreOnDevice),
-            "an EU country should not set store-on-device without a signal"
+            "an EU country should not set necessary.operations.storage without a signal"
         );
         assert!(
             maps.resolve(Some("DE"), None, |p| p == Permission::StoreOnDevice)
                 .is_set(Permission::StoreOnDevice),
-            "an EU country should set store-on-device once a signal grants it"
+            "an EU country should set necessary.operations.storage once a signal grants it"
         );
         assert!(
             maps.resolve(Some("GB"), None, |_| false)
                 .is_set(Permission::StoreOnDevice),
-            "the UK should grant store-on-device without a signal"
+            "the UK should grant necessary.operations.storage without a signal"
         );
     }
 
@@ -896,7 +903,7 @@ mod tests {
             assert!(
                 maps.resolve(Some(code), None, |_| false)
                     .is_set(Permission::StoreOnDevice),
-                "{code} should grant store-on-device by default"
+                "{code} should grant necessary.operations.storage by default"
             );
         }
         // No default configured, so an unmapped country hits the requires-signal
@@ -911,12 +918,12 @@ mod tests {
 
     #[test]
     fn resolve_with_revokes_a_granted_permission_on_opt_out() {
-        // US grants store-on-device by default; an opt-out signal revokes it.
+        // US grants necessary.operations.storage by default; an opt-out signal revokes it.
         let maps = PermissionMaps::standard();
         assert!(
             maps.baseline(Some("US"), None, None, None)
                 .is_set(Permission::StoreOnDevice),
-            "the US baseline should set store-on-device"
+            "the US baseline should set necessary.operations.storage"
         );
         let revoked = maps.resolve_with(Some("US"), None, None, None, |p| {
             if p == Permission::StoreOnDevice {
@@ -965,7 +972,7 @@ rules:
   US: us
   US/CA:
     group: eu
-    permissions: [+store-on-device, -select-basic-ads]
+    permissions: [+necessary.operations.storage, -advertising_marketing.first_party.contextual]
 "#;
         let maps = PermissionMaps::from_yaml(yaml).expect("should parse the rules");
 
@@ -982,19 +989,19 @@ rules:
             "US (us) grants device storage"
         );
 
-        // CA references the eu group, but +store-on-device grants it, overriding
+        // CA references the eu group, but +necessary.operations.storage grants it, overriding
         // the eu baseline.
         assert!(
             maps.baseline(Some("US"), Some("CA"), None, None)
                 .is_set(Permission::StoreOnDevice),
-            "+store-on-device grants it for CA, overriding the eu baseline"
+            "+necessary.operations.storage grants it for CA, overriding the eu baseline"
         );
-        // -select-basic-ads denies it: not set even when a signal grants it.
+        // -advertising_marketing.first_party.contextual denies it: not set even when a signal grants it.
         assert!(
             !maps
                 .resolve_with(Some("US"), Some("CA"), None, None, |_| ConsentSignal::Grant)
                 .is_set(Permission::SelectBasicAds),
-            "-select-basic-ads denies it even when a signal grants it"
+            "-advertising_marketing.first_party.contextual denies it even when a signal grants it"
         );
 
         // An unmapped country with a default of `US` uses the us (granted) rule.
@@ -1025,9 +1032,9 @@ rules:
     #[test]
     fn from_yaml_rejects_an_incomplete_group_without_default() {
         // A group with no `default` must list every permission, so this one
-        // (only store-on-device) is rejected rather than silently leaving the
+        // (only necessary.operations.storage) is rejected rather than silently leaving the
         // other ten unset.
-        let yaml = "groups:\n  g:\n    store-on-device: granted\nrules: {}\n";
+        let yaml = "groups:\n  g:\n    necessary.operations.storage: granted\nrules: {}\n";
         let err = PermissionMaps::from_yaml(yaml)
             .expect_err("an incomplete group without a default should be rejected");
         assert!(
@@ -1076,7 +1083,7 @@ rules:
 
     #[test]
     fn from_yaml_rejects_modification_without_sign() {
-        let yaml = "groups:\n  g:\n    default: granted\nrules:\n  US:\n    group: g\n    permissions: [store-on-device]\n";
+        let yaml = "groups:\n  g:\n    default: granted\nrules:\n  US:\n    group: g\n    permissions: [necessary.operations.storage]\n";
         let err = PermissionMaps::from_yaml(yaml)
             .expect_err("a modification without +/- should be rejected");
         assert!(

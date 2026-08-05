@@ -265,7 +265,7 @@ impl EdgeCookieProvider for HostSignalProvider {
     }
 
     fn required_permissions(&self) -> PermissionSet {
-        // Writes the Edge Cookie to the device, so it requires store-on-device
+        // Writes the Edge Cookie to the device, so it requires necessary.operations.storage
         // (TCF Purpose 1), the same gate as the HMAC provider.
         PermissionSet::none().with(Permission::StoreOnDevice)
     }
@@ -336,7 +336,7 @@ impl EdgeCookieProvider for ClientFixedProvider {
 
     fn required_permissions(&self) -> PermissionSet {
         // The provider writes the resolved value to the device as the Edge
-        // Cookie, so it requires store-on-device (TCF Purpose 1), the same gate
+        // Cookie, so it requires necessary.operations.storage (TCF Purpose 1), the same gate
         // as the HMAC provider.
         PermissionSet::none().with(Permission::StoreOnDevice)
     }
@@ -482,7 +482,7 @@ mod tests {
         let required = provider.required_permissions();
         assert!(
             required.contains(Permission::StoreOnDevice),
-            "the HMAC provider writes a cookie, so it requires store-on-device"
+            "the HMAC provider writes a cookie, so it requires necessary.operations.storage"
         );
         assert!(
             !required.contains(Permission::SelectPersonalisedAds),
@@ -509,7 +509,7 @@ mod tests {
             provider
                 .required_permissions()
                 .contains(Permission::StoreOnDevice),
-            "the host-signal provider writes a cookie, so it requires store-on-device"
+            "the host-signal provider writes a cookie, so it requires necessary.operations.storage"
         );
     }
 
@@ -537,11 +537,11 @@ mod tests {
             "the floor should not run the Edge Cookie provider without the permission set"
         );
 
-        // A grant signal for store-on-device: the provider's permission is now set.
+        // A grant signal for necessary.operations.storage: the provider's permission is now set.
         assert!(
             maps.resolve(None, None, |p| p == Permission::StoreOnDevice)
                 .all_set(required),
-            "the Edge Cookie provider runs once store-on-device is set"
+            "the Edge Cookie provider runs once necessary.operations.storage is set"
         );
     }
 
@@ -596,7 +596,7 @@ mod tests {
             ClientFixedProvider
                 .required_permissions()
                 .contains(Permission::StoreOnDevice),
-            "client-fixed writes a cookie, so it requires store-on-device"
+            "client-fixed writes a cookie, so it requires necessary.operations.storage"
         );
     }
 

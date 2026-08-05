@@ -166,7 +166,7 @@ mod tests {
     #[test]
     fn hmac_provider_is_blocked_without_storage_consent() {
         // The test settings select the HMAC provider, which requires
-        // store-on-device. With no signal and no configured default country,
+        // necessary.operations.storage. With no signal and no configured default country,
         // that permission sits at the requires-signal floor, so it is not set and
         // no Edge Cookie is written.
         let settings = create_test_settings();
@@ -199,7 +199,7 @@ mod tests {
         assert!(
             state.is_set(Permission::StoreOnDevice)
                 && state.is_set(Permission::SelectPersonalisedAds),
-            "a US opt-out state should grant store-on-device and select-personalised-ads"
+            "a US opt-out state should grant necessary.operations.storage and advertising_marketing.first_party.targeted"
         );
     }
 
@@ -216,7 +216,7 @@ mod tests {
         assert!(
             !state.is_set(Permission::StoreOnDevice)
                 && !state.is_set(Permission::SelectPersonalisedAds),
-            "GPC should revoke the granted store-on-device and select-personalised-ads baseline"
+            "GPC should revoke the granted necessary.operations.storage and advertising_marketing.first_party.targeted baseline"
         );
     }
 }

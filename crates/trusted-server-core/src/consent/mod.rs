@@ -505,7 +505,7 @@ pub fn gate_eids_by_permissions<T>(
         Some(eids)
     } else {
         log::info!(
-            "EIDs stripped: store-on-device or select-personalised-ads is not set in the resolved permissions"
+            "EIDs stripped: necessary.operations.storage or advertising_marketing.first_party.targeted is not set in the resolved permissions"
         );
         None
     }
@@ -1139,14 +1139,14 @@ mod tests {
 
     #[test]
     fn gate_eids_keeps_eids_when_required_permissions_are_set() {
-        // US maps to us-opt-out, where store-on-device and select-personalised-ads
+        // US maps to us-opt-out, where necessary.operations.storage and advertising_marketing.first_party.targeted
         // are granted with no signal, so bidstream EIDs are transmitted.
         let permissions =
             crate::permissions::PermissionMaps::standard().resolve(Some("US"), None, |_| false);
         let eids = Some(vec!["eid-1".to_owned()]);
         assert!(
             gate_eids_by_permissions(eids, &permissions).is_some(),
-            "EIDs should pass when store-on-device and select-personalised-ads are set"
+            "EIDs should pass when necessary.operations.storage and advertising_marketing.first_party.targeted are set"
         );
     }
 

@@ -71,14 +71,14 @@ When the required permissions cannot be established for the current request (for
 
 ## Permission Gating
 
-EC creation is gated through the [permission model](/guide/permission-model), not by a jurisdiction rule baked into the core. The Edge Cookie provider advertises the permissions its data use requires, and Trusted Server creates an Edge Cookie only when every required permission is set. The built-in HMAC provider requires `store-on-device` (TCF Purpose 1), because the `Set-Cookie` operation stores information on the device.
+EC creation is gated through the [permission model](/guide/permission-model), not by a jurisdiction rule baked into the core. The Edge Cookie provider advertises the permissions its data use requires, and Trusted Server creates an Edge Cookie only when every required permission is set. The built-in HMAC provider requires `necessary.operations.storage` (TCF Purpose 1), because the `Set-Cookie` operation stores information on the device.
 
 The Edge Cookie code never reads consent. It checks only whether the required **permission** is set. Consent is one of the sources that _set_ a permission, not something the gate reads directly, so the Edge Cookie logic does not change when a consent framework changes. Two sources combine for each request:
 
 - **A country and region baseline.** The country, and an optional region such as a US state, that the geo provider returns. A region rule takes precedence over its country, and when no country is identified, or the country/region has no rule, the configured default country applies.
 - **Consent and privacy signals.** TCF, GPP, and GPC (`euconsent-v2`, `__gpp` / `__gpp_sid`, `us_privacy`, `Sec-GPC`) decoded from the request and mapped onto permissions as a **grant or a revoke** on top of that baseline. There is no separate consent KV fallback.
 
-Today only `store-on-device` is resolved this way: its country and region baseline is adjusted by the incoming TCF signal, and the Edge Cookie is created only when the result is set. With no configured default country, an unknown country sets nothing without a signal, so the cookie is not created unless a signal grants the permission. The core encodes no jurisdiction's law. The deployer brings the policy, and the per-country and per-region rules are configuration rather than core logic. See the [permission model](/guide/permission-model) for the full list of permission sources and the resolution order.
+Today only `necessary.operations.storage` is resolved this way: its country and region baseline is adjusted by the incoming TCF signal, and the Edge Cookie is created only when the result is set. With no configured default country, an unknown country sets nothing without a signal, so the cookie is not created unless a signal grants the permission. The core encodes no jurisdiction's law. The deployer brings the policy, and the per-country and per-region rules are configuration rather than core logic. See the [permission model](/guide/permission-model) for the full list of permission sources and the resolution order.
 
 ```mermaid
 flowchart TD

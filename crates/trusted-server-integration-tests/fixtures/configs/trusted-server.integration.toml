@@ -13,7 +13,7 @@ proxy_secret = "integration-test-proxy-secret"
 # request carries no country and default_country supplies the baseline the
 # permission model uses. US/CA is a US opt-out state (every purpose granted
 # without a signal), so the EC lifecycle scenarios can assert
-# permission-driven behavior, for example GPC revoking store-on-device so the
+# permission-driven behavior, for example GPC revoking necessary.operations.storage so the
 # EC is no longer permitted and the ts-ec cookie is expired.
 [geo]
 default_country = "US/CA"

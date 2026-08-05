@@ -77,24 +77,28 @@ into the consumer.
 
 ## The permission vocabulary
 
-The permission names are the IAB TCF Europe purpose set, used **only** as
-technical identifiers. No CMP or TCF policy is implemented in the core. Today
-only `store-on-device` (TCF Purpose 1) is resolved against the incoming
-consent and privacy signals. The remaining purposes are modeled for forward
-compatibility so that later providers can advertise them.
+The permission names are IAB Privacy Taxonomy Data Uses, mapped from the IAB TCF
+Europe purposes and used **only** as technical identifiers. No CMP or TCF policy
+is implemented in the core. Two purposes have no Data Use yet: purpose 1 (device
+storage) uses a proposed `necessary.operations.storage` key, and purpose 11
+keeps its TCF identifier `select-basic-content`. Both are flagged for an upstream
+taxonomy addition. Today only `necessary.operations.storage` (TCF Purpose 1) is
+resolved against the incoming consent and privacy signals. The remaining
+purposes are modeled for forward compatibility so that later providers can
+advertise them.
 
-| #   | Identifier                    | IAB TCF Europe purpose                          |
+| #   | Data Use identifier           | IAB TCF Europe purpose                          |
 | --- | ----------------------------- | ----------------------------------------------- |
-| 1   | `store-on-device`             | Store and/or access information on a device     |
-| 2   | `select-basic-ads`            | Use limited data to select advertising          |
-| 3   | `create-ads-profile`          | Create profiles for personalised advertising    |
-| 4   | `select-personalised-ads`     | Use profiles to select personalised advertising |
-| 5   | `create-content-profile`      | Create profiles to personalise content          |
-| 6   | `select-personalised-content` | Use profiles to select personalised content     |
-| 7   | `measure-ad-performance`      | Measure advertising performance                 |
-| 8   | `measure-content-performance` | Measure content performance                     |
-| 9   | `market-research`             | Understand audiences through statistics         |
-| 10  | `develop-services`            | Develop and improve services                    |
+| 1   | `necessary.operations.storage`             | Store and/or access information on a device     |
+| 2   | `advertising_marketing.first_party.contextual`            | Use limited data to select advertising          |
+| 3   | `advertising_marketing.profiling`          | Create profiles for personalised advertising    |
+| 4   | `advertising_marketing.first_party.targeted`     | Use profiles to select personalised advertising |
+| 5   | `advertising_marketing.personalize.profiling`      | Create profiles to personalise content          |
+| 6   | `advertising_marketing.personalize.content` | Use profiles to select personalised content     |
+| 7   | `analytics.ad_reporting.measure_ad_performance`      | Measure advertising performance                 |
+| 8   | `analytics.ad_reporting.content_performance` | Measure content performance                     |
+| 9   | `analytics.ad_reporting.market_research`             | Understand audiences through statistics         |
+| 10  | `necessary.operations.improve`            | Develop and improve services                    |
 | 11  | `select-basic-content`        | Use limited data to select content              |
 
 ## How providers use permissions
@@ -105,10 +109,10 @@ required permission is set.
 
 | Provider                  | Requires          | Effect when not set       |
 | ------------------------- | ----------------- | ------------------------- |
-| Built-in HMAC Edge Cookie | `store-on-device` | No Edge Cookie is created |
+| Built-in HMAC Edge Cookie | `necessary.operations.storage` | No Edge Cookie is created |
 | A vendor-neutral provider | nothing           | Always runs               |
 
-The Edge Cookie `Set-Cookie` operation always requires `store-on-device`
+The Edge Cookie `Set-Cookie` operation always requires `necessary.operations.storage`
 (Purpose 1), because writing the cookie stores information on the device.
 
 ## Groups and rules
@@ -215,12 +219,12 @@ default_country = "US"
 # Rules map countries and states to a group.
 groups:
   gdpr-eu: # opt-in, every purpose requires a signal
-    store-on-device: requires_signal
-    select-basic-ads: requires_signal
+    necessary.operations.storage: requires_signal
+    advertising_marketing.first_party.contextual: requires_signal
     # ... the remaining purposes, also requires_signal
   us-opt-out: # opt-out, every purpose granted
-    store-on-device: granted
-    select-basic-ads: granted
+    necessary.operations.storage: granted
+    advertising_marketing.first_party.contextual: granted
     # ... the remaining purposes, also granted
 
 rules:
@@ -228,12 +232,12 @@ rules:
   US: us-opt-out
   US/CA: # a state can tweak its group with +grants and -denies
     group: us-opt-out
-    permissions: [-select-personalised-ads]
+    permissions: [-advertising_marketing.first_party.targeted]
 ```
 
 ## Relationship to Edge Cookies
 
 Edge Cookie creation is gated through this model: the built-in HMAC provider
-requires `store-on-device`, so an Edge Cookie is created only when that
+requires `necessary.operations.storage`, so an Edge Cookie is created only when that
 permission is set. See [Edge Cookies](/guide/edge-cookies) for the full
 request lifecycle.
