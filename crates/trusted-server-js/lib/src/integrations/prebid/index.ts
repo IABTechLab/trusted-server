@@ -411,6 +411,14 @@ type RefreshGptSlot = {
   getSizes?: () => unknown[];
 };
 
+function recordPrebidRefreshForDiagnostics(slots: RefreshGptSlot[]): void {
+  try {
+    window.tsjs?.gptDiagnostics?.recordPrebidRefresh?.(slots);
+  } catch {
+    // Diagnostics must not suppress the GAM request.
+  }
+}
+
 const DEFAULT_REFRESH_SIZES: BannerSize[] = [
   [728, 90],
   [300, 250],
@@ -1356,6 +1364,7 @@ export function installRefreshHandler(timeoutMs = 1500): void {
       const deliverySlots = publisherDeliverySlots(targetSlots);
       const independentSlots = targetSlots.filter((slot) => !deliverySlots.has(slot));
       if (independentSlots.length === 0) {
+        recordPrebidRefreshForDiagnostics(targetSlots);
         return originalRefresh(slots, opts);
       }
 
@@ -1434,6 +1443,7 @@ export function installRefreshHandler(timeoutMs = 1500): void {
             log.error('[tsjs-prebid] refresh targeting failed', error);
           }
         }
+        recordPrebidRefreshForDiagnostics(targetSlots);
         // A bare refresh that filters slots must pass the resolved complete list
         // to GPT; otherwise the excluded slots would be refreshed implicitly but
         // would not be represented by the wrapper's concrete target set. Keep
