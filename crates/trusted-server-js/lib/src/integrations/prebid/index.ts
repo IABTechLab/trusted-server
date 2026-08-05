@@ -428,6 +428,12 @@ function recordPrebidRefreshForDiagnostics(slots: RefreshGptSlot[]): void {
  * double-labeled publisher-initiated merely because the wrappers are
  * nested. The previous value is restored in `finally` rather than cleared
  * to `false`, so a nested delegation cannot clear an outer active context.
+ *
+ * No-ops when `window.tsjs` is absent: diagnostic state is optional and must
+ * never gate refresh delivery. That fail-open guard also means a test which
+ * asserts this context stays inactive must install a live (even empty) `tsjs`
+ * object, or the assertion holds trivially whether or not the branch under
+ * test is wrapped.
  */
 function withPrebidRefreshDispatch<T>(callback: () => T): T {
   const ts = window.tsjs;
