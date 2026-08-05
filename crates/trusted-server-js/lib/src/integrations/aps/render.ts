@@ -290,7 +290,7 @@ function createNonce(): string | undefined {
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
 
-/** Return the absolute, same-publisher URL used by direct and Universal Creative rendering. */
+/** Return the absolute, same-origin URL used by direct and Universal Creative rendering. */
 export function apsRendererUrl(pageOrigin = window.location.origin): string | undefined {
   try {
     const origin = new URL(pageOrigin);

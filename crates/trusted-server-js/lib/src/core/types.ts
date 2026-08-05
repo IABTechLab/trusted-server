@@ -230,7 +230,7 @@ export type GptDiagnosticsTrustedServerOpportunity =
   | 'unrenderable_candidate'
   | 'no_candidate';
 
-/** A safe failure category observed while obtaining or posting creative markup. */
+/** A safe failure category observed while obtaining or posting a creative response. */
 export type GptDiagnosticsCreativeFailure =
   | 'missing_render_source'
   | 'cache_fetch_failed'
@@ -355,9 +355,9 @@ export interface GptDiagnosticsApi {
   ): void;
   /** Mark slots whose next observed GPT request follows the Prebid refresh path. */
   recordPrebidRefresh?(slots: GptDiagnosticsSlotHandle[]): void;
-  /** Record a creative markup request and return its opaque attempt ID. */
+  /** Record a creative request and return its opaque attempt ID. */
   recordTrustedServerCreativeRequest?(auctionSlotId: string): number | undefined;
-  /** Record that a creative attempt successfully posted markup. */
+  /** Record that a creative attempt successfully posted its response. */
   recordTrustedServerCreativeResponse?(attemptId: number): void;
   /** Record a safe failure category for a creative attempt. */
   recordTrustedServerCreativeFailure?(

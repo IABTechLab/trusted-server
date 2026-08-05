@@ -15,8 +15,9 @@ as versioned JSON.
 
 The console reports positive observations, not inferred ownership. A filled result
 means only that GPT emitted `slotRenderEnded` with `isEmpty === false`. A Trusted
-Server candidate, a PUC markup request, a successfully posted markup response, and a
-GPT slot load are separate steps in an evidence ladder.
+Server candidate, a PUC creative request, a successfully posted creative response,
+and a GPT slot load are separate steps in an evidence ladder. A creative response may
+carry inline or cached markup, or a validated APS renderer descriptor.
 
 This feature requires zero publisher-code changes. Activation remains the existing
 server integration configuration plus `?ts_console=true`; it does not require new
@@ -117,11 +118,17 @@ values were sent or selected.
 
 For the direct path, `adInit` records one opportunity:
 
-| Opportunity              | Meaning                                                                                                                    |
-| ------------------------ | -------------------------------------------------------------------------------------------------------------------------- |
-| `renderable_candidate`   | Bid targeting was applied with a non-empty ad ID and inline markup or complete PBS Cache coordinates.                      |
-| `unrenderable_candidate` | Bid targeting was applied, but the current bridge lacked the complete ID/render-source combination needed to serve markup. |
-| `no_candidate`           | `adInit` explicitly observed no direct Trusted Server bid targeting for that configured slot.                              |
+| Opportunity              | Meaning                                                                                                                                                                         |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `renderable_candidate`   | Bid targeting was applied with a non-empty ad ID and either a valid APS descriptor plus usable same-origin renderer endpoint, inline markup, or complete PBS Cache coordinates. |
+| `unrenderable_candidate` | Bid targeting was applied, but the current bridge lacked the complete ID/render-source combination needed to send a creative response.                                          |
+| `no_candidate`           | `adInit` explicitly observed no direct Trusted Server bid targeting for that configured slot.                                                                                   |
+
+APS renderers use fail-closed precedence. When a bid contains `renderer`, the bridge
+requires both a valid APS descriptor and a usable same-origin renderer endpoint. An
+invalid descriptor or unavailable endpoint remains unrenderable even if legacy
+`adm` or cache fields coexist. Only renderer-absent bids may use inline markup or
+complete PBS Cache coordinates.
 
 An absent opportunity is displayed as unknown. It must not be converted into a
 negative demand-source conclusion.
@@ -133,21 +140,22 @@ The console keeps these observations independent and ordered:
 1. `adInit` observed a direct opportunity and applied any candidate targeting.
 2. A PUC `Prebid Request` passed the exact message-source, slot, and Trusted Server
    ad-ID ownership checks. This is selection evidence.
-3. The bridge obtained markup and `port.postMessage` returned without throwing. This
-   confirms that a markup response was sent to the requesting PUC.
+3. The bridge obtained inline or cached markup, or validated an APS renderer descriptor
+   and endpoint, and `port.postMessage` returned without throwing. This confirms that a
+   creative response was sent to the requesting PUC.
 4. GPT later emitted `slotOnload` for the correlated slot.
 
 Each step proves only itself. In particular, a successful response post does not prove
 that the PUC consumed the response, and `slotOnload` is a GPT slot fact. Pixel-level
-proof would require a controlled creative acknowledgement after the inner markup runs;
+proof would require a controlled creative acknowledgement after the inner creative runs;
 that acknowledgement is outside the zero-publisher-change design.
 
 The derived `delivery` value uses these evidence-safe meanings:
 
 | Delivery state                 | Panel wording                                                                                      |
 | ------------------------------ | -------------------------------------------------------------------------------------------------- |
-| `trusted_server_response_sent` | Trusted Server selected; markup response sent to PUC                                               |
-| `trusted_server_selected`      | Trusted Server selected; no markup response confirmed                                              |
+| `trusted_server_response_sent` | Trusted Server selected; creative response sent to PUC                                             |
+| `trusted_server_selected`      | Trusted Server selected; no creative response confirmed                                            |
 | `candidate_unconfirmed`        | Trusted Server candidate unconfirmed — another GAM result or a creative/bridge failure is possible |
 | `no_candidate`                 | adInit observed no direct Trusted Server candidate for this request                                |
 | `unknown`                      | Delivery status unknown — required GPT or direct-candidate evidence was not observed               |

@@ -129,9 +129,9 @@ function formatMilliseconds(value: number | undefined): string | undefined {
 function deliveryFact(cycle: GptDiagnosticsRequestCycle): string | undefined {
   switch (cycle.delivery) {
     case 'trusted_server_response_sent':
-      return 'Trusted Server selected; markup response sent to PUC';
+      return 'Trusted Server selected; creative response sent to PUC';
     case 'trusted_server_selected':
-      return 'Trusted Server selected; no markup response confirmed';
+      return 'Trusted Server selected; no creative response confirmed';
     case 'candidate_unconfirmed':
       return 'Trusted Server candidate unconfirmed — another GAM result or a creative/bridge failure is possible';
     case 'no_candidate':
@@ -230,7 +230,7 @@ function cycleFacts(cycle: GptDiagnosticsRequestCycle): string[] {
   }
   const creativeResponseAt = formatMilliseconds(cycle.trustedServerCreativeResponseAtMs);
   if (creativeResponseAt) {
-    facts.push(`Trusted Server markup response sent at ${creativeResponseAt}`);
+    facts.push(`Trusted Server creative response sent at ${creativeResponseAt}`);
   }
   for (const failure of new Set(cycle.trustedServerCreativeFailures ?? [])) {
     facts.push(creativeFailureFact(failure));

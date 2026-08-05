@@ -245,14 +245,14 @@ describe('GptDiagnosticsOverlay', () => {
     expect(responseSentArticle).toContain('Request path: Trusted Server direct');
     expect(responseSentArticle).toContain('Direct opportunity: Renderable candidate');
     expect(responseSentArticle).toContain('Trusted Server creative request observed at 13 ms');
-    expect(responseSentArticle).toContain('Trusted Server markup response sent at 14 ms');
+    expect(responseSentArticle).toContain('Trusted Server creative response sent at 14 ms');
     expect(
       responseSentArticle.match(/Creative bridge failure: missing render source/g)
     ).toHaveLength(1);
     expect(responseSentArticle).toContain('Creative bridge failure: cache fetch failed');
     expect(responseSentArticle).toContain('Creative bridge failure: invalid cache payload');
     expect(responseSentArticle).toContain('Creative bridge failure: response post failed');
-    expect(responseSentArticle).toContain('Trusted Server selected; markup response sent to PUC');
+    expect(responseSentArticle).toContain('Trusted Server selected; creative response sent to PUC');
     expect(responseSentArticle).toContain(
       'Ad Manager reported line item 6543210987 · order 2345678901'
     );
@@ -265,8 +265,8 @@ describe('GptDiagnosticsOverlay', () => {
     expect(selectedArticle).toContain('Request path: Competing paths');
     expect(selectedArticle).toContain('Direct opportunity: Unrenderable candidate');
     expect(selectedArticle).toContain('Trusted Server creative request observed at 23 ms');
-    expect(selectedArticle).not.toContain('Trusted Server markup response sent');
-    expect(selectedArticle).toContain('Trusted Server selected; no markup response confirmed');
+    expect(selectedArticle).not.toContain('Trusted Server creative response sent');
+    expect(selectedArticle).toContain('Trusted Server selected; no creative response confirmed');
 
     const noCandidateArticle = slotArticle(root!, 'no-candidate-slot').textContent ?? '';
     expect(noCandidateArticle).toContain('Request path: Trusted Server direct');
@@ -314,6 +314,7 @@ describe('GptDiagnosticsOverlay', () => {
     expect(text).not.toMatch(
       /creative rendered|other demand won|no Trusted Server creative ran|ad visible|pixels confirmed/i
     );
+    expect(text).not.toContain('markup response');
     overlay.destroy();
   });
 

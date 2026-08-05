@@ -313,7 +313,7 @@ export class GptDiagnosticsStore {
     }
   }
 
-  /** Record a creative markup request against the associated current GPT cycle. */
+  /** Record a creative request against the associated current GPT cycle. */
   recordTrustedServerCreativeRequest(auctionSlotId: string): number | undefined {
     const timestampMs = this.now();
     this.expireCreativeAttempts(timestampMs);
@@ -427,7 +427,7 @@ export class GptDiagnosticsStore {
     return id;
   }
 
-  /** Record that a creative attempt successfully posted markup. */
+  /** Record a successfully posted creative response for an attempt. */
   recordTrustedServerCreativeResponse(attemptId: number): void {
     const timestampMs = this.now();
     this.expireCreativeAttempts(timestampMs);

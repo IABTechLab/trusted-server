@@ -6,6 +6,15 @@ import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vites
 import envelope from '../../fixtures/aps-renderer-v1.json';
 import type { AuctionBidData, TsjsApi } from '../../../src/core/types';
 
+const apsRenderMocks = vi.hoisted(() => ({
+  apsRendererUrl: vi.fn<() => string | undefined>(),
+}));
+
+vi.mock('../../../src/integrations/aps/render', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../src/integrations/aps/render')>();
+  return { ...actual, apsRendererUrl: apsRenderMocks.apsRendererUrl };
+});
+
 function apsRenderer() {
   const bid = envelope.seatbid[0].bid[0];
   return {
@@ -21,6 +30,13 @@ function apsRenderer() {
     height: bid.h,
   };
 }
+
+beforeEach(() => {
+  apsRenderMocks.apsRendererUrl.mockReset();
+  apsRenderMocks.apsRendererUrl.mockReturnValue(
+    new URL('/integrations/aps/renderer', window.location.origin).href
+  );
+});
 
 // Track every 'message' EventListener added to window across the entire test
 // file.  This lets the installTsRenderBridge suite remove all accumulated
@@ -204,6 +220,9 @@ describe('installTsAdInit', () => {
     return { mockPubads, mockSlot };
   }
 
+  const validOpportunityRenderer = apsRenderer();
+  const invalidOpportunityRenderer = { ...apsRenderer(), aaxResponse: 'invalid' };
+
   it.each([
     [
       'inline markup',
@@ -219,6 +238,36 @@ describe('installTsAdInit', () => {
         hb_cache_path: '/cache',
       },
       'renderable_candidate',
+    ],
+    [
+      'a valid APS renderer',
+      {
+        hb_bidder: 'aps',
+        hb_adid: validOpportunityRenderer.bidId,
+        renderer: validOpportunityRenderer,
+      },
+      'renderable_candidate',
+    ],
+    [
+      'an invalid APS renderer',
+      {
+        hb_bidder: 'aps',
+        hb_adid: invalidOpportunityRenderer.bidId,
+        renderer: invalidOpportunityRenderer,
+      },
+      'unrenderable_candidate',
+    ],
+    [
+      'an invalid APS renderer with legacy fallback fields',
+      {
+        hb_bidder: 'aps',
+        hb_adid: invalidOpportunityRenderer.bidId,
+        renderer: invalidOpportunityRenderer,
+        adm: '<div>Creative</div>',
+        hb_cache_host: 'cache.example.com',
+        hb_cache_path: '/cache',
+      },
+      'unrenderable_candidate',
     ],
     [
       'an ad ID without a render source',
@@ -256,6 +305,34 @@ describe('installTsAdInit', () => {
       );
     }
   );
+
+  it('does not classify APS as renderable when its renderer endpoint is unavailable', async () => {
+    apsRenderMocks.apsRendererUrl.mockReturnValue(undefined);
+    const recordTrustedServerOpportunity = vi.fn();
+    const renderer = apsRenderer();
+    const { mockSlot } = configureOpportunityDiagnostics(
+      {
+        hb_bidder: 'aps',
+        hb_adid: renderer.bidId,
+        renderer,
+        adm: '<div>Creative</div>',
+        hb_cache_host: 'cache.example.com',
+        hb_cache_path: '/cache',
+      },
+      recordTrustedServerOpportunity
+    );
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(recordTrustedServerOpportunity).toHaveBeenCalledTimes(1);
+    expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
+      mockSlot,
+      'atf_sidebar_ad',
+      'unrenderable_candidate'
+    );
+  });
 
   it('records no_candidate when the resolved slot has no bid', async () => {
     const recordTrustedServerOpportunity = vi.fn();
@@ -2672,6 +2749,63 @@ describe('installTsRenderBridge', () => {
     return bridgeListener!;
   }
 
+  function configureCreativeDiagnostics(attemptId: number) {
+    const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(attemptId);
+    const recordTrustedServerCreativeResponse = vi.fn();
+    const recordTrustedServerCreativeFailure = vi.fn();
+    (window as TestWindow).tsjs!.gptDiagnostics = {
+      recordTrustedServerCreativeRequest,
+      recordTrustedServerCreativeResponse,
+      recordTrustedServerCreativeFailure,
+    } as unknown as TsjsApi['gptDiagnostics'];
+    return {
+      recordTrustedServerCreativeRequest,
+      recordTrustedServerCreativeResponse,
+      recordTrustedServerCreativeFailure,
+    };
+  }
+
+  function setDirectApsBid(
+    renderer: NonNullable<AuctionBidData['renderer']>,
+    extra: Partial<AuctionBidData> = {}
+  ): void {
+    (window as TestWindow).tsjs!.bids!.homepage_header = {
+      hb_adid: renderer.bidId,
+      hb_bidder: 'aps',
+      renderer,
+      ...extra,
+    };
+  }
+
+  function sendBridgeRequest(
+    bridgeListener: (event: MessageEvent) => unknown,
+    source: Window,
+    adId: string,
+    postMessage: ReturnType<typeof vi.fn>,
+    stopImmediatePropagation = vi.fn()
+  ): void {
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId }),
+        ports: [{ postMessage }],
+        source,
+        stopImmediatePropagation,
+      }) as unknown as MessageEvent
+    );
+  }
+
+  function collapseTrustedSlotFrame(): HTMLIFrameElement {
+    const slot = document.getElementById('div-header')!;
+    const frame = slot.querySelector<HTMLIFrameElement>('iframe')!;
+    slot.style.width = '1px';
+    slot.style.height = '1px';
+    frame.width = '1';
+    frame.height = '1';
+    frame.style.width = '1px';
+    frame.style.height = '1px';
+    return frame;
+  }
+
   it('serves one exact APS dynamic-renderer response without cache fetches or beacons', async () => {
     const renderer = apsRenderer();
     (window as TestWindow).tsjs.bids.homepage_header = {
@@ -2772,6 +2906,164 @@ describe('installTsRenderBridge', () => {
     beaconSpy.mockRestore();
   });
 
+  it('records a direct APS request and response before resize work on the same attempt', async () => {
+    const renderer = apsRenderer();
+    const {
+      recordTrustedServerCreativeRequest,
+      recordTrustedServerCreativeResponse,
+      recordTrustedServerCreativeFailure,
+    } = configureCreativeDiagnostics(61);
+    setDirectApsBid(renderer, { hb_pb: '1.23' });
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    collapseTrustedSlotFrame();
+    const postMessage = vi.fn();
+    const getComputedStyleSpy = vi.spyOn(window, 'getComputedStyle');
+
+    try {
+      sendBridgeRequest(bridgeListener, source, renderer.bidId, postMessage);
+
+      expect(recordTrustedServerCreativeRequest).toHaveBeenCalledWith('homepage_header');
+      expect(postMessage).toHaveBeenCalledTimes(1);
+      expect(recordTrustedServerCreativeResponse).toHaveBeenCalledWith(61);
+      expect(recordTrustedServerCreativeFailure).not.toHaveBeenCalled();
+      expect(recordTrustedServerCreativeRequest.mock.invocationCallOrder[0]).toBeLessThan(
+        postMessage.mock.invocationCallOrder[0]
+      );
+      expect(postMessage.mock.invocationCallOrder[0]).toBeLessThan(
+        recordTrustedServerCreativeResponse.mock.invocationCallOrder[0]
+      );
+      expect(recordTrustedServerCreativeResponse.mock.invocationCallOrder[0]).toBeLessThan(
+        getComputedStyleSpy.mock.invocationCallOrder[0]
+      );
+    } finally {
+      getComputedStyleSpy.mockRestore();
+    }
+  });
+
+  it('keeps direct APS response evidence when resize work throws', async () => {
+    const renderer = apsRenderer();
+    const { recordTrustedServerCreativeResponse, recordTrustedServerCreativeFailure } =
+      configureCreativeDiagnostics(62);
+    setDirectApsBid(renderer);
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    collapseTrustedSlotFrame();
+    const postMessage = vi.fn();
+    const { log } = await import('../../../src/core/log');
+    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {
+      throw new Error('fictional resize warning failure');
+    });
+    const getComputedStyleSpy = vi.spyOn(window, 'getComputedStyle').mockImplementation(() => {
+      throw new Error('fictional resize failure');
+    });
+
+    try {
+      expect(() =>
+        sendBridgeRequest(bridgeListener, source, renderer.bidId, postMessage)
+      ).not.toThrow();
+
+      expect(postMessage).toHaveBeenCalledTimes(1);
+      expect(getComputedStyleSpy).toHaveBeenCalled();
+      expect(warnSpy).toHaveBeenCalled();
+      expect(recordTrustedServerCreativeResponse).toHaveBeenCalledWith(62);
+      expect(recordTrustedServerCreativeFailure).not.toHaveBeenCalled();
+    } finally {
+      getComputedStyleSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('records only response_post_failed when posting a direct APS response throws', async () => {
+    const renderer = apsRenderer();
+    const { recordTrustedServerCreativeResponse, recordTrustedServerCreativeFailure } =
+      configureCreativeDiagnostics(63);
+    setDirectApsBid(renderer);
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const postMessage = vi.fn(() => {
+      throw new Error('port closed');
+    });
+    expect(() =>
+      sendBridgeRequest(bridgeListener, source, renderer.bidId, postMessage)
+    ).not.toThrow();
+
+    expect(recordTrustedServerCreativeFailure).toHaveBeenCalledTimes(1);
+    expect(recordTrustedServerCreativeFailure).toHaveBeenCalledWith(63, 'response_post_failed');
+    expect(recordTrustedServerCreativeResponse).not.toHaveBeenCalled();
+  });
+
+  it.each(['request', 'response'] as const)(
+    'keeps direct APS delivery unchanged when the diagnostics %s writer throws',
+    async (throwingWriter) => {
+      const renderer = apsRenderer();
+      const {
+        recordTrustedServerCreativeRequest,
+        recordTrustedServerCreativeResponse,
+        recordTrustedServerCreativeFailure,
+      } = configureCreativeDiagnostics(64);
+      if (throwingWriter === 'request') {
+        recordTrustedServerCreativeRequest.mockImplementation(() => {
+          throw new Error('diagnostics request failed');
+        });
+      } else {
+        recordTrustedServerCreativeResponse.mockImplementation(() => {
+          throw new Error('diagnostics response failed');
+        });
+      }
+      setDirectApsBid(renderer);
+
+      const bridgeListener = await captureBridgeListener();
+      const source = createTrustedSlotIframe();
+      const postMessage = vi.fn();
+      expect(() =>
+        sendBridgeRequest(bridgeListener, source, renderer.bidId, postMessage)
+      ).not.toThrow();
+
+      expect(postMessage).toHaveBeenCalledTimes(1);
+      expect(recordTrustedServerCreativeFailure).not.toHaveBeenCalled();
+      if (throwingWriter === 'response') {
+        expect(recordTrustedServerCreativeResponse).toHaveBeenCalledWith(64);
+      } else {
+        expect(recordTrustedServerCreativeResponse).not.toHaveBeenCalled();
+      }
+    }
+  );
+
+  it('reuses a direct APS attempt after a failed post and can record a later response', async () => {
+    const renderer = apsRenderer();
+    const {
+      recordTrustedServerCreativeRequest,
+      recordTrustedServerCreativeResponse,
+      recordTrustedServerCreativeFailure,
+    } = configureCreativeDiagnostics(65);
+    setDirectApsBid(renderer);
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const sendRequest = (postMessage: ReturnType<typeof vi.fn>): void => {
+      sendBridgeRequest(bridgeListener, source, renderer.bidId, postMessage);
+    };
+
+    sendRequest(
+      vi.fn(() => {
+        throw new Error('port closed');
+      })
+    );
+    const successfulPost = vi.fn();
+    sendRequest(successfulPost);
+
+    expect(recordTrustedServerCreativeRequest).toHaveBeenCalledTimes(2);
+    expect(recordTrustedServerCreativeFailure).toHaveBeenCalledTimes(1);
+    expect(recordTrustedServerCreativeFailure).toHaveBeenCalledWith(65, 'response_post_failed');
+    expect(successfulPost).toHaveBeenCalledTimes(1);
+    expect(recordTrustedServerCreativeResponse).toHaveBeenCalledTimes(1);
+    expect(recordTrustedServerCreativeResponse).toHaveBeenCalledWith(65);
+  });
+
   it('resizes only the authenticated collapsed 1x1 creative shell after responding', async () => {
     (window as TestWindow).tsjs.bids.homepage_header = {
       hb_adid: 'collapsed-inline-ad-id',
@@ -2864,7 +3156,13 @@ describe('installTsRenderBridge', () => {
     const prebidAdId = 'prebid-generated-ad-id';
     const markWinner = vi.fn();
     const markRendered = vi.fn();
-    (window as TestWindow).tsjs.apsPrebidRenderers = {
+    const {
+      recordTrustedServerCreativeRequest,
+      recordTrustedServerCreativeResponse,
+      recordTrustedServerCreativeFailure,
+    } = configureCreativeDiagnostics(60);
+    const tsjs = (window as TestWindow).tsjs!;
+    tsjs.apsPrebidRenderers = {
       [prebidAdId]: {
         adUnitCode: 'div-header',
         renderer,
@@ -2914,7 +3212,60 @@ describe('installTsRenderBridge', () => {
     expect(renderer.bidId).not.toBe(prebidAdId);
     expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeUndefined();
     expect(fetchStub).not.toHaveBeenCalled();
+    expect(recordTrustedServerCreativeRequest).not.toHaveBeenCalled();
+    expect(recordTrustedServerCreativeResponse).not.toHaveBeenCalled();
+    expect(recordTrustedServerCreativeFailure).not.toHaveBeenCalled();
     foreignIframe.remove();
+  });
+
+  it('marks a registered Prebid APS renderer rendered when resize isolation logging throws', async () => {
+    const renderer = apsRenderer();
+    const prebidAdId = 'prebid-resize-failure-ad-id';
+    const markRendered = vi.fn();
+    (window as TestWindow).tsjs!.apsPrebidRenderers = {
+      [prebidAdId]: {
+        adUnitCode: 'div-header',
+        renderer,
+        registeredAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+        markWinner: vi.fn(),
+        markRendered,
+      },
+    };
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    collapseTrustedSlotFrame();
+    const postMessage = vi.fn();
+    const { log } = await import('../../../src/core/log');
+    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {
+      throw new Error('fictional resize warning failure');
+    });
+    const getComputedStyleSpy = vi.spyOn(window, 'getComputedStyle').mockImplementation(() => {
+      throw new Error('fictional resize failure');
+    });
+
+    try {
+      expect(() =>
+        sendBridgeRequest(bridgeListener, source, prebidAdId, postMessage)
+      ).not.toThrow();
+      expect(postMessage).toHaveBeenCalledTimes(1);
+      expect(getComputedStyleSpy).toHaveBeenCalled();
+      expect(warnSpy).toHaveBeenCalled();
+      expect(markRendered).toHaveBeenCalledTimes(1);
+      expect(postMessage.mock.invocationCallOrder[0]).toBeLessThan(
+        getComputedStyleSpy.mock.invocationCallOrder[0]
+      );
+      expect(getComputedStyleSpy.mock.invocationCallOrder[0]).toBeLessThan(
+        warnSpy.mock.invocationCallOrder[0]
+      );
+      expect(warnSpy.mock.invocationCallOrder[0]).toBeLessThan(
+        markRendered.mock.invocationCallOrder[0]
+      );
+    } finally {
+      getComputedStyleSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
   });
 
   it('still serves the APS renderer when markWinner throws', async () => {
@@ -3185,29 +3536,74 @@ describe('installTsRenderBridge', () => {
     expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeUndefined();
   });
 
-  it('validates APS data before claiming the Prebid request', async () => {
+  it('fails closed on an invalid APS renderer even when legacy fallback fields are present', async () => {
     const renderer = { ...apsRenderer(), aaxResponse: 'invalid' };
-    (window as TestWindow).tsjs.bids.homepage_header = {
-      hb_adid: renderer.bidId,
-      hb_bidder: 'aps',
-      renderer,
-    };
+    const {
+      recordTrustedServerCreativeRequest,
+      recordTrustedServerCreativeResponse,
+      recordTrustedServerCreativeFailure,
+    } = configureCreativeDiagnostics(66);
+    setDirectApsBid(renderer, {
+      adm: '<div>Legacy creative</div>',
+      hb_cache_host: 'cache.example.com',
+      hb_cache_path: '/cache',
+    });
 
     const bridgeListener = await captureBridgeListener();
     const source = createTrustedSlotIframe();
     const stopSpy = vi.fn();
-    const portMessages: string[] = [];
+    const postMessage = vi.fn();
     bridgeListener(
       Object.assign(new Event('message'), {
         data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
-        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+        ports: [{ postMessage }],
         source,
         stopImmediatePropagation: stopSpy,
       }) as unknown as MessageEvent
     );
 
     expect(stopSpy).not.toHaveBeenCalled();
-    expect(portMessages).toEqual([]);
+    expect(recordTrustedServerCreativeRequest).toHaveBeenCalledWith('homepage_header');
+    expect(recordTrustedServerCreativeFailure).toHaveBeenCalledTimes(1);
+    expect(recordTrustedServerCreativeFailure).toHaveBeenCalledWith(66, 'missing_render_source');
+    expect(postMessage).not.toHaveBeenCalled();
+    expect(recordTrustedServerCreativeResponse).not.toHaveBeenCalled();
+    expect(fetchStub).not.toHaveBeenCalled();
+  });
+
+  it('fails closed on an unavailable APS renderer endpoint without using fallback fields', async () => {
+    const renderer = apsRenderer();
+    const {
+      recordTrustedServerCreativeRequest,
+      recordTrustedServerCreativeResponse,
+      recordTrustedServerCreativeFailure,
+    } = configureCreativeDiagnostics(67);
+    setDirectApsBid(renderer, {
+      adm: '<div>Legacy creative</div>',
+      hb_cache_host: 'cache.example.com',
+      hb_cache_path: '/cache',
+    });
+    apsRenderMocks.apsRendererUrl.mockReturnValue(undefined);
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const stopImmediatePropagation = vi.fn();
+    const postMessage = vi.fn();
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
+        ports: [{ postMessage }],
+        source,
+        stopImmediatePropagation,
+      }) as unknown as MessageEvent
+    );
+
+    expect(recordTrustedServerCreativeRequest).toHaveBeenCalledWith('homepage_header');
+    expect(recordTrustedServerCreativeFailure).toHaveBeenCalledTimes(1);
+    expect(recordTrustedServerCreativeFailure).toHaveBeenCalledWith(67, 'missing_render_source');
+    expect(postMessage).not.toHaveBeenCalled();
+    expect(recordTrustedServerCreativeResponse).not.toHaveBeenCalled();
+    expect(stopImmediatePropagation).not.toHaveBeenCalled();
     expect(fetchStub).not.toHaveBeenCalled();
   });
 
@@ -3323,23 +3719,32 @@ describe('installTsRenderBridge', () => {
 
     const bridgeListener = await captureBridgeListener();
     const source = createTrustedSlotIframe();
+    collapseTrustedSlotFrame();
     const postMessage = vi.fn();
-    bridgeListener(
-      Object.assign(new Event('message'), {
-        data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
-        ports: [{ postMessage }],
-        source,
-        stopImmediatePropagation: vi.fn(),
-      }) as unknown as MessageEvent
-    );
+    const getComputedStyleSpy = vi.spyOn(window, 'getComputedStyle');
+    try {
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+          ports: [{ postMessage }],
+          source,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
 
-    expect(recordTrustedServerCreativeRequest).toHaveBeenCalledWith('homepage_header');
-    expect(postMessage).toHaveBeenCalledTimes(1);
-    expect(recordTrustedServerCreativeResponse).toHaveBeenCalledWith(41);
-    expect(postMessage.mock.invocationCallOrder[0]).toBeLessThan(
-      recordTrustedServerCreativeResponse.mock.invocationCallOrder[0]
-    );
-    expect(recordTrustedServerCreativeFailure).not.toHaveBeenCalled();
+      expect(recordTrustedServerCreativeRequest).toHaveBeenCalledWith('homepage_header');
+      expect(postMessage).toHaveBeenCalledTimes(1);
+      expect(recordTrustedServerCreativeResponse).toHaveBeenCalledWith(41);
+      expect(postMessage.mock.invocationCallOrder[0]).toBeLessThan(
+        recordTrustedServerCreativeResponse.mock.invocationCallOrder[0]
+      );
+      expect(recordTrustedServerCreativeResponse.mock.invocationCallOrder[0]).toBeLessThan(
+        getComputedStyleSpy.mock.invocationCallOrder[0]
+      );
+      expect(recordTrustedServerCreativeFailure).not.toHaveBeenCalled();
+    } finally {
+      getComputedStyleSpy.mockRestore();
+    }
   });
 
   it('records no creative evidence for an ad ID the requesting slot does not own', async () => {
@@ -3493,20 +3898,35 @@ describe('installTsRenderBridge', () => {
     const postMessage = vi.fn((message: string) => portMessages.push(message));
     const fakePort = { postMessage };
     const source = createTrustedSlotIframe();
+    const slot = document.getElementById('div-header')!;
+    const frame = slot.querySelector<HTMLIFrameElement>('iframe')!;
+    slot.style.width = '1px';
+    slot.style.height = '1px';
+    frame.width = '1';
+    frame.height = '1';
+    frame.style.width = '1px';
+    frame.style.height = '1px';
+    const getComputedStyleSpy = vi.spyOn(window, 'getComputedStyle');
+    let resizeCallOrder: number | undefined;
 
     // Dispatch the fake event — bridge listener fires synchronously, then runs
     // fire-and-forget fetch().then() chains asynchronously.
-    bridgeListener!(
-      Object.assign(new Event('message'), {
-        data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
-        ports: [fakePort],
-        source,
-        stopImmediatePropagation: stopSpy,
-      }) as unknown as MessageEvent
-    );
+    try {
+      bridgeListener!(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+          ports: [fakePort],
+          source,
+          stopImmediatePropagation: stopSpy,
+        }) as unknown as MessageEvent
+      );
 
-    // Flush microtasks so the fetch mock resolves and .then chains fire.
-    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      // Flush microtasks so the fetch mock resolves and .then chains fire.
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      resizeCallOrder = getComputedStyleSpy.mock.invocationCallOrder[0];
+    } finally {
+      getComputedStyleSpy.mockRestore();
+    }
 
     expect(fetchStub).toHaveBeenCalledWith(
       'https://openads.example.com/cache?uuid=test-cache-uuid',
@@ -3540,6 +3960,10 @@ describe('installTsRenderBridge', () => {
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
     expect(beaconSpy).toHaveBeenCalledTimes(2);
     beaconSpy.mockRestore();
+    expect(resizeCallOrder).toBeDefined();
+    expect(recordTrustedServerCreativeResponse.mock.invocationCallOrder[0]).toBeLessThan(
+      resizeCallOrder!
+    );
   });
 
   it('does not classify a downstream cache-processing throw as cache_fetch_failed', async () => {
