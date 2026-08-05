@@ -1304,6 +1304,129 @@ TRUSTED_SERVER__AUCTION__TIMEOUT_MS=2000
 TRUSTED_SERVER__AUCTION__CREATIVE_STORE=creative_store
 ```
 
+## Creative Opportunities Configuration
+
+### `[creative_opportunities]`
+
+Defines the ad slots the trusted server offers on a page: which pages each slot
+appears on (`page_patterns`), its supported sizes (`formats`), and the GAM ad
+unit it maps to (`gam_unit_path`).
+
+```toml
+[creative_opportunities]
+gam_network_id = "123456789"
+price_granularity = "dense"
+
+# Shared placeholder value for the site root ("/") — see {section} below.
+section_root = "home"
+# Which path segment names the section, 0-based. Default 0 (first segment).
+# Set to 1 for locale-prefixed URLs such as "/en/news/article".
+# section_segment = 0
+
+[[creative_opportunities.slot]]
+id = "ad-header"
+gam_unit_path = "/{network_id}/example/{section}"
+# List each section landing page as well as its subtree: `/news/*` matches
+# `/news/article` but NOT `/news` — the glob requires the trailing separator.
+page_patterns = ["/", "/news", "/news/*", "/reviews", "/reviews/*"]
+formats = [{ width = 728, height = 90 }]
+```
+
+### `gam_unit_path` templating
+
+`gam_unit_path` is a template. A publisher whose ad unit varies by site section
+expresses that in **one** slot rule instead of one rule per (slot × section).
+
+Supported placeholders:
+
+| Placeholder    | Resolves to                                                             |
+| -------------- | ----------------------------------------------------------------------- |
+| `{network_id}` | `gam_network_id`                                                        |
+| `{slot_id}`    | the slot's `id`                                                         |
+| `{section}`    | non-empty path segment at `section_segment` (default: first; see below) |
+
+A template with **no** placeholders is used verbatim. A slot with **no**
+`gam_unit_path` falls back to `/<network_id>/<slot_id>`. Both preserve the
+pre-templating behavior, so existing static configs are unchanged.
+
+Trusted Server conservatively caps the whole rendered dynamic path at 100 UTF-8
+bytes, informed by Google's [100-character per-ad-unit-code
+limit](https://support.google.com/admanager/answer/1628457?hl=en). If a
+request-specific substitution would exceed the dynamic limit, only that slot is
+omitted before auction dispatch; the response itself still succeeds. Trusted
+Server logs a warning containing the slot ID and request path. Explicit static
+paths and absent/default paths retain legacy behavior and are not subject to this
+dynamic-only limit.
+
+### `{section}` derivation
+
+`{section}` is derived from the request path at request time:
+
+- It is the non-empty path segment at `section_segment` (0-based, default `0`).
+  With the default, `/news/article-123` → `news`. A site that prefixes a locale
+  sets `section_segment = 1`, so `/en/news/article` → `news` rather than `en`.
+- It is sanitized: each run of characters outside `[A-Za-z0-9_-]` becomes a
+  single `_`, and the request-derived result is capped at 100 ASCII bytes.
+- Casing is preserved. [Google documents GAM ad-unit codes as
+  case-insensitive](https://support.google.com/admanager/answer/10477476?hl=en),
+  so do not lowercase the value.
+- The path is used **raw — it is not percent-decoded**. So `/new%20s` →
+  `new_20s` (only `%` is disallowed; `2` and `0` are kept), never the decoded
+  `new_s`. This keeps `{section}` consistent with how `page_patterns` match the
+  same raw path.
+- When the path has no segment at that index — the site root (`/`, or repeated
+  slashes), or a path shorter than `section_segment` — `{section}` is
+  `section_root`. So with `section_segment = 1`, the path `/en` renders the root
+  section rather than reusing the locale.
+
+`section_root` is **required** whenever any slot's template uses `{section}`,
+and must match `[A-Za-z0-9_-]+`. There is no default: the home-section name is
+publisher-specific. Startup fails if `{section}` is used without a valid
+`section_root`. Startup rejects a blank `gam_network_id` only when an absent
+path/default or a `{network_id}` template consumes it; static paths and
+templates without `{network_id}` do not consume it. A
+`[creative_opportunities]` block with no slots is disabled, so its
+`gam_network_id` is not checked.
+
+Both knobs are config-driven, so the URL→section convention stays with the
+publisher: `section_segment` selects which segment names the section, and
+`section_root` names the section when there is none.
+
+During typed/startup finalization, after templates parse successfully, every
+placeholder-bearing dynamic template that omits `section_segment` has
+`section_segment = 0` materialized, so an older binary rejects the pushed blob
+loudly. Static and absent paths remain compatible with the legacy config schema
+only when both `section_root` and `section_segment` are omitted. Before rolling
+back below this feature, replace or remove dynamic paths, remove both
+`section_root` and `section_segment`, re-push and finalize the config, then
+roll back the binary.
+
+Example resolution for `gam_unit_path = "/{network_id}/example/{section}"` with
+`gam_network_id = "123456789"`, `section_root = "home"`, and the
+`page_patterns` shown above:
+
+| Request path    | `gam_unit_path`              |
+| --------------- | ---------------------------- |
+| `/`             | `/123456789/example/home`    |
+| `/news`         | `/123456789/example/news`    |
+| `/news/article` | `/123456789/example/news`    |
+| `/reviews/x`    | `/123456789/example/reviews` |
+
+The same config with `section_segment = 1` and locale-prefixed patterns
+(`["/en", "/en/news", "/en/news/*"]`):
+
+| Request path       | `gam_unit_path`           |
+| ------------------ | ------------------------- |
+| `/en`              | `/123456789/example/home` |
+| `/en/news`         | `/123456789/example/news` |
+| `/en/news/article` | `/123456789/example/news` |
+
+An **unmatched route** — a path matched by no slot's `page_patterns` — produces
+no slot at all, so no template is rendered for it.
+
+Startup validation rejects a malformed template: an unknown placeholder (e.g.
+`{oops}`), an unmatched or nested `{`, a stray `}`, or an empty `gam_unit_path`.
+
 ## Fastly Runtime Config Store
 
 After the EdgeZero cutover, the Fastly adapter always dispatches through the
