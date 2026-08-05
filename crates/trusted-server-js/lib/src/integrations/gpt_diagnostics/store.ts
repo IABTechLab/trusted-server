@@ -24,6 +24,9 @@ export const CREATIVE_ATTEMPT_WINDOW_MS = 30_000;
 export const MAX_CREATIVE_ATTEMPTS = 128;
 export const MAX_ATTRIBUTION_ISSUES = 128;
 
+/** Maximum UTF-8 byte length retained for an optional Trusted Server auction ID. */
+export const MAX_TRUSTED_SERVER_AUCTION_ID_UTF8_BYTES = 256;
+
 /** How long request-path evidence remains eligible for the next GPT request. */
 export const REQUEST_PATH_ATTRIBUTION_WINDOW_MS = 5_000;
 
@@ -98,10 +101,21 @@ interface StoreOptions {
   defer?: (callback: () => void, delayMs: number) => void;
 }
 
-interface PendingMarker<T> {
+/** A request-triggering source observable at an installed integration boundary. */
+type RequestIntentSource = 'trusted_server_direct' | 'prebid_refresh' | 'publisher_refresh';
+
+/** One source's independently timestamped evidence for a pending per-slot request intent. */
+interface PendingSourceEvidence {
   generation: number;
-  recordedAtMs: number;
-  value: T;
+  observedAtMs: number;
+  trustedServerOpportunity?: GptDiagnosticsTrustedServerOpportunity;
+  trustedServerAuctionId?: string;
+}
+
+/** Accumulated, not-yet-consumed request-triggering evidence for a GPT slot's next request. */
+interface PendingRequestIntent {
+  intentId: number;
+  sources: Map<RequestIntentSource, PendingSourceEvidence>;
 }
 
 type AttemptStatus = 'live' | 'completed' | 'expired' | 'evicted';
@@ -152,6 +166,30 @@ function isTrustedServerOpportunity(
     opportunity === 'unrenderable_candidate' ||
     opportunity === 'no_candidate'
   );
+}
+
+/** Accept only a string whose trimmed value is non-empty and within the UTF-8 byte boundary. */
+function normalizeTrustedServerAuctionId(candidate: unknown): string | undefined {
+  if (typeof candidate !== 'string') return undefined;
+
+  const trimmed = candidate.trim();
+  if (trimmed.length === 0) return undefined;
+  if (new TextEncoder().encode(trimmed).length > MAX_TRUSTED_SERVER_AUCTION_ID_UTF8_BYTES) {
+    return undefined;
+  }
+
+  return trimmed;
+}
+
+/** Classify a consumed request intent by how many independent sources observed it. */
+function classifyRequestIntent(
+  intent: PendingRequestIntent | undefined
+): GptDiagnosticsRequestPath {
+  if (intent === undefined || intent.sources.size === 0) return 'unattributed';
+  if (intent.sources.size > 1) return 'competing';
+
+  const [source] = intent.sources.keys();
+  return source;
 }
 
 function isCreativeFailure(reason: unknown): reason is GptDiagnosticsCreativeFailure {
@@ -243,11 +281,8 @@ export class GptDiagnosticsStore {
   private readonly defer: (callback: () => void, delayMs: number) => void;
   /** Auction slot ID → GPT slot, established by the Trusted Server integration. */
   private readonly trustedServerSlots = new Map<string, GptDiagnosticsSlotLike>();
-  private readonly pendingTrustedServerOpportunities = new WeakMap<
-    object,
-    PendingMarker<GptDiagnosticsTrustedServerOpportunity>
-  >();
-  private readonly pendingPrebidRefreshes = new WeakMap<object, PendingMarker<true>>();
+  /** Per-slot accumulated, not-yet-consumed request-intent evidence. */
+  private readonly pendingRequestIntents = new WeakMap<object, PendingRequestIntent>();
   private readonly slotNumbers = new WeakMap<object, number>();
   private readonly requestNumbers = new WeakMap<object, number>();
   private readonly attemptIdsByCycle = new WeakMap<MutableRequestCycle, number>();
@@ -267,6 +302,7 @@ export class GptDiagnosticsStore {
   };
   private nextRuntimeSlotNumber = 1;
   private nextMarkerGeneration = 1;
+  private nextRequestIntentId = 1;
   private nextCreativeAttemptId = 1;
   private notificationScheduled = false;
   private gptObserved = false;
@@ -277,11 +313,18 @@ export class GptDiagnosticsStore {
     this.defer = options.defer ?? ((callback, delayMs) => setTimeout(callback, delayMs));
   }
 
-  /** Record Trusted Server's opportunity evidence for a GPT slot's next request. */
+  /**
+   * Record Trusted Server's opportunity evidence for a GPT slot's next request.
+   * `trustedServerAuctionId` is accepted only when its trimmed value is
+   * non-empty and no more than {@link MAX_TRUSTED_SERVER_AUCTION_ID_UTF8_BYTES}
+   * UTF-8 bytes; an invalid or absent value clears any prior auction ID
+   * without dropping the opportunity evidence.
+   */
   recordTrustedServerOpportunity(
     slot: GptDiagnosticsSlotLike,
     auctionSlotId: string,
-    opportunity: GptDiagnosticsTrustedServerOpportunity
+    opportunity: GptDiagnosticsTrustedServerOpportunity,
+    trustedServerAuctionId?: string
   ): void {
     if (
       !isSlotObject(slot) ||
@@ -300,7 +343,10 @@ export class GptDiagnosticsStore {
       this.trustedServerSlots.delete(oldest);
     }
 
-    this.installMarker(this.pendingTrustedServerOpportunities, slot, opportunity);
+    this.recordIntentSource(slot, 'trusted_server_direct', {
+      trustedServerOpportunity: opportunity,
+      trustedServerAuctionId: normalizeTrustedServerAuctionId(trustedServerAuctionId),
+    });
   }
 
   /** Mark GPT slots whose next request follows a Prebid-controlled refresh. */
@@ -309,7 +355,17 @@ export class GptDiagnosticsStore {
 
     for (const slot of slots) {
       if (!isSlotObject(slot)) continue;
-      this.installMarker(this.pendingPrebidRefreshes, slot, true);
+      this.recordIntentSource(slot, 'prebid_refresh');
+    }
+  }
+
+  /** Mark GPT slots whose next request follows the installed publisher refresh boundary. */
+  recordPublisherRefresh(slots: GptDiagnosticsSlotLike[]): void {
+    if (!Array.isArray(slots)) return;
+
+    for (const slot of slots) {
+      if (!isSlotObject(slot)) continue;
+      this.recordIntentSource(slot, 'publisher_refresh');
     }
   }
 
@@ -515,27 +571,24 @@ export class GptDiagnosticsStore {
 
     const requestNumber = (this.requestNumbers.get(slot) ?? 0) + 1;
     this.requestNumbers.set(slot, requestNumber);
-    const trustedServerOpportunity = this.consumeMarker(
-      this.pendingTrustedServerOpportunities,
-      slot,
-      timestampMs
-    );
-    const prebidRefresh = this.consumeMarker(this.pendingPrebidRefreshes, slot, timestampMs);
-    const requestPath: GptDiagnosticsRequestPath =
-      trustedServerOpportunity !== undefined && prebidRefresh
-        ? 'competing'
-        : trustedServerOpportunity !== undefined
-          ? 'trusted_server_direct'
-          : prebidRefresh
-            ? 'prebid_refresh'
-            : 'unattributed';
+
+    const intent = this.consumeRequestIntent(slot, timestampMs);
+    const trustedServerEvidence = intent?.sources.get('trusted_server_direct');
+    const opportunityToRequestMs = validDuration(trustedServerEvidence?.observedAtMs, timestampMs);
     record.requests.push({
       requestNumber,
       requestedAtMs: timestampMs,
       durations: {},
       incompleteSequence: false,
-      requestPath,
-      ...(trustedServerOpportunity !== undefined ? { trustedServerOpportunity } : {}),
+      requestPath: classifyRequestIntent(intent),
+      ...(intent !== undefined ? { requestIntentId: intent.intentId } : {}),
+      ...(trustedServerEvidence?.trustedServerOpportunity !== undefined
+        ? { trustedServerOpportunity: trustedServerEvidence.trustedServerOpportunity }
+        : {}),
+      ...(trustedServerEvidence?.trustedServerAuctionId !== undefined
+        ? { trustedServerAuctionId: trustedServerEvidence.trustedServerAuctionId }
+        : {}),
+      ...(opportunityToRequestMs !== undefined ? { opportunityToRequestMs } : {}),
     });
     this.incrementDisposition('slotRequested', 'matched');
     this.notify();
@@ -796,37 +849,80 @@ export class GptDiagnosticsStore {
     return false;
   }
 
-  private installMarker<T>(
-    markers: WeakMap<object, PendingMarker<T>>,
-    slot: object,
-    value: T
-  ): void {
-    const generation = this.nextMarkerGeneration;
-    this.nextMarkerGeneration += 1;
-    markers.set(slot, {
-      generation,
-      recordedAtMs: this.now(),
-      value,
-    });
-    this.defer(() => {
-      if (markers.get(slot)?.generation === generation) markers.delete(slot);
-    }, REQUEST_PATH_ATTRIBUTION_WINDOW_MS);
+  /** Prune every age-expired source synchronously, removing the intent if none remain active. */
+  private pruneExpiredIntentSources(slot: object, nowMs: number): void {
+    const intent = this.pendingRequestIntents.get(slot);
+    if (!intent) return;
+
+    for (const [source, evidence] of intent.sources) {
+      if (nowMs - evidence.observedAtMs >= REQUEST_PATH_ATTRIBUTION_WINDOW_MS) {
+        intent.sources.delete(source);
+      }
+    }
+
+    if (intent.sources.size === 0) this.pendingRequestIntents.delete(slot);
   }
 
-  private consumeMarker<T>(
-    markers: WeakMap<object, PendingMarker<T>>,
+  /**
+   * Record one source's evidence for a slot's pending request intent.
+   * Prunes fully-stale evidence first, so a new intent ID is minted only
+   * when no active intent remains. Replaces and restarts expiry only for the
+   * recorded source, leaving sibling source evidence and its expiry intact.
+   */
+  private recordIntentSource(
     slot: object,
-    timestampMs: number
-  ): T | undefined {
-    const marker = markers.get(slot);
-    markers.delete(slot);
-    if (
-      marker === undefined ||
-      timestampMs - marker.recordedAtMs >= REQUEST_PATH_ATTRIBUTION_WINDOW_MS
-    ) {
-      return undefined;
+    source: RequestIntentSource,
+    evidence: Pick<
+      PendingSourceEvidence,
+      'trustedServerOpportunity' | 'trustedServerAuctionId'
+    > = {}
+  ): void {
+    const nowMs = this.now();
+    this.pruneExpiredIntentSources(slot, nowMs);
+
+    let intent = this.pendingRequestIntents.get(slot);
+    if (!intent) {
+      intent = { intentId: this.nextRequestIntentId, sources: new Map() };
+      this.nextRequestIntentId += 1;
+      this.pendingRequestIntents.set(slot, intent);
     }
-    return marker.value;
+
+    const generation = this.nextMarkerGeneration;
+    this.nextMarkerGeneration += 1;
+    intent.sources.set(source, { generation, observedAtMs: nowMs, ...evidence });
+
+    this.defer(
+      () => this.expireIntentSource(slot, source, generation),
+      REQUEST_PATH_ATTRIBUTION_WINDOW_MS
+    );
+  }
+
+  /** Remove one source's evidence only if this callback's generation is still current. */
+  private expireIntentSource(slot: object, source: RequestIntentSource, generation: number): void {
+    const intent = this.pendingRequestIntents.get(slot);
+    if (!intent) return;
+
+    const evidence = intent.sources.get(source);
+    if (!evidence || evidence.generation !== generation) return;
+
+    intent.sources.delete(source);
+    if (intent.sources.size === 0) this.pendingRequestIntents.delete(slot);
+  }
+
+  /** Consume the slot's pending intent once, filtering any source that aged out before this request. */
+  private consumeRequestIntent(slot: object, nowMs: number): PendingRequestIntent | undefined {
+    const intent = this.pendingRequestIntents.get(slot);
+    this.pendingRequestIntents.delete(slot);
+    if (!intent) return undefined;
+
+    const freshSources = new Map<RequestIntentSource, PendingSourceEvidence>();
+    for (const [source, evidence] of intent.sources) {
+      if (nowMs - evidence.observedAtMs < REQUEST_PATH_ATTRIBUTION_WINDOW_MS) {
+        freshSources.set(source, evidence);
+      }
+    }
+
+    return freshSources.size > 0 ? { intentId: intent.intentId, sources: freshSources } : undefined;
   }
 
   private timestamp(): number {

@@ -221,6 +221,7 @@ export type GptDiagnosticsResponseClass =
 export type GptDiagnosticsRequestPath =
   | 'trusted_server_direct'
   | 'prebid_refresh'
+  | 'publisher_refresh'
   | 'competing'
   | 'unattributed';
 
@@ -263,7 +264,17 @@ export interface GptDiagnosticsRequestCycle {
   adManager?: GptDiagnosticsAdManagerIdentity;
   responseClass?: GptDiagnosticsResponseClass;
   requestPath?: GptDiagnosticsRequestPath;
+  /** Present only when an observed request intent was consumed for this request. */
+  requestIntentId?: number;
   trustedServerOpportunity?: GptDiagnosticsTrustedServerOpportunity;
+  /** Present only when the consumed intent carried Trusted Server evidence with a valid auction ID. */
+  trustedServerAuctionId?: string;
+  /**
+   * From the Trusted Server opportunity observation to this request.
+   * Omitted when the consumed intent lacks Trusted Server evidence or the
+   * duration would be invalid or negative.
+   */
+  opportunityToRequestMs?: number;
   trustedServerCreativeRequestAtMs?: number;
   trustedServerCreativeResponseAtMs?: number;
   trustedServerCreativeFailures?: GptDiagnosticsCreativeFailure[];
@@ -347,14 +358,23 @@ export interface GptDiagnosticsApi {
   subscribe(listener: (snapshot: GptDiagnosticsExportV1) => void): () => void;
   show(): void;
   hide(): void;
-  /** Record Trusted Server's creative opportunity for an associated GPT slot. */
+  /**
+   * Record Trusted Server's creative opportunity for an associated GPT slot.
+   * `trustedServerAuctionId` is accepted only when it is a string whose
+   * trimmed value is non-empty and no more than 256 UTF-8 bytes; an invalid
+   * or absent value omits the correlation field without dropping the
+   * opportunity evidence.
+   */
   recordTrustedServerOpportunity?(
     slot: GptDiagnosticsSlotHandle,
     auctionSlotId: string,
-    opportunity: GptDiagnosticsTrustedServerOpportunity
+    opportunity: GptDiagnosticsTrustedServerOpportunity,
+    trustedServerAuctionId?: string
   ): void;
   /** Mark slots whose next observed GPT request follows the Prebid refresh path. */
   recordPrebidRefresh?(slots: GptDiagnosticsSlotHandle[]): void;
+  /** Mark slots whose next observed GPT request follows the installed publisher refresh boundary. */
+  recordPublisherRefresh?(slots: GptDiagnosticsSlotHandle[]): void;
   /** Record a creative request and return its opaque attempt ID. */
   recordTrustedServerCreativeRequest?(auctionSlotId: string): number | undefined;
   /** Record that a creative attempt successfully posted its response. */
@@ -443,6 +463,17 @@ export interface TsjsApi {
   gptSlotHandoffs?: Record<string, GptSlotHandoff>;
   /** True only while TS calls a GPT function that the handoff wrappers observe. */
   gptSlotHandoffInternal?: boolean;
+  /**
+   * True only while Prebid's refresh wrapper synchronously delegates a
+   * refresh for which it also records Prebid diagnostic intent. The GPT
+   * late-handoff wrapper skips recording publisher diagnostic intent while
+   * this is set, so a Prebid-delivered request is not double-counted as
+   * publisher-initiated merely because the wrappers are nested. Restored in
+   * `finally`; production code may use it only to decide diagnostic
+   * attribution — it must not influence slot selection, targeting,
+   * callbacks, timeouts, or whether the wrapped refresh runs.
+   */
+  prebidRefreshDispatchInProgress?: boolean;
   /** Guards SPA pushState hook installation. */
   spaHookInstalled?: boolean;
   /**

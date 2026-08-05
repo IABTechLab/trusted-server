@@ -15,9 +15,11 @@ interface ApiStore {
   recordTrustedServerOpportunity(
     slot: GptDiagnosticsSlotHandle,
     auctionSlotId: string,
-    opportunity: GptDiagnosticsTrustedServerOpportunity
+    opportunity: GptDiagnosticsTrustedServerOpportunity,
+    trustedServerAuctionId?: string
   ): void;
   recordPrebidRefresh(slots: GptDiagnosticsSlotHandle[]): void;
+  recordPublisherRefresh(slots: GptDiagnosticsSlotHandle[]): void;
   recordTrustedServerCreativeRequest(auctionSlotId: string): number | undefined;
   recordTrustedServerCreativeResponse(attemptId: number): void;
   recordTrustedServerCreativeFailure(
@@ -56,6 +58,7 @@ type InstalledGptDiagnosticsApi = GptDiagnosticsApi &
       GptDiagnosticsApi,
       | 'recordTrustedServerOpportunity'
       | 'recordPrebidRefresh'
+      | 'recordPublisherRefresh'
       | 'recordTrustedServerCreativeRequest'
       | 'recordTrustedServerCreativeResponse'
       | 'recordTrustedServerCreativeFailure'
@@ -117,11 +120,23 @@ export class GptDiagnosticsApiController {
       subscribe: (listener) => this.subscribe(listener),
       show: () => this.presentation.show(),
       hide: () => this.presentation.hide(),
-      recordTrustedServerOpportunity: (slot, auctionSlotId, opportunity) =>
+      recordTrustedServerOpportunity: (slot, auctionSlotId, opportunity, trustedServerAuctionId) =>
         safelyRecord(() =>
-          this.store.recordTrustedServerOpportunity(slot, auctionSlotId, opportunity)
+          // Omit a trailing `undefined` argument entirely rather than forwarding it
+          // explicitly, so callers that pass only three arguments are forwarded
+          // with exactly three arguments to the store.
+          trustedServerAuctionId === undefined
+            ? this.store.recordTrustedServerOpportunity(slot, auctionSlotId, opportunity)
+            : this.store.recordTrustedServerOpportunity(
+                slot,
+                auctionSlotId,
+                opportunity,
+                trustedServerAuctionId
+              )
         ),
       recordPrebidRefresh: (slots) => safelyRecord(() => this.store.recordPrebidRefresh(slots)),
+      recordPublisherRefresh: (slots) =>
+        safelyRecord(() => this.store.recordPublisherRefresh(slots)),
       recordTrustedServerCreativeRequest: (auctionSlotId) =>
         safelyCreateAttempt(() => this.store.recordTrustedServerCreativeRequest(auctionSlotId)),
       recordTrustedServerCreativeResponse: (attemptId) =>

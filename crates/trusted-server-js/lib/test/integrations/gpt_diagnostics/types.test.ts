@@ -139,4 +139,56 @@ describe('GPT diagnostics public types', () => {
     expectTypeOf<GptDiagnosticsAttributionIssue>().not.toHaveProperty('cacheUrl');
     expectTypeOf<GptDiagnosticsAttributionIssue>().not.toHaveProperty('payload');
   });
+
+  it('accepts publisher-refresh request-path evidence and request-intent correlation fields', () => {
+    const cycle: GptDiagnosticsRequestCycle = {
+      requestNumber: 3,
+      durations: {},
+      incompleteSequence: false,
+      requestPath: 'publisher_refresh',
+      requestIntentId: 7,
+      trustedServerAuctionId: 'auction-a',
+      opportunityToRequestMs: 24,
+    };
+
+    expect(cycle.requestPath).toBe('publisher_refresh');
+    expect(cycle.requestIntentId).toBe(7);
+    expect(cycle.trustedServerAuctionId).toBe('auction-a');
+    expect(cycle.opportunityToRequestMs).toBe(24);
+    expectTypeOf(cycle).toEqualTypeOf<GptDiagnosticsRequestCycle>();
+  });
+
+  it('keeps the Trusted Server auction ID and publisher-refresh recorder source-compatible', () => {
+    const api: GptDiagnosticsApi = {
+      snapshot: () => ({
+        version: 1,
+        capturedAt: '2026-08-05T00:00:00.000Z',
+        page: { origin: 'https://example.com', pathname: '/' },
+        slots: [],
+        callbackIssues: [],
+        coverage: {
+          slotRequested: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
+          slotResponseReceived: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
+          slotRenderEnded: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
+          slotOnload: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
+          impressionViewable: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
+          slotVisibilityChanged: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
+        },
+        metadata: { droppedCallbacks: 0, evictedSlots: 0, evictedRequestCycles: 0 },
+      }),
+      export: () => undefined,
+      subscribe: () => () => undefined,
+      show: () => undefined,
+      hide: () => undefined,
+      recordTrustedServerOpportunity: (
+        _slot,
+        _auctionSlotId,
+        _opportunity,
+        _trustedServerAuctionId
+      ) => undefined,
+      recordPublisherRefresh: (_slots) => undefined,
+    };
+
+    expectTypeOf(api).toEqualTypeOf<GptDiagnosticsApi>();
+  });
 });

@@ -1376,4 +1376,371 @@ describe('GptDiagnosticsStore', () => {
     expect(second.slots[0].requests[0].requestNumber).toBe(1);
     expect(second.coverage.slotRequested.matched).toBe(1);
   });
+
+  describe('request intents', () => {
+    it.each([
+      {
+        name: 'publisher-only evidence',
+        sources: ['publisher'],
+        expectedPath: 'publisher_refresh',
+      },
+      {
+        name: 'Trusted Server and publisher evidence',
+        sources: ['ts', 'publisher'],
+        expectedPath: 'competing',
+      },
+      {
+        name: 'Prebid and publisher evidence',
+        sources: ['prebid', 'publisher'],
+        expectedPath: 'competing',
+      },
+      {
+        name: 'Trusted Server, Prebid, and publisher evidence',
+        sources: ['ts', 'prebid', 'publisher'],
+        expectedPath: 'competing',
+      },
+    ] as Array<{
+      name: string;
+      sources: Array<'ts' | 'prebid' | 'publisher'>;
+      expectedPath: string;
+    }>)('classifies $name as $expectedPath', ({ sources, expectedPath }) => {
+      const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+      const slot = fakeSlot('intent-source-combo');
+
+      if (sources.includes('ts')) {
+        store.recordTrustedServerOpportunity(slot, 'auction-combo', 'renderable_candidate');
+      }
+      if (sources.includes('prebid')) store.recordPrebidRefresh([slot]);
+      if (sources.includes('publisher')) store.recordPublisherRefresh([slot]);
+      store.recordSlotRequested(slot);
+
+      expect(store.snapshot().slots[0].requests[0].requestPath).toBe(expectedPath);
+    });
+
+    it('keeps repeated Prebid and publisher refresh evidence single-source, not competing', () => {
+      const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+      const prebidSlot = fakeSlot('prebid-repeat');
+      const publisherSlot = fakeSlot('publisher-repeat');
+
+      store.recordPrebidRefresh([prebidSlot]);
+      store.recordPrebidRefresh([prebidSlot]);
+      store.recordSlotRequested(prebidSlot);
+
+      store.recordPublisherRefresh([publisherSlot]);
+      store.recordPublisherRefresh([publisherSlot]);
+      store.recordSlotRequested(publisherSlot);
+
+      const [prebidCycle, publisherCycle] = store.snapshot().slots.map((slot) => slot.requests[0]);
+      expect(prebidCycle.requestPath).toBe('prebid_refresh');
+      expect(publisherCycle.requestPath).toBe('publisher_refresh');
+    });
+
+    it('replaces repeated Trusted Server evidence and clears an omitted auction ID', () => {
+      let now = 0;
+      const store = new GptDiagnosticsStore({ now: () => now, defer: () => undefined });
+      const slot = fakeSlot('ts-replace');
+
+      store.recordTrustedServerOpportunity(
+        slot,
+        'auction-replace',
+        'renderable_candidate',
+        'first-auction'
+      );
+      now = 10;
+      store.recordTrustedServerOpportunity(slot, 'auction-replace', 'unrenderable_candidate');
+      now = 20;
+      store.recordSlotRequested(slot);
+
+      const cycle = store.snapshot().slots[0].requests[0];
+      expect(cycle).toMatchObject({
+        requestPath: 'trusted_server_direct',
+        trustedServerOpportunity: 'unrenderable_candidate',
+        opportunityToRequestMs: 10,
+      });
+      expect(
+        cycle.trustedServerAuctionId,
+        'an absent replacement auction ID must clear the stale one'
+      ).toBeUndefined();
+    });
+
+    it('replaces a prior Trusted Server auction ID with a newly supplied one', () => {
+      const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+      const slot = fakeSlot('ts-auction-replace');
+
+      store.recordTrustedServerOpportunity(
+        slot,
+        'auction-x',
+        'renderable_candidate',
+        'first-auction'
+      );
+      store.recordTrustedServerOpportunity(
+        slot,
+        'auction-x',
+        'renderable_candidate',
+        'second-auction'
+      );
+      store.recordSlotRequested(slot);
+
+      expect(store.snapshot().slots[0].requests[0].trustedServerAuctionId).toBe('second-auction');
+    });
+
+    it('assigns strictly increasing intent IDs to independently consumed requests', () => {
+      const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+      const first = fakeSlot('intent-id-first');
+      const second = fakeSlot('intent-id-second');
+
+      store.recordPublisherRefresh([first]);
+      store.recordSlotRequested(first);
+      store.recordPublisherRefresh([second]);
+      store.recordSlotRequested(second);
+
+      const [firstCycle, secondCycle] = store.snapshot().slots.map((slot) => slot.requests[0]);
+      expect(firstCycle.requestIntentId).toEqual(expect.any(Number));
+      expect(secondCycle.requestIntentId).toBeGreaterThan(firstCycle.requestIntentId!);
+    });
+
+    it('omits requestIntentId for an unattributed request and includes it for an attributed one', () => {
+      const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+      const slot = fakeSlot('intent-id-presence');
+
+      store.recordPublisherRefresh([slot]);
+      store.recordSlotRequested(slot);
+      store.recordSlotRequested(slot);
+
+      const [attributed, unattributed] = store.snapshot().slots[0].requests;
+      expect(attributed.requestIntentId).toEqual(expect.any(Number));
+      expect(unattributed.requestPath).toBe('unattributed');
+      expect(unattributed.requestIntentId).toBeUndefined();
+    });
+
+    it('expires only the aged-out source of a multi-source intent, keeping the fresher one active', () => {
+      let now = 0;
+      const store = new GptDiagnosticsStore({ now: () => now, defer: () => undefined });
+      const slot = fakeSlot('partial-expiry');
+
+      store.recordTrustedServerOpportunity(slot, 'auction-partial', 'renderable_candidate');
+      now = 3_000;
+      store.recordPrebidRefresh([slot]);
+      // TS evidence (age 5000) is stale; Prebid evidence (age 2000) is fresh.
+      now = REQUEST_PATH_ATTRIBUTION_WINDOW_MS;
+      store.recordSlotRequested(slot);
+
+      const cycle = store.snapshot().slots[0].requests[0];
+      expect(cycle.requestPath, 'only the fresher Prebid source should classify the request').toBe(
+        'prebid_refresh'
+      );
+      expect(cycle.trustedServerOpportunity).toBeUndefined();
+    });
+
+    it('lets a deferred single-source expiry remove only that source, keeping siblings and the intent alive', () => {
+      let now = 0;
+      const deferred: Array<() => void> = [];
+      const store = new GptDiagnosticsStore({
+        now: () => now,
+        defer: (callback) => deferred.push(callback),
+      });
+      const slot = fakeSlot('deferred-partial-expiry');
+
+      store.recordTrustedServerOpportunity(
+        slot,
+        'auction-deferred-partial',
+        'renderable_candidate'
+      );
+      now = 1_000;
+      store.recordPrebidRefresh([slot]);
+
+      now = REQUEST_PATH_ATTRIBUTION_WINDOW_MS;
+      deferred[0](); // The Trusted Server source's own deferred expiry callback.
+      store.recordSlotRequested(slot);
+
+      const cycle = store.snapshot().slots[0].requests[0];
+      expect(
+        cycle.requestPath,
+        'the still-fresh Prebid source must remain classifiable after a sibling source expires'
+      ).toBe('prebid_refresh');
+      expect(cycle.trustedServerOpportunity).toBeUndefined();
+    });
+
+    it('prunes a fully stale intent before recording new evidence and mints a fresh intent ID', () => {
+      let now = 0;
+      const store = new GptDiagnosticsStore({ now: () => now, defer: () => undefined });
+      const first = fakeSlot('first-request');
+      const stale = fakeSlot('stale-final-source');
+
+      // Establish the current monotonic counter using an unrelated, already-consumed intent.
+      store.recordPublisherRefresh([first]);
+      store.recordSlotRequested(first);
+      const priorIntentId = store.snapshot().slots[0].requests[0].requestIntentId!;
+
+      store.recordTrustedServerOpportunity(stale, 'auction-stale', 'renderable_candidate');
+      now = REQUEST_PATH_ATTRIBUTION_WINDOW_MS;
+      store.recordPublisherRefresh([stale]);
+      store.recordSlotRequested(stale);
+
+      const cycle = store.snapshot().slots[1].requests[0];
+      expect(cycle.requestPath, 'a fully stale intent must not resurrect competing status').toBe(
+        'publisher_refresh'
+      );
+      expect(cycle.trustedServerOpportunity).toBeUndefined();
+      expect(
+        cycle.requestIntentId,
+        'pruning the stale source must replace the intent rather than reuse its ID'
+      ).toBe(priorIntentId + 2);
+    });
+
+    it('measures opportunity-to-request latency from the Trusted Server observation, not a later source', () => {
+      let now = 0;
+      const store = new GptDiagnosticsStore({ now: () => now, defer: () => undefined });
+      const slot = fakeSlot('slot-a');
+
+      store.recordTrustedServerOpportunity(slot, 'slot-a', 'renderable_candidate', 'auction-a');
+      now = 100;
+      store.recordPublisherRefresh([slot]);
+      now = 124;
+      store.recordSlotRequested(slot);
+
+      expect(store.snapshot().slots[0].requests[0]).toMatchObject({
+        requestPath: 'competing',
+        trustedServerAuctionId: 'auction-a',
+        opportunityToRequestMs: 124,
+      });
+    });
+
+    it('omits a negative opportunity-to-request duration caused by an out-of-order clock', () => {
+      let now = 100;
+      const store = new GptDiagnosticsStore({ now: () => now, defer: () => undefined });
+      const slot = fakeSlot('negative-duration');
+
+      store.recordTrustedServerOpportunity(slot, 'auction-negative', 'renderable_candidate');
+      now = 50;
+      store.recordSlotRequested(slot);
+
+      const cycle = store.snapshot().slots[0].requests[0];
+      expect(cycle.requestPath).toBe('trusted_server_direct');
+      expect(cycle.opportunityToRequestMs).toBeUndefined();
+    });
+
+    it('omits a non-finite opportunity-to-request duration without dropping the Trusted Server intent', () => {
+      let now = 10;
+      const store = new GptDiagnosticsStore({ now: () => now, defer: () => undefined });
+      const slot = fakeSlot('non-finite-duration');
+
+      now = Number.POSITIVE_INFINITY;
+      store.recordTrustedServerOpportunity(slot, 'auction-non-finite', 'renderable_candidate');
+      now = 20;
+      store.recordSlotRequested(slot);
+
+      const cycle = store.snapshot().slots[0].requests[0];
+      expect(cycle.requestPath).toBe('trusted_server_direct');
+      expect(cycle.opportunityToRequestMs).toBeUndefined();
+    });
+
+    it('ignores malformed publisher-refresh inputs without throwing', () => {
+      const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+      const slot = fakeSlot('valid-publisher-marker');
+
+      expect(() => store.recordPublisherRefresh(null as never)).not.toThrow();
+      expect(() => store.recordPublisherRefresh([null, 1, slot] as never)).not.toThrow();
+
+      store.recordSlotRequested(slot);
+      expect(store.snapshot().slots[0].requests[0]).toMatchObject({
+        requestPath: 'publisher_refresh',
+      });
+    });
+
+    describe('Trusted Server auction ID validation', () => {
+      it('trims surrounding whitespace and exports the trimmed value', () => {
+        const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+        const slot = fakeSlot('auction-id-trim');
+
+        store.recordTrustedServerOpportunity(
+          slot,
+          'auction-trim',
+          'renderable_candidate',
+          '  auction-value  '
+        );
+        store.recordSlotRequested(slot);
+
+        expect(store.snapshot().slots[0].requests[0].trustedServerAuctionId).toBe('auction-value');
+      });
+
+      it('accepts an auction ID of exactly 256 UTF-8 bytes', () => {
+        const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+        const slot = fakeSlot('auction-id-exact-256');
+        const exactly256Bytes = 'a'.repeat(256);
+        expect(new TextEncoder().encode(exactly256Bytes).length).toBe(256);
+
+        store.recordTrustedServerOpportunity(
+          slot,
+          'auction-256',
+          'renderable_candidate',
+          exactly256Bytes
+        );
+        store.recordSlotRequested(slot);
+
+        expect(store.snapshot().slots[0].requests[0].trustedServerAuctionId).toBe(exactly256Bytes);
+      });
+
+      it('rejects a 257-byte ASCII auction ID without dropping the Trusted Server intent', () => {
+        const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+        const slot = fakeSlot('auction-id-257');
+        const tooLongAscii = 'a'.repeat(257);
+
+        store.recordTrustedServerOpportunity(
+          slot,
+          'auction-257',
+          'renderable_candidate',
+          tooLongAscii
+        );
+        store.recordSlotRequested(slot);
+
+        const cycle = store.snapshot().slots[0].requests[0];
+        expect(cycle.requestPath).toBe('trusted_server_direct');
+        expect(cycle.trustedServerOpportunity).toBe('renderable_candidate');
+        expect(cycle.trustedServerAuctionId).toBeUndefined();
+      });
+
+      it('rejects a multibyte auction ID over 256 UTF-8 bytes without dropping the Trusted Server intent', () => {
+        const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+        const slot = fakeSlot('auction-id-multibyte');
+        // Each euro sign encodes to 3 UTF-8 bytes; 86 copies = 258 bytes, over the boundary.
+        const multibyteTooLong = '€'.repeat(86);
+        expect(new TextEncoder().encode(multibyteTooLong).length).toBeGreaterThan(256);
+
+        store.recordTrustedServerOpportunity(
+          slot,
+          'auction-multibyte',
+          'renderable_candidate',
+          multibyteTooLong
+        );
+        store.recordSlotRequested(slot);
+
+        const cycle = store.snapshot().slots[0].requests[0];
+        expect(cycle.requestPath).toBe('trusted_server_direct');
+        expect(cycle.trustedServerAuctionId).toBeUndefined();
+      });
+
+      it.each([
+        { name: 'a non-string value', value: 12_345 as unknown as string },
+        { name: 'an empty string', value: '' },
+        { name: 'a whitespace-only string', value: '   ' },
+      ])('omits the auction ID for $name while preserving Trusted Server intent', ({ value }) => {
+        const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+        const slot = fakeSlot('auction-id-invalid');
+
+        store.recordTrustedServerOpportunity(
+          slot,
+          'auction-invalid',
+          'renderable_candidate',
+          value
+        );
+        store.recordSlotRequested(slot);
+
+        const cycle = store.snapshot().slots[0].requests[0];
+        expect(cycle.requestPath).toBe('trusted_server_direct');
+        expect(cycle.trustedServerOpportunity).toBe('renderable_candidate');
+        expect(cycle.trustedServerAuctionId).toBeUndefined();
+      });
+    });
+  });
 });

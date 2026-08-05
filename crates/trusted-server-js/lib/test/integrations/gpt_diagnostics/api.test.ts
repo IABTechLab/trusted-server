@@ -66,6 +66,7 @@ function fakeApiStore() {
     subscribe: vi.fn(() => () => undefined),
     recordTrustedServerOpportunity: vi.fn(),
     recordPrebidRefresh: vi.fn(),
+    recordPublisherRefresh: vi.fn(),
     recordTrustedServerCreativeRequest: vi.fn((_auctionSlotId: string) => 41),
     recordTrustedServerCreativeResponse: vi.fn(),
     recordTrustedServerCreativeFailure: vi.fn(),
@@ -124,6 +125,9 @@ describe('GptDiagnosticsApiController', () => {
       recordPrebidRefresh: vi.fn(() => {
         throw failure;
       }),
+      recordPublisherRefresh: vi.fn(() => {
+        throw failure;
+      }),
       recordTrustedServerCreativeRequest: vi.fn((_auctionSlotId: string): number | undefined => {
         throw failure;
       }),
@@ -144,10 +148,12 @@ describe('GptDiagnosticsApiController', () => {
       controller.api.recordTrustedServerOpportunity(
         slot,
         'auction-slot-example',
-        'renderable_candidate'
+        'renderable_candidate',
+        'auction-server-id'
       )
     ).not.toThrow();
     expect(() => controller.api.recordPrebidRefresh([slot])).not.toThrow();
+    expect(() => controller.api.recordPublisherRefresh([slot])).not.toThrow();
     expect(
       controller.api.recordTrustedServerCreativeRequest('auction-slot-example')
     ).toBeUndefined();
@@ -155,6 +161,33 @@ describe('GptDiagnosticsApiController', () => {
     expect(() =>
       controller.api.recordTrustedServerCreativeFailure(41, 'response_post_failed')
     ).not.toThrow();
+  });
+
+  it('forwards the optional Trusted Server auction ID and the publisher-refresh method with exact arguments', () => {
+    const store = fakeApiStore();
+    const controller = new GptDiagnosticsApiController(store, new FakeBindings(), {
+      show: vi.fn(),
+      hide: vi.fn(),
+    });
+    const slot = fakeSlot();
+
+    controller.api.recordTrustedServerOpportunity(
+      slot,
+      'slot-a',
+      'renderable_candidate',
+      'auction-a'
+    );
+    controller.api.recordPublisherRefresh([slot]);
+
+    expect(store.recordTrustedServerOpportunity).toHaveBeenCalledTimes(1);
+    expect(store.recordTrustedServerOpportunity).toHaveBeenCalledWith(
+      slot,
+      'slot-a',
+      'renderable_candidate',
+      'auction-a'
+    );
+    expect(store.recordPublisherRefresh).toHaveBeenCalledTimes(1);
+    expect(store.recordPublisherRefresh).toHaveBeenCalledWith([slot]);
   });
 
   it('detaches nested attribution evidence from the store snapshot', () => {
