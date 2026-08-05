@@ -3838,6 +3838,12 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
         getTargeting: () => [],
         clearTargeting: vi.fn(),
       };
+      // A real (though otherwise empty) `window.tsjs` is required here: the
+      // dispatch helper no-ops whenever `window.tsjs` is absent, so without
+      // this object the assertion below would pass even if this branch were
+      // wrongly wrapped. Installing a live object makes the negative
+      // assertion meaningful.
+      testWindow.tsjs = {};
       const { originalRefresh, pubads } = installGpt([slot]);
       const observed = captureDispatchContextOnCall(originalRefresh);
 
@@ -3848,6 +3854,9 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     });
 
     it('leaves the dispatch context inactive for an unresolved bare refresh', () => {
+      // See the comment in the previous test: a live `window.tsjs` is
+      // required or this assertion would hold vacuously.
+      testWindow.tsjs = {};
       const originalRefresh = vi.fn();
       const pubads = { refresh: originalRefresh };
       testWindow.googletag = {
@@ -3869,6 +3878,10 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
         getTargeting: vi.fn(() => []),
         clearTargeting: vi.fn(),
       };
+      // `__tsjs_prebid` (injected refresh config) is a different global from
+      // `tsjs` (diagnostics/dispatch state) — both are set here so the
+      // dispatch assertion below is not vacuous.
+      testWindow.tsjs = {};
       testWindow.__tsjs_prebid = { excludedGamAdUnitPathSuffixes: ['/trackingonly'] };
       const { originalRefresh, pubads } = installGpt([trackingSlot]);
       const observed = captureDispatchContextOnCall(originalRefresh);
@@ -3886,7 +3899,11 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
           getTargeting: () => [],
           clearTargeting: vi.fn(),
         };
-        const { pubads } = installGpt([slot]);
+        // A live `window.tsjs` makes the pending-auction assertion below
+        // meaningful — see the comment on the first test in this describe.
+        testWindow.tsjs = {};
+        const { originalRefresh, pubads } = installGpt([slot]);
+        const observed = captureDispatchContextOnCall(originalRefresh);
         let bidsBackHandler: (() => void) | undefined;
         mockRequestBids.mockImplementation((opts) => {
           bidsBackHandler = opts.bidsBackHandler;
@@ -3894,9 +3911,15 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
         installPrebidNpm();
 
         pubads.refresh([slot]);
+        // While bids are pending, no refresh has been delegated yet — the
+        // context must not be set preemptively before the auction resolves.
         expect(testWindow.tsjs?.prebidRefreshDispatchInProgress).toBeUndefined();
+        expect(observed).toEqual([]);
 
         bidsBackHandler?.();
+        // The delegated native refresh observed the context active, then
+        // it was restored immediately after that synchronous call returned.
+        expect(observed).toEqual([true]);
         expect(testWindow.tsjs?.prebidRefreshDispatchInProgress).toBeUndefined();
       } finally {
         vi.runOnlyPendingTimers();
