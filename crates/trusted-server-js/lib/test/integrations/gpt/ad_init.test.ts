@@ -3,7 +3,7 @@ import path from 'node:path';
 
 import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
 
-import type { TsjsApi } from '../../../src/core/types';
+import type { AuctionBidData, TsjsApi } from '../../../src/core/types';
 
 // Track every 'message' EventListener added to window across the entire test
 // file.  This lets the installTsRenderBridge suite remove all accumulated
@@ -110,10 +110,14 @@ describe('installTsAdInit', () => {
 
   afterEach(() => {
     document.getElementById('div-atf-sidebar')?.remove();
+    document.getElementById('div-new-slot')?.remove();
     document.getElementById("ad'prefix-real")?.remove();
   });
 
-  it('associates the GPT slot with its auction slot for GPT diagnostics', async () => {
+  function configureOpportunityDiagnostics(
+    bid: AuctionBidData | undefined,
+    recordTrustedServerOpportunity: ReturnType<typeof vi.fn>
+  ) {
     const mockSlot = {
       addService: vi.fn().mockReturnThis(),
       setTargeting: vi.fn().mockReturnThis(),
@@ -132,7 +136,6 @@ describe('installTsAdInit', () => {
       pubads: vi.fn().mockReturnValue(mockPubads),
       enableServices: vi.fn(),
     };
-    const recordTrustedServerCandidate = vi.fn();
     (window as TestWindow).tsjs = {
       adSlots: [
         {
@@ -143,37 +146,117 @@ describe('installTsAdInit', () => {
           targeting: {},
         },
       ],
-      bids: { atf_sidebar_ad: { hb_adid: 'abc-uuid', hb_pb: '1.00' } },
-      gptDiagnostics: { recordTrustedServerCandidate },
+      bids: bid ? { atf_sidebar_ad: bid } : {},
+      gptDiagnostics: {
+        recordTrustedServerOpportunity,
+      } as unknown as TsjsApi['gptDiagnostics'],
     };
+
+    return { mockPubads, mockSlot };
+  }
+
+  it.each([
+    [
+      'inline markup',
+      { hb_pb: '1.00', hb_adid: 'abc-uuid', adm: '<div>Creative</div>' },
+      'renderable_candidate',
+    ],
+    [
+      'complete cache coordinates',
+      {
+        hb_bidder: 'example-bidder',
+        hb_adid: 'abc-uuid',
+        hb_cache_host: 'cache.example.com',
+        hb_cache_path: '/cache',
+      },
+      'renderable_candidate',
+    ],
+    [
+      'an ad ID without a render source',
+      { hb_pb: '1.00', hb_adid: 'abc-uuid' },
+      'unrenderable_candidate',
+    ],
+    [
+      'a render source without an ad ID',
+      { hb_pb: '1.00', adm: '<div>Creative</div>' },
+      'unrenderable_candidate',
+    ],
+    [
+      'no non-empty Trusted Server bid targeting',
+      { hb_pb: '', hb_bidder: '', hb_adid: '', adm: '<div>Creative</div>' },
+      'no_candidate',
+    ],
+  ] as const)(
+    'records exactly one %s opportunity for every resolved GPT slot',
+    async (_description, bid, expectedOpportunity) => {
+      const recordTrustedServerOpportunity = vi.fn();
+      const { mockSlot } = configureOpportunityDiagnostics(
+        bid as AuctionBidData,
+        recordTrustedServerOpportunity
+      );
+
+      const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+      installTsAdInit();
+      (window as TestWindow).tsjs!.adInit!();
+
+      expect(recordTrustedServerOpportunity).toHaveBeenCalledTimes(1);
+      expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
+        mockSlot,
+        'atf_sidebar_ad',
+        expectedOpportunity
+      );
+    }
+  );
+
+  it('records no_candidate when the resolved slot has no bid', async () => {
+    const recordTrustedServerOpportunity = vi.fn();
+    const { mockSlot } = configureOpportunityDiagnostics(undefined, recordTrustedServerOpportunity);
 
     const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
     (window as TestWindow).tsjs!.adInit!();
 
-    expect(recordTrustedServerCandidate).toHaveBeenCalledWith(mockSlot, 'atf_sidebar_ad');
+    expect(recordTrustedServerOpportunity).toHaveBeenCalledTimes(1);
+    expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
+      mockSlot,
+      'atf_sidebar_ad',
+      'no_candidate'
+    );
   });
 
-  it('reports no diagnostics candidate for a slot without a Trusted Server bid', async () => {
-    const mockSlot = {
+  it('keeps targeting, display, and refresh running when opportunity diagnostics throws', async () => {
+    const existingSlot = {
       addService: vi.fn().mockReturnThis(),
       setTargeting: vi.fn().mockReturnThis(),
       getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
       getTargeting: vi.fn().mockReturnValue([]),
     };
+    const definedSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-new-slot'),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
     const mockPubads = {
       enableSingleRequest: vi.fn(),
-      getSlots: vi.fn().mockReturnValue([mockSlot]),
+      getSlots: vi.fn().mockReturnValue([existingSlot]),
       addEventListener: vi.fn(),
       refresh: vi.fn(),
     };
+    const display = vi.fn();
     (window as TestWindow).googletag = {
       cmd: { push: vi.fn((fn: () => void) => fn()) },
-      defineSlot: vi.fn().mockReturnValue(mockSlot),
+      defineSlot: vi.fn().mockReturnValue(definedSlot),
       pubads: vi.fn().mockReturnValue(mockPubads),
       enableServices: vi.fn(),
+      display,
     };
-    const recordTrustedServerCandidate = vi.fn();
+    const newSlotDiv = document.createElement('div');
+    newSlotDiv.id = 'div-new-slot';
+    document.body.appendChild(newSlotDiv);
+    const recordTrustedServerOpportunity = vi.fn(() => {
+      throw new Error('diagnostics unavailable');
+    });
     (window as TestWindow).tsjs = {
       adSlots: [
         {
@@ -183,16 +266,40 @@ describe('installTsAdInit', () => {
           formats: [[300, 250]],
           targeting: {},
         },
+        {
+          id: 'new_slot_ad',
+          gam_unit_path: '/123/new',
+          div_id: 'div-new-slot',
+          formats: [[728, 90]],
+          targeting: {},
+        },
       ],
-      bids: {},
-      gptDiagnostics: { recordTrustedServerCandidate },
+      bids: {
+        atf_sidebar_ad: {
+          hb_pb: '1.00',
+          hb_adid: 'existing-id',
+          adm: '<div>Existing</div>',
+        },
+        new_slot_ad: {
+          hb_pb: '2.00',
+          hb_adid: 'new-id',
+          adm: '<div>New</div>',
+        },
+      },
+      gptDiagnostics: {
+        recordTrustedServerOpportunity,
+      } as unknown as TsjsApi['gptDiagnostics'],
     };
 
     const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
-    (window as TestWindow).tsjs!.adInit!();
+    expect(() => (window as TestWindow).tsjs!.adInit!()).not.toThrow();
 
-    expect(recordTrustedServerCandidate).not.toHaveBeenCalled();
+    expect(recordTrustedServerOpportunity).toHaveBeenCalledTimes(2);
+    expect(existingSlot.setTargeting).toHaveBeenCalledWith('hb_pb', '1.00');
+    expect(definedSlot.setTargeting).toHaveBeenCalledWith('hb_pb', '2.00');
+    expect(display).toHaveBeenCalledWith('div-new-slot');
+    expect(mockPubads.refresh).toHaveBeenCalledWith([existingSlot]);
   });
 
   it('reads window.tsjs.bids synchronously and applies bid targeting before refresh', async () => {
@@ -1449,33 +1556,50 @@ describe('installTsRenderBridge', () => {
     return bridgeListener!;
   }
 
-  it('reports the creative markup request to GPT diagnostics when activated', async () => {
-    const recordTrustedServerClaim = vi.fn();
+  it('records an inline creative request and response with the same opaque attempt ID', async () => {
+    const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(41);
+    const recordTrustedServerCreativeResponse = vi.fn();
+    const recordTrustedServerCreativeFailure = vi.fn();
     const tsjs = (window as TestWindow).tsjs!;
-    tsjs.gptDiagnostics = { recordTrustedServerClaim };
-    // Serve from inline adm so the claim is asserted without a cache fetch
-    // whose fire-and-forget continuation would outlive this test.
+    tsjs.gptDiagnostics = {
+      recordTrustedServerCreativeRequest,
+      recordTrustedServerCreativeResponse,
+      recordTrustedServerCreativeFailure,
+    } as unknown as TsjsApi['gptDiagnostics'];
     tsjs.bids.homepage_header.adm = '<div>Creative</div>';
     delete tsjs.bids.homepage_header.nurl;
     delete tsjs.bids.homepage_header.burl;
 
     const bridgeListener = await captureBridgeListener();
     const source = createTrustedSlotIframe();
+    const postMessage = vi.fn();
     bridgeListener(
       Object.assign(new Event('message'), {
         data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
-        ports: [{ postMessage: vi.fn() }],
+        ports: [{ postMessage }],
         source,
         stopImmediatePropagation: vi.fn(),
       }) as unknown as MessageEvent
     );
 
-    expect(recordTrustedServerClaim).toHaveBeenCalledWith('homepage_header');
+    expect(recordTrustedServerCreativeRequest).toHaveBeenCalledWith('homepage_header');
+    expect(postMessage).toHaveBeenCalledTimes(1);
+    expect(recordTrustedServerCreativeResponse).toHaveBeenCalledWith(41);
+    expect(postMessage.mock.invocationCallOrder[0]).toBeLessThan(
+      recordTrustedServerCreativeResponse.mock.invocationCallOrder[0]
+    );
+    expect(recordTrustedServerCreativeFailure).not.toHaveBeenCalled();
   });
 
-  it('reports no claim for an ad ID the requesting slot does not own', async () => {
-    const recordTrustedServerClaim = vi.fn();
-    (window as TestWindow).tsjs!.gptDiagnostics = { recordTrustedServerClaim };
+  it('records no creative evidence for an ad ID the requesting slot does not own', async () => {
+    const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(42);
+    const recordTrustedServerCreativeResponse = vi.fn();
+    const recordTrustedServerCreativeFailure = vi.fn();
+    (window as TestWindow).tsjs!.gptDiagnostics = {
+      recordTrustedServerCreativeRequest,
+      recordTrustedServerCreativeResponse,
+      recordTrustedServerCreativeFailure,
+    } as unknown as TsjsApi['gptDiagnostics'];
 
     const bridgeListener = await captureBridgeListener();
     const source = createTrustedSlotIframe();
@@ -1488,11 +1612,102 @@ describe('installTsRenderBridge', () => {
       }) as unknown as MessageEvent
     );
 
-    expect(recordTrustedServerClaim).not.toHaveBeenCalled();
+    expect(recordTrustedServerCreativeRequest).not.toHaveBeenCalled();
+    expect(recordTrustedServerCreativeResponse).not.toHaveBeenCalled();
+    expect(recordTrustedServerCreativeFailure).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['missing cache coordinates', {}],
+    ['incomplete cache coordinates', { hb_cache_host: 'cache.example.com' }],
+  ] as const)(
+    'records missing_render_source for an exact-owned request with %s',
+    async (_description, cacheFields) => {
+      const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(45);
+      const recordTrustedServerCreativeResponse = vi.fn();
+      const recordTrustedServerCreativeFailure = vi.fn();
+      const tsjs = (window as TestWindow).tsjs!;
+      tsjs.gptDiagnostics = {
+        recordTrustedServerCreativeRequest,
+        recordTrustedServerCreativeResponse,
+        recordTrustedServerCreativeFailure,
+      } as unknown as TsjsApi['gptDiagnostics'];
+      delete tsjs.bids.homepage_header.hb_cache_host;
+      delete tsjs.bids.homepage_header.hb_cache_path;
+      Object.assign(tsjs.bids.homepage_header, cacheFields);
+
+      const bridgeListener = await captureBridgeListener();
+      const source = createTrustedSlotIframe();
+      const stopImmediatePropagation = vi.fn();
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+          ports: [{ postMessage: vi.fn() }],
+          source,
+          stopImmediatePropagation,
+        }) as unknown as MessageEvent
+      );
+
+      expect(recordTrustedServerCreativeRequest).toHaveBeenCalledWith('homepage_header');
+      expect(recordTrustedServerCreativeFailure).toHaveBeenCalledTimes(1);
+      expect(recordTrustedServerCreativeFailure).toHaveBeenCalledWith(45, 'missing_render_source');
+      expect(recordTrustedServerCreativeResponse).not.toHaveBeenCalled();
+      expect(stopImmediatePropagation).not.toHaveBeenCalled();
+      expect(fetchStub).not.toHaveBeenCalled();
+    }
+  );
+
+  it('records response_post_failed when posting inline markup throws', async () => {
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(46);
+    const recordTrustedServerCreativeResponse = vi.fn();
+    const recordTrustedServerCreativeFailure = vi.fn();
+    const tsjs = (window as TestWindow).tsjs!;
+    tsjs.gptDiagnostics = {
+      recordTrustedServerCreativeRequest,
+      recordTrustedServerCreativeResponse,
+      recordTrustedServerCreativeFailure,
+    } as unknown as TsjsApi['gptDiagnostics'];
+    tsjs.bids.homepage_header.adm = '<div>Creative</div>';
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const stopImmediatePropagation = vi.fn();
+    expect(() =>
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+          ports: [
+            {
+              postMessage: vi.fn(() => {
+                throw new Error('port closed');
+              }),
+            },
+          ],
+          source,
+          stopImmediatePropagation,
+        }) as unknown as MessageEvent
+      )
+    ).not.toThrow();
+
+    expect(stopImmediatePropagation).toHaveBeenCalledTimes(1);
+    expect(recordTrustedServerCreativeFailure).toHaveBeenCalledTimes(1);
+    expect(recordTrustedServerCreativeFailure).toHaveBeenCalledWith(46, 'response_post_failed');
+    expect(recordTrustedServerCreativeResponse).not.toHaveBeenCalled();
+    expect(beaconSpy).not.toHaveBeenCalled();
+    beaconSpy.mockRestore();
   });
 
   it('calls stopImmediatePropagation and fetches PBS Cache for a TS bid', async () => {
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(43);
+    const recordTrustedServerCreativeResponse = vi.fn();
+    const recordTrustedServerCreativeFailure = vi.fn();
+    (window as TestWindow).tsjs!.gptDiagnostics = {
+      recordTrustedServerCreativeRequest,
+      recordTrustedServerCreativeResponse,
+      recordTrustedServerCreativeFailure,
+    } as unknown as TsjsApi['gptDiagnostics'];
     const mockAd = '<div>Test Creative</div>';
     // PBS Cache (returnCreative=false) returns the cached bid as a JSON object;
     // the creative lives under `adm`, not as the raw response body. The bridge
@@ -1524,7 +1739,8 @@ describe('installTsRenderBridge', () => {
 
     const stopSpy = vi.fn();
     const portMessages: string[] = [];
-    const fakePort = { postMessage: (s: string) => portMessages.push(s) };
+    const postMessage = vi.fn((message: string) => portMessages.push(message));
+    const fakePort = { postMessage };
     const source = createTrustedSlotIframe();
 
     // Dispatch the fake event — bridge listener fires synchronously, then runs
@@ -1552,6 +1768,12 @@ describe('installTsRenderBridge', () => {
     expect(parsed.message).toBe('Prebid Response');
     expect(parsed.adId).toBe('test-cache-uuid');
     expect(parsed.ad).toBe(mockAd);
+    expect(recordTrustedServerCreativeRequest).toHaveBeenCalledWith('homepage_header');
+    expect(recordTrustedServerCreativeResponse).toHaveBeenCalledWith(43);
+    expect(recordTrustedServerCreativeFailure).not.toHaveBeenCalled();
+    expect(postMessage.mock.invocationCallOrder[0]).toBeLessThan(
+      recordTrustedServerCreativeResponse.mock.invocationCallOrder[0]
+    );
     expect(beaconSpy).toHaveBeenCalledWith('https://ssp.example/win');
     expect(beaconSpy).toHaveBeenCalledWith('https://ssp.example/bill');
     expect(beaconSpy).toHaveBeenCalledTimes(2);
@@ -1569,8 +1791,277 @@ describe('installTsRenderBridge', () => {
     beaconSpy.mockRestore();
   });
 
+  it('does not classify a downstream cache-processing throw as cache_fetch_failed', async () => {
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(54);
+    const recordTrustedServerCreativeResponse = vi.fn();
+    const recordTrustedServerCreativeFailure = vi.fn();
+    (window as TestWindow).tsjs!.gptDiagnostics = {
+      recordTrustedServerCreativeRequest,
+      recordTrustedServerCreativeResponse,
+      recordTrustedServerCreativeFailure,
+    } as unknown as TsjsApi['gptDiagnostics'];
+    fetchStub.mockResolvedValue({
+      ok: true,
+      text: () => Promise.resolve(JSON.stringify({ adm: '<div>Creative</div>' })),
+    } as Response);
+    const { log } = await import('../../../src/core/log');
+    const debugSpy = vi.spyOn(log, 'debug').mockImplementation(() => {
+      throw new Error('success logging unavailable');
+    });
+
+    try {
+      const bridgeListener = await captureBridgeListener();
+      const source = createTrustedSlotIframe();
+      const postMessage = vi.fn();
+      const dispatch = () =>
+        bridgeListener(
+          Object.assign(new Event('message'), {
+            data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+            ports: [{ postMessage }],
+            source,
+            stopImmediatePropagation: vi.fn(),
+          }) as unknown as MessageEvent
+        );
+
+      dispatch();
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+      expect(postMessage).toHaveBeenCalledTimes(1);
+      expect(recordTrustedServerCreativeResponse).toHaveBeenCalledWith(54);
+      expect(recordTrustedServerCreativeFailure).not.toHaveBeenCalled();
+
+      // A second request must run after the first downstream failure, proving
+      // the in-flight key was still cleared by the promise's finally handler.
+      dispatch();
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      expect(fetchStub).toHaveBeenCalledTimes(2);
+      expect(postMessage).toHaveBeenCalledTimes(2);
+      expect(recordTrustedServerCreativeFailure).not.toHaveBeenCalled();
+    } finally {
+      debugSpy.mockRestore();
+      beaconSpy.mockRestore();
+    }
+  });
+
+  it.each([
+    [
+      'an HTTP non-ok response',
+      (stub: ReturnType<typeof vi.fn>) =>
+        stub.mockResolvedValue({ ok: false, status: 503 } as Response),
+    ],
+    [
+      'a response body read rejection',
+      (stub: ReturnType<typeof vi.fn>) =>
+        stub.mockResolvedValue({
+          ok: true,
+          text: () => Promise.reject(new Error('body unavailable')),
+        } as Response),
+    ],
+    [
+      'a network rejection',
+      (stub: ReturnType<typeof vi.fn>) => stub.mockRejectedValue(new Error('network unavailable')),
+    ],
+  ] as const)('records cache_fetch_failed once for %s', async (_description, arrangeFetch) => {
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(47);
+    const recordTrustedServerCreativeResponse = vi.fn();
+    const recordTrustedServerCreativeFailure = vi.fn();
+    (window as TestWindow).tsjs!.gptDiagnostics = {
+      recordTrustedServerCreativeRequest,
+      recordTrustedServerCreativeResponse,
+      recordTrustedServerCreativeFailure,
+    } as unknown as TsjsApi['gptDiagnostics'];
+    arrangeFetch(fetchStub);
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+        ports: [{ postMessage: vi.fn() }],
+        source,
+        stopImmediatePropagation: vi.fn(),
+      }) as unknown as MessageEvent
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    expect(recordTrustedServerCreativeRequest).toHaveBeenCalledWith('homepage_header');
+    expect(recordTrustedServerCreativeFailure).toHaveBeenCalledTimes(1);
+    expect(recordTrustedServerCreativeFailure).toHaveBeenCalledWith(47, 'cache_fetch_failed');
+    expect(recordTrustedServerCreativeResponse).not.toHaveBeenCalled();
+    expect(beaconSpy).not.toHaveBeenCalled();
+    beaconSpy.mockRestore();
+  });
+
+  it('records only response_post_failed when posting cached markup throws', async () => {
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(48);
+    const recordTrustedServerCreativeResponse = vi.fn();
+    const recordTrustedServerCreativeFailure = vi.fn();
+    (window as TestWindow).tsjs!.gptDiagnostics = {
+      recordTrustedServerCreativeRequest,
+      recordTrustedServerCreativeResponse,
+      recordTrustedServerCreativeFailure,
+    } as unknown as TsjsApi['gptDiagnostics'];
+    fetchStub.mockResolvedValue({
+      ok: true,
+      text: () => Promise.resolve(JSON.stringify({ adm: '<div>Creative</div>' })),
+    } as Response);
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+        ports: [
+          {
+            postMessage: vi.fn(() => {
+              throw new Error('port closed');
+            }),
+          },
+        ],
+        source,
+        stopImmediatePropagation: vi.fn(),
+      }) as unknown as MessageEvent
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    expect(recordTrustedServerCreativeFailure).toHaveBeenCalledTimes(1);
+    expect(recordTrustedServerCreativeFailure).toHaveBeenCalledWith(48, 'response_post_failed');
+    expect(recordTrustedServerCreativeResponse).not.toHaveBeenCalled();
+    expect(beaconSpy).not.toHaveBeenCalled();
+    beaconSpy.mockRestore();
+  });
+
+  it.each(['request', 'response'] as const)(
+    'keeps inline delivery and beacons unchanged when the diagnostics %s writer throws',
+    async (throwingWriter) => {
+      const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+      const recordTrustedServerCreativeRequest = vi.fn(() => {
+        if (throwingWriter === 'request') throw new Error('diagnostics request failed');
+        return 49;
+      });
+      const recordTrustedServerCreativeResponse = vi.fn(() => {
+        if (throwingWriter === 'response') throw new Error('diagnostics response failed');
+      });
+      const recordTrustedServerCreativeFailure = vi.fn();
+      const tsjs = (window as TestWindow).tsjs!;
+      tsjs.gptDiagnostics = {
+        recordTrustedServerCreativeRequest,
+        recordTrustedServerCreativeResponse,
+        recordTrustedServerCreativeFailure,
+      } as unknown as TsjsApi['gptDiagnostics'];
+      tsjs.bids.homepage_header.adm = '<div>Creative</div>';
+
+      const bridgeListener = await captureBridgeListener();
+      const source = createTrustedSlotIframe();
+      const stopImmediatePropagation = vi.fn();
+      const postMessage = vi.fn();
+      expect(() =>
+        bridgeListener(
+          Object.assign(new Event('message'), {
+            data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+            ports: [{ postMessage }],
+            source,
+            stopImmediatePropagation,
+          }) as unknown as MessageEvent
+        )
+      ).not.toThrow();
+
+      expect(stopImmediatePropagation).toHaveBeenCalledTimes(1);
+      expect(postMessage).toHaveBeenCalledTimes(1);
+      expect(beaconSpy).toHaveBeenCalledTimes(2);
+      expect(recordTrustedServerCreativeFailure).not.toHaveBeenCalled();
+      if (throwingWriter === 'response') {
+        expect(recordTrustedServerCreativeResponse).toHaveBeenCalledWith(49);
+      } else {
+        expect(recordTrustedServerCreativeResponse).not.toHaveBeenCalled();
+      }
+      beaconSpy.mockRestore();
+    }
+  );
+
+  it('does not turn a throwing cache response diagnostic into a cache failure', async () => {
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(50);
+    const recordTrustedServerCreativeResponse = vi.fn(() => {
+      throw new Error('diagnostics response failed');
+    });
+    const recordTrustedServerCreativeFailure = vi.fn();
+    (window as TestWindow).tsjs!.gptDiagnostics = {
+      recordTrustedServerCreativeRequest,
+      recordTrustedServerCreativeResponse,
+      recordTrustedServerCreativeFailure,
+    } as unknown as TsjsApi['gptDiagnostics'];
+    fetchStub.mockResolvedValue({
+      ok: true,
+      text: () => Promise.resolve(JSON.stringify({ adm: '<div>Creative</div>' })),
+    } as Response);
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const postMessage = vi.fn();
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+        ports: [{ postMessage }],
+        source,
+        stopImmediatePropagation: vi.fn(),
+      }) as unknown as MessageEvent
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    expect(postMessage).toHaveBeenCalledTimes(1);
+    expect(recordTrustedServerCreativeResponse).toHaveBeenCalledWith(50);
+    expect(recordTrustedServerCreativeFailure).not.toHaveBeenCalled();
+    expect(beaconSpy).toHaveBeenCalledTimes(2);
+    beaconSpy.mockRestore();
+  });
+
+  it('preserves missing-source fallback when the failure diagnostic throws', async () => {
+    const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(51);
+    const recordTrustedServerCreativeFailure = vi.fn(() => {
+      throw new Error('diagnostics failure writer failed');
+    });
+    const tsjs = (window as TestWindow).tsjs!;
+    tsjs.gptDiagnostics = {
+      recordTrustedServerCreativeRequest,
+      recordTrustedServerCreativeResponse: vi.fn(),
+      recordTrustedServerCreativeFailure,
+    } as unknown as TsjsApi['gptDiagnostics'];
+    delete tsjs.bids.homepage_header.hb_cache_host;
+    delete tsjs.bids.homepage_header.hb_cache_path;
+
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const stopImmediatePropagation = vi.fn();
+    expect(() =>
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+          ports: [{ postMessage: vi.fn() }],
+          source,
+          stopImmediatePropagation,
+        }) as unknown as MessageEvent
+      )
+    ).not.toThrow();
+
+    expect(recordTrustedServerCreativeFailure).toHaveBeenCalledWith(51, 'missing_render_source');
+    expect(stopImmediatePropagation).not.toHaveBeenCalled();
+    expect(fetchStub).not.toHaveBeenCalled();
+  });
+
   it('declines to render when the PBS Cache response carries no adm', async () => {
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(44);
+    const recordTrustedServerCreativeResponse = vi.fn();
+    const recordTrustedServerCreativeFailure = vi.fn();
+    (window as TestWindow).tsjs!.gptDiagnostics = {
+      recordTrustedServerCreativeRequest,
+      recordTrustedServerCreativeResponse,
+      recordTrustedServerCreativeFailure,
+    } as unknown as TsjsApi['gptDiagnostics'];
     // A returnCreative=false JSON entry with no `adm` (VAST-only, or malformed).
     // The bridge must NOT forward the serialized bid document to PUC.
     fetchStub.mockResolvedValue({
@@ -1599,6 +2090,10 @@ describe('installTsRenderBridge', () => {
     expect(fetchStub).toHaveBeenCalled();
     expect(stopSpy).toHaveBeenCalled();
     expect(portMessages).toHaveLength(0);
+    expect(recordTrustedServerCreativeRequest).toHaveBeenCalledWith('homepage_header');
+    expect(recordTrustedServerCreativeFailure).toHaveBeenCalledTimes(1);
+    expect(recordTrustedServerCreativeFailure).toHaveBeenCalledWith(44, 'invalid_cache_payload');
+    expect(recordTrustedServerCreativeResponse).not.toHaveBeenCalled();
     expect(beaconSpy).not.toHaveBeenCalled();
     beaconSpy.mockRestore();
   });
@@ -2160,6 +2655,14 @@ describe('installTsRenderBridge', () => {
   });
 
   it('ignores matching adId messages from outside configured slot iframes', async () => {
+    const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(52);
+    const recordTrustedServerCreativeResponse = vi.fn();
+    const recordTrustedServerCreativeFailure = vi.fn();
+    (window as TestWindow).tsjs!.gptDiagnostics = {
+      recordTrustedServerCreativeRequest,
+      recordTrustedServerCreativeResponse,
+      recordTrustedServerCreativeFailure,
+    } as unknown as TsjsApi['gptDiagnostics'];
     await import('../../../src/integrations/gpt/index');
     fetchStub.mockResolvedValue({ ok: true, text: () => Promise.resolve('') } as Response);
 
@@ -2181,6 +2684,9 @@ describe('installTsRenderBridge', () => {
     expect(fetchStub).not.toHaveBeenCalled();
     expect(stopSpy).not.toHaveBeenCalled();
     expect(portMessages).toHaveLength(0);
+    expect(recordTrustedServerCreativeRequest).not.toHaveBeenCalled();
+    expect(recordTrustedServerCreativeResponse).not.toHaveBeenCalled();
+    expect(recordTrustedServerCreativeFailure).not.toHaveBeenCalled();
     foreignIframe.remove();
   });
 
@@ -2203,6 +2709,14 @@ describe('installTsRenderBridge', () => {
       div_id: 'div-footer',
       targeting: {},
     });
+    const recordTrustedServerCreativeRequest = vi.fn().mockReturnValue(53);
+    const recordTrustedServerCreativeResponse = vi.fn();
+    const recordTrustedServerCreativeFailure = vi.fn();
+    (window as TestWindow).tsjs!.gptDiagnostics = {
+      recordTrustedServerCreativeRequest,
+      recordTrustedServerCreativeResponse,
+      recordTrustedServerCreativeFailure,
+    } as unknown as TsjsApi['gptDiagnostics'];
 
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
     await import('../../../src/integrations/gpt/index');
@@ -2226,6 +2740,9 @@ describe('installTsRenderBridge', () => {
     expect(fetchStub).not.toHaveBeenCalled();
     expect(portMessages).toHaveLength(0);
     expect(beaconSpy).not.toHaveBeenCalled();
+    expect(recordTrustedServerCreativeRequest).not.toHaveBeenCalled();
+    expect(recordTrustedServerCreativeResponse).not.toHaveBeenCalled();
+    expect(recordTrustedServerCreativeFailure).not.toHaveBeenCalled();
     document.getElementById('div-footer')?.remove();
   });
 

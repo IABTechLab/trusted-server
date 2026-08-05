@@ -77,12 +77,26 @@ function formatMilliseconds(value: number | undefined): string | undefined {
 }
 
 function deliveryLabel(cycle: GptDiagnosticsRequestCycle): string | undefined {
-  if (cycle.delivery === 'trusted_server') return 'TS creative';
-  if (cycle.delivery === 'pending') return 'TS candidate';
-  if (cycle.delivery !== 'other_demand') return undefined;
+  if (cycle.trustedServerCreativeResponseAtMs !== undefined) return 'TS response sent';
+  if (cycle.trustedServerCreativeRequestAtMs !== undefined) return 'TS selected';
 
-  const lineItem = cycle.adManager?.lineItemId ?? cycle.adManager?.sourceAgnosticLineItemId;
-  return lineItem ? `GAM line item ${lineItem}` : 'Other GAM demand';
+  switch (cycle.delivery) {
+    case 'trusted_server_response_sent':
+      return 'TS response sent';
+    case 'trusted_server_selected':
+      return 'TS selected';
+    case 'pending':
+      return 'TS candidate (pending)';
+    case 'candidate_unconfirmed':
+      return 'TS unconfirmed';
+    case 'no_candidate':
+      return 'No TS candidate';
+    case 'unknown':
+      return 'Delivery unknown';
+    case 'not_applicable':
+    default:
+      return undefined;
+  }
 }
 
 function badgeText(cycle: GptDiagnosticsRequestCycle): string {
@@ -93,6 +107,7 @@ function badgeText(cycle: GptDiagnosticsRequestCycle): string {
   else firstLine.push('Pending');
   const delivery = deliveryLabel(cycle);
   if (delivery) firstLine.push(delivery);
+  if (cycle.requestPath === 'competing') firstLine.push('Competing paths');
   if (cycle.size) firstLine.push(`${cycle.size[0]}×${cycle.size[1]}`);
 
   const timingLine: string[] = [];

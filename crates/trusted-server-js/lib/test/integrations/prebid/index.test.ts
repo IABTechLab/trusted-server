@@ -1634,6 +1634,304 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     opts?.bidsBackHandler?.(bidResponses, false, auctionId);
   }
 
+  function installPrebidRefreshDiagnostics(
+    implementation?: (slots: Array<Record<string, unknown>>) => void
+  ) {
+    const recordPrebidRefresh = vi.fn(implementation);
+    testWindow.tsjs = { gptDiagnostics: { recordPrebidRefresh } };
+    return recordPrebidRefresh;
+  }
+
+  it('records a publisher delivery refresh immediately before its GPT request', () => {
+    const slot = {
+      getSlotElementId: () => 'example-delivery-marker',
+      getTargeting: () => [],
+      clearTargeting: vi.fn(),
+    };
+    const recordPrebidRefresh = installPrebidRefreshDiagnostics();
+    const { originalRefresh, pubads } = installGpt([slot]);
+    mockRequestBids.mockImplementation((opts) => completePublisherAuction(opts));
+    const pbjs = installPrebidNpm();
+
+    pbjs.requestBids({
+      adUnits: [
+        { code: 'example-delivery-marker', bids: [{ bidder: 'exampleServer', params: {} }] },
+      ],
+      bidsBackHandler: () => pubads.refresh([slot]),
+    } as unknown as RequestBidsArg);
+
+    expect(recordPrebidRefresh).toHaveBeenCalledTimes(1);
+    expect(recordPrebidRefresh).toHaveBeenCalledWith([slot]);
+    expect(recordPrebidRefresh.mock.invocationCallOrder[0]).toBeLessThan(
+      originalRefresh.mock.invocationCallOrder[0]
+    );
+    expect(originalRefresh).toHaveBeenCalledTimes(1);
+    expect(originalRefresh).toHaveBeenCalledWith([slot], undefined);
+  });
+
+  it('records a completed synthetic refresh immediately before its GPT request', () => {
+    const slot = {
+      getSlotElementId: () => 'example-synthetic-marker',
+      getTargeting: () => [],
+      clearTargeting: vi.fn(),
+    };
+    const recordPrebidRefresh = installPrebidRefreshDiagnostics();
+    const { originalRefresh, pubads } = installGpt([slot]);
+    mockRequestBids.mockImplementation((opts) => completePublisherAuction(opts));
+    installPrebidNpm();
+
+    pubads.refresh([slot]);
+
+    expect(recordPrebidRefresh).toHaveBeenCalledTimes(1);
+    expect(recordPrebidRefresh).toHaveBeenCalledWith([slot]);
+    expect(recordPrebidRefresh.mock.invocationCallOrder[0]).toBeLessThan(
+      originalRefresh.mock.invocationCallOrder[0]
+    );
+    expect(originalRefresh).toHaveBeenCalledTimes(1);
+    expect(originalRefresh).toHaveBeenCalledWith([slot], undefined);
+  });
+
+  it('records every slot in a mixed SRA refresh before its GPT request', () => {
+    const deliverySlot = {
+      getSlotElementId: () => 'example-mixed-delivery-marker',
+      getTargeting: () => [],
+      clearTargeting: vi.fn(),
+    };
+    const independentSlot = {
+      getSlotElementId: () => 'example-mixed-independent-marker',
+      getTargeting: () => [],
+      clearTargeting: vi.fn(),
+    };
+    const targetSlots = [deliverySlot, independentSlot];
+    const recordPrebidRefresh = installPrebidRefreshDiagnostics();
+    const { originalRefresh, pubads } = installGpt(targetSlots);
+    mockRequestBids.mockImplementation((opts) => completePublisherAuction(opts));
+    const pbjs = installPrebidNpm();
+
+    pbjs.requestBids({
+      adUnits: [
+        {
+          code: 'example-mixed-delivery-marker',
+          bids: [{ bidder: 'exampleServer', params: {} }],
+        },
+      ],
+      bidsBackHandler: () => pubads.refresh(targetSlots),
+    } as unknown as RequestBidsArg);
+
+    expect(recordPrebidRefresh).toHaveBeenCalledTimes(1);
+    expect(recordPrebidRefresh).toHaveBeenCalledWith(targetSlots);
+    expect(recordPrebidRefresh.mock.calls[0][0][0]).toBe(deliverySlot);
+    expect(recordPrebidRefresh.mock.calls[0][0][1]).toBe(independentSlot);
+    expect(recordPrebidRefresh.mock.invocationCallOrder[0]).toBeLessThan(
+      originalRefresh.mock.invocationCallOrder[0]
+    );
+    expect(originalRefresh).toHaveBeenCalledTimes(1);
+    expect(originalRefresh).toHaveBeenCalledWith(targetSlots, undefined);
+  });
+
+  it('records one synthetic timeout fallback before one GPT request', () => {
+    vi.useFakeTimers();
+    try {
+      const slot = {
+        getSlotElementId: () => 'example-timeout-marker',
+        getTargeting: () => [],
+        clearTargeting: vi.fn(),
+      };
+      const recordPrebidRefresh = installPrebidRefreshDiagnostics();
+      const { originalRefresh, pubads } = installGpt([slot]);
+      mockRequestBids.mockImplementation(() => undefined);
+      installPrebidNpm();
+
+      pubads.refresh([slot]);
+      expect(recordPrebidRefresh).not.toHaveBeenCalled();
+      expect(originalRefresh).not.toHaveBeenCalled();
+
+      vi.advanceTimersByTime(640);
+
+      expect(recordPrebidRefresh).toHaveBeenCalledTimes(1);
+      expect(recordPrebidRefresh).toHaveBeenCalledWith([slot]);
+      expect(recordPrebidRefresh.mock.invocationCallOrder[0]).toBeLessThan(
+        originalRefresh.mock.invocationCallOrder[0]
+      );
+      expect(originalRefresh).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.runOnlyPendingTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it('records a caught synthetic auction failure before one GPT fallback request', () => {
+    const slot = {
+      getSlotElementId: () => 'example-failure-marker',
+      getTargeting: () => [],
+      clearTargeting: vi.fn(),
+    };
+    const recordPrebidRefresh = installPrebidRefreshDiagnostics();
+    const { originalRefresh, pubads } = installGpt([slot]);
+    mockRequestBids.mockImplementation(() => {
+      throw new Error('example auction failure');
+    });
+    installPrebidNpm();
+
+    pubads.refresh([slot]);
+
+    expect(recordPrebidRefresh).toHaveBeenCalledTimes(1);
+    expect(recordPrebidRefresh).toHaveBeenCalledWith([slot]);
+    expect(recordPrebidRefresh.mock.invocationCallOrder[0]).toBeLessThan(
+      originalRefresh.mock.invocationCallOrder[0]
+    );
+    expect(originalRefresh).toHaveBeenCalledTimes(1);
+    expect(originalRefresh).toHaveBeenCalledWith([slot], undefined);
+  });
+
+  it('does not record or refresh again for a late callback after timeout', () => {
+    vi.useFakeTimers();
+    try {
+      const slot = {
+        getSlotElementId: () => 'example-late-marker',
+        getTargeting: () => [],
+        clearTargeting: vi.fn(),
+      };
+      const recordPrebidRefresh = installPrebidRefreshDiagnostics();
+      const { originalRefresh, pubads } = installGpt([slot]);
+      let bidsBackHandler: (() => void) | undefined;
+      mockRequestBids.mockImplementation((opts) => {
+        bidsBackHandler = opts.bidsBackHandler;
+      });
+      installPrebidNpm();
+
+      pubads.refresh([slot]);
+      vi.advanceTimersByTime(640);
+      bidsBackHandler?.();
+
+      expect(recordPrebidRefresh).toHaveBeenCalledTimes(1);
+      expect(recordPrebidRefresh).toHaveBeenCalledWith([slot]);
+      expect(recordPrebidRefresh.mock.invocationCallOrder[0]).toBeLessThan(
+        originalRefresh.mock.invocationCallOrder[0]
+      );
+      expect(originalRefresh).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.runOnlyPendingTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not record an adInit refresh bypass', () => {
+    const slot = {
+      getSlotElementId: () => 'example-adinit-marker-bypass',
+      getTargeting: () => [],
+      clearTargeting: vi.fn(),
+    };
+    const recordPrebidRefresh = vi.fn();
+    testWindow.tsjs = {
+      adInitRefreshInProgress: true,
+      gptDiagnostics: { recordPrebidRefresh },
+    };
+    const { originalRefresh, pubads } = installGpt([slot]);
+
+    pubads.refresh([slot]);
+
+    expect(recordPrebidRefresh).not.toHaveBeenCalled();
+    expect(mockRequestBids).not.toHaveBeenCalled();
+    expect(originalRefresh).toHaveBeenCalledTimes(1);
+    expect(originalRefresh).toHaveBeenCalledWith([slot], undefined);
+  });
+
+  it('does not record empty or invalid refresh passthroughs', () => {
+    const slot = {
+      getSlotElementId: () => 'example-invalid-marker-bypass',
+      getTargeting: () => [],
+      clearTargeting: vi.fn(),
+    };
+    const recordPrebidRefresh = installPrebidRefreshDiagnostics();
+    const { originalRefresh, pubads } = installGpt([slot]);
+    const invalidSlots = [slot, null];
+
+    pubads.refresh([]);
+    pubads.refresh(invalidSlots);
+
+    expect(recordPrebidRefresh).not.toHaveBeenCalled();
+    expect(mockRequestBids).not.toHaveBeenCalled();
+    expect(originalRefresh).toHaveBeenCalledTimes(2);
+    expect(originalRefresh).toHaveBeenNthCalledWith(1, [], undefined);
+    expect(originalRefresh).toHaveBeenNthCalledWith(2, invalidSlots, undefined);
+  });
+
+  it('does not record a bare refresh when GPT cannot resolve its slot list', () => {
+    const recordPrebidRefresh = installPrebidRefreshDiagnostics();
+    const originalRefresh = vi.fn();
+    const pubads = { refresh: originalRefresh };
+    testWindow.googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    installRefreshHandler(640);
+
+    pubads.refresh();
+
+    expect(recordPrebidRefresh).not.toHaveBeenCalled();
+    expect(mockRequestBids).not.toHaveBeenCalled();
+    expect(originalRefresh).toHaveBeenCalledTimes(1);
+    expect(originalRefresh).toHaveBeenCalledWith(undefined, undefined);
+  });
+
+  it('does not record while a synthetic refresh is still waiting for its auction', () => {
+    vi.useFakeTimers();
+    try {
+      const slot = {
+        getSlotElementId: () => 'example-waiting-marker',
+        getTargeting: () => [],
+        clearTargeting: vi.fn(),
+      };
+      const recordPrebidRefresh = installPrebidRefreshDiagnostics();
+      const { originalRefresh, pubads } = installGpt([slot]);
+      let bidsBackHandler: (() => void) | undefined;
+      mockRequestBids.mockImplementation((opts) => {
+        bidsBackHandler = opts.bidsBackHandler;
+      });
+      installPrebidNpm();
+
+      pubads.refresh([slot]);
+
+      expect(recordPrebidRefresh).not.toHaveBeenCalled();
+      expect(originalRefresh).not.toHaveBeenCalled();
+
+      bidsBackHandler?.();
+      expect(recordPrebidRefresh).toHaveBeenCalledTimes(1);
+      expect(recordPrebidRefresh.mock.invocationCallOrder[0]).toBeLessThan(
+        originalRefresh.mock.invocationCallOrder[0]
+      );
+    } finally {
+      vi.runOnlyPendingTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it('still refreshes with unchanged arguments when diagnostics throws', () => {
+    const slot = {
+      getSlotElementId: () => 'example-throwing-marker',
+      getTargeting: () => [],
+      clearTargeting: vi.fn(),
+    };
+    const refreshOptions = { changeCorrelator: false };
+    const recordPrebidRefresh = installPrebidRefreshDiagnostics(() => {
+      throw new Error('example diagnostics failure');
+    });
+    const { originalRefresh, pubads } = installGpt([slot]);
+    mockRequestBids.mockImplementation((opts) => completePublisherAuction(opts));
+    installPrebidNpm();
+
+    pubads.refresh([slot], refreshOptions);
+
+    expect(recordPrebidRefresh).toHaveBeenCalledTimes(1);
+    expect(recordPrebidRefresh).toHaveBeenCalledWith([slot]);
+    expect(recordPrebidRefresh.mock.invocationCallOrder[0]).toBeLessThan(
+      originalRefresh.mock.invocationCallOrder[0]
+    );
+    expect(originalRefresh).toHaveBeenCalledTimes(1);
+    expect(originalRefresh).toHaveBeenCalledWith([slot], refreshOptions);
+  });
+
   it('recovers inline params, ordered client bids, and zone when pbjs.adUnits is empty', () => {
     testWindow.__tsjs_prebid = { clientSideBidders: ['exampleBrowser'] };
     const runtimeInstance = 'example-runtime-instance';

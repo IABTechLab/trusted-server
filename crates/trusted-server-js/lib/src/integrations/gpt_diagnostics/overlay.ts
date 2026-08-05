@@ -128,16 +128,65 @@ function formatMilliseconds(value: number | undefined): string | undefined {
 
 function deliveryFact(cycle: GptDiagnosticsRequestCycle): string | undefined {
   switch (cycle.delivery) {
-    case 'trusted_server':
-      return 'Trusted Server creative rendered — it requested its markup';
-    case 'other_demand':
-      return 'Other Ad Manager demand rendered — no Trusted Server creative ran';
+    case 'trusted_server_response_sent':
+      return 'Trusted Server selected; markup response sent to PUC';
+    case 'trusted_server_selected':
+      return 'Trusted Server selected; no markup response confirmed';
+    case 'candidate_unconfirmed':
+      return 'Trusted Server candidate unconfirmed — another GAM result or a creative/bridge failure is possible';
     case 'no_candidate':
-      return 'No Trusted Server candidate on this slot';
+      return 'adInit observed no direct Trusted Server candidate for this request';
+    case 'unknown':
+      return 'Delivery status unknown — required GPT or direct-candidate evidence was not observed';
     case 'pending':
-      return 'Trusted Server candidate — waiting for the creative';
+      return 'Waiting for Trusted Server creative evidence';
+    case 'not_applicable':
+      return undefined;
     default:
       return undefined;
+  }
+}
+
+function requestPathFact(cycle: GptDiagnosticsRequestCycle): string {
+  switch (cycle.requestPath) {
+    case 'trusted_server_direct':
+      return 'Request path: Trusted Server direct';
+    case 'prebid_refresh':
+      return 'Request path: Prebid refresh';
+    case 'competing':
+      return 'Request path: Competing paths';
+    case 'unattributed':
+      return 'Request path: Unattributed';
+    default:
+      return 'Request path: Unknown (not observed)';
+  }
+}
+
+function trustedServerOpportunityFact(cycle: GptDiagnosticsRequestCycle): string {
+  switch (cycle.trustedServerOpportunity) {
+    case 'renderable_candidate':
+      return 'Direct opportunity: Renderable candidate';
+    case 'unrenderable_candidate':
+      return 'Direct opportunity: Unrenderable candidate';
+    case 'no_candidate':
+      return 'Direct opportunity: No candidate';
+    default:
+      return 'Direct opportunity: Unknown (not observed)';
+  }
+}
+
+function creativeFailureFact(
+  failure: NonNullable<GptDiagnosticsRequestCycle['trustedServerCreativeFailures']>[number]
+): string {
+  switch (failure) {
+    case 'missing_render_source':
+      return 'Creative bridge failure: missing render source';
+    case 'cache_fetch_failed':
+      return 'Creative bridge failure: cache fetch failed';
+    case 'invalid_cache_payload':
+      return 'Creative bridge failure: invalid cache payload';
+    case 'response_post_failed':
+      return 'Creative bridge failure: response post failed';
   }
 }
 
@@ -160,26 +209,40 @@ function adManagerFact(cycle: GptDiagnosticsRequestCycle): string | undefined {
 
 function responseClassFact(cycle: GptDiagnosticsRequestCycle): string | undefined {
   switch (cycle.responseClass) {
+    case 'empty':
+      return 'Ad Manager response class: empty';
+    case 'backfill':
+      return 'Ad Manager response class: backfill';
     case 'reservation':
       return 'Ad Manager reservation line item';
     case 'unclassified_non_empty':
-      return 'Filled without Ad Manager identifiers — default, backup, or another service';
+      return 'Ad Manager response class: unclassified non-empty';
     default:
       return undefined;
   }
 }
 
 function cycleFacts(cycle: GptDiagnosticsRequestCycle): string[] {
-  const facts: string[] = [];
+  const facts: string[] = [requestPathFact(cycle), trustedServerOpportunityFact(cycle)];
+  const creativeRequestAt = formatMilliseconds(cycle.trustedServerCreativeRequestAtMs);
+  if (creativeRequestAt) {
+    facts.push(`Trusted Server creative request observed at ${creativeRequestAt}`);
+  }
+  const creativeResponseAt = formatMilliseconds(cycle.trustedServerCreativeResponseAtMs);
+  if (creativeResponseAt) {
+    facts.push(`Trusted Server markup response sent at ${creativeResponseAt}`);
+  }
+  for (const failure of new Set(cycle.trustedServerCreativeFailures ?? [])) {
+    facts.push(creativeFailureFact(failure));
+  }
   const deliveryLine = deliveryFact(cycle);
   if (deliveryLine) facts.push(deliveryLine);
   const responseClassLine = responseClassFact(cycle);
   if (responseClassLine) facts.push(responseClassLine);
   const adManagerLine = adManagerFact(cycle);
   if (adManagerLine) facts.push(adManagerLine);
-  if (cycle.loadAtMs !== undefined) facts.push('Loaded');
-  else if (cycle.isEmpty === false) facts.push('Load not observed');
-  if (cycle.viewableAtMs !== undefined) facts.push('Viewable');
+  if (cycle.loadAtMs !== undefined) facts.push('GPT slot onload observed');
+  if (cycle.viewableAtMs !== undefined) facts.push('GPT impressionViewable observed');
   if (cycle.incompleteSequence) facts.push('Incomplete sequence');
   if (cycle.size) facts.push(`Rendered size ${cycle.size[0]}×${cycle.size[1]}`);
   if (cycle.isBackfill !== undefined) facts.push(`Backfill ${cycle.isBackfill ? 'yes' : 'no'}`);
@@ -464,7 +527,7 @@ export class GptDiagnosticsOverlay {
 
     const summary = this.document.createElement('div');
     summary.className = 'tsgd-summary';
-    summary.textContent = `${snapshot.slots.length} slots · ${snapshot.callbackIssues.length} callback issues`;
+    summary.textContent = `${snapshot.slots.length} slots · ${snapshot.callbackIssues.length} callback issues · ${snapshot.attributionIssues.length} attribution issues`;
     const coverage = this.document.createElement('ul');
     coverage.className = 'tsgd-coverage';
     for (const [kind, counters] of Object.entries(snapshot.coverage)) {

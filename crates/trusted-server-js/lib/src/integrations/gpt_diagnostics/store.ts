@@ -1,28 +1,33 @@
 import type {
   GptDiagnosticsAdManagerIdentity,
+  GptDiagnosticsAttributionIssue,
+  GptDiagnosticsAttributionIssueReason,
   GptDiagnosticsCallbackDisposition,
   GptDiagnosticsCallbackIssue,
   GptDiagnosticsCallbackKind,
   GptDiagnosticsCoverageCounters,
+  GptDiagnosticsCreativeFailure,
   GptDiagnosticsDelivery,
   GptDiagnosticsDurations,
   GptDiagnosticsRequestCycle,
+  GptDiagnosticsRequestPath,
   GptDiagnosticsResponseClass,
+  GptDiagnosticsTrustedServerOpportunity,
   Size,
 } from '../../core/types';
 
 export const MAX_DIAGNOSTIC_SLOTS = 64;
 export const MAX_REQUEST_CYCLES_PER_SLOT = 10;
 export const MAX_CALLBACK_ISSUES = 128;
-export const MAX_TRUSTED_SERVER_CANDIDATE_SLOTS = 64;
+export const MAX_TRUSTED_SERVER_ASSOCIATIONS = 64;
+export const CREATIVE_ATTEMPT_WINDOW_MS = 30_000;
+export const MAX_CREATIVE_ATTEMPTS = 128;
+export const MAX_ATTRIBUTION_ISSUES = 128;
 
-/**
- * How long a filled Trusted Server candidate waits for its creative to request
- * markup before the cycle is reported as other Ad Manager demand.
- *
- * The Prebid Universal Creative requests markup as soon as Ad Manager writes it
- * into the slot. A later claim still upgrades the cycle.
- */
+/** How long request-path evidence remains eligible for the next GPT request. */
+export const REQUEST_PATH_ATTRIBUTION_WINDOW_MS = 5_000;
+
+/** How long an explicit non-empty render with an opportunity waits for creative evidence. */
 export const TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS = 5_000;
 
 const CALLBACK_KINDS: GptDiagnosticsCallbackKind[] = [
@@ -65,9 +70,11 @@ export interface GptDiagnosticsStoreSnapshot {
   gptObserved: boolean;
   slots: GptDiagnosticsStoreSlotSnapshot[];
   callbackIssues: GptDiagnosticsCallbackIssue[];
+  attributionIssues: GptDiagnosticsAttributionIssue[];
   coverage: Record<GptDiagnosticsCallbackKind, GptDiagnosticsCoverageCounters>;
   metadata: {
     droppedCallbacks: number;
+    droppedAttributionIssues: number;
     evictedSlots: number;
     evictedRequestCycles: number;
   };
@@ -87,9 +94,30 @@ interface MutableSlotRecord {
 interface StoreOptions {
   now?: () => number;
   schedule?: (callback: () => void) => void;
-  /** Deferred re-notification, used only to close an attribution window. */
+  /** Deferred marker cleanup and diagnostic-window re-notification. */
   defer?: (callback: () => void, delayMs: number) => void;
 }
+
+interface PendingMarker<T> {
+  generation: number;
+  recordedAtMs: number;
+  value: T;
+}
+
+type AttemptStatus = 'live' | 'completed' | 'expired' | 'evicted';
+
+interface CreativeAttemptRecord {
+  id: number;
+  cycle?: MutableRequestCycle;
+  runtimeSlotNumber?: number;
+  slotElementId?: string;
+  requestedAtMs: number;
+  expiresAtMs: number;
+  provisionalBeforeRender: boolean;
+  status: AttemptStatus;
+}
+
+type AttributionIdentity = Partial<Pick<MutableSlotRecord, 'runtimeSlotNumber' | 'slotElementId'>>;
 
 type StoreListener = () => void;
 
@@ -110,6 +138,29 @@ function optionalNonEmptyString(read: (() => string) | undefined): string | unde
   } catch {
     return undefined;
   }
+}
+
+function isSlotObject(slot: unknown): slot is GptDiagnosticsSlotLike & object {
+  return typeof slot === 'object' && slot !== null;
+}
+
+function isTrustedServerOpportunity(
+  opportunity: unknown
+): opportunity is GptDiagnosticsTrustedServerOpportunity {
+  return (
+    opportunity === 'renderable_candidate' ||
+    opportunity === 'unrenderable_candidate' ||
+    opportunity === 'no_candidate'
+  );
+}
+
+function isCreativeFailure(reason: unknown): reason is GptDiagnosticsCreativeFailure {
+  return (
+    reason === 'missing_render_source' ||
+    reason === 'cache_fetch_failed' ||
+    reason === 'invalid_cache_payload' ||
+    reason === 'response_post_failed'
+  );
 }
 
 function validDuration(start: number | undefined, end: number | undefined): number | undefined {
@@ -139,6 +190,7 @@ function derivedDurations(cycle: MutableRequestCycle): GptDiagnosticsDurations {
 function responseClass(cycle: MutableRequestCycle): GptDiagnosticsResponseClass | undefined {
   if (cycle.renderAtMs === undefined) return undefined;
   if (cycle.isEmpty === true) return 'empty';
+  if (cycle.isEmpty !== false) return undefined;
   if (cycle.isBackfill === true) return 'backfill';
   return cycle.adManager?.lineItemId !== undefined ||
     cycle.adManager?.creativeId !== undefined ||
@@ -147,20 +199,18 @@ function responseClass(cycle: MutableRequestCycle): GptDiagnosticsResponseClass 
     : 'unclassified_non_empty';
 }
 
-/**
- * Resolve who delivered the ad from observed evidence only.
- *
- * A claim proves Ad Manager selected the Trusted Server creative, because no
- * other creative asks Trusted Server for markup. Absence of a claim proves the
- * opposite only once the attribution window has elapsed, and only for a slot
- * Trusted Server actually had a candidate on.
- */
+/** Resolve delivery state from positive observations without guessing ownership. */
 function delivery(cycle: MutableRequestCycle, nowMs: number): GptDiagnosticsDelivery {
-  if (cycle.trustedServerClaimAtMs !== undefined) return 'trusted_server';
-  if (cycle.renderAtMs === undefined || cycle.isEmpty !== false) return 'not_applicable';
-  if (!cycle.trustedServerCandidate) return 'no_candidate';
+  if (cycle.trustedServerCreativeResponseAtMs !== undefined) {
+    return 'trusted_server_response_sent';
+  }
+  if (cycle.trustedServerCreativeRequestAtMs !== undefined) return 'trusted_server_selected';
+  if (cycle.renderAtMs === undefined || cycle.isEmpty === true) return 'not_applicable';
+  if (cycle.isEmpty !== false) return 'unknown';
+  if (cycle.trustedServerOpportunity === 'no_candidate') return 'no_candidate';
+  if (cycle.trustedServerOpportunity === undefined) return 'unknown';
   return nowMs - cycle.renderAtMs >= TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS
-    ? 'other_demand'
+    ? 'candidate_unconfirmed'
     : 'pending';
 }
 
@@ -169,35 +219,55 @@ function copyCycle(cycle: MutableRequestCycle, nowMs: number): GptDiagnosticsReq
     ...cycle,
     durations: derivedDurations(cycle),
     size: cycle.size ? ([...cycle.size] as Size) : undefined,
-    adManager: cycle.adManager ? { ...cycle.adManager } : undefined,
+    adManager: cycle.adManager
+      ? {
+          ...cycle.adManager,
+          yieldGroupIds: cycle.adManager.yieldGroupIds
+            ? [...cycle.adManager.yieldGroupIds]
+            : undefined,
+          companyIds: cycle.adManager.companyIds ? [...cycle.adManager.companyIds] : undefined,
+        }
+      : undefined,
+    trustedServerCreativeFailures: cycle.trustedServerCreativeFailures
+      ? [...cycle.trustedServerCreativeFailures]
+      : undefined,
     responseClass: responseClass(cycle),
     delivery: delivery(cycle, nowMs),
   };
 }
 
-/** Bounded store for facts observed directly from GPT callbacks. */
+/** Bounded store for facts observed from GPT callbacks and diagnostics integration bridges. */
 export class GptDiagnosticsStore {
   private readonly now: () => number;
   private readonly schedule: (callback: () => void) => void;
   private readonly defer: (callback: () => void, delayMs: number) => void;
   /** Auction slot ID → GPT slot, established by the Trusted Server integration. */
   private readonly trustedServerSlots = new Map<string, GptDiagnosticsSlotLike>();
-  /** Slots carrying Trusted Server targeting that has not yet been requested. */
-  private readonly pendingCandidates = new WeakSet<object>();
+  private readonly pendingTrustedServerOpportunities = new WeakMap<
+    object,
+    PendingMarker<GptDiagnosticsTrustedServerOpportunity>
+  >();
+  private readonly pendingPrebidRefreshes = new WeakMap<object, PendingMarker<true>>();
   private readonly slotNumbers = new WeakMap<object, number>();
   private readonly requestNumbers = new WeakMap<object, number>();
+  private readonly attemptIdsByCycle = new WeakMap<MutableRequestCycle, number>();
+  private readonly creativeAttempts = new Map<number, CreativeAttemptRecord>();
   private readonly slots = new Map<number, MutableSlotRecord>();
   private readonly slotOrder: number[] = [];
   private readonly slotActivityOrder: number[] = [];
   private readonly listeners = new Set<StoreListener>();
   private readonly coverage = emptyCoverage();
   private readonly callbackIssues: GptDiagnosticsCallbackIssue[] = [];
+  private readonly attributionIssues: GptDiagnosticsAttributionIssue[] = [];
   private readonly metadata = {
     droppedCallbacks: 0,
+    droppedAttributionIssues: 0,
     evictedSlots: 0,
     evictedRequestCycles: 0,
   };
   private nextRuntimeSlotNumber = 1;
+  private nextMarkerGeneration = 1;
+  private nextCreativeAttemptId = 1;
   private notificationScheduled = false;
   private gptObserved = false;
 
@@ -207,77 +277,216 @@ export class GptDiagnosticsStore {
     this.defer = options.defer ?? ((callback, delayMs) => setTimeout(callback, delayMs));
   }
 
-  /**
-   * Associate a GPT slot with the auction slot whose targeting Trusted Server
-   * applied to it.
-   *
-   * The association is keyed by GPT slot object identity, the same key every
-   * other correlation in this store uses, so no element ID is guessed.
-   */
-  recordTrustedServerCandidate(slot: GptDiagnosticsSlotLike, auctionSlotId: string): void {
-    if (!slot || typeof auctionSlotId !== 'string' || auctionSlotId.length === 0) return;
+  /** Record Trusted Server's opportunity evidence for a GPT slot's next request. */
+  recordTrustedServerOpportunity(
+    slot: GptDiagnosticsSlotLike,
+    auctionSlotId: string,
+    opportunity: GptDiagnosticsTrustedServerOpportunity
+  ): void {
+    if (
+      !isSlotObject(slot) ||
+      typeof auctionSlotId !== 'string' ||
+      auctionSlotId.length === 0 ||
+      !isTrustedServerOpportunity(opportunity)
+    ) {
+      return;
+    }
 
     this.trustedServerSlots.delete(auctionSlotId);
     this.trustedServerSlots.set(auctionSlotId, slot);
-    while (this.trustedServerSlots.size > MAX_TRUSTED_SERVER_CANDIDATE_SLOTS) {
+    while (this.trustedServerSlots.size > MAX_TRUSTED_SERVER_ASSOCIATIONS) {
       const oldest = this.trustedServerSlots.keys().next().value;
       if (oldest === undefined) break;
       this.trustedServerSlots.delete(oldest);
     }
 
-    const record = this.slots.get(this.slotNumbers.get(slot) ?? -1);
-    const pending = record?.requests[record.requests.length - 1];
-    // A candidate declared before the request cycle exists is carried by the
-    // association above and applied when the cycle opens.
-    if (pending && pending.renderAtMs === undefined) {
-      pending.trustedServerCandidate = true;
-      this.notify();
-    }
-    this.pendingCandidates.add(slot);
+    this.installMarker(this.pendingTrustedServerOpportunities, slot, opportunity);
   }
 
-  /**
-   * Record that the rendered creative requested its markup from Trusted Server.
-   *
-   * Attributed to the auction slot's most recent rendered cycle. An unknown
-   * slot or a cycle that never rendered is preserved as an issue rather than
-   * attached to a guess.
-   */
-  recordTrustedServerClaim(auctionSlotId: string): void {
+  /** Mark GPT slots whose next request follows a Prebid-controlled refresh. */
+  recordPrebidRefresh(slots: GptDiagnosticsSlotLike[]): void {
+    if (!Array.isArray(slots)) return;
+
+    for (const slot of slots) {
+      if (!isSlotObject(slot)) continue;
+      this.installMarker(this.pendingPrebidRefreshes, slot, true);
+    }
+  }
+
+  /** Record a creative markup request against the associated current GPT cycle. */
+  recordTrustedServerCreativeRequest(auctionSlotId: string): number | undefined {
     const timestampMs = this.now();
+    this.expireCreativeAttempts(timestampMs);
+
+    if (typeof auctionSlotId !== 'string' || auctionSlotId.length === 0) {
+      this.reportAttributionIssue('creative_request_without_slot', timestampMs);
+      return undefined;
+    }
+
     const slot = this.trustedServerSlots.get(auctionSlotId);
-    const record = slot ? this.slots.get(this.slotNumbers.get(slot) ?? -1) : undefined;
-    if (!record) {
-      this.addIssue(
-        'slotRenderEnded',
-        { runtimeSlotNumber: 0 },
-        timestampMs,
-        'unmatched',
-        'trusted_server_claim_without_slot'
-      );
-      this.notify();
-      return;
+    if (!slot) {
+      this.reportAttributionIssue('creative_request_without_slot', timestampMs);
+      return undefined;
     }
 
-    const candidates = record.requests.filter(
-      (cycle) => cycle.isEmpty === false && cycle.trustedServerClaimAtMs === undefined
+    const identity = this.attributionIdentity(slot);
+    const runtimeSlotNumber = this.slotNumbers.get(slot);
+    const record = runtimeSlotNumber === undefined ? undefined : this.slots.get(runtimeSlotNumber);
+    if (!record || record.requests.length === 0) {
+      this.reportAttributionIssue('creative_request_without_cycle', timestampMs, identity);
+      return undefined;
+    }
+
+    const cycle = record.requests.reduce((greatest, candidate) =>
+      candidate.requestNumber > greatest.requestNumber ? candidate : greatest
     );
-    if (candidates.length !== 1) {
-      this.addIssue(
-        'slotRenderEnded',
-        record,
+    const existingAttemptId = this.attemptIdsByCycle.get(cycle);
+    if (existingAttemptId !== undefined) {
+      if (cycle.trustedServerCreativeResponseAtMs !== undefined) return undefined;
+
+      const existingAttempt = this.creativeAttempts.get(existingAttemptId);
+      if (!existingAttempt) {
+        this.reportAttributionIssue('creative_attempt_unknown', timestampMs, identity);
+        return undefined;
+      }
+      if (existingAttempt.status === 'live') return existingAttempt.id;
+      if (existingAttempt.status === 'completed') return undefined;
+
+      this.reportAttributionIssue(
+        existingAttempt.status === 'expired'
+          ? 'creative_attempt_expired'
+          : 'creative_attempt_evicted',
         timestampMs,
-        candidates.length === 0 ? 'unmatched' : 'ambiguous',
-        candidates.length === 0
-          ? 'trusted_server_claim_without_render'
-          : 'trusted_server_claim_ambiguous_cycle'
+        existingAttempt
       );
-      this.notify();
+      return undefined;
+    }
+    if (cycle.trustedServerCreativeResponseAtMs !== undefined) return undefined;
+
+    const retainedCreativeRequestAtMs = cycle.trustedServerCreativeRequestAtMs;
+    if (
+      retainedCreativeRequestAtMs !== undefined &&
+      Number.isFinite(retainedCreativeRequestAtMs) &&
+      timestampMs - retainedCreativeRequestAtMs >= CREATIVE_ATTEMPT_WINDOW_MS
+    ) {
+      this.reportAttributionIssue('creative_attempt_expired', timestampMs, identity);
+      return undefined;
+    }
+
+    const requestedAtMs = cycle.requestedAtMs;
+    if (
+      !Number.isFinite(timestampMs) ||
+      requestedAtMs === undefined ||
+      !Number.isFinite(requestedAtMs) ||
+      timestampMs - requestedAtMs > CREATIVE_ATTEMPT_WINDOW_MS ||
+      cycle.isEmpty === true
+    ) {
+      this.reportAttributionIssue('creative_request_without_cycle', timestampMs, identity);
+      return undefined;
+    }
+
+    const provisionalBeforeRender = cycle.renderAtMs === undefined;
+    if (
+      provisionalBeforeRender &&
+      record.requests.some(
+        (candidate) =>
+          candidate !== cycle &&
+          candidate.requestNumber < cycle.requestNumber &&
+          candidate.isEmpty === false &&
+          candidate.requestedAtMs !== undefined &&
+          Number.isFinite(candidate.requestedAtMs) &&
+          timestampMs - candidate.requestedAtMs <= CREATIVE_ATTEMPT_WINDOW_MS
+      )
+    ) {
+      this.reportAttributionIssue('creative_request_ambiguous_cycle', timestampMs, identity);
+      return undefined;
+    }
+
+    cycle.trustedServerCreativeRequestAtMs ??= timestampMs;
+    if (!this.ensureCreativeAttemptCapacity()) {
+      this.reportAttributionIssue('creative_attempt_capacity', timestampMs, identity);
+      return undefined;
+    }
+
+    const id = this.nextCreativeAttemptId;
+    this.nextCreativeAttemptId += 1;
+    const creativeRequestedAtMs = cycle.trustedServerCreativeRequestAtMs;
+    const attempt: CreativeAttemptRecord = {
+      id,
+      cycle,
+      runtimeSlotNumber: record.runtimeSlotNumber,
+      slotElementId: record.slotElementId,
+      requestedAtMs: creativeRequestedAtMs,
+      expiresAtMs: creativeRequestedAtMs + CREATIVE_ATTEMPT_WINDOW_MS,
+      provisionalBeforeRender,
+      status: 'live',
+    };
+    this.creativeAttempts.set(id, attempt);
+    this.attemptIdsByCycle.set(cycle, id);
+    this.notify();
+    return id;
+  }
+
+  /** Record that a creative attempt successfully posted markup. */
+  recordTrustedServerCreativeResponse(attemptId: number): void {
+    const timestampMs = this.now();
+    this.expireCreativeAttempts(timestampMs);
+    const attempt = this.creativeAttempts.get(attemptId);
+    if (!attempt) {
+      this.reportAttributionIssue('creative_attempt_unknown', timestampMs);
+      return;
+    }
+    if (attempt.status === 'completed') return;
+    if (attempt.status !== 'live') {
+      this.reportAttributionIssue(
+        attempt.status === 'expired' ? 'creative_attempt_expired' : 'creative_attempt_evicted',
+        timestampMs,
+        attempt
+      );
+      return;
+    }
+    if (!attempt.cycle) {
+      this.reportAttributionIssue('creative_attempt_unknown', timestampMs, attempt);
       return;
     }
 
-    candidates[0].trustedServerClaimAtMs = timestampMs;
-    candidates[0].trustedServerCandidate = true;
+    attempt.cycle.trustedServerCreativeResponseAtMs ??= timestampMs;
+    attempt.status = 'completed';
+    attempt.cycle = undefined;
+    this.notify();
+  }
+
+  /** Record one safe, non-terminal creative failure category. */
+  recordTrustedServerCreativeFailure(
+    attemptId: number,
+    reason: GptDiagnosticsCreativeFailure
+  ): void {
+    if (!isCreativeFailure(reason)) return;
+
+    const timestampMs = this.now();
+    this.expireCreativeAttempts(timestampMs);
+    const attempt = this.creativeAttempts.get(attemptId);
+    if (!attempt) {
+      this.reportAttributionIssue('creative_attempt_unknown', timestampMs);
+      return;
+    }
+    if (attempt.status === 'completed') return;
+    if (attempt.status !== 'live') {
+      this.reportAttributionIssue(
+        attempt.status === 'expired' ? 'creative_attempt_expired' : 'creative_attempt_evicted',
+        timestampMs,
+        attempt
+      );
+      return;
+    }
+    if (!attempt.cycle) {
+      this.reportAttributionIssue('creative_attempt_unknown', timestampMs, attempt);
+      return;
+    }
+
+    const failures = (attempt.cycle.trustedServerCreativeFailures ??= []);
+    if (failures.includes(reason)) return;
+    failures.push(reason);
     this.notify();
   }
 
@@ -298,20 +507,35 @@ export class GptDiagnosticsStore {
     if (!record) return;
 
     if (record.requests.length >= MAX_REQUEST_CYCLES_PER_SLOT) {
+      const evictedCycle = record.requests[0];
+      if (evictedCycle) this.evictCreativeAttempt(evictedCycle);
       record.requests.shift();
       this.metadata.evictedRequestCycles += 1;
     }
 
     const requestNumber = (this.requestNumbers.get(slot) ?? 0) + 1;
     this.requestNumbers.set(slot, requestNumber);
-    const trustedServerCandidate = this.pendingCandidates.has(slot);
-    this.pendingCandidates.delete(slot);
+    const trustedServerOpportunity = this.consumeMarker(
+      this.pendingTrustedServerOpportunities,
+      slot,
+      timestampMs
+    );
+    const prebidRefresh = this.consumeMarker(this.pendingPrebidRefreshes, slot, timestampMs);
+    const requestPath: GptDiagnosticsRequestPath =
+      trustedServerOpportunity !== undefined && prebidRefresh
+        ? 'competing'
+        : trustedServerOpportunity !== undefined
+          ? 'trusted_server_direct'
+          : prebidRefresh
+            ? 'prebid_refresh'
+            : 'unattributed';
     record.requests.push({
       requestNumber,
       requestedAtMs: timestampMs,
       durations: {},
       incompleteSequence: false,
-      ...(trustedServerCandidate ? { trustedServerCandidate: true } : {}),
+      requestPath,
+      ...(trustedServerOpportunity !== undefined ? { trustedServerOpportunity } : {}),
     });
     this.incrementDisposition('slotRequested', 'matched');
     this.notify();
@@ -351,6 +575,8 @@ export class GptDiagnosticsStore {
       timestampMs,
       (cycle) => cycle.renderAtMs === undefined,
       (record, cycle) => {
+        const provisionalCreativeRequest =
+          cycle.renderAtMs === undefined && cycle.trustedServerCreativeRequestAtMs !== undefined;
         cycle.renderAtMs = timestampMs;
         cycle.isEmpty = facts.isEmpty;
         cycle.size = facts.size ? ([...facts.size] as Size) : undefined;
@@ -358,9 +584,15 @@ export class GptDiagnosticsStore {
         cycle.slotContentChanged = facts.slotContentChanged;
         cycle.adManager = facts.adManager ? { ...facts.adManager } : undefined;
 
-        // A filled candidate resolves to other demand once its window closes,
-        // so the panel needs one notification at that boundary.
-        if (facts.isEmpty === false && cycle.trustedServerCandidate) {
+        if (facts.isEmpty === true && provisionalCreativeRequest) {
+          this.addAttributionIssue('creative_request_on_empty_cycle', timestampMs, record);
+        }
+
+        if (
+          facts.isEmpty === false &&
+          (cycle.trustedServerOpportunity === 'renderable_candidate' ||
+            cycle.trustedServerOpportunity === 'unrenderable_candidate')
+        ) {
           this.defer(() => this.notify(), TRUSTED_SERVER_ATTRIBUTION_WINDOW_MS);
         }
 
@@ -485,11 +717,116 @@ export class GptDiagnosticsStore {
         ];
       }),
       callbackIssues: this.callbackIssues.map((issue) => ({ ...issue })),
+      attributionIssues: this.attributionIssues.map((issue) => ({ ...issue })),
       coverage: Object.fromEntries(
         CALLBACK_KINDS.map((kind) => [kind, { ...this.coverage[kind] }])
       ) as Record<GptDiagnosticsCallbackKind, GptDiagnosticsCoverageCounters>,
       metadata: { ...this.metadata },
     };
+  }
+
+  private attributionIdentity(slot: GptDiagnosticsSlotLike & object): AttributionIdentity {
+    const runtimeSlotNumber = this.slotNumbers.get(slot);
+    const record = runtimeSlotNumber === undefined ? undefined : this.slots.get(runtimeSlotNumber);
+    const slotElementId =
+      record?.slotElementId ??
+      optionalNonEmptyString(
+        typeof slot.getSlotElementId === 'function' ? slot.getSlotElementId.bind(slot) : undefined
+      );
+    return {
+      ...(runtimeSlotNumber !== undefined ? { runtimeSlotNumber } : {}),
+      ...(slotElementId !== undefined ? { slotElementId } : {}),
+    };
+  }
+
+  private addAttributionIssue(
+    reason: GptDiagnosticsAttributionIssueReason,
+    timestampMs: number,
+    identity: AttributionIdentity = {}
+  ): void {
+    if (this.attributionIssues.length >= MAX_ATTRIBUTION_ISSUES) {
+      this.attributionIssues.shift();
+      this.metadata.droppedAttributionIssues += 1;
+    }
+
+    this.attributionIssues.push({
+      reason,
+      timestampMs,
+      ...(identity.runtimeSlotNumber !== undefined && identity.runtimeSlotNumber > 0
+        ? { runtimeSlotNumber: identity.runtimeSlotNumber }
+        : {}),
+      ...(identity.slotElementId !== undefined ? { slotElementId: identity.slotElementId } : {}),
+    });
+  }
+
+  private reportAttributionIssue(
+    reason: GptDiagnosticsAttributionIssueReason,
+    timestampMs: number,
+    identity: AttributionIdentity = {}
+  ): void {
+    this.addAttributionIssue(reason, timestampMs, identity);
+    this.notify();
+  }
+
+  private expireCreativeAttempts(timestampMs: number): void {
+    for (const attempt of this.creativeAttempts.values()) {
+      if (attempt.status !== 'live' || timestampMs < attempt.expiresAtMs) continue;
+      attempt.status = 'expired';
+      attempt.cycle = undefined;
+    }
+  }
+
+  private evictCreativeAttempt(cycle: MutableRequestCycle): void {
+    const attemptId = this.attemptIdsByCycle.get(cycle);
+    if (attemptId === undefined) return;
+    const attempt = this.creativeAttempts.get(attemptId);
+    if (!attempt || attempt.status !== 'live') return;
+    attempt.status = 'evicted';
+    attempt.cycle = undefined;
+  }
+
+  private ensureCreativeAttemptCapacity(): boolean {
+    if (this.creativeAttempts.size < MAX_CREATIVE_ATTEMPTS) return true;
+
+    for (const [attemptId, attempt] of this.creativeAttempts) {
+      if (attempt.status === 'live') continue;
+      this.creativeAttempts.delete(attemptId);
+      return true;
+    }
+    return false;
+  }
+
+  private installMarker<T>(
+    markers: WeakMap<object, PendingMarker<T>>,
+    slot: object,
+    value: T
+  ): void {
+    const generation = this.nextMarkerGeneration;
+    this.nextMarkerGeneration += 1;
+    markers.set(slot, {
+      generation,
+      recordedAtMs: this.now(),
+      value,
+    });
+    this.defer(() => {
+      if (markers.get(slot)?.generation === generation) markers.delete(slot);
+    }, REQUEST_PATH_ATTRIBUTION_WINDOW_MS);
+  }
+
+  private consumeMarker<T>(
+    markers: WeakMap<object, PendingMarker<T>>,
+    slot: object,
+    timestampMs: number
+  ): T | undefined {
+    const marker = markers.get(slot);
+    markers.delete(slot);
+    if (
+      marker === undefined ||
+      timestampMs - marker.recordedAtMs >= REQUEST_PATH_ATTRIBUTION_WINDOW_MS
+    ) {
+      return undefined;
+    }
+    return marker.value;
   }
 
   private timestamp(): number {
@@ -529,6 +866,10 @@ export class GptDiagnosticsStore {
     if (this.slots.size >= MAX_DIAGNOSTIC_SLOTS) {
       const evictedNumber = this.slotActivityOrder.shift();
       if (evictedNumber !== undefined) {
+        const evictedRecord = this.slots.get(evictedNumber);
+        if (evictedRecord) {
+          for (const cycle of evictedRecord.requests) this.evictCreativeAttempt(cycle);
+        }
         this.slots.delete(evictedNumber);
         const slotIndex = this.slotOrder.indexOf(evictedNumber);
         if (slotIndex >= 0) this.slotOrder.splice(slotIndex, 1);

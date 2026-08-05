@@ -1,7 +1,9 @@
 import type {
   GptDiagnosticsApi,
+  GptDiagnosticsCreativeFailure,
   GptDiagnosticsExportV1,
   GptDiagnosticsSlotHandle,
+  GptDiagnosticsTrustedServerOpportunity,
 } from '../../core/types';
 
 import type { GptDiagnosticsBindingManager } from './binding';
@@ -10,8 +12,18 @@ import type { GptDiagnosticsStoreSnapshot } from './store';
 interface ApiStore {
   snapshot(): GptDiagnosticsStoreSnapshot;
   subscribe(listener: () => void): () => void;
-  recordTrustedServerCandidate(slot: GptDiagnosticsSlotHandle, auctionSlotId: string): void;
-  recordTrustedServerClaim(auctionSlotId: string): void;
+  recordTrustedServerOpportunity(
+    slot: GptDiagnosticsSlotHandle,
+    auctionSlotId: string,
+    opportunity: GptDiagnosticsTrustedServerOpportunity
+  ): void;
+  recordPrebidRefresh(slots: GptDiagnosticsSlotHandle[]): void;
+  recordTrustedServerCreativeRequest(auctionSlotId: string): number | undefined;
+  recordTrustedServerCreativeResponse(attemptId: number): void;
+  recordTrustedServerCreativeFailure(
+    attemptId: number,
+    reason: GptDiagnosticsCreativeFailure
+  ): void;
 }
 
 interface ApiBindingManager {
@@ -37,6 +49,22 @@ interface ApiOptions {
 }
 
 type ApiListener = (snapshot: GptDiagnosticsExportV1) => void;
+
+function safelyRecord(action: () => void): void {
+  try {
+    action();
+  } catch {
+    // Diagnostics must not alter delivery.
+  }
+}
+
+function safelyCreateAttempt(action: () => number | undefined): number | undefined {
+  try {
+    return action();
+  } catch {
+    return undefined;
+  }
+}
 
 /** Owns the public read-only diagnostics API and its source subscriptions. */
 export class GptDiagnosticsApiController {
@@ -77,12 +105,17 @@ export class GptDiagnosticsApiController {
       subscribe: (listener) => this.subscribe(listener),
       show: () => this.presentation.show(),
       hide: () => this.presentation.hide(),
-      recordTrustedServerCandidate: (slot, auctionSlotId) => {
-        this.store.recordTrustedServerCandidate(slot, auctionSlotId);
-      },
-      recordTrustedServerClaim: (auctionSlotId) => {
-        this.store.recordTrustedServerClaim(auctionSlotId);
-      },
+      recordTrustedServerOpportunity: (slot, auctionSlotId, opportunity) =>
+        safelyRecord(() =>
+          this.store.recordTrustedServerOpportunity(slot, auctionSlotId, opportunity)
+        ),
+      recordPrebidRefresh: (slots) => safelyRecord(() => this.store.recordPrebidRefresh(slots)),
+      recordTrustedServerCreativeRequest: (auctionSlotId) =>
+        safelyCreateAttempt(() => this.store.recordTrustedServerCreativeRequest(auctionSlotId)),
+      recordTrustedServerCreativeResponse: (attemptId) =>
+        safelyRecord(() => this.store.recordTrustedServerCreativeResponse(attemptId)),
+      recordTrustedServerCreativeFailure: (attemptId, reason) =>
+        safelyRecord(() => this.store.recordTrustedServerCreativeFailure(attemptId, reason)),
     };
   }
 
@@ -106,13 +139,31 @@ export class GptDiagnosticsApiController {
           ...cycle,
           durations: { ...cycle.durations },
           size: cycle.size ? [...cycle.size] : undefined,
+          adManager: cycle.adManager
+            ? {
+                ...cycle.adManager,
+                yieldGroupIds: cycle.adManager.yieldGroupIds
+                  ? [...cycle.adManager.yieldGroupIds]
+                  : undefined,
+                companyIds: cycle.adManager.companyIds
+                  ? [...cycle.adManager.companyIds]
+                  : undefined,
+              }
+            : undefined,
+          trustedServerCreativeFailures: cycle.trustedServerCreativeFailures
+            ? [...cycle.trustedServerCreativeFailures]
+            : undefined,
         })),
       })),
       callbackIssues: store.callbackIssues.map((issue) => ({ ...issue })),
+      attributionIssues: (store.attributionIssues ?? []).map((issue) => ({ ...issue })),
       coverage: Object.fromEntries(
         Object.entries(store.coverage).map(([kind, counters]) => [kind, { ...counters }])
       ) as GptDiagnosticsExportV1['coverage'],
-      metadata: { ...store.metadata },
+      metadata: {
+        ...store.metadata,
+        droppedAttributionIssues: store.metadata.droppedAttributionIssues ?? 0,
+      },
     };
   }
 
