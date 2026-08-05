@@ -318,6 +318,126 @@ describe('GptDiagnosticsOverlay', () => {
     overlay.destroy();
   });
 
+  it('presents publisher-refresh attribution, Trusted Server correlation, and rendered-replacement facts', () => {
+    const frames: Array<() => void> = [];
+    let now = 0;
+    const store = new GptDiagnosticsStore({
+      now: () => now,
+      schedule: (callback) => callback(),
+      defer: () => undefined,
+    });
+    const bindings = new FakeBindings();
+
+    // Publisher-only intent: exercises the previously-missing overlay case
+    // for `publisher_refresh` and the request-intent fact.
+    const publisherSlot = slot('publisher-refresh-slot');
+    store.recordPublisherRefresh([publisherSlot]);
+    store.recordSlotRequested(publisherSlot);
+    const publisherIntentId = store.snapshot().slots[0].requests[0].requestIntentId;
+
+    // Trusted Server direct intent with an auction ID: exercises the
+    // auction and opportunity-latency facts.
+    const trustedServerSlot = slot('trusted-server-auction-slot');
+    now = 0;
+    store.recordTrustedServerOpportunity(
+      trustedServerSlot,
+      'trusted-server-auction-slot',
+      'renderable_candidate',
+      'auction-7'
+    );
+    now = 24;
+    store.recordSlotRequested(trustedServerSlot);
+
+    // A later non-empty render replaces an earlier retained non-empty
+    // render for the same slot, with a differing creative ID.
+    const replacementSlot = slot('replacement-slot');
+    now = 0;
+    store.recordSlotRequested(replacementSlot);
+    now = 5;
+    store.recordSlotRenderEnded(replacementSlot, {
+      isEmpty: false,
+      adManager: { creativeId: 424_242_424_242 },
+    });
+    now = 6_053;
+    store.recordSlotRequested(replacementSlot);
+    now = 6_060;
+    store.recordSlotRenderEnded(replacementSlot, {
+      isEmpty: false,
+      adManager: { creativeId: 424_242_424_243 },
+    });
+
+    // Equal creative IDs across the replacement report "unchanged".
+    const unchangedSlot = slot('replacement-unchanged-slot');
+    now = 0;
+    store.recordSlotRequested(unchangedSlot);
+    store.recordSlotRenderEnded(unchangedSlot, {
+      isEmpty: false,
+      adManager: { creativeId: 909_090_909_090 },
+    });
+    now = 10;
+    store.recordSlotRequested(unchangedSlot);
+    store.recordSlotRenderEnded(unchangedSlot, {
+      isEmpty: false,
+      adManager: { creativeId: 909_090_909_090 },
+    });
+
+    // A missing current creative ID omits the creative comparison, but the
+    // replacement relationship itself is still reported.
+    const missingIdSlot = slot('replacement-missing-id-slot');
+    now = 0;
+    store.recordSlotRequested(missingIdSlot);
+    store.recordSlotRenderEnded(missingIdSlot, {
+      isEmpty: false,
+      adManager: { creativeId: 808_080_808_080 },
+    });
+    now = 10;
+    store.recordSlotRequested(missingIdSlot);
+    store.recordSlotRenderEnded(missingIdSlot, { isEmpty: false });
+
+    let root: ShadowRoot | undefined;
+    const overlay = new GptDiagnosticsOverlay(store, bindings, {
+      scheduleFrame: (callback) => frames.push(callback),
+      onShadowRoot: (createdRoot) => {
+        root = createdRoot;
+      },
+    });
+    runNextFrame(frames);
+    runNextFrame(frames);
+
+    const publisherArticle = slotArticle(root!, 'publisher-refresh-slot').textContent ?? '';
+    expect(publisherArticle).toContain('Request path: Publisher refresh');
+    expect(publisherArticle).toContain(`Request intent: ${publisherIntentId}`);
+    expect(publisherArticle).not.toContain('Trusted Server auction:');
+    expect(publisherArticle).not.toContain('Opportunity → request');
+
+    const trustedServerArticle =
+      slotArticle(root!, 'trusted-server-auction-slot').textContent ?? '';
+    expect(trustedServerArticle).toContain('Request path: Trusted Server direct');
+    expect(trustedServerArticle).toContain('Trusted Server auction: auction-7');
+    expect(trustedServerArticle).toContain('Opportunity → request 24 ms');
+
+    const replacementArticle = slotArticle(root!, 'replacement-slot').textContent ?? '';
+    expect(replacementArticle).toContain('Replaced rendered request 1 after 6048 ms');
+    expect(replacementArticle).toContain('Creative changed 424242424242 → 424242424243');
+
+    const unchangedArticle = slotArticle(root!, 'replacement-unchanged-slot').textContent ?? '';
+    expect(unchangedArticle).toContain('Replaced rendered request 1 after 10 ms');
+    expect(unchangedArticle).toContain('Creative unchanged 909090909090');
+    expect(unchangedArticle).not.toContain('Creative changed');
+
+    const missingIdArticle = slotArticle(root!, 'replacement-missing-id-slot').textContent ?? '';
+    expect(
+      missingIdArticle,
+      'the replacement relationship is reported even without a creative ID'
+    ).toContain('Replaced rendered request 1 after 10 ms');
+    expect(
+      missingIdArticle,
+      'a missing creative ID must omit the comparison, not display "unknown changed"'
+    ).not.toMatch(/Creative changed|Creative unchanged|unknown changed/);
+
+    overlay.destroy();
+  });
+
   it('renders lifecycle facts, coverage, history, controls, and scoped styles', () => {
     const frames: Array<() => void> = [];
     let now = 10;

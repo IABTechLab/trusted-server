@@ -275,6 +275,35 @@ export interface GptDiagnosticsRequestCycle {
    * duration would be invalid or negative.
    */
   opportunityToRequestMs?: number;
+  /**
+   * The earlier retained cycle's `requestNumber` this cycle's non-empty
+   * render replaced. Present only when this cycle received a non-empty
+   * `slotRenderEnded` callback and a most-recent earlier retained cycle for
+   * the same slot also rendered non-empty. Absent when no such earlier
+   * render is retained (including when it has been evicted) — no
+   * replacement relationship is invented in that case.
+   */
+  replacedRequestNumber?: number;
+  /**
+   * From the replaced cycle's render to this cycle's request. Present only
+   * alongside {@link replacedRequestNumber}, and only when that duration is
+   * finite and non-negative.
+   */
+  previousRenderToRequestMs?: number;
+  /**
+   * The replaced cycle's Ad Manager creative ID (preferring `creativeId`
+   * over `sourceAgnosticCreativeId`). Present only alongside
+   * {@link replacedRequestNumber} and only when the replaced cycle exposed
+   * a creative ID.
+   */
+  previousCreativeId?: number;
+  /**
+   * Whether this cycle's creative ID differs from {@link previousCreativeId}.
+   * Present only when both this cycle and the replaced cycle expose a
+   * creative ID; this is an observed slot-render replacement relationship,
+   * not proof the visible pixels changed — see `slotContentChanged`.
+   */
+  creativeChanged?: boolean;
   trustedServerCreativeRequestAtMs?: number;
   trustedServerCreativeResponseAtMs?: number;
   trustedServerCreativeFailures?: GptDiagnosticsCreativeFailure[];

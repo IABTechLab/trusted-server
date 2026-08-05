@@ -191,4 +191,28 @@ describe('GPT diagnostics public types', () => {
 
     expectTypeOf(api).toEqualTypeOf<GptDiagnosticsApi>();
   });
+
+  it('accepts rendered-replacement correlation fields with a non-widened creative ID type', () => {
+    const cycle: GptDiagnosticsRequestCycle = {
+      requestNumber: 4,
+      durations: {},
+      incompleteSequence: false,
+      requestPath: 'trusted_server_direct',
+      replacedRequestNumber: 1,
+      previousRenderToRequestMs: 6048,
+      previousCreativeId: 424242424242,
+      creativeChanged: true,
+    };
+
+    expect(cycle.replacedRequestNumber).toBe(1);
+    expect(cycle.previousRenderToRequestMs).toBe(6048);
+    expect(cycle.previousCreativeId).toBe(424242424242);
+    expect(cycle.creativeChanged).toBe(true);
+    expectTypeOf(cycle).toEqualTypeOf<GptDiagnosticsRequestCycle>();
+    // Design decision: reuse the existing GPT Ad Manager identity type
+    // (number) rather than widen it to `string | number`.
+    expectTypeOf<GptDiagnosticsRequestCycle['previousCreativeId']>().toEqualTypeOf<
+      number | undefined
+    >();
+  });
 });

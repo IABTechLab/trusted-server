@@ -1743,4 +1743,220 @@ describe('GptDiagnosticsStore', () => {
       });
     });
   });
+
+  describe('rendered replacement detection', () => {
+    function nonEmptyRender(
+      creativeId?: number
+    ): Parameters<GptDiagnosticsStore['recordSlotRenderEnded']>[1] {
+      return {
+        isEmpty: false,
+        ...(creativeId !== undefined ? { adManager: { creativeId } } : {}),
+      };
+    }
+
+    it('does not record a replacement relationship for the first non-empty render of a slot', () => {
+      const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+      const slot = fakeSlot('replacement-first-render');
+
+      store.recordSlotRequested(slot);
+      store.recordSlotRenderEnded(slot, nonEmptyRender(1_111_111_111));
+
+      const cycle = store.snapshot().slots[0].requests[0];
+      expect(cycle.replacedRequestNumber).toBeUndefined();
+      expect(cycle.previousRenderToRequestMs).toBeUndefined();
+      expect(cycle.previousCreativeId).toBeUndefined();
+      expect(cycle.creativeChanged).toBeUndefined();
+    });
+
+    it('does not record a replacement relationship when the only earlier render was empty', () => {
+      const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+      const slot = fakeSlot('replacement-only-empty-earlier');
+
+      store.recordSlotRequested(slot);
+      store.recordSlotRenderEnded(slot, { isEmpty: true });
+      store.recordSlotRequested(slot);
+      store.recordSlotRenderEnded(slot, nonEmptyRender(2_222_222_222));
+
+      const cycle = store.snapshot().slots[0].requests[1];
+      expect(
+        cycle.replacedRequestNumber,
+        'an empty earlier render must not count as a replaced render'
+      ).toBeUndefined();
+    });
+
+    it('does not record a replacement relationship when the current render is empty, even though an earlier non-empty render exists', () => {
+      const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+      const slot = fakeSlot('replacement-current-empty');
+
+      store.recordSlotRequested(slot);
+      store.recordSlotRenderEnded(slot, nonEmptyRender(3_333_333_333));
+      store.recordSlotRequested(slot);
+      store.recordSlotRenderEnded(slot, { isEmpty: true });
+
+      const cycle = store.snapshot().slots[0].requests[1];
+      expect(
+        cycle.replacedRequestNumber,
+        'an empty current render must not claim a rendered replacement'
+      ).toBeUndefined();
+    });
+
+    it('identifies the most recent earlier non-empty render, skipping an intervening empty cycle', () => {
+      let now = 0;
+      const store = new GptDiagnosticsStore({ now: () => now, defer: () => undefined });
+      const slot = fakeSlot('replacement-skip-empty');
+
+      store.recordSlotRequested(slot);
+      now = 5;
+      store.recordSlotRenderEnded(slot, nonEmptyRender(4_444_444_444));
+      now = 10;
+      store.recordSlotRequested(slot);
+      now = 15;
+      store.recordSlotRenderEnded(slot, { isEmpty: true });
+      now = 6_053;
+      store.recordSlotRequested(slot);
+      now = 6_060;
+      store.recordSlotRenderEnded(slot, nonEmptyRender(5_555_555_555));
+
+      const cycle = store.snapshot().slots[0].requests[2];
+      expect(
+        cycle.replacedRequestNumber,
+        'must reach past the empty intervening cycle to the earlier non-empty render'
+      ).toBe(1);
+      expect(cycle.previousRenderToRequestMs).toBe(6_048);
+      expect(cycle.previousCreativeId).toBe(4_444_444_444);
+      expect(cycle.creativeChanged).toBe(true);
+    });
+
+    it('reports creative unchanged when the replaced and current creative IDs match', () => {
+      let now = 0;
+      const store = new GptDiagnosticsStore({ now: () => now, defer: () => undefined });
+      const slot = fakeSlot('replacement-creative-unchanged');
+
+      store.recordSlotRequested(slot);
+      store.recordSlotRenderEnded(slot, nonEmptyRender(6_666_666_666));
+      now = 10;
+      store.recordSlotRequested(slot);
+      store.recordSlotRenderEnded(slot, nonEmptyRender(6_666_666_666));
+
+      const cycle = store.snapshot().slots[0].requests[1];
+      expect(cycle.replacedRequestNumber).toBe(1);
+      expect(cycle.creativeChanged, 'matching IDs must report unchanged, not changed').toBe(false);
+    });
+
+    it('prefers creativeId over sourceAgnosticCreativeId for both the replaced and current cycle', () => {
+      let now = 0;
+      const store = new GptDiagnosticsStore({ now: () => now, defer: () => undefined });
+      const slot = fakeSlot('replacement-id-precedence');
+
+      store.recordSlotRequested(slot);
+      store.recordSlotRenderEnded(slot, {
+        isEmpty: false,
+        adManager: { creativeId: 7_777_777_777, sourceAgnosticCreativeId: 9_999_999_999 },
+      });
+      now = 10;
+      store.recordSlotRequested(slot);
+      store.recordSlotRenderEnded(slot, {
+        isEmpty: false,
+        adManager: { creativeId: 8_888_888_888, sourceAgnosticCreativeId: 9_999_999_999 },
+      });
+
+      const cycle = store.snapshot().slots[0].requests[1];
+      expect(
+        cycle.previousCreativeId,
+        'creativeId must win over sourceAgnosticCreativeId for the replaced cycle'
+      ).toBe(7_777_777_777);
+      expect(
+        cycle.creativeChanged,
+        'the current cycle creativeId must also win over its sourceAgnosticCreativeId'
+      ).toBe(true);
+    });
+
+    it('copies the replaced creative ID but omits creativeChanged when only the current render lacks a creative ID', () => {
+      let now = 0;
+      const store = new GptDiagnosticsStore({ now: () => now, defer: () => undefined });
+      const slot = fakeSlot('replacement-current-missing-id');
+
+      store.recordSlotRequested(slot);
+      store.recordSlotRenderEnded(slot, nonEmptyRender(1_212_121_212));
+      now = 10;
+      store.recordSlotRequested(slot);
+      store.recordSlotRenderEnded(slot, nonEmptyRender());
+
+      const cycle = store.snapshot().slots[0].requests[1];
+      expect(cycle.replacedRequestNumber).toBe(1);
+      expect(cycle.previousCreativeId).toBe(1_212_121_212);
+      expect(
+        cycle.creativeChanged,
+        'a missing current creative ID must omit the comparison, not report a change'
+      ).toBeUndefined();
+    });
+
+    it('omits both the previous creative ID and creativeChanged when only the replaced render lacks a creative ID', () => {
+      let now = 0;
+      const store = new GptDiagnosticsStore({ now: () => now, defer: () => undefined });
+      const slot = fakeSlot('replacement-previous-missing-id');
+
+      store.recordSlotRequested(slot);
+      store.recordSlotRenderEnded(slot, nonEmptyRender());
+      now = 10;
+      store.recordSlotRequested(slot);
+      store.recordSlotRenderEnded(slot, nonEmptyRender(1_313_131_313));
+
+      const cycle = store.snapshot().slots[0].requests[1];
+      expect(
+        cycle.replacedRequestNumber,
+        'the replacement relationship itself does not require a creative ID'
+      ).toBe(1);
+      expect(cycle.previousCreativeId).toBeUndefined();
+      expect(cycle.creativeChanged).toBeUndefined();
+    });
+
+    it('omits previousRenderToRequestMs for a negative duration but keeps the replacement relationship', () => {
+      let now = 100;
+      const store = new GptDiagnosticsStore({ now: () => now, defer: () => undefined });
+      const slot = fakeSlot('replacement-negative-duration');
+
+      store.recordSlotRequested(slot);
+      store.recordSlotRenderEnded(slot, nonEmptyRender(1_414_141_414));
+      now = 50;
+      store.recordSlotRequested(slot);
+      store.recordSlotRenderEnded(slot, nonEmptyRender(1_515_151_515));
+
+      const cycle = store.snapshot().slots[0].requests[1];
+      expect(
+        cycle.replacedRequestNumber,
+        'an invalid duration must not erase the replacement relationship'
+      ).toBe(1);
+      expect(cycle.previousRenderToRequestMs).toBeUndefined();
+    });
+
+    it('does not fabricate a replacement relationship for a rendered cycle that has already been evicted', () => {
+      const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
+      const slot = fakeSlot('replacement-evicted-history');
+
+      store.recordSlotRequested(slot);
+      store.recordSlotRenderEnded(slot, nonEmptyRender(1_616_161_616));
+      for (let index = 0; index < MAX_REQUEST_CYCLES_PER_SLOT - 1; index += 1) {
+        store.recordSlotRequested(slot);
+        store.recordSlotRenderEnded(slot, { isEmpty: true });
+      }
+      // The next request evicts the first (non-empty) cycle before this render.
+      store.recordSlotRequested(slot);
+      store.recordSlotRenderEnded(slot, nonEmptyRender(1_717_171_717));
+
+      const snapshot = store.snapshot().slots[0];
+      expect(snapshot.requests).toHaveLength(MAX_REQUEST_CYCLES_PER_SLOT);
+      expect(
+        snapshot.requests[0].requestNumber,
+        'the original non-empty render must have been evicted'
+      ).toBeGreaterThan(1);
+      const cycle = snapshot.requests[snapshot.requests.length - 1];
+      expect(
+        cycle.replacedRequestNumber,
+        'an evicted earlier render must not be resurrected into a fabricated replacement'
+      ).toBeUndefined();
+      expect(cycle.previousCreativeId).toBeUndefined();
+      expect(cycle.creativeChanged).toBeUndefined();
+    });
+  });
 });

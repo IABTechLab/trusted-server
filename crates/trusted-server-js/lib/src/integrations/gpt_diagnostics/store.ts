@@ -630,6 +630,19 @@ export class GptDiagnosticsStore {
       (record, cycle) => {
         const provisionalCreativeRequest =
           cycle.renderAtMs === undefined && cycle.trustedServerCreativeRequestAtMs !== undefined;
+
+        // --- Rendered replacement derivation --------------------------------
+        // Must run before `cycle.renderAtMs` is set below: the search relies
+        // on the natural `renderAtMs !== undefined` filter to exclude this
+        // same cycle. Reads only cycles already retained in
+        // `record.requests` — no new retained state, no raised retention
+        // limit, and an evicted earlier render is simply absent from that
+        // array, so no replacement relationship is invented for it.
+        if (facts.isEmpty === false) {
+          this.deriveRenderedReplacement(record, cycle, facts);
+        }
+        // ---------------------------------------------------------------------
+
         cycle.renderAtMs = timestampMs;
         cycle.isEmpty = facts.isEmpty;
         cycle.size = facts.size ? ([...facts.size] as Size) : undefined;
@@ -1029,6 +1042,54 @@ export class GptDiagnosticsStore {
     attach(record, candidates[0]);
     this.incrementDisposition(kind, 'matched');
     this.notify();
+  }
+
+  /**
+   * Find the most recent earlier retained non-empty render for this slot
+   * and, when found, record the rendered-replacement relationship on
+   * `cycle`. Only called for a current non-empty render. Leaves `cycle`
+   * untouched when no qualifying earlier render is retained.
+   */
+  private deriveRenderedReplacement(
+    record: MutableSlotRecord,
+    cycle: MutableRequestCycle,
+    facts: GptRenderFacts
+  ): void {
+    const previous = record.requests.reduce<MutableRequestCycle | undefined>(
+      (latest, candidate) => {
+        if (
+          candidate === cycle ||
+          candidate.renderAtMs === undefined ||
+          candidate.isEmpty !== false
+        ) {
+          return latest;
+        }
+        return latest === undefined || candidate.requestNumber > latest.requestNumber
+          ? candidate
+          : latest;
+      },
+      undefined
+    );
+    if (!previous) return;
+
+    cycle.replacedRequestNumber = previous.requestNumber;
+
+    const previousRenderToRequestMs = validDuration(previous.renderAtMs, cycle.requestedAtMs);
+    if (previousRenderToRequestMs !== undefined) {
+      cycle.previousRenderToRequestMs = previousRenderToRequestMs;
+    }
+
+    const previousCreativeId =
+      previous.adManager?.creativeId ?? previous.adManager?.sourceAgnosticCreativeId;
+    if (previousCreativeId !== undefined) {
+      cycle.previousCreativeId = previousCreativeId;
+    }
+
+    const currentCreativeId =
+      facts.adManager?.creativeId ?? facts.adManager?.sourceAgnosticCreativeId;
+    if (previousCreativeId !== undefined && currentCreativeId !== undefined) {
+      cycle.creativeChanged = previousCreativeId !== currentCreativeId;
+    }
   }
 
   private incrementDisposition(

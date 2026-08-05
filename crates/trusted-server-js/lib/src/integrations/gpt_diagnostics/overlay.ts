@@ -153,6 +153,8 @@ function requestPathFact(cycle: GptDiagnosticsRequestCycle): string {
       return 'Request path: Trusted Server direct';
     case 'prebid_refresh':
       return 'Request path: Prebid refresh';
+    case 'publisher_refresh':
+      return 'Request path: Publisher refresh';
     case 'competing':
       return 'Request path: Competing paths';
     case 'unattributed':
@@ -160,6 +162,55 @@ function requestPathFact(cycle: GptDiagnosticsRequestCycle): string {
     default:
       return 'Request path: Unknown (not observed)';
   }
+}
+
+/** Present only when an observed request intent was consumed for this cycle. */
+function requestIntentFact(cycle: GptDiagnosticsRequestCycle): string | undefined {
+  return cycle.requestIntentId !== undefined
+    ? `Request intent: ${cycle.requestIntentId}`
+    : undefined;
+}
+
+/** Present only when the consumed intent carried a valid Trusted Server auction ID. */
+function trustedServerAuctionFact(cycle: GptDiagnosticsRequestCycle): string | undefined {
+  return cycle.trustedServerAuctionId !== undefined
+    ? `Trusted Server auction: ${cycle.trustedServerAuctionId}`
+    : undefined;
+}
+
+/** Present only when the opportunity-to-request duration is valid. */
+function opportunityToRequestFact(cycle: GptDiagnosticsRequestCycle): string | undefined {
+  const duration = formatMilliseconds(cycle.opportunityToRequestMs);
+  return duration ? `Opportunity → request ${duration}` : undefined;
+}
+
+/**
+ * Present only when a rendered-replacement relationship was found. The
+ * duration is appended only when it is valid; missing it does not remove
+ * the relationship fact.
+ */
+function replacementFact(cycle: GptDiagnosticsRequestCycle): string | undefined {
+  if (cycle.replacedRequestNumber === undefined) return undefined;
+  const duration = formatMilliseconds(cycle.previousRenderToRequestMs);
+  return duration
+    ? `Replaced rendered request ${cycle.replacedRequestNumber} after ${duration}`
+    : `Replaced rendered request ${cycle.replacedRequestNumber}`;
+}
+
+/**
+ * Present only when both the current and replaced cycle exposed a creative
+ * ID. Omits the comparison entirely rather than reporting "unknown changed"
+ * when either ID is unavailable.
+ */
+function creativeTransitionFact(cycle: GptDiagnosticsRequestCycle): string | undefined {
+  if (cycle.creativeChanged === undefined) return undefined;
+  const previousCreativeId = cycle.previousCreativeId;
+  const currentCreativeId =
+    cycle.adManager?.creativeId ?? cycle.adManager?.sourceAgnosticCreativeId;
+  if (previousCreativeId === undefined || currentCreativeId === undefined) return undefined;
+  return cycle.creativeChanged
+    ? `Creative changed ${previousCreativeId} → ${currentCreativeId}`
+    : `Creative unchanged ${currentCreativeId}`;
 }
 
 function trustedServerOpportunityFact(cycle: GptDiagnosticsRequestCycle): string {
@@ -224,6 +275,12 @@ function responseClassFact(cycle: GptDiagnosticsRequestCycle): string | undefine
 
 function cycleFacts(cycle: GptDiagnosticsRequestCycle): string[] {
   const facts: string[] = [requestPathFact(cycle), trustedServerOpportunityFact(cycle)];
+  const requestIntent = requestIntentFact(cycle);
+  if (requestIntent) facts.push(requestIntent);
+  const trustedServerAuction = trustedServerAuctionFact(cycle);
+  if (trustedServerAuction) facts.push(trustedServerAuction);
+  const opportunityToRequest = opportunityToRequestFact(cycle);
+  if (opportunityToRequest) facts.push(opportunityToRequest);
   const creativeRequestAt = formatMilliseconds(cycle.trustedServerCreativeRequestAtMs);
   if (creativeRequestAt) {
     facts.push(`Trusted Server creative request observed at ${creativeRequestAt}`);
@@ -241,6 +298,10 @@ function cycleFacts(cycle: GptDiagnosticsRequestCycle): string[] {
   if (responseClassLine) facts.push(responseClassLine);
   const adManagerLine = adManagerFact(cycle);
   if (adManagerLine) facts.push(adManagerLine);
+  const replacementLine = replacementFact(cycle);
+  if (replacementLine) facts.push(replacementLine);
+  const creativeTransitionLine = creativeTransitionFact(cycle);
+  if (creativeTransitionLine) facts.push(creativeTransitionLine);
   if (cycle.loadAtMs !== undefined) facts.push('GPT slot onload observed');
   if (cycle.viewableAtMs !== undefined) facts.push('GPT impressionViewable observed');
   if (cycle.incompleteSequence) facts.push('Incomplete sequence');
