@@ -19,6 +19,7 @@ function clientAuctionBundlePaths() {
         core: resolve(TSJS_CRATE, "dist/tsjs-core.js"),
         gpt: resolve(TSJS_CRATE, "dist/tsjs-gpt.js"),
         prebid: resolve(TSJS_CRATE, "dist/prebid", manifest.filename),
+        prebidShim: resolve(TSJS_CRATE, "dist/tsjs-prebid.js"),
     };
 }
 
@@ -212,8 +213,10 @@ test.describe("APS opaque renderer", () => {
 
         await page.goto(runtimeUrl("/aps-prebid-adapter-test"));
         const bundles = clientAuctionBundlePaths();
+        await page.addScriptTag({ path: bundles.core });
         await page.addScriptTag({ path: bundles.gpt });
         await page.addScriptTag({ path: bundles.prebid });
+        await page.addScriptTag({ path: bundles.prebidShim });
 
         const result = await page.evaluate(async () => {
             type PrebidBid = {

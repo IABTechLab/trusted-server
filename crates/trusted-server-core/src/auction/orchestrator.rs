@@ -665,9 +665,10 @@ impl AuctionOrchestrator {
         //
         // NOTE: `select()` blocks until at least one backend responds and, on
         // some adapters, buffers the selected response body before returning.
-        // Hard deadline enforcement therefore depends on every backend's
-        // first-byte and between-bytes timeouts being set to at most the
-        // remaining auction budget, which Phase 1 above guarantees.
+        // Backend first-byte and between-bytes timeouts are capped to the
+        // remaining auction budget in Phase 1. They are transport timers, not
+        // absolute wall-clock limits, so connection setup and byte-trickling
+        // remain bounded operational risks rather than strict deadline proof.
         let mut remaining = pending_requests;
 
         while !remaining.is_empty() {
@@ -1299,13 +1300,12 @@ impl AuctionOrchestrator {
             match self.providers.get(mediator_name.as_str()) {
                 Some(mediator) => {
                     // Cap the mediator at whichever is tighter: its own configured
-                    // timeout or the remaining auction budget (A_deadline).  The old
-                    // comment here claimed origin drain could exhaust the budget before
-                    // collection, but SSP backends are given first-byte and between-bytes
-                    // timeouts equal to effective_timeout (capped at their provider
-                    // timeout) at dispatch time, so they cannot run past A_deadline
-                    // independently. Giving the mediator an uncapped timeout lets it run
-                    // past A_deadline, violating the bounded hold invariant.
+                    // timeout or the remaining auction budget (A_deadline). Backend
+                    // first-byte and between-bytes timeouts bound normal collection, but
+                    // they are transport timers rather than absolute wall-clock limits:
+                    // connection setup and byte-trickling can still consume more of the
+                    // auction budget. Recomputing the remaining budget here prevents the
+                    // mediator from extending that bounded response hold.
                     let remaining = remaining_budget_ms(auction_start, timeout_ms);
                     let mediator_timeout = services
                         .backend()

@@ -211,13 +211,12 @@ export function registerApsPrebidRenderer(
   adUnitCode: unknown,
   input: unknown,
   ttlSeconds: unknown = DEFAULT_PREBID_RENDERER_TTL_SECONDS,
-  lifecycle?: { markWinner(): void; markRendered(): void }
+  lifecycle?: { markUsed(): void }
 ): boolean {
   if (
     !validPrebidAdId(adId) ||
     !validPrebidIdentity(adUnitCode) ||
-    typeof lifecycle?.markWinner !== 'function' ||
-    typeof lifecycle.markRendered !== 'function'
+    typeof lifecycle?.markUsed !== 'function'
   ) {
     return false;
   }
@@ -248,8 +247,7 @@ export function registerApsPrebidRenderer(
     renderer,
     registeredAt: now,
     expiresAt: now + boundedTtlSeconds * 1000,
-    markWinner: lifecycle.markWinner,
-    markRendered: lifecycle.markRendered,
+    markUsed: lifecycle.markUsed,
   };
   return true;
 }
@@ -263,8 +261,7 @@ export function getApsPrebidRenderer(adId: string): ApsPrebidRendererEntry | und
   if (
     !Number.isFinite(entry.expiresAt) ||
     entry.expiresAt <= Date.now() ||
-    typeof entry.markWinner !== 'function' ||
-    typeof entry.markRendered !== 'function'
+    typeof entry.markUsed !== 'function'
   ) {
     delete registry![adId];
     return undefined;
@@ -290,7 +287,13 @@ function createNonce(): string | undefined {
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
 
-/** Return the absolute, same-publisher URL used by direct and Universal Creative rendering. */
+/**
+ * Return the absolute same-publisher URL used by direct and Universal Creative rendering.
+ *
+ * This intentionally inherits the publisher page scheme for same-origin deployments,
+ * including local development. APS endpoints and third-party creative URLs remain
+ * HTTPS-only.
+ */
 export function apsRendererUrl(pageOrigin = window.location.origin): string | undefined {
   try {
     const origin = new URL(pageOrigin);

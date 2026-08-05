@@ -1300,12 +1300,6 @@ export function installTsRenderBridge(): void {
       if (!consumeApsPrebidRenderer(adId, prebidRendererEntry)) return;
       recordConsumedPrebidApsId(consumedPrebidApsIds, adId, prebidRendererEntry.expiresAt);
 
-      try {
-        prebidRendererEntry.markWinner();
-      } catch (err) {
-        log.warn(`[tsjs-gpt] APS Prebid markWinner callback threw for '${adId}'`, err);
-      }
-
       port.postMessage(
         JSON.stringify({
           message: 'Prebid Response',
@@ -1320,9 +1314,9 @@ export function installTsRenderBridge(): void {
       );
 
       try {
-        prebidRendererEntry.markRendered();
+        prebidRendererEntry.markUsed();
       } catch (err) {
-        log.warn(`[tsjs-gpt] APS Prebid markRendered callback threw for '${adId}'`, err);
+        log.warn(`[tsjs-gpt] APS Prebid markUsed callback threw for '${adId}'`, err);
       }
       return;
     }

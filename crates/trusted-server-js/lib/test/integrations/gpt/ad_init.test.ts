@@ -2,7 +2,9 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
+
 import envelope from '../../fixtures/aps-renderer-v1.json';
+import type { TsjsApi } from '../../../src/core/types';
 
 function apsRenderer() {
   const bid = envelope.seatbid[0].bid[0];
@@ -21,7 +23,6 @@ function apsRenderer() {
 }
 
 import type { AuctionBidData, TsjsApi } from '../../../src/core/types';
-
 // Track every 'message' EventListener added to window across the entire test
 // file.  This lets the installTsRenderBridge suite remove all accumulated
 // handlers (registered by each vi.resetModules() + module re-import in the
@@ -1876,16 +1877,14 @@ describe('installTsRenderBridge', () => {
   it('serves a registered Prebid APS renderer when its generated ad ID differs from the APS bid ID', async () => {
     const renderer = apsRenderer();
     const prebidAdId = 'prebid-generated-ad-id';
-    const markWinner = vi.fn();
-    const markRendered = vi.fn();
+    const markUsed = vi.fn();
     (window as TestWindow).tsjs.apsPrebidRenderers = {
       [prebidAdId]: {
         adUnitCode: 'div-header',
         renderer,
         registeredAt: Date.now(),
         expiresAt: Date.now() + 60_000,
-        markWinner,
-        markRendered,
+        markUsed,
       },
     };
 
@@ -1914,8 +1913,7 @@ describe('installTsRenderBridge', () => {
 
     expect(stopSpy).toHaveBeenCalledTimes(2);
     expect(portMessages).toHaveLength(1);
-    expect(markWinner).toHaveBeenCalledTimes(1);
-    expect(markRendered).toHaveBeenCalledTimes(1);
+    expect(markUsed).toHaveBeenCalledTimes(1);
     expect(JSON.parse(portMessages[0])).toEqual(
       expect.objectContaining({
         message: 'Prebid Response',
@@ -1931,21 +1929,19 @@ describe('installTsRenderBridge', () => {
     foreignIframe.remove();
   });
 
-  it('still serves the APS renderer when markWinner throws', async () => {
+  it('still serves the APS renderer when markUsed throws', async () => {
     const renderer = apsRenderer();
-    const prebidAdId = 'throwing-mark-winner-ad-id';
-    const markWinner = vi.fn(() => {
-      throw new Error('fictional markWinner failure');
+    const prebidAdId = 'throwing-mark-used-ad-id';
+    const markUsed = vi.fn(() => {
+      throw new Error('fictional markUsed failure');
     });
-    const markRendered = vi.fn();
     (window as TestWindow).tsjs.apsPrebidRenderers = {
       [prebidAdId]: {
         adUnitCode: 'div-header',
         renderer,
         registeredAt: Date.now(),
         expiresAt: Date.now() + 60_000,
-        markWinner,
-        markRendered,
+        markUsed,
       },
     };
 
@@ -1972,53 +1968,7 @@ describe('installTsRenderBridge', () => {
         apsRenderer: renderer,
       })
     );
-    expect(markWinner).toHaveBeenCalledTimes(1);
-    expect(markRendered).toHaveBeenCalledTimes(1);
-  });
-
-  it('still completes the APS render when markRendered throws', async () => {
-    const renderer = apsRenderer();
-    const prebidAdId = 'throwing-mark-rendered-ad-id';
-    const markWinner = vi.fn();
-    const markRendered = vi.fn(() => {
-      throw new Error('fictional markRendered failure');
-    });
-    (window as TestWindow).tsjs.apsPrebidRenderers = {
-      [prebidAdId]: {
-        adUnitCode: 'div-header',
-        renderer,
-        registeredAt: Date.now(),
-        expiresAt: Date.now() + 60_000,
-        markWinner,
-        markRendered,
-      },
-    };
-
-    const bridgeListener = await captureBridgeListener();
-    const source = createTrustedSlotIframe();
-    const portMessages: string[] = [];
-
-    expect(() =>
-      bridgeListener(
-        Object.assign(new Event('message'), {
-          data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
-          ports: [{ postMessage: (message: string) => portMessages.push(message) }],
-          source,
-          stopImmediatePropagation: vi.fn(),
-        }) as unknown as MessageEvent
-      )
-    ).not.toThrow();
-
-    expect(portMessages).toHaveLength(1);
-    expect(JSON.parse(portMessages[0])).toEqual(
-      expect.objectContaining({
-        message: 'Prebid Response',
-        adId: prebidAdId,
-        apsRenderer: renderer,
-      })
-    );
-    expect(markWinner).toHaveBeenCalledTimes(1);
-    expect(markRendered).toHaveBeenCalledTimes(1);
+    expect(markUsed).toHaveBeenCalledTimes(1);
   });
 
   it('prunes expired consumed APS renderer IDs', async () => {
@@ -2027,18 +1977,15 @@ describe('installTsRenderBridge', () => {
       const renderer = apsRenderer();
       const prebidAdId = 'expiring-consumed-ad-id';
       const start = Date.now();
-      const firstMarkWinner = vi.fn();
-      const firstMarkRendered = vi.fn();
-      const secondMarkWinner = vi.fn();
-      const secondMarkRendered = vi.fn();
+      const firstMarkUsed = vi.fn();
+      const secondMarkUsed = vi.fn();
       (window as TestWindow).tsjs.apsPrebidRenderers = {
         [prebidAdId]: {
           adUnitCode: 'div-header',
           renderer,
           registeredAt: start,
           expiresAt: start + 60_000,
-          markWinner: firstMarkWinner,
-          markRendered: firstMarkRendered,
+          markUsed: firstMarkUsed,
         },
       };
 
@@ -2064,17 +2011,14 @@ describe('installTsRenderBridge', () => {
         renderer,
         registeredAt: Date.now(),
         expiresAt: Date.now() + 60_000,
-        markWinner: secondMarkWinner,
-        markRendered: secondMarkRendered,
+        markUsed: secondMarkUsed,
       };
       sendRequest();
 
       expect(portMessages).toHaveLength(2);
       expect(stopImmediatePropagation).toHaveBeenCalledTimes(2);
-      expect(firstMarkWinner).toHaveBeenCalledTimes(1);
-      expect(firstMarkRendered).toHaveBeenCalledTimes(1);
-      expect(secondMarkWinner).toHaveBeenCalledTimes(1);
-      expect(secondMarkRendered).toHaveBeenCalledTimes(1);
+      expect(firstMarkUsed).toHaveBeenCalledTimes(1);
+      expect(secondMarkUsed).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
     }
@@ -2084,8 +2028,7 @@ describe('installTsRenderBridge', () => {
     const renderer = apsRenderer();
     const capacity = 256;
     const callbacks = Array.from({ length: capacity + 1 }, () => ({
-      markWinner: vi.fn(),
-      markRendered: vi.fn(),
+      markUsed: vi.fn(),
     }));
     const entries = Object.fromEntries(
       callbacks.map((lifecycle, index) => [
@@ -2123,10 +2066,9 @@ describe('installTsRenderBridge', () => {
     sendRequest('capacity-ad-0');
 
     expect(portMessages).toHaveLength(capacity);
-    expect(callbacks[capacity].markWinner).not.toHaveBeenCalled();
-    expect(callbacks[capacity].markRendered).not.toHaveBeenCalled();
+    expect(callbacks[capacity].markUsed).not.toHaveBeenCalled();
     expect(entries[`capacity-ad-${capacity}`]).toBeDefined();
-    expect(callbacks[0].markWinner).toHaveBeenCalledTimes(1);
+    expect(callbacks[0].markUsed).toHaveBeenCalledTimes(1);
     expect(stopImmediatePropagation).toHaveBeenCalledTimes(capacity + 2);
   });
 
@@ -2139,8 +2081,7 @@ describe('installTsRenderBridge', () => {
         renderer,
         registeredAt: Date.now(),
         expiresAt: Date.now() + 60_000,
-        markWinner: vi.fn(),
-        markRendered: vi.fn(),
+        markUsed: vi.fn(),
       },
     };
 
@@ -2176,8 +2117,7 @@ describe('installTsRenderBridge', () => {
         renderer: apsRenderer(),
         registeredAt: Date.now() - 61_000,
         expiresAt: Date.now() - 1_000,
-        markWinner: vi.fn(),
-        markRendered: vi.fn(),
+        markUsed: vi.fn(),
       },
     };
 
