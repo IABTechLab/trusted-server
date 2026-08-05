@@ -51,17 +51,6 @@ async function buildModule(name, entryPath) {
   await build({
     configFile: false,
     root: __dirname,
-    resolve: {
-      alias: [
-        {
-          find: 'prebid.js/src/adRendering.js',
-          replacement: path.resolve(
-            __dirname,
-            'node_modules/prebid.js/dist/src/src/adRendering.js'
-          ),
-        },
-      ],
-    },
     build: {
       emptyOutDir: false,
       outDir: distDir,

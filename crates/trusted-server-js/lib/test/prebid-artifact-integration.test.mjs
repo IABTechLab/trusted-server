@@ -46,17 +46,6 @@ beforeAll(async () => {
   await build({
     configFile: false,
     root: libDir,
-    resolve: {
-      alias: [
-        {
-          find: 'prebid.js/src/adRendering.js',
-          replacement: path.resolve(
-            libDir,
-            'node_modules/prebid.js/dist/src/src/adRendering.js'
-          ),
-        },
-      ],
-    },
     build: {
       emptyOutDir: false,
       outDir: outputDirectory,
@@ -85,17 +74,20 @@ afterAll(() => {
 });
 
 describe('tsjs-prebid shim artifact', () => {
-  it('stays Prebid-free: no core markers and an order-of-magnitude size gap', () => {
-    // The embedded version string is the core marker. Prove it appears in the
-    // external bundle first so this test fails loudly if the marker rots
-    // instead of silently passing.
+  it('stays Prebid-free and uses only the external bundle public API', () => {
+    // The embedded version string and `_pbjsGlobals` are core markers. Prove
+    // they appear in the external artifact first so this test fails loudly if
+    // either marker rots instead of silently passing.
     expect(bundleCode).toContain(prebidVersion);
+    expect(bundleCode).toContain('_pbjsGlobals');
     expect(shimCode).not.toContain(prebidVersion);
+    expect(shimCode).not.toContain('_pbjsGlobals');
 
-    // A value-import of 'prebid.js' would multiply the shim size; the shim
-    // must stay an order of magnitude smaller than Prebid core.
+    // A value-import of Prebid or a private rendering helper would multiply
+    // the shim size; retain a margin above the normal compact shim output.
     expect(bundleCode.length).toBeGreaterThan(200_000);
-    expect(shimCode.length).toBeLessThan(150_000);
+    expect(shimCode.length).toBeLessThan(30_000);
+    expect(shimCode).toContain('markWinningBidAsUsed');
   });
 });
 

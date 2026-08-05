@@ -332,7 +332,7 @@ impl CreativeOpportunitiesConfig {
         }
 
         for slot in &self.slot {
-            slot.validate_runtime()?
+            slot.validate_runtime()?;
         }
 
         if self

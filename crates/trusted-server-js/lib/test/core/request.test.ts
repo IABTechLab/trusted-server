@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import type { AdUnit } from '../../src/core/types';
 import envelope from '../fixtures/aps-renderer-v1.json';
 
 async function flushRequestAds(): Promise<void> {
@@ -80,7 +82,7 @@ describe('request.requestAds', () => {
       width: apsBid.w,
       height: apsBid.h,
     };
-    (globalThis as any).fetch = vi.fn().mockResolvedValue({
+    globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
       headers: { get: () => 'application/json' },
@@ -105,7 +107,10 @@ describe('request.requestAds', () => {
     const { addAdUnits } = await import('../../src/core/registry');
     const { requestAds } = await import('../../src/core/request');
     document.body.innerHTML = '<div id="slot1"><span>existing</span></div>';
-    addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
+    addAdUnits({
+      code: 'slot1',
+      mediaTypes: { banner: { sizes: [[300, 250]] } },
+    } satisfies AdUnit);
 
     requestAds();
     await flushRequestAds();
@@ -133,7 +138,7 @@ describe('request.requestAds', () => {
   });
 
   it('does not mutate the slot for an invalid APS descriptor', async () => {
-    (globalThis as any).fetch = vi.fn().mockResolvedValue({
+    globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
       headers: { get: () => 'application/json' },
@@ -159,7 +164,10 @@ describe('request.requestAds', () => {
     const { addAdUnits } = await import('../../src/core/registry');
     const { requestAds } = await import('../../src/core/request');
     document.body.innerHTML = '<div id="slot1"><span>existing</span></div>';
-    addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } } as any);
+    addAdUnits({
+      code: 'slot1',
+      mediaTypes: { banner: { sizes: [[300, 250]] } },
+    } satisfies AdUnit);
 
     requestAds();
     await flushRequestAds();
