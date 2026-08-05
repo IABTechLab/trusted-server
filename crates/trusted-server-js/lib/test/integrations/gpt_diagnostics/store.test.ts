@@ -1959,4 +1959,248 @@ describe('GptDiagnosticsStore', () => {
       expect(cycle.creativeChanged).toBeUndefined();
     });
   });
+
+  describe('slotOnload correlation', () => {
+    // GPT does not guarantee that `slotOnload` follows `slotRenderEnded`. On
+    // observed production pages the load callback arrives roughly 1-2ms before
+    // the render callback for every cycle, so correlation must key on the
+    // response rather than the render.
+    function driveCycle(
+      store: GptDiagnosticsStore,
+      slot: GptDiagnosticsSlotLike,
+      clock: { now: number },
+      times: { requested: number; response: number; onload: number; render: number }
+    ): void {
+      clock.now = times.requested;
+      store.recordSlotRequested(slot);
+      clock.now = times.response;
+      store.recordSlotResponseReceived(slot);
+      if (times.onload < times.render) {
+        clock.now = times.onload;
+        store.recordSlotOnload(slot);
+        clock.now = times.render;
+        store.recordSlotRenderEnded(slot, { isEmpty: false });
+        return;
+      }
+      clock.now = times.render;
+      store.recordSlotRenderEnded(slot, { isEmpty: false });
+      clock.now = times.onload;
+      store.recordSlotOnload(slot);
+    }
+
+    it('correlates every exported callback sequence to its own cycle', () => {
+      // Timestamps reproduced from a deployed diagnostics export in which all
+      // seven load callbacks preceded their render callback.
+      const clock = { now: 0 };
+      const store = new GptDiagnosticsStore({ now: () => clock.now, defer: () => undefined });
+      const interstitial = fakeSlot('ad-interstitial');
+      const header = fakeSlot('ad-header');
+      const fixedBottom = fakeSlot('ad-fixed-bottom');
+
+      driveCycle(store, interstitial, clock, {
+        requested: 12156.2,
+        response: 12317.5,
+        onload: 12381.8,
+        render: 12382.3,
+      });
+      driveCycle(store, header, clock, {
+        requested: 12768.3,
+        response: 13760,
+        onload: 13871.4,
+        render: 13872.4,
+      });
+      driveCycle(store, fixedBottom, clock, {
+        requested: 12770.9,
+        response: 13771,
+        onload: 13832.5,
+        render: 13833.6,
+      });
+      driveCycle(store, header, clock, {
+        requested: 22175.2,
+        response: 22780.8,
+        onload: 22931.2,
+        render: 22933,
+      });
+      driveCycle(store, fixedBottom, clock, {
+        requested: 22176,
+        response: 22829.3,
+        onload: 22987.3,
+        render: 22988.9,
+      });
+      driveCycle(store, fixedBottom, clock, {
+        requested: 46272.5,
+        response: 46961.2,
+        onload: 47108.3,
+        render: 47109.9,
+      });
+      driveCycle(store, fixedBottom, clock, {
+        requested: 55383.4,
+        response: 55939.3,
+        onload: 56040.5,
+        render: 56042,
+      });
+
+      const snapshot = store.snapshot();
+      expect(
+        snapshot.coverage.slotOnload,
+        'all seven load callbacks must correlate, none dropped or ambiguous'
+      ).toMatchObject({ observed: 7, matched: 7, unmatched: 0, ambiguous: 0 });
+
+      const loadTimes = snapshot.slots.flatMap((recordedSlot) =>
+        recordedSlot.requests.map((cycle) => cycle.loadAtMs)
+      );
+      expect(loadTimes, 'each cycle must own the load callback that preceded its render').toEqual([
+        12381.8, 13871.4, 22931.2, 13832.5, 22987.3, 47108.3, 56040.5,
+      ]);
+      assertCoverageEquation(store);
+    });
+
+    it('does not shift a load callback onto the previous cycle across sequential refreshes', () => {
+      const clock = { now: 0 };
+      const store = new GptDiagnosticsStore({ now: () => clock.now, defer: () => undefined });
+      const slot = fakeSlot('ad-refreshed');
+
+      driveCycle(store, slot, clock, {
+        requested: 100,
+        response: 200,
+        onload: 299,
+        render: 300,
+      });
+      driveCycle(store, slot, clock, {
+        requested: 1000,
+        response: 1100,
+        onload: 1199,
+        render: 1200,
+      });
+
+      const [first, second] = store.snapshot().slots[0].requests;
+      expect(first.loadAtMs, 'the first cycle keeps its own load callback').toBe(299);
+      expect(
+        second.loadAtMs,
+        'the second cycle must not donate its load callback to the first'
+      ).toBe(1199);
+      expect(
+        first.durations.renderToLoadMs,
+        'an inter-request interval must never be reported as a load latency'
+      ).toBeUndefined();
+    });
+
+    it('reports ambiguity when two response-complete cycles are both eligible', () => {
+      const clock = { now: 0 };
+      const store = new GptDiagnosticsStore({ now: () => clock.now, defer: () => undefined });
+      const slot = fakeSlot('ad-ambiguous');
+
+      clock.now = 100;
+      store.recordSlotRequested(slot);
+      clock.now = 200;
+      store.recordSlotResponseReceived(slot);
+      clock.now = 300;
+      store.recordSlotRequested(slot);
+      clock.now = 400;
+      store.recordSlotResponseReceived(slot);
+      clock.now = 500;
+      store.recordSlotOnload(slot);
+
+      const snapshot = store.snapshot();
+      expect(
+        snapshot.coverage.slotOnload,
+        'two eligible cycles must be reported ambiguous rather than guessed'
+      ).toMatchObject({ observed: 1, matched: 0, ambiguous: 1 });
+      expect(snapshot.slots[0].requests.every((cycle) => cycle.loadAtMs === undefined)).toBe(true);
+    });
+
+    it('leaves a load callback that arrives before any response unmatched', () => {
+      const clock = { now: 0 };
+      const store = new GptDiagnosticsStore({ now: () => clock.now, defer: () => undefined });
+      const slot = fakeSlot('ad-early');
+
+      clock.now = 100;
+      store.recordSlotRequested(slot);
+      clock.now = 150;
+      store.recordSlotOnload(slot);
+
+      const snapshot = store.snapshot();
+      expect(
+        snapshot.coverage.slotOnload,
+        'a load callback cannot precede the response that carries the creative'
+      ).toMatchObject({ observed: 1, matched: 0, unmatched: 1 });
+      expect(snapshot.slots[0].requests[0].loadAtMs).toBeUndefined();
+    });
+
+    it('still reports a render-to-load duration when the load callback follows the render', () => {
+      const clock = { now: 0 };
+      const store = new GptDiagnosticsStore({ now: () => clock.now, defer: () => undefined });
+      const slot = fakeSlot('ad-ordered');
+
+      driveCycle(store, slot, clock, {
+        requested: 100,
+        response: 200,
+        render: 300,
+        onload: 340,
+      });
+
+      const cycle = store.snapshot().slots[0].requests[0];
+      expect(cycle.durations.renderToLoadMs, 'normal ordering still yields a duration').toBe(40);
+      expect(cycle.loadObservedBeforeRender).toBeUndefined();
+      expect(cycle.incompleteSequence).toBe(false);
+    });
+
+    it('flags a pre-render load callback without a duration or an ordering issue', () => {
+      const clock = { now: 0 };
+      const store = new GptDiagnosticsStore({ now: () => clock.now, defer: () => undefined });
+      const slot = fakeSlot('ad-preceded');
+
+      driveCycle(store, slot, clock, {
+        requested: 100,
+        response: 200,
+        onload: 299,
+        render: 300,
+      });
+
+      const snapshot = store.snapshot();
+      const cycle = snapshot.slots[0].requests[0];
+      expect(cycle.loadAtMs, 'the load callback still correlates to its own cycle').toBe(299);
+      expect(
+        cycle.loadObservedBeforeRender,
+        'callback ordering must be stated rather than left as missing data'
+      ).toBe(true);
+      expect(
+        cycle.durations.renderToLoadMs,
+        'render-to-load is not a meaningful interval when load precedes render'
+      ).toBeUndefined();
+      expect(
+        cycle.incompleteSequence,
+        'documented GPT callback ordering is not an incomplete sequence'
+      ).toBe(false);
+      expect(
+        snapshot.callbackIssues.some((issue) => issue.reason === 'invalid_event_order'),
+        'early load ordering must not be reported as an invalid event order'
+      ).toBe(false);
+    });
+
+    it('leaves impressionViewable correlation unchanged', () => {
+      const clock = { now: 0 };
+      const store = new GptDiagnosticsStore({ now: () => clock.now, defer: () => undefined });
+      const slot = fakeSlot('ad-viewable');
+
+      driveCycle(store, slot, clock, {
+        requested: 100,
+        response: 200,
+        onload: 299,
+        render: 300,
+      });
+      clock.now = 1300;
+      store.recordImpressionViewable(slot);
+
+      const cycle = store.snapshot().slots[0].requests[0];
+      expect(cycle.viewableAtMs, 'viewability still correlates after render').toBe(1300);
+      expect(cycle.durations.renderToViewableMs).toBe(1000);
+      expect(store.snapshot().coverage.impressionViewable).toMatchObject({
+        observed: 1,
+        matched: 1,
+        unmatched: 0,
+        ambiguous: 0,
+      });
+    });
+  });
 });

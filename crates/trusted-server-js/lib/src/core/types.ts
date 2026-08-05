@@ -254,6 +254,13 @@ export interface GptDiagnosticsRequestCycle {
   responseAtMs?: number;
   renderAtMs?: number;
   loadAtMs?: number;
+  /**
+   * Present and `true` only when GPT dispatched `slotOnload` for this cycle
+   * before `slotRenderEnded`. GPT does not guarantee an order between the two,
+   * and the early ordering is normal rather than a fault. It explains why
+   * {@link GptDiagnosticsDurations.renderToLoadMs} is absent for the cycle.
+   */
+  loadObservedBeforeRender?: boolean;
   viewableAtMs?: number;
   durations: GptDiagnosticsDurations;
   isEmpty?: boolean;

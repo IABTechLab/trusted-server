@@ -685,10 +685,23 @@ export class GptDiagnosticsStore {
       'slotOnload',
       slot,
       timestampMs,
+      // A creative cannot load before the response that carries it, so the
+      // response is the real precondition. Gating on the render instead would
+      // make the owning cycle ineligible whenever GPT dispatches `slotOnload`
+      // first — which it does — and the callback would then attach to the most
+      // recent already-rendered cycle, shifting every load onto its
+      // predecessor.
       (cycle) =>
-        cycle.renderAtMs !== undefined && cycle.isEmpty !== true && cycle.loadAtMs === undefined,
+        cycle.responseAtMs !== undefined && cycle.isEmpty !== true && cycle.loadAtMs === undefined,
       (record, cycle) => {
         cycle.loadAtMs = timestampMs;
+        if (cycle.renderAtMs === undefined) {
+          // Documented GPT behavior, not a fault: record the ordering so the
+          // absent render-to-load duration is explained rather than looking
+          // like a dropped callback.
+          cycle.loadObservedBeforeRender = true;
+          return;
+        }
         if (validDuration(cycle.renderAtMs, timestampMs) === undefined) {
           cycle.incompleteSequence = true;
           this.addIssue('slotOnload', record, timestampMs, 'matched', 'invalid_event_order');
