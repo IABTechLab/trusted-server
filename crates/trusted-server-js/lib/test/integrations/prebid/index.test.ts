@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import type { Mock } from 'vitest';
 
 function apsRenderer() {
   const bid = envelope.seatbid[0].bid[0];
@@ -3713,6 +3714,249 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     expect(mockRequestBids).toHaveBeenCalledTimes(1);
     expect(originalRefresh).toHaveBeenCalledTimes(1);
     expect(originalRefresh).toHaveBeenCalledWith([slot], undefined);
+  });
+
+  describe('prebid refresh dispatch context', () => {
+    /** Observe `prebidRefreshDispatchInProgress` at the moment a native refresh mock runs. */
+    function captureDispatchContextOnCall(
+      nativeRefresh: Mock<() => void>
+    ): Array<boolean | undefined> {
+      const observed: Array<boolean | undefined> = [];
+      nativeRefresh.mockImplementation(() => {
+        observed.push(testWindow.tsjs?.prebidRefreshDispatchInProgress as boolean | undefined);
+      });
+      return observed;
+    }
+
+    it('activates the dispatch context for a delivery-only refresh', () => {
+      const slot = {
+        getSlotElementId: () => 'example-dispatch-delivery-marker',
+        getTargeting: () => [],
+        clearTargeting: vi.fn(),
+      };
+      installPrebidRefreshDiagnostics();
+      const { originalRefresh, pubads } = installGpt([slot]);
+      const observed = captureDispatchContextOnCall(originalRefresh);
+      mockRequestBids.mockImplementation((opts) => completePublisherAuction(opts));
+      const pbjs = installPrebidNpm();
+
+      pbjs.requestBids({
+        adUnits: [
+          {
+            code: 'example-dispatch-delivery-marker',
+            bids: [{ bidder: 'exampleServer', params: {} }],
+          },
+        ],
+        bidsBackHandler: () => pubads.refresh([slot]),
+      } as unknown as RequestBidsArg);
+
+      expect(observed).toEqual([true]);
+      expect(testWindow.tsjs?.prebidRefreshDispatchInProgress).toBeUndefined();
+    });
+
+    it('activates the dispatch context for a completed synthetic auction', () => {
+      const slot = {
+        getSlotElementId: () => 'example-dispatch-synthetic-marker',
+        getTargeting: () => [],
+        clearTargeting: vi.fn(),
+      };
+      installPrebidRefreshDiagnostics();
+      const { originalRefresh, pubads } = installGpt([slot]);
+      const observed = captureDispatchContextOnCall(originalRefresh);
+      mockRequestBids.mockImplementation((opts) => completePublisherAuction(opts));
+      installPrebidNpm();
+
+      pubads.refresh([slot]);
+
+      expect(observed).toEqual([true]);
+      expect(testWindow.tsjs?.prebidRefreshDispatchInProgress).toBeUndefined();
+    });
+
+    it('activates the dispatch context for the timeout watchdog completion', () => {
+      vi.useFakeTimers();
+      try {
+        const slot = {
+          getSlotElementId: () => 'example-dispatch-timeout-marker',
+          getTargeting: () => [],
+          clearTargeting: vi.fn(),
+        };
+        installPrebidRefreshDiagnostics();
+        const { originalRefresh, pubads } = installGpt([slot]);
+        const observed = captureDispatchContextOnCall(originalRefresh);
+        mockRequestBids.mockImplementation(() => undefined);
+        installPrebidNpm();
+
+        pubads.refresh([slot]);
+        vi.advanceTimersByTime(640);
+
+        expect(observed).toEqual([true]);
+        expect(testWindow.tsjs?.prebidRefreshDispatchInProgress).toBeUndefined();
+      } finally {
+        vi.runOnlyPendingTimers();
+        vi.useRealTimers();
+      }
+    });
+
+    it('activates the dispatch context for a caught synthetic auction failure', () => {
+      const slot = {
+        getSlotElementId: () => 'example-dispatch-failure-marker',
+        getTargeting: () => [],
+        clearTargeting: vi.fn(),
+      };
+      installPrebidRefreshDiagnostics();
+      const { originalRefresh, pubads } = installGpt([slot]);
+      const observed = captureDispatchContextOnCall(originalRefresh);
+      mockRequestBids.mockImplementation(() => {
+        throw new Error('example auction failure');
+      });
+      installPrebidNpm();
+
+      pubads.refresh([slot]);
+
+      expect(observed).toEqual([true]);
+      expect(testWindow.tsjs?.prebidRefreshDispatchInProgress).toBeUndefined();
+    });
+
+    it('leaves the dispatch context inactive for an adInit refresh bypass', () => {
+      const slot = {
+        getSlotElementId: () => 'example-dispatch-adinit-bypass',
+        getTargeting: () => [],
+        clearTargeting: vi.fn(),
+      };
+      testWindow.tsjs = { adInitRefreshInProgress: true };
+      const { originalRefresh, pubads } = installGpt([slot]);
+      const observed = captureDispatchContextOnCall(originalRefresh);
+
+      pubads.refresh([slot]);
+
+      expect(observed).toEqual([undefined]);
+    });
+
+    it('leaves the dispatch context inactive for empty or invalid refresh passthroughs', () => {
+      const slot = {
+        getSlotElementId: () => 'example-dispatch-invalid-bypass',
+        getTargeting: () => [],
+        clearTargeting: vi.fn(),
+      };
+      const { originalRefresh, pubads } = installGpt([slot]);
+      const observed = captureDispatchContextOnCall(originalRefresh);
+
+      pubads.refresh([]);
+      pubads.refresh([slot, null]);
+
+      expect(observed).toEqual([undefined, undefined]);
+    });
+
+    it('leaves the dispatch context inactive for an unresolved bare refresh', () => {
+      const originalRefresh = vi.fn();
+      const pubads = { refresh: originalRefresh };
+      testWindow.googletag = {
+        cmd: { push: (fn: () => void) => fn() },
+        pubads: () => pubads,
+      };
+      const observed = captureDispatchContextOnCall(originalRefresh);
+      installRefreshHandler(640);
+
+      pubads.refresh();
+
+      expect(observed).toEqual([undefined]);
+    });
+
+    it('leaves the dispatch context inactive for a fully excluded refresh', () => {
+      const trackingSlot = {
+        getSlotElementId: vi.fn(() => 'example-dispatch-tracking'),
+        getAdUnitPath: vi.fn(() => '/123/trackingonly'),
+        getTargeting: vi.fn(() => []),
+        clearTargeting: vi.fn(),
+      };
+      testWindow.__tsjs_prebid = { excludedGamAdUnitPathSuffixes: ['/trackingonly'] };
+      const { originalRefresh, pubads } = installGpt([trackingSlot]);
+      const observed = captureDispatchContextOnCall(originalRefresh);
+
+      pubads.refresh([trackingSlot]);
+
+      expect(observed).toEqual([undefined]);
+    });
+
+    it('leaves the dispatch context inactive while waiting for the synthetic auction to complete', () => {
+      vi.useFakeTimers();
+      try {
+        const slot = {
+          getSlotElementId: () => 'example-dispatch-waiting-marker',
+          getTargeting: () => [],
+          clearTargeting: vi.fn(),
+        };
+        const { pubads } = installGpt([slot]);
+        let bidsBackHandler: (() => void) | undefined;
+        mockRequestBids.mockImplementation((opts) => {
+          bidsBackHandler = opts.bidsBackHandler;
+        });
+        installPrebidNpm();
+
+        pubads.refresh([slot]);
+        expect(testWindow.tsjs?.prebidRefreshDispatchInProgress).toBeUndefined();
+
+        bidsBackHandler?.();
+        expect(testWindow.tsjs?.prebidRefreshDispatchInProgress).toBeUndefined();
+      } finally {
+        vi.runOnlyPendingTimers();
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  describe('prebid refresh dispatch context exceptions', () => {
+    it('restores the previous flag and rethrows the same error on a native synchronous throw', () => {
+      const slot = {
+        getSlotElementId: () => 'example-dispatch-throw-marker',
+        getTargeting: () => [],
+        clearTargeting: vi.fn(),
+      };
+      const nativeError = new Error('example native refresh failure');
+      installPrebidRefreshDiagnostics();
+      const { originalRefresh, pubads } = installGpt([slot]);
+      mockRequestBids.mockImplementation((opts) => completePublisherAuction(opts));
+      const pbjs = installPrebidNpm();
+
+      // Register a pending delivery for the slot so the next refresh takes
+      // the delivery-only branch, which delegates directly with no
+      // enclosing try/catch of its own — unlike the synthetic-auction
+      // completion path, which is nested inside one.
+      pbjs.requestBids({
+        adUnits: [
+          {
+            code: 'example-dispatch-throw-marker',
+            bids: [{ bidder: 'exampleServer', params: {} }],
+          },
+        ],
+        bidsBackHandler: () => undefined,
+      } as unknown as RequestBidsArg);
+      originalRefresh.mockImplementation(() => {
+        throw nativeError;
+      });
+
+      expect(() => pubads.refresh([slot])).toThrow(nativeError);
+      expect(testWindow.tsjs?.prebidRefreshDispatchInProgress).toBeUndefined();
+    });
+
+    it('restores a previously active context instead of clearing it', () => {
+      const slot = {
+        getSlotElementId: () => 'example-dispatch-nested-marker',
+        getTargeting: () => [],
+        clearTargeting: vi.fn(),
+      };
+      installPrebidRefreshDiagnostics();
+      const { pubads } = installGpt([slot]);
+      testWindow.tsjs!.prebidRefreshDispatchInProgress = true;
+      mockRequestBids.mockImplementation((opts) => completePublisherAuction(opts));
+      installPrebidNpm();
+
+      pubads.refresh([slot]);
+
+      // The outer context was already active before this delegation; the
+      // dispatch helper must restore that previous value, not `false`.
+      expect(testWindow.tsjs?.prebidRefreshDispatchInProgress).toBe(true);
+    });
   });
 });
 

@@ -3043,6 +3043,136 @@ describe('installTsAdInit', () => {
     });
   });
 
+  describe('installer order and refresh diagnostics', () => {
+    /** Minimal `window.pbjs` surface the Prebid module's self-init requires. */
+    interface MockPbjs {
+      registerBidAdapter: ReturnType<typeof vi.fn>;
+      requestBids: ReturnType<typeof vi.fn>;
+      setConfig: ReturnType<typeof vi.fn>;
+      processQueue: ReturnType<typeof vi.fn>;
+      onEvent: ReturnType<typeof vi.fn>;
+      adUnits: unknown[];
+    }
+
+    type WindowWithPbjs = TestWindow & {
+      pbjs?: MockPbjs;
+      __tsjsPrebidShimInstalled?: boolean;
+    };
+
+    /**
+     * Install a minimal `window.pbjs` and clear the Prebid shim sentinel, then
+     * dynamically import the real Prebid module so its self-init runs and
+     * installs its refresh wrapper — capturing whatever `pubads.refresh`
+     * currently is as its own "original".
+     */
+    async function installRealPrebid(
+      bidsBackHandler: (opts: { bidsBackHandler?: (...args: unknown[]) => void }) => void
+    ): Promise<MockPbjs> {
+      const mockPbjs: MockPbjs = {
+        registerBidAdapter: vi.fn(),
+        requestBids: vi.fn(bidsBackHandler),
+        setConfig: vi.fn(),
+        processQueue: vi.fn(),
+        onEvent: vi.fn(),
+        adUnits: [],
+      };
+      (window as WindowWithPbjs).pbjs = mockPbjs;
+      delete (window as WindowWithPbjs).__tsjsPrebidShimInstalled;
+      await import('../../../src/integrations/prebid/index');
+      return mockPbjs;
+    }
+
+    afterEach(() => {
+      delete (window as WindowWithPbjs).pbjs;
+      delete (window as WindowWithPbjs).__tsjsPrebidShimInstalled;
+      delete (window as { __tsjs_prebid_diagnostics?: unknown }).__tsjs_prebid_diagnostics;
+    });
+
+    /** Install a mock `googletag`/`gptDiagnostics` fixture shared by the installer-order tests below. */
+    function setupInstallerOrderFixture(slotElementId: string): {
+      slot: { getSlotElementId: ReturnType<typeof vi.fn> };
+      nativeRefresh: ReturnType<typeof vi.fn>;
+      pubads: { getSlots: ReturnType<typeof vi.fn>; refresh: ReturnType<typeof vi.fn> };
+      recordPrebidRefresh: ReturnType<typeof vi.fn>;
+      recordPublisherRefresh: ReturnType<typeof vi.fn>;
+    } {
+      const slot = { getSlotElementId: vi.fn().mockReturnValue(slotElementId) };
+      const nativeRefresh = vi.fn();
+      const pubads = { getSlots: vi.fn().mockReturnValue([slot]), refresh: nativeRefresh };
+      const recordPrebidRefresh = vi.fn();
+      const recordPublisherRefresh = vi.fn();
+      (window as TestWindow).googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot: vi.fn(),
+        display: vi.fn(),
+        pubads: vi.fn().mockReturnValue(pubads),
+      };
+      (window as TestWindow).tsjs = {
+        gptDiagnostics: {
+          recordPrebidRefresh,
+          recordPublisherRefresh,
+        } as unknown as TsjsApi['gptDiagnostics'],
+      };
+      return { slot, nativeRefresh, pubads, recordPrebidRefresh, recordPublisherRefresh };
+    }
+
+    it('produces one Prebid marker and zero publisher markers through the real GPT-then-Prebid install order', async () => {
+      const { slot, nativeRefresh, pubads, recordPrebidRefresh, recordPublisherRefresh } =
+        setupInstallerOrderFixture('example-installer-order-marker');
+
+      // Real production order: GPT's late-handoff wrapper installs first
+      // (main bundle), then Prebid's refresh wrapper installs later
+      // (deferred bundle) and captures the handoff wrapper as its own
+      // "original" — making Prebid the outer wrapper.
+      const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+      installTsAdInit();
+      await installRealPrebid((opts) => opts.bidsBackHandler?.({}, false, 'example-auction-id'));
+
+      (pubads.refresh as (slots: unknown[]) => void)([slot]);
+
+      expect(recordPrebidRefresh).toHaveBeenCalledTimes(1);
+      expect(recordPublisherRefresh).not.toHaveBeenCalled();
+      expect(nativeRefresh).toHaveBeenCalledTimes(1);
+    });
+
+    it('preserves order and records no duplicate markers when GPT is reinstalled before Prebid', async () => {
+      const { slot, nativeRefresh, pubads, recordPrebidRefresh, recordPublisherRefresh } =
+        setupInstallerOrderFixture('example-reinstall-gpt-marker');
+
+      const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+      installTsAdInit();
+      installTsAdInit();
+      await installRealPrebid((opts) => opts.bidsBackHandler?.({}, false, 'example-auction-id'));
+
+      (pubads.refresh as (slots: unknown[]) => void)([slot]);
+
+      expect(recordPrebidRefresh).toHaveBeenCalledTimes(1);
+      expect(recordPublisherRefresh).not.toHaveBeenCalled();
+      expect(nativeRefresh).toHaveBeenCalledTimes(1);
+    });
+
+    it('preserves order and records no duplicate markers when Prebid is reinstalled after GPT', async () => {
+      const { slot, nativeRefresh, pubads, recordPrebidRefresh, recordPublisherRefresh } =
+        setupInstallerOrderFixture('example-reinstall-prebid-marker');
+
+      const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+      installTsAdInit();
+      await installRealPrebid((opts) => opts.bidsBackHandler?.({}, false, 'example-auction-id'));
+      // Re-import resolves to the same cached module instance (no
+      // `vi.resetModules()` since installRealPrebid ran) — reinstall its
+      // refresh wrapper explicitly and confirm the idempotency sentinel on
+      // `pubads` keeps this a no-op.
+      const { installRefreshHandler } = await import('../../../src/integrations/prebid/index');
+      installRefreshHandler();
+
+      (pubads.refresh as (slots: unknown[]) => void)([slot]);
+
+      expect(recordPrebidRefresh).toHaveBeenCalledTimes(1);
+      expect(recordPublisherRefresh).not.toHaveBeenCalled();
+      expect(nativeRefresh).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe('auction ID diagnostics', () => {
     it('forwards the bid auction ID as the fourth argument to recordTrustedServerOpportunity', async () => {
       const recordTrustedServerOpportunity = vi.fn();

@@ -419,6 +419,28 @@ function recordPrebidRefreshForDiagnostics(slots: RefreshGptSlot[]): void {
   }
 }
 
+/**
+ * Set a synchronous, exception-safe diagnostic dispatch context while
+ * delegating a refresh for which Prebid also records its own intent.
+ *
+ * The GPT late-handoff wrapper skips recording publisher diagnostic intent
+ * while this context is active, so a Prebid-delivered refresh is not
+ * double-labeled publisher-initiated merely because the wrappers are
+ * nested. The previous value is restored in `finally` rather than cleared
+ * to `false`, so a nested delegation cannot clear an outer active context.
+ */
+function withPrebidRefreshDispatch<T>(callback: () => T): T {
+  const ts = window.tsjs;
+  if (!ts) return callback();
+  const previous = ts.prebidRefreshDispatchInProgress;
+  ts.prebidRefreshDispatchInProgress = true;
+  try {
+    return callback();
+  } finally {
+    ts.prebidRefreshDispatchInProgress = previous;
+  }
+}
+
 const DEFAULT_REFRESH_SIZES: BannerSize[] = [
   [728, 90],
   [300, 250],
@@ -1365,7 +1387,7 @@ export function installRefreshHandler(timeoutMs = 1500): void {
       const independentSlots = targetSlots.filter((slot) => !deliverySlots.has(slot));
       if (independentSlots.length === 0) {
         recordPrebidRefreshForDiagnostics(targetSlots);
-        return originalRefresh(slots, opts);
+        return withPrebidRefreshDispatch(() => originalRefresh(slots, opts));
       }
 
       // Clear stale Trusted Server/Prebid targeting from independent slots before
@@ -1448,7 +1470,9 @@ export function installRefreshHandler(timeoutMs = 1500): void {
         // to GPT; otherwise the excluded slots would be refreshed implicitly but
         // would not be represented by the wrapper's concrete target set. Keep
         // the existing bare-refresh delivery behavior when no filtering occurs.
-        originalRefresh(slots === undefined && hasExcludedSlots ? targetSlots : slots, opts);
+        withPrebidRefreshDispatch(() =>
+          originalRefresh(slots === undefined && hasExcludedSlots ? targetSlots : slots, opts)
+        );
       }
 
       try {
