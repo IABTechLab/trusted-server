@@ -1,8 +1,11 @@
 # APS Render Fix and TSJS Resilience Architecture — Design
 
-- **Status:** revision 9 — closes the eighth review round's mandatory set:
-  attempt schema, diagnostic renewal, telemetry/gate model, CSP routing, and
-  rollout measurement. Fully self-contained.
+- **Status:** revision 10 — closes the ninth review round (assignment-id
+  trusted path, control-build event parity, affinity lifetime, two-phase
+  bridge ack, missing-slot termination, materialized cycle denominator,
+  publisher-bound affinity token, admin route family, billing estimator
+  source, independent RC attestation) and re-inlines the alternatives and
+  risk registers so the document is genuinely self-contained.
 - **Date:** 2026-08-04
 - **Baseline:** `rc/july` @ `248fe9558` ("Fix APS PUC rendering and collapsed
   GAM shells"). All file:line citations refer to this commit.
@@ -31,23 +34,45 @@
 - Assets: embedded only; hashed pathnames for cache identity; unknown hash →
   `410`, `no-store`.
 - **Authenticated sticky affinity.** The router sets `ts-rel` on HTML
-  responses — format `r1.<kid>.<exp>.<release>.<cohort>.<assignment_id>.
-<sig>`: `kid ^[a-z0-9-]{1,16}$`; canonical decimal `exp` (TTL 24 h);
-  `release` from the allowlist; `cohort ∈ {canary, control}`;
-  `assignment_id` = 32-hex CSPRNG (the pseudonymous **randomization unit**,
-  §8); `sig` = unpadded base64url HMAC-SHA-256 over the domain-separated
-  length-prefixed input `"ts-affinity-v1" || u32be-len fields ||
-u64be(exp)`; keys owned and rotated by the routing layer (active +
-  previous, ≥ 24 h retention); constant-time verification; test vectors
-  checked in. Attributes `Secure; HttpOnly; SameSite=Lax; Path=/`. Cache
-  keys use the post-validation release label only.
+  responses — format
+  `r1.<kid>.<exp>.<phost>.<release>.<cohort>.<assignment_id>.<sig>`:
+  `kid ^[a-z0-9-]{1,16}$`; canonical decimal `exp`; `phost` = normalized
+  publisher host; `release ^[a-z0-9._-]{1,40}$` from the allowlist;
+  `cohort ∈ {canary, control}`; `assignment_id` = 32-hex CSPRNG (the
+  pseudonymous **randomization unit**, §8); `sig` = unpadded base64url
+  HMAC-SHA-256 over the domain-separated length-prefixed input
+  `"ts-affinity-v1" || u32be(len)||field …` over **every** field
+  including `phost` (so a valid token replayed against another publisher
+  host fails); keys owned/rotated by the routing layer (active + previous,
+  retained ≥ the affinity lifetime + skew); constant-time verification;
+  test vectors checked in. Attributes `Secure; HttpOnly; SameSite=Lax;
+Path=/`. Cache keys use the post-validation release label only.
+- **Affinity lifetime covers the experiment.** `exp` TTL is set to the
+  **maximum experiment window** in force (default 14 days — the billing
+  gate's 7 d + 7 d extension), not 24 h, so a canary visitor never crosses
+  over to control mid-experiment. Renewal on any HTML response before
+  expiry re-signs the **same `assignment_id` and `cohort`** with a fresh
+  `exp` (a browser session's arm is fixed for the experiment). Expired
+  tokens are distinguished from forged ones (expired = valid sig, past
+  `exp`) and, during an active experiment, expired-but-valid tokens are
+  renewed to their original arm rather than reassigned.
+- **assignment_id reaches telemetry only by a trusted server path.** The
+  cookie is `HttpOnly`; the client never reads it and never sends
+  `assignment_id`. The router **strips any inbound assignment/cohort
+  header**, validates `ts-rel`, and injects trusted internal metadata
+  (`X-TS-Cohort`, `X-TS-Assignment`, `X-TS-Release`) on the proxied
+  request; the client-events handler stamps those onto every row
+  server-side. Ingest rejects any client-supplied assignment/cohort field.
+  Tests: spoofed inbound header stripped; wrong-arm; null-rate; cookie
+  expiry mid-session; cross-pool.
 - **State-dependent routing defaults:** during canary, valid tokens route by
-  their binding; invalid/expired/forged → control + reissue. **After forward
-  cutover ("weight 100%"), the safe default flips:** stale, invalid, or
-  control-bound tokens on HTML requests are reassigned to the active
-  release; non-HTML requests with unknown or stale tokens route to the
-  active release — 100% means 100%, not "except 24 h of old cookies."
-  Rollback flips the default back.
+  their binding; invalid/forged → control + reissue; expired-but-valid →
+  renewed to their arm (above). **Forward cutover ("weight 100%")
+  explicitly retires the old release:** for HTML **and** non-HTML request
+  families, stale/invalid/old-release-bound tokens are reassigned/routed to
+  the active release — 100% means 100%. **Rollback symmetrically retires
+  the new release:** still-valid canary bindings are overridden on every
+  request family, not merely defaulted.
 - **CSP-report affinity never depends on cookies:** the renderer is
   sandboxed without `allow-same-origin` (`aps/render.ts:4`), so its
   browser-generated reports are cross-origin to the publisher endpoint and
@@ -58,13 +83,21 @@ u64be(exp)`; keys owned and rotated by the routing layer (active +
 - Beacon and trace-auth transports use `credentials: "same-origin"` so the
   affinity cookie routes them; handlers derive no identity from cookies.
 - **Canary/control measurement (closing the empty-control-arm gap):** the
-  control pool for Phase-3 statistics runs an **observation-only control
-  build** — the baseline plus Phase-2 instrumentation only (trace, beacon,
-  probes; zero behavior changes) — so both arms emit comparable sampled
-  telemetry. Arms write to **arm-specific datasources**; the canonical
-  union view stamps a trusted `deployment_pool` dimension from the write
-  identity (token → dataset → arm), making the arm a queryable row
-  dimension rather than an authorization side effect.
+  control pool runs an **observation-only control build** — baseline render
+  _decisions_, but with **every measurement-only lifecycle hook the
+  Phase-3 gates read**. The control build implements a normative
+  **event-parity contract**: it emits `request_cycle_started`,
+  `attempt_started`, `bridge_request`, `bridge_response_sent`,
+  `renderer_document_loaded`/`adm_document_loaded`, and `render_terminal`
+  at the **same timing points** as the canary build, populated from
+  baseline behavior (e.g. its own `slotRenderEnded`, its own bridge
+  responses) — only the render-decision code differs, never the event
+  definitions or their emission points. Both arms therefore populate the
+  funnel and latency gates identically. Arms write to **arm-specific
+  datasources**; the union view stamps a trusted `deployment_pool` from the
+  write identity. The event-parity contract is itself gated by an **A/A
+  test** (canary-build vs canary-build) that must show zero metric
+  movement before any A/B canary begins.
 - Router weight over sticky cohorts is the sole activation primitive; flags
   are in-pool emergency kill switches. Cutover = weight 100% + CDN purge;
   rollback = weight back + re-purge. The affinity acceptance test covers
@@ -191,28 +224,40 @@ class as the existing `ts-debug` comment). The **diagnostic credential**
   `ext.trusted_server.trace = {trace_id, auth, auction_id}`.
 - **Attempt identity (closing the parent/child collision):** every render
   attempt mints a client-side **`attempt_id`** (8-char `[a-z0-9]`,
-  CSPRNG, unique per trace) and carries nullable **`parent_attempt_id`**
-  (fallback children reference their parent). The tuple
-  `(trace_id, nav_gen, refresh_gen, slot)` remains a **grouping key
-  only**; `ts_render_attempts_v` keys by `attempt_id`. Exactly one
-  terminal event per `attempt_id` (G4c) is a tested invariant.
+  CSPRNG) and carries nullable **`parent_attempt_id`** (fallback children
+  reference their parent). **The canonical attempt key is
+  `(publisher_domain, trace_id, attempt_id)`** — `attempt_id` alone (≈ 2.8
+  T values) is not globally unique at production volume, so
+  `ts_render_attempts_v` keys and parent lookups use the full triple.
+  Uniqueness within a trace is guaranteed by a **per-trace live-set
+  collision check with retry** (the `NavigationSession` holds the issued
+  set; a collision re-draws). The tuple
+  `(trace_id, nav_gen, refresh_gen, slot)` remains a **grouping key only**.
+  Exactly one terminal event per attempt key (G4c) is a tested invariant.
 - **Deterministic keyed sampling:** first 8 bytes of
   `HMAC-SHA-256(sampling_key, trace_id)` as u64 BE; `sampled` iff
   `u64 < floor(sample_rate × 2⁶⁴)`; `sample_rate` finite in `[0, 1]`.
 - **Cross-tier join:** equality key = the server telemetry
   **`auction_id`** (UUID; the client column is `Nullable(UUID)` and
   ingest validates canonical UUID syntax). Generations are client-side
-  only. **Join grains are explicit:** auction-level joins hit the one
-  summary row per `auction_id`; slot-level joins use
-  `auction_id + slot + row_kind`; bid-level joins are opt-in for
-  bid-grained analyses. Raw attempt × auction-row joins are forbidden
-  (row multiplication).
+  only. **Join grains are explicit, and the slot grain goes through a
+  dedicated summary view.** `auction_events_raw` has multiple
+  `row_kind=slot` rows per slot (bid, provider, drop, selection), so a
+  `auction_id + slot` join multiplies rows; funnels therefore join against
+  **`ts_auction_slot_summary_v` — one row per `(auction_id,
+canonical_slot)`** built from the `selection_summary` slot rows.
+  Auction-level joins hit the one totals/summary row per `auction_id`;
+  bid/drop/provider joins carry their real grain and are opt-in. **Client
+  `slot` and server `slot_id` use the same canonical normalization**
+  (lowercased, `-container` suffix stripped — the resolution rule of
+  `gpt/index.ts:112-138`), applied on both sides and tested.
 - Cache-privacy invariant: traces/authorizations only in per-request
   auction-bearing responses; such HTML is `private, no-store`.
 - Envelope: per-trace groups `{trace_id, auth, events[]}`; events carry
   `{nav_gen, refresh_gen, seq, flow, attempt_id?, parent_attempt_id?,
-auction_id?, t_rel_ms?}`. **`t_rel_ms`** is a bounded monotonic
-  duration (`performance.now()` truncated to u32 ms, relative to
+auction_id?, t_rel_ms?}`. **`t_rel_ms`** (time, relative, in
+  milliseconds) is a bounded monotonic duration (`performance.now()`
+  truncated to u32 ms, relative to
   navigation start) — the latency gates' basis; `received_at` is ingest
   time and is never used as event time. `flow` is closed:
   `ssat | prebid | page_bids | direct | fallback | system`.
@@ -264,25 +309,44 @@ class or opposite — supersedes a pending uncertain intent**, and if the
 uncertain one could still be in flight, the next `slotRequested` is
 ambiguous → quarantine. Cycles open only on `slotRequested` (causal
 head; SRA = one per slot per batch) and close on `slotRenderEnded`
-(`responseIdentifier` dedups drain). One outstanding TS cycle per slot;
-one queued replacement. Attribution requires exactly one outstanding TS
-cycle and no overlap; otherwise `cycle_unattributable`, fail closed. **No
-timeout re-arm** — re-arm only on count-based drain, safe TS-owned
-destroy/redefine, or page end; unissued intents are NavigationSession
-children; physical state is RuntimeSession. Deterministic-harness CI +
+(`responseIdentifier` dedups drain). **Each attributable `slotRequested`
+emits exactly one `request_cycle_started` event** — the materialized
+denominator the fill and attribution gates divide by (`attempt_started`
+is not equivalent: an attempt can fail before producing a physical
+request). One outstanding TS cycle per slot; one queued replacement.
+Attribution requires exactly one outstanding TS cycle and no overlap;
+otherwise `cycle_unattributable`, fail closed. **No timeout re-arm** —
+re-arm only on count-based drain, safe TS-owned destroy/redefine, or page
+end; unissued intents are NavigationSession children; physical state is
+RuntimeSession. Deterministic-harness CI +
 the release-gating real-GAM suite (Appendix A.3).
 
-**G4b — Acknowledgement, per render path.** Nonces are per-attempt
-128-bit CSPRNG values; the kernel validates source ownership (§6.8),
-nonce, token, `nav_gen`, `refresh_gen` before transitions or
-notifications; navigation/supersession invalidates; late acks →
-`stale_navigation`. Deadlines: document 3 s, runner 10 s, adm 5 s.
+**G4b — Two-phase acknowledgement (the nonce is minted by the claim, not
+carried in the request).** The baseline PUC request is `{message, adId}`
 
-1. **APS-PUC** (baseline transport): MessageChannel into the renderer
-   document (`ports.length` checks, exact-key replies, one-shot latch,
-   port close); the document posts authenticated
-   `renderer_document_loaded` then the accepted/failed result to the top
-   window.
+- a `MessagePort` — it cannot carry a nonce or generations, and the nonce
+  can only exist **after** a claim succeeds. So the protocol is two phases:
+
+* **Phase 1 — claim (on the incoming `Prebid Request`):** validate source
+  ownership (§6.8), the reserved `adId` against the reservation store, and
+  the internal current `nav_gen`/`refresh_gen` **held in the kernel**
+  (not in the message); on success, **mint the per-attempt 128-bit CSPRNG
+  nonce**, bind notifications, reply over the `MessagePort` (the renderer
+  depends on this reply to settle its PUC promise), and — for the APS
+  path — hand the nonce to the renderer document in the response.
+* **Phase 2 — acknowledgement (later document/runner messages):** validate
+  source, nonce, token, `nav_gen`, `refresh_gen`. Navigation/supersession
+  invalidates the nonce; late acks → `stale_navigation`. Deadlines:
+  document 3 s, runner 10 s, adm 5 s.
+
+Per render path:
+
+1. **APS-PUC** (baseline transport): the Phase-1 reply travels over the
+   `MessagePort`; the response also transfers the freshly minted nonce
+   into the renderer document (`ports.length` checks, exact-key replies,
+   one-shot latch, port close); the document then posts authenticated
+   `renderer_document_loaded` and the accepted/failed result to the top
+   window (Phase 2).
 2. **Generic ADM/cache-PUC:** **the acceptance observation lives in the
    trusted owner, not the creative document** — the owner observes its
    own iframe's `load`/`error` events and emits `adm_document_loaded`;
@@ -315,11 +379,15 @@ fallback: attributed parent `gam_empty` immediately before child
 render). `nurl` at bind; `burl` at `accepted`; idempotency key
 `(trace_id, nav_gen, refresh_gen, slot, id_kind, id_value)`.
 **Dispatch mechanics (normative):** macros are expanded server-side
-only; the client fires
+only; the client fires exactly one
 `fetch(url, {method: "GET", mode: "no-cors", credentials: "omit",
-redirect: "follow", referrerPolicy: "no-referrer", keepalive: true})`;
-on synchronous failure the fallback is a detached `Image()` request; no
-retries either way. Every dispatch emits
+redirect: "follow", referrerPolicy: "no-referrer", keepalive: true})`
+and awaits its settlement. **There is no `Image()` fallback** — a
+detached image request would construct a separate credentialed,
+referrer-bearing request outside this privacy contract; a request that
+rejects (construction error) or resolves to a network failure emits
+`notification_sent{result: failed}` and stops. No retries. Every
+dispatch emits
 `notification_sent{kind, notif_id, result: queued | failed}` with the
 **server-minted `notif_id`** (12-char token delivered with the bid).
 Duplicates: hermetic exactly-once proof + production detection alarm +
@@ -341,7 +409,11 @@ child identity before any effect. Tests: partial overlap, full overlap,
 timeout, navigation disposal, reversed responses. The auction client
 returns a discriminated result — `{ok: bids[]} | {error:
 "auction_timeout" | "network_error" | "http_error" | "invalid_response"}`
-(§3.14); only a parsed empty response is `no_bid`. Public API:
+(§3.14); only a parsed empty response is `no_bid`. **After the batch
+processes every response bid, each still-live child with no valid
+matching winner is terminated `render_terminal{no_bid}`** — a response
+carrying only slot X never leaves slot Y's child nonterminal, so
+`RequestAdsResult` always settles. Public API:
 `tsjs.requestAds(options): Promise<RequestAdsResult>`,
 `RequestAdsResult = {traceId, slots: [{slot, outcome, reason?}]}`,
 settling when every child attempt is terminal.
@@ -365,15 +437,21 @@ implying a live channel that does not exist.
   publication (config is a release-time input); serving is lookup-only;
   unknown vector = build error; unknown hash = `410 no-store`; exact
   match = `public, max-age=31536000, immutable`.
-- **Internal route families — four** (renderer, client-events,
-  CSP-report, `/_ts/trace-auth`): dispatch before auth/EC/publisher/
-  integration filters (`app.rs:709` orders these wrong today); all
-  methods + version prefixes reserved locally (405 + `Allow` +
-  `no-store`; unknown version 404 `no-store`; no publisher fall-through,
-  `adapter-spin app.rs:804`); no body/cookie/authorization forwarding.
-  **Per-family origin policy:** client-events + trace-auth strict
-  normalized same-origin; CSP admits opaque/`null` origins with path
-  identity + limits; renderer is a public GET validated by version/path.
+- **Internal route families — five** (renderer, client-events,
+  CSP-report, `/_ts/trace-auth`, and the **admin issuance family**
+  `/_ts/admin/*` — diagnostic-credential and probe-authorization, §5.3):
+  all dispatch before auth/EC/publisher/integration filters (`app.rs:709`
+  orders these wrong today); all methods + version prefixes reserved
+  locally (405 + `Allow` + `no-store`; unknown version 404 `no-store`; no
+  publisher fall-through, `adapter-spin app.rs:804`); no
+  body/cookie/authorization forwarding to the publisher. **Per-family
+  origin/auth policy:** client-events + trace-auth strict normalized
+  same-origin; CSP admits opaque/`null` origins with path identity +
+  limits; renderer is a public GET validated by version/path; **the admin
+  family sits behind operator authentication with its own rate limits and
+  exists on all adapters that expose an admin plane** (elsewhere it is
+  absent, and diagnostic/probe modes are unavailable there — stated, not
+  implied). All five families appear in the four-adapter parity matrix.
 - Ingest routes in all four adapters; Fastly has real sinks; others
   accept-count-drop (DR-5). §5.6 schemas deploy before writers.
 
@@ -389,9 +467,10 @@ implying a live channel that does not exist.
 
 | `t`                        | fields                                        | allowed `flow`          |
 | -------------------------- | --------------------------------------------- | ----------------------- |
+| `request_cycle_started`    | slot                                          | ssat, prebid, page_bids |
 | `bid_received`             | slot, id_kind, source                         | render flows            |
 | `targeting_set`            | slot, id_kind                                 | render flows            |
-| `attempt_started`          | slot, source                                  | render flows            |
+| `attempt_started`          | slot, source?                                 | render flows            |
 | `bridge_request`           | slot, id_kind, matched                        | ssat, prebid, page_bids |
 | `bridge_response_sent`     | slot, source                                  | ssat, prebid, page_bids |
 | `render_terminal`          | slot, outcome, reason?, source?               | render flows            |
@@ -408,13 +487,18 @@ implying a live channel that does not exist.
 | `heartbeat`                | probe_run_id, expected_seq, adapter, target   | system                  |
 
 Render flows = `ssat | prebid | page_bids | direct | fallback`.
-`attempt_started` carries the attempt's `t_rel_ms` baseline; the latency
-metric is `render_terminal{accepted}.t_rel_ms −
-attempt_started.t_rel_ms` per attempt. `source` on `render_terminal` is
-nullable for pre-source reasons (`gpt_absent`, `pbjs_absent`,
-`slot_unresolved`, `intent_no_request`, `abi_mismatch`, `registry_full`,
-`bundle_partial`); the per-event/per-reason validity matrix is a
-generated artifact (§6.7). Reason enum: `renderer_document_no_load`,
+`attempt_started` carries the attempt's `t_rel_ms` baseline and its
+`source` is **optional** (direct attempts start before a response selects
+a source); the latency metric is `render_terminal{accepted}.t_rel_ms −
+attempt_started.t_rel_ms` per attempt. **`render_terminal.source` is
+present iff a render source was actually bound** — absent for
+`no_bid`/`cancelled` and every pre-winner outcome (`auction_timeout`,
+`network_error`, `http_error`, `invalid_response`) as well as the
+pre-source reasons (`gpt_absent`, `pbjs_absent`, `slot_unresolved`,
+`intent_no_request`, `abi_mismatch`, `registry_full`, `bundle_partial`);
+the generated per-event/per-reason validity matrix (§6.7) encodes
+source-presence by whether a source was bound, not by a hand-list.
+Reason enum: `renderer_document_no_load`,
 `runner_no_load`, `runner_failed`, `descriptor_invalid`,
 `invalid_dimensions`, `dimensions_out_of_range`, `bridge_id_mismatch`,
 `cycle_unattributable`, `intent_no_request`, `stale_navigation`,
@@ -525,13 +609,18 @@ same-origin` else normalized `Origin` equality; absent both →
   `attempt_id`**); the arm-union views stamp `deployment_pool` from the
   write identity (§0). Dashboards/alerts query canonical views only.
 - The Fastly sink is fire-and-forget (`tinybird.rs:153`) —
-  **per-datasource authenticated probes**: every probe row carries
-  `{probe_run_id, expected_seq, adapter, target}`; client-events via
-  `heartbeat` events under probe-mode tokens; CSP via probe reports to a
-  **secret-derived probe `policy_id`** (registered like any policy id,
-  not guessable — `policy_id = "probe"` would be publicly forgeable);
-  ops via an authenticated probe counter write. **Persistence gates are
-  scoped to sink-backed adapters** (DR-5); accept-count-drop adapters
+  **per-datasource authenticated probes**. **Every probe-capable table
+  carries `{probe_run_id, expected_seq, adapter, target}`** (added to
+  `ts_csp_reports` and `ts_ops_counters` below, not only
+  `ts_client_events`), so loss queries distinguish runs, retries, resets,
+  and adapters. **These four fields are cryptographically bound to the
+  issued probe authorization** — the admin-issued probe token
+  (`POST /_ts/admin/probe-authorization`, §5.3) signs `probe_run_id`,
+  `adapter`, and `target`, and the ingest handler stamps the row from the
+  verified token rather than trusting submitted values. A secret-derived
+  CSP probe `policy_id` is a bearer capability for _routing_ only; it is
+  never treated as proof of authentic run metadata. **Persistence gates
+  are scoped to sink-backed adapters** (DR-5); accept-count-drop adapters
   get HTTP-parity gates only. Freshness = probe lag ≤ 5 min; loss =
   `expected_seq` gaps < 0.1%; alert owner: release owner's on-call.
 - **Alert-delivery drill:** a synthetic canary page injects a known
@@ -582,27 +671,37 @@ duplicate_bid_id, bid_id_too_large, empty_seatbid,
 empty_seatbid_bids, unknown_impid, invalid_price,
 unsupported_media_type, creative_id_too_large,
 renderer_extension_serialization_failed, no_render_source,
-lost_to_higher_bid, overflow` — covering `aps.rs:740-929`
-    (incl. `empty_seatbid_bids` at `:875`) and `formats.rs:408-419`; a
-    **compile-time exhaustiveness test maps every producer to the enum**.
+lost_to_higher_bid, unsupported_currency, missing_request_context,
+overflow` — covering every baseline producer at `aps.rs:740-929`
+    (incl. `empty_seatbid_bids` at `:875`, `unsupported_currency`, and
+    the response-level `missing_request_context`, whose totals/error-row
+    disposition is `row_kind = totals` with a null slot) and
+    `formats.rs:408-419`. `currency_mismatch` and `unsupported_currency`
+    are **distinct** (config-vs-response mismatch vs an unsupported
+    currency code). Producers emit a **shared typed enum, no string
+    literals**, so the **compile-time exhaustiveness test is real**: every
+    variant maps to a producer and every producer to a variant.
 - **`ts_csp_reports`**: `received_at DateTime64, publisher_domain
 LowCardinality(String), release_id String, policy_id
 LowCardinality(String), cohort LowCardinality(String), directive_bucket
 Enum(script|style|frame|img|connect|font|media|worker|other),
 source_bucket Enum(https_host_allowlisted|data|blob|inline|eval|other),
-count UInt32`; sorting key `(publisher_domain, received_at, policy_id)`;
-  TTL 30 days. Ingest: body ≤ 8 KiB, ≤ 10 reports/request, strings ≤ 256,
-  nesting ≤ 4, both media types with separate validators, unused fields
-  discarded, own limiter bucket. **Caps with values:** 10,000
-  reports/hour/publisher and 1,000/hour/cohort; overflow increments the
-  `csp_overflow` ops counter (dropped reports counted, never parsed
-  further).
+count UInt32, probe_run_id Nullable(String), expected_seq
+Nullable(UInt32), adapter Nullable(Enum), target Nullable(Enum)`;
+  sorting key `(publisher_domain, received_at, policy_id)`; TTL 30 days.
+  Ingest: body ≤ 8 KiB, ≤ 10 reports/request, strings ≤ 256, nesting ≤ 4,
+  both media types with separate validators, unused fields discarded, own
+  limiter bucket. **Caps with values:** 10,000 reports/hour/publisher and
+  1,000/hour/cohort; overflow increments the `csp_overflow` ops counter
+  (dropped reports counted, never parsed further).
 - **`ts_ops_counters`**: `received_at DateTime64, publisher_domain
 LowCardinality(String), release_id String, counter
 Enum(renderer_requests|renderer_unknown_version|renderer_auth_blocked|
 ingest_accepted|ingest_dropped|ingest_rate_limited|abuse_flagged|
-csp_overflow|probe), value UInt64`; sorting key `(publisher_domain,
-received_at, counter)`; TTL 90 days.
+csp_overflow|probe), value UInt64, probe_run_id Nullable(String),
+expected_seq Nullable(UInt32), adapter Nullable(Enum), target
+Nullable(Enum)`; sorting key `(publisher_domain, received_at, counter)`;
+  TTL 90 days.
 - **Sink plumbing:** one generic multi-target Tinybird sink trait;
   `RuntimeServices` (`platform/types.rs:158`) gains handles for
   client-events, CSP, and ops targets beside the auction sink; each
@@ -640,14 +739,17 @@ explicit `winner_selection`.
 
 ### 6.1 Mediation
 
-Eight rules, arrival-independent, one shared helper across both
+Seven rules, arrival-independent, one shared helper across both
 lifecycles: (1) required `[auction].currency` (APS + non-USD = startup
 error; Prebid validates at parse, `prebid.rs:2433`); (2) candidate
 identity `source_candidate_id = (provider_name, upstream_bid_id)` with
 the upstream id **required, ≤ 64 chars, unique** — missing/duplicate/
 oversized → `bid_drop{missing_bid_id | duplicate_bid_id |
-bid_id_too_large}`, **no fingerprint fallback**; `candidate_id` (CSPRNG
-wire echo, never an ordering key); (3) mediator echoes
+bid_id_too_large}`, **no fingerprint fallback**; `candidate_id` is a
+server-minted 12-char `^[a-z0-9]{12}$` CSPRNG wire echo with in-auction
+collision retry, **never an ordering key**, and the mediator's echoed
+value is validated against the issued set on return (an echo matching no
+issued id is `provenance_invalid`); (3) mediator echoes
 `ext.trusted_server.candidate_id` — resolves → forwarded candidate,
 provenance `mediator`, **price authoritative from the mediator, every
 render-source and notification field from the stored candidate, deal
@@ -837,28 +939,34 @@ versions and is invalid if any differ). Browser timing:
 `performance.mark("tsjs:bids-script")` →
 `performance.mark("tsjs:first-display")`; reference fixture; warm cache;
 local resources; 5 warm-ups, 50 samples, nearest-rank p90 ≤ baseline ×
-1.10; inconclusive (3-run agreement > 5%) → one rerun, then fail. **Peak
-JS heap, reproducibly:** via the Playwright CDP session —
+1.10; inconclusive (3-run agreement > 5%) → one rerun, then fail.
+**Retained-heap budget (named accurately — this measures retained, not
+transient allocation peak):** via the Playwright CDP session —
 `HeapProfiler.collectGarbage` then `Runtime.getHeapUsage`, sampled at
 five fixed points (post-boot, post-adInit, post-first-render,
 post-refresh, post-SPA-navigation) on the maximal vector; metric = max
-sample; gate ≤ baseline × 1.10; same rerun rule. Server benchmark: the
-G5 lookup path; 100 warm-ups, 1,000 iterations; median + p90 one-sided
-≤ baseline × 1.10; 3-run 5% agreement or inconclusive.
+retained sample; gate ≤ baseline × 1.10; same rerun rule. (Transient
+allocation peak is out of scope; if a future leak needs it, add
+`HeapProfiler` continuous sampling as a separate budget.) Server
+benchmark: the G5 lookup path; 100 warm-ups, 1,000 iterations; median +
+p90 one-sided ≤ baseline × 1.10; 3-run 5% agreement or inconclusive.
 
 ### 7.11 Toolchain
 
 TypeScript floor to the resolved 5.9 line; release-gating flags
 `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`,
 `verbatimModuleSyntax`, `noImplicitOverride`,
-`useUnknownInCatchVariables`; checked-in npm script `typecheck`:
+`useUnknownInCatchVariables`. The gate is a **checked-in package.json
+script**, `"typecheck": "tsc -p tsconfig.json --noEmit"`, invoked so the
+lockfile-resolved compiler is used:
 
 ```
-cd crates/trusted-server-js/lib && npx --no-install tsc -p tsconfig.json --noEmit
+npm --prefix crates/trusted-server-js/lib run typecheck
 ```
 
-Dev toolchain bumps as individual CI-gated PRs; `prebid.js` excluded
-from casual bumps; monthly review.
+(the script runs `tsc` from the package's own `node_modules/.bin`, so no
+`npx` path ambiguity). Dev toolchain bumps as individual CI-gated PRs;
+`prebid.js` excluded from casual bumps; monthly review.
 
 ## 8. Rollout
 
@@ -871,12 +979,31 @@ resample assignment ids, 2,000 resamples, fixed seed recorded in the
 gate artifact, strata (publisher × slot) weighted by control-arm
 traffic share; one-sided 95% confidence bounds on **relative
 differences**; each gate is an independent go/no-go (no cross-gate
-multiplicity correction — stated). Missing telemetry counts as failure.
-Per-flow floors; rare flows (direct, fallback) gate hermetically +
-real-GAM, never statistically. `cycle_unattributable` divides by all
-attribution-candidate TS cycles. **Billing cohort dimension in external
-reports:** TS-driven GAM requests set a `ts_arm=<cohort>` key-value,
-making the arm a reportable GAM dimension for reconciliation.
+multiplicity correction — stated). **"Missing telemetry counts as
+failure" is made enforceable for whole-missing traces:** the server
+writes a **sampled exposure row** (`ts_expected_attempts`, one per
+server-observed eligible APS win in a sampled trace) at auction time;
+gates **left-join client attempts to expected rows**, so a trace whose
+client events never arrive is a visible missing attempt (not an absent
+row that silently shrinks the denominator). A per-window
+client-transport completeness ratio below 90% makes the statistical gate
+**inconclusive** rather than passing on a biased sample. Per-flow floors;
+rare flows (direct, fallback) gate hermetically + real-GAM, never
+statistically. `cycle_unattributable` divides by all
+attribution-candidate TS cycles.
+
+**Billing is the one gate the cluster bootstrap cannot run**, because GAM
+aggregate reports expose only per-`ts_arm` totals, not session clusters.
+Two options, one chosen per DR: (a) source billing from **GAM Data
+Transfer / impression-level logs**, which carry the `ts_arm` key-value
+**and** a joinable impression/`attempt_id` correlator, and run the same
+cluster bootstrap over impression rows; or (b) if Data Transfer is
+unavailable, use a **separate pre-reviewed aggregate estimator** with the
+**day** as the randomization unit (a two-sample non-inferiority test over
+daily per-arm RPM across the billing window), declared in the gate
+artifact. Whichever is chosen, `ts_arm` is a **reserved, network-audited
+key proven untargeted by any production line item and A/A-validated
+before canary** (§0, §11), so it cannot perturb the metric it measures.
 
 **Phase 0 decision records:** DR-1 mediator presence; DR-2 script
 creatives (deployment decision); DR-3 #997 vs re-merge; DR-4
@@ -941,32 +1068,81 @@ Hermetic CI blocks PRs; the real-GAM suite is release-gating (A.3).
 | Policy           | script-creative warning; `invalid_dimensions` w/h; `dimensions_out_of_range` unclamped; `boot.debug` + response `debug` gating; diagnostic completeness; kill-switch snapshot semantics                                                                                          |
 | Perf             | marks present; three vectors; heap CDP; inconclusive-rerun; pinned-environment baseline validity                                                                                                                                                                                 |
 
-## 10. Alternatives considered
+## 10. Alternatives considered (complete)
 
-Revision 8's twelve rejections stand (patch-without-telemetry;
-always-direct-render; shared chunks now; big-bang rewrite; dropping the
-bootstrap; timeout fallback; timeout re-arm; N/N−1 machinery;
-client-computed hashes; fingerprint identities; plain cohort cookie;
-`billing_outcome`), plus: **13.** injected in-realm ADM reporter —
-rejected (hands bidder code the acceptance credential); owner-observed
-`load`/`error` instead. **14.** cookie-routed CSP affinity — rejected
-(opaque-origin reports carry no cookie); path-identity routing. **15.**
-token-identity alone for arm attribution — rejected (authorization is
-not a row dimension); arm-specific datasources + stamped union view.
-**16.** indefinite diagnostic renewal — rejected; `dexp` ceiling.
-**17.** shared attempt identity for parent/child — rejected; distinct
-`attempt_id`.
+1. **Patch APS point-failures without telemetry** — rejected: four correct
+   fixes produced no reliable ads; the next would be another guess.
+2. **Always direct-render APS** (skip GAM/PUC) — rejected: unilaterally
+   changes GAM reporting/pacing; kept only as the attributed-`gam_empty`
+   fallback.
+3. **Single module graph / shared chunks now** — rejected for this release:
+   changes the delivery pipeline while everything else changes; successor
+   option behind the same registry surface.
+4. **Full rewrite in one branch without phases** — rejected: the
+   browser-spec safety net is thinnest exactly where behavior changes.
+5. **Dropping the ES5 bootstrap** — rejected: loses the pinned no-bundle
+   guarantee; the generated fallback keeps it.
+6. **Timeout-triggered fallback rendering** — rejected: uncancelable GPT
+   requests race late fills → double-render/double-bill.
+7. **Timeout-based quarantine re-arm** — rejected: recreates the
+   stale-event bug.
+8. **N/N−1 compatibility machinery** — removed by the §0 policy decision.
+9. **Client-computed notification hashes** — rejected: no key without
+   breaking the pseudonymization boundary; server-minted `notif_id`.
+10. **Fingerprint identities for id-less bids** — rejected: can merge
+    distinct demand; rejection with closed reasons instead.
+11. **Plain readable cohort cookie** — rejected: dark-pool opt-in +
+    cache-cardinality abuse; opaque authenticated token.
+12. **`billing_outcome` event** — removed: no honest post-accept producer.
+13. **Injected in-realm ADM reporter** — rejected: hands bidder code the
+    acceptance credential; owner-observed `load`/`error` instead.
+14. **Cookie-routed CSP affinity** — rejected: opaque-origin reports carry
+    no cookie; server-selected `policy_id` path identity.
+15. **Token-identity alone for arm attribution** — rejected: authorization
+    is not a queryable row dimension; the router injects a trusted internal
+    cohort header ingest stamps (§0).
+16. **Indefinite diagnostic renewal** — rejected: signed `dexp` ceiling.
+17. **Shared attempt identity for parent/child** — rejected: distinct
+    `attempt_id`.
+18. **24 h affinity for a multi-day experiment** — rejected: the affinity
+    lifetime now covers the maximum experiment window (§0).
+19. **`Image()` notification fallback** — rejected: it constructs a
+    separate credentialed/referrer-bearing request outside the primary
+    transport's privacy contract; a failed dispatch reports `failed`
+    instead (§G4d).
 
-## 11. Risks
+## 11. Risks (complete register)
 
-Revision 8's register stands (cutover blast radius; sticky-cohort
-infrastructure; mediator wire-contract change; published notification
-triggers; required-config startup errors; beacon abuse; memory bounds;
-advisory CSP; sink blindness; ABI freeze; schema generation), plus: the
-**observation-only control build** is new scoped work whose "zero
-behavior change" property is itself gated (hermetic parity vs baseline);
-and `assignment_id` persistence is pseudonymous but new — bounded by the
-24 h token TTL and excluded from any identity join by schema review.
+- **Hard-cutover blast radius** — accepted by policy; bounded by the §0
+  runbook (probes, low-weight canary, monitored window, weight-back).
+- **Sticky-cohort routing is new infrastructure** the cutover depends on —
+  Phase 0 work; its coherence and affinity-lifetime tests are
+  release-gating.
+- **Mediator wire-contract change** (`candidate_id` echo) — DR-4 gates
+  `merge_highest_cpm`; config validation enforces the block.
+- **Published notification triggers** become a contract for PBS-path
+  demand — changing them later breaks SSP reporting.
+- **Required `[auction].currency`/`winner_selection`** in mediated
+  deployments are a deliberate startup-error class under §0.
+- **Beacon abuse** — pre-parse caps, per-family origin policies,
+  fail-closed numeric limits, signed modes, credentialed diagnostics.
+- **Registry/limiter memory** — explicit capacities, TTL reclamation,
+  reject-at-capacity; Fastly overshoot documented, not claimed.
+- **CSP data is advisory** — never a sole automatic rollback signal.
+- **Sink blindness** — per-datasource authenticated probes.
+- **ABI freeze** — `tsjs._internal.registry` is load-bearing; exact-release
+  verdicts are the contract.
+- **Schema generation** — checked-in artifacts + staleness CI.
+- **Observation-only control build** is new scoped work whose "zero
+  behavior change" property is itself gated by hermetic parity vs baseline
+  **and an A/A pre-canary** (the `ts_arm` GAM key must move no metric).
+- **`assignment_id` persistence** is pseudonymous but new — bounded by the
+  affinity token lifetime and excluded from any identity join by schema
+  review; it reaches telemetry only via the router-injected trusted header
+  (§0), never a client field.
+- **`ts_arm` GAM targeting key** could itself perturb line-item matching —
+  reserved and audited network-wide, proven untargeted by production line
+  items, and A/A-tested before canary (§8).
 
 ## 12. Success criteria
 
@@ -1024,29 +1200,29 @@ decision records. Low volume: inconclusive → extend once → Hold.
 
 ### A.1 Phase gates
 
-| Phase | Gate                          | Artifact                               | Numerator / denominator (source)                                                         | Floor           | Threshold                                          | Window                    | Owner | Action   |
-| ----- | ----------------------------- | -------------------------------------- | ---------------------------------------------------------------------------------------- | --------------- | -------------------------------------------------- | ------------------------- | ----- | -------- |
-| 0     | Dark-pool health              | `probe-pool.sh`                        | expected responses / probe requests                                                      | 1,000           | 100%                                               | 24 h                      | OPS   | Hold     |
-| 0     | Schema validation             | `schema-writes.sh`                     | accepted / deterministic synthetic rows (all tables)                                     | 10,000          | **0 rejections**                                   | 24 h                      | RO    | Hold     |
-| 0     | Asset identity                | `asset-probe.sh`                       | correct status / probed hashes                                                           | all             | 100%                                               | once                      | QA    | Hold     |
-| 0     | Config binding                | `config-hash.sh`                       | verified pools / pools                                                                   | all             | 100%                                               | once                      | OPS   | Hold     |
-| 1     | Kernel/bootstrap (hermetic)   | `bootstrap-ownership.spec` + counters  | passing cases / cases (no beacon dependency)                                             | all             | 100%                                               | CI                        | QA    | Hold     |
-| 2     | Ingest HTTP parity            | `ingest-parity.sh`                     | passing / parity cases (4 adapters × 4 families)                                         | all             | 100%                                               | CI                        | QA    | Hold     |
-| 2     | Persistence (sink-backed)     | `gate_ingest.pipe`                     | accepted probe events / sent (probe tokens)                                              | 10,000          | ≥ 99%; dedup exactly-once                          | 24 h                      | OPS   | Hold     |
-| 2     | Per-sink authenticated probes | `gate_probes.pipe`                     | on-time probe rows / expected (`probe_run_id×seq`), per datasource × sink-backed adapter | 1,000 each      | lag ≤ 5 min; loss < 0.1%                           | 24 h                      | OPS   | Hold     |
-| 2     | Alert drill                   | `alert-drill.sh`                       | alerts ≤ 1 h / injected failure episodes                                                 | 3 episodes      | 100%                                               | 24 h                      | OPS   | Hold     |
-| 3     | Funnel ssat/prebid/page_bids  | `gate_funnel.pipe`                     | per A.2 stage pairs (`ts_render_attempts_v` ⋈ slot-level auction rows)                   | 10,000/flow-arm | per A.2                                            | 24 h                      | RO    | Rollback |
-| 3     | Direct/fallback conformance   | hermetic + A.3 rows                    | passing / suite cases                                                                    | all             | 100%                                               | CI + RG                   | QA    | Hold     |
-| 3     | Attribution soundness         | `gate_cycles.pipe`                     | `cycle_unattributable` / **all attribution-candidate TS cycles**                         | 10,000          | < 0.5%                                             | 24 h                      | RO    | Rollback |
-| 3     | GAM fill                      | `gate_fill.pipe`                       | nonempty `slotRenderEnded` / TS request cycles, canary vs control                        | 10,000/arm      | 1-sided 95% CB rel. diff ≥ −2%                     | 24 h                      | RO    | Rollback |
-| 3     | Latency                       | `gate_latency.pipe`                    | p95 of (`render_terminal{accepted}.t_rel_ms − attempt_started.t_rel_ms`) per arm         | 10,000/arm      | 1-sided 95% CB rel. diff ≤ +2%                     | 24 h                      | RO    | Rollback |
-| 3     | Billing                       | `gate_billing.pipe` + GAM `ts_arm`     | revenue per 1,000 attempts per arm (GAM report ⋈ attempts)                               | 100,000/arm     | 1-sided 95% CB rel. diff ≥ −2%                     | 7 d (+7 d ext.)           | RO    | Rollback |
-| 3     | Duplicate `burl` alarm        | `gate_dup_notif.pipe` + reconciliation | duplicate `notification_sent{burl}` per `notif_id` / dispatches; GAM-vs-server deltas    | 1,000           | 0 observed; reconciliation within 1%               | 24 h / billing wnd        | RO    | Rollback |
-| 4     | Layering + leaks              | lint CI + `disposal-inventory.spec`    | —                                                                                        | —               | 0 exceptions / 0 leaks                             | CI                        | QA    | Hold     |
-| 4     | Four-flow parity              | `flow-parity.spec`                     | passing / parity cases                                                                   | all             | 100%                                               | CI                        | QA    | Hold     |
-| 5     | Parity rerun + budgets        | `flow-parity.spec`; `perf.yml`         | —                                                                                        | —               | 100% / §7.10 tolerances                            | CI                        | QA    | Hold     |
-| 5     | RC re-canary                  | all Phase-3 rows on the attested RC    | as Phase 3                                                                               | as Phase 3      | as Phase 3                                         | **each row's own window** | RO    | Rollback |
-| 5     | Cutover monitor               | `gate_slis.pipe`                       | probe freshness/loss; `render_terminal{failed}` rate vs pre-cutover canary               | —               | lag ≤ 5 min; loss < 0.1%; failed ≤ canary + 0.5 pt | 24 h                      | OPS   | Rollback |
+| Phase | Gate                          | Artifact                               | Numerator / denominator (source)                                                         | Floor                | Threshold                                                                                                         | Window                    | Owner | Action   |
+| ----- | ----------------------------- | -------------------------------------- | ---------------------------------------------------------------------------------------- | -------------------- | ----------------------------------------------------------------------------------------------------------------- | ------------------------- | ----- | -------- |
+| 0     | Dark-pool health              | `probe-pool.sh`                        | expected responses / probe requests                                                      | 1,000                | 100%                                                                                                              | 24 h                      | OPS   | Hold     |
+| 0     | Schema validation             | `schema-writes.sh`                     | accepted / deterministic synthetic rows (all tables)                                     | 10,000               | **0 rejections**                                                                                                  | 24 h                      | RO    | Hold     |
+| 0     | Asset identity                | `asset-probe.sh`                       | correct status / probed hashes                                                           | all                  | 100%                                                                                                              | once                      | QA    | Hold     |
+| 0     | Config binding                | `config-hash.sh`                       | verified pools / pools                                                                   | all                  | 100%                                                                                                              | once                      | OPS   | Hold     |
+| 1     | Kernel/bootstrap (hermetic)   | `bootstrap-ownership.spec` + counters  | passing cases / cases (no beacon dependency)                                             | all                  | 100%                                                                                                              | CI                        | QA    | Hold     |
+| 2     | Ingest HTTP parity            | `ingest-parity.sh`                     | passing / parity cases (4 adapters × 4 families)                                         | all                  | 100%                                                                                                              | CI                        | QA    | Hold     |
+| 2     | Persistence (sink-backed)     | `gate_ingest.pipe`                     | accepted probe events / sent (probe tokens)                                              | 10,000               | ≥ 99%; dedup exactly-once                                                                                         | 24 h                      | OPS   | Hold     |
+| 2     | Per-sink authenticated probes | `gate_probes.pipe`                     | on-time probe rows / expected (`probe_run_id×seq`), per datasource × sink-backed adapter | 1,000 each           | lag ≤ 5 min; loss < 0.1%                                                                                          | 24 h                      | OPS   | Hold     |
+| 2     | Alert drill                   | `alert-drill.sh`                       | alerts ≤ 1 h / injected failure episodes                                                 | 3 episodes           | 100%                                                                                                              | 24 h                      | OPS   | Hold     |
+| 3     | Funnel ssat/prebid/page_bids  | `gate_funnel.pipe`                     | per A.2 stage pairs (`ts_render_attempts_v` ⋈ slot-level auction rows)                   | 10,000/flow-arm      | per A.2                                                                                                           | 24 h                      | RO    | Rollback |
+| 3     | Direct/fallback conformance   | hermetic + A.3 rows                    | passing / suite cases                                                                    | all                  | 100%                                                                                                              | CI + RG                   | QA    | Hold     |
+| 3     | Attribution soundness         | `gate_cycles.pipe`                     | `cycle_unattributable` / **all attribution-candidate TS cycles**                         | 10,000               | < 0.5%                                                                                                            | 24 h                      | RO    | Rollback |
+| 3     | GAM fill                      | `gate_fill.pipe`                       | nonempty `slotRenderEnded` / TS request cycles, canary vs control                        | 10,000/arm           | 1-sided 95% CB rel. diff ≥ −2%                                                                                    | 24 h                      | RO    | Rollback |
+| 3     | Latency                       | `gate_latency.pipe`                    | p95 of (`render_terminal{accepted}.t_rel_ms − attempt_started.t_rel_ms`) per arm         | 10,000/arm           | 1-sided 95% CB rel. diff ≤ +2%                                                                                    | 24 h                      | RO    | Rollback |
+| 3     | Billing                       | `gate_billing.pipe` + GAM `ts_arm`     | revenue per 1,000 attempts per arm (GAM report ⋈ attempts)                               | 100,000/arm          | 1-sided 95% CB rel. diff ≥ −2%                                                                                    | 7 d (+7 d ext.)           | RO    | Rollback |
+| 3     | Duplicate `burl` alarm        | `gate_dup_notif.pipe` + reconciliation | duplicate `notification_sent{burl}` per `notif_id` / dispatches; GAM-vs-server deltas    | 1,000                | 0 observed; reconciliation within 1%                                                                              | 24 h / billing wnd        | RO    | Rollback |
+| 4     | Layering + leaks              | lint CI + `disposal-inventory.spec`    | —                                                                                        | —                    | 0 exceptions / 0 leaks                                                                                            | CI                        | QA    | Hold     |
+| 4     | Four-flow parity              | `flow-parity.spec`                     | passing / parity cases                                                                   | all                  | 100%                                                                                                              | CI                        | QA    | Hold     |
+| 5     | Parity rerun + budgets        | `flow-parity.spec`; `perf.yml`         | —                                                                                        | —                    | 100% / §7.10 tolerances                                                                                           | CI                        | QA    | Hold     |
+| 5     | RC re-canary                  | all Phase-3 rows on the attested RC    | as Phase 3                                                                               | as Phase 3           | as Phase 3                                                                                                        | **each row's own window** | RO    | Rollback |
+| 5     | Cutover monitor               | `gate_slis.pipe`                       | probe freshness/loss; per-flow `render_terminal{failed}` rate vs pre-cutover canary      | 10,000 attempts/flow | lag ≤ 5 min; loss < 0.1%; per-flow failed ≤ canary + 0.5 pt (flow-weighted; a below-floor flow holds, not passes) | 24 h                      | OPS   | Rollback |
 
 ### A.2 Expected stages per flow
 
@@ -1060,16 +1236,17 @@ decision records. Low volume: inconclusive → extend once → Hold.
 
 ### A.3 Real-GAM suite (attested)
 
-| Field              | Value                                                                                                                                             |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Workflow           | `.github/workflows/real-gam-release.yml` (manual dispatch, release-gating; created in Phase 0)                                                    |
-| **Input**          | **the immutable release manifest `{release_id, bundle hashes, binary hash, config_hash, pool}`**                                                  |
-| **Output**         | **attested report embedding the manifest** — a green run attests the exact build it exercised, parameterized by (release, pool, deployment epoch) |
-| Topologies         | one per A.2 flow; publisher-overlap; disabled-initial-load formation; same-class supersession                                                     |
-| Browsers           | Chromium, Firefox, WebKit (CSP/opaque rows); Chromium (funnel rows)                                                                               |
-| Fixture            | dedicated GAM test network + line items targeting `hb_bidder=aps`; fixture doc in repo                                                            |
-| Account/credential | owner recorded in the Phase-0 DR (operator-held; never in repo)                                                                                   |
-| Command            | `npx playwright test --config real-gam.config.ts`                                                                                                 |
-| Artifact           | Playwright HTML report + trace zips, retained 90 days                                                                                             |
-| Retry policy       | one automatic retry per flaky-tagged spec; failures after retry are gate failures                                                                 |
-| Approval evidence  | green attested run URL in the release checklist, signed off by RO                                                                                 |
+| Field                        | Value                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Workflow                     | `.github/workflows/real-gam-release.yml` (manual dispatch, release-gating; created in Phase 0)                                                                                                                                                                                                                                                                                                                   |
+| **Input**                    | **the immutable release manifest `{release_id, bundle hashes, binary hash, config_hash, pool}`**                                                                                                                                                                                                                                                                                                                 |
+| **Independent verification** | **the workflow does not trust its input**: it fetches the deployed pool's runtime `release_id`/`config_hash` from a trusted control-plane endpoint, hashes the actually-served bundle bytes, verifies the deploy-provider binary provenance and the pool/epoch, and **compares all of them to the manifest — any mismatch fails the run** (so a green run cannot claim manifest X while exercising deployment Y) |
+| **Output**                   | **OIDC-backed signed provenance** embedding the verified (release, pool, deployment epoch), not a caller-supplied echo                                                                                                                                                                                                                                                                                           |
+| Topologies                   | one per A.2 flow; publisher-overlap; disabled-initial-load formation; same-class supersession                                                                                                                                                                                                                                                                                                                    |
+| Browsers                     | Chromium, Firefox, WebKit (CSP/opaque rows); Chromium (funnel rows)                                                                                                                                                                                                                                                                                                                                              |
+| Fixture                      | dedicated GAM test network + line items targeting `hb_bidder=aps`; fixture doc in repo                                                                                                                                                                                                                                                                                                                           |
+| Account/credential           | owner recorded in the Phase-0 DR (operator-held; never in repo)                                                                                                                                                                                                                                                                                                                                                  |
+| Command                      | `npx playwright test --config real-gam.config.ts`                                                                                                                                                                                                                                                                                                                                                                |
+| Artifact                     | Playwright HTML report + trace zips, retained 90 days                                                                                                                                                                                                                                                                                                                                                            |
+| Retry policy                 | one automatic retry per flaky-tagged spec; failures after retry are gate failures                                                                                                                                                                                                                                                                                                                                |
+| Approval evidence            | green attested run URL in the release checklist, signed off by RO                                                                                                                                                                                                                                                                                                                                                |
