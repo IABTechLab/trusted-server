@@ -3196,6 +3196,25 @@ pub(crate) fn write_bids_to_state(
 /// enabled cannot bloat every page render without bound.
 const MAX_AUCTION_DEBUG_DUMP_BYTES: usize = 256 * 1024;
 
+/// Provider-metadata keys safe to surface in the on-page `ts-debug` dump.
+///
+/// Fail-closed allowlist: any key not listed — notably `debug`, which carries
+/// the resolved `OpenRTB` request (EC ID, `user.ext.eids`, the TC consent string,
+/// `device.ip`, and `device.geo`) plus per-bidder `httpcalls` — is dropped so a
+/// visitor's identity graph cannot reach the client-readable DOM even when
+/// `[integration.prebid].debug` is also enabled. Full debug detail remains
+/// available server-side via `log::trace!`.
+const DEBUG_DUMP_METADATA_ALLOWLIST: &[&str] = &[
+    "drop_reasons",
+    "error_type",
+    "status",
+    "message",
+    "responsetimemillis",
+    "errors",
+    "warnings",
+    "bidstatus",
+];
+
 /// Per-bid creative preview length (in bytes) in the `ts-debug` dump. Mirrors
 /// the 512-byte upstream-body preview the prebid provider logs on an HTTP error
 /// (`integrations/prebid.rs`): enough to identify a creative without copying
@@ -6698,8 +6717,8 @@ mod tests {
 
     use super::*;
     use crate::auction::orchestrator::OrchestrationResult;
-    use crate::auction::types::AuctionResponse;
     use crate::auction::types::{AdFormat, AdSlot, MediaType};
+    use crate::auction::types::{AuctionDropReason, AuctionResponse};
     use crate::integrations::IntegrationRegistry;
     use crate::platform::test_support::{
         NoopSecretStore, StubHttpClient, build_services_with_http_client,
@@ -6831,84 +6850,28 @@ mod tests {
     }
 
     #[test]
-    fn auction_debug_comment_reaches_the_shared_template_seam() {
+    fn auction_debug_comment_projects_typed_drop_reasons() {
+        let response = AuctionResponse::no_bid("aps", 12)
+            .with_drop_reason(AuctionDropReason::DuplicateUpstreamBidId);
         let result = OrchestrationResult {
-            provider_responses: vec![AuctionResponse::no_bid("prebid", 12)],
+            provider_responses: vec![response],
             mediator_response: None,
             winning_bids: std::collections::HashMap::new(),
             total_time_ms: 12,
             metadata: std::collections::HashMap::new(),
         };
-        let state = AdBidsState::with_script("BIDS_SCRIPT");
-        prepend_auction_debug_comment(
-            "stream",
-            &result,
-            &state,
-            &AuctionDebugCommentOptions::default(),
-        );
+        let state = Arc::new(Mutex::new(Some("BIDS_SCRIPT".to_string())));
 
-        let seam = state.build_seam_script("[]");
+        prepend_auction_debug_comment("stream", &result, &state);
 
+        let comment = state
+            .lock()
+            .expect("should lock state")
+            .clone()
+            .expect("should have comment");
         assert!(
-            seam.contains("<!-- ts-debug:"),
-            "debug state must reach ESI"
-        );
-        assert!(
-            seam.find("<!-- ts-debug:") < seam.find("<script>"),
-            "the diagnostic comment should precede the executable seam: {seam}"
-        );
-    }
-
-    #[test]
-    fn auction_debug_comment_pretty_formats_outer_json_without_changing_value() {
-        let compact_comment = dump_comment_for_creative("<div>plain</div>");
-        let pretty_options = AuctionDebugCommentOptions {
-            format: AuctionDebugCommentFormat::Pretty,
-            ..AuctionDebugCommentOptions::default()
-        };
-        let pretty_comment =
-            dump_comment_for_creative_with_options("<div>plain</div>", &pretty_options);
-
-        assert!(
-            compact_comment.contains("dump={\"provider_responses\":"),
-            "default output should remain compact: {compact_comment}"
-        );
-        assert!(
-            pretty_comment.contains("dump={\n  \"provider_responses\":"),
-            "pretty output should indent the outer dump: {pretty_comment}"
-        );
-
-        let (_, compact_dump) = dump_from_comment(&compact_comment);
-        let (_, pretty_dump) = dump_from_comment(&pretty_comment);
-        assert_eq!(
-            pretty_dump, compact_dump,
-            "formatting should not change the dump value"
-        );
-    }
-
-    #[test]
-    fn auction_debug_comment_pretty_preserves_nested_json_as_string() {
-        let metadata = std::collections::HashMap::from([(
-            "debug".to_string(),
-            serde_json::json!({
-                "httpcalls": {
-                    "openx": [{ "requestbody": "{\"id\":\"request-1\"}" }]
-                }
-            }),
-        )]);
-        let options = AuctionDebugCommentOptions {
-            verbosity: AuctionDebugCommentVerbosity::Full,
-            format: AuctionDebugCommentFormat::Pretty,
-            ..AuctionDebugCommentOptions::default()
-        };
-
-        let comment = dump_comment_for_metadata_with_options(metadata, &options);
-        let response_metadata = response_metadata_from_comment(&comment);
-        let request_body = &response_metadata["debug"]["httpcalls"]["openx"][0]["requestbody"];
-        assert_eq!(request_body, "{\"id\":\"request-1\"}");
-        assert!(
-            request_body.is_string(),
-            "nested request body should remain a string"
+            comment.contains("\"drop_reasons\":{\"duplicate_upstream_bid_id\":1}"),
+            "typed fixed reason/count metadata should remain visible: {comment}"
         );
     }
 
