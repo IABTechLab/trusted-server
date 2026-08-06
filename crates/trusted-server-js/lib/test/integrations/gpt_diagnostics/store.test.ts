@@ -758,6 +758,112 @@ describe('GptDiagnosticsStore', () => {
     });
   });
 
+  it('uses the latest earlier filled render while ignoring empty renders', () => {
+    let now = 1;
+    const store = new GptDiagnosticsStore({ now: () => now });
+    const slot = fakeSlot('replacement-most-recent-filled');
+
+    store.recordSlotRequested(slot);
+    now = 2;
+    store.recordSlotRenderEnded(slot, { isEmpty: false, adManager: { creativeId: 101 } });
+    now = 3;
+    store.recordSlotRequested(slot);
+    now = 4;
+    store.recordSlotRenderEnded(slot, { isEmpty: false, adManager: { creativeId: 202 } });
+    now = 5;
+    store.recordSlotRequested(slot);
+    now = 6;
+    store.recordSlotRenderEnded(slot, { isEmpty: true });
+    now = 7;
+    store.recordSlotRequested(slot);
+    now = 8;
+    store.recordSlotRenderEnded(slot, { isEmpty: false, adManager: { creativeId: 303 } });
+
+    const requests = store.snapshot().slots[0].requests;
+    expect(requests[2].replacedRequestNumber).toBeUndefined();
+    expect(requests[3]).toMatchObject({
+      replacedRequestNumber: 2,
+      previousRenderToRequestMs: 3,
+      previousCreativeId: 202,
+      creativeChanged: true,
+    });
+  });
+
+  it('reports one-sided creative IDs without claiming a creative change', () => {
+    let now = 1;
+    const store = new GptDiagnosticsStore({ now: () => now });
+    const previousOnly = fakeSlot('replacement-previous-id-only');
+    const currentOnly = fakeSlot('replacement-current-id-only');
+
+    store.recordSlotRequested(previousOnly);
+    now = 2;
+    store.recordSlotRenderEnded(previousOnly, { isEmpty: false, adManager: { creativeId: 101 } });
+    now = 3;
+    store.recordSlotRequested(previousOnly);
+    now = 4;
+    store.recordSlotRenderEnded(previousOnly, { isEmpty: false });
+
+    store.recordSlotRequested(currentOnly);
+    now = 5;
+    store.recordSlotRenderEnded(currentOnly, { isEmpty: false });
+    now = 6;
+    store.recordSlotRequested(currentOnly);
+    now = 7;
+    store.recordSlotRenderEnded(currentOnly, { isEmpty: false, adManager: { creativeId: 202 } });
+
+    const [previousOnlyCycle] = store.snapshot().slots[0].requests.slice(-1);
+    const [currentOnlyCycle] = store.snapshot().slots[1].requests.slice(-1);
+    expect(previousOnlyCycle).toMatchObject({ replacedRequestNumber: 1, previousCreativeId: 101 });
+    expect(previousOnlyCycle.creativeChanged).toBeUndefined();
+    expect(currentOnlyCycle).toMatchObject({ replacedRequestNumber: 1 });
+    expect(currentOnlyCycle.previousCreativeId).toBeUndefined();
+    expect(currentOnlyCycle.creativeChanged).toBeUndefined();
+  });
+
+  it('does not infer replacements once the earlier filled cycle has been evicted', () => {
+    let now = 1;
+    const store = new GptDiagnosticsStore({ now: () => now });
+    const slot = fakeSlot('replacement-evicted');
+
+    store.recordSlotRequested(slot);
+    now += 1;
+    store.recordSlotRenderEnded(slot, { isEmpty: false, adManager: { creativeId: 101 } });
+    for (let index = 0; index < MAX_REQUEST_CYCLES_PER_SLOT; index += 1) {
+      now += 1;
+      store.recordSlotRequested(slot);
+    }
+    now += 1;
+    store.recordSlotRenderEnded(slot, { isEmpty: false, adManager: { creativeId: 202 } });
+
+    const latestCycle = last(store.snapshot().slots[0].requests)!;
+    expect(latestCycle.replacedRequestNumber).toBeUndefined();
+    expect(latestCycle.previousRenderToRequestMs).toBeUndefined();
+    expect(latestCycle.previousCreativeId).toBeUndefined();
+  });
+
+  it('keeps Trusted Server and publisher source evidence separate from replacement facts', () => {
+    let now = 1;
+    const store = new GptDiagnosticsStore({ now: () => now, defer: () => undefined });
+    const slot = fakeSlot('replacement-source-evidence');
+
+    store.recordSlotRequested(slot);
+    now = 2;
+    store.recordSlotRenderEnded(slot, { isEmpty: false, adManager: { creativeId: 101 } });
+    now = 3;
+    store.recordTrustedServerOpportunity(slot, 'auction-slot', 'renderable_candidate');
+    store.recordPublisherRefresh([slot]);
+    store.recordSlotRequested(slot);
+    now = 4;
+    store.recordSlotRenderEnded(slot, { isEmpty: false, adManager: { creativeId: 202 } });
+
+    expect(store.snapshot().slots[0].requests[1]).toMatchObject({
+      requestPath: 'competing',
+      replacedRequestNumber: 1,
+      previousCreativeId: 101,
+      creativeChanged: true,
+    });
+  });
+
   it('expires request-path markers at the five-second boundary without waiting for timers', () => {
     let now = 0;
     const deferred: Array<() => void> = [];
@@ -842,6 +948,38 @@ describe('GptDiagnosticsStore', () => {
       trustedServerOpportunity: 'no_candidate',
     });
     expect(store.snapshot().slots[0].requests[0].trustedServerAuctionId).toBeUndefined();
+  });
+
+  it('uses replacement Trusted Server evidence for latency and removes an unconsumed final source', () => {
+    let now = 0;
+    const deferred: Array<() => void> = [];
+    const store = new GptDiagnosticsStore({
+      now: () => now,
+      defer: (callback) => deferred.push(callback),
+    });
+    const repeated = fakeSlot('repeated-trusted-server-evidence');
+    const unconsumed = fakeSlot('unconsumed-trusted-server-evidence');
+
+    store.recordTrustedServerOpportunity(repeated, 'auction-slot', 'renderable_candidate');
+    now = 40;
+    store.recordTrustedServerOpportunity(repeated, 'auction-slot', 'no_candidate');
+    now = 50;
+    store.recordSlotRequested(repeated);
+
+    expect(store.snapshot().slots[0].requests[0]).toMatchObject({
+      requestPath: 'trusted_server_direct',
+      trustedServerOpportunity: 'no_candidate',
+      opportunityToRequestMs: 10,
+    });
+
+    now = 60;
+    store.recordTrustedServerOpportunity(unconsumed, 'other-auction-slot', 'no_candidate');
+    deferred[2]();
+    store.recordSlotRequested(unconsumed);
+
+    const unconsumedCycle = store.snapshot().slots[1].requests[0];
+    expect(unconsumedCycle.requestPath).toBe('unattributed');
+    expect(unconsumedCycle.requestIntentId).toBeUndefined();
   });
 
   it('retains only valid bounded auction IDs without dropping Trusted Server intent', () => {

@@ -155,6 +155,8 @@ import {
 } from '../../../src/integrations/prebid/index';
 import type { AuctionBid } from '../../../src/core/auction';
 import { log } from '../../../src/core/log';
+import { GptDiagnosticsObserver } from '../../../src/integrations/gpt_diagnostics/observer';
+import { GptDiagnosticsStore } from '../../../src/integrations/gpt_diagnostics/store';
 
 // installPrebidNpm is a per-page no-op once the sentinel is set (the module
 // self-init above already set it), so every test starts from a clean page.
@@ -1542,6 +1544,84 @@ describe('prebid/installRefreshHandler', () => {
 
     expect(mockRequestBids).toHaveBeenCalled();
     expect(originalRefresh).not.toHaveBeenCalled();
+  });
+
+  it('keeps nested Prebid refreshes Prebid-only and restores the diagnostics context', () => {
+    const listeners = new Map<string, (event: { slot: object }) => void>();
+    const store = new GptDiagnosticsStore({ defer: () => undefined });
+    const explicitSlot = {
+      getSlotElementId: () => 'nested-explicit',
+      getTargeting: () => [],
+      clearTargeting: vi.fn(),
+    };
+    const bareSlot = {
+      getSlotElementId: () => 'nested-bare',
+      getTargeting: () => [],
+      clearTargeting: vi.fn(),
+    };
+    let throwRefresh = false;
+    let getSlots: () => object[] = () => [];
+    const originalRefresh = vi.fn((slots?: unknown[]) => {
+      for (const slot of slots ?? getSlots()) listeners.get('slotRequested')?.({ slot });
+      if (throwRefresh) throw new Error('delegated refresh failed');
+      return 'delegated refresh result';
+    });
+    const pubads = {
+      addEventListener: vi.fn((name: string, listener: (event: { slot: object }) => void) => {
+        listeners.set(name, listener);
+      }),
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => [bareSlot]),
+    };
+    getSlots = pubads.getSlots;
+    testWindow.googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    testWindow.tsjs = {
+      gptDiagnostics: {
+        recordPrebidRefresh: (slots: object[]) => store.recordPrebidRefresh(slots),
+      },
+    };
+
+    new GptDiagnosticsObserver(store).install();
+    installRefreshHandler(750);
+    const pbjs = installPrebidNpm();
+
+    const prepareDelivery = (code: string) => {
+      mockRequestBids.mockImplementationOnce((options) => {
+        options.bidsBackHandler?.();
+      });
+      pbjs.requestBids({
+        adUnits: [{ code, bids: [{ bidder: 'exampleServer', params: {} }] }],
+        bidsBackHandler: vi.fn(),
+      } as unknown as RequestBidsArg);
+    };
+
+    prepareDelivery('nested-explicit');
+    expect(pubads.refresh([explicitSlot])).toBe('delegated refresh result');
+    expect(store.snapshot().slots[0].requests[0].requestPath).toBe('prebid_refresh');
+    expect(Object.hasOwn(testWindow.tsjs as object, 'prebidRefreshDispatchInProgress')).toBe(false);
+
+    prepareDelivery('nested-bare');
+    expect(pubads.refresh()).toBe('delegated refresh result');
+    expect(store.snapshot().slots[1].requests[0].requestPath).toBe('prebid_refresh');
+    expect(Object.hasOwn(testWindow.tsjs as object, 'prebidRefreshDispatchInProgress')).toBe(false);
+
+    prepareDelivery('nested-explicit');
+    throwRefresh = true;
+    expect(() => pubads.refresh([explicitSlot])).toThrow('delegated refresh failed');
+    expect(Object.hasOwn(testWindow.tsjs as object, 'prebidRefreshDispatchInProgress')).toBe(false);
+
+    testWindow.tsjs = {
+      adInitRefreshInProgress: true,
+      gptDiagnostics: {
+        recordPrebidRefresh: (slots: object[]) => store.recordPrebidRefresh(slots),
+      },
+    };
+    throwRefresh = false;
+    expect(pubads.refresh([explicitSlot])).toBe('delegated refresh result');
+    expect(store.snapshot().slots[0].requests[2].requestPath).toBe('unattributed');
   });
 });
 
