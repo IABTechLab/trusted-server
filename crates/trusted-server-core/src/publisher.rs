@@ -17798,7 +17798,7 @@ mod tests {
             build_bid_map, build_bids_script, diagnostics_auction_id, html_escape_for_script,
             write_bids_to_state,
         };
-        use crate::auction::types::{ApsRendererV1, ApsTagType, Bid, BidRenderer, MediaType};
+        use crate::auction::types::{ApsRendererV1, ApsTagType, Bid, BidRenderSourceV1, MediaType};
         use crate::consent::ConsentContext;
         use crate::creative_opportunities::{
             CreativeOpportunitiesConfig, CreativeOpportunityFormat, CreativeOpportunitySlot,
@@ -18063,13 +18063,23 @@ mod tests {
         /// Guards the browser-visible token every auction path shares: it must
         /// be fresh per auction and absent unless diagnostics can consume it.
         #[test]
-        fn diagnostics_auction_id_is_fresh_and_gated() {
-            let mut settings = test_settings();
-            assert_eq!(
-                diagnostics_auction_id(&settings),
-                None,
-                "no token should be minted without the diagnostics integration"
-            );
+        fn bid_map_exposes_aps_renderer_and_selected_bid_id_without_debug_adm() {
+            let mut bid = make_bid("atf_sidebar_ad", 1.50, "aps", "fallback-ad", "", "");
+            bid.bid_id = Some("selected-bid".to_string());
+            bid.renderer = Some(BidRenderSourceV1::Aps(ApsRendererV1 {
+                version: 1,
+                account_id: "example-account".to_string(),
+                bid_id: "selected-bid".to_string(),
+                creative_id: None,
+                tag_type: ApsTagType::Iframe,
+                creative_url: "https://creative.example/render".to_string(),
+                aax_response: "fictional-base64</script>".to_string(),
+                width: 300,
+                height: 250,
+            }));
+            bid.nurl = None;
+            bid.burl = None;
+            let winning_bids = HashMap::from([("atf_sidebar_ad".to_string(), bid)]);
 
             settings
                 .integrations
@@ -18976,7 +18986,7 @@ mod tests {
             bid.creative = Some("<script>reject()</script>".to_string());
             bid.nurl = None;
             bid.burl = None;
-            bid.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
+            bid.renderer = Some(BidRenderSourceV1::Aps(ApsRendererV1 {
                 version: 1,
                 account_id: "example-account".to_string(),
                 bid_id: "selected-bid".to_string(),

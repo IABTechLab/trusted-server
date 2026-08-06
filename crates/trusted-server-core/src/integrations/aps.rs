@@ -27,7 +27,9 @@ use crate::auction::routing::ProviderAuctionInput;
 #[cfg(test)]
 use crate::auction::types::{AdSlot, AuctionContext, AuctionRequest};
 use crate::auction::types::{
-    ApsRendererV1, ApsTagType, AuctionResponse, Bid, BidRenderer, MediaType,
+    AdSlot, ApsRendererV1, ApsRendererValidationResult, ApsTagType, AuctionContext, AuctionRequest,
+    AuctionResponse, Bid, BidRenderSourceV1, MediaType, RENDER_DIMENSION_MAX,
+    classify_aps_renderer_v1,
 };
 use crate::error::TrustedServerError;
 use crate::integrations::{
@@ -68,51 +70,25 @@ const MAX_PAGE_URL_BYTES: usize = 8192;
 const MAX_RENDER_ENVELOPE_BYTES: usize = 256 * 1024;
 const APS_RENDERER_CSP: &str = "default-src 'none'; sandbox allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation; script-src 'unsafe-inline' https:; connect-src https:; frame-src https:; img-src https: data:; media-src https: blob:; style-src 'unsafe-inline' https:; font-src https: data:;";
 
-const APS_RENDERER_DOCUMENT: &str = r#"<!doctype html>
+const APS_RENDERER_DOCUMENT: &str = concat!(
+    r#"<!doctype html>
 <meta charset="utf-8">
 <style>html,body{margin:0;padding:0}body>iframe{display:block}</style>
 <script>
 (function(){
 'use strict';
+"#,
+    include_str!("generated/aps_renderer_validator_v1.js"),
+    r#"
 var match=/^#tsaps=([A-Za-z0-9_-]{22,128})$/.exec(location.hash);
 var expected=match&&match[1];
 try{history.replaceState(null,'',location.pathname+location.search);}catch(_error){}
 if(!expected)return;
-function keys(value,expectedKeys){
- if(!value||typeof value!=='object'||Array.isArray(value))return false;
- var actual=Object.keys(value).sort();
- return actual.length===expectedKeys.length&&actual.every(function(key,index){return key===expectedKeys[index];});
-}
-function validRenderer(renderer){
- if(!keys(renderer,['aaxResponse','accountId','bidId','creativeId','creativeUrl','height','tagType','type','version','width'])&&
-    !keys(renderer,['aaxResponse','accountId','bidId','creativeUrl','height','tagType','type','version','width']))return false;
- if(renderer.type!=='aps'||renderer.version!==1||typeof renderer.accountId!=='string'||!renderer.accountId||new TextEncoder().encode(renderer.accountId).length>1024)return false;
- if(typeof renderer.bidId!=='string'||!renderer.bidId||!Number.isInteger(renderer.width)||renderer.width<=0||!Number.isInteger(renderer.height)||renderer.height<=0)return false;
- if(Object.prototype.hasOwnProperty.call(renderer,'creativeId')&&(typeof renderer.creativeId!=='string'||!renderer.creativeId||new TextEncoder().encode(renderer.creativeId).length>1024))return false;
- if(renderer.tagType!=='iframe'&&renderer.tagType!=='script')return false;
- if(typeof renderer.creativeUrl!=='string'||new TextEncoder().encode(renderer.creativeUrl).length>4096)return false;
- if(typeof renderer.aaxResponse!=='string'||!renderer.aaxResponse||renderer.aaxResponse.length>349528)return false;
- try{
-  var url=new URL(renderer.creativeUrl);
-  if(url.protocol!=='https:'||url.username||url.password)return false;
-  var binary=atob(renderer.aaxResponse);
-  if(binary.length>262144||btoa(binary)!==renderer.aaxResponse)return false;
-  var bytes=Uint8Array.from(binary,function(character){return character.charCodeAt(0);});
-  var decoded=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));
-  if(!keys(decoded,['seatbid'])||!Array.isArray(decoded.seatbid)||decoded.seatbid.length!==1)return false;
-  var seat=decoded.seatbid[0];
-  if(!keys(seat,['bid'])||!Array.isArray(seat.bid)||seat.bid.length!==1)return false;
-  var bid=seat.bid[0];
-  if(!keys(bid,['ext','h','id','price','w'])||!keys(bid.ext,['creativeurl','tagtype']))return false;
-  return bid.id===renderer.bidId&&bid.w===renderer.width&&bid.h===renderer.height&&
-   bid.ext.creativeurl===renderer.creativeUrl&&bid.ext.tagtype===renderer.tagType&&
-   typeof bid.price==='number'&&Number.isFinite(bid.price)&&bid.price>=0;
- }catch(_error){return false;}
-}
 function receive(event){
  if(event.source!==parent)return;
  var message=event.data;
- if(!keys(message,['nonce','renderer'])||message.nonce!==expected||!validRenderer(message.renderer))return;
+ if(!apsExactRecord(message,['nonce','renderer'])||message.nonce!==expected||
+    classifyApsRendererV1(message.renderer,location.origin)!=='accepted')return;
  removeEventListener('message',receive);
  var acceptedNonce=expected;
  expected='';
@@ -133,7 +109,8 @@ function receive(event){
 addEventListener('message',receive);
 })();
 </script>
-"#;
+"#
+);
 
 /// Rendering owner for selected APS bids.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -1279,7 +1256,7 @@ impl ApsAuctionProvider {
             })
     }
 
-    fn valid_creative_url(&self, value: &str, publisher_domain: &str) -> bool {
+    fn valid_creative_url(&self, value: &str, publisher_origin: &str) -> bool {
         if value.len() > MAX_CREATIVE_URL_BYTES {
             return false;
         }
@@ -1287,14 +1264,17 @@ impl ApsAuctionProvider {
             return false;
         };
         parsed.scheme() == "https"
-            && parsed
-                .host_str()
-                .is_some_and(|host| !host.eq_ignore_ascii_case(publisher_domain))
+            && parsed.host_str().is_some()
             && parsed.username().is_empty()
             && parsed.password().is_none()
+            && parsed.origin().ascii_serialization() != publisher_origin
     }
 
-    fn build_renderer(&self, input: ApsRendererInput<'_>) -> Option<BidRenderer> {
+    fn build_renderer(
+        &self,
+        input: ApsRendererInput<'_>,
+        publisher_origin: &str,
+    ) -> Option<BidRenderSourceV1> {
         let tag_type_value = match input.tag_type {
             ApsTagType::Iframe => "iframe",
             ApsTagType::Script => "script",
@@ -1317,7 +1297,7 @@ impl ApsAuctionProvider {
         if serialized.len() > MAX_RENDER_ENVELOPE_BYTES {
             return None;
         }
-        Some(BidRenderer::Aps(ApsRendererV1 {
+        let renderer = BidRenderSourceV1::Aps(ApsRendererV1 {
             version: 1,
             account_id: self.config.account_id.clone(),
             bid_id: input.bid_id.to_string(),
@@ -1327,7 +1307,11 @@ impl ApsAuctionProvider {
             aax_response: BASE64_STANDARD.encode(serialized),
             width: input.width,
             height: input.height,
-        }))
+        });
+        let value = serde_json::to_value(&renderer).ok()?;
+        (classify_aps_renderer_v1(&value, publisher_origin)
+            == ApsRendererValidationResult::Accepted)
+            .then_some(renderer)
     }
 
     fn increment_reason(reasons: &mut BTreeMap<String, u64>, reason: &'static str) {
@@ -1338,13 +1322,18 @@ impl ApsAuctionProvider {
         &self,
         value: &Json,
         slots: &HashMap<&str, &AdSlot>,
-        publisher_domain: &str,
+        publisher_origin: &str,
     ) -> Result<Bid, &'static str> {
         let bid_id = value
             .get("id")
             .and_then(Json::as_str)
-            .filter(|value| !value.is_empty())
             .ok_or("missing_render_source")?;
+        if bid_id.is_empty()
+            || bid_id.len() > 64
+            || bid_id.bytes().any(|byte| byte <= 0x1f || byte == 0x7f)
+        {
+            return Err("invalid_bid_id");
+        }
         let slot_id = value
             .get("impid")
             .and_then(Json::as_str)
@@ -1361,16 +1350,19 @@ impl ApsAuctionProvider {
         {
             return Err("unsupported_media_type");
         }
-        let width = value
-            .get("w")
-            .and_then(Json::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-            .ok_or("invalid_dimensions")?;
-        let height = value
-            .get("h")
-            .and_then(Json::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-            .ok_or("invalid_dimensions")?;
+        let parse_dimension = |field: &str| {
+            let number = value
+                .get(field)
+                .and_then(Json::as_f64)
+                .filter(|number| number.is_finite() && number.fract() == 0.0 && *number > 0.0)
+                .ok_or("invalid_dimensions")?;
+            if number > RENDER_DIMENSION_MAX as f64 {
+                return Err("dimensions_out_of_range");
+            }
+            u32::try_from(number as u64).map_err(|_| "dimensions_out_of_range")
+        };
+        let width = parse_dimension("w")?;
+        let height = parse_dimension("h")?;
         if !Self::compatible_dimensions(slot, width, height) {
             return Err("invalid_dimensions");
         }
@@ -1382,7 +1374,7 @@ impl ApsAuctionProvider {
             .get("creativeurl")
             .and_then(Json::as_str)
             .ok_or("missing_render_source")?;
-        if !self.valid_creative_url(creative_url, publisher_domain) {
+        if !self.valid_creative_url(creative_url, publisher_origin) {
             return Err("invalid_creative_url");
         }
         let tag_type = match ext.get("tagtype").and_then(Json::as_str) {
@@ -1403,15 +1395,18 @@ impl ApsAuctionProvider {
             return Err("creative_id_too_large");
         }
         let renderer = self
-            .build_renderer(ApsRendererInput {
-                bid_id,
-                creative_id: creative_id.clone(),
-                tag_type,
-                creative_url,
-                price,
-                width,
-                height,
-            })
+            .build_renderer(
+                ApsRendererInput {
+                    bid_id,
+                    creative_id: creative_id.clone(),
+                    tag_type,
+                    creative_url,
+                    price,
+                    width,
+                    height,
+                },
+                publisher_origin,
+            )
             .ok_or("render_payload_too_large")?;
         let adomain = value
             .get("adomain")
@@ -1485,6 +1480,14 @@ impl ApsAuctionProvider {
         let mut selected: HashMap<String, Bid> = HashMap::new();
         let mut dropped = 0_u64;
 
+        let publisher_origin = request
+            .publisher
+            .page_url
+            .as_deref()
+            .and_then(|page_url| Url::parse(page_url).ok())
+            .map(|page_url| page_url.origin().ascii_serialization())
+            .unwrap_or_else(|| format!("https://{}", request.publisher.domain));
+
         for seatbid in seatbids.into_iter().flatten() {
             let Some(bids) = seatbid.get("bid").and_then(Json::as_array) else {
                 dropped += 1;
@@ -1492,7 +1495,7 @@ impl ApsAuctionProvider {
                 continue;
             };
             for value in bids {
-                match self.parse_bid(value, &slots, &request.publisher.domain) {
+                match self.parse_bid(value, &slots, &publisher_origin) {
                     Ok(candidate) => {
                         let replace = selected.get(&candidate.slot_id).is_none_or(|current| {
                             let candidate_price = candidate.price.unwrap_or_default();
@@ -2035,6 +2038,380 @@ mod tests {
             "adm": "<script>discarded</script>",
             "nurl": "https://notice.example/win"
         })
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RendererCorpus {
+        publisher_origin: String,
+        base_descriptor: Json,
+        vectors: Vec<RendererCorpusVector>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RendererCorpusVector {
+        id: String,
+        expected: String,
+        operation: Json,
+    }
+
+    fn corpus_value<'a>(operation: &'a Json, field: &str) -> &'a Json {
+        operation
+            .get(field)
+            .unwrap_or_else(|| panic!("should include corpus operation field {field}"))
+    }
+
+    fn corpus_string<'a>(operation: &'a Json, field: &str) -> &'a str {
+        corpus_value(operation, field)
+            .as_str()
+            .unwrap_or_else(|| panic!("corpus operation field {field} should be a string"))
+    }
+
+    fn corpus_usize(operation: &Json, field: &str) -> usize {
+        corpus_value(operation, field)
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or_else(|| panic!("corpus operation field {field} should be a usize"))
+    }
+
+    fn set_json_path(root: &mut Json, path: &[Json], value: Json) {
+        let (segment, tail) = path
+            .split_first()
+            .expect("corpus JSON path should not be empty");
+        if tail.is_empty() {
+            if let Some(field) = segment.as_str() {
+                root.as_object_mut()
+                    .expect("corpus string path should address an object")
+                    .insert(field.to_string(), value);
+            } else {
+                let index = segment
+                    .as_u64()
+                    .and_then(|index| usize::try_from(index).ok())
+                    .expect("corpus numeric path should be a usize");
+                let slot = root
+                    .as_array_mut()
+                    .and_then(|array| array.get_mut(index))
+                    .expect("corpus numeric path should address an array element");
+                *slot = value;
+            }
+            return;
+        }
+
+        let child = if let Some(field) = segment.as_str() {
+            root.as_object_mut()
+                .and_then(|object| object.get_mut(field))
+                .expect("corpus string path should address an object field")
+        } else {
+            let index = segment
+                .as_u64()
+                .and_then(|index| usize::try_from(index).ok())
+                .expect("corpus numeric path should be a usize");
+            root.as_array_mut()
+                .and_then(|array| array.get_mut(index))
+                .expect("corpus numeric path should address an array element")
+        };
+        set_json_path(child, tail, value);
+    }
+
+    fn delete_json_path(root: &mut Json, path: &[Json]) {
+        let (segment, tail) = path
+            .split_first()
+            .expect("corpus JSON path should not be empty");
+        if tail.is_empty() {
+            let field = segment
+                .as_str()
+                .expect("corpus delete path should end in an object field");
+            root.as_object_mut()
+                .expect("corpus delete path should address an object")
+                .remove(field);
+            return;
+        }
+
+        let child = if let Some(field) = segment.as_str() {
+            root.as_object_mut()
+                .and_then(|object| object.get_mut(field))
+                .expect("corpus string path should address an object field")
+        } else {
+            let index = segment
+                .as_u64()
+                .and_then(|index| usize::try_from(index).ok())
+                .expect("corpus numeric path should be a usize");
+            root.as_array_mut()
+                .and_then(|array| array.get_mut(index))
+                .expect("corpus numeric path should address an array element")
+        };
+        delete_json_path(child, tail);
+    }
+
+    fn descriptor_field(descriptor: &mut Json, field: &str, value: Json) {
+        descriptor
+            .as_object_mut()
+            .expect("corpus descriptor should be an object")
+            .insert(field.to_string(), value);
+    }
+
+    fn materialize_renderer_corpus_vector(
+        corpus: &RendererCorpus,
+        vector: &RendererCorpusVector,
+    ) -> Json {
+        let mut descriptor = corpus.base_descriptor.clone();
+        let mut envelope: Json = serde_json::from_str(include_str!(
+            "../../../trusted-server-js/lib/test/fixtures/aps-renderer-v1.json"
+        ))
+        .expect("should parse shared APS renderer fixture");
+        let operation = &vector.operation;
+        let kind = corpus_string(operation, "kind");
+        let mut encoded_envelope = None;
+
+        match kind {
+            "none" => {}
+            "descriptor-delete" => {
+                descriptor
+                    .as_object_mut()
+                    .expect("corpus descriptor should be an object")
+                    .remove(corpus_string(operation, "field"));
+            }
+            "descriptor-set" => descriptor_field(
+                &mut descriptor,
+                corpus_string(operation, "field"),
+                corpus_value(operation, "value").clone(),
+            ),
+            "descriptor-repeat" => {
+                let mut repeated =
+                    corpus_string(operation, "unit").repeat(corpus_usize(operation, "count"));
+                if let Some(suffix) = operation.get("suffix").and_then(Json::as_str) {
+                    repeated.push_str(suffix);
+                }
+                descriptor_field(
+                    &mut descriptor,
+                    corpus_string(operation, "field"),
+                    json!(repeated),
+                );
+            }
+            "bid-id-repeat" => {
+                let mut repeated =
+                    corpus_string(operation, "unit").repeat(corpus_usize(operation, "count"));
+                if let Some(suffix) = operation.get("suffix").and_then(Json::as_str) {
+                    repeated.push_str(suffix);
+                }
+                descriptor_field(&mut descriptor, "bidId", json!(repeated));
+                set_json_path(
+                    &mut envelope,
+                    &[
+                        json!("seatbid"),
+                        json!(0),
+                        json!("bid"),
+                        json!(0),
+                        json!("id"),
+                    ],
+                    json!(repeated),
+                );
+            }
+            "dimension" => {
+                let field = corpus_string(operation, "field");
+                let envelope_field = match field {
+                    "width" => "w",
+                    "height" => "h",
+                    _ => panic!("corpus dimension field should be width or height"),
+                };
+                let value = corpus_value(operation, "value").clone();
+                descriptor_field(&mut descriptor, field, value.clone());
+                set_json_path(
+                    &mut envelope,
+                    &[
+                        json!("seatbid"),
+                        json!(0),
+                        json!("bid"),
+                        json!(0),
+                        json!(envelope_field),
+                    ],
+                    value,
+                );
+            }
+            "dimensions" => {
+                let width = corpus_value(operation, "width").clone();
+                let height = corpus_value(operation, "height").clone();
+                descriptor_field(&mut descriptor, "width", width.clone());
+                descriptor_field(&mut descriptor, "height", height.clone());
+                set_json_path(
+                    &mut envelope,
+                    &[
+                        json!("seatbid"),
+                        json!(0),
+                        json!("bid"),
+                        json!(0),
+                        json!("w"),
+                    ],
+                    width,
+                );
+                set_json_path(
+                    &mut envelope,
+                    &[
+                        json!("seatbid"),
+                        json!(0),
+                        json!("bid"),
+                        json!(0),
+                        json!("h"),
+                    ],
+                    height,
+                );
+            }
+            "creative-url" => {
+                let value = corpus_string(operation, "value").to_string();
+                descriptor_field(&mut descriptor, "creativeUrl", json!(value));
+                set_json_path(
+                    &mut envelope,
+                    &[
+                        json!("seatbid"),
+                        json!(0),
+                        json!("bid"),
+                        json!(0),
+                        json!("ext"),
+                        json!("creativeurl"),
+                    ],
+                    json!(value),
+                );
+            }
+            "creative-url-bytes" => {
+                let prefix = "https://creative.example/";
+                let bytes = corpus_usize(operation, "bytes");
+                let value = format!(
+                    "{prefix}{}",
+                    "a".repeat(
+                        bytes
+                            .checked_sub(prefix.len())
+                            .expect("corpus URL size should include its prefix")
+                    )
+                );
+                descriptor_field(&mut descriptor, "creativeUrl", json!(value));
+                set_json_path(
+                    &mut envelope,
+                    &[
+                        json!("seatbid"),
+                        json!(0),
+                        json!("bid"),
+                        json!(0),
+                        json!("ext"),
+                        json!("creativeurl"),
+                    ],
+                    json!(value),
+                );
+            }
+            "aax-literal" => {
+                encoded_envelope = Some(corpus_string(operation, "value").to_string());
+            }
+            "aax-bytes" => {
+                let bytes: Vec<u8> = corpus_value(operation, "values")
+                    .as_array()
+                    .expect("corpus byte vector should be an array")
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_u64()
+                            .and_then(|value| u8::try_from(value).ok())
+                            .expect("corpus byte vector should contain u8 values")
+                    })
+                    .collect();
+                encoded_envelope = Some(BASE64_STANDARD.encode(bytes));
+            }
+            "aax-raw-json" => {
+                encoded_envelope =
+                    Some(BASE64_STANDARD.encode(corpus_string(operation, "value").as_bytes()));
+            }
+            "aax-decoded-bytes" => {
+                let mut serialized =
+                    serde_json::to_string(&envelope).expect("should serialize corpus envelope");
+                let target = corpus_usize(operation, "bytes");
+                serialized.push_str(
+                    &" ".repeat(
+                        target
+                            .checked_sub(serialized.len())
+                            .expect("corpus decoded size should exceed fixture size"),
+                    ),
+                );
+                encoded_envelope = Some(BASE64_STANDARD.encode(serialized.as_bytes()));
+            }
+            "aax-raw-price" => {
+                let serialized =
+                    serde_json::to_string(&envelope).expect("should serialize corpus envelope");
+                let replacement = format!("\"price\":{}", corpus_string(operation, "value"));
+                let raw = serialized.replacen("\"price\":1.23", &replacement, 1);
+                assert_ne!(raw, serialized, "should replace the corpus fixture price");
+                encoded_envelope = Some(BASE64_STANDARD.encode(raw.as_bytes()));
+            }
+            "envelope-set" => {
+                let path = corpus_value(operation, "path")
+                    .as_array()
+                    .expect("corpus path should be an array");
+                set_json_path(
+                    &mut envelope,
+                    path,
+                    corpus_value(operation, "value").clone(),
+                );
+            }
+            "envelope-delete" => {
+                let path = corpus_value(operation, "path")
+                    .as_array()
+                    .expect("corpus path should be an array");
+                delete_json_path(&mut envelope, path);
+            }
+            "duplicate-seat" => {
+                let seats = envelope
+                    .get_mut("seatbid")
+                    .and_then(Json::as_array_mut)
+                    .expect("corpus fixture should contain a seat array");
+                let first = seats
+                    .first()
+                    .cloned()
+                    .expect("corpus fixture should contain one seat");
+                seats.push(first);
+            }
+            "duplicate-bid" => {
+                let bids = envelope
+                    .get_mut("seatbid")
+                    .and_then(Json::as_array_mut)
+                    .and_then(|seats| seats.first_mut())
+                    .and_then(|seat| seat.get_mut("bid"))
+                    .and_then(Json::as_array_mut)
+                    .expect("corpus fixture should contain a bid array");
+                let first = bids
+                    .first()
+                    .cloned()
+                    .expect("corpus fixture should contain one bid");
+                bids.push(first);
+            }
+            _ => panic!("unknown APS renderer corpus operation: {kind}"),
+        }
+
+        let encoded = encoded_envelope.unwrap_or_else(|| {
+            BASE64_STANDARD.encode(
+                serde_json::to_vec(&envelope).expect("should serialize corpus renderer envelope"),
+            )
+        });
+        descriptor_field(&mut descriptor, "aaxResponse", json!(encoded));
+        descriptor
+    }
+
+    #[test]
+    fn aps_renderer_matches_shared_cross_language_contract_corpus() {
+        let corpus: RendererCorpus = serde_json::from_str(include_str!(
+            "../../../trusted-server-js/lib/test/fixtures/aps-renderer-v1-corpus.json"
+        ))
+        .expect("should parse shared APS renderer corpus");
+        assert_eq!(
+            corpus.publisher_origin, "https://publisher.example",
+            "should pin the corpus publisher origin"
+        );
+
+        for vector in &corpus.vectors {
+            let descriptor = materialize_renderer_corpus_vector(&corpus, vector);
+            let actual = classify_aps_renderer_v1(&descriptor, &corpus.publisher_origin).as_str();
+            assert_eq!(
+                actual, vector.expected,
+                "should match APS renderer corpus vector {}",
+                vector.id
+            );
+        }
     }
 
     fn parse_with_context(
@@ -3003,6 +3380,8 @@ mod tests {
 
         let mut uppercase_publisher = request();
         uppercase_publisher.publisher.domain = "Creative.Example".to_string();
+        uppercase_publisher.publisher.page_url =
+            Some("https://Creative.Example/article".to_string());
         let response = provider.parse_aps_response(
             &json!({"seatbid": [{"bid": [bid("same-origin", 1.0, "iframe")]}]}),
             12,

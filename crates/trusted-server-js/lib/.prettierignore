@@ -1,4 +1,5 @@
 node_modules
 dist
 coverage
-
+src/integrations/aps/generated/renderer_validator_v1.ts
+test/fixtures/performance/aps-tsjs-prechange.json

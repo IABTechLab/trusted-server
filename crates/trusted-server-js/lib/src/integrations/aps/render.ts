@@ -2,6 +2,11 @@ import { log } from '../../core/log';
 import { findSlot } from '../../core/render';
 import type { ApsPrebidRendererEntry, ApsRendererV1, TsjsApi } from '../../core/types';
 
+import {
+  classifyApsRendererDescriptorV1,
+  classifyApsRendererV1,
+} from './generated/renderer_validator_v1';
+
 export const APS_RENDERER_PATH = '/integrations/aps/renderer';
 export const APS_RENDERING_MODE_ATTRIBUTE_NAME = 'data-ts-aps-rendering-mode';
 export const APS_PREBID_CREATIVE_RUNNER_URL =
@@ -11,23 +16,6 @@ export const APS_RENDERER_SANDBOX =
   'allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation';
 export const APS_UNIVERSAL_CREATIVE_RENDERER_VERSION = 4;
 
-const MAX_ACCOUNT_ID_BYTES = 1024;
-const MAX_CREATIVE_ID_BYTES = 1024;
-const MAX_CREATIVE_URL_BYTES = 4096;
-const MAX_RENDER_ENVELOPE_BYTES = 256 * 1024;
-const MAX_RENDER_ENVELOPE_BASE64_BYTES = 4 * Math.ceil(MAX_RENDER_ENVELOPE_BYTES / 3);
-const DESCRIPTOR_KEYS = [
-  'aaxResponse',
-  'accountId',
-  'bidId',
-  'creativeUrl',
-  'height',
-  'tagType',
-  'type',
-  'version',
-  'width',
-] as const;
-const DESCRIPTOR_KEYS_WITH_CREATIVE_ID = [...DESCRIPTOR_KEYS, 'creativeId'].sort();
 const activeFrames = new WeakMap<HTMLElement, HTMLIFrameElement>();
 const pendingFrameCancels = new WeakMap<HTMLElement, () => void>();
 const RENDERER_READY_MESSAGE = 'trusted-server/aps/renderer-ready';
@@ -134,87 +122,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function hasExactKeys(
-  value: unknown,
-  expected: readonly string[]
-): value is Record<string, unknown> {
+function isExactRendererResult(value: unknown): value is Record<string, unknown> {
   if (!isRecord(value)) return false;
   const actual = Object.keys(value).sort();
-  const sortedExpected = [...expected].sort();
-  return (
-    actual.length === sortedExpected.length &&
-    actual.every((key, index) => key === sortedExpected[index])
-  );
+  return actual.length === 2 && actual[0] === 'message' && actual[1] === 'nonce';
 }
 
 /** Parse only the versioned descriptor shape; decoded-envelope trust checks happen separately. */
 export function parseApsRendererDescriptor(value: unknown): ApsRendererV1 | undefined {
-  if (
-    !hasExactKeys(value, DESCRIPTOR_KEYS) &&
-    !hasExactKeys(value, DESCRIPTOR_KEYS_WITH_CREATIVE_ID)
-  ) {
-    return undefined;
-  }
-
-  if (
-    value.type !== 'aps' ||
-    value.version !== 1 ||
-    typeof value.accountId !== 'string' ||
-    value.accountId.length === 0 ||
-    new TextEncoder().encode(value.accountId).length > MAX_ACCOUNT_ID_BYTES ||
-    typeof value.bidId !== 'string' ||
-    value.bidId.length === 0 ||
-    (Object.prototype.hasOwnProperty.call(value, 'creativeId') &&
-      (typeof value.creativeId !== 'string' ||
-        value.creativeId.length === 0 ||
-        new TextEncoder().encode(value.creativeId).length > MAX_CREATIVE_ID_BYTES)) ||
-    (value.tagType !== 'iframe' && value.tagType !== 'script') ||
-    typeof value.creativeUrl !== 'string' ||
-    typeof value.aaxResponse !== 'string' ||
-    value.aaxResponse.length > MAX_RENDER_ENVELOPE_BASE64_BYTES ||
-    !Number.isSafeInteger(value.width) ||
-    (value.width as number) <= 0 ||
-    !Number.isSafeInteger(value.height) ||
-    (value.height as number) <= 0
-  ) {
+  if (classifyApsRendererDescriptorV1(value) !== 'accepted') {
     return undefined;
   }
 
   return value as unknown as ApsRendererV1;
-}
-
-function decodeStandardBase64(value: string): Uint8Array | undefined {
-  if (
-    value.length === 0 ||
-    value.length % 4 !== 0 ||
-    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)
-  ) {
-    return undefined;
-  }
-
-  try {
-    const binary = atob(value);
-    if (binary.length > MAX_RENDER_ENVELOPE_BYTES || btoa(binary) !== value) return undefined;
-    return Uint8Array.from(binary, (character) => character.charCodeAt(0));
-  } catch {
-    return undefined;
-  }
-}
-
-function validCreativeUrl(value: string, publisherOrigin: string): boolean {
-  if (new TextEncoder().encode(value).length > MAX_CREATIVE_URL_BYTES) return false;
-
-  try {
-    const url = new URL(value);
-    return (
-      url.protocol === 'https:' &&
-      url.username === '' &&
-      url.password === '' &&
-      url.origin !== publisherOrigin
-    );
-  } catch {
-    return false;
-  }
 }
 
 /** Fully validate the exact APS envelope and cross-check every duplicated descriptor field. */
@@ -227,43 +147,8 @@ export function validateApsRenderer(
     if (cached?.publisherOrigin === publisherOrigin) return cached.renderer;
   }
 
-  const renderer = parseApsRendererDescriptor(value);
-  if (!renderer || !validCreativeUrl(renderer.creativeUrl, publisherOrigin)) return undefined;
-
-  const bytes = decodeStandardBase64(renderer.aaxResponse);
-  if (!bytes) return undefined;
-
-  let decoded: unknown;
-  try {
-    decoded = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
-  } catch {
-    return undefined;
-  }
-
-  if (!hasExactKeys(decoded, ['seatbid'])) return undefined;
-  const seatbids = decoded.seatbid;
-  if (!Array.isArray(seatbids) || seatbids.length !== 1) return undefined;
-  const seat = seatbids[0];
-  if (!hasExactKeys(seat, ['bid']) || !Array.isArray(seat.bid) || seat.bid.length !== 1) {
-    return undefined;
-  }
-
-  const bid = seat.bid[0];
-  if (!hasExactKeys(bid, ['ext', 'h', 'id', 'price', 'w'])) return undefined;
-  if (!hasExactKeys(bid.ext, ['creativeurl', 'tagtype'])) return undefined;
-
-  if (
-    bid.id !== renderer.bidId ||
-    bid.w !== renderer.width ||
-    bid.h !== renderer.height ||
-    bid.ext.creativeurl !== renderer.creativeUrl ||
-    bid.ext.tagtype !== renderer.tagType ||
-    typeof bid.price !== 'number' ||
-    !Number.isFinite(bid.price) ||
-    bid.price < 0
-  ) {
-    return undefined;
-  }
+  if (classifyApsRendererV1(value, publisherOrigin) !== 'accepted') return undefined;
+  const renderer = value as ApsRendererV1;
 
   const validated = Object.freeze({ ...renderer }) as ApsRendererV1;
   validatedRendererCache.set(value as object, { publisherOrigin, renderer: validated });
@@ -665,7 +550,7 @@ export function renderApsCreative({ slotId, renderer: input }: RenderApsCreative
     iframe.style.display = '';
   };
   function receive(event: MessageEvent): void {
-    if (event.source !== iframe.contentWindow || !hasExactKeys(event.data, ['message', 'nonce'])) {
+    if (event.source !== iframe.contentWindow || !isExactRendererResult(event.data)) {
       return;
     }
     if (event.data.nonce !== nonce) return;

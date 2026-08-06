@@ -66,7 +66,24 @@ export interface ApsRendererV1 {
   height: number;
 }
 
-export type AuctionBidRenderer = ApsRendererV1;
+export interface AdmRenderSourceV1 {
+  type: 'adm';
+  version: 1;
+  adm: string;
+  width: number;
+  height: number;
+}
+
+export interface CacheRenderSourceV1 {
+  type: 'cache';
+  version: 1;
+  cacheId: string;
+  fetchUrl: string;
+  width: number;
+  height: number;
+}
+
+export type BidRenderSourceV1 = ApsRendererV1 | AdmRenderSourceV1 | CacheRenderSourceV1;
 
 /** A client-side Prebid bid's generated ad ID bound to its APS render capability. */
 export interface ApsPrebidRendererEntry {
@@ -96,7 +113,7 @@ export interface AuctionBidData {
   nurl?: string | undefined;
   burl?: string | undefined;
   /** Typed winning-bid renderer capability. */
-  renderer?: AuctionBidRenderer | undefined;
+  renderer?: BidRenderSourceV1 | undefined;
   /** Winning creative width used by the inline render bridge. */
   w?: number | undefined;
   /** Winning creative height used by the inline render bridge. */
