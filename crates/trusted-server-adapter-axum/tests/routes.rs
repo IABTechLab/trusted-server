@@ -26,6 +26,11 @@ fn test_settings() -> trusted_server_core::settings::Settings {
             username = "admin"
             password = "admin-pass"
 
+            [[handlers]]
+            path = "^/integrations/aps"
+            username = "aps-user"
+            password = "aps-pass"
+
             [publisher]
             domain = "test-publisher.example.com"
             cookie_domain = ".test-publisher.example.com"
@@ -34,6 +39,11 @@ fn test_settings() -> trusted_server_core::settings::Settings {
 
             [ec]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [integrations.aps]
+            enabled = true
+            account_id = "route-test-aps-account"
+            allow_script_creatives = true
         "#,
     )
     .expect("should parse route test settings")
@@ -42,6 +52,19 @@ fn test_settings() -> trusted_server_core::settings::Settings {
 fn test_router() -> edgezero_core::router::RouterService {
     TrustedServerApp::routes_with_settings(test_settings())
         .expect("should build router from test settings")
+}
+
+#[cfg(feature = "aps-runner-proxy-integration-test")]
+async fn route_reserved(request: Request<AxumBody>) -> axum::http::Response<AxumBody> {
+    let request = edgezero_adapter_axum::request::into_core_request(request)
+        .await
+        .expect("should convert reserved APS request");
+    let response =
+        trusted_server_adapter_axum::app::dispatch_reserved_with_settings(test_settings(), request)
+            .await
+            .expect("should build APS dispatcher")
+            .expect("APS family should be reserved");
+    edgezero_adapter_axum::response::into_axum_response(response)
 }
 
 fn make_service() -> EdgeZeroAxumService {
@@ -249,40 +272,99 @@ async fn tsjs_route_prefix_is_handled_not_5xx() {
     );
 }
 
+#[cfg(feature = "aps-runner-proxy-integration-test")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tsjs_route_matching_hash_uses_s_maxage_fallback() {
-    let mut svc = make_service();
-    let src = trusted_server_core::tsjs::tsjs_script_src(&["creative"]);
-    let req = Request::builder()
+async fn aps_cutover_renderer_and_family_failures_are_local() {
+    let renderer = Request::builder()
         .method("GET")
-        .uri(src)
+        .uri("/integrations/aps/renderer/v1")
+        .header("authorization", "Bearer must-not-reach-publisher")
         .body(AxumBody::empty())
-        .expect("should build request");
+        .expect("should build APS renderer request");
+    let response = route_reserved(renderer).await;
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/html; charset=utf-8")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("public, max-age=31536000, immutable")
+    );
+    assert!(response.headers().get("x-frame-options").is_none());
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("renderer body should be bounded");
+    let body = std::str::from_utf8(&body).expect("renderer should be UTF-8");
+    assert!(body.contains("/integrations/aps/runner.js"));
+    assert!(!body.contains("client.aps.amazon-adsystem.com"));
 
-    let resp = svc
+    for (method, path, expected) in [
+        ("POST", "/integrations/aps/runner.js", 405),
+        ("TRACE", "/integrations/aps/renderer/v1", 405),
+        ("CONNECT", "/integrations/aps/renderer/v1", 405),
+        ("PROPFIND", "/integrations/aps/renderer/v1", 405),
+        ("GET", "/integrations/aps/renderer/v2", 404),
+        ("GET", "/integrations/aps/runner/v1.js", 404),
+        ("GET", "/integrations/aps", 404),
+    ] {
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", "Bearer must-not-reach-publisher")
+            .body(AxumBody::empty())
+            .expect("should build APS family request");
+        let response = route_reserved(request).await;
+        assert_eq!(response.status().as_u16(), expected, "{method} {path}");
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store"),
+            "{method} {path}"
+        );
+        assert!(
+            response.headers().get("x-geo-info-available").is_none(),
+            "{method} {path} must not receive generic finalizer headers"
+        );
+        if expected == 405 {
+            assert_eq!(
+                response
+                    .headers()
+                    .get("allow")
+                    .and_then(|v| v.to_str().ok()),
+                Some("GET")
+            );
+            assert_eq!(response.headers().len(), 2, "{method} {path}");
+        } else {
+            assert_eq!(response.headers().len(), 1, "{method} {path}");
+        }
+        let body = axum::body::to_bytes(response.into_body(), 1)
+            .await
+            .expect("local APS failure body should be empty");
+        assert!(body.is_empty(), "{method} {path}");
+    }
+
+    let protected_control = Request::builder()
+        .method("GET")
+        .uri("/integrations/apsx")
+        .body(AxumBody::empty())
+        .expect("should build protected non-APS boundary request");
+    let response = make_service()
         .ready()
         .await
         .expect("should be ready")
-        .call(req)
+        .call(protected_control)
         .await
-        .expect("should respond");
-
-    assert_eq!(
-        resp.status().as_u16(),
-        200,
-        "matching TSJS hash should serve OK"
-    );
-    assert_eq!(
-        resp.headers()
-            .get("cache-control")
-            .and_then(|value| value.to_str().ok()),
-        Some("public, max-age=31536000, s-maxage=31536000, immutable"),
-        "Axum adapter should render the portable s-maxage fallback"
-    );
-    assert!(
-        resp.headers().get("surrogate-control").is_none(),
-        "s-maxage fallback must not emit Fastly Surrogate-Control"
-    );
+        .expect("should auth-gate non-APS boundary request");
+    assert_eq!(response.status().as_u16(), 401);
 }
 
 // ---------------------------------------------------------------------------

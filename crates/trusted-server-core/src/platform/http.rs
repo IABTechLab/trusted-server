@@ -1,11 +1,70 @@
 use std::any::Any;
 use std::fmt;
+use std::time::Duration;
 
 use edgezero_core::http::{Request as EdgeRequest, Response as EdgeResponse};
 use error_stack::Report;
 
 use super::PlatformError;
 use super::image_optimizer::PlatformImageOptimizerOptions;
+
+/// Raw evidence for one security-relevant upstream response header.
+///
+/// Values are never split or normalized. A runtime that preserves duplicate
+/// fields returns every occurrence; a runtime that visibly combines fields
+/// returns that exact combined byte string; erased evidence is unavailable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyHeaderEvidenceV1 {
+    /// Every raw header occurrence, including an empty vector for known absence.
+    Occurrences(Vec<Vec<u8>>),
+    /// One exact runtime-combined value. Core must not split it.
+    Combined(Vec<u8>),
+    /// The runtime erased or ambiguously transformed the evidence.
+    Unavailable,
+}
+
+impl ProxyHeaderEvidenceV1 {
+    /// Known absence of the header.
+    #[must_use]
+    pub fn absent() -> Self {
+        Self::Occurrences(Vec::new())
+    }
+
+    /// One preserved raw header occurrence.
+    #[must_use]
+    pub fn one(value: impl Into<Vec<u8>>) -> Self {
+        Self::Occurrences(vec![value.into()])
+    }
+}
+
+/// Status and raw security-header evidence captured before adapter normalization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyResponseEvidenceV1 {
+    pub status: u16,
+    pub content_type: ProxyHeaderEvidenceV1,
+    pub content_encoding: ProxyHeaderEvidenceV1,
+    pub content_length: ProxyHeaderEvidenceV1,
+}
+
+/// Dedicated bounded raw-proxy transport policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawProxyPolicyV1 {
+    /// Monotonic deadline covering dispatch through the final body byte.
+    pub total_timeout: Duration,
+    /// Maximum time the transport may wait for response headers.
+    pub first_byte_timeout: Duration,
+    /// Maximum duration of one blocking response-body read.
+    pub blocking_read_timeout: Duration,
+    /// Maximum accepted identity-body bytes.
+    pub max_response_bytes: usize,
+}
+
+/// Byte-preserving response produced by the dedicated raw-proxy transport.
+#[derive(Debug)]
+pub struct RawProxyResponseV1 {
+    pub evidence: ProxyResponseEvidenceV1,
+    pub body: Vec<u8>,
+}
 
 /// Outbound HTTP request paired with a pre-resolved backend name.
 ///
@@ -265,6 +324,21 @@ pub trait PlatformHttpClient: Send + Sync {
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>>;
+
+    /// Send one response-evidence-preserving, byte-bounded raw proxy request.
+    ///
+    /// Adapters must disable redirects and transformations, capture the three
+    /// evidence headers before generic normalization, enforce the total
+    /// monotonic deadline and byte cap, and cancel/drop in-flight resources on
+    /// failure. The default fails closed for platforms without that contract.
+    async fn send_raw_proxy_v1(
+        &self,
+        _request: PlatformHttpRequest,
+        _policy: RawProxyPolicyV1,
+    ) -> Result<RawProxyResponseV1, Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported)
+            .attach("bounded raw-proxy transport is unavailable on this platform"))
+    }
 
     /// Start an upstream request without waiting for it to complete.
     ///

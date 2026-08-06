@@ -195,16 +195,30 @@ pub(crate) fn build_state(
     build_state_from_settings(load_settings_from_config_store(stores)?)
 }
 
-pub(crate) fn load_settings_from_config_store(
-    stores: &RuntimeStoreConfig,
-) -> Result<Settings, Report<TrustedServerError>> {
-    get_settings_from_config_store(
-        &FastlyPlatformConfigStore,
-        &FastlyPlatformSecretStore,
-        &stores.config_store_name,
-        &stores.config_key,
-        &stores.secret_store_name,
+#[cfg(feature = "aps-runner-proxy-integration-test")]
+pub(crate) async fn dispatch_reserved_for_state(
+    state: &Arc<AppState>,
+    req: Request,
+) -> Option<Response> {
+    if !state.registry.has_reserved_path(req.uri().path()) {
+        return None;
+    }
+    let ctx = RequestContext::new(req, edgezero_core::params::PathParams::default());
+    let services = build_per_request_services(state, &ctx);
+    Some(
+        state
+            .registry
+            .handle_reserved_proxy(&state.settings, &services, ctx.into_request())
+            .await
+            .expect("reserved path should have a coordinated-cutover handler")
+            .unwrap_or_else(|report| http_error(&report)),
     )
+}
+
+pub(crate) fn load_settings_from_config_store() -> Result<Settings, Report<TrustedServerError>> {
+    let store_name = default_config_store_name();
+    let config_key = default_config_key();
+    get_settings_from_config_store(&FastlyPlatformConfigStore, &store_name, &config_key)
 }
 
 pub(crate) fn build_state_from_settings(
@@ -212,10 +226,11 @@ pub(crate) fn build_state_from_settings(
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     warn_if_certificate_check_disabled(&settings);
 
-    let plan = Arc::new(compile_auction_plan(&settings)?);
-    plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Fastly)?;
-    let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
-    let registry = IntegrationRegistry::with_plan(&settings, plan)?;
+    let orchestrator = build_orchestrator(&settings)?;
+    #[cfg(feature = "aps-runner-proxy-integration-test")]
+    let registry = IntegrationRegistry::new_with_aps_v1_for_tests(&settings)?;
+    #[cfg(not(feature = "aps-runner-proxy-integration-test"))]
+    let registry = IntegrationRegistry::new(&settings)?;
 
     let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
@@ -1355,6 +1370,8 @@ impl Hooks for TrustedServerApp {
 mod tests {
     use std::sync::Arc;
 
+    #[cfg(feature = "aps-runner-proxy-integration-test")]
+    use super::dispatch_reserved_for_state;
     use super::{
         AppState, NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH,
         RuntimeStoreConfig, TrustedServerApp, build_per_request_services,
@@ -1516,6 +1533,11 @@ mod tests {
             username = "admin"
             password = "admin-pass"
 
+            [[handlers]]
+            path = "^/integrations/aps"
+            username = "aps-user"
+            password = "aps-pass"
+
             [publisher]
             domain = "test-publisher.com"
             cookie_domain = ".test-publisher.com"
@@ -1537,6 +1559,11 @@ mod tests {
             enabled = true
             external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
 
+            [integrations.aps]
+            enabled = true
+            account_id = "route-test-aps-account"
+            allow_script_creatives = true
+
             [auction]
             enabled = true
             [auction.providers.prebid]
@@ -1554,34 +1581,88 @@ mod tests {
         TrustedServerApp::routes_for_state(&state)
     }
 
-    #[test]
-    fn per_request_services_register_the_fastly_template_assembler() {
+    #[cfg(feature = "aps-runner-proxy-integration-test")]
+    fn route_reserved(request: edgezero_core::http::Request) -> Response {
         let state = build_state_from_settings(test_settings()).expect("should build test state");
-        let context = RequestContext::new(
-            empty_request(Method::GET, "/article"),
-            PathParams::default(),
-        );
+        block_on(dispatch_reserved_for_state(&state, request))
+            .expect("APS family should be reserved")
+    }
 
-        let services = build_per_request_services(&state, &context);
-        let template = format!(
-            "<html><body>article{}</body></html>",
-            trusted_server_core::publisher::AD_ASSEMBLY_SEAM
-        );
-        let fragment = b"<script>reader state</script>";
-        let assembled = services
-            .template_assembler()
-            .assemble(template.as_bytes(), fragment)
-            .expect("Fastly services should provide ESI assembly");
-
+    #[cfg(feature = "aps-runner-proxy-integration-test")]
+    #[test]
+    fn aps_cutover_renderer_and_family_failures_are_local() {
+        let response = route_reserved(empty_request(Method::GET, "/integrations/aps/renderer/v1"));
+        assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            assembled,
-            template
-                .replace(
-                    trusted_server_core::publisher::AD_ASSEMBLY_SEAM,
-                    std::str::from_utf8(fragment).expect("fragment should be UTF-8")
-                )
-                .into_bytes()
+            response.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
         );
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=31536000, immutable"
+        );
+        assert!(!response.headers().contains_key("x-frame-options"));
+        let body = response.into_body().into_bytes().unwrap_or_default();
+        let body = std::str::from_utf8(&body).expect("renderer should be UTF-8");
+        assert!(body.contains("/integrations/aps/runner.js"));
+        assert!(!body.contains("client.aps.amazon-adsystem.com"));
+
+        for (method, path, expected) in [
+            (
+                Method::POST,
+                "/integrations/aps/runner.js",
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (
+                Method::TRACE,
+                "/integrations/aps/renderer/v1",
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (
+                Method::CONNECT,
+                "/integrations/aps/renderer/v1",
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (
+                Method::from_bytes(b"PROPFIND").expect("PROPFIND should be a valid method"),
+                "/integrations/aps/renderer/v1",
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (
+                Method::GET,
+                "/integrations/aps/renderer/v2",
+                StatusCode::NOT_FOUND,
+            ),
+            (Method::GET, "/integrations/aps", StatusCode::NOT_FOUND),
+        ] {
+            let mut request = empty_request(method.clone(), path);
+            request.headers_mut().insert(
+                header::AUTHORIZATION,
+                "Bearer must-not-reach-publisher"
+                    .parse()
+                    .expect("should parse authorization header"),
+            );
+            let response = route_reserved(request);
+            assert_eq!(response.status(), expected, "{method} {path}");
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            assert!(!response.headers().contains_key(HEADER_X_GEO_INFO_AVAILABLE));
+            if expected == StatusCode::METHOD_NOT_ALLOWED {
+                assert_eq!(response.headers()[header::ALLOW], "GET");
+            }
+            assert!(
+                response
+                    .into_body()
+                    .into_bytes()
+                    .unwrap_or_default()
+                    .is_empty()
+            );
+        }
+
+        let response = route(
+            &test_router(),
+            empty_request(Method::GET, "/integrations/apsx"),
+        );
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// Builds a router whose `AppState` uses a registry containing the given

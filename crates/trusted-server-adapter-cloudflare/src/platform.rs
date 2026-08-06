@@ -18,6 +18,7 @@ use trusted_server_core::platform::UnavailableHttpClient;
 #[cfg(target_arch = "wasm32")]
 use trusted_server_core::platform::{
     PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, PlatformSelectResult,
+    ProxyHeaderEvidenceV1, ProxyResponseEvidenceV1, RawProxyPolicyV1, RawProxyResponseV1,
 };
 
 // ---------------------------------------------------------------------------
@@ -190,7 +191,13 @@ struct CloudflarePendingResponse {
 /// fetch layer; the Workers runtime's global CPU budget (~30 s on paid plans)
 /// is the only implicit deadline.
 #[cfg(target_arch = "wasm32")]
-pub struct CloudflareHttpClient;
+pub struct CloudflareHttpClient {
+    #[cfg(feature = "aps-runner-proxy-integration-test")]
+    aps_runner_proxy_test_fetcher: Option<worker::Fetcher>,
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "aps-runner-proxy-integration-test"))]
+const APS_RUNNER_PROXY_TEST_SERVICE_BINDING: &str = "APS_RUNNER_PROXY_FIXTURE";
 
 /// Maximum buffered upstream response body, mirroring the Fastly adapter's cap.
 ///
@@ -281,6 +288,27 @@ fn outbound_request_init(method: worker::Method, headers: worker::Headers) -> wo
 
 #[cfg(target_arch = "wasm32")]
 impl CloudflareHttpClient {
+    fn new(request_context: &edgezero_core::context::RequestContext) -> Self {
+        #[cfg(not(feature = "aps-runner-proxy-integration-test"))]
+        let _ = request_context;
+        #[cfg(feature = "aps-runner-proxy-integration-test")]
+        let aps_runner_proxy_test_fetcher =
+            edgezero_adapter_cloudflare::context::CloudflareRequestContext::get(
+                request_context.request(),
+            )
+            .and_then(|cloudflare_context| {
+                cloudflare_context
+                    .env()
+                    .service(APS_RUNNER_PROXY_TEST_SERVICE_BINDING)
+                    .ok()
+            });
+
+        Self {
+            #[cfg(feature = "aps-runner-proxy-integration-test")]
+            aps_runner_proxy_test_fetcher,
+        }
+    }
+
     async fn execute(
         &self,
         request: PlatformHttpRequest,
@@ -436,6 +464,195 @@ impl CloudflareHttpClient {
 
         Ok(PlatformResponse::new(edge_resp).with_backend_name(request.backend_name))
     }
+
+    fn raw_header_evidence(headers: &worker::Headers, name: &str) -> ProxyHeaderEvidenceV1 {
+        match headers.get(name) {
+            Ok(Some(value)) => ProxyHeaderEvidenceV1::Combined(value.into_bytes()),
+            Ok(None) => ProxyHeaderEvidenceV1::absent(),
+            Err(_) => ProxyHeaderEvidenceV1::Unavailable,
+        }
+    }
+
+    fn canonical_declared_length(evidence: &ProxyHeaderEvidenceV1) -> Option<usize> {
+        let value = match evidence {
+            ProxyHeaderEvidenceV1::Occurrences(values) => {
+                let [value] = values.as_slice() else {
+                    return None;
+                };
+                value.as_slice()
+            }
+            ProxyHeaderEvidenceV1::Combined(value) => value.as_slice(),
+            ProxyHeaderEvidenceV1::Unavailable => return None,
+        };
+        if value.is_empty()
+            || !value.iter().all(u8::is_ascii_digit)
+            || (value.len() > 1 && value[0] == b'0')
+        {
+            return None;
+        }
+        std::str::from_utf8(value).ok()?.parse().ok()
+    }
+
+    async fn execute_raw_proxy_v1(
+        &self,
+        request: PlatformHttpRequest,
+        policy: RawProxyPolicyV1,
+    ) -> Result<RawProxyResponseV1, Report<PlatformError>> {
+        use futures::{FutureExt as _, StreamExt as _, future::Either};
+        use worker::{
+            AbortController, CacheMode, Fetch, Headers, Method, Request, RequestInit,
+            RequestRedirect, ResponseBody,
+        };
+
+        if request.image_optimizer.is_some() || request.stream_response {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("unsupported option on Cloudflare raw proxy request"));
+        }
+
+        let cache_mode = outbound_cache_mode(request.bypass_cache);
+        let uri = request.request.uri().to_string();
+        #[cfg(feature = "aps-runner-proxy-integration-test")]
+        let use_test_service_binding = {
+            use trusted_server_core::integrations::aps::APS_RUNNER_UPSTREAM_URL;
+
+            uri == APS_RUNNER_UPSTREAM_URL
+        };
+        let method = Method::from(request.request.method().to_string());
+        let headers = Headers::new();
+        for (name, value) in request.request.headers() {
+            let value =
+                std::str::from_utf8(value.as_bytes()).change_context(PlatformError::HttpClient)?;
+            headers
+                .append(name.as_str(), value)
+                .change_context(PlatformError::HttpClient)?;
+        }
+        #[cfg(feature = "aps-runner-proxy-integration-test")]
+        if use_test_service_binding {
+            headers
+                .set("x-ts-aps-logical-url", &uri)
+                .change_context(PlatformError::HttpClient)?;
+        }
+
+        let (_, body) = request.request.into_parts();
+        let body = match body {
+            edgezero_core::body::Body::Once(bytes) => bytes.to_vec(),
+            edgezero_core::body::Body::Stream(_) => {
+                return Err(Report::new(PlatformError::HttpClient)
+                    .attach("streaming request bodies are not supported on Cloudflare raw proxy"));
+            }
+        };
+        let mut init = RequestInit::new();
+        init.with_method(method)
+            .with_headers(headers)
+            .with_redirect(RequestRedirect::Manual);
+        if cache_mode == OutboundCacheMode::NoStore {
+            init.with_cache(CacheMode::NoStore);
+        }
+        if !body.is_empty() {
+            init.with_body(Some(js_sys::Uint8Array::from(body.as_slice()).into()));
+        }
+        let worker_request =
+            Request::new_with_init(&uri, &init).change_context(PlatformError::HttpClient)?;
+
+        let controller = AbortController::default();
+        let signal = controller.signal();
+        #[cfg(feature = "aps-runner-proxy-integration-test")]
+        let test_fetcher = if use_test_service_binding {
+            Some(self.aps_runner_proxy_test_fetcher.clone().ok_or_else(|| {
+                Report::new(PlatformError::HttpClient)
+                    .attach("APS runner proxy integration service binding is unavailable")
+            })?)
+        } else {
+            None
+        };
+        let operation = async {
+            #[cfg(feature = "aps-runner-proxy-integration-test")]
+            let mut response = if let Some(fetcher) = test_fetcher {
+                let mut bound_request: worker::HttpRequest = worker_request
+                    .try_into()
+                    .change_context(PlatformError::HttpClient)?;
+                bound_request.extensions_mut().insert(signal.clone());
+                let bound_response = fetcher
+                    .fetch_request(bound_request)
+                    .await
+                    .change_context(PlatformError::HttpClient)?;
+                worker::Response::try_from(bound_response)
+                    .change_context(PlatformError::HttpClient)?
+            } else {
+                let fetch = Fetch::Request(worker_request);
+                fetch
+                    .send_with_signal(&signal)
+                    .await
+                    .change_context(PlatformError::HttpClient)?
+            };
+            #[cfg(not(feature = "aps-runner-proxy-integration-test"))]
+            let mut response = {
+                let fetch = Fetch::Request(worker_request);
+                fetch
+                    .send_with_signal(&signal)
+                    .await
+                    .change_context(PlatformError::HttpClient)?
+            };
+            let evidence = ProxyResponseEvidenceV1 {
+                status: response.status_code(),
+                content_type: Self::raw_header_evidence(response.headers(), "content-type"),
+                content_encoding: Self::raw_header_evidence(response.headers(), "content-encoding"),
+                content_length: Self::raw_header_evidence(response.headers(), "content-length"),
+            };
+            if Self::canonical_declared_length(&evidence.content_length)
+                .is_some_and(|length| length > policy.max_response_bytes)
+            {
+                return Err(Report::new(PlatformError::HttpClient)
+                    .attach("raw proxy declared body exceeds configured cap"));
+            }
+
+            let mut body = match response.body().clone() {
+                ResponseBody::Empty => Vec::new(),
+                ResponseBody::Body(bytes) => bytes,
+                ResponseBody::Stream(_) => {
+                    let mut stream = response
+                        .stream()
+                        .change_context(PlatformError::HttpClient)?;
+                    let mut body = Vec::new();
+                    while let Some(chunk) = stream.next().await {
+                        let chunk = chunk.change_context(PlatformError::HttpClient)?;
+                        let next_len = body.len().checked_add(chunk.len()).ok_or_else(|| {
+                            Report::new(PlatformError::HttpClient)
+                                .attach("raw proxy body length overflow")
+                        })?;
+                        if next_len > policy.max_response_bytes {
+                            return Err(Report::new(PlatformError::HttpClient)
+                                .attach("raw proxy body exceeds configured cap"));
+                        }
+                        body.extend_from_slice(&chunk);
+                    }
+                    body
+                }
+            };
+            if body.len() > policy.max_response_bytes {
+                body.clear();
+                return Err(Report::new(PlatformError::HttpClient)
+                    .attach("raw proxy buffered body exceeds configured cap"));
+            }
+            Ok(RawProxyResponseV1 { evidence, body })
+        }
+        .boxed_local();
+        let deadline = worker::Delay::from(policy.total_timeout).boxed_local();
+
+        match futures::future::select(operation, deadline).await {
+            Either::Left((result, _)) => {
+                if result.is_err() {
+                    controller.abort();
+                }
+                result
+            }
+            Either::Right(((), _)) => {
+                controller.abort();
+                Err(Report::new(PlatformError::HttpClient)
+                    .attach("raw proxy total deadline exceeded"))
+            }
+        }
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -446,6 +663,14 @@ impl PlatformHttpClient for CloudflareHttpClient {
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
         self.execute(request).await
+    }
+
+    async fn send_raw_proxy_v1(
+        &self,
+        request: PlatformHttpRequest,
+        policy: RawProxyPolicyV1,
+    ) -> Result<RawProxyResponseV1, Report<PlatformError>> {
+        self.execute_raw_proxy_v1(request, policy).await
     }
 
     fn supports_concurrent_fanout(&self) -> bool {
@@ -594,7 +819,7 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
     let client_ip = extract_client_ip(ctx);
 
     #[cfg(target_arch = "wasm32")]
-    let http_client: Arc<dyn PlatformHttpClient> = Arc::new(CloudflareHttpClient);
+    let http_client: Arc<dyn PlatformHttpClient> = Arc::new(CloudflareHttpClient::new(ctx));
     #[cfg(not(target_arch = "wasm32"))]
     let http_client: Arc<dyn PlatformHttpClient> = Arc::new(UnavailableHttpClient);
 

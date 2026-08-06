@@ -23,7 +23,8 @@ use std::io::Read as _;
 use trusted_server_core::platform::PlatformHttpRequest;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use trusted_server_core::platform::{
-    PlatformPendingRequest, PlatformResponse, PlatformSelectResult,
+    PlatformPendingRequest, PlatformResponse, PlatformSelectResult, ProxyHeaderEvidenceV1,
+    ProxyResponseEvidenceV1, RawProxyPolicyV1, RawProxyResponseV1,
 };
 
 // 8 MiB ceiling: conservative for ad-server responses while leaving headroom in
@@ -465,8 +466,56 @@ struct SpinPendingResponse {
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub struct SpinPlatformHttpClient;
 
+#[cfg(all(
+    feature = "aps-runner-proxy-integration-test",
+    any(test, all(feature = "spin", target_arch = "wasm32"))
+))]
+fn aps_runner_proxy_transport_uri(
+    logical_uri: &str,
+    endpoint: &str,
+) -> Result<Option<String>, Report<PlatformError>> {
+    use trusted_server_core::integrations::aps::APS_RUNNER_UPSTREAM_URL;
+
+    if logical_uri != APS_RUNNER_UPSTREAM_URL {
+        return Ok(None);
+    }
+    let parsed: edgezero_core::http::Uri = endpoint.parse().map_err(|_| {
+        Report::new(PlatformError::HttpClient)
+            .attach("invalid APS runner proxy integration fixture endpoint")
+    })?;
+    if parsed.scheme_str() != Some("http")
+        || !matches!(parsed.host(), Some("127.0.0.1" | "::1"))
+        || parsed.port_u16().is_none()
+        || parsed.path().is_empty()
+        || parsed.query().is_some()
+    {
+        return Err(Report::new(PlatformError::HttpClient).attach(
+            "APS runner proxy integration fixture endpoint must be an explicit loopback HTTP URL",
+        ));
+    }
+    Ok(Some(endpoint.to_owned()))
+}
+
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 impl SpinPlatformHttpClient {
+    #[cfg(all(
+        feature = "aps-runner-proxy-integration-test",
+        feature = "spin",
+        target_arch = "wasm32"
+    ))]
+    async fn aps_runner_proxy_test_transport_uri(
+        logical_uri: &str,
+    ) -> Result<Option<String>, Report<PlatformError>> {
+        let endpoint = spin_sdk::variables::get("aps_runner_proxy_test_endpoint")
+            .await
+            .map_err(|_| {
+                Report::new(PlatformError::HttpClient).attach(
+                    "APS runner proxy integration artifact requires its loopback fixture endpoint",
+                )
+            })?;
+        aps_runner_proxy_transport_uri(logical_uri, &endpoint)
+    }
+
     async fn execute(
         &self,
         request: PlatformHttpRequest,
@@ -552,6 +601,173 @@ impl SpinPlatformHttpClient {
 
         Ok(PlatformResponse::new(edge_resp).with_backend_name(request.backend_name))
     }
+
+    fn raw_header_evidence(
+        headers: &spin_sdk::wasip3::http::types::Headers,
+        name: &str,
+    ) -> ProxyHeaderEvidenceV1 {
+        ProxyHeaderEvidenceV1::Occurrences(headers.get(name))
+    }
+
+    fn canonical_declared_length(evidence: &ProxyHeaderEvidenceV1) -> Option<usize> {
+        let ProxyHeaderEvidenceV1::Occurrences(values) = evidence else {
+            return None;
+        };
+        let [value] = values.as_slice() else {
+            return None;
+        };
+        if value.is_empty()
+            || !value.iter().all(u8::is_ascii_digit)
+            || (value.len() > 1 && value[0] == b'0')
+        {
+            return None;
+        }
+        std::str::from_utf8(value).ok()?.parse().ok()
+    }
+
+    async fn execute_raw_proxy_v1(
+        &self,
+        request: PlatformHttpRequest,
+        policy: RawProxyPolicyV1,
+    ) -> Result<RawProxyResponseV1, Report<PlatformError>> {
+        use futures::{FutureExt as _, future::Either};
+        use spin_sdk::http::IntoRequest as _;
+        use spin_sdk::wasip3::http::types::RequestOptions;
+        use spin_sdk::wasip3::http_compat::{IncomingResponseBody, RequestOptionsExtension};
+
+        reject_unsupported_request_contracts(&request)?;
+        let method = request.request.method().clone();
+        let logical_uri = request.request.uri().to_string();
+        #[cfg(feature = "aps-runner-proxy-integration-test")]
+        let transport_uri = Self::aps_runner_proxy_test_transport_uri(&logical_uri).await?;
+        let mut builder = spin_sdk::http::Request::builder()
+            .method(into_spin_method(&method))
+            .uri(&logical_uri);
+        for (name, value) in request.request.headers() {
+            if is_wasi_forbidden_outbound_header(name.as_str()) {
+                continue;
+            }
+            builder = builder.header(name.as_str(), value.as_bytes());
+        }
+        #[cfg(feature = "aps-runner-proxy-integration-test")]
+        if transport_uri.is_some() {
+            builder = builder.header("x-ts-aps-logical-url", logical_uri);
+        }
+
+        let (_, request_body) = request.request.into_parts();
+        let request_body = match request_body {
+            edgezero_core::body::Body::Once(bytes) => bytes.to_vec(),
+            edgezero_core::body::Body::Stream(_) => {
+                return Err(Report::new(PlatformError::HttpClient)
+                    .attach("streaming request bodies are not supported on Spin raw proxy"));
+            }
+        };
+        let mut spin_request = builder
+            .body(spin_sdk::http::FullBody::new(Bytes::from(request_body)))
+            .map_err(|error| {
+                Report::new(PlatformError::HttpClient)
+                    .attach(format!("failed to build Spin raw proxy request: {error}"))
+            })?;
+
+        // Spin/Wasmtime owns the wire `Host` header and forbids guests from
+        // setting it. Keep the fixed APS URL through the core→adapter contract,
+        // then apply the loopback-only integration target at the final lowering
+        // boundary. Production builds have no transport override constructor.
+        #[cfg(feature = "aps-runner-proxy-integration-test")]
+        if let Some(transport_uri) = transport_uri {
+            *spin_request.uri_mut() = transport_uri.parse().map_err(|_| {
+                Report::new(PlatformError::HttpClient)
+                    .attach("failed to lower APS loopback transport URI")
+            })?;
+        }
+
+        let timeout_nanos = policy.total_timeout.as_nanos().try_into().map_err(|_| {
+            Report::new(PlatformError::HttpClient)
+                .attach("raw proxy timeout exceeds WASI HTTP duration range")
+        })?;
+        let options = RequestOptions::new();
+        options
+            .set_connect_timeout(Some(timeout_nanos))
+            .map_err(|_| {
+                Report::new(PlatformError::Unsupported)
+                    .attach("Spin raw proxy connect timeout is unavailable")
+            })?;
+        options
+            .set_first_byte_timeout(Some(timeout_nanos))
+            .map_err(|_| {
+                Report::new(PlatformError::Unsupported)
+                    .attach("Spin raw proxy first-byte timeout is unavailable")
+            })?;
+        options
+            .set_between_bytes_timeout(Some(timeout_nanos))
+            .map_err(|_| {
+                Report::new(PlatformError::Unsupported)
+                    .attach("Spin raw proxy between-bytes timeout is unavailable")
+            })?;
+        spin_request
+            .extensions_mut()
+            .insert(RequestOptionsExtension(options));
+        let wasi_request = spin_request.into_request().map_err(|error| {
+            Report::new(PlatformError::HttpClient)
+                .attach(format!("failed to lower Spin raw proxy request: {error}"))
+        })?;
+
+        let operation = async move {
+            let response = spin_sdk::wasip3::http::client::send(wasi_request)
+                .await
+                .map_err(|error| {
+                    Report::new(PlatformError::HttpClient)
+                        .attach(format!("Spin raw proxy request failed: {error}"))
+                })?;
+            let status = response.get_status_code();
+            let headers = response.get_headers();
+            let evidence = ProxyResponseEvidenceV1 {
+                status,
+                content_type: Self::raw_header_evidence(&headers, "content-type"),
+                content_encoding: Self::raw_header_evidence(&headers, "content-encoding"),
+                content_length: Self::raw_header_evidence(&headers, "content-length"),
+            };
+            if Self::canonical_declared_length(&evidence.content_length)
+                .is_some_and(|length| length > policy.max_response_bytes)
+            {
+                return Err(Report::new(PlatformError::HttpClient)
+                    .attach("raw proxy declared body exceeds configured cap"));
+            }
+
+            let mut incoming = IncomingResponseBody::new(response).map_err(|error| {
+                Report::new(PlatformError::HttpClient)
+                    .attach(format!("failed to open Spin raw proxy body: {error}"))
+            })?;
+            let mut body = Vec::new();
+            while let Some(frame) = incoming.frame().await {
+                let frame = frame.map_err(|error| {
+                    Report::new(PlatformError::HttpClient)
+                        .attach(format!("failed to read Spin raw proxy body: {error}"))
+                })?;
+                let Ok(data) = frame.into_data() else {
+                    continue;
+                };
+                let next_len = body.len().checked_add(data.len()).ok_or_else(|| {
+                    Report::new(PlatformError::HttpClient).attach("raw proxy body length overflow")
+                })?;
+                if next_len > policy.max_response_bytes {
+                    return Err(Report::new(PlatformError::HttpClient)
+                        .attach("raw proxy body exceeds configured cap"));
+                }
+                body.extend_from_slice(&data);
+            }
+            Ok(RawProxyResponseV1 { evidence, body })
+        }
+        .boxed_local();
+        let deadline = spin_sdk::time::sleep(policy.total_timeout).boxed_local();
+        match futures::future::select(operation, deadline).await {
+            Either::Left((result, _)) => result,
+            Either::Right(((), _)) => {
+                Err(Report::new(PlatformError::HttpClient)
+                    .attach("raw proxy total deadline exceeded"))
+            }
+        }
+    }
 }
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
@@ -569,6 +785,14 @@ impl PlatformHttpClient for SpinPlatformHttpClient {
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
         self.execute(request).await
+    }
+
+    async fn send_raw_proxy_v1(
+        &self,
+        request: PlatformHttpRequest,
+        policy: RawProxyPolicyV1,
+    ) -> Result<RawProxyResponseV1, Report<PlatformError>> {
+        self.execute_raw_proxy_v1(request, policy).await
     }
 
     async fn send_async(
@@ -813,6 +1037,22 @@ mod tests {
         async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
             Ok(self.0.get(key).cloned())
         }
+    }
+
+    #[cfg(feature = "aps-runner-proxy-integration-test")]
+    #[test]
+    fn aps_test_transport_mapping_preserves_logical_authority_until_lowering() {
+        use trusted_server_core::integrations::aps::APS_RUNNER_UPSTREAM_URL;
+
+        let endpoint = "http://127.0.0.1:49152/prebid-creative.js";
+        let transport = aps_runner_proxy_transport_uri(APS_RUNNER_UPSTREAM_URL, endpoint)
+            .expect("loopback integration endpoint should be accepted")
+            .expect("fixed APS URL should select the integration transport");
+        assert_eq!(transport.to_string(), endpoint);
+        let logical: edgezero_core::http::Uri = APS_RUNNER_UPSTREAM_URL
+            .parse()
+            .expect("fixed APS URL should parse");
+        assert_eq!(logical.host(), Some("client.aps.amazon-adsystem.com"));
     }
 
     fn make_ctx_without_spin_context() -> RequestContext {

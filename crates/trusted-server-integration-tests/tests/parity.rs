@@ -14,10 +14,12 @@ use edgezero_adapter_axum::service::EdgeZeroAxumService;
 use edgezero_core::http::request_builder;
 use edgezero_core::router::RouterService;
 use http::HeaderMap;
+use std::collections::BTreeMap;
 use tower::{Service as _, ServiceExt as _};
 use trusted_server_adapter_axum::app::TrustedServerApp as AxumApp;
 use trusted_server_adapter_cloudflare::app::TrustedServerApp as CloudflareApp;
 use trusted_server_adapter_spin::app::TrustedServerApp as SpinApp;
+use trusted_server_core::integrations::aps::APS_RENDERER_V1_ROUTE;
 use trusted_server_core::settings::Settings;
 
 /// Shared test settings for all adapters.
@@ -44,6 +46,11 @@ fn test_settings() -> Settings {
 
             [ec]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [integrations.aps]
+            enabled = true
+            account_id = "parity-test-aps-account"
+            allow_script_creatives = true
         "#,
     )
     .expect("should parse parity test settings")
@@ -755,6 +762,94 @@ async fn spin_auction_ignores_spoofed_forwarded_headers() {
         clean_status, spoofed_status,
         "spoofed forwarded headers must not change Spin /auction behaviour: \
          clean={clean_status} spoofed={spoofed_status}"
+    );
+}
+
+fn canonical_headers(headers: &HeaderMap) -> BTreeMap<String, Vec<String>> {
+    let mut canonical = BTreeMap::<String, Vec<String>>::new();
+    for (name, value) in headers {
+        canonical
+            .entry(name.as_str().to_string())
+            .or_default()
+            .push(
+                value
+                    .to_str()
+                    .expect("renderer response headers should be UTF-8")
+                    .to_string(),
+            );
+    }
+    canonical
+}
+
+fn aps_renderer_request() -> edgezero_core::http::Request {
+    request_builder()
+        .method("GET")
+        .uri(APS_RENDERER_V1_ROUTE)
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build APS renderer request")
+}
+
+fn response_parts(response: edgezero_core::http::Response) -> (u16, HeaderMap, bytes::Bytes) {
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let body = response
+        .into_body()
+        .into_bytes()
+        .expect("APS renderer response body should be buffered");
+    (status, headers, body)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aps_renderer_v1_response_is_exact_across_portable_adapters() {
+    let axum = trusted_server_adapter_axum::app::dispatch_reserved_with_settings(
+        test_settings(),
+        aps_renderer_request(),
+    )
+    .await
+    .expect("Axum reserved dispatcher should initialize")
+    .expect("Axum APS renderer path should be reserved");
+    let cloudflare = trusted_server_adapter_cloudflare::app::dispatch_reserved_with_settings(
+        test_settings(),
+        aps_renderer_request(),
+    )
+    .await
+    .expect("Cloudflare reserved dispatcher should initialize")
+    .expect("Cloudflare APS renderer path should be reserved");
+    let spin = trusted_server_adapter_spin::app::dispatch_reserved_with_settings(
+        test_settings(),
+        aps_renderer_request(),
+    )
+    .await
+    .expect("Spin reserved dispatcher should initialize")
+    .expect("Spin APS renderer path should be reserved");
+    let axum = response_parts(axum);
+    let cloudflare = response_parts(cloudflare);
+    let spin = response_parts(spin);
+
+    assert_eq!(axum.0, 200, "Axum renderer should be available");
+    assert_eq!(cloudflare.0, 200, "Cloudflare renderer should be available");
+    assert_eq!(spin.0, 200, "Spin renderer should be available");
+    assert_eq!(axum.2, cloudflare.2, "renderer bytes should match");
+    assert_eq!(cloudflare.2, spin.2, "renderer bytes should match");
+
+    let axum_headers = canonical_headers(&axum.1);
+    let cloudflare_headers = canonical_headers(&cloudflare.1);
+    let spin_headers = canonical_headers(&spin.1);
+    assert_eq!(
+        axum_headers, cloudflare_headers,
+        "renderer response headers should match"
+    );
+    assert_eq!(
+        cloudflare_headers, spin_headers,
+        "renderer response headers should match"
+    );
+    assert!(
+        !axum_headers.contains_key("x-geo-info-available"),
+        "the exact renderer contract should bypass generic response decoration"
+    );
+    assert!(
+        !axum_headers.contains_key("x-frame-options"),
+        "the sandbox contract deliberately omits X-Frame-Options"
     );
 }
 

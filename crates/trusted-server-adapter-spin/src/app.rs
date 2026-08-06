@@ -13,11 +13,8 @@ use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, he
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
-use trusted_server_core::auction::{
-    AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan,
-};
-use trusted_server_core::cache_policy::EdgeCacheHeader;
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+#[cfg(all(feature = "aps-runner-proxy-integration-test", target_arch = "wasm32"))]
 use trusted_server_core::config_payload::settings_from_config_blob;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::admin::{
@@ -75,43 +72,24 @@ pub struct AppState {
 ///
 /// Returns an error when settings, the auction orchestrator, or the integration
 /// registry fail to initialise.
+#[cfg(not(all(feature = "aps-runner-proxy-integration-test", target_arch = "wasm32")))]
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let settings = load_startup_settings()?;
     build_state_with_settings(settings)
 }
 
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
-    let config_store_name = StoreName::from(SPIN_DEFAULT_CONFIG_STORE);
-    let config_key = default_config_key();
-    let config_store =
-        futures::executor::block_on(SpinConfigStore::open(config_store_name.as_ref().to_owned()))
+#[cfg(all(feature = "aps-runner-proxy-integration-test", target_arch = "wasm32"))]
+fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    let envelope =
+        futures::executor::block_on(spin_sdk::variables::get("v_trusted_x5fserver_x5fconfig"))
             .map_err(|error| {
-            Report::new(TrustedServerError::Configuration {
-                message: "failed to open Spin Trusted Server config store".to_string(),
-            })
-            .attach(error.to_string())
-        })?;
-    let config_handle = ConfigStoreHandle::new(Arc::new(config_store));
-    let config_adapter = ConfigStoreHandleAdapter(config_handle);
-    let raw_envelope = config_adapter
-        .get(&config_store_name, &config_key)
-        .map_err(|error| {
-            Report::new(TrustedServerError::Configuration {
-                message: "failed to read Spin Trusted Server app-config blob".to_string(),
-            })
-            .attach(error.to_string())
-        })?;
-    let secret_store = SpinSecretStoreAdapter;
-    settings_from_config_blob(&raw_envelope, &secret_store, &default_secret_store_name())
-}
-
-#[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
-fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
-    Err(Report::new(TrustedServerError::Configuration {
-        message: "Spin startup settings require the production config store".to_string(),
-    })
-    .attach("use TrustedServerApp::routes_with_settings for host tests"))
+                Report::new(TrustedServerError::Configuration {
+                    message: "failed to read the Spin APS proxy test app config".to_string(),
+                })
+                .attach(error.to_string())
+            })?;
+    let settings = settings_from_config_blob(&envelope)?;
+    build_state_with_settings(settings)
 }
 
 /// Build the application state from explicit settings.
@@ -123,16 +101,63 @@ fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
 fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let plan = Arc::new(compile_auction_plan(&settings)?);
-    plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Spin)?;
-    let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
-    let registry = IntegrationRegistry::with_plan(&settings, plan)?;
+    let orchestrator = build_orchestrator(&settings)?;
+    #[cfg(feature = "aps-runner-proxy-integration-test")]
+    let registry = IntegrationRegistry::new_with_aps_v1_for_tests(&settings)?;
+    #[cfg(not(feature = "aps-runner-proxy-integration-test"))]
+    let registry = IntegrationRegistry::new(&settings)?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
     }))
+}
+
+#[cfg(feature = "aps-runner-proxy-integration-test")]
+async fn dispatch_reserved_for_state(state: &Arc<AppState>, req: Request) -> Option<Response> {
+    if !state.registry.has_reserved_path(req.uri().path()) {
+        return None;
+    }
+    let ctx = RequestContext::new(req, edgezero_core::params::PathParams::default());
+    let services = build_runtime_services(&ctx);
+    Some(
+        state
+            .registry
+            .handle_reserved_proxy(&state.settings, &services, ctx.into_request())
+            .await
+            .expect("reserved path should have a coordinated-cutover handler")
+            .unwrap_or_else(|report| http_error(&report)),
+    )
+}
+
+#[cfg(feature = "aps-runner-proxy-integration-test")]
+/// Dispatch a reserved APS request using explicit settings.
+///
+/// # Errors
+///
+/// Returns an error when the feature-only application state cannot be
+/// initialized from `settings`.
+pub async fn dispatch_reserved_with_settings(
+    settings: Settings,
+    req: Request,
+) -> Result<Option<Response>, Report<TrustedServerError>> {
+    let state = build_state_with_settings(settings)?;
+    Ok(dispatch_reserved_for_state(&state, req).await)
+}
+
+#[cfg(feature = "aps-runner-proxy-integration-test")]
+/// Dispatch a reserved APS request using startup settings.
+///
+/// # Errors
+///
+/// Returns an error when startup settings or the feature-only application
+/// state cannot be initialized.
+pub async fn dispatch_reserved(
+    req: Request,
+) -> Result<Option<Response>, Report<TrustedServerError>> {
+    let state = build_state()?;
+    Ok(dispatch_reserved_for_state(&state, req).await)
 }
 
 // ---------------------------------------------------------------------------

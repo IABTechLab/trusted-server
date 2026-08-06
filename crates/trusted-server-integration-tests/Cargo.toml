@@ -17,6 +17,15 @@ name = "parity"
 path = "tests/parity.rs"
 harness = true
 
+[[test]]
+name = "aps_runner_proxy"
+path = "tests/aps_runner_proxy.rs"
+harness = true
+required-features = ["aps-runner-proxy"]
+
+[features]
+aps-runner-proxy = []
+
 [lints]
 workspace = true
 
@@ -40,9 +49,10 @@ log = { workspace = true }
 reqwest = { workspace = true, features = ["blocking", "cookies"] }
 scraper = { workspace = true }
 testcontainers = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 tower = { workspace = true, features = ["util"] }
-trusted-server-adapter-axum = { path = "../trusted-server-adapter-axum" }
-trusted-server-adapter-cloudflare = { path = "../trusted-server-adapter-cloudflare" }
-trusted-server-adapter-spin = { path = "../trusted-server-adapter-spin" }
+trusted-server-adapter-axum = { path = "../trusted-server-adapter-axum", features = ["aps-runner-proxy-integration-test"] }
+trusted-server-adapter-cloudflare = { path = "../trusted-server-adapter-cloudflare", features = ["aps-runner-proxy-integration-test"] }
+trusted-server-adapter-spin = { path = "../trusted-server-adapter-spin", features = ["aps-runner-proxy-integration-test"] }
 urlencoding = { workspace = true }
