@@ -43,9 +43,13 @@ source-interface is **explicitly deferred**, not silently dropped — §10
 records the divergence, and adding a source later means adding a grant- or
 opt-out-class input to §4's taxonomy, not a new resolution algorithm.
 
-Scope: the model governs decisions Trusted Server makes. Downstream RTB
-partners receive the full, unmodified regulatory context and make their own
-compliance decisions.
+Scope: the model governs decisions Trusted Server makes. A downstream
+protocol receives the full, unmodified regulatory context only when that
+protocol normatively requires it and the destination is an authorized
+privacy-signal consumer. Raw consent strings are request-scoped transport
+data, not general identity metadata: ordinary identity rows retain the
+normalized per-permission provenance and a digest, never the raw string
+(§7; providers spec §6.3).
 
 ## 2. Vocabulary: enforced permissions only
 
@@ -122,9 +126,10 @@ overrides. Each permission resolves to an **acquisition rule**:
 
 ```toml
 # Illustrative schema example — NOT the shipped policy. The shipped
-# example (trusted-server.example.toml) pairs these groups with the most
-# protective rules.default; the permissive default below demonstrates the
-# reserved key.
+# example (`trusted-server.example.toml`) defines a `protective-default`
+# group (`regime = "gdpr"`, `default = "requires_signal"`) and points
+# `rules.default` to it; the permissive default below demonstrates the
+# reserved key for the migration-preserving posture.
 [permissions.groups.gdpr-eu]
 regime = "gdpr"
 default = "requires_signal"
@@ -141,14 +146,20 @@ default = "requires_signal"
 regime = "none"
 default = "granted"
 
+# Optional explicit entries live under one typed child map. Quoted permission
+# IDs are required because they contain hyphens. An explicit entry replaces
+# this group's default for only that permission.
+[permissions.groups.us-opt-out.permissions]
+"store-on-device" = "requires_signal"
+"select-personalised-ads" = "requires_signal"
+
 [permissions.rules]
 FR = "gdpr-eu"
-# US privacy gating applies per configured privacy state, matching today's
-# state-list behavior; country-level US traffic (a Wyoming request, or one
-# whose geo provider yields no region) stays non-regulated. One US/<state>
-# rule per configured privacy state:
+# US privacy gating has a protective country-wide floor. State rules may
+# tighten or specialize it, but country-only geo and regionless US traffic
+# never fall through to a non-regulated grant.
 "US/CA" = "us-opt-out"
-US = "non-regulated"
+US = "us-opt-out"
 # Overrides name explicit acquisition rules — no +/- sigil syntax; TOML
 # expresses the target state directly.
 "US/CO" = { group = "us-opt-out", overrides = { select-personalised-ads = "requires_signal" } }
@@ -158,8 +169,12 @@ US = "non-regulated"
 default = "non-regulated"
 ```
 
-A group's `default` covers unlisted permissions; a group may also name
-permissions explicitly. Overrides map identifier → acquisition rule, so any
+A group's `default` covers permissions absent from its optional
+`permissions` child map. That map has the exact type
+`BTreeMap<PermissionId, AcquisitionRule>`; direct permission-shaped keys on the
+group object are unknown fields and rejected. An explicit map entry replaces
+the group default for exactly that permission. A group without `default` must
+list every vocabulary permission exactly once. Overrides map identifier → acquisition rule, so any
 target state (including `requires_signal`) is expressible — PR #838's
 `+`/`-` sigil scheme could not express "requires a signal", the most common
 real-world override.
@@ -191,7 +206,14 @@ Validation rejects:
   house rule-key format corresponding to ISO 3166-2 `US-CA`;
 - references to permissions outside the enforced vocabulary (§2);
 - references to undefined groups, and groups missing the `regime` class;
+- group identifiers outside `[a-z0-9][a-z0-9-]{0,63}`; the lowercase ASCII
+  grammar makes reference equality, JCS bytes, logs, and metrics identical on
+  every runtime;
 - groups that neither list every permission nor provide `default`;
+- duplicate explicit permission entries, unknown permission IDs, a direct
+  permission-shaped group key outside the `permissions` child map, or a value
+  outside `granted | denied | requires_signal`; explicit entries take
+  precedence over `default` and there is no merge-by-file-order behavior;
 - a present `[permissions]` section without a `rules.default` entry (§5.4
   depends on it existing — its absence must be a validation error, not a
   runtime surprise);
@@ -227,13 +249,12 @@ explicit, commented exceptions in the test — never silent. Both legacy
 lists are in scope, not only the GDPR one — and the US check is
 region-shaped: **every configured `consent.us_states.privacy_states` entry must
 have a matching `US/<state>` rule**, and the country-level `US` rule must
-resolve non-regulated (today applies privacy gating only to the configured
-states), or the divergence is an explicit commented exception. An adapter
-whose geo provider cannot resolve regions degrades **intentionally and
-declaredly**: regionless US traffic hits the country rule — non-regulated,
-today's behavior for non-privacy-state traffic; an operator preferring
-protective country-wide gating writes `US = "us-opt-out"` as their own
-declared choice.
+resolve to at least the `us-opt-out` protective floor; a more permissive
+country fallback is invalid. An adapter whose geo provider cannot resolve
+regions therefore degrades intentionally to country-wide US privacy gating,
+never to `non-regulated`. A provider that can resolve a region still uses
+the matching `US/<state>` rule first, and an operator may configure a
+stricter country rule.
 
 ### 3.5 Shipped-table coverage
 
@@ -243,7 +264,11 @@ nothing in PR #838's validation covered: a mistyped country key (`DL:` for
 `DK:`) parses cleanly, starts cleanly, and silently drops a member state to
 the fallback rule. Countries intentionally unlisted are governed by the
 `rules.default` entry (§3.2); the example policy documents that fallback
-inline, and ships it as the most protective baseline.
+inline and ships the exact `protective-default` group described in §3.2
+(`regime = "gdpr"`, every permission `requires_signal`). The separate
+migration-preserving fixtures deliberately point `rules.default` to
+`non-regulated` and declare that divergence (migration spec §5); the example
+and migration fixture are not aliases.
 
 ## 4. Signal precedence — normative
 
@@ -252,21 +277,21 @@ opt-out) cannot reproduce today's US behavior, where no-signal traffic is
 blocked but an **explicit non-opt-out** value grants:
 
 - **Opt-out signals**, in two subclasses assigned by the §4.5 mapping:
-  **destructive** opt-outs (GPC; sale opt-outs; USP opt-out) revoke and
-  trigger withdrawal; **non-destructive** opt-outs (sharing,
-  targeted-advertising) revoke the permissions they map to but never
-  destroy the stored identity — a targeted-ads choice must not tombstone.
-  Both subclasses are honored **globally**, not only in the jurisdictions whose law defines
-  them — a deliberate, more-protective simplification: scoping a browser's
-  explicit opt-out to a geolocation guess would honor it for some visitors
-  and ignore it for others based on IP evidence. (For jurisdictions outside
-  US states this is a declared behavior change; migration spec §2 records
-  it.)
+  **use opt-outs** (GPC, sale, sharing, targeted-advertising, and USP sale
+  opt-out) suppress the permissions they map to and persist negative authority
+  but do **not** destroy the first-party identity merely because sale or
+  sharing stopped; **destructive withdrawal signals** are limited to an
+  explicit storage-consent withdrawal, an authenticated deletion request,
+  or the TCF Purpose-1 refusal conditions of §4.2. Both subclasses are
+  honored **globally**, not only in the jurisdiction whose law defines them —
+  scoping an explicit choice to a geolocation guess would honor it for some
+  visitors and ignore it for others. “Global” follows the identity's use;
+  it does not broaden a sale/sharing choice into deletion.
 - **Grant signals** (affirmative permission): a decodable TCF record
   consenting to the purpose; an **explicit GPP non-opt-out value** (e.g.
-  `sale_opt_out = false`); a **US Privacy string present and not opting
-  out** — including the "not applicable" flag, which today's tests pin as
-  allowing. Grant signals are what let a `requires_signal` US rule
+  `sale_opt_out = false`); a **US Privacy string present with an explicit
+  `N` value**. _Not Applicable_, missing, reserved, unknown, and unsupported
+  values never grant. Grant signals are what let a `requires_signal` US rule
   preserve today's "no signal → block, explicit non-opt-out → allow"
   behavior, which neither `granted` nor a TCF-only grant class could
   express. **Which grant evidence a rule accepts is regime- and
@@ -285,7 +310,7 @@ blocked but an **explicit non-opt-out** value grants:
   the migration matrix. Auction dispatch blocking separately would not
   help; identity use would already be authorized. Opt-out signals and
   refusals remain regime-agnostic (global), as before: scoping applies
-  only to what can _grant_, never to what can _revoke_.
+  only to what can _grant_, never to what can _suppress_.
 
 - **Refusals**: a decodable TCF record refusing the purpose. A refusal is
   neither a grant nor an opt-out — it blocks acquisition (precedence 3)
@@ -294,10 +319,11 @@ blocked but an **explicit non-opt-out** value grants:
 **Precedence, highest first:**
 
 1. Policy `denied` — never set, regardless of any signal.
-2. **Opt-out signal — always revokes**, regardless of any consent record
-   present. A GPC header revokes `store-on-device` and
+2. **Opt-out signal — always suppresses its mapped use**, regardless of any
+   consent record present. A GPC header suppresses
    `select-personalised-ads` even when an accompanying TCF string consents to
-   them. _(This is the rule PR #838 inverted: its resolution returned from
+   it; it does not itself revoke `store-on-device` or request deletion.
+   _(This is the rule PR #838 inverted: its resolution returned from
    inside the TCF branch before ever reaching the opt-out check, so a
    consenting CMP string made the browser's GPC signal a no-op — a
    CCPA-facing regression. The pre-existing tests pinning this rule —
@@ -350,12 +376,11 @@ group label, since a group can mix rules across permissions.
 
 The triggers, exhaustively — nothing else withdraws:
 
-1. **A destructive opt-out signal (per §4.5's destructive column: GPC,
-   sale opt-outs, USP opt-out) withdraws in every jurisdiction, whatever
-   the baseline.** Non-destructive opt-outs (sharing,
-   targeted-advertising) never trigger this — they revoke acquisition
-   only. (For US states this preserves today's behavior; elsewhere it is
-   the declared change of §4's global-opt-out rule.)
+1. **An explicit storage withdrawal or authenticated deletion request
+   withdraws in every jurisdiction, whatever the baseline.** GPC and
+   sale/sharing/targeted-advertising opt-outs are use restrictions, not
+   deletion requests: they persist suppression for their mapped permissions
+   but never trigger family revocation by themselves.
 2. **A TCF record refusing `store-on-device` withdraws iff the baseline
    is `requires_signal` or `denied` — and only when the refusal is
    carried by the live request.** A persisted-KV consent record
@@ -382,8 +407,9 @@ The triggers, exhaustively — nothing else withdraws:
 4. **Absence of signal never destroys identity.** A visitor who has not yet
    made a choice is never stripped of an existing identity.
 
-Withdrawal checking follows §4 precedence: an opt-out signal triggers
-withdrawal even when a consenting TCF record is present.
+Withdrawal checking follows §4 precedence: a destructive signal from the
+exhaustive list above triggers withdrawal even when other evidence grants;
+a use opt-out suppresses only its mapped use and never enters this path.
 `ec_storage_withdrawn` (or its successor) gets direct unit coverage for
 every trigger above; in PR #838 the headline "withdrawal expires identity"
 behavior had no unit test at all.
@@ -402,8 +428,8 @@ and the fail-closed marker:
   or breaks the protocol — **rows that lack the field derive it
   deterministically** as a function of (record kind, provider namespace,
   canonical graph key), per the providers spec §6.3 derivation (`tsfam1|` + record-kind byte + provider code + graph key). Determinism is the
-  point: a withdrawal arriving on the **first post-upgrade request** — a
-  GPC-carrying visitor whose v1 row has no family field and has never been
+  point: an explicit storage withdrawal arriving on the **first
+  post-upgrade request** — from a visitor whose v1 row has no family field and has never been
   backfilled — computes the same family ID that every future reader of
   that row computes, so the revocation record is discoverable even if the
   writer crashes before ever touching the member row — and the write is
@@ -423,7 +449,7 @@ and the fail-closed marker:
   replacement (which today discards the original row's identity and
   metadata, making sibling discovery impossible).
 - **Negative authority has its own permission-exempt record, with a
-  complete transition contract.** A live refusal or opt-out must clear
+  complete transition contract.** A non-destructive refusal or use opt-out must clear
   prior positive provenance, but the row write that would do it requires
   `store-on-device` — which the refusal just unset — and identity rows
   may be eventually consistent. The **suppression record**
@@ -432,10 +458,19 @@ and the fail-closed marker:
 
   **Creation is cause-aware and mostly read-free.** A live resolution
   whose outcome for a permission is unset writes suppression when the
-  cause is a **signal state** — refusal, non-destructive opt-out,
-  malformed-present — **unconditionally** — meaning independent of _prior positive authority_, never independent of **family admission** (every durable write still passes the providers spec §5 admission arms; for an observed v1 row the non-destructive sequence applies) — with no row read needed for the decision itself: conditioning
+  cause is a **signal state** — a refusal that is not destructive under
+  §4.2, a use opt-out, or malformed-present — **unconditionally** —
+  meaning independent of _prior positive authority_, never independent of **family admission** (every durable write still passes the providers spec §5 admission arms; for an observed v1 row the non-destructive sequence applies) — with no row read needed for the decision itself: conditioning
   on observing positive provenance through an eventually consistent row
   loses the race where a stale replica hides a just-committed grant. The
+  old rowless identity is the explicit boundary: its live refusal,
+  malformed-present state, or use opt-out still denies this request but creates
+  no `s`, `q`, `fam`, or `w` record. If P1 permits ordinary same-request
+  re-minting, the new graph-backed family's authority-state commit includes
+  that live suppression (or its negative intent) before the new cookie or
+  identity is usable; otherwise no durable state exists and the next
+  presentation is reevaluated. The `w` class remains destructive-withdrawal
+  only. The
   one cause that inherently needs prior state — applicable **absence**
   clearing a previously positive permission — uses a narrow
   **permission-exempt suppression-decision read** exposing only the
@@ -462,38 +497,47 @@ and the fail-closed marker:
   when its evidence timestamp is **newer than or equal to** the stored
   entry's; ties resolve to the more restrictive state. So a delayed
   grant with `LastUpdated = 100` never clears a suppression whose
-  refusal carried `200`, while a genuine re-consent at `300` does. **Every suppression entry carries its own `valid_until`, derived from
-  its evidence class's TTL, and an expired entry is inert** — treated as
-  cleared without a write, lazily garbage-collected. Without this, an
-  expired TCF refusal under a `granted` baseline would deny forever:
-  normalization says an expired record is absent and "must not revoke
-  indefinitely", yet the surviving suppression would block the baseline
-  grant that same table promises — the two contracts now agree, in the
-  normalization table's favor. (Destructive opt-outs tombstone and need
-  no suppression longevity; non-destructive opt-out entries expire on
-  the consent-TTL horizon of the evidence that created them.) The
+  refusal carried `200`, while a genuine re-consent at `300` does.
+  **Suppression expiry is cause-specific.** Refusal, malformed, and absence
+  entries carry `valid_until` derived from the evidence or retired-authority
+  horizon and become inert at expiry. A valid use opt-out (GPC,
+  sale/sharing/targeted-advertising, or USP sale opt-out) is different:
+  it remains effective until a strictly newer, explicit, regime-accepted
+  opt-in/authorization clears it, or until deletion of the identity makes
+  the record unnecessary. Passage of a consent TTL alone never restores
+  sale/sharing or personalized-ad use. **"Strictly newer" requires an
+  authoritative order, not later receipt:** either a regime-accepted TCF
+  grant whose valid `LastUpdated` is after the opt-out evidence, or an
+  authenticated same-subject authorization action that commits a monotonic
+  authorization revision in the strong authority record. A bare GPP/USP
+  not-opted-out value has no authoritative timestamp and therefore cannot by
+  itself clear a persisted use opt-out; treating its new receipt time as
+  recency would let replay of an older string restore processing. This epic
+  does not invent an authenticated authorization endpoint: until a separate
+  approved flow supplies that revision, only qualifying authoritative TCF
+  evidence or identity deletion can clear such a suppression. The
   transition table (causes without an intrinsic timestamp — malformed
   records decode no `LastUpdated`, absence has no source — use their
   **observation timestamp**, server receipt on the shared clock basis
   within the skew window; cross-source comparison uses the authoritative
   timestamp where one exists, else the observation timestamp, ties
   restrictive), by stored cause: **opt-out from a timestamp-less
-  source** — within its lifetime, cleared only by a grant with an
-  authoritative timestamp newer than its observation; its lifetime is
-  the ordinary consent-TTL `valid_until`, at which it goes inert
-  automatically (**TTL-sticky** — the one rule chosen among three that
-  circulated: not user-sticky-forever, and not the migration spec's
-  former "irreversible artifact requiring administrative clear", which
-  is superseded; administrative clear remains an optional early exit —
-  sign-off 16 — **with one declared exception**: an opt-out arriving as
-  a restrictive _overflow_ while its source's replay history is
-  saturated inherits the live restrictive marker (first-overflow-pinned;
-  it outlives its epoch and can span epoch boundaries, providers spec
-  wire schema) and may receive less than a full lifetime, down to
-  nearly zero near the marker's expiry (the exception is carried by
-  sign-offs 16 and 31, and the alternatives — per-overflow state,
-  marker refresh — were rejected for unbounded storage and
-  replay-extension respectively); **TCF refusal** — cleared by any regime-accepted grant with newer
+  source** — cleared only by the ordered explicit authorization defined
+  above; an
+  exact semantic replay keeps its original first-seen and cannot clear or
+  refresh authority age. **A currently presented restrictive value still
+  starts a new restrictive episode after an ordered clear**: a timestamp-less
+  source cannot prove that its presentation predates the authenticated clear,
+  so the privacy-protective result is a new suppression transition whose
+  clearing floor is the current `authorization_revision`, while the evidence's
+  original first-seen remains unchanged. A later clear therefore needs another
+  authenticated monotonic increment (or qualifying newer TCF evidence).
+  Restrictive evidence never clears positive or negative state. Replay-history
+  saturation never shortens a newly
+  observed restrictive choice: grant-class history is evicted before
+  restrictive history, and a restrictive overflow updates the bounded
+  per-permission restrictive marker to preserve at least the full
+  opt-out horizon. **TCF refusal** — cleared by any regime-accepted grant with newer
   authoritative evidence; **malformed-present / absence** — cleared by
   any regime-accepted valid grant with newer evidence, including a
   timestamp-less grant whose first-seen is newer, **and — recovery
@@ -511,7 +555,9 @@ and the fail-closed marker:
   evidence (these causes are not user opt-outs, so stickiness does not
   apply — without recovery, one truncated request would deny a
   GPP-only user for the suppression's full TTL). Policy
-  changes never clear user-signal suppressions.
+  changes never clear user-signal suppressions, and administrative repair
+  may delete a suppression only with an auditable record of the consumer's
+  newer authorization or deletion request.
 
   **Anti-replay for timestamps.** A future-dated record is rejected as
   malformed beyond the skew window; within it, the record's digest is
@@ -520,7 +566,7 @@ and the fail-closed marker:
   an opt-out would keep re-normalizing to "now" and clear it. Equality is
   **source-specific**: for GPP/USP the digest is the **canonical
   per-permission semantic result** of §4.5 aggregation alone — two
-  encodings (or `N` vs explicit N/A) with the same meaning are the same
+  encodings of the same explicit applicable value are the same
   evidence and keep the original first-seen, so alternating equivalent
   values cannot renew authority; for TCF the digest is the semantic
   result **plus the authoritative `LastUpdated`** — a genuine CMP
@@ -565,7 +611,10 @@ and the fail-closed marker:
   identity row** — deciding "no prior authority" from an eventual
   not-found loses the race where a just-committed grant is invisible on
   a stale replica. A suppression/authority read failure **fails closed**
-  like a revocation read failure; retention must outlive the positive
+  like a revocation read failure. Every positive identity decision fresh-reads
+  family revocation, authority/suppression, pending outbox, applicable `w`,
+  and the global breaker; successful absence/health/authority has no lease.
+  Only a typed restrictive result may be cached, and only to deny. Retention must outlive the positive
   authority it masks (providers spec durability/retention capability).
 
   **The strong record is the commit point — the two-record protocol is
@@ -597,25 +646,84 @@ and the fail-closed marker:
   see the providers spec §5 order, where eligibility begins at the
   **authority-state commit**, not the row commit.
 
-  **Write failure fails closed for the live request**, and the S2S residual is unbounded
-  for a never-returning visitor (sign-off 11), with fault tests for
-  suppress-vs-clear races, repeated-value sequences, and the
+  **Write failure fails closed beyond the live request.** A deployment that
+  enables persisted identity use must also provide a durable
+  negative-intent outbox, independent of both the identity row's eventual
+  store **and the strong target record's failure domain**.
+  If a family-revocation or suppression CAS fails, the same request durably
+  enqueues the idempotent negative intent before it can complete; workers
+  retry it until the strong record commits. Every live, cached, and S2S
+  identity decision checks the per-family outbox before positive use; a
+  pending revocation denies the family and a pending suppression denies its
+  mapped permission. If neither the target record nor the outbox can commit,
+  a globally visible identity safety breaker disables all positive identity
+  mint, use, graph access, and egress until repair; negative repair,
+  withdrawal, and authenticated deletion paths remain enabled. An adapter
+  that provides none of these primitives is ineligible for stateful identity.
+  “Independent” is a qualification result, not a second key prefix in one
+  store: target and outbox use distinct durability/failure domains. The
+  breaker may share the outbox domain only when that domain proves this
+  failure contract: if it cannot accept either the family enqueue or the
+  breaker CAS, every subsequent strong outbox/breaker read fails rather than
+  returning a stale successful absence. Every positive decision performs
+  those reads fresh; no success lease is allowed. Implementations may cache
+  only a typed restrictive result — revoked, suppressed, pending, or
+  breaker-tripped — and may use that cache only to deny. A cached restrictive
+  result cannot construct an `AuthorizedIdentity`, clear or acknowledge state,
+  or drive a CAS; stale denial may reduce availability after recovery but can
+  never authorize use. Absence, health, and positive authority are never
+  cached for a positive decision. Under the qualified fault
+  model, target failure leaves outbox/breaker available, while outbox-domain
+  failure leaves either the target committed or all positive readers closed.
+  An adapter that cannot prove those outcomes is ineligible even if all three
+  APIs individually advertise CAS.
+
+  The outbox has one total state machine. Each family record carries
+  `schema_version`, a monotonic `queue_revision`, and a bounded map of pending
+  negative transitions keyed by the deterministic §6.3 provider-wire
+  `intent_id`. That wire schema is the sole definition of the materialized JCS
+  transition payload: cause, source class, evidence time and digest, permission,
+  state, validity, and the clearing-floor authorization revision all
+  participate in identity; enqueue time and queue metadata do not. A producer
+  that cannot construct the complete payload cannot enqueue a transition and
+  must commit the global breaker. Only family revocation and
+  creation/strengthening of suppression
+  enter the map; a failed clear is never queued as negative intent because the
+  existing denial is already safe. Enqueue CAS-unions entries: family
+  revocation is absorbing; per-permission conflicts use the authority-state
+  transition comparator (newer authoritative evidence, restrictive on a tie),
+  and an older arrival cannot replace newer negative evidence. The cap is 32
+  pending intents per family. Revocation consumes one slot and suppression
+  entries consume one per permission/source; exact duplicates consume none.
+  Capacity overflow must commit the global breaker before returning and cannot
+  evict a negative intent.
+
+  A worker applies the exact transition idempotently to the target, then
+  CAS-removes that `intent_id` only if the queue revision and stored bytes still
+  match. Target success followed by acknowledgment failure leaves a harmless
+  pending denial and retry; acknowledgment can never precede target commit.
+  Empty records are deleted by CAS. Queue retention is the maximum horizon of
+  all contained transitions plus the recovery/audit window and can never be
+  shorter than the target negative state. Unknown schema, malformed intent,
+  read error, revision regression, or retention uncertainty denies the family
+  rather than skipping the queue.
+  Fault tests cover
+  suppress-vs-clear races, enqueue/enqueue merge, target-success/ack-failure,
+  stale-worker acknowledgment, capacity overflow, outbox replay,
+  target-domain outage, outbox-domain outage, breaker propagation, and the
   stale-provenance-read case.
 
 - **The cookie expires only after the family record commits.**
-- **If the family-record write itself fails, nothing durable exists** —
-  the cookie stays and the durable client-side signal (GPC, CMP-stored
-  TCF) retries the whole withdrawal on the next request. Mitigations:
-  while graph **writes are degraded** (health signal), S2S partner egress
-  and sync updates fail closed on that instance (providers spec §6.2);
-  the failure is logged at `error` with a metric feeding the operational
-  repair path. The residual that remains — a single failed write on an
-  otherwise healthy graph, for a visitor who **never returns** — is
-  **unbounded**, not "bounded by return latency": return latency has no
-  bound for a non-returning visitor, and the per-instance breaker does
-  not reach other instances. Accepting this residual instead of building
-  a durable external retry queue is **product sign-off item 11**
-  (migration spec §8), not a footnote.
+- **If the family-record write itself fails, negative intent still becomes
+  durable before browser state changes.** The cookie stays; the writer
+  enqueues the family-scoped intent in the required outbox and retries the
+  family record asynchronously. A failed outbox enqueue trips the global
+  identity safety breaker; a per-instance health flag is insufficient because a
+  different instance could otherwise continue partner use for a visitor who
+  never returns. The error and breaker state are logged and metered, and the
+  breaker clears only after the outbox and strong record are healthy, the
+  queue is drained through its recovery watermark, and an audit event records
+  the controller action.
 - **Consistency and retention are backend contracts with a single
   normative home**: the providers spec consistency matrix (§7). It — not
   this spec — states the requirement, and it requires **globally observable
@@ -634,7 +742,7 @@ and the fail-closed marker:
   untouched, S2S behavior per degraded mode, retry completes; member
   tombstone N fails after the family record → identity already revoked for
   every reader, cleanup retries; the same-signal retry path end to end;
-  **first post-upgrade request is a withdrawal** (v1 row, no family field,
+  **first post-upgrade request is an explicit storage withdrawal** (v1 row, no family field,
   derived ID; crash between family record and row write; reader of the
   untouched v1 row still sees the revocation).
 
@@ -652,51 +760,50 @@ valid sources.** Current runtime resolves conflicts first and can select
 an expired record before clearing both sources; expiry-first is a
 **declared change** (migration matrix) that removes that path:
 
-| Input state                                                      | Effective record / outcome                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | Status                                                                                                                            |
-| ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| Standalone TCF and GPP-embedded TCF disagree, mode `restrictive` | **Whole-record selection comparing the P1 ∧ P4 conjunction only** — today's algorithm, preserved (an earlier draft's lexicographic (P1, P4) tuple would have changed split-purpose outcomes): if exactly one record's conjunction is false, `restrictive` selects it; **equal conjunctions — including split-purpose disagreements — keep the standalone record**, as current code does                                                                                                                                                                   | Preserved — pinned against current tests                                                                                          |
-| Same, mode `permissive`                                          | Same conjunction comparison, selecting the record whose conjunction is true; equal conjunctions keep the standalone record                                                                                                                                                                                                                                                                                                                                                                                                                                | Preserved — same pinning                                                                                                          |
-| Same, mode `newest`                                              | Whole-record selection by **`LastUpdated`** subject to the existing freshness threshold; a tie, an incomparable pair, or timestamps inside the threshold fall back to the `restrictive` rule above (itself deterministic)                                                                                                                                                                                                                                                                                                                                 | Preserved — same pinning                                                                                                          |
-| Expired consent record                                           | Treated as **absent entirely** — grants nothing, refuses nothing, withdraws nothing; the baseline applies. Under a `granted` baseline that means the grant stands: an expired refusal is not current evidence and must not revoke indefinitely                                                                                                                                                                                                                                                                                                            | Preserved                                                                                                                         |
-| One valid record + a second malformed record of the same family  | The **valid record governs**; the malformed one is ignored with a `warn` log. Fail-closed-on-malformed (below) applies only when no valid record of that family exists                                                                                                                                                                                                                                                                                                                                                                                    | Decided here                                                                                                                      |
-| One valid record + one **expired** record of the same family     | The valid record governs — the expired one dropped at pipeline step 2, before conflict resolution ever saw it                                                                                                                                                                                                                                                                                                                                                                                                                                             | **Changed (declared)** — current runtime resolves the conflict first and can select the expired record                            |
-| **Expired** live record + still-valid persisted-KV record        | The expired live record is absent entirely (step 2), so it does **not** suppress the fallback: the persisted record substitutes, subject to its own TTL and the full pipeline — "live wins" applies to live records that still exist after expiry filtering                                                                                                                                                                                                                                                                                               | Decided here                                                                                                                      |
-| Persisted-KV consent record, live record present                 | **Live wins**, always; the stored record is never consulted                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | Preserved                                                                                                                         |
-| Persisted-KV consent record, no live record                      | Substitutes as the effective record **iff within the same TTL as a live record**, then flows through the full normalization pipeline (syntax, expiry, conflict) like any live record; staler → absent. This narrow read is exempt from the graph-read permission gate (§7) — determining `store-on-device` cannot itself require `store-on-device`                                                                                                                                                                                                        | **Changed (declared)**: current code returns immediately after the KV load, bypassing expiry and conflict normalization           |
-| Proxy/mirror mode                                                | **Minimal opt-out extraction still runs; full semantic decoding is skipped.** Because opt-outs are globally authoritative (§4), proxy mode must not suppress them: the §4.5-mapped opt-out fields (GPP US sections) and the US Privacy string are decoded — nothing else — alongside syntax validation, so a valid SaleOptOut or USP opt-out revokes and withdraws exactly as outside proxy mode. No grants are ever derived from records in proxy mode; a present record otherwise blocks grants (fail-closed); absent → baseline. GPC needs no decoding | **Changed (declared)**: today proxy mode skips decoding entirely — fail-open under permissive baselines and, worse, opt-out-blind |
-| GPP / US Privacy fields                                          | Per the normative field mapping of §4.5 — fields are not interchangeable signals; **explicit N/A is grant-class (not-opted-out), absent grants nothing** — one meaning, everywhere                                                                                                                                                                                                                                                                                                                                                                        | Decided here (§4.5)                                                                                                               |
-| Malformed-but-present record, no valid record of that family     | **Blocks grants** (fail-closed acquisition — it does not degrade to "absent", which under a `granted` baseline would turn garbage into a grant, the fail-open path in both #838 and the first draft of this spec). Never triggers withdrawal — destruction requires an affirmative, decodable signal (§4.2)                                                                                                                                                                                                                                               | Changed (declared)                                                                                                                |
+| Input state                                                      | Effective record / outcome                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | Status                                                                                                                            |
+| ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| Standalone TCF and GPP-embedded TCF disagree, mode `restrictive` | **Whole-record selection comparing the P1 ∧ P4 conjunction only** — today's algorithm, preserved (an earlier draft's lexicographic (P1, P4) tuple would have changed split-purpose outcomes): if exactly one record's conjunction is false, `restrictive` selects it; **equal conjunctions — including split-purpose disagreements — keep the standalone record**, as current code does                                                                                                                                                           | Preserved — pinned against current tests                                                                                          |
+| Same, mode `permissive`                                          | Same conjunction comparison, selecting the record whose conjunction is true; equal conjunctions keep the standalone record                                                                                                                                                                                                                                                                                                                                                                                                                        | Preserved — same pinning                                                                                                          |
+| Same, mode `newest`                                              | Whole-record selection by **`LastUpdated`** subject to the existing freshness threshold; a tie, an incomparable pair, or timestamps inside the threshold fall back to the `restrictive` rule above (itself deterministic)                                                                                                                                                                                                                                                                                                                         | Preserved — same pinning                                                                                                          |
+| Expired consent record                                           | Treated as **absent entirely** — grants nothing, refuses nothing, withdraws nothing; the baseline applies. Under a `granted` baseline that means the grant stands: an expired refusal is not current evidence and must not revoke indefinitely                                                                                                                                                                                                                                                                                                    | Preserved                                                                                                                         |
+| One valid record + a second malformed record of the same family  | For standalone-vs-embedded **TCF**, the valid record governs and the malformed one is ignored with a `warn` log. This row does not govern GPP's independently parsed multi-section aggregation; §4.5's mapped-section blocker does                                                                                                                                                                                                                                                                                                                | Decided here                                                                                                                      |
+| One valid record + one **expired** record of the same family     | The valid record governs — the expired one dropped at pipeline step 2, before conflict resolution ever saw it                                                                                                                                                                                                                                                                                                                                                                                                                                     | **Changed (declared)** — current runtime resolves the conflict first and can select the expired record                            |
+| **Expired** live record + still-valid persisted-KV record        | The expired live record is absent entirely (step 2), so it does **not** suppress the fallback: the persisted record substitutes, subject to its own TTL and the full pipeline — "live wins" applies to live records that still exist after expiry filtering                                                                                                                                                                                                                                                                                       | Decided here                                                                                                                      |
+| Persisted-KV consent record, live record present                 | **Live wins**, always; the stored record is never consulted                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Preserved                                                                                                                         |
+| Persisted-KV consent record, no live record                      | Substitutes as the effective record **iff within the same TTL as a live record**, then flows through the full normalization pipeline (syntax, expiry, conflict) like any live record; staler → absent. This narrow read is exempt from the graph-read permission gate (§7) — determining `store-on-device` cannot itself require `store-on-device`                                                                                                                                                                                                | **Changed (declared)**: current code returns immediately after the KV load, bypassing expiry and conflict normalization           |
+| Proxy/mirror mode                                                | **Minimal opt-out extraction still runs; full semantic decoding is skipped.** Because opt-outs are globally authoritative (§4), proxy mode must not suppress them: the §4.5-mapped opt-out fields (GPP US sections) and the US Privacy string are decoded — nothing else — alongside syntax validation, so a valid SaleOptOut or USP opt-out suppresses P4 exactly as outside proxy mode. No grants are ever derived from records in proxy mode; a present record otherwise blocks grants (fail-closed); absent → baseline. GPC needs no decoding | **Changed (declared)**: today proxy mode skips decoding entirely — fail-open under permissive baselines and, worse, opt-out-blind |
+| GPP / US Privacy fields                                          | Per the normative field mapping of §4.5 — fields are not interchangeable signals; **explicit N/A and absence both grant nothing**; only an explicit applicable not-opted-out value can grant                                                                                                                                                                                                                                                                                                                                                      | Decided here (§4.5)                                                                                                               |
+| Malformed-but-present record, no valid record of that family     | **Blocks grants** (fail-closed acquisition — it does not degrade to "absent", which under a `granted` baseline would turn garbage into a grant, the fail-open path in both #838 and the first draft of this spec). Never triggers withdrawal — destruction requires an affirmative, decodable signal (§4.2)                                                                                                                                                                                                                                       | Changed (declared)                                                                                                                |
 
 ### 4.5 US signal field mapping — normative
 
 GPP and US Privacy fields map to specific permissions with specific
-effects; they are never interchangeable, a field's absence or N/A value
-behaves per its table row — **explicit _Not Applicable_ is grant-class
-(not-opted-out), preserving current USP tests and GPP `NotApplicable`
-handling; only a genuinely absent field contributes nothing** (this is
-the single normative statement; an earlier "N/A contributes nothing"
-rule is dead, and the P4-authorizing consequence is sign-off item 17) —
-and only the fields marked destructive trigger
-withdrawal. Section IDs and versions are those of the IAB GPP
+effects; they are never interchangeable. A field's absence, explicit
+_Not Applicable_ value, reserved value, unknown value, or unsupported
+version contributes nothing and can never authorize processing. Only an
+explicit applicable “did not opt out” value is grant-class, and no
+sale/sharing/targeted-advertising field is destructive. Section IDs and
+versions are those of the IAB GPP
 specification pinned by the vendored snapshot; adding a section or field is
 a change to this table.
 
-| Source · field                               | Value                       | `store-on-device` (P1)                 | `select-personalised-ads` (P4)         | Destructive withdrawal?                                                                                            |
-| -------------------------------------------- | --------------------------- | -------------------------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| GPP US section · `SaleOptOut`                | opted out                   | opt-out                                | opt-out                                | **Yes** (preserves today)                                                                                          |
-| GPP US section · `SaleOptOut`                | not opted out               | grant                                  | grant                                  | —                                                                                                                  |
-| GPP US section · `SharingOptOut`             | opted out                   | —                                      | opt-out                                | No                                                                                                                 |
-| GPP US section · `SharingOptOut`             | not opted out               | —                                      | grant                                  | —                                                                                                                  |
-| GPP US section · `TargetedAdvertisingOptOut` | opted out                   | —                                      | opt-out                                | **No** — a targeted-advertising choice must never destroy the stored identity                                      |
-| GPP US section · `TargetedAdvertisingOptOut` | not opted out               | —                                      | grant                                  | —                                                                                                                  |
-| US Privacy · `opt_out_sale`                  | `Y`                         | opt-out                                | opt-out                                | **Yes** (preserves today)                                                                                          |
-| US Privacy · present, `N` or N/A             | —                           | grant                                  | grant                                  | — (today's tests pin N/A as allowing; USP carries no distinct targeted-advertising field, so it never maps to one) |
-| Any field                                    | explicitly _Not Applicable_ | as the field's not-opted-out row above | as the field's not-opted-out row above | —                                                                                                                  |
-| Any field                                    | absent                      | —                                      | —                                      | —                                                                                                                  |
+| Source · field                               | Value                       | `store-on-device` (P1) | `select-personalised-ads` (P4) | Destructive withdrawal? |
+| -------------------------------------------- | --------------------------- | ---------------------- | ------------------------------ | ----------------------- |
+| GPP US section · `SaleOptOut`                | opted out                   | —                      | opt-out                        | No                      |
+| GPP US section · `SaleOptOut`                | not opted out               | —                      | grant                          | —                       |
+| GPP US section · `SharingOptOut`             | opted out                   | —                      | opt-out                        | No                      |
+| GPP US section · `SharingOptOut`             | not opted out               | —                      | grant                          | —                       |
+| GPP US section · `TargetedAdvertisingOptOut` | opted out                   | —                      | opt-out                        | No                      |
+| GPP US section · `TargetedAdvertisingOptOut` | not opted out               | —                      | grant                          | —                       |
+| US Privacy · `opt_out_sale`                  | `Y`                         | —                      | opt-out                        | No                      |
+| US Privacy · `opt_out_sale`                  | `N`                         | —                      | grant                          | —                       |
+| Any field                                    | explicitly _Not Applicable_ | —                      | —                              | —                       |
+| Any field                                    | absent / unknown / reserved | —                      | —                              | —                       |
 
-**N/A vs absent (restating the single rule):** explicit _Not
-Applicable_ = grant-class; absent = nothing; a non-applicable section's
-fields grant nothing (their opt-outs still count, per step 2).
+**N/A vs explicit non-opt-out:** _Not Applicable_ is not affirmative
+permission and contributes nothing. An explicit applicable not-opted-out
+value can grant only the permission mapped by its row and only under the
+regime/applicability rules below.
 
 **Unknown section IDs contribute nothing — and bound what
 embedded-GPC scanning can promise.** A section ID outside the pinned map
@@ -713,8 +820,8 @@ per-section by these rules.
 `GpcSegmentIncluded` and `Gpc` fields; a request with embedded
 `Gpc = true` and no `Sec-GPC` header was previously unspecified despite
 the global-GPC rule. Normatively: embedded `Gpc = true` in **any**
-section is the same **destructive global opt-out** as the header
-(aggregated with it by OR — opt-outs are never jurisdiction-filtered);
+section is the same **global P4 use opt-out** as the header (aggregated
+with it by OR — opt-outs are never jurisdiction-filtered);
 `GpcSegmentIncluded = false`, an absent segment, or `Gpc = false`
 contributes nothing; a malformed optional GPC segment renders that
 section malformed-present (blocks grants, never withdraws).
@@ -729,29 +836,17 @@ section malformed-present (blocks grants, never withdraws).
    the state sections — `US/CA` ↔ 8, `US/VA` ↔ 9, `US/CO` ↔ 10,
    `US/UT` ↔ 11, `US/CT` ↔ 12, `US/FL` ↔ 13, `US/MT` ↔ 14, `US/OR` ↔ 15,
    `US/TX` ↔ 16, `US/DE` ↔ 17, `US/IA` ↔ 18, `US/NE` ↔ 19, `US/NH` ↔ 20,
-   `US/NJ` ↔ 21, `US/TN` ↔ 22, `US/MN` ↔ 23; **IDs 24–27 (MD/IN/KY/RI) are mapped as
-   _reserved-pending-official-schema_** — the public official registries
-   currently expose sections only through 23, so 24–27 have IDs but no
-   reproducible published binary layout; until the vendored snapshot can
-   carry an official layout, those four states behave as
-   no-section states (national section only) and the map does **not**
-   claim official-registry coverage for them (an earlier revision
-   claimed both "no section" and later "official through 27" — each
-   wrong in its own direction). A truncated map silently loses
-   opt-outs — a Texas (16) sale opt-out must not vanish. **The current decoder is an explicit prerequisite gap**: it
-   (and `iab_gpp` 0.1.2) supports sections 7–23 only and models `usnat`
-   v2 while the snapshot pins v1 — implementation must reject versions
-   the library happens to decode but the snapshot disallows. Sections
-   24–27 are **not** a decoder work item and carry **no accepted
-   version** (the snapshot lists them in a separate _reserved_ table,
-   not the accepted-version table — an accepted-version entry plus
-   "inert" prose let two implementations diverge): with no reproducible
-   official layout they are reserved and inert (national-only for those
-   states — sign-off 32). Their **presence differs from an unknown
-   section only in logging**: both contribute nothing, but a reserved
-   ID is expected-inert while an unknown ID is flagged for snapshot
-   review. The earlier "Maryland opt-out must not vanish / extend the
-   decoder" reading is withdrawn.
+   `US/NJ` ↔ 21, `US/TN` ↔ 22, `US/MN` ↔ 23, `US/MD` ↔ 24,
+   `US/IN` ↔ 25, `US/KY` ↔ 26, and `US/RI` ↔ 27. All accepted versions
+   and layouts are pinned by `gpp-registry-snapshot.md`; the current
+   snapshot accepts version 1 for sections 24–27 from the official IAB
+   registry commit named there. A truncated map silently loses opt-outs,
+   so every accepted section is an implementation prerequisite rather
+   than an inert placeholder. **The current decoder is an explicit
+   prerequisite gap**: it (and `iab_gpp` 0.1.2) does not implement the
+   complete pinned set and models `usnat` v2 while the snapshot pins v1.
+   Implementation must add the missing official layouts and reject
+   versions the library happens to decode but the snapshot disallows.
    The implementation PR cross-checks this list against both the current
    decoder's section set and the official registry, and the accepted version per
    section is **pinned to the vendored registry snapshot
@@ -776,7 +871,21 @@ section malformed-present (blocks grants, never withdraws).
    on non-`us-privacy` requests grant nothing. Regionless US traffic:
    national section only. A configured privacy state with no
    state-specific section uses the national section alone.
-3. **State-over-national, per field — for grants only:** where an
+3. **Malformed mapped sections participate before value aggregation.** Each
+   mapped section is syntax/version-validated independently. A
+   malformed/truncated mapped section or mapped section at an unsupported
+   version blocks every **grant** for every permission any field in that
+   section maps to; in v1 that is P4. The blocker is global rather than
+   jurisdiction-filtered because a decodable opt-out in the same section would
+   be global under step 2. It never manufactures an opt-out, suppression, or
+   destructive withdrawal. Valid opt-outs in other sections are still honored.
+   Consequently valid national grant + malformed state, valid state grant +
+   malformed national, and two valid grants + one malformed mapped foreign
+   state all deny the affected grant. Unknown **unmapped** section IDs remain
+   the explicitly bounded exception described above: they contribute nothing
+   rather than making all future registry additions fail closed. This
+   conservative mapped-section policy is product sign-off item 33.
+4. **State-over-national, per field — for grants only:** where an
    applicable state section carries a field, its value governs that
    field's **grant** derivation; the national section fills only fields
    the state section lacks. This precedence **never suppresses an
@@ -784,9 +893,39 @@ section malformed-present (blocks grants, never withdraws).
    section's same field says not-opted-out — step 2's global rule wins,
    or a state string could erase a globally authoritative national
    opt-out.
-4. **Aggregate across what remains applicable:** an opt-out (of either
+5. **Aggregate across what remains applicable:** an opt-out (of either
    subclass) in any applicable field beats a grant from another —
    restrictive aggregation.
+
+**OpenRTB `gpp_sid` construction is derived, never copied.** After the ordered
+algorithm above, core constructs one sorted, duplicate-free integer array from
+the pinned section IDs actually present in the decoded GPP header that either
+(a) contributed a valid global opt-out or mapped-malformed grant blocker, or
+(b) were applicable to the resolved transaction for grant evaluation. A pinned
+and decoded GPP TCF section 2 is included when it supplied the effective TCF
+record. Unknown unmapped IDs, foreign sections that contributed nothing, IDs
+not present in the GPP header are omitted. A known mapped section at an
+unsupported version remains identifiable from the decoded GPP header and is
+included when its malformed-present blocker contributed; if the GPP header
+itself cannot be decoded well enough to enumerate section IDs, no transport
+pair is constructable. The serializer emits
+`regs.ext.gpp` and `regs.ext.gpp_sid` atomically or emits neither; it never
+sends raw GPP with a guessed, empty-by-error, or client-copied SID array.
+
+The request companion `__gpp_sid`, when present, uses the exact ASCII grammar
+`section-id *( "," section-id )`, where `section-id` is a positive base-10
+integer without sign, whitespace, or leading zero. Input order is immaterial
+and is canonicalized to a sorted set; a duplicate is malformed. The companion
+is used only for consistency checking and is not the source of the OpenRTB
+field. Exact set equality with the derived applicable set is accepted.
+Absence is allowed because core can derive the set. A mismatch, duplicate,
+non-decimal value, or reference to a mapped ID absent from the GPP header is a
+malformed auxiliary signal: it blocks grants for the union of recognized
+mapped permissions implicated by either set, preserves every decodable opt-out,
+and never manufactures withdrawal. The derived set remains the only egress
+value. Named fixtures cover absent companion, reordered/duplicate input,
+foreign-state omission, global opt-out inclusion, section-2 inclusion,
+mapped-version failure, and unknown-unmapped omission.
 
 `SharingOptOut` and `TargetedAdvertisingOptOut` are new enforcement
 inputs — current code consults only the sale field — and are declared as
@@ -804,19 +943,28 @@ case-insensitively.
 
 ### 5.2 Lookup failure
 
-Provider selected, lookup resolves nothing for a request → the configured
-`[geo] default_country` rules apply (per #779). An adapter whose geo
+Provider selected, lookup resolves nothing for a request → the compiled-in
+protective failure profile applies: both permissions `requires_signal` and
+`regime = "gdpr"`. `default_country` is not a provider-outage fallback; it
+is used only for the explicitly acknowledged static-jurisdiction mode of
+§5.3. An adapter whose geo
 implementation can never resolve anything must not accept the selection at
 all — that is the capability check of providers spec §6, and it prevents a
 "selected but always empty" provider from silently converting every request
 to §5.3 semantics without §5.3's guard.
 
-Declared residual: when the default country's baseline is permissive, a
-per-request lookup failure is a per-request grant to traffic of unknown
-origin — this path is not fail-closed, and the spec does not pretend it is.
-The lookup-failure rate is exported as a metric and logged, so an elevated
-rate (a degraded geo backend silently converting traffic to the default) is
-observable rather than invisible.
+The lookup-failure rate is exported as a metric and logged. A deployment may
+use a bounded operational circuit breaker to stop auction dispatch during a
+prolonged failure, but it may never substitute a permissive country rule for
+unknown origin. Recovery to ordinary jurisdiction rules occurs only after a
+successful live lookup.
+
+Named divergence fixtures pin both sides of migration matrix row 5: lookup
+failure with absent, malformed, expired, or regime-inapplicable evidence denies
+both permissions and contextualizes dispatch; lookup failure with an explicit
+valid regime-accepted grant may grant only its mapped permission under
+`requires_signal`. The latter is a declared behavior change, never described
+as preservation of today's deny-all path.
 
 ### 5.3 No geo provider selected
 
@@ -844,8 +992,9 @@ log always prints the effective baseline and whether geo is live.
 
 ### 5.4 Defaults, two distinct fallbacks
 
-`[geo] default_country` is required; startup fails without it (per #779).
-It covers requests that resolve **no country at all**. Countries that
+`[geo] default_country` is required only when no provider is configured and
+`assume_single_jurisdiction = true`; startup fails without it in that mode.
+It does not cover a selected provider's lookup failure (§5.2). Countries that
 resolve but match no rule fall to the policy's `rules.default` entry
 (§3.2). The two fallbacks are deliberately separate: "we could not place
 this request" and "we placed it somewhere we have no rule for" are
@@ -857,98 +1006,395 @@ migration story unresolvable (migration spec §2, rows 5 and 7).
 
 A **policy revision** has one identity used everywhere: the pair
 **(content digest, activation ordinal)**. The digest is SHA-256 with
-domain tag `tspol1|` over the canonical JSON of the parsed policy (keys
-sorted lexicographically by UTF-8 code unit, numbers shortest
-round-trip, defaults materialized, no insignificant whitespace;
-cross-language vectors required) — identity, so an A→B→A rollback
-yields A's digest again. The ordinal comes from the **policy-activation register** —
+domain tag `tspol1|` over the canonical JSON of the parsed policy —
+**canonicalization is RFC 8785 (JCS), referenced normatively**, not a
+home-grown rule list (key ordering, number formatting, string
+escaping, and Unicode handling are exactly JCS's), applied after
+defaults are materialized, with a policy-schema profile making the
+remaining cases unreachable: validation rejects non-finite numbers,
+numbers outside the exactly representable integer range
+(absolute value above 2^53 − 1) unless the field is string-typed, and
+`null` values (materialized defaults mean `null` never appears);
+negative zero serializes as JCS mandates. The machine-readable,
+cross-language conformance fixtures are pinned in
+`docs/superpowers/specs/policy-canonicalization-vectors.json`; every
+runtime and the push tool must reproduce both the canonical UTF-8 bytes
+and digest, and must reject every rejection vector before activation. A
+digest difference is a startup failure, so canonicalization cannot be
+approximately specified. The digest is pure content identity, so an
+A→B→A rollback yields A's digest again.
+
+The ordinal comes from the **policy/config/model activation register** —
 deployment-metadata name `02` (providers spec §6.3), a linearizable
-register holding the current `{source_version, policy_digest, ordinal}`
-**plus a bounded history of the last 16 activations**. Current-value-only
-was shown to break activation identity: an interleaved registration
-evicted the pair, and a same-push latecomer then minted a second
-ordinal for one activation — two `(digest, ordinal)` identities for one
-push. Transition rules, evaluated on a strong read + CAS:
+register holding `active`, an optional settings `candidate`, an optional
+`model_candidate`, an `activation_journal_head`, and a bounded history of the
+last 16 activations. `candidate` and `model_candidate` are mutually exclusive;
+installing either while the other exists is rejected.
+`active` is `{logical_root, immutable_blob_id,
+source_version, data_hash, config_revision, policy_digest, ordinal,
+model_epoch, minimum_binary_generation, row_schema_floor,
+activation_generation}`. `activation_generation` is a logical active-tuple
+`u64`, not the backing store's CAS/version token: installing a candidate or
+readiness entry does not change it; each successful settings or model promotion
+increments it by exactly one, and overflow is a hard deployment error. This is
+the stable generation used by serve admission while candidate readiness is
+changing. Each deployment additionally qualifies one
+`serve_admission_lease_bound_ms`: the maximum interval from the
+invocation of a successful linearizable admission read until every admission
+derived from that read is locally invalid, including timer-rate error, delayed
+response, suspend/resume, and every other adapter timing uncertainty. It is a
+portable positive integer, is immutable while any member is traffic eligible,
+and is not configurable through the settings blob; changing it requires
+traffic to be stopped and the deployment capability to be requalified. Every
+candidate snapshots the exact bound and every member readiness entry attests
+it. Candidate installation rejects zero, a value different from the currently
+qualified deployment bound, or an attempted bound change while any member is
+traffic eligible. The activation register and immutable journal-object service
+expose one authenticated, nondecreasing Unix-millisecond time domain; an
+adapter with distinct or merely offset-local clocks is unqualified. The time
+domain and its backing service are immutable while any member is traffic
+eligible or a candidate exists; migration requires stopped traffic, no
+candidate, and fresh qualification. The register's trusted clock qualification guarantees that its
+promotion-not-before condition cannot become true until at least that much
+real elapsed time after the draining CAS; forward steps, rate error, and
+uncertainty fail the check rather than shorten the interval. `model_epoch` is
+exactly `pre_epic_v1` or `permissions_v2`. Every binary exposes one immutable
+monotonic `binary_generation` build constant. The initial N+1/N+2 generations
+are 1/2, and values are never reused. A settings
+`candidate` carries a `candidate_incarnation` of 32 lowercase hex characters
+from 16 CSPRNG bytes, never reused in the deployment scope, plus the bound
+active activation generation and complete active tuple, the complete proposed
+content-binding tuple, copies the active model
+fields byte-for-byte, and adds `proposed_ordinal`, the snapshotted
+`serve_admission_lease_bound_ms`, an immutable authoritative
+`fleet_snapshot`, phase (`preparing` or `draining`), readiness entries, and
+quiescence entries. It also carries mutable `drain_attempt: u64`, initialized
+to 0, and mutable `promotion_not_before_unix_ms`, null until each drain begins.
+A `model_candidate` has its own never-reused candidate incarnation and
+carries the exact bound active activation generation and complete active tuple,
+all three proposed model fields, the immutable authoritative `fleet_snapshot`,
+the same snapshotted admission-lease bound, phase, drain attempt,
+promotion-not-before value, and readiness/quiescence entries. A snapshot
+is `{membership_epoch, members[]}` where members are sorted unique stable
+deployment-instance IDs. It is produced only by the authenticated deployment
+membership controller from the set of instances eligible to receive traffic;
+an application process, config publisher, or readiness writer cannot nominate
+or remove members. Each readiness entry is authenticated as its member ID and
+contains the membership epoch plus the complete immutable candidate identity
+(every candidate field except mutable phase, drain attempt,
+promotion-not-before, and the
+readiness/quiescence maps). That identity includes the candidate incarnation;
+a delayed entry from an aborted or restaged candidate can never validate even
+when every content and fleet field is otherwise identical. The same member's
+quiescence entry additionally binds the `draining` phase, exact nonzero
+`drain_attempt`, and exact `promotion_not_before_unix_ms`, and is valid only
+after that member has atomically closed new request admission and completed or
+cancelled every request admitted under the bound activation generation.
+Readiness cannot stand in for quiescence. The
+immutable blob ID is the adapter mapping of `(logical_root, source_version)`;
+`data_hash` is the verified envelope data hash, and `config_revision` is the
+effective-config digest defined below. A readiness entry is therefore not bound
+merely to source version and policy digest: a byte change, logical-root change,
+config-only change, membership change, or ordinal change makes an old
+acknowledgment inapplicable, while the `preparing` → `draining` phase CAS does
+not. The register's 16-entry history is an operational
+rollback window, not the audit or garbage-collection clock. Every promotion
+also appends an immutable, hash-linked activation-journal record containing the
+previous journal head, expected logical active `activation_generation`, complete
+displaced and new tuples, membership epoch, readiness and quiescence sets,
+the admission-lease bound and promotion-not-before time, retention horizon,
+and controller identity. The journal object's qualified immutable-store
+metadata supplies store-issued `created_at`; its canonical schema, object ID,
+known-answer vector, lifecycle, listing, genesis, and pruning rules are
+normative in CLI §5.1. The controller writes and read-verifies that object
+before promotion; the one register CAS both promotes the candidate and changes
+`activation_journal_head` to its object ID. A losing CAS leaves an unreferenced
+journal object, never an active tuple without a journal entry. Journal records
+and every blob they name are retained for
+at least 30 days and for at least the maximum processed-artifact, cookie-scope
+migration, rollback, and audit horizon, whichever is longer. Rapid pushes can
+evict a tuple from the 16-entry register but never shorten that time-based
+retention. “Atomic” here means the register CAS binds the already verified
+immutable journal object; it does not assume a cross-store transaction. The CAS
+verifies the journal object's authenticated `created_at` in that common time
+domain, rejects creation before the candidate's exact promotion-not-before
+value, and rejects an object more than 60 seconds old. The earliest deletion
+time adds that 60-second promotion allowance to the
+required retention horizon, so even the latest permitted promotion receives
+the full horizon. Local process time never starts or shortens retention. An
+adapter without store-issued journal time, that binding, a qualified journal
+listing/read path, and lifecycle enforcement is ineligible for multi-instance
+activation. History and journal records never make an old configuration
+eligible. `proposed_ordinal` equals the active ordinal for an unchanged policy
+digest and active ordinal + 1 for a changed digest, with the overflow rule
+below. Before the first activation, the compiled-in
+protective configuration is the synthetic active tuple with logical root and
+blob ID `builtin`, source version and ordinal 0, and reproducible
+data/config/policy digests derived by the same grammars from materialized
+compiled defaults; its model fields are `pre_epic_v1`, minimum binary
+generation 1, row schema floor 1, and activation generation 0, and it permits
+no destructive interpretation of historical evidence. Candidate abort is an
+authenticated deployment-controller operation, is audit-recorded with the
+complete candidate tuple and reason, and never rewrites `active` or reuses the
+candidate's source version, blob identity, or candidate incarnation.
 
-- `(source_version, policy_digest)` **found in the history** → adopt
-  that entry's ordinal, no increment — idempotent for every instance
-  of the same activation however late it arrives within the window, so
-  one activation has exactly one `(digest, ordinal)` fleet-wide.
-- `source_version` found in the history with a **different digest** →
-  **fail closed at startup**: one pushed configuration parsing to two
-  canonical-policy digests is mixed-binary parse divergence — a hard
-  incompatibility, never a novel pair, never a new ordinal.
-- `source_version` **newer** than every history entry → a new
-  activation: CAS-append `(source_version, digest, max_ordinal + 1)`,
-  evicting the oldest history entry.
-- `source_version` older than the newest and absent from the history →
-  **stale, rejected** (an instance restarting on old config can
-  neither mint an ordinal nor regress the register; a laggard older
-  than the 16-entry window is also rejected — it must fetch current
-  config, not activate).
+Every nonnegative integer carried into the activation journal — source version,
+policy ordinal, model/binary/schema/activation generation, membership epoch,
+drain attempt, admission-lease bound, promotion-not-before, readiness fields,
+and retention — is additionally constrained
+to the portable JCS range `0..=2^53-1`. The register may use a wider integer
+primitive internally, but candidate installation rejects a value outside that
+range; no activation can create an unjournalable active tuple.
 
-`source_version` must be an **ordered identifier assigned exactly once
-upstream**: the config store's push version where the backend has one,
-else the **monotonic push sequence the `ts config push` envelope stamps
-into the blob**. The earlier digest-only fallback is **deleted** — a
-digest cannot distinguish a deliberate rollback from a stale-instance
-restart, and it re-minted ordinals for a single activation. A
-deployment with neither ordered identifier is not eligible for
-multi-instance policy activation (an adapter capability cell, providers
-spec §7). A→B→A remains a **third activation** — new `source_version`,
-A's digest, a new ordinal — digest for identity, ordinal for order,
-exactly as revision identity requires. Order is adapter-independent
-(per-instance counters ordered nothing across a fleet). Authority wire records, the S2S recompute, and the hook cache
-tuple all use this same pair; the hook's earlier "config-store push
-version" and any digest-only usage are superseded. The other cache-tuple
-inputs are likewise domain-separated hashes of effective configuration:
-integration-registry revision = `tsreg1|` over the canonical-JSON
-`(id, version)` list; config revision = `tscfg1|` over the effective
-config blob — so adapters derive identical revisions from identical
-configuration.
+`source_version` is an ordered `u64` within that portable range, scoped once per
+deployment/application across all config-blob names. A single scope matches
+the fixed deployment-metadata register key and avoids two independently
+ordered streams aliasing one register.
+Where the platform does not expose a trustworthy ordered push version, the
+push tool allocates envelope `push_sequence` from a separate linearizable
+**config-sequence register** in deployment metadata: strong-read + CAS
+`next := current + 1`, then publish the envelope carrying `next`. Reaching the
+portable maximum is a hard deployment error. Allocation
+gaps after a failed publish are allowed; reuse is forbidden. A restore or
+rollback republishes old content under a new sequence. The config store
+itself is not assumed to provide conditional publication — its current
+get/put/delete interface does not — and an adapter without the deployment-
+metadata allocator is ineligible for multi-instance config/policy activation.
+The CLI envelope design must add this field and allocator interaction.
 
-A policy edit propagates through the config store, so a fleet briefly
-mixes revisions. The contract: instances stamp every resolution and
-every provenance write with the (digest, ordinal) they used (already
-required by §7); the mixing window is bounded by config propagation and
-observable via the activation-ordinal metric; and mixed-revision
-irreversibility is bounded and **accepted, not denied** (sign-off 19):
-destructive withdrawal triggers are user signals, never policy (§4.2
-trigger 3) — the one revision-sensitive destructive case (trigger 2
-under a now-`denied` baseline) requires an affirmative user refusal at
-the evaluating instance, which is safe under either revision. S2S
-recomputation always evaluates against the instance's current revision
-and records it. One divergence is explicitly accepted rather than
-fenced: during convergence, a live refusal under a `granted`-revision
-instance suppresses while the same refusal under a tightened-revision
-instance destroys (trigger 2) — the destructive outcome is the target
-revision's intended behavior arriving early on part of the fleet,
-coordinated activation fencing is not worth its machinery, and the
-acceptance is sign-off item 19. Rolling a policy revision back restores
-acquisition rules but **cannot resurrect tombstoned identities**; the
-migration guide says so where operators will read it.
+Activation is **prepare then commit**, never “first instance wins”:
+
+1. The push tool writes and read-verifies a new immutable envelope object,
+   then CAS-installs its complete content-binding tuple as the sole candidate.
+   Merely overwriting a mutable `app_config` key cannot stage or activate
+   anything. A second candidate CAS is rejected until the current candidate
+   activates or is explicitly aborted; an unreferenced object written by the
+   loser is inert and later garbage-collected.
+2. Every member of the candidate's immutable authoritative deployment-
+   membership snapshot loads **that exact immutable object**, verifies the
+   envelope data and sequence-binding hashes, materializes defaults, validates
+   config and policy semantics, derives both config and policy digests, and
+   CAS-records readiness for the complete candidate tuple. A member that
+   cannot load the object or derives any different field fails closed and
+   never acknowledges.
+   Membership is frozen for that candidate. A new traffic-eligible member, a
+   replacement instance with a new stable ID, or removal of a dead member
+   changes `membership_epoch`, automatically aborts the candidate, and requires
+   prepare to restart against a new snapshot. A controller cannot shrink a
+   candidate in place to manufacture unanimity. Autoscaled instances may start
+   during prepare, but receive no traffic until they load the current active
+   object and enter the next authoritative membership epoch.
+3. Only after every member in that snapshot is ready does the controller CAS
+   the same candidate from `preparing` to `draining`, increments
+   `drain_attempt` by one, atomically clears every quiescence entry, and, from
+   the register's trusted store clock at that CAS's linearization point, sets
+   `promotion_not_before_unix_ms` to the checked sum
+   `store_now + serve_admission_lease_bound_ms`;
+   overflow aborts and restages the candidate. At lease expiry, each member
+   atomically stops admitting **all** new requests unless a renewal strong-read
+   returns a non-draining result; a read that fails, is delayed past expiry, or
+   observes `draining` cannot renew. The member's authenticated activation
+   watcher also strong-reads the drain state, invalidates the local lease,
+   closes admission, drains or cancels every request admitted under the bound
+   activation generation, then writes its authenticated quiescence entry. A
+   member may acknowledge only when no such
+   request or its background work can still reach origin, bidder, partner,
+   vendor, cache publication, identity mutation, or another configurable
+   effect. A member that has observed `draining`, or whose prior admission
+   lease has expired, gives new requests the deployment-unavailable response
+   with no configurable egress. An unexpired lease may continue admitting the
+   previous generation only until its hard bound; no admission read that
+   linearizes after the drain CAS can create or renew such a lease. A member
+   may acknowledge quiescence before the promotion-not-before time only when
+   its own admission gate is already closed, but time alone never substitutes
+   for that member's acknowledgment. A delayed watcher or acknowledgment
+   extends the unavailable interval and cannot weaken the fence. A controller
+   failure leaves admission closed until an authenticated
+   `cancel-drain` CAS restores `preparing` and atomically clears every
+   quiescence entry and the promotion-not-before value, a
+   candidate abort removes the candidate, or a valid promotion completes; a
+   local timeout cannot reopen traffic. Cancellation does not itself authorize
+   traffic: each member must strong-read the restored phase before acquiring a
+   new lease. Resumed traffic makes every earlier quiescence acknowledgment
+   inapplicable.
+4. Only after every member in that snapshot is both ready and quiescent, and
+   the register's trusted store clock has reached the exact
+   promotion-not-before value, does the deployment controller construct and
+   read-verify the immutable journal object and
+   CAS-promote the candidate to `active` while binding that object as the new
+   journal head. The register itself rejects promotion while its trusted store
+   clock is earlier than the candidate's exact
+   `promotion_not_before_unix_ms`; a controller sleep or wall-clock comparison
+   cannot satisfy this condition. Expiry of the bound only closes further old
+   admissions — authenticated quiescence is still required to prove that the
+   last admitted request and every asynchronous effect ended. If its policy digest
+   differs from current `active`, promotion verifies
+   `proposed_ordinal == max_ordinal + 1` and uses that new policy ordinal;
+   mismatch or portable-range overflow is a hard deployment error, never wraparound. If
+   the digest is unchanged, promotion verifies `proposed_ordinal` equals the
+   current ordinal. For a
+   config-only push, promotion advances `source_version` but retains the
+   existing ordinal — unrelated configuration must not manufacture a new
+   policy identity. A settings promotion copies the current model epoch,
+   minimum binary generation, and row schema floor byte-for-byte; config cannot
+   advance or roll them back, and sets activation generation to the bound
+   generation + 1. **Every** promotion appends the complete previous active
+   tuple to operational history, including config-only pushes. Audit and
+   immutable-blob retention come from the independently time-bounded journal,
+   so evicting operational history never loses the displaced snapshot.
+5. Instances continue serving the entire previous active configuration while
+   preparation is incomplete; the newest physical blob has no “latest wins”
+   semantics, then stop during the explicit drain above. After promotion,
+   members load and verify the new active tuple before reopening admission.
+   **Every request**, including requests that do not use identity, must present
+   a live admission validation when it atomically registers at the local gate.
+   The validation covers both candidate phase and the complete `active` tuple,
+   including `activation_generation` and model fields. An admitted request may
+   outlive that validation's admission window; its gate/refcount registration,
+   rather than a mid-request lease renewal, keeps it inside the drain and
+   quiescence proof. With no live validation, admission strong-reads the
+   register and may lease only a
+   successful non-draining result for at most the deployment's qualified
+   `serve_admission_lease_bound_ms`. Lease age starts no later than invocation
+   of that linearizable read, never response receipt, so latency shortens the
+   usable interval and a response arriving at or after expiry cannot admit.
+   The lease binds the deployment, stable member ID, exact active tuple, and
+   bound; it is process-local, is invalid after restart or suspend/resume, and
+   cannot survive read, timer, or renewal uncertainty.
+   `draining` rejects admission as above; otherwise the request uses settings
+   loaded from that exact active blob whose data/config/policy hashes match.
+   Local admission closing and request/background-effect registration use one
+   atomic gate/refcount that compares the validation's exact active tuple with
+   the gate's current tuple before incrementing, so quiescence cannot race a
+   last admission and a delayed old-generation read cannot enter after reopen.
+   The fence covers routing,
+   auction serialization, integration selection, DataDome, response mutation,
+   cache lookup/replay, identity, and destructive paths. The v1 fence's strong
+   read may be amortized only by this activation-scoped lease; it grants no
+   lease for authority, revocation, outbox, `w`, breaker, or other privacy
+   state. A mismatch stops processing before origin,
+   bidder, partner, or vendor egress, refreshes the complete settings object,
+   and admits later requests only after every binding verifies. Failure to read
+   or load active returns the deployment-unavailable response and performs no
+   configurable egress. An
+   instance starting or restarting likewise loads, verifies, and obtains a
+   fresh admission validation on active before the traffic controller marks it
+   serving. After promotion a member reopens only after loading the promoted
+   tuple and strong-reading a lease for its new generation. No identity-only exception,
+   mutable-root fallback, stale-on-error path, or partial per-subsystem refresh
+   is permitted.
+
+Model/writer activation is a second transition on the **same register**, so it
+cannot race or drift from settings activation:
+
+1. With new-shape settings active and no settings candidate, the controller
+   CAS-installs a `preparing` `model_candidate`. Its immutable identity is the
+   never-reused candidate incarnation, bound active activation generation,
+   bound complete active tuple, proposed
+   model epoch `permissions_v2`, proposed minimum binary generation 2,
+   proposed row schema floor 2, snapshotted
+   `serve_admission_lease_bound_ms`, and fleet snapshot; its mutable state is
+   phase, drain attempt, promotion-not-before value, readiness, and
+   quiescence. Re-entry at the same exact identity is idempotent; any different
+   concurrent candidate is rejected.
+2. Every traffic-eligible member in the authoritative snapshot must load the
+   bound active settings, prove `binary_generation >= 2`, validate the v2
+   provider/permission writer, and authenticate readiness for the complete
+   model candidate. N+2 runs `pre_epic_v1` behavior until this promotion; it may
+   not write v2 rows, positive authority, or durable use suppression merely
+   because its binary understands them. A membership or active-settings
+   activation-generation change aborts and restages the model candidate.
+3. After unanimous readiness, the controller CASes the model candidate to
+   `draining`, increments the model candidate's `drain_attempt`, and atomically
+   clears old quiescence entries while setting the same store-clock
+   `promotion_not_before_unix_ms`; every member applies the settings procedure's all-request
+   admission stop, completes or cancels every `pre_epic_v1` request, and
+   records bound quiescence. Local timeout cannot resume admission.
+4. After unanimous readiness **and quiescence**, the controller creates the same immutable
+   journal object required for a settings promotion and one register CAS
+   verifies the promotion-not-before time has passed, the bound active
+   activation generation, and complete tuple, changes
+   `model_epoch`,
+   `minimum_binary_generation`, and `row_schema_floor` together, clears the
+   model candidate, increments `activation_generation`, appends operational
+   history, and binds the journal head. Policy digest/ordinal and settings
+   source version do not change.
+5. Every serve-admission read checks the model fields as well as the settings
+   tuple. After promotion, a binary with generation below the minimum stops
+   before all request processing and cannot start serving; a qualifying N+2
+   binary enables the new live gate/writer only after observing that exact
+   active activation generation. There is therefore no interval in which N+1
+   serves while N+2 writes v2. The old deployment-metadata `m00` schema-floor key is only a
+   monotonic startup compatibility mirror written after this CAS; it has no
+   authority to enable writes or serving. After a successful model CAS, the
+   authenticated deployment controller owns the idempotent mirror completion
+   step: strong-read `active` and `m00`; if `m00` is missing or lower, CAS it
+   to exactly `active.row_schema_floor`, while equality is an idempotent
+   no-op; then strong-read and verify exact equality before declaring the
+   transition complete. A crash retries the same operation; it never lowers
+   `m00` and never changes or authorizes the active register. An unreadable
+   mirror or failed CAS/read-verification keeps startup closed and is retried.
+   A mirror higher than active is rejected before any write and cannot be
+   auto-lowered: startup fails for register/journal inconsistency
+   investigation. The authoritative schema floor advances only in the single
+   fenced model transition.
+
+Head rules are therefore unambiguous: equal active `source_version` plus equal
+data/config/policy digests adopts the active ordinal; equal version plus any
+different digest or blob identity is a hard parse-divergence failure; lower
+version is stale and rejected;
+higher version is staged and is not active until fleet commit. A duplicate
+publication never creates another ordinal. A higher-version config-only push
+with the active policy digest retains the ordinal after readiness but changes
+the active blob/data/config tuple. A→B→A remains a
+third activation with a new `source_version`, A's digest, and a new ordinal
+because A differs from the then-active B.
+
+Authority wire records and S2S recomputation use the active policy `(digest,
+ordinal)` pair. The hook's one complete cache revision tuple additionally binds
+`model_epoch`, logical `activation_generation`, and its hook-invariant revision
+exactly as the hook spec §3 defines, so model-only activation cannot replay a
+pre-epic artifact. Its registry and config inputs are domain-separated SHA-256
+hashes of JCS UTF-8 bytes: integration-registry revision = `tsreg1|` plus the
+registration-order array of `{id, behavior_revision}`; config revision =
+`tscfg1|` plus the complete typed effective config after defaults. Registry
+array order is preserved because mutator order is behavior. The config form
+contains secret **references**, never resolved secret bytes, and excludes
+runtime observations. Both emit lowercase 64-hex digests and must reproduce
+`docs/superpowers/specs/revision-canonicalization-vectors.json`. Tests cover a
+pre/post-model-CAS cache miss as well as concurrent push allocation, publish
+gaps, equal-version idempotence, equal-version
+digest mismatch, same-digest higher-version ordinal retention, stale restart,
+candidate abort, partial readiness, promotion, old-instance behavior after
+promotion, and A→B→A.
+
+Mixed-revision irreversible behavior is **prohibited**, not accepted. Config
+distribution may be mixed during preparation, but only the complete `active`
+tuple authorizes identity decisions, and destructive effects are fenced to
+that tuple (wire provenance records its policy pair). Rolling back acquisition
+policy still cannot resurrect an identity
+withdrawn by a valid user signal; rollback itself follows the same staged
+activation protocol.
 
 ## 6. Failure-mode matrix — normative
 
-| Condition                                            | Resolution behavior                                                                           |
-| ---------------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| Geo lookup fails at request time (provider selected) | `default_country` baseline                                                                    |
-| No geo provider configured                           | `default_country` baseline, guarded by §5.3                                                   |
-| Country resolved, no matching rule                   | Policy `rules.default`                                                                        |
-| Region resolved, no region rule                      | Country rule                                                                                  |
-| No `[permissions]` section                           | Compiled-in fallback: everything `requires_signal`, `regime = "gdpr"`                         |
-| S2S sync request (no user signals)                   | Authorized by stored provenance re-validated against current policy (§7)                      |
-| Malformed policy                                     | Rejected at config push / startup (§3.3) — never per request                                  |
-| No `default_country`                                 | Startup failure                                                                               |
-| Undecodable TCF/GPP record (present but malformed)   | Blocks grants (fail-closed acquisition, §4.4); never withdraws; opt-out signals still honored |
-| Signals contradict (opt-out + consent)               | Opt-out wins (§4)                                                                             |
+| Condition                                                                                 | Resolution behavior                                                                           |
+| ----------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| Geo lookup fails at request time (provider selected)                                      | Protective failure profile: both permissions `requires_signal`, `regime = "gdpr"`             |
+| No geo provider configured                                                                | `default_country` baseline, guarded by §5.3                                                   |
+| Country resolved, no matching rule                                                        | Policy `rules.default`                                                                        |
+| Region resolved, no region rule                                                           | Country rule                                                                                  |
+| No `[permissions]` section                                                                | Compiled-in fallback: everything `requires_signal`, `regime = "gdpr"`                         |
+| S2S sync request (no user signals)                                                        | Authorized by stored provenance re-validated against current policy (§7)                      |
+| Malformed policy                                                                          | Rejected at config push / startup (§3.3) — never per request                                  |
+| No `default_country` in acknowledged no-provider static mode with a jurisdiction consumer | Startup failure; otherwise the field is not required (§5.3–§5.4)                              |
+| Undecodable TCF/GPP record (present but malformed)                                        | Blocks grants (fail-closed acquisition, §4.4); never withdraws; opt-out signals still honored |
+| Signals contradict (opt-out + consent)                                                    | Opt-out wins (§4)                                                                             |
 
-The intended posture is fail-closed, with its two exceptions stated rather
-than glossed: geo lookup failure resolves to the configured default (§5.2's
-declared, metered residual — permissive defaults make this path fail-open),
-and the §5.3 static-jurisdiction configuration exists only behind an
-explicit operator acknowledgment. Every other ambiguous state resolves to
-the configured baseline or more restrictive.
+The intended posture is fail-closed. Geo lookup failure uses the protective
+profile, and the §5.3 static-jurisdiction configuration exists only behind
+an explicit operator acknowledgment. Every other ambiguous state resolves
+to the configured baseline or more restrictive.
 
 ## 7. Enforcement points
 
@@ -992,6 +1438,100 @@ Consumers of the resolved set in this epic:
    | Authority-state / suppression-decision read (§4.3)                 | **exempt**, narrowly scoped                                            | Returns only family ID, per-permission authority summary, and suppression entries — no identity values, no partner data; a test proves nothing else escapes                                                                                                                                                                                                                                       |
    | `AuthorityRefresh` provenance write (§4.3)                         | **exempt**, strictly scoped                                            | Commits current-live-resolution provenance only; enables suppression recovery without reopening `GraphOps`                                                                                                                                                                                                                                                                                        |
 
+   **Raw regulatory transport is a separate positive allowlist.** The
+   current allowlist contains only OpenRTB-compatible auction dispatch, and
+   only the protocol field actually defined for that source: TCF in
+   `user.ext.consent`, GPP in the atomic `regs.ext.gpp` + derived
+   `regs.ext.gpp_sid` pair defined in §4.5, and
+   US Privacy in `regs.ext.us_privacy`. A destination registration declares
+   the fields it supports; TS sends the minimum matching source set, never a
+   generic bundle of every raw signal. APS/direct auction APIs are not assumed
+   equivalent to OpenRTB and receive no raw string until their checked-in
+   protocol registration names the required field. Publisher origin,
+   proxy/click/Testlight, identify and sync endpoints, ordinary integrations,
+   identity rows, and observability sinks are explicitly not consumers.
+   Unknown destinations default deny. Tests enumerate every allowed
+   destination × field and assert every other egress view is structurally
+   unable to access the raw strings.
+
+   **Contextual OpenRTB is a positive projection, not “the ordinary request
+   minus EC.”** Whenever auction dispatch is allowed while
+   `select-personalised-ads` is unset, core serializes a
+   `ContextualAuctionView` constructed independently from the ordinary auction
+   object. The **sole normative v1 output schema** is the checked-in
+   `docs/superpowers/specs/contextual-openrtb-v1-allowlist.json`; descriptive
+   prose cannot add a field. Its path language is dot-separated exact JSON
+   member names, with `[]` denoting every element of the immediately preceding
+   array. Object and array containers are implicit and exist only when at least
+   one admitted descendant requires them; admitting a container never admits
+   another child. `site` and `app` are mutually exclusive, and `imp` contains
+   at least one element. V1 supports only the allowlisted banner and video
+   impression shapes. A native, audio, or DOOH impression, or any impression
+   that cannot be represented entirely by one allowlisted shape, makes the
+   contextual serializer fail with no dispatch.
+
+   Each manifest rule gives one exact leaf path, JSON scalar type,
+   cardinality, derivation class, and, where present, the complete value enum.
+   Cardinalities have these exact meanings: `required_single` is present once
+   in its object; `optional_single` is absent or present once;
+   `required_array` is a non-empty array whose every scalar element matches the
+   rule; `optional_array` is absent or such a non-empty array;
+   `required_array_member` is present once in every instance of the nearest
+   enclosing object-array element; and `optional_array_member` is absent or
+   present once in each such element. Empty optional arrays are omitted, never
+   encoded. JSON numbers must be finite; integers use the OpenRTB field's
+   declared range. Strings are valid UTF-8, are normalized by the field's
+   OpenRTB grammar, and are rejected rather than truncated when they exceed its
+   bound.
+
+   The manifest's `cross_field_rules` are equally normative. Paths sharing an
+   `[]` segment are evaluated within the same array-element binding, never
+   across different impressions/nodes. `all_or_none` requires every named leaf
+   or none; `required_nonempty_object_arrays` requires the named object array
+   to exist with at least one element whenever its parent exists; and
+   `at_least_one_complete_group` requires at least one listed group to be fully
+   present whenever its parent exists. Thus GPP and its nonempty derived SID
+   array are atomic, an emitted supply chain has at least one complete node,
+   banner `w`/`h` are paired, and every emitted `banner.format` element has
+   both dimensions. Unknown rule kinds or container paths fail startup.
+
+   The derivation vocabulary is closed by that manifest. `fresh_transaction`
+   is a new CSPRNG value for this dispatch and is never copied from or derived
+   from EC, IP, consent, DataDome, graph, or stored provenance; `inventory` is
+   a value from validated publisher inventory configuration, never a request
+   free-form or extension value; `request_coarse` is only the typed coarse
+   request fact named by the exact path; `privacy` is produced by the
+   permission resolver or the raw-regulatory allowlist immediately above; and
+   `constant` is the literal named by the rule. In v1 `device.lmt` is therefore
+   exactly integer `1`. `device.os` has no version, `device.language` is one
+   normalized primary language subtag, and `device.geo.country` is an uppercase
+   ISO 3166-1 alpha-2 code; a finer or malformed source is omitted rather than
+   rounded ad hoc.
+
+   The serializer is generated from, or startup-validated byte-for-byte
+   against, this manifest. A conformance walker expands every final encoded
+   JSON leaf to the same normalized path and requires it to match exactly one
+   rule with its type, cardinality, derivation tag, and enum, then evaluates
+   every container and cross-field rule over the same final tree. An unknown,
+   duplicate, ill-typed, untraceable, or unlisted leaf is a serialization error
+   and produces **no bidder request**. This includes every unlisted `ext`
+   member: there is no arbitrary JSON pass-through. V1 has no destination
+   extension registrations; adding one requires a separate checked-in,
+   machine-readable manifest using this same closed grammar and named for that
+   destination. A destination that cannot consume this exact projection also
+   receives no request — TS never falls back to the ordinary serializer.
+
+   Consequently the v1 output has no EC or other user identifier, IP/IPv6,
+   user agent, IFA, client forwarding header, hardware/network/screen
+   fingerprint, precise geo, region/city/ZIP/metro, page/referrer/store URL,
+   query/fragment, demographics, keywords, segments, custom data, or
+   non-allowlisted extension. `user` can exist only as the implicit parent of
+   the exact allowlisted `user.ext.consent` leaf when the destination's raw
+   regulatory registration requires TCF. Conformance tests inspect the final
+   encoded HTTP headers and body, poison every forbidden source (including
+   nested extension objects), and prove that each poison is absent or the
+   dispatch is suppressed.
+
    With **no EC provider configured**, identity use fails closed: a cookie
    value present on the request never egresses anywhere — never vacuously
    allowed (#838's `ec_allowed` was `is_none_or`, vacuously true with no
@@ -1007,7 +1547,7 @@ Consumers of the resolved set in this epic:
    requests — grant basis
    (which signal class granted, per permission), the evidence's
    **authoritative timestamp and `valid_until`** (per evidence class),
-   resolved jurisdiction **with `jurisdiction_observed_at`**, and policy
+   tagged jurisdiction provenance (defined below), and policy
    revision (the §5.5 pair) — **this list references the one normative
    summary schema, the providers spec §6.3 authority-state wire record;
    it is not a second schema** — and **not** provider/version,
@@ -1054,13 +1594,25 @@ Consumers of the resolved set in this epic:
    the stored grant's source class (§4's regime-scoped table). Any of
    these → no update, row flagged for the operational cleanup of §4.2
    trigger 3. Sync never mints authority of its own. **Stored
-   jurisdiction ages too**: batch sync has no live geo, so the
-   jurisdiction it recomputes against is the one from the last browser
-   visit — and a visitor who moved from a permissive into a GDPR
+   jurisdiction ages too**: batch sync has no live geo. The strong summary's
+   jurisdiction is a tagged value, never an unlabelled country:
+   - `Live { jurisdiction, provider_id, observed_at }` comes from a successful
+     live geo lookup.
+   - `StaticDefault { jurisdiction, config_revision, observed_at }` comes only
+     from acknowledged §5.3 mode; S2S accepts it only while the active config
+     revision still selects the same static jurisdiction.
+   - `ProtectiveLookupFailure { provider_id, profile_revision, observed_at }`
+     records §5.2 evaluation but **never authorizes context-free S2S egress**.
+     A later successful live lookup must replace it first. The live request may
+     still perform only what its protective-profile resolution authorizes.
+
+   For `Live` or matching `StaticDefault`, batch sync recomputes against the
+   stored jurisdiction from the last browser visit — and a visitor who moved
+   from a permissive into a GDPR
    jurisdiction would otherwise keep old-rule egress for up to the row
    lifetime. A stored jurisdiction older than the **consent-TTL
-   horizon** — age measured as now − `jurisdiction_observed_at`, the
-   summary's dedicated field written **only by live geo resolution**
+   horizon** — age measured as now − the tag's `observed_at`, written by the
+   browser-request resolution that produced `Live` or `StaticDefault`
    (providers spec §6.3; evidence timestamps are not a proxy: TCF
    `LastUpdated` can predate the live lookup, and a policy-baseline
    grant has no wall-clock evidence timestamp at all) — fails closed
@@ -1084,21 +1636,24 @@ Consumers of the resolved set in this epic:
 4. **Server-side auction dispatch** — gated on the policy `regime` class,
    normatively:
 
-   | Regime                                                                                                                                                                                          | Dispatch rule                                                                                                                                                                                                                                                                                                                                                                       | Preserves                                     |
-   | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
-   | `gdpr`                                                                                                                                                                                          | Dispatch only with a decodable, unexpired TCF record consenting to Purpose 1. Malformed, expired, or absent record → **no bid request leaves** (no-bid response).                                                                                                                                                                                                                   | Today's GDPR/unknown arm                      |
-   | `us-privacy`                                                                                                                                                                                    | Dispatch proceeds in every signal state, including opt-out — the opt-out strips identity (rows above) but the contextual auction runs.                                                                                                                                                                                                                                              | Today's US-state arm                          |
-   | `none`                                                                                                                                                                                          | Dispatch proceeds.                                                                                                                                                                                                                                                                                                                                                                  | Today's non-regulated arm                     |
-   | **Any regime, TCF-sourced effective record** — a raw TC string on the request, a GPP section-2 hint (both detected **before decoding**), or a persisted-KV fallback record of TCF origin (§4.4) | The `gdpr` row applies: dispatch requires the _effective_ record to be decodable, unexpired, and consenting to Purpose 1. A **malformed or expired** raw signal therefore blocks dispatch — today a malformed raw TCF blocks, and gating this arm on decodability would have silently relaxed that. A US or non-regulated request carrying a Purpose 1 refusal is likewise blocked. | Today's raw-signal arm — **must not regress** |
+   | Regime                                                                                                                                                                                          | Dispatch rule                                                                                                                                                                                                                                                                                                                                                                       | Preserves                                                     |
+   | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
+   | `gdpr`                                                                                                                                                                                          | Dispatch only with a decodable, unexpired TCF record consenting to Purpose 1. Malformed, expired, or absent record → **no bid request leaves** (no-bid response).                                                                                                                                                                                                                   | Today's GDPR/unknown arm                                      |
+   | `us-privacy`                                                                                                                                                                                    | Dispatch proceeds in every signal state. When P4 is set, the ordinary egress inventory applies. When P4 is unset, including any mapped opt-out, dispatch is allowed only through the exact `ContextualAuctionView` above; serializer or destination-registration failure produces no bid request.                                                                                   | Today's dispatch posture, with contextuality made enforceable |
+   | `none`                                                                                                                                                                                          | Dispatch proceeds.                                                                                                                                                                                                                                                                                                                                                                  | Today's non-regulated arm                                     |
+   | **Any regime, TCF-sourced effective record** — a raw TC string on the request, a GPP section-2 hint (both detected **before decoding**), or a persisted-KV fallback record of TCF origin (§4.4) | The `gdpr` row applies: dispatch requires the _effective_ record to be decodable, unexpired, and consenting to Purpose 1. A **malformed or expired** raw signal therefore blocks dispatch — today a malformed raw TCF blocks, and gating this arm on decodability would have silently relaxed that. A US or non-regulated request carrying a Purpose 1 refusal is likewise blocked. | Today's raw-signal arm — **must not regress**                 |
 
    The **compiled-in fallback policy has `regime = "gdpr"`** (§3.1) — the
    no-policy posture must be the most protective for dispatch too, and a
    regime-less fallback would leave dispatch undefined. When dispatch is
    blocked, nothing leaves for that request: no PBS/APS call, no UA/IP/geo
-   forwarding to bidders. When dispatch proceeds, what the request may
-   carry is governed row-by-row by the egress inventory; the full
-   regulatory context (consent strings) is always forwarded so downstream
-   partners make their own decisions (§1).
+   forwarding to bidders. When dispatch proceeds, what the request may carry
+   is governed row-by-row by the egress inventory and, whenever P4 is unset,
+   by the stricter positive contextual projection. Full regulatory
+   strings are forwarded only to a destination whose protocol normatively
+   requires them and whose registration declares it an authorized
+   privacy-signal consumer; every other destination receives normalized
+   outcomes or no regulatory field (§1).
 
 The client-cycle resolve endpoint (own spec, currently on hold) would be a
 further consumer if and when it proceeds.
@@ -1119,6 +1674,15 @@ further consumer if and when it proceeds.
   (consent, opt-out, malformed, expired, absent), including the
   no-policy fallback regime, asserting both the dispatch decision and
   that a blocked dispatch emits no outbound request.
+- The contextual serializer is tested as a positive schema against final
+  encoded OpenRTB bytes. Fixtures place forbidden values in every ordinary and
+  extension location (EC/derived IDs, user IDs/data/segments, IP/IPv6, UA,
+  precise geo, URL/referrer/query, device IDs/fingerprints, and forwarding
+  headers) and prove none survives; a destination without a qualified
+  contextual registration produces no outbound request.
+- GPP transport fixtures derive sorted unique `gpp_sid` from decoded
+  applicability, never copy `__gpp_sid`, and assert atomic pair omission for an
+  unconstructable set plus restrictive mismatch handling.
 - The §7 S2S authority path: **every denial reason individually** —
   denied rule, tightened baseline without acceptable stored evidence,
   expired evidence, regime-rejected grant source — plus the exempt
@@ -1132,6 +1696,12 @@ further consumer if and when it proceeds.
   → refusal, → opt-out, → malformed, → absent — plus a mid-replacement
   fault proving the surviving state is the complete old **or** complete
   new snapshot, never a merged mixture.
+- Timestamp-less opt-out clearing: GPP/USP opt-out → later bare explicit
+  not-opted-out presentation remains suppressed; a newer TCF `LastUpdated` or
+  authenticated monotonic authorization revision clears → an identical
+  timestamp-less opt-out presentation starts a new restrictive episode without
+  refreshing its original first-seen, and the following no-signal live/S2S
+  decisions remain suppressed; replay and equal revisions never grant.
 - Legacy-row withdrawal end to end (§4.3's derived family ID).
 - §4.3 fault-injection cases.
 - Policy validation tests for every §3.3 rejection, exercised through both

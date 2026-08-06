@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "canonicalization": "RFC 8785 (JCS)",
+  "digest": "SHA-256",
+  "vectors": [
+    {
+      "name": "ordered-integration-registry",
+      "domain_prefix_utf8": "tsreg1|",
+      "normalized_value": [
+        {
+          "behavior_revision": 1,
+          "id": "datadome"
+        },
+        {
+          "behavior_revision": 2,
+          "id": "prebid"
+        }
+      ],
+      "canonical_json_utf8": "[{\"behavior_revision\":1,\"id\":\"datadome\"},{\"behavior_revision\":2,\"id\":\"prebid\"}]",
+      "sha256_hex": "a2a81a6727226821d87f885c92410b5ebd2466e1060a070e027ad0eba210eff4"
+    },
+    {
+      "name": "effective-config-hash-grammar-smoke",
+      "domain_prefix_utf8": "tscfg1|",
+      "normalized_value": {
+        "integrations": {
+          "datadome": {
+            "secret_name": "datadome-api-key",
+            "enabled": true
+          }
+        }
+      },
+      "canonical_json_utf8": "{\"integrations\":{\"datadome\":{\"enabled\":true,\"secret_name\":\"datadome-api-key\"}}}",
+      "sha256_hex": "83c85084578ee35ddba12418c6337b7cc064b7022be5c8ffed068e94b07118d6"
+    },
+    {
+      "name": "config-sequence-binding",
+      "domain_prefix_utf8": "tscfgseq1|",
+      "push_sequence": 42,
+      "push_sequence_u64_be_hex": "000000000000002a",
+      "data_hash_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "sha256_hex": "70edd94cd5728550a815355a1b719f4aafb466aa228571a4a7a6e88ad5178df0"
+    }
+  ]
+}

@@ -29,6 +29,11 @@ mutators to the outbound response for HTML document responses it processed.
 - `IntegrationRegistration::builder(ID).with_response_mutator(...)` registers
   a mutator; `IntegrationRegistry::apply_response_headers(...)` applies all
   registered mutators in registration order.
+- Every registration carries a nonzero `behavior_revision: u32`, bumped for
+  any change to its response decision, operation semantics, declared read set,
+  or security field list. Integration IDs match
+  `[a-z0-9][a-z0-9-]{0,63}` and are unique. The registry revision hashes the
+  ordered registration list — order is behavior, so the array is never sorted.
 - **The mutator API is structured operations, not header-map access.** A
   mutator returns (or is handed a recorder for) typed operations —
   `append(name, value)` and `replace(name, value)` (v1 is headers-only;
@@ -110,7 +115,39 @@ no-store` in that case regardless of the mutation; `max-age`/`s-maxage` may
   computation → cache-key construction → body/metadata commit** — with
   three identity rules. Cache matching uses the **exact final publisher
   request** (post-overlay view; keying from the redacted view would
-  collapse personalized variants). **Every** `Vary`-nominated request value is stored **only as a keyed
+  collapse personalized variants).
+
+  The final `Vary` name list has one cross-adapter grammar. Core collects every
+  `Vary` response field line from the snapshot plus mutation, parses each as an
+  HTTP comma-list, trims optional whitespace around every member, and requires
+  each non-empty member to be an RFC field-name token. It lowercases ASCII,
+  removes duplicates, and sorts unique names by unsigned ASCII byte order. An
+  empty member or invalid token introduced by a mutation invalidates that
+  batch. If the reverted snapshot itself is malformed, the invariant replaces
+  the final value with `Vary: *`, forces `no-store`, and writes no cache
+  artifact. `*` in either source likewise dominates every other member: the
+  normalized result is the single `*` and is uncacheable. For an ordinary
+  list, the wire response emits one lowercase `, `-joined value, while the
+  variant descriptor stores `vary_names` as the exact sorted JSON array of
+  lowercase strings. Thus field-line grouping, case, and input ordering cannot
+  produce different cache identities.
+
+  A normalized name nominates one request header. Digest construction obtains
+  **all** values for that header from the exact final publisher request after
+  overlay, preserving received field-line order and value octets; it does not
+  comma-fold, trim, or split those request values. The `<name>` bytes in the
+  HMAC input below are always the normalized lowercase ASCII name, and a name
+  is digested once even if it appeared repeatedly in `Vary`. Known-answer
+  normalization fixture: snapshot/mutation lines `Vary: X-Tenant ,
+  Accept-Encoding` and `Vary: accept-encoding` produce wire value
+  `accept-encoding, x-tenant` and descriptor value
+  `["accept-encoding", "x-tenant"]`, then digest each nominated request
+  field's original instances in their received order. Fixtures also cover
+  differently grouped lines, case variants, duplicate names, empty members,
+  invalid tokens, `*`, absent versus present-empty request fields, and one value
+  containing a comma.
+
+  **Every** `Vary`-nominated request value is stored **only as a keyed
   digest** — every value, not a sensitivity classification an unknown
   credential field could slip past: HMAC-SHA-256 with domain tag
   `tsvry1|`, over an input that encodes **presence, instance count, and
@@ -120,29 +157,74 @@ no-store` in that case regardless of the mutation; `max-age`/`s-maxage` may
   absence, and two members `a`,`b` collided with one member `a,b`),
   which could select a representation built under a different
   credential or tenant. Absent field → `tsvry1|<name>|a`; present →
-  `tsvry1|<name>|p|<count>` then, per member in received order,
+  `tsvry1|<name>|p|<count>` with `count` as ASCII decimal, then, per member in received order,
   `|<len>:<octets>` with `len` the ASCII-decimal byte count. Output
   lowercase hex (64 chars). **The key is a deployable contract, not an
   implementation detail**: the setting
   `[cache] vary_digest_key_secret_name` names a platform-secret-store
-  entry (≥ 32 CSPRNG bytes); key ids match `[a-z0-9-]{1,16}` and
-  version every cache entry; startup **fails** when response caching is
-  enabled and the key does not resolve (digests are never computed
-  unkeyed); rotation introduces a new id while the previous stays
-  resolvable — entries under any resolvable id keep matching, others
-  miss and refill; the whole requirement is an adapter capability and
-  startup gate, since every caching adapter needs it. Known-answer
-  vectors under the all-zero 32-byte test key:
+  entry containing one versioned keyring JSON object:
+  `{ "schema_version": 1, "current_key_id": "<id>", "keys":
+  [{ "id": "<id>", "key_base64url": "<unpadded>" }] }`. `keys` is
+  sorted by `id`, contains 1..4 unique entries, rejects unknown fields,
+  and every value decodes to exactly 32 CSPRNG bytes. An id is derived,
+  not operator-invented: the first 16 lowercase hex characters of
+  SHA-256 over the raw key bytes; a supplied mismatch or one id bound to
+  different bytes is fatal. The current id must exist in the array.
+  Every cache entry stores its id; raw keys never enter config, cache
+  artifacts, logs, or metrics. Startup **fails** when response caching is
+  enabled and the keyring/current key does not resolve (digests are never
+  computed unkeyed).
+
+  Lookup uses a stable per-representation **variant index** so the key ID is
+  discoverable before the variant artifact is addressed. The base index key is
+  the cache tuple excluding `Vary` values. Each bounded index descriptor stores
+  only the normalized final `Vary` name list, key ID, corresponding keyed
+  digests, artifact key, artifact expiry, and artifact revision tuple — never
+  raw request values. A reader loads the index, groups descriptors by key ID,
+  resolves each referenced key (one atomic keyring refresh if an ID is
+  unknown), recomputes the digests from the exact final publisher request, and
+  fetches only a descriptor whose complete name/digest tuple matches. A
+  still-unknown ID, malformed descriptor, missing artifact, expiry, or revision
+  mismatch is a miss for that descriptor, never a comparison under another
+  key. Multiple matching descriptors are corruption and make the entire base
+  lookup a miss with a metric; index order never chooses a winner.
+
+  Publication writes and verifies the immutable artifact first, then CAS-adds
+  or replaces its complete descriptor in the index. Rekeying or a changed
+  `Vary` set inserts the new artifact/descriptor before removing the old
+  descriptor; a crash may leave a safely unreachable artifact or two
+  nonmatching descriptors but cannot point to a partial artifact. Index
+  capacity eviction removes expired descriptors first and otherwise the
+  least-recently-used complete descriptor; it never rewrites a digest under a
+  new key ID. This is the one meaning of “insert-new-then-index-update rekey” in
+  the capability matrix and 304 rules.
+
+  Rotation atomically replaces the secret entry with a new valid keyring
+  containing the new current key **and all still-live previous keys**. Fleet
+  propagation may be mixed only in the safe direction: a process with the old
+  keyring can write/read the old id; the variant index exposes that id before
+  lookup, so a process seeing an unknown descriptor id refreshes the keyring
+  once, then treats a still-unknown descriptor as a cache miss. It never
+  guesses, probes with the current key, or computes unkeyed. A previous key may
+  be retired only after no unexpired index descriptor references it **and** the
+  maximum processed-artifact lifetime plus the adapter's qualified keyring
+  refresh bound has elapsed since it stopped being current. Key IDs are never
+  reused. Secret replacement atomicity, maximum propagation/refresh time, and
+  unknown-id refresh are explicit adapter capability cells and startup gates;
+  an unqualified adapter disables response caching rather than weakening the
+  grammar. Cross-adapter fixtures cover old→mixed→new propagation, unknown-id
+  refresh/miss, premature retirement rejection, and id/material mismatch.
+  Known-answer vectors under the all-zero 32-byte test key:
   `tsvry1|authorization|p|1|10:Bearer abc` →
   `c880c5e8c36febc0b1581c92f1d598fded34391626e67372ed63b2857d8a7b6b`;
   absent-field form `tsvry1|x-tenant|a` →
   `a2ae26cf529a5843a25f1448acc4e90016d4c1dce0ffda5662e3ac459433e1ab`. And
   a response derived from a request carrying an **identity-bearing TS
-  overlay** (the DataDome ClientID overlay) is forced `private,
-  no-store` unless an explicit per-overlay contract says otherwise —
+  overlay** (the DataDome ClientID overlay) is forced `private, no-store`
+  unless an explicit per-overlay contract says otherwise —
   the `Authorization` rule protects origin credentials, and this rule
-  protects the identity TS itself injected. Parsing itself is a **shared core parser with
-  fail-closed normalization**, not four adapter interpretations:
+  protects the identity TS itself injected. Parsing itself is a **shared core
+  parser with fail-closed normalization**, not four adapter interpretations:
   a `Cache-Control` value that fails the shared grammar has an
   **enumerated result, not a "most restrictive reading"** (restrictions
   are independent axes, so no single most-restrictive point exists):
@@ -206,19 +288,25 @@ no-store` in that case regardless of the mutation; `max-age`/`s-maxage` may
   Integration IDs are **startup-unique, enforced**: registry
   construction rejects a duplicate ID (current code silently coalesces,
   which corrupts attribution and budgets), with a duplicate-ID test in
-  the done-when. The registration also carries the **version the cache
-  tuple consumes, with a bump contract**: the version MUST change with
-  every output-semantic change of the mutator (review-checklist item;
-  where the mutator's behavior is fully declared configuration, the
-  version is a content hash of that declaration, making the bump
-  automatic), and the build-time invariant revision MUST bump with any
-  parser or merge-rule change — otherwise a deploy silently reuses old
-  post-hook finals and a new privacy restriction waits for cache
-  expiry. Until then the
+  the done-when. The registration's `behavior_revision` follows §2's bump
+  contract; configuration-dependent behavior is captured separately by the
+  effective-config digest. Model-only activation is separate from both, so the
+  **one cache revision tuple** contains exactly
+  `integration_registry_revision`, `effective_config_revision`,
+  `active_policy_digest`, `active_policy_ordinal`, `model_epoch`,
+  `activation_generation`, and `hook_invariant_revision` from the strong active
+  tuple at publication. Every processed artifact, mutation IR/read-set bundle,
+  variant descriptor, and variant-index update stores that complete tuple; a
+  lookup, local conditional, HEAD update, or 304 replay requires byte-for-byte
+  equality with current active. In particular, the `permissions_v2` model CAS
+  misses every `pre_epic_v1` artifact even though config/policy bytes did not
+  change. Core also carries a nonzero
+  `HOOK_INVARIANT_REVISION: u32`, bumped for every parser, merge, budget,
+  cache-artifact, or invariant semantic change. The cache tuple stores all
+  fields above, so a deploy cannot silently reuse old finals while a new
+  restriction waits for cache expiry. Until then the
   operation set is headers-only, and `Set-Cookie` is fully reserved.
-  `Set-Cookie` is fully reserved in v1 (§3 deferral). Violations are
-  rejected
-  at the operation layer (§2) and
+  Violations are rejected at the operation layer (§2) and
   logged at `warn` with the integration id. The reserved lists are single
   constants next to the definitions they protect, not duplicated in the
   hook.
@@ -259,11 +347,27 @@ no-store` in that case regardless of the mutation; `max-age`/`s-maxage` may
   separators), validated against core's budget at startup so a batch
   that passes core can never fail only on one adapter; a snapshot
   already **over** the core budget before any mutation rejects every
-  mutation batch — the budget bounds additions and never bricks an
-  over-budget origin response, which passes through and is counted)
-  bounds the sum across integrations — enforced in registration
-  order, so which operations are rejected when a budget trips is
-  deterministic.
+  ordinary batch — the budget bounds additions and never bricks an
+  over-budget origin response, which passes through and is counted;
+  security follows the replacement/reserve rule below)
+  bounds the sum across integrations. The budget has normative priority
+  partitions: ordinary mutators may consume at most **112 headers / 24 KiB**,
+  reserving 16 headers / 8 KiB for the core-owned security channel. Ordinary
+  batches remain registration-ordered within their partition. A security
+  `Continue` batch uses the reserve and, if necessary, evicts whole accepted
+  ordinary batches in reverse registration order until it fits; it never
+  removes half a batch and never drops origin fields. Ordinary output can
+  therefore never crowd out security effects. If the immutable origin head
+  plus the security batch alone exceeds the full budget, the security batch
+  is rejected atomically and the request follows the documented security
+  fail-open path with a dedicated metric — origin fields are not silently
+  sacrificed. A security `Respond` owns a replacement
+  response: all ordinary mutation batches are discarded and the challenge
+  is validated against the full 128-header / 32-KiB budget. A base publisher
+  response already over the full budget still passes unchanged, but no
+  ordinary mutation applies; security `Continue` applies only if the final
+  response fits after all ordinary batches are removed. These are separate
+  outcomes and metrics.
 
   | Adapter    | Header-count / total-bytes ceiling (capability cell)                                                                                                   |
   | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -274,7 +378,29 @@ no-store` in that case regardless of the mutation; `max-age`/`s-maxage` may
 
   A recorded cell below core's 128-header / 32 KiB budget is a startup
   error (shrink the core budget or raise the ceiling — never a silent
-  per-adapter divergence). Each mutator receives an **immutable, redacted snapshot of the
+  per-adapter divergence).
+
+  Hook/cache eligibility has the following concrete adapter cells; any
+  `qualification-pending` cell fails startup when the depending feature is
+  selected:
+
+  | Capability                                                                                         | Fastly                                                                                  | Axum (dev)                                          | Cloudflare                     | Spin                             |
+  | -------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- | --------------------------------------------------- | ------------------------------ | -------------------------------- |
+  | Runtime secret lookup for Vary-HMAC/DataDome                                                       | wired secret store; qualify key-rotation behavior                                       | dev secret binding required                         | qualify Workers secret binding | qualify component secret binding |
+  | Persisted processed artifact + mutation IR/read sets                                               | qualification-pending                                                                   | in-process dev implementation required; non-durable | qualification-pending          | qualification-pending            |
+  | Atomic artifact/metadata entry commit                                                              | qualification-pending                                                                   | implementation required                             | qualification-pending          | qualification-pending            |
+  | `Vary` variant index + insert-new-then-index-update rekey                                          | qualification-pending                                                                   | implementation required                             | qualification-pending          | qualification-pending            |
+  | DataDome field-line order, trusted IP/port, fixed HTTPS backend/no-redirect, and exact form limits | qualification-pending                                                                   | qualification-pending                               | qualification-pending          | qualification-pending            |
+  | SecurityUse JA4 request evidence                                                                   | platform value available; exact-field/payload qualification and sign-offs 23/28 pending | unavailable                                         | unavailable                    | unavailable                      |
+
+  The qualification commit records storage lifetime, maximum object size,
+  concurrency semantics, torn-write behavior, and fault-injection evidence;
+  “platform has KV” is not a qualifying cell.
+  `expose_host_fingerprints_to_vendor = true` also requires a qualified
+  SecurityUse JA4 cell; unsupported or pending is a startup error, while the
+  default `false` remains portable.
+
+  Each mutator receives an **immutable, redacted snapshot of the
   response head** (status and headers as of its turn, prior integrations'
   accepted operations applied) as its read context; it never holds a
   mutable reference (§2). Redaction is a security boundary, not
@@ -285,13 +411,19 @@ no-store` in that case regardless of the mutation; `max-age`/`s-maxage` may
   **excludes every `Set-Cookie` value and every reserved identity,
   consent, and privacy header value** (names may be listed as present;
   values are withheld).
+  Each registration also declares the complete set of response fields its
+  decision may read, including status as a distinguished input. Core records
+  the union with the accepted operation batch. Undeclared reads are a hard
+  conformance failure in tests; an integration unable to declare a complete
+  read set marks itself `revalidation = "refetch"`, which forbids IR replay
+  after any origin metadata change.
   Operations arrive as **attributed batches bound to a registration
   ID** — one batch per integration per response, ordered by
   registration, with the security channel's batch (§4a) ordered **after**
   ordinary response mutators — one global order, core finalization →
   ordinary mutators → security effects → invariant pass — so the
-  security layer's precedence over publisher-facing mutations holds
-  without a second ordering claim; the current flat effects vector satisfies neither
+  security layer's precedence over publisher-facing mutations holds through
+  both position and its reserved/response-owning budget rule; the current flat effects vector satisfies neither
   attribution nor budgets and is restructured accordingly. Validation
   and budgeting are **atomic per batch**: a batch that exceeds its
   budget is rejected whole (logged, attributed), never partially
@@ -311,39 +443,107 @@ no-store` in that case regardless of the mutation; `max-age`/`s-maxage` may
 Which responses the hook runs on, enumerated so two implementations cannot
 diverge silently:
 
-| Response                                          | Hook runs?                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| ------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Processed HTML document (rewritten by TS)         | Yes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| Streamed processed document                       | Yes — operations apply to the header block before first byte                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| Pass-through proxy response (not processed)       | No — TS is a transparent proxy for it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| Served-from-cache processed document              | Serves the **persisted post-hook finals** captured at cache fill (revision-versioned; mismatch = miss) — mutators run at fill/processing time only, so a normal hit and a conditional hit return identical policy metadata **by construction**, with no purity or determinism assumption about mutators                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| Redirect (3xx)                                    | No                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| Error responses TS itself generates (4xx/5xx)     | No                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `304 Not Modified` for a processed representation | **Persisted-metadata pass**: when the processed 200 was cached, its **final post-hook header set and the accepted mutation-operation batches that produced it (the persisted mutation IR)** were stored alongside the representation, **versioned by a fleet-stable tuple of four revisions** — the integration-registry revision (content hash over the ordered (integration ID, version) list), the config revision (the `tscfg1`-tagged effective-config digest), the policy revision (the (digest, activation-ordinal) pair from the permission spec's §5.5 register — the earlier "config store's globally assigned push version" definition is superseded), and the build-time invariant revision; local counters would collide across instances and binaries. There are two distinct 304 cases. A **locally generated conditional hit** (TS answers the client's conditional from its own fresh stored artifact) re-emits the persisted finals when **all four revisions** match, else cache-miss. An **origin-revalidation 304** is handled staged, then atomic, never in place: TS stages the 304's metadata off-record and diffs it against the separately stored **origin-side** metadata (origin validators and origin `Content-Length` describe origin bytes, not the rewritten artifact). (a) Any **byte-coupled representation field changed** (`Content-Encoding`, `Content-Type`, validators, digests — **changed, not merely present**: an ordinary 304 repeats the matching validator) → nothing publishes; the entry is invalidated and a full 200 is fetched and processed before any serve (RFC 9111 §3.2). (b) Only fields of the **enumerated safe-update set** changed — exactly: `Cache-Control`, the four enumerated CDN cache fields (under their reserved rules), `Expires`, `Date`, `Age`, `Vary`, and the registry-admitted mutable fields; **this set is the one definition of "cache-relevant fields," stated once** — → the new finals are **derived deterministically without re-running mutators** (mutators may be nondeterministic and run only at fill time): replay the persisted mutation IR — whose append/replace/merge semantics are core-defined deterministic functions of the operations plus the base — over the updated origin metadata, then re-run the invariant pass; an entry lacking its IR (an older cache schema) is unsafe → full refetch. The updated origin-side metadata, re-derived finals, and IR publish in **one atomic entry commit**; a changed `Vary` rekeys by **insert-new-entry-then-update-index ordering**, so a torn state yields a miss, never a wrong hit — single-entry atomic commit and this rekey discipline are adapter capability cells. (c) Nothing changed → re-emit as in the local-hit case. Artifact absence or a revision mismatch makes the recovery fetch **unconditional — every conditional field is stripped, the client's and TS's own alike** (forwarding the client's condition could return another 304 TS holds no usable bytes for); TS processes the full 200 under current revisions, then evaluates the client's **complete precondition set per RFC 9110 §13 against the new processed validators** — a failing `If-Match` or `If-Unmodified-Since` yields `412`, a matching `If-None-Match` or `If-Modified-Since` yields `304`, anything else the full response. `Set-Cookie` and validators follow ordinary 304 rules and are never replayed. Absent metadata → cache miss |
-| `HEAD` of a processed document                    | **Serves the persisted GET artifact when one exists** — parity with GET/304 by construction, since RFC 9111 §4.3.5 lets HEAD metadata update a stored GET response and mutators are not required to be deterministic; with no persisted artifact, HEAD is processed like a GET (headers only) and its finals stored as a **distinct head-only artifact type that never satisfies a later GET** — when a stored GET artifact exists a HEAD may **update** it only when the comparison — made against the separately stored **origin-side** metadata, never the processed artifact's (origin and rewritten lengths differ by construction, so the processed length is never the comparand and HEAD metadata never touches processed-side headers) — finds validators and origin `Content-Length` matching and no byte-coupled representation field changed (RFC 9111 §4.3.5); qualifying updates land origin-side under the same atomic-commit discipline as the 304 rules, and any mismatch **invalidates** the stored GET artifact rather than updating it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| Informational `1xx`, `204`, `205`, `206`          | No — enumerated so adapters do not infer independently                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+In this table, **persisted post-hook finals** means the cache-safe ordinary
+artifact only: origin metadata plus accepted ordinary mutation IR and the
+cache/privacy invariant result, with `Set-Cookie`, core request-specific
+identity fields, security-channel effects, and origin validators excluded.
+The security request filter evaluates every request before cache selection; a
+fresh `Respond` bypasses the artifact, while a fresh `Continue` batch is
+applied to the persisted ordinary artifact and the invariant pass reruns before
+emission. This applies equally to ordinary hits, local conditionals,
+origin-revalidation 304s, and HEAD. Therefore "`Set-Cookie` is never replayed"
+means never replayed from storage; a freshly validated per-request typed cookie
+operation may still emit on that response. Security `Respond` outputs are
+always `private, no-store` and never become artifacts.
+
+An **unconditional recovery fetch** first saves the client's preconditions for
+later local evaluation, then removes every upstream conditional/range field
+(`If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`,
+`If-Range`, and `Range`) so origin must return full bytes. TS processes that
+200 under current revisions, constructs the processed validator, and only then
+evaluates the saved client preconditions as the authoritative server for the
+transformed representation. Another bodyless origin 304 can never satisfy
+recovery.
+
+The 304 **safe-update set** is exactly `Cache-Control`, `Expires`, `Date`,
+`Age`, `Vary`, `Surrogate-Control`, `CDN-Cache-Control`,
+`Cloudflare-CDN-Cache-Control`, and `Edge-Control`. The phrase
+"registry-admitted mutable fields" in the matrix denotes an empty set in v1;
+adding any name requires a reviewed spec/registry revision and conformance
+fixture, never a runtime wildcard.
+
+| Response                                          | Hook runs?                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Processed HTML document (rewritten by TS)         | Yes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| Streamed processed document                       | Yes — operations apply to the header block before first byte                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| Pass-through proxy response (not processed)       | No — TS is a transparent proxy for it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| Served-from-cache processed document              | Serves the **persisted post-hook finals** captured at cache fill (revision-versioned; mismatch = miss) — mutators run at fill/processing time only, so a normal hit and a conditional hit return identical policy metadata **by construction**, with no purity or determinism assumption about mutators                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| Redirect (3xx)                                    | No                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| Error responses TS itself generates (4xx/5xx)     | No                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `304 Not Modified` for a processed representation | **Persisted-metadata pass**: a cached processed 200 stores its final post-hook headers, accepted mutation-operation batches, and the union of every mutator's declared response-field read set (the persisted mutation IR), versioned by §3's complete cache revision tuple, including model epoch and logical activation generation. A local conditional hit re-emits persisted finals only when the complete tuple matches current active. An origin-revalidation 304 is staged and diffed against separately stored origin-side metadata. (a) Any byte-coupled field changed (`Content-Encoding`, `Content-Type`, validators, digests) → invalidate and fetch/process a full 200. (b) A changed metadata field that intersects any persisted mutator read set, or an artifact/mutator lacking a complete read-set declaration, is also unsafe → full 200 refetch and ordinary hook execution; deterministic replay of old operations cannot stand in for re-evaluating a decision made from changed inputs. (c) If every changed field is outside every declared read set and belongs to the enumerated safe-update set (`Cache-Control`, reserved CDN cache fields, `Expires`, `Date`, `Age`, `Vary`, registry-admitted mutable fields), replay the persisted deterministic operations over updated origin metadata and rerun invariants. Updated origin metadata, finals, IR, read sets, and complete revision tuple publish in one atomic entry commit; changed `Vary` uses insert-new-entry-then-index-update ordering. (d) No change → re-emit persisted finals. Artifact absence or any tuple mismatch triggers an unconditional recovery fetch so TS obtains bytes. For processed-document GET/HEAD routes, TS is explicitly the authoritative server for the transformed representation: after processing the full 200 it evaluates RFC 9110 §13 preconditions against **processed** validators; this is not evaluation of origin validators by an intermediary cache. Other methods are never eligible for this recovery path. `Set-Cookie` and origin validators are never replayed. Absent metadata → cache miss |
+| `HEAD` of a processed document                    | **Serves the persisted GET artifact when one exists** — parity with GET/304 by construction, since RFC 9111 §4.3.5 lets HEAD metadata update a stored GET response and mutators are not required to be deterministic; with no persisted artifact, HEAD is processed like a GET (headers only) and its finals stored as a **distinct head-only artifact type that never satisfies a later GET** — when a stored GET artifact exists a HEAD may **update** it only when the comparison — made against the separately stored **origin-side** metadata, never the processed artifact's (origin and rewritten lengths differ by construction, so the processed length is never the comparand and HEAD metadata never touches processed-side headers) — finds validators and origin `Content-Length` matching and no byte-coupled representation field changed (RFC 9111 §4.3.5); qualifying updates land origin-side under the same atomic-commit discipline as the 304 rules, and any mismatch **invalidates** the stored GET artifact rather than updating it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Informational `1xx`, `204`, `205`, `206`          | No — enumerated so adapters do not infer independently                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 
 This deliberately narrows #782's general "outbound response" phrasing to
 processed documents (§6).
 
 ## 4a. The security channel — normative closed boundary
 
-The security channel (today: DataDome) is not a general exception; every
-degree of freedom is closed:
+The security channel (today: DataDome) runs under a distinct, typed
+`SecurityUse` authority rather than the advertising permissions P1/P4.
+`SecurityUse` permits bot/fraud evaluation and challenge continuity only;
+it never authorizes TS-controlled advertising identity, graph linkage, partner egress,
+other integrations, or general raw-value observability. Request-scoped raw
+security evidence may be disclosed only to the fixed DataDome Protection API
+endpoint and only from that integration's explicit field allowlist; it is not
+persisted in the identity graph, exposed to publisher origin or other
+integrations, or emitted in logs. It carries its own configured retention and
+deletion path. An advertising opt-out does not erase a
+strictly security-scoped identifier, while an authenticated deletion request
+or expiry under the security retention policy does. This is not a general
+exception. The path-only `Request` remains publisher-originated data and is
+explicitly covered by vendor retention/DSR sign-off; query strings and full
+referrers are never in the security view. Every degree of freedom is closed:
+
+- **Host evidence is not a back door to the deferred device provider.**
+  `[device] provider = "fastly"` remains startup-rejected and no JA4-derived
+  classification is stored. If DataDome's Protection API is allowed to receive
+  request-scoped `TlsProtocol`/`JA4` evidence, its registration enumerates each field,
+  proves vendor necessity and payload bounds, and keeps it ephemeral under
+  `SecurityUse`; those exact consumers and fields are part of product/vendor
+  sign-offs 23/28. `TlsCipher` is omitted because the platform value has
+  different semantics from the vendor field, `H2Fingerprint` is not in the
+  vendor contract, and all other host evidence is omitted.
+- **Deletion and retention name the system boundary honestly.** TS stores no
+  server-side DataDome identifier mapping. On an authenticated TS deletion
+  request it excludes the route from vendor validation, emits a typed
+  `datadome` cookie deletion, and sends no ClientID to DataDome for that
+  request; re-presentation retries deletion. A lost browser response can leave
+  the cookie until its configured `security_cookie_max_age`, which is the
+  bounded residual sign-off 23 accepts. This operation does **not** claim to
+  erase data already held by DataDome: vendor-side retention and data-subject
+  deletion require a named contractual/API procedure in the decision record.
+  If no such vendor procedure exists, operator documentation says so and may
+  not describe TS cookie deletion as vendor-data deletion.
 
 - **Typed security-cookie operation with a concrete lifecycle, not
   header strings.** The channel emits cookies only through a typed
   operation, and the registration is not a placeholder — for DataDome
   it pins, **aligned to documented vendor behavior where hardening was
-  not intended**: cookie name exactly `datadome`; `Domain` per
-  DataDome's own guidance (the module sets it; TS validates it does not
-  exceed the registrable domain, computed against the **vendored
+  not intended**: cookie name exactly `datadome`; one configured ownership
+  tuple for every set and deletion: path exactly `/` and
+  `security_cookie_domain = "host-only"` (default) or one explicit normalized
+  ASCII domain. Host-only mode requires the vendor `Domain` attribute to be
+  absent; explicit-domain mode requires it to equal the configured domain
+  exactly — TS never accepts a different domain and never rewrites one scope
+  into another. The explicit value cannot exceed the registrable domain,
+  computed against the **vendored
   Mozilla PSL snapshot** `docs/superpowers/specs/psl-snapshot-ref.md` —
   ICANN + private sections, IDNA-mapped; IP-literal or single-label
   hosts fall back to host-only), path `/`; `Secure` mandatory;
   `SameSite` configurable `Lax` (default) / `Strict` / `None`
   (`None` requires `Secure`), matching the vendor's endpoint options;
-  the returned `Domain` must additionally **domain-match the current
+  the configured/returned `Domain` must additionally **domain-match the current
   request host** per RFC 10025, the current cookie specification obsoleting RFC 6265 (domain-match and the PSL boundary check
   are separate requirements) and a vendor cookie using `Expires` is
   normalized to its Max-Age equivalent (both present → `Max-Age` wins,
@@ -366,8 +566,10 @@ degree of freedom is closed:
   wall clock at parse time (the shared skew-bounded basis; a result of
   0 is a deletion), and the 512-byte limit measures the **normalized**
   serialized `name=value` plus attributes in bytes;
-  `Max-Age` at most **31,536,000 seconds** (the vendor's one-year cap —
-  the earlier 396-day figure exceeded it); size ≤ **512 bytes**
+  `Max-Age` is capped by required operator configuration
+  `security_cookie_max_age` in the vendor-supported range 7 days through
+  **31,536,000 seconds** (one year); the returned cookie may be shorter but
+  never longer. There is no silent one-year default. Size ≤ **512 bytes**
   (DataDome's current Fastly-module limit; 4 KiB was ours, not theirs).
   Where the contract **is** deliberately narrower than the vendor — the
   spec-pinned pointer allowlist starting at ClientID-only against
@@ -404,12 +606,35 @@ degree of freedom is closed:
   other integrations' request views, publisher-origin proxy forwarding,
   proxy/click/Testlight upstreams, auction/page-bids request
   serialization, and logs (redaction list) — each surface a tested row
-  of the inventory; only the security channel itself observes it; vendor egress goes only to DataDome
-  endpoints; deletion is always possible; and whether TS's own
-  destructive withdrawal also expires it is exactly the open half of
-  **sign-off item 23** — the carve-out is _pending ratification_, not
-  ratified, and the permission inventory's cookie deferral stands until
-  it closes. No other request filter inherits the cookie capability.
+  of the inventory; only the security channel itself observes it; vendor
+  egress goes only to the fixed DataDome Protection API authority and path;
+  redirects are not followed; deletion is always possible
+  through the `SecurityUse` lifecycle; and advertising withdrawal never
+  grants access to or reuses the identifier. No other request filter
+  inherits the cookie capability.
+- **Cookie ownership makes deletion total for the scope TS creates.** While
+  DataDome is enabled, `datadome` is a security-owned name across the final
+  response: before the security batch applies, core removes and meters every
+  origin, core, cached, or ordinary-mutator `Set-Cookie` for that name;
+  unrelated cookie names remain separate field lines. Only the typed security
+  operation may emit it. Authenticated deletion emits the same configured
+  `(name, domain mode/domain, path)` tuple with `Max-Age=0`; it does not guess a
+  scope from the request cookie, whose wire form carries no Domain or Path.
+  Candidate validation rejects a change of domain mode/domain while the
+  previous active DataDome configuration can still have a live cookie. The
+  supported migration is disable + wait at least the previous
+  `security_cookie_max_age` + activate the new scope; a faster scope change
+  requires a separate bounded deletion-fan-out design. The permission spec
+  §5.5 whole-settings serve fence applies before cookie processing. A bounded
+  old-generation admission validation may survive only during the pre-promotion
+  drain; the register's promotion-not-before plus member quiescence proves it
+  and every admitted effect ended before the activation CAS. After that CAS,
+  no instance may emit, refresh, or delete a `datadome` cookie until it has
+  loaded and leased the exact new active tuple. A stale instance stops at serve
+  admission rather than extending the old scope. Fixtures cover origin
+  collision, host-only vs explicit-domain set/delete, attempted domain change,
+  and duplicate request cookies. The deletion claim therefore covers every
+  cookie this contract can create, not arbitrary pre-contract scopes.
 - **The incoming `X-DataDome-ClientID` request header is owner-only,
   like the cookie.** DataDome prioritizes the header over the cookie,
   so leaving it in the shared request would hand other integrations and
@@ -446,20 +671,25 @@ degree of freedom is closed:
   priority rule exists in v1: the header session form (`X-Set-Cookie`)
   is matrix-governed as batch-invalid, so "header form wins" is
   unreachable and deleted.
-- **Request-header pointers are a positive, enumerated allowlist.**
+- **Request-header pointers are a positive, enumerated allowlist with no
+  default publisher-origin identifier exposure.**
   "Documented enrichment headers" is not enforceable; the registration
   enumerates the exact names from the **checked-in allowlist file
   `docs/superpowers/specs/datadome-header-allowlist.md`** — spec-pinned
-  today to exactly **`X-DataDome-ClientID`**; every other `X-DataDome-*`
+  today to exactly **`X-DataDome-ClientID`**, admitted only when the
+  operator explicitly sets
+  `[integrations.datadome] expose_client_id_to_origin = true` (default
+  `false`); every other `X-DataDome-*`
   field is rejected until a reviewed commit adds it to that file
   ("documented enrichment set, listed one by one" without an actual list
   was a wildcard whose contents could change outside the spec) —
-  resolving what was a contradiction:
-  ClientID propagation is required by the existing DataDome contract
-  and test, and its identity-class nature is precisely why it applies
-  only to an **owner-scoped publisher-upstream overlay**, never the
-  shared request that later integrations read, with its vendor egress
-  ratified under sign-off 23. Everything else — authentication,
+  resolving what was a contradiction. When the opt-in is false, the
+  vendor-returned ClientID is discarded and the publisher origin is not
+  an identifier observer. When true, it applies only to an owner-scoped
+  publisher-upstream overlay, never the shared request; startup logs the
+  additional consumer, operator documentation must disclose its purpose
+  and retention, and a fixture proves no other surface can read it.
+  Everything else — authentication,
   `Cookie`, `Forwarded`/`X-Forwarded-*`, other identity, consent, and
   routing-authority fields — is rejected by name and by class: a
   compromised endpoint must not replace origin credentials, inject
@@ -516,8 +746,9 @@ degree of freedom is closed:
   `X-DD-*`, and `Pragma`, letting one conforming implementation accept
   the vendor's documented `Set-Cookie X-DD-B` allow-example while
   another invalidated the whole batch). No `X-DD-*` wildcard exists:
-  every name is enumerated, `X-DD-B` included (drop-individually in
-  cookie mode — dropping it does not break cookie sessions). The
+  every name is enumerated, `X-DD-B` included and forwarded exactly once
+  as the vendor's documented cookie-mode browser-response signal; it is
+  never copied into publisher-upstream or another integration. The
   documented vendor responses (both the challenge example and the
   `Set-Cookie X-DD-B` allow example) are **verbatim fixtures asserting
   the decision survives** and exactly the mapped fields emit.
@@ -550,11 +781,15 @@ degree of freedom is closed:
 ## 4. Done-when (from #782, sharpened)
 
 1. Trait + builder + registry application, each public item documented.
-2. **The pre-existing `RequestFilterEffects.response_headers` channel
-   remains a distinct, core-owned security channel — §4a defines its
-   closed boundary.** Folding it into this hook would break its one real
-   consumer: DataDome sets headers **and cookies** on 200, 301/302, 401,
-   403, and 429 responses — response classes (§3a) this hook never runs
+2. **The old generic `RequestFilterEffects.response_headers` channel is
+   removed.** DataDome uses the separate sealed, core-registered
+   `DataDomeSecurityRequestFilter` and typed `DataDomeSecurityEffects` defined
+   by its design; §4a defines that closed boundary. Generic request filters
+   receive only `RedactedRequestView` and ordinary attributed effects and
+   cannot express the security view, owner overlay, cookie operation, or
+   reserved security header. The dedicated channel is necessary because
+   DataDome sets headers **and cookies** on 200, 301/302, 401, 403, and 429
+   responses — response classes (§3a) the ordinary response hook never runs
    on, with cookie emission v1 reserves.
 3. **At least one real consumer ships in the same PR** — an existing
    integration registering a mutator for a real need (or, failing a real
@@ -576,7 +811,14 @@ degree of freedom is closed:
    origin's cache restrictions + public replacement → restriction
    preserved (pass-through responses never run the hook, §3a); a cache-hit serve re-applying mutations without
    weakening the stored classification; a `Vary` mutation neither
-   dropping core-required values nor bypassing the snapshot; each of the four enumerated CDN fields (`Surrogate-Control`,
+   dropping core-required values nor bypassing the snapshot; the §3
+   normalization fixture proves field-line grouping/case/order collapse to one
+   sorted lowercase descriptor, repeated names digest once, request value
+   instances retain octet/order boundaries, malformed/empty mutation members
+   reject, a malformed snapshot becomes `Vary: *` plus `no-store`, and `*`
+   writes no artifact; a `pre_epic_v1` artifact/index descriptor is a miss
+   immediately after the model-only `permissions_v2` activation CAS even when
+   config and policy digests are unchanged; each of the four enumerated CDN fields (`Surrogate-Control`,
    `CDN-Cache-Control`, `Cloudflare-CDN-Cache-Control`, `Edge-Control`)
    individually stripped; and a rejected `Content-Encoding` mutation.
 

@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "canonicalization": "RFC 8785 (JCS)",
+  "digest": "SHA-256",
+  "domain_prefix_utf8": "tspol1|",
+  "vectors": [
+    {
+      "name": "minimal-gdpr-policy",
+      "effective_policy": {
+        "rules": {
+          "default": "gdpr"
+        },
+        "groups": {
+          "gdpr": {
+            "regime": "gdpr",
+            "default": "requires_signal"
+          }
+        }
+      },
+      "canonical_json_utf8": "{\"groups\":{\"gdpr\":{\"default\":\"requires_signal\",\"regime\":\"gdpr\"}},\"rules\":{\"default\":\"gdpr\"}}",
+      "sha256_hex": "68f72cc004bd59df7f799be24685b85cbbf5d5fbd1ba3069c8bf51adf4a88e6b"
+    },
+    {
+      "name": "us-country-floor-and-state-override",
+      "effective_policy": {
+        "rules": {
+          "default": "non-regulated",
+          "US/CA": {
+            "overrides": {
+              "select-personalised-ads": "requires_signal"
+            },
+            "group": "us-opt-out"
+          },
+          "US": "us-opt-out"
+        },
+        "groups": {
+          "us-opt-out": {
+            "regime": "us-privacy",
+            "default": "requires_signal"
+          },
+          "non-regulated": {
+            "regime": "none",
+            "default": "granted"
+          }
+        }
+      },
+      "canonical_json_utf8": "{\"groups\":{\"non-regulated\":{\"default\":\"granted\",\"regime\":\"none\"},\"us-opt-out\":{\"default\":\"requires_signal\",\"regime\":\"us-privacy\"}},\"rules\":{\"US\":\"us-opt-out\",\"US/CA\":{\"group\":\"us-opt-out\",\"overrides\":{\"select-personalised-ads\":\"requires_signal\"}},\"default\":\"non-regulated\"}}",
+      "sha256_hex": "6c578c849c323936dc6d492449214c19e16e968b01a962c6ef99e9bbe3a08553"
+    },
+    {
+      "name": "explicit-permission-map-without-default",
+      "effective_policy": {
+        "rules": {
+          "default": "explicit"
+        },
+        "groups": {
+          "explicit": {
+            "regime": "none",
+            "permissions": {
+              "store-on-device": "granted",
+              "select-personalised-ads": "requires_signal"
+            }
+          }
+        }
+      },
+      "canonical_json_utf8": "{\"groups\":{\"explicit\":{\"permissions\":{\"select-personalised-ads\":\"requires_signal\",\"store-on-device\":\"granted\"},\"regime\":\"none\"}},\"rules\":{\"default\":\"explicit\"}}",
+      "sha256_hex": "47745dbb0b5cf113e4d2eb9dda48e6fc9c6c8c18dc39ee715e9838edfd57727b"
+    }
+  ],
+  "rejection_vectors": [
+    {
+      "name": "null-is-not-a-materialized-policy-value",
+      "raw_json": "{\"rules\":{\"default\":null}}",
+      "error": "null value"
+    }
+  ]
+}

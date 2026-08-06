@@ -25,40 +25,54 @@ here is treated as malformed-present (permission spec §4.4).
 | 21             | usnj                                                | 1                   |
 | 22             | ustn                                                | 1                   |
 | 23             | usmn                                                | 1                   |
+| 24             | usmd                                                | 1                   |
+| 25             | usin                                                | 1                   |
+| 26             | usky                                                | 1                   |
+| 27             | usri                                                | 1                   |
 
-Version values for sections 6–23 were captured from the IAB registry at
-the time of writing and are re-verified against the official registry as
-part of ratification review. Sections 24–27 have assigned IDs but no
-reproducibly published binary layouts in the official sources as of this
-snapshot; they are reserved and inert until an official layout can be
-vendored here. Any change is a reviewed change to this file.
-
-## Reserved sections — NOT accepted, no version
-
-These state sections have assigned IDs but no reproducibly published
-official binary layout as of this snapshot. They are **not** in the
-accepted-version table above: an implementation MUST NOT decode them,
-and a request carrying one behaves national-section-only (permission
-spec §4.5, sign-off 32). A reserved ID is _expected-inert_; an unknown
-ID (outside both tables) is _flagged for snapshot review_ — the only
-observable difference is logging.
-
-| GPP section ID | State     | Status                        |
-| -------------- | --------- | ----------------------------- |
-| 24             | usmd (MD) | reserved — no official layout |
-| 25             | usin (IN) | reserved — no official layout |
-| 26             | usky (KY) | reserved — no official layout |
-| 27             | usri (RI) | reserved — no official layout |
+At the pinned commit below, the official section registry assigns IDs 24–27
+to MD, IN, KY, and RI and each named state specification defines accepted
+version 1. That commit-backed statement, rather than an unverified publication
+month, is the authority for admitting them. Treating them as national-only
+would discard a state-specific choice. Unknown IDs outside the accepted table
+still contribute nothing and are flagged for snapshot review.
 
 ## Provenance and vectors
 
-Supported sections (6–23) pin to the official IAB GPP registry revision
-recorded by the implementation PR (immutable upstream commit hash), with
-per-section encoded conformance vectors vendored alongside. A date is not
-a revision; the commit hash is the reproducible authority.
+The immutable authority is the official
+`InteractiveAdvertisingBureau/Global-Privacy-Platform` commit:
 
-**Status: placeholder until ratification.** Neither the immutable
-registry commit nor the conformance vectors are recorded yet; like the
-PSL snapshot, filling them is a pre-ratification prerequisite
-(migration spec §4) — the §4.5 field mappings cannot be reproduced
-against a pinned registry until they land.
+`00ffaefe91513785e886c83877e9b56a4ec8e88c`
+
+Normative upstream paths for the newly admitted layouts are:
+
+- `Sections/US-States/MD/Maryland Privacy Technical Specification.md`
+- `Sections/US-States/IN/Indiana Privacy Technical Specification.md`
+- `Sections/US-States/KY/Kentucky Privacy Technical Specification.md`
+- `Sections/US-States/RI/Rhode Island Privacy Technical Specification.md`
+- `Sections/Section Information.md`
+
+The implementation vendors decoder fixtures under
+`crates/trusted-server-core/testdata/gpp/00ffaefe91513785e886c83877e9b56a4ec8e88c/`.
+That directory contains a `manifest.json` object with:
+
+- `upstream_commit_oid` and `upstream_commit_tree_oid`;
+- a sorted `sources` array containing `{path, blob_oid, sha256_hex}` for all
+  five normative paths above — the four state specifications and
+  `Sections/Section Information.md`; and
+- a sorted `cases` array whose entries are
+  `{section_id, version, case, encoded, expected}`.
+
+The vendoring PR description quotes the same commit/tree/blob values and the
+independent command output used to verify every raw source SHA-256 and the
+byte-for-byte copy. A commit OID without its tree and source-blob witnesses is
+not accepted as completed provenance. `expected` uses the
+permission spec's normalized P1/P4/GPC tokens, not decoder-library enums.
+Fixture encodings must be constructed from the pinned bit layouts by an
+independent generator or hand-checked vector, never emitted and consumed only
+by the decoder under test. For every accepted section/version the corpus must
+contain: minimum valid core-only string, core + GPC true, each mapped opt-out
+value, each explicit not-opted-out value, explicit N/A, malformed/truncated
+input, unsupported version, and a mixed known/unknown-section string. CI
+refuses to update this file unless the complete corpus for the new commit is
+present.

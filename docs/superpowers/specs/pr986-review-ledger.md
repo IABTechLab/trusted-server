@@ -631,3 +631,255 @@ and the cookie citations updated to RFC 10025 (obsoleting RFC 6265).
 Ratification state: unchanged — 32 open rows, decisions/ empty beyond
 the README, no adapter qualified for the identity protocol or the
 header ceilings, GPP/PSL snapshots placeholders. All user-side gates.
+
+## Post-decision pass 1 (author assessment; formerly internal Round 21)
+
+The product posture was re-reviewed and the recommended resolutions were
+applied to the normative text while ratification remains open. This round
+supersedes Round 20 where the two conflict; historical rows above are not
+current requirements.
+
+- GPC and GPP/USP sale, sharing, and targeted-advertising choices are
+  persistent P4 use opt-outs, not identity deletion or P1 withdrawal.
+  Destruction is limited to the exhaustive permission §4.2 triggers.
+- N/A, absence, reserved, unknown, and unsupported values never grant.
+  Regionless/country-only US traffic uses the protective country floor;
+  selected-provider geo failure uses the protective failure profile.
+- Use opt-outs do not expire at a consent TTL and replay saturation never
+  shortens them. Expired/grant history is evicted first; restrictive state
+  retains its complete horizon.
+- Prefix saturation blocks rowless admission only. It never revokes an
+  authenticated real row without an exact withdrawn-suffix match.
+- Failed negative writes use a durable per-family outbox checked by every
+  identity consumer; failure of both target and outbox closes a globally
+  visible breaker over all positive identity operations while repair remains
+  enabled.
+- Host JA4/H2 fingerprinting is deferred and startup-rejected; the shipped
+  classifier is UA-only and no fingerprint-derived value is newly stored.
+- Policy distribution uses a separate monotonic push-sequence allocator and
+  prepare/commit fleet activation. Mixed-revision destructive execution is
+  prohibited. JCS digest vectors are now checked in.
+- DataDome has a narrow `SecurityUse` lifecycle, no publisher-origin ClientID
+  exposure by default, a required bounded cookie lifetime, reserved response
+  budget, and exactly-once browser forwarding of documented `X-DD-B`.
+- GPP sections 24–27 are accepted at official version 1 and pinned to the IAB
+  repository commit in `gpp-registry-snapshot.md`; the PSL reference is also
+  pinned. The generated GPP corpus and vendored PSL bytes remain release
+  prerequisites, not facts already present in this worktree.
+
+Ratification state remained user-side: all 32 rows then listed were `open` and
+no decision record was fabricated. Later passes added rows 33–34; the current
+table therefore has 34 open rows. Adapter qualification cells and the required
+vendored artifacts remain explicit pre-implementation gates.
+
+## Post-decision pass 2 (internal read-only assessment; formerly Round 22)
+
+An internally dispatched read-only pass rechecked the then-current normative text across
+activation, negative state, replay, jurisdiction, GPP aggregation, cache
+security, and the DataDome lifecycle. It reported no P0. This pass supersedes
+post-decision pass 1 where the implementation contracts became more precise:
+
+- Config publication is immutable and version-addressed. Candidate,
+  readiness, and active records bind the complete blob/data/config/policy
+  tuple; a mutable latest blob has no activation authority, and config-only
+  pushes stage the entire settings snapshot while retaining the policy
+  ordinal.
+- The negative outbox is in a failure domain independent of its target and now
+  has a bounded, absorbing, evidence-ordered enqueue/apply/exact-ack state
+  machine. Capability qualification includes failure semantics, not merely
+  three strong key APIs.
+- Timestamp-less GPP/USP/GPC replay cannot grant, but a currently presented
+  restrictive value reasserts suppression after an ordered clear. GPC has an
+  assigned source token and digest vectors.
+- Authority summaries carry tagged live/static/failure jurisdiction
+  provenance. Protective lookup failure cannot authorize context-free S2S;
+  static provenance is fenced to its active config and age horizon.
+- Mapped malformed GPP sections now participate in the ordered aggregator as
+  P4 grant blockers. Because this is a product choice, it is new open sign-off
+  item 33 rather than a fabricated decision.
+- The DataDome filter no longer receives raw `Request` or generic header
+  mutations. Cookie set/delete uses one configured ownership tuple;
+  `datadome` and `X-DD-B` collisions are stripped under security ownership;
+  the config inventory, request limits, exposure defaults, and adapter gates
+  are single-source and exact.
+- Vary-HMAC rotation has a versioned keyring grammar, deterministic key IDs,
+  overlap/retirement rules, refresh-on-unknown behavior, and adapter
+  qualification fixtures.
+
+At that pass 33 rows were open; the current table has 34. No decision record
+exists beyond the README, no adapter currently qualifies the new stateful
+identity or response-artifact protocols, and the GPP corpus plus PSL bytes/hash
+remain missing release artifacts. The recommended spec posture is internally
+stated; product ratification and implementation planning remain separate gates.
+
+The follow-up internal blocker pass reported **no remaining P0 or P1** after
+the generic request-filter and sealed DataDome security-filter APIs were
+physically separated and the legacy generic security-header channel was
+removed. This is an internal assessment, not external verified closure.
+
+## Post-decision pass 3 (author whole-surface assessment; formerly Round 23)
+
+A fresh internal specification-only review found no P0, but found six remaining P1
+contract contradictions and six P2 completeness gaps. This pass supersedes
+post-decision pass 2's “no remaining P1” conclusion. The approved conservative resolutions
+are now normative:
+
+- The negative-intent outbox has the missing `q` physical constructor/parser,
+  one fully materialized JCS transition schema, closed source/cause tokens, and
+  a known-answer vector that includes evidence and a post-clear authorization
+  floor. Deferred transaction tag `x` is no longer presented as an allocated
+  v1 key.
+- Whole-config prepare/commit now names authenticated authoritative membership,
+  stable member IDs, membership-change restaging, startup admission, and a
+  strong per-request fence over every settings consumer. A hash-linked
+  activation journal, atomically bound by the promotion CAS, separates the
+  minimum 30-day/time-horizon audit and GC clock from the 16-entry operational
+  history.
+- N+1 remains a fail-restrictive reader of N+2 negative state and can persist
+  explicit pre-epic withdrawal/deletion, but it does not originate durable P4
+  use suppression. Suppression creation begins only with N+2, active new-shape
+  configuration, and the fleet-wide `permissions_v2` model promotion,
+  matching the promised pre-epic live gate.
+- DataDome Protection API egress is fixed to one HTTPS host/path with no
+  redirect following. `Request` is path-only, `Referer` origin-only, raw
+  forwarding-IP headers are omitted, IP/port come from trusted connection
+  metadata, and publisher path disclosure is named honestly in vendor
+  retention/DSR sign-off rather than called identity-free.
+- Auction dispatch with P4 unset uses a positive `ContextualAuctionView`, not
+  the ordinary request minus TS IDs. The view excludes client IP/UA, precise
+  geo, page/referrer URL, user IDs/data/segments, arbitrary extensions, device
+  fingerprints, and client forwarding headers; an unqualified destination
+  receives no request.
+- Policy groups have one exact `permissions` child-map grammar and a canonical
+  vector. GPP transport derives `gpp_sid` from decoded applicability and emits
+  the GPP/SID pair atomically. Vary-HMAC lookup uses a stable variant index that
+  exposes the stored key ID before digest comparison. Long provider identifiers
+  use an explicit collision-detecting SHA-256 mode with a vector and fail-closed
+  canonical-identifier comparison.
+- The normative cleanup removes the config-only-push typo, uses the consistent
+  policy/config-activation name, and replaces invalid bare workspace test/lint
+  commands with the repository's target-matched aliases.
+
+Ratification state remains separate: product decision rows 1–34 are open, no
+decision record is fabricated, adapter qualification remains pending, and the
+vendored GPP corpus plus PSL bytes/hash remain release prerequisites.
+
+## Post-decision pass 4 (internal executable-contract assessment; formerly Round 24)
+
+Two internally dispatched read-only passes rechecked the edited specification
+set. The first found two P1 and four P2 gaps in the post-decision pass 3
+repairs; iterative fixes and a final internal whole-surface pass reported **no
+remaining P0, P1, P2, or P3 spec finding at that revision**. This is a
+self-assessed result, not a claim of externally verified closure. The contracts
+at that revision were:
+
+- Settings and writer/model activation share one strong register with an
+  explicit logical `activation_generation`. Both transitions require immutable
+  fleet membership, unanimous readiness, an all-request admission stop, and
+  bound quiescence before the promotion CAS. A never-reused candidate
+  incarnation plus incrementing drain attempt prevents delayed readiness or
+  quiescence acknowledgments from crossing cancel/abort/restage boundaries.
+  N+2 emulates N+1 until the quiescent `permissions_v2` CAS; afterward the
+  minimum binary generation excludes N+1 before admission.
+- The activation journal now has a portable JCS object ID, exact schema,
+  candidate/drain/readiness/quiescence bindings, safe-integer profile,
+  store-clock lifecycle, snapshot-consistent listing, conservative GC, and
+  authenticated checkpoint pruning. Its known-answer object ID is
+  `2ac2ab49922f261a8eecaee64f3621da8a2f2c1061c945defd7bc75ac2d5a569`,
+  with three numeric rejection vectors.
+- Contextual auction output is governed by the sole machine-readable
+  `contextual-openrtb-v1-allowlist.json`: 98 unique exact leaf rules, closed
+  type/cardinality/derivation vocabularies, executable container/cross-field
+  constraints, atomic GPP/GPP-SID transport, nonempty supply chain, and exact
+  banner/video shapes. Unknown, unlisted, ill-typed, or untraceable output
+  suppresses dispatch.
+- Processed artifacts, mutation IR, variant descriptors, and indexes bind the
+  complete cache revision tuple, including `model_epoch` and logical
+  `activation_generation`; a model-only cutover cannot replay a pre-epic
+  artifact. `Vary` names have one lowercase/deduplicated/sorted grammar and
+  repeated request values retain presence, instance, length, order, and octet
+  identity under keyed digests.
+- `sha256-detect` graph keys carry an atomic canonical-identifier collision
+  witness checked before every read/write/merge/use. DataDome request headers
+  now have exact singleton/list/cookie multiplicity, OWS/UTF-8 handling,
+  length, omission, and cross-adapter fixture rules.
+
+This was author-assessed specification completeness, not product ratification
+or implementation readiness. A subsequent external reviewer independently
+recomputed the then-current eleven known-answer vectors (including the
+byte-exact JCS intent ID) and the 98 unique contextual allowlist leaves; those
+computations are externally verified for that revision, while the broader
+“no findings” statement remains internal. Product decision rows 1–34 remain
+open; no decision record has been fabricated. Adapter qualification, the
+generated/vendored GPP corpus, and the pinned PSL bytes/hash remain explicit
+release gates.
+
+## Post-decision pass 5 (external consequence review, 2026-08-05)
+
+A subsequent external specification review found no P0 and no internal P1
+contradiction, but identified two material operational consequences that the
+sign-off rows did not state plainly, plus P2/P3 audit and runbook gaps. The
+approved conservative resolutions are now normative:
+
+- Whole-settings/model serve admission may use only the deployment-qualified
+  bounded activation lease. The draining CAS records a non-early store-clock
+  promotion-not-before; lease expiry closes old admission unless a fresh
+  non-draining renewal succeeds, while every authenticated member's
+  quiescence still proves that the last request and background effect ended.
+  Successful authority, revocation, outbox, `w`, and breaker reads remain fresh
+  for every positive identity decision; only typed restrictive results may be
+  cached to deny.
+- Sign-off 19 now says directly that every ordinary settings promotion is a
+  scheduled fleet-wide deployment-unavailable interval and is not a
+  zero-downtime config protocol. A narrower or blue/green drain remains a
+  separate effect-classification design.
+- The authenticated deployment controller owns an idempotent post-model-CAS
+  `m00` raise/read-verify step. A lower mirror retries without changing active;
+  a higher mirror remains a fail-closed register/journal inconsistency.
+- Non-destructive signals on the old rowless identity are request-local and
+  create no per-family or `w` state. If the same request is permitted to mint a
+  new row-backed family, that family's current suppression becomes durable
+  before its cookie or identity is usable.
+- The geo-failure behavior row now declares the signal-backed grant divergence;
+  decision rows 11 and 16 name their rejected unbounded-residual and TTL-sticky
+  alternatives; snapshot vendoring requires commit-tree, source-blob, and
+  byte-hash witnesses; and the unsupported publication-month assertion was
+  replaced by commit-backed GPP registry/layout facts.
+- Internal rounds 21–24 were renamed post-decision passes and their
+  self-assessed versus externally verified evidence is explicit.
+
+The activation-journal schema and KAT gained the lease bound and
+promotion-not-before witness, so pass 4's externally recomputed activation
+object ID is historical. The current local KAT object ID is
+`7af3934b4e5500903ef77ad8a1367db83b03fc62a0bb83bd0849289c685d2e88`;
+it requires fresh external recomputation before being described as externally
+verified. Ratification remains unchanged: all 34 decision rows are open,
+`decisions/` contains no fabricated approval, no adapter qualifies the complete
+stateful identity/activation protocol, and vendored GPP/PSL artifacts remain
+release prerequisites.
+
+## Post-decision pass 6 (independent internal targeted assessment, 2026-08-05)
+
+An independent read-only pass over the consequence-review changes found no P0
+and recomputed the current activation-journal object ID exactly. It identified
+five cross-spec gaps, now text-closed:
+
+- Stateless identity no longer appears to waive the universal activation
+  fence. Every serving adapter must qualify whole-settings/model activation;
+  stateless selection waives only identity-state capabilities.
+- The register promotion gate and journal `created_at` comparison now require
+  one explicitly qualified authenticated time domain. Adapters with
+  incomparable register/object-store clocks fail qualification rather than
+  performing an undefined timestamp comparison.
+- The exhaustive model-candidate identity list now includes the snapshotted
+  admission-lease bound.
+- Qualification fixtures now reject a zero config/model bound, candidate or
+  readiness mismatch, and attempted in-traffic bound change before drain.
+- The migration runbook's mirror-completion cross-reference now points to §4
+  requirement 5 rather than rollout item 5.
+
+The independent internal recomputation produced
+`7af3934b4e5500903ef77ad8a1367db83b03fc62a0bb83bd0849289c685d2e88`.
+This verifies the current KAT inside the review process but is not relabeled as
+the fresh external recomputation requested in pass 5. Decision rows and release
+gates remain unchanged.

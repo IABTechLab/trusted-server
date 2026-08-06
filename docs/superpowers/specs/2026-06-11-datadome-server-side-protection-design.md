@@ -13,7 +13,11 @@
 > send `X-DataDome-X-Set-Cookie` when the header ID is used") is
 > **superseded for v1**: header-session mode is startup-rejected (hook
 > spec §4a); TS never requests it and does not forward incoming header
-> ClientIDs to the vendor.
+> ClientIDs to the vendor. This document's generic "TLS/client metadata"
+> instruction is also narrowed by §4a: DataDome may receive only explicitly
+> enumerated, request-scoped security fields under `SecurityUse`; the device
+> provider remains deferred, no fingerprint-derived classification is stored,
+> and unlisted host evidence is omitted.
 
 **Issue:** #317
 **Date:** 2026-06-11
@@ -69,8 +73,10 @@ JavaScript SDK.
    default. Default-exclude Trusted Server internal routes and static assets.
 2. **Endpoint default:** default to DataDome's Fastly-specific Protection API
    endpoint from the official Fastly Compute docs, while allowing override.
-3. **Header precedence:** apply DataDome downstream headers last so DataDome
-   cookies/cache/challenge headers are not overwritten by generic finalization.
+3. **Header precedence (updated by PR #986):** apply DataDome through the
+   core-owned security channel after ordinary mutators, then run the final
+   cache/privacy invariant pass unconditionally last. Security effects do not
+   override framing, cache safety, or privacy invariants.
 4. **GraphQL support:** defer.
 5. **Client-side tag:** auto-inject when a client-side key is configured.
 6. **Methods:** protect every non-`OPTIONS` method, including `HEAD`, when the
@@ -181,41 +187,76 @@ pub trait IntegrationRequestFilter: Send + Sync {
 pub struct RequestFilterInput<'a> {
     pub settings: &'a Settings,
     pub services: &'a RuntimeServices,
-    pub request: &'a Request,
+    /// The only request surface generic integrations receive.
+    pub request: &'a RedactedRequestView<'a>,
 }
 
 pub enum RequestFilterDecision {
-    Continue(RequestFilterEffects),
+    Continue(OrdinaryRequestFilterEffects),
     Respond {
         response: Response,
-        effects: RequestFilterEffects,
+        effects: OrdinaryRequestFilterEffects,
+    },
+}
+
+// Separate, core-only registration path. It is not a supertrait or optional
+// field on IntegrationRequestFilter, so another integration cannot receive
+// the DataDome capability through the generic runner.
+#[async_trait(?Send)]
+pub(crate) trait DataDomeSecurityRequestFilter: sealed::Sealed + Send + Sync {
+    async fn filter_datadome(
+        &self,
+        input: DataDomeSecurityFilterInput<'_>,
+    ) -> Result<DataDomeSecurityDecision, Report<TrustedServerError>>;
+}
+
+pub(crate) struct DataDomeSecurityFilterInput<'a> {
+    pub settings: &'a Settings,
+    pub services: &'a RuntimeServices,
+    pub request: &'a RedactedRequestView<'a>,
+    /// Constructed by core from the normative field allowlist. No raw
+    /// Request/header map or AuthorizedIdentity is exposed.
+    pub security: &'a DataDomeSecurityRequestView<'a>,
+}
+
+pub(crate) enum DataDomeSecurityDecision {
+    Continue(DataDomeSecurityEffects),
+    Respond {
+        response: Response,
+        effects: DataDomeSecurityEffects,
     },
 }
 
 #[derive(Default)]
-pub struct RequestFilterEffects {
-    pub request_headers: Vec<HeaderMutation>,
-    pub response_headers: Vec<HeaderMutation>,
-}
-
-pub struct HeaderMutation {
-    pub name: String,
-    pub value: String,
-    pub mode: HeaderMutationMode,
-}
-
-pub enum HeaderMutationMode {
-    Set,
-    Append,
+pub(crate) struct DataDomeSecurityEffects {
+    pub upstream_overlay: Vec<DataDomeUpstreamOperation>,
+    pub browser_effects: Vec<DataDomeBrowserOperation>,
 }
 ```
 
+`RedactedRequestView`, `DataDomeSecurityRequestView`, the security trait, and
+both security operation enums are core-owned sealed surfaces. Generic
+integrations cannot construct or read them or recover the underlying raw
+request. Core strips `ts-*`, EID/identity material,
+`X-DataDome-ClientID`, and the `datadome` cookie before building the shared
+view; the security view restores only the one typed cookie value and exact
+request evidence admitted by `datadome-header-allowlist.md`. Another filter
+receives only the shared redacted view and cannot inherit this owner
+capability. This paragraph and the hook spec §4a replace every earlier generic
+`&Request`/generic security-header-mutation sketch in this document. The
+ordinary effects type remains subject to the hook's ordinary attributed-batch
+registry and cannot express `SecurityUse`, owner overlay, cookies, or reserved
+security names.
+
 Important behavior:
 
-- Filters run in registration order.
-- On `Continue`, request header mutations are applied immediately before the
-  next filter and before route matching.
-- Response header mutations are accumulated and applied to the final response.
+- Ordinary filters run in registration order over the redacted view. DataDome's
+  security owner view is evaluated in its dedicated security position and is
+  never passed to the next filter.
+- On `Continue`, allowlist-validated upstream operations enter only DataDome's
+  owner-scoped publisher overlay; they never mutate the shared request.
+- Typed browser effects are accumulated and applied through the hook spec's
+  single pointer matrix and security budget.
 - On `Respond`, routing short-circuits with that response while preserving any
   downstream response header effects that must be applied after finalization.
   _(Superseded: one global order applies — core finalization → ordinary
@@ -250,8 +291,10 @@ pub async fn filter_request(
 ) -> Result<RequestFilterRegistryOutcome, Report<TrustedServerError>>
 ```
 
-The registry outcome should contain either an immediate response plus response
-header mutations, or a continue decision with accumulated response header
+The registry outcome should contain either an immediate response plus typed
+security operations, or a continue decision with accumulated typed security
+operations and an owner-scoped publisher overlay. Generic header name/value
+mutations are not part of this API.
 mutations.
 
 ### 3. Fastly Route Hook
@@ -262,12 +305,13 @@ In `route_request()`, run filters after normal basic auth succeeds and before
 ```text
 basic auth ok
 → integration_registry.filter_request(...)
-  → Respond { response, effects }: finalize response, apply DataDome headers last, return
-  → Continue(effects): request is enriched; route normally; remember response effects
+  → Respond { response, security_effects }: validate the complete security batch
+  → Continue(security_effects): apply only the owner-scoped upstream overlay; route normally
 → route matching
 → EC finalize
-→ generic finalize_response
-→ apply request-filter response headers last
+→ ordinary response mutators
+→ validated security effects
+→ final cache/privacy invariant pass (always last)
 ```
 
 Streaming publisher responses need the same treatment before headers are
@@ -275,8 +319,9 @@ committed via `stream_to_client()`.
 
 ### 4. Header Mutation Semantics
 
-DataDome pointer headers are internal instructions and must not be forwarded.
-Only headers named by the pointers should be copied.
+DataDome pointer headers are internal instructions and are never forwarded.
+The one normative field/pointer allowlist and decision matrix is
+`datadome-header-allowlist.md`; a pointer does not authorize an unlisted name.
 
 | Pointer header               | Destination                                        |
 | ---------------------------- | -------------------------------------------------- |
@@ -285,14 +330,14 @@ Only headers named by the pointers should be copied.
 
 Rules:
 
-- `Set-Cookie` mutations use append mode.
-- Other headers use set/replace mode.
+- `datadome` cookie effects use the hook spec's typed cookie operation; raw
+  `Set-Cookie` is not a generic mutation.
+- Every other admitted field follows its exact decision-matrix cell; there is
+  no generic set/replace default.
 - Pointer headers themselves are never forwarded.
-- Header mutations must reject hop-by-hop, request-target, body framing, and
-  Trusted Server internal headers such as `Connection`, `Transfer-Encoding`,
-  `Content-Length`, `Host`, and `x-ts-*`.
-- DataDome downstream headers are applied after `ec_finalize_response()` and
-  `finalize_response()`.
+- Hop-by-hop, request-target, body-framing, credential, Trusted Server
+  internal, and unlisted headers invalidate the applicable batch.
+- Security effects run before the final invariant pass, never after it.
 
 ## DataDome Protection Design
 
@@ -315,14 +360,23 @@ rewrite_sdk = true
 enable_protection = false
 server_side_key_secret_store = "ts_secrets"
 server_side_key_secret_name = "datadome_server_side_key"
-protection_api_origin = "https://api-fastly.datadome.co"
 timeout_ms = 1500
+complete_response_timeout_ms = 3000
+challenge_body_max_bytes = 65536
 protection_excluded_methods = ["OPTIONS"]
 protection_excluded_asns = []
 protection_excluded_ip_cidrs = []
 protection_excluded_ip_cidr_sources = []
 protection_ip_list_cache_ttl_seconds = 300
 enable_graphql_support = false
+
+# Security identity/lifecycle. No default exists for max age: enabling
+# protection without an explicit value is a startup error.
+security_cookie_max_age = 2592000 # example: 30 days; allowed 7d..=365d
+security_cookie_domain = "host-only" # or one exact normalized ASCII domain
+security_cookie_same_site = "Lax" # Lax | Strict | None
+expose_client_id_to_origin = false
+expose_host_fingerprints_to_vendor = false
 
 # New client-side tag injection layer
 client_side_key = ""
@@ -336,6 +390,12 @@ type = "path_regex"
 patterns = ["(?i)\\.(avi|flv|mka|mkv|mov|mp4|mpeg|mpg|mp3|flac|ogg|ogm|opus|wav|webm|webp|bmp|gif|ico|jpeg|jpg|png|svg|svgz|swf|eot|otf|ttf|woff|woff2|css|less|js|map)$"]
 ```
 
+This block is the canonical v1 DataDome configuration inventory; the hook and
+allowlist specs reference it rather than defining another schema. Unknown
+legacy security/session fields are errors, not ignored compatibility toggles.
+In particular, `sessionByHeader`, `session_by_header`, and any equivalent are
+startup-rejected in v1.
+
 Notes:
 
 - The literal server-side key is not stored in Rust config. Rust config stores
@@ -348,8 +408,27 @@ Notes:
 - `client_side_key` is optional. Auto-injection emits a tag only when
   `inject_client_side_tag = true` and `client_side_key` is non-empty; an empty
   key is a valid no-op.
-- `protection_api_origin` remains configurable for regional/static endpoint
-  selection.
+- The v1 Protection API URL is the core-owned constant
+  `https://api-fastly.datadome.co/validate-request`. It is not operator
+  configurable. Supporting another DataDome region or a publisher proxy is a
+  new reviewed endpoint-registry entry and product/security decision, not a
+  free-form URL setting. Unknown legacy `protection_api_origin` fields are
+  startup errors so an old override cannot silently exfiltrate the server key.
+- `complete_response_timeout_ms` defaults to and may not exceed 3000;
+  `challenge_body_max_bytes` defaults to and may not exceed 65,536. The hook
+  spec §4a owns the measurement/abort semantics.
+- `security_cookie_max_age` is required when protection is enabled and must be
+  604,800..=31,536,000 seconds. `security_cookie_domain` defaults to
+  `host-only`; an explicit domain must pass the hook spec's exact-domain,
+  domain-match, PSL, and active-scope-change checks.
+- `security_cookie_same_site` accepts exactly `Lax`, `Strict`, or `None`;
+  `None` is valid only with the unconditionally emitted `Secure` attribute.
+  DataDome cookies never carry `HttpOnly`.
+- Both exposure booleans default to `false`. ClientID-to-origin requires the
+  exact owner-overlay capability; host fingerprints require qualified JA4
+  availability and sign-offs 23/28. A selected adapter that cannot preserve
+  admitted request-header field-line order or enforce the request/body limits
+  fails startup for protection rather than synthesizing different evidence.
 - Static-asset exclusion is represented as a default typed `path_regex` rule and
   should remain case-insensitive so uppercase file extensions such as `.PNG` are
   skipped.
@@ -435,15 +514,21 @@ Responsibilities:
 
 1. Decide whether a request should be protected.
 2. Build the form-encoded Protection API payload.
-3. Send `POST /validate-request` through platform services.
+3. Send `POST https://api-fastly.datadome.co/validate-request` through platform
+   services.
 4. Classify the API response.
 5. Extract pointer-header mutations.
 6. Return a request-filter decision.
 
 Use platform abstractions for the outbound call:
 
-- Parse `protection_api_origin` with `url`.
-- Build a `PlatformBackendSpec` with `first_byte_timeout = timeout_ms`.
+- Construct the URL only from the core constant and assert at startup that its
+  scheme is `https`, host is exactly `api-fastly.datadome.co`, port is absent
+  (therefore 443), path is exactly `/validate-request`, and it has no userinfo,
+  query, or fragment. No request/config value participates in this URL.
+- Build a `PlatformBackendSpec` with `first_byte_timeout = timeout_ms` and
+  automatic redirect following disabled. A 3xx response is returned to the
+  DataDome decision parser; it is never followed to a second authority.
 - Resolve/register backend with `RuntimeServices::backend().ensure(...)`.
 - Send an `edgezero_core::http::Request` through
   `RuntimeServices::http_client().send(...)`.
@@ -456,7 +541,9 @@ Content-Length: <encoded body length>
 X-DataDome-X-Set-Cookie: true  # only when X-DataDome-ClientID is used — SUPERSEDED for v1: never sent (hook spec §4a)
 ```
 
-Payload fields should include the core fields from DataDome's official module:
+The exhaustive payload field set is the Protection API request-field section
+of `datadome-header-allowlist.md`. The list below is informative and may not
+expand that normative allowlist:
 
 - `Key`
 - `IP`
@@ -464,7 +551,7 @@ Payload fields should include the core fields from DataDome's official module:
 - `Protocol`
 - `Host`
 - `ServerHostname`
-- `Request` as path plus query
+- `Request` as the normalized path only; query and fragment are never disclosed
 - `RequestModuleName`
 - `ModuleVersion`
 - `TimeRequest`
@@ -481,35 +568,36 @@ Payload fields should include the core fields from DataDome's official module:
   - `Connection`
   - `Content-Type`
   - `From`
-  - `Origin`
+  - `Origin` as parsed origin only
   - `PostParamLen`
   - `Pragma`
-  - `Referer`
+  - `Referer` as parsed origin only
   - `User-Agent`
   - `Via`
-  - `X-Forwarded-For`
-  - `X-Real-IP`
   - `X-Requested-With`
-  - Sec-CH and Sec-Fetch headers supported by the official module
-- TLS/client metadata when available from `RuntimeServices::client_info()`
+  - only the individually enumerated Sec-CH and Sec-Fetch fields in the
+    normative allowlist
+- only the TLS/client metadata fields explicitly admitted by the normative
+  allowlist and sign-offs 23/28; JA4 egress additionally requires
+  `expose_host_fingerprints_to_vendor = true`, and availability alone is not
+  authorization. `TlsCipher` and `H2Fingerprint` are omitted in v1 for the
+  semantic reasons recorded in that allowlist
 
-`ClientID` source priority:
-
-1. `X-DataDome-ClientID` request header
-2. `datadome` cookie
-
-When `X-DataDome-ClientID` is used, send
-`X-DataDome-X-Set-Cookie: true` to the Protection API.
-_(Superseded for v1: header-supplied ClientIDs are not forwarded at
-all — the vendor payload's ClientID derives only from the `datadome`
-cookie, so this header is never sent — hook spec §4a.)_
+In cookie-mode v1, `ClientID` comes only from a single unambiguous
+`datadome` cookie. `X-DataDome-ClientID` is stripped from every shared
+surface and is not forwarded to the vendor, so TS never sends
+`X-DataDome-X-Set-Cookie: true`.
 
 Encoding and size rules:
 
 - URL-encode all values.
-- Omit empty fields.
-- Apply per-field truncation before encoding.
-- Keep the global payload under DataDome's documented limit.
+- Omit empty source-header fields; keep mandatory `ClientID` present with an
+  empty value when there is no unambiguous cookie.
+- Apply the exact per-field decoded-byte limits in the normative allowlist
+  before encoding.
+- Measure the complete form-encoded body and enforce the allowlist's 24,576-byte
+  ceiling before issuing the call; overflow takes metered fail-open and never
+  triggers ad hoc field dropping.
 
 ### Client Metadata
 
@@ -525,6 +613,7 @@ that adapters can populate when available:
 ```rust
 pub struct ClientInfo {
     pub client_ip: Option<IpAddr>,
+    pub client_port: Option<u16>,
     pub tls_protocol: Option<String>,
     pub tls_cipher: Option<String>,
     pub tls_ja4: Option<String>,
@@ -535,8 +624,13 @@ pub struct ClientInfo {
 ```
 
 Fastly can populate `tls_ja4` and `h2_fingerprint` from the request APIs already
-used by the JA4/debug device-signal code. Other adapters may leave these fields
-empty.
+used by the JA4/debug device-signal code. Other adapters may leave those
+optional fingerprint fields empty. `client_ip` and `client_port` are required
+for a release-qualified Protection API call and come from the adapter's trusted
+connection metadata, never a request header. If either is unavailable, the
+adapter skips the vendor call through the metered fail-open path and remains
+unqualified until vendor sign-off explicitly accepts a different profile; it
+never invents port `0` or substitutes a forwarded header.
 
 ### Protection API Response
 
@@ -562,23 +656,23 @@ fail open and continue without effects.
 For challenge statuses:
 
 1. Build a response using DataDome's API response status and body.
-2. Copy only headers listed in `X-DataDome-headers`.
-3. Append `Set-Cookie` values.
+2. Validate the complete decision-scoped pointer batch against
+   `datadome-header-allowlist.md` and the typed-cookie contract.
+3. Apply the accepted security batch atomically.
 4. Do not contact the publisher origin.
-5. Still run Trusted Server response finalization, then apply DataDome headers
-   last.
+5. Run the final cache/privacy invariant pass after the security batch.
 
 ### Allowed Requests
 
 For allow status `200`:
 
-1. Copy headers listed in `X-DataDome-request-headers` into the request before
-   Trusted Server route matching.
-2. Accumulate headers listed in `X-DataDome-headers` for the final browser
-   response.
+1. Apply only the owner-scoped publisher-upstream fields admitted by
+   `datadome-header-allowlist.md` before route matching; the default is no
+   ClientID exposure.
+2. Validate and retain the decision-scoped browser security batch.
 3. Continue normal route matching.
-4. Apply accumulated DataDome downstream headers after EC and generic response
-   finalization.
+4. Apply ordinary response mutators, then the security batch, then the final
+   invariant pass.
 
 ## Client-Side Auto-Injection
 
@@ -621,17 +715,24 @@ Add:
 - `IntegrationRequestFilter`
 - `RequestFilterInput`
 - `RequestFilterDecision`
-- `RequestFilterEffects`
-- `HeaderMutation`
-- `HeaderMutationMode`
-- request-filter storage in `IntegrationRegistryInner`
-- builder method `with_request_filter`
-- registry method to run filters
+- `OrdinaryRequestFilterEffects`
+- sealed `DataDomeSecurityRequestFilter`, `DataDomeSecurityFilterInput`, and
+  `DataDomeSecurityRequestView`
+- typed `DataDomeSecurityDecision`, `DataDomeSecurityEffects`,
+  `DataDomeUpstreamOperation`, and `DataDomeBrowserOperation`
+- separate ordinary-filter storage and one core-owned DataDome security slot in
+  `IntegrationRegistryInner`
+- public builder method `with_request_filter` for ordinary filters; a
+  crate-private `with_datadome_security_filter` callable only by the built-in
+  DataDome registration path
+- separate registry runners; the ordinary runner's input type cannot carry the
+  security view
 - unit-test helpers for filters
 
 ### `crates/trusted-server-core/src/integrations/mod.rs`
 
-Re-export the new request-filter types.
+Re-export only the ordinary request-filter types. The sealed DataDome security
+trait, input/view, and operations remain crate-private.
 
 ### `crates/trusted-server-core/src/integrations/datadome.rs`
 
@@ -675,7 +776,8 @@ Populate new `ClientInfo` fields from Fastly request/environment when available.
 - Apply request header mutations before route matching.
 - Carry response header mutations through all non-streaming and streaming
   response paths.
-- Apply DataDome/filter response headers last.
+- Apply DataDome/filter response effects through the hook spec's security
+  channel, followed by the invariant pass.
 
 ### `trusted-server.toml`
 
@@ -698,11 +800,13 @@ Update after implementation to describe:
 
 ### Registry Tests
 
-- filter runs in registration order
-- `Continue` applies request headers before next filter
-- response header effects accumulate
-- `Respond` short-circuits later filters
-- append/set header modes behave correctly
+- ordinary filters run in registration order over `RedactedRequestView`
+- DataDome alone receives the sealed typed security view
+- `Continue` applies only validated owner-overlay operations before publisher
+  origin; another filter never observes them
+- `Respond` short-circuits later filters and discards ordinary batches under the
+  hook's security ordering
+- generic operations cannot express reserved security names or cookies
 
 ### DataDome Config Tests
 
@@ -710,6 +814,8 @@ Update after implementation to describe:
 - protection disabled does not require server-side key secret store/name fields
 - protection enabled requires non-empty server-side key secret store/name fields
 - protection fails open when the configured server-side key secret cannot be read
+- legacy/free-form `protection_api_origin`, session-header, and unknown security
+  fields fail startup
 - invalid regex fails startup
 - injection disabled allows empty `client_side_key`
 - injection enabled with empty `client_side_key` emits no head insert and does
@@ -729,15 +835,30 @@ Update after implementation to describe:
 ### Payload Tests
 
 - form encoding is correct
-- empty fields are omitted
-- `ClientID` comes from `X-DataDome-ClientID` before cookie
-  _(superseded for v1: cookie-only — the header is stripped and never
-  used for the vendor payload, hook spec §4a)_
-- `X-DataDome-X-Set-Cookie` is sent when header-based ClientID is used
-  _(superseded for v1: never sent, hook spec §4a)_
+- empty source-header fields are omitted while mandatory `ClientID` remains
+  present as an empty value
+- the outbound authority/path is exactly the core-owned HTTPS endpoint and 3xx
+  responses are never followed
+- `Request` contains normalized path only, with query/fragment absent, and
+  `Referer` contains origin only
+- `IP`/`Port` come only from trusted connection metadata; their absence skips
+  the call, and raw `true-client-ip`, `x-forwarded-for`, and `x-real-ip` values
+  never enter the payload or `HeadersList`
+- `ClientID` comes only from a single unambiguous `datadome` cookie
+- incoming `X-DataDome-ClientID` is stripped and
+  `X-DataDome-X-Set-Cookie` is never sent in cookie-mode v1
 - `datadome` cookie is parsed safely
-- long fields are truncated according to configured limits
-- request headers list is generated deterministically enough for tests
+- repeated list-valued source headers normalize in received field-line order
+  with literal `, ` separators, while repeated singleton,
+  `authorization`, or `content-length` headers skip the call without choosing
+  first/last; empty and comma-containing values match the normative allowlist
+- multiple cookie field lines use the normative `; ` join for `CookiesLen` and
+  parsing; duplicate or malformed `datadome` pairs leave mandatory `ClientID`
+  empty and expose no other cookie value
+- long fields are truncated according to the one normative allowlist
+- the cross-adapter repeated-field corpus produces byte-identical normalized
+  form fields, lengths, `HeadersList`, and reject/omit outcomes; an adapter
+  without that capability cannot enable protection
 
 ### Response Classification Tests
 
@@ -748,8 +869,8 @@ Update after implementation to describe:
 - `5xx` fails open
 - pointer headers are not forwarded
 - request enriched headers are applied to allowed requests
-- downstream headers are applied to final responses
-- `Set-Cookie` appends instead of replacing
+- admitted security fields are applied atomically before final invariants
+- the typed `datadome` cookie never overwrites another cookie name
 
 ### Route Tests
 
@@ -757,8 +878,9 @@ Update after implementation to describe:
 - auth challenge short-circuits before DataDome
 - DataDome challenge bypasses publisher origin
 - allowed DataDome response enriches request before publisher origin
-- DataDome downstream headers apply to buffered responses
-- DataDome downstream headers apply before streaming response headers commit
+- DataDome security batches apply to buffered responses before final invariants
+- DataDome security batches and final invariants both complete before streaming
+  response headers commit
 
 ## Acceptance Criteria
 
@@ -775,12 +897,12 @@ passes.
 - [x] DataDome challenge responses return without contacting the origin. Covered
       by an adapter route test that returns the DataDome challenge response even
       with no publisher-origin fallback.
-- [x] Allowed requests receive DataDome request-enrichment headers. Covered by a
-      registry test that applies DataDome-style request mutations before routing.
-- [x] Final responses receive DataDome downstream headers/cookies. Covered by
-      adapter route tests for allowed and challenged responses.
-- [x] `Set-Cookie` is appended, not coalesced or overwritten. Covered by pointer
-      header route tests for DataDome downstream cookies.
+- [ ] Allowed-request enrichment conforms to the owner-scoped allowlist and
+      default-disabled ClientID exposure in the hook spec.
+- [ ] Final responses use the hook spec's atomic security batch and final
+      invariant ordering on every adapter/path.
+- [ ] The typed `datadome` cookie contract and complete response-pointer matrix
+      replace generic `Set-Cookie`/header mutation.
 - [x] Static assets and internal Trusted Server routes are excluded by default.
       Covered by adapter route tests for discovery and default static-extension
       exclusions.
@@ -791,7 +913,14 @@ passes.
 - [x] GraphQL body parsing is not implemented in v1 and is clearly documented.
 - [x] Existing DataDome first-party proxy behavior remains unchanged. Existing
       DataDome proxy/rewrite tests pass as part of full workspace verification.
-- [x] `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo test --workspace` pass after implementation. Verified on 2026-06-15.
+- [ ] `cargo fmt --all -- --check` and the repository's target-matched test and
+      lint aliases pass after implementation: `cargo test-fastly`,
+      `cargo test-axum`, `cargo test-cloudflare`, `cargo test-spin`,
+      `cargo clippy-fastly`, `cargo clippy-axum`,
+      `cargo clippy-cloudflare`, `cargo clippy-cloudflare-wasm`,
+      `cargo clippy-spin-native`, and `cargo clippy-spin-wasm`. Do not use bare
+      `cargo test --workspace` or workspace-wide all-feature clippy for this
+      multi-WASM-target repository.
 
 ## Resolved Questions
 
@@ -813,13 +942,14 @@ passes.
    deadline in v1. _(The hook spec §4a now adds the 3000 ms
    complete-response deadline on the monotonic clock with defined
    measurement points; both bounds apply.)_
-2. **Client metadata scope:** JA4 and H2 fingerprint values are sent only in the
-   form-encoded Protection API payload to DataDome. They are not forwarded to
-   the publisher origin or returned to the browser unless DataDome independently
-   returns mapped enriched headers. Include them in v1 when the platform exposes
-   them because DataDome recommends TLS fingerprints and these signals are
-   useful for distinguishing browser and automation network stacks. Omit the
-   fields when unavailable.
+2. **Client metadata scope:** only JA4 may be optionally admitted to the
+   form-encoded Protection API payload, never publisher origin, browser, graph,
+   another integration, or raw logs. Availability is not authorization: omit
+   it unless `expose_host_fingerprints_to_vendor = true`. `TlsCipher` is omitted
+   because the platform exposes a negotiated cipher while the vendor field
+   means ordered offered ciphers; `H2Fingerprint` is not a documented
+   Protection API field. Admit no host evidence outside
+   `datadome-header-allowlist.md`.
 3. **Challenge status source of truth:** follow the Protection API docs in v1:
    `301`, `302`, `401`, `403`, and `429` are challenge statuses when
    `X-DataDomeResponse` matches the HTTP status.
