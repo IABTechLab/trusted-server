@@ -15,7 +15,8 @@ interface ApiStore {
   recordTrustedServerOpportunity(
     slot: GptDiagnosticsSlotHandle,
     auctionSlotId: string,
-    opportunity: GptDiagnosticsTrustedServerOpportunity
+    opportunity: GptDiagnosticsTrustedServerOpportunity,
+    trustedServerAuctionId?: string
   ): void;
   recordPrebidRefresh(slots: GptDiagnosticsSlotHandle[]): void;
   recordTrustedServerCreativeRequest(auctionSlotId: string): number | undefined;
@@ -117,10 +118,19 @@ export class GptDiagnosticsApiController {
       subscribe: (listener) => this.subscribe(listener),
       show: () => this.presentation.show(),
       hide: () => this.presentation.hide(),
-      recordTrustedServerOpportunity: (slot, auctionSlotId, opportunity) =>
-        safelyRecord(() =>
-          this.store.recordTrustedServerOpportunity(slot, auctionSlotId, opportunity)
-        ),
+      recordTrustedServerOpportunity: (slot, auctionSlotId, opportunity, trustedServerAuctionId) =>
+        safelyRecord(() => {
+          if (trustedServerAuctionId === undefined) {
+            this.store.recordTrustedServerOpportunity(slot, auctionSlotId, opportunity);
+          } else {
+            this.store.recordTrustedServerOpportunity(
+              slot,
+              auctionSlotId,
+              opportunity,
+              trustedServerAuctionId
+            );
+          }
+        }),
       recordPrebidRefresh: (slots) => safelyRecord(() => this.store.recordPrebidRefresh(slots)),
       recordTrustedServerCreativeRequest: (auctionSlotId) =>
         safelyCreateAttempt(() => this.store.recordTrustedServerCreativeRequest(auctionSlotId)),

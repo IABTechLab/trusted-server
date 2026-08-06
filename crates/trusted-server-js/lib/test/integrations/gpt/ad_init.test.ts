@@ -208,6 +208,30 @@ describe('installTsAdInit', () => {
     }
   );
 
+  it('forwards winning bid auction metadata to diagnostics only when present', async () => {
+    const recordTrustedServerOpportunity = vi.fn();
+    const { mockSlot } = configureOpportunityDiagnostics(
+      {
+        hb_pb: '1.00',
+        hb_bidder: 'example',
+        hb_adid: 'creative-1',
+        hb_auction_id: 'auction-123',
+      },
+      recordTrustedServerOpportunity
+    );
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(recordTrustedServerOpportunity).toHaveBeenCalledWith(
+      mockSlot,
+      'atf_sidebar_ad',
+      'unrenderable_candidate',
+      'auction-123'
+    );
+  });
+
   it('records no_candidate when the resolved slot has no bid', async () => {
     const recordTrustedServerOpportunity = vi.fn();
     const { mockSlot } = configureOpportunityDiagnostics(undefined, recordTrustedServerOpportunity);

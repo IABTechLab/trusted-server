@@ -114,6 +114,29 @@ describe('GptDiagnosticsApiController', () => {
     expect(store.recordTrustedServerCreativeFailure).toHaveBeenCalledWith(41, 'cache_fetch_failed');
   });
 
+  it('forwards an optional opaque auction ID without changing diagnostics fail-open behavior', () => {
+    const store = fakeApiStore();
+    const controller = new GptDiagnosticsApiController(store, new FakeBindings(), {
+      show: vi.fn(),
+      hide: vi.fn(),
+    });
+    const slot = fakeSlot();
+
+    controller.api.recordTrustedServerOpportunity(
+      slot,
+      'auction-slot-example',
+      'renderable_candidate',
+      'auction-123'
+    );
+
+    expect(store.recordTrustedServerOpportunity).toHaveBeenCalledWith(
+      slot,
+      'auction-slot-example',
+      'renderable_candidate',
+      'auction-123'
+    );
+  });
+
   it('swallows every attribution writer failure without changing ad delivery', () => {
     const failure = new Error('diagnostics failed');
     const store = {

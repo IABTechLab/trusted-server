@@ -685,11 +685,17 @@ export function installTsAdInit(): void {
         // Diagnostics are observational only. A missing or malformed debug
         // implementation must never interrupt slot mapping or delivery.
         try {
-          ts.gptDiagnostics?.recordTrustedServerOpportunity?.(
-            gptSlot,
-            slot.id,
-            trustedServerOpportunity(bid)
-          );
+          const opportunity = trustedServerOpportunity(bid);
+          if (bid.hb_auction_id !== undefined) {
+            ts.gptDiagnostics?.recordTrustedServerOpportunity?.(
+              gptSlot,
+              slot.id,
+              opportunity,
+              bid.hb_auction_id
+            );
+          } else {
+            ts.gptDiagnostics?.recordTrustedServerOpportunity?.(gptSlot, slot.id, opportunity);
+          }
         } catch {
           // Diagnostics must not alter ad delivery.
         }
