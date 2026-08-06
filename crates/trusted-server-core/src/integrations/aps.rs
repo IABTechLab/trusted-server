@@ -1,6 +1,6 @@
 //! Amazon Publisher Services (APS/TAM) `OpenRTB` integration.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,9 +18,9 @@ use validator::{Validate, ValidationError};
 
 use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
 use crate::auction::types::{
-    AdSlot, ApsRendererV1, ApsRendererValidationResult, ApsTagType, AuctionContext, AuctionRequest,
-    AuctionResponse, Bid, BidRenderSourceV1, MediaType, RENDER_DIMENSION_MAX,
-    classify_aps_renderer_v1,
+    AdSlot, ApsRendererV1, ApsRendererValidationResult, ApsTagType, AuctionContext,
+    AuctionDropReason, AuctionDropReasons, AuctionRequest, AuctionResponse, Bid, BidRenderSourceV1,
+    MediaType, RENDER_DIMENSION_MAX, classify_aps_renderer_v1, record_auction_drop,
 };
 use crate::error::TrustedServerError;
 use crate::integrations::{
@@ -41,6 +41,7 @@ const DEFAULT_CURRENCY: &str = "USD";
 const APS_SDK_SOURCE: &str = "prebid";
 const APS_SDK_VERSION: &str = "2.2.0";
 const MAX_ACCOUNT_ID_BYTES: usize = 1024;
+const MAX_BID_ID_BYTES: usize = 64;
 const MAX_CREATIVE_ID_BYTES: usize = 1024;
 const MAX_DEBUG_RESPONSE_PREVIEW_BYTES: usize = 512;
 const MAX_CREATIVE_URL_BYTES: usize = 4096;
@@ -658,7 +659,7 @@ impl ApsAuctionProvider {
         &self,
         input: ApsRendererInput<'_>,
         publisher_origin: &str,
-    ) -> Option<BidRenderSourceV1> {
+    ) -> Result<BidRenderSourceV1, AuctionDropReason> {
         let tag_type_value = match input.tag_type {
             ApsTagType::Iframe => "iframe",
             ApsTagType::Script => "script",
@@ -677,9 +678,10 @@ impl ApsAuctionProvider {
                 }]
             }]
         });
-        let serialized = serde_json::to_vec(&envelope).ok()?;
+        let serialized = serde_json::to_vec(&envelope)
+            .map_err(|_| AuctionDropReason::InvalidProviderResponse)?;
         if serialized.len() > MAX_RENDER_ENVELOPE_BYTES {
-            return None;
+            return Err(AuctionDropReason::RenderPayloadTooLarge);
         }
         let renderer = BidRenderSourceV1::Aps(ApsRendererV1 {
             version: 1,
@@ -692,14 +694,14 @@ impl ApsAuctionProvider {
             width: input.width,
             height: input.height,
         });
-        let value = serde_json::to_value(&renderer).ok()?;
-        (classify_aps_renderer_v1(&value, publisher_origin)
-            == ApsRendererValidationResult::Accepted)
-            .then_some(renderer)
-    }
-
-    fn increment_reason(reasons: &mut BTreeMap<String, u64>, reason: &'static str) {
-        *reasons.entry(reason.to_string()).or_default() += 1;
+        let value = serde_json::to_value(&renderer)
+            .map_err(|_| AuctionDropReason::InvalidProviderResponse)?;
+        if classify_aps_renderer_v1(&value, publisher_origin)
+            != ApsRendererValidationResult::Accepted
+        {
+            return Err(AuctionDropReason::InvalidProviderResponse);
+        }
+        Ok(renderer)
     }
 
     fn parse_bid(
@@ -707,91 +709,104 @@ impl ApsAuctionProvider {
         value: &Json,
         slots: &HashMap<&str, &AdSlot>,
         publisher_origin: &str,
-    ) -> Result<Bid, &'static str> {
-        let bid_id = value
-            .get("id")
-            .and_then(Json::as_str)
-            .ok_or("missing_render_source")?;
-        if bid_id.is_empty()
-            || bid_id.len() > 64
-            || bid_id.bytes().any(|byte| byte <= 0x1f || byte == 0x7f)
-        {
-            return Err("invalid_bid_id");
+        duplicate_ids: &HashSet<String>,
+    ) -> Result<Bid, AuctionDropReason> {
+        let object = value.as_object().ok_or(AuctionDropReason::MalformedBid)?;
+        let Some(bid_id_value) = object.get("id") else {
+            return Err(AuctionDropReason::MissingUpstreamBidId);
+        };
+        let bid_id = bid_id_value
+            .as_str()
+            .ok_or(AuctionDropReason::InvalidUpstreamBidId)?;
+        if bid_id.is_empty() {
+            return Err(AuctionDropReason::MissingUpstreamBidId);
+        }
+        if bid_id.len() > MAX_BID_ID_BYTES {
+            return Err(AuctionDropReason::UpstreamBidIdTooLarge);
+        }
+        if bid_id.bytes().any(|byte| byte <= 0x1f || byte == 0x7f) {
+            return Err(AuctionDropReason::InvalidUpstreamBidId);
+        }
+        if duplicate_ids.contains(bid_id) {
+            return Err(AuctionDropReason::DuplicateUpstreamBidId);
         }
         let slot_id = value
             .get("impid")
             .and_then(Json::as_str)
-            .ok_or("unknown_impid")?;
-        let slot = slots.get(slot_id).ok_or("unknown_impid")?;
+            .ok_or(AuctionDropReason::UnknownImpression)?;
+        let slot = slots
+            .get(slot_id)
+            .ok_or(AuctionDropReason::UnknownImpression)?;
         let price = value
             .get("price")
             .and_then(Json::as_f64)
             .filter(|price| price.is_finite() && *price >= 0.0)
-            .ok_or("invalid_price")?;
+            .ok_or(AuctionDropReason::InvalidPrice)?;
         if value
             .get("mtype")
             .is_some_and(|mtype| mtype.as_i64() != Some(1))
         {
-            return Err("unsupported_media_type");
+            return Err(AuctionDropReason::UnsupportedMediaType);
         }
         let parse_dimension = |field: &str| {
             let number = value
                 .get(field)
                 .and_then(Json::as_f64)
                 .filter(|number| number.is_finite() && number.fract() == 0.0 && *number > 0.0)
-                .ok_or("invalid_dimensions")?;
+                .ok_or(AuctionDropReason::InvalidDimensions)?;
             if number > RENDER_DIMENSION_MAX as f64 {
-                return Err("dimensions_out_of_range");
+                return Err(AuctionDropReason::DimensionsOutOfRange);
             }
-            u32::try_from(number as u64).map_err(|_| "dimensions_out_of_range")
+            u32::try_from(number as u64).map_err(|_| AuctionDropReason::DimensionsOutOfRange)
         };
         let width = parse_dimension("w")?;
         let height = parse_dimension("h")?;
         if !Self::compatible_dimensions(slot, width, height) {
-            return Err("invalid_dimensions");
+            return Err(AuctionDropReason::InvalidDimensions);
         }
         let ext = value
             .get("ext")
             .and_then(Json::as_object)
-            .ok_or("missing_render_source")?;
-        let creative_url = ext
-            .get("creativeurl")
-            .and_then(Json::as_str)
-            .ok_or("missing_render_source")?;
+            .ok_or(AuctionDropReason::MissingCreativeUrl)?;
+        let Some(creative_url_value) = ext.get("creativeurl") else {
+            return Err(AuctionDropReason::MissingCreativeUrl);
+        };
+        let creative_url = creative_url_value
+            .as_str()
+            .ok_or(AuctionDropReason::InvalidCreativeUrl)?;
         if !self.valid_creative_url(creative_url, publisher_origin) {
-            return Err("invalid_creative_url");
+            return Err(AuctionDropReason::InvalidCreativeUrl);
         }
         let tag_type = match ext.get("tagtype").and_then(Json::as_str) {
             Some("iframe") => ApsTagType::Iframe,
             Some("script") if self.config.allow_script_creatives => ApsTagType::Script,
-            Some("script") => return Err("script_rendering_disabled"),
-            _ => return Err("unsupported_tagtype"),
+            Some("script") => return Err(AuctionDropReason::ScriptRenderingDisabled),
+            _ => return Err(AuctionDropReason::InvalidTagType),
         };
-        let creative_id = value
-            .get("crid")
-            .and_then(Json::as_str)
-            .filter(|creative_id| !creative_id.is_empty())
-            .map(str::to_string);
+        let creative_id = match value.get("crid") {
+            None => None,
+            Some(Json::String(creative_id)) if creative_id.is_empty() => None,
+            Some(Json::String(creative_id)) => Some(creative_id.clone()),
+            Some(_) => return Err(AuctionDropReason::InvalidCreativeId),
+        };
         if creative_id
             .as_ref()
             .is_some_and(|creative_id| creative_id.len() > MAX_CREATIVE_ID_BYTES)
         {
-            return Err("creative_id_too_large");
+            return Err(AuctionDropReason::CreativeIdTooLarge);
         }
-        let renderer = self
-            .build_renderer(
-                ApsRendererInput {
-                    bid_id,
-                    creative_id: creative_id.clone(),
-                    tag_type,
-                    creative_url,
-                    price,
-                    width,
-                    height,
-                },
-                publisher_origin,
-            )
-            .ok_or("render_payload_too_large")?;
+        let renderer = self.build_renderer(
+            ApsRendererInput {
+                bid_id,
+                creative_id: creative_id.clone(),
+                tag_type,
+                creative_url,
+                price,
+                width,
+                height,
+            },
+            publisher_origin,
+        )?;
         let adomain = value
             .get("adomain")
             .and_then(Json::as_array)
@@ -841,15 +856,15 @@ impl ApsAuctionProvider {
                 .is_some_and(|seatbids| !seatbids.is_array())
         {
             return AuctionResponse::error(APS_INTEGRATION_ID, response_time_ms)
-                .with_metadata("drop_reasons", json!({"unexpected_response_shape": 1}));
+                .with_drop_reason(AuctionDropReason::InvalidProviderResponse);
         }
         if value
             .get("cur")
             .and_then(Json::as_str)
             .is_some_and(|currency| !currency.eq_ignore_ascii_case(DEFAULT_CURRENCY))
         {
-            return AuctionResponse::no_bid(APS_INTEGRATION_ID, response_time_ms)
-                .with_metadata("drop_reasons", json!({"unsupported_currency": 1}));
+            return AuctionResponse::error(APS_INTEGRATION_ID, response_time_ms)
+                .with_drop_reason(AuctionDropReason::InvalidProviderResponse);
         }
 
         let slots: HashMap<&str, &AdSlot> = request
@@ -859,9 +874,30 @@ impl ApsAuctionProvider {
             .collect();
         let seatbids = value.get("seatbid").and_then(Json::as_array);
         let seatbid_count = seatbids.map_or(0, Vec::len);
-        let mut reasons = BTreeMap::new();
+        let mut reasons = AuctionDropReasons::new();
         let mut selected: HashMap<String, Bid> = HashMap::new();
         let mut dropped = 0_u64;
+
+        let mut id_counts = HashMap::<&str, usize>::new();
+        for candidate in seatbids
+            .into_iter()
+            .flatten()
+            .filter_map(|seatbid| seatbid.get("bid").and_then(Json::as_array))
+            .flatten()
+        {
+            if let Some(bid_id) = candidate.get("id").and_then(Json::as_str)
+                && !bid_id.is_empty()
+                && bid_id.len() <= MAX_BID_ID_BYTES
+                && !bid_id.bytes().any(|byte| byte <= 0x1f || byte == 0x7f)
+            {
+                *id_counts.entry(bid_id).or_default() += 1;
+            }
+        }
+        let duplicate_ids: HashSet<String> = id_counts
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .map(|(bid_id, _)| bid_id.to_string())
+            .collect();
 
         let publisher_origin = request
             .publisher
@@ -874,11 +910,11 @@ impl ApsAuctionProvider {
         for seatbid in seatbids.into_iter().flatten() {
             let Some(bids) = seatbid.get("bid").and_then(Json::as_array) else {
                 dropped += 1;
-                Self::increment_reason(&mut reasons, "empty_seatbid_bids");
+                record_auction_drop(&mut reasons, AuctionDropReason::EmptySeatBidBids);
                 continue;
             };
             for value in bids {
-                match self.parse_bid(value, &slots, &publisher_origin) {
+                match self.parse_bid(value, &slots, &publisher_origin, &duplicate_ids) {
                     Ok(candidate) => {
                         let replace = selected.get(&candidate.slot_id).is_none_or(|current| {
                             let candidate_price = candidate.price.unwrap_or_default();
@@ -894,42 +930,45 @@ impl ApsAuctionProvider {
                                 .is_some()
                             {
                                 dropped += 1;
-                                Self::increment_reason(&mut reasons, "lost_to_higher_bid");
+                                record_auction_drop(
+                                    &mut reasons,
+                                    AuctionDropReason::LostToHigherBid,
+                                );
                             }
                         } else {
                             dropped += 1;
-                            Self::increment_reason(&mut reasons, "lost_to_higher_bid");
+                            record_auction_drop(&mut reasons, AuctionDropReason::LostToHigherBid);
                         }
                     }
                     Err(reason) => {
                         dropped += 1;
-                        Self::increment_reason(&mut reasons, reason);
+                        record_auction_drop(&mut reasons, reason);
                     }
                 }
             }
         }
 
         if seatbid_count == 0 {
-            Self::increment_reason(&mut reasons, "empty_seatbid");
+            record_auction_drop(&mut reasons, AuctionDropReason::EmptySeatBid);
         }
         let accepted = selected.len();
         let metadata = [
             ("seatbid_count".to_string(), json!(seatbid_count)),
             ("accepted_bid_count".to_string(), json!(accepted)),
             ("dropped_bid_count".to_string(), json!(dropped)),
-            ("drop_reasons".to_string(), json!(reasons)),
         ];
         let mut response = if selected.is_empty() {
             AuctionResponse::no_bid(APS_INTEGRATION_ID, response_time_ms)
         } else {
-            AuctionResponse::success(
-                APS_INTEGRATION_ID,
-                selected.into_values().collect(),
-                response_time_ms,
-            )
+            let bids = request
+                .slots
+                .iter()
+                .filter_map(|slot| selected.remove(&slot.id))
+                .collect();
+            AuctionResponse::success(APS_INTEGRATION_ID, bids, response_time_ms)
         };
         response.metadata.extend(metadata);
-        response
+        response.with_drop_reasons(&reasons)
     }
 
     async fn parse_response_inner(
@@ -1001,7 +1040,7 @@ impl ApsAuctionProvider {
             Err(error) => {
                 log::warn!("Failed to parse APS response JSON: {error}");
                 let parsed = AuctionResponse::error(APS_INTEGRATION_ID, response_time_ms)
-                    .with_metadata("drop_reasons", json!({"unexpected_response_shape": 1}));
+                    .with_drop_reason(AuctionDropReason::InvalidProviderResponse);
                 return Ok(self.attach_debug_metadata(
                     parsed,
                     debug_enabled,
@@ -1017,7 +1056,7 @@ impl ApsAuctionProvider {
                 "APS cannot parse a successful bid response without the original auction request context"
             );
             let response = AuctionResponse::error(APS_INTEGRATION_ID, response_time_ms)
-                .with_metadata("drop_reasons", json!({"missing_request_context": 1}));
+                .with_drop_reason(AuctionDropReason::MissingRequestContext);
             return Ok(self.attach_debug_metadata(
                 response,
                 debug_enabled,
@@ -1267,8 +1306,8 @@ pub fn register_providers(
 mod tests {
     use super::*;
     use crate::auction::types::{
-        AdFormat, AdSlot, AuctionContext, AuctionRequest, BidStatus, DeviceInfo, PublisherInfo,
-        UserInfo,
+        AdFormat, AdSlot, AuctionContext, AuctionDropReason, AuctionRequest, BidStatus, DeviceInfo,
+        PublisherInfo, UserInfo,
     };
     use crate::consent::ConsentContext;
     use crate::openrtb::{Eid, Uid};
@@ -1338,6 +1377,12 @@ mod tests {
             "adm": "<script>discarded</script>",
             "nurl": "https://notice.example/win"
         })
+    }
+
+    fn drop_count(response: &AuctionResponse, reason: AuctionDropReason) -> u64 {
+        response.metadata["drop_reasons"][reason.as_str()]
+            .as_u64()
+            .unwrap_or_default()
     }
 
     #[derive(serde::Deserialize)]
@@ -2200,10 +2245,221 @@ mod tests {
             let response = provider.parse_aps_response(&value, 12, &request());
             assert!(response.bids.is_empty());
             assert_eq!(
-                response.metadata["drop_reasons"]["unexpected_response_shape"],
+                drop_count(&response, AuctionDropReason::InvalidProviderResponse),
                 1
             );
         }
+    }
+
+    #[test]
+    fn upstream_bid_ids_are_required_bounded_control_free_and_response_unique() {
+        let provider = ApsAuctionProvider::new(config());
+        let mut missing = bid("missing", 1.0, "iframe");
+        missing
+            .as_object_mut()
+            .expect("should build an object bid")
+            .remove("id");
+        let empty = bid("", 1.1, "iframe");
+        let oversized = bid(&format!("{}x", "é".repeat(32)), 1.2, "iframe");
+        let control = bid("control\u{0000}id", 1.3, "iframe");
+        let duplicate_low = bid("duplicate", 1.4, "iframe");
+        let duplicate_high = bid("duplicate", 9.0, "iframe");
+        let valid_boundary = bid(&"é".repeat(32), 2.0, "iframe");
+
+        let response = provider.parse_aps_response(
+            &json!({"seatbid": [{"bid": [
+                missing,
+                empty,
+                oversized,
+                control,
+                duplicate_low,
+                duplicate_high,
+                valid_boundary
+            ]}]}),
+            12,
+            &request(),
+        );
+
+        assert_eq!(response.status, BidStatus::Success);
+        assert_eq!(response.bids.len(), 1);
+        assert_eq!(
+            response.bids[0].bid_id.as_deref(),
+            Some("é".repeat(32).as_str())
+        );
+        assert_eq!(
+            drop_count(&response, AuctionDropReason::MissingUpstreamBidId),
+            2
+        );
+        assert_eq!(
+            drop_count(&response, AuctionDropReason::UpstreamBidIdTooLarge),
+            1
+        );
+        assert_eq!(
+            drop_count(&response, AuctionDropReason::InvalidUpstreamBidId),
+            1
+        );
+        assert_eq!(
+            drop_count(&response, AuctionDropReason::DuplicateUpstreamBidId),
+            2
+        );
+    }
+
+    #[test]
+    fn bid_validation_is_typed_and_isolated_from_a_valid_sibling() {
+        let provider = ApsAuctionProvider::new(config());
+        let mut unknown_imp = bid("unknown-imp", 1.0, "iframe");
+        unknown_imp["impid"] = json!("not-requested");
+        let negative_price = bid("negative-price", -0.1, "iframe");
+        let mut wrong_price = bid("wrong-price", 1.0, "iframe");
+        wrong_price["price"] = json!("1.0");
+        let mut zero_width = bid("zero-width", 1.0, "iframe");
+        zero_width["w"] = json!(0);
+        let mut over_height = bid("over-height", 1.0, "iframe");
+        over_height["h"] = json!(4097);
+        let mut unmatched_size = bid("unmatched-size", 1.0, "iframe");
+        unmatched_size["w"] = json!(728);
+        unmatched_size["h"] = json!(90);
+        let mut missing_url = bid("missing-url", 1.0, "iframe");
+        missing_url["ext"]
+            .as_object_mut()
+            .expect("should build a bid extension")
+            .remove("creativeurl");
+        let mut invalid_url = bid("invalid-url", 1.0, "iframe");
+        invalid_url["ext"]["creativeurl"] = json!("http://creative.example/render");
+        let invalid_tag = bid("invalid-tag", 1.0, "video");
+        let mut invalid_creative_id = bid("invalid-creative-id", 1.0, "iframe");
+        invalid_creative_id["crid"] = json!(42);
+        let mut unsupported_media = bid("unsupported-media", 1.0, "iframe");
+        unsupported_media["mtype"] = json!(2);
+        let valid = bid("valid-sibling", 2.0, "iframe");
+
+        let response = provider.parse_aps_response(
+            &json!({"seatbid": [{"bid": [
+                "malformed",
+                unknown_imp,
+                negative_price,
+                wrong_price,
+                zero_width,
+                over_height,
+                unmatched_size,
+                missing_url,
+                invalid_url,
+                invalid_tag,
+                invalid_creative_id,
+                unsupported_media,
+                valid
+            ]}]}),
+            12,
+            &request(),
+        );
+
+        assert_eq!(response.bids.len(), 1);
+        assert_eq!(response.bids[0].bid_id.as_deref(), Some("valid-sibling"));
+        for reason in [
+            AuctionDropReason::MalformedBid,
+            AuctionDropReason::UnknownImpression,
+            AuctionDropReason::DimensionsOutOfRange,
+            AuctionDropReason::MissingCreativeUrl,
+            AuctionDropReason::InvalidCreativeUrl,
+            AuctionDropReason::InvalidTagType,
+            AuctionDropReason::InvalidCreativeId,
+            AuctionDropReason::UnsupportedMediaType,
+        ] {
+            assert_eq!(drop_count(&response, reason), 1, "should report {reason:?}");
+        }
+        assert_eq!(drop_count(&response, AuctionDropReason::InvalidPrice), 2);
+        assert_eq!(
+            drop_count(&response, AuctionDropReason::InvalidDimensions),
+            2
+        );
+    }
+
+    #[test]
+    fn dimensions_accept_exact_requested_membership_at_contract_boundaries() {
+        let provider = ApsAuctionProvider::new(config());
+        let mut auction_request = request();
+        auction_request.slots = vec![
+            AdSlot {
+                id: "minimum-slot".to_string(),
+                formats: vec![AdFormat {
+                    media_type: MediaType::Banner,
+                    width: 1,
+                    height: 1,
+                }],
+                floor_price: None,
+                targeting: HashMap::new(),
+                bidders: HashMap::new(),
+            },
+            AdSlot {
+                id: "maximum-slot".to_string(),
+                formats: vec![AdFormat {
+                    media_type: MediaType::Banner,
+                    width: 4096,
+                    height: 4096,
+                }],
+                floor_price: None,
+                targeting: HashMap::new(),
+                bidders: HashMap::new(),
+            },
+        ];
+        let mut minimum = bid("minimum", 1.0, "iframe");
+        minimum["impid"] = json!("minimum-slot");
+        minimum["w"] = json!(1);
+        minimum["h"] = json!(1);
+        let mut maximum = bid("maximum", 1.0, "iframe");
+        maximum["impid"] = json!("maximum-slot");
+        maximum["w"] = json!(4096);
+        maximum["h"] = json!(4096);
+
+        let response = provider.parse_aps_response(
+            &json!({"seatbid": [{"bid": [minimum, maximum]}]}),
+            12,
+            &auction_request,
+        );
+
+        assert_eq!(response.status, BidStatus::Success);
+        assert_eq!(response.bids.len(), 2);
+        assert_eq!(response.bids[0].slot_id, "minimum-slot");
+        assert_eq!(response.bids[1].slot_id, "maximum-slot");
+        assert_eq!(response.metadata["dropped_bid_count"], 0);
+    }
+
+    #[test]
+    fn contextual_currency_and_nonfinite_json_are_invalid_provider_responses() {
+        let provider = ApsAuctionProvider::new(config());
+        for value in [
+            json!({"contextual": {"slots": []}, "seatbid": [{"bid": [bid("valid", 1.0, "iframe")]}]}),
+            json!({"cur": "EUR", "seatbid": [{"bid": [bid("eur", 1.0, "iframe")]}]}),
+        ] {
+            let response = provider.parse_aps_response(&value, 12, &request());
+            assert_eq!(response.status, BidStatus::Error);
+            assert_eq!(
+                drop_count(&response, AuctionDropReason::InvalidProviderResponse),
+                1
+            );
+        }
+
+        let body = br#"{"seatbid":[{"bid":[{"id":"overflow","impid":"fictional-slot","price":1e400,"w":300,"h":250,"ext":{"creativeurl":"https://creative.example/render","tagtype":"iframe"}}]}]}"#;
+        let response = futures::executor::block_on(
+            provider.parse_response_inner(
+                PlatformResponse::new(
+                    edgezero_core::http::response_builder()
+                        .status(StatusCode::OK)
+                        .body(EdgeBody::from(body.to_vec()))
+                        .expect("should build nonfinite APS response"),
+                ),
+                12,
+                Some(&request()),
+                None,
+                false,
+            ),
+        )
+        .expect("should reject nonfinite APS JSON safely");
+        assert_eq!(response.status, BidStatus::Error);
+        assert_eq!(
+            drop_count(&response, AuctionDropReason::InvalidProviderResponse),
+            1
+        );
     }
 
     #[test]
@@ -2393,7 +2649,7 @@ mod tests {
         let oversized = parse_with_context(&provider, oversized);
 
         assert_eq!(
-            malformed.metadata["drop_reasons"]["unexpected_response_shape"],
+            drop_count(&malformed, AuctionDropReason::InvalidProviderResponse),
             1
         );
         assert_eq!(
@@ -2473,7 +2729,7 @@ mod tests {
 
         assert!(response.bids.is_empty());
         assert_eq!(
-            response.metadata["drop_reasons"]["unexpected_response_shape"],
+            drop_count(&response, AuctionDropReason::InvalidProviderResponse),
             1
         );
     }
@@ -2553,15 +2809,18 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_currency_is_a_no_bid() {
+    fn unsupported_currency_is_an_invalid_provider_response() {
         let provider = ApsAuctionProvider::new(config());
         let response = provider.parse_aps_response(
             &json!({"cur": "EUR", "seatbid": [{"bid": [bid("eur-bid", 1.0, "iframe")]}]}),
             12,
             &request(),
         );
-        assert_eq!(response.status, BidStatus::NoBid);
-        assert_eq!(response.metadata["drop_reasons"]["unsupported_currency"], 1);
+        assert_eq!(response.status, BidStatus::Error);
+        assert_eq!(
+            drop_count(&response, AuctionDropReason::InvalidProviderResponse),
+            1
+        );
     }
 
     #[test]
@@ -2574,10 +2833,7 @@ mod tests {
         );
         assert_eq!(response.bids.len(), 1);
         assert_eq!(response.bids[0].bid_id.as_deref(), Some("valid"));
-        assert_eq!(
-            response.metadata["drop_reasons"]["missing_render_source"],
-            1
-        );
+        assert_eq!(drop_count(&response, AuctionDropReason::MalformedBid), 1);
     }
 
     #[test]
@@ -2653,7 +2909,7 @@ mod tests {
         );
         assert!(response.bids.is_empty());
         assert_eq!(
-            response.metadata["drop_reasons"]["missing_render_source"],
+            drop_count(&response, AuctionDropReason::MissingCreativeUrl),
             1
         );
         assert_eq!(response.metadata["drop_reasons"]["invalid_dimensions"], 1);

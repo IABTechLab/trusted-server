@@ -156,6 +156,121 @@ pub struct AuctionContext<'a> {
     pub services: &'a RuntimeServices,
 }
 
+/// Closed, local reason set for rejecting provider bids or undeliverable winners.
+///
+/// These values are serialized only into existing auction debug/diagnostic
+/// surfaces. They are not a persistence or external-event taxonomy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuctionDropReason {
+    /// Optional creative ID is present with an invalid type or value.
+    InvalidCreativeId,
+    /// Optional creative ID exceeds its UTF-8 byte bound.
+    CreativeIdTooLarge,
+    /// A positive integral dimension exceeds the supported range.
+    DimensionsOutOfRange,
+    /// An otherwise valid upstream bid ID is repeated in one provider response.
+    DuplicateUpstreamBidId,
+    /// A response contains no seat bids.
+    #[serde(rename = "empty_seatbid")]
+    EmptySeatBid,
+    /// A seat bid contains no usable bid array.
+    #[serde(rename = "empty_seatbid_bids")]
+    EmptySeatBidBids,
+    /// A creative URL is malformed, unsafe, or self-origin.
+    InvalidCreativeUrl,
+    /// A dimension is missing, malformed, nonpositive, or not requested.
+    InvalidDimensions,
+    /// A price is missing, malformed, nonfinite, or negative.
+    InvalidPrice,
+    /// The provider response violates the response-level contract.
+    InvalidProviderResponse,
+    /// The APS tag type is missing or unsupported.
+    InvalidTagType,
+    /// An upstream bid ID contains a forbidden control value or has the wrong type.
+    InvalidUpstreamBidId,
+    /// A valid sibling was preferred by deterministic per-slot reduction.
+    LostToHigherBid,
+    /// A provider bid is not an object.
+    MalformedBid,
+    /// APS creative metadata does not contain `creativeurl`.
+    MissingCreativeUrl,
+    /// Provider parsing was invoked without its request-local context.
+    MissingRequestContext,
+    /// A required upstream bid ID is absent or empty.
+    MissingUpstreamBidId,
+    /// A winner carries more than one render source.
+    MultipleRenderSources,
+    /// A winner has no render source.
+    NoRenderSource,
+    /// A typed renderer extension could not be serialized.
+    RendererExtensionSerializationFailed,
+    /// A validated renderer projection exceeds its bound.
+    RenderPayloadTooLarge,
+    /// APS script rendering is disabled by configuration.
+    ScriptRenderingDisabled,
+    /// A provider bid references an impression that was not dispatched.
+    UnknownImpression,
+    /// A provider bid declares a non-banner media type.
+    UnsupportedMediaType,
+    /// An upstream bid ID exceeds 64 UTF-8 bytes.
+    UpstreamBidIdTooLarge,
+}
+
+impl AuctionDropReason {
+    /// Return the exact existing debug/projection literal.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidCreativeId => "invalid_creative_id",
+            Self::CreativeIdTooLarge => "creative_id_too_large",
+            Self::DimensionsOutOfRange => "dimensions_out_of_range",
+            Self::DuplicateUpstreamBidId => "duplicate_upstream_bid_id",
+            Self::EmptySeatBid => "empty_seatbid",
+            Self::EmptySeatBidBids => "empty_seatbid_bids",
+            Self::InvalidCreativeUrl => "invalid_creative_url",
+            Self::InvalidDimensions => "invalid_dimensions",
+            Self::InvalidPrice => "invalid_price",
+            Self::InvalidProviderResponse => "invalid_provider_response",
+            Self::InvalidTagType => "invalid_tag_type",
+            Self::InvalidUpstreamBidId => "invalid_upstream_bid_id",
+            Self::LostToHigherBid => "lost_to_higher_bid",
+            Self::MalformedBid => "malformed_bid",
+            Self::MissingCreativeUrl => "missing_creative_url",
+            Self::MissingRequestContext => "missing_request_context",
+            Self::MissingUpstreamBidId => "missing_upstream_bid_id",
+            Self::MultipleRenderSources => "multiple_render_sources",
+            Self::NoRenderSource => "no_render_source",
+            Self::RendererExtensionSerializationFailed => "renderer_extension_serialization_failed",
+            Self::RenderPayloadTooLarge => "render_payload_too_large",
+            Self::ScriptRenderingDisabled => "script_rendering_disabled",
+            Self::UnknownImpression => "unknown_impression",
+            Self::UnsupportedMediaType => "unsupported_media_type",
+            Self::UpstreamBidIdTooLarge => "upstream_bid_id_too_large",
+        }
+    }
+}
+
+impl Ord for AuctionDropReason {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl PartialOrd for AuctionDropReason {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Typed counts projected into the existing `drop_reasons` debug object.
+pub type AuctionDropReasons = BTreeMap<AuctionDropReason, u64>;
+
+/// Increment one typed local drop reason.
+pub(crate) fn record_auction_drop(reasons: &mut AuctionDropReasons, reason: AuctionDropReason) {
+    *reasons.entry(reason).or_default() += 1;
+}
+
 /// URL used by the orchestrator when invoking a mediator from the collect
 /// path. Providers can `debug_assert` against this value to catch a mediator
 /// that has accidentally started depending on `context.request` carrying real
@@ -646,7 +761,7 @@ pub struct OrchestratorExt {
     pub dropped_winner_count: usize,
     /// Machine-readable reasons for omitted winners.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub dropped_winner_reasons: BTreeMap<String, usize>,
+    pub dropped_winner_reasons: AuctionDropReasons,
 }
 
 /// Status of bid response.
@@ -702,12 +817,82 @@ impl AuctionResponse {
         self.metadata.insert(key.into(), value);
         self
     }
+
+    /// Project typed local drop reasons into the existing provider metadata surface.
+    #[must_use]
+    pub fn with_drop_reasons(mut self, reasons: &AuctionDropReasons) -> Self {
+        if !reasons.is_empty() {
+            let values = reasons
+                .iter()
+                .map(|(reason, count)| {
+                    (reason.as_str().to_string(), serde_json::Value::from(*count))
+                })
+                .collect();
+            self.metadata.insert(
+                "drop_reasons".to_string(),
+                serde_json::Value::Object(values),
+            );
+        }
+        self
+    }
+
+    /// Project one typed local drop reason into provider metadata.
+    #[must_use]
+    pub fn with_drop_reason(self, reason: AuctionDropReason) -> Self {
+        self.with_drop_reasons(&BTreeMap::from([(reason, 1)]))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn typed_drop_reasons_use_exact_literals_in_provider_summary_metadata() {
+        let reasons = [
+            AuctionDropReason::InvalidCreativeId,
+            AuctionDropReason::CreativeIdTooLarge,
+            AuctionDropReason::DimensionsOutOfRange,
+            AuctionDropReason::DuplicateUpstreamBidId,
+            AuctionDropReason::EmptySeatBid,
+            AuctionDropReason::EmptySeatBidBids,
+            AuctionDropReason::InvalidCreativeUrl,
+            AuctionDropReason::InvalidDimensions,
+            AuctionDropReason::InvalidPrice,
+            AuctionDropReason::InvalidProviderResponse,
+            AuctionDropReason::InvalidTagType,
+            AuctionDropReason::InvalidUpstreamBidId,
+            AuctionDropReason::LostToHigherBid,
+            AuctionDropReason::MalformedBid,
+            AuctionDropReason::MissingCreativeUrl,
+            AuctionDropReason::MissingRequestContext,
+            AuctionDropReason::MissingUpstreamBidId,
+            AuctionDropReason::MultipleRenderSources,
+            AuctionDropReason::NoRenderSource,
+            AuctionDropReason::RendererExtensionSerializationFailed,
+            AuctionDropReason::RenderPayloadTooLarge,
+            AuctionDropReason::ScriptRenderingDisabled,
+            AuctionDropReason::UnknownImpression,
+            AuctionDropReason::UnsupportedMediaType,
+            AuctionDropReason::UpstreamBidIdTooLarge,
+        ];
+        for reason in reasons {
+            assert_eq!(
+                serde_json::to_value(reason).expect("drop reason should serialize"),
+                json!(reason.as_str()),
+                "serde and diagnostic literal should agree for {reason:?}"
+            );
+        }
+
+        let response = AuctionResponse::no_bid("aps", 12)
+            .with_drop_reason(AuctionDropReason::InvalidProviderResponse);
+        let summary = ProviderSummary::from(&response);
+        assert_eq!(
+            summary.metadata["drop_reasons"]["invalid_provider_response"], 1,
+            "publisher provider-summary projection should retain the typed reason"
+        );
+    }
 
     fn make_bid(bidder: &str) -> Bid {
         Bid {

@@ -9,7 +9,7 @@ use error_stack::{Report, ResultExt, ensure};
 use http::{HeaderValue, Request, Response, StatusCode, header};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use url::Url;
 use uuid::Uuid;
 
@@ -29,8 +29,8 @@ use crate::settings::Settings;
 
 use super::orchestrator::OrchestrationResult;
 use super::types::{
-    AdFormat, AdSlot, AuctionRequest, DeviceInfo, MediaType, OrchestratorExt, ProviderSummary,
-    PublisherInfo, SiteInfo, UserInfo,
+    AdFormat, AdSlot, AuctionDropReason, AuctionDropReasons, AuctionRequest, DeviceInfo, MediaType,
+    OrchestratorExt, ProviderSummary, PublisherInfo, SiteInfo, UserInfo, record_auction_drop,
 };
 
 /// Request body for `POST /auction` (tsjs / Prebid.js wire format).
@@ -289,16 +289,13 @@ pub(crate) struct AuctionDeliveryReport {
     /// Winners omitted because they could not be delivered safely.
     pub dropped_winner_count: usize,
     /// Machine-readable reasons for omitted winners.
-    pub dropped_winner_reasons: BTreeMap<String, usize>,
+    pub dropped_winner_reasons: AuctionDropReasons,
 }
 
 impl AuctionDeliveryReport {
-    fn record_drop(&mut self, reason: &str) {
+    fn record_drop(&mut self, reason: AuctionDropReason) {
         self.dropped_winner_count += 1;
-        *self
-            .dropped_winner_reasons
-            .entry(reason.to_string())
-            .or_default() += 1;
+        record_auction_drop(&mut self.dropped_winner_reasons, reason);
     }
 }
 
@@ -376,7 +373,7 @@ pub(crate) fn convert_to_openrtb_response_with_report(
                 slot_id,
                 bid.bidder
             );
-            delivery.record_drop("multiple_render_sources");
+            delivery.record_drop(AuctionDropReason::MultipleRenderSources);
             continue;
         }
 
@@ -409,7 +406,7 @@ pub(crate) fn convert_to_openrtb_response_with_report(
                     slot_id,
                     bid.bidder
                 );
-                delivery.record_drop("renderer_extension_serialization_failed");
+                delivery.record_drop(AuctionDropReason::RendererExtensionSerializationFailed);
                 continue;
             };
             (None, Some(ext))
@@ -420,7 +417,7 @@ pub(crate) fn convert_to_openrtb_response_with_report(
                 slot_id,
                 bid.bidder
             );
-            delivery.record_drop("no_render_source");
+            delivery.record_drop(AuctionDropReason::NoRenderSource);
             continue;
         };
 
@@ -1451,7 +1448,7 @@ mod tests {
         );
         assert_eq!(conversion.delivery.dropped_winner_count, 2);
         assert_eq!(
-            conversion.delivery.dropped_winner_reasons["no_render_source"],
+            conversion.delivery.dropped_winner_reasons[&AuctionDropReason::NoRenderSource],
             2
         );
         let json = response_json(conversion.response);
@@ -1518,7 +1515,7 @@ mod tests {
             conversion
                 .delivery
                 .dropped_winner_reasons
-                .contains_key("multiple_render_sources"),
+                .contains_key(&AuctionDropReason::MultipleRenderSources),
             "should report the exact ambiguous-source reason"
         );
     }

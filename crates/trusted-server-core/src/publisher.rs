@@ -1863,6 +1863,7 @@ const MAX_AUCTION_DEBUG_DUMP_BYTES: usize = 256 * 1024;
 /// `[integration.prebid].debug` is also enabled. Full debug detail remains
 /// available server-side via `log::trace!`.
 const DEBUG_DUMP_METADATA_ALLOWLIST: &[&str] = &[
+    "drop_reasons",
     "error_type",
     "status",
     "message",
@@ -4164,8 +4165,8 @@ mod tests {
 
     use super::*;
     use crate::auction::orchestrator::OrchestrationResult;
-    use crate::auction::types::AuctionResponse;
     use crate::auction::types::{AdFormat, AdSlot, MediaType};
+    use crate::auction::types::{AuctionDropReason, AuctionResponse};
     use crate::integrations::IntegrationRegistry;
     use crate::platform::test_support::{
         StubHttpClient, build_services_with_http_client, noop_services,
@@ -4241,6 +4242,32 @@ mod tests {
         assert!(
             !comment.contains("mediator_response"),
             "should omit mediator_response when no mediator ran: {comment}"
+        );
+    }
+
+    #[test]
+    fn auction_debug_comment_projects_typed_drop_reasons() {
+        let response = AuctionResponse::no_bid("aps", 12)
+            .with_drop_reason(AuctionDropReason::DuplicateUpstreamBidId);
+        let result = OrchestrationResult {
+            provider_responses: vec![response],
+            mediator_response: None,
+            winning_bids: std::collections::HashMap::new(),
+            total_time_ms: 12,
+            metadata: std::collections::HashMap::new(),
+        };
+        let state = Arc::new(Mutex::new(Some("BIDS_SCRIPT".to_string())));
+
+        prepend_auction_debug_comment("stream", &result, &state);
+
+        let comment = state
+            .lock()
+            .expect("should lock state")
+            .clone()
+            .expect("should have comment");
+        assert!(
+            comment.contains("\"drop_reasons\":{\"duplicate_upstream_bid_id\":1}"),
+            "typed fixed reason/count metadata should remain visible: {comment}"
         );
     }
 
