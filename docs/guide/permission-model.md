@@ -96,19 +96,19 @@ jurisdiction rules.
 
 The eleven named Data Uses, with the TCF purpose each maps from:
 
-| #   | Data Use identifier           | IAB TCF Europe purpose                          |
-| --- | ----------------------------- | ----------------------------------------------- |
-| 1   | `necessary.operations.storage`             | Store and/or access information on a device     |
-| 2   | `advertising_marketing.first_party.contextual`            | Use limited data to select advertising          |
-| 3   | `advertising_marketing.profiling`          | Create profiles for personalised advertising    |
-| 4   | `advertising_marketing.first_party.targeted`     | Use profiles to select personalised advertising |
-| 5   | `advertising_marketing.personalize.profiling`      | Create profiles to personalise content          |
-| 6   | `advertising_marketing.personalize.content` | Use profiles to select personalised content     |
-| 7   | `analytics.ad_reporting.measure_ad_performance`      | Measure advertising performance                 |
-| 8   | `analytics.ad_reporting.content_performance` | Measure content performance                     |
-| 9   | `analytics.ad_reporting.market_research`             | Understand audiences through statistics         |
-| 10  | `necessary.operations.improve`            | Develop and improve services                    |
-| 11  | `select-basic-content`        | Use limited data to select content              |
+| #   | Data Use identifier                             | IAB TCF Europe purpose                          |
+| --- | ----------------------------------------------- | ----------------------------------------------- |
+| 1   | `necessary.operations.storage`                  | Store and/or access information on a device     |
+| 2   | `advertising_marketing.first_party.contextual`  | Use limited data to select advertising          |
+| 3   | `advertising_marketing.profiling`               | Create profiles for personalised advertising    |
+| 4   | `advertising_marketing.first_party.targeted`    | Use profiles to select personalised advertising |
+| 5   | `advertising_marketing.personalize.profiling`   | Create profiles to personalise content          |
+| 6   | `advertising_marketing.personalize.content`     | Use profiles to select personalised content     |
+| 7   | `analytics.ad_reporting.measure_ad_performance` | Measure advertising performance                 |
+| 8   | `analytics.ad_reporting.content_performance`    | Measure content performance                     |
+| 9   | `analytics.ad_reporting.market_research`        | Understand audiences through statistics         |
+| 10  | `necessary.operations.improve`                  | Develop and improve services                    |
+| 11  | `select-basic-content`                          | Use limited data to select content              |
 
 ## How providers use permissions
 
@@ -116,10 +116,10 @@ A provider advertises a required permission set. The core resolves the
 permissions it has set for the request, then runs the provider only when every
 required permission is set.
 
-| Provider                  | Requires          | Effect when not set       |
-| ------------------------- | ----------------- | ------------------------- |
+| Provider                  | Requires                       | Effect when not set       |
+| ------------------------- | ------------------------------ | ------------------------- |
 | Built-in HMAC Edge Cookie | `necessary.operations.storage` | No Edge Cookie is created |
-| A vendor-neutral provider | nothing           | Always runs               |
+| A vendor-neutral provider | nothing                        | Always runs               |
 
 The Edge Cookie `Set-Cookie` operation always requires `necessary.operations.storage`
 (Purpose 1), because writing the cookie stores information on the device.
