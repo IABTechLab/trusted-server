@@ -131,6 +131,27 @@ describe('GptDiagnosticsStore', () => {
     assertCoverageEquation(store);
   });
 
+  it('matches the unique response-bearing load that arrives before render', () => {
+    let now = 1;
+    const store = new GptDiagnosticsStore({ now: () => now });
+    const slot = fakeSlot('early-load');
+
+    store.recordSlotRequested(slot);
+    now = 2;
+    store.recordSlotResponseReceived(slot);
+    now = 3;
+    store.recordSlotOnload(slot);
+    now = 4;
+    store.recordSlotRenderEnded(slot, { isEmpty: false });
+
+    const cycle = store.snapshot().slots[0].requests[0];
+    expect(cycle).toMatchObject({ loadAtMs: 3, loadObservedBeforeRender: true, incompleteSequence: false });
+    expect(cycle.durations.renderToLoadMs).toBeUndefined();
+    expect(store.snapshot().callbackIssues).not.toContainEqual(
+      expect.objectContaining({ kind: 'slotOnload', reason: 'invalid_event_order' })
+    );
+  });
+
   it('matches load and viewability after a render with unknown fill state', () => {
     let now = 1;
     const store = new GptDiagnosticsStore({ now: () => now });
@@ -160,9 +181,9 @@ describe('GptDiagnosticsStore', () => {
       viewableAtMs: 8,
       durations: { renderToLoadMs: 2, renderToViewableMs: 5 },
     });
-    expect(emptyCycle.loadAtMs).toBeUndefined();
+    expect(emptyCycle.loadAtMs).toBe(8);
     expect(emptyCycle.viewableAtMs).toBeUndefined();
-    expect(store.snapshot().coverage.slotOnload).toMatchObject({ matched: 1, unmatched: 1 });
+    expect(store.snapshot().coverage.slotOnload).toMatchObject({ matched: 2, unmatched: 0 });
     expect(store.snapshot().coverage.impressionViewable).toMatchObject({
       matched: 1,
       unmatched: 1,
@@ -565,6 +586,65 @@ describe('GptDiagnosticsStore', () => {
       { requestPath: 'unattributed' },
     ]);
     expect(cycles[1].trustedServerOpportunity).toBeUndefined();
+  });
+
+  it('consumes a combined request intent with independent source facts', () => {
+    let now = 10;
+    const deferred: Array<() => void> = [];
+    const store = new GptDiagnosticsStore({
+      now: () => now,
+      defer: (callback) => deferred.push(callback),
+    });
+    const slot = fakeSlot('intent');
+
+    store.recordTrustedServerOpportunity(slot, 'auction-slot', 'renderable_candidate', ' auction-123 ');
+    now = 20;
+    store.recordPrebidRefresh([slot]);
+    now = 30;
+    store.recordPublisherRefresh([slot]);
+    now = 34;
+    store.recordSlotRequested(slot);
+    now = 35;
+    store.recordSlotRequested(slot);
+
+    const cycles = store.snapshot().slots[0].requests;
+    expect(cycles).toMatchObject([
+      {
+        requestPath: 'competing',
+        requestIntentId: 1,
+        trustedServerOpportunity: 'renderable_candidate',
+        trustedServerAuctionId: 'auction-123',
+        opportunityToRequestMs: 24,
+      },
+      { requestPath: 'unattributed' },
+    ]);
+    expect(cycles[1].requestIntentId).toBeUndefined();
+    expect(deferred).toHaveLength(3);
+  });
+
+  it('derives a replacement from the most recent earlier filled render', () => {
+    let now = 1;
+    const store = new GptDiagnosticsStore({ now: () => now });
+    const slot = fakeSlot('replacement');
+
+    store.recordSlotRequested(slot);
+    now = 2;
+    store.recordSlotResponseReceived(slot);
+    now = 3;
+    store.recordSlotRenderEnded(slot, { isEmpty: false, adManager: { creativeId: 101 } });
+    now = 20;
+    store.recordSlotRequested(slot);
+    now = 21;
+    store.recordSlotResponseReceived(slot);
+    now = 22;
+    store.recordSlotRenderEnded(slot, { isEmpty: false, adManager: { creativeId: 202 } });
+
+    expect(store.snapshot().slots[0].requests[1]).toMatchObject({
+      replacedRequestNumber: 1,
+      previousRenderToRequestMs: 17,
+      previousCreativeId: 101,
+      creativeChanged: true,
+    });
   });
 
   it('expires request-path markers at the five-second boundary without waiting for timers', () => {

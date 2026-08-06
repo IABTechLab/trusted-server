@@ -98,10 +98,18 @@ interface StoreOptions {
   defer?: (callback: () => void, delayMs: number) => void;
 }
 
-interface PendingMarker<T> {
+type RequestIntentSource = 'trusted_server_direct' | 'prebid_refresh' | 'publisher_refresh';
+
+interface PendingSourceEvidence {
   generation: number;
-  recordedAtMs: number;
-  value: T;
+  observedAtMs: number;
+  trustedServerOpportunity?: GptDiagnosticsTrustedServerOpportunity;
+  trustedServerAuctionId?: string;
+}
+
+interface PendingRequestIntent {
+  intentId: number;
+  sources: Map<RequestIntentSource, PendingSourceEvidence>;
 }
 
 type AttemptStatus = 'live' | 'completed' | 'expired' | 'evicted';
@@ -182,9 +190,18 @@ function derivedDurations(cycle: MutableRequestCycle): GptDiagnosticsDurations {
     requestToResponseMs: validDuration(cycle.requestedAtMs, cycle.responseAtMs),
     responseToRenderMs: validDuration(cycle.responseAtMs, cycle.renderAtMs),
     requestToRenderMs: validDuration(cycle.requestedAtMs, cycle.renderAtMs),
-    renderToLoadMs: validDuration(cycle.renderAtMs, cycle.loadAtMs),
+    ...(cycle.loadObservedBeforeRender
+      ? {}
+      : { renderToLoadMs: validDuration(cycle.renderAtMs, cycle.loadAtMs) }),
     renderToViewableMs: validDuration(cycle.renderAtMs, cycle.viewableAtMs),
   };
+}
+
+function normalizedAuctionId(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return undefined;
+  return new TextEncoder().encode(trimmed).length <= 256 ? trimmed : undefined;
 }
 
 function responseClass(cycle: MutableRequestCycle): GptDiagnosticsResponseClass | undefined {
@@ -243,11 +260,7 @@ export class GptDiagnosticsStore {
   private readonly defer: (callback: () => void, delayMs: number) => void;
   /** Auction slot ID → GPT slot, established by the Trusted Server integration. */
   private readonly trustedServerSlots = new Map<string, GptDiagnosticsSlotLike>();
-  private readonly pendingTrustedServerOpportunities = new WeakMap<
-    object,
-    PendingMarker<GptDiagnosticsTrustedServerOpportunity>
-  >();
-  private readonly pendingPrebidRefreshes = new WeakMap<object, PendingMarker<true>>();
+  private readonly pendingRequestIntents = new WeakMap<object, PendingRequestIntent>();
   private readonly slotNumbers = new WeakMap<object, number>();
   private readonly requestNumbers = new WeakMap<object, number>();
   private readonly attemptIdsByCycle = new WeakMap<MutableRequestCycle, number>();
@@ -266,7 +279,8 @@ export class GptDiagnosticsStore {
     evictedRequestCycles: 0,
   };
   private nextRuntimeSlotNumber = 1;
-  private nextMarkerGeneration = 1;
+  private nextRequestIntentId = 1;
+  private nextIntentSourceGeneration = 1;
   private nextCreativeAttemptId = 1;
   private notificationScheduled = false;
   private gptObserved = false;
@@ -281,7 +295,8 @@ export class GptDiagnosticsStore {
   recordTrustedServerOpportunity(
     slot: GptDiagnosticsSlotLike,
     auctionSlotId: string,
-    opportunity: GptDiagnosticsTrustedServerOpportunity
+    opportunity: GptDiagnosticsTrustedServerOpportunity,
+    trustedServerAuctionId?: string
   ): void {
     if (
       !isSlotObject(slot) ||
@@ -300,7 +315,10 @@ export class GptDiagnosticsStore {
       this.trustedServerSlots.delete(oldest);
     }
 
-    this.installMarker(this.pendingTrustedServerOpportunities, slot, opportunity);
+    this.recordRequestIntentSource(slot, 'trusted_server_direct', {
+      trustedServerOpportunity: opportunity,
+      trustedServerAuctionId: normalizedAuctionId(trustedServerAuctionId),
+    });
   }
 
   /** Mark GPT slots whose next request follows a Prebid-controlled refresh. */
@@ -309,7 +327,16 @@ export class GptDiagnosticsStore {
 
     for (const slot of slots) {
       if (!isSlotObject(slot)) continue;
-      this.installMarker(this.pendingPrebidRefreshes, slot, true);
+      this.recordRequestIntentSource(slot, 'prebid_refresh');
+    }
+  }
+
+  /** Record publisher refresh observation from the private GPT diagnostics observer. */
+  recordPublisherRefresh(slots: GptDiagnosticsSlotLike[]): void {
+    if (!Array.isArray(slots)) return;
+    for (const slot of slots) {
+      if (!isSlotObject(slot)) continue;
+      this.recordRequestIntentSource(slot, 'publisher_refresh');
     }
   }
 
@@ -515,27 +542,30 @@ export class GptDiagnosticsStore {
 
     const requestNumber = (this.requestNumbers.get(slot) ?? 0) + 1;
     this.requestNumbers.set(slot, requestNumber);
-    const trustedServerOpportunity = this.consumeMarker(
-      this.pendingTrustedServerOpportunities,
-      slot,
-      timestampMs
-    );
-    const prebidRefresh = this.consumeMarker(this.pendingPrebidRefreshes, slot, timestampMs);
-    const requestPath: GptDiagnosticsRequestPath =
-      trustedServerOpportunity !== undefined && prebidRefresh
-        ? 'competing'
-        : trustedServerOpportunity !== undefined
-          ? 'trusted_server_direct'
-          : prebidRefresh
-            ? 'prebid_refresh'
-            : 'unattributed';
+    const intent = this.consumeRequestIntent(slot, timestampMs);
+    const trustedServerEvidence = intent?.sources.get('trusted_server_direct');
+    const requestPath = this.requestPath(intent);
     record.requests.push({
       requestNumber,
       requestedAtMs: timestampMs,
       durations: {},
       incompleteSequence: false,
       requestPath,
-      ...(trustedServerOpportunity !== undefined ? { trustedServerOpportunity } : {}),
+      ...(intent ? { requestIntentId: intent.intentId } : {}),
+      ...(trustedServerEvidence?.trustedServerOpportunity !== undefined
+        ? { trustedServerOpportunity: trustedServerEvidence.trustedServerOpportunity }
+        : {}),
+      ...(trustedServerEvidence?.trustedServerAuctionId !== undefined
+        ? { trustedServerAuctionId: trustedServerEvidence.trustedServerAuctionId }
+        : {}),
+      ...(trustedServerEvidence
+        ? {
+            opportunityToRequestMs: validDuration(
+              trustedServerEvidence.observedAtMs,
+              timestampMs
+            ),
+          }
+        : {}),
     });
     this.incrementDisposition('slotRequested', 'matched');
     this.notify();
@@ -584,6 +614,8 @@ export class GptDiagnosticsStore {
         cycle.slotContentChanged = facts.slotContentChanged;
         cycle.adManager = facts.adManager ? { ...facts.adManager } : undefined;
 
+        if (facts.isEmpty === false) this.recordReplacement(record, cycle);
+
         if (facts.isEmpty === true && provisionalCreativeRequest) {
           this.addAttributionIssue('creative_request_on_empty_cycle', timestampMs, record);
         }
@@ -619,11 +651,12 @@ export class GptDiagnosticsStore {
       'slotOnload',
       slot,
       timestampMs,
-      (cycle) =>
-        cycle.renderAtMs !== undefined && cycle.isEmpty !== true && cycle.loadAtMs === undefined,
+      (cycle) => cycle.responseAtMs !== undefined && cycle.loadAtMs === undefined,
       (record, cycle) => {
         cycle.loadAtMs = timestampMs;
-        if (validDuration(cycle.renderAtMs, timestampMs) === undefined) {
+        if (cycle.renderAtMs === undefined) {
+          cycle.loadObservedBeforeRender = true;
+        } else if (validDuration(cycle.renderAtMs, timestampMs) === undefined) {
           cycle.incompleteSequence = true;
           this.addIssue('slotOnload', record, timestampMs, 'matched', 'invalid_event_order');
         }
@@ -796,37 +829,64 @@ export class GptDiagnosticsStore {
     return false;
   }
 
-  private installMarker<T>(
-    markers: WeakMap<object, PendingMarker<T>>,
+  private recordRequestIntentSource(
     slot: object,
-    value: T
+    source: RequestIntentSource,
+    facts: Pick<PendingSourceEvidence, 'trustedServerOpportunity' | 'trustedServerAuctionId'> = {}
   ): void {
-    const generation = this.nextMarkerGeneration;
-    this.nextMarkerGeneration += 1;
-    markers.set(slot, {
-      generation,
-      recordedAtMs: this.now(),
-      value,
-    });
+    let intent = this.pendingRequestIntents.get(slot);
+    if (!intent) {
+      intent = { intentId: this.nextRequestIntentId, sources: new Map() };
+      this.nextRequestIntentId += 1;
+      this.pendingRequestIntents.set(slot, intent);
+    }
+    const generation = this.nextIntentSourceGeneration;
+    this.nextIntentSourceGeneration += 1;
+    const evidence: PendingSourceEvidence = { generation, observedAtMs: this.now(), ...facts };
+    intent.sources.set(source, evidence);
     this.defer(() => {
-      if (markers.get(slot)?.generation === generation) markers.delete(slot);
+      const currentIntent = this.pendingRequestIntents.get(slot);
+      if (currentIntent !== intent || currentIntent.sources.get(source)?.generation !== generation) return;
+      currentIntent.sources.delete(source);
+      if (currentIntent.sources.size === 0) this.pendingRequestIntents.delete(slot);
     }, REQUEST_PATH_ATTRIBUTION_WINDOW_MS);
   }
 
-  private consumeMarker<T>(
-    markers: WeakMap<object, PendingMarker<T>>,
-    slot: object,
-    timestampMs: number
-  ): T | undefined {
-    const marker = markers.get(slot);
-    markers.delete(slot);
-    if (
-      marker === undefined ||
-      timestampMs - marker.recordedAtMs >= REQUEST_PATH_ATTRIBUTION_WINDOW_MS
-    ) {
-      return undefined;
+  private consumeRequestIntent(slot: object, timestampMs: number): PendingRequestIntent | undefined {
+    const intent = this.pendingRequestIntents.get(slot);
+    this.pendingRequestIntents.delete(slot);
+    if (!intent) return undefined;
+    for (const [source, evidence] of intent.sources) {
+      if (timestampMs - evidence.observedAtMs >= REQUEST_PATH_ATTRIBUTION_WINDOW_MS) {
+        intent.sources.delete(source);
+      }
     }
-    return marker.value;
+    return intent.sources.size > 0 ? intent : undefined;
+  }
+
+  private requestPath(intent: PendingRequestIntent | undefined): GptDiagnosticsRequestPath {
+    if (!intent) return 'unattributed';
+    if (intent.sources.size > 1) return 'competing';
+    const source = intent.sources.keys().next().value as RequestIntentSource | undefined;
+    return source ?? 'unattributed';
+  }
+
+  private recordReplacement(record: MutableSlotRecord, cycle: MutableRequestCycle): void {
+    const currentIndex = record.requests.indexOf(cycle);
+    if (currentIndex <= 0) return;
+    const previous = record.requests
+      .slice(0, currentIndex)
+      .reverse()
+      .find((candidate) => candidate.isEmpty === false && candidate.renderAtMs !== undefined);
+    if (!previous) return;
+    cycle.replacedRequestNumber = previous.requestNumber;
+    cycle.previousRenderToRequestMs = validDuration(previous.renderAtMs, cycle.requestedAtMs);
+    const previousCreativeId = previous.adManager?.creativeId;
+    const currentCreativeId = cycle.adManager?.creativeId;
+    if (previousCreativeId !== undefined) cycle.previousCreativeId = previousCreativeId;
+    if (previousCreativeId !== undefined && currentCreativeId !== undefined) {
+      cycle.creativeChanged = previousCreativeId !== currentCreativeId;
+    }
   }
 
   private timestamp(): number {
