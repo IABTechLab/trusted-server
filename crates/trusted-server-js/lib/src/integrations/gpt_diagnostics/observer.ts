@@ -1,5 +1,5 @@
 import { log } from '../../core/log';
-import type { GptDiagnosticsAdManagerIdentity, Size } from '../../core/types';
+import type { GptDiagnosticsAdManagerIdentity, Size, TsjsApi } from '../../core/types';
 
 import type { GptDiagnosticsSlotLike, GptRenderFacts } from './store';
 
@@ -11,6 +11,7 @@ export interface GptDiagnosticsObserverStore {
   recordSlotOnload(slot: GptDiagnosticsSlotLike): void;
   recordImpressionViewable(slot: GptDiagnosticsSlotLike): void;
   recordSlotVisibilityChanged(slot: GptDiagnosticsSlotLike, percentage: number): void;
+  recordPublisherRefresh(slots: GptDiagnosticsSlotLike[]): void;
 }
 
 interface GptEvent {
@@ -48,6 +49,8 @@ type GptEventListener = (event: GptEvent) => void;
 
 interface GptPubAdsService {
   addEventListener(name: GptEventName, listener: GptEventListener): void;
+  refresh?: (...args: unknown[]) => unknown;
+  getSlots?: () => unknown;
 }
 
 interface GptCommandQueue {
@@ -61,6 +64,7 @@ interface GoogletagLike {
 
 export interface GptObserverWindow {
   googletag?: GoogletagLike;
+  tsjs?: Pick<TsjsApi, 'adInitRefreshInProgress' | 'prebidRefreshDispatchInProgress'>;
 }
 
 interface ObserverLogger {
@@ -88,6 +92,7 @@ function normalizeSize(value: unknown): Size | undefined {
 }
 
 const MAX_AD_MANAGER_ID_LIST = 8;
+const REFRESH_OBSERVER_INSTALLED = Symbol('gptDiagnosticsRefreshObserverInstalled');
 
 function normalizeAdManagerId(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
@@ -208,6 +213,12 @@ export class GptDiagnosticsObserver {
         });
       });
 
+      try {
+        this.installRefreshObserver(pubads);
+      } catch (error) {
+        this.logger.warn('gpt diagnostics: refresh observer installation failed', error);
+      }
+
       this.installed = true;
       this.store.markGptObserved();
     } catch (error) {
@@ -221,5 +232,52 @@ export class GptDiagnosticsObserver {
     } catch (error) {
       this.logger.warn(`gpt diagnostics: ${kind} callback failed`, error);
     }
+  }
+
+  private installRefreshObserver(pubads: GptPubAdsService): void {
+    if (
+      typeof pubads.refresh !== 'function' ||
+      (pubads as GptPubAdsService & { [REFRESH_OBSERVER_INSTALLED]?: boolean })[
+        REFRESH_OBSERVER_INSTALLED
+      ]
+    ) {
+      return;
+    }
+    const originalRefresh = pubads.refresh;
+    const observer = this;
+    pubads.refresh = function (this: unknown, ...args: unknown[]): unknown {
+      try {
+        if (observer.shouldRecordPublisherRefresh()) {
+          const slots = observer.refreshSlots(pubads, args);
+          if (slots.length > 0) observer.store.recordPublisherRefresh(slots);
+        }
+      } catch {
+        // Diagnostics must not affect the original refresh.
+      }
+      return Reflect.apply(originalRefresh, this, args);
+    };
+    (pubads as GptPubAdsService & { [REFRESH_OBSERVER_INSTALLED]?: boolean })[
+      REFRESH_OBSERVER_INSTALLED
+    ] = true;
+  }
+
+  private shouldRecordPublisherRefresh(): boolean {
+    try {
+      return !(
+        this.window.tsjs?.adInitRefreshInProgress ||
+        this.window.tsjs?.prebidRefreshDispatchInProgress
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  private refreshSlots(pubads: GptPubAdsService, args: unknown[]): GptDiagnosticsSlotLike[] {
+    const rawSlots = args.length === 0 ? pubads.getSlots?.() : args[0];
+    return Array.isArray(rawSlots)
+      ? rawSlots.filter((slot): slot is GptDiagnosticsSlotLike =>
+          typeof slot === 'object' && slot !== null
+        )
+      : [];
   }
 }

@@ -27,6 +27,7 @@ function fakeStore(): GptDiagnosticsObserverStore {
     recordSlotOnload: vi.fn(),
     recordImpressionViewable: vi.fn(),
     recordSlotVisibilityChanged: vi.fn(),
+    recordPublisherRefresh: vi.fn(),
   };
 }
 
@@ -102,6 +103,26 @@ describe('GptDiagnosticsObserver', () => {
 
     expect(gpt.pubads.addEventListener).toHaveBeenCalledTimes(EVENT_NAMES.length);
     expect(store.markGptObserved).toHaveBeenCalledTimes(1);
+  });
+
+  it('observes publisher refresh slots without changing the delegated call', () => {
+    const store = fakeStore();
+    const gpt = controlledGpt();
+    const slot = fakeSlot();
+    const receiver = { refresh: gpt.pubads.refresh };
+    const originalRefresh = vi.fn(function (this: unknown, ...args: unknown[]) {
+      return { receiver: this, args };
+    });
+    gpt.pubads.refresh = originalRefresh;
+    const observer = new GptDiagnosticsObserver(store, { window: gpt.window });
+    observer.install();
+    gpt.googletag.cmd[0]();
+
+    const result = Reflect.apply(gpt.pubads.refresh, receiver, [[slot], { changeCorrelator: false }]);
+
+    expect(store.recordPublisherRefresh).toHaveBeenCalledWith([slot]);
+    expect(originalRefresh).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ receiver, args: [[slot], { changeCorrelator: false }] });
   });
 
   it('creates a command queue and waits when GPT is absent', () => {
@@ -311,7 +332,7 @@ describe('GptDiagnosticsObserver', () => {
     expect(logger.warn).toHaveBeenCalledTimes(2);
   });
 
-  it('does not patch GPT or browser methods', () => {
+  it('wraps only PubAds refresh and leaves unrelated GPT and browser methods intact', () => {
     const store = fakeStore();
     const gpt = controlledGpt();
     const observer = new GptDiagnosticsObserver(store, { window: gpt.window });
@@ -330,7 +351,7 @@ describe('GptDiagnosticsObserver', () => {
 
     expect(gpt.googletag.display).toBe(references.display);
     expect(gpt.googletag.defineSlot).toBe(references.defineSlot);
-    expect(gpt.pubads.refresh).toBe(references.refresh);
+    expect(gpt.pubads.refresh).not.toBe(references.refresh);
     expect(window.fetch).toBe(references.fetch);
     expect(window.XMLHttpRequest).toBe(references.XMLHttpRequest);
     expect(window.history.pushState).toBe(references.pushState);
