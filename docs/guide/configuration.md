@@ -410,7 +410,7 @@ TRUSTED_SERVER__TESTER_COOKIE__ENABLED=true
 
 ## EC Configuration
 
-Settings for generating privacy-preserving Edge Cookie identifiers. The `ec_store` KV store is the only KV-backed EC lifecycle store; it holds identity graph state, minimal consent metadata, source-domain keyed partner UIDs, and withdrawal tombstones. Consent configuration controls request-local interpretation and forwarding, not separate KV persistence.
+Settings for Edge Cookie identifier generation. The `ec_store` KV store is the only KV-backed EC lifecycle store. It holds identity graph state, minimal consent metadata, source-domain keyed partner UIDs, and withdrawal tombstones. Consent configuration controls request-local interpretation and forwarding, not separate KV persistence.
 
 ### `[ec]`
 
@@ -588,7 +588,7 @@ Individual env var keys like `TRUSTED_SERVER__RESPONSE_HEADERS__X_CUSTOM_HEADER`
 
 **Use Cases**:
 
-- Custom tracking headers
+- Custom measurement headers
 - Cache control overrides
 - Debugging identifiers
 - CORS headers (if needed)
@@ -1733,5 +1733,5 @@ cat trusted-server.toml | npx toml-cli validate
 
 - Set up [Request Signing](/guide/request-signing) for secure API calls
 - Configure [First-Party Proxy](/guide/first-party-proxy) for URL proxying
-- Learn about [Edge Cookies](/guide/edge-cookies) for privacy-preserving identification
+- Learn about [Edge Cookies](/guide/edge-cookies) for first-party state management
 - Review [Integrations](/guide/integrations-overview) for partner support
