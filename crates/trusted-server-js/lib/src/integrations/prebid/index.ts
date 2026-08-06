@@ -16,7 +16,7 @@ import type _pbjsDefault from 'prebid.js';
 import { log } from '../../core/log';
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
 import type { AuctionBid, AuctionEid } from '../../core/auction';
-import type { AuctionSlot } from '../../core/types';
+import type { AuctionSlot, TsjsApi } from '../../core/types';
 
 import { PREBID_USER_ID_MODULE_REGISTRY } from './user_id_modules';
 
@@ -374,6 +374,43 @@ function recordPrebidRefreshForDiagnostics(slots: RefreshGptSlot[]): void {
     window.tsjs?.gptDiagnostics?.recordPrebidRefresh?.(slots);
   } catch {
     // Diagnostics must not suppress the GAM request.
+  }
+}
+
+function dispatchPrebidRefresh(
+  refresh: (slots?: unknown[], opts?: unknown) => void,
+  slots: unknown[] | undefined,
+  opts: unknown
+): void {
+  let tsjs: TsjsApi | undefined;
+  let hadOwnContext = false;
+  let previousContext: boolean | undefined;
+  let contextSet = false;
+  try {
+    tsjs = window.tsjs;
+    if (tsjs) {
+      hadOwnContext = Object.prototype.hasOwnProperty.call(tsjs, 'prebidRefreshDispatchInProgress');
+      previousContext = tsjs.prebidRefreshDispatchInProgress;
+      tsjs.prebidRefreshDispatchInProgress = true;
+      contextSet = true;
+    }
+  } catch {
+    // Diagnostics context must not affect refresh delegation.
+  }
+  try {
+    refresh(slots, opts);
+  } finally {
+    if (contextSet && tsjs) {
+      try {
+        if (hadOwnContext) {
+          tsjs.prebidRefreshDispatchInProgress = previousContext;
+        } else {
+          delete tsjs.prebidRefreshDispatchInProgress;
+        }
+      } catch {
+        // Diagnostics context restoration must not mask a refresh result or throw.
+      }
+    }
   }
 }
 
@@ -1235,7 +1272,7 @@ export function installRefreshHandler(timeoutMs = 1500): void {
       const independentSlots = targetSlots.filter((slot) => !deliverySlots.has(slot));
       if (independentSlots.length === 0) {
         recordPrebidRefreshForDiagnostics(targetSlots);
-        return originalRefresh(slots, opts);
+        return dispatchPrebidRefresh(originalRefresh, slots, opts);
       }
 
       independentSlots.forEach(clearRefreshTargeting);
@@ -1301,7 +1338,7 @@ export function installRefreshHandler(timeoutMs = 1500): void {
           }
         }
         recordPrebidRefreshForDiagnostics(targetSlots);
-        originalRefresh(slots, opts);
+        dispatchPrebidRefresh(originalRefresh, slots, opts);
       }
 
       try {
