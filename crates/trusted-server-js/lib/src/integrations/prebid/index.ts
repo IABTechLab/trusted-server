@@ -15,10 +15,14 @@ import type _pbjsDefault from 'prebid.js';
 
 import { log } from '../../core/log';
 import { isEffectivelyVisible, recordRender, stampCreativeTrace } from '../../core/trace';
-import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
+import {
+  buildAdRequest,
+  isRendererReservationIdV1,
+  parseAuctionResponse,
+} from '../../core/auction';
 import { registerApsPrebidRenderer, validateApsRenderer } from '../aps/render';
 import type { AuctionBid, AuctionEid } from '../../core/auction';
-import type { AuctionSlot, RenderRecord } from '../../core/types';
+import type { AuctionSlot, BrowserAuctionBidV1, RenderRecord } from '../../core/types';
 
 import { PREBID_USER_ID_MODULE_REGISTRY } from './user_id_modules';
 
@@ -286,6 +290,55 @@ function recordUserIdModuleDiagnostics(): PrebidUserIdDiagnostics {
 // ---------------------------------------------------------------------------
 // trustedServer bid adapter helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Prepare a generated Trusted Server Prebid bid for the hard cutover without
+ * publishing it or mutating Prebid-owned state. Native bids never enter this
+ * boundary and therefore retain their Prebid-generated identities.
+ */
+export function prepareTrustedServerPrebidBidV1(
+  bid: BrowserAuctionBidV1,
+  generatedBid: Readonly<Record<string, unknown>>
+): Readonly<Record<string, unknown>> | undefined {
+  if (
+    !isRendererReservationIdV1(bid.rendererReservationId) ||
+    !['aps', 'adm', 'cache'].includes(bid.renderSource.type) ||
+    typeof generatedBid !== 'object' ||
+    generatedBid === null ||
+    Array.isArray(generatedBid) ||
+    Object.getPrototypeOf(generatedBid) !== Object.prototype
+  ) {
+    return undefined;
+  }
+
+  const descriptors = Object.getOwnPropertyDescriptors(generatedBid);
+  const keys = Reflect.ownKeys(generatedBid);
+  const adId = descriptors['adId'];
+  if (
+    keys.some((key) => typeof key !== 'string') ||
+    !adId ||
+    !Object.prototype.hasOwnProperty.call(adId, 'value') ||
+    typeof adId.value !== 'string' ||
+    adId.value.length === 0
+  ) {
+    return undefined;
+  }
+
+  const prepared: Record<string, unknown> = {};
+  for (const key of keys as string[]) {
+    const descriptor = descriptors[key];
+    if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) {
+      return undefined;
+    }
+    Object.defineProperty(prepared, key, {
+      value: key === 'adId' ? bid.rendererReservationId : descriptor.value,
+      enumerable: descriptor.enumerable === true,
+      writable: false,
+      configurable: false,
+    });
+  }
+  return Object.freeze(prepared);
+}
 
 /** Resolved endpoint — set by installPrebidNpm, read by the adapter. */
 let auctionEndpoint = '/auction';

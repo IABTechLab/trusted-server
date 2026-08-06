@@ -9,6 +9,8 @@ import {
   sendAuction,
 } from '../../src/core/auction';
 import envelope from '../fixtures/aps-renderer-v1.json';
+import { parseCacheFetchPolicyV1 } from '../../src/core/config';
+import type { BrowserAuctionProjectionV1 } from '../../src/core/types';
 
 function apsRenderer(creativeId?: string) {
   const bid = envelope.seatbid[0]!.bid[0]!;
@@ -627,7 +629,9 @@ describe('auction/parseBrowserAuctionProjectionV1', () => {
 
     expect(parsed).toBeDefined();
     expect(Object.getPrototypeOf(parsed!.bids[0]!.targeting)).toBe(Object.prototype);
-    expect(Object.prototype.hasOwnProperty.call(parsed!.bids[0]!.targeting, '__proto__')).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(parsed!.bids[0]!.targeting, '__proto__')).toBe(
+      true
+    );
     expect(parsed!.bids[0]!.targeting['__proto__']).toBe('publisher-value');
   });
 
@@ -650,6 +654,46 @@ describe('auction/parseBrowserAuctionProjectionV1', () => {
         MAX_BROWSER_AUCTION_PROJECTION_BYTES + delta
       );
       expect(parseBrowserAuctionProjectionV1(value) !== undefined).toBe(accepted);
+    }
+  });
+
+  it('requires cache sources to match one frozen cache policy exactly', () => {
+    const cacheId = 'f47447a0-b759-4f2f-9887-af458b79b570';
+    const policy = parseCacheFetchPolicyV1({
+      version: 1,
+      baseUrl: 'https://cache.example:8443/pbc/v1/cache',
+    });
+    expect(policy).toBeDefined();
+
+    const cacheProjection = () => {
+      const value = browserProjection() as unknown as BrowserAuctionProjectionV1;
+      value.bids[0]!.renderSource = {
+        type: 'cache',
+        version: 1,
+        cacheId,
+        fetchUrl: `https://cache.example:8443/pbc/v1/cache?uuid=${cacheId}`,
+        width: 300,
+        height: 250,
+      };
+      return value;
+    };
+
+    expect(parseBrowserAuctionProjectionV1(cacheProjection())).toBeUndefined();
+    expect(parseBrowserAuctionProjectionV1(cacheProjection(), policy)).toBeDefined();
+
+    for (const fetchUrl of [
+      `https://other.example:8443/pbc/v1/cache?uuid=${cacheId}`,
+      `https://cache.example/pbc/v1/cache?uuid=${cacheId}`,
+      `https://cache.example:8443/other?uuid=${cacheId}`,
+      `https://user@cache.example:8443/pbc/v1/cache?uuid=${cacheId}`,
+      `https://cache.example:8443/pbc/v1/cache?uuid=${cacheId}&uuid=${cacheId}`,
+      `https://cache.example:8443/pbc/v1/cache?uuid=${cacheId}&extra=1`,
+      `https://cache.example:8443/pbc/v1/cache?uuid=${cacheId}#fragment`,
+    ]) {
+      const value = cacheProjection();
+      if (value.bids[0]!.renderSource.type !== 'cache') throw new Error('expected cache source');
+      value.bids[0]!.renderSource.fetchUrl = fetchUrl;
+      expect(parseBrowserAuctionProjectionV1(value, policy)).toBeUndefined();
     }
   });
 });
@@ -796,7 +840,13 @@ describe('auction/parseTrustedServerAuctionResponseV1', () => {
 
   it('permits matching adm only for ADM sources', () => {
     const adm = response();
-    const source = { type: 'adm' as const, version: 1 as const, adm: '<div>ok</div>', width: 1, height: 1 };
+    const source = {
+      type: 'adm' as const,
+      version: 1 as const,
+      adm: '<div>ok</div>',
+      width: 1,
+      height: 1,
+    };
     const bid = adm.seatbid[0]!.bid[0]!;
     bid.w = 1;
     bid.h = 1;
@@ -815,6 +865,34 @@ describe('auction/parseTrustedServerAuctionResponseV1', () => {
     const apsWithAdm = response();
     apsWithAdm.seatbid[0]!.bid[0]!.adm = '<div>forbidden</div>';
     expect(parseTrustedServerAuctionResponseV1(apsWithAdm)).toBeUndefined();
+  });
+
+  it('binds direct cache winners to the same frozen boot policy', () => {
+    const cacheId = 'f47447a0-b759-4f2f-9887-af458b79b570';
+    const policy = parseCacheFetchPolicyV1({
+      version: 1,
+      baseUrl: 'https://cache.example:8443/pbc/v1/cache',
+    });
+    const value = response();
+    const bid = value.seatbid[0]!.bid[0]!;
+    bid.ext.trusted_server.render_source = {
+      type: 'cache',
+      version: 1,
+      cacheId,
+      fetchUrl: `https://cache.example:8443/pbc/v1/cache?uuid=${cacheId}`,
+      width: bid.w,
+      height: bid.h,
+    };
+
+    expect(parseTrustedServerAuctionResponseV1(value)).toBeUndefined();
+    expect(parseTrustedServerAuctionResponseV1(value, policy)).toBeDefined();
+
+    const mismatched = structuredClone(value);
+    const source = mismatched.seatbid[0]!.bid[0]!.ext.trusted_server.render_source as {
+      fetchUrl: string;
+    };
+    source.fetchUrl = `https://cache.example:9443/pbc/v1/cache?uuid=${cacheId}`;
+    expect(parseTrustedServerAuctionResponseV1(mismatched, policy)).toBeUndefined();
   });
 });
 

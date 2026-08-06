@@ -31,10 +31,10 @@ use super::orchestrator::OrchestrationResult;
 use super::types::{
     AdFormat, AdSlot, AuctionDecisionSetV1, AuctionDropReason, AuctionDropReasons, AuctionRequest,
     AuctionSlotFailureReason, BidRenderSourceV1, BrowserAuctionBidV1, BrowserAuctionProjectionV1,
-    DeviceInfo, MAX_BROWSER_AUCTION_PROJECTION_BYTES, MAX_BROWSER_AUCTION_RESULTS,
-    MAX_BROWSER_AUCTION_TARGETING_ENTRIES, MediaType, OrchestratorExt, ProviderSummary,
-    PublisherInfo, RENDER_DIMENSION_MAX, RENDER_DIMENSION_MIN, SiteInfo, SlotAuctionDecisionV1,
-    UserInfo, classify_aps_renderer_v1, record_auction_drop,
+    CacheFetchPolicyV1, DeviceInfo, MAX_BROWSER_AUCTION_PROJECTION_BYTES,
+    MAX_BROWSER_AUCTION_RESULTS, MAX_BROWSER_AUCTION_TARGETING_ENTRIES, MediaType, OrchestratorExt,
+    ProviderSummary, PublisherInfo, RENDER_DIMENSION_MAX, RENDER_DIMENSION_MIN, SiteInfo,
+    SlotAuctionDecisionV1, UserInfo, classify_aps_renderer_v1, record_auction_drop,
 };
 
 /// Request body for `POST /auction` (tsjs / Prebid.js wire format).
@@ -332,6 +332,36 @@ pub(crate) mod coordinated_cutover_v1 {
     fn projection_contract_error(message: impl Into<String>) -> Report<TrustedServerError> {
         Report::new(TrustedServerError::Auction {
             message: message.into(),
+        })
+    }
+
+    /// Validate and deep-own the immutable cache fetch base used by projection.
+    pub(crate) fn canonicalize_cache_fetch_policy_v1(
+        base_url: &str,
+    ) -> Result<CacheFetchPolicyV1, Report<TrustedServerError>> {
+        ensure!(
+            !base_url.is_empty()
+                && base_url.len() <= 4096
+                && !base_url
+                    .chars()
+                    .any(|character| matches!(character, '\0'..='\u{1f}' | '\u{7f}')),
+            projection_contract_error("Cache policy base URL violates the byte grammar")
+        );
+        let parsed = Url::parse(base_url)
+            .map_err(|_| projection_contract_error("Cache policy base URL is invalid"))?;
+        ensure!(
+            parsed.scheme() == "https"
+                && parsed.host_str().is_some()
+                && parsed.username().is_empty()
+                && parsed.password().is_none()
+                && parsed.query().is_none()
+                && parsed.fragment().is_none()
+                && parsed.path() != "/",
+            projection_contract_error("Cache policy base URL is not a trusted fixed endpoint")
+        );
+        Ok(CacheFetchPolicyV1 {
+            version: 1,
+            base_url: base_url.to_string(),
         })
     }
 
@@ -731,7 +761,8 @@ pub(crate) mod coordinated_cutover_v1 {
 
 #[cfg(test)]
 use coordinated_cutover_v1::{
-    canonicalize_browser_auction_projection_v1, serialize_trusted_server_auction_response_v1,
+    canonicalize_browser_auction_projection_v1, canonicalize_cache_fetch_policy_v1,
+    serialize_trusted_server_auction_response_v1,
 };
 
 /// Convert `OrchestrationResult` to `OpenRTB` response format.
@@ -2497,6 +2528,35 @@ mod convert_tests {
             json.starts_with("{\"version\":1,\"auction\":{\"version\":1,\"auctionId\":"),
             "top-level and decision-set fields should retain schema order: {json}"
         );
+    }
+
+    #[test]
+    fn cache_policy_requires_one_exact_trusted_https_base() {
+        let policy = canonicalize_cache_fetch_policy_v1("https://cache.example:8443/pbc/v1/cache")
+            .expect("valid cache policy should canonicalize");
+        assert_eq!(policy.version, 1);
+        assert_eq!(policy.base_url, "https://cache.example:8443/pbc/v1/cache");
+        assert_eq!(
+            serde_json::to_value(&policy).expect("cache policy should serialize"),
+            serde_json::json!({
+                "version": 1,
+                "baseUrl": "https://cache.example:8443/pbc/v1/cache"
+            }),
+            "the pure policy must be ready for the exact tsjs.boot.cachePolicy member"
+        );
+
+        for invalid in [
+            "http://cache.example/pbc/v1/cache",
+            "https://user@cache.example/pbc/v1/cache",
+            "https://cache.example/",
+            "https://cache.example/pbc/v1/cache?existing=1",
+            "https://cache.example/pbc/v1/cache#fragment",
+        ] {
+            assert!(
+                canonicalize_cache_fetch_policy_v1(invalid).is_err(),
+                "should reject {invalid}"
+            );
+        }
     }
 
     #[test]

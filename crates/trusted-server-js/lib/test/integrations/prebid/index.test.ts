@@ -194,9 +194,10 @@ import {
   auctionBidsToPrebidBids,
   installPrebidNpm,
   installRefreshHandler,
+  prepareTrustedServerPrebidBidV1,
 } from '../../../src/integrations/prebid/index';
 import type { AuctionBid } from '../../../src/core/auction';
-import type { TsjsApi } from '../../../src/core/types';
+import type { BidRenderSourceV1, BrowserAuctionBidV1, TsjsApi } from '../../../src/core/types';
 import { log } from '../../../src/core/log';
 import envelope from '../../fixtures/aps-renderer-v1.json';
 
@@ -204,6 +205,106 @@ import envelope from '../../fixtures/aps-renderer-v1.json';
 // self-init above already set it), so every test starts from a clean page.
 beforeEach(() => {
   delete testWindow.__tsjsPrebidShimInstalled;
+});
+
+describe('prebid/prepareTrustedServerPrebidBidV1', () => {
+  const reservationId = 'r1_BwcHBwcHBwcHBwcHBwcHBw';
+  const renderSources: BidRenderSourceV1[] = [
+    {
+      type: 'aps',
+      version: 1,
+      accountId: 'example-account-id',
+      bidId: 'example-aps-bid-id',
+      creativeId: 'example-creative-id',
+      tagType: 'iframe',
+      creativeUrl: 'https://c.amazon-adsystem.com/example',
+      aaxResponse: 'eyJpZCI6ImV4YW1wbGUifQ==',
+      width: 300,
+      height: 250,
+    },
+    { type: 'adm', version: 1, adm: '<div>trusted creative</div>', width: 300, height: 250 },
+    {
+      type: 'cache',
+      version: 1,
+      cacheId: '123e4567-e89b-42d3-a456-426614174000',
+      fetchUrl: 'https://cache.example.test/cache?uuid=123e4567-e89b-42d3-a456-426614174000',
+      width: 300,
+      height: 250,
+    },
+  ];
+
+  function projectedBid(renderSource: BidRenderSourceV1): BrowserAuctionBidV1 {
+    return {
+      candidateId: 'AQIDBAUGBwgJ',
+      slot: 'homepage_header',
+      provider: 'example',
+      upstreamBidId: 'upstream-bid-id',
+      cpm: 1.25,
+      currency: 'USD',
+      targeting: Object.freeze({ hb_bidder: 'example', hb_pb: '1.20' }),
+      rendererReservationId: reservationId,
+      renderSource,
+    };
+  }
+
+  it.each(renderSources)(
+    'replaces only the generated Trusted Server adId for $type rendering',
+    (renderSource) => {
+      const generatedTsBid = { adId: 'prebid-generated-id', cpm: 1.25, bidder: 'trustedServer' };
+      const nativeBid = { adId: 'native-prebid-id', cpm: 2.5, bidder: 'nativeBidder' };
+
+      const prepared = prepareTrustedServerPrebidBidV1(projectedBid(renderSource), generatedTsBid);
+
+      expect(prepared).toEqual({
+        adId: reservationId,
+        cpm: 1.25,
+        bidder: 'trustedServer',
+      });
+      expect(Object.isFrozen(prepared)).toBe(true);
+      expect(generatedTsBid.adId).toBe('prebid-generated-id');
+      expect(nativeBid.adId).toBe('native-prebid-id');
+    }
+  );
+
+  it('rejects malformed reservations instead of truncating or falling back to other ids', () => {
+    const bid = projectedBid(renderSources[0]!);
+    const generatedTsBid = {
+      adId: 'prebid-generated-id',
+      bidId: 'upstream-fallback-id',
+      cacheId: '123e4567-e89b-42d3-a456-426614174000',
+    };
+
+    expect(
+      prepareTrustedServerPrebidBidV1(
+        { ...bid, rendererReservationId: `${reservationId}extra` },
+        generatedTsBid
+      )
+    ).toBeUndefined();
+    expect(generatedTsBid).toEqual({
+      adId: 'prebid-generated-id',
+      bidId: 'upstream-fallback-id',
+      cacheId: '123e4567-e89b-42d3-a456-426614174000',
+    });
+  });
+
+  it('rejects accessor and non-plain generated bids before reading or mutating them', () => {
+    const accessor = vi.fn(() => 'prebid-generated-id');
+    const generatedTsBid = Object.defineProperty({}, 'adId', {
+      get: accessor,
+      enumerable: true,
+    });
+
+    expect(
+      prepareTrustedServerPrebidBidV1(projectedBid(renderSources[1]!), generatedTsBid)
+    ).toBeUndefined();
+    expect(accessor).not.toHaveBeenCalled();
+    expect(
+      prepareTrustedServerPrebidBidV1(
+        projectedBid(renderSources[1]!),
+        Object.create({ adId: 'inherited-id' }) as Record<string, unknown>
+      )
+    ).toBeUndefined();
+  });
 });
 
 describe('prebid/collectBidders', () => {

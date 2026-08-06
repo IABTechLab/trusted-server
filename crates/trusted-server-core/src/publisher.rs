@@ -19,6 +19,7 @@
 //! the streaming route). It is not a content-rewriting concern.
 
 use std::borrow::Cow;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -37,16 +38,21 @@ use http::{HeaderValue, Method, Request, Response, StatusCode, Uri, header};
 use crate::auction::endpoints::{
     merge_auction_eids, resolve_auction_eids, resolve_client_auction_eids,
 };
-use crate::auction::formats::sanitize_publisher_page_url;
+use crate::auction::formats::{
+    coordinated_cutover_v1::CanonicalBrowserAuctionProjectionV1, sanitize_publisher_page_url,
+};
 use crate::auction::orchestrator::{
-    AuctionOrchestrator, DispatchAuctionOutcome, DispatchedAuction,
+    AuctionOrchestrator, DispatchAuctionOutcome, DispatchedAuction, OrchestrationResult,
 };
 use crate::auction::telemetry::{
     AuctionObservationContext, AuctionSource, AuctionTerminalOutcome, build_auction_events,
     emit_auction_events_best_effort_lazy,
 };
 use crate::auction::types::{
-    AuctionContext, AuctionRequest, Bid, DeviceInfo, PublisherInfo, SiteInfo, UserInfo,
+    AdmRenderSourceV1, AuctionContext, AuctionIdentityGenerator, AuctionRequest,
+    AuctionSlotFailureReason, Bid, BidRenderSourceV1, BrowserAuctionBidV1,
+    BrowserAuctionProjectionV1, CacheFetchPolicyV1, CacheRenderSourceV1, DeviceInfo, PublisherInfo,
+    SiteInfo, SlotAuctionDecisionV1, UserInfo, mint_response_unique_base64url_identity,
 };
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
 use crate::constants::{COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
@@ -3292,6 +3298,214 @@ fn html_escape_for_script(s: &str) -> String {
     out
 }
 
+#[allow(
+    dead_code,
+    reason = "pure coordinated-cutover projection is wired to entry points in Task 19"
+)]
+pub(crate) mod coordinated_cutover_v1 {
+    use super::*;
+
+    const RENDERER_RESERVATION_BYTES: usize = 16;
+    const RENDERER_RESERVATION_COLLISION_RETRIES: usize = 8;
+
+    fn cache_policy_base(policy: &CacheFetchPolicyV1) -> Option<url::Url> {
+        if policy.version != 1 {
+            return None;
+        }
+        let canonical =
+            crate::auction::formats::coordinated_cutover_v1::canonicalize_cache_fetch_policy_v1(
+                &policy.base_url,
+            )
+            .ok()?;
+        url::Url::parse(&canonical.base_url).ok()
+    }
+
+    fn cache_source_from_legacy_bid(
+        bid: &Bid,
+        policy: Option<&CacheFetchPolicyV1>,
+    ) -> Option<BidRenderSourceV1> {
+        let policy = policy?;
+        let mut base = cache_policy_base(policy)?;
+        let cache_id = bid.cache_id.as_deref()?;
+        if bid.cache_host.as_deref() != base.host_str()
+            || bid.cache_path.as_deref() != Some(base.path())
+        {
+            return None;
+        }
+        base.query_pairs_mut().append_pair("uuid", cache_id);
+        Some(BidRenderSourceV1::Cache(CacheRenderSourceV1 {
+            version: 1,
+            cache_id: cache_id.to_string(),
+            fetch_url: base.to_string(),
+            width: bid.width,
+            height: bid.height,
+        }))
+    }
+
+    fn typed_source_matches_cache_policy(
+        source: &BidRenderSourceV1,
+        policy: Option<&CacheFetchPolicyV1>,
+    ) -> bool {
+        let BidRenderSourceV1::Cache(source) = source else {
+            return true;
+        };
+        let Some(mut expected) = policy.and_then(cache_policy_base) else {
+            return false;
+        };
+        expected
+            .query_pairs_mut()
+            .append_pair("uuid", &source.cache_id);
+        source.fetch_url == expected.as_str()
+    }
+
+    fn project_render_source(
+        bid: &Bid,
+        settings: &Settings,
+        request_origin: &str,
+        cache_policy: Option<&CacheFetchPolicyV1>,
+    ) -> Option<BidRenderSourceV1> {
+        match (&bid.renderer, &bid.creative, &bid.cache_id) {
+            (Some(source), None, None)
+                if bid.cache_host.is_none()
+                    && bid.cache_path.is_none()
+                    && typed_source_matches_cache_policy(source, cache_policy) =>
+            {
+                Some(source.clone())
+            }
+            (None, Some(raw_creative), _) => {
+                let priced = crate::creative::expand_auction_price_macro(
+                    raw_creative,
+                    bid.price
+                        .filter(|price| price.is_finite() && *price >= 0.0)?,
+                );
+                let adm = crate::creative::process_inline_auction_creative(
+                    settings,
+                    request_origin,
+                    &priced,
+                );
+                (!adm.is_empty()).then_some(BidRenderSourceV1::Adm(AdmRenderSourceV1 {
+                    version: 1,
+                    adm,
+                    width: bid.width,
+                    height: bid.height,
+                }))
+            }
+            (None, None, Some(_)) => cache_source_from_legacy_bid(bid, cache_policy),
+            _ => None,
+        }
+    }
+
+    fn project_targeting(
+        bid: &Bid,
+        cpm: f64,
+        granularity: PriceGranularity,
+    ) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("hb_bidder".to_string(), bid.bidder.clone()),
+            ("hb_pb".to_string(), price_bucket(cpm, granularity)),
+        ])
+    }
+
+    /// Build the exact immutable browser projection without publishing it.
+    pub(crate) fn build_browser_auction_projection_v1(
+        result: &OrchestrationResult,
+        granularity: PriceGranularity,
+        settings: &Settings,
+        request_origin: &str,
+        cache_policy: Option<&CacheFetchPolicyV1>,
+        identity_generator: &dyn AuctionIdentityGenerator,
+    ) -> Result<CanonicalBrowserAuctionProjectionV1, Report<TrustedServerError>> {
+        let mut reservation_ids = HashSet::new();
+        let mut projected_results = Vec::with_capacity(result.decision_set.results.len());
+        let mut projected_bids = Vec::new();
+
+        for decision in &result.decision_set.results {
+            let SlotAuctionDecisionV1::Winner { slot, candidate_id } = decision else {
+                projected_results.push(decision.clone());
+                continue;
+            };
+            let Some(bid) = result.winning_bids.get(slot).filter(|bid| {
+                bid.slot_id == *slot && bid.candidate_id.as_deref() == Some(candidate_id.as_str())
+            }) else {
+                projected_results.push(SlotAuctionDecisionV1::Failed {
+                    slot: slot.clone(),
+                    reason: AuctionSlotFailureReason::WinnerNotRenderable,
+                });
+                continue;
+            };
+            let Some(cpm) = bid.price.filter(|price| price.is_finite() && *price >= 0.0) else {
+                projected_results.push(SlotAuctionDecisionV1::Failed {
+                    slot: slot.clone(),
+                    reason: AuctionSlotFailureReason::WinnerNotRenderable,
+                });
+                continue;
+            };
+            let Some(provider) = bid.candidate_provider.clone() else {
+                projected_results.push(SlotAuctionDecisionV1::Failed {
+                    slot: slot.clone(),
+                    reason: AuctionSlotFailureReason::WinnerNotRenderable,
+                });
+                continue;
+            };
+            let Some(upstream_bid_id) = bid.bid_id.clone() else {
+                projected_results.push(SlotAuctionDecisionV1::Failed {
+                    slot: slot.clone(),
+                    reason: AuctionSlotFailureReason::WinnerNotRenderable,
+                });
+                continue;
+            };
+            let Some(render_source) =
+                project_render_source(bid, settings, request_origin, cache_policy)
+            else {
+                projected_results.push(SlotAuctionDecisionV1::Failed {
+                    slot: slot.clone(),
+                    reason: AuctionSlotFailureReason::WinnerNotRenderable,
+                });
+                continue;
+            };
+            let Some(renderer_reservation_id) = mint_response_unique_base64url_identity(
+                identity_generator,
+                &mut reservation_ids,
+                "r1_",
+                RENDERER_RESERVATION_BYTES,
+                RENDERER_RESERVATION_COLLISION_RETRIES,
+            ) else {
+                projected_results.push(SlotAuctionDecisionV1::Failed {
+                    slot: slot.clone(),
+                    reason: AuctionSlotFailureReason::IdentityGenerationFailed,
+                });
+                continue;
+            };
+
+            projected_results.push(decision.clone());
+            projected_bids.push(BrowserAuctionBidV1 {
+                candidate_id: candidate_id.clone(),
+                slot: slot.clone(),
+                provider,
+                upstream_bid_id,
+                cpm,
+                currency: bid.currency.clone(),
+                targeting: project_targeting(bid, cpm, granularity),
+                renderer_reservation_id,
+                render_source,
+            });
+        }
+
+        crate::auction::formats::coordinated_cutover_v1::canonicalize_browser_auction_projection_v1(
+            BrowserAuctionProjectionV1 {
+                version: 1,
+                auction: crate::auction::types::AuctionDecisionSetV1 {
+                    version: 1,
+                    auction_id: result.decision_set.auction_id.clone(),
+                    results: projected_results,
+                },
+                bids: projected_bids,
+            },
+            request_origin,
+        )
+    }
+}
+
 /// Build a price-bucketed bid map from winning bids.
 ///
 /// Returns a JSON object map of slot ID → bid metadata including the bucketed
@@ -4200,6 +4414,349 @@ mod tests {
             cache_host: None,
             cache_path: None,
             metadata: Default::default(),
+        }
+    }
+
+    mod coordinated_cutover_projection_tests {
+        use std::collections::{HashMap, VecDeque};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use super::*;
+        use crate::auction::types::{
+            AdmRenderSourceV1, ApsRendererV1, ApsTagType, AuctionIdentityGenerator,
+            AuctionSlotFailureReason, BidRenderSourceV1, CacheFetchPolicyV1, CacheRenderSourceV1,
+            SlotAuctionDecisionV1,
+        };
+        use crate::price_bucket::PriceGranularity;
+        use base64::Engine as _;
+
+        struct ScriptedIdentityGenerator {
+            draws: Mutex<VecDeque<Vec<u8>>>,
+            count: AtomicUsize,
+        }
+
+        impl ScriptedIdentityGenerator {
+            fn new(draws: impl IntoIterator<Item = Vec<u8>>) -> Self {
+                Self {
+                    draws: Mutex::new(draws.into_iter().collect()),
+                    count: AtomicUsize::new(0),
+                }
+            }
+        }
+
+        impl AuctionIdentityGenerator for ScriptedIdentityGenerator {
+            fn fill(&self, destination: &mut [u8]) -> Result<(), ()> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                let draw = self
+                    .draws
+                    .lock()
+                    .expect("should lock scripted draws")
+                    .pop_front()
+                    .ok_or(())?;
+                if draw.len() != destination.len() {
+                    return Err(());
+                }
+                destination.copy_from_slice(&draw);
+                Ok(())
+            }
+        }
+
+        fn tagged_adm_bid(slot: &str, candidate_id: &str, cpm: f64) -> Bid {
+            Bid {
+                slot_id: slot.to_string(),
+                candidate_id: Some(candidate_id.to_string()),
+                candidate_provider: Some("prebid".to_string()),
+                renderer_reservation_id: None,
+                price: Some(cpm),
+                currency: "USD".to_string(),
+                creative: None,
+                adomain: None,
+                bidder: "example_bidder".to_string(),
+                width: 300,
+                height: 250,
+                nurl: None,
+                burl: None,
+                bid_id: Some(format!("upstream-{slot}")),
+                ad_id: None,
+                creative_id: None,
+                renderer: Some(BidRenderSourceV1::Adm(AdmRenderSourceV1 {
+                    version: 1,
+                    adm: format!("<div>{slot}</div>"),
+                    width: 300,
+                    height: 250,
+                })),
+                cache_id: None,
+                cache_host: None,
+                cache_path: None,
+                metadata: HashMap::new(),
+            }
+        }
+
+        fn tagged_aps_bid(slot: &str, candidate_id: &str, cpm: f64) -> Bid {
+            let envelope =
+                include_str!("../../trusted-server-js/lib/test/fixtures/aps-renderer-v1.json");
+            let mut bid = tagged_adm_bid(slot, candidate_id, cpm);
+            bid.candidate_provider = Some("aps".to_string());
+            bid.bidder = "aps".to_string();
+            bid.bid_id = Some("fictional-selected-bid-id".to_string());
+            bid.renderer = Some(BidRenderSourceV1::Aps(ApsRendererV1 {
+                version: 1,
+                account_id: "example-account-id".to_string(),
+                bid_id: "fictional-selected-bid-id".to_string(),
+                creative_id: None,
+                tag_type: ApsTagType::Iframe,
+                creative_url: "https://creative.example/render".to_string(),
+                aax_response: base64::engine::general_purpose::STANDARD.encode(envelope),
+                width: 300,
+                height: 250,
+            }));
+            bid
+        }
+
+        fn result_with_winners(bids: Vec<Bid>) -> OrchestrationResult {
+            let results = bids
+                .iter()
+                .map(|bid| SlotAuctionDecisionV1::Winner {
+                    slot: bid.slot_id.clone(),
+                    candidate_id: bid
+                        .candidate_id
+                        .clone()
+                        .expect("test winner should have candidate id"),
+                })
+                .collect();
+            OrchestrationResult {
+                provider_responses: Vec::new(),
+                mediator_response: None,
+                winning_bids: bids
+                    .into_iter()
+                    .map(|bid| (bid.slot_id.clone(), bid))
+                    .collect(),
+                decision_set: AuctionDecisionSetV1 {
+                    version: 1,
+                    auction_id: "auction-projection".to_string(),
+                    results,
+                },
+                total_time_ms: 1,
+                metadata: HashMap::new(),
+            }
+        }
+
+        #[test]
+        fn projection_preserves_tagged_source_and_uses_one_reservation_on_both_wires() {
+            let source = BidRenderSourceV1::Adm(AdmRenderSourceV1 {
+                version: 1,
+                adm: "<div>slot-1</div>".to_string(),
+                width: 300,
+                height: 250,
+            });
+            let result = result_with_winners(vec![tagged_adm_bid("slot-1", "AAAAAAAAAAAA", 2.75)]);
+            let generator = ScriptedIdentityGenerator::new([vec![7; 16]]);
+
+            let canonical = coordinated_cutover_v1::build_browser_auction_projection_v1(
+                &result,
+                PriceGranularity::Dense,
+                &Settings::default(),
+                "https://publisher.example",
+                None,
+                &generator,
+            )
+            .expect("valid winner should project");
+
+            let bid = &canonical.projection.bids[0];
+            assert_eq!(bid.candidate_id, "AAAAAAAAAAAA");
+            assert_eq!(bid.cpm, 2.75);
+            assert_eq!(bid.render_source, source);
+            assert_eq!(bid.renderer_reservation_id, "r1_BwcHBwcHBwcHBwcHBwcHBw");
+            assert!(
+                !serde_json::to_value(&bid.render_source)
+                    .expect("render source should serialize")
+                    .to_string()
+                    .contains("2.75"),
+                "selected CPM must not enter the render capability"
+            );
+
+            let direct: serde_json::Value = serde_json::from_slice(
+                &crate::auction::formats::coordinated_cutover_v1::serialize_trusted_server_auction_response_v1(
+                    &canonical,
+                )
+                .expect("direct wire should serialize"),
+            )
+            .expect("direct wire should be JSON");
+            assert_eq!(
+                direct["seatbid"][0]["bid"][0]["id"],
+                bid.renderer_reservation_id
+            );
+        }
+
+        #[test]
+        fn reservation_collision_exhaustion_fails_only_the_affected_winner() {
+            let repeated = vec![9; 16];
+            let generator = ScriptedIdentityGenerator::new(
+                std::iter::once(repeated.clone()).chain(std::iter::repeat_n(repeated, 9)),
+            );
+            let result = result_with_winners(vec![
+                tagged_adm_bid("slot-1", "AAAAAAAAAAAA", 2.0),
+                tagged_adm_bid("slot-2", "BBBBBBBBBBBB", 1.0),
+            ]);
+
+            let canonical = coordinated_cutover_v1::build_browser_auction_projection_v1(
+                &result,
+                PriceGranularity::Dense,
+                &Settings::default(),
+                "https://publisher.example",
+                None,
+                &generator,
+            )
+            .expect("collision exhaustion should remain a per-slot decision");
+
+            assert_eq!(generator.count.load(Ordering::SeqCst), 10);
+            assert_eq!(canonical.projection.bids.len(), 1);
+            assert!(matches!(
+                &canonical.projection.auction.results[0],
+                SlotAuctionDecisionV1::Winner { slot, .. } if slot == "slot-1"
+            ));
+            assert_eq!(
+                canonical.projection.auction.results[1],
+                SlotAuctionDecisionV1::Failed {
+                    slot: "slot-2".to_string(),
+                    reason: AuctionSlotFailureReason::IdentityGenerationFailed,
+                }
+            );
+        }
+
+        #[test]
+        fn aps_projection_preserves_the_validated_descriptor_without_cpm() {
+            let result = result_with_winners(vec![tagged_aps_bid("slot-1", "AAAAAAAAAAAA", 4.25)]);
+            let source = result.winning_bids["slot-1"]
+                .renderer
+                .clone()
+                .expect("APS source should exist");
+            let generator = ScriptedIdentityGenerator::new([vec![3; 16]]);
+
+            let canonical = coordinated_cutover_v1::build_browser_auction_projection_v1(
+                &result,
+                PriceGranularity::Dense,
+                &Settings::default(),
+                "https://publisher.example",
+                None,
+                &generator,
+            )
+            .expect("valid APS winner should project");
+
+            assert_eq!(canonical.projection.bids[0].render_source, source);
+            assert_eq!(canonical.projection.bids[0].cpm, 4.25);
+            assert!(
+                !serde_json::to_string(&canonical.projection.bids[0].render_source)
+                    .expect("APS source should serialize")
+                    .contains("4.25")
+            );
+        }
+
+        #[test]
+        fn cache_projection_uses_only_the_frozen_policy_and_preserves_the_uuid() {
+            let mut bid = tagged_adm_bid("slot-1", "AAAAAAAAAAAA", 1.5);
+            bid.renderer = None;
+            bid.cache_id = Some("f47447a0-b759-4f2f-9887-af458b79b570".to_string());
+            bid.cache_host = Some("cache.example".to_string());
+            bid.cache_path = Some("/pbc/v1/cache".to_string());
+            let result = result_with_winners(vec![bid]);
+            let policy = CacheFetchPolicyV1 {
+                version: 1,
+                base_url: "https://cache.example/pbc/v1/cache".to_string(),
+            };
+            let generator = ScriptedIdentityGenerator::new([vec![4; 16]]);
+
+            let canonical = coordinated_cutover_v1::build_browser_auction_projection_v1(
+                &result,
+                PriceGranularity::Dense,
+                &Settings::default(),
+                "https://publisher.example",
+                Some(&policy),
+                &generator,
+            )
+            .expect("valid cache winner should project");
+
+            assert_eq!(
+                canonical.projection.bids[0].render_source,
+                BidRenderSourceV1::Cache(CacheRenderSourceV1 {
+                    version: 1,
+                    cache_id: "f47447a0-b759-4f2f-9887-af458b79b570".to_string(),
+                    fetch_url: "https://cache.example/pbc/v1/cache?uuid=f47447a0-b759-4f2f-9887-af458b79b570".to_string(),
+                    width: 300,
+                    height: 250,
+                })
+            );
+
+            let without_policy = coordinated_cutover_v1::build_browser_auction_projection_v1(
+                &result,
+                PriceGranularity::Dense,
+                &Settings::default(),
+                "https://publisher.example",
+                None,
+                &ScriptedIdentityGenerator::new([]),
+            )
+            .expect("missing policy should remain an explicit winner failure");
+            assert!(without_policy.projection.bids.is_empty());
+            assert_eq!(
+                without_policy.projection.auction.results[0],
+                SlotAuctionDecisionV1::Failed {
+                    slot: "slot-1".to_string(),
+                    reason: AuctionSlotFailureReason::WinnerNotRenderable,
+                }
+            );
+        }
+
+        #[test]
+        fn invalid_targeting_is_rejected_without_truncation() {
+            let mut bid = tagged_adm_bid("slot-1", "AAAAAAAAAAAA", 1.5);
+            bid.bidder = "x".repeat(41);
+            let result = result_with_winners(vec![bid]);
+            let canonical = coordinated_cutover_v1::build_browser_auction_projection_v1(
+                &result,
+                PriceGranularity::Dense,
+                &Settings::default(),
+                "https://publisher.example",
+                None,
+                &ScriptedIdentityGenerator::new([vec![5; 16]]),
+            )
+            .expect("invalid winner targeting should remain an explicit slot result");
+
+            assert!(canonical.projection.bids.is_empty());
+            assert_eq!(
+                canonical.projection.auction.results[0],
+                SlotAuctionDecisionV1::Failed {
+                    slot: "slot-1".to_string(),
+                    reason: AuctionSlotFailureReason::WinnerNotRenderable,
+                }
+            );
+            assert!(
+                !String::from_utf8(canonical.json)
+                    .expect("canonical projection should be UTF-8")
+                    .contains(&"x".repeat(40))
+            );
+        }
+
+        #[test]
+        fn unavailable_reservation_randomness_is_identity_generation_failed() {
+            let result = result_with_winners(vec![tagged_adm_bid("slot-1", "AAAAAAAAAAAA", 1.5)]);
+            let canonical = coordinated_cutover_v1::build_browser_auction_projection_v1(
+                &result,
+                PriceGranularity::Dense,
+                &Settings::default(),
+                "https://publisher.example",
+                None,
+                &ScriptedIdentityGenerator::new([]),
+            )
+            .expect("CSPRNG failure should remain a per-slot decision");
+
+            assert!(canonical.projection.bids.is_empty());
+            assert_eq!(
+                canonical.projection.auction.results[0],
+                SlotAuctionDecisionV1::Failed {
+                    slot: "slot-1".to_string(),
+                    reason: AuctionSlotFailureReason::IdentityGenerationFailed,
+                }
+            );
         }
     }
 
