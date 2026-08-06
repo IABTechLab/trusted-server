@@ -385,14 +385,14 @@ function dispatchPrebidRefresh<T>(
   let tsjs: TsjsApi | undefined;
   let hadOwnContext = false;
   let previousContext: boolean | undefined;
-  let contextSet = false;
+  let shouldRestoreContext = false;
   try {
     tsjs = window.tsjs;
     if (tsjs) {
       hadOwnContext = Object.prototype.hasOwnProperty.call(tsjs, 'prebidRefreshDispatchInProgress');
       previousContext = tsjs.prebidRefreshDispatchInProgress;
+      shouldRestoreContext = true;
       tsjs.prebidRefreshDispatchInProgress = true;
-      contextSet = true;
     }
   } catch {
     // Diagnostics context must not affect refresh delegation.
@@ -400,7 +400,7 @@ function dispatchPrebidRefresh<T>(
   try {
     return refresh(slots, opts);
   } finally {
-    if (contextSet && tsjs) {
+    if (shouldRestoreContext && tsjs) {
       try {
         if (hadOwnContext) {
           tsjs.prebidRefreshDispatchInProgress = previousContext;

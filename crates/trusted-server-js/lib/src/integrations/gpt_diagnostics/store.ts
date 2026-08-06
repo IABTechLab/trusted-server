@@ -103,8 +103,13 @@ type RequestIntentSource = 'trusted_server_direct' | 'prebid_refresh' | 'publish
 interface PendingSourceEvidence {
   generation: number;
   observedAtMs: number;
+  expiryScheduled: boolean;
   trustedServerOpportunity?: GptDiagnosticsTrustedServerOpportunity;
   trustedServerAuctionId?: string;
+}
+
+interface WeakSlotReference {
+  deref(): object | undefined;
 }
 
 interface PendingRequestIntent {
@@ -839,15 +844,53 @@ export class GptDiagnosticsStore {
     }
     const generation = this.nextIntentSourceGeneration;
     this.nextIntentSourceGeneration += 1;
-    const evidence: PendingSourceEvidence = { generation, observedAtMs: this.now(), ...facts };
+    const evidence: PendingSourceEvidence = {
+      generation,
+      observedAtMs: this.now(),
+      expiryScheduled: intent.sources.get(source)?.expiryScheduled ?? false,
+      ...facts,
+    };
     intent.sources.set(source, evidence);
+    if (evidence.expiryScheduled) return;
+
+    const WeakRefConstructor = (
+      globalThis as typeof globalThis & {
+        WeakRef?: new (target: object) => WeakSlotReference;
+      }
+    ).WeakRef;
+    const slotReference = WeakRefConstructor ? new WeakRefConstructor(slot) : { deref: () => slot };
+
+    evidence.expiryScheduled = true;
+    this.scheduleRequestIntentSourceExpiry(
+      slotReference,
+      intent,
+      source,
+      REQUEST_PATH_ATTRIBUTION_WINDOW_MS
+    );
+  }
+
+  private scheduleRequestIntentSourceExpiry(
+    slotReference: WeakSlotReference,
+    intent: PendingRequestIntent,
+    source: RequestIntentSource,
+    delayMs: number
+  ): void {
     this.defer(() => {
+      const slot = slotReference.deref();
+      if (!slot) return;
       const currentIntent = this.pendingRequestIntents.get(slot);
-      if (currentIntent !== intent || currentIntent.sources.get(source)?.generation !== generation)
+      if (currentIntent !== intent) return;
+      const currentEvidence = currentIntent.sources.get(source);
+      if (!currentEvidence) return;
+      const remainingMs =
+        REQUEST_PATH_ATTRIBUTION_WINDOW_MS - (this.now() - currentEvidence.observedAtMs);
+      if (remainingMs > 0) {
+        this.scheduleRequestIntentSourceExpiry(slotReference, intent, source, remainingMs);
         return;
+      }
       currentIntent.sources.delete(source);
       if (currentIntent.sources.size === 0) this.pendingRequestIntents.delete(slot);
-    }, REQUEST_PATH_ATTRIBUTION_WINDOW_MS);
+    }, delayMs);
   }
 
   private consumeRequestIntent(

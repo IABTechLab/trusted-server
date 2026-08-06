@@ -9696,7 +9696,7 @@ mod tests {
                 &winning_response
                     .into_body()
                     .into_bytes()
-                    .unwrap_or_default(),
+                    .expect("should read winning page-bids response body"),
             )
             .expect("should serialize winning page-bids response as JSON");
             let auction_request = winning_request
@@ -9739,7 +9739,7 @@ mod tests {
                 &no_winner_response
                     .into_body()
                     .into_bytes()
-                    .unwrap_or_default(),
+                    .expect("should read no-winner page-bids response body"),
             )
             .expect("should serialize no-winner page-bids response as JSON");
 

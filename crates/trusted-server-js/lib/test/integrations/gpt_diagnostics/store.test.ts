@@ -708,6 +708,70 @@ describe('GptDiagnosticsStore', () => {
     });
   });
 
+  it('coalesces repeated-source expiry work and expires the latest evidence', () => {
+    let now = 0;
+    const deferred: Array<{ callback: () => void; delayMs: number }> = [];
+    const store = new GptDiagnosticsStore({
+      now: () => now,
+      defer: (callback, delayMs) => deferred.push({ callback, delayMs }),
+    });
+    const consumed = fakeSlot('coalesced-expiry-consumed');
+    const expired = fakeSlot('coalesced-expiry-expired');
+
+    for (let observation = 0; observation < 1_000; observation += 1) {
+      now = observation;
+      store.recordPublisherRefresh([consumed, expired]);
+    }
+
+    expect(deferred, 'should keep one outstanding expiry per slot and source').toHaveLength(2);
+
+    now = REQUEST_PATH_ATTRIBUTION_WINDOW_MS;
+    deferred.shift()?.callback();
+    deferred.shift()?.callback();
+    expect(deferred).toMatchObject([{ delayMs: 999 }, { delayMs: 999 }]);
+
+    now = REQUEST_PATH_ATTRIBUTION_WINDOW_MS + 998;
+    store.recordSlotRequested(consumed);
+    now += 1;
+    deferred.shift()?.callback();
+    deferred.shift()?.callback();
+    store.recordSlotRequested(expired);
+
+    expect(store.snapshot().slots[0].requests[0].requestPath).toBe('publisher_refresh');
+    expect(store.snapshot().slots[1].requests[0].requestPath).toBe('unattributed');
+  });
+
+  it('coalesces and expires repeated-source work when WeakRef is unavailable', () => {
+    const weakRefGlobal = globalThis as unknown as Record<string, unknown>;
+    const previousWeakRef = weakRefGlobal.WeakRef;
+    weakRefGlobal.WeakRef = undefined;
+    try {
+      let now = 0;
+      const deferred: Array<{ callback: () => void; delayMs: number }> = [];
+      const store = new GptDiagnosticsStore({
+        now: () => now,
+        defer: (callback, delayMs) => deferred.push({ callback, delayMs }),
+      });
+      const slot = fakeSlot('coalesced-expiry-without-weak-ref');
+
+      for (let observation = 0; observation < 1_000; observation += 1) {
+        now = observation;
+        store.recordPublisherRefresh([slot]);
+      }
+
+      expect(deferred).toMatchObject([{ delayMs: REQUEST_PATH_ATTRIBUTION_WINDOW_MS }]);
+
+      now += REQUEST_PATH_ATTRIBUTION_WINDOW_MS;
+      deferred.shift()?.callback();
+      store.recordSlotRequested(slot);
+
+      expect(deferred).toHaveLength(0);
+      expect(store.snapshot().slots[0].requests[0].requestPath).toBe('unattributed');
+    } finally {
+      weakRefGlobal.WeakRef = previousWeakRef;
+    }
+  });
+
   it('derives a replacement from the most recent earlier filled render', () => {
     let now = 1;
     const store = new GptDiagnosticsStore({ now: () => now });
@@ -974,7 +1038,8 @@ describe('GptDiagnosticsStore', () => {
 
     now = 60;
     store.recordTrustedServerOpportunity(unconsumed, 'other-auction-slot', 'no_candidate');
-    deferred[2]();
+    now += REQUEST_PATH_ATTRIBUTION_WINDOW_MS;
+    deferred[1]();
     store.recordSlotRequested(unconsumed);
 
     const unconsumedCycle = store.snapshot().slots[1].requests[0];

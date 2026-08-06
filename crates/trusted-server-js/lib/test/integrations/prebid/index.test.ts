@@ -1623,6 +1623,46 @@ describe('prebid/installRefreshHandler', () => {
     expect(pubads.refresh([explicitSlot])).toBe('delegated refresh result');
     expect(store.snapshot().slots[0].requests[2].requestPath).toBe('unattributed');
   });
+
+  it('restores diagnostics context when its setter mutates and then throws', () => {
+    const slot = {
+      getSlotElementId: () => 'mutating-context-setter',
+      getTargeting: () => [],
+      clearTargeting: vi.fn(),
+    };
+    const originalRefresh = vi.fn();
+    const pubads = {
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => [slot]),
+    };
+    const contextTarget: Record<string, unknown> = {};
+    let throwAfterMutation = true;
+    testWindow.tsjs = new Proxy(contextTarget, {
+      set(target, property, value) {
+        Reflect.set(target, property, value);
+        if (property === 'prebidRefreshDispatchInProgress' && throwAfterMutation) {
+          throwAfterMutation = false;
+          throw new Error('example mutating context setter failure');
+        }
+        return true;
+      },
+    });
+    testWindow.googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    mockRequestBids.mockImplementation((options) => options.bidsBackHandler?.());
+
+    installPrebidNpm();
+    installRefreshHandler(750);
+    pubads.refresh([slot]);
+    pubads.refresh([slot]);
+
+    expect(originalRefresh).toHaveBeenCalledTimes(2);
+    expect(
+      Object.prototype.hasOwnProperty.call(contextTarget, 'prebidRefreshDispatchInProgress')
+    ).toBe(false);
+  });
 });
 
 describe('prebid publisher snapshots and delivery refreshes', () => {
