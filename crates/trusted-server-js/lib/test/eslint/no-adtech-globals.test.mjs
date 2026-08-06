@@ -202,7 +202,7 @@ test('every temporary exemption still maps to an active legacy violation', async
       files: ['src/**/*.ts', 'src/**/*.tsx'],
       rules: {
         'tsjs/no-adtech-globals': ['error', { allowFiles: [] }],
-        'import/no-restricted-paths': [
+        'import-x/no-restricted-paths': [
           'error',
           {
             basePath: packageRoot,
@@ -226,7 +226,7 @@ test('every temporary exemption still maps to an active legacy violation', async
     const [result] = await strictEslint.lintFiles([relativeFilename]);
     assert.ok(result);
     assert.ok(
-      result.messages.some((message) => message.ruleId === 'import/no-restricted-paths'),
+      result.messages.some((message) => message.ruleId === 'import-x/no-restricted-paths'),
       `${relativeFilename} no longer needs its restricted-import exemption`
     );
   }
@@ -234,7 +234,7 @@ test('every temporary exemption still maps to an active legacy violation', async
 
 test('restricted paths enforce dependency direction and exact target-file exemptions', async () => {
   const eslint = new ESLint({ cwd: packageRoot });
-  const restrictedRuleId = 'import/no-restricted-paths';
+  const restrictedRuleId = 'import-x/no-restricted-paths';
 
   async function restrictedMessages(source, relativeFilename) {
     const [result] = await eslint.lintText(source, {

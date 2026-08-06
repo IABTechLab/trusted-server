@@ -41,8 +41,7 @@ export function createDynamicSrcProxy<E extends ElementWithSrc>(
   let nativeGet: ((this: E) => string) | undefined;
   let nativeSetAttribute: (this: E, name: string, value: string) => void = () => undefined;
   let nativeSetAttributeNS:
-    | ((this: E, namespace: string | null, name: string, value: string) => void)
-    | undefined;
+    ((this: E, namespace: string | null, name: string, value: string) => void) | undefined;
   const wrappedInstances = new WeakSet<E>();
   let createElementPatched = false;
   let factoryPatched = false;

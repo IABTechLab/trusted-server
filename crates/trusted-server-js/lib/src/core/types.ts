@@ -547,8 +547,7 @@ export interface TsjsApi {
    * document's, and then be read by that route's `adInit()`.
    */
   scheduleInitialAdInit?:
-    | ((initialBids?: Record<string, AuctionBidData> | undefined) => void)
-    | undefined;
+    ((initialBids?: Record<string, AuctionBidData> | undefined) => void) | undefined;
   /** Read-only GPT lifecycle diagnostics API, present only in an activated tab. */
   gptDiagnostics?: GptDiagnosticsApi | undefined;
 }

@@ -71,10 +71,7 @@ function descriptor(overrides: Partial<ApsRendererV1> = {}): ApsRendererV1 {
 }
 
 type CorpusResult =
-  | 'accepted'
-  | 'descriptor_invalid'
-  | 'invalid_dimensions'
-  | 'dimensions_out_of_range';
+  'accepted' | 'descriptor_invalid' | 'invalid_dimensions' | 'dimensions_out_of_range';
 
 interface CorpusVector {
   id: string;

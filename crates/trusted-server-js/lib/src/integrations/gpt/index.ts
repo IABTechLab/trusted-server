@@ -758,8 +758,7 @@ function installInitialLoadDetector(ts: TsjsApi): void {
   if (!cmd) return;
   cmd.push(() => {
     const gpt = win.googletag as
-      | (Partial<GoogleTag> & { __tsInitialLoadConfigHooked?: boolean })
-      | undefined;
+      (Partial<GoogleTag> & { __tsInitialLoadConfigHooked?: boolean }) | undefined;
     if (!gpt) return;
 
     syncInitialLoadDisabled(gpt, ts);

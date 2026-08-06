@@ -12,13 +12,7 @@ const ABORTED = Symbol('aborted');
 
 export type BootFailureReason = 'abi_mismatch' | 'bundle_partial';
 export type IntegrationRegistryState =
-  | 'collecting'
-  | 'preparing'
-  | 'activating'
-  | 'publishing'
-  | 'committed'
-  | 'failed'
-  | 'disposed';
+  'collecting' | 'preparing' | 'activating' | 'publishing' | 'committed' | 'failed' | 'disposed';
 
 export interface IntegrationBindings {
   readonly config: unknown;

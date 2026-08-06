@@ -96,7 +96,6 @@ async function buildModule(name, entryPath) {
           format: 'iife',
           dir: distDir,
           entryFileNames: outFile,
-          inlineDynamicImports: true,
           extend: false,
           // Use a unique IIFE name per module to avoid conflicts
           name: name === 'core' ? 'tsjs' : `tsjs_${name}`,
