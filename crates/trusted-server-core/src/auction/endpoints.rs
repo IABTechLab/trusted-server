@@ -586,10 +586,7 @@ mod tests {
         NoopBackend, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore, StubHttpClient,
         noop_services,
     };
-    use crate::platform::{
-        ClientInfo, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
-        PlatformResponse,
-    };
+    use crate::platform::{ClientInfo, PlatformHttpClient, PlatformHttpRequest, PlatformResponse};
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
