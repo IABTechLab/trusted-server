@@ -45,12 +45,13 @@ pub fn ec_permission_granted(
     consent: &ConsentContext,
     geo: Option<&GeoInfo>,
     host_signals: Option<Arc<dyn HostSignals>>,
+    injected: Option<Arc<dyn crate::ec::provider::EdgeCookieProvider>>,
 ) -> Result<bool, Report<TrustedServerError>> {
     // The provider declares the permissions its data use requires. Build it to
     // read that declaration; with no provider configured there is nothing to
     // gate, so the check passes. Reading `required_permissions()` needs no request
     // data, so no request info is threaded here.
-    let Some(provider) = build_provider(&settings.ec, host_signals)? else {
+    let Some(provider) = build_provider(&settings.ec, host_signals, injected)? else {
         return Ok(true);
     };
     Ok(assemble_permissions(settings, consent, geo).all_set(provider.required_permissions()))
@@ -213,7 +214,7 @@ mod tests {
         let mut settings = create_test_settings();
         settings.ec.provider = None;
         assert!(
-            ec_permission_granted(&settings, &ConsentContext::default(), None, None)
+            ec_permission_granted(&settings, &ConsentContext::default(), None, None, None)
                 .expect("the gate should evaluate without error"),
             "no provider means nothing to gate, so the check passes"
         );
@@ -227,7 +228,7 @@ mod tests {
         // no Edge Cookie is written.
         let settings = create_test_settings();
         assert!(
-            !ec_permission_granted(&settings, &ConsentContext::default(), None, None)
+            !ec_permission_granted(&settings, &ConsentContext::default(), None, None, None)
                 .expect("the gate should evaluate without error"),
             "the floor should not run the HMAC provider without the permission set"
         );

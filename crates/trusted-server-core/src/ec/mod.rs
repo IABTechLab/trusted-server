@@ -180,6 +180,11 @@ pub struct EcContext {
     /// host that exposes none. Injected into a provider that needs it when the
     /// provider is built.
     host_signals: Option<Arc<dyn HostSignals>>,
+    /// The adapter-injected Edge Cookie provider, when one is wired for this
+    /// request. Captured once from [`RuntimeServices`] at construction and
+    /// passed to [`build_provider`] on every path, so a vendor or host provider
+    /// resolves without core naming it. `None` for built-in-only deployments.
+    ec_provider: Option<Arc<dyn crate::ec::provider::EdgeCookieProvider>>,
     /// Response headers a provider asked to set, captured during
     /// [`EcContext::generate_if_needed`] and applied to the response by EC
     /// finalization. Empty for providers that set no headers.
@@ -257,9 +262,10 @@ impl EcContext {
         // provider that needs a service the host did not supply fails to build
         // here, which stops the request.
         let host_signals = services.host_signals();
+        let ec_provider = services.ec_provider();
         // The provider is built here only to read its required permissions, which
         // need no request data, so nothing is cloned from the request.
-        let ec_allowed = build_provider(&settings.ec, host_signals.clone())?
+        let ec_allowed = build_provider(&settings.ec, host_signals.clone(), ec_provider.clone())?
             .is_none_or(|provider| permissions.all_set(provider.required_permissions()));
 
         log::info!(
@@ -282,6 +288,7 @@ impl EcContext {
             geo_info: geo_info.cloned(),
             device_signals: None,
             host_signals,
+            ec_provider,
             response_headers: Vec::new(),
         })
     }
@@ -324,7 +331,12 @@ impl EcContext {
                 message: "Client IP required for EC generation but unavailable".to_owned(),
             }));
         }
-        let Some(ec_provider) = build_provider(&settings.ec, self.host_signals.clone())? else {
+        let Some(ec_provider) = build_provider(
+            &settings.ec,
+            self.host_signals.clone(),
+            self.ec_provider.clone(),
+        )?
+        else {
             log::info!("EC generation skipped: no Edge Cookie provider configured");
             return Ok(());
         };
@@ -493,6 +505,12 @@ impl EcContext {
         self.host_signals.clone()
     }
 
+    /// Returns the adapter-injected Edge Cookie provider captured for this
+    /// request, or `None` for a built-in-only deployment.
+    pub(crate) fn ec_provider(&self) -> Option<Arc<dyn crate::ec::provider::EdgeCookieProvider>> {
+        self.ec_provider.clone()
+    }
+
     /// Returns the pre-routing geo data, if available.
     #[must_use]
     pub fn geo_info(&self) -> Option<&GeoInfo> {
@@ -584,6 +602,7 @@ impl EcContext {
             geo_info: None,
             device_signals: None,
             host_signals: None,
+            ec_provider: None,
             response_headers: Vec::new(),
         }
     }
@@ -608,6 +627,7 @@ impl EcContext {
             geo_info: None,
             device_signals: None,
             host_signals: None,
+            ec_provider: None,
             response_headers: Vec::new(),
         }
     }
@@ -636,6 +656,7 @@ impl EcContext {
             geo_info: None,
             device_signals: None,
             host_signals: None,
+            ec_provider: None,
             response_headers: Vec::new(),
         }
     }
@@ -681,6 +702,7 @@ mod tests {
 
     /// A test provider that compares identifiers by the payload after a `:`,
     /// modeling an envelope whose wrapper can differ for the same identity.
+    #[derive(Debug)]
     struct WrapperInsensitiveProvider;
 
     impl EdgeCookieProvider for WrapperInsensitiveProvider {
@@ -706,6 +728,7 @@ mod tests {
 
     /// A test provider that does not override `keys_equal`, so it uses the
     /// default natural string equality.
+    #[derive(Debug)]
     struct NaturalProvider;
 
     impl EdgeCookieProvider for NaturalProvider {
@@ -747,6 +770,7 @@ mod tests {
     /// A provider that records the `Cookie` header from the request info passed
     /// to `generate`, so a test can prove request cookies reach a provider (a
     /// client that stores values in cookies relies on this).
+    #[derive(Debug)]
     struct CookieCapturingProvider {
         seen_cookie: std::sync::Mutex<Option<String>>,
     }

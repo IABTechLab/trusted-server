@@ -102,7 +102,7 @@ pub struct GeneratedEdgeCookie {
 /// A provider returns `Ok(None)` from [`generate`](Self::generate) when it
 /// cannot derive an identifier at the edge, so the request proceeds without an
 /// Edge Cookie rather than failing.
-pub trait EdgeCookieProvider: Send + Sync {
+pub trait EdgeCookieProvider: Send + Sync + core::fmt::Debug {
     /// Returns the stable identifier for this provider, used in configuration
     /// and logs.
     fn id(&self) -> &'static str;
@@ -361,6 +361,7 @@ impl EdgeCookieProvider for ClientFixedProvider {
 pub fn build_provider(
     ec: &Ec,
     host_signals: Option<Arc<dyn HostSignals>>,
+    injected: Option<Arc<dyn EdgeCookieProvider>>,
 ) -> Result<Option<Box<dyn EdgeCookieProvider>>, Report<TrustedServerError>> {
     let Some(key) = ec.provider.as_deref() else {
         return Ok(None);
@@ -387,9 +388,56 @@ pub fn build_provider(
                 Box::new(HostSignalProvider::new(config.passphrase.clone(), signals)) as _
             })
         }
-        _ => None,
+        // Any other key names a vendor or host provider the adapter injects
+        // through [`RuntimeServices`](crate::platform::RuntimeServices), the same
+        // seam the device and geo providers use, so core never names a vendor.
+        // The injected provider is used when its own id matches the selected key,
+        // and its `[ec.providers.<key>]` block is read by the adapter that built
+        // it. A key with no matching injected provider resolves to `None`.
+        other => injected
+            .filter(|provider| provider.id() == other)
+            .map(|provider| Box::new(SharedProvider(provider)) as _),
     };
     Ok(provider)
+}
+
+/// Adapts an injected, shared [`EdgeCookieProvider`] to the owned `Box` that
+/// [`build_provider`] returns.
+///
+/// A vendor or host provider is injected as an `Arc` so it can live in
+/// [`RuntimeServices`](crate::platform::RuntimeServices) and be cloned per
+/// request. Every method delegates to the inner provider, so its behavior is
+/// unchanged.
+#[derive(Debug)]
+struct SharedProvider(Arc<dyn EdgeCookieProvider>);
+
+impl EdgeCookieProvider for SharedProvider {
+    fn id(&self) -> &'static str {
+        self.0.id()
+    }
+
+    fn generate(
+        &self,
+        request_info: &dyn RequestInfo,
+        input: &IdentityInput<'_>,
+    ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+        self.0.generate(request_info, input)
+    }
+
+    fn keys_equal(&self, left: &str, right: &str) -> bool {
+        self.0.keys_equal(left, right)
+    }
+
+    fn required_permissions(&self) -> PermissionSet {
+        self.0.required_permissions()
+    }
+
+    fn resolve_from_client(
+        &self,
+        input: &ClientResolveInput<'_>,
+    ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+        self.0.resolve_from_client(input)
+    }
 }
 
 #[cfg(test)]

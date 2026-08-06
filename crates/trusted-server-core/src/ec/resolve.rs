@@ -62,7 +62,12 @@ pub fn handle_ec_resolve(
     // Rebuild the provider with the same host signals captured on the context, so
     // a provider that needs a service the host cannot supply fails here. The
     // client value is verified from the posted body below, not from request info.
-    let Some(provider) = build_provider(&settings.ec, ec_context.host_signals())? else {
+    let Some(provider) = build_provider(
+        &settings.ec,
+        ec_context.host_signals(),
+        ec_context.ec_provider(),
+    )?
+    else {
         log::info!("EC resolve skipped: no Edge Cookie provider configured");
         return Ok(status_only(StatusCode::NO_CONTENT));
     };

@@ -54,7 +54,12 @@ pub fn generate_ec_id(
 
     log::trace!("Generating fresh EC ID from normalized client context");
 
-    let Some(provider) = build_provider(&settings.ec, services.host_signals())? else {
+    let Some(provider) = build_provider(
+        &settings.ec,
+        services.host_signals(),
+        services.ec_provider(),
+    )?
+    else {
         log::info!("No Edge Cookie provider configured; running statelessly");
         return Ok(None);
     };

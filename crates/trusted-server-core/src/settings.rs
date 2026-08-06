@@ -551,7 +551,10 @@ impl Ec {
             // The client-fixed demo provider takes no configuration block.
             "client-fixed" => true,
             "host-signals" => self.providers.host_signals.is_some(),
-            _ => false,
+            // A vendor or host provider the adapter injects is configured when
+            // its `[ec.providers.<key>]` block is present. The adapter validates
+            // the block's own contents when it builds the provider.
+            other => self.providers.has_vendor(other),
         };
 
         if configured {
@@ -591,6 +594,31 @@ pub struct EcProviders {
     #[serde(default, rename = "host-signals")]
     #[validate(nested)]
     pub host_signals: Option<HostSignalsProviderConfig>,
+
+    /// Configuration blocks for vendor or host providers that live in their own
+    /// crates and are injected by the adapter. Any `[ec.providers.<key>]` block
+    /// whose key is not a built-in is captured here as raw values, and the
+    /// adapter that constructs the provider deserializes its own block into the
+    /// vendor crate's config type. Core never names a vendor, so a new provider
+    /// adds nothing here.
+    #[serde(flatten)]
+    vendor: HashMap<String, JsonValue>,
+}
+
+impl EcProviders {
+    /// Returns the raw configuration block for a vendor provider `key`, or
+    /// `None` when no `[ec.providers.<key>]` block is present. The adapter that
+    /// builds the provider deserializes this into its own config type.
+    #[must_use]
+    pub fn vendor_config(&self, key: &str) -> Option<&JsonValue> {
+        self.vendor.get(key)
+    }
+
+    /// Whether a vendor provider configuration block is present for `key`.
+    #[must_use]
+    pub fn has_vendor(&self, key: &str) -> bool {
+        self.vendor.contains_key(key)
+    }
 }
 
 /// Configuration for the built-in HMAC Edge Cookie provider.
