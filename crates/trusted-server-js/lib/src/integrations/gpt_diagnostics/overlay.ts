@@ -243,12 +243,14 @@ function cycleFacts(cycle: GptDiagnosticsRequestCycle): string[] {
   if (
     cycle.creativeChanged !== undefined &&
     cycle.previousCreativeId !== undefined &&
-    cycle.adManager?.creativeId !== undefined
+    (cycle.adManager?.creativeId ?? cycle.adManager?.sourceAgnosticCreativeId) !== undefined
   ) {
+    const currentCreativeId =
+      cycle.adManager?.creativeId ?? cycle.adManager?.sourceAgnosticCreativeId;
     facts.push(
       cycle.creativeChanged
-        ? `Creative changed ${cycle.previousCreativeId} → ${cycle.adManager.creativeId}`
-        : `Creative unchanged ${cycle.adManager.creativeId}`
+        ? `Creative changed ${cycle.previousCreativeId} → ${currentCreativeId}`
+        : `Creative unchanged ${currentCreativeId}`
     );
   }
   const creativeRequestAt = formatMilliseconds(cycle.trustedServerCreativeRequestAtMs);

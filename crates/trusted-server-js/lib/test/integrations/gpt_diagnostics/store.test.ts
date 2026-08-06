@@ -656,6 +656,31 @@ describe('GptDiagnosticsStore', () => {
     });
   });
 
+  it('compares primary and source-agnostic GPT creative identities for replacements', () => {
+    let now = 1;
+    const store = new GptDiagnosticsStore({ now: () => now });
+    const slot = fakeSlot('replacement-fallback-creative');
+    store.recordSlotRequested(slot);
+    now = 2;
+    store.recordSlotResponseReceived(slot);
+    now = 3;
+    store.recordSlotRenderEnded(slot, {
+      isEmpty: false,
+      adManager: { sourceAgnosticCreativeId: 101 },
+    });
+    now = 4;
+    store.recordSlotRequested(slot);
+    now = 5;
+    store.recordSlotResponseReceived(slot);
+    now = 6;
+    store.recordSlotRenderEnded(slot, { isEmpty: false, adManager: { creativeId: 101 } });
+
+    expect(store.snapshot().slots[0].requests[1]).toMatchObject({
+      previousCreativeId: 101,
+      creativeChanged: false,
+    });
+  });
+
   it('expires request-path markers at the five-second boundary without waiting for timers', () => {
     let now = 0;
     const deferred: Array<() => void> = [];

@@ -377,11 +377,11 @@ function recordPrebidRefreshForDiagnostics(slots: RefreshGptSlot[]): void {
   }
 }
 
-function dispatchPrebidRefresh(
-  refresh: (slots?: unknown[], opts?: unknown) => void,
+function dispatchPrebidRefresh<T>(
+  refresh: (slots?: unknown[], opts?: unknown) => T,
   slots: unknown[] | undefined,
   opts: unknown
-): void {
+): T {
   let tsjs: TsjsApi | undefined;
   let hadOwnContext = false;
   let previousContext: boolean | undefined;
@@ -398,7 +398,7 @@ function dispatchPrebidRefresh(
     // Diagnostics context must not affect refresh delegation.
   }
   try {
-    refresh(slots, opts);
+    return refresh(slots, opts);
   } finally {
     if (contextSet && tsjs) {
       try {

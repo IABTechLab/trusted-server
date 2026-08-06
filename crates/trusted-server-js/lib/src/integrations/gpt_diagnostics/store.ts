@@ -882,8 +882,10 @@ export class GptDiagnosticsStore {
     if (!previous) return;
     cycle.replacedRequestNumber = previous.requestNumber;
     cycle.previousRenderToRequestMs = validDuration(previous.renderAtMs, cycle.requestedAtMs);
-    const previousCreativeId = previous.adManager?.creativeId;
-    const currentCreativeId = cycle.adManager?.creativeId;
+    const previousCreativeId =
+      previous.adManager?.creativeId ?? previous.adManager?.sourceAgnosticCreativeId;
+    const currentCreativeId =
+      cycle.adManager?.creativeId ?? cycle.adManager?.sourceAgnosticCreativeId;
     if (previousCreativeId !== undefined) cycle.previousCreativeId = previousCreativeId;
     if (previousCreativeId !== undefined && currentCreativeId !== undefined) {
       cycle.creativeChanged = previousCreativeId !== currentCreativeId;
