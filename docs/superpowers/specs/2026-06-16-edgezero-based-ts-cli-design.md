@@ -177,8 +177,7 @@ The envelope contains:
   `SHA-256("tscfgseq1|" || push_sequence.to_be_bytes() || data_hash_bytes)`,
   where the domain tag is UTF-8, the integer is unsigned 64-bit big-endian,
   and `data_hash_bytes` is the 32 decoded bytes of the preceding hash; the
-  known-answer vector is in
-  `docs/superpowers/specs/revision-canonicalization-vectors.json`;
+  known-answer vector is inline in the permission spec §5.5.2;
 - generation timestamp metadata.
 
 Runtime loading must verify both the data hash and sequence-binding hash before
@@ -285,8 +284,8 @@ on a language's larger integer type.
   to at least 2,592,000,000 and the longest applicable artifact, cookie-scope,
   rollback, and audit horizon.
 
-The cross-language known-answer vector is
-`docs/superpowers/specs/activation-journal-vectors.json`; every controller,
+The cross-language known-answer and rejection vectors are inline in §5.1.1;
+every controller,
 runtime verifier, and GC must reproduce both JCS bytes and object ID and reject
 every numeric boundary vector. For the
 first promotion, `previous_journal_id` is null only when the register head is
@@ -360,6 +359,118 @@ Reserved future keys, not written in this initial spec:
 Request-signing public/private state is intentionally out of scope for this
 initial CLI. It will be revisited after EdgeZero exposes suitable secret-store
 write primitives.
+
+#### 5.1.1 Activation-journal vectors
+
+The JSON object between the stable markers is the sole normative
+machine-readable activation-journal fixture. Extractors exclude the markers
+and code fences, parse the enclosed UTF-8 JSON, and must reject duplicate
+object keys.
+
+<!-- BEGIN NORMATIVE JSON: activation-journal-v1 -->
+
+```json
+{
+  "schema_version": 1,
+  "canonicalization": "RFC 8785 (JCS)",
+  "digest": "SHA-256",
+  "domain_prefix_utf8": "tsactj1|",
+  "numeric_profile": {
+    "type": "integer",
+    "minimum": 0,
+    "maximum": 9007199254740991
+  },
+  "vectors": [
+    {
+      "name": "genesis-config-promotion",
+      "journal": {
+        "schema_version": 1,
+        "attempt_id": "00000000000000000000000000000000",
+        "candidate_incarnation": "11111111111111111111111111111111",
+        "previous_journal_id": null,
+        "pruned_through_journal_id": null,
+        "expected_activation_generation": 0,
+        "drain_attempt": 1,
+        "serve_admission_lease_bound_ms": 1000,
+        "promotion_not_before_unix_ms": 1700000001000,
+        "transition_kind": "config",
+        "displaced_active": {
+          "logical_root": "builtin",
+          "immutable_blob_id": "builtin",
+          "source_version": 0,
+          "data_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+          "config_revision": "0000000000000000000000000000000000000000000000000000000000000000",
+          "policy_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+          "ordinal": 0,
+          "model_epoch": "pre_epic_v1",
+          "minimum_binary_generation": 1,
+          "row_schema_floor": 1,
+          "activation_generation": 0
+        },
+        "activated_active": {
+          "logical_root": "app_config",
+          "immutable_blob_id": "app_config/1",
+          "source_version": 1,
+          "data_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+          "config_revision": "2222222222222222222222222222222222222222222222222222222222222222",
+          "policy_digest": "3333333333333333333333333333333333333333333333333333333333333333",
+          "ordinal": 1,
+          "model_epoch": "pre_epic_v1",
+          "minimum_binary_generation": 1,
+          "row_schema_floor": 1,
+          "activation_generation": 1
+        },
+        "membership_epoch": 7,
+        "ready_members": ["edge-a", "edge-b"],
+        "quiesced_members": ["edge-a", "edge-b"],
+        "controller_id": "deploy-controller",
+        "retain_for_ms": 2592000000
+      },
+      "canonical_json_utf8": "{\"activated_active\":{\"activation_generation\":1,\"config_revision\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"data_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"immutable_blob_id\":\"app_config/1\",\"logical_root\":\"app_config\",\"minimum_binary_generation\":1,\"model_epoch\":\"pre_epic_v1\",\"ordinal\":1,\"policy_digest\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"row_schema_floor\":1,\"source_version\":1},\"attempt_id\":\"00000000000000000000000000000000\",\"candidate_incarnation\":\"11111111111111111111111111111111\",\"controller_id\":\"deploy-controller\",\"displaced_active\":{\"activation_generation\":0,\"config_revision\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"data_hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"immutable_blob_id\":\"builtin\",\"logical_root\":\"builtin\",\"minimum_binary_generation\":1,\"model_epoch\":\"pre_epic_v1\",\"ordinal\":0,\"policy_digest\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"row_schema_floor\":1,\"source_version\":0},\"drain_attempt\":1,\"expected_activation_generation\":0,\"membership_epoch\":7,\"previous_journal_id\":null,\"promotion_not_before_unix_ms\":1700000001000,\"pruned_through_journal_id\":null,\"quiesced_members\":[\"edge-a\",\"edge-b\"],\"ready_members\":[\"edge-a\",\"edge-b\"],\"retain_for_ms\":2592000000,\"schema_version\":1,\"serve_admission_lease_bound_ms\":1000,\"transition_kind\":\"config\"}",
+      "sha256_hex": "7af3934b4e5500903ef77ad8a1367db83b03fc62a0bb83bd0849289c685d2e88"
+    }
+  ],
+  "rejection_vectors": [
+    {
+      "name": "unsafe-top-level-u64",
+      "base_vector": "genesis-config-promotion",
+      "replace_json_pointer": "/expected_activation_generation",
+      "raw_json_number": "9007199254740992",
+      "error": "integer exceeds portable JCS profile"
+    },
+    {
+      "name": "unsafe-embedded-active-u64",
+      "base_vector": "genesis-config-promotion",
+      "replace_json_pointer": "/activated_active/source_version",
+      "raw_json_number": "9007199254740992",
+      "error": "integer exceeds portable JCS profile"
+    },
+    {
+      "name": "fractional-journal-number",
+      "base_vector": "genesis-config-promotion",
+      "replace_json_pointer": "/retain_for_ms",
+      "raw_json_number": "2592000000.5",
+      "error": "journal number is not an integer"
+    },
+    {
+      "name": "unsafe-admission-lease-bound",
+      "base_vector": "genesis-config-promotion",
+      "replace_json_pointer": "/serve_admission_lease_bound_ms",
+      "raw_json_number": "9007199254740992",
+      "error": "integer exceeds portable JCS profile"
+    },
+    {
+      "name": "zero-promotion-admission-lease-bound",
+      "base_vector": "genesis-config-promotion",
+      "replace_json_pointer": "/serve_admission_lease_bound_ms",
+      "raw_json_number": "0",
+      "error": "config/model admission lease bound is not positive"
+    }
+  ]
+}
+```
+
+<!-- END NORMATIVE JSON: activation-journal-v1 -->
 
 ## 6. Blob config pipeline
 

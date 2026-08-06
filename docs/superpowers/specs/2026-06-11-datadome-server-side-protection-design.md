@@ -7,8 +7,8 @@
 > (`2026-07-30-integration-response-header-hook-design.md`): one global
 > order applies (core finalization → ordinary mutators → security
 > effects → final cache/privacy invariant pass, unconditionally last),
-> with typed cookie/header operations, enumerated allowlists
-> (`datadome-header-allowlist.md`), and owner-only identifier
+> with typed cookie/header operations, the enumerated field contract in
+> §4a.2 of that spec, and owner-only identifier
 > boundaries. Where this document conflicts, the hook spec governs. Additionally, this document's sessionByHeader requirement ("always
 > send `X-DataDome-X-Set-Cookie` when the header ID is used") is
 > **superseded for v1**: header-session mode is startup-rejected (hook
@@ -240,7 +240,7 @@ integrations cannot construct or read them or recover the underlying raw
 request. Core strips `ts-*`, EID/identity material,
 `X-DataDome-ClientID`, and the `datadome` cookie before building the shared
 view; the security view restores only the one typed cookie value and exact
-request evidence admitted by `datadome-header-allowlist.md`. Another filter
+request evidence admitted by the hook spec §4a.2.1. Another filter
 receives only the shared redacted view and cannot inherit this owner
 capability. This paragraph and the hook spec §4a replace every earlier generic
 `&Request`/generic security-header-mutation sketch in this document. The
@@ -320,8 +320,9 @@ committed via `stream_to_client()`.
 ### 4. Header Mutation Semantics
 
 DataDome pointer headers are internal instructions and are never forwarded.
-The one normative field/pointer allowlist and decision matrix is
-`datadome-header-allowlist.md`; a pointer does not authorize an unlisted name.
+The one normative field/pointer contract is the hook spec §4a.2, with the
+publisher-upstream overlay in §4a.2.2 and the browser-response matrix in
+§4a.2.3; a pointer does not authorize an unlisted name.
 
 | Pointer header               | Destination                                        |
 | ---------------------------- | -------------------------------------------------- |
@@ -541,9 +542,8 @@ Content-Length: <encoded body length>
 X-DataDome-X-Set-Cookie: true  # only when X-DataDome-ClientID is used — SUPERSEDED for v1: never sent (hook spec §4a)
 ```
 
-The exhaustive payload field set is the Protection API request-field section
-of `datadome-header-allowlist.md`. The list below is informative and may not
-expand that normative allowlist:
+The exhaustive payload field set is the hook spec §4a.2.1. The list below is
+informative and may not expand that normative allowlist:
 
 - `Key`
 - `IP`
@@ -656,8 +656,8 @@ fail open and continue without effects.
 For challenge statuses:
 
 1. Build a response using DataDome's API response status and body.
-2. Validate the complete decision-scoped pointer batch against
-   `datadome-header-allowlist.md` and the typed-cookie contract.
+2. Validate the complete decision-scoped pointer batch against the hook spec
+   §4a.2.3 and the typed-cookie contract.
 3. Apply the accepted security batch atomically.
 4. Do not contact the publisher origin.
 5. Run the final cache/privacy invariant pass after the security batch.
@@ -666,8 +666,8 @@ For challenge statuses:
 
 For allow status `200`:
 
-1. Apply only the owner-scoped publisher-upstream fields admitted by
-   `datadome-header-allowlist.md` before route matching; the default is no
+1. Apply only the owner-scoped publisher-upstream fields admitted by the hook
+   spec §4a.2.2 before route matching; the default is no
    ClientID exposure.
 2. Validate and retain the decision-scoped browser security batch.
 3. Continue normal route matching.
@@ -948,8 +948,7 @@ passes.
    it unless `expose_host_fingerprints_to_vendor = true`. `TlsCipher` is omitted
    because the platform exposes a negotiated cipher while the vendor field
    means ordered offered ciphers; `H2Fingerprint` is not a documented
-   Protection API field. Admit no host evidence outside
-   `datadome-header-allowlist.md`.
+   Protection API field. Admit no host evidence outside the hook spec §4a.2.1.
 3. **Challenge status source of truth:** follow the Protection API docs in v1:
    `301`, `302`, `401`, `403`, and `429` are challenge statuses when
    `X-DataDomeResponse` matches the HTTP status.

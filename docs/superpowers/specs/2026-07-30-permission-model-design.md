@@ -838,8 +838,8 @@ section malformed-present (blocks grants, never withdraws).
    `US/TX` ↔ 16, `US/DE` ↔ 17, `US/IA` ↔ 18, `US/NE` ↔ 19, `US/NH` ↔ 20,
    `US/NJ` ↔ 21, `US/TN` ↔ 22, `US/MN` ↔ 23, `US/MD` ↔ 24,
    `US/IN` ↔ 25, `US/KY` ↔ 26, and `US/RI` ↔ 27. All accepted versions
-   and layouts are pinned by `gpp-registry-snapshot.md`; the current
-   snapshot accepts version 1 for sections 24–27 from the official IAB
+   and layouts are pinned by the inline GPP registry snapshot in §4.5.1; the
+   current snapshot accepts version 1 for sections 24–27 from the official IAB
    registry commit named there. A truncated map silently loses opt-outs,
    so every accepted section is an implementation prerequisite rather
    than an inert placeholder. **The current decoder is an explicit
@@ -849,12 +849,12 @@ section malformed-present (blocks grants, never withdraws).
    versions the library happens to decode but the snapshot disallows.
    The implementation PR cross-checks this list against both the current
    decoder's section set and the official registry, and the accepted version per
-   section is **pinned to the vendored registry snapshot
-   `docs/superpowers/specs/gpp-registry-snapshot.md`** — a checked-in file enumerating, per mapped section, the
+   section is **pinned to the vendored registry snapshot in §4.5.1** — the
+   inline table enumerates, per mapped section, the
    accepted version(s), taken from the IAB registry at ratification (a
    date is not an immutable identifier, and "enumerated by the
    implementation PR" was two-implementations-diverge territory; the
-   vendored file is the single reproducible authority, and updating it
+   inline snapshot is the single reproducible authority, and updating it
    is a reviewed spec change); a
    mapped section carrying a version outside the pinned revision is
    treated as malformed-present (blocks grants, never withdraws — §4.4),
@@ -930,6 +930,85 @@ mapped-version failure, and unknown-unmapped omission.
 `SharingOptOut` and `TargetedAdvertisingOptOut` are new enforcement
 inputs — current code consults only the sale field — and are declared as
 such in the migration matrix.
+
+#### 4.5.1 GPP registry snapshot (normative, vendored)
+
+The pinned per-section accepted versions for the §4.5 map. This subsection is
+the single reproducible authority; updating it is a
+reviewed spec change. A mapped section presenting a version not listed
+here is treated as malformed-present (§4.4).
+
+| GPP section ID | Section                                             | Accepted version(s) |
+| -------------- | --------------------------------------------------- | ------------------- |
+| 6              | US Privacy string (uspv1, carried as a GPP section) | 1                   |
+| 7              | usnat                                               | 1                   |
+| 8              | usca                                                | 1                   |
+| 9              | usva                                                | 1                   |
+| 10             | usco                                                | 1                   |
+| 11             | usut                                                | 1                   |
+| 12             | usct                                                | 1                   |
+| 13             | usfl                                                | 1                   |
+| 14             | usmt                                                | 1                   |
+| 15             | usor                                                | 1                   |
+| 16             | ustx                                                | 1                   |
+| 17             | usde                                                | 1                   |
+| 18             | usia                                                | 1                   |
+| 19             | usne                                                | 1                   |
+| 20             | usnh                                                | 1                   |
+| 21             | usnj                                                | 1                   |
+| 22             | ustn                                                | 1                   |
+| 23             | usmn                                                | 1                   |
+| 24             | usmd                                                | 1                   |
+| 25             | usin                                                | 1                   |
+| 26             | usky                                                | 1                   |
+| 27             | usri                                                | 1                   |
+
+At the pinned commit below, the official section registry assigns IDs 24–27
+to MD, IN, KY, and RI and each named state specification defines accepted
+version 1. That commit-backed statement, rather than an unverified publication
+month, is the authority for admitting them. Treating them as national-only
+would discard a state-specific choice. Unknown IDs outside the accepted table
+still contribute nothing and are flagged for snapshot review.
+
+##### Provenance and vectors
+
+The immutable authority is the official
+`InteractiveAdvertisingBureau/Global-Privacy-Platform` commit:
+
+`00ffaefe91513785e886c83877e9b56a4ec8e88c`
+
+Normative upstream paths for the newly admitted layouts are:
+
+- `Sections/US-States/MD/Maryland Privacy Technical Specification.md`
+- `Sections/US-States/IN/Indiana Privacy Technical Specification.md`
+- `Sections/US-States/KY/Kentucky Privacy Technical Specification.md`
+- `Sections/US-States/RI/Rhode Island Privacy Technical Specification.md`
+- `Sections/Section Information.md`
+
+The implementation vendors decoder fixtures under
+`crates/trusted-server-core/testdata/gpp/00ffaefe91513785e886c83877e9b56a4ec8e88c/`.
+That directory contains a `manifest.json` object with:
+
+- `upstream_commit_oid` and `upstream_commit_tree_oid`;
+- a sorted `sources` array containing `{path, blob_oid, sha256_hex}` for all
+  five normative paths above — the four state specifications and
+  `Sections/Section Information.md`; and
+- a sorted `cases` array whose entries are
+  `{section_id, version, case, encoded, expected}`.
+
+The vendoring PR description quotes the same commit/tree/blob values and the
+independent command output used to verify every raw source SHA-256 and the
+byte-for-byte copy. A commit OID without its tree and source-blob witnesses is
+not accepted as completed provenance. `expected` uses the
+permission spec's normalized P1/P4/GPC tokens, not decoder-library enums.
+Fixture encodings must be constructed from the pinned bit layouts by an
+independent generator or hand-checked vector, never emitted and consumed only
+by the decoder under test. For every accepted section/version the corpus must
+contain: minimum valid core-only string, core + GPC true, each mapped opt-out
+value, each explicit not-opted-out value, explicit N/A, malformed/truncated
+input, unsupported version, and a mixed known/unknown-section string. CI
+rejects an update to this subsection unless the complete corpus for the new
+commit is present.
 
 ## 5. Jurisdiction resolution
 
@@ -1016,8 +1095,7 @@ numbers outside the exactly representable integer range
 (absolute value above 2^53 − 1) unless the field is string-typed, and
 `null` values (materialized defaults mean `null` never appears);
 negative zero serializes as JCS mandates. The machine-readable,
-cross-language conformance fixtures are pinned in
-`docs/superpowers/specs/policy-canonicalization-vectors.json`; every
+cross-language conformance fixtures are pinned inline in §5.5.1; every
 runtime and the push tool must reproduce both the canonical UTF-8 bytes
 and digest, and must reject every rejection vector before activation. A
 digest difference is a startup failure, so canonicalization cannot be
@@ -1361,7 +1439,7 @@ registration-order array of `{id, behavior_revision}`; config revision =
 array order is preserved because mutator order is behavior. The config form
 contains secret **references**, never resolved secret bytes, and excludes
 runtime observations. Both emit lowercase 64-hex digests and must reproduce
-`docs/superpowers/specs/revision-canonicalization-vectors.json`. Tests cover a
+the inline revision fixtures in §5.5.2. Tests cover a
 pre/post-model-CAS cache miss as well as concurrent push allocation, publish
 gaps, equal-version idempotence, equal-version
 digest mismatch, same-digest higher-version ordinal retention, stale restart,
@@ -1375,6 +1453,153 @@ that tuple (wire provenance records its policy pair). Rolling back acquisition
 policy still cannot resurrect an identity
 withdrawn by a valid user signal; rollback itself follows the same staged
 activation protocol.
+
+#### 5.5.1 Policy canonicalization vectors
+
+The JSON object between the stable markers is the sole normative
+machine-readable policy fixture. Extractors exclude the markers and code
+fences, parse the enclosed UTF-8 JSON, and must reject duplicate object keys.
+
+<!-- BEGIN NORMATIVE JSON: policy-canonicalization-v1 -->
+
+```json
+{
+  "schema_version": 1,
+  "canonicalization": "RFC 8785 (JCS)",
+  "digest": "SHA-256",
+  "domain_prefix_utf8": "tspol1|",
+  "vectors": [
+    {
+      "name": "minimal-gdpr-policy",
+      "effective_policy": {
+        "rules": {
+          "default": "gdpr"
+        },
+        "groups": {
+          "gdpr": {
+            "regime": "gdpr",
+            "default": "requires_signal"
+          }
+        }
+      },
+      "canonical_json_utf8": "{\"groups\":{\"gdpr\":{\"default\":\"requires_signal\",\"regime\":\"gdpr\"}},\"rules\":{\"default\":\"gdpr\"}}",
+      "sha256_hex": "68f72cc004bd59df7f799be24685b85cbbf5d5fbd1ba3069c8bf51adf4a88e6b"
+    },
+    {
+      "name": "us-country-floor-and-state-override",
+      "effective_policy": {
+        "rules": {
+          "default": "non-regulated",
+          "US/CA": {
+            "overrides": {
+              "select-personalised-ads": "requires_signal"
+            },
+            "group": "us-opt-out"
+          },
+          "US": "us-opt-out"
+        },
+        "groups": {
+          "us-opt-out": {
+            "regime": "us-privacy",
+            "default": "requires_signal"
+          },
+          "non-regulated": {
+            "regime": "none",
+            "default": "granted"
+          }
+        }
+      },
+      "canonical_json_utf8": "{\"groups\":{\"non-regulated\":{\"default\":\"granted\",\"regime\":\"none\"},\"us-opt-out\":{\"default\":\"requires_signal\",\"regime\":\"us-privacy\"}},\"rules\":{\"US\":\"us-opt-out\",\"US/CA\":{\"group\":\"us-opt-out\",\"overrides\":{\"select-personalised-ads\":\"requires_signal\"}},\"default\":\"non-regulated\"}}",
+      "sha256_hex": "6c578c849c323936dc6d492449214c19e16e968b01a962c6ef99e9bbe3a08553"
+    },
+    {
+      "name": "explicit-permission-map-without-default",
+      "effective_policy": {
+        "rules": {
+          "default": "explicit"
+        },
+        "groups": {
+          "explicit": {
+            "regime": "none",
+            "permissions": {
+              "store-on-device": "granted",
+              "select-personalised-ads": "requires_signal"
+            }
+          }
+        }
+      },
+      "canonical_json_utf8": "{\"groups\":{\"explicit\":{\"permissions\":{\"select-personalised-ads\":\"requires_signal\",\"store-on-device\":\"granted\"},\"regime\":\"none\"}},\"rules\":{\"default\":\"explicit\"}}",
+      "sha256_hex": "47745dbb0b5cf113e4d2eb9dda48e6fc9c6c8c18dc39ee715e9838edfd57727b"
+    }
+  ],
+  "rejection_vectors": [
+    {
+      "name": "null-is-not-a-materialized-policy-value",
+      "raw_json": "{\"rules\":{\"default\":null}}",
+      "error": "null value"
+    }
+  ]
+}
+```
+
+<!-- END NORMATIVE JSON: policy-canonicalization-v1 -->
+
+#### 5.5.2 Configuration-revision canonicalization vectors
+
+The same extraction rule applies to this sole normative registry/config
+revision fixture.
+
+<!-- BEGIN NORMATIVE JSON: revision-canonicalization-v1 -->
+
+```json
+{
+  "schema_version": 1,
+  "canonicalization": "RFC 8785 (JCS)",
+  "digest": "SHA-256",
+  "vectors": [
+    {
+      "name": "ordered-integration-registry",
+      "domain_prefix_utf8": "tsreg1|",
+      "normalized_value": [
+        {
+          "behavior_revision": 1,
+          "id": "datadome"
+        },
+        {
+          "behavior_revision": 2,
+          "id": "prebid"
+        }
+      ],
+      "canonical_json_utf8": "[{\"behavior_revision\":1,\"id\":\"datadome\"},{\"behavior_revision\":2,\"id\":\"prebid\"}]",
+      "sha256_hex": "a2a81a6727226821d87f885c92410b5ebd2466e1060a070e027ad0eba210eff4"
+    },
+    {
+      "name": "effective-config-hash-grammar-smoke",
+      "domain_prefix_utf8": "tscfg1|",
+      "normalized_value": {
+        "integrations": {
+          "datadome": {
+            "secret_name": "datadome-api-key",
+            "enabled": true
+          }
+        }
+      },
+      "canonical_json_utf8": "{\"integrations\":{\"datadome\":{\"enabled\":true,\"secret_name\":\"datadome-api-key\"}}}",
+      "sha256_hex": "83c85084578ee35ddba12418c6337b7cc064b7022be5c8ffed068e94b07118d6"
+    },
+    {
+      "name": "config-sequence-binding",
+      "domain_prefix_utf8": "tscfgseq1|",
+      "push_sequence": 42,
+      "push_sequence_u64_be_hex": "000000000000002a",
+      "data_hash_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "sha256_hex": "70edd94cd5728550a815355a1b719f4aafb466aa228571a4a7a6e88ad5178df0"
+    }
+  ]
+}
+```
+
+<!-- END NORMATIVE JSON: revision-canonicalization-v1 -->
 
 ## 6. Failure-mode matrix — normative
 
@@ -1458,8 +1683,8 @@ Consumers of the resolved set in this epic:
    minus EC.”** Whenever auction dispatch is allowed while
    `select-personalised-ads` is unset, core serializes a
    `ContextualAuctionView` constructed independently from the ordinary auction
-   object. The **sole normative v1 output schema** is the checked-in
-   `docs/superpowers/specs/contextual-openrtb-v1-allowlist.json`; descriptive
+   object. The **sole normative v1 output schema** is the inline manifest in
+   §7.1; descriptive
    prose cannot add a field. Its path language is dot-separated exact JSON
    member names, with `[]` denoting every element of the immediately preceding
    array. Object and array containers are implicit and exist only when at least
@@ -1657,6 +1882,688 @@ Consumers of the resolved set in this epic:
 
 The client-cycle resolve endpoint (own spec, currently on hold) would be a
 further consumer if and when it proceeds.
+
+### 7.1 Contextual OpenRTB v1 allowlist
+
+The JSON object between the stable markers is the sole normative
+machine-readable contextual projection. Extractors exclude the markers and
+code fences, parse the enclosed UTF-8 JSON, and must reject duplicate object
+keys. Descriptive prose elsewhere cannot add a field or relax a constraint.
+
+<!-- BEGIN NORMATIVE JSON: contextual-openrtb-v1 -->
+
+```json
+{
+  "schema_version": 1,
+  "openrtb_version": "2.6",
+  "path_grammar": "dot-separated exact JSON member names; [] denotes each array element",
+  "default": "deny",
+  "unknown_or_unlisted_behavior": "serialization_error_no_dispatch",
+  "container_rules": {
+    "implicit_parents_only": true,
+    "omit_empty_optional_arrays": true,
+    "minimum_imp_elements": 1,
+    "site_app": "exactly_one",
+    "supported_imp_media": ["banner", "video"],
+    "each_imp_media": "exactly_one_of_banner_video",
+    "unsupported_imp_media_behavior": "serialization_error_no_dispatch"
+  },
+  "cardinalities": {
+    "required_single": "present exactly once in its object",
+    "optional_single": "absent or present exactly once in its object",
+    "required_array": "present non-empty scalar array; every element matches the rule",
+    "optional_array": "absent or present non-empty scalar array; every element matches the rule",
+    "required_array_member": "present exactly once in every nearest enclosing object-array element",
+    "optional_array_member": "absent or present exactly once in every nearest enclosing object-array element"
+  },
+  "cross_field_rules": {
+    "all_or_none": [
+      ["regs.ext.gpp", "regs.ext.gpp_sid[]"],
+      ["imp[].banner.w", "imp[].banner.h"]
+    ],
+    "required_nonempty_object_arrays": [
+      {
+        "when_parent_present": "source.ext.schain",
+        "array_path": "source.ext.schain.nodes[]"
+      }
+    ],
+    "at_least_one_complete_group": [
+      {
+        "when_parent_present": "imp[].banner",
+        "groups": [
+          ["imp[].banner.w", "imp[].banner.h"],
+          ["imp[].banner.format[]"]
+        ]
+      }
+    ]
+  },
+  "derivations": {
+    "fresh_transaction": "fresh CSPRNG request value, never derived from request/user/security state",
+    "inventory": "validated publisher inventory configuration only",
+    "request_coarse": "typed coarse request value named by the rule",
+    "privacy": "permission resolver or admitted raw regulatory transport only",
+    "constant": "literal value named by the rule"
+  },
+  "rules": [
+    {
+      "path": "id",
+      "type": "string",
+      "cardinality": "required_single",
+      "derivation": "fresh_transaction"
+    },
+    {
+      "path": "at",
+      "type": "integer",
+      "cardinality": "optional_single",
+      "derivation": "inventory"
+    },
+    {
+      "path": "tmax",
+      "type": "integer",
+      "cardinality": "optional_single",
+      "derivation": "inventory"
+    },
+    {
+      "path": "test",
+      "type": "integer",
+      "cardinality": "optional_single",
+      "derivation": "inventory",
+      "allowed": [0, 1]
+    },
+    {
+      "path": "allimps",
+      "type": "integer",
+      "cardinality": "optional_single",
+      "derivation": "inventory",
+      "allowed": [0, 1]
+    },
+    {
+      "path": "cur[]",
+      "type": "string",
+      "cardinality": "optional_array",
+      "derivation": "inventory"
+    },
+    {
+      "path": "bcat[]",
+      "type": "string",
+      "cardinality": "optional_array",
+      "derivation": "inventory"
+    },
+    {
+      "path": "badv[]",
+      "type": "string",
+      "cardinality": "optional_array",
+      "derivation": "inventory"
+    },
+    {
+      "path": "wseat[]",
+      "type": "string",
+      "cardinality": "optional_array",
+      "derivation": "inventory"
+    },
+
+    {
+      "path": "source.fd",
+      "type": "integer",
+      "cardinality": "optional_single",
+      "derivation": "inventory",
+      "allowed": [0, 1]
+    },
+    {
+      "path": "source.tid",
+      "type": "string",
+      "cardinality": "optional_single",
+      "derivation": "fresh_transaction"
+    },
+    {
+      "path": "source.pchain",
+      "type": "string",
+      "cardinality": "optional_single",
+      "derivation": "inventory"
+    },
+    {
+      "path": "source.ext.schain.complete",
+      "type": "integer",
+      "cardinality": "required_single",
+      "derivation": "inventory",
+      "allowed": [0, 1]
+    },
+    {
+      "path": "source.ext.schain.ver",
+      "type": "string",
+      "cardinality": "required_single",
+      "derivation": "inventory"
+    },
+    {
+      "path": "source.ext.schain.nodes[].asi",
+      "type": "string",
+      "cardinality": "required_array_member",
+      "derivation": "inventory"
+    },
+    {
+      "path": "source.ext.schain.nodes[].sid",
+      "type": "string",
+      "cardinality": "required_array_member",
+      "derivation": "inventory"
+    },
+    {
+      "path": "source.ext.schain.nodes[].hp",
+      "type": "integer",
+      "cardinality": "required_array_member",
+      "derivation": "inventory",
+      "allowed": [0, 1]
+    },
+    {
+      "path": "source.ext.schain.nodes[].rid",
+      "type": "string",
+      "cardinality": "optional_array_member",
+      "derivation": "fresh_transaction"
+    },
+    {
+      "path": "source.ext.schain.nodes[].name",
+      "type": "string",
+      "cardinality": "optional_array_member",
+      "derivation": "inventory"
+    },
+    {
+      "path": "source.ext.schain.nodes[].domain",
+      "type": "string",
+      "cardinality": "optional_array_member",
+      "derivation": "inventory"
+    },
+
+    {
+      "path": "imp[].id",
+      "type": "string",
+      "cardinality": "required_array_member",
+      "derivation": "fresh_transaction"
+    },
+    {
+      "path": "imp[].tagid",
+      "type": "string",
+      "cardinality": "optional_array_member",
+      "derivation": "inventory"
+    },
+    {
+      "path": "imp[].instl",
+      "type": "integer",
+      "cardinality": "optional_array_member",
+      "derivation": "inventory",
+      "allowed": [0, 1]
+    },
+    {
+      "path": "imp[].bidfloor",
+      "type": "number",
+      "cardinality": "optional_array_member",
+      "derivation": "inventory"
+    },
+    {
+      "path": "imp[].bidfloorcur",
+      "type": "string",
+      "cardinality": "optional_array_member",
+      "derivation": "inventory"
+    },
+    {
+      "path": "imp[].secure",
+      "type": "integer",
+      "cardinality": "optional_array_member",
+      "derivation": "inventory",
+      "allowed": [0, 1]
+    },
+    {
+      "path": "imp[].exp",
+      "type": "integer",
+      "cardinality": "optional_array_member",
+      "derivation": "inventory"
+    },
+
+    {
+      "path": "imp[].banner.w",
+      "type": "integer",
+      "cardinality": "optional_array_member",
+      "derivation": "inventory"
+    },
+    {
+      "path": "imp[].banner.h",
+      "type": "integer",
+      "cardinality": "optional_array_member",
+      "derivation": "inventory"
+    },
+    {
+      "path": "imp[].banner.format[].w",
+      "type": "integer",
+      "cardinality": "required_array_member",
+      "derivation": "inventory"
+    },
+    {
+      "path": "imp[].banner.format[].h",
+      "type": "integer",
+      "cardinality": "required_array_member",
+      "derivation": "inventory"
+    },
+    {
+      "path": "imp[].banner.pos",
+      "type": "integer",
+      "cardinality": "optional_array_member",
+      "derivation": "inventory"
+    },
+    {
+      "path": "imp[].banner.topframe",
+      "type": "integer",
+      "cardinality": "optional_array_member",
+      "derivation": "inventory",
+      "allowed": [0, 1]
+    },
+    {
+      "path": "imp[].banner.btype[]",
+      "type": "integer",
+      "cardinality": "optional_array",
+      "derivation": "inventory"
+    },
+    {
+      "path": "imp[].banner.battr[]",
+      "type": "integer",
+      "cardinality": "optional_array",
+      "derivation": "inventory"
+    },
+    {
+      "path": "imp[].banner.mimes[]",
+      "type": "string",
+      "cardinality": "optional_array",
+      "derivation": "inventory"
+    },
+    {
+      "path": "imp[].banner.api[]",
+      "type": "integer",
+      "cardinality": "optional_array",
+      "derivation": "inventory"
+    },
+
+    {
+      "path": "imp[].video.mimes[]",
+      "type": "string",
+      "cardinality": "required_array",
+      "derivation": "inventory"
+    },
+    {
+      "path": "imp[].video.minduration",
+      "type": "integer",
+      "cardinality": "required_array_member",
+      "derivation": "inventory"
+    },
+    {
+      "path": "imp[].video.maxduration",
+      "type": "integer",
+      "cardinality": "required_array_member",
+      "derivation": "inventory"
+    },
+    {
+      "path": "imp[].video.protocols[]",
+      "type": "integer",
+      "cardinality": "optional_array",
+      "derivation": "inventory"
+    },
+    {
+      "path": "imp[].video.w",
+      "type": "integer",
+      "cardinality": "optional_array_member",
+      "derivation": "inventory"
+    },
+    {
+      "path": "imp[].video.h",
+      "type": "integer",
+      "cardinality": "optional_array_member",
+      "derivation": "inventory"
+    },
+    {
+      "path": "imp[].video.startdelay",
+      "type": "integer",
+      "cardinality": "optional_array_member",
+      "derivation": "inventory"
+    },
+    {
+      "path": "imp[].video.placement",
+      "type": "integer",
+      "cardinality": "optional_array_member",
+      "derivation": "inventory"
+    },
+    {
+      "path": "imp[].video.plcmt",
+      "type": "integer",
+      "cardinality": "optional_array_member",
+      "derivation": "inventory"
+    },
+    {
+      "path": "imp[].video.linearity",
+      "type": "integer",
+      "cardinality": "optional_array_member",
+      "derivation": "inventory"
+    },
+    {
+      "path": "imp[].video.skip",
+      "type": "integer",
+      "cardinality": "optional_array_member",
+      "derivation": "inventory",
+      "allowed": [0, 1]
+    },
+    {
+      "path": "imp[].video.playbackmethod[]",
+      "type": "integer",
+      "cardinality": "optional_array",
+      "derivation": "inventory"
+    },
+    {
+      "path": "imp[].video.api[]",
+      "type": "integer",
+      "cardinality": "optional_array",
+      "derivation": "inventory"
+    },
+    {
+      "path": "imp[].video.battr[]",
+      "type": "integer",
+      "cardinality": "optional_array",
+      "derivation": "inventory"
+    },
+    {
+      "path": "imp[].video.pos",
+      "type": "integer",
+      "cardinality": "optional_array_member",
+      "derivation": "inventory"
+    },
+
+    {
+      "path": "imp[].pmp.private_auction",
+      "type": "integer",
+      "cardinality": "optional_array_member",
+      "derivation": "inventory",
+      "allowed": [0, 1]
+    },
+    {
+      "path": "imp[].pmp.deals[].id",
+      "type": "string",
+      "cardinality": "required_array_member",
+      "derivation": "inventory"
+    },
+    {
+      "path": "imp[].pmp.deals[].bidfloor",
+      "type": "number",
+      "cardinality": "optional_array_member",
+      "derivation": "inventory"
+    },
+    {
+      "path": "imp[].pmp.deals[].bidfloorcur",
+      "type": "string",
+      "cardinality": "optional_array_member",
+      "derivation": "inventory"
+    },
+    {
+      "path": "imp[].pmp.deals[].at",
+      "type": "integer",
+      "cardinality": "optional_array_member",
+      "derivation": "inventory"
+    },
+    {
+      "path": "imp[].pmp.deals[].wseat[]",
+      "type": "string",
+      "cardinality": "optional_array",
+      "derivation": "inventory"
+    },
+    {
+      "path": "imp[].pmp.deals[].wadomain[]",
+      "type": "string",
+      "cardinality": "optional_array",
+      "derivation": "inventory"
+    },
+
+    {
+      "path": "site.id",
+      "type": "string",
+      "cardinality": "optional_single",
+      "derivation": "inventory"
+    },
+    {
+      "path": "site.name",
+      "type": "string",
+      "cardinality": "optional_single",
+      "derivation": "inventory"
+    },
+    {
+      "path": "site.domain",
+      "type": "string",
+      "cardinality": "optional_single",
+      "derivation": "inventory"
+    },
+    {
+      "path": "site.cat[]",
+      "type": "string",
+      "cardinality": "optional_array",
+      "derivation": "inventory"
+    },
+    {
+      "path": "site.sectioncat[]",
+      "type": "string",
+      "cardinality": "optional_array",
+      "derivation": "inventory"
+    },
+    {
+      "path": "site.pagecat[]",
+      "type": "string",
+      "cardinality": "optional_array",
+      "derivation": "inventory"
+    },
+    {
+      "path": "site.mobile",
+      "type": "integer",
+      "cardinality": "optional_single",
+      "derivation": "inventory",
+      "allowed": [0, 1]
+    },
+    {
+      "path": "site.privacypolicy",
+      "type": "integer",
+      "cardinality": "optional_single",
+      "derivation": "inventory",
+      "allowed": [0, 1]
+    },
+    {
+      "path": "site.publisher.id",
+      "type": "string",
+      "cardinality": "optional_single",
+      "derivation": "inventory"
+    },
+    {
+      "path": "site.publisher.name",
+      "type": "string",
+      "cardinality": "optional_single",
+      "derivation": "inventory"
+    },
+    {
+      "path": "site.publisher.domain",
+      "type": "string",
+      "cardinality": "optional_single",
+      "derivation": "inventory"
+    },
+    {
+      "path": "site.content.cat[]",
+      "type": "string",
+      "cardinality": "optional_array",
+      "derivation": "inventory"
+    },
+    {
+      "path": "site.content.language",
+      "type": "string",
+      "cardinality": "optional_single",
+      "derivation": "inventory"
+    },
+
+    {
+      "path": "app.id",
+      "type": "string",
+      "cardinality": "optional_single",
+      "derivation": "inventory"
+    },
+    {
+      "path": "app.name",
+      "type": "string",
+      "cardinality": "optional_single",
+      "derivation": "inventory"
+    },
+    {
+      "path": "app.bundle",
+      "type": "string",
+      "cardinality": "optional_single",
+      "derivation": "inventory"
+    },
+    {
+      "path": "app.domain",
+      "type": "string",
+      "cardinality": "optional_single",
+      "derivation": "inventory"
+    },
+    {
+      "path": "app.ver",
+      "type": "string",
+      "cardinality": "optional_single",
+      "derivation": "inventory"
+    },
+    {
+      "path": "app.paid",
+      "type": "integer",
+      "cardinality": "optional_single",
+      "derivation": "inventory",
+      "allowed": [0, 1]
+    },
+    {
+      "path": "app.cat[]",
+      "type": "string",
+      "cardinality": "optional_array",
+      "derivation": "inventory"
+    },
+    {
+      "path": "app.sectioncat[]",
+      "type": "string",
+      "cardinality": "optional_array",
+      "derivation": "inventory"
+    },
+    {
+      "path": "app.pagecat[]",
+      "type": "string",
+      "cardinality": "optional_array",
+      "derivation": "inventory"
+    },
+    {
+      "path": "app.privacypolicy",
+      "type": "integer",
+      "cardinality": "optional_single",
+      "derivation": "inventory",
+      "allowed": [0, 1]
+    },
+    {
+      "path": "app.publisher.id",
+      "type": "string",
+      "cardinality": "optional_single",
+      "derivation": "inventory"
+    },
+    {
+      "path": "app.publisher.name",
+      "type": "string",
+      "cardinality": "optional_single",
+      "derivation": "inventory"
+    },
+    {
+      "path": "app.publisher.domain",
+      "type": "string",
+      "cardinality": "optional_single",
+      "derivation": "inventory"
+    },
+    {
+      "path": "app.content.cat[]",
+      "type": "string",
+      "cardinality": "optional_array",
+      "derivation": "inventory"
+    },
+    {
+      "path": "app.content.language",
+      "type": "string",
+      "cardinality": "optional_single",
+      "derivation": "inventory"
+    },
+
+    {
+      "path": "device.devicetype",
+      "type": "integer",
+      "cardinality": "optional_single",
+      "derivation": "request_coarse"
+    },
+    {
+      "path": "device.os",
+      "type": "string",
+      "cardinality": "optional_single",
+      "derivation": "request_coarse"
+    },
+    {
+      "path": "device.language",
+      "type": "string",
+      "cardinality": "optional_single",
+      "derivation": "request_coarse"
+    },
+    {
+      "path": "device.lmt",
+      "type": "integer",
+      "cardinality": "required_single",
+      "derivation": "constant",
+      "constant": 1
+    },
+    {
+      "path": "device.geo.country",
+      "type": "string",
+      "cardinality": "optional_single",
+      "derivation": "request_coarse"
+    },
+
+    {
+      "path": "regs.coppa",
+      "type": "integer",
+      "cardinality": "optional_single",
+      "derivation": "privacy",
+      "allowed": [0, 1]
+    },
+    {
+      "path": "regs.ext.gdpr",
+      "type": "integer",
+      "cardinality": "optional_single",
+      "derivation": "privacy",
+      "allowed": [0, 1]
+    },
+    {
+      "path": "regs.ext.us_privacy",
+      "type": "string",
+      "cardinality": "optional_single",
+      "derivation": "privacy"
+    },
+    {
+      "path": "regs.ext.gpp",
+      "type": "string",
+      "cardinality": "optional_single",
+      "derivation": "privacy"
+    },
+    {
+      "path": "regs.ext.gpp_sid[]",
+      "type": "integer",
+      "cardinality": "optional_array",
+      "derivation": "privacy"
+    },
+    {
+      "path": "user.ext.consent",
+      "type": "string",
+      "cardinality": "optional_single",
+      "derivation": "privacy"
+    }
+  ]
+}
+```
+
+<!-- END NORMATIVE JSON: contextual-openrtb-v1 -->
 
 ## 8. Testing strategy
 

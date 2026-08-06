@@ -229,10 +229,10 @@ instead of trusting prose.
 | P1 N+1 cannot run suppression recovery                             | fixed ("N+1 neither creates nor clears" authority-state; reads fail closed; clears wait for roll-forward — declared protective limitation)                                                                    |
 | P1 row schema missing revision / stale provider-version            | fixed (provenance-revision field row added with init/overflow/CAS rules; provider/version stripped from the mutable provenance row)                                                                           |
 | P1 summary insufficient for policy-only rule                       | fixed (summary carries kind, grant basis/source class, policy revision, valid_until — absence decision reproducible from the strong record)                                                                   |
-| P1 DataDome allowlist not enumerated                               | fixed (checked-in `datadome-header-allowlist.md`, spec-pinned to `X-DataDome-ClientID` alone; other `X-DataDome-*` rejected)                                                                                  |
+| P1 DataDome allowlist not enumerated                               | fixed (inline hook §4a.2 field contract, spec-pinned to `X-DataDome-ClientID` alone; other `X-DataDome-*` rejected)                                                                                           |
 | P1 cookie confinement misses upstream/log surfaces                 | fixed (exhaustive strip inventory: origin forwarding, proxy/click/Testlight upstreams, auction serialization, logs — each a tested row)                                                                       |
 | P1 304 not implementable                                           | fixed (persisted final post-hook header set re-emitted; absent metadata → cache miss)                                                                                                                         |
-| P2 GPP snapshot missing                                            | fixed (`gpp-registry-snapshot.md` vendored, sections 6–27, ratification re-verification note)                                                                                                                 |
+| P2 GPP snapshot missing                                            | fixed (inline permission §4.5.1 snapshot, sections 6–27, ratification re-verification note)                                                                                                                   |
 | P2 field registry not enumerated                                   | fixed (v1 admitted set enumerated in-spec; growth is a spec change)                                                                                                                                           |
 | P2 domain/lifetime irreproducible                                  | fixed (PSL-computed registrable domain, vendored PSL revision, Max-Age ≤ 34,214,400 s)                                                                                                                        |
 | P2 skew window unvalued                                            | fixed (normative 300 s constant with rationale)                                                                                                                                                               |
@@ -663,7 +663,7 @@ current requirements.
   exposure by default, a required bounded cookie lifetime, reserved response
   budget, and exactly-once browser forwarding of documented `X-DD-B`.
 - GPP sections 24–27 are accepted at official version 1 and pinned to the IAB
-  repository commit in `gpp-registry-snapshot.md`; the PSL reference is also
+  repository commit in permission §4.5.1; the PSL reference in hook §4a.1 is also
   pinned. The generated GPP corpus and vendored PSL bytes remain release
   prerequisites, not facts already present in this worktree.
 
@@ -788,7 +788,7 @@ at that revision were:
   `2ac2ab49922f261a8eecaee64f3621da8a2f2c1061c945defd7bc75ac2d5a569`,
   with three numeric rejection vectors.
 - Contextual auction output is governed by the sole machine-readable
-  `contextual-openrtb-v1-allowlist.json`: 98 unique exact leaf rules, closed
+  permission §7.1's inline `contextual-openrtb-v1` manifest: 98 unique exact leaf rules, closed
   type/cardinality/derivation vocabularies, executable container/cross-field
   constraints, atomic GPP/GPP-SID transport, nonempty supply chain, and exact
   banner/video shapes. Unknown, unlisted, ill-typed, or untraceable output
