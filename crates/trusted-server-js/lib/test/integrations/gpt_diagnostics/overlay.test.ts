@@ -321,6 +321,68 @@ describe('GptDiagnosticsOverlay', () => {
     overlay.destroy();
   });
 
+  it('renders publisher, replacement, creative, and independent content-change facts', () => {
+    const frames: Array<() => void> = [];
+    let now = 1;
+    const store = new GptDiagnosticsStore({ now: () => now, schedule: (callback) => callback() });
+    const replacementSlot = slot('replacement-facts');
+    store.recordPublisherRefresh([replacementSlot]);
+    store.recordSlotRequested(replacementSlot);
+    now = 2;
+    store.recordSlotResponseReceived(replacementSlot);
+    now = 3;
+    store.recordSlotRenderEnded(replacementSlot, {
+      isEmpty: false,
+      adManager: { sourceAgnosticCreativeId: 101 },
+      slotContentChanged: false,
+    });
+    now = 6;
+    store.recordSlotRequested(replacementSlot);
+    now = 7;
+    store.recordSlotResponseReceived(replacementSlot);
+    now = 8;
+    store.recordSlotRenderEnded(replacementSlot, {
+      isEmpty: false,
+      adManager: { creativeId: 202 },
+      slotContentChanged: true,
+    });
+    now = 10;
+    store.recordSlotRequested(replacementSlot);
+    now = 11;
+    store.recordSlotResponseReceived(replacementSlot);
+    now = 12;
+    store.recordSlotRenderEnded(replacementSlot, {
+      isEmpty: false,
+      adManager: { creativeId: 202 },
+      slotContentChanged: false,
+    });
+    now = 14;
+    store.recordSlotRequested(replacementSlot);
+    now = 15;
+    store.recordSlotResponseReceived(replacementSlot);
+    now = 16;
+    store.recordSlotRenderEnded(replacementSlot, { isEmpty: false, slotContentChanged: true });
+
+    let root: ShadowRoot | undefined;
+    const overlay = new GptDiagnosticsOverlay(store, new FakeBindings(), {
+      scheduleFrame: (callback) => frames.push(callback),
+      onShadowRoot: (createdRoot) => {
+        root = createdRoot;
+      },
+    });
+    runNextFrame(frames);
+    runNextFrame(frames);
+    const text = slotArticle(root!, 'replacement-facts').textContent ?? '';
+    expect(text).toContain('Request path: Publisher refresh');
+    expect(text).toContain('Replaced rendered request 1 after 3 ms');
+    expect(text).toContain('Creative changed 101 → 202');
+    expect(text).toContain('Creative unchanged 202');
+    expect(text).toContain('Slot content changed yes');
+    expect(text).toContain('Slot content changed no');
+    expect(text).not.toContain('unknown changed');
+    overlay.destroy();
+  });
+
   it('renders lifecycle facts, coverage, history, controls, and scoped styles', () => {
     const frames: Array<() => void> = [];
     let now = 10;
