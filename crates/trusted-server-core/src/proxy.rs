@@ -552,7 +552,7 @@ fn origin_response_metadata(
 /// Apply image content-type header and log pixel heuristics.
 ///
 /// Sets a generic `image/*` content-type when the response has none, then logs
-/// a warning if size or path heuristics suggest a tracking pixel. Both call
+/// a warning if size or path heuristics suggest a pixel image. Both call
 /// sites pass the response through unchanged afterwards, so this returns
 /// nothing.
 fn apply_image_passthrough_metadata(

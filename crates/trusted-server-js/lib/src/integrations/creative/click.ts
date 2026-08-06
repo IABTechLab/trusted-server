@@ -1,4 +1,4 @@
-// Click guard runtime: detects mutated tracking URLs and rebuilds signed first-party clicks.
+// Click guard runtime: detects mutated click URLs and rebuilds signed first-party clicks.
 import { log } from '../../core/log';
 import { creativeGlobal } from '../../shared/globals';
 import { delay, queueTask } from '../../shared/async';
