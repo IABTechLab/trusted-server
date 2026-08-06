@@ -416,86 +416,17 @@ export interface GptDiagnosticsApi {
   hide(): void;
 }
 
-/**
- * Evidence writers used by Trusted Server's own integration modules.
- *
- * Separate bundles can only reach each other through `window.tsjs`, so this
- * channel is reachable from the page like anything else there. Keeping it off
- * [`GptDiagnosticsApi`] is what makes the documented operator surface read-only
- * and stops the writers from becoming part of the public contract.
- */
-export interface GptDiagnosticsRecorder {
-  /** Record Trusted Server's creative opportunity and configured sizes for an associated GPT slot. */
-  recordTrustedServerOpportunity(
-    slot: GptDiagnosticsSlotHandle,
-    auctionSlotId: string,
-    opportunity: GptDiagnosticsTrustedServerOpportunity,
-    trustedServerAuctionId?: string,
-    requestedSlotSizes?: ReadonlyArray<Size>
-  ): void;
-  /** Mark slots whose next observed GPT request follows the Prebid refresh path. */
-  recordPrebidRefresh(slots: GptDiagnosticsSlotHandle[]): void;
-  /** Record a creative markup request and return its opaque attempt ID. */
-  recordTrustedServerCreativeRequest(auctionSlotId: string): number | undefined;
-  /** Record that a creative attempt successfully posted markup. */
-  recordTrustedServerCreativeResponse(attemptId: number): void;
-  /** Record a safe failure category for a creative attempt. */
-  recordTrustedServerCreativeFailure(
-    attemptId: number,
-    reason: GptDiagnosticsCreativeFailure
-  ): void;
+/** Release-internal integration inventory emitted by the server before core. */
+export interface BootManifestIntegrationV1 {
+  readonly id: string;
+  readonly required: true;
 }
 
-/**
- * Lifecycle state for a GPT slot TS created before its publisher declares it.
- *
- * Stored on `window.tsjs` so the head bootstrap and the full TSJS bundle share
- * one handoff protocol.
- */
-export interface GptSlotHandoff {
-  gamUnitPath: string;
-  formats: Array<[number, number]>;
-  /** Stable configured prefix used to safely bridge framework-generated IDs. */
-  divIdPrefix: string;
-  /** Element ID GPT received when TS created the fallback slot. */
-  slotElementId: string;
-  publisherClaimed: boolean;
-  suppressPublisherDisplay: boolean;
-  suppressPublisherRefresh: boolean;
-}
-
-export type FirstImpressionOwner = 'publisher' | 'trusted_server';
-export type FirstImpressionPhase = 'auctioning' | 'delivery_pending' | 'requested' | 'rendered';
-
-/** One publisher auction participating in the current navigation's first impression. */
-export interface FirstImpressionPublisherAuction {
-  token: string;
-  adUnitCode: string;
-  phase: 'auctioning' | 'delivery_pending';
-  expiresAt: number;
-  adIds: string[];
-  suppressDelivery: boolean;
-}
-
-/** First-impression ownership for one exact physical slot element. */
-export interface FirstImpressionSlotClaim {
-  generation: number;
-  slotElementId: string;
-  element: HTMLElement;
-  owner: FirstImpressionOwner;
-  phase: FirstImpressionPhase;
-  expiresAt: number;
-  publisherAuctions: Record<string, FirstImpressionPublisherAuction>;
-  suppressionConsumed?: boolean;
-  targeting?: Record<string, string | string[]>;
-}
-
-/** Bounded first-impression state shared by the GPT bootstrap, GPT, and Prebid bundles. */
-export interface FirstImpressionState {
-  generation: number;
-  nextToken: number;
-  slots: Record<string, FirstImpressionSlotClaim>;
-  fallbackSlots: Record<string, HTMLElement>;
+/** Exact bundle set and injection order required by one TSJS release. */
+export interface BootManifestV1 {
+  readonly version: 1;
+  readonly releaseId: string;
+  readonly integrations: readonly BootManifestIntegrationV1[];
 }
 
 export interface TsjsApi {
