@@ -1312,8 +1312,16 @@ Defines the ad slots the trusted server offers on a page: which pages each slot
 appears on (`page_patterns`), its supported sizes (`formats`), and the GAM ad
 unit it maps to (`gam_unit_path`).
 
+`enabled` is the dedicated server-side ad-template switch. It defaults to `true`
+for compatibility with existing configurations. Set it to `false` to stop
+publisher HTML and SPA page-bids template delivery while retaining the slot
+configuration and direct `POST /auction` endpoint. The browser-facing cache
+policy for a disabled template stack is `Cache-Control: max-age=60`, unless the
+origin already sends `private` or `no-store`.
+
 ```toml
 [creative_opportunities]
+enabled = true # set to false to disable server-side ad templates
 gam_network_id = "123456789"
 price_granularity = "dense"
 
@@ -1330,6 +1338,13 @@ gam_unit_path = "/{network_id}/example/{section}"
 # `/news/article` but NOT `/news` — the glob requires the trailing separator.
 page_patterns = ["/", "/news", "/news/*", "/reviews", "/reviews/*"]
 formats = [{ width = 728, height = 90 }]
+```
+
+The same switch can be overridden through the legacy environment-variable
+loader:
+
+```bash
+TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__ENABLED=false
 ```
 
 ### `gam_unit_path` templating
@@ -1385,8 +1400,9 @@ publisher-specific. Startup fails if `{section}` is used without a valid
 `section_root`. Startup rejects a blank `gam_network_id` only when an absent
 path/default or a `{network_id}` template consumes it; static paths and
 templates without `{network_id}` do not consume it. A
-`[creative_opportunities]` block with no slots is disabled, so its
-`gam_network_id` is not checked.
+`[creative_opportunities]` block with `enabled = false` or no slots is
+inactive, so no publisher templates are delivered and its `gam_network_id` is
+not checked when no slot uses it.
 
 Both knobs are config-driven, so the URL→section convention stays with the
 publisher: `section_segment` selects which segment names the section, and
