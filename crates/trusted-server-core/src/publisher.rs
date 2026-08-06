@@ -3003,18 +3003,44 @@ pub async fn handle_publisher_request(
     //
     // Gate on `should_run_ad_stack` rather than content-type alone: when no slot
     // matched, the feature is disabled, or this is not an ad-eligible navigation,
-    // no per-user `tsjs.adSlots`/`tsjs.bids` are injected, so forcing private
-    // here would needlessly strip shared cacheability from ordinary publisher
-    // HTML. Applies regardless of the auction *outcome* (empty bids still inject
-    // per-user slot state). The separate EC-cookie cache net in the adapter's
-    // `finalize_response` keeps first-visit identity responses private.
+    // no per-user `tsjs.adSlots`/`tsjs.bids` are injected. Applies regardless of
+    // the auction *outcome* (empty bids still inject per-user slot state). The
+    // separate EC-cookie cache net in the adapter's `finalize_response` keeps
+    // first-visit identity responses private.
     let origin_content_type = response
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
         .unwrap_or_default();
-    if should_run_ad_stack && is_html_content_type(origin_content_type) {
-        enforce_synthesized_html_cache_privacy(&mut response);
+    if is_html_content_type(origin_content_type) {
+        if should_run_ad_stack {
+            enforce_synthesized_html_cache_privacy(&mut response);
+        } else if is_get
+            && is_navigation
+            && !is_prefetch
+            && !is_bot
+            && consent_allows_auction
+            && response.status() == StatusCode::OK
+        {
+            // Issue #1007 intentionally caps browser caching for structurally
+            // inactive server-side ad templates. Request-scoped skips retain the
+            // origin policy because the same URL can otherwise render templates.
+            let origin_cache_control = response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_ascii_lowercase);
+            if !origin_cache_control
+                .as_deref()
+                .is_some_and(|value| value.contains("private") || value.contains("no-store"))
+            {
+                response.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static("max-age=60"),
+                );
+            }
+        }
+    }
     }
 
     let content_type = response
@@ -4907,13 +4933,16 @@ mod tests {
                 .expect("should build conditional navigation request")
         }
 
-        fn queue_cacheable_html_response(stub: &StubHttpClient) {
+        fn queue_html_response_with_cache_control(
+            stub: &StubHttpClient,
+            cache_control: &'static str,
+        ) {
             stub.push_response_with_headers(
                 200,
                 b"<html><body>origin</body></html>".to_vec(),
                 vec![
                     ("content-type", "text/html; charset=utf-8"),
-                    ("cache-control", "public, max-age=300"),
+                    ("cache-control", cache_control),
                     ("etag", ORIGIN_ETAG),
                     ("last-modified", ORIGIN_LAST_MODIFIED),
                     ("surrogate-control", "max-age=300"),
@@ -4983,7 +5012,7 @@ mod tests {
             // Arrange
             let settings = settings_with_enabled_auction_and_creative_opportunities();
             let stub = Arc::new(StubHttpClient::new());
-            queue_cacheable_html_response(&stub);
+            queue_html_response_with_cache_control(&stub, "public, max-age=300");
             let services = build_services_with_http_client(
                 Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
             );
@@ -5076,11 +5105,11 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn navigation_without_matched_slots_preserves_origin_cache_policy() {
+        async fn navigation_without_matched_slots_uses_short_browser_cache_policy() {
             // Arrange
             let settings = settings_with_enabled_auction_and_creative_opportunities();
             let stub = Arc::new(StubHttpClient::new());
-            queue_cacheable_html_response(&stub);
+            queue_html_response_with_cache_control(&stub, "public, max-age=300");
             let services = build_services_with_http_client(
                 Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
             );
@@ -5126,7 +5155,7 @@ mod tests {
             );
 
             for (header_name, expected) in [
-                (header::CACHE_CONTROL, "public, max-age=300"),
+                (header::CACHE_CONTROL, "max-age=60"),
                 (header::ETAG, ORIGIN_ETAG),
                 (header::LAST_MODIFIED, ORIGIN_LAST_MODIFIED),
                 (
@@ -5153,6 +5182,36 @@ mod tests {
                         .and_then(|value| value.to_str().ok()),
                     Some(expected),
                     "publisher response without matched slots should preserve {header_name}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn navigation_without_matched_slots_preserves_private_origin_cache_policy() {
+            let settings = settings_with_enabled_auction_and_creative_opportunities();
+
+            for cache_control in ["private, max-age=0", "No-Store"] {
+                // Arrange
+                let stub = Arc::new(StubHttpClient::new());
+                queue_html_response_with_cache_control(&stub, cache_control);
+                let services = build_services_with_http_client(
+                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+                );
+
+                // Act
+                let response =
+                    run_with_slots(&settings, &services, &[], conditional_navigation_request())
+                        .await;
+                let response_head = response_head(response);
+
+                // Assert
+                assert_eq!(
+                    response_head
+                        .headers
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|value| value.to_str().ok()),
+                    Some(cache_control),
+                    "origin {cache_control} policy should not be weakened"
                 );
             }
         }
