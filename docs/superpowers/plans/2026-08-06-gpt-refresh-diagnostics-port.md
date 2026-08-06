@@ -21,24 +21,25 @@
 
 ## File map
 
-| File | Responsibility |
-| --- | --- |
-| `crates/trusted-server-js/lib/src/core/types.ts` | Public bid and diagnostics request-cycle/API types, including shared Prebid dispatch context. |
-| `crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/store.ts` | Intent storage, classification, correlation fields, and replacement derivation. |
-| `crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/api.ts` | Safe forwarding of the optional auction ID. |
-| `crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/observer.ts` | GPT listeners plus standalone idempotent publisher refresh observer. |
-| `crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/index.ts` | Install the observer before deferred Prebid installation can wrap it. |
-| `crates/trusted-server-js/lib/src/integrations/prebid/index.ts` | Synchronous scoped Prebid diagnostic dispatch context surrounding the delegated refresh. |
-| `crates/trusted-server-js/lib/src/integrations/gpt/index.ts` | Forward `bid.hb_auction_id` from `adInit` to diagnostics. |
-| `crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/overlay.ts` | Render source, intent, latency, auction, and replacement facts only when present. |
+| File                                                                                                              | Responsibility                                                                                                   |
+| ----------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `crates/trusted-server-js/lib/src/core/types.ts`                                                                  | Public bid and diagnostics request-cycle/API types, including shared Prebid dispatch context.                    |
+| `crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/store.ts`                                          | Intent storage, classification, correlation fields, and replacement derivation.                                  |
+| `crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/api.ts`                                            | Safe forwarding of the optional auction ID.                                                                      |
+| `crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/observer.ts`                                       | GPT listeners plus standalone idempotent publisher refresh observer.                                             |
+| `crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/index.ts`                                          | Install the observer before deferred Prebid installation can wrap it.                                            |
+| `crates/trusted-server-js/lib/src/integrations/prebid/index.ts`                                                   | Synchronous scoped Prebid diagnostic dispatch context surrounding the delegated refresh.                         |
+| `crates/trusted-server-js/lib/src/integrations/gpt/index.ts`                                                      | Forward `bid.hb_auction_id` from `adInit` to diagnostics.                                                        |
+| `crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/overlay.ts`                                        | Render source, intent, latency, auction, and replacement facts only when present.                                |
 | `crates/trusted-server-js/lib/test/integrations/gpt_diagnostics/{store,api,observer,overlay,index,types}.test.ts` | TDD coverage for store semantics, API/type/export shape, wrapper behavior, installation order, and presentation. |
-| `crates/trusted-server-js/lib/test/integrations/{gpt/ad_init,prebid/index}.test.ts` | TDD coverage for auction-ID forwarding and Prebid context/refresh transparency. |
-| `crates/trusted-server-core/src/publisher.rs` | Copy `AuctionRequest.id` into optional winner metadata for initial and page-bids bid maps. |
-| `docs/guide/integrations/gpt-diagnostics.md` | Operator-facing source semantics, privacy, replacement, retention, and API documentation. |
+| `crates/trusted-server-js/lib/test/integrations/{gpt/ad_init,prebid/index}.test.ts`                               | TDD coverage for auction-ID forwarding and Prebid context/refresh transparency.                                  |
+| `crates/trusted-server-core/src/publisher.rs`                                                                     | Copy `AuctionRequest.id` into optional winner metadata for initial and page-bids bid maps.                       |
+| `docs/guide/integrations/gpt-diagnostics.md`                                                                      | Operator-facing source semantics, privacy, replacement, retention, and API documentation.                        |
 
 ### Task 1: Define the exported contracts first
 
 **Files:**
+
 - Modify: `crates/trusted-server-js/lib/src/core/types.ts`
 - Modify: `crates/trusted-server-js/lib/test/integrations/gpt_diagnostics/types.test.ts`
 
@@ -107,6 +108,7 @@
 ### Task 2: Correct response-gated `slotOnload` attribution, then add request intents
 
 **Files:**
+
 - Modify: `crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/store.ts`
 - Modify: `crates/trusted-server-js/lib/test/integrations/gpt_diagnostics/store.test.ts`
 
@@ -172,18 +174,18 @@
   type RequestIntentSource =
     | 'trusted_server_direct'
     | 'prebid_refresh'
-    | 'publisher_refresh';
+    | 'publisher_refresh'
 
   interface PendingSourceEvidence {
-    generation: number;
-    observedAtMs: number;
-    trustedServerOpportunity?: GptDiagnosticsTrustedServerOpportunity;
-    trustedServerAuctionId?: string;
+    generation: number
+    observedAtMs: number
+    trustedServerOpportunity?: GptDiagnosticsTrustedServerOpportunity
+    trustedServerAuctionId?: string
   }
 
   interface PendingRequestIntent {
-    intentId: number;
-    sources: Map<RequestIntentSource, PendingSourceEvidence>;
+    intentId: number
+    sources: Map<RequestIntentSource, PendingSourceEvidence>
   }
   ```
 
@@ -225,6 +227,7 @@
 ### Task 3: Safely expose the optional Trusted Server auction ID
 
 **Files:**
+
 - Modify: `crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/api.ts`
 - Modify: `crates/trusted-server-js/lib/test/integrations/gpt_diagnostics/api.test.ts`
 - Modify: `crates/trusted-server-js/lib/src/integrations/gpt/index.ts`
@@ -264,6 +267,7 @@
 ### Task 4: Add the standalone fail-open publisher refresh observer
 
 **Files:**
+
 - Modify: `crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/observer.ts`
 - Modify: `crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/index.ts`
 - Modify: `crates/trusted-server-js/lib/test/integrations/gpt_diagnostics/observer.test.ts`
@@ -309,6 +313,7 @@
 ### Task 5: Make nested Prebid refreshes Prebid-only with synchronous context
 
 **Files:**
+
 - Modify: `crates/trusted-server-js/lib/src/integrations/prebid/index.ts`
 - Modify: `crates/trusted-server-js/lib/test/integrations/prebid/index.test.ts`
 - Modify: `crates/trusted-server-js/lib/test/integrations/gpt_diagnostics/observer.test.ts`
@@ -343,6 +348,7 @@
 ### Task 6: Carry `AuctionRequest.id` in branch-native winning-bid metadata
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/publisher.rs`
 - Test: `crates/trusted-server-core/src/publisher.rs` (`creative_opportunities_tests` and `page_bids_no_match_tests`)
 
@@ -376,6 +382,7 @@
 ### Task 7: Present and document observed facts without overclaiming
 
 **Files:**
+
 - Modify: `crates/trusted-server-js/lib/src/integrations/gpt_diagnostics/overlay.ts`
 - Modify: `crates/trusted-server-js/lib/test/integrations/gpt_diagnostics/overlay.test.ts`
 - Modify: `docs/guide/integrations/gpt-diagnostics.md`
@@ -414,6 +421,7 @@
 ### Task 8: Run focused and full verification before handoff
 
 **Files:**
+
 - Verify only; no production changes.
 
 - [ ] **Step 1: Run all touched JavaScript diagnostics and integration tests.**
