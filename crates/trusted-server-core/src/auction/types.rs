@@ -1,10 +1,14 @@
 //! Core types for auction requests and responses.
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD},
+};
 use edgezero_core::body::Body as EdgeBody;
 use http::Request;
+use rand::{RngCore as _, rngs::OsRng};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use url::Url;
 
 use crate::auction::context::ContextValue;
@@ -14,6 +18,42 @@ use crate::settings::Settings;
 
 fn is_zero(value: &usize) -> bool {
     *value == 0
+}
+
+/// Injectable CSPRNG boundary for server-minted response-local identities.
+pub(crate) trait AuctionIdentityGenerator: Send + Sync {
+    /// Fill the complete destination or report that secure randomness is unavailable.
+    fn fill(&self, destination: &mut [u8]) -> Result<(), ()>;
+}
+
+/// Production CSPRNG for server-minted auction identities.
+pub(crate) struct SystemAuctionIdentityGenerator;
+
+impl AuctionIdentityGenerator for SystemAuctionIdentityGenerator {
+    fn fill(&self, destination: &mut [u8]) -> Result<(), ()> {
+        OsRng.try_fill_bytes(destination).map_err(|_| ())
+    }
+}
+
+/// Mint one response-unique unpadded base64url identity.
+pub(crate) fn mint_response_unique_base64url_identity(
+    generator: &dyn AuctionIdentityGenerator,
+    issued: &mut HashSet<String>,
+    prefix: &str,
+    random_byte_count: usize,
+    collision_retries: usize,
+) -> Option<String> {
+    for _ in 0..=collision_retries {
+        let mut bytes = vec![0_u8; random_byte_count];
+        if generator.fill(&mut bytes).is_err() {
+            return None;
+        }
+        let identity = format!("{prefix}{}", URL_SAFE_NO_PAD.encode(bytes));
+        if issued.insert(identity.clone()) {
+            return Some(identity);
+        }
+    }
+    None
 }
 
 /// Represents a unified auction request across all providers.
@@ -562,6 +602,16 @@ pub struct CacheRenderSourceV1 {
     pub width: u32,
     /// Creative height.
     pub height: u32,
+}
+
+/// Immutable trusted base used to construct and admit PBS Cache fetches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CacheFetchPolicyV1 {
+    /// Cache-policy contract version.
+    pub version: u8,
+    /// Canonical configured HTTPS cache endpoint without query or fragment.
+    pub base_url: String,
 }
 
 /// Typed browser render source carried by a bid.

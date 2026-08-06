@@ -83,6 +83,11 @@ export interface CacheRenderSourceV1 {
   height: number;
 }
 
+export interface CacheFetchPolicyV1 {
+  version: 1;
+  baseUrl: string;
+}
+
 export type BidRenderSourceV1 = ApsRendererV1 | AdmRenderSourceV1 | CacheRenderSourceV1;
 
 export type AuctionSlotFailureReason =

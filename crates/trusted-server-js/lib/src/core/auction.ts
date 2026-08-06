@@ -4,6 +4,7 @@
 
 import { parseApsRendererDescriptor, validateApsRenderer } from '../integrations/aps/render';
 
+import { parseCacheFetchPolicyV1 } from './config';
 import { log } from './log';
 import type {
   AdmRenderSourceV1,
@@ -13,6 +14,7 @@ import type {
   BidRenderSourceV1,
   BrowserAuctionBidV1,
   BrowserAuctionProjectionV1,
+  CacheFetchPolicyV1,
   CacheRenderSourceV1,
   SlotAuctionDecisionV1,
 } from './types';
@@ -121,6 +123,11 @@ const auctionFailureReasons = new Set<AuctionSlotFailureReason>([
   'internal_error',
 ]);
 
+/** Whether a value is one exact server-minted renderer reservation identity. */
+export function isRendererReservationIdV1(value: unknown): value is string {
+  return typeof value === 'string' && reservationIdPattern.test(value);
+}
+
 function ownDataObject(
   value: unknown,
   expectedKeys?: readonly string[]
@@ -201,7 +208,10 @@ function validDimension(value: unknown): value is number {
   );
 }
 
-function parseRenderSource(value: unknown): BidRenderSourceV1 | undefined {
+function parseRenderSource(
+  value: unknown,
+  cachePolicy?: Readonly<CacheFetchPolicyV1>
+): BidRenderSourceV1 | undefined {
   const record = ownDataObject(value);
   if (!record || typeof record.type !== 'string') return undefined;
 
@@ -271,7 +281,8 @@ function parseRenderSource(value: unknown): BidRenderSourceV1 | undefined {
       !cacheIdPattern.test(source.cacheId) ||
       !validBoundedString(source.fetchUrl, MAX_URL_BYTES) ||
       !validDimension(source.width) ||
-      !validDimension(source.height)
+      !validDimension(source.height) ||
+      !cachePolicy
     ) {
       return undefined;
     }
@@ -289,6 +300,22 @@ function parseRenderSource(value: unknown): BidRenderSourceV1 | undefined {
       [...fetchUrl.searchParams.keys()].length !== 1 ||
       fetchUrl.searchParams.get('uuid') !== source.cacheId ||
       fetchUrl.search !== `?uuid=${encodeURIComponent(source.cacheId)}`
+    ) {
+      return undefined;
+    }
+    let policyBase: URL;
+    try {
+      policyBase = new URL(cachePolicy.baseUrl);
+    } catch {
+      return undefined;
+    }
+    const expected = new URL(policyBase.href);
+    expected.search = `?uuid=${encodeURIComponent(source.cacheId)}`;
+    if (
+      fetchUrl.origin !== policyBase.origin ||
+      fetchUrl.port !== policyBase.port ||
+      fetchUrl.pathname !== policyBase.pathname ||
+      fetchUrl.href !== expected.href
     ) {
       return undefined;
     }
@@ -382,7 +409,10 @@ function parseTargeting(value: unknown): Record<string, string> | undefined {
   return targeting;
 }
 
-function parseBrowserBid(value: unknown): BrowserAuctionBidV1 | undefined {
+function parseBrowserBid(
+  value: unknown,
+  cachePolicy?: Readonly<CacheFetchPolicyV1>
+): BrowserAuctionBidV1 | undefined {
   const bid = ownDataObject(value, [
     'candidateId',
     'slot',
@@ -406,13 +436,12 @@ function parseBrowserBid(value: unknown): BrowserAuctionBidV1 | undefined {
     !Number.isFinite(bid.cpm) ||
     bid.cpm < 0 ||
     bid.currency !== 'USD' ||
-    typeof bid.rendererReservationId !== 'string' ||
-    !reservationIdPattern.test(bid.rendererReservationId)
+    !isRendererReservationIdV1(bid.rendererReservationId)
   ) {
     return undefined;
   }
   const targeting = parseTargeting(bid.targeting);
-  const renderSource = parseRenderSource(bid.renderSource);
+  const renderSource = parseRenderSource(bid.renderSource, cachePolicy);
   if (!targeting || !renderSource) return undefined;
   return {
     candidateId: bid.candidateId,
@@ -429,8 +458,12 @@ function parseBrowserBid(value: unknown): BrowserAuctionBidV1 | undefined {
 
 /** Validate, canonicalize, and deep-copy a complete browser auction projection. */
 export function parseBrowserAuctionProjectionV1(
-  value: unknown
+  value: unknown,
+  cachePolicyValue?: unknown
 ): BrowserAuctionProjectionV1 | undefined {
+  const cachePolicy =
+    cachePolicyValue === undefined ? undefined : parseCacheFetchPolicyV1(cachePolicyValue);
+  if (cachePolicyValue !== undefined && !cachePolicy) return undefined;
   const record = ownDataObject(value, ['version', 'auction', 'bids']);
   if (!record || record.version !== 1) return undefined;
   const auction = parseDecisionSet(record.auction);
@@ -440,7 +473,7 @@ export function parseBrowserAuctionProjectionV1(
   const candidateIds = new Set<string>();
   const reservationIds = new Set<string>();
   for (const raw of rawBids) {
-    const bid = parseBrowserBid(raw);
+    const bid = parseBrowserBid(raw, cachePolicy);
     if (
       !bid ||
       candidateIds.has(bid.candidateId) ||
@@ -468,7 +501,9 @@ export function parseBrowserAuctionProjectionV1(
   }
 
   const projection: BrowserAuctionProjectionV1 = { version: 1, auction, bids };
-  if (textEncoder.encode(JSON.stringify(projection)).length > MAX_BROWSER_AUCTION_PROJECTION_BYTES) {
+  if (
+    textEncoder.encode(JSON.stringify(projection)).length > MAX_BROWSER_AUCTION_PROJECTION_BYTES
+  ) {
     return undefined;
   }
   return projection;
@@ -476,8 +511,12 @@ export function parseBrowserAuctionProjectionV1(
 
 /** Parse the coordinated-cutover `/auction` wire without activating it in production yet. */
 export function parseTrustedServerAuctionResponseV1(
-  value: unknown
+  value: unknown,
+  cachePolicyValue?: unknown
 ): TrustedServerAuctionResponseV1 | undefined {
+  const cachePolicy =
+    cachePolicyValue === undefined ? undefined : parseCacheFetchPolicyV1(cachePolicyValue);
+  if (cachePolicyValue !== undefined && !cachePolicy) return undefined;
   const body = ownDataObject(value, ['id', 'seatbid', 'cur', 'ext']);
   if (!body || typeof body.id !== 'string' || body.cur !== 'USD') return undefined;
   const responseExt = ownDataObject(body.ext, ['trusted_server']);
@@ -489,7 +528,8 @@ export function parseTrustedServerAuctionResponseV1(
   const bids: TrustedServerAuctionBidV1[] = [];
   for (const rawSeat of seatbids) {
     const seat = ownDataObject(rawSeat, ['seat', 'bid']);
-    if (!seat || typeof seat.seat !== 'string' || !providerPattern.test(seat.seat)) return undefined;
+    if (!seat || typeof seat.seat !== 'string' || !providerPattern.test(seat.seat))
+      return undefined;
     const rawBids = ownDataArray(seat.bid, MAX_AUCTION_RESULTS - bids.length);
     if (!rawBids || rawBids.length === 0) return undefined;
     for (const rawBid of rawBids) {
@@ -513,8 +553,7 @@ export function parseTrustedServerAuctionResponseV1(
       if (
         !bid ||
         !trusted ||
-        typeof bid.id !== 'string' ||
-        !reservationIdPattern.test(bid.id) ||
+        !isRendererReservationIdV1(bid.id) ||
         !validBoundedString(bid.impid, 256) ||
         typeof trusted.candidate_id !== 'string' ||
         !candidateIdPattern.test(trusted.candidate_id) ||
@@ -527,7 +566,7 @@ export function parseTrustedServerAuctionResponseV1(
       ) {
         return undefined;
       }
-      const renderSource = parseRenderSource(trusted.render_source);
+      const renderSource = parseRenderSource(trusted.render_source, cachePolicy);
       if (!renderSource || renderSource.width !== bid.w || renderSource.height !== bid.h) {
         return undefined;
       }
@@ -562,10 +601,7 @@ export function parseTrustedServerAuctionResponseV1(
   if (
     winners.length !== bids.length ||
     bids.some((bid) => {
-      if (
-        candidates.has(bid.candidateId) ||
-        reservations.has(bid.rendererReservationId)
-      ) {
+      if (candidates.has(bid.candidateId) || reservations.has(bid.rendererReservationId)) {
         return true;
       }
       candidates.add(bid.candidateId);

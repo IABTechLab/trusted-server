@@ -1,10 +1,8 @@
 //! Auction orchestrator for managing multi-provider auctions.
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::Request;
-use rand::{RngCore as _, rngs::OsRng};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use web_time::Instant;
@@ -20,27 +18,14 @@ use super::provider::{
 };
 use super::telemetry::AbandonedProviderCall;
 use super::types::{
-    AuctionContext, AuctionDecisionSetV1, AuctionDropReason, AuctionRequest, AuctionResponse,
-    AuctionSlotFailureReason, Bid, BidStatus, SlotAuctionDecisionV1,
+    AuctionContext, AuctionDecisionSetV1, AuctionDropReason, AuctionIdentityGenerator,
+    AuctionRequest, AuctionResponse, AuctionSlotFailureReason, Bid, BidStatus,
+    SlotAuctionDecisionV1, SystemAuctionIdentityGenerator, mint_response_unique_base64url_identity,
 };
 
 const CANDIDATE_ID_BYTES: usize = 9;
 const CANDIDATE_ID_COLLISION_RETRIES: usize = 8;
 const MAX_UPSTREAM_BID_ID_BYTES: usize = 64;
-
-/// Injectable CSPRNG boundary for response-local auction identities.
-pub(crate) trait AuctionIdentityGenerator: Send + Sync {
-    /// Fill the complete destination or report that secure randomness is unavailable.
-    fn fill(&self, destination: &mut [u8]) -> Result<(), ()>;
-}
-
-struct SystemAuctionIdentityGenerator;
-
-impl AuctionIdentityGenerator for SystemAuctionIdentityGenerator {
-    fn fill(&self, destination: &mut [u8]) -> Result<(), ()> {
-        OsRng.try_fill_bytes(destination).map_err(|_| ())
-    }
-}
 
 struct NormalizedProviderResponses {
     outcomes: Vec<ProviderSlotOutcome>,
@@ -950,18 +935,15 @@ impl AuctionOrchestrator {
     }
 
     fn mint_candidate_id(&self, issued: &mut HashSet<String>) -> Option<String> {
-        for _ in 0..=CANDIDATE_ID_COLLISION_RETRIES {
-            let mut bytes = [0_u8; CANDIDATE_ID_BYTES];
-            if self.identity_generator.fill(&mut bytes).is_err() {
-                return None;
-            }
-            let candidate_id = URL_SAFE_NO_PAD.encode(bytes);
-            debug_assert_eq!(candidate_id.len(), 12);
-            if issued.insert(candidate_id.clone()) {
-                return Some(candidate_id);
-            }
-        }
-        None
+        let candidate_id = mint_response_unique_base64url_identity(
+            self.identity_generator.as_ref(),
+            issued,
+            "",
+            CANDIDATE_ID_BYTES,
+            CANDIDATE_ID_COLLISION_RETRIES,
+        )?;
+        debug_assert_eq!(candidate_id.len(), 12);
+        Some(candidate_id)
     }
 
     fn response_failure_reason(response: &AuctionResponse) -> Option<AuctionSlotFailureReason> {

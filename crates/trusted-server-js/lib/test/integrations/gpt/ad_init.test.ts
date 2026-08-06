@@ -6,7 +6,12 @@ import { resolve } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
 
 import envelope from '../../fixtures/aps-renderer-v1.json';
-import type { GptSlotHandoff, TsjsApi } from '../../../src/core/types';
+import type {
+  BidRenderSourceV1,
+  BrowserAuctionBidV1,
+  GptSlotHandoff,
+  TsjsApi,
+} from '../../../src/core/types';
 
 function apsRenderer() {
   const bid = envelope.seatbid[0]!.bid[0]!;
@@ -23,6 +28,72 @@ function apsRenderer() {
     height: bid.h,
   };
 }
+
+describe('prepareTrustedServerGptTargetingV1', () => {
+  function projectedBid(renderSource: BidRenderSourceV1): BrowserAuctionBidV1 {
+    return {
+      candidateId: 'AAAAAAAAAAAA',
+      slot: 'slot-1',
+      provider: 'prebid',
+      upstreamBidId: 'upstream-bid',
+      cpm: 1.25,
+      currency: 'USD',
+      targeting: { hb_bidder: 'example', hb_pb: '1.25' },
+      rendererReservationId: 'r1_AAAAAAAAAAAAAAAAAAAAAA',
+      renderSource,
+    };
+  }
+
+  it('uses the exact renderer reservation as hb_adid for APS, ADM, and cache', async () => {
+    const { prepareTrustedServerGptTargetingV1 } =
+      await import('../../../src/integrations/gpt/index');
+    const sources: BidRenderSourceV1[] = [
+      apsRenderer(),
+      { type: 'adm', version: 1, adm: '<div>ad</div>', width: 300, height: 250 },
+      {
+        type: 'cache',
+        version: 1,
+        cacheId: 'f47447a0-b759-4f2f-9887-af458b79b570',
+        fetchUrl: 'https://cache.example/pbc/v1/cache?uuid=f47447a0-b759-4f2f-9887-af458b79b570',
+        width: 300,
+        height: 250,
+      },
+    ];
+
+    for (const source of sources) {
+      const bid = projectedBid(source);
+      const targeting = prepareTrustedServerGptTargetingV1(bid);
+      expect(targeting).toEqual({
+        hb_adid: 'r1_AAAAAAAAAAAAAAAAAAAAAA',
+        hb_bidder: 'example',
+        hb_pb: '1.25',
+      });
+      expect(bid.targeting).toEqual({ hb_bidder: 'example', hb_pb: '1.25' });
+    }
+  });
+
+  it('rejects malformed reservations without truncating or falling back to other ids', async () => {
+    const { prepareTrustedServerGptTargetingV1 } =
+      await import('../../../src/integrations/gpt/index');
+    const malformed = projectedBid({
+      type: 'cache',
+      version: 1,
+      cacheId: 'f47447a0-b759-4f2f-9887-af458b79b570',
+      fetchUrl: 'https://cache.example/pbc/v1/cache?uuid=f47447a0-b759-4f2f-9887-af458b79b570',
+      width: 300,
+      height: 250,
+    });
+    malformed.rendererReservationId = `r1_${'A'.repeat(23)}`;
+    malformed.upstreamBidId = 'fallback-upstream';
+
+    expect(prepareTrustedServerGptTargetingV1(malformed)).toBeUndefined();
+    expect(malformed.rendererReservationId).toHaveLength(26);
+
+    const prepopulated = projectedBid(apsRenderer());
+    prepopulated.targeting.hb_adid = 'forbidden-fallback';
+    expect(prepareTrustedServerGptTargetingV1(prepopulated)).toBeUndefined();
+  });
+});
 
 // Track every 'message' EventListener added to window across the entire test
 // file.  This lets the installTsRenderBridge suite remove all accumulated

@@ -7,11 +7,12 @@ import {
   reservePublisherFirstImpressionFallback,
 } from '../../core/first_impression';
 import { log } from '../../core/log';
+import { isRendererReservationIdV1 } from '../../core/auction';
+import { isEffectivelyVisible, recordRender, stampCreativeTrace } from '../../core/trace';
 import type {
   AuctionSlot,
   AuctionBidData,
-  GptDiagnosticsCreativeFailure,
-  GptDiagnosticsTrustedServerOpportunity,
+  BrowserAuctionBidV1,
   GptSlotHandoff,
   TsjsApi,
 } from '../../core/types';
@@ -57,6 +58,34 @@ const TS_BID_TARGETING_KEYS = [
   'hb_cache_path',
 ] as const;
 const TS_BASE_TARGETING_KEYS = [...TS_BID_TARGETING_KEYS, TS_INITIAL_TARGETING_KEY] as const;
+/** Prepare dormant hard-cutover GPT targeting without mutating a live slot or bid. */
+export function prepareTrustedServerGptTargetingV1(
+  bid: BrowserAuctionBidV1
+): Readonly<Record<string, string>> | undefined {
+  if (
+    !isRendererReservationIdV1(bid.rendererReservationId) ||
+    !['aps', 'adm', 'cache'].includes(bid.renderSource.type) ||
+    typeof bid.targeting !== 'object' ||
+    bid.targeting === null ||
+    Array.isArray(bid.targeting) ||
+    Object.getPrototypeOf(bid.targeting) !== Object.prototype ||
+    Object.prototype.hasOwnProperty.call(bid.targeting, 'hb_adid')
+  ) {
+    return undefined;
+  }
+
+  const targeting: Record<string, string> = { hb_adid: bid.rendererReservationId };
+  for (const [key, value] of Object.entries(bid.targeting)) {
+    if (typeof value !== 'string') return undefined;
+    Object.defineProperty(targeting, key, {
+      value,
+      enumerable: true,
+      writable: false,
+      configurable: false,
+    });
+  }
+  return Object.freeze(targeting);
+}
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0;
