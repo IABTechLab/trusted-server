@@ -3231,6 +3231,21 @@ fn html_escape_for_script(s: &str) -> String {
     out
 }
 
+/// Maximum length Google Ad Manager accepts for a key-value targeting value.
+/// Longer values are rejected by GAM, so the key never reaches the creative and
+/// the `hb_adid` render handshake cannot complete.
+const GAM_TARGETING_VALUE_MAX_LEN: usize = 40;
+
+/// Treat an empty identifier as absent.
+///
+/// `Option::or` considers `Some("")` present, which would let a blank
+/// `cacheId`/`adid` win the `hb_adid` precedence below and emit an empty
+/// targeting value — falsey on the page, so GPT skips the key and the render
+/// bridge has nothing to match, exactly the failure the fallback chain closes.
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.filter(|v| !v.is_empty())
+}
+
 /// Build a price-bucketed bid map from winning bids.
 ///
 /// Returns a JSON object map of slot ID → bid metadata including the bucketed
@@ -3286,12 +3301,24 @@ pub(crate) fn build_bid_map(
                 // that return neither a cache UUID nor `adid`. Without it those
                 // bids carry no hb_adid at all, so no targeting key reaches GAM and
                 // the render handshake can never start.
-                let hb_adid = bid
-                    .cache_id
-                    .as_deref()
-                    .or(bid.ad_id.as_deref())
-                    .or(bid.bid_id.as_deref());
+                let hb_adid = non_empty(bid.cache_id.as_deref())
+                    .or_else(|| non_empty(bid.ad_id.as_deref()))
+                    .or_else(|| non_empty(bid.bid_id.as_deref()));
                 if let Some(id) = hb_adid {
+                    // GAM drops an over-long targeting value, so the creative
+                    // echoes nothing and the bridge's equality check never
+                    // matches — the same silent no-render as a missing hb_adid.
+                    // Log rather than truncate: a truncated id is no longer
+                    // unique per bid, which is what lets one slot's render claim
+                    // another slot's creative.
+                    if id.len() > GAM_TARGETING_VALUE_MAX_LEN {
+                        log::warn!(
+                            "hb_adid for slot '{slot_id}' is {} characters, over GAM's \
+                             {GAM_TARGETING_VALUE_MAX_LEN}-character targeting value limit — \
+                             GAM may drop the key and the creative will not render",
+                            id.len()
+                        );
+                    }
                     obj.insert(
                         "hb_adid".to_string(),
                         serde_json::Value::String(id.to_string()),
@@ -3301,17 +3328,26 @@ pub(crate) fn build_bid_map(
                 // Cache endpoint coordinates — only present for PBS bids with Prebid Cache enabled.
                 // The Prebid Universal Creative constructs:
                 //   https://<hb_cache_host><hb_cache_path>?uuid=<hb_adid>
-                if let Some(ref host) = bid.cache_host {
-                    obj.insert(
-                        "hb_cache_host".to_string(),
-                        serde_json::Value::String(host.clone()),
-                    );
-                }
-                if let Some(ref path) = bid.cache_path {
-                    obj.insert(
-                        "hb_cache_path".to_string(),
-                        serde_json::Value::String(path.clone()),
-                    );
+                //
+                // Gated on `cache_id`: PBS reports the cache `url` and `cacheId`
+                // independently, and hb_adid falls back to a non-cache identifier
+                // (`adid`, then the bid id). Emitting the coordinates without a
+                // cache UUID would point the Universal Creative at
+                // `?uuid=<non-cache-id>` — a guaranteed cache miss — instead of
+                // letting it fall through to the inline `adm`.
+                if bid.cache_id.is_some() {
+                    if let Some(ref host) = bid.cache_host {
+                        obj.insert(
+                            "hb_cache_host".to_string(),
+                            serde_json::Value::String(host.clone()),
+                        );
+                    }
+                    if let Some(ref path) = bid.cache_path {
+                        obj.insert(
+                            "hb_cache_path".to_string(),
+                            serde_json::Value::String(path.clone()),
+                        );
+                    }
                 }
                 // Win/billing notification URLs, fired verbatim by the bridge.
                 // Per OpenRTB these are the canonical carriers of
@@ -9010,6 +9046,103 @@ mod tests {
                 obj.get("hb_adid").and_then(|v| v.as_str()),
                 Some("019f7e2a-b45b-70b0-a2d1-b651c430700b"),
                 "should fall back to bid_id when cache_id and ad_id are both absent"
+            );
+        }
+
+        #[test]
+        fn bid_map_skips_blank_cache_id_and_ad_id_for_hb_adid() {
+            // A bidder that emits `cacheId`/`adid` as empty strings must not win
+            // the precedence: an empty hb_adid is falsey on the page, so GPT skips
+            // the targeting key and the render bridge has nothing to match — the
+            // same failure as omitting hb_adid entirely.
+            let mut winning_bids = HashMap::new();
+            winning_bids.insert(
+                "atf_sidebar_ad".to_string(),
+                Bid {
+                    slot_id: "atf_sidebar_ad".to_string(),
+                    price: Some(1.00),
+                    currency: "USD".to_string(),
+                    creative: None,
+                    adomain: None,
+                    bidder: "example-bidder".to_string(),
+                    width: 300,
+                    height: 250,
+                    nurl: None,
+                    burl: None,
+                    bid_id: Some("019f7e2a-b45b-70b0-a2d1-b651c430700b".to_string()),
+                    ad_id: Some(String::new()),
+                    cache_id: Some(String::new()),
+                    cache_host: None,
+                    cache_path: None,
+                    metadata: Default::default(),
+                },
+            );
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                "",
+                false,
+            );
+            let obj = map
+                .get("atf_sidebar_ad")
+                .expect("should have bid entry")
+                .as_object()
+                .expect("should be object");
+            assert_eq!(
+                obj.get("hb_adid").and_then(|v| v.as_str()),
+                Some("019f7e2a-b45b-70b0-a2d1-b651c430700b"),
+                "should treat blank cache_id and ad_id as absent and use bid_id"
+            );
+        }
+
+        #[test]
+        fn bid_map_omits_cache_coordinates_without_a_cache_id() {
+            // PBS reports the cache `url` and `cacheId` independently. With
+            // coordinates but no UUID, hb_adid holds a non-cache identifier, so
+            // emitting them would send the Universal Creative to
+            // `?uuid=<bid id>` — a guaranteed miss — instead of the inline adm.
+            let mut winning_bids = HashMap::new();
+            winning_bids.insert(
+                "atf_sidebar_ad".to_string(),
+                Bid {
+                    slot_id: "atf_sidebar_ad".to_string(),
+                    price: Some(1.00),
+                    currency: "USD".to_string(),
+                    creative: None,
+                    adomain: None,
+                    bidder: "example-bidder".to_string(),
+                    width: 300,
+                    height: 250,
+                    nurl: None,
+                    burl: None,
+                    bid_id: Some("019f7e2a-b45b-70b0-a2d1-b651c430700b".to_string()),
+                    ad_id: None,
+                    cache_id: None,
+                    cache_host: Some("cache.example.com".to_string()),
+                    cache_path: Some("/cache".to_string()),
+                    metadata: Default::default(),
+                },
+            );
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                "",
+                false,
+            );
+            let obj = map
+                .get("atf_sidebar_ad")
+                .expect("should have bid entry")
+                .as_object()
+                .expect("should be object");
+            assert!(
+                obj.get("hb_cache_host").is_none(),
+                "should omit hb_cache_host when there is no cache UUID to look up"
+            );
+            assert!(
+                obj.get("hb_cache_path").is_none(),
+                "should omit hb_cache_path when there is no cache UUID to look up"
             );
         }
 
