@@ -2395,7 +2395,10 @@ async fn collect_non_html_auction(
     services: &RuntimeServices,
     settings: &Settings,
 ) {
-    let auction_id = telemetry.auction_request.as_ref().map(|request| request.id.clone());
+    let auction_id = telemetry
+        .auction_request
+        .as_ref()
+        .map(|request| request.id.clone());
     let placeholder = mediator_placeholder_request();
     let result = orchestrator
         .collect_dispatched_auction(
@@ -2445,7 +2448,10 @@ async fn collect_stream_auction(
         settings,
         request_origin,
     } = deps;
-    let auction_id = telemetry.auction_request.as_ref().map(|request| request.id.clone());
+    let auction_id = telemetry
+        .auction_request
+        .as_ref()
+        .map(|request| request.id.clone());
     log::info!("body_close_hold_loop: collecting dispatched auction before held body tail");
     let placeholder = mediator_placeholder_request();
     let collect_ctx = make_collect_context(settings, services, &placeholder);
@@ -8353,8 +8359,7 @@ mod tests {
             );
 
             assert_eq!(
-                map["atf_sidebar_ad"]["hb_auction_id"],
-                "auction-example-123",
+                map["atf_sidebar_ad"]["hb_auction_id"], "auction-example-123",
                 "should expose only the current opaque request ID"
             );
             let empty = build_bid_map_with_auction_id(
@@ -8365,7 +8370,10 @@ mod tests {
                 false,
                 Some("auction-example-123"),
             );
-            assert!(empty.is_empty(), "should not create bid metadata without a winner");
+            assert!(
+                empty.is_empty(),
+                "should not create bid metadata without a winner"
+            );
         }
 
         #[test]
