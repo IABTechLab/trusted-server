@@ -669,6 +669,28 @@ pub(crate) fn noop_services() -> RuntimeServices {
     build_services_with_config(NoopConfigStore)
 }
 
+/// Build a [`RuntimeServices`] with an injected Edge Cookie provider, so a test
+/// can exercise the adapter-injection path an opaque-identifier vendor provider
+/// reaches core through.
+pub(crate) fn noop_services_with_ec_provider(
+    ec_provider: Arc<dyn crate::ec::provider::EdgeCookieProvider>,
+) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(NoopBackend))
+        .http_client(Arc::new(NoopHttpClient))
+        .geo(Arc::new(NoopGeo))
+        // A fixed client IP so the generate path (which requires one) can run.
+        .client_info(ClientInfo {
+            client_ip: Some("203.0.113.10".parse().expect("should parse test client IP")),
+            ..ClientInfo::default()
+        })
+        .ec_provider(ec_provider)
+        .build()
+}
+
 /// Build a [`RuntimeServices`] whose auction telemetry sink is the supplied
 /// recording (or otherwise custom) sink, so tests can assert which terminal
 /// auction events were emitted.

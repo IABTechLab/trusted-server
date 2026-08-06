@@ -185,6 +185,23 @@ pub struct EcContext {
     /// passed to [`build_provider`] on every path, so a vendor or host provider
     /// resolves without core naming it. `None` for built-in-only deployments.
     ec_provider: Option<Arc<dyn crate::ec::provider::EdgeCookieProvider>>,
+    /// The selected Edge Cookie provider (built-in or injected), built once at
+    /// construction. Core asks it whether an identifier is well formed
+    /// ([`accepts_id`](crate::ec::provider::EdgeCookieProvider::accepts_id)) so
+    /// an opaque vendor identifier round-trips through read-back and withdrawal
+    /// instead of being dropped by the built-in shape check. `None` when no
+    /// provider is configured.
+    selected_provider: Option<Arc<dyn crate::ec::provider::EdgeCookieProvider>>,
+    /// A snapshot of the request evidence a provider reads at generation time:
+    /// the request headers (so a provider can read cookies and client hints), and
+    /// the URL path and query string (so it can read request parameters).
+    /// Captured once at construction, and only when a provider is configured, so
+    /// a deployment with no Edge Cookie provider clones nothing. A provider reads
+    /// these through [`RequestInfo`](crate::evidence::RequestInfo) at generate
+    /// time.
+    request_headers: http::HeaderMap,
+    request_path: String,
+    request_query: String,
     /// Response headers a provider asked to set, captured during
     /// [`EcContext::generate_if_needed`] and applied to the response by EC
     /// finalization. Empty for providers that set no headers.
@@ -228,12 +245,47 @@ impl EcContext {
     ) -> Result<Self, Report<TrustedServerError>> {
         let parsed = parse_ec_from_request(req)?;
 
-        let ec_value = parsed.cookie_ec.clone().filter(|v| is_valid_ec_id(v));
+        // Build the selected provider once, injecting any host signals the host
+        // supplies. It is used here to decide whether the incoming cookie value
+        // is a usable identifier and to read its required permissions. A provider
+        // that needs a service the host did not supply fails to build here, which
+        // stops the request. Reading either needs no request data, so nothing is
+        // cloned from the request.
+        let host_signals = services.host_signals();
+        let ec_provider = services.ec_provider();
+        let selected_provider: Option<Arc<dyn crate::ec::provider::EdgeCookieProvider>> =
+            build_provider(&settings.ec, host_signals.clone(), ec_provider.clone())?.map(Arc::from);
+
+        // Read back an existing identifier only when the selected provider
+        // accepts its shape, so an opaque vendor identifier (for example a signed
+        // envelope) round-trips instead of being silently dropped by the built-in
+        // shape check. With no provider configured there is nothing to read back
+        // for, so fall back to the built-in shape.
+        let ec_value = parsed.cookie_ec.clone().filter(|v| {
+            selected_provider
+                .as_ref()
+                .map_or_else(|| is_valid_ec_id(v), |selected| selected.accepts_id(v))
+        });
         let ec_was_present = ec_value.is_some();
 
         if let Some(ref id) = ec_value {
             log::trace!("Existing EC ID found: {}", log_id(id));
         }
+
+        // Snapshot the request evidence a provider reads at generation time (the
+        // headers, so it can read cookies and client hints, and the URL path and
+        // query, so it can read request parameters). Capture only when a provider
+        // is configured, so a no-provider deployment clones nothing. Generation
+        // runs after the request body may be consumed, so the snapshot is owned.
+        let (request_headers, request_path, request_query) = if selected_provider.is_some() {
+            (
+                req.headers().clone(),
+                req.uri().path().to_owned(),
+                req.uri().query().unwrap_or_default().to_owned(),
+            )
+        } else {
+            (http::HeaderMap::new(), String::new(), String::new())
+        };
 
         // Capture the client IP from platform services (normalized).
         let client_ip = services
@@ -257,16 +309,9 @@ impl EcContext {
         // [`EcContext::permissions`] and [`EcContext::ec_allowed`] rather than
         // re-deriving it.
         let permissions = consent::assemble_permissions(settings, &consent, geo_info);
-        // Build the selected provider once, injecting the request info and any
-        // host signals the host supplies, to read its required permissions. A
-        // provider that needs a service the host did not supply fails to build
-        // here, which stops the request.
-        let host_signals = services.host_signals();
-        let ec_provider = services.ec_provider();
-        // The provider is built here only to read its required permissions, which
-        // need no request data, so nothing is cloned from the request.
-        let ec_allowed = build_provider(&settings.ec, host_signals.clone(), ec_provider.clone())?
-            .is_none_or(|provider| permissions.all_set(provider.required_permissions()));
+        let ec_allowed = selected_provider
+            .as_ref()
+            .is_none_or(|selected| permissions.all_set(selected.required_permissions()));
 
         log::info!(
             "EC context: present={}, cookie_present={}, ec_allowed={}, jurisdiction={}",
@@ -289,6 +334,10 @@ impl EcContext {
             device_signals: None,
             host_signals,
             ec_provider,
+            selected_provider,
+            request_headers,
+            request_path,
+            request_query,
             response_headers: Vec::new(),
         })
     }
@@ -370,10 +419,16 @@ impl EcContext {
             permissions: Some(&self.permissions),
             consent: Some(&self.consent),
         };
-        // The provider reads only the client IP on this path; pass it borrowed
-        // with no header snapshot, so no request data is cloned.
-        let request_info =
-            BorrowedRequestInfo::new(self.client_ip.as_deref().unwrap_or_default(), None);
+        // Pass the request evidence captured at read time, borrowed: the client
+        // IP, the request headers (so a provider reads cookies and client hints),
+        // and the URL path and query (so it reads request parameters). A built-in
+        // provider reads only the client IP; a vendor provider reads what it
+        // needs through [`RequestInfo`].
+        let request_info = BorrowedRequestInfo::new(
+            self.client_ip.as_deref().unwrap_or_default(),
+            Some(&self.request_headers),
+        )
+        .with_request_target(&self.request_path, &self.request_query);
         let generated: GeneratedEdgeCookie = ec_provider.generate(&request_info, &input)?;
         // Capture any response headers the provider asked for, even when it
         // produced no identifier (for example while it still needs more client
@@ -427,6 +482,21 @@ impl EcContext {
     #[must_use]
     pub fn ec_value(&self) -> Option<&str> {
         self.ec_value.as_deref()
+    }
+
+    /// Returns whether `value` is a well-formed identifier for the selected
+    /// provider.
+    ///
+    /// Lets core validate a cookie or active identifier (for example before
+    /// withdrawing it) through the provider that issued it, rather than assuming
+    /// the built-in shape. Falls back to the built-in shape when no provider is
+    /// configured.
+    #[must_use]
+    pub(crate) fn accepts_id(&self, value: &str) -> bool {
+        self.selected_provider.as_ref().map_or_else(
+            || is_valid_ec_id(value),
+            |provider| provider.accepts_id(value),
+        )
     }
 
     /// Returns whether the `ts-ec` cookie was present on the incoming request.
@@ -603,6 +673,10 @@ impl EcContext {
             device_signals: None,
             host_signals: None,
             ec_provider: None,
+            selected_provider: None,
+            request_headers: http::HeaderMap::new(),
+            request_path: String::new(),
+            request_query: String::new(),
             response_headers: Vec::new(),
         }
     }
@@ -628,6 +702,10 @@ impl EcContext {
             device_signals: None,
             host_signals: None,
             ec_provider: None,
+            selected_provider: None,
+            request_headers: http::HeaderMap::new(),
+            request_path: String::new(),
+            request_query: String::new(),
             response_headers: Vec::new(),
         }
     }
@@ -657,6 +735,10 @@ impl EcContext {
             device_signals: None,
             host_signals: None,
             ec_provider: None,
+            selected_provider: None,
+            request_headers: http::HeaderMap::new(),
+            request_path: String::new(),
+            request_query: String::new(),
             response_headers: Vec::new(),
         }
     }
@@ -821,6 +903,139 @@ mod tests {
                 .as_deref(),
             Some("client-id=abc123; ts-ec=xyz"),
             "the provider should read the request cookies from the request info"
+        );
+    }
+
+    /// A provider whose identifiers are opaque and deliberately not the
+    /// built-in HMAC shape (no dot, mixed case), modeling a vendor identifier
+    /// such as a signed envelope. It accepts any of its own non-empty
+    /// identifiers.
+    #[derive(Debug)]
+    struct OpaqueIdProvider;
+
+    impl EdgeCookieProvider for OpaqueIdProvider {
+        fn id(&self) -> &'static str {
+            "opaque"
+        }
+
+        fn generate(
+            &self,
+            _request_info: &dyn RequestInfo,
+            _input: &IdentityInput<'_>,
+        ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+            Ok(GeneratedEdgeCookie::default())
+        }
+
+        fn accepts_id(&self, value: &str) -> bool {
+            !value.is_empty()
+        }
+    }
+
+    #[test]
+    fn read_from_request_round_trips_an_opaque_provider_identifier() {
+        use crate::platform::test_support::noop_services_with_ec_provider;
+
+        // A vendor identifier that is deliberately not the built-in HMAC shape
+        // (no dot, mixed case) — the exact value the built-in check would drop.
+        const OPAQUE_ID: &str = "AbC123opaqueEnvelopeValueXYZ";
+
+        let mut settings = create_test_settings();
+        settings.ec.provider = Some("opaque".to_owned());
+        let cookie = format!("ts-ec={OPAQUE_ID}");
+        let req = create_test_request(&[("cookie", &cookie)]);
+
+        // With the opaque provider injected, its `accepts_id` governs read-back,
+        // so the identifier survives verbatim.
+        let services = noop_services_with_ec_provider(Arc::new(OpaqueIdProvider));
+        let ec = EcContext::read_from_request(&settings, &req, &services)
+            .expect("should read EC context");
+        assert_eq!(
+            ec.ec_value(),
+            Some(OPAQUE_ID),
+            "an opaque provider identifier should round-trip through read-back verbatim"
+        );
+
+        // Control: without the provider, the built-in shape check drops the same
+        // value. This is the regression the round-trip guards against: a cookie
+        // that can be set but never read back.
+        let ec_without = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context");
+        assert_eq!(
+            ec_without.ec_value(),
+            None,
+            "without the provider, the built-in shape check drops the opaque identifier"
+        );
+    }
+
+    /// A provider that records the request query parameter `id` and the `Cookie`
+    /// header it is given at generate time, proving request evidence (parameters
+    /// and cookies) reaches a provider through the organic generate path.
+    #[derive(Debug, Default)]
+    struct EvidenceCapturingProvider {
+        seen: std::sync::Mutex<Option<(String, String)>>,
+    }
+
+    impl EdgeCookieProvider for EvidenceCapturingProvider {
+        fn id(&self) -> &'static str {
+            "evidence"
+        }
+
+        fn generate(
+            &self,
+            request_info: &dyn RequestInfo,
+            _input: &IdentityInput<'_>,
+        ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+            let query_id = request_info.query_param("id").unwrap_or_default();
+            let cookie = request_info.header("cookie").unwrap_or_default().to_owned();
+            *self.seen.lock().expect("should lock seen evidence") = Some((query_id, cookie));
+            Ok(GeneratedEdgeCookie {
+                id: Some("evidence-ec".to_owned()),
+                response_headers: Vec::new(),
+            })
+        }
+
+        fn accepts_id(&self, value: &str) -> bool {
+            !value.is_empty()
+        }
+    }
+
+    #[test]
+    fn generate_passes_request_parameters_and_cookies_to_the_provider() {
+        use crate::platform::test_support::noop_services_with_ec_provider;
+
+        let provider = Arc::new(EvidenceCapturingProvider::default());
+        let mut settings = create_test_settings();
+        settings.ec.provider = Some("evidence".to_owned());
+
+        // A request carrying a query parameter and a (non-EC) cookie, with no
+        // existing `ts-ec` cookie so the generate path runs.
+        let req = Request::builder()
+            .method("GET")
+            .uri("http://example.com/page?id=abc123&debug=1")
+            .header("cookie", "client-id=xyz789")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let services = noop_services_with_ec_provider(provider.clone());
+        let mut ec = EcContext::read_from_request(&settings, &req, &services)
+            .expect("should read EC context");
+        ec.generate_if_needed(&settings, None)
+            .expect("should run generation");
+
+        let seen = provider
+            .seen
+            .lock()
+            .expect("should lock seen evidence")
+            .clone();
+        assert_eq!(
+            seen,
+            Some(("abc123".to_owned(), "client-id=xyz789".to_owned())),
+            "the provider should read the request query parameter and cookies at generate time"
+        );
+        assert_eq!(
+            ec.ec_value(),
+            Some("evidence-ec"),
+            "the identifier the provider minted should be committed"
         );
     }
 

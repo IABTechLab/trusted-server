@@ -139,6 +139,34 @@ pub trait EdgeCookieProvider: Send + Sync + core::fmt::Debug {
         left == right
     }
 
+    /// Returns whether `value` is a well-formed identifier this provider issues.
+    ///
+    /// Core calls this to decide whether an incoming `ts-ec` cookie value is a
+    /// usable Edge Cookie identifier before reading it back, keying the KV
+    /// identity graph, or withdrawing it. This keeps the identifier opaque to
+    /// core: a provider whose identifiers are not the built-in shape (for
+    /// example an opaque signed envelope) accepts its own format here, so its
+    /// identifier round-trips instead of being silently dropped on read-back.
+    ///
+    /// The default accepts the built-in HMAC identifier shape
+    /// (`<64 hex>.<6 alphanumeric>`), which is correct for [`HmacProvider`] and
+    /// the other core providers.
+    fn accepts_id(&self, value: &str) -> bool {
+        generation::is_valid_ec_id(value)
+    }
+
+    /// Returns the KV-key form of `value` for this provider's identifiers.
+    ///
+    /// Core keys the identity graph by the returned string, so a provider whose
+    /// identifiers are case-sensitive or carry no separable segments returns the
+    /// value unchanged to avoid collapsing distinct identifiers into one key.
+    ///
+    /// The default lowercases the leading HMAC hash segment and preserves the
+    /// suffix, matching the built-in identifier shape.
+    fn normalize_id_for_kv(&self, value: &str) -> String {
+        generation::normalize_ec_id_for_kv(value)
+    }
+
     /// The permissions this provider's data use requires.
     ///
     /// Trusted Server executes the provider only when every permission returned
@@ -426,6 +454,14 @@ impl EdgeCookieProvider for SharedProvider {
 
     fn keys_equal(&self, left: &str, right: &str) -> bool {
         self.0.keys_equal(left, right)
+    }
+
+    fn accepts_id(&self, value: &str) -> bool {
+        self.0.accepts_id(value)
+    }
+
+    fn normalize_id_for_kv(&self, value: &str) -> String {
+        self.0.normalize_id_for_kv(value)
     }
 
     fn required_permissions(&self) -> PermissionSet {

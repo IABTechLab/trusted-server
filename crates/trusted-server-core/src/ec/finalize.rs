@@ -13,7 +13,6 @@ use crate::settings::Settings;
 use super::EcContext;
 use super::consent::ec_storage_withdrawn;
 use super::cookies::{expire_ec_cookie, set_ec_cookie};
-use super::generation::is_valid_ec_id;
 use super::kv::KvIdentityGraph;
 use super::log_id;
 use super::prebid_eids::ingest_eid_cookies;
@@ -168,13 +167,13 @@ fn withdrawal_ec_ids(ec_context: &EcContext) -> HashSet<String> {
     let mut hashes = HashSet::new();
 
     if let Some(cookie_ec_id) = ec_context.existing_cookie_ec_id()
-        && is_valid_ec_id(cookie_ec_id)
+        && ec_context.accepts_id(cookie_ec_id)
     {
         hashes.insert(cookie_ec_id.to_owned());
     }
 
     if let Some(active_ec_id) = ec_context.ec_value()
-        && is_valid_ec_id(active_ec_id)
+        && ec_context.accepts_id(active_ec_id)
     {
         hashes.insert(active_ec_id.to_owned());
     }
