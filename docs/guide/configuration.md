@@ -1066,6 +1066,12 @@ apply when the integration section exists in `trusted-server.toml`.
 | `client_side_bidders`      | Array[String] | `[]`                                                                   | Bidders that run client-side via native Prebid.js adapters instead of server-side (see [Prebid docs](/guide/integrations/prebid#client-side-bidders)) |
 | `script_patterns`          | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                                                                                           |
 
+APS is configured exclusively under `[integrations.aps]`. `aps` entries in
+`bidders` or `client_side_bidders` are logged and removed case-insensitively so
+an upgrade does not prevent Trusted Server from starting. Remove those entries
+from operator configuration; this guard prevents APS demand from reaching
+Prebid Server or the client-side Prebid bundle.
+
 **Example**:
 
 ```toml

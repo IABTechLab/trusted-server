@@ -74,10 +74,8 @@ export interface ApsPrebidRendererEntry {
   renderer: ApsRendererV1;
   registeredAt: number;
   expiresAt: number;
-  /** Notify Prebid that GAM selected this bid before replying to Universal Creative. */
-  markWinner(): void;
-  /** Mark Prebid's bid rendered after the Universal Creative response is posted. */
-  markRendered(): void;
+  /** Mark the bid as won and rendered after replying to Universal Creative. */
+  markUsed(): void;
 }
 
 /** Bid targeting data from the server-side auction, injected into `window.tsjs.bids`. */

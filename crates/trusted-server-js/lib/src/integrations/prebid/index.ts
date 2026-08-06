@@ -12,7 +12,6 @@
 // bids flow through the orchestrator.
 
 import type _pbjsDefault from 'prebid.js';
-import { markBidAsRendered, markWinner } from 'prebid.js/src/adRendering.js';
 
 import { log } from '../../core/log';
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
@@ -89,7 +88,14 @@ function getExternalBundleManifest(): ExternalPrebidBundleManifest | undefined {
  * bundle fails to load.
  */
 function hasPrebidJsApi(): boolean {
-  return typeof (pbjs as { registerBidAdapter?: unknown }).registerBidAdapter === 'function';
+  const prebidApi = pbjs as {
+    markWinningBidAsUsed?: unknown;
+    registerBidAdapter?: unknown;
+  };
+  return (
+    typeof prebidApi.registerBidAdapter === 'function' &&
+    typeof prebidApi.markWinningBidAsUsed === 'function'
+  );
 }
 
 const ADAPTER_CODE = 'trustedServer';
@@ -937,20 +943,17 @@ function installApsBidResponseRegistry(): void {
         ? (rawMeta as Record<string, unknown>)
         : undefined;
     const renderer = bid[APS_RENDERER_FIELD] ?? meta?.[APS_RENDERER_FIELD];
-    if (renderer === undefined) {
+    const adId = bid['adId'];
+    if (renderer === undefined || typeof adId !== 'string') {
       return;
     }
 
-    const registered = registerApsPrebidRenderer(
-      bid['adId'],
-      bid['adUnitCode'],
-      renderer,
-      bid['ttl'],
-      {
-        markWinner: () => markWinner(rawBid),
-        markRendered: () => markBidAsRendered(rawBid),
-      }
-    );
+    const registered = registerApsPrebidRenderer(adId, bid['adUnitCode'], renderer, bid['ttl'], {
+      // Prebid exposes only a public combined winner/rendered API. Keep it
+      // at the existing rendered lifecycle point so the bid is not reported
+      // rendered before Universal Creative receives its response.
+      markUsed: () => pbjs.markWinningBidAsUsed({ adId, events: true }),
+    });
     // Keep the executable capability only in the bounded, one-time registry. Prebid
     // still owns the generated ad ID and ordinary GAM targeting on this bid object.
     delete bid[APS_RENDERER_FIELD];
@@ -978,8 +981,8 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   // API — installing the adapter is impossible, so bail out loudly.
   if (!hasPrebidJsApi()) {
     log.error(
-      '[tsjs-prebid] window.pbjs has no Prebid.js API — the external Prebid bundle ' +
-        'failed to load. Prebid integration disabled.'
+      '[tsjs-prebid] window.pbjs is missing the required Prebid.js API — the external ' +
+        'bundle failed to load or is incompatible. Prebid integration disabled.'
     );
     return pbjs;
   }
