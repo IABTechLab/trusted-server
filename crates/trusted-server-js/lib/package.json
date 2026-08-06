@@ -13,7 +13,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "lint": "eslint . --max-warnings=0",
+    "test:architecture": "node --test test/eslint/no-adtech-globals.test.mjs",
+    "lint": "npm run test:architecture && eslint . --max-warnings=0",
     "lint:fix": "eslint --fix . --max-warnings=0",
     "format": "prettier --check \"**/*.{ts,tsx,js,json,css,md}\"",
     "format:write": "prettier --write \"**/*.{ts,tsx,js,json,css,md}\""
@@ -29,6 +30,7 @@
     "@typescript-eslint/parser": "^8.6.0",
     "eslint": "^9.10.0",
     "eslint-config-prettier": "^10.1.8",
+    "eslint-import-resolver-typescript": "^4.4.5",
     "eslint-plugin-import": "^2.29.1",
     "eslint-plugin-jsdoc": "^62.5.4",
     "eslint-plugin-unicorn": "^62.0.0",
