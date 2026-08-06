@@ -960,6 +960,7 @@ export function installTsAdInit(): void {
       // first-impression slot renders blank on initial-load-disabled pages. Only
       // add them in that case; otherwise display() + refresh() would
       // double-request the impression.
+      syncInitialLoadDisabled(g, ts);
       const slotsNeedingRefresh = ts.gptInitialLoadDisabled
         ? slotsToRefresh.concat(newSlots)
         : slotsToRefresh;

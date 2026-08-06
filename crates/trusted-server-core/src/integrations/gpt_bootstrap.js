@@ -425,6 +425,7 @@
       // unless the publisher disabled initial load, in which case display() only
       // registers the slot and refresh() must request the ad — otherwise they render
       // blank. Only add them in that case to avoid double-requesting.
+      syncInitialLoadDisabled(window.googletag);
       var slotsNeedingRefresh = ts.gptInitialLoadDisabled
         ? slotsToRefresh.concat(newSlots)
         : slotsToRefresh;

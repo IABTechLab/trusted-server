@@ -1238,10 +1238,11 @@ describe('installTsAdInit', () => {
       getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
     };
     const disableInitialLoadMock = vi.fn();
+    const nativeRefresh = vi.fn();
     const mockPubads = {
       enableSingleRequest: vi.fn(),
       getSlots: vi.fn().mockReturnValue([]),
-      refresh: vi.fn(),
+      refresh: nativeRefresh,
       disableInitialLoad: disableInitialLoadMock,
     };
     const displayMock = vi.fn();
@@ -1277,7 +1278,7 @@ describe('installTsAdInit', () => {
     (window as TestWindow).tsjs!.adInit!();
 
     expect(displayMock).toHaveBeenCalledWith('div-atf-sidebar');
-    expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
+    expect(nativeRefresh).toHaveBeenCalledWith([mockSlot]);
   });
 
   it('tracks setConfig state and re-enabling in the edge bootstrap', async () => {
@@ -1295,10 +1296,11 @@ describe('installTsAdInit', () => {
         effectiveConfig = { disableInitialLoad: config.disableInitialLoad === true };
       }
     });
+    const nativeRefresh = vi.fn();
     const mockPubads = {
       enableSingleRequest: vi.fn(),
       getSlots: vi.fn().mockReturnValue([]),
-      refresh: vi.fn(),
+      refresh: nativeRefresh,
     };
     const displayMock = vi.fn();
     const googletag = {
@@ -1342,15 +1344,15 @@ describe('installTsAdInit', () => {
     (window as TestWindow).tsjs!.adInit!();
 
     expect(displayMock).toHaveBeenCalledWith('div-atf-sidebar');
-    expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
+    expect(nativeRefresh).toHaveBeenCalledWith([mockSlot]);
 
-    mockPubads.refresh.mockClear();
+    nativeRefresh.mockClear();
     googletag.setConfig({ disableInitialLoad: false });
     expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(false);
 
     (window as TestWindow).tsjs!.adInit!();
 
-    expect(mockPubads.refresh).not.toHaveBeenCalled();
+    expect(nativeRefresh).not.toHaveBeenCalled();
 
     googletag.setConfig({ disableInitialLoad: true });
     googletag.setConfig({ disableInitialLoad: null });
@@ -1358,7 +1360,7 @@ describe('installTsAdInit', () => {
 
     (window as TestWindow).tsjs!.adInit!();
 
-    expect(mockPubads.refresh).not.toHaveBeenCalled();
+    expect(nativeRefresh).not.toHaveBeenCalled();
   });
 
   it('tracks the effective initial-load state from setConfig', async () => {
@@ -1383,12 +1385,13 @@ describe('installTsAdInit', () => {
     const disableInitialLoadMock = vi.fn(() => {
       effectiveConfig = { disableInitialLoad: true };
     });
+    const nativeRefresh = vi.fn();
     const mockPubads = {
       enableSingleRequest: vi.fn(),
       // Publisher has not defined this slot, so TS defines (owns) it.
       getSlots: vi.fn().mockReturnValue([]),
       addEventListener: vi.fn(),
-      refresh: vi.fn(),
+      refresh: nativeRefresh,
       disableInitialLoad: disableInitialLoadMock,
     };
     const displayMock = vi.fn();
@@ -1430,7 +1433,7 @@ describe('installTsAdInit', () => {
     (window as TestWindow).tsjs!.adInit!();
 
     expect(displayMock).toHaveBeenCalledWith('div-atf-sidebar');
-    expect(mockPubads.refresh).not.toHaveBeenCalled();
+    expect(nativeRefresh).not.toHaveBeenCalled();
 
     // Fall back to the explicit setConfig value when getConfig is unavailable.
     gpt.setConfig({ disableInitialLoad: true });
@@ -1449,9 +1452,9 @@ describe('installTsAdInit', () => {
 
     (window as TestWindow).tsjs!.adInit!();
 
-    expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
+    expect(nativeRefresh).toHaveBeenCalledWith([mockSlot]);
 
-    mockPubads.refresh.mockClear();
+    nativeRefresh.mockClear();
     gpt.setConfig({ disableInitialLoad: false });
     expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(false);
     gpt.setConfig({ disableInitialLoad: null });
@@ -1459,7 +1462,7 @@ describe('installTsAdInit', () => {
 
     (window as TestWindow).tsjs!.adInit!();
 
-    expect(mockPubads.refresh).not.toHaveBeenCalled();
+    expect(nativeRefresh).not.toHaveBeenCalled();
 
     // GPT exposes one effective setting across the modern and legacy APIs.
     // A legacy call made after setConfig(false) disables initial load.
@@ -1468,16 +1471,16 @@ describe('installTsAdInit', () => {
 
     (window as TestWindow).tsjs!.adInit!();
 
-    expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
+    expect(nativeRefresh).toHaveBeenCalledWith([mockSlot]);
 
     // A later modern call can re-enable initial load after the legacy API.
-    mockPubads.refresh.mockClear();
+    nativeRefresh.mockClear();
     gpt.setConfig({ disableInitialLoad: false });
     expect((window as TestWindow).tsjs!.gptInitialLoadDisabled).toBe(false);
 
     (window as TestWindow).tsjs!.adInit!();
 
-    expect(mockPubads.refresh).not.toHaveBeenCalled();
+    expect(nativeRefresh).not.toHaveBeenCalled();
 
     // Resetting the setting to its default has the same effective result.
     mockPubads.disableInitialLoad();
@@ -1486,7 +1489,7 @@ describe('installTsAdInit', () => {
 
     (window as TestWindow).tsjs!.adInit!();
 
-    expect(mockPubads.refresh).not.toHaveBeenCalled();
+    expect(nativeRefresh).not.toHaveBeenCalled();
   });
 
   it('reads initial-load configuration effective before detector installation', async () => {
@@ -1496,11 +1499,12 @@ describe('installTsAdInit', () => {
       getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
       getTargeting: vi.fn().mockReturnValue([]),
     };
+    const nativeRefresh = vi.fn();
     const mockPubads = {
       enableSingleRequest: vi.fn(),
       getSlots: vi.fn().mockReturnValue([]),
       addEventListener: vi.fn(),
-      refresh: vi.fn(),
+      refresh: nativeRefresh,
     };
     const displayMock = vi.fn();
     const getConfigMock = vi.fn().mockReturnValue({ disableInitialLoad: true });
@@ -1534,7 +1538,7 @@ describe('installTsAdInit', () => {
     (window as TestWindow).tsjs!.adInit!();
 
     expect(displayMock).toHaveBeenCalledWith('div-atf-sidebar');
-    expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
+    expect(nativeRefresh).toHaveBeenCalledWith([mockSlot]);
   });
 
   it('sets adInitRefreshInProgress only for the duration of the internal refresh', async () => {
