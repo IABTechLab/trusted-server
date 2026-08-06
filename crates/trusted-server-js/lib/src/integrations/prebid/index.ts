@@ -18,7 +18,7 @@ import { isEffectivelyVisible, recordRender, stampCreativeTrace } from '../../co
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
 import { registerApsPrebidRenderer, validateApsRenderer } from '../aps/render';
 import type { AuctionBid, AuctionEid } from '../../core/auction';
-import type { AuctionSlot, RenderRecord } from '../../core/types';
+import type { AuctionSlot, RenderRecord, TsjsApi } from '../../core/types';
 
 import { PREBID_USER_ID_MODULE_REGISTRY } from './user_id_modules';
 
@@ -410,6 +410,51 @@ type RefreshGptSlot = {
   clearTargeting?: (key?: string) => RefreshGptSlot;
   getSizes?: () => unknown[];
 };
+
+function recordPrebidRefreshForDiagnostics(slots: RefreshGptSlot[]): void {
+  try {
+    window.tsjs?.gptDiagnostics?.recordPrebidRefresh?.(slots);
+  } catch {
+    // Diagnostics must not suppress the GAM request.
+  }
+}
+
+function dispatchPrebidRefresh<T>(
+  refresh: (slots?: unknown[], opts?: unknown) => T,
+  slots: unknown[] | undefined,
+  opts: unknown
+): T {
+  let tsjs: TsjsApi | undefined;
+  let hadOwnContext = false;
+  let previousContext: boolean | undefined;
+  let shouldRestoreContext = false;
+  try {
+    tsjs = window.tsjs;
+    if (tsjs) {
+      hadOwnContext = Object.prototype.hasOwnProperty.call(tsjs, 'prebidRefreshDispatchInProgress');
+      previousContext = tsjs.prebidRefreshDispatchInProgress;
+      shouldRestoreContext = true;
+      tsjs.prebidRefreshDispatchInProgress = true;
+    }
+  } catch {
+    // Diagnostics context must not affect refresh delegation.
+  }
+  try {
+    return refresh(slots, opts);
+  } finally {
+    if (shouldRestoreContext && tsjs) {
+      try {
+        if (hadOwnContext) {
+          tsjs.prebidRefreshDispatchInProgress = previousContext;
+        } else {
+          delete tsjs.prebidRefreshDispatchInProgress;
+        }
+      } catch {
+        // Diagnostics context restoration must not mask a refresh result or throw.
+      }
+    }
+  }
+}
 
 const DEFAULT_REFRESH_SIZES: BannerSize[] = [
   [728, 90],
@@ -1356,7 +1401,8 @@ export function installRefreshHandler(timeoutMs = 1500): void {
       const deliverySlots = publisherDeliverySlots(targetSlots);
       const independentSlots = targetSlots.filter((slot) => !deliverySlots.has(slot));
       if (independentSlots.length === 0) {
-        return originalRefresh(slots, opts);
+        recordPrebidRefreshForDiagnostics(targetSlots);
+        return dispatchPrebidRefresh(originalRefresh, slots, opts);
       }
 
       // Clear stale Trusted Server/Prebid targeting from independent slots before
@@ -1438,7 +1484,9 @@ export function installRefreshHandler(timeoutMs = 1500): void {
         // to GPT; otherwise the excluded slots would be refreshed implicitly but
         // would not be represented by the wrapper's concrete target set. Keep
         // the existing bare-refresh delivery behavior when no filtering occurs.
-        originalRefresh(slots === undefined && hasExcludedSlots ? targetSlots : slots, opts);
+        const deliveredSlots = slots === undefined && hasExcludedSlots ? targetSlots : slots;
+        recordPrebidRefreshForDiagnostics(targetSlots);
+        dispatchPrebidRefresh(originalRefresh, deliveredSlots, opts);
       }
 
       try {
