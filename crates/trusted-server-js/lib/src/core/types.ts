@@ -251,9 +251,10 @@ export interface TsjsApi {
   navGeneration?: number;
   /**
    * Defers the initial `adInit()` until after React hydration: the first
-   * hydration signal to arrive — the Next.js App Router runtime patching
-   * `window.__next_f`, or window `load` as the fallback and the only signal on
-   * non-Next publishers — then a double `requestAnimationFrame`. Called by the
+   * signal to arrive — React having hydrated the ad-slot containers `adInit`
+   * mutates, or window `load` as the fallback and the only signal where those
+   * containers never report hydrated (non-React publishers) — then a double
+   * `requestAnimationFrame`. Called by the
    * server-injected `</body>` bids script with the SSR bids payload. The whole
    * initial pass is pinned to navigation generation 0 (the SSR document): if an
    * SPA navigation has already committed — or commits while the deferred

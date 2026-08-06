@@ -3392,11 +3392,12 @@ pub(crate) fn build_bids_script(bid_map: &serde_json::Map<String, serde_json::Va
     // mutates those ad-slot subtrees. Calling it synchronously here (this script
     // runs at body-parse time) lands those mutations inside React's hydration
     // window and trips a #418 hydration mismatch. The deferral — gate on the
-    // first hydration signal to arrive (the Next.js App Router runtime patching
-    // `window.__next_f`, or window `load` as the fallback and the only signal on
-    // non-Next publishers), then a double `requestAnimationFrame`, pinned to
-    // navigation generation 0 so a faster SPA navigation cancels it — lives in
-    // the GPT bundle module as `tsjs.scheduleInitialAdInit`
+    // first signal to arrive (React having hydrated the ad-slot containers
+    // adInit is about to mutate, or window `load` as the fallback and the only
+    // signal where those containers never report hydrated), then a double
+    // `requestAnimationFrame`, pinned to navigation generation 0 so a faster
+    // SPA navigation cancels it — lives in the GPT bundle module as
+    // `tsjs.scheduleInitialAdInit`
     // (crates/trusted-server-js/lib/src/integrations/gpt/index.ts), where the
     // lifecycle is executable under Vitest (schedule_initial_ad_init.test.ts)
     // and the navigation-generation guard is shared with the SPA auction hook;
@@ -3407,8 +3408,8 @@ pub(crate) fn build_bids_script(bid_map: &serde_json::Map<String, serde_json::Va
     // page — even though only hydrating React publishers exhibit the #418
     // failure. Uniform behavior keeps one code path to reason about and
     // avoids a framework-detection or config surface that must be kept
-    // truthful per publisher. Non-Next publishers still wait for `load`:
-    // `__next_f` is never patched there, so the poll simply never fires.
+    // truthful per publisher. Non-React publishers still wait for `load`:
+    // their containers never report a React fiber, so the poll never fires.
     //
     // The bids payload is handed to the scheduler instead of being assigned
     // here: an SPA navigation that committed while this document was still

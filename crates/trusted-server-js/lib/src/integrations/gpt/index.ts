@@ -63,6 +63,20 @@ function findSlotElementByDivId(divId: string): HTMLElement | null {
   );
 }
 
+// Whether React has claimed this element during hydration.
+//
+// React DOM attaches an internal `__reactFiber$<key>` / `__reactProps$<key>`
+// own property to each host node it hydrates, so the element itself reports
+// whether React has reached it — a per-element signal, unlike a page-global
+// framework flag. The key suffix is randomized per React instance and the
+// prefixes are internal, so this is a heuristic: if React renames them the
+// check simply never returns true and the `window.load` fallback still fires.
+function isReactHydrated(el: Element): boolean {
+  return Object.getOwnPropertyNames(el).some(
+    (key) => key.startsWith('__reactFiber$') || key.startsWith('__reactProps$')
+  );
+}
+
 function candidateSlotRoots(divId: string): HTMLElement[] {
   const roots: HTMLElement[] = [];
   const slotEl = findSlotElementByDivId(divId);
@@ -565,14 +579,23 @@ function installScheduleInitialAdInit(ts: TsjsApi): void {
       afterHydrationFrames();
       return;
     }
-    // Fire on whichever hydration signal arrives first, exactly once:
-    //  - Next.js App Router runtime: window.__next_f.push is replaced by the RSC
-    //    runtime once it starts hydrating the streamed tree (~9s on heavy
-    //    publishers, vs ~40s for window.load). Poll for it.
-    //  - window.load: unconditional fallback, and the only signal on non-Next
-    //    publishers (__next_f is never patched there, so the poll never fires).
+    // Fire on whichever signal arrives first, exactly once:
+    //  - the slot containers adInit is about to mutate having been hydrated by
+    //    React, checked directly on those elements. This is the early signal.
+    //  - window.load: unconditional fallback, and the only signal where the
+    //    containers never report hydrated (non-React publishers, or a React
+    //    internal rename), so the failure mode stays "slow, not broken".
     // The double requestAnimationFrame after the trigger still lands the call
     // after React commits, and runUnlessNavigated still honors navGeneration.
+    //
+    // Why the mutation targets and not a page-global signal: adInit defines GPT
+    // slots on the publisher's ad-slot subtrees, so what matters is whether
+    // React has hydrated *those* elements — not whether the framework runtime
+    // booted or every subresource finished. Measured on a live App Router
+    // publisher, a page-global runtime signal fires within ~30ms of React's
+    // FIRST commit while the ad containers hydrate seconds later; mutating in
+    // that window trips #418 and React then regenerates the subtree, destroying
+    // the creative that was just rendered into it.
     let fired = false;
     const fire = (): void => {
       if (fired) return;
@@ -580,23 +603,29 @@ function installScheduleInitialAdInit(ts: TsjsApi): void {
       afterHydrationFrames();
     };
     window.addEventListener('load', fire, { once: true });
-    const nextRuntimeReady = (): boolean => {
-      const flight = (window as unknown as { __next_f?: { push?: unknown } }).__next_f;
-      return !!flight && flight.push !== Array.prototype.push;
+    // The whole initial pass is one adInit call, so GPT issues a single batched
+    // ad request; requiring every currently-present container to be hydrated
+    // keeps that batch intact. Containers that appear later are not part of the
+    // initial pass today either.
+    const slotContainersHydrated = (): boolean => {
+      const slots = ts.adSlots ?? [];
+      if (slots.length === 0) return false;
+      const roots = slots.flatMap((slot) => candidateSlotRoots(slot.div_id));
+      if (roots.length === 0) return false;
+      return roots.every(isReactHydrated);
     };
-    // This script runs at `</body>`, and on a streamed App Router page the async
-    // chunks can already have executed by then — so check once synchronously
-    // before installing the interval, rather than idling up to a poll period.
-    // The `load` listener above stays registered; `once: true` plus the `fired`
-    // guard make it inert.
-    if (nextRuntimeReady()) {
+    // This script runs at `</body>`; on a streamed App Router page React can
+    // already have hydrated the containers by then, so check once synchronously
+    // before installing the interval. The `load` listener above stays
+    // registered; `once: true` plus the `fired` guard make it inert.
+    if (slotContainersHydrated()) {
       fire();
       return;
     }
     // The poll stops itself on the first tick after either signal wins, so a
-    // late `__next_f` patch cannot re-run adInit (the `fired` guard also holds).
+    // later hydration cannot re-run adInit (the `fired` guard also holds).
     const poll: ReturnType<typeof setInterval> = setInterval(() => {
-      if (!fired && !nextRuntimeReady()) return;
+      if (!fired && !slotContainersHydrated()) return;
       clearInterval(poll);
       fire();
     }, 50);

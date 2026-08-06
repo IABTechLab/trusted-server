@@ -41,6 +41,33 @@ describe('scheduleInitialAdInit', () => {
     return import('../../../src/integrations/gpt/index');
   }
 
+  /** A slot config pointing at `divId`, shaped like the SSR-injected payload. */
+  function slotFor(divId: string) {
+    return {
+      id: 'in_content_ad',
+      gam_unit_path: '/123/in_content',
+      div_id: divId,
+      formats: [[300, 250]] as [number, number][],
+      targeting: {},
+    };
+  }
+
+  /** Append an ad-slot element the way the publisher's SSR markup would. */
+  function appendSlotElement(divId: string): HTMLElement {
+    const el = document.createElement('div');
+    el.id = divId;
+    document.body.appendChild(el);
+    return el;
+  }
+
+  /**
+   * Mark an element hydrated the way React DOM does: an own property whose name
+   * carries the `__reactFiber$` prefix plus a per-instance random suffix.
+   */
+  function markReactHydrated(el: Element): void {
+    Object.defineProperty(el, '__reactFiber$r4nd0m', { value: {}, configurable: true });
+  }
+
   beforeEach(() => {
     vi.resetModules();
     delete (window as TestWindow).tsjs;
@@ -249,7 +276,7 @@ describe('scheduleInitialAdInit', () => {
     expect(targetingOrder).toBeLessThan(refreshOrder);
   });
 
-  it('fires on the Next.js __next_f runtime signal before window load', async () => {
+  it('fires once the slot containers are React-hydrated, before window load', async () => {
     // Fake only the poll's interval — leave requestAnimationFrame to the
     // manual rafQueue override installed in beforeEach.
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
@@ -258,15 +285,20 @@ describe('scheduleInitialAdInit', () => {
       const ts = (window as TestWindow).tsjs!;
       const adInit = vi.fn();
       ts.adInit = adInit;
+      const el = appendSlotElement('ad-in_content-0');
+      ts.adSlots = [slotFor('ad-in_content-0')];
 
       ts.scheduleInitialAdInit!();
-      // App Router runtime patches __next_f.push (no longer the array's) only
-      // after the schedule call, so the interval — not the synchronous
-      // pre-check — is what observes it.
-      (window as unknown as { __next_f?: { push: () => void } }).__next_f = {
-        push: () => {},
-      };
-      // No load event dispatched — the runtime-signal poll must trigger it.
+      // The container is present but React has not claimed it yet. Mutating now
+      // is what trips #418, so the poll must hold however long that takes.
+      vi.advanceTimersByTime(500);
+      flushFrame();
+      flushFrame();
+      expect(adInit).not.toHaveBeenCalled();
+
+      // React hydrates the container the adInit pass will mutate.
+      markReactHydrated(el);
+      // No load event dispatched — the container poll must trigger it.
       vi.advanceTimersByTime(50);
       // The trigger fired, but the double rAF still gates the actual call.
       flushFrame();
@@ -274,12 +306,42 @@ describe('scheduleInitialAdInit', () => {
       flushFrame();
       expect(adInit).toHaveBeenCalledTimes(1);
     } finally {
-      delete (window as unknown as Record<string, unknown>).__next_f;
       vi.useRealTimers();
     }
   });
 
-  it('does not fire from the runtime poll on non-Next pages, falls back to window load', async () => {
+  it('holds while any matched container is unhydrated, then fires on window load', async () => {
+    // One container hydrates and the other never does. adInit issues a single
+    // batched GPT request for the whole initial pass, so it must wait for the
+    // laggard rather than mutate a container React has not reached.
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      await importGptModule();
+      const ts = (window as TestWindow).tsjs!;
+      const adInit = vi.fn();
+      ts.adInit = adInit;
+      const first = appendSlotElement('ad-in_content-0');
+      appendSlotElement('ad-in_content-1');
+      ts.adSlots = [slotFor('ad-in_content-0'), slotFor('ad-in_content-1')];
+
+      ts.scheduleInitialAdInit!();
+      markReactHydrated(first);
+      vi.advanceTimersByTime(500);
+      flushFrame();
+      flushFrame();
+      expect(adInit).not.toHaveBeenCalled();
+
+      // window.load remains the can't-hang fallback.
+      window.dispatchEvent(new Event('load'));
+      flushFrame();
+      flushFrame();
+      expect(adInit).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not fire from the container poll on non-React pages, falls back to window load', async () => {
     // Fake only the poll's interval — leave requestAnimationFrame to the
     // manual rafQueue override installed in beforeEach.
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
@@ -289,7 +351,8 @@ describe('scheduleInitialAdInit', () => {
       const adInit = vi.fn();
       ts.adInit = adInit;
 
-      // No __next_f (non-Next publisher): the poll must never fire adInit.
+      // No React (so containers never report hydrated): the poll must never
+      // fire adInit on its own.
       ts.scheduleInitialAdInit!();
       vi.advanceTimersByTime(500);
       flushFrame();
@@ -306,7 +369,7 @@ describe('scheduleInitialAdInit', () => {
     }
   });
 
-  it('fires exactly once when the runtime signal and a later load event both occur', async () => {
+  it('fires exactly once when hydration and a later load event both occur', async () => {
     // Fake only the poll's interval — leave requestAnimationFrame to the
     // manual rafQueue override installed in beforeEach.
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
@@ -315,11 +378,11 @@ describe('scheduleInitialAdInit', () => {
       const ts = (window as TestWindow).tsjs!;
       const adInit = vi.fn();
       ts.adInit = adInit;
+      const el = appendSlotElement('ad-in_content-0');
+      ts.adSlots = [slotFor('ad-in_content-0')];
 
       ts.scheduleInitialAdInit!();
-      (window as unknown as { __next_f?: { push: () => void } }).__next_f = {
-        push: () => {},
-      };
+      markReactHydrated(el);
       vi.advanceTimersByTime(50);
       flushFrame();
       flushFrame();
@@ -331,21 +394,22 @@ describe('scheduleInitialAdInit', () => {
       flushFrame();
       expect(adInit).toHaveBeenCalledTimes(1);
     } finally {
-      delete (window as unknown as Record<string, unknown>).__next_f;
       vi.useRealTimers();
     }
   });
 
-  it('fires exactly once when a load event precedes the runtime signal', async () => {
-    // The reverse signal order: `load` wins the race on a page that only
-    // becomes observably "Next" afterwards. The poll installed at schedule time
-    // must have been cleared, so the late __next_f patch cannot re-run adInit.
+  it('fires exactly once when a load event precedes container hydration', async () => {
+    // The reverse signal order: `load` wins the race on a page whose containers
+    // hydrate later. The poll installed at schedule time must have been
+    // cleared, so the late hydration cannot re-run adInit.
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
     try {
       await importGptModule();
       const ts = (window as TestWindow).tsjs!;
       const adInit = vi.fn();
       ts.adInit = adInit;
+      const el = appendSlotElement('ad-in_content-0');
+      ts.adSlots = [slotFor('ad-in_content-0')];
 
       ts.scheduleInitialAdInit!();
       window.dispatchEvent(new Event('load'));
@@ -353,33 +417,29 @@ describe('scheduleInitialAdInit', () => {
       flushFrame();
       expect(adInit).toHaveBeenCalledTimes(1);
 
-      (window as unknown as { __next_f?: { push: () => void } }).__next_f = {
-        push: () => {},
-      };
+      markReactHydrated(el);
       vi.advanceTimersByTime(500);
       flushFrame();
       flushFrame();
       expect(adInit).toHaveBeenCalledTimes(1);
     } finally {
-      delete (window as unknown as Record<string, unknown>).__next_f;
       vi.useRealTimers();
     }
   });
 
-  it('fires without waiting a poll tick when the runtime is already patched at schedule time', async () => {
-    // On a streamed App Router page the chunks can execute before the `</body>`
-    // bids script runs, so the synchronous pre-check must catch it — no timer
-    // is ever advanced here.
+  it('fires without waiting a poll tick when the containers are already hydrated', async () => {
+    // On a streamed App Router page React can reach the ad containers before
+    // the `</body>` bids script runs, so the synchronous pre-check must catch
+    // it — no timer is ever advanced here.
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
     try {
       await importGptModule();
       const ts = (window as TestWindow).tsjs!;
       const adInit = vi.fn();
       ts.adInit = adInit;
-
-      (window as unknown as { __next_f?: { push: () => void } }).__next_f = {
-        push: () => {},
-      };
+      const el = appendSlotElement('ad-in_content-0');
+      markReactHydrated(el);
+      ts.adSlots = [slotFor('ad-in_content-0')];
 
       ts.scheduleInitialAdInit!();
       expect(vi.getTimerCount()).toBe(0);
@@ -388,7 +448,6 @@ describe('scheduleInitialAdInit', () => {
       flushFrame();
       expect(adInit).toHaveBeenCalledTimes(1);
     } finally {
-      delete (window as unknown as Record<string, unknown>).__next_f;
       vi.useRealTimers();
     }
   });
