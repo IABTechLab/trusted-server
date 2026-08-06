@@ -90,11 +90,19 @@ directly.
 Creatives rendered by Trusted Server's own path run in a sandboxed iframe
 **without** `allow-same-origin`, i.e. an opaque origin. The injected creative
 runtime's click guard recovers mutated clicks there via a GET
-`/first-party/proxy-rebuild` navigation (302 chain), and proxied assets carry
-`Access-Control-Allow-Origin: *` so CORS-mode subresources (ES modules,
-`crossorigin` fonts) still load.
+`/first-party/proxy-rebuild` navigation (302 chain).
 
-One capability is unavailable in that context: **dynamic** resource signing,
+Two capabilities are unavailable in that context. **CORS-mode subresources** —
+ES modules, `crossorigin` fonts, `fetch`/XHR — cannot load through
+`/first-party/proxy`, because that endpoint deliberately sends no
+`Access-Control-Allow-Origin`: it is a generic signed fetcher that forwards the
+EC ID and client-derived headers, so letting an opaque creative frame read its
+responses would turn it into a readable bidder-controlled proxy. Ordinary
+subresources (`<img>`, `<script src>`, stylesheets, media) are unaffected. A
+separately constrained asset capability is tracked in
+[#982](https://github.com/IABTechLab/trusted-server/issues/982).
+
+The second is **dynamic** resource signing,
 which rewrites URLs on elements a creative inserts at runtime. It is installed
 only when `renderGuard` is enabled in `tsCreativeConfig`, and that is `false`
 by default — deployments using the default configuration are unaffected. Where

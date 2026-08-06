@@ -657,29 +657,20 @@ fn finalize_proxied_response_streaming(
     beresp
 }
 
-/// Allow proxied assets to load into opaque-origin creative frames.
-///
-/// Creative iframes are sandboxed without `allow-same-origin`, so their requests
-/// to `/first-party/proxy` are cross-origin with `Origin: null`. CORS-mode
-/// subresources — ES modules, `crossorigin` fonts, `fetch`/XHR — are blocked
-/// without an allow header, even though plain `<img>`/`<script src>` loads are
-/// unaffected.
-///
-/// `*` is sound here and no wider than the upstream already is: the target must
-/// carry a valid HMAC to be proxied at all, and asset requests are made as
-/// Trusted Server with client cookies and forwarding headers stripped
-/// (see [`ASSET_PROXY_FORWARD_HEADERS`]), so a response can never contain
-/// credentialed or user-specific upstream content. Credentials are deliberately
-/// not allowed, which the wildcard also forbids at the browser level.
-fn allow_cross_origin_asset_use(response: &mut Response<EdgeBody>) {
-    response.headers_mut().insert(
-        header::ACCESS_CONTROL_ALLOW_ORIGIN,
-        HeaderValue::from_static("*"),
-    );
-}
-
 /// Finalize a proxied response, choosing between streaming passthrough and full
 /// content processing based on the `stream_passthrough` flag.
+///
+/// Deliberately emits no `Access-Control-Allow-Origin`. `/first-party/proxy` is
+/// a generic signed fetcher: it forwards the EC ID and curated client-derived
+/// headers, follows redirects, and runs in open mode when
+/// `proxy.allowed_domains` is empty. A signature proves only that this service
+/// minted the URL — and with `sanitize_creatives` disabled the rewriter mints
+/// them from bidder-controlled markup — so allowing an opaque creative frame to
+/// *read* those bodies would turn the endpoint into a readable
+/// bidder-controlled proxy. Non-CORS subresources (`<img>`, `<script src>`,
+/// stylesheets) are unaffected; CORS-mode ones are covered by the constrained
+/// asset capability tracked in
+/// <https://github.com/IABTechLab/trusted-server/issues/982>.
 fn finalize_response(
     settings: &Settings,
     req: &Request<EdgeBody>,
@@ -687,13 +678,11 @@ fn finalize_response(
     beresp: Response<EdgeBody>,
     stream_passthrough: bool,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    let mut response = if stream_passthrough {
-        finalize_proxied_response_streaming(req, url, beresp)
+    if stream_passthrough {
+        Ok(finalize_proxied_response_streaming(req, url, beresp))
     } else {
-        finalize_proxied_response(settings, req, url, beresp)?
-    };
-    allow_cross_origin_asset_use(&mut response);
-    Ok(response)
+        finalize_proxied_response(settings, req, url, beresp)
+    }
 }
 
 /// Bundles per-request header configuration and [`RuntimeServices`] for the proxy redirect loop.
@@ -1801,12 +1790,16 @@ pub async fn handle_first_party_proxy_rebuild(
         }
     };
 
-    let base = "https://edge.local"; // dummy origin to parse relative path
-    let c_url = url::Url::parse(&format!("{}{}", base, payload.tsclick)).change_context(
-        TrustedServerError::Proxy {
+    // Accept both the root-relative form the rewriter emits and an absolute
+    // first-party URL: the client may have absolutized the click to keep it
+    // resolvable inside a `srcdoc` frame. Concatenating a dummy origin would
+    // mangle the absolute form, so parse it properly instead. The signature
+    // covers `tsurl` plus params only, never the origin, so both forms validate
+    // identically.
+    let c_url =
+        parse_request_target(&payload.tsclick).change_context(TrustedServerError::Proxy {
             message: "invalid tsclick".to_string(),
-        },
-    )?;
+        })?;
     if c_url.path() != "/first-party/click" {
         return Err(Report::new(TrustedServerError::Proxy {
             message: "invalid tsclick path".to_string(),
@@ -1815,7 +1808,7 @@ pub async fn handle_first_party_proxy_rebuild(
     // Validate the tstoken on the original click URL before applying any changes.
     // Without this, an attacker could submit an unsigned tsclick and mint valid
     // click redirects to arbitrary URLs.
-    reconstruct_and_validate_signed_target(settings, &format!("{}{}", base, payload.tsclick))?;
+    reconstruct_and_validate_signed_target(settings, c_url.as_str())?;
 
     // Extract tsurl and original params (exclude tstoken if present)
     let mut tsurl: Option<String> = None;
@@ -2740,30 +2733,29 @@ mod tests {
     }
 
     #[test]
-    fn proxied_responses_allow_opaque_origin_use() {
-        // Creative iframes are sandboxed without `allow-same-origin`, so their
-        // module/font/fetch requests to the proxy are cross-origin with
-        // `Origin: null` and need an explicit allow header.
+    fn proxied_responses_are_not_cross_origin_readable() {
+        // `/first-party/proxy` forwards the EC ID and client-derived headers and
+        // runs in open mode with an empty allowlist, and the rewriter mints its
+        // signed URLs from bidder-controlled markup when sanitization is off.
+        // An allow-origin header would therefore let a creative in an opaque
+        // frame read arbitrary proxied bodies, so neither branch may emit one.
         let settings = create_test_settings();
-        let req = build_http_request(Method::GET, "https://edge.example/first-party/proxy");
-        let beresp = build_http_response(StatusCode::OK, EdgeBody::from("body{}"));
 
-        let out = super::finalize_response(
+        let buffered = super::finalize_response(
             &settings,
-            &req,
+            &build_http_request(Method::GET, "https://edge.example/first-party/proxy"),
             "https://cdn.example/app.mjs",
-            beresp,
+            build_http_response(StatusCode::OK, EdgeBody::from("body{}")),
             false,
         )
         .expect("finalize should succeed");
 
         assert_eq!(
-            response_header(&out, header::ACCESS_CONTROL_ALLOW_ORIGIN),
-            Some("*"),
-            "proxied assets must be loadable from an opaque creative origin"
+            response_header(&buffered, header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            None,
+            "proxied responses must not be readable cross-origin"
         );
 
-        // Streaming passthrough takes a different branch and must agree.
         let streamed = super::finalize_response(
             &settings,
             &build_http_request(Method::GET, "https://edge.example/first-party/proxy"),
@@ -2775,8 +2767,8 @@ mod tests {
 
         assert_eq!(
             response_header(&streamed, header::ACCESS_CONTROL_ALLOW_ORIGIN),
-            Some("*"),
-            "streamed proxied assets must carry the same allow header"
+            None,
+            "streaming passthrough must agree"
         );
     }
 
@@ -2896,6 +2888,44 @@ mod tests {
                 location.contains("y=2") && !location.contains("x=1"),
                 "should apply the add/del mutations: {location}"
             );
+        });
+    }
+
+    #[test]
+    fn proxy_rebuild_accepts_absolute_tsclick() {
+        // The creative runtime absolutizes hrefs so they resolve inside a
+        // `srcdoc` frame; a client that echoes an absolute click back as the
+        // rebuild payload must still be accepted, since the signature covers
+        // `tsurl` plus params and never the origin.
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let absolute = format!(
+                "https://publisher.example{}",
+                signed_click_target(&settings)
+            );
+            let body = serde_json::json!({
+                "tsclick": absolute,
+                "add": {"y": "2"},
+            });
+            let req = HttpRequest::builder()
+                .method(Method::POST)
+                .uri("https://edge.example/first-party/proxy-rebuild")
+                .body(EdgeBody::from(
+                    serde_json::to_string(&body).expect("test JSON should serialize"),
+                ))
+                .expect("should build proxy rebuild request");
+
+            let resp = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
+                .await
+                .expect("absolute tsclick should be accepted");
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            let json = response_body_string(resp);
+            assert!(
+                json.contains("/first-party/click?tsurl="),
+                "should rebuild a first-party click: {json}"
+            );
+            assert!(json.contains("\"added\":{\"y\":\"2\"}"), "{json}");
         });
     }
 

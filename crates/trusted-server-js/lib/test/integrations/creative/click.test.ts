@@ -74,7 +74,51 @@ describe('creative/click.ts', () => {
     });
 
     expect(anchor.getAttribute('href')).toBe(absolute(PROXY_RESPONSE));
-    expect(anchor.getAttribute('data-tsclick')).toBe(absolute(PROXY_RESPONSE));
+    // data-tsclick keeps the server's root-relative shape: it is echoed back as
+    // the rebuild payload's `tsclick`, which the server parses as a click path.
+    expect(anchor.getAttribute('data-tsclick')).toBe(PROXY_RESPONSE);
+  });
+
+  it('sends a root-relative tsclick on a second rebuild after a successful one', async () => {
+    // Regression: persisting an absolute canonical click made the next rebuild
+    // POST a value the server rejects as an invalid click path, so the second
+    // mutation was silently lost on non-opaque consumers.
+    vi.useFakeTimers();
+
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ href: PROXY_RESPONSE }),
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const anchor = document.createElement('a');
+    anchor.setAttribute('data-tsclick', FIRST_PARTY_CLICK);
+    anchor.setAttribute('href', FIRST_PARTY_CLICK);
+    document.body.appendChild(anchor);
+
+    await importCreativeModule();
+
+    anchor.setAttribute('href', MUTATED_CLICK);
+    await Promise.resolve();
+    await vi.runAllTimersAsync();
+
+    expect(anchor.getAttribute('data-tsclick')).toBe(PROXY_RESPONSE);
+
+    // A second mutation now diffs against the rebuilt canonical click.
+    anchor.setAttribute('href', 'https://example.com/landing?baz=3');
+    await Promise.resolve();
+    await vi.runAllTimersAsync();
+
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(1);
+    const payloads = fetchMock.mock.calls.map(
+      (call) => JSON.parse(call[1]?.body as string) as { tsclick: string }
+    );
+    // Every payload must carry the server's root-relative click form: an
+    // absolute one is rejected as an invalid click path.
+    for (const payload of payloads) {
+      expect(payload.tsclick.startsWith('/first-party/click?')).toBe(true);
+    }
+    expect(payloads.some((payload) => payload.tsclick === PROXY_RESPONSE)).toBe(true);
   });
 
   it('skips the doomed POST and uses the GET fallback in an opaque origin', async () => {

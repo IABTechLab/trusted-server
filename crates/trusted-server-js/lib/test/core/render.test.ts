@@ -56,10 +56,35 @@ describe('render', () => {
     const creativeHtml = '<div>creative</div>';
     const documentHtml = buildCreativeDocument(creativeHtml);
 
-    expect(documentHtml).toContain(`window.__tsCreativeOrigin = '${location.origin}'`);
+    expect(documentHtml).toContain(`value: '${location.origin}'`);
     expect(documentHtml.indexOf('__tsCreativeOrigin')).toBeLessThan(
       documentHtml.indexOf(creativeHtml)
     );
+  });
+
+  it('defines the stamped origin so creative script cannot overwrite it', async () => {
+    // Creative markup can carry its own <head> script, whose content executes
+    // before the runtime injected at the top of <body>. A plain assignment
+    // would let it point click and rebuild resolution at an attacker origin.
+    const { buildCreativeDocument } = await import('../../src/core/render');
+    const documentHtml = buildCreativeDocument('<div>creative</div>');
+
+    expect(documentHtml).toContain("Object.defineProperty(window, '__tsCreativeOrigin'");
+    expect(documentHtml).toContain('writable: false');
+    expect(documentHtml).toContain('configurable: false');
+
+    // Execute the stamp exactly as the browser would, then try to overwrite it.
+    const stamp = documentHtml.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+    expect(stamp, 'document should carry the stamping script').toBeTruthy();
+    const host: Record<string, unknown> = {};
+    new Function('window', stamp as string)(host);
+    expect(host.__tsCreativeOrigin).toBe(location.origin);
+    try {
+      host.__tsCreativeOrigin = 'https://attacker.example';
+    } catch {
+      // strict-mode assignment throws; either way the value must not change
+    }
+    expect(host.__tsCreativeOrigin).toBe(location.origin);
   });
 
   it('accepts safe static markup during sanitization', async () => {
