@@ -24,7 +24,7 @@ type UspCallback = (data?: { uspString?: string }, success?: boolean) => void;
 
 function clearAllCookies(): void {
   document.cookie.split(';').forEach((cookie) => {
-    const name = cookie.split('=')[0].trim();
+    const name = cookie.split('=')[0]?.trim() ?? '';
     if (name) document.cookie = `${name}=; path=/; Max-Age=0`;
   });
 }

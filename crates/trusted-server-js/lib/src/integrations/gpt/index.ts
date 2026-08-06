@@ -489,7 +489,7 @@ function patchCommandQueue(tag: Partial<GoogleTag>): void {
   // Only applicable when cmd is an array (pre-GPT-load case).
   if (Array.isArray(queue)) {
     for (let i = 0; i < queue.length; i++) {
-      queue[i] = wrapCommand(queue[i]);
+      queue[i] = wrapCommand(queue[i]!);
     }
     log.debug('GPT shim: command queue patched', { pendingCommands: queue.length });
   } else {
@@ -1445,6 +1445,22 @@ export function installTsAdInit(): void {
         : slotsToRefresh;
 
       if (slotsNeedingRefresh.length > 0) {
+        slotsNeedingRefresh.forEach((slotToRefresh) => {
+          const slotId = (ts.divToSlotId ?? {})[slotToRefresh.getSlotElementId()];
+          const pending = slotId ? (ts.bids ?? {})[slotId] : undefined;
+          if (slotId) {
+            // Capture the bid/generation before the asynchronous GPT event.
+            // The event handler still records the live slot state below.
+            (
+              slotToRefresh as GoogleTagSlot & { __tsRenderGeneration?: number }
+            ).__tsRenderGeneration = renderGeneration;
+            (
+              slotToRefresh as GoogleTagSlot & {
+                __tsRenderBid?: AuctionBidData | undefined;
+              }
+            ).__tsRenderBid = pending;
+          }
+        });
         // One-shot bypass: this internal refresh delivers the just-applied
         // server-side targeting to GAM. If slim-Prebid has wrapped refresh(), it
         // must pass this call straight through — not clear the targeting and run
@@ -1780,9 +1796,9 @@ function expandAuctionPriceMacro(markup: string, cpm: number): string {
 /** A decoded PBS Cache bid: the renderable creative plus its render metadata. */
 export interface CachedBid {
   adm: string;
-  width?: number;
-  height?: number;
-  price?: number;
+  width?: number | undefined;
+  height?: number | undefined;
+  price?: number | undefined;
 }
 
 /**

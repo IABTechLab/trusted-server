@@ -44,7 +44,7 @@ describe('GPT shim – patchCommandQueue', () => {
 
   it('preserves googletag.cmd array identity', () => {
     const originalCmd: Array<() => void> = [];
-    win.googletag = { cmd: originalCmd } as GptWindow['googletag'];
+    win.googletag = { cmd: originalCmd };
 
     installGptShim();
 
@@ -65,7 +65,7 @@ describe('GPT shim – patchCommandQueue', () => {
     };
     cmd.push = gptCustomPush;
 
-    win.googletag = { cmd, _loaded_: true } as GptWindow['googletag'];
+    win.googletag = { cmd, _loaded_: true };
 
     installGptShim();
 
@@ -79,7 +79,7 @@ describe('GPT shim – patchCommandQueue', () => {
   });
 
   it('wraps callbacks pushed after patching with error handling', () => {
-    win.googletag = { cmd: [] } as GptWindow['googletag'];
+    win.googletag = { cmd: [] };
 
     installGptShim();
 
@@ -92,7 +92,7 @@ describe('GPT shim – patchCommandQueue', () => {
 
     // The wrapped callback should be in the queue — execute it.
     const wrappedFn = win.googletag!.cmd[win.googletag!.cmd.length - 1];
-    expect(() => wrappedFn()).not.toThrow();
+    expect(() => wrappedFn!()).not.toThrow();
 
     errorSpy.mockRestore();
   });
@@ -101,7 +101,7 @@ describe('GPT shim – patchCommandQueue', () => {
     const callOrder: string[] = [];
     const pending = [() => callOrder.push('first'), () => callOrder.push('second')];
 
-    win.googletag = { cmd: pending } as GptWindow['googletag'];
+    win.googletag = { cmd: pending };
 
     installGptShim();
 
@@ -123,7 +123,7 @@ describe('GPT shim – patchCommandQueue', () => {
       () => callOrder.push('after-error'),
     ];
 
-    win.googletag = { cmd: pending } as GptWindow['googletag'];
+    win.googletag = { cmd: pending };
 
     installGptShim();
 
@@ -137,7 +137,7 @@ describe('GPT shim – patchCommandQueue', () => {
 
   it('is idempotent — calling installGptShim twice does not double-wrap', () => {
     const calls: number[] = [];
-    win.googletag = { cmd: [] } as GptWindow['googletag'];
+    win.googletag = { cmd: [] };
 
     installGptShim();
     const pushAfterFirst = win.googletag!.cmd.push;
@@ -151,7 +151,7 @@ describe('GPT shim – patchCommandQueue', () => {
     // Push a callback and verify it only executes once (not double-wrapped).
     win.googletag!.cmd.push(() => calls.push(1));
     const fn = win.googletag!.cmd[win.googletag!.cmd.length - 1];
-    fn();
+    fn!();
 
     expect(calls).toEqual([1]);
   });

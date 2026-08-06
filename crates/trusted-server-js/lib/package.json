@@ -10,6 +10,7 @@
     "dev": "vite build --watch",
     "test": "vitest run",
     "test:watch": "vitest",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint . --max-warnings=0",
     "lint:fix": "eslint --fix . --max-warnings=0",
     "format": "prettier --check \"**/*.{ts,tsx,js,json,css,md}\"",

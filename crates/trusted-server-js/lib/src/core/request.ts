@@ -9,18 +9,21 @@ import { createAdIframe, findSlot, buildCreativeDocument, sanitizeCreativeHtml }
 
 export type RequestAdsCallback = () => void;
 export interface RequestAdsOptions {
-  bidsBackHandler?: RequestAdsCallback;
-  timeout?: number;
+  bidsBackHandler?: RequestAdsCallback | undefined;
+  timeout?: number | undefined;
 }
 
 type RenderCreativeInlineOptions = {
   slotId: string;
   // Accept unknown input here because bidder JSON is untrusted at runtime.
   creativeHtml: unknown;
-  creativeWidth?: number;
-  creativeHeight?: number;
+  creativeWidth?: number | undefined;
+  creativeHeight?: number | undefined;
   seat: string;
   creativeId: string;
+  auctionId?: string | undefined;
+  bidId?: string | undefined;
+  admHash?: string | undefined;
 };
 
 // Entry point matching Prebid's requestBids signature; uses unified /auction endpoint.

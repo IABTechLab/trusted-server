@@ -45,9 +45,9 @@ export interface AuctionBid {
   /** Matches the `impid` in the response — corresponds to adUnit `code`. */
   impid: string;
   /** Creative HTML (already rewritten with proxy URLs by the server). */
-  adm: string;
+  adm?: string | undefined;
   /** Typed APS renderer descriptor, when the bid does not carry `adm`. */
-  renderer?: ApsRendererV1;
+  renderer?: ApsRendererV1 | undefined;
   /** CPM price. */
   price: number;
   /** Creative width. */
@@ -60,6 +60,12 @@ export interface AuctionBid {
   creativeId: string;
   /** Advertiser domains. */
   adomain: string[];
+  /** Server-side auction ID used for render tracing. */
+  auctionId?: string | undefined;
+  /** Upstream OpenRTB bid ID used for render tracing. */
+  bidId?: string | undefined;
+  /** Trace hash of the delivered creative markup. */
+  admHash?: string | undefined;
 }
 
 // ---------------------------------------------------------------------------

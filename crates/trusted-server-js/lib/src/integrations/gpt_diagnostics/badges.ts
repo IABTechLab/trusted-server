@@ -21,8 +21,8 @@ interface BadgeBindings {
 }
 
 type BadgeWindow = Window & {
-  MutationObserver?: typeof MutationObserver;
-  ResizeObserver?: typeof ResizeObserver;
+  MutationObserver?: typeof MutationObserver | undefined;
+  ResizeObserver?: typeof ResizeObserver | undefined;
 };
 
 const BADGE_MAX_WIDTH_PX = 260;
@@ -30,9 +30,9 @@ const BADGE_EDGE_GUTTER_PX = 4;
 const MAX_BADGE_REQUESTED_SLOT_SIZES = 3;
 
 interface BadgeOptions {
-  window?: BadgeWindow;
-  document?: Document;
-  scheduleFrame?: (callback: () => void) => void;
+  window?: BadgeWindow | undefined;
+  document?: Document | undefined;
+  scheduleFrame?: ((callback: () => void) => void) | undefined;
 }
 
 function intersectsViewport(rectangle: DOMRect, window: Window): boolean {
@@ -152,7 +152,7 @@ export class GptDiagnosticsBadgeManager {
   private readonly unsubscribeBindings: () => void;
   private readonly slotElementIds = new Set<string>();
   private slots: GptDiagnosticsStoreSlotSnapshot[] = [];
-  private layer?: HTMLElement;
+  private layer: HTMLElement | undefined;
   private mutationObserver?: MutationObserver;
   private resizeObserver?: ResizeObserver;
   private scheduled = false;

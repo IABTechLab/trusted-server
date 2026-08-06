@@ -6,47 +6,10 @@ import { resolve } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
 
 import envelope from '../../fixtures/aps-renderer-v1.json';
-import { registerPublisherFirstImpressionAuctions } from '../../../src/core/first_impression';
-import type { AuctionBidData, TsjsApi } from '../../../src/core/types';
-import {
-  APS_PREBID_CREATIVE_RUNNER_URL,
-  APS_RENDERING_MODE_ATTRIBUTE_NAME,
-} from '../../../src/integrations/aps/render';
-
-let publisherNativeScript: HTMLScriptElement | undefined;
-
-function enablePublisherNativeMode(): { remove(): void } {
-  publisherNativeScript = document.createElement('script');
-  publisherNativeScript.setAttribute(APS_RENDERING_MODE_ATTRIBUTE_NAME, 'publisher_native');
-  return {
-    remove: () => {
-      publisherNativeScript = undefined;
-    },
-  };
-}
-
-function nativeRunnerIn(divId: string): {
-  frame: HTMLIFrameElement;
-  runner: HTMLScriptElement;
-  event: CustomEvent<{ aaxResponse: string; seatBidId: string }>;
-} {
-  const container = document.getElementById(divId)!;
-  const frame = Array.from(container.querySelectorAll('iframe')).find(
-    (candidate) => candidate.title === 'Ad content'
-  );
-  expect(frame).not.toBeUndefined();
-  const runner = frame!.contentDocument?.querySelector<HTMLScriptElement>('script');
-  const frameWindow = frame!.contentWindow as unknown as {
-    _aps: Map<string, { queue: Array<CustomEvent<{ aaxResponse: string; seatBidId: string }>> }>;
-  };
-  const event = Array.from(frameWindow._aps.values())[0]?.queue[0];
-  expect(runner?.src).toBe(APS_PREBID_CREATIVE_RUNNER_URL);
-  expect(event).not.toBeUndefined();
-  return { frame: frame!, runner: runner!, event };
-}
+import type { GptSlotHandoff, TsjsApi } from '../../../src/core/types';
 
 function apsRenderer() {
-  const bid = envelope.seatbid[0].bid[0];
+  const bid = envelope.seatbid[0]!.bid[0]!;
   return {
     type: 'aps' as const,
     version: 1 as const,
@@ -114,10 +77,14 @@ interface PrebidResponseMessage {
 // `tsjs` is declared globally as the full `TsjsApi` (core/types.ts). Omitting
 // it from `Window` before re-adding it as a `Partial` avoids the intersection
 // that would force every fixture below to satisfy the whole `TsjsApi` shape.
+type TestGptSlotHandoff = Omit<GptSlotHandoff, 'formats'> & { formats: number[][] };
+type TestTsjsApi = Omit<Partial<TsjsApi>, 'gptSlotHandoffs'> & {
+  gptSlotHandoffs?: Record<string, TestGptSlotHandoff> | undefined;
+};
 type TestWindow = Omit<Window, 'tsjs'> & {
   googletag?: unknown;
   apstag?: { setDisplayBids?: () => void };
-  tsjs?: Partial<TsjsApi>;
+  tsjs?: TestTsjsApi;
 };
 
 async function runGptBootstrapWithGoogleTag(googletag: object): Promise<void> {
@@ -923,8 +890,8 @@ describe('installTsAdInit', () => {
 
       expect(nativeDefineSlot).toHaveBeenCalledTimes(1);
       expect(requests).toEqual(['ad-header-0-_R_0_']);
-      expect((window as TestWindow).tsjs!.gptSlotHandoffs[hydratedId]).toBe(
-        (window as TestWindow).tsjs!.gptSlotHandoffs['ad-header-0-_R_0_']
+      expect((window as TestWindow).tsjs!.gptSlotHandoffs![hydratedId]).toBe(
+        (window as TestWindow).tsjs!.gptSlotHandoffs!['ad-header-0-_R_0_']
       );
     }
   );
@@ -1090,9 +1057,9 @@ describe('installTsAdInit', () => {
     installTsAdInit();
     (window as TestWindow).tsjs!.adInit!();
 
-    const handoff = (window as TestWindow).tsjs!.gptSlotHandoffs['div-atf-sidebar'];
-    (window as TestWindow).tsjs!.gptSlotHandoffs['div-atf-sidebar-hydrated'] = handoff;
-    (window as TestWindow).tsjs!.gptSlotHandoffs.unrelated = {
+    const handoff = (window as TestWindow).tsjs!.gptSlotHandoffs!['div-atf-sidebar']!;
+    (window as TestWindow).tsjs!.gptSlotHandoffs!['div-atf-sidebar-hydrated'] = handoff;
+    (window as TestWindow).tsjs!.gptSlotHandoffs!.unrelated = {
       ...handoff,
       slotElementId: 'div-unrelated',
     };
@@ -1417,7 +1384,7 @@ describe('installTsAdInit', () => {
       (pubads.refresh as () => void)();
 
       expect(nativeRefresh).toHaveBeenCalledWith([unrelatedSlot]);
-      expect((window as TestWindow).tsjs!.gptSlotHandoffs['div-claimed']).toEqual(
+      expect((window as TestWindow).tsjs!.gptSlotHandoffs!['div-claimed']).toEqual(
         expect.objectContaining({ suppressPublisherRefresh: false })
       );
     });
@@ -2570,7 +2537,7 @@ describe('installTsAdInit', () => {
         atf_sidebar_ad: {
           hb_pb: '1.50',
           hb_bidder: 'aps',
-          hb_adid: envelope.seatbid[0].bid[0].id,
+          hb_adid: envelope.seatbid[0]!.bid[0]!.id,
           renderer: apsRenderer(),
         },
       },
@@ -3423,7 +3390,7 @@ describe('installTsRenderBridge', () => {
 
   it('serves a server APS renderer once and rejects a repeated request', async () => {
     const renderer = apsRenderer();
-    (window as TestWindow).tsjs.bids.homepage_header = {
+    (window as TestWindow).tsjs!.bids!.homepage_header = {
       hb_adid: renderer.bidId,
       hb_bidder: 'aps',
       hb_pb: '1.23',
@@ -3455,10 +3422,10 @@ describe('installTsRenderBridge', () => {
     expect(stopSpy).toHaveBeenCalledTimes(2);
     expect(fetchStub).not.toHaveBeenCalled();
     expect(beaconSpy).not.toHaveBeenCalled();
-    // Server-rendered APS capabilities are one-shot per slot and ad ID. A
-    // repeated Universal Creative request is claimed but receives no payload.
-    expect(portMessages).toHaveLength(1);
-    const response = JSON.parse(portMessages[0]) as Record<string, unknown>;
+    // Server-rendered APS descriptors are reusable: GAM can issue repeated
+    // Universal Creative requests for the same winning ad ID.
+    expect(portMessages).toHaveLength(2);
+    const response = JSON.parse(portMessages[0]!) as Record<string, unknown>;
     expect(Object.keys(response).sort()).toEqual(
       [
         'adId',
@@ -3505,7 +3472,7 @@ describe('installTsRenderBridge', () => {
 
       const rendererPost = vi.spyOn(outerFrame.contentWindow!, 'postMessage');
       outerFrame.dispatchEvent(new Event('load'));
-      const sent = rendererPost.mock.calls[0][0] as { nonce: string };
+      const sent = rendererPost.mock.calls[0]![0] as { nonce: string };
       window.dispatchEvent(
         new MessageEvent('message', {
           data: { message: 'trusted-server/aps/renderer-ready', nonce: sent.nonce },
@@ -3595,8 +3562,9 @@ describe('installTsRenderBridge', () => {
   it('serves a registered Prebid APS renderer when its generated ad ID differs from the APS bid ID', async () => {
     const renderer = apsRenderer();
     const prebidAdId = 'prebid-generated-ad-id';
-    const markUsed = vi.fn();
-    (window as TestWindow).tsjs.apsPrebidRenderers = {
+    const markWinner = vi.fn();
+    const markRendered = vi.fn();
+    (window as TestWindow).tsjs!.apsPrebidRenderers = {
       [prebidAdId]: {
         adUnitCode: 'div-header',
         renderer,
@@ -3632,8 +3600,9 @@ describe('installTsRenderBridge', () => {
 
     expect(stopSpy).toHaveBeenCalledTimes(2);
     expect(portMessages).toHaveLength(1);
-    expect(markUsed).toHaveBeenCalledTimes(1);
-    expect(JSON.parse(portMessages[0])).toEqual(
+    expect(markWinner).toHaveBeenCalledTimes(1);
+    expect(markRendered).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(portMessages[0]!)).toEqual(
       expect.objectContaining({
         message: 'Prebid Response',
         adId: prebidAdId,
@@ -3643,20 +3612,19 @@ describe('installTsRenderBridge', () => {
       })
     );
     expect(renderer.bidId).not.toBe(prebidAdId);
-    expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeUndefined();
-    expect(collapsed.iframe.width).toBe('300');
-    expect(collapsed.iframe.height).toBe('250');
-    expect(collapsed.wrapper.style.width).toBe('300px');
-    expect(collapsed.wrapper.style.height).toBe('250px');
+    expect((window as TestWindow).tsjs!.apsPrebidRenderers![prebidAdId]).toBeUndefined();
     expect(fetchStub).not.toHaveBeenCalled();
     foreignIframe.remove();
   });
 
   it('contract test: fails a registered APS runner without a Universal Creative response or markUsed', async () => {
     const renderer = apsRenderer();
-    const prebidAdId = 'native-prebid-decline-ad-id';
-    const markUsed = vi.fn();
-    (window as TestWindow).tsjs.apsPrebidRenderers = {
+    const prebidAdId = 'throwing-mark-winner-ad-id';
+    const markWinner = vi.fn(() => {
+      throw new Error('fictional markWinner failure');
+    });
+    const markRendered = vi.fn();
+    (window as TestWindow).tsjs!.apsPrebidRenderers = {
       [prebidAdId]: {
         adUnitCode: 'div-header',
         renderer,
@@ -3684,14 +3652,16 @@ describe('installTsRenderBridge', () => {
       await Promise.resolve();
       bridgeListener(request);
 
-      expect(markUsed).not.toHaveBeenCalled();
-      expect(portMessages).toEqual([]);
-      expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeUndefined();
-      expect(document.querySelector('iframe[title="Ad content"]')).toBeNull();
-      expect(document.querySelector('iframe[src*="/integrations/aps/renderer"]')).toBeNull();
-    } finally {
-      marker.remove();
-    }
+    expect(portMessages).toHaveLength(1);
+    expect(JSON.parse(portMessages[0]!)).toEqual(
+      expect.objectContaining({
+        message: 'Prebid Response',
+        adId: prebidAdId,
+        apsRenderer: renderer,
+      })
+    );
+    expect(markWinner).toHaveBeenCalledTimes(1);
+    expect(markRendered).toHaveBeenCalledTimes(1);
   });
 
   it('contract test: consumes a registered APS capability and marks it used only after runner load', async () => {
@@ -3781,7 +3751,7 @@ describe('installTsRenderBridge', () => {
     const markUsed = vi.fn(() => {
       throw new Error('fictional markUsed failure');
     });
-    (window as TestWindow).tsjs.apsPrebidRenderers = {
+    (window as TestWindow).tsjs!.apsPrebidRenderers = {
       [prebidAdId]: {
         adUnitCode: 'div-header',
         renderer,
@@ -3807,7 +3777,7 @@ describe('installTsRenderBridge', () => {
     ).not.toThrow();
 
     expect(portMessages).toHaveLength(1);
-    expect(JSON.parse(portMessages[0])).toEqual(
+    expect(JSON.parse(portMessages[0]!)).toEqual(
       expect.objectContaining({
         message: 'Prebid Response',
         adId: prebidAdId,
@@ -3823,9 +3793,11 @@ describe('installTsRenderBridge', () => {
       const renderer = apsRenderer();
       const prebidAdId = 'expiring-consumed-ad-id';
       const start = Date.now();
-      const firstMarkUsed = vi.fn();
-      const secondMarkUsed = vi.fn();
-      (window as TestWindow).tsjs.apsPrebidRenderers = {
+      const firstMarkWinner = vi.fn();
+      const firstMarkRendered = vi.fn();
+      const secondMarkWinner = vi.fn();
+      const secondMarkRendered = vi.fn();
+      (window as TestWindow).tsjs!.apsPrebidRenderers = {
         [prebidAdId]: {
           adUnitCode: 'div-header',
           renderer,
@@ -3852,7 +3824,7 @@ describe('installTsRenderBridge', () => {
 
       sendRequest();
       vi.advanceTimersByTime(60_001);
-      (window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId] = {
+      (window as TestWindow).tsjs!.apsPrebidRenderers![prebidAdId] = {
         adUnitCode: 'div-header',
         renderer,
         registeredAt: Date.now(),
@@ -3888,7 +3860,7 @@ describe('installTsRenderBridge', () => {
         },
       ])
     );
-    (window as TestWindow).tsjs.apsPrebidRenderers = entries;
+    (window as TestWindow).tsjs!.apsPrebidRenderers = entries;
 
     const bridgeListener = await captureBridgeListener();
     const source = createTrustedSlotIframe();
@@ -3912,16 +3884,17 @@ describe('installTsRenderBridge', () => {
     sendRequest('capacity-ad-0');
 
     expect(portMessages).toHaveLength(capacity);
-    expect(callbacks[capacity].markUsed).not.toHaveBeenCalled();
+    expect(callbacks[capacity]!.markWinner).not.toHaveBeenCalled();
+    expect(callbacks[capacity]!.markRendered).not.toHaveBeenCalled();
     expect(entries[`capacity-ad-${capacity}`]).toBeDefined();
-    expect(callbacks[0].markUsed).toHaveBeenCalledTimes(1);
+    expect(callbacks[0]!.markWinner).toHaveBeenCalledTimes(1);
     expect(stopImmediatePropagation).toHaveBeenCalledTimes(capacity + 2);
   });
 
   it('does not expose a registered Prebid APS renderer to another slot iframe', async () => {
     const renderer = apsRenderer();
     const prebidAdId = 'prebid-generated-ad-id';
-    (window as TestWindow).tsjs.apsPrebidRenderers = {
+    (window as TestWindow).tsjs!.apsPrebidRenderers = {
       [prebidAdId]: {
         adUnitCode: 'div-header',
         renderer,
@@ -3951,13 +3924,13 @@ describe('installTsRenderBridge', () => {
 
     expect(stopSpy).toHaveBeenCalledTimes(1);
     expect(portMessages).toEqual([]);
-    expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeDefined();
+    expect((window as TestWindow).tsjs!.apsPrebidRenderers![prebidAdId]).toBeDefined();
     footer.remove();
   });
 
   it('drops an expired Prebid APS renderer without claiming the creative request', async () => {
     const prebidAdId = 'expired-prebid-ad-id';
-    (window as TestWindow).tsjs.apsPrebidRenderers = {
+    (window as TestWindow).tsjs!.apsPrebidRenderers = {
       [prebidAdId]: {
         adUnitCode: 'div-header',
         renderer: apsRenderer(),
@@ -3982,12 +3955,12 @@ describe('installTsRenderBridge', () => {
 
     expect(stopSpy).not.toHaveBeenCalled();
     expect(portMessages).toEqual([]);
-    expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeUndefined();
+    expect((window as TestWindow).tsjs!.apsPrebidRenderers![prebidAdId]).toBeUndefined();
   });
 
   it('claims a TS-owned request before rejecting invalid APS data', async () => {
     const renderer = { ...apsRenderer(), aaxResponse: 'invalid' };
-    (window as TestWindow).tsjs.bids.homepage_header = {
+    (window as TestWindow).tsjs!.bids!.homepage_header = {
       hb_adid: renderer.bidId,
       hb_bidder: 'aps',
       renderer,
@@ -4013,12 +3986,12 @@ describe('installTsRenderBridge', () => {
 
   it('accepts an APS request from a dynamic slot root resolved from its configured prefix', async () => {
     const renderer = apsRenderer();
-    (window as TestWindow).tsjs.bids.homepage_header = {
+    (window as TestWindow).tsjs!.bids!.homepage_header = {
       hb_adid: renderer.bidId,
       hb_bidder: 'aps',
       renderer,
     };
-    (window as TestWindow).tsjs.adSlots[0].div_id = 'div-header-';
+    (window as TestWindow).tsjs!.adSlots![0]!.div_id = 'div-header-';
 
     const bridgeListener = await captureBridgeListener();
     const source = createTrustedSlotIframe('div-header-dynamic');
@@ -4038,12 +4011,12 @@ describe('installTsRenderBridge', () => {
 
   it('does not let an overlapping slot prefix claim another slot iframe', async () => {
     const renderer = apsRenderer();
-    (window as TestWindow).tsjs.bids.homepage_header = {
+    (window as TestWindow).tsjs!.bids!.homepage_header = {
       hb_adid: renderer.bidId,
       hb_bidder: 'aps',
       renderer,
     };
-    (window as TestWindow).tsjs.adSlots.push({
+    (window as TestWindow).tsjs!.adSlots!.push({
       id: 'homepage_header_mobile',
       formats: [[320, 50]],
       gam_unit_path: '/a/b/mobile',
@@ -4071,12 +4044,12 @@ describe('installTsRenderBridge', () => {
 
   it('ignores an APS ad ID requested by another configured slot', async () => {
     const renderer = apsRenderer();
-    (window as TestWindow).tsjs.bids.homepage_header = {
+    (window as TestWindow).tsjs!.bids!.homepage_header = {
       hb_adid: renderer.bidId,
       hb_bidder: 'aps',
       renderer,
     };
-    (window as TestWindow).tsjs.adSlots.push({
+    (window as TestWindow).tsjs!.adSlots!.push({
       id: 'homepage_footer',
       formats: [[300, 250]],
       gam_unit_path: '/a/b/footer',
@@ -4173,7 +4146,7 @@ describe('installTsRenderBridge', () => {
     expect(stopSpy).toHaveBeenCalled();
     expect(portMessages).toHaveLength(1);
 
-    const parsed = JSON.parse(portMessages[0]) as PrebidResponseMessage;
+    const parsed = JSON.parse(portMessages[0]!) as PrebidResponseMessage;
     expect(parsed.message).toBe('Prebid Response');
     expect(parsed.adId).toBe('test-cache-uuid');
     expect(parsed.ad).toBe(mockAd);
@@ -4590,7 +4563,7 @@ describe('installTsRenderBridge', () => {
 
     expect(portMessages).toHaveLength(1);
 
-    const parsed = JSON.parse(portMessages[0]) as PrebidResponseMessage;
+    const parsed = JSON.parse(portMessages[0]!) as PrebidResponseMessage;
     expect(parsed.ad).toBe(rawAd);
     expect(beaconSpy).toHaveBeenCalledTimes(2);
     beaconSpy.mockRestore();
@@ -4622,7 +4595,7 @@ describe('installTsRenderBridge', () => {
 
     expect(portMessages).toHaveLength(1);
 
-    const parsed = JSON.parse(portMessages[0]) as PrebidResponseMessage;
+    const parsed = JSON.parse(portMessages[0]!) as PrebidResponseMessage;
     expect(parsed.width).toBe(300);
     expect(parsed.height).toBe(250);
     expect(collapsed.iframe.width).toBe('300');
@@ -4694,7 +4667,7 @@ describe('installTsRenderBridge', () => {
 
     expect(portMessages).toHaveLength(1);
 
-    const parsed = JSON.parse(portMessages[0]) as PrebidResponseMessage;
+    const parsed = JSON.parse(portMessages[0]!) as PrebidResponseMessage;
     expect(parsed.ad).toContain('p=2.5');
     expect(parsed.ad).not.toContain('${AUCTION_PRICE}');
     beaconSpy.mockRestore();
@@ -4899,7 +4872,7 @@ describe('installTsRenderBridge', () => {
     expect(stopSpy).toHaveBeenCalled();
     expect(portMessages).toHaveLength(1);
 
-    const parsed = JSON.parse(portMessages[0]) as PrebidResponseMessage;
+    const parsed = JSON.parse(portMessages[0]!) as PrebidResponseMessage;
     expect(parsed.message).toBe('Prebid Response');
     expect(parsed.adId).toBe('debug-adid');
     expect(parsed.ad).toBe(inlineAdm);
@@ -4961,7 +4934,7 @@ describe('installTsRenderBridge', () => {
 
       expect(portMessages).toHaveLength(1);
 
-      const parsed = JSON.parse(portMessages[0]) as PrebidResponseMessage;
+      const parsed = JSON.parse(portMessages[0]!) as PrebidResponseMessage;
       expect(parsed.width).toBe(300);
       expect(parsed.height).toBe(250);
     } finally {
@@ -5037,7 +5010,7 @@ describe('installTsRenderBridge', () => {
 
       expect(portMessages).toHaveLength(1);
 
-      const parsed = JSON.parse(portMessages[0]) as PrebidResponseMessage;
+      const parsed = JSON.parse(portMessages[0]!) as PrebidResponseMessage;
       // The requesting slot's own creative and dimensions, not the first match's.
       expect(parsed.ad).toBe(inContentAdm);
       expect(parsed.width).toBe(300);

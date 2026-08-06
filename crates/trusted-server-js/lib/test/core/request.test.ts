@@ -6,6 +6,7 @@ import {
   APS_RENDERING_MODE_ATTRIBUTE_NAME,
 } from '../../src/integrations/aps/render';
 import envelope from '../fixtures/aps-renderer-v1.json';
+import type { addAdUnits } from '../../src/core/registry';
 
 async function flushRequestAds(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
@@ -74,7 +75,7 @@ describe('request.requestAds', () => {
   });
 
   it('dispatches a valid APS descriptor to the opaque static renderer route', async () => {
-    const apsBid = envelope.seatbid[0].bid[0];
+    const apsBid = envelope.seatbid[0]!.bid[0]!;
     const renderer = {
       type: 'aps',
       version: 1,
@@ -131,7 +132,7 @@ describe('request.requestAds', () => {
     expect(document.querySelector('#slot1 span')).not.toBeNull();
     expect(postMessage).toHaveBeenCalledWith(expect.objectContaining({ renderer }), '*');
 
-    const message = postMessage.mock.calls[0][0] as { nonce: string };
+    const message = postMessage.mock.calls[0]![0] as { nonce: string };
     window.dispatchEvent(
       new MessageEvent('message', {
         data: { message: 'trusted-server/aps/renderer-ready', nonce: message.nonce },

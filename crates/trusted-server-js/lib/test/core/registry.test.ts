@@ -24,6 +24,6 @@ describe('registry', () => {
 
     const all = getAllUnits();
     expect(all.length).toBe(1);
-    expect(firstSize(all[0])!.join('x')).toBe('320x50');
+    expect(firstSize(all[0]!)!.join('x')).toBe('320x50');
   });
 });

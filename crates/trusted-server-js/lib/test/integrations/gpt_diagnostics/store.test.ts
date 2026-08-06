@@ -98,8 +98,8 @@ describe('GptDiagnosticsStore', () => {
     store.recordSlotVisibilityChanged(slot, 20);
 
     const snapshot = store.snapshot();
-    const recordedSlot = snapshot.slots[0];
-    const cycle = recordedSlot.requests[0];
+    const recordedSlot = snapshot.slots[0]!;
+    const cycle = recordedSlot.requests[0]!;
 
     expect(snapshot.gptObserved).toBe(true);
     expect(recordedSlot).toMatchObject({
@@ -209,9 +209,9 @@ describe('GptDiagnosticsStore', () => {
       viewableAtMs: 8,
       durations: { renderToLoadMs: 2, renderToViewableMs: 5 },
     });
-    expect(emptyCycle.loadAtMs).toBe(8);
-    expect(emptyCycle.viewableAtMs).toBeUndefined();
-    expect(store.snapshot().coverage.slotOnload).toMatchObject({ matched: 2, unmatched: 0 });
+    expect(emptyCycle!.loadAtMs).toBeUndefined();
+    expect(emptyCycle!.viewableAtMs).toBeUndefined();
+    expect(store.snapshot().coverage.slotOnload).toMatchObject({ matched: 1, unmatched: 1 });
     expect(store.snapshot().coverage.impressionViewable).toMatchObject({
       matched: 1,
       unmatched: 1,
@@ -242,10 +242,10 @@ describe('GptDiagnosticsStore', () => {
       .snapshot()
       .slots.map((slot) => slot.requests[0]);
 
-    expect(requestingCycle.incompleteSequence).toBe(false);
-    expect(requestingCycle.responseAtMs).toBeUndefined();
-    expect(respondedCycle.incompleteSequence).toBe(false);
-    expect(respondedCycle.renderAtMs).toBeUndefined();
+    expect(requestingCycle!.incompleteSequence).toBe(false);
+    expect(requestingCycle!.responseAtMs).toBeUndefined();
+    expect(respondedCycle!.incompleteSequence).toBe(false);
+    expect(respondedCycle!.renderAtMs).toBeUndefined();
     expect(emptyCycle).toMatchObject({ isEmpty: true, incompleteSequence: false });
   });
 
@@ -260,7 +260,7 @@ describe('GptDiagnosticsStore', () => {
       store.recordSlotRenderEnded(slot, { isEmpty: request === 1 });
     }
 
-    expect(store.snapshot().slots[0].requests.map((cycle) => cycle.requestNumber)).toEqual([
+    expect(store.snapshot().slots[0]!.requests.map((cycle) => cycle.requestNumber)).toEqual([
       1, 2, 3,
     ]);
     assertCoverageEquation(store);
@@ -291,8 +291,8 @@ describe('GptDiagnosticsStore', () => {
 
     expect(() => store.recordSlotRequested(slot)).not.toThrow();
     expect(store.snapshot().slots[0]).toMatchObject({ runtimeSlotNumber: 1 });
-    expect(store.snapshot().slots[0].slotElementId).toBeUndefined();
-    expect(store.snapshot().slots[0].adUnitPath).toBeUndefined();
+    expect(store.snapshot().slots[0]!.slotElementId).toBeUndefined();
+    expect(store.snapshot().slots[0]!.adUnitPath).toBeUndefined();
   });
 
   it('records callbacks without a request as unmatched issues', () => {
@@ -305,7 +305,7 @@ describe('GptDiagnosticsStore', () => {
     store.recordImpressionViewable(slot);
 
     const snapshot = store.snapshot();
-    expect(snapshot.slots[0].requests).toEqual([]);
+    expect(snapshot.slots[0]!.requests).toEqual([]);
     expect(snapshot.callbackIssues).toHaveLength(4);
     expect(snapshot.callbackIssues.every((issue) => issue.disposition === 'unmatched')).toBe(true);
     expect(
@@ -325,11 +325,11 @@ describe('GptDiagnosticsStore', () => {
     store.recordSlotRenderEnded(slot, { isEmpty: false });
 
     const snapshot = store.snapshot();
-    expect(snapshot.slots[0].requests).toHaveLength(2);
-    expect(snapshot.slots[0].requests.every((cycle) => cycle.responseAtMs === undefined)).toBe(
+    expect(snapshot.slots[0]!.requests).toHaveLength(2);
+    expect(snapshot.slots[0]!.requests.every((cycle) => cycle.responseAtMs === undefined)).toBe(
       true
     );
-    expect(snapshot.slots[0].requests.every((cycle) => cycle.renderAtMs === undefined)).toBe(true);
+    expect(snapshot.slots[0]!.requests.every((cycle) => cycle.renderAtMs === undefined)).toBe(true);
     expect(snapshot.callbackIssues).toMatchObject([
       {
         kind: 'slotResponseReceived',
@@ -357,7 +357,7 @@ describe('GptDiagnosticsStore', () => {
     store.recordSlotResponseReceived(slot);
 
     const snapshot = store.snapshot();
-    const cycle = snapshot.slots[0].requests[0];
+    const cycle = snapshot.slots[0]!.requests[0]!;
     expect(cycle.incompleteSequence).toBe(true);
     expect(cycle.durations.requestToResponseMs).toBe(20);
     expect(cycle.durations.requestToRenderMs).toBe(10);
@@ -389,10 +389,10 @@ describe('GptDiagnosticsStore', () => {
 
     let snapshot = store.snapshot();
     expect(snapshot.slots).toHaveLength(MAX_DIAGNOSTIC_SLOTS);
-    expect(snapshot.slots[0].runtimeSlotNumber).toBe(2);
+    expect(snapshot.slots[0]!.runtimeSlotNumber).toBe(2);
     expect(snapshot.metadata.evictedSlots).toBe(1);
 
-    store.recordSlotResponseReceived(slots[0]);
+    store.recordSlotResponseReceived(slots[0]!);
     snapshot = store.snapshot();
     expect(snapshot.callbackIssues[snapshot.callbackIssues.length - 1]).toMatchObject({
       runtimeSlotNumber: 1,
@@ -400,14 +400,14 @@ describe('GptDiagnosticsStore', () => {
       reason: 'evicted_slot',
     });
 
-    const retainedSlot = slots[slots.length - 1];
+    const retainedSlot = slots[slots.length - 1]!;
     for (let index = 0; index < MAX_REQUEST_CYCLES_PER_SLOT; index += 1) {
       store.recordSlotRequested(retainedSlot);
     }
     snapshot = store.snapshot();
-    const retainedRecord = snapshot.slots[snapshot.slots.length - 1];
+    const retainedRecord = snapshot.slots[snapshot.slots.length - 1]!;
     expect(retainedRecord.requests).toHaveLength(MAX_REQUEST_CYCLES_PER_SLOT);
-    expect(retainedRecord.requests[0].requestNumber).toBe(2);
+    expect(retainedRecord.requests[0]!.requestNumber).toBe(2);
     expect(snapshot.metadata.evictedRequestCycles).toBe(1);
 
     const issueSlot = fakeSlot('issues');
@@ -430,23 +430,23 @@ describe('GptDiagnosticsStore', () => {
       store.recordSlotRequested(retained);
     }
 
-    store.recordSlotVisibilityChanged(slots[0], 10);
-    store.recordSlotRequested(slots[MAX_DIAGNOSTIC_SLOTS]);
+    store.recordSlotVisibilityChanged(slots[0]!, 10);
+    store.recordSlotRequested(slots[MAX_DIAGNOSTIC_SLOTS]!);
     expect(store.snapshot().slots.some((slot) => slot.runtimeSlotNumber === 1)).toBe(true);
     expect(store.snapshot().slots.some((slot) => slot.runtimeSlotNumber === 2)).toBe(false);
 
-    store.recordSlotResponseReceived(slots[1]);
-    expect(last(store.snapshot().callbackIssues)).toMatchObject({
+    store.recordSlotResponseReceived(slots[1]!);
+    expect(store.snapshot().callbackIssues.slice(-1)[0]).toMatchObject({
       runtimeSlotNumber: 2,
       reason: 'evicted_slot',
     });
 
-    store.recordSlotRequested(slots[1]);
-    store.recordSlotResponseReceived(slots[1]);
+    store.recordSlotRequested(slots[1]!);
+    store.recordSlotResponseReceived(slots[1]!);
     const reentered = store.snapshot().slots.find((slot) => slot.slotElementId === 'lru-1');
     expect(reentered).toMatchObject({ runtimeSlotNumber: 66 });
     expect(reentered?.requests[0]).toMatchObject({ requestNumber: 2 });
-    expect(reentered?.requests[0].responseAtMs).toBeDefined();
+    expect(reentered?.requests[0]!.responseAtMs).toBeDefined();
     expect(store.snapshot().slots).toHaveLength(MAX_DIAGNOSTIC_SLOTS);
     expect(store.snapshot().metadata.evictedSlots).toBe(2);
     assertCoverageEquation(store);
@@ -465,8 +465,8 @@ describe('GptDiagnosticsStore', () => {
       { runtimeSlotNumber: 1, slotElementId: 'first' },
       { runtimeSlotNumber: 2, slotElementId: 'second' },
     ]);
-    inputs[0].slotElementId = 'changed';
-    expect(store.bindingInputs()[0].slotElementId).toBe('first');
+    inputs[0]!.slotElementId = 'changed';
+    expect(store.bindingInputs()[0]!.slotElementId).toBe('first');
   });
 
   it('coalesces notifications and isolates throwing subscribers', () => {
@@ -1924,11 +1924,11 @@ describe('GptDiagnosticsStore', () => {
     store.recordSlotRequested(slot);
 
     const first = store.snapshot();
-    first.slots[0].requests[0].requestNumber = 999;
+    first.slots[0]!.requests[0]!.requestNumber = 999;
     first.coverage.slotRequested.matched = 999;
 
     const second = store.snapshot();
-    expect(second.slots[0].requests[0].requestNumber).toBe(1);
+    expect(second.slots[0]!.requests[0]!.requestNumber).toBe(1);
     expect(second.coverage.slotRequested.matched).toBe(1);
   });
   it('ignores malformed publisher refresh inputs without recording intent', () => {

@@ -41,32 +41,30 @@ const CALLBACK_KINDS: GptDiagnosticsCallbackKind[] = [
   'slotVisibilityChanged',
 ];
 
-/**
- * The GPT slot shape diagnostics reads. Aliased to the exported handle type so
- * the writer signatures and the store implementation cannot drift apart.
- */
-export type GptDiagnosticsSlotLike = GptDiagnosticsSlotHandle;
+export interface GptDiagnosticsSlotLike {
+  getSlotElementId?: (() => string) | undefined;
+  getAdUnitPath?: (() => string) | undefined;
+}
 
 export interface GptRenderFacts {
-  isEmpty?: boolean;
-  size?: Size;
-  isBackfill?: boolean;
-  slotContentChanged?: boolean;
-  adManager?: GptDiagnosticsAdManagerIdentity;
+  isEmpty?: boolean | undefined;
+  size?: Size | undefined;
+  isBackfill?: boolean | undefined;
+  slotContentChanged?: boolean | undefined;
 }
 
 export interface GptDiagnosticsStoreSlotSnapshot {
   runtimeSlotNumber: number;
-  slotElementId?: string;
-  adUnitPath?: string;
-  currentVisibilityPercentage?: number;
-  maximumVisibilityPercentage?: number;
+  slotElementId?: string | undefined;
+  adUnitPath?: string | undefined;
+  currentVisibilityPercentage?: number | undefined;
+  maximumVisibilityPercentage?: number | undefined;
   requests: GptDiagnosticsRequestCycle[];
 }
 
 export interface GptDiagnosticsBindingInput {
   runtimeSlotNumber: number;
-  slotElementId?: string;
+  slotElementId?: string | undefined;
 }
 
 export interface GptDiagnosticsStoreSnapshot {
@@ -87,18 +85,16 @@ type MutableRequestCycle = GptDiagnosticsRequestCycle;
 
 interface MutableSlotRecord {
   runtimeSlotNumber: number;
-  slotElementId?: string;
-  adUnitPath?: string;
-  currentVisibilityPercentage?: number;
-  maximumVisibilityPercentage?: number;
+  slotElementId?: string | undefined;
+  adUnitPath?: string | undefined;
+  currentVisibilityPercentage?: number | undefined;
+  maximumVisibilityPercentage?: number | undefined;
   requests: MutableRequestCycle[];
 }
 
 interface StoreOptions {
-  now?: () => number;
-  schedule?: (callback: () => void) => void;
-  /** Deferred marker cleanup and diagnostic-window re-notification. */
-  defer?: (callback: () => void, delayMs: number) => void;
+  now?: (() => number) | undefined;
+  schedule?: ((callback: () => void) => void) | undefined;
 }
 
 type RequestIntentSource = 'trusted_server_direct' | 'prebid_refresh' | 'publisher_refresh';
@@ -1146,7 +1142,7 @@ export class GptDiagnosticsStore {
       return;
     }
 
-    attach(record, candidates[0]);
+    attach(record, candidates[0]!);
     this.incrementDisposition(kind, 'matched');
     this.notify();
   }

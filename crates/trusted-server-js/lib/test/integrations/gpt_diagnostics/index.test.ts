@@ -158,8 +158,8 @@ describe('GPT diagnostics integration composition', () => {
     await settle();
 
     expect(document.getElementById(GPT_DIAGNOSTICS_HOST_ID)).toBeNull();
-    expect(api.snapshot().slots[0].requests).toHaveLength(1);
-    expect(api.snapshot().slots[0].requests[0].isEmpty).toBe(false);
+    expect(api.snapshot().slots[0]!.requests).toHaveLength(1);
+    expect(api.snapshot().slots[0]!.requests[0]!.isEmpty).toBe(false);
 
     api.show();
     expect(document.getElementById(GPT_DIAGNOSTICS_HOST_ID)).not.toBeNull();
@@ -212,7 +212,7 @@ describe('GPT diagnostics integration composition', () => {
       binding: { status: 'bound' },
       currentVisibilityPercentage: 75,
     });
-    expect(snapshot.slots[0].requests.map((cycle) => cycle.requestNumber)).toEqual([1, 2, 3, 4]);
+    expect(snapshot.slots[0]!.requests.map((cycle) => cycle.requestNumber)).toEqual([1, 2, 3, 4]);
     expect(snapshot.callbackIssues).toContainEqual(
       expect.objectContaining({
         kind: 'slotResponseReceived',

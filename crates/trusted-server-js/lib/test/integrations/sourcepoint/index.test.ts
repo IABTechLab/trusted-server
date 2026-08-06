@@ -71,7 +71,7 @@ function sourcepointPayload(gppString = 'DBABLA~BVQqAAAAAgA.QA', applicableSecti
 describe('integrations/sourcepoint', () => {
   function clearAllCookies(): void {
     document.cookie.split(';').forEach((c) => {
-      const name = c.split('=')[0].trim();
+      const name = c.split('=')[0]?.trim() ?? '';
       if (name) document.cookie = `${name}=; path=/; Max-Age=0`;
     });
   }
