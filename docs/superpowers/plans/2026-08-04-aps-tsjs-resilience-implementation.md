@@ -198,8 +198,10 @@ Every task's regression suite therefore remains green in task order.
   Any pre-existing failure is recorded in the execution notes; it is not silently
   attributed to this work.
 
-- [ ] **Step 3: Keep the lockfile-resolved compiler; dependency upgrading is not part of this**
-      work. Add the checked-in `typecheck` script:
+- [ ] **Step 3: Keep the lockfile-resolved compiler unchanged only while capturing the**
+      pre-change baseline. Task 7A performs the intentional package and TypeScript
+      upgrade before the remaining TSJS runtime is built. Add the checked-in
+      `typecheck` script:
 
   ```json
   "typecheck": "tsc -p tsconfig.json --noEmit"
@@ -917,6 +919,84 @@ Every task's regression suite therefore remains green in task order.
   npm --prefix crates/trusted-server-js/lib test -- --run test/kernel/disposable.test.ts test/kernel/integration_registry.test.ts
   npm --prefix crates/trusted-server-js/lib run typecheck
   ```
+
+### Task 7A: Upgrade the TSJS package and TypeScript toolchain
+
+**Files:**
+
+- Modify: `crates/trusted-server-js/lib/package.json`
+- Modify: `crates/trusted-server-js/lib/package-lock.json`
+- Modify: `crates/trusted-server-js/lib/eslint.config.js`
+- Modify if required by an actual compatibility failure:
+  `crates/trusted-server-js/lib/tsconfig.json`
+- Modify if required by an actual compatibility failure:
+  `crates/trusted-server-js/lib/vitest.config.ts`
+- Modify only the exact TSJS source/test/build files that a new compiler or tool
+  correctly rejects; do not mix in behavior changes or unrelated refactors
+
+- [ ] **Step 1: Capture an executable package-compatibility inventory before changing the**
+      lockfile. Run `npm outdated --json`, query direct-package peer/engine ranges,
+      and record the current Node/npm/compiler versions. Select the newest stable,
+      mutually compatible direct toolchain supported by the repository-pinned Node
+      major. Upgrade TypeScript to the newest stable release supported by the newest
+      `typescript-eslint`; do not install a newer TypeScript that its parser explicitly
+      excludes. Keep `@types/node` on the repository's pinned Node major.
+
+  `prebid.js` is the one explicit package exception: pin it to exactly `10.26.0`, as
+  required by this design's external pure-Prebid artifact contract. Do not use this
+  task to adopt Prebid 11 or change the selected Prebid modules. If the latest ESLint
+  major is incompatible with the unmaintained `eslint-plugin-import`, migrate the
+  existing import rules to the maintained compatible `eslint-plugin-import-x` rather
+  than holding the rest of the lint toolchain back. Remove redundant direct
+  `@typescript-eslint/parser`/plugin declarations when the used `typescript-eslint`
+  package already owns those exact dependencies.
+
+- [ ] **Step 2: Update direct package ranges and regenerate `package-lock.json` through npm.**
+      Do not hand-edit lock entries. Require a peer-clean `npm ls --all` and a second
+      clean `npm ci` from the generated lock. Treat invalid, missing, or extraneous
+      nodes as failures. Do not run `npm audit fix --force`; audit findings that remain
+      solely behind the mandated Prebid pin are reported, not silently solved by
+      violating the artifact contract.
+
+- [ ] **Step 3: Make only compatibility edits proven necessary by the upgraded tools.** Keep
+      all strict compiler flags and architecture rules enabled. A new compiler/linter
+      diagnostic gets a source fix or a documented, narrow configuration correction;
+      it is not suppressed globally. Production bundle entry points, bundle ids,
+      integration behavior, the APS runner policy, and the Prebid module set must not
+      change in this task.
+
+- [ ] **Step 4: Verify the upgraded toolchain and every shipped artifact:**
+
+  ```bash
+  npm --prefix crates/trusted-server-js/lib ci
+  npm --prefix crates/trusted-server-js/lib ls --all
+  npm --prefix crates/trusted-server-js/lib run typecheck
+  npm --prefix crates/trusted-server-js/lib run lint
+  npm --prefix crates/trusted-server-js/lib run format
+  npm --prefix crates/trusted-server-js/lib test -- --run
+  npm --prefix crates/trusted-server-js/lib run build
+  node --test crates/trusted-server-js/lib/test/contract/rc-july-adoption.test.mjs
+  ```
+
+  Also print the resolved Node, npm, TypeScript, ESLint, Vite, Vitest, and jsdom
+  versions into the task verification evidence. Re-run the external Prebid artifact
+  integration test and prove both `package.json` and the lockfile resolve Prebid
+  `10.26.0` exactly.
+
+- [ ] **Step 5: Commit the toolchain upgrade as its own rollback boundary.**
+
+  ```bash
+  git add \
+    crates/trusted-server-js/lib/package.json \
+    crates/trusted-server-js/lib/package-lock.json \
+    crates/trusted-server-js/lib/eslint.config.js \
+    crates/trusted-server-js/lib/tsconfig.json \
+    crates/trusted-server-js/lib/vitest.config.ts
+  git commit -m "chore(tsjs): upgrade the package and TypeScript toolchain"
+  ```
+
+  Add only compatibility files that actually changed to the explicit staging list;
+  do not use broad staging.
 
 ### Task 8: Implement bootstrap ownership and the single runtime registry, dormant
 

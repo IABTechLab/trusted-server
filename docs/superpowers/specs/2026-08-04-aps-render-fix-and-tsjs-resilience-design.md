@@ -2717,9 +2717,20 @@ their internal behavior is not otherwise rewritten.
 
 ### 5.12 TypeScript and performance gates
 
-The lockfile compiler is the authority. CI runs a checked-in `typecheck` script with
-`strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`,
-`verbatimModuleSyntax`, `noImplicitOverride`, and
+Before the coordinated runtime implementation proceeds, the TSJS direct development
+toolchain is upgraded to the newest stable, mutually compatible versions supported
+by the repository-pinned Node major. TypeScript advances to the newest stable release
+inside the latest `typescript-eslint` parser's declared support range; an unsupported
+compiler/parser pairing is not accepted merely to claim a higher version. The
+external artifact dependency remains exactly `prebid.js@10.26.0`, and Node type
+declarations remain on the pinned Node major. Those are explicit compatibility and
+artifact-contract constraints, not permission to leave the rest of the toolchain
+stale. The upgrade must pass a clean `npm ci`, a peer-clean `npm ls --all`, complete
+build/lint/typecheck/tests, and exact Prebid artifact verification.
+
+After that upgrade, the lockfile compiler is the authority. CI runs a checked-in
+`typecheck` script with `strict`, `noUncheckedIndexedAccess`,
+`exactOptionalPropertyTypes`, `verbatimModuleSyntax`, `noImplicitOverride`, and
 `useUnknownInCatchVariables`. Production bundles contain no dynamic imports.
 
 Before implementation, CI records deterministic gzip/Brotli baselines for minimal,
