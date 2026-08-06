@@ -37,7 +37,7 @@ pub fn enforce_set_cookie_cache_privacy(response: &mut Response) {
     if !response.headers().contains_key(header::SET_COOKIE) {
         return;
     }
-    // Surrogate cache headers must come off every cookie-bearing response, even
+    // Shared-cache control headers must come off every cookie-bearing response, even
     // one already carrying a stricter `no-store`/`private` directive — they are
     // independent of Cache-Control and would otherwise let a shared cache store
     // and replay one visitor's Set-Cookie.

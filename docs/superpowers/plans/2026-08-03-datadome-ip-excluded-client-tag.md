@@ -136,6 +136,7 @@ matches!(reason, "client_ip" | "client_ip_source" | "ip_cidr" | "ip_cidr_source"
 - [ ] **Step 3: Make `filter_protection_request` own a mutable input and pass it
       mutably to `is_request_protected`.** In the existing
       `ProtectionScopeDecision::Skip` arm:
+
   1. determine whether the reason is IP-based;
   2. if so, insert the typed marker into `input.request.extensions_mut()`;
   3. call the updated skip logger with `client_tag_omitted = true`; and
@@ -151,7 +152,7 @@ matches!(reason, "client_ip" | "client_ip_source" | "ip_cidr" | "ip_cidr_source"
       desired shape is:
 
 ```text
-[datadome] protection decision=skipped rule=excluded-ip-cidrs reason=client_ip client_tag=omitted method=GET host=example.com path=/page
+[datadome] protection decision=skipped rule=excluded-ip-cidrs reason=client_ip client_tag=omitted method=GET
 ```
 
 - [ ] **Step 5: Add filter-level marker tests.** Add small helpers in the
@@ -159,6 +160,7 @@ matches!(reason, "client_ip" | "client_ip_source" | "ip_cidr" | "ip_cidr_source"
       optional Config Store data, and a mutable request. For each case, call
       `filter_protection_request`, assert it returns `Continue`, and inspect the
       request extension:
+
   - inline `protection_excluded_ip_cidrs` match → marker present;
   - `protection_excluded_ip_cidr_sources` match → marker present;
   - structured `ProtectionMatcherConfig::IpCidr` match → marker present;
@@ -218,6 +220,7 @@ DataDomeClientTagSuppressed request extension
 - [ ] **Step 2: Add a boolean to the owned and borrowed publisher-processing
       parameter structs.** Add a clearly named field such as
       `suppress_datadome_client_side_tag` to:
+
   - `OwnedProcessResponseParams`;
   - `ProcessResponseParams`; and
   - `HtmlStreamProcessorParams`.
@@ -238,6 +241,7 @@ DataDomeClientTagSuppressed request extension
 - [ ] **Step 4: Extend `IntegrationHtmlContext`.** Add the boolean as immutable
       request-scoped context. Populate it at both construction sites in
       `html_processor.rs`:
+
   - the streaming `<head>` element handler; and
   - `HtmlWithPostProcessing::process_chunk` for full-document post-processors.
 
@@ -245,6 +249,7 @@ DataDomeClientTagSuppressed request extension
     `false` by default.
 
 - [ ] **Step 5: Add plumbing tests.**
+
   - `HtmlProcessorConfig::from_settings` defaults to non-suppressed.
   - A test head injector records the context flag and sees `true` when a config
     is built with suppression.
@@ -327,6 +332,7 @@ optimization.
       with a processable HTML content type, suppression `true`, and cacheable
       origin headers (`Cache-Control`, `Surrogate-Control`, and
       `Fastly-Surrogate-Control`). Assert the stream response is:
+
   - `Cache-Control: private, max-age=0`; and
   - missing both surrogate cache headers.
 
@@ -337,6 +343,7 @@ optimization.
       204/205/304, or responses without suppression: none has a body variation
       created by this feature.
 - [ ] **Step 3: Add non-regression cache tests.** Verify that:
+
   - non-suppressed processed HTML keeps its existing cache headers unless
     another existing policy changes them;
   - a suppressed CSS/non-HTML stream is not made private by this feature; and

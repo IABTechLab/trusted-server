@@ -184,23 +184,30 @@ Protection API:
 ```toml
 [integrations.datadome.protection_test_bypass]
 enabled = true
-header_name = "x-ts-datadome-test-bypass"
-credential = "temporary-test-credential"
+credential_secret_store = "ts_secrets"
+credential_secret_name = "datadome_test_bypass"
 ```
 
 `protection_test_bypass` requires `enable_protection = true`; it is disabled
-when omitted. Treat the credential as a temporary secret: configure it only
-while needed, protect the site with an outer access control such as Basic Auth,
-and remove the section when testing finishes. Do not enable it in production.
+when omitted. Store the temporary credential in the configured Secret Store,
+configure this section only while needed, protect the site with an outer access
+control such as Basic Auth, and remove the section when testing finishes. Do not
+enable it in production.
 
-A matching header is compared in constant time, removed before the request can
-reach DataDome or the publisher origin, and never logged. With Playwright,
-apply it to the browser context:
+The fixed `x-ts-datadome-bypass` header is compared in constant time, removed
+before the request can reach DataDome or the publisher origin, and never
+logged. Scope the header to the staging origin; do not attach it to every
+request in a browser context because that can disclose the credential to
+third-party origins. With Playwright:
 
 ```ts
-await context.setExtraHTTPHeaders({
-  "X-TS-DataDome-Test-Bypass": process.env.DATADOME_TEST_BYPASS!,
-});
+await context.route('https://staging.example.com/**', async (route) => {
+  const headers = {
+    ...route.request().headers(),
+    'x-ts-datadome-bypass': process.env.DATADOME_TEST_BYPASS!,
+  }
+  await route.continue({ headers })
+})
 ```
 
 ### Client-side tag suppression behavior
@@ -229,7 +236,7 @@ surrogate caches. The decision is reported in the existing protection log, for
 example:
 
 ```text
-[datadome] protection decision=skipped rule=protection-test-bypass reason=test_bypass client_tag=omitted method=GET host=example.com path=/page
+[datadome] protection decision=skipped rule=protection-test-bypass reason=test_bypass client_tag=omitted method=GET
 ```
 
 ### Structured exclusion rules
