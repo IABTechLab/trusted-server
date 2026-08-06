@@ -1039,6 +1039,81 @@ mod tests {
         );
     }
 
+    /// A provider that mints an opaque, mixed-case, non-HMAC identifier at the
+    /// edge, so a test can prove such an identifier persists to the KV identity
+    /// graph under its own value as the key.
+    #[derive(Debug)]
+    struct ServerOpaqueProvider;
+
+    impl EdgeCookieProvider for ServerOpaqueProvider {
+        fn id(&self) -> &'static str {
+            "server-opaque"
+        }
+
+        fn generate(
+            &self,
+            _request_info: &dyn RequestInfo,
+            _input: &IdentityInput<'_>,
+        ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+            Ok(GeneratedEdgeCookie {
+                id: Some("Opaque_EC_Value_MixedCase_123".to_owned()),
+                response_headers: Vec::new(),
+            })
+        }
+
+        fn accepts_id(&self, value: &str) -> bool {
+            !value.is_empty()
+        }
+
+        fn normalize_id_for_kv(&self, value: &str) -> String {
+            value.to_owned()
+        }
+    }
+
+    #[test]
+    fn generate_persists_an_opaque_identifier_to_kv_under_its_own_key() {
+        use crate::platform::test_support::noop_services_with_ec_provider;
+
+        const OPAQUE: &str = "Opaque_EC_Value_MixedCase_123";
+
+        let mut settings = create_test_settings();
+        settings.ec.provider = Some("server-opaque".to_owned());
+        let services = noop_services_with_ec_provider(Arc::new(ServerOpaqueProvider));
+        let graph = KvIdentityGraph::in_memory("test-ec-store");
+
+        // No existing cookie, so the edge mints and persists.
+        let req = create_test_request(&[]);
+        let mut ec = EcContext::read_from_request(&settings, &req, &services)
+            .expect("should read EC context");
+        ec.generate_if_needed(&settings, Some(&graph))
+            .expect("should generate and persist");
+
+        assert_eq!(
+            ec.ec_value(),
+            Some(OPAQUE),
+            "the opaque identifier should be minted"
+        );
+
+        // The entry is stored under the full identifier verbatim.
+        assert!(
+            graph
+                .get(OPAQUE)
+                .expect("kv get should succeed")
+                .is_some(),
+            "the entry should exist under the opaque identifier key"
+        );
+
+        // A lowercased key must miss, proving the key preserves case rather than
+        // being lowercased like the built-in HMAC form (the clash this guards).
+        assert!(
+            graph
+                .get(&OPAQUE.to_lowercase())
+                .expect("kv get should succeed")
+                .is_none(),
+            "the KV key must be case-sensitive and verbatim, not lowercased"
+        );
+    }
+
     #[test]
     fn read_from_request_ignores_header_ec() {
         let settings = create_test_settings();

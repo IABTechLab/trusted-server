@@ -535,6 +535,31 @@ mod tests {
     }
 
     #[test]
+    fn default_id_semantics_match_the_builtin_shape() {
+        let provider = HmacProvider::new(test_passphrase());
+
+        // The default `accepts_id` accepts the built-in HMAC shape and rejects
+        // anything else, so a built-in provider's identifiers round-trip while an
+        // opaque value is left to a provider that overrides the check.
+        let valid = format!("{}.{}", "a".repeat(64), "abc123");
+        assert!(provider.accepts_id(&valid), "should accept the HMAC shape");
+        assert!(
+            !provider.accepts_id("not-hmac-shaped"),
+            "should reject a non-HMAC identifier by default"
+        );
+
+        // The default `normalize_id_for_kv` lowercases the hash segment. This is
+        // exactly the transform that would corrupt an opaque case-sensitive
+        // identifier, which is why such a provider overrides it.
+        let mixed = format!("{}.{}", "A".repeat(64), "abc123");
+        assert_eq!(
+            provider.normalize_id_for_kv(&mixed),
+            format!("{}.{}", "a".repeat(64), "abc123"),
+            "the default should lowercase the hash segment"
+        );
+    }
+
+    #[test]
     fn hmac_keys_equal_uses_natural_equality() {
         let provider = HmacProvider::new(test_passphrase());
         assert!(

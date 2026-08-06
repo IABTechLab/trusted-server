@@ -231,3 +231,79 @@ impl RequestInfo for BorrowedRequestInfo<'_> {
         self.query
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers_with_cookie() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            "client-id=abc123; ts-ec=xyz"
+                .parse()
+                .expect("should parse cookie header"),
+        );
+        headers
+    }
+
+    #[test]
+    fn query_param_decodes_and_selects_the_first_value() {
+        let info = OwnedRequestInfo::new(String::new(), HeaderMap::new())
+            .with_request_target("/page".to_owned(), "id=a%20b&id=second&flag=1".to_owned());
+
+        assert_eq!(
+            info.query_param("id").as_deref(),
+            Some("a b"),
+            "should percent-decode and return the first value for a repeated key"
+        );
+        assert_eq!(info.query_param("flag").as_deref(), Some("1"));
+        assert_eq!(
+            info.query_param("missing"),
+            None,
+            "an absent parameter should be None"
+        );
+    }
+
+    #[test]
+    fn path_and_query_accessors_return_the_request_target() {
+        let info = OwnedRequestInfo::new(String::new(), HeaderMap::new())
+            .with_request_target("/a/b".to_owned(), "x=1".to_owned());
+        assert_eq!(info.path(), "/a/b");
+        assert_eq!(info.query(), "x=1");
+    }
+
+    #[test]
+    fn request_info_defaults_to_an_empty_target() {
+        let info = OwnedRequestInfo::new("203.0.113.5".to_owned(), HeaderMap::new());
+        assert_eq!(info.path(), "", "path should default to empty");
+        assert_eq!(info.query(), "", "query should default to empty");
+        assert_eq!(
+            info.query_param("id"),
+            None,
+            "query_param over an empty query should be None"
+        );
+    }
+
+    #[test]
+    fn a_provider_reads_cookies_from_the_header() {
+        let info = OwnedRequestInfo::new("203.0.113.5".to_owned(), headers_with_cookie());
+        assert_eq!(
+            info.header("cookie"),
+            Some("client-id=abc123; ts-ec=xyz"),
+            "cookies are read through the Cookie header"
+        );
+    }
+
+    #[test]
+    fn borrowed_request_info_exposes_the_same_target() {
+        let headers = headers_with_cookie();
+        let info = BorrowedRequestInfo::new("203.0.113.5", Some(&headers))
+            .with_request_target("/page", "id=abc123");
+
+        assert_eq!(info.path(), "/page");
+        assert_eq!(info.query(), "id=abc123");
+        assert_eq!(info.query_param("id").as_deref(), Some("abc123"));
+        assert_eq!(info.header("cookie"), Some("client-id=abc123; ts-ec=xyz"));
+    }
+}

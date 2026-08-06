@@ -137,8 +137,12 @@ fn content_length_exceeds_limit(req: &Request<EdgeBody>, limit: usize) -> bool {
 mod tests {
     use super::*;
     use crate::consent::types::ConsentContext;
+    use crate::ec::provider::{EdgeCookieProvider, GeneratedEdgeCookie, IdentityInput};
+    use crate::evidence::RequestInfo;
+    use crate::platform::test_support::noop_services_with_ec_provider;
     use crate::test_support::tests::create_test_settings;
     use http::Method;
+    use std::sync::Arc;
 
     fn settings_with_client_fixed() -> Settings {
         let mut settings = create_test_settings();
@@ -159,6 +163,137 @@ mod tests {
 
     fn gated(ec_allowed: bool) -> EcContext {
         EcContext::new_for_test_gated(None, ConsentContext::default(), ec_allowed)
+    }
+
+    /// Returns whether `value` is a canonical UUID (`8-4-4-4-12` lowercase hex).
+    fn is_uuid(value: &str) -> bool {
+        let groups = [8, 4, 4, 4, 12];
+        let parts: Vec<&str> = value.split('-').collect();
+        parts.len() == groups.len()
+            && parts.iter().zip(groups).all(|(part, len)| {
+                part.len() == len
+                    && part
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+    }
+
+    /// A **test-only** provider modeling a client-generated, first-party
+    /// identifier (a `UUID`) that the browser mints and posts back for the server
+    /// to set. It is not a production provider and exists only to exercise the
+    /// client-set Edge Cookie value path from end to end. The edge defers, the
+    /// page posts a value, and it must round-trip as the cookie and the KV key.
+    ///
+    /// A `UUID` has no separator, so the built-in [`normalize_id_for_kv`] default
+    /// would append a trailing dot and corrupt it, which is why this provider
+    /// (like any opaque-identifier provider) returns the value unchanged.
+    ///
+    /// [`normalize_id_for_kv`]: EdgeCookieProvider::normalize_id_for_kv
+    #[derive(Debug)]
+    struct TestIdProvider;
+
+    impl EdgeCookieProvider for TestIdProvider {
+        fn id(&self) -> &'static str {
+            "testid"
+        }
+
+        fn generate(
+            &self,
+            _request_info: &dyn RequestInfo,
+            _input: &IdentityInput<'_>,
+        ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+            // The identifier is minted in the browser, so the edge derives nothing.
+            Ok(GeneratedEdgeCookie::default())
+        }
+
+        fn resolve_from_client(
+            &self,
+            input: &ClientResolveInput<'_>,
+        ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+            // The page posts the identifier it generated. Accept a well-formed UUID.
+            let value = core::str::from_utf8(input.payload).unwrap_or_default().trim();
+            if is_uuid(value) {
+                Ok(GeneratedEdgeCookie {
+                    id: Some(value.to_owned()),
+                    response_headers: Vec::new(),
+                })
+            } else {
+                Ok(GeneratedEdgeCookie::default())
+            }
+        }
+
+        fn accepts_id(&self, value: &str) -> bool {
+            is_uuid(value)
+        }
+
+        fn normalize_id_for_kv(&self, value: &str) -> String {
+            value.to_owned()
+        }
+    }
+
+    #[test]
+    fn client_set_value_round_trips_through_the_ec_scenario() {
+        // A client-generated first-party UUID, the value the browser posts back.
+        const TEST_ID: &str = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
+
+        let provider: Arc<dyn EdgeCookieProvider> = Arc::new(TestIdProvider);
+        let mut settings = create_test_settings();
+        settings.ec.provider = Some("testid".to_owned());
+        let services = noop_services_with_ec_provider(Arc::clone(&provider));
+
+        // 1. Organic first visit: no EC yet, and the edge defers because the
+        //    identifier is generated in the browser, not derived server-side.
+        let organic = Request::builder()
+            .method(Method::GET)
+            .uri("https://edge.example.com/")
+            .body(EdgeBody::empty())
+            .expect("should build organic request");
+        let mut ec = EcContext::read_from_request(&settings, &organic, &services)
+            .expect("should read EC context");
+        assert!(ec.ec_value().is_none(), "no EC should exist on the first visit");
+        ec.generate_if_needed(&settings, None)
+            .expect("should run generation");
+        assert!(
+            ec.ec_value().is_none(),
+            "a client-set provider defers minting to the browser"
+        );
+
+        // 2. The page generates its identifier and posts it to the resolve
+        //    endpoint; the server sets it as the EC value.
+        let response = handle_ec_resolve(&settings, post(TEST_ID), &ec)
+            .expect("should handle resolve");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a valid client-set value should return 200"
+        );
+        let set_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("should set the EC cookie")
+            .to_str()
+            .expect("should be utf-8");
+        assert!(
+            set_cookie.contains(TEST_ID),
+            "the EC cookie should carry the full client-set identifier, got {set_cookie}"
+        );
+
+        // 3. A later request carries the EC cookie; the server reads the
+        //    identifier back verbatim. This is the step the built-in shape check
+        //    used to drop.
+        let ret = Request::builder()
+            .method(Method::GET)
+            .uri("https://edge.example.com/")
+            .header("cookie", format!("ts-ec={TEST_ID}"))
+            .body(EdgeBody::empty())
+            .expect("should build return request");
+        let ec2 = EcContext::read_from_request(&settings, &ret, &services)
+            .expect("should read EC context");
+        assert_eq!(
+            ec2.ec_value(),
+            Some(TEST_ID),
+            "the client-set identifier should round-trip as the EC value"
+        );
     }
 
     #[test]
