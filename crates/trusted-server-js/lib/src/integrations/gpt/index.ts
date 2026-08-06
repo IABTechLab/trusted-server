@@ -1682,9 +1682,11 @@ export function installTsRenderBridge(): void {
     const sourceSlotId = sourceSlotFrame.slotId;
 
     // Resolve the bid by the requesting slot, not by the first bid whose hb_adid
-    // matches. hb_adid is not unique per bid: absent PBS Cache, it falls back to a
-    // creative id a bidder may reuse across slots. A first-match-by-adId lookup
-    // would resolve every duplicate to one slot, so all but that slot render blank.
+    // matches. hb_adid is not unique per bid: absent PBS Cache it falls back to a
+    // creative id a bidder may reuse across slots, and only absent that too does it
+    // fall back to the OpenRTB bid id, which is unique per bid instance. A
+    // first-match-by-adId lookup would resolve every duplicate to one slot, so all
+    // but that slot render blank.
     const bids = window.tsjs?.bids ?? {};
     const slotId = sourceSlotId;
     const matchedBid = bids[slotId];

@@ -25,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Protocol-relative creative URLs now honor `rewrite.exclude_domains`, so excluded creative assets stay direct and excluded absolute or protocol-relative URLs submitted to `/first-party/sign` are rejected.
-- Server-side ad template bids now always carry `hb_adid` in `window.tsjs.bids`. Bidders that return neither a Prebid Cache UUID nor an `adid` previously produced no `hb_adid` at all, so no `hb_adid` GPT targeting key was set and the Universal Creative render bridge had nothing to match — the winning creative never rendered. The OpenRTB bid `id`, which is mandatory per spec, is now the last-resort source; `cache_id` and `adid` still take priority where present.
+- Server-side ad template bids now always carry `hb_adid` in `window.tsjs.bids`. Bidders that return neither a Prebid Cache UUID nor an `adid` previously produced no `hb_adid` at all, so no `hb_adid` GPT targeting key was set and the Universal Creative render bridge had nothing to match — the winning creative never rendered. The OpenRTB bid `id`, which is mandatory per spec, is now the last-resort source; `cache_id` and `adid` still take priority where present. Blank `cacheId`/`adid` values no longer win that precedence and emit an unusable empty `hb_adid`, and `hb_cache_host`/`hb_cache_path` are now emitted only alongside a real Prebid Cache UUID — without one they pointed the Universal Creative at a guaranteed cache miss instead of letting it fall through to the inline creative.
 
 ### Added
 

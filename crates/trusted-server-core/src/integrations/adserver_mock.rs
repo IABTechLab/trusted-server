@@ -258,6 +258,8 @@ impl AdServerMockProvider {
     /// fields back, so they are restored from the index using
     /// `(seat, impid, bidder)` where bidder is recovered from the echoed `crid`
     /// field (`"{bidder}-creative"` format set during request construction).
+    /// `bid_id` is the exception: the mediation response carries its own
+    /// `OpenRTB` bid `id`, which is preferred over the original SSP bid's.
     fn parse_mediation_response(
         &self,
         json: &Json,
@@ -319,7 +321,19 @@ impl AdServerMockProvider {
                     }),
                     nurl: original.and_then(|b| b.nurl.clone()),
                     burl: original.and_then(|b| b.burl.clone()),
-                    bid_id: original.and_then(|bid| bid.bid_id.clone()),
+                    // The original SSP bid's id wins: a typed `renderer` envelope is
+                    // minted against it, and `build_bid_map` derives `hb_adid` from
+                    // that pairing, so substituting the mediator's own id would key
+                    // targeting to an id the renderer does not know. The mediated
+                    // `OpenRTB` bid's `id` is the fallback for a mediator whose
+                    // upstream bid carried none — without either, a bid whose only
+                    // `hb_adid` source is the bid id loses it and never renders.
+                    bid_id: original.and_then(|b| b.bid_id.clone()).or_else(|| {
+                        bid["id"]
+                            .as_str()
+                            .filter(|id| !id.is_empty())
+                            .map(String::from)
+                    }),
                     ad_id: original.and_then(|bid| bid.ad_id.clone()),
                     creative_id: original.and_then(|bid| bid.creative_id.clone()),
                     renderer: original.and_then(|bid| bid.renderer.clone()),
@@ -868,7 +882,11 @@ mod tests {
             Some("https://ssp.example/bill"),
             "should restore burl"
         );
-        assert_eq!(bid.bid_id.as_deref(), Some("source-bid-id"));
+        assert_eq!(
+            bid.bid_id.as_deref(),
+            Some("source-bid-id"),
+            "should keep the original bid id the renderer envelope is keyed on, not the mediator's"
+        );
         assert_eq!(
             bid.ad_id.as_deref(),
             Some("bid-impression-id"),
@@ -890,6 +908,74 @@ mod tests {
             bid.cache_path.as_deref(),
             Some("/cache"),
             "should restore PBS cache path"
+        );
+    }
+
+    #[test]
+    fn parse_mediation_response_falls_back_to_mediated_bid_id() {
+        // The original bid carries no id of its own, so there is nothing to
+        // restore and no renderer envelope to stay consistent with. The mediation
+        // response is itself OpenRTB, so its bid `id` is the remaining hb_adid
+        // source — without it the bid reaches the page with no hb_adid and the
+        // render bridge never receives a matching request.
+        let provider = AdServerMockProvider::new(AdServerMockConfig::default());
+        let mediation_response = json!({
+            "id": "test-auction-123",
+            "seatbid": [
+                {
+                    "seat": "prebid",
+                    "bid": [
+                        {
+                            "id": "mediated-bid-002",
+                            "impid": "header-banner",
+                            "price": 0.20,
+                            "adm": "<div>Mediated Ad</div>",
+                            "w": 728,
+                            "h": 90,
+                            "crid": "example-bidder-creative",
+                        }
+                    ]
+                }
+            ],
+            "cur": "USD"
+        });
+        let mut bid_index = BidIndex::new();
+        bid_index.insert(
+            (
+                "prebid".to_string(),
+                "header-banner".to_string(),
+                "example-bidder".to_string(),
+            ),
+            Bid {
+                slot_id: "header-banner".to_string(),
+                price: Some(0.20),
+                currency: "USD".to_string(),
+                creative: Some("<div>Original Ad</div>".to_string()),
+                adomain: None,
+                bidder: "example-bidder".to_string(),
+                width: 728,
+                height: 90,
+                nurl: None,
+                burl: None,
+                bid_id: None,
+                ad_id: None,
+                creative_id: None,
+                renderer: None,
+                cache_id: None,
+                cache_host: None,
+                cache_path: None,
+                metadata: HashMap::new(),
+            },
+        );
+
+        let auction_response =
+            provider.parse_mediation_response(&mediation_response, 42, &bid_index);
+
+        let bid = &auction_response.bids[0];
+        assert_eq!(
+            bid.bid_id.as_deref(),
+            Some("mediated-bid-002"),
+            "should fall back to the mediated OpenRTB bid id when the original has none"
         );
     }
 
