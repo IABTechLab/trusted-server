@@ -820,6 +820,9 @@ impl ApsAuctionProvider {
 
         Ok(Bid {
             slot_id: slot_id.to_string(),
+            candidate_id: None,
+            candidate_provider: None,
+            renderer_reservation_id: None,
             price: Some(price),
             currency: DEFAULT_CURRENCY.to_string(),
             creative: None,

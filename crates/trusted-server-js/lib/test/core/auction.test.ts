@@ -1,6 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-import { buildAdRequest, parseAuctionResponse, sendAuction } from '../../src/core/auction';
+import {
+  buildAdRequest,
+  MAX_BROWSER_AUCTION_PROJECTION_BYTES,
+  parseAuctionResponse,
+  parseBrowserAuctionProjectionV1,
+  parseTrustedServerAuctionResponseV1,
+  sendAuction,
+} from '../../src/core/auction';
 import envelope from '../fixtures/aps-renderer-v1.json';
 
 function apsRenderer(creativeId?: string) {
@@ -16,6 +23,75 @@ function apsRenderer(creativeId?: string) {
     aaxResponse: btoa(JSON.stringify(envelope)),
     width: bid.w,
     height: bid.h,
+  };
+}
+
+function candidateId(index = 0): string {
+  return index.toString(36).padStart(12, 'A');
+}
+
+function reservationId(index = 0): string {
+  return `r1_${index.toString(36).padStart(22, 'A')}`;
+}
+
+function browserProjection() {
+  const renderer = apsRenderer('fictional-creative-id');
+  return {
+    version: 1,
+    auction: {
+      version: 1,
+      auctionId: 'auction-1',
+      results: [
+        { slot: 'slot-1', outcome: 'winner', candidateId: candidateId() },
+        { slot: 'slot-2', outcome: 'no_bid' },
+        { slot: 'slot-3', outcome: 'failed', reason: 'provider_timeout' },
+      ],
+    },
+    bids: [
+      {
+        candidateId: candidateId(),
+        slot: 'slot-1',
+        provider: 'aps',
+        upstreamBidId: renderer.bidId,
+        cpm: 1.25,
+        currency: 'USD',
+        targeting: { hb_bidder: 'aps', hb_pb: '1.25' } as Record<string, string>,
+        rendererReservationId: reservationId(),
+        renderSource: renderer,
+      },
+    ],
+  };
+}
+
+function largeAdmProjection(admLengths: number[]) {
+  return {
+    version: 1,
+    auction: {
+      version: 1,
+      auctionId: 'auction-large',
+      results: admLengths.map((_, index) => ({
+        slot: `slot-${index}`,
+        outcome: 'winner' as const,
+        candidateId: candidateId(index),
+      })),
+    },
+    bids: admLengths.map((length, index) => ({
+      candidateId: candidateId(index),
+      slot: `slot-${index}`,
+      provider: 'prebid',
+      upstreamBidId: `upstream-${index}`,
+      cpm: index,
+      currency: 'USD',
+      targeting: {} as Record<string, string>,
+      rendererReservationId: reservationId(index),
+      renderSource: {
+        type: 'adm' as const,
+        version: 1 as const,
+        adm: 'x'.repeat(length),
+        width: 300,
+        height: 250,
+      },
+    })),
   };
 }
 
@@ -315,6 +391,430 @@ describe('auction/parseAuctionResponse', () => {
     expect(bids[0]!.width).toBe(300);
     expect(bids[0]!.height).toBe(250);
     expect(bids[0]!.adomain).toEqual([]);
+  });
+});
+
+describe('auction/parseBrowserAuctionProjectionV1', () => {
+  it('accepts one exact ordered decision per slot and deep-copies the projection', () => {
+    const input = browserProjection();
+    const parsed = parseBrowserAuctionProjectionV1(input);
+
+    expect(parsed).toEqual(input);
+    expect(parsed).not.toBe(input);
+    expect(parsed!.auction.results.map((result) => result.slot)).toEqual([
+      'slot-1',
+      'slot-2',
+      'slot-3',
+    ]);
+    expect(Object.keys(parsed!.bids[0]!.targeting)).toEqual(['hb_bidder', 'hb_pb']);
+  });
+
+  it('rejects duplicate, missing, extra, and mismatched decision/bid joins', () => {
+    const cases: unknown[] = [];
+
+    const duplicateResult = browserProjection();
+    duplicateResult.auction.results.push({
+      slot: 'slot-1',
+      outcome: 'no_bid',
+    });
+    cases.push(duplicateResult);
+
+    const missingBid = browserProjection();
+    missingBid.bids = [];
+    cases.push(missingBid);
+
+    const extraBid = browserProjection();
+    extraBid.bids.push({ ...extraBid.bids[0]!, candidateId: candidateId(1) });
+    cases.push(extraBid);
+
+    const mismatchedSlot = browserProjection();
+    mismatchedSlot.bids[0]!.slot = 'slot-other';
+    cases.push(mismatchedSlot);
+
+    const duplicateCandidate = browserProjection();
+    duplicateCandidate.auction.results.push({
+      slot: 'slot-4',
+      outcome: 'winner',
+      candidateId: candidateId(),
+    });
+    duplicateCandidate.bids.push({ ...duplicateCandidate.bids[0]!, slot: 'slot-4' });
+    cases.push(duplicateCandidate);
+
+    for (const value of cases) {
+      expect(parseBrowserAuctionProjectionV1(value)).toBeUndefined();
+    }
+  });
+
+  it('enforces exact objects, own data properties, and ordinary prototypes', () => {
+    const unknownTopLevel = { ...browserProjection(), unknown: true };
+    const unknownDecision = browserProjection();
+    Object.assign(unknownDecision.auction.results[0]!, { unknown: true });
+    const accessor = browserProjection();
+    Object.defineProperty(accessor.bids[0]!, 'provider', {
+      enumerable: true,
+      get: () => 'aps',
+    });
+    const inherited = browserProjection();
+    Object.setPrototypeOf(inherited.bids[0]!, { inherited: true });
+
+    for (const value of [unknownTopLevel, unknownDecision, accessor, inherited]) {
+      expect(parseBrowserAuctionProjectionV1(value)).toBeUndefined();
+    }
+  });
+
+  it('enforces result and bid count boundaries', () => {
+    expect(
+      parseBrowserAuctionProjectionV1({
+        version: 1,
+        auction: { version: 1, auctionId: 'auction-empty', results: [] },
+        bids: [],
+      })
+    ).toBeDefined();
+
+    const atLimit = browserProjection();
+    atLimit.auction.results = [];
+    atLimit.bids = [];
+    for (let index = 0; index < 256; index += 1) {
+      const slot = `slot-${index}`;
+      const id = candidateId(index);
+      atLimit.auction.results.push({ slot, outcome: 'winner', candidateId: id });
+      atLimit.bids.push({
+        ...browserProjection().bids[0]!,
+        slot,
+        candidateId: id,
+        upstreamBidId: `upstream-${index}`,
+        rendererReservationId: reservationId(index),
+      });
+    }
+    expect(parseBrowserAuctionProjectionV1(atLimit)).toBeDefined();
+
+    const tooManyResults = structuredClone(atLimit);
+    tooManyResults.auction.results.push({ slot: 'overflow', outcome: 'no_bid' });
+    expect(parseBrowserAuctionProjectionV1(tooManyResults)).toBeUndefined();
+
+    const tooManyBids = structuredClone(atLimit);
+    tooManyBids.bids.push({
+      ...tooManyBids.bids[0]!,
+      slot: 'overflow',
+      candidateId: candidateId(300),
+      rendererReservationId: reservationId(300),
+    });
+    expect(parseBrowserAuctionProjectionV1(tooManyBids)).toBeUndefined();
+  });
+
+  it('enforces identity, price, currency, and targeting boundaries', () => {
+    const valid = browserProjection();
+    valid.auction.auctionId = 'A'.repeat(128);
+    valid.auction.results[0]!.slot = 'é'.repeat(128);
+    valid.bids[0]!.slot = 'é'.repeat(128);
+    valid.bids[0]!.upstreamBidId = 'é'.repeat(32);
+    valid.bids[0]!.targeting = Object.fromEntries(
+      Array.from({ length: 32 }, (_, index) => [
+        `key_${String(index).padStart(2, '0')}`,
+        index === 0 ? '😀'.repeat(40) : 'v',
+      ])
+    );
+    expect(parseBrowserAuctionProjectionV1(valid)).toBeDefined();
+
+    const mutations: Array<(value: ReturnType<typeof browserProjection>) => void> = [
+      (value) => {
+        value.auction.auctionId = 'A'.repeat(129);
+      },
+      (value) => {
+        value.auction.auctionId = 'contains space';
+      },
+      (value) => {
+        value.auction.results[0]!.candidateId = 'short';
+      },
+      (value) => {
+        value.auction.results[0]!.slot = `bad\u0000slot`;
+      },
+      (value) => {
+        value.bids[0]!.provider = '-aps';
+      },
+      (value) => {
+        value.bids[0]!.upstreamBidId = 'é'.repeat(33);
+      },
+      (value) => {
+        value.bids[0]!.cpm = Number.POSITIVE_INFINITY;
+      },
+      (value) => {
+        value.bids[0]!.cpm = -0.01;
+      },
+      (value) => {
+        value.bids[0]!.currency = 'EUR';
+      },
+      (value) => {
+        value.bids[0]!.rendererReservationId = 'r1_short';
+      },
+      (value) => {
+        value.bids[0]!.targeting = { hb_adid: reservationId() };
+      },
+      (value) => {
+        value.bids[0]!.targeting = { ['k'.repeat(21)]: 'v' };
+      },
+      (value) => {
+        value.bids[0]!.targeting = { key: '😀'.repeat(41) };
+      },
+      (value) => {
+        value.bids[0]!.targeting = { key: 'é'.repeat(81) };
+      },
+      (value) => {
+        value.bids[0]!.targeting = { key: 'bad\u0001value' };
+      },
+      (value) => {
+        value.bids[0]!.targeting = { key: String.fromCharCode(0xd800) };
+      },
+    ];
+
+    for (const mutate of mutations) {
+      const value = browserProjection();
+      mutate(value);
+      expect(parseBrowserAuctionProjectionV1(value)).toBeUndefined();
+    }
+  });
+
+  it('enforces exact targeting entry, key, scalar, and UTF-8 byte boundaries', () => {
+    for (const count of [31, 32]) {
+      const value = browserProjection();
+      value.bids[0]!.targeting = Object.fromEntries(
+        Array.from({ length: count }, (_, index) => [`k_${index}`, 'v'])
+      );
+      expect(parseBrowserAuctionProjectionV1(value)).toBeDefined();
+    }
+    const tooManyEntries = browserProjection();
+    tooManyEntries.bids[0]!.targeting = Object.fromEntries(
+      Array.from({ length: 33 }, (_, index) => [`k_${index}`, 'v'])
+    );
+    expect(parseBrowserAuctionProjectionV1(tooManyEntries)).toBeUndefined();
+
+    for (const length of [19, 20]) {
+      const value = browserProjection();
+      value.bids[0]!.targeting = { ['k'.repeat(length)]: 'v' };
+      expect(parseBrowserAuctionProjectionV1(value)).toBeDefined();
+    }
+    const keyTooLong = browserProjection();
+    keyTooLong.bids[0]!.targeting = { ['k'.repeat(21)]: 'v' };
+    expect(parseBrowserAuctionProjectionV1(keyTooLong)).toBeUndefined();
+
+    for (const scalars of [39, 40]) {
+      const value = browserProjection();
+      value.bids[0]!.targeting = { key: 'a'.repeat(scalars) };
+      expect(parseBrowserAuctionProjectionV1(value)).toBeDefined();
+    }
+    const tooManyScalars = browserProjection();
+    tooManyScalars.bids[0]!.targeting = { key: 'a'.repeat(41) };
+    expect(parseBrowserAuctionProjectionV1(tooManyScalars)).toBeUndefined();
+
+    for (const valueText of ['😀'.repeat(39) + '€', '😀'.repeat(40)]) {
+      const value = browserProjection();
+      value.bids[0]!.targeting = { key: valueText };
+      expect(parseBrowserAuctionProjectionV1(value)).toBeDefined();
+    }
+    const tooManyBytes = browserProjection();
+    tooManyBytes.bids[0]!.targeting = { key: '😀'.repeat(40) + 'a' };
+    expect(parseBrowserAuctionProjectionV1(tooManyBytes)).toBeUndefined();
+  });
+
+  it('deep-copies every admitted targeting key as own data, including __proto__', () => {
+    const value = browserProjection();
+    value.bids[0]!.targeting = JSON.parse('{"__proto__":"publisher-value"}') as Record<
+      string,
+      string
+    >;
+
+    const parsed = parseBrowserAuctionProjectionV1(value);
+
+    expect(parsed).toBeDefined();
+    expect(Object.getPrototypeOf(parsed!.bids[0]!.targeting)).toBe(Object.prototype);
+    expect(Object.prototype.hasOwnProperty.call(parsed!.bids[0]!.targeting, '__proto__')).toBe(true);
+    expect(parsed!.bids[0]!.targeting['__proto__']).toBe('publisher-value');
+  });
+
+  it('enforces canonical UTF-8 JSON just below, at, and above 8 MiB', () => {
+    const lengths = Array.from({ length: 16 }, () => 512 * 1024);
+    lengths[15] = 1;
+    const baseline = largeAdmProjection(lengths);
+    const baselineBytes = new TextEncoder().encode(JSON.stringify(baseline)).length;
+    const exactTail = 1 + MAX_BROWSER_AUCTION_PROJECTION_BYTES - baselineBytes;
+    expect(exactTail).toBeLessThanOrEqual(512 * 1024);
+
+    for (const [delta, accepted] of [
+      [-1, true],
+      [0, true],
+      [1, false],
+    ] as const) {
+      lengths[15] = exactTail + delta;
+      const value = largeAdmProjection(lengths);
+      expect(new TextEncoder().encode(JSON.stringify(value)).length).toBe(
+        MAX_BROWSER_AUCTION_PROJECTION_BYTES + delta
+      );
+      expect(parseBrowserAuctionProjectionV1(value) !== undefined).toBe(accepted);
+    }
+  });
+});
+
+describe('auction/parseTrustedServerAuctionResponseV1', () => {
+  interface MutableWireBid {
+    id: string;
+    impid: string;
+    price: number;
+    w: number;
+    h: number;
+    adm?: string;
+    ext: {
+      trusted_server: {
+        candidate_id: string;
+        slot_id: string;
+        render_source: unknown;
+        extra?: boolean;
+      };
+    };
+  }
+
+  function response(): {
+    id: string;
+    cur: string;
+    seatbid: Array<{ seat: string; bid: MutableWireBid[] }>;
+    ext: { trusted_server: { slot_results: unknown } };
+  } {
+    const projection = browserProjection();
+    const winner = projection.bids[0]!;
+    return {
+      id: projection.auction.auctionId,
+      cur: 'USD',
+      seatbid: [
+        {
+          seat: winner.provider,
+          bid: [
+            {
+              id: winner.rendererReservationId,
+              impid: winner.slot,
+              price: winner.cpm,
+              w: winner.renderSource.width,
+              h: winner.renderSource.height,
+              ext: {
+                trusted_server: {
+                  candidate_id: winner.candidateId,
+                  slot_id: winner.slot,
+                  render_source: winner.renderSource,
+                },
+              },
+            },
+          ],
+        },
+      ],
+      ext: { trusted_server: { slot_results: projection.auction } },
+    };
+  }
+
+  it('accepts the exact four-way decision/candidate/impid/slot join', () => {
+    const parsed = parseTrustedServerAuctionResponseV1(response());
+
+    expect(parsed?.auction.results).toEqual(browserProjection().auction.results);
+    expect(parsed?.bids[0]).toEqual(
+      expect.objectContaining({
+        candidateId: candidateId(),
+        rendererReservationId: reservationId(),
+        impid: 'slot-1',
+        renderSource: apsRenderer('fictional-creative-id'),
+      })
+    );
+  });
+
+  it('returns direct winners in decision order regardless of response order', () => {
+    const value = response();
+    const first = value.seatbid[0]!.bid[0]!;
+    const second = structuredClone(first);
+    second.id = reservationId(1);
+    second.impid = 'slot-2';
+    second.ext.trusted_server.candidate_id = candidateId(1);
+    second.ext.trusted_server.slot_id = 'slot-2';
+    value.seatbid[0]!.bid = [second, first];
+    const decisions = value.ext.trusted_server.slot_results as ReturnType<
+      typeof browserProjection
+    >['auction'];
+    decisions.results[1] = {
+      slot: 'slot-2',
+      outcome: 'winner',
+      candidateId: candidateId(1),
+    };
+
+    expect(parseTrustedServerAuctionResponseV1(value)?.bids.map((bid) => bid.candidateId)).toEqual([
+      candidateId(),
+      candidateId(1),
+    ]);
+  });
+
+  it('rejects missing, duplicate, extra, and mismatched joins transactionally', () => {
+    const missing = response();
+    missing.seatbid = [];
+    const duplicate = response();
+    duplicate.seatbid[0]!.bid.push(structuredClone(duplicate.seatbid[0]!.bid[0]!));
+    const mismatchedImpid = response();
+    mismatchedImpid.seatbid[0]!.bid[0]!.impid = 'slot-other';
+    const mismatchedSlot = response();
+    mismatchedSlot.seatbid[0]!.bid[0]!.ext.trusted_server.slot_id = 'slot-other';
+    const unknownTrustedKey = response();
+    Object.assign(unknownTrustedKey.seatbid[0]!.bid[0]!.ext.trusted_server, { extra: true });
+
+    for (const value of [missing, duplicate, mismatchedImpid, mismatchedSlot, unknownTrustedKey]) {
+      expect(parseTrustedServerAuctionResponseV1(value)).toBeUndefined();
+    }
+  });
+
+  it('rejects non-USD currency, duplicate reservations, and unknown outer wire keys', () => {
+    const nonUsd = response();
+    nonUsd.cur = 'EUR';
+
+    const duplicateReservation = response();
+    const second = structuredClone(duplicateReservation.seatbid[0]!.bid[0]!);
+    second.impid = 'slot-2';
+    second.ext.trusted_server.slot_id = 'slot-2';
+    second.ext.trusted_server.candidate_id = candidateId(1);
+    duplicateReservation.seatbid[0]!.bid.push(second);
+    const decisions = duplicateReservation.ext.trusted_server.slot_results as ReturnType<
+      typeof browserProjection
+    >['auction'];
+    decisions.results[1] = {
+      slot: 'slot-2',
+      outcome: 'winner',
+      candidateId: candidateId(1),
+    };
+
+    const unknownBody = response() as ReturnType<typeof response> & { unknown?: boolean };
+    unknownBody.unknown = true;
+    const unknownBid = response();
+    Object.assign(unknownBid.seatbid[0]!.bid[0]!, { unknown: true });
+    const emptySeat = response();
+    emptySeat.seatbid[0]!.bid = [];
+
+    for (const value of [nonUsd, duplicateReservation, unknownBody, unknownBid, emptySeat]) {
+      expect(parseTrustedServerAuctionResponseV1(value)).toBeUndefined();
+    }
+  });
+
+  it('permits matching adm only for ADM sources', () => {
+    const adm = response();
+    const source = { type: 'adm' as const, version: 1 as const, adm: '<div>ok</div>', width: 1, height: 1 };
+    const bid = adm.seatbid[0]!.bid[0]!;
+    bid.w = 1;
+    bid.h = 1;
+    bid.adm = source.adm;
+    bid.ext.trusted_server.render_source = source;
+    expect(parseTrustedServerAuctionResponseV1(adm)).toBeDefined();
+
+    const admWithoutStandardField = structuredClone(adm);
+    delete admWithoutStandardField.seatbid[0]!.bid[0]!.adm;
+    expect(parseTrustedServerAuctionResponseV1(admWithoutStandardField)).toBeDefined();
+
+    const mismatch = structuredClone(adm);
+    mismatch.seatbid[0]!.bid[0]!.adm = '<div>different</div>';
+    expect(parseTrustedServerAuctionResponseV1(mismatch)).toBeUndefined();
+
+    const apsWithAdm = response();
+    apsWithAdm.seatbid[0]!.bid[0]!.adm = '<div>forbidden</div>';
+    expect(parseTrustedServerAuctionResponseV1(apsWithAdm)).toBeUndefined();
   });
 });
 

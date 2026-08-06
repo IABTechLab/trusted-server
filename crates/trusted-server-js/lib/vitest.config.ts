@@ -1,6 +1,6 @@
 import path from 'node:path';
 
-import { defineConfig } from 'vitest/config';
+import { configDefaults, defineConfig } from 'vitest/config';
 
 export default defineConfig({
   resolve: {
@@ -21,6 +21,10 @@ export default defineConfig({
   test: {
     environment: 'jsdom',
     globals: true,
+    // This suite deliberately uses node:test + vm so it executes the generated
+    // ES5 artifact without Vite transforms. CI invokes it separately with
+    // `node --test`; importing it through Vitest rewrites import.meta.url.
+    exclude: [...configDefaults.exclude, 'test/contract/aps-renderer-es5.test.mjs'],
     // Run tests in the main thread to avoid spawning
     // child processes/workers, which are blocked in this sandbox.
     threads: false,

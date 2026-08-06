@@ -8,7 +8,31 @@ use error_stack::Report;
 use crate::error::TrustedServerError;
 use crate::platform::{PlatformPendingRequest, PlatformResponse, RuntimeServices};
 
-use super::types::{AuctionContext, AuctionRequest, AuctionResponse};
+use super::types::{
+    AuctionContext, AuctionRequest, AuctionResponse, AuctionSlotFailureReason, Bid,
+};
+
+/// Exactly one normalized outcome for a slot dispatched to one provider.
+#[derive(Debug, Clone)]
+pub struct ProviderSlotOutcome {
+    /// Provider integration that received the slot.
+    pub provider: String,
+    /// Exact dispatched slot identifier.
+    pub slot: String,
+    /// Candidate, successful no-bid, or typed failure.
+    pub disposition: ProviderSlotDisposition,
+}
+
+/// Closed normalized provider result for one dispatched slot.
+#[derive(Debug, Clone)]
+pub enum ProviderSlotDisposition {
+    /// One or more independently validated candidates returned for the slot.
+    Candidates(Vec<Bid>),
+    /// Provider completed successfully without a candidate for this slot.
+    NoBid,
+    /// Provider failed for this slot.
+    Failed(AuctionSlotFailureReason),
+}
 
 /// Provider-local state carried from request dispatch to response parsing.
 pub type ProviderParseState = Box<dyn Any + Send + Sync>;

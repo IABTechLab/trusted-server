@@ -7,9 +7,9 @@
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt, ensure};
 use http::{HeaderValue, Request, Response, StatusCode, header};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use url::Url;
 use uuid::Uuid;
 
@@ -29,8 +29,12 @@ use crate::settings::Settings;
 
 use super::orchestrator::OrchestrationResult;
 use super::types::{
-    AdFormat, AdSlot, AuctionDropReason, AuctionDropReasons, AuctionRequest, DeviceInfo, MediaType,
-    OrchestratorExt, ProviderSummary, PublisherInfo, SiteInfo, UserInfo, record_auction_drop,
+    AdFormat, AdSlot, AuctionDecisionSetV1, AuctionDropReason, AuctionDropReasons, AuctionRequest,
+    AuctionSlotFailureReason, BidRenderSourceV1, BrowserAuctionBidV1, BrowserAuctionProjectionV1,
+    DeviceInfo, MAX_BROWSER_AUCTION_PROJECTION_BYTES, MAX_BROWSER_AUCTION_RESULTS,
+    MAX_BROWSER_AUCTION_TARGETING_ENTRIES, MediaType, OrchestratorExt, ProviderSummary,
+    PublisherInfo, RENDER_DIMENSION_MAX, RENDER_DIMENSION_MIN, SiteInfo, SlotAuctionDecisionV1,
+    UserInfo, classify_aps_renderer_v1, record_auction_drop,
 };
 
 /// Request body for `POST /auction` (tsjs / Prebid.js wire format).
@@ -307,6 +311,429 @@ pub(crate) struct OpenRtbResponseConversion {
     pub delivery: AuctionDeliveryReport,
 }
 
+#[allow(
+    dead_code,
+    reason = "pure coordinated-cutover contract is exercised directly until Task 19 wires endpoints"
+)]
+pub(crate) mod coordinated_cutover_v1 {
+    use super::*;
+
+    /// Validated projection plus its exact canonical UTF-8 representation.
+    #[derive(Debug, Clone)]
+    pub(crate) struct CanonicalBrowserAuctionProjectionV1 {
+        /// Deep-owned, validated projection in canonical result/bid/targeting order.
+        pub projection: BrowserAuctionProjectionV1,
+        /// Whitespace-free JSON using schema field order.
+        pub json: Vec<u8>,
+        /// Whether the exact aggregate overflow rule replaced every winner.
+        pub reduced_for_size: bool,
+    }
+
+    fn projection_contract_error(message: impl Into<String>) -> Report<TrustedServerError> {
+        Report::new(TrustedServerError::Auction {
+            message: message.into(),
+        })
+    }
+
+    fn is_base64url_byte(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+    }
+
+    fn valid_auction_id(value: &str) -> bool {
+        !value.is_empty()
+            && value.len() <= 128
+            && value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')
+            })
+    }
+
+    fn valid_candidate_id(value: &str) -> bool {
+        value.len() == 12 && value.bytes().all(is_base64url_byte)
+    }
+
+    fn valid_renderer_reservation_id(value: &str) -> bool {
+        value
+            .strip_prefix("r1_")
+            .is_some_and(|token| token.len() == 22 && token.bytes().all(is_base64url_byte))
+    }
+
+    fn valid_provider_name(value: &str) -> bool {
+        let bytes = value.as_bytes();
+        (1..=64).contains(&bytes.len())
+            && bytes[0].is_ascii_alphanumeric()
+            && bytes[1..]
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b'-'))
+    }
+
+    fn valid_bounded_text(value: &str, maximum_bytes: usize) -> bool {
+        !value.is_empty()
+            && value.len() <= maximum_bytes
+            && !value
+                .chars()
+                .any(|character| matches!(character, '\0'..='\u{1f}' | '\u{7f}'))
+    }
+
+    fn valid_targeting_key(value: &str) -> bool {
+        !value.is_empty()
+            && value.len() <= 20
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    }
+
+    fn valid_targeting(targeting: &BTreeMap<String, String>) -> bool {
+        targeting.len() <= MAX_BROWSER_AUCTION_TARGETING_ENTRIES
+            && targeting.iter().all(|(key, value)| {
+                key != "hb_adid"
+                    && valid_targeting_key(key)
+                    && valid_bounded_text(value, 160)
+                    && value.chars().count() <= 40
+            })
+    }
+
+    fn valid_render_dimension(value: u32) -> bool {
+        (RENDER_DIMENSION_MIN..=RENDER_DIMENSION_MAX).contains(&u64::from(value))
+    }
+
+    fn valid_cache_id(value: &str) -> bool {
+        let Ok(uuid) = Uuid::parse_str(value) else {
+            return false;
+        };
+        uuid.hyphenated().to_string().eq_ignore_ascii_case(value)
+            && matches!(uuid.get_version_num(), 1..=5)
+            && uuid.get_variant() == uuid::Variant::RFC4122
+    }
+
+    fn valid_cache_fetch_url(fetch_url: &str, cache_id: &str) -> bool {
+        if fetch_url.len() > 4096 {
+            return false;
+        }
+        let Ok(url) = Url::parse(fetch_url) else {
+            return false;
+        };
+        let query = format!("uuid={cache_id}");
+        url.scheme() == "https"
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.fragment().is_none()
+            && url.query() == Some(query.as_str())
+            && url
+                .query_pairs()
+                .exactly_one()
+                .is_ok_and(|(key, value)| key == "uuid" && value == cache_id)
+    }
+
+    trait ExactlyOne: Iterator + Sized {
+        fn exactly_one(mut self) -> Result<Self::Item, ()> {
+            let Some(value) = self.next() else {
+                return Err(());
+            };
+            if self.next().is_some() {
+                return Err(());
+            }
+            Ok(value)
+        }
+    }
+
+    impl<I: Iterator> ExactlyOne for I {}
+
+    fn render_source_dimensions(source: &BidRenderSourceV1) -> (u32, u32) {
+        match source {
+            BidRenderSourceV1::Aps(source) => (source.width, source.height),
+            BidRenderSourceV1::Adm(source) => (source.width, source.height),
+            BidRenderSourceV1::Cache(source) => (source.width, source.height),
+        }
+    }
+
+    fn valid_render_source(source: &BidRenderSourceV1, publisher_origin: &str) -> bool {
+        let (width, height) = render_source_dimensions(source);
+        if !valid_render_dimension(width) || !valid_render_dimension(height) {
+            return false;
+        }
+
+        match source {
+            BidRenderSourceV1::Aps(source) => {
+                source.version == 1
+                    && serde_json::to_value(BidRenderSourceV1::Aps(source.clone())).is_ok_and(
+                        |value| {
+                            classify_aps_renderer_v1(&value, publisher_origin)
+                                == crate::auction::types::ApsRendererValidationResult::Accepted
+                        },
+                    )
+            }
+            BidRenderSourceV1::Adm(source) => {
+                source.version == 1 && !source.adm.is_empty() && source.adm.len() <= 512 * 1024
+            }
+            BidRenderSourceV1::Cache(source) => {
+                source.version == 1
+                    && valid_cache_id(&source.cache_id)
+                    && valid_cache_fetch_url(&source.fetch_url, &source.cache_id)
+            }
+        }
+    }
+
+    fn valid_browser_bid(bid: &BrowserAuctionBidV1, publisher_origin: &str) -> bool {
+        valid_candidate_id(&bid.candidate_id)
+            && valid_bounded_text(&bid.slot, 256)
+            && valid_provider_name(&bid.provider)
+            && valid_bounded_text(&bid.upstream_bid_id, 64)
+            && bid.cpm.is_finite()
+            && bid.cpm >= 0.0
+            && bid.currency == "USD"
+            && valid_targeting(&bid.targeting)
+            && valid_renderer_reservation_id(&bid.renderer_reservation_id)
+            && valid_render_source(&bid.render_source, publisher_origin)
+    }
+
+    fn validate_decision_set(
+        decision_set: &AuctionDecisionSetV1,
+    ) -> Result<(), Report<TrustedServerError>> {
+        ensure!(
+            decision_set.version == 1,
+            projection_contract_error("Browser auction decision version must be 1")
+        );
+        ensure!(
+            valid_auction_id(&decision_set.auction_id),
+            projection_contract_error("Browser auction id violates the version-1 grammar")
+        );
+        ensure!(
+            decision_set.results.len() <= MAX_BROWSER_AUCTION_RESULTS,
+            projection_contract_error("Browser auction result count exceeds 256")
+        );
+
+        let mut slots = HashSet::new();
+        let mut candidates = HashSet::new();
+        for result in &decision_set.results {
+            ensure!(
+                valid_bounded_text(result.slot(), 256) && slots.insert(result.slot()),
+                projection_contract_error("Browser auction result slots must be valid and unique")
+            );
+            if let SlotAuctionDecisionV1::Winner { candidate_id, .. } = result {
+                ensure!(
+                    valid_candidate_id(candidate_id) && candidates.insert(candidate_id),
+                    projection_contract_error(
+                        "Browser auction winner candidates must be valid and unique"
+                    )
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate, reorder, and canonically serialize a complete browser auction projection.
+    ///
+    /// Winner-local projection failures become `winner_not_renderable`. Aggregate
+    /// overflow applies the contract's all-winners reduction; it never selects a
+    /// response-order-dependent subset.
+    pub(crate) fn canonicalize_browser_auction_projection_v1(
+        input: BrowserAuctionProjectionV1,
+        publisher_origin: &str,
+    ) -> Result<CanonicalBrowserAuctionProjectionV1, Report<TrustedServerError>> {
+        ensure!(
+            input.version == 1,
+            projection_contract_error("Browser auction projection version must be 1")
+        );
+        validate_decision_set(&input.auction)?;
+        ensure!(
+            input.bids.len() <= MAX_BROWSER_AUCTION_RESULTS,
+            projection_contract_error("Browser auction bid count exceeds 256")
+        );
+
+        let publisher_origin = Url::parse(publisher_origin)
+            .ok()
+            .filter(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+            .map(|url| url.origin().ascii_serialization())
+            .ok_or_else(|| projection_contract_error("Publisher origin is invalid"))?;
+
+        let mut bids_by_candidate = HashMap::with_capacity(input.bids.len());
+        for bid in input.bids {
+            let candidate_id = bid.candidate_id.clone();
+            ensure!(
+                bids_by_candidate.insert(candidate_id, bid).is_none(),
+                projection_contract_error("Browser auction candidate bids must be unique")
+            );
+        }
+
+        let mut reservation_ids = HashSet::new();
+        let mut canonical_bids = Vec::new();
+        let mut canonical_results = Vec::with_capacity(input.auction.results.len());
+        for result in input.auction.results {
+            match result {
+                SlotAuctionDecisionV1::Winner { slot, candidate_id } => {
+                    let bid = bids_by_candidate.remove(&candidate_id);
+                    if let Some(bid) = bid.filter(|bid| {
+                        bid.slot == slot
+                            && valid_browser_bid(bid, &publisher_origin)
+                            && reservation_ids.insert(bid.renderer_reservation_id.clone())
+                    }) {
+                        canonical_results
+                            .push(SlotAuctionDecisionV1::Winner { slot, candidate_id });
+                        canonical_bids.push(bid);
+                    } else {
+                        canonical_results.push(SlotAuctionDecisionV1::Failed {
+                            slot,
+                            reason: AuctionSlotFailureReason::WinnerNotRenderable,
+                        });
+                    }
+                }
+                non_winner => canonical_results.push(non_winner),
+            }
+        }
+        ensure!(
+            bids_by_candidate.is_empty(),
+            projection_contract_error("Browser auction contains a bid without a winner decision")
+        );
+
+        let mut projection = BrowserAuctionProjectionV1 {
+            version: 1,
+            auction: AuctionDecisionSetV1 {
+                version: 1,
+                auction_id: input.auction.auction_id,
+                results: canonical_results,
+            },
+            bids: canonical_bids,
+        };
+        let mut json =
+            serde_json::to_vec(&projection).change_context(TrustedServerError::Auction {
+                message: "Failed to serialize browser auction projection".to_string(),
+            })?;
+        let reduced_for_size = json.len() > MAX_BROWSER_AUCTION_PROJECTION_BYTES;
+        if reduced_for_size {
+            projection.auction.results = projection
+                .auction
+                .results
+                .into_iter()
+                .map(|result| match result {
+                    SlotAuctionDecisionV1::Winner { slot, .. } => SlotAuctionDecisionV1::Failed {
+                        slot,
+                        reason: AuctionSlotFailureReason::WinnerNotRenderable,
+                    },
+                    non_winner => non_winner,
+                })
+                .collect();
+            projection.bids.clear();
+            json = serde_json::to_vec(&projection).change_context(TrustedServerError::Auction {
+                message: "Failed to serialize reduced browser auction projection".to_string(),
+            })?;
+            ensure!(
+                json.len() <= MAX_BROWSER_AUCTION_PROJECTION_BYTES,
+                projection_contract_error("Reduced browser auction projection exceeds 8 MiB")
+            );
+        }
+
+        Ok(CanonicalBrowserAuctionProjectionV1 {
+            projection,
+            json,
+            reduced_for_size,
+        })
+    }
+
+    #[derive(Serialize)]
+    struct TrustedServerOpenRtbBidExtV1<'a> {
+        candidate_id: &'a str,
+        slot_id: &'a str,
+        render_source: &'a BidRenderSourceV1,
+    }
+
+    #[derive(Serialize)]
+    struct OpenRtbBidExtV1<'a> {
+        trusted_server: TrustedServerOpenRtbBidExtV1<'a>,
+    }
+
+    #[derive(Serialize)]
+    struct TrustedServerOpenRtbBidV1<'a> {
+        id: &'a str,
+        impid: &'a str,
+        price: f64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        adm: Option<&'a str>,
+        w: u32,
+        h: u32,
+        ext: OpenRtbBidExtV1<'a>,
+    }
+
+    #[derive(Serialize)]
+    struct TrustedServerSeatBidV1<'a> {
+        seat: &'a str,
+        bid: Vec<TrustedServerOpenRtbBidV1<'a>>,
+    }
+
+    #[derive(Serialize)]
+    struct TrustedServerResponseExtInnerV1<'a> {
+        slot_results: &'a AuctionDecisionSetV1,
+    }
+
+    #[derive(Serialize)]
+    struct TrustedServerResponseExtV1<'a> {
+        trusted_server: TrustedServerResponseExtInnerV1<'a>,
+    }
+
+    #[derive(Serialize)]
+    struct TrustedServerAuctionResponseWireV1<'a> {
+        id: &'a str,
+        seatbid: Vec<TrustedServerSeatBidV1<'a>>,
+        cur: &'static str,
+        ext: TrustedServerResponseExtV1<'a>,
+    }
+
+    /// Serialize the coordinated-cutover exact `/auction` winner wire.
+    ///
+    /// This remains a pure contract function until Task 19 switches the endpoint.
+    pub(crate) fn serialize_trusted_server_auction_response_v1(
+        canonical: &CanonicalBrowserAuctionProjectionV1,
+    ) -> Result<Vec<u8>, Report<TrustedServerError>> {
+        let seatbid = canonical
+            .projection
+            .bids
+            .iter()
+            .map(|bid| {
+                let (width, height) = render_source_dimensions(&bid.render_source);
+                TrustedServerSeatBidV1 {
+                    seat: &bid.provider,
+                    bid: vec![TrustedServerOpenRtbBidV1 {
+                        id: &bid.renderer_reservation_id,
+                        impid: &bid.slot,
+                        price: bid.cpm,
+                        // `render_source` is the sole browser authority. Standard
+                        // `adm` is optional on the exact wire and omitted by the
+                        // producer to avoid duplicating up to 512 KiB per winner.
+                        adm: None,
+                        w: width,
+                        h: height,
+                        ext: OpenRtbBidExtV1 {
+                            trusted_server: TrustedServerOpenRtbBidExtV1 {
+                                candidate_id: &bid.candidate_id,
+                                slot_id: &bid.slot,
+                                render_source: &bid.render_source,
+                            },
+                        },
+                    }],
+                }
+            })
+            .collect();
+        let response = TrustedServerAuctionResponseWireV1 {
+            id: &canonical.projection.auction.auction_id,
+            seatbid,
+            cur: "USD",
+            ext: TrustedServerResponseExtV1 {
+                trusted_server: TrustedServerResponseExtInnerV1 {
+                    slot_results: &canonical.projection.auction,
+                },
+            },
+        };
+        serde_json::to_vec(&response).change_context(TrustedServerError::Auction {
+            message: "Failed to serialize exact trusted-server auction response".to_string(),
+        })
+    }
+}
+
+#[cfg(test)]
+use coordinated_cutover_v1::{
+    canonicalize_browser_auction_projection_v1, serialize_trusted_server_auction_response_v1,
+};
+
 /// Convert `OrchestrationResult` to `OpenRTB` response format.
 ///
 /// Creative HTML in the `adm` field is optionally sanitized and optionally
@@ -520,7 +947,8 @@ pub(crate) fn convert_to_openrtb_response_with_report(
 mod tests {
     use super::*;
     use crate::auction::types::{
-        ApsRendererV1, ApsTagType, AuctionResponse, Bid, BidRenderSourceV1, BidStatus,
+        ApsRendererV1, ApsTagType, AuctionDecisionSetV1, AuctionResponse, Bid, BidRenderSourceV1,
+        BidStatus,
     };
     use crate::openrtb::{Eid, Uid};
     use crate::platform::test_support::noop_services;
@@ -576,6 +1004,11 @@ mod tests {
             provider_responses: Vec::new(),
             mediator_response: None,
             winning_bids: HashMap::new(),
+            decision_set: AuctionDecisionSetV1 {
+                version: 1,
+                auction_id: "auction-1".to_string(),
+                results: Vec::new(),
+            },
             total_time_ms: 10,
             metadata: HashMap::new(),
         }
@@ -584,6 +1017,9 @@ mod tests {
     fn make_bid(slot_id: &str, bidder: &str, price: Option<f64>) -> Bid {
         Bid {
             slot_id: slot_id.to_string(),
+            candidate_id: None,
+            candidate_provider: None,
+            renderer_reservation_id: None,
             price,
             currency: "USD".to_string(),
             creative: Some("<div>Ad</div>".to_string()),
@@ -624,6 +1060,11 @@ mod tests {
             }],
             mediator_response: None,
             winning_bids: HashMap::from([(bid.slot_id.clone(), bid)]),
+            decision_set: AuctionDecisionSetV1 {
+                version: 1,
+                auction_id: "auction-1".to_string(),
+                results: Vec::new(),
+            },
             total_time_ms: 50,
             metadata: HashMap::new(),
         }
@@ -1386,6 +1827,11 @@ mod tests {
             }],
             mediator_response: None,
             winning_bids: HashMap::from([(bid.slot_id.clone(), bid)]),
+            decision_set: AuctionDecisionSetV1 {
+                version: 1,
+                auction_id: "auction-1".to_string(),
+                results: Vec::new(),
+            },
             total_time_ms: 50,
             metadata: HashMap::new(),
         };
@@ -1434,6 +1880,11 @@ mod tests {
                 (ordinary.slot_id.clone(), ordinary),
                 (renderer.slot_id.clone(), renderer),
             ]),
+            decision_set: AuctionDecisionSetV1 {
+                version: 1,
+                auction_id: "auction-1".to_string(),
+                results: Vec::new(),
+            },
             total_time_ms: 50,
             metadata: HashMap::new(),
         };
@@ -1596,6 +2047,11 @@ mod tests {
             provider_responses: vec![],
             mediator_response: None,
             winning_bids: HashMap::new(),
+            decision_set: AuctionDecisionSetV1 {
+                version: 1,
+                auction_id: "auction-1".to_string(),
+                results: Vec::new(),
+            },
             total_time_ms: 50,
             metadata: HashMap::new(),
         };
@@ -1637,6 +2093,11 @@ mod tests {
                 (top_bid.slot_id.clone(), top_bid),
                 (sidebar_bid.slot_id.clone(), sidebar_bid),
             ]),
+            decision_set: AuctionDecisionSetV1 {
+                version: 1,
+                auction_id: "auction-1".to_string(),
+                results: Vec::new(),
+            },
             total_time_ms: 50,
             metadata: HashMap::new(),
         };
@@ -1769,10 +2230,16 @@ mod tests {
 #[cfg(test)]
 mod convert_tests {
     use super::*;
+    use crate::auction::types::{
+        AdmRenderSourceV1, AuctionDecisionSetV1, BidRenderSourceV1, BrowserAuctionBidV1,
+        BrowserAuctionProjectionV1, MAX_BROWSER_AUCTION_PROJECTION_BYTES, SlotAuctionDecisionV1,
+    };
     use crate::consent::ConsentContext;
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::crate_test_settings_str;
     use http::Method;
+    use serde_json::json;
+    use std::collections::BTreeMap;
 
     fn make_settings() -> Settings {
         Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings")
@@ -1943,6 +2410,248 @@ mod convert_tests {
         assert!(
             result.is_err(),
             "3-element banner size should return an error"
+        );
+    }
+
+    fn projection_candidate_id(index: usize) -> String {
+        format!("{index:012x}")
+    }
+
+    fn projection_reservation_id(index: usize) -> String {
+        format!("r1_{index:022x}")
+    }
+
+    fn projection_adm_bid(index: usize, slot: &str, adm: String) -> BrowserAuctionBidV1 {
+        BrowserAuctionBidV1 {
+            candidate_id: projection_candidate_id(index),
+            slot: slot.to_string(),
+            provider: "prebid".to_string(),
+            upstream_bid_id: format!("upstream-{index}"),
+            cpm: index as f64,
+            currency: "USD".to_string(),
+            targeting: BTreeMap::from([
+                ("z_key".to_string(), "last".to_string()),
+                ("a_key".to_string(), "first".to_string()),
+            ]),
+            renderer_reservation_id: projection_reservation_id(index),
+            render_source: BidRenderSourceV1::Adm(AdmRenderSourceV1 {
+                version: 1,
+                adm,
+                width: 300,
+                height: 250,
+            }),
+        }
+    }
+
+    fn projection_with_adm_lengths(lengths: &[usize]) -> BrowserAuctionProjectionV1 {
+        let results = lengths
+            .iter()
+            .enumerate()
+            .map(|(index, _)| SlotAuctionDecisionV1::Winner {
+                slot: format!("slot-{index}"),
+                candidate_id: projection_candidate_id(index),
+            })
+            .collect();
+        let bids = lengths
+            .iter()
+            .enumerate()
+            .map(|(index, length)| {
+                projection_adm_bid(index, &format!("slot-{index}"), "x".repeat(*length))
+            })
+            .rev()
+            .collect();
+        BrowserAuctionProjectionV1 {
+            version: 1,
+            auction: AuctionDecisionSetV1 {
+                version: 1,
+                auction_id: "auction-1".to_string(),
+                results,
+            },
+            bids,
+        }
+    }
+
+    #[test]
+    fn canonical_projection_orders_bids_and_targeting_by_contract() {
+        let input = projection_with_adm_lengths(&[1, 1]);
+        let mut permuted = input.clone();
+        permuted.bids.reverse();
+
+        let canonical =
+            canonicalize_browser_auction_projection_v1(input, "https://publisher.example")
+                .expect("valid projection should canonicalize");
+        let canonical_permuted =
+            canonicalize_browser_auction_projection_v1(permuted, "https://publisher.example")
+                .expect("response-order permutation should canonicalize");
+
+        assert!(!canonical.reduced_for_size);
+        assert_eq!(canonical.json, canonical_permuted.json);
+        assert_eq!(canonical.projection.bids[0].slot, "slot-0");
+        assert_eq!(canonical.projection.bids[1].slot, "slot-1");
+        let json = String::from_utf8(canonical.json).expect("canonical JSON should be UTF-8");
+        assert!(
+            json.find("\"a_key\"") < json.find("\"z_key\""),
+            "targeting keys should be lexically sorted"
+        );
+        assert!(
+            json.starts_with("{\"version\":1,\"auction\":{\"version\":1,\"auctionId\":"),
+            "top-level and decision-set fields should retain schema order: {json}"
+        );
+    }
+
+    #[test]
+    fn invalid_selected_winner_becomes_winner_not_renderable() {
+        let mut input = projection_with_adm_lengths(&[1]);
+        input.bids[0].renderer_reservation_id = "not-a-reservation".to_string();
+
+        let canonical =
+            canonicalize_browser_auction_projection_v1(input, "https://publisher.example")
+                .expect("selected projection failure should remain an explicit slot result");
+
+        assert!(canonical.projection.bids.is_empty());
+        assert_eq!(
+            canonical.projection.auction.results,
+            vec![SlotAuctionDecisionV1::Failed {
+                slot: "slot-0".to_string(),
+                reason: crate::auction::types::AuctionSlotFailureReason::WinnerNotRenderable,
+            }]
+        );
+    }
+
+    #[test]
+    fn canonical_projection_enforces_exact_eight_mib_all_winner_reduction() {
+        let mut lengths = vec![512 * 1024; 15];
+        lengths.push(1);
+        let baseline = projection_with_adm_lengths(&lengths);
+        let baseline_len = serde_json::to_vec(&baseline)
+            .expect("typed baseline should serialize")
+            .len();
+        let exact_tail = 1 + MAX_BROWSER_AUCTION_PROJECTION_BYTES - baseline_len;
+        assert!(
+            exact_tail <= 512 * 1024,
+            "tail ADM should remain individually valid"
+        );
+
+        for (delta, should_reduce) in [(-1_isize, false), (0, false), (1, true)] {
+            lengths[15] = exact_tail
+                .checked_add_signed(delta)
+                .expect("positive exact tail");
+            let input = projection_with_adm_lengths(&lengths);
+            let canonical =
+                canonicalize_browser_auction_projection_v1(input, "https://publisher.example")
+                    .expect("boundary projection should canonicalize or reduce");
+            assert_eq!(canonical.reduced_for_size, should_reduce, "delta {delta}");
+            assert!(canonical.json.len() <= MAX_BROWSER_AUCTION_PROJECTION_BYTES);
+            if should_reduce {
+                assert!(canonical.projection.bids.is_empty());
+                assert!(canonical.projection.auction.results.iter().all(|result| matches!(
+                    result,
+                    SlotAuctionDecisionV1::Failed {
+                        reason: crate::auction::types::AuctionSlotFailureReason::WinnerNotRenderable,
+                        ..
+                    }
+                )));
+                let wire: JsonValue = serde_json::from_slice(
+                    &serialize_trusted_server_auction_response_v1(&canonical)
+                        .expect("reduced exact response should serialize"),
+                )
+                .expect("reduced exact response should be JSON");
+                assert_eq!(wire["seatbid"], json!([]));
+            } else {
+                assert_eq!(
+                    canonical.json.len(),
+                    MAX_BROWSER_AUCTION_PROJECTION_BYTES
+                        .checked_add_signed(delta)
+                        .expect("boundary size should remain positive")
+                );
+                if delta == 0 {
+                    let wire = serialize_trusted_server_auction_response_v1(&canonical)
+                        .expect("exact-boundary response should serialize");
+                    assert!(
+                        wire.len() <= MAX_BROWSER_AUCTION_PROJECTION_BYTES,
+                        "exact response should not exceed the admitted projection cap"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exact_openrtb_serializer_uses_reservation_and_trusted_server_join_only() {
+        let canonical = canonicalize_browser_auction_projection_v1(
+            projection_with_adm_lengths(&[7]),
+            "https://publisher.example",
+        )
+        .expect("projection should canonicalize");
+
+        let json: JsonValue = serde_json::from_slice(
+            &serialize_trusted_server_auction_response_v1(&canonical)
+                .expect("exact response should serialize"),
+        )
+        .expect("exact response should be JSON");
+
+        let bid = &json["seatbid"][0]["bid"][0];
+        assert_eq!(bid["id"], projection_reservation_id(0));
+        assert_eq!(bid["impid"], "slot-0");
+        assert!(
+            bid.get("adm").is_none(),
+            "tagged render_source should be the sole browser authority"
+        );
+        assert_eq!(json["cur"], "USD");
+        assert_eq!(
+            bid["ext"]["trusted_server"],
+            json!({
+                "candidate_id": projection_candidate_id(0),
+                "slot_id": "slot-0",
+                "render_source": {
+                    "type": "adm",
+                    "version": 1,
+                    "adm": "xxxxxxx",
+                    "width": 300,
+                    "height": 250,
+                }
+            })
+        );
+        assert_eq!(
+            json["ext"]["trusted_server"]["slot_results"],
+            serde_json::to_value(&canonical.projection.auction)
+                .expect("decision set should serialize")
+        );
+    }
+
+    #[test]
+    fn exact_openrtb_serializer_carries_identity_generation_failure_without_a_bid() {
+        let canonical = canonicalize_browser_auction_projection_v1(
+            BrowserAuctionProjectionV1 {
+                version: 1,
+                auction: AuctionDecisionSetV1 {
+                    version: 1,
+                    auction_id: "auction-identity-failure".to_string(),
+                    results: vec![SlotAuctionDecisionV1::Failed {
+                        slot: "slot-0".to_string(),
+                        reason: crate::auction::types::AuctionSlotFailureReason::IdentityGenerationFailed,
+                    }],
+                },
+                bids: Vec::new(),
+            },
+            "https://publisher.example",
+        )
+        .expect("identity failure decision should canonicalize");
+
+        let json: JsonValue = serde_json::from_slice(
+            &serialize_trusted_server_auction_response_v1(&canonical)
+                .expect("identity failure response should serialize"),
+        )
+        .expect("identity failure response should be JSON");
+
+        assert_eq!(json["seatbid"], json!([]));
+        assert_eq!(
+            json["ext"]["trusted_server"]["slot_results"]["results"][0],
+            json!({
+                "slot": "slot-0",
+                "outcome": "failed",
+                "reason": "identity_generation_failed",
+            })
         );
     }
 }

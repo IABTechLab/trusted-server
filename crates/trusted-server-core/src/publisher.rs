@@ -4166,7 +4166,7 @@ mod tests {
     use super::*;
     use crate::auction::orchestrator::OrchestrationResult;
     use crate::auction::types::{AdFormat, AdSlot, MediaType};
-    use crate::auction::types::{AuctionDropReason, AuctionResponse};
+    use crate::auction::types::{AuctionDecisionSetV1, AuctionDropReason, AuctionResponse};
     use crate::integrations::IntegrationRegistry;
     use crate::platform::test_support::{
         StubHttpClient, build_services_with_http_client, noop_services,
@@ -4180,6 +4180,9 @@ mod tests {
     fn make_test_bid_with_creative(creative: &str) -> Bid {
         Bid {
             slot_id: "slot".to_string(),
+            candidate_id: None,
+            candidate_provider: None,
+            renderer_reservation_id: None,
             price: Some(1.0),
             currency: "USD".to_string(),
             creative: Some(creative.to_string()),
@@ -4212,6 +4215,11 @@ mod tests {
             ],
             mediator_response: None,
             winning_bids: std::collections::HashMap::new(),
+            decision_set: AuctionDecisionSetV1 {
+                version: 1,
+                auction_id: "debug-auction".to_string(),
+                results: Vec::new(),
+            },
             total_time_ms: 665,
             metadata: std::collections::HashMap::new(),
         };
@@ -4253,6 +4261,11 @@ mod tests {
             provider_responses: vec![response],
             mediator_response: None,
             winning_bids: std::collections::HashMap::new(),
+            decision_set: AuctionDecisionSetV1 {
+                version: 1,
+                auction_id: "debug-auction".to_string(),
+                results: Vec::new(),
+            },
             total_time_ms: 12,
             metadata: std::collections::HashMap::new(),
         };
@@ -4299,6 +4312,11 @@ mod tests {
             provider_responses: vec![response],
             mediator_response: None,
             winning_bids: std::collections::HashMap::new(),
+            decision_set: AuctionDecisionSetV1 {
+                version: 1,
+                auction_id: "debug-auction".to_string(),
+                results: Vec::new(),
+            },
             total_time_ms: 12,
             metadata: std::collections::HashMap::new(),
         };
@@ -8448,6 +8466,9 @@ mod tests {
         ) -> Bid {
             Bid {
                 slot_id: slot_id.to_string(),
+                candidate_id: None,
+                candidate_provider: None,
+                renderer_reservation_id: None,
                 price: Some(price),
                 currency: "USD".to_string(),
                 creative: None,
@@ -8975,6 +8996,9 @@ mod tests {
         fn cached_bid_with_creative(creative: &str) -> Bid {
             Bid {
                 slot_id: "atf_sidebar_ad".to_string(),
+                candidate_id: None,
+                candidate_provider: None,
+                renderer_reservation_id: None,
                 price: Some(1.50),
                 currency: "USD".to_string(),
                 creative: Some(creative.to_string()),
@@ -9377,6 +9401,9 @@ mod tests {
                 "atf_sidebar_ad".to_string(),
                 Bid {
                     slot_id: "atf_sidebar_ad".to_string(),
+                    candidate_id: None,
+                    candidate_provider: None,
+                    renderer_reservation_id: None,
                     price: Some(1.50),
                     currency: "USD".to_string(),
                     creative: None,
@@ -9434,6 +9461,9 @@ mod tests {
                 "atf_sidebar_ad".to_string(),
                 Bid {
                     slot_id: "atf_sidebar_ad".to_string(),
+                    candidate_id: None,
+                    candidate_provider: None,
+                    renderer_reservation_id: None,
                     price: Some(0.50),
                     currency: "USD".to_string(),
                     creative: None,
@@ -9535,6 +9565,9 @@ mod tests {
                 "atf_sidebar_ad".to_string(),
                 Bid {
                     slot_id: "atf_sidebar_ad".to_string(),
+                    candidate_id: None,
+                    candidate_provider: None,
+                    renderer_reservation_id: None,
                     price: Some(1.00),
                     currency: "USD".to_string(),
                     creative: None,
@@ -9580,6 +9613,9 @@ mod tests {
                 "atf_sidebar_ad".to_string(),
                 Bid {
                     slot_id: "atf_sidebar_ad".to_string(),
+                    candidate_id: None,
+                    candidate_provider: None,
+                    renderer_reservation_id: None,
                     price: Some(0.50),
                     currency: "USD".to_string(),
                     creative: None,
@@ -9624,6 +9660,9 @@ mod tests {
                 "no-price-slot".to_string(),
                 Bid {
                     slot_id: "no-price-slot".to_string(),
+                    candidate_id: None,
+                    candidate_provider: None,
+                    renderer_reservation_id: None,
                     price: None,
                     currency: "USD".to_string(),
                     creative: None,
