@@ -156,6 +156,28 @@ describe('GptDiagnosticsStore', () => {
     );
   });
 
+  it('keeps no-response loads unmatched and overlapping response-bearing loads ambiguous', () => {
+    let now = 1;
+    const store = new GptDiagnosticsStore({ now: () => now });
+    const missingResponse = fakeSlot('missing-load-response');
+    store.recordSlotRequested(missingResponse);
+    store.recordSlotOnload(missingResponse);
+    const overlapping = fakeSlot('overlapping-load-response');
+    now = 2;
+    store.recordSlotRequested(overlapping);
+    now = 3;
+    store.recordSlotResponseReceived(overlapping);
+    now = 4;
+    store.recordSlotRequested(overlapping);
+    now = 5;
+    store.recordSlotResponseReceived(overlapping);
+    now = 6;
+    store.recordSlotOnload(overlapping);
+
+    expect(store.snapshot().coverage.slotOnload).toMatchObject({ unmatched: 1, ambiguous: 1 });
+    assertCoverageEquation(store);
+  });
+
   it('matches load and viewability after a render with unknown fill state', () => {
     let now = 1;
     const store = new GptDiagnosticsStore({ now: () => now });
@@ -662,6 +684,30 @@ describe('GptDiagnosticsStore', () => {
     expect(deferred).toHaveLength(3);
   });
 
+  it('keeps repeated source evidence single-source and increments consumed intent IDs', () => {
+    let now = 1;
+    const store = new GptDiagnosticsStore({ now: () => now, defer: () => undefined });
+    const first = fakeSlot('repeat-intent-first');
+    const second = fakeSlot('repeat-intent-second');
+    store.recordPublisherRefresh([first]);
+    now = 2;
+    store.recordPublisherRefresh([first]);
+    store.recordSlotRequested(first);
+    now = 3;
+    store.recordTrustedServerOpportunity(second, 'second-auction', 'no_candidate');
+    store.recordPublisherRefresh([second]);
+    store.recordSlotRequested(second);
+
+    expect(store.snapshot().slots[0].requests[0]).toMatchObject({
+      requestPath: 'publisher_refresh',
+      requestIntentId: 1,
+    });
+    expect(store.snapshot().slots[1].requests[0]).toMatchObject({
+      requestPath: 'competing',
+      requestIntentId: 2,
+    });
+  });
+
   it('derives a replacement from the most recent earlier filled render', () => {
     let now = 1;
     const store = new GptDiagnosticsStore({ now: () => now });
@@ -796,6 +842,31 @@ describe('GptDiagnosticsStore', () => {
       trustedServerOpportunity: 'no_candidate',
     });
     expect(store.snapshot().slots[0].requests[0].trustedServerAuctionId).toBeUndefined();
+  });
+
+  it('retains only valid bounded auction IDs without dropping Trusted Server intent', () => {
+    const valid = 'a'.repeat(256);
+    const cases: Array<[unknown, string | undefined]> = [
+      [valid, valid],
+      ['', undefined],
+      ['   ', undefined],
+      [123, undefined],
+      ['é'.repeat(129), undefined],
+    ];
+    for (const [auctionId, expected] of cases) {
+      const store = new GptDiagnosticsStore({ now: () => 1, defer: () => undefined });
+      const slot = fakeSlot(`auction-id-${String(auctionId).length}`);
+      store.recordTrustedServerOpportunity(
+        slot,
+        'auction-slot',
+        'renderable_candidate',
+        auctionId as string
+      );
+      store.recordSlotRequested(slot);
+      const cycle = store.snapshot().slots[0].requests[0];
+      expect(cycle.requestPath).toBe('trusted_server_direct');
+      expect(cycle.trustedServerAuctionId).toBe(expected);
+    }
   });
 
   it('does not mutate an open request cycle when a later direct marker arrives', () => {

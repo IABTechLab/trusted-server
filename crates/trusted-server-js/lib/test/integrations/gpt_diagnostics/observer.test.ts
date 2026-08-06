@@ -163,6 +163,31 @@ describe('GptDiagnosticsObserver', () => {
     expect(originalRefresh).toHaveBeenCalledTimes(5);
   });
 
+  it('delegates when the shared diagnostics context accessor throws', () => {
+    const store = fakeStore();
+    const gpt = controlledGpt();
+    const slot = fakeSlot();
+    const originalRefresh = vi.fn(() => 'delegated');
+    gpt.pubads.refresh = originalRefresh;
+    Object.assign(gpt.pubads, { getSlots: () => [slot] });
+    const target = { googletag: gpt.googletag } as {
+      googletag: typeof gpt.googletag;
+      tsjs?: unknown;
+    };
+    Object.defineProperty(target, 'tsjs', {
+      get: () => {
+        throw new Error('context unavailable');
+      },
+    });
+    const observer = new GptDiagnosticsObserver(store, { window: target });
+    observer.install();
+    gpt.googletag.cmd[0]();
+
+    expect(gpt.pubads.refresh()).toBe('delegated');
+    expect(originalRefresh).toHaveBeenCalledTimes(1);
+    expect(store.recordPublisherRefresh).not.toHaveBeenCalled();
+  });
+
   it('creates a command queue and waits when GPT is absent', () => {
     const store = fakeStore();
     const delayedWindow: {
