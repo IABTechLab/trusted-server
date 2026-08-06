@@ -76,12 +76,38 @@ function formatMilliseconds(value: number | undefined): string | undefined {
   return `${Math.round(value)} ms`;
 }
 
+function deliveryLabel(cycle: GptDiagnosticsRequestCycle): string | undefined {
+  if (cycle.trustedServerCreativeResponseAtMs !== undefined) return 'TS response sent';
+  if (cycle.trustedServerCreativeRequestAtMs !== undefined) return 'TS selected';
+
+  switch (cycle.delivery) {
+    case 'trusted_server_response_sent':
+      return 'TS response sent';
+    case 'trusted_server_selected':
+      return 'TS selected';
+    case 'pending':
+      return 'TS candidate (pending)';
+    case 'candidate_unconfirmed':
+      return 'TS unconfirmed';
+    case 'no_candidate':
+      return 'No TS candidate';
+    case 'unknown':
+      return 'Delivery unknown';
+    case 'not_applicable':
+    default:
+      return undefined;
+  }
+}
+
 function badgeText(cycle: GptDiagnosticsRequestCycle): string {
   const firstLine: string[] = [];
   if (cycle.isEmpty === true) firstLine.push('Empty');
   else if (cycle.isEmpty === false) firstLine.push('Filled');
   else if (cycle.renderAtMs !== undefined) firstLine.push('Rendered (fill unknown)');
   else firstLine.push('Pending');
+  const delivery = deliveryLabel(cycle);
+  if (delivery) firstLine.push(delivery);
+  if (cycle.requestPath === 'competing') firstLine.push('Competing paths');
   if (cycle.size) firstLine.push(`${cycle.size[0]}×${cycle.size[1]}`);
 
   const timingLine: string[] = [];

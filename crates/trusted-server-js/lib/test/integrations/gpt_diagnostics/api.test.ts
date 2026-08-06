@@ -37,12 +37,215 @@ function readBlob(blob: Blob): Promise<string> {
   });
 }
 
+function emptyCoverage() {
+  return {
+    slotRequested: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
+    slotResponseReceived: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
+    slotRenderEnded: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
+    slotOnload: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
+    impressionViewable: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
+    slotVisibilityChanged: { observed: 0, matched: 0, unmatched: 0, ambiguous: 0 },
+  };
+}
+
+function fakeApiStore() {
+  return {
+    snapshot: vi.fn(() => ({
+      gptObserved: false,
+      slots: [],
+      callbackIssues: [],
+      attributionIssues: [],
+      coverage: emptyCoverage(),
+      metadata: {
+        droppedCallbacks: 0,
+        droppedAttributionIssues: 0,
+        evictedSlots: 0,
+        evictedRequestCycles: 0,
+      },
+    })),
+    subscribe: vi.fn(() => () => undefined),
+    recordTrustedServerOpportunity: vi.fn(),
+    recordPrebidRefresh: vi.fn(),
+    recordTrustedServerCreativeRequest: vi.fn((_auctionSlotId: string) => 41),
+    recordTrustedServerCreativeResponse: vi.fn(),
+    recordTrustedServerCreativeFailure: vi.fn(),
+  };
+}
+
 beforeEach(() => {
   vi.restoreAllMocks();
   window.history.replaceState({}, '', '/article?private=value#fragment');
 });
 
 describe('GptDiagnosticsApiController', () => {
+  it('delegates attribution writers with exact arguments and returns the attempt ID', () => {
+    const store = fakeApiStore();
+    const controller = new GptDiagnosticsApiController(store, new FakeBindings(), {
+      show: vi.fn(),
+      hide: vi.fn(),
+    });
+    const slot = fakeSlot();
+    const slots = [slot];
+
+    controller.api.recordTrustedServerOpportunity(
+      slot,
+      'auction-slot-example',
+      'renderable_candidate'
+    );
+    controller.api.recordPrebidRefresh(slots);
+    const attemptId = controller.api.recordTrustedServerCreativeRequest('auction-slot-example');
+    controller.api.recordTrustedServerCreativeResponse(41);
+    controller.api.recordTrustedServerCreativeFailure(41, 'cache_fetch_failed');
+
+    expect(store.recordTrustedServerOpportunity).toHaveBeenCalledTimes(1);
+    expect(store.recordTrustedServerOpportunity).toHaveBeenCalledWith(
+      slot,
+      'auction-slot-example',
+      'renderable_candidate'
+    );
+    expect(store.recordPrebidRefresh).toHaveBeenCalledTimes(1);
+    expect(store.recordPrebidRefresh).toHaveBeenCalledWith(slots);
+    expect(store.recordTrustedServerCreativeRequest).toHaveBeenCalledTimes(1);
+    expect(store.recordTrustedServerCreativeRequest).toHaveBeenCalledWith('auction-slot-example');
+    expect(attemptId).toBe(41);
+    expect(store.recordTrustedServerCreativeResponse).toHaveBeenCalledTimes(1);
+    expect(store.recordTrustedServerCreativeResponse).toHaveBeenCalledWith(41);
+    expect(store.recordTrustedServerCreativeFailure).toHaveBeenCalledTimes(1);
+    expect(store.recordTrustedServerCreativeFailure).toHaveBeenCalledWith(41, 'cache_fetch_failed');
+  });
+
+  it('forwards an optional opaque auction ID without changing diagnostics fail-open behavior', () => {
+    const store = fakeApiStore();
+    const controller = new GptDiagnosticsApiController(store, new FakeBindings(), {
+      show: vi.fn(),
+      hide: vi.fn(),
+    });
+    const slot = fakeSlot();
+
+    controller.api.recordTrustedServerOpportunity(
+      slot,
+      'auction-slot-example',
+      'renderable_candidate',
+      'auction-123'
+    );
+
+    expect(store.recordTrustedServerOpportunity).toHaveBeenCalledWith(
+      slot,
+      'auction-slot-example',
+      'renderable_candidate',
+      'auction-123'
+    );
+  });
+
+  it('swallows every attribution writer failure without changing ad delivery', () => {
+    const failure = new Error('diagnostics failed');
+    const store = {
+      ...fakeApiStore(),
+      recordTrustedServerOpportunity: vi.fn(() => {
+        throw failure;
+      }),
+      recordPrebidRefresh: vi.fn(() => {
+        throw failure;
+      }),
+      recordTrustedServerCreativeRequest: vi.fn((_auctionSlotId: string): number | undefined => {
+        throw failure;
+      }),
+      recordTrustedServerCreativeResponse: vi.fn(() => {
+        throw failure;
+      }),
+      recordTrustedServerCreativeFailure: vi.fn(() => {
+        throw failure;
+      }),
+    };
+    const controller = new GptDiagnosticsApiController(store, new FakeBindings(), {
+      show: vi.fn(),
+      hide: vi.fn(),
+    });
+    const slot = fakeSlot();
+
+    expect(() =>
+      controller.api.recordTrustedServerOpportunity(
+        slot,
+        'auction-slot-example',
+        'renderable_candidate'
+      )
+    ).not.toThrow();
+    expect(() => controller.api.recordPrebidRefresh([slot])).not.toThrow();
+    expect(
+      controller.api.recordTrustedServerCreativeRequest('auction-slot-example')
+    ).toBeUndefined();
+    expect(() => controller.api.recordTrustedServerCreativeResponse(41)).not.toThrow();
+    expect(() =>
+      controller.api.recordTrustedServerCreativeFailure(41, 'response_post_failed')
+    ).not.toThrow();
+  });
+
+  it('detaches nested attribution evidence from the store snapshot', () => {
+    const source = {
+      gptObserved: true,
+      slots: [
+        {
+          runtimeSlotNumber: 1,
+          requests: [
+            {
+              requestNumber: 1,
+              durations: {},
+              incompleteSequence: false,
+              adManager: {
+                yieldGroupIds: [10],
+                companyIds: [20],
+              },
+              trustedServerCreativeFailures: ['cache_fetch_failed' as const],
+            },
+          ],
+        },
+      ],
+      callbackIssues: [],
+      attributionIssues: [
+        {
+          reason: 'creative_attempt_expired' as const,
+          timestampMs: 30,
+        },
+      ],
+      coverage: emptyCoverage(),
+      metadata: {
+        droppedCallbacks: 0,
+        droppedAttributionIssues: 2,
+        evictedSlots: 0,
+        evictedRequestCycles: 0,
+      },
+    };
+    const store = {
+      ...fakeApiStore(),
+      snapshot: vi.fn(() => source),
+    };
+    const controller = new GptDiagnosticsApiController(store, new FakeBindings(), {
+      show: vi.fn(),
+      hide: vi.fn(),
+    });
+
+    const snapshot = controller.api.snapshot();
+    const cycle = snapshot.slots[0]?.requests[0];
+
+    expect(snapshot.attributionIssues).toEqual(source.attributionIssues);
+    expect(snapshot.attributionIssues).not.toBe(source.attributionIssues);
+    expect(snapshot.attributionIssues?.[0]).not.toBe(source.attributionIssues[0]);
+    expect(cycle?.trustedServerCreativeFailures).toEqual(['cache_fetch_failed']);
+    expect(cycle?.trustedServerCreativeFailures).not.toBe(
+      source.slots[0]?.requests[0]?.trustedServerCreativeFailures
+    );
+    expect(cycle?.adManager?.yieldGroupIds).toEqual([10]);
+    expect(cycle?.adManager?.yieldGroupIds).not.toBe(
+      source.slots[0]?.requests[0]?.adManager.yieldGroupIds
+    );
+    expect(cycle?.adManager?.companyIds).toEqual([20]);
+    expect(cycle?.adManager?.companyIds).not.toBe(
+      source.slots[0]?.requests[0]?.adManager.companyIds
+    );
+    expect(snapshot.metadata).not.toBe(source.metadata);
+    expect(snapshot.metadata.droppedAttributionIssues).toBe(2);
+  });
+
   it('creates a fresh V1 allowlist snapshot with current binding facts', () => {
     let monotonicNow = 10;
     const store = new GptDiagnosticsStore({

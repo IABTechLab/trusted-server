@@ -1,5 +1,5 @@
 import { log } from '../../core/log';
-import type { Size } from '../../core/types';
+import type { GptDiagnosticsAdManagerIdentity, Size, TsjsApi } from '../../core/types';
 
 import type { GptDiagnosticsSlotLike, GptRenderFacts } from './store';
 
@@ -11,6 +11,7 @@ export interface GptDiagnosticsObserverStore {
   recordSlotOnload(slot: GptDiagnosticsSlotLike): void;
   recordImpressionViewable(slot: GptDiagnosticsSlotLike): void;
   recordSlotVisibilityChanged(slot: GptDiagnosticsSlotLike, percentage: number): void;
+  recordPublisherRefresh(slots: GptDiagnosticsSlotLike[]): void;
 }
 
 interface GptEvent {
@@ -22,6 +23,14 @@ interface GptRenderEvent extends GptEvent {
   size?: unknown;
   isBackfill?: boolean;
   slotContentChanged?: boolean;
+  lineItemId?: unknown;
+  creativeId?: unknown;
+  campaignId?: unknown;
+  advertiserId?: unknown;
+  sourceAgnosticLineItemId?: unknown;
+  sourceAgnosticCreativeId?: unknown;
+  yieldGroupIds?: unknown;
+  companyIds?: unknown;
 }
 
 interface GptVisibilityEvent extends GptEvent {
@@ -40,6 +49,8 @@ type GptEventListener = (event: GptEvent) => void;
 
 interface GptPubAdsService {
   addEventListener(name: GptEventName, listener: GptEventListener): void;
+  refresh?: (...args: unknown[]) => unknown;
+  getSlots?: () => unknown;
 }
 
 interface GptCommandQueue {
@@ -53,6 +64,7 @@ interface GoogletagLike {
 
 export interface GptObserverWindow {
   googletag?: GoogletagLike;
+  tsjs?: Pick<TsjsApi, 'adInitRefreshInProgress' | 'prebidRefreshDispatchInProgress'>;
 }
 
 interface ObserverLogger {
@@ -77,6 +89,50 @@ function normalizeSize(value: unknown): Size | undefined {
   }
 
   return [value[0], value[1]];
+}
+
+const MAX_AD_MANAGER_ID_LIST = 8;
+const REFRESH_OBSERVER_INSTALLED = Symbol('gptDiagnosticsRefreshObserverInstalled');
+
+function normalizeAdManagerId(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+function normalizeAdManagerIdList(value: unknown): number[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+
+  const ids = value
+    .map(normalizeAdManagerId)
+    .filter((id): id is number => id !== undefined)
+    .slice(0, MAX_AD_MANAGER_ID_LIST);
+  return ids.length > 0 ? ids : undefined;
+}
+
+/**
+ * Collects the Ad Manager identifiers `slotRenderEnded` exposes.
+ *
+ * GPT reports these only for reservation and backfill ads served by
+ * PubAdsService, so an absent value is itself a fact about the render rather
+ * than a gap in observation.
+ */
+function normalizeAdManagerIdentity(
+  event: GptRenderEvent
+): GptDiagnosticsAdManagerIdentity | undefined {
+  const identity: GptDiagnosticsAdManagerIdentity = {
+    lineItemId: normalizeAdManagerId(event.lineItemId),
+    creativeId: normalizeAdManagerId(event.creativeId),
+    campaignId: normalizeAdManagerId(event.campaignId),
+    advertiserId: normalizeAdManagerId(event.advertiserId),
+    sourceAgnosticLineItemId: normalizeAdManagerId(event.sourceAgnosticLineItemId),
+    sourceAgnosticCreativeId: normalizeAdManagerId(event.sourceAgnosticCreativeId),
+    yieldGroupIds: normalizeAdManagerIdList(event.yieldGroupIds),
+    companyIds: normalizeAdManagerIdList(event.companyIds),
+  };
+
+  for (const key of Object.keys(identity) as Array<keyof GptDiagnosticsAdManagerIdentity>) {
+    if (identity[key] === undefined) delete identity[key];
+  }
+  return Object.keys(identity).length > 0 ? identity : undefined;
 }
 
 /** Installs documented GPT event listeners through `googletag.cmd`. */
@@ -137,6 +193,7 @@ export class GptDiagnosticsObserver {
               typeof renderEvent.slotContentChanged === 'boolean'
                 ? renderEvent.slotContentChanged
                 : undefined,
+            adManager: normalizeAdManagerIdentity(renderEvent),
           });
         });
       });
@@ -156,6 +213,12 @@ export class GptDiagnosticsObserver {
         });
       });
 
+      try {
+        this.installRefreshObserver(pubads);
+      } catch (error) {
+        this.logger.warn('gpt diagnostics: refresh observer installation failed', error);
+      }
+
       this.installed = true;
       this.store.markGptObserved();
     } catch (error) {
@@ -169,5 +232,42 @@ export class GptDiagnosticsObserver {
     } catch (error) {
       this.logger.warn(`gpt diagnostics: ${kind} callback failed`, error);
     }
+  }
+
+  private installRefreshObserver(pubads: GptPubAdsService): void {
+    if (
+      typeof pubads.refresh !== 'function' ||
+      (pubads as GptPubAdsService & { [REFRESH_OBSERVER_INSTALLED]?: boolean })[
+        REFRESH_OBSERVER_INSTALLED
+      ]
+    ) {
+      return;
+    }
+    const originalRefresh = pubads.refresh;
+    const { store, window: observerWindow } = this;
+    pubads.refresh = function (this: unknown, ...args: unknown[]): unknown {
+      try {
+        if (
+          !(
+            observerWindow.tsjs?.adInitRefreshInProgress ||
+            observerWindow.tsjs?.prebidRefreshDispatchInProgress
+          )
+        ) {
+          const rawSlots = args.length === 0 ? pubads.getSlots?.() : args[0];
+          const slots = Array.isArray(rawSlots)
+            ? rawSlots.filter(
+                (slot): slot is GptDiagnosticsSlotLike => typeof slot === 'object' && slot !== null
+              )
+            : [];
+          if (slots.length > 0) store.recordPublisherRefresh(slots);
+        }
+      } catch {
+        // Diagnostics must not affect the original refresh.
+      }
+      return Reflect.apply(originalRefresh, this, args);
+    };
+    (pubads as GptPubAdsService & { [REFRESH_OBSERVER_INSTALLED]?: boolean })[
+      REFRESH_OBSERVER_INSTALLED
+    ] = true;
   }
 }
