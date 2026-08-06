@@ -199,16 +199,6 @@ impl Permission {
         }
     }
 
-    /// The IAB TCF Europe purpose number (1 to 11), or `None` for a Data Use
-    /// with no dedicated variant.
-    #[must_use]
-    pub const fn tcf_purpose(self) -> Option<u8> {
-        match self {
-            Permission::Extra(_) => None,
-            named => Some(named.index() + 1),
-        }
-    }
-
     /// The single-bit mask for this permission within a [`PermissionSet`].
     const fn bit(self) -> u128 {
         1 << self.index()
@@ -357,6 +347,103 @@ impl CountryRules {
     }
 }
 
+/// Which Data Uses a signal revokes.
+#[derive(Debug, Clone, Default)]
+enum RevokeSet {
+    /// The signal revokes nothing.
+    #[default]
+    None,
+    /// The signal revokes every Data Use (the map bounds what a revoke drops).
+    All,
+    /// The signal revokes only the listed Data Uses.
+    Set(PermissionSet),
+}
+
+/// How each session signal maps onto permissions, parsed from the `signals`
+/// section of `permissions.yaml`.
+///
+/// The permission model holds this as data so the consent mapping applies it
+/// rather than encoding any signal policy in the code. It is jurisdiction-free:
+/// it says only how a decoded signal grants or revokes each Data Use, and the
+/// country/region baseline decides the rest.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SignalPolicy {
+    /// Whether a present TCF record overrides the opt-out signals.
+    tcf_authoritative: bool,
+    /// Permission bit index to the TCF purpose number that grants it.
+    tcf_purpose: BTreeMap<u8, u8>,
+    /// The signals that constitute a US-style opt-out.
+    opt_out_sources: Vec<OptOutSource>,
+    /// Which Data Uses a US-style opt-out revokes.
+    opt_out_revokes: RevokeSet,
+}
+
+impl SignalPolicy {
+    /// Whether a present TCF record overrides the opt-out signals.
+    pub(crate) fn tcf_authoritative(&self) -> bool {
+        self.tcf_authoritative
+    }
+
+    /// The TCF purpose number that grants `permission`, or `None` when no purpose
+    /// maps to it.
+    pub(crate) fn tcf_purpose(&self, permission: Permission) -> Option<u8> {
+        self.tcf_purpose.get(&permission.index()).copied()
+    }
+
+    /// The signals that constitute a US-style opt-out.
+    pub(crate) fn opt_out_sources(&self) -> &[OptOutSource] {
+        &self.opt_out_sources
+    }
+
+    /// Whether a US-style opt-out revokes `permission`.
+    pub(crate) fn opt_out_revokes(&self, permission: Permission) -> bool {
+        match &self.opt_out_revokes {
+            RevokeSet::None => false,
+            RevokeSet::All => true,
+            RevokeSet::Set(set) => set.contains(permission),
+        }
+    }
+}
+
+/// Builds a validated [`SignalPolicy`] from the parsed `signals` section,
+/// erroring when it names an unknown Data Use or revoke rule.
+fn build_signal_policy(spec: &SignalsSpec) -> Result<SignalPolicy, PermissionsError> {
+    let mut policy = SignalPolicy::default();
+    if let Some(tcf) = &spec.tcf {
+        policy.tcf_authoritative = tcf.authoritative;
+        for (purpose, data_use) in &tcf.purposes {
+            let permission = Permission::from_identifier(data_use).ok_or_else(|| {
+                PermissionsError::UnknownPermission {
+                    name: data_use.clone(),
+                }
+            })?;
+            policy.tcf_purpose.insert(permission.index(), *purpose);
+        }
+    }
+    if let Some(opt_out) = &spec.us_opt_out {
+        policy.opt_out_sources = opt_out.sources.clone();
+        policy.opt_out_revokes = match &opt_out.revokes {
+            RevokeSpec::Keyword(keyword) if keyword == "all" => RevokeSet::All,
+            RevokeSpec::Keyword(other) => {
+                return Err(PermissionsError::UnknownRevoke {
+                    value: other.clone(),
+                });
+            }
+            RevokeSpec::List(names) => {
+                let mut set = PermissionSet::none();
+                for name in names {
+                    let permission = Permission::from_identifier(name).ok_or_else(|| {
+                        PermissionsError::UnknownPermission { name: name.clone() }
+                    })?;
+                    set = set.with(permission);
+                }
+                RevokeSet::Set(set)
+            }
+        };
+    }
+    Ok(policy)
+}
+
 /// Looks up the [`CountryRules`] for a request's country and region.
 ///
 /// `by_country` is keyed on the ISO 3166-1 alpha-2 code a geo provider returns
@@ -370,6 +457,7 @@ impl CountryRules {
 pub struct PermissionMaps {
     by_country: BTreeMap<String, CountryRules>,
     by_region: BTreeMap<String, CountryRules>,
+    signals: SignalPolicy,
 }
 
 /// The default permission rules, compiled into the build from the human-editable
@@ -391,6 +479,14 @@ impl PermissionMaps {
     #[must_use]
     pub fn empty() -> Self {
         Self::default()
+    }
+
+    /// The signal-to-permission policy parsed from the `signals` section of
+    /// `permissions.yaml`. The consent mapping reads this rather than encoding
+    /// any signal policy in the code.
+    #[must_use]
+    pub(crate) fn signals(&self) -> &SignalPolicy {
+        &self.signals
     }
 
     /// Registers explicit rules for an ISO 3166-1 alpha-2 country code.
@@ -466,6 +562,7 @@ impl PermissionMaps {
                 None => maps = maps.with_country(key, rules),
             }
         }
+        maps.signals = build_signal_policy(&file.signals)?;
         Ok(maps)
     }
 
@@ -635,6 +732,77 @@ struct RulesFile {
     /// Rules keyed by country (`FR`) or country and region (`US/CA`).
     #[serde(default)]
     rules: BTreeMap<String, RuleSpec>,
+    /// How each session signal maps onto Data Uses.
+    #[serde(default)]
+    signals: SignalsSpec,
+}
+
+/// The `signals` section: how each signal source maps onto Data Uses. Parsed
+/// into a [`SignalPolicy`] by [`build_signal_policy`].
+#[derive(Debug, Default, Deserialize)]
+struct SignalsSpec {
+    /// The TCF record mapping, or `None` when the file declares no TCF policy.
+    #[serde(default)]
+    tcf: Option<TcfSignalSpec>,
+    /// The US-style opt-out mapping, or `None` when none is declared.
+    #[serde(default)]
+    us_opt_out: Option<OptOutSpec>,
+}
+
+/// The `signals.tcf` block.
+#[derive(Debug, Deserialize)]
+struct TcfSignalSpec {
+    /// Whether a present TCF record overrides the opt-out signals.
+    #[serde(default = "default_true")]
+    authoritative: bool,
+    /// TCF purpose number to the Data Use it grants (and revokes when the record
+    /// does not consent to that purpose).
+    #[serde(default)]
+    purposes: BTreeMap<u8, String>,
+}
+
+/// The `signals.us_opt_out` block.
+#[derive(Debug, Deserialize)]
+struct OptOutSpec {
+    /// The signals that constitute a US-style opt-out.
+    #[serde(default)]
+    sources: Vec<OptOutSource>,
+    /// Which Data Uses the opt-out revokes.
+    #[serde(default)]
+    revokes: RevokeSpec,
+}
+
+/// A `revokes` value: the keyword `all`, or an explicit list of Data Uses.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RevokeSpec {
+    /// A bare keyword, expected to be `all`.
+    Keyword(String),
+    /// An explicit list of Data Use identifiers.
+    List(Vec<String>),
+}
+
+impl Default for RevokeSpec {
+    fn default() -> Self {
+        RevokeSpec::List(Vec::new())
+    }
+}
+
+/// A single US-style opt-out signal source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OptOutSource {
+    /// The `Sec-GPC` request header (Global Privacy Control).
+    Gpc,
+    /// A GPP US sale opt-out.
+    GppSaleOptOut,
+    /// A US Privacy string sale opt-out.
+    UsPrivacyOptOut,
+}
+
+/// Default for `#[serde(default = ...)]` on a `bool` field that should be `true`.
+fn default_true() -> bool {
+    true
 }
 
 /// A rule entry: either a bare group name, or a group with explicit
@@ -765,6 +933,9 @@ pub enum PermissionsError {
     /// A rule modification did not start with `+` or `-`.
     #[display("permission modification `{value}` must start with `+` or `-`")]
     InvalidModification { value: String },
+    /// A `signals` opt-out `revokes` value was neither `all` nor a list.
+    #[display("unknown revoke rule `{value}` (expected `all` or a list of Data Uses)")]
+    UnknownRevoke { value: String },
 }
 
 impl core::error::Error for PermissionsError {}
@@ -799,27 +970,18 @@ mod tests {
     }
 
     #[test]
-    fn permission_set_iterates_in_purpose_order() {
+    fn permission_set_iterates_in_bit_index_order() {
         let set = PermissionSet::none()
             .with(Permission::SelectBasicAds)
             .with(Permission::StoreOnDevice);
-        let order: Vec<u8> = set.iter().filter_map(Permission::tcf_purpose).collect();
+        let order: Vec<&str> = set.iter().map(Permission::as_str).collect();
         assert_eq!(
             order,
-            vec![1, 2],
-            "iteration should be in TCF purpose order"
-        );
-    }
-
-    #[test]
-    fn tcf_purpose_numbers_are_one_to_eleven() {
-        let numbers: Vec<u8> = Permission::all()
-            .filter_map(Permission::tcf_purpose)
-            .collect();
-        assert_eq!(
-            numbers,
-            (1..=11).collect::<Vec<_>>(),
-            "the named purposes should be 1..=11"
+            vec![
+                "necessary.operations.storage",
+                "advertising_marketing.first_party.contextual"
+            ],
+            "iteration should be in stable bit-index order"
         );
     }
 
@@ -1191,6 +1353,73 @@ rules:
         assert!(
             matches!(err, PermissionsError::InvalidModification { .. }),
             "should report an invalid modification, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_yaml_parses_the_signals_section_into_a_policy() {
+        let yaml = "\
+groups:
+  g:
+    default: requires_signal
+rules:
+  FR: g
+signals:
+  tcf:
+    authoritative: true
+    purposes:
+      1: necessary.operations.storage
+      4: advertising_marketing.first_party.targeted
+  us_opt_out:
+    sources: [gpc]
+    revokes: [advertising_marketing.first_party.targeted]
+";
+        let maps = PermissionMaps::from_yaml(yaml).expect("should parse the signals section");
+        let signals = maps.signals();
+        assert!(signals.tcf_authoritative(), "tcf should be authoritative");
+        assert_eq!(
+            signals.tcf_purpose(Permission::StoreOnDevice),
+            Some(1),
+            "Purpose 1 should map to device storage"
+        );
+        assert_eq!(
+            signals.tcf_purpose(Permission::SelectPersonalisedAds),
+            Some(4),
+            "Purpose 4 should map to targeted advertising"
+        );
+        assert_eq!(
+            signals.tcf_purpose(Permission::CreateAdsProfile),
+            None,
+            "an unmapped Data Use has no purpose"
+        );
+        assert!(
+            signals.opt_out_revokes(Permission::SelectPersonalisedAds),
+            "a listed Data Use is revoked by the opt-out"
+        );
+        assert!(
+            !signals.opt_out_revokes(Permission::StoreOnDevice),
+            "an unlisted Data Use is not revoked by the opt-out"
+        );
+    }
+
+    #[test]
+    fn from_yaml_rejects_an_unknown_revoke_keyword() {
+        let yaml = "\
+groups:
+  g:
+    default: requires_signal
+rules:
+  FR: g
+signals:
+  us_opt_out:
+    sources: [gpc]
+    revokes: everything
+";
+        let err = PermissionMaps::from_yaml(yaml)
+            .expect_err("an unknown revoke keyword should be rejected");
+        assert!(
+            matches!(err, PermissionsError::UnknownRevoke { .. }),
+            "should report an unknown revoke rule, got {err:?}"
         );
     }
 }

@@ -14,7 +14,9 @@ use error_stack::Report;
 use crate::consent::ConsentContext;
 use crate::error::TrustedServerError;
 use crate::evidence::HostSignals;
-use crate::permissions::{ConsentSignal, Permission, PermissionMaps, PermissionState};
+use crate::permissions::{
+    ConsentSignal, OptOutSource, Permission, PermissionMaps, PermissionState, SignalPolicy,
+};
 use crate::platform::GeoInfo;
 use crate::settings::Settings;
 
@@ -82,46 +84,74 @@ pub fn assemble_permissions(
         geo.and_then(|info| info.region.as_deref()),
         default_country,
         default_region,
-        permission_signal(consent),
+        permission_signal(consent, maps.signals()),
     )
 }
 
-/// Maps a consent context to a [`ConsentSignal`] for each permission.
+/// Maps a consent context to a [`ConsentSignal`] for each permission, applying
+/// the [`SignalPolicy`] the permission model parsed from `permissions.yaml`.
 ///
-/// This is the only place the EC subsystem reads consent signals, and it is
-/// jurisdiction-free. A TCF record is authoritative wherever it is present (a CMP
-/// under GDPR emits it): it grants or refuses each purpose it carries directly,
-/// and a US-style opt-out does not override it. With no TCF record, a US-style
-/// opt-out (GPC, GPP sale opt-out, or US Privacy opt-out) revokes the permission,
-/// and anything else is neutral so the country/region baseline stands.
+/// This is the only place the EC subsystem reads consent signals. The policy,
+/// not this function, decides which sources are authoritative, which TCF purpose
+/// maps to which Data Use, and what a US-style opt-out revokes. This function
+/// only decodes the request and applies that policy, so no signal-to-permission
+/// policy lives in the code.
 ///
-/// Whether a `Revoke` changes anything is decided by the map: it drops a
-/// `granted` baseline and has nothing to drop where the permission is
-/// `requires_signal`. Only the two permissions that Edge Cookie identity and
-/// bidstream EIDs depend on are resolved against a signal:
-/// [`Permission::StoreOnDevice`] (TCF Purpose 1) and
-/// [`Permission::SelectPersonalisedAds`] (TCF Purpose 4); every other permission
-/// is neutral so its baseline stands.
-fn permission_signal(consent: &ConsentContext) -> impl Fn(Permission) -> ConsentSignal + '_ {
+/// It considers every source the policy names: a TCF record (a standalone TC
+/// string or the EU TCF section of a GPP string), and the US-style opt-out
+/// signals (GPC, a GPP sale opt-out, or a US Privacy opt-out). When the policy
+/// marks TCF authoritative, a present TCF record wins and a US-style opt-out does
+/// not override it. Each permission is granted when the TCF record consents to
+/// the purpose the policy maps to it, and revoked when it does not. A Data Use
+/// the policy maps to no purpose stays neutral, so its baseline stands.
+///
+/// With no authoritative TCF record, a US-style opt-out revokes the Data Uses the
+/// policy lists and anything else is neutral. Whether a `Revoke` changes anything
+/// is decided by the country/region map, which drops a `granted` baseline and has
+/// nothing to drop where the permission is `requires_signal` or `denied`.
+fn permission_signal<'a>(
+    consent: &'a ConsentContext,
+    signals: &'a SignalPolicy,
+) -> impl Fn(Permission) -> ConsentSignal + 'a {
     move |permission| {
-        if let Some(tcf) = crate::consent::effective_tcf(consent) {
-            let consented = match permission {
-                Permission::StoreOnDevice => tcf.has_storage_consent(),
-                Permission::SelectPersonalisedAds => tcf.has_personalized_ads_consent(),
-                _ => return ConsentSignal::Neutral,
-            };
-            return if consented {
-                ConsentSignal::Grant
-            } else {
-                ConsentSignal::Revoke
+        if signals.tcf_authoritative()
+            && let Some(tcf) = crate::consent::effective_tcf(consent)
+        {
+            return match signals.tcf_purpose(permission) {
+                Some(purpose) => {
+                    if tcf.has_purpose_consent(usize::from(purpose)) {
+                        ConsentSignal::Grant
+                    } else {
+                        ConsentSignal::Revoke
+                    }
+                }
+                None => ConsentSignal::Neutral,
             };
         }
-        if crate::consent::has_storage_optout_signal(consent) {
+        if opt_out_present(consent, signals.opt_out_sources())
+            && signals.opt_out_revokes(permission)
+        {
             ConsentSignal::Revoke
         } else {
             ConsentSignal::Neutral
         }
     }
+}
+
+/// Whether the request carries any of the `sources` a US-style opt-out is
+/// declared to use. Decoding only, so the policy (not this function) decides
+/// which sources count and what the opt-out revokes.
+fn opt_out_present(consent: &ConsentContext, sources: &[OptOutSource]) -> bool {
+    sources.iter().any(|source| match source {
+        OptOutSource::Gpc => consent.gpc,
+        OptOutSource::GppSaleOptOut => {
+            consent.gpp.as_ref().and_then(|gpp| gpp.us_sale_opt_out) == Some(true)
+        }
+        OptOutSource::UsPrivacyOptOut => consent
+            .us_privacy
+            .as_ref()
+            .is_some_and(|usp| usp.opt_out_sale == crate::consent::PrivacyFlag::Yes),
+    })
 }
 
 /// Reports whether the request carries an explicit signal withdrawing Edge
@@ -147,7 +177,33 @@ pub fn ec_storage_withdrawn(consent: &ConsentContext) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consent::TcfConsent;
     use crate::test_support::tests::create_test_settings;
+
+    /// Builds a minimal decoded TCF record consenting to the given 1-indexed
+    /// purposes, with everything else refused.
+    fn tcf_with_purposes(consented: &[usize]) -> TcfConsent {
+        let mut purpose_consents = vec![false; 24];
+        for &purpose in consented {
+            purpose_consents[purpose - 1] = true;
+        }
+        TcfConsent {
+            version: 2,
+            cmp_id: 0,
+            cmp_version: 0,
+            consent_screen: 0,
+            consent_language: "EN".to_owned(),
+            vendor_list_version: 0,
+            tcf_policy_version: 2,
+            created_ds: 0,
+            last_updated_ds: 0,
+            purpose_consents,
+            purpose_legitimate_interests: vec![false; 24],
+            vendor_consents: Vec::new(),
+            vendor_legitimate_interests: Vec::new(),
+            special_feature_opt_ins: vec![false; 12],
+        }
+    }
 
     #[test]
     fn no_edge_cookie_provider_is_vacuously_granted() {
@@ -217,6 +273,38 @@ mod tests {
             !state.is_set(Permission::StoreOnDevice)
                 && !state.is_set(Permission::SelectPersonalisedAds),
             "GPC should revoke the granted necessary.operations.storage and advertising_marketing.first_party.targeted baseline"
+        );
+    }
+
+    #[test]
+    fn tcf_resolves_every_mapped_purpose_not_just_storage_and_ads() {
+        // A TCF record now grants or revokes every one of the eleven mapped
+        // purposes, not only Purpose 1 and Purpose 4. Consent to all purposes
+        // except Purpose 7 (measure ad performance), in a US opt-out state where
+        // the baseline granted them all, so a revoke is observable as a drop.
+        let settings = create_test_settings();
+        let consented: Vec<usize> = (1..=11).filter(|&p| p != 7).collect();
+        let consent = ConsentContext {
+            tcf: Some(tcf_with_purposes(&consented)),
+            ..ConsentContext::default()
+        };
+        let state = assemble_permissions(&settings, &consent, Some(&us_ca_geo()));
+
+        // Purpose 2 is now resolved (it was neutral before), so consent sets it.
+        assert!(
+            state.is_set(Permission::SelectBasicAds),
+            "Purpose 2 consent should set advertising_marketing.first_party.contextual"
+        );
+        // Purpose 7 was refused, so the granted baseline is revoked.
+        assert!(
+            !state.is_set(Permission::MeasureAdPerformance),
+            "Purpose 7 refusal should revoke analytics.ad_reporting.measure_ad_performance"
+        );
+        // The originally wired purposes still behave.
+        assert!(
+            state.is_set(Permission::StoreOnDevice)
+                && state.is_set(Permission::SelectPersonalisedAds),
+            "Purposes 1 and 4 remain resolved from the TCF record"
         );
     }
 }

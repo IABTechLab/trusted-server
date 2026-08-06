@@ -4,10 +4,12 @@
 # rebuilding is how a deployer changes the default policy, so the rules stay
 # visible and reviewable in version control.
 #
-# There are two parts:
-#   groups  named permission baselines, defined once and referenced by rules
-#   rules   map a country (FR) or country/state (US/CA) to a group, with optional
-#           explicit per-permission overrides
+# There are three parts:
+#   groups   named permission baselines, defined once and referenced by rules
+#   rules    map a country (FR) or country/state (US/CA) to a group, with optional
+#            explicit per-permission overrides
+#   signals  how each session signal (TCF, US-style opt-out) maps onto Data Uses,
+#            so no signal-to-permission policy lives in the code
 #
 # Rule keys use the codes a geo provider returns, matched case-insensitively:
 #   country        ISO 3166-1 alpha-2 (for example FR, US, GB)
@@ -297,3 +299,39 @@ rules:
   #     permissions: [-select-personalised-ads]
   # or reference a stricter group.
   US: us-opt-out
+
+# How each session signal maps onto Data Uses. The permission engine reads this,
+# so no signal-to-permission policy lives in the code. For each Data Use a signal
+# produces a grant or a revoke, which the resolver then applies against the group
+# baseline above (a grant sets a `requires_signal` Data Use, a revoke drops a
+# `granted` one, and `denied` always wins so no signal can set it).
+signals:
+  # A present TCF v2 record (a standalone TC string, or the EU TCF section of a
+  # GPP string) is authoritative and overrides the opt-out signals below. Each
+  # listed TCF purpose grants the Data Use it maps to when the record consents to
+  # that purpose, and revokes it otherwise. This is the interim home for the
+  # purpose to Data Use mapping. Once the IAB Privacy Taxonomy tcf column is
+  # finalized (fideslang) that becomes the single source and this block is
+  # dropped.
+  tcf:
+    authoritative: true
+    purposes:
+      1: necessary.operations.storage
+      2: advertising_marketing.first_party.contextual
+      3: advertising_marketing.profiling
+      4: advertising_marketing.first_party.targeted
+      5: advertising_marketing.personalize.profiling
+      6: advertising_marketing.personalize.content
+      7: analytics.ad_reporting.measure_ad_performance
+      8: analytics.ad_reporting.content_performance
+      9: analytics.ad_reporting.market_research
+      10: necessary.operations.improve
+      11: select-basic-content
+  # US-style opt-out of sale or sharing. It applies when any listed source is set
+  # and no authoritative TCF record is present. `revokes: all` drops every granted
+  # Data Use, and the map bounds what that actually touches. A deployer can
+  # instead list specific Data Uses, for example the sharing and targeted
+  # advertising uses.
+  us_opt_out:
+    sources: [gpc, gpp_sale_opt_out, us_privacy_opt_out]
+    revokes: all

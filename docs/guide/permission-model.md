@@ -82,10 +82,15 @@ Europe purposes and used **only** as technical identifiers. No CMP or TCF policy
 is implemented in the core. Two purposes have no Data Use yet: purpose 1 (device
 storage) uses a proposed `necessary.operations.storage` key, and purpose 11
 keeps its TCF identifier `select-basic-content`. Both are flagged for an upstream
-taxonomy addition. Today only `necessary.operations.storage` (TCF Purpose 1) is
-resolved against the incoming consent and privacy signals. The remaining
-purposes are modeled for forward compatibility so that later providers can
-advertise them.
+taxonomy addition. All eleven purposes are now resolved against the incoming
+consent and privacy signals. A present TCF record grants or revokes each purpose
+directly, and where no TCF record is present a US-style opt-out (GPC, a GPP sale
+opt-out, or a US Privacy opt-out) is honored. The remaining taxonomy Data Uses
+have no TCF purpose, so no signal maps to them and their configured baseline
+stands. The mapping itself, which TCF purpose grants which Data Use and what a
+US-style opt-out revokes, is declared in the `signals` section of
+`permissions.yaml`, not in the code, so a deployer changes policy by editing that
+file.
 
 `permissions.yaml` carries a policy flag for **every** Data Use in the taxonomy,
 not only the eleven below. The eleven have a dedicated identifier because a
@@ -159,10 +164,31 @@ per-permission tweaks on top of its group: **`+permission`** grants it (set
 without a signal) and **`-permission`** denies it (never set), each overriding
 the group baseline.
 
+### Why three states, not two
+
+`requires_signal` and `denied` both start unset, so they can look like the same
+"off" state, but they answer different questions and a session signal treats
+them differently.
+
+- `requires_signal` means the Data Use is permitted **with** a signal. A grant,
+  for example TCF consent to the mapped purpose, sets it.
+- `denied` means the Data Use is not permitted here at all. A grant **cannot**
+  set it. This models a jurisdiction where there is no lawful basis for the use,
+  so a consent signal is irrelevant.
+
+For a worked example, take a deployer who sets
+`advertising_marketing.profiling: denied` for a country that does not permit
+profiling. A request arrives with a TCF string that consents to Purpose 3
+(create profiles for personalised advertising), which maps to that Data Use. The
+resolver pairs the `denied` baseline with the grant signal and still leaves the
+permission **unset**, so a provider that requires profiling does not run. The
+same consent against a `requires_signal` baseline would set it. Consent lifts
+`requires_signal`; it never lifts `denied`.
+
 The shipped `permissions.yaml` defines `gdpr-eu`, `gdpr-uk`, and `us-opt-out`
 groups, and maps the EU 27 to `gdpr-eu`, the UK to `gdpr-uk`, and the US (with
-all 50 states and DC) and Australia to `us-opt-out`. For the one
-permission resolved today, device storage (Purpose 1), that yields:
+all 50 states and DC) and Australia to `us-opt-out`. For device storage
+(Purpose 1), that yields:
 
 | Country        | Device storage (Purpose 1)                                      |
 | -------------- | --------------------------------------------------------------- |
