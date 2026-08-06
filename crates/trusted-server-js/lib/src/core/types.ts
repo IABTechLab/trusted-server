@@ -85,6 +85,47 @@ export interface CacheRenderSourceV1 {
 
 export type BidRenderSourceV1 = ApsRendererV1 | AdmRenderSourceV1 | CacheRenderSourceV1;
 
+export type AuctionSlotFailureReason =
+  | 'auction_disabled'
+  | 'consent_denied'
+  | 'slot_not_eligible'
+  | 'provider_timeout'
+  | 'provider_error'
+  | 'invalid_provider_response'
+  | 'mediation_failed'
+  | 'winner_not_renderable'
+  | 'identity_generation_failed'
+  | 'internal_error';
+
+export type SlotAuctionDecisionV1 =
+  | { slot: string; outcome: 'winner'; candidateId: string }
+  | { slot: string; outcome: 'no_bid' }
+  | { slot: string; outcome: 'failed'; reason: AuctionSlotFailureReason };
+
+export interface AuctionDecisionSetV1 {
+  version: 1;
+  auctionId: string;
+  results: SlotAuctionDecisionV1[];
+}
+
+export interface BrowserAuctionBidV1 {
+  candidateId: string;
+  slot: string;
+  provider: string;
+  upstreamBidId: string;
+  cpm: number;
+  currency: 'USD';
+  targeting: Record<string, string>;
+  rendererReservationId: string;
+  renderSource: BidRenderSourceV1;
+}
+
+export interface BrowserAuctionProjectionV1 {
+  version: 1;
+  auction: AuctionDecisionSetV1;
+  bids: BrowserAuctionBidV1[];
+}
+
 /** A client-side Prebid bid's generated ad ID bound to its APS render capability. */
 export interface ApsPrebidRendererEntry {
   adUnitCode: string;

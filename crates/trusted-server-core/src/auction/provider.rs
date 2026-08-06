@@ -18,14 +18,31 @@ use crate::platform::{
 };
 use crate::request_signing::{RequestSigner, SigningParams};
 
-use super::openrtb::{
-    OpenRtbBuildOutcome, RequestFinalization, apply_notification_policy, build_request,
-    extract_standard_response, unused_bidder_params_count,
+use super::types::{
+    AuctionContext, AuctionRequest, AuctionResponse, AuctionSlotFailureReason, Bid,
 };
-use super::plan::ProviderPlan;
-use super::profile::CompiledOpenRtbProfile;
-use super::routing::{ProviderAuctionInput, RoutedAuction};
-use super::types::{AuctionContext, AuctionRequest, AuctionResponse};
+
+/// Exactly one normalized outcome for a slot dispatched to one provider.
+#[derive(Debug, Clone)]
+pub struct ProviderSlotOutcome {
+    /// Provider integration that received the slot.
+    pub provider: String,
+    /// Exact dispatched slot identifier.
+    pub slot: String,
+    /// Candidate, successful no-bid, or typed failure.
+    pub disposition: ProviderSlotDisposition,
+}
+
+/// Closed normalized provider result for one dispatched slot.
+#[derive(Debug, Clone)]
+pub enum ProviderSlotDisposition {
+    /// One or more independently validated candidates returned for the slot.
+    Candidates(Vec<Bid>),
+    /// Provider completed successfully without a candidate for this slot.
+    NoBid,
+    /// Provider failed for this slot.
+    Failed(AuctionSlotFailureReason),
+}
 
 const MAX_PLANNED_RESPONSE_BYTES: usize = 1024 * 1024;
 

@@ -278,6 +278,206 @@ pub(crate) fn record_auction_drop(reasons: &mut AuctionDropReasons, reason: Auct
     *reasons.entry(reason).or_default() += 1;
 }
 
+/// Closed failure set for one requested slot's server-auction decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuctionSlotFailureReason {
+    /// The auction orchestrator is disabled.
+    AuctionDisabled,
+    /// Request consent does not permit a server-side auction.
+    ConsentDenied,
+    /// No enabled configured provider can bid on the slot.
+    SlotNotEligible,
+    /// A dispatched provider exceeded its deadline.
+    ProviderTimeout,
+    /// A provider could not launch or complete its transport/HTTP exchange.
+    ProviderError,
+    /// A provider response failed structural, currency, identity, or bid validation.
+    InvalidProviderResponse,
+    /// The configured mediator failed or returned invalid provenance.
+    MediationFailed,
+    /// A selected candidate cannot be represented by the exact browser contract.
+    WinnerNotRenderable,
+    /// A unique renderer reservation could not be minted.
+    IdentityGenerationFailed,
+    /// An internal invariant or candidate-identity operation failed.
+    InternalError,
+}
+
+impl AuctionSlotFailureReason {
+    /// Return the exact wire literal.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AuctionDisabled => "auction_disabled",
+            Self::ConsentDenied => "consent_denied",
+            Self::SlotNotEligible => "slot_not_eligible",
+            Self::ProviderTimeout => "provider_timeout",
+            Self::ProviderError => "provider_error",
+            Self::InvalidProviderResponse => "invalid_provider_response",
+            Self::MediationFailed => "mediation_failed",
+            Self::WinnerNotRenderable => "winner_not_renderable",
+            Self::IdentityGenerationFailed => "identity_generation_failed",
+            Self::InternalError => "internal_error",
+        }
+    }
+
+    /// Closed multi-provider aggregation priority; lower values win.
+    #[must_use]
+    pub const fn priority(self) -> u8 {
+        match self {
+            Self::InternalError => 0,
+            Self::MediationFailed => 1,
+            Self::InvalidProviderResponse => 2,
+            Self::ProviderError => 3,
+            Self::ProviderTimeout => 4,
+            Self::ConsentDenied => 5,
+            Self::AuctionDisabled => 6,
+            Self::SlotNotEligible => 7,
+            Self::WinnerNotRenderable | Self::IdentityGenerationFailed => u8::MAX,
+        }
+    }
+}
+
+/// Exactly one final server-auction decision for a requested slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotAuctionDecisionV1 {
+    /// A candidate won and joins exactly one projected bid.
+    Winner {
+        /// Exact request slot identifier.
+        slot: String,
+        /// Opaque response-local candidate identifier.
+        candidate_id: String,
+    },
+    /// Every dispatched provider completed successfully without a candidate.
+    NoBid {
+        /// Exact request slot identifier.
+        slot: String,
+    },
+    /// The slot failed with one closed reason.
+    Failed {
+        /// Exact request slot identifier.
+        slot: String,
+        /// Exact failure reason.
+        reason: AuctionSlotFailureReason,
+    },
+}
+
+impl SlotAuctionDecisionV1 {
+    /// Return the exact slot identifier shared by every variant.
+    #[must_use]
+    pub fn slot(&self) -> &str {
+        match self {
+            Self::Winner { slot, .. } | Self::NoBid { slot } | Self::Failed { slot, .. } => slot,
+        }
+    }
+}
+
+impl Serialize for SlotAuctionDecisionV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        match self {
+            Self::Winner { slot, candidate_id } => {
+                let mut state = serializer.serialize_struct("SlotAuctionDecisionV1", 3)?;
+                state.serialize_field("slot", slot)?;
+                state.serialize_field("outcome", "winner")?;
+                state.serialize_field("candidateId", candidate_id)?;
+                state.end()
+            }
+            Self::NoBid { slot } => {
+                let mut state = serializer.serialize_struct("SlotAuctionDecisionV1", 2)?;
+                state.serialize_field("slot", slot)?;
+                state.serialize_field("outcome", "no_bid")?;
+                state.end()
+            }
+            Self::Failed { slot, reason } => {
+                let mut state = serializer.serialize_struct("SlotAuctionDecisionV1", 3)?;
+                state.serialize_field("slot", slot)?;
+                state.serialize_field("outcome", "failed")?;
+                state.serialize_field("reason", reason)?;
+                state.end()
+            }
+        }
+    }
+}
+
+/// Ordered version-1 decision set for one server auction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuctionDecisionSetV1 {
+    /// Contract version.
+    pub version: u8,
+    /// Exact auction identifier.
+    pub auction_id: String,
+    /// Exactly one decision per requested slot, in request order.
+    pub results: Vec<SlotAuctionDecisionV1>,
+}
+
+impl AuctionDecisionSetV1 {
+    /// Construct an ordered decision set for a request-wide gate.
+    #[must_use]
+    pub fn failed(request: &AuctionRequest, reason: AuctionSlotFailureReason) -> Self {
+        Self {
+            version: 1,
+            auction_id: request.id.clone(),
+            results: request
+                .slots
+                .iter()
+                .map(|slot| SlotAuctionDecisionV1::Failed {
+                    slot: slot.id.clone(),
+                    reason,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Maximum canonical UTF-8 size of the browser auction projection.
+pub const MAX_BROWSER_AUCTION_PROJECTION_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum number of requested results or projected winner bids.
+pub const MAX_BROWSER_AUCTION_RESULTS: usize = 256;
+/// Maximum number of publisher targeting entries on one projected bid.
+pub const MAX_BROWSER_AUCTION_TARGETING_ENTRIES: usize = 32;
+
+/// One exact browser-facing winner projection.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserAuctionBidV1 {
+    /// Response-local mediator candidate identity.
+    pub candidate_id: String,
+    /// Exact requested server slot identity.
+    pub slot: String,
+    /// Canonical provider integration name.
+    pub provider: String,
+    /// Exact provider-native upstream bid identity.
+    pub upstream_bid_id: String,
+    /// Selected finite, nonnegative CPM.
+    pub cpm: f64,
+    /// Exact auction currency; version 1 admits only `USD`.
+    pub currency: String,
+    /// Lexically ordered publisher targeting, excluding runtime-owned `hb_adid`.
+    pub targeting: BTreeMap<String, String>,
+    /// Server-minted renderer capability identity.
+    pub renderer_reservation_id: String,
+    /// Sole tagged render authority for the winner.
+    pub render_source: BidRenderSourceV1,
+}
+
+/// Complete browser-facing version-1 auction projection.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BrowserAuctionProjectionV1 {
+    /// Contract version.
+    pub version: u8,
+    /// Ordered decision set for every requested slot.
+    pub auction: AuctionDecisionSetV1,
+    /// Winner bids in matching decision order.
+    pub bids: Vec<BrowserAuctionBidV1>,
+}
+
 /// URL used by the orchestrator when invoking a mediator from the collect
 /// path. Providers can `debug_assert` against this value to catch a mediator
 /// that has accidentally started depending on `context.request` carrying real
@@ -641,6 +841,15 @@ pub fn classify_aps_renderer_v1(
 pub struct Bid {
     /// Slot this bid is for
     pub slot_id: String,
+    /// Server-minted opaque identifier used only for this auction response.
+    #[serde(skip)]
+    pub candidate_id: Option<String>,
+    /// Provider integration name paired with the upstream bid ID for provenance.
+    #[serde(skip)]
+    pub candidate_provider: Option<String>,
+    /// Server-minted renderer capability identifier (populated during projection).
+    #[serde(skip)]
+    pub renderer_reservation_id: Option<String>,
     /// Bid price in CPM.
     pub price: Option<f64>,
     /// Currency code (e.g., "USD")
@@ -885,6 +1094,9 @@ mod tests {
     fn make_bid(bidder: &str) -> Bid {
         Bid {
             slot_id: "slot-1".to_owned(),
+            candidate_id: None,
+            candidate_provider: None,
+            renderer_reservation_id: None,
             price: Some(1.0),
             currency: "USD".to_owned(),
             creative: None,
@@ -1032,6 +1244,9 @@ mod tests {
     fn bid_with_cache_fields_round_trips_through_json() {
         let bid = Bid {
             slot_id: "atf".to_string(),
+            candidate_id: None,
+            candidate_provider: None,
+            renderer_reservation_id: None,
             price: Some(1.50),
             currency: "USD".to_string(),
             creative: None,
@@ -1136,9 +1351,39 @@ mod tests {
     }
 
     #[test]
+    fn slot_failure_priority_matches_the_closed_contract() {
+        let ordered = [
+            AuctionSlotFailureReason::InternalError,
+            AuctionSlotFailureReason::MediationFailed,
+            AuctionSlotFailureReason::InvalidProviderResponse,
+            AuctionSlotFailureReason::ProviderError,
+            AuctionSlotFailureReason::ProviderTimeout,
+            AuctionSlotFailureReason::ConsentDenied,
+            AuctionSlotFailureReason::AuctionDisabled,
+            AuctionSlotFailureReason::SlotNotEligible,
+        ];
+
+        assert_eq!(
+            ordered.map(AuctionSlotFailureReason::priority),
+            [0, 1, 2, 3, 4, 5, 6, 7]
+        );
+        assert_eq!(
+            AuctionSlotFailureReason::WinnerNotRenderable.priority(),
+            u8::MAX
+        );
+        assert_eq!(
+            AuctionSlotFailureReason::IdentityGenerationFailed.priority(),
+            u8::MAX
+        );
+    }
+
+    #[test]
     fn bid_has_ad_id_field() {
         let bid = Bid {
             slot_id: "s".to_string(),
+            candidate_id: None,
+            candidate_provider: None,
+            renderer_reservation_id: None,
             price: Some(1.0),
             currency: "USD".to_string(),
             creative: None,

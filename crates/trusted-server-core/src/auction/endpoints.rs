@@ -33,7 +33,7 @@ use super::telemetry::{
     AuctionObservationContext, AuctionSource, AuctionTerminalOutcome, build_auction_events,
     emit_auction_events_best_effort_lazy,
 };
-use super::types::AuctionContext;
+use super::types::{AuctionContext, AuctionDecisionSetV1, AuctionSlotFailureReason};
 
 const MAX_CLIENT_EID_SOURCES: usize = 64;
 const MAX_CLIENT_UIDS_PER_SOURCE: usize = 32;
@@ -247,6 +247,10 @@ pub async fn handle_auction(
             provider_responses: Vec::new(),
             mediator_response: None,
             winning_bids: HashMap::new(),
+            decision_set: AuctionDecisionSetV1::failed(
+                &auction_request,
+                AuctionSlotFailureReason::ConsentDenied,
+            ),
             total_time_ms: 0,
             metadata: HashMap::new(),
         };

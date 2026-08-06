@@ -3127,6 +3127,9 @@ impl PrebidAuctionProvider {
 
         Ok(AuctionBid {
             slot_id,
+            candidate_id: None,
+            candidate_provider: None,
+            renderer_reservation_id: None,
             price: Some(price), // Prebid provides decoded prices
             currency: DEFAULT_CURRENCY.to_string(),
             creative,
@@ -6629,6 +6632,11 @@ external_bundle_sri = "sha384-AAAA"
             provider_responses: vec![provider_response],
             mediator_response: None,
             winning_bids: HashMap::new(),
+            decision_set: crate::auction::types::AuctionDecisionSetV1 {
+                version: 1,
+                auction_id: "test-auction".to_string(),
+                results: Vec::new(),
+            },
             total_time_ms: 42,
             metadata: HashMap::new(),
         };

@@ -937,7 +937,7 @@ mod tests {
 
     use serde_json::json;
 
-    use crate::auction::types::{AdFormat, AdSlot, PublisherInfo, UserInfo};
+    use crate::auction::types::{AdFormat, AdSlot, AuctionDecisionSetV1, PublisherInfo, UserInfo};
 
     use super::*;
 
@@ -973,6 +973,9 @@ mod tests {
     fn bid(slot_id: &str, bidder: &str, ad_id: Option<&str>, price: Option<f64>) -> Bid {
         Bid {
             slot_id: slot_id.to_owned(),
+            candidate_id: None,
+            candidate_provider: None,
+            renderer_reservation_id: None,
             price,
             currency: "USD".to_owned(),
             creative: None,
@@ -1054,6 +1057,11 @@ mod tests {
             provider_responses: vec![provider_success, provider_no_bid, provider_error],
             mediator_response: None,
             winning_bids: HashMap::from([("slot-1".to_owned(), winning)]),
+            decision_set: AuctionDecisionSetV1 {
+                version: 1,
+                auction_id: request.id.clone(),
+                results: Vec::new(),
+            },
             total_time_ms: 99,
             metadata: HashMap::new(),
         };
@@ -1223,6 +1231,11 @@ mod tests {
             provider_responses: vec![provider_success.clone()],
             mediator_response: None,
             winning_bids: HashMap::from([("slot-1".to_owned(), provider_success.bids[0].clone())]),
+            decision_set: AuctionDecisionSetV1 {
+                version: 1,
+                auction_id: request.id.clone(),
+                results: Vec::new(),
+            },
             total_time_ms: 42,
             metadata: HashMap::new(),
         };
@@ -1264,6 +1277,11 @@ mod tests {
             provider_responses: vec![provider_http_error],
             mediator_response: None,
             winning_bids: HashMap::new(),
+            decision_set: AuctionDecisionSetV1 {
+                version: 1,
+                auction_id: request.id.clone(),
+                results: Vec::new(),
+            },
             total_time_ms: 12,
             metadata: HashMap::new(),
         };
@@ -1302,6 +1320,11 @@ mod tests {
             provider_responses: vec![provider_success],
             mediator_response: Some(mediator_response),
             winning_bids: HashMap::from([("slot-1".to_owned(), mediator_bid)]),
+            decision_set: AuctionDecisionSetV1 {
+                version: 1,
+                auction_id: request.id.clone(),
+                results: Vec::new(),
+            },
             total_time_ms: 80,
             metadata: HashMap::new(),
         };
@@ -1342,6 +1365,11 @@ mod tests {
             provider_responses: Vec::new(),
             mediator_response: None,
             winning_bids: HashMap::new(),
+            decision_set: AuctionDecisionSetV1 {
+                version: 1,
+                auction_id: request.id.clone(),
+                results: Vec::new(),
+            },
             total_time_ms: 1,
             metadata: HashMap::new(),
         };
