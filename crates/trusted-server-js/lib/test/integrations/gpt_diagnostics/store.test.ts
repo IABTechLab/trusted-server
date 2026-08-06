@@ -513,6 +513,7 @@ describe('GptDiagnosticsStore', () => {
       name: 'a direct renderable candidate',
       direct: 'renderable_candidate',
       prebid: false,
+      publisher: false,
       expectedPath: 'trusted_server_direct',
       expectedOpportunity: 'renderable_candidate',
     },
@@ -520,6 +521,7 @@ describe('GptDiagnosticsStore', () => {
       name: 'a direct unrenderable candidate',
       direct: 'unrenderable_candidate',
       prebid: false,
+      publisher: false,
       expectedPath: 'trusted_server_direct',
       expectedOpportunity: 'unrenderable_candidate',
     },
@@ -527,6 +529,7 @@ describe('GptDiagnosticsStore', () => {
       name: 'a direct request without a candidate',
       direct: 'no_candidate',
       prebid: false,
+      publisher: false,
       expectedPath: 'trusted_server_direct',
       expectedOpportunity: 'no_candidate',
     },
@@ -534,6 +537,7 @@ describe('GptDiagnosticsStore', () => {
       name: 'a Prebid refresh',
       direct: undefined,
       prebid: true,
+      publisher: false,
       expectedPath: 'prebid_refresh',
       expectedOpportunity: undefined,
     },
@@ -541,6 +545,7 @@ describe('GptDiagnosticsStore', () => {
       name: 'competing direct and Prebid evidence',
       direct: 'renderable_candidate',
       prebid: true,
+      publisher: false,
       expectedPath: 'competing',
       expectedOpportunity: 'renderable_candidate',
     },
@@ -548,12 +553,37 @@ describe('GptDiagnosticsStore', () => {
       name: 'an unattributed request',
       direct: undefined,
       prebid: false,
+      publisher: false,
       expectedPath: 'unattributed',
       expectedOpportunity: undefined,
     },
+    {
+      name: 'a publisher refresh',
+      direct: undefined,
+      prebid: false,
+      publisher: true,
+      expectedPath: 'publisher_refresh',
+      expectedOpportunity: undefined,
+    },
+    {
+      name: 'competing Prebid and publisher evidence',
+      direct: undefined,
+      prebid: true,
+      publisher: true,
+      expectedPath: 'competing',
+      expectedOpportunity: undefined,
+    },
+    {
+      name: 'competing all source evidence',
+      direct: 'renderable_candidate',
+      prebid: true,
+      publisher: true,
+      expectedPath: 'competing',
+      expectedOpportunity: 'renderable_candidate',
+    },
   ] as const)(
     'attributes $name without inferring demand ownership',
-    ({ direct, prebid, expectedPath, expectedOpportunity }) => {
+    ({ direct, prebid, publisher, expectedPath, expectedOpportunity }) => {
       const store = new GptDiagnosticsStore({ now: () => 10, defer: () => undefined });
       const slot = fakeSlot('path-slot');
 
@@ -561,6 +591,7 @@ describe('GptDiagnosticsStore', () => {
         store.recordTrustedServerOpportunity(slot, 'auction-slot', direct);
       }
       if (prebid) store.recordPrebidRefresh([slot]);
+      if (publisher) store.recordPublisherRefresh([slot]);
       store.recordSlotRequested(slot);
 
       const cycle = store.snapshot().slots[0].requests[0];
@@ -740,6 +771,31 @@ describe('GptDiagnosticsStore', () => {
       requestPath: 'competing',
       trustedServerOpportunity: 'unrenderable_candidate',
     });
+  });
+
+  it('expires sources independently and replaces Trusted Server auction metadata', () => {
+    let now = 0;
+    const deferred: Array<() => void> = [];
+    const store = new GptDiagnosticsStore({
+      now: () => now,
+      defer: (callback) => deferred.push(callback),
+    });
+    const slot = fakeSlot('independent-expiry');
+    store.recordTrustedServerOpportunity(slot, 'auction-slot', 'renderable_candidate', 'old');
+    now = 1;
+    store.recordPrebidRefresh([slot]);
+    now = 2;
+    store.recordTrustedServerOpportunity(slot, 'auction-slot', 'no_candidate');
+    deferred[0]();
+    now = REQUEST_PATH_ATTRIBUTION_WINDOW_MS + 1;
+    deferred[1]();
+    store.recordSlotRequested(slot);
+
+    expect(store.snapshot().slots[0].requests[0]).toMatchObject({
+      requestPath: 'trusted_server_direct',
+      trustedServerOpportunity: 'no_candidate',
+    });
+    expect(store.snapshot().slots[0].requests[0].trustedServerAuctionId).toBeUndefined();
   });
 
   it('does not mutate an open request cycle when a later direct marker arrives', () => {

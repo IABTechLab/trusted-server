@@ -128,6 +128,41 @@ describe('GptDiagnosticsObserver', () => {
     expect(result).toEqual({ receiver, args: [[slot], { changeCorrelator: false }] });
   });
 
+  it('preserves bare, explicit-undefined, malformed, throwing, and nested refresh behavior', () => {
+    const store = fakeStore();
+    const gpt = controlledGpt();
+    const slot = fakeSlot();
+    const secondSlot = fakeSlot();
+    const originalRefresh = vi.fn(function (this: unknown, ...args: unknown[]) {
+      if (args[0] === 'throw') throw new Error('refresh failure');
+      return { receiver: this, args };
+    });
+    const getSlots = vi.fn(() => [slot, null, secondSlot]);
+    gpt.pubads.refresh = originalRefresh;
+    Object.assign(gpt.pubads, { getSlots });
+    const runtime = { tsjs: {} };
+    const observer = new GptDiagnosticsObserver(store, { window: { ...gpt.window, ...runtime } });
+    observer.install();
+    gpt.googletag.cmd[0]();
+    observer.install();
+
+    expect(gpt.pubads.refresh()).toEqual({ receiver: gpt.pubads, args: [] });
+    expect(store.recordPublisherRefresh).toHaveBeenLastCalledWith([slot, secondSlot]);
+    expect(gpt.pubads.refresh(undefined)).toEqual({ receiver: gpt.pubads, args: [undefined] });
+    expect(store.recordPublisherRefresh).toHaveBeenCalledTimes(1);
+    getSlots.mockImplementationOnce(() => {
+      throw new Error('getSlots failure');
+    });
+    expect(gpt.pubads.refresh()).toEqual({ receiver: gpt.pubads, args: [] });
+    expect(() => gpt.pubads.refresh('throw')).toThrow('refresh failure');
+    (
+      observer as unknown as { window: { tsjs: { prebidRefreshDispatchInProgress?: boolean } } }
+    ).window.tsjs.prebidRefreshDispatchInProgress = true;
+    gpt.pubads.refresh([slot]);
+    expect(store.recordPublisherRefresh).toHaveBeenCalledTimes(1);
+    expect(originalRefresh).toHaveBeenCalledTimes(5);
+  });
+
   it('creates a command queue and waits when GPT is absent', () => {
     const store = fakeStore();
     const delayedWindow: {
