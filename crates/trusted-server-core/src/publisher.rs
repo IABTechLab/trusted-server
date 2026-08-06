@@ -1794,18 +1794,20 @@ pub(crate) fn write_bids_to_state(
     settings: &Settings,
     request_origin: &str,
     include_debug_bid: bool,
+    auction_id: Option<&str>,
 ) {
     log::debug!(
         "write_bids_to_state: {} winning bid(s): [{}]",
         winning_bids.len(),
         winning_bids.keys().cloned().collect::<Vec<_>>().join(", ")
     );
-    let bid_map = build_bid_map(
+    let bid_map = build_bid_map_with_auction_id(
         winning_bids,
         price_granularity,
         settings,
         request_origin,
         include_debug_bid,
+        auction_id,
     );
     let bids_script = build_bids_script(&bid_map);
     *ad_bids_state.lock().expect("should lock bid state") = Some(bids_script);
@@ -2393,6 +2395,7 @@ async fn collect_non_html_auction(
     services: &RuntimeServices,
     settings: &Settings,
 ) {
+    let auction_id = telemetry.auction_request.as_ref().map(|request| request.id.clone());
     let placeholder = mediator_placeholder_request();
     let result = orchestrator
         .collect_dispatched_auction(
@@ -2422,6 +2425,7 @@ async fn collect_non_html_auction(
         settings,
         &request_origin(&params.request_scheme, &params.request_host),
         settings.debug.inject_adm_for_testing,
+        auction_id.as_deref(),
     );
 }
 
@@ -2441,6 +2445,7 @@ async fn collect_stream_auction(
         settings,
         request_origin,
     } = deps;
+    let auction_id = telemetry.auction_request.as_ref().map(|request| request.id.clone());
     log::info!("body_close_hold_loop: collecting dispatched auction before held body tail");
     let placeholder = mediator_placeholder_request();
     let collect_ctx = make_collect_context(settings, services, &placeholder);
@@ -2472,6 +2477,7 @@ async fn collect_stream_auction(
         settings,
         request_origin,
         settings.debug.inject_adm_for_testing,
+        auction_id.as_deref(),
     );
 
     if settings.debug.auction_html_comment {
@@ -3235,12 +3241,31 @@ fn html_escape_for_script(s: &str) -> String {
 ///
 /// Returns a JSON object map of slot ID → bid metadata including the bucketed
 /// CPM (`hb_pb`), bidder (`hb_bidder`), and optional ad ID, nurl, and burl.
+#[cfg(test)]
 pub(crate) fn build_bid_map(
     winning_bids: &std::collections::HashMap<String, Bid>,
     granularity: crate::price_bucket::PriceGranularity,
     settings: &Settings,
     request_origin: &str,
     include_debug_bid: bool,
+) -> serde_json::Map<String, serde_json::Value> {
+    build_bid_map_with_auction_id(
+        winning_bids,
+        granularity,
+        settings,
+        request_origin,
+        include_debug_bid,
+        None,
+    )
+}
+
+pub(crate) fn build_bid_map_with_auction_id(
+    winning_bids: &std::collections::HashMap<String, Bid>,
+    granularity: crate::price_bucket::PriceGranularity,
+    settings: &Settings,
+    request_origin: &str,
+    include_debug_bid: bool,
+    auction_id: Option<&str>,
 ) -> serde_json::Map<String, serde_json::Value> {
     // Inline creatives render in a foreign origin (PUC's srcdoc under GAM), so
     // their proxy/click URLs must be absolute against the origin the visitor is
@@ -3263,6 +3288,12 @@ pub(crate) fn build_bid_map(
                     "hb_bidder".to_string(),
                     serde_json::Value::String(bid.bidder.clone()),
                 );
+                if let Some(auction_id) = auction_id {
+                    obj.insert(
+                        "hb_auction_id".to_string(),
+                        serde_json::Value::String(auction_id.to_owned()),
+                    );
+                }
                 // Winning creative dimensions — the bridge sizes the inline
                 // render from these, falling back to the first configured slot
                 // format only when absent, which mis-sizes a multi-size slot.
@@ -3799,8 +3830,8 @@ pub async fn handle_page_bids(
     // skip the live auction, matching the existing bot/prefetch behaviour.
     let ad_stack_enabled = auction_enabled && consent_allows_auction;
 
-    let winning_bids = if matched_slots.is_empty() {
-        std::collections::HashMap::new()
+    let (winning_bids, auction_id) = if matched_slots.is_empty() {
+        (std::collections::HashMap::new(), None)
     } else {
         // Same publisher identity as the outbound bid request — see the
         // matching note on the initial-navigation observation above.
@@ -3866,7 +3897,7 @@ pub async fn handle_page_bids(
                         )
                     })
                     .await;
-                    winning_bids
+                    (winning_bids, Some(auction_request.id))
                 }
                 Err(e) => {
                     log::warn!("page-bids auction failed: {e:?}");
@@ -3883,7 +3914,7 @@ pub async fn handle_page_bids(
                         )
                     })
                     .await;
-                    std::collections::HashMap::new()
+                    (std::collections::HashMap::new(), None)
                 }
             }
         } else {
@@ -3909,16 +3940,17 @@ pub async fn handle_page_bids(
                 )
             })
             .await;
-            std::collections::HashMap::new()
+            (std::collections::HashMap::new(), None)
         }
     };
 
-    let bid_map = build_bid_map(
+    let bid_map = build_bid_map_with_auction_id(
         &winning_bids,
         co_config.price_granularity,
         settings,
         &page_bids_request_origin,
         settings.debug.inject_adm_for_testing,
+        auction_id.as_deref(),
     );
 
     // Gate slots on the ad-stack kill switch / consent: when disabled, return no
@@ -8050,7 +8082,7 @@ mod tests {
     mod creative_opportunities_tests {
         use super::super::{
             MatchedSlotsContext, build_ad_slots_script, build_auction_request, build_bid_map,
-            build_bids_script, html_escape_for_script,
+            build_bid_map_with_auction_id, build_bids_script, html_escape_for_script,
         };
         use crate::auction::types::{Bid, MediaType};
         use crate::consent::ConsentContext;
@@ -8294,6 +8326,46 @@ mod tests {
                 Some("https://ssp/bill"),
                 "should include burl"
             );
+        }
+
+        #[test]
+        fn bid_map_includes_the_opaque_auction_id_only_for_winning_bids() {
+            let mut winning_bids = HashMap::new();
+            winning_bids.insert(
+                "atf_sidebar_ad".to_string(),
+                make_bid(
+                    "atf_sidebar_ad",
+                    1.50,
+                    "example_bidder",
+                    "abc123",
+                    "https://example.com/win",
+                    "https://example.com/bill",
+                ),
+            );
+
+            let map = build_bid_map_with_auction_id(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                "",
+                false,
+                Some("auction-example-123"),
+            );
+
+            assert_eq!(
+                map["atf_sidebar_ad"]["hb_auction_id"],
+                "auction-example-123",
+                "should expose only the current opaque request ID"
+            );
+            let empty = build_bid_map_with_auction_id(
+                &HashMap::new(),
+                PriceGranularity::Dense,
+                &test_settings(),
+                "",
+                false,
+                Some("auction-example-123"),
+            );
+            assert!(empty.is_empty(), "should not create bid metadata without a winner");
         }
 
         #[test]
