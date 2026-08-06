@@ -18,10 +18,10 @@ interface GptEvent {
 }
 
 interface GptRenderEvent extends GptEvent {
-  isEmpty?: boolean;
+  isEmpty?: boolean | undefined;
   size?: unknown;
-  isBackfill?: boolean;
-  slotContentChanged?: boolean;
+  isBackfill?: boolean | undefined;
+  slotContentChanged?: boolean | undefined;
 }
 
 interface GptVisibilityEvent extends GptEvent {
@@ -48,11 +48,11 @@ interface GptCommandQueue {
 
 interface GoogletagLike {
   cmd: GptCommandQueue;
-  pubads?: () => GptPubAdsService;
+  pubads?: (() => GptPubAdsService) | undefined;
 }
 
 export interface GptObserverWindow {
-  googletag?: GoogletagLike;
+  googletag?: GoogletagLike | undefined;
 }
 
 interface ObserverLogger {
@@ -60,8 +60,8 @@ interface ObserverLogger {
 }
 
 interface ObserverOptions {
-  window?: GptObserverWindow;
-  logger?: ObserverLogger;
+  window?: GptObserverWindow | undefined;
+  logger?: ObserverLogger | undefined;
 }
 
 function normalizeSize(value: unknown): Size | undefined {

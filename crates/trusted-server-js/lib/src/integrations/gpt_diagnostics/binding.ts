@@ -8,20 +8,20 @@ interface BindingStore {
 }
 
 type BindingWindow = Window & {
-  CSS?: typeof CSS;
+  CSS?: typeof CSS | undefined;
   HTMLElement: typeof HTMLElement;
-  MutationObserver?: typeof MutationObserver;
+  MutationObserver?: typeof MutationObserver | undefined;
 };
 
 interface BindingOptions {
-  document?: Document;
-  window?: BindingWindow;
-  scheduleFrame?: (callback: () => void) => void;
+  document?: Document | undefined;
+  window?: BindingWindow | undefined;
+  scheduleFrame?: ((callback: () => void) => void) | undefined;
 }
 
 export interface GptDiagnosticsBindingView {
   binding: GptDiagnosticsBinding;
-  element?: HTMLElement;
+  element?: HTMLElement | undefined;
   visible: boolean;
 }
 

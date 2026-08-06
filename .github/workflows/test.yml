@@ -247,5 +247,14 @@ jobs:
       - name: Build bundle
         run: npm run build
 
+      - name: Typecheck full TSJS package
+        run: npm run typecheck
+
+      - name: Lint full TSJS package
+        run: npm run lint
+
+      - name: Verify rc/july adoption manifest
+        run: node --test test/contract/rc-july-adoption.test.mjs
+
       - name: Run unit tests
         run: npm test -- --run

@@ -3,9 +3,11 @@ import { log } from '../../core/log';
 import { installSourcepointGuard } from './script_guard';
 
 type SourcepointWindow = Window & {
-  __tsjs_sourcepoint?: {
-    rewriteSdk?: boolean;
-  };
+  __tsjs_sourcepoint?:
+    | {
+        rewriteSdk?: boolean | undefined;
+      }
+    | undefined;
 };
 
 function shouldInstallSourcepointGuard(): boolean {
@@ -30,33 +32,33 @@ const GPP_SOURCE_SOURCEPOINT = 'sp';
 const INITIAL_RETRY_DELAY_MS = 500;
 
 interface SourcepointGppData {
-  gppString?: string;
-  applicableSections?: number[];
+  gppString?: string | undefined;
+  applicableSections?: number[] | undefined;
 }
 
 interface SourcepointConsentStringEntry {
-  sectionId?: number;
+  sectionId?: number | undefined;
 }
 
 interface SourcepointSectionPayload {
-  consentString?: string;
-  applicableSections?: number[];
-  consentStrings?: SourcepointConsentStringEntry[];
+  consentString?: string | undefined;
+  applicableSections?: number[] | undefined;
+  consentStrings?: SourcepointConsentStringEntry[] | undefined;
 }
 
 interface SourcepointConsentPayload {
-  gppData?: SourcepointGppData;
+  gppData?: SourcepointGppData | undefined;
   [key: string]: unknown;
 }
 
 interface MirroredSourcepointConsent {
   gppString: string;
-  applicableSections?: number[];
+  applicableSections?: number[] | undefined;
 }
 
 let initialized = false;
 let initialRetryDone = false;
-let retryTimer: ReturnType<typeof window.setTimeout> | undefined;
+let retryTimer: number | undefined;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;

@@ -22,29 +22,29 @@ const CALLBACK_KINDS: GptDiagnosticsCallbackKind[] = [
 ];
 
 export interface GptDiagnosticsSlotLike {
-  getSlotElementId?(): string;
-  getAdUnitPath?(): string;
+  getSlotElementId?: (() => string) | undefined;
+  getAdUnitPath?: (() => string) | undefined;
 }
 
 export interface GptRenderFacts {
-  isEmpty?: boolean;
-  size?: Size;
-  isBackfill?: boolean;
-  slotContentChanged?: boolean;
+  isEmpty?: boolean | undefined;
+  size?: Size | undefined;
+  isBackfill?: boolean | undefined;
+  slotContentChanged?: boolean | undefined;
 }
 
 export interface GptDiagnosticsStoreSlotSnapshot {
   runtimeSlotNumber: number;
-  slotElementId?: string;
-  adUnitPath?: string;
-  currentVisibilityPercentage?: number;
-  maximumVisibilityPercentage?: number;
+  slotElementId?: string | undefined;
+  adUnitPath?: string | undefined;
+  currentVisibilityPercentage?: number | undefined;
+  maximumVisibilityPercentage?: number | undefined;
   requests: GptDiagnosticsRequestCycle[];
 }
 
 export interface GptDiagnosticsBindingInput {
   runtimeSlotNumber: number;
-  slotElementId?: string;
+  slotElementId?: string | undefined;
 }
 
 export interface GptDiagnosticsStoreSnapshot {
@@ -63,16 +63,16 @@ type MutableRequestCycle = GptDiagnosticsRequestCycle;
 
 interface MutableSlotRecord {
   runtimeSlotNumber: number;
-  slotElementId?: string;
-  adUnitPath?: string;
-  currentVisibilityPercentage?: number;
-  maximumVisibilityPercentage?: number;
+  slotElementId?: string | undefined;
+  adUnitPath?: string | undefined;
+  currentVisibilityPercentage?: number | undefined;
+  maximumVisibilityPercentage?: number | undefined;
   requests: MutableRequestCycle[];
 }
 
 interface StoreOptions {
-  now?: () => number;
-  schedule?: (callback: () => void) => void;
+  now?: (() => number) | undefined;
+  schedule?: ((callback: () => void) => void) | undefined;
 }
 
 type StoreListener = () => void;
@@ -451,7 +451,7 @@ export class GptDiagnosticsStore {
       return;
     }
 
-    attach(record, candidates[0]);
+    attach(record, candidates[0]!);
     this.incrementDisposition(kind, 'matched');
     this.notify();
   }

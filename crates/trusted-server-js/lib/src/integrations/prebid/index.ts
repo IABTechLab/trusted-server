@@ -52,9 +52,9 @@ const pbjs: PbjsGlobal = (
  * user ID modules were compiled into it.
  */
 interface ExternalPrebidBundleManifest {
-  adapters?: string[];
-  bidderCodes?: string[];
-  userIdModules?: string[];
+  adapters?: string[] | undefined;
+  bidderCodes?: string[] | undefined;
+  userIdModules?: string[] | undefined;
 }
 
 function sanitizeManifestList(value: unknown): string[] | undefined {
@@ -132,11 +132,11 @@ const PENDING_PUBLISHER_DELIVERY_TTL_MS = 5000;
 /** Configuration options for the Prebid integration. */
 export interface PrebidNpmConfig {
   /** Auction endpoint path. Defaults to '/auction'. */
-  endpoint?: string;
+  endpoint?: string | undefined;
   /** Server-side bid timeout in milliseconds. Defaults to 1000. */
-  timeout?: number;
+  timeout?: number | undefined;
   /** Enable Prebid.js debug logging. Defaults to false. */
-  debug?: boolean;
+  debug?: boolean | undefined;
 }
 
 /**
@@ -1082,7 +1082,9 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       if (hasUserIdApi && !auctionEids) {
         clearPrebidEidsCookie();
       }
-      const payload = buildAdRequest(validBidRequests, { eids: auctionEids });
+      const payload = buildAdRequest(validBidRequests, {
+        eids: auctionEids,
+      } as Parameters<typeof buildAdRequest>[1]);
       return {
         method: 'POST',
         url: auctionEndpoint,

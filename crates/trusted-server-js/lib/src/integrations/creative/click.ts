@@ -96,7 +96,7 @@ function equalCanon(a: Canon, b: Canon): boolean {
   const bk = Object.keys(b.params).sort();
   if (ak.length !== bk.length) return false;
   for (let i = 0; i < ak.length; i++) {
-    const k = ak[i];
+    const k = ak[i]!;
     if (k !== bk[i] || a.params[k] !== b.params[k]) return false;
   }
   return true;

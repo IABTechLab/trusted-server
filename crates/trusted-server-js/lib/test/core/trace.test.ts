@@ -69,7 +69,7 @@ describe('trace/recordRender', () => {
     const record = recordRender({ slotId: 'slot-ev', path: 'auction', rendered: true });
 
     expect(listener).toHaveBeenCalledTimes(1);
-    const event = listener.mock.calls[0][0] as CustomEvent<RenderRecord>;
+    const event = listener.mock.calls[0]![0] as CustomEvent<RenderRecord>;
     expect(event.detail).toEqual(record);
 
     window.removeEventListener(RENDER_EVENT_NAME, listener);
@@ -297,8 +297,8 @@ describe('trace/floating panel', () => {
     const panels = document.querySelectorAll(`#${TRACE_PANEL_ID}`);
     expect(panels).toHaveLength(1);
     // Second render of the same slot bumps the count and appends a history row.
-    expect(panels[0].textContent).toContain('TS Render Trace · 1/1 slots ok');
-    expect(panels[0].textContent).toContain('×2');
+    expect(panels[0]!.textContent).toContain('TS Render Trace · 1/1 slots ok');
+    expect(panels[0]!.textContent).toContain('×2');
   });
 
   it("keeps GAM's fill signal and drops ? placeholders on an unattributed refresh", () => {

@@ -17,7 +17,7 @@ export function addAdUnits(units: AdUnit | AdUnit[]): void {
 // Convenience helper to grab the first banner size off an ad unit.
 export function firstSize(unit: AdUnit): Size | null {
   const sizes = unit.mediaTypes?.banner?.sizes;
-  return sizes && sizes.length ? sizes[0] : null;
+  return sizes && sizes.length ? sizes[0]! : null;
 }
 
 // Return a snapshot array of all registered ad units.

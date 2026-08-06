@@ -24,10 +24,10 @@ type ApiWindow = Window & {
 };
 
 interface ApiOptions {
-  window?: ApiWindow;
-  document?: Document;
-  now?: () => Date;
-  schedule?: (callback: () => void) => void;
+  window?: ApiWindow | undefined;
+  document?: Document | undefined;
+  now?: (() => Date) | undefined;
+  schedule?: ((callback: () => void) => void) | undefined;
 }
 
 type ApiListener = (snapshot: GptDiagnosticsExportV1) => void;

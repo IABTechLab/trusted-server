@@ -64,7 +64,7 @@ describe('creative/click.ts', () => {
     await vi.runAllTimersAsync();
 
     expect(fetchMock).toHaveBeenCalled();
-    const call = fetchMock.mock.calls[0];
+    const call = fetchMock.mock.calls[0]!;
     expect(call[0]).toBe('/first-party/proxy-rebuild');
     const payload = JSON.parse(call[1]?.body as string);
     expect(payload).toEqual({
@@ -203,7 +203,7 @@ describe('creative/click.ts', () => {
       await vi.runAllTimersAsync();
 
       expect(openMock).toHaveBeenCalled();
-      const navigated = String(openMock.mock.calls[0][0]);
+      const navigated = String(openMock.mock.calls[0]![0]);
       expect(navigated.startsWith(REBUILD_PREFIX)).toBe(true);
       expect(navigated).toContain('add=%7B%22bar%22%3A%222%22%7D');
       expect(navigated).not.toBe(absolute(FIRST_PARTY_CLICK));

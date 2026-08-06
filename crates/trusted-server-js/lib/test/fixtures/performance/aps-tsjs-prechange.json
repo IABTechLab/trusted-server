@@ -1,0 +1,86 @@
+{
+  "schemaVersion": 1,
+  "mode": "baseline",
+  "source": {
+    "ref": "spec/aps-tsjs-resilience-design",
+    "sha": "1b9753efa01a7985ae8ea804b1997a3cf3b3a7b4"
+  },
+  "environment": {
+    "node": "v24.12.0",
+    "npm": "11.6.2",
+    "typescript": "5.9.3",
+    "chromium": "145.0.7632.6",
+    "ciMachineClass": "local:darwin-arm64",
+    "fixture": "tsjs-core-placeholder-v1"
+  },
+  "sampling": {
+    "warmups": 5,
+    "samples": 50,
+    "percentile": 90
+  },
+  "bundles": {
+    "minimal": {
+      "files": ["tsjs-core.js"],
+      "rawBytes": 23317,
+      "gzipBytes": 8687,
+      "brotliBytes": 7686,
+      "sha256": "1e027cfb238cb6eed090b7addcdba5042059737cb319fbdef1b50e286689b851"
+    },
+    "reference": {
+      "files": ["tsjs-core.js", "tsjs-creative.js", "tsjs-gpt.js", "tsjs-prebid.js"],
+      "rawBytes": 107265,
+      "gzipBytes": 33428,
+      "brotliBytes": 25236,
+      "sha256": "8b9a440310ad358c292864dfa2e088c895c59199c2518fe9a3044236e459d19d"
+    },
+    "maximal": {
+      "files": [
+        "tsjs-core.js",
+        "tsjs-creative.js",
+        "tsjs-datadome.js",
+        "tsjs-didomi.js",
+        "tsjs-google_tag_manager.js",
+        "tsjs-gpt.js",
+        "tsjs-gpt_diagnostics.js",
+        "tsjs-lockr.js",
+        "tsjs-osano.js",
+        "tsjs-permutive.js",
+        "tsjs-prebid.js",
+        "tsjs-sourcepoint.js",
+        "tsjs-testlight.js"
+      ],
+      "rawBytes": 187224,
+      "gzipBytes": 53799,
+      "brotliBytes": 37790,
+      "sha256": "ce5fa29ba8914ad7074221ae777b12c0f496c00b19c42171e42a3d6005c378d3"
+    }
+  },
+  "performance": {
+    "bootToFirstDisplayMs": {
+      "samples": [
+        11.300000011920929, 11.400000005960464, 11, 10.599999994039536, 11.599999994039536,
+        13.199999988079071, 11.799999982118607, 11.100000023841858, 11, 11.799999982118607, 11.5,
+        10.5, 10.800000011920929, 11.899999976158142, 11.199999988079071, 10.600000023841858,
+        10.799999982118607, 11.099999994039536, 10.800000011920929, 10.699999988079071, 10.5,
+        11.200000017881393, 10.599999994039536, 10.5, 10.800000011920929, 10.5, 10.300000011920929,
+        10.199999988079071, 10.800000011920929, 10.700000017881393, 10.299999982118607,
+        10.800000011920929, 10.800000011920929, 11.099999994039536, 15.699999988079071,
+        10.399999976158142, 10.599999994039536, 10.5, 10.800000011920929, 10.599999994039536,
+        10.699999988079071, 10.599999994039536, 11.599999994039536, 11.699999988079071,
+        11.599999994039536, 10.5, 10.699999988079071, 10.400000005960464, 11.099999994039536,
+        11.700000017881393
+      ],
+      "p90": 11.700000017881393
+    },
+    "retainedHeapBytes": {
+      "afterBoot": 1210116,
+      "afterFirstRender": 1213316,
+      "afterRefresh": 1213316,
+      "afterSpaNavigation": 1220364
+    }
+  },
+  "evidence": {
+    "evidenceId": null,
+    "workflowRunId": null
+  }
+}

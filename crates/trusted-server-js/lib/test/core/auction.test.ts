@@ -4,7 +4,7 @@ import { buildAdRequest, parseAuctionResponse, sendAuction } from '../../src/cor
 import envelope from '../fixtures/aps-renderer-v1.json';
 
 function apsRenderer(creativeId?: string) {
-  const bid = envelope.seatbid[0].bid[0];
+  const bid = envelope.seatbid[0]!.bid[0]!;
   return {
     type: 'aps' as const,
     version: 1 as const,
@@ -42,14 +42,17 @@ describe('auction/buildAdRequest', () => {
     const result = buildAdRequest(units);
 
     expect(result.adUnits).toHaveLength(1);
-    expect(result.adUnits[0].code).toBe('div-1');
-    expect(result.adUnits[0].mediaTypes.banner?.sizes).toEqual([
+    expect(result.adUnits[0]!.code).toBe('div-1');
+    expect(result.adUnits[0]!.mediaTypes.banner?.sizes).toEqual([
       [300, 250],
       [728, 90],
     ]);
-    expect(result.adUnits[0].bids).toHaveLength(2);
-    expect(result.adUnits[0].bids[0]).toEqual({ bidder: 'appnexus', params: { placementId: 123 } });
-    expect(result.adUnits[0].bids[1]).toEqual({ bidder: 'rubicon', params: {} });
+    expect(result.adUnits[0]!.bids).toHaveLength(2);
+    expect(result.adUnits[0]!.bids[0]).toEqual({
+      bidder: 'appnexus',
+      params: { placementId: 123 },
+    });
+    expect(result.adUnits[0]!.bids[1]).toEqual({ bidder: 'rubicon', params: {} });
   });
 
   it('builds from Prebid BidRequest objects (adUnitCode + bidder)', () => {
@@ -81,13 +84,13 @@ describe('auction/buildAdRequest', () => {
     const unit1 = result.adUnits.find((u) => u.code === 'div-gpt-1');
     expect(unit1).toBeDefined();
     expect(unit1!.bids).toHaveLength(2);
-    expect(unit1!.bids[0].bidder).toBe('appnexus');
-    expect(unit1!.bids[1].bidder).toBe('rubicon');
+    expect(unit1!.bids[0]!.bidder).toBe('appnexus');
+    expect(unit1!.bids[1]!.bidder).toBe('rubicon');
 
     const unit2 = result.adUnits.find((u) => u.code === 'div-gpt-2');
     expect(unit2).toBeDefined();
     expect(unit2!.bids).toHaveLength(1);
-    expect(unit2!.bids[0].bidder).toBe('openx');
+    expect(unit2!.bids[0]!.bidder).toBe('openx');
   });
 
   it('handles empty units array', () => {
@@ -139,7 +142,7 @@ describe('auction/buildAdRequest', () => {
     const result = buildAdRequest(units);
 
     expect(result.adUnits).toHaveLength(1);
-    expect(result.adUnits[0].mediaTypes).toEqual({});
+    expect(result.adUnits[0]!.mediaTypes).toEqual({});
   });
 
   it('deduplicates by code/adUnitCode', () => {
@@ -150,9 +153,9 @@ describe('auction/buildAdRequest', () => {
 
     const result = buildAdRequest(units);
     expect(result.adUnits).toHaveLength(1);
-    expect(result.adUnits[0].bids).toHaveLength(2);
-    expect(result.adUnits[0].bids[0].bidder).toBe('a');
-    expect(result.adUnits[0].bids[1].bidder).toBe('b');
+    expect(result.adUnits[0]!.bids).toHaveLength(2);
+    expect(result.adUnits[0]!.bids[0]!.bidder).toBe('a');
+    expect(result.adUnits[0]!.bids[1]!.bidder).toBe('b');
   });
 });
 
@@ -245,8 +248,8 @@ describe('auction/parseAuctionResponse', () => {
       ],
     });
 
-    expect(bids[0].renderer).toEqual(renderer);
-    expect(bids[0].creativeId).toBe('aps-fictional-slot');
+    expect(bids[0]!.renderer).toEqual(renderer);
+    expect(bids[0]!.creativeId).toBe('aps-fictional-slot');
   });
 
   it('ignores unrelated or malformed renderer extensions while retaining ordinary adm', () => {
@@ -265,8 +268,8 @@ describe('auction/parseAuctionResponse', () => {
       ],
     });
 
-    expect(bids[0].renderer).toBeUndefined();
-    expect(bids[0].adm).toBe('<div>ordinary</div>');
+    expect(bids[0]!.renderer).toBeUndefined();
+    expect(bids[0]!.adm).toBe('<div>ordinary</div>');
   });
 
   it('handles multiple seatbids with multiple bids', () => {
@@ -307,11 +310,11 @@ describe('auction/parseAuctionResponse', () => {
 
     const bids = parseAuctionResponse(body);
     expect(bids).toHaveLength(1);
-    expect(bids[0].seat).toBe('unknown');
-    expect(bids[0].adm).toBe('');
-    expect(bids[0].width).toBe(300);
-    expect(bids[0].height).toBe(250);
-    expect(bids[0].adomain).toEqual([]);
+    expect(bids[0]!.seat).toBe('unknown');
+    expect(bids[0]!.adm).toBe('');
+    expect(bids[0]!.width).toBe(300);
+    expect(bids[0]!.height).toBe(250);
+    expect(bids[0]!.adomain).toEqual([]);
   });
 });
 
@@ -365,7 +368,7 @@ describe('auction/sendAuction', () => {
       })
     );
     expect(bids).toHaveLength(1);
-    expect(bids[0].price).toBe(2.5);
+    expect(bids[0]!.price).toBe(2.5);
   });
 
   it('returns empty array on network error', async () => {

@@ -80,7 +80,7 @@ describe('GptDiagnosticsObserver', () => {
     expect(gpt.googletag.cmd).toHaveLength(1);
     expect(gpt.pubads.addEventListener).not.toHaveBeenCalled();
 
-    gpt.googletag.cmd[0]();
+    gpt.googletag.cmd[0]!();
 
     expect(gpt.pubads.addEventListener).toHaveBeenCalledTimes(EVENT_NAMES.length);
     expect(gpt.pubads.addEventListener.mock.calls.map(([name]) => name)).toEqual(EVENT_NAMES);
@@ -96,9 +96,9 @@ describe('GptDiagnosticsObserver', () => {
     observer.install();
     expect(gpt.googletag.cmd).toHaveLength(1);
 
-    gpt.googletag.cmd[0]();
+    gpt.googletag.cmd[0]!();
     observer.install();
-    gpt.googletag.cmd[0]();
+    gpt.googletag.cmd[0]!();
 
     expect(gpt.pubads.addEventListener).toHaveBeenCalledTimes(EVENT_NAMES.length);
     expect(store.markGptObserved).toHaveBeenCalledTimes(1);
@@ -119,7 +119,7 @@ describe('GptDiagnosticsObserver', () => {
     expect(delayedWindow.googletag?.cmd).toHaveLength(1);
     const gpt = controlledGpt();
     delayedWindow.googletag!.pubads = gpt.googletag.pubads;
-    delayedWindow.googletag!.cmd[0]();
+    delayedWindow.googletag!.cmd[0]!();
 
     expect(gpt.pubads.addEventListener).toHaveBeenCalledTimes(EVENT_NAMES.length);
   });
@@ -154,7 +154,7 @@ describe('GptDiagnosticsObserver', () => {
     const slot = fakeSlot();
     const observer = new GptDiagnosticsObserver(store, { window: gpt.window });
     observer.install();
-    gpt.googletag.cmd[0]();
+    gpt.googletag.cmd[0]!();
 
     gpt.emit('slotRequested', { slot });
     gpt.emit('slotResponseReceived', { slot });
@@ -189,7 +189,7 @@ describe('GptDiagnosticsObserver', () => {
     const slot = fakeSlot();
     const observer = new GptDiagnosticsObserver(store, { window: gpt.window });
     observer.install();
-    gpt.googletag.cmd[0]();
+    gpt.googletag.cmd[0]!();
 
     gpt.emit('slotRenderEnded', { slot, isEmpty: false, size: 'fluid' });
 
@@ -208,7 +208,7 @@ describe('GptDiagnosticsObserver', () => {
     const gpt = controlledGpt();
     const observer = new GptDiagnosticsObserver(store, { window: gpt.window, logger });
     observer.install();
-    gpt.googletag.cmd[0]();
+    gpt.googletag.cmd[0]!();
     const event = {
       get slot(): GptDiagnosticsSlotLike {
         throw new Error('slot accessor failed');
@@ -248,7 +248,7 @@ describe('GptDiagnosticsObserver', () => {
     });
     listenerObserver.install();
 
-    expect(() => gpt.googletag.cmd[0]()).not.toThrow();
+    expect(() => gpt.googletag.cmd[0]!()).not.toThrow();
     expect(logger.warn).toHaveBeenCalledTimes(2);
   });
 
@@ -267,7 +267,7 @@ describe('GptDiagnosticsObserver', () => {
     };
 
     observer.install();
-    gpt.googletag.cmd[0]();
+    gpt.googletag.cmd[0]!();
 
     expect(gpt.googletag.display).toBe(references.display);
     expect(gpt.googletag.defineSlot).toBe(references.defineSlot);

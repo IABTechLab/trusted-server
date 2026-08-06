@@ -118,7 +118,7 @@ describe('GptDiagnosticsBindingManager', () => {
       status: 'unbound',
       reason: 'missing_slot_element_id',
     });
-    expect(store.snapshot().slots[0].slotElementId).toBeUndefined();
+    expect(store.snapshot().slots[0]!.slotElementId).toBeUndefined();
   });
 
   it('treats duplicate DOM IDs as ambiguous', () => {

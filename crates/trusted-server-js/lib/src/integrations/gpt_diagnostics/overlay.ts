@@ -19,16 +19,16 @@ interface OverlayBindings {
 }
 
 type OverlayWindow = Window & {
-  MutationObserver?: typeof MutationObserver;
+  MutationObserver?: typeof MutationObserver | undefined;
 };
 
 interface OverlayOptions {
-  window?: OverlayWindow;
-  document?: Document;
-  scheduleFrame?: (callback: () => void) => void;
-  onExport?: () => void;
-  onShadowRoot?: (root: ShadowRoot) => void;
-  onBadgeLayerChange?: (layer: HTMLElement | undefined) => void;
+  window?: OverlayWindow | undefined;
+  document?: Document | undefined;
+  scheduleFrame?: ((callback: () => void) => void) | undefined;
+  onExport?: (() => void) | undefined;
+  onShadowRoot?: ((root: ShadowRoot) => void) | undefined;
+  onBadgeLayerChange?: ((layer: HTMLElement | undefined) => void) | undefined;
 }
 
 const PANEL_STYLES = `
@@ -191,12 +191,12 @@ export class GptDiagnosticsOverlay {
   private readonly document: Document;
   private readonly scheduleFrame: (callback: () => void) => void;
   private readonly onExport: () => void;
-  private readonly onShadowRoot?: (root: ShadowRoot) => void;
-  private readonly onBadgeLayerChange?: (layer: HTMLElement | undefined) => void;
+  private readonly onShadowRoot: ((root: ShadowRoot) => void) | undefined;
+  private readonly onBadgeLayerChange: ((layer: HTMLElement | undefined) => void) | undefined;
   private readonly unsubscribeStore: () => void;
   private readonly unsubscribeBindings: () => void;
-  private host?: HTMLElement;
-  private panel?: HTMLElement;
+  private host: HTMLElement | undefined;
+  private panel: HTMLElement | undefined;
   private lifecycleObserver?: MutationObserver;
   private visualReady = false;
   private mountWaitStarted = false;

@@ -315,7 +315,7 @@ function patchCommandQueue(tag: Partial<GoogleTag>): void {
   // Only applicable when cmd is an array (pre-GPT-load case).
   if (Array.isArray(queue)) {
     for (let i = 0; i < queue.length; i++) {
-      queue[i] = wrapCommand(queue[i]);
+      queue[i] = wrapCommand(queue[i]!);
     }
     log.debug('GPT shim: command queue patched', { pendingCommands: queue.length });
   } else {
@@ -1087,8 +1087,11 @@ export function installTsAdInit(): void {
             (
               slotToRefresh as GoogleTagSlot & { __tsRenderGeneration?: number }
             ).__tsRenderGeneration = renderGeneration;
-            (slotToRefresh as GoogleTagSlot & { __tsRenderBid?: AuctionBidData }).__tsRenderBid =
-              pending;
+            (
+              slotToRefresh as GoogleTagSlot & {
+                __tsRenderBid?: AuctionBidData | undefined;
+              }
+            ).__tsRenderBid = pending;
           }
         });
         // One-shot bypass: this internal refresh delivers the just-applied
@@ -1408,9 +1411,9 @@ function expandAuctionPriceMacro(markup: string, cpm: number): string {
 /** A decoded PBS Cache bid: the renderable creative plus its render metadata. */
 export interface CachedBid {
   adm: string;
-  width?: number;
-  height?: number;
-  price?: number;
+  width?: number | undefined;
+  height?: number | undefined;
+  price?: number | undefined;
 }
 
 /**

@@ -1,5 +1,6 @@
 // Global configuration storage for the tsjs runtime (logging, debug, etc.).
-import { log, LogLevel } from './log';
+import { log } from './log';
+import type { LogLevel } from './log';
 
 export interface Config {
   debug?: boolean;

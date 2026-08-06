@@ -34,7 +34,7 @@ function encodeEnvelopeAtSize(size: number): string {
 }
 
 function descriptor(overrides: Partial<ApsRendererV1> = {}): ApsRendererV1 {
-  const bid = envelope.seatbid[0].bid[0];
+  const bid = envelope.seatbid[0]!.bid[0]!;
   return {
     type: 'aps',
     version: 1,
@@ -93,19 +93,19 @@ describe('APS renderer validation', () => {
     ['sibling seat', { seatbid: [...envelope.seatbid, envelope.seatbid[0]] }],
     [
       'sibling bid',
-      { seatbid: [{ bid: [...envelope.seatbid[0].bid, envelope.seatbid[0].bid[0]] }] },
+      { seatbid: [{ bid: [...envelope.seatbid[0]!.bid, envelope.seatbid[0]!.bid[0]!] }] },
     ],
     [
       'markup',
       {
         seatbid: [
-          { bid: [{ ...envelope.seatbid[0].bid[0], adm: '<script>forbidden()</script>' }] },
+          { bid: [{ ...envelope.seatbid[0]!.bid[0]!, adm: '<script>forbidden()</script>' }] },
         ],
       },
     ],
     [
       'notification',
-      { seatbid: [{ bid: [{ ...envelope.seatbid[0].bid[0], nurl: 'https://notify.example' }] }] },
+      { seatbid: [{ bid: [{ ...envelope.seatbid[0]!.bid[0]!, nurl: 'https://notify.example' }] }] },
     ],
     [
       'unknown extension',
@@ -114,8 +114,8 @@ describe('APS renderer validation', () => {
           {
             bid: [
               {
-                ...envelope.seatbid[0].bid[0],
-                ext: { ...envelope.seatbid[0].bid[0].ext, userSyncs: [] },
+                ...envelope.seatbid[0]!.bid[0]!,
+                ext: { ...envelope.seatbid[0]!.bid[0]!.ext, userSyncs: [] },
               },
             ],
           },
@@ -153,8 +153,8 @@ describe('APS renderer validation', () => {
     const canonical = encodeBytes(new TextEncoder().encode(`${JSON.stringify(envelope)} `));
     const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
     const finalDataIndex = canonical.length - 3;
-    const canonicalIndex = alphabet.indexOf(canonical[finalDataIndex]);
-    const nonCanonical = `${canonical.slice(0, finalDataIndex)}${alphabet[canonicalIndex + 1]}==`;
+    const canonicalIndex = alphabet.indexOf(canonical[finalDataIndex]!);
+    const nonCanonical = `${canonical.slice(0, finalDataIndex)}${alphabet[canonicalIndex + 1]!}==`;
 
     expect(atob(nonCanonical)).toBe(atob(canonical));
     expect(validateApsRenderer(descriptor({ aaxResponse: canonical }))).toBeDefined();
@@ -167,7 +167,7 @@ describe('APS renderer validation', () => {
     `${window.location.origin}/creative`,
   ])('rejects an unsafe creative URL', (creativeUrl) => {
     const invalidEnvelope = structuredClone(envelope);
-    invalidEnvelope.seatbid[0].bid[0].ext.creativeurl = creativeUrl;
+    invalidEnvelope.seatbid[0]!.bid[0]!.ext.creativeurl = creativeUrl;
     expect(
       validateApsRenderer(descriptor({ creativeUrl, aaxResponse: encodeEnvelope(invalidEnvelope) }))
     ).toBeUndefined();
@@ -192,9 +192,9 @@ describe('APS renderer validation', () => {
     const atLimit = `${prefix}${'a'.repeat(4096 - prefix.length)}`;
     const overLimit = `${atLimit}x`;
     const atLimitEnvelope = structuredClone(envelope);
-    atLimitEnvelope.seatbid[0].bid[0].ext.creativeurl = atLimit;
+    atLimitEnvelope.seatbid[0]!.bid[0]!.ext.creativeurl = atLimit;
     const overLimitEnvelope = structuredClone(envelope);
-    overLimitEnvelope.seatbid[0].bid[0].ext.creativeurl = overLimit;
+    overLimitEnvelope.seatbid[0]!.bid[0]!.ext.creativeurl = overLimit;
 
     expect(
       validateApsRenderer(
@@ -298,7 +298,7 @@ describe('direct APS rendering', () => {
       '*'
     );
 
-    const message = postMessage.mock.calls[0][0] as { nonce: string };
+    const message = postMessage.mock.calls[0]![0] as { nonce: string };
     window.dispatchEvent(
       new MessageEvent('message', {
         data: {
@@ -324,10 +324,10 @@ describe('direct APS rendering', () => {
     expect(renderApsCreative({ slotId: 'fictional-slot', renderer: descriptor() })).toBe(true);
 
     const slot = document.getElementById('fictional-slot')!;
-    const rendererFrame = slot.querySelector('iframe')!;
+    const rendererFrame = slot.querySelector<HTMLIFrameElement>('iframe')!;
     const postMessage = vi.spyOn(rendererFrame.contentWindow!, 'postMessage');
     rendererFrame.dispatchEvent(new Event('load'));
-    const sent = postMessage.mock.calls[0][0] as { nonce: string };
+    const sent = postMessage.mock.calls[0]![0] as { nonce: string };
     const foreignFrame = document.createElement('iframe');
     document.body.appendChild(foreignFrame);
 
@@ -363,7 +363,7 @@ describe('direct APS rendering', () => {
     expect(document.querySelector('#fictional-slot iframe')).toBeNull();
 
     expect(renderApsCreative({ slotId: 'fictional-slot', renderer: descriptor() })).toBe(true);
-    const iframe = document.querySelector('#fictional-slot iframe')!;
+    const iframe = document.querySelector<HTMLIFrameElement>('#fictional-slot iframe')!;
     iframe.dispatchEvent(new Event('error'));
     expect(document.querySelector('#fictional-slot span')).not.toBeNull();
     expect(document.querySelector('#fictional-slot iframe')).toBeNull();
@@ -373,7 +373,7 @@ describe('direct APS rendering', () => {
     vi.useFakeTimers();
     try {
       expect(renderApsCreative({ slotId: 'fictional-slot', renderer: descriptor() })).toBe(true);
-      const iframe = document.querySelector('#fictional-slot iframe')!;
+      const iframe = document.querySelector<HTMLIFrameElement>('#fictional-slot iframe')!;
       iframe.dispatchEvent(new Event('load'));
 
       vi.advanceTimersByTime(10_000);
@@ -391,20 +391,20 @@ describe('direct APS rendering', () => {
     try {
       const baselineTimers = vi.getTimerCount();
       expect(renderApsCreative({ slotId: 'fictional-slot', renderer: descriptor() })).toBe(true);
-      const firstFrame = document.querySelector('#fictional-slot iframe')!;
+      const firstFrame = document.querySelector<HTMLIFrameElement>('#fictional-slot iframe')!;
       const firstPostMessage = vi.spyOn(firstFrame.contentWindow!, 'postMessage');
       firstFrame.dispatchEvent(new Event('load'));
-      const firstSent = firstPostMessage.mock.calls[0][0] as { nonce: string };
+      const firstSent = firstPostMessage.mock.calls[0]![0] as { nonce: string };
       const timersAfterFirst = vi.getTimerCount();
       expect(timersAfterFirst).toBeGreaterThan(baselineTimers);
 
       expect(renderApsCreative({ slotId: 'fictional-slot', renderer: descriptor() })).toBe(true);
-      const secondFrame = document.querySelector('#fictional-slot iframe')!;
+      const secondFrame = document.querySelector<HTMLIFrameElement>('#fictional-slot iframe')!;
       expect(firstFrame.isConnected).toBe(false);
       expect(vi.getTimerCount()).toBe(timersAfterFirst);
       const postMessage = vi.spyOn(secondFrame.contentWindow!, 'postMessage');
       secondFrame.dispatchEvent(new Event('load'));
-      const sent = postMessage.mock.calls[0][0] as { nonce: string };
+      const sent = postMessage.mock.calls[0]![0] as { nonce: string };
 
       window.dispatchEvent(
         new MessageEvent('message', {
@@ -467,14 +467,14 @@ describe('Universal Creative APS source', () => {
         undefined,
         window
       );
-      const iframe = document.body.querySelector('iframe')!;
+      const iframe = document.body.querySelector<HTMLIFrameElement>('iframe')!;
       expect(iframe.src).toMatch(/\/integrations\/aps\/renderer#tsaps=[A-Za-z0-9_-]{22}$/);
       expect(iframe.getAttribute('sandbox')).toBe(APS_RENDERER_SANDBOX);
       expect(iframe.getAttribute('sandbox')).not.toContain('allow-same-origin');
 
       const postMessage = vi.spyOn(iframe.contentWindow!, 'postMessage');
       iframe.dispatchEvent(new Event('load'));
-      const sent = postMessage.mock.calls[0][0] as { nonce: string; renderer: ApsRendererV1 };
+      const sent = postMessage.mock.calls[0]![0] as { nonce: string; renderer: ApsRendererV1 };
       expect(sent.renderer).toEqual(renderer);
 
       let settled = false;
