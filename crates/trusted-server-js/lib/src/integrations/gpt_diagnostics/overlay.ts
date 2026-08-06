@@ -153,6 +153,8 @@ function requestPathFact(cycle: GptDiagnosticsRequestCycle): string {
       return 'Request path: Trusted Server direct';
     case 'prebid_refresh':
       return 'Request path: Prebid refresh';
+    case 'publisher_refresh':
+      return 'Request path: Publisher refresh';
     case 'competing':
       return 'Request path: Competing paths';
     case 'unattributed':
@@ -224,6 +226,31 @@ function responseClassFact(cycle: GptDiagnosticsRequestCycle): string | undefine
 
 function cycleFacts(cycle: GptDiagnosticsRequestCycle): string[] {
   const facts: string[] = [requestPathFact(cycle), trustedServerOpportunityFact(cycle)];
+  if (Number.isSafeInteger(cycle.requestIntentId) && cycle.requestIntentId! > 0) {
+    facts.push(`Request intent: ${cycle.requestIntentId}`);
+  }
+  if (typeof cycle.trustedServerAuctionId === 'string' && cycle.trustedServerAuctionId.length > 0) {
+    facts.push(`Trusted Server auction: ${cycle.trustedServerAuctionId}`);
+  }
+  const opportunityToRequest = formatMilliseconds(cycle.opportunityToRequestMs);
+  if (opportunityToRequest) facts.push(`Opportunity → request ${opportunityToRequest}`);
+  const previousRenderToRequest = formatMilliseconds(cycle.previousRenderToRequestMs);
+  if (cycle.replacedRequestNumber !== undefined && previousRenderToRequest) {
+    facts.push(
+      `Replaced rendered request ${cycle.replacedRequestNumber} after ${previousRenderToRequest}`
+    );
+  }
+  if (
+    cycle.creativeChanged !== undefined &&
+    cycle.previousCreativeId !== undefined &&
+    cycle.adManager?.creativeId !== undefined
+  ) {
+    facts.push(
+      cycle.creativeChanged
+        ? `Creative changed ${cycle.previousCreativeId} → ${cycle.adManager.creativeId}`
+        : `Creative unchanged ${cycle.adManager.creativeId}`
+    );
+  }
   const creativeRequestAt = formatMilliseconds(cycle.trustedServerCreativeRequestAtMs);
   if (creativeRequestAt) {
     facts.push(`Trusted Server creative request observed at ${creativeRequestAt}`);

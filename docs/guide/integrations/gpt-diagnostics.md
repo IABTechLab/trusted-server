@@ -78,7 +78,9 @@ Visible, Filled, Empty, Pending/Incomplete, and Unbound/Ambiguous slots.
 
 Each request cycle can show:
 
-- The observed request path and direct Trusted Server opportunity.
+- The observed request path, request-intent ID, and direct Trusted Server opportunity.
+- Opaque Trusted Server auction-ID correlation and opportunity-to-request latency when available.
+- Observed replacement of an earlier retained filled render, including GPT creative-ID transitions.
 - Requesting, Response received, Filled, Empty, or Rendered (fill unknown) GPT
   lifecycle state.
 - The creative request and successful response timestamps as independent facts.
@@ -102,18 +104,40 @@ Request-path labels describe integration paths observed immediately before one G
 `slotRequested` callback. They do not identify a bidder winner or the owner of the
 actual network request.
 
-| Request path            | Meaning                                                                                                                   |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| `trusted_server_direct` | Only the one-shot opportunity marker from `adInit` was consumed by the request.                                           |
-| `prebid_refresh`        | Only the installed Prebid refresh path marked the slots passed to its GPT refresh.                                        |
-| `competing`             | Both integration paths touched the slot before the request; targeting competition or overwrite is possible, but unproven. |
-| `unattributed`          | Neither marker was observed; diagnostics do not infer a path from timing, element IDs, or targeting names.                |
+| Request path            | Meaning                                                                                                        |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `trusted_server_direct` | Only the `adInit` observation was consumed by the request.                                                     |
+| `prebid_refresh`        | Only the installed Prebid refresh path was observed.                                                           |
+| `publisher_refresh`     | The request crossed the installed publisher `pubads.refresh` boundary.                                         |
+| `competing`             | Two or more observed paths contributed evidence; competition or overwrite is possible, but unproven.           |
+| `unattributed`          | No observed intent was consumed; diagnostics do not infer a path from timing, element IDs, or targeting names. |
 
-Both request-path markers live for five seconds and are consumed once. Their expiry
-means the observation was too old to associate, not that either path did or did not
-own a later request. Because documented GPT callbacks expose no request token,
+Each source in a per-slot request intent lives for five seconds and is consumed once.
+Sources expire independently: re-observing one source cannot extend another source's
+window. Their expiry means the observation was too old to associate, not that either
+path did or did not own a later request. Because documented GPT callbacks expose no request token,
 `competing` is a warning about possible competition, not a conclusion about which
 values were sent or selected.
+
+The publisher-refresh observer delegates exactly once with the original receiver,
+arguments, result, and synchronous throw. Bare `refresh()` calls use GPT's current
+slot list only for diagnostics. A stale refresh function reference captured before
+installation bypasses that boundary and remains `unattributed`. Prebid sets a scoped,
+synchronous diagnostics context while delegating its own refresh, so nesting does not
+mislabel a Prebid refresh as `competing`. Diagnostics never suppresses or changes a
+GPT request.
+
+For a direct observation, the optional opaque auction ID is retained only after
+trimming to a non-empty value no longer than 256 UTF-8 bytes. No auction payload,
+targeting map, bid price, markup, network body, or stack trace is exported. The
+reported opportunity-to-request duration is browser-observed only and is omitted for
+invalid or negative timing.
+
+When a non-empty render follows a later request for the same retained GPT slot, the
+console can report the most recent earlier non-empty render it replaces. This is an
+observed callback relationship, not proof that pixels changed. GPT-provided creative
+IDs are compared only when both cycles provide IDs; `slotContentChanged` remains a
+separate GPT fact.
 
 For the direct path, `adInit` records one opportunity:
 
@@ -216,6 +240,11 @@ have more than one compatible cycle, such as overlapping refreshes. A uniquely
 correlated out-of-order callback remains matched and also records an
 `invalid_event_order` callback issue. Coverage describes callback correlation, not
 fill rate or revenue.
+
+A unique response-bearing cycle can observe `slotOnload` before
+`slotRenderEnded`. Diagnostics records `loadObservedBeforeRender`, deliberately omits
+`renderToLoadMs`, and does not mark that normal ordering incomplete or invalid.
+Overlapping response-bearing candidates remain ambiguous.
 
 ## Correlation, Slot Binding, and Badges
 

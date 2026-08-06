@@ -124,7 +124,8 @@ describe('GptDiagnosticsOverlay', () => {
     store.recordTrustedServerOpportunity(
       responseSentSlot,
       'auction-response-sent',
-      'renderable_candidate'
+      'renderable_candidate',
+      'auction-123'
     );
     store.recordSlotRequested(responseSentSlot);
     now = 11;
@@ -243,6 +244,9 @@ describe('GptDiagnosticsOverlay', () => {
     const text = root!.textContent ?? '';
     const responseSentArticle = slotArticle(root!, 'response-sent-slot').textContent ?? '';
     expect(responseSentArticle).toContain('Request path: Trusted Server direct');
+    expect(responseSentArticle).toContain('Request intent: 1');
+    expect(responseSentArticle).toContain('Trusted Server auction: auction-123');
+    expect(responseSentArticle).toContain('Opportunity → request 0 ms');
     expect(responseSentArticle).toContain('Direct opportunity: Renderable candidate');
     expect(responseSentArticle).toContain('Trusted Server creative request observed at 13 ms');
     expect(responseSentArticle).toContain('Trusted Server markup response sent at 14 ms');
