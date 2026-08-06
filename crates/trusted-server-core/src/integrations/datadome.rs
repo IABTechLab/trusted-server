@@ -914,12 +914,26 @@ fn build(
         return Ok(None);
     };
 
-    log::info!(
-        "[datadome] Registering integration (sdk_origin: {}, rewrite_sdk: {}, enable_protection: {})",
-        config.sdk_origin,
-        config.rewrite_sdk,
-        config.enable_protection
-    );
+    if let Some(bypass) = config
+        .protection_test_bypass
+        .as_ref()
+        .filter(|bypass| bypass.enabled)
+    {
+        log::info!(
+            "[datadome] Registering integration (sdk_origin: {}, rewrite_sdk: {}, enable_protection: {}, protection_test_bypass: enabled, protection_test_bypass_header: {})",
+            config.sdk_origin,
+            config.rewrite_sdk,
+            config.enable_protection,
+            bypass.header_name,
+        );
+    } else {
+        log::info!(
+            "[datadome] Registering integration (sdk_origin: {}, rewrite_sdk: {}, enable_protection: {}, protection_test_bypass: disabled)",
+            config.sdk_origin,
+            config.rewrite_sdk,
+            config.enable_protection,
+        );
+    }
 
     Ok(Some(DataDomeIntegration::try_new(config)?))
 }
