@@ -152,7 +152,7 @@ matches!(reason, "client_ip" | "client_ip_source" | "ip_cidr" | "ip_cidr_source"
       desired shape is:
 
 ```text
-[datadome] protection decision=skipped rule=excluded-ip-cidrs reason=client_ip client_tag=omitted method=GET host=example.com path=/page
+[datadome] protection decision=skipped rule=excluded-ip-cidrs reason=client_ip client_tag=omitted method=GET
 ```
 
 - [ ] **Step 5: Add filter-level marker tests.** Add small helpers in the

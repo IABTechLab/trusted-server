@@ -61,7 +61,7 @@ use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::header;
-use http::{HeaderName, Method, StatusCode};
+use http::{Method, StatusCode};
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -77,7 +77,6 @@ use crate::integrations::{
     collect_body_bounded, collect_response_bounded, ensure_integration_backend,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
-use crate::redacted::Redacted;
 use crate::settings::{IntegrationConfig, Settings};
 
 mod protection;
@@ -90,6 +89,7 @@ pub use protection_scope::{
 use protection_scope::ProtectionScope;
 
 pub(crate) const DATADOME_INTEGRATION_ID: &str = "datadome";
+pub(crate) const HEADER_DATADOME_TEST_BYPASS: &str = "x-ts-datadome-bypass";
 
 /// Request marker indicating that Trusted Server should omit its automatic
 /// `DataDome` client-side tag for the current response.
@@ -121,8 +121,9 @@ static DATADOME_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 /// Temporary static-header bypass for server-side `DataDome` protection.
 ///
 /// This is intended only for an access-controlled staging environment. A
-/// matching header bypasses the server-side Protection API and is removed
-/// before the publisher origin receives the request.
+/// matching `x-ts-datadome-bypass` header bypasses the server-side Protection
+/// API and is removed before the publisher origin receives the request. The
+/// credential itself is loaded from the Secret Store at runtime.
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProtectionTestBypassConfig {
@@ -130,13 +131,13 @@ pub struct ProtectionTestBypassConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Header name carrying the temporary bypass credential.
-    #[serde(default)]
-    pub header_name: String,
+    /// Secret Store containing the temporary bypass credential.
+    #[serde(default = "default_protection_test_bypass_secret_store")]
+    pub credential_secret_store: String,
 
-    /// Static credential expected in [`Self::header_name`].
-    #[serde(default)]
-    pub credential: Redacted<String>,
+    /// Secret name containing the temporary bypass credential.
+    #[serde(default = "default_protection_test_bypass_secret_name")]
+    pub credential_secret_name: String,
 }
 
 /// Configuration for `DataDome` integration.
@@ -278,6 +279,14 @@ fn default_server_side_key_secret_name() -> String {
     "datadome_server_side_key".to_string()
 }
 
+fn default_protection_test_bypass_secret_store() -> String {
+    "ts_secrets".to_string()
+}
+
+fn default_protection_test_bypass_secret_name() -> String {
+    "datadome_test_bypass".to_string()
+}
+
 fn default_timeout_ms() -> u32 {
     1500
 }
@@ -390,7 +399,8 @@ impl DataDomeIntegration {
         config.protection_api_origin = config.protection_api_origin.trim().to_string();
         config.client_side_tag_url = config.client_side_tag_url.trim().to_string();
         if let Some(bypass) = &mut config.protection_test_bypass {
-            bypass.header_name = bypass.header_name.trim().to_string();
+            bypass.credential_secret_store = bypass.credential_secret_store.trim().to_string();
+            bypass.credential_secret_name = bypass.credential_secret_name.trim().to_string();
         }
 
         if config.enable_protection {
@@ -453,6 +463,12 @@ impl DataDomeIntegration {
         Ok(())
     }
 
+    pub(crate) fn validate_config_for_startup(
+        config: DataDomeConfig,
+    ) -> Result<(), Report<TrustedServerError>> {
+        Self::try_new(config).map(|_| ())
+    }
+
     fn validate_protection_test_bypass(
         config: &DataDomeConfig,
     ) -> Result<(), Report<TrustedServerError>> {
@@ -469,14 +485,9 @@ impl DataDomeIntegration {
                 "protection_test_bypass requires enable_protection to be true",
             )));
         }
-        if HeaderName::from_bytes(bypass.header_name.as_bytes()).is_err() {
+        if bypass.credential_secret_store.is_empty() || bypass.credential_secret_name.is_empty() {
             return Err(Report::new(Self::error(
-                "protection_test_bypass.header_name must be a valid HTTP header name",
-            )));
-        }
-        if bypass.credential.expose().is_empty() {
-            return Err(Report::new(Self::error(
-                "protection_test_bypass.credential must not be empty when enabled",
+                "protection_test_bypass credential_secret_store and credential_secret_name must not be empty when enabled",
             )));
         }
 
@@ -914,28 +925,25 @@ fn build(
         return Ok(None);
     };
 
-    if let Some(bypass) = config
+    let integration = DataDomeIntegration::try_new(config)?;
+    let protection_test_bypass = integration
+        .config
         .protection_test_bypass
         .as_ref()
-        .filter(|bypass| bypass.enabled)
-    {
-        log::info!(
-            "[datadome] Registering integration (sdk_origin: {}, rewrite_sdk: {}, enable_protection: {}, protection_test_bypass: enabled, protection_test_bypass_header: {})",
-            config.sdk_origin,
-            config.rewrite_sdk,
-            config.enable_protection,
-            bypass.header_name,
-        );
-    } else {
-        log::info!(
-            "[datadome] Registering integration (sdk_origin: {}, rewrite_sdk: {}, enable_protection: {}, protection_test_bypass: disabled)",
-            config.sdk_origin,
-            config.rewrite_sdk,
-            config.enable_protection,
-        );
-    }
+        .is_some_and(|bypass| bypass.enabled);
+    log::info!(
+        "[datadome] Registering integration (sdk_origin: {}, rewrite_sdk: {}, enable_protection: {}, protection_test_bypass: {})",
+        integration.config.sdk_origin,
+        integration.config.rewrite_sdk,
+        integration.config.enable_protection,
+        if protection_test_bypass {
+            "enabled"
+        } else {
+            "disabled"
+        },
+    );
 
-    Ok(Some(DataDomeIntegration::try_new(config)?))
+    Ok(Some(integration))
 }
 
 /// Register the `DataDome` integration with Trusted Server.
@@ -1188,8 +1196,8 @@ mod tests {
 
             [protection_test_bypass]
             enabled = true
-            header_name = "x-ts-datadome-test-bypass"
-            credential = "temporary-test-credential"
+            credential_secret_store = "ts_secrets"
+            credential_secret_name = "datadome_test_bypass"
             "#,
         )
         .expect("should deserialize DataDome test bypass configuration");
@@ -1199,34 +1207,33 @@ mod tests {
 
         assert!(bypass.enabled, "should retain the enabled flag");
         assert_eq!(
-            bypass.header_name, "x-ts-datadome-test-bypass",
-            "should retain the configured header name"
+            bypass.credential_secret_store, "ts_secrets",
+            "should retain the configured credential Secret Store"
         );
         assert_eq!(
-            bypass.credential.expose(),
-            "temporary-test-credential",
-            "should retain the configured credential"
+            bypass.credential_secret_name, "datadome_test_bypass",
+            "should retain the configured credential secret name"
         );
     }
 
     #[test]
-    fn protection_test_bypass_requires_protection_header_and_credential() {
-        for (enable_protection, header_name, credential, expected_message) in [
+    fn protection_test_bypass_requires_protection_and_secret_references() {
+        for (enable_protection, store, name, expected_message) in [
             (
                 false,
-                "x-ts-datadome-test-bypass",
-                "temporary-test-credential",
+                "ts_secrets",
+                "datadome_test_bypass",
                 "requires enable_protection",
             ),
-            (true, "", "temporary-test-credential", "header_name"),
-            (true, "x-ts-datadome-test-bypass", "", "credential"),
+            (true, "", "datadome_test_bypass", "credential_secret_store"),
+            (true, "ts_secrets", "", "credential_secret_name"),
         ] {
             let mut config = test_config();
             config.enable_protection = enable_protection;
             config.protection_test_bypass = Some(ProtectionTestBypassConfig {
                 enabled: true,
-                header_name: header_name.to_string(),
-                credential: Redacted::new(credential.to_string()),
+                credential_secret_store: store.to_string(),
+                credential_secret_name: name.to_string(),
             });
 
             let err = match DataDomeIntegration::try_new(config) {

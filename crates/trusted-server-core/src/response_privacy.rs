@@ -22,6 +22,7 @@ pub const CDN_CACHE_HEADERS: &[&str] = &[
     "fastly-surrogate-control",
     "cdn-cache-control",
     "cloudflare-cdn-cache-control",
+    "cdn-cache-control",
 ];
 
 /// Forces cookie-bearing responses to stay private to shared caches.
@@ -37,7 +38,7 @@ pub fn enforce_set_cookie_cache_privacy(response: &mut Response) {
     if !response.headers().contains_key(header::SET_COOKIE) {
         return;
     }
-    // Surrogate cache headers must come off every cookie-bearing response, even
+    // Shared-cache control headers must come off every cookie-bearing response, even
     // one already carrying a stricter `no-store`/`private` directive — they are
     // independent of Cache-Control and would otherwise let a shared cache store
     // and replay one visitor's Set-Cookie.

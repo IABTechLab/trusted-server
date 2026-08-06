@@ -1452,12 +1452,21 @@ fn apply_datadome_client_tag_cache_privacy(
         return;
     }
 
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("private, max-age=0"),
-    );
-    response.headers_mut().remove("surrogate-control");
-    response.headers_mut().remove("fastly-surrogate-control");
+    let already_uncacheable = response
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|value| value.contains("private") || value.contains("no-store"));
+    if !already_uncacheable {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, max-age=0"),
+        );
+    }
+    for header_name in CDN_CACHE_HEADERS {
+        response.headers_mut().remove(*header_name);
+    }
 }
 
 /// Drop a bodiless response's body and correct its framing headers.
@@ -2895,6 +2904,10 @@ pub async fn handle_publisher_request(
         .extensions()
         .get::<crate::integrations::datadome::DataDomeClientTagSuppressed>()
         .is_some();
+    if suppress_datadome_client_side_tag {
+        req.headers_mut().remove(header::IF_NONE_MATCH);
+        req.headers_mut().remove(header::IF_MODIFIED_SINCE);
+    }
     let mut platform_request = PlatformHttpRequest::new(req, backend_name);
     if services.http_client().supports_streaming_responses() {
         platform_request = platform_request.with_stream_response();
@@ -5204,6 +5217,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn suppressed_publisher_request_removes_conditional_validators() {
+        let settings = create_test_settings();
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            200,
+            b"<html><body>origin</body></html>".to_vec(),
+            vec![("content-type", "text/html; charset=utf-8")],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let mut req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/page")
+            .header(header::HOST, "publisher.example")
+            .header(header::IF_NONE_MATCH, "\"cached-page\"")
+            .header(header::IF_MODIFIED_SINCE, "Wed, 21 Oct 2015 07:28:00 GMT")
+            .body(EdgeBody::empty())
+            .expect("should build conditional request");
+        req.extensions_mut()
+            .insert(crate::integrations::datadome::DataDomeClientTagSuppressed);
+
+        let _response = run_publisher_proxy(&settings, &services, req).await;
+
+        let headers = stub
+            .recorded_request_headers()
+            .into_iter()
+            .next()
+            .expect("should record one outbound request");
+        assert!(
+            headers
+                .iter()
+                .all(|(name, _)| !name.eq_ignore_ascii_case(header::IF_NONE_MATCH.as_str())),
+            "suppressed requests must not forward If-None-Match"
+        );
+        assert!(
+            headers
+                .iter()
+                .all(|(name, _)| !name.eq_ignore_ascii_case(header::IF_MODIFIED_SINCE.as_str())),
+            "suppressed requests must not forward If-Modified-Since"
+        );
+    }
+
+    #[tokio::test]
     async fn publisher_origin_fetch_leaves_stream_response_disabled_when_unsupported() {
         let settings = create_test_settings();
         let stub = Arc::new(StubHttpClient::new());
@@ -5365,6 +5422,8 @@ mod tests {
             .header(header::CACHE_CONTROL, "public, max-age=600")
             .header("surrogate-control", "max-age=600")
             .header("fastly-surrogate-control", "max-age=600")
+            .header("cloudflare-cdn-cache-control", "max-age=600")
+            .header("cdn-cache-control", "max-age=600")
             .body(EdgeBody::empty())
             .expect("should build cacheable HTML response");
 
@@ -5390,6 +5449,37 @@ mod tests {
         assert!(
             response.headers().get("fastly-surrogate-control").is_none(),
             "suppressed HTML should not retain Fastly-Surrogate-Control"
+        );
+        assert!(
+            response
+                .headers()
+                .get("cloudflare-cdn-cache-control")
+                .is_none(),
+            "suppressed HTML should not retain Cloudflare-CDN-Cache-Control"
+        );
+        assert!(
+            response.headers().get("cdn-cache-control").is_none(),
+            "suppressed HTML should not retain CDN-Cache-Control"
+        );
+
+        let mut no_store_response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(EdgeBody::empty())
+            .expect("should build no-store HTML response");
+        super::apply_datadome_client_tag_cache_privacy(
+            &mut no_store_response,
+            &Method::GET,
+            true,
+            "text/html; charset=utf-8",
+        );
+        assert_eq!(
+            no_store_response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store"),
+            "suppressed HTML should preserve an existing no-store policy"
         );
     }
 
