@@ -808,7 +808,9 @@ Every task's regression suite therefore remains green in task order.
 **Files:**
 
 - Modify: `crates/trusted-server-js/lib/eslint.config.js`
+- Modify: `crates/trusted-server-js/lib/package-lock.json`
 - Modify: `crates/trusted-server-js/lib/package.json`
+- Modify: `crates/trusted-server-js/lib/vitest.config.ts`
 - Create: `crates/trusted-server-js/lib/eslint-rules/no-adtech-globals.js`
 - Create: `crates/trusted-server-js/lib/test/eslint/no-adtech-globals.test.mjs`
 - Create: `crates/trusted-server-js/lib/src/adapters/googletag.ts`
@@ -822,9 +824,12 @@ Every task's regression suite therefore remains green in task order.
       inside adapters and kernel `window.tsjs`/messaging code.
 
 - [ ] **Step 2: Configure `import/no-restricted-paths` for the dependency direction in the**
-      source-shape diagram. Add a narrow, enumerated temporary allowlist for current
-      production files that still violate the target (`core/request.ts`, GPT/Prebid
-      integration files, and diagnostics files found by the initial lint inventory).
+      source-shape diagram. Resolve imports with the package's TypeScript bundler
+      semantics so explicit `.js` specifiers cannot bypass `.ts` boundaries. Add a
+      narrow, enumerated temporary allowlist for current
+      production files that still violate the target (`core/auction.ts`,
+      `core/request.ts`, GPT/Prebid integration files, and the diagnostics observer
+      found by the executable lint inventory).
       New files receive no exemption. Check the allowlist into the lint test and make
       Task 22 fail if any entry remains.
 

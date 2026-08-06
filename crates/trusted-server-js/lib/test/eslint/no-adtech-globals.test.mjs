@@ -1,0 +1,339 @@
+import assert from 'node:assert/strict';
+import { readdir } from 'node:fs/promises';
+import path from 'node:path';
+import test from 'node:test';
+
+import { ESLint, Linter } from 'eslint';
+
+import noAdtechGlobals, {
+  LEGACY_ADTECH_GLOBAL_ALLOWLIST,
+  LEGACY_RESTRICTED_IMPORT_ALLOWLIST,
+} from '../../eslint-rules/no-adtech-globals.js';
+import {
+  ARCHITECTURE_INTEGRATION_DIRECTORIES,
+  ARCHITECTURE_RESTRICTED_LAYER_ZONES,
+} from '../../eslint.config.js';
+
+const ruleId = 'tsjs/no-adtech-globals';
+const packageRoot = path.resolve(import.meta.dirname, '../..');
+
+function lint(source, filename = 'src/kernel/new-runtime.js') {
+  const linter = new Linter({ configType: 'flat' });
+
+  return linter.verify(
+    source,
+    [
+      {
+        files: ['**/*.js', '**/*.ts', '**/*.tsx'],
+        languageOptions: {
+          ecmaVersion: 'latest',
+          sourceType: 'module',
+          globals: {
+            globalThis: 'readonly',
+            self: 'readonly',
+            window: 'readonly',
+          },
+        },
+        plugins: {
+          tsjs: {
+            rules: {
+              'no-adtech-globals': noAdtechGlobals,
+            },
+          },
+        },
+        rules: {
+          [ruleId]: [
+            'error',
+            {
+              allowFiles: LEGACY_ADTECH_GLOBAL_ALLOWLIST,
+            },
+          ],
+        },
+      },
+    ],
+    { filename }
+  );
+}
+
+function assertRejected(source, filename) {
+  const messages = lint(source, filename);
+  assert.ok(messages.length > 0, `expected an ad-tech-global error for: ${source}`);
+  assert.ok(messages.every((message) => message.ruleId === ruleId));
+  assert.ok(messages.every((message) => message.messageId === 'externalGlobalOwnedByAdapter'));
+}
+
+test('rejects direct GPT and Prebid access through every browser global root', () => {
+  for (const source of [
+    'window.googletag.cmd.push(run);',
+    "globalThis['pbjs'].requestBids();",
+    'window[`googletag`].cmd.push(run);',
+    'self.googletag?.pubads();',
+    'googletag.cmd.push(run);',
+    'pbjs.requestBids();',
+  ]) {
+    assertRejected(source);
+  }
+});
+
+test('rejects same-file aliases of roots and external objects', () => {
+  for (const source of [
+    'const root = window; root.googletag.cmd.push(run);',
+    'const first = globalThis; const second = first; second.pbjs.requestBids();',
+    'let root; root = self; root.googletag.pubads();',
+    'const tag = window.googletag; tag.cmd.push(run);',
+    'const prebid = globalThis.pbjs; prebid.requestBids();',
+    'const { googletag: tag } = window; tag.cmd.push(run);',
+    'const { pbjs: prebid } = self; prebid.requestBids();',
+    'const { googletag } = window;',
+    "let prebid; ({ ['pbjs']: prebid } = globalThis);",
+    'let root; ({ window: root } = globalThis); root.pbjs.requestBids();',
+    'const { ...root } = window; root.googletag.cmd.push(run);',
+    'const root = (0, window); root.pbjs.requestBids();',
+    'class Owner { bind() { this.root = window; } read() { return this.root.googletag; } }',
+    'class Owner { root = window; read() { return this.root.pbjs; } }',
+    'class Owner { bind() { this.root = this.root ?? window; } read() { return this.root.pbjs; } }',
+    'class Owner { #root = window; read() { return this.#root.googletag; } }',
+    'function inspect(root = window) { return root.googletag; }',
+    'function inspect({ window: root } = globalThis) { return root.pbjs; }',
+    'for (const root of [window]) { root.googletag; }',
+    'let root; for (root of [globalThis]) { root.pbjs; }',
+  ]) {
+    assertRejected(source);
+  }
+});
+
+test('is scope-aware and permits unrelated shadowed values', () => {
+  assert.deepEqual(
+    lint(`
+      function inspect(window, globalThis, self, googletag, pbjs) {
+        window.googletag;
+        globalThis.pbjs;
+        self.googletag;
+        googletag.cmd;
+        pbjs.requestBids;
+      }
+      void inspect;
+    `),
+    []
+  );
+  assert.deepEqual(
+    lint(`
+      const values = [window];
+      values.googletag;
+      [window].pbjs;
+    `),
+    []
+  );
+  assert.deepEqual(
+    lint(`
+      class SelfReference {
+        bind() { this.root = this.root; }
+        read() { return this.root.googletag; }
+      }
+      void SelfReference;
+    `),
+    []
+  );
+  assert.deepEqual(
+    lint(`
+      class BrowserState { bind() { this.root = window; } }
+      class LocalState {
+        constructor() { this.root = { googletag: 'local' }; }
+        read() { return this.root.googletag; }
+      }
+      void BrowserState;
+      void LocalState;
+    `),
+    []
+  );
+  assert.deepEqual(
+    lint(`
+      class LocalState {
+        constructor() { this.window = { googletag: 'local' }; }
+        read() { return this.window.googletag; }
+      }
+      void LocalState;
+    `),
+    []
+  );
+});
+
+test('permits TSJS API and messaging access outside adapters', () => {
+  assert.deepEqual(
+    lint(`
+      window.tsjs?.requestAds();
+      globalThis.window?.postMessage({ type: 'TSJS_V1' }, '*');
+      self.addEventListener('message', onMessage, { capture: true });
+    `),
+    []
+  );
+});
+
+test('permits external-global ownership only in adapter source files', () => {
+  assert.deepEqual(
+    lint('const root = window; root.googletag; globalThis.pbjs;', 'src/adapters/googletag.js'),
+    []
+  );
+  assertRejected('window.googletag;', 'src/adapters-pretender/googletag.js');
+});
+
+test('temporary allowlists are exact, narrow, and inventoried for Task 22 removal', () => {
+  assert.deepEqual(LEGACY_ADTECH_GLOBAL_ALLOWLIST, [
+    'src/integrations/gpt/index.ts',
+    'src/integrations/gpt_diagnostics/observer.ts',
+    'src/integrations/prebid/index.ts',
+  ]);
+  assert.deepEqual(LEGACY_RESTRICTED_IMPORT_ALLOWLIST, [
+    'src/core/auction.ts',
+    'src/core/request.ts',
+    'src/integrations/gpt/index.ts',
+    'src/integrations/prebid/index.ts',
+  ]);
+
+  assert.deepEqual(lint('window.googletag;', 'src/integrations/gpt/index.ts'), []);
+  assertRejected('window.googletag;', 'src/integrations/gpt/index-copy.ts');
+  assertRejected('window.googletag;', 'src/new/src/integrations/gpt/index.ts');
+});
+
+test('every temporary exemption still maps to an active legacy violation', async () => {
+  const strictEslint = new ESLint({
+    cwd: packageRoot,
+    overrideConfig: {
+      files: ['src/**/*.ts', 'src/**/*.tsx'],
+      rules: {
+        'tsjs/no-adtech-globals': ['error', { allowFiles: [] }],
+        'import/no-restricted-paths': [
+          'error',
+          {
+            basePath: packageRoot,
+            zones: ARCHITECTURE_RESTRICTED_LAYER_ZONES,
+          },
+        ],
+      },
+    },
+  });
+
+  for (const relativeFilename of LEGACY_ADTECH_GLOBAL_ALLOWLIST) {
+    const [result] = await strictEslint.lintFiles([relativeFilename]);
+    assert.ok(result);
+    assert.ok(
+      result.messages.some((message) => message.ruleId === 'tsjs/no-adtech-globals'),
+      `${relativeFilename} no longer needs its ad-tech-global exemption`
+    );
+  }
+
+  for (const relativeFilename of LEGACY_RESTRICTED_IMPORT_ALLOWLIST) {
+    const [result] = await strictEslint.lintFiles([relativeFilename]);
+    assert.ok(result);
+    assert.ok(
+      result.messages.some((message) => message.ruleId === 'import/no-restricted-paths'),
+      `${relativeFilename} no longer needs its restricted-import exemption`
+    );
+  }
+});
+
+test('restricted paths enforce dependency direction and exact target-file exemptions', async () => {
+  const eslint = new ESLint({ cwd: packageRoot });
+  const restrictedRuleId = 'import/no-restricted-paths';
+
+  async function restrictedMessages(source, relativeFilename) {
+    const [result] = await eslint.lintText(source, {
+      filePath: path.join(packageRoot, relativeFilename),
+    });
+    assert.ok(result);
+    assert.equal(result.fatalErrorCount, 0);
+    return result.messages.filter((message) => message.ruleId === restrictedRuleId);
+  }
+
+  async function projectRuleMessages(source, relativeFilename, projectRuleId) {
+    const [result] = await eslint.lintText(source, {
+      filePath: path.join(packageRoot, relativeFilename),
+    });
+    assert.ok(result);
+    assert.equal(result.fatalErrorCount, 0);
+    return result.messages.filter((message) => message.ruleId === projectRuleId);
+  }
+
+  assert.ok(
+    (await restrictedMessages("import '../integrations/aps/render';", 'src/core/new-request.ts'))
+      .length > 0
+  );
+  assert.ok(
+    (await restrictedMessages("import '../adapters/googletag';", 'src/kernel/probe.tsx')).length > 0
+  );
+  assert.ok(
+    (
+      await projectRuleMessages(
+        'window.googletag;',
+        'src/kernel/probe.tsx',
+        'tsjs/no-adtech-globals'
+      )
+    ).length > 0
+  );
+  assert.ok(
+    (await restrictedMessages("import '../adapters/googletag';", 'src/core/new-index.ts')).length >
+      0
+  );
+  assert.ok((await restrictedMessages("import '../index';", 'src/adapters/probe.ts')).length > 0);
+  assert.ok(
+    (await restrictedMessages("import '../core/log.js';", 'src/adapters/probe.ts')).length > 0
+  );
+  assert.ok(
+    (await restrictedMessages("import '../index.js';", 'src/adapters/probe.ts')).length > 0
+  );
+  assert.ok(
+    (await restrictedMessages("import '../adapters/googletag.js';", 'src/kernel/probe.ts')).length >
+      0
+  );
+  assert.ok(
+    (await restrictedMessages("import '../core/types';", 'src/adapters/new-adapter.ts')).length > 0
+  );
+  assert.ok(
+    (await restrictedMessages("import '../core/types';", 'src/services/new-service.ts')).length > 0
+  );
+  assert.ok(
+    (await restrictedMessages("import '../composition/browser';", 'src/kernel/new-runtime.ts'))
+      .length > 0
+  );
+  assert.ok(
+    (
+      await restrictedMessages(
+        "import '../../composition/browser';",
+        'src/integrations/gpt/new-module.ts'
+      )
+    ).length > 0
+  );
+  assert.ok(
+    (await restrictedMessages("import '../prebid/index';", 'src/integrations/gpt/new-module.ts'))
+      .length > 0
+  );
+
+  assert.deepEqual(
+    await restrictedMessages("import '../integrations/aps/render';", 'src/core/request.ts'),
+    []
+  );
+  assert.ok(
+    (await restrictedMessages("import '../integrations/aps/render';", 'src/kernel/request.ts'))
+      .length > 0
+  );
+  assert.deepEqual(
+    await restrictedMessages("import '../adapters/googletag';", 'src/composition/new-browser.ts'),
+    []
+  );
+  assert.deepEqual(
+    await restrictedMessages("import './script_guard';", 'src/integrations/gpt/new-module.ts'),
+    []
+  );
+});
+
+test('every current integration directory participates in cross-integration isolation', async () => {
+  const entries = await readdir(path.join(packageRoot, 'src/integrations'), {
+    withFileTypes: true,
+  });
+  const actual = entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort();
+
+  assert.deepEqual(actual, [...ARCHITECTURE_INTEGRATION_DIRECTORIES].sort());
+});

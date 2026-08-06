@@ -21,10 +21,14 @@ export default defineConfig({
   test: {
     environment: 'jsdom',
     globals: true,
-    // This suite deliberately uses node:test + vm so it executes the generated
-    // ES5 artifact without Vite transforms. CI invokes it separately with
-    // `node --test`; importing it through Vitest rewrites import.meta.url.
-    exclude: [...configDefaults.exclude, 'test/contract/aps-renderer-es5.test.mjs'],
+    // These suites deliberately use node:test. CI invokes them through their
+    // package scripts; importing them through Vitest either rewrites the VM
+    // contract fixture or leaves Vitest with no registered suite.
+    exclude: [
+      ...configDefaults.exclude,
+      'test/contract/aps-renderer-es5.test.mjs',
+      'test/eslint/no-adtech-globals.test.mjs',
+    ],
     // Run tests in the main thread to avoid spawning
     // child processes/workers, which are blocked in this sandbox.
     threads: false,
