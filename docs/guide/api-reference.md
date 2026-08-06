@@ -400,7 +400,7 @@ Navigation form of the same recovery, for creatives rendered in a sandboxed ifra
 | --------- | -------- | ------------------------------------------------- |
 | `tsclick` | Yes      | URL-encoded signed click URL                      |
 | `add`     | No       | URL-encoded JSON object of parameters to add      |
-| `del`     | No       | URL-encoded JSON array of parameter names to drop  |
+| `del`     | No       | URL-encoded JSON array of parameter names to drop |
 
 **Response:** `302` with the rebuilt `/first-party/click?...` URL in `Location` and `Cache-Control: no-store, private`. The browser follows it to `/first-party/click`, which redirects on to the advertiser.
 

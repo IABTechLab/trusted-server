@@ -74,7 +74,10 @@ describe('render', () => {
     expect(documentHtml).toContain('configurable: false');
 
     // Execute the stamp exactly as the browser would, then try to overwrite it.
-    const stamp = documentHtml.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+    // Parse rather than regex out the script: tag-matching patterns miss case
+    // and attribute variations, and the DOM is what the browser actually uses.
+    const parsed = new DOMParser().parseFromString(documentHtml, 'text/html');
+    const stamp = parsed.querySelector('head script')?.textContent;
     expect(stamp, 'document should carry the stamping script').toBeTruthy();
     const host: Record<string, unknown> = {};
     new Function('window', stamp as string)(host);

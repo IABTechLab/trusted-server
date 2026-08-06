@@ -208,8 +208,8 @@ Content-Type: application/json
 }
 ```
 
-| Field     | Required | Description                                             |
-| --------- | -------- | ------------------------------------------------------- |
+| Field     | Required | Description                                              |
+| --------- | -------- | -------------------------------------------------------- |
 | `tsclick` | Yes      | The signed click URL, root-relative or absolute          |
 | `add`     | No       | Object of parameters to add; keys must not already exist |
 | `del`     | No       | Array of parameter names to remove                       |
@@ -231,11 +231,11 @@ Responds `200` with the rebuilt URL and diagnostics:
 GET /first-party/proxy-rebuild?tsclick=<url-encoded click>&add=<JSON object>&del=<JSON array>
 ```
 
-| Parameter | Required | Description                                          |
-| --------- | -------- | ---------------------------------------------------- |
-| `tsclick` | Yes      | URL-encoded signed click URL (not base64)            |
-| `add`     | No       | URL-encoded JSON object, e.g. `{"variant":"red"}`    |
-| `del`     | No       | URL-encoded JSON array, e.g. `["product"]`           |
+| Parameter | Required | Description                                       |
+| --------- | -------- | ------------------------------------------------- |
+| `tsclick` | Yes      | URL-encoded signed click URL (not base64)         |
+| `add`     | No       | URL-encoded JSON object, e.g. `{"variant":"red"}` |
+| `del`     | No       | URL-encoded JSON array, e.g. `["product"]`        |
 
 Responds `302` with the rebuilt click in `Location` (plus
 `Cache-Control: no-store, private`), so the browser continues to
