@@ -211,7 +211,9 @@ mod tests {
             input: &ClientResolveInput<'_>,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             // The page posts the identifier it generated. Accept a well-formed UUID.
-            let value = core::str::from_utf8(input.payload).unwrap_or_default().trim();
+            let value = core::str::from_utf8(input.payload)
+                .unwrap_or_default()
+                .trim();
             if is_uuid(value) {
                 Ok(GeneratedEdgeCookie {
                     id: Some(value.to_owned()),
@@ -250,7 +252,10 @@ mod tests {
             .expect("should build organic request");
         let mut ec = EcContext::read_from_request(&settings, &organic, &services)
             .expect("should read EC context");
-        assert!(ec.ec_value().is_none(), "no EC should exist on the first visit");
+        assert!(
+            ec.ec_value().is_none(),
+            "no EC should exist on the first visit"
+        );
         ec.generate_if_needed(&settings, None)
             .expect("should run generation");
         assert!(
@@ -260,8 +265,8 @@ mod tests {
 
         // 2. The page generates its identifier and posts it to the resolve
         //    endpoint; the server sets it as the EC value.
-        let response = handle_ec_resolve(&settings, post(TEST_ID), &ec)
-            .expect("should handle resolve");
+        let response =
+            handle_ec_resolve(&settings, post(TEST_ID), &ec).expect("should handle resolve");
         assert_eq!(
             response.status(),
             StatusCode::OK,

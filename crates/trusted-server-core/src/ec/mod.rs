@@ -1096,10 +1096,7 @@ mod tests {
 
         // The entry is stored under the full identifier verbatim.
         assert!(
-            graph
-                .get(OPAQUE)
-                .expect("kv get should succeed")
-                .is_some(),
+            graph.get(OPAQUE).expect("kv get should succeed").is_some(),
             "the entry should exist under the opaque identifier key"
         );
 
