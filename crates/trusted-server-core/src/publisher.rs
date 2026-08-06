@@ -1792,27 +1792,34 @@ pub(crate) fn is_prefetch_request(req: &Request<EdgeBody>) -> bool {
     header("sec-purpose") || header("purpose")
 }
 
-/// Returns true only when the publisher request should run the full
-/// server-side ad stack: auction dispatch plus initial ad-slot injection.
+#[derive(Debug, Clone, Copy)]
+struct ServerSideAdStackConfig {
+    /// Dedicated `[creative_opportunities].enabled` switch.
+    ad_templates_enabled: bool,
+    /// Global `[auction].enabled` gate used by publisher/page-bids flows.
+    auction_enabled: bool,
+}
+
+/// Returns true only when the publisher should inject and run server-side ad templates.
 ///
-/// `auction_enabled` is the global `[auction].enabled` kill switch — when
-/// false, no automatic server-side auction or ad-slot injection runs.
-pub(crate) fn should_run_server_side_ad_stack(
+/// This includes auction dispatch plus initial ad-slot injection.
+fn should_run_server_side_ad_stack(
     is_get: bool,
     is_navigation: bool,
     is_prefetch: bool,
     is_bot: bool,
     has_matched_slots: bool,
     consent_allows_auction: bool,
-    auction_enabled: bool,
+    config: ServerSideAdStackConfig,
 ) -> bool {
     is_get
         && is_navigation
         && !is_prefetch
         && !is_bot
+        && config.ad_templates_enabled
         && has_matched_slots
         && consent_allows_auction
-        && auction_enabled
+        && config.auction_enabled
 }
 
 /// Build the request origin (`scheme://host`, where `host` includes any port)
@@ -2688,7 +2695,10 @@ pub async fn handle_publisher_request(
     let is_prefetch = is_prefetch_request(&req);
     let is_bot = is_bot_user_agent(&req);
 
-    let matched_slots = if is_get {
+    let creative_opportunities = settings.creative_opportunities.as_ref();
+    let ad_templates_enabled = creative_opportunities.is_some_and(|co_config| co_config.enabled);
+    let ad_templates_disabled = creative_opportunities.is_some_and(|co_config| !co_config.enabled);
+    let matched_slots = if is_get && ad_templates_enabled {
         settings
             .creative_opportunities
             .as_ref()
@@ -2711,7 +2721,10 @@ pub async fn handle_publisher_request(
         is_bot,
         !matched_slots.is_empty(),
         consent_allows_auction,
-        auction.orchestrator.is_enabled(),
+        ServerSideAdStackConfig {
+            ad_templates_enabled,
+            auction_enabled: auction.orchestrator.is_enabled(),
+        },
     );
     let should_run_auction = should_run_ad_stack;
     // Diagnostic: shows which gate suppresses the server-side auction. Pair with
@@ -2719,14 +2732,16 @@ pub async fn handle_publisher_request(
     // when `consent_allows_auction=false`.
     log::debug!(
         "server-side ad-stack gate: is_get={is_get} is_navigation={is_navigation} \
-         is_prefetch={is_prefetch} is_bot={is_bot} matched_slots={} \
-         consent_allows_auction={consent_allows_auction} orchestrator_enabled={} \
-         -> should_run_auction={should_run_auction}",
+         is_prefetch={is_prefetch} is_bot={is_bot} ad_templates_enabled={ad_templates_enabled} \
+         matched_slots={} consent_allows_auction={consent_allows_auction} \
+         orchestrator_enabled={} -> should_run_auction={should_run_auction}",
         matched_slots.len(),
         auction.orchestrator.is_enabled(),
     );
 
-    if matched_slots.is_empty() && settings.creative_opportunities.is_some() {
+    if ad_templates_disabled {
+        log::debug!("Server-side ad templates are disabled by configuration");
+    } else if matched_slots.is_empty() && settings.creative_opportunities.is_some() {
         log::debug!(
             "No creative opportunity slots matched path '{}' — skipping auction and injection",
             request_path
@@ -2851,7 +2866,9 @@ pub async fn handle_publisher_request(
                 }
             }
         } else {
-            let skip_reason = if !auction.orchestrator.is_enabled() {
+            let skip_reason = if ad_templates_disabled {
+                "ad_templates_disabled"
+            } else if !auction.orchestrator.is_enabled() {
                 "auction_disabled"
             } else if !consent_allows_auction {
                 "consent_denied"
@@ -3983,7 +4000,11 @@ pub async fn handle_page_bids(
     let path_param = normalize_page_bids_path(&requested_page);
     let page_path_and_query = normalize_page_bids_path_and_query(&requested_page);
 
-    let matched_slots = match_renderable_slots(auction.slots, co_config, &path_param);
+    let matched_slots = if co_config.enabled {
+        match_renderable_slots(auction.slots, co_config, &path_param)
+    } else {
+        Vec::new()
+    };
 
     let request_info = crate::http_util::RequestInfo::from_request(&req, services.client_info());
     let ec_id = ec_context.ec_value().filter(|_| ec_context.ec_allowed());
@@ -4002,7 +4023,10 @@ pub async fn handle_page_bids(
     let is_bot = is_bot_user_agent(&req);
 
     let auction_enabled = auction.orchestrator.is_enabled();
-    if !auction_enabled {
+    let ad_templates_enabled = co_config.enabled;
+    if !ad_templates_enabled {
+        log::debug!("page-bids: [creative_opportunities].enabled is false — skipping templates");
+    } else if !auction_enabled {
         log::debug!("page-bids: [auction].enabled is false — skipping auction");
     } else if matched_slots.is_empty() {
         log::debug!(
@@ -4018,14 +4042,14 @@ pub async fn handle_page_bids(
         );
     }
 
-    // The [auction].enabled kill switch and a consent denial disable the entire
-    // server-side ad stack. In those states the endpoint must return no slots,
-    // so the SPA hook does not assign `ts.adSlots` and call `adInit()` —
-    // otherwise the kill switch/consent gate would stop SSP calls but still let
-    // the client create/refresh GPT slots. Bot/prefetch requests, by contrast,
-    // keep their slot definitions (the placement structure is unchanged) but
-    // skip the live auction, matching the existing bot/prefetch behaviour.
-    let ad_stack_enabled = auction_enabled && consent_allows_auction;
+    // The dedicated template switch, [auction].enabled, and a consent denial
+    // disable the entire server-side ad stack. In those states the endpoint must
+    // return no slots, so the SPA hook does not assign `ts.adSlots` and call
+    // `adInit()` — otherwise the gate would stop SSP calls but still let the
+    // client create/refresh GPT slots client-side. Bot/prefetch requests, by
+    // contrast, keep their slot definitions (the placement structure is
+    // unchanged) but skip the live auction, matching the existing behavior.
+    let ad_stack_enabled = ad_templates_enabled && auction_enabled && consent_allows_auction;
 
     let (winning_bids, prebuilt_bid_map) = if matched_slots.is_empty() {
         (std::collections::HashMap::new(), None)
@@ -4125,7 +4149,9 @@ pub async fn handle_page_bids(
                 }
             }
         } else {
-            let skip_reason = if !auction_enabled {
+            let skip_reason = if !ad_templates_enabled {
+                "ad_templates_disabled"
+            } else if !auction_enabled {
                 "auction_disabled"
             } else if !consent_allows_auction {
                 "consent_denied"
@@ -4884,6 +4910,15 @@ mod tests {
                 .expect("should parse settings with auction and creative opportunities enabled")
         }
 
+        fn settings_with_disabled_ad_templates() -> Settings {
+            let toml = format!(
+                "{}\n[auction]\nenabled = true\n\n\
+                 [creative_opportunities]\nenabled = false\ngam_network_id = \"12345\"\n",
+                crate_test_settings_str()
+            );
+            Settings::from_toml(&toml).expect("should parse settings with disabled ad templates")
+        }
+
         fn settings_with_dispatching_provider() -> Settings {
             let toml = format!(
                 "{}\n[auction]\nenabled = true\nproviders = [\"{UNEXPECTED_304_PROVIDER}\"]\n\n\
@@ -5191,6 +5226,72 @@ mod tests {
                         .and_then(|value| value.to_str().ok()),
                     Some(expected),
                     "publisher response without matched slots should preserve {header_name}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn disabled_ad_templates_use_short_browser_cache_policy() {
+            // Arrange
+            let settings = settings_with_disabled_ad_templates();
+            let stub = Arc::new(StubHttpClient::new());
+            queue_html_response_with_cache_control(&stub, "public, max-age=300");
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let slots = [article_slot()];
+
+            // Act
+            let response = run_with_slots(
+                &settings,
+                &services,
+                &slots,
+                conditional_navigation_request(),
+            )
+            .await;
+            let response_head = response_head(response);
+
+            // Assert
+            assert_eq!(
+                stub.recorded_cache_bypass_flags(),
+                vec![false],
+                "disabled server-side ad templates should not bypass the origin cache"
+            );
+            assert_eq!(
+                response_head
+                    .headers
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("max-age=60"),
+                "disabled server-side ad templates should use the short browser cache policy"
+            );
+            for (header_name, expected) in [
+                (header::ETAG, ORIGIN_ETAG),
+                (header::LAST_MODIFIED, ORIGIN_LAST_MODIFIED),
+                (
+                    header::HeaderName::from_static("surrogate-control"),
+                    "max-age=300",
+                ),
+                (
+                    header::HeaderName::from_static("fastly-surrogate-control"),
+                    "max-age=300",
+                ),
+                (
+                    header::HeaderName::from_static("cdn-cache-control"),
+                    "max-age=300",
+                ),
+                (
+                    header::HeaderName::from_static("cloudflare-cdn-cache-control"),
+                    "max-age=300",
+                ),
+            ] {
+                assert_eq!(
+                    response_head
+                        .headers
+                        .get(&header_name)
+                        .and_then(|value| value.to_str().ok()),
+                    Some(expected),
+                    "disabled server-side ad templates should preserve {header_name}"
                 );
             }
         }
@@ -5827,38 +5928,68 @@ mod tests {
 
     #[test]
     fn server_side_ad_stack_runs_only_when_all_auction_gates_pass() {
+        let enabled_config = ServerSideAdStackConfig {
+            ad_templates_enabled: true,
+            auction_enabled: true,
+        };
         assert!(
-            should_run_server_side_ad_stack(true, true, false, false, true, true, true),
-            "GET, real navigation, matched slots, and consent should run TS ad stack"
+            should_run_server_side_ad_stack(true, true, false, false, true, true, enabled_config,),
+            "GET, real navigation, enabled templates, matched slots, and consent should run TS ad stack"
         );
 
         assert!(
-            !should_run_server_side_ad_stack(false, true, false, false, true, true, true),
+            !should_run_server_side_ad_stack(false, true, false, false, true, true, enabled_config,),
             "non-GET requests should skip TS ad stack"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, false, false, false, true, true, true),
+            !should_run_server_side_ad_stack(true, false, false, false, true, true, enabled_config,),
             "non-document requests should skip TS ad stack"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, true, false, true, true, true),
+            !should_run_server_side_ad_stack(true, true, true, false, true, true, enabled_config,),
             "prefetch requests should skip TS ad stack and injection"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, false, true, true, true, true),
+            !should_run_server_side_ad_stack(true, true, false, true, true, true, enabled_config,),
             "bot requests should skip TS ad stack and injection"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, false, false, false, true, true),
+            !should_run_server_side_ad_stack(true, true, false, false, false, true, enabled_config,),
             "requests with no matching slots should skip TS ad stack"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, false, false, true, false, true),
+            !should_run_server_side_ad_stack(true, true, false, false, true, false, enabled_config,),
             "requests without required consent should skip TS ad stack and injection"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, false, false, true, true, false),
+            !should_run_server_side_ad_stack(
+                true,
+                true,
+                false,
+                false,
+                true,
+                true,
+                ServerSideAdStackConfig {
+                    ad_templates_enabled: true,
+                    auction_enabled: false,
+                },
+            ),
             "disabled [auction].enabled kill switch should skip TS ad stack and injection"
+        );
+        assert!(
+            !should_run_server_side_ad_stack(
+                true,
+                true,
+                false,
+                false,
+                true,
+                true,
+                ServerSideAdStackConfig {
+                    ad_templates_enabled: false,
+                    auction_enabled: true,
+                },
+            ),
+            "disabled [creative_opportunities].enabled switch should skip TS ad stack and injection"
         );
     }
 
@@ -8516,6 +8647,7 @@ mod tests {
 
         fn make_config() -> CreativeOpportunitiesConfig {
             CreativeOpportunitiesConfig {
+                enabled: true,
                 gam_network_id: "21765378893".to_string(),
                 auction_timeout_ms: Some(500),
                 price_granularity: PriceGranularity::Dense,
@@ -10340,6 +10472,14 @@ mod tests {
             Settings::from_toml(&toml).expect("should parse settings with creative_opportunities")
         }
 
+        fn settings_with_co_templates_disabled() -> Settings {
+            let toml = format!(
+                "{}\n[auction]\nenabled = true\n\n[creative_opportunities]\nenabled = false\ngam_network_id = \"12345\"\n",
+                crate_test_settings_str()
+            );
+            Settings::from_toml(&toml).expect("should parse settings with disabled templates")
+        }
+
         async fn run_page_bids(
             settings: &Settings,
             orchestrator: &AuctionOrchestrator,
@@ -11008,6 +11148,35 @@ mod tests {
                     .len(),
                 0,
                 "disabled auction must not produce bids"
+            );
+        }
+
+        #[tokio::test]
+        async fn disabled_server_side_ad_templates_return_no_slots_or_bids() {
+            // The dedicated template switch must suppress publisher/page-bids
+            // delivery without using the global auction switch.
+            let settings = settings_with_co_templates_disabled();
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let slots = article_slot();
+            let req = make_page_bids_request("/2024/01/my-article/");
+
+            let body = run_page_bids_consent_allowed(&settings, &orchestrator, &slots, req).await;
+
+            assert_eq!(
+                body["slots"]
+                    .as_array()
+                    .expect("slots should be array")
+                    .len(),
+                0,
+                "disabled server-side ad templates must not return slot definitions"
+            );
+            assert_eq!(
+                body["bids"]
+                    .as_object()
+                    .expect("bids should be object")
+                    .len(),
+                0,
+                "disabled server-side ad templates must not produce bids"
             );
         }
 
