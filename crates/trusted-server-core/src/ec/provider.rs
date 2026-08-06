@@ -560,6 +560,56 @@ mod tests {
     }
 
     #[test]
+    fn shared_provider_delegates_id_semantics_to_the_inner_provider() {
+        // `SharedProvider` wraps an adapter-injected provider. It must forward
+        // every trait method to the inner provider, including `accepts_id` and
+        // `normalize_id_for_kv`; a wrapper that silently used the defaults would
+        // drop an opaque vendor identifier on read-back. This guards that
+        // delegation directly.
+        #[derive(Debug)]
+        struct Inner;
+
+        impl EdgeCookieProvider for Inner {
+            fn id(&self) -> &'static str {
+                "inner"
+            }
+
+            fn generate(
+                &self,
+                _request_info: &dyn RequestInfo,
+                _input: &IdentityInput<'_>,
+            ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+                Ok(GeneratedEdgeCookie::default())
+            }
+
+            fn accepts_id(&self, value: &str) -> bool {
+                value == "opaque-ok"
+            }
+
+            fn normalize_id_for_kv(&self, value: &str) -> String {
+                format!("kv:{value}")
+            }
+        }
+
+        let shared = SharedProvider(Arc::new(Inner));
+
+        assert_eq!(shared.id(), "inner", "should delegate id");
+        assert!(
+            shared.accepts_id("opaque-ok"),
+            "should delegate accepts_id acceptance to the inner provider"
+        );
+        assert!(
+            !shared.accepts_id("something-else"),
+            "should delegate accepts_id rejection to the inner provider"
+        );
+        assert_eq!(
+            shared.normalize_id_for_kv("x"),
+            "kv:x",
+            "should delegate normalize_id_for_kv to the inner provider"
+        );
+    }
+
+    #[test]
     fn hmac_keys_equal_uses_natural_equality() {
         let provider = HmacProvider::new(test_passphrase());
         assert!(
