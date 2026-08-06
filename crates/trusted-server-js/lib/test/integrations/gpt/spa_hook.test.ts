@@ -315,6 +315,45 @@ describe('installSpaAuctionHook', () => {
     expect(adInit).toHaveBeenCalledTimes(1);
   });
 
+  it('cancels a pending visible-tab frame when the document becomes hidden', async () => {
+    let visibility: DocumentVisibilityState = 'visible';
+    vi.spyOn(document, 'visibilityState', 'get').mockImplementation(() => visibility);
+    const requestAnimationFrameMock = vi.fn().mockReturnValue(17);
+    const cancelAnimationFrameMock = vi.fn();
+    vi.stubGlobal('requestAnimationFrame', requestAnimationFrameMock);
+    vi.stubGlobal('cancelAnimationFrame', cancelAnimationFrameMock);
+    fetchStub.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        slots: [{ id: 'hidden-late', div_id: 'div-hidden-late' }],
+        bids: { 'hidden-late': { hb_pb: '3.50' } },
+      }),
+    });
+    const { installSpaAuctionHook } = await importGptModule();
+    installSpaAuctionHook();
+    const ts = (window as TestWindow).tsjs!;
+    const adInit = vi.fn();
+    ts.adInit = adInit;
+
+    history.pushState({}, '', '/hidden-late-route');
+    await flushAsync();
+
+    // A mutation while visible schedules a frame that never runs.
+    document.body.appendChild(document.createElement('span'));
+    await flushAsync();
+    expect(requestAnimationFrameMock).toHaveBeenCalledTimes(1);
+
+    // The next mutation happens after the document is hidden. It must cancel
+    // the stale frame and perform the presence check immediately.
+    visibility = 'hidden';
+    document.body.innerHTML = '<div id="div-hidden-late"></div>';
+    await flushAsync();
+
+    expect(cancelAnimationFrameMock).toHaveBeenCalledWith(17);
+    expect(adInit).toHaveBeenCalledTimes(1);
+    expect(ts.adSlots).toEqual([{ id: 'hidden-late', div_id: 'div-hidden-late' }]);
+  });
+
   it('waits for every configured route ad container before applying bids', async () => {
     document.body.innerHTML = '<div id="div-first"></div>';
     fetchStub.mockResolvedValue({

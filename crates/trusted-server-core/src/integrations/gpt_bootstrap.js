@@ -164,11 +164,11 @@
   }
 
   function isElementVisible(element) {
-    if (
-      typeof element.checkVisibility === "function" &&
-      !element.checkVisibility()
-    ) {
-      return false;
+    if (typeof element.checkVisibility === "function") {
+      return element.checkVisibility({
+        checkVisibilityCSS: true,
+        visibilityProperty: true,
+      });
     }
 
     for (var current = element; current; current = current.parentElement) {

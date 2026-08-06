@@ -60,13 +60,16 @@ interface SlotElementResolution {
 
 function isElementVisible(element: HTMLElement): boolean {
   const elementWithVisibilityCheck = element as HTMLElement & {
-    checkVisibility?: () => boolean;
+    checkVisibility?: (options?: {
+      checkVisibilityCSS?: boolean;
+      visibilityProperty?: boolean;
+    }) => boolean;
   };
-  if (
-    typeof elementWithVisibilityCheck.checkVisibility === 'function' &&
-    !elementWithVisibilityCheck.checkVisibility()
-  ) {
-    return false;
+  if (typeof elementWithVisibilityCheck.checkVisibility === 'function') {
+    return elementWithVisibilityCheck.checkVisibility({
+      checkVisibilityCSS: true,
+      visibilityProperty: true,
+    });
   }
 
   for (let current: HTMLElement | null = element; current; current = current.parentElement) {
@@ -691,7 +694,6 @@ function registerHandoffAlias(ts: TsjsApi, elementId: string, handoff: GptSlotHa
   (ts.gptSlotHandoffs ??= {})[elementId] = handoff;
 }
 
-
 function withGptSlotHandoffInternal<T>(ts: TsjsApi, callback: () => T): T {
   const wasInternal = ts.gptSlotHandoffInternal;
   ts.gptSlotHandoffInternal = true;
@@ -1050,7 +1052,6 @@ export function installTsAdInit(): void {
         ? slotsToRefresh.concat(newSlots)
         : slotsToRefresh;
 
-
       if (slotsNeedingRefresh.length > 0) {
         // One-shot bypass: this internal refresh delivers the just-applied
         // server-side targeting to GAM. If slim-Prebid has wrapped refresh(), it
@@ -1185,11 +1186,15 @@ function waitForSlotElements(slots: AuctionSlot[], signal: AbortSignal): Promise
       resolve();
     };
     const observer = new MutationObserver(() => {
-      if (animationFrame !== undefined) return;
       if (document.visibilityState === 'hidden' || typeof requestAnimationFrame === 'undefined') {
+        if (animationFrame !== undefined) {
+          cancelAnimationFrame(animationFrame);
+          animationFrame = undefined;
+        }
         if (allPresent()) finish();
         return;
       }
+      if (animationFrame !== undefined) return;
       animationFrame = requestAnimationFrame(() => {
         animationFrame = undefined;
         if (allPresent()) finish();

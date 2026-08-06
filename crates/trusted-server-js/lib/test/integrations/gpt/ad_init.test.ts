@@ -111,6 +111,7 @@ interface ResponsiveSlotElementOptions {
   elementHidden?: boolean;
   elementWidth?: number;
   elementHeight?: number;
+  checkVisibility?: boolean;
 }
 
 function appendResponsiveSlotElement(
@@ -122,6 +123,7 @@ function appendResponsiveSlotElement(
     elementHidden = false,
     elementWidth = 0,
     elementHeight = 0,
+    checkVisibility,
   }: ResponsiveSlotElementOptions = {}
 ): HTMLDivElement {
   const container = document.createElement('div');
@@ -135,6 +137,11 @@ function appendResponsiveSlotElement(
   element.id = id;
   element.style.display = elementHidden ? 'none' : 'block';
   element.getBoundingClientRect = () => ({ width: elementWidth, height: elementHeight }) as DOMRect;
+  if (checkVisibility !== undefined) {
+    (element as HTMLElement & { checkVisibility?: () => boolean }).checkVisibility = vi
+      .fn()
+      .mockReturnValue(checkVisibility);
+  }
   container.appendChild(element);
   document.body.appendChild(container);
   return element;
@@ -2466,6 +2473,57 @@ describe('installTsAdInit', () => {
     }
   );
 
+  it.each(['runtime', 'bootstrap'] as const)(
+    '$implementation trusts checkVisibility when resolving a visible slot',
+    async (implementation) => {
+      const element = appendResponsiveSlotElement('ad-native-slot', {
+        checkVisibility: true,
+      });
+      const mockSlot = {
+        addService: vi.fn().mockReturnThis(),
+        setTargeting: vi.fn().mockReturnThis(),
+        getSlotElementId: vi.fn().mockReturnValue(element.id),
+        getTargeting: vi.fn().mockReturnValue([]),
+      };
+      const defineSlot = vi.fn().mockReturnValue(mockSlot);
+      const mockPubads = {
+        enableSingleRequest: vi.fn(),
+        getSlots: vi.fn().mockReturnValue([]),
+        addEventListener: vi.fn(),
+        refresh: vi.fn(),
+      };
+      (window as TestWindow).googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot,
+        display: vi.fn(),
+        pubads: vi.fn().mockReturnValue(mockPubads),
+        enableServices: vi.fn(),
+      };
+      (window as TestWindow).tsjs = {
+        adSlots: [
+          {
+            id: 'native_visibility_slot',
+            gam_unit_path: '/123/native-visibility',
+            div_id: 'ad-native-',
+            formats: [[300, 250]],
+            targeting: {},
+          },
+        ],
+        bids: {},
+      };
+
+      if (implementation === 'runtime') {
+        const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+        installTsAdInit();
+      } else {
+        runGptBootstrap();
+      }
+      (window as TestWindow).tsjs!.adInit!();
+
+      expect(defineSlot).toHaveBeenCalledWith('/123/native-visibility', [[300, 250]], element.id);
+    }
+  );
+
   it('resolves dynamic div prefixes without interpolating div_id into a CSS selector', async () => {
     const dynamicDiv = document.createElement('div');
     dynamicDiv.id = "ad'prefix-real";
@@ -2994,6 +3052,7 @@ describe('installTsRenderBridge', () => {
           targeting: {},
         },
       ],
+      divToSlotId: { 'div-a': 'slot_a', 'div-b': 'slot_b' },
     };
 
     const bridgeListener = await captureBridgeListener();
@@ -3139,6 +3198,7 @@ describe('installTsRenderBridge', () => {
           targeting: {},
         },
       ],
+      divToSlotId: { 'div-header': 'homepage_header' },
     };
 
     const bridgeListener = await captureBridgeListener();
@@ -3207,6 +3267,7 @@ describe('installTsRenderBridge', () => {
           targeting: {},
         },
       ],
+      divToSlotId: { 'div-header': 'homepage_header', 'div-in-content': 'homepage_in_content' },
     };
 
     const bridgeListener = await captureBridgeListener();
