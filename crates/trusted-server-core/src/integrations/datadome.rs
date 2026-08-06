@@ -61,7 +61,7 @@ use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::header;
-use http::{Method, StatusCode};
+use http::{HeaderName, Method, StatusCode};
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -77,6 +77,7 @@ use crate::integrations::{
     collect_body_bounded, collect_response_bounded, ensure_integration_backend,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
+use crate::redacted::Redacted;
 use crate::settings::{IntegrationConfig, Settings};
 
 mod protection;
@@ -116,6 +117,27 @@ static DATADOME_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(['"])(https?:)?(//)?(api-)?js\.datadome\.co(/[^'"]*)?(['"])"#)
         .expect("DataDome URL rewrite regex should compile")
 });
+
+/// Temporary static-header bypass for server-side `DataDome` protection.
+///
+/// This is intended only for an access-controlled staging environment. A
+/// matching header bypasses the server-side Protection API and is removed
+/// before the publisher origin receives the request.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProtectionTestBypassConfig {
+    /// Enables the bypass. Defaults to disabled when the section is present.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Header name carrying the temporary bypass credential.
+    #[serde(default)]
+    pub header_name: String,
+
+    /// Static credential expected in [`Self::header_name`].
+    #[serde(default)]
+    pub credential: Redacted<String>,
+}
 
 /// Configuration for `DataDome` integration.
 #[derive(Debug, Clone, Deserialize, Validate)]
@@ -198,6 +220,10 @@ pub struct DataDomeConfig {
         deserialize_with = "crate::settings::vec_from_seq_or_map"
     )]
     pub protection_exclusion_rules: Vec<ProtectionExclusionRuleConfig>,
+
+    /// Temporary static-header bypass for access-controlled staging tests.
+    #[serde(default)]
+    pub protection_test_bypass: Option<ProtectionTestBypassConfig>,
 
     /// Reserved flag for future GraphQL payload extraction.
     #[serde(default)]
@@ -329,6 +355,7 @@ impl Default for DataDomeConfig {
             protection_excluded_ip_cidr_sources: Vec::new(),
             protection_ip_list_cache_ttl_seconds: default_protection_ip_list_cache_ttl_seconds(),
             protection_exclusion_rules: default_protection_exclusion_rules(),
+            protection_test_bypass: None,
             enable_graphql_support: false,
             client_side_key: String::new(),
             inject_client_side_tag: default_inject_client_side_tag(),
@@ -362,6 +389,9 @@ impl DataDomeIntegration {
         config.server_side_key_secret_name = config.server_side_key_secret_name.trim().to_string();
         config.protection_api_origin = config.protection_api_origin.trim().to_string();
         config.client_side_tag_url = config.client_side_tag_url.trim().to_string();
+        if let Some(bypass) = &mut config.protection_test_bypass {
+            bypass.header_name = bypass.header_name.trim().to_string();
+        }
 
         if config.enable_protection {
             if config.server_side_key_secret_store.is_empty()
@@ -373,6 +403,7 @@ impl DataDomeIntegration {
             }
             Self::validate_protection_api_origin(&config.protection_api_origin)?;
         }
+        Self::validate_protection_test_bypass(&config)?;
 
         if config.inject_client_side_tag {
             Self::validate_client_side_tag_url(&config.client_side_tag_url)?;
@@ -416,6 +447,36 @@ impl DataDomeIntegration {
         {
             return Err(Report::new(Self::error(
                 "protection_api_origin must be an origin URL without path, query, or fragment",
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn validate_protection_test_bypass(
+        config: &DataDomeConfig,
+    ) -> Result<(), Report<TrustedServerError>> {
+        let Some(bypass) = config
+            .protection_test_bypass
+            .as_ref()
+            .filter(|bypass| bypass.enabled)
+        else {
+            return Ok(());
+        };
+
+        if !config.enable_protection {
+            return Err(Report::new(Self::error(
+                "protection_test_bypass requires enable_protection to be true",
+            )));
+        }
+        if HeaderName::from_bytes(bypass.header_name.as_bytes()).is_err() {
+            return Err(Report::new(Self::error(
+                "protection_test_bypass.header_name must be a valid HTTP header name",
+            )));
+        }
+        if bypass.credential.expose().is_empty() {
+            return Err(Report::new(Self::error(
+                "protection_test_bypass.credential must not be empty when enabled",
             )));
         }
 
@@ -1098,6 +1159,71 @@ mod tests {
             config.server_side_key_secret_name,
             "datadome_server_side_key"
         );
+        assert!(
+            config.protection_test_bypass.is_none(),
+            "the temporary test bypass should be disabled by default"
+        );
+    }
+
+    #[test]
+    fn protection_test_bypass_deserializes_nested_configuration() {
+        let config: DataDomeConfig = toml::from_str(
+            r#"
+            enabled = true
+            enable_protection = true
+
+            [protection_test_bypass]
+            enabled = true
+            header_name = "x-ts-datadome-test-bypass"
+            credential = "temporary-test-credential"
+            "#,
+        )
+        .expect("should deserialize DataDome test bypass configuration");
+        let bypass = config
+            .protection_test_bypass
+            .expect("should deserialize the nested test bypass configuration");
+
+        assert!(bypass.enabled, "should retain the enabled flag");
+        assert_eq!(
+            bypass.header_name, "x-ts-datadome-test-bypass",
+            "should retain the configured header name"
+        );
+        assert_eq!(
+            bypass.credential.expose(),
+            "temporary-test-credential",
+            "should retain the configured credential"
+        );
+    }
+
+    #[test]
+    fn protection_test_bypass_requires_protection_header_and_credential() {
+        for (enable_protection, header_name, credential, expected_message) in [
+            (
+                false,
+                "x-ts-datadome-test-bypass",
+                "temporary-test-credential",
+                "requires enable_protection",
+            ),
+            (true, "", "temporary-test-credential", "header_name"),
+            (true, "x-ts-datadome-test-bypass", "", "credential"),
+        ] {
+            let mut config = test_config();
+            config.enable_protection = enable_protection;
+            config.protection_test_bypass = Some(ProtectionTestBypassConfig {
+                enabled: true,
+                header_name: header_name.to_string(),
+                credential: Redacted::new(credential.to_string()),
+            });
+
+            let err = match DataDomeIntegration::try_new(config) {
+                Ok(_) => panic!("should reject invalid protection test bypass configuration"),
+                Err(err) => err,
+            };
+            assert!(
+                format!("{err:?}").contains(expected_message),
+                "should explain the invalid protection test bypass configuration"
+            );
+        }
     }
 
     #[test]
