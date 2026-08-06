@@ -80,7 +80,14 @@ describe('GPT diagnostics public types', () => {
       requestNumber: 2,
       durations: {},
       incompleteSequence: false,
-      requestPath: 'competing',
+      requestPath: 'publisher_refresh',
+      requestIntentId: 7,
+      trustedServerAuctionId: 'auction-123',
+      opportunityToRequestMs: 24,
+      replacedRequestNumber: 1,
+      previousRenderToRequestMs: 6048,
+      previousCreativeId: 138563319574,
+      creativeChanged: true,
       trustedServerOpportunity: 'renderable_candidate',
       trustedServerCreativeRequestAtMs: 20,
       trustedServerCreativeResponseAtMs: 25,
@@ -117,6 +124,11 @@ describe('GPT diagnostics public types', () => {
     expect(evidenceSnapshot.slots[0]?.requests[0]).toBe(evidenceCycle);
     expect(evidenceSnapshot.attributionIssues?.[0]).toBe(issue);
     expect(issueReasons).toHaveLength(8);
+    expect(JSON.stringify(snapshot)).not.toContain('requestIntentId');
+    expect(JSON.stringify(snapshot)).not.toContain('trustedServerAuctionId');
+    expectTypeOf(evidenceCycle.requestPath).toEqualTypeOf<'publisher_refresh' | undefined>();
+    expectTypeOf(evidenceCycle.requestIntentId).toEqualTypeOf<number | undefined>();
+    expectTypeOf(evidenceCycle.trustedServerAuctionId).toEqualTypeOf<string | undefined>();
     expect(JSON.stringify(snapshot)).not.toMatch(
       /bidder|targeting|creativeMarkup|auction|userId|cookie/i
     );

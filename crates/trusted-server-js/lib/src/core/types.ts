@@ -55,6 +55,8 @@ export interface AuctionBidData {
   hb_adid?: string;
   hb_cache_host?: string;
   hb_cache_path?: string;
+  /** Opaque server-auction correlation ID used only by GPT diagnostics. */
+  hb_auction_id?: string;
   /** Winning creative width; the bridge sizes the inline render from this. */
   w?: number;
   /** Winning creative height; the bridge sizes the inline render from this. */
@@ -142,6 +144,7 @@ export type GptDiagnosticsResponseClass =
 export type GptDiagnosticsRequestPath =
   | 'trusted_server_direct'
   | 'prebid_refresh'
+  | 'publisher_refresh'
   | 'competing'
   | 'unattributed';
 
@@ -184,6 +187,14 @@ export interface GptDiagnosticsRequestCycle {
   adManager?: GptDiagnosticsAdManagerIdentity;
   responseClass?: GptDiagnosticsResponseClass;
   requestPath?: GptDiagnosticsRequestPath;
+  requestIntentId?: number;
+  trustedServerAuctionId?: string;
+  opportunityToRequestMs?: number;
+  replacedRequestNumber?: number;
+  previousRenderToRequestMs?: number;
+  creativeChanged?: boolean;
+  previousCreativeId?: GptDiagnosticsAdManagerIdentity['creativeId'];
+  loadObservedBeforeRender?: boolean;
   trustedServerOpportunity?: GptDiagnosticsTrustedServerOpportunity;
   trustedServerCreativeRequestAtMs?: number;
   trustedServerCreativeResponseAtMs?: number;
@@ -272,7 +283,8 @@ export interface GptDiagnosticsApi {
   recordTrustedServerOpportunity?(
     slot: GptDiagnosticsSlotHandle,
     auctionSlotId: string,
-    opportunity: GptDiagnosticsTrustedServerOpportunity
+    opportunity: GptDiagnosticsTrustedServerOpportunity,
+    trustedServerAuctionId?: string
   ): void;
   /** Mark slots whose next observed GPT request follows the Prebid refresh path. */
   recordPrebidRefresh?(slots: GptDiagnosticsSlotHandle[]): void;
@@ -337,6 +349,8 @@ export interface TsjsApi {
    * client-side auction that would clear the just-applied TS targeting.
    */
   adInitRefreshInProgress?: boolean;
+  /** Scoped context marking an active Prebid-controlled GPT refresh delegation. */
+  prebidRefreshDispatchInProgress?: boolean;
   /**
    * Whether the publisher disabled GPT initial load through
    * `googletag.setConfig()` or `googletag.pubads().disableInitialLoad()`.
