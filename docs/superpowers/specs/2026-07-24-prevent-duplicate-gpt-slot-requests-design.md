@@ -81,9 +81,9 @@ competing container slot and an invalid duplicate definition.
    destroy a slot after ownership has transferred.
 
 The wrapper is not a global deduplicator. It only handles IDs present in TS's
-handoff registry, or one uniquely safe hydrated-ID match, and must preserve native
-`defineSlot`, all supported `display()` argument forms, and both `refresh()`
-arguments for every other placement.
+handoff registry or one uniquely safe hydrated-ID match and must preserve native
+`defineSlot`, all supported `display()` argument forms, and `refresh()` options for
+every other placement.
 
 ## Implementation shape
 

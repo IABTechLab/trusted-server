@@ -85,29 +85,103 @@ interface SlotRenderEndedEvent {
   slot: GoogleTagSlot;
 }
 
-function findSlotElementByDivId(divId: string): HTMLElement | null {
-  const exact = document.getElementById(divId);
-  if (exact) return exact;
-
-  return (
-    Array.from(document.querySelectorAll<HTMLElement>('[id]')).find(
-      (el) => el.id.startsWith(divId) && !el.id.endsWith('-container')
-    ) ?? null
-  );
+interface SlotElementResolution {
+  element: HTMLElement | null;
+  prefixMatchCount: number;
+  activeMatchCount: number;
 }
 
-function candidateSlotRoots(divId: string): HTMLElement[] {
-  const roots: HTMLElement[] = [];
-  const slotEl = findSlotElementByDivId(divId);
-  if (slotEl) {
-    roots.push(slotEl);
-    const container = document.getElementById(`${slotEl.id}-container`);
-    if (container) roots.push(container);
+function isElementVisible(element: HTMLElement): boolean {
+  const elementWithVisibilityCheck = element as HTMLElement & {
+    checkVisibility?: (options?: {
+      checkVisibilityCSS?: boolean;
+      visibilityProperty?: boolean;
+    }) => boolean;
+  };
+  if (typeof elementWithVisibilityCheck.checkVisibility === 'function') {
+    return elementWithVisibilityCheck.checkVisibility({
+      checkVisibilityCSS: true,
+      visibilityProperty: true,
+    });
   }
 
-  const configuredContainer = document.getElementById(`${divId}-container`);
-  if (configuredContainer && !roots.includes(configuredContainer)) {
-    roots.push(configuredContainer);
+  for (let current: HTMLElement | null = element; current; current = current.parentElement) {
+    const style = window.getComputedStyle(current);
+    if (
+      style.display === 'none' ||
+      style.visibility === 'hidden' ||
+      style.visibility === 'collapse'
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function slotElementHasLayout(element: HTMLElement): boolean {
+  if (!isElementVisible(element)) return false;
+  const elementRect = element.getBoundingClientRect();
+  if (elementRect.width > 0 && elementRect.height > 0) return true;
+
+  const container = document.getElementById(`${element.id}-container`);
+  if (!container || !isElementVisible(container)) return false;
+  const containerRect = container.getBoundingClientRect();
+  return containerRect.width > 0;
+}
+
+function resolveSlotElementByDivId(divId: string): SlotElementResolution {
+  if (!divId) {
+    return { element: null, prefixMatchCount: 0, activeMatchCount: 0 };
+  }
+  const exact = document.getElementById(divId);
+  if (exact) {
+    return { element: exact, prefixMatchCount: 1, activeMatchCount: 1 };
+  }
+
+  const prefixMatches = Array.from(document.querySelectorAll<HTMLElement>('[id]')).filter(
+    (element) => element.id.startsWith(divId) && !element.id.endsWith('-container')
+  );
+  // A unique prefix match may be a lazy slot that has not been sized yet, but
+  // it must still be visible through its ancestor containers.
+  if (prefixMatches.length === 1 && isElementVisible(prefixMatches[0]!)) {
+    return {
+      element: prefixMatches[0]!,
+      prefixMatchCount: 1,
+      activeMatchCount: 1,
+    };
+  }
+
+  const visibleMatches = prefixMatches.filter(isElementVisible);
+  if (visibleMatches.length === 1) {
+    return {
+      element: visibleMatches[0]!,
+      prefixMatchCount: prefixMatches.length,
+      activeMatchCount: 1,
+    };
+  }
+
+  const activeMatches = visibleMatches.filter(slotElementHasLayout);
+  return {
+    element: activeMatches.length === 1 ? activeMatches[0]! : null,
+    prefixMatchCount: prefixMatches.length,
+    activeMatchCount: activeMatches.length,
+  };
+}
+
+function findSlotElementByDivId(divId: string): HTMLElement | null {
+  return resolveSlotElementByDivId(divId).element;
+}
+
+function candidateSlotRoots(elementId: string): HTMLElement[] {
+  const roots: HTMLElement[] = [];
+  const slotEl = document.getElementById(elementId);
+  if (slotEl) {
+    roots.push(slotEl);
+  }
+
+  const container = document.getElementById(`${elementId}-container`);
+  if (container && !roots.includes(container)) {
+    roots.push(container);
   }
 
   return roots;
@@ -116,18 +190,12 @@ function candidateSlotRoots(divId: string): HTMLElement[] {
 function slotIdForMessageSource(source: MessageEventSource | null): string | undefined {
   if (!source) return undefined;
 
-  const slots = window.tsjs?.adSlots ?? [];
-  // Prefer the most-specific configured prefix so an earlier broad prefix
-  // cannot claim an iframe owned by a later, more-specific slot.
-  return [...slots]
-    .sort((left, right) => right.div_id.length - left.div_id.length)
-    .find((slot) =>
-      candidateSlotRoots(slot.div_id).some((root) =>
-        Array.from(root.querySelectorAll('iframe')).some(
-          (iframe) => iframe.contentWindow === source
-        )
-      )
-    )?.id;
+  const divToSlotId = window.tsjs?.divToSlotId ?? {};
+  return Object.entries(divToSlotId).find(([elementId]) =>
+    candidateSlotRoots(elementId).some((root) =>
+      Array.from(root.querySelectorAll('iframe')).some((iframe) => iframe.contentWindow === source)
+    )
+  )?.[1];
 }
 
 function messageSourceBelongsToAdUnit(
@@ -827,6 +895,7 @@ export function installTsAdInit(): void {
     const generation = ts.navGeneration ?? 0;
     const g = (window as GptWindow).googletag;
     if (!g) return;
+    const warnedResolutionFailures = new Set<string>();
 
     g.cmd?.push(() => {
       if ((ts.navGeneration ?? 0) !== generation) return;
@@ -883,11 +952,23 @@ export function installTsAdInit(): void {
       }
 
       slots.forEach((slot) => {
-        // Resolve actual div ID: exact match first, then prefix query.
-        // div_id in config may be a stable prefix (e.g. "ad-header-0-") when
-        // the suffix is dynamically generated by the framework at render time.
-        const el = findSlotElementByDivId(slot.div_id);
-        if (!el) return;
+        // Resolve actual div ID: exact match first, then the visibility and
+        // geometry tiers for prefix matches. div_id in config may be a stable
+        // prefix (e.g. "ad-header-0-") when the suffix is dynamically
+        // generated by the framework at render time.
+        const resolution = resolveSlotElementByDivId(slot.div_id);
+        const el = resolution.element;
+        if (!el) {
+          if (resolution.prefixMatchCount > 1 && !warnedResolutionFailures.has(slot.div_id)) {
+            warnedResolutionFailures.add(slot.div_id);
+            log.warn('GPT slot prefix did not resolve to one active element', {
+              divId: slot.div_id,
+              prefixMatchCount: resolution.prefixMatchCount,
+              activeMatchCount: resolution.activeMatchCount,
+            });
+          }
+          return;
+        }
         const actualDivId = el.id;
         const bid = bids[slot.id] ?? {};
 
@@ -1018,6 +1099,7 @@ export function installTsAdInit(): void {
       // enabled, so this runs unconditionally for any newly-defined slots.
       slotsToDisplay.forEach((divId) => withGptSlotHandoffInternal(ts, () => g.display?.(divId)));
 
+      syncInitialLoadDisabled(g, ts);
       // Slots needing an explicit ad request via refresh(). Reused
       // publisher-owned slots always need one to pick up the just-applied
       // server-side targeting. TS-defined slots are normally fetched by the
@@ -1027,7 +1109,6 @@ export function installTsAdInit(): void {
       // first-impression slot renders blank on initial-load-disabled pages. Only
       // add them in that case; otherwise display() + refresh() would
       // double-request the impression.
-      syncInitialLoadDisabled(g, ts);
       const slotsNeedingRefresh = ts.gptInitialLoadDisabled
         ? slotsToRefresh.concat(newSlots)
         : slotsToRefresh;
@@ -1155,16 +1236,30 @@ function waitForSlotElements(slots: AuctionSlot[], signal: AbortSignal): Promise
 
   return new Promise<void>((resolve) => {
     let settled = false;
+    let animationFrame: number | undefined;
     const finish = (): void => {
       if (settled) return;
       settled = true;
+      if (animationFrame !== undefined) cancelAnimationFrame(animationFrame);
       observer.disconnect();
       clearTimeout(timer);
       signal.removeEventListener('abort', finish);
       resolve();
     };
     const observer = new MutationObserver(() => {
-      if (allPresent()) finish();
+      if (document.visibilityState === 'hidden' || typeof requestAnimationFrame === 'undefined') {
+        if (animationFrame !== undefined) {
+          cancelAnimationFrame(animationFrame);
+          animationFrame = undefined;
+        }
+        if (allPresent()) finish();
+        return;
+      }
+      if (animationFrame !== undefined) return;
+      animationFrame = requestAnimationFrame(() => {
+        animationFrame = undefined;
+        if (allPresent()) finish();
+      });
     });
     observer.observe(document.documentElement, { childList: true, subtree: true });
     const timer = setTimeout(finish, SPA_SLOT_WAIT_MS);

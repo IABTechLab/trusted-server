@@ -22,6 +22,12 @@ async function flushAsync(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+/** Allow a MutationObserver-scheduled slot check to run. */
+async function flushAnimationFrame(): Promise<void> {
+  await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+  await Promise.resolve();
+}
+
 describe('installSpaAuctionHook', () => {
   let fetchStub: ReturnType<typeof vi.fn>;
   // popstate listeners registered by each module import. In production the hook
@@ -274,11 +280,78 @@ describe('installSpaAuctionHook', () => {
 
     // Container commits — the hook should now apply bids exactly once.
     document.body.innerHTML = '<div id="div-late"></div>';
-    await flushAsync();
+    await flushAnimationFrame();
 
     expect(ts.adSlots).toEqual([{ id: 'late', div_id: 'div-late' }]);
     expect(ts.bids).toEqual({ late: { hb_pb: '2.00' } });
     expect(adInit).toHaveBeenCalledTimes(1);
+  });
+
+  it('checks for route containers directly in a hidden document', async () => {
+    vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
+    vi.stubGlobal('requestAnimationFrame', undefined);
+    fetchStub.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        slots: [{ id: 'hidden', div_id: 'div-hidden' }],
+        bids: { hidden: { hb_pb: '3.00' } },
+      }),
+    });
+    const { installSpaAuctionHook } = await importGptModule();
+    installSpaAuctionHook();
+    const ts = (window as TestWindow).tsjs!;
+    const adInit = vi.fn();
+    ts.adInit = adInit;
+
+    history.pushState({}, '', '/hidden-route');
+    await flushAsync();
+    expect(adInit).not.toHaveBeenCalled();
+
+    document.body.innerHTML = '<div id="div-hidden"></div>';
+    await flushAsync();
+
+    expect(ts.adSlots).toEqual([{ id: 'hidden', div_id: 'div-hidden' }]);
+    expect(ts.bids).toEqual({ hidden: { hb_pb: '3.00' } });
+    expect(adInit).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancels a pending visible-tab frame when the document becomes hidden', async () => {
+    let visibility: DocumentVisibilityState = 'visible';
+    vi.spyOn(document, 'visibilityState', 'get').mockImplementation(() => visibility);
+    const requestAnimationFrameMock = vi.fn().mockReturnValue(17);
+    const cancelAnimationFrameMock = vi.fn();
+    vi.stubGlobal('requestAnimationFrame', requestAnimationFrameMock);
+    vi.stubGlobal('cancelAnimationFrame', cancelAnimationFrameMock);
+    fetchStub.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        slots: [{ id: 'hidden-late', div_id: 'div-hidden-late' }],
+        bids: { 'hidden-late': { hb_pb: '3.50' } },
+      }),
+    });
+    const { installSpaAuctionHook } = await importGptModule();
+    installSpaAuctionHook();
+    const ts = (window as TestWindow).tsjs!;
+    const adInit = vi.fn();
+    ts.adInit = adInit;
+
+    history.pushState({}, '', '/hidden-late-route');
+    await flushAsync();
+
+    // A mutation while visible schedules a frame that never runs.
+    document.body.appendChild(document.createElement('span'));
+    await flushAsync();
+    expect(requestAnimationFrameMock).toHaveBeenCalledTimes(1);
+
+    // The next mutation happens after the document is hidden. It must cancel
+    // the stale frame and perform the presence check immediately.
+    visibility = 'hidden';
+    document.body.innerHTML = '<div id="div-hidden-late"></div>';
+    await flushAsync();
+
+    expect(cancelAnimationFrameMock).toHaveBeenCalledWith(17);
+    expect(adInit).toHaveBeenCalledTimes(1);
+    expect(ts.adSlots).toEqual([{ id: 'hidden-late', div_id: 'div-hidden-late' }]);
   });
 
   it('waits for every configured route ad container before applying bids', async () => {
@@ -311,7 +384,7 @@ describe('installSpaAuctionHook', () => {
     const second = document.createElement('div');
     second.id = 'div-second';
     document.body.appendChild(second);
-    await flushAsync();
+    await flushAnimationFrame();
 
     expect(ts.adSlots).toEqual([
       { id: 'first', div_id: 'div-first' },
