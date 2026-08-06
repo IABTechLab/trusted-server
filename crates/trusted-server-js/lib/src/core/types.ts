@@ -317,6 +317,19 @@ export interface GptDiagnosticsApi {
   hide(): void;
 }
 
+/** Release-internal integration inventory emitted by the server before core. */
+export interface BootManifestIntegrationV1 {
+  readonly id: string;
+  readonly required: true;
+}
+
+/** Exact bundle set and injection order required by one TSJS release. */
+export interface BootManifestV1 {
+  readonly version: 1;
+  readonly releaseId: string;
+  readonly integrations: readonly BootManifestIntegrationV1[];
+}
+
 export interface TsjsApi {
   version: string;
   que: Array<() => void>;
