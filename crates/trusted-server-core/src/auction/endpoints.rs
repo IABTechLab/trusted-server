@@ -691,14 +691,14 @@ mod tests {
             &self,
             _request: &AuctionRequest,
             context: &AuctionContext<'_>,
-        ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
             *self.calls.lock().expect("should lock provider call count") += 1;
             let request = Request::builder()
                 .method("POST")
                 .uri("https://bidder.example/auction")
                 .body(EdgeBody::empty())
                 .expect("should build probe provider request");
-            context
+            let pending = context
                 .services
                 .http_client()
                 .send_async(PlatformHttpRequest::new(
@@ -708,7 +708,8 @@ mod tests {
                 .await
                 .change_context(TrustedServerError::Auction {
                     message: "probe provider launch failed".to_string(),
-                })
+                })?;
+            Ok(ProviderRequestOutcome::pending(pending))
         }
 
         async fn parse_response(
