@@ -109,6 +109,9 @@ fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let orchestrator = build_orchestrator(&settings)?;
+    #[cfg(feature = "aps-runner-proxy-integration-test")]
+    let registry = IntegrationRegistry::new_with_aps_v1_for_tests(&settings)?;
+    #[cfg(not(feature = "aps-runner-proxy-integration-test"))]
     let registry = IntegrationRegistry::new(&settings)?;
 
     Ok(Arc::new(AppState {
@@ -116,6 +119,50 @@ fn build_state_with_settings(
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
     }))
+}
+
+#[cfg(feature = "aps-runner-proxy-integration-test")]
+async fn dispatch_reserved_for_state(state: &Arc<AppState>, req: Request) -> Option<Response> {
+    if !state.registry.has_reserved_path(req.uri().path()) {
+        return None;
+    }
+    let ctx = RequestContext::new(req, edgezero_core::params::PathParams::default());
+    let services = build_runtime_services(&ctx);
+    Some(
+        state
+            .registry
+            .handle_reserved_proxy(&state.settings, &services, ctx.into_request())
+            .await
+            .expect("reserved path should have a coordinated-cutover handler")
+            .unwrap_or_else(|report| http_error(&report)),
+    )
+}
+
+#[cfg(feature = "aps-runner-proxy-integration-test")]
+/// Dispatch a reserved request using explicit settings.
+///
+/// # Errors
+///
+/// Returns an error when the adapter state cannot be built from `settings`.
+pub async fn dispatch_reserved_with_settings(
+    settings: Settings,
+    req: Request,
+) -> Result<Option<Response>, Report<TrustedServerError>> {
+    let state = build_state_with_settings(settings)?;
+    Ok(dispatch_reserved_for_state(&state, req).await)
+}
+
+#[cfg(feature = "aps-runner-proxy-integration-test")]
+/// Dispatch a reserved request using the configured adapter state.
+///
+/// # Errors
+///
+/// Returns an error when the configured adapter state cannot be built.
+pub async fn dispatch_reserved(
+    req: Request,
+) -> Result<Option<Response>, Report<TrustedServerError>> {
+    let state = build_state()?;
+    Ok(dispatch_reserved_for_state(&state, req).await)
 }
 
 // ---------------------------------------------------------------------------

@@ -7,7 +7,7 @@
 #
 # Prerequisites:
 #   - Docker running
-#   - Viceroy installed: cargo install viceroy --version 0.17.0 --locked --force
+#   - Viceroy installed: cargo install viceroy --version 0.19.0 --locked --force
 #   - wasm32-wasip1 target: rustup target add wasm32-wasip1
 #   - Node.js with npm available
 #
@@ -23,6 +23,17 @@ NODE_VERSION="$(grep '^nodejs ' .tool-versions | awk '{print $2}')"
 FRAMEWORKS_VALUE="${TS_BROWSER_FRAMEWORKS:-nextjs wordpress}"
 FRAMEWORKS_VALUE="${FRAMEWORKS_VALUE//,/ }"
 read -r -a FRAMEWORKS <<< "$FRAMEWORKS_VALUE"
+APS_V1_VALUE="${TS_TEST_APS_V1:-0}"
+APS_V1_FEATURE_ARGS=()
+
+case "$APS_V1_VALUE" in
+    0) ;;
+    1) APS_V1_FEATURE_ARGS=(--features aps-runner-proxy-integration-test) ;;
+    *)
+        echo "TS_TEST_APS_V1 must be exactly 0 or 1" >&2
+        exit 1
+        ;;
+esac
 
 if [ -z "$NODE_VERSION" ]; then
     echo "Failed to detect Node.js version from .tool-versions" >&2
@@ -51,7 +62,8 @@ TRUSTED_SERVER__PUBLISHER__PROXY_SECRET="integration-test-proxy-secret" \
 TRUSTED_SERVER__EC__PASSPHRASE="integration-test-ec-secret-padded-32" \
 TRUSTED_SERVER__EC__PARTNERS='[{"name":"Integration Test Partner","source_domain":"inttest.example.com","bidstream_enabled":true,"api_token":"integration-test-token-alpha-32-bytes-ok"},{"name":"Integration Test Partner 2","source_domain":"inttest2.example.com","bidstream_enabled":true,"api_token":"integration-test-token-bravo-32-bytes-ok"}]' \
 TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK=false \
-    cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
+    cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1 \
+        "${APS_V1_FEATURE_ARGS[@]}"
 
 echo "==> Generating Viceroy configs..."
 INTEGRATION_ORIGIN_PORT="$ORIGIN_PORT" ./scripts/generate-integration-viceroy-configs.sh

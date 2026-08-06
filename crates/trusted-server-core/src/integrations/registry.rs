@@ -693,6 +693,7 @@ struct IntegrationRegistryInner {
     patch_router: Router<RouteValue>,
     head_router: Router<RouteValue>,
     options_router: Router<RouteValue>,
+    reserved_proxies: Vec<(&'static str, Arc<dyn IntegrationProxy>)>,
 
     // Metadata for introspection
     routes: Vec<(IntegrationEndpoint, &'static str)>,
@@ -716,6 +717,7 @@ impl Default for IntegrationRegistryInner {
             patch_router: Router::new(),
             head_router: Router::new(),
             options_router: Router::new(),
+            reserved_proxies: Vec::new(),
             routes: Vec::new(),
             enabled_integration_ids: Vec::new(),
             deferred_js_ids: Vec::new(),
@@ -865,6 +867,62 @@ impl IntegrationRegistry {
         Ok(Self {
             inner: Arc::new(inner),
         })
+    }
+
+    /// Build the coordinated-cutover APS surface for hermetic tests only.
+    ///
+    /// Ordinary production construction deliberately has no reserved APS
+    /// dispatcher until the hard cutover task activates it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when ordinary registry construction or APS
+    /// configuration validation fails.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn new_with_aps_v1_for_tests(
+        settings: &Settings,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        let mut registry = Self::new(settings)?;
+        let proxy: Arc<dyn IntegrationProxy> =
+            Arc::new(super::aps::ApsV1Integration::from_settings(settings)?);
+        let inner = Arc::get_mut(&mut registry.inner).ok_or_else(|| {
+            Report::new(TrustedServerError::Configuration {
+                message: "APS test registry became shared during construction".to_string(),
+            })
+        })?;
+        inner.reserved_proxies.push(("/integrations/aps", proxy));
+        Ok(registry)
+    }
+
+    fn reserved_proxy(&self, path: &str) -> Option<&Arc<dyn IntegrationProxy>> {
+        self.inner
+            .reserved_proxies
+            .iter()
+            .find(|(family, _)| {
+                path == *family
+                    || path
+                        .strip_prefix(*family)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            })
+            .map(|(_, proxy)| proxy)
+    }
+
+    /// Return true when a coordinated-cutover family owns this path.
+    #[must_use]
+    pub fn has_reserved_path(&self, path: &str) -> bool {
+        self.reserved_proxy(path).is_some()
+    }
+
+    /// Dispatch a coordinated-cutover family before auth, EC, filters, and fallback.
+    #[must_use]
+    pub async fn handle_reserved_proxy(
+        &self,
+        settings: &Settings,
+        services: &RuntimeServices,
+        req: Request<EdgeBody>,
+    ) -> Option<Result<Response<EdgeBody>, Report<TrustedServerError>>> {
+        let proxy = self.reserved_proxy(req.uri().path())?;
+        Some(proxy.handle(settings, services, req).await)
     }
 
     fn find_route(&self, method: &Method, path: &str) -> Option<&RouteValue> {
@@ -1181,6 +1239,7 @@ impl IntegrationRegistry {
                 patch_router: Router::new(),
                 head_router: Router::new(),
                 options_router: Router::new(),
+                reserved_proxies: Vec::new(),
                 routes: Vec::new(),
                 enabled_integration_ids: Vec::new(),
                 html_rewriters: attribute_rewriters,
@@ -1210,6 +1269,7 @@ impl IntegrationRegistry {
                 patch_router: Router::new(),
                 head_router: Router::new(),
                 options_router: Router::new(),
+                reserved_proxies: Vec::new(),
                 routes: Vec::new(),
                 enabled_integration_ids: Vec::new(),
                 html_rewriters: attribute_rewriters,
@@ -1235,6 +1295,7 @@ impl IntegrationRegistry {
                 patch_router: Router::new(),
                 head_router: Router::new(),
                 options_router: Router::new(),
+                reserved_proxies: Vec::new(),
                 routes: Vec::new(),
                 enabled_integration_ids: Vec::new(),
                 html_rewriters: Vec::new(),
@@ -1300,6 +1361,7 @@ impl IntegrationRegistry {
                 patch_router,
                 head_router,
                 options_router,
+                reserved_proxies: Vec::new(),
                 routes: Vec::new(),
                 enabled_integration_ids: Vec::new(),
                 html_rewriters: Vec::new(),
@@ -1460,6 +1522,38 @@ mod tests {
             "/integrations/test/echo",
             "should expose the HTTP request path to the proxy"
         );
+    }
+
+    #[test]
+    fn aps_coordinated_cutover_family_exists_only_in_explicit_test_registry() {
+        let settings = create_test_settings();
+        let ordinary = IntegrationRegistry::new(&settings).expect("ordinary registry should build");
+        assert!(!ordinary.has_reserved_path("/integrations/aps"));
+        assert!(!ordinary.has_reserved_path("/integrations/aps/runner.js"));
+
+        let cutover = IntegrationRegistry::new_with_aps_v1_for_tests(&settings)
+            .expect("coordinated-cutover registry should build");
+        assert!(cutover.has_reserved_path("/integrations/aps"));
+        assert!(cutover.has_reserved_path("/integrations/aps/runner.js"));
+        assert!(cutover.has_reserved_path("/integrations/aps/malformed/path"));
+        assert!(!cutover.has_reserved_path("/integrations/apsx/runner.js"));
+        assert!(!cutover.has_reserved_path("/integrations/aps-legacy"));
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/integrations/aps/renderer/v1")
+            .header(HEADER_X_TS_EC.clone(), "caller-controlled")
+            .body(EdgeBody::empty())
+            .expect("should build reserved APS request");
+        let response = futures::executor::block_on(cutover.handle_reserved_proxy(
+            &settings,
+            &noop_services(),
+            request,
+        ))
+        .expect("reserved family should be handled")
+        .expect("disabled APS response should be local");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     }
 
     #[test]

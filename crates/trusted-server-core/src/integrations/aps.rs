@@ -23,6 +23,8 @@ use crate::auction::types::{
     MediaType, RENDER_DIMENSION_MAX, classify_aps_renderer_v1, record_auction_drop,
 };
 use crate::error::TrustedServerError;
+#[cfg(any(test, feature = "test-utils"))]
+use crate::integrations::ensure_integration_backend_with_transport_timeouts;
 use crate::integrations::{
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
     UPSTREAM_RTB_MAX_RESPONSE_BYTES, collect_response_bounded,
@@ -33,10 +35,18 @@ use crate::openrtb::{
     UserExt, to_openrtb_i32,
 };
 use crate::platform::{PlatformHttpRequest, PlatformResponse, RuntimeServices};
+#[cfg(any(test, feature = "test-utils"))]
+use crate::platform::{ProxyHeaderEvidenceV1, RawProxyPolicyV1, RawProxyResponseV1};
 use crate::settings::{IntegrationConfig, Settings};
 
 const APS_INTEGRATION_ID: &str = "aps";
 const APS_RENDERER_ROUTE: &str = "/integrations/aps/renderer";
+pub const APS_RENDERER_V1_ROUTE: &str = "/integrations/aps/renderer/v1";
+pub const APS_RUNNER_ROUTE: &str = "/integrations/aps/runner.js";
+pub const APS_RUNNER_UPSTREAM_URL: &str =
+    "https://client.aps.amazon-adsystem.com/prebid-creative.js";
+pub const APS_RUNNER_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+pub const APS_RENDERER_SANDBOX: &str = "allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation";
 const DEFAULT_CURRENCY: &str = "USD";
 const APS_SDK_SOURCE: &str = "prebid";
 const APS_SDK_VERSION: &str = "2.2.0";
@@ -48,7 +58,25 @@ const MAX_CREATIVE_URL_BYTES: usize = 4096;
 const MAX_LANGUAGE_BYTES: usize = 8;
 const MAX_PAGE_URL_BYTES: usize = 8192;
 const MAX_RENDER_ENVELOPE_BYTES: usize = 256 * 1024;
+#[cfg(any(test, feature = "test-utils"))]
+// Reserve downstream response/finalization overhead inside the externally
+// observed five-second dispatch-to-final-byte ceiling.
+const APS_RUNNER_TOTAL_TIMEOUT: Duration = Duration::from_millis(4_500);
+#[cfg(any(test, feature = "test-utils"))]
+/// Maximum wait for the APS runner response headers.
+pub const APS_RUNNER_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(4);
+#[cfg(any(test, feature = "test-utils"))]
+/// Maximum duration of one blocking APS runner response-body read.
+pub const APS_RUNNER_BLOCKING_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const APS_RENDERER_CSP: &str = "default-src 'none'; sandbox allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation; script-src 'unsafe-inline' https:; connect-src https:; frame-src https:; img-src https: data:; media-src https: blob:; style-src 'unsafe-inline' https:; font-src https: data:;";
+
+/// Whether `path` belongs to the reserved APS integration family.
+#[must_use]
+pub fn is_aps_family_path(path: &str) -> bool {
+    path == "/integrations/aps" || path.starts_with("/integrations/aps/")
+}
+#[cfg(any(test, feature = "test-utils"))]
+const APS_RENDERER_V1_CSP: &str = "default-src 'none'; sandbox allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation; base-uri 'none'; object-src 'none'; script-src 'unsafe-inline' 'self' https:; connect-src https:; frame-src https: data: blob:; img-src https: data: blob:; media-src https: data: blob:; style-src 'unsafe-inline' https:; font-src https: data:; worker-src https: blob:; form-action https:;";
 
 const APS_RENDERER_DOCUMENT: &str = concat!(
     r#"<!doctype html>
@@ -83,6 +111,119 @@ function receive(event){
  script.src='https://client.aps.amazon-adsystem.com/prebid-creative.js';
  script.onload=function(){parent.postMessage({message:'trusted-server/aps/renderer-ready',nonce:acceptedNonce},'*');};
  script.onerror=function(){parent.postMessage({message:'trusted-server/aps/renderer-failed',nonce:acceptedNonce},'*');};
+ document.head.appendChild(script);
+}
+addEventListener('message',receive);
+})();
+</script>
+"#
+);
+
+#[cfg(any(test, feature = "test-utils"))]
+const APS_RENDERER_V1_DOCUMENT: &str = concat!(
+    r#"<!doctype html>
+<meta charset="utf-8">
+<style>html,body{margin:0;padding:0;overflow:hidden}</style>
+<script>
+(function(){
+'use strict';
+"#,
+    include_str!("generated/aps_renderer_validator_v1.js"),
+    r#"
+var match=/^#tsaps=(n1_[A-Za-z0-9_-]{22})$/.exec(location.hash);
+var expected=match&&match[1];
+try{history.replaceState(null,'',location.pathname+location.search);}catch(_error){}
+if(!expected)return;
+var port=null;
+var terminal=false;
+var runnerLoaded=false;
+var callbackOutcome=null;
+function send(message){
+ if(!port)return;
+ try{port.postMessage(message);}catch(_error){}
+}
+function close(){
+ if(!port)return;
+ try{port.close();}catch(_error){}
+}
+function fail(reason){
+ if(terminal)return;
+ terminal=true;
+ send({message:'TS APS Render Failed',version:1,nonce:expected,reason:reason});
+ close();
+}
+function finishCallback(){
+ if(terminal||!runnerLoaded||callbackOutcome===null)return;
+ if(callbackOutcome==='rejected'){
+  fail('runner_failed');
+  return;
+ }
+ terminal=true;
+ send({message:'TS APS Render Completed',version:1,nonce:expected});
+ close();
+}
+function publisherOrigin(value){
+ if(typeof value!=='string'||value.length===0||value.length>2048)return false;
+ for(var index=0;index<value.length;index+=1){
+  var code=value.charCodeAt(index);
+  if(code<=31||code===127)return false;
+ }
+ try{
+  var parsed=new URL(value);
+  return (parsed.protocol==='https:'||parsed.protocol==='http:')&&
+   parsed.username===''&&parsed.password===''&&parsed.pathname==='/'&&
+   parsed.search===''&&parsed.hash===''&&parsed.origin===value;
+ }catch(_error){return false;}
+}
+function receive(event){
+ if(event.source!==parent||!event.ports||event.ports.length!==1)return;
+ port=event.ports[0];
+ removeEventListener('message',receive);
+ var envelope=event.data;
+ if(!apsExactRecord(envelope,['nonce','publisherOrigin','renderer','version'])||
+    envelope.version!==1||envelope.nonce!==expected||
+    !publisherOrigin(envelope.publisherOrigin)||
+    classifyApsRendererV1(envelope.renderer,envelope.publisherOrigin)!=='accepted'){
+  fail('descriptor_invalid');
+  return;
+ }
+ port.onmessageerror=function(){fail('descriptor_invalid');};
+ try{port.start();}catch(_error){}
+ var renderer=envelope.renderer;
+ send({message:'TS APS Document Accepted',version:1,nonce:expected});
+ window._aps=window._aps instanceof Map?window._aps:new Map();
+ var account=window._aps.get(renderer.accountId);
+ if(!account){
+  account={queue:[],store:new Map([['listeners',new Map()]])};
+  window._aps.set(renderer.accountId,account);
+ }
+ var renderPromise=new Promise(function(resolve,reject){
+  account.queue.push(new CustomEvent('prebid/creative/render',{detail:{
+   aaxResponse:renderer.aaxResponse,
+   seatBidId:renderer.bidId,
+   source:'internal',
+   resolve:resolve,
+   reject:reject
+ }}));
+ });
+ renderPromise.then(function(){
+  callbackOutcome='resolved';
+  finishCallback();
+ },function(){
+  callbackOutcome='rejected';
+  finishCallback();
+ });
+ var script=document.createElement('script');
+ script.src=new URL('/integrations/aps/runner.js',location.href).href;
+ script.crossOrigin='anonymous';
+ script.referrerPolicy='no-referrer';
+ script.onload=function(){
+  if(terminal)return;
+  runnerLoaded=true;
+  send({message:'TS APS Runner Loaded',version:1,nonce:expected});
+  finishCallback();
+ };
+ script.onerror=function(){fail('runner_no_load');};
  document.head.appendChild(script);
 }
 addEventListener('message',receive);
@@ -1265,6 +1406,280 @@ impl IntegrationProxy for ApsRendererIntegration {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug)]
+pub(crate) struct ApsV1Integration {
+    enabled: bool,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl ApsV1Integration {
+    fn mark_exact_headers(mut response: http::Response<EdgeBody>) -> http::Response<EdgeBody> {
+        response
+            .extensions_mut()
+            .insert(crate::platform::ExactResponseHeadersV1);
+        response
+    }
+
+    pub(crate) fn from_settings(settings: &Settings) -> Result<Self, Report<TrustedServerError>> {
+        Ok(Self {
+            enabled: settings
+                .integration_config::<ApsConfig>(APS_INTEGRATION_ID)?
+                .is_some(),
+        })
+    }
+
+    fn local_status(
+        status: StatusCode,
+        allow_get: bool,
+    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+        let mut builder = http::Response::builder()
+            .status(status)
+            .header(header::CACHE_CONTROL, "no-store");
+        if allow_get {
+            builder = builder.header(header::ALLOW, "GET");
+        }
+        builder
+            .body(EdgeBody::empty())
+            .change_context(TrustedServerError::Integration {
+                integration: APS_INTEGRATION_ID.to_string(),
+                message: "Failed to build local APS route response".to_string(),
+            })
+            .map(Self::mark_exact_headers)
+    }
+
+    fn renderer_response() -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+        http::Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+            .header("x-content-type-options", "nosniff")
+            .header("referrer-policy", "no-referrer")
+            .header(header::CONTENT_SECURITY_POLICY, APS_RENDERER_V1_CSP)
+            .body(EdgeBody::from(APS_RENDERER_V1_DOCUMENT))
+            .change_context(TrustedServerError::Integration {
+                integration: APS_INTEGRATION_ID.to_string(),
+                message: "Failed to build APS renderer v1 response".to_string(),
+            })
+            .map(Self::mark_exact_headers)
+    }
+
+    fn singleton_proxy_header(
+        evidence: &ProxyHeaderEvidenceV1,
+        required: bool,
+    ) -> Result<Option<&[u8]>, &'static str> {
+        match evidence {
+            ProxyHeaderEvidenceV1::Occurrences(values) => match values.as_slice() {
+                [] if !required => Ok(None),
+                [value] => Ok(Some(value.as_slice())),
+                [] => Err("missing_header"),
+                _ => Err("duplicate_header"),
+            },
+            ProxyHeaderEvidenceV1::Combined(value) if !value.contains(&b',') => {
+                Ok(Some(value.as_slice()))
+            }
+            ProxyHeaderEvidenceV1::Combined(_) => Err("listed_header"),
+            ProxyHeaderEvidenceV1::Unavailable => Err("unavailable_header"),
+        }
+    }
+
+    fn trim_http_ows(value: &[u8]) -> &[u8] {
+        let start = value
+            .iter()
+            .position(|byte| !matches!(byte, b' ' | b'\t'))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|byte| !matches!(byte, b' ' | b'\t'))
+            .map_or(start, |index| index + 1);
+        &value[start..end]
+    }
+
+    fn validate_runner_content_type(evidence: &ProxyHeaderEvidenceV1) -> Result<(), &'static str> {
+        let raw = Self::singleton_proxy_header(evidence, true)?;
+        let value = std::str::from_utf8(raw.ok_or("missing_content_type")?)
+            .map_err(|_| "invalid_content_type")?;
+        if !value.is_ascii() {
+            return Err("invalid_content_type");
+        }
+        if value.as_bytes().contains(&b',') {
+            return Err("listed_content_type");
+        }
+
+        let mut parts = value.split(';');
+        let essence = parts
+            .next()
+            .ok_or("missing_content_type")?
+            .trim_matches([' ', '\t']);
+        if !essence.eq_ignore_ascii_case("application/javascript")
+            && !essence.eq_ignore_ascii_case("text/javascript")
+        {
+            return Err("rejected_content_type");
+        }
+        let Some(parameter) = parts.next() else {
+            return Ok(());
+        };
+        if parts.next().is_some() {
+            return Err("duplicate_content_type_parameter");
+        }
+        let (name, value) = parameter
+            .split_once('=')
+            .ok_or("invalid_content_type_parameter")?;
+        if !name
+            .trim_matches([' ', '\t'])
+            .eq_ignore_ascii_case("charset")
+            || !value
+                .trim_matches([' ', '\t'])
+                .eq_ignore_ascii_case("utf-8")
+        {
+            return Err("rejected_content_type_parameter");
+        }
+        Ok(())
+    }
+
+    fn validate_runner_content_encoding(
+        evidence: &ProxyHeaderEvidenceV1,
+    ) -> Result<(), &'static str> {
+        let Some(raw) = Self::singleton_proxy_header(evidence, false)? else {
+            return Ok(());
+        };
+        let value = Self::trim_http_ows(raw);
+        if value.contains(&b',') || !value.eq_ignore_ascii_case(b"identity") {
+            return Err("rejected_content_encoding");
+        }
+        Ok(())
+    }
+
+    fn validate_runner_content_length(
+        evidence: &ProxyHeaderEvidenceV1,
+    ) -> Result<Option<usize>, &'static str> {
+        let Some(value) = Self::singleton_proxy_header(evidence, false)? else {
+            return Ok(None);
+        };
+        if value.is_empty()
+            || value.contains(&b',')
+            || !value.iter().all(u8::is_ascii_digit)
+            || (value.len() > 1 && value[0] == b'0')
+        {
+            return Err("invalid_content_length");
+        }
+        let value = std::str::from_utf8(value)
+            .map_err(|_| "invalid_content_length")?
+            .parse::<usize>()
+            .map_err(|_| "invalid_content_length")?;
+        if value > APS_RUNNER_MAX_RESPONSE_BYTES {
+            return Err("content_length_overflow");
+        }
+        Ok(Some(value))
+    }
+
+    fn validate_runner_response(response: &RawProxyResponseV1) -> Result<(), &'static str> {
+        if response.evidence.status != StatusCode::OK.as_u16() {
+            return Err("rejected_status");
+        }
+        Self::validate_runner_content_type(&response.evidence.content_type)?;
+        Self::validate_runner_content_encoding(&response.evidence.content_encoding)?;
+        let declared_length =
+            Self::validate_runner_content_length(&response.evidence.content_length)?;
+        if response.body.len() > APS_RUNNER_MAX_RESPONSE_BYTES {
+            return Err("body_overflow");
+        }
+        if declared_length.is_some_and(|length| length != response.body.len()) {
+            return Err("content_length_mismatch");
+        }
+        std::str::from_utf8(&response.body).map_err(|_| "invalid_utf8")?;
+        Ok(())
+    }
+
+    async fn runner_response(
+        services: &RuntimeServices,
+    ) -> Result<http::Response<EdgeBody>, &'static str> {
+        let outbound_request = http::Request::builder()
+            .method(Method::GET)
+            .uri(APS_RUNNER_UPSTREAM_URL)
+            .header(header::ACCEPT_ENCODING, "identity")
+            .body(EdgeBody::empty())
+            .map_err(|_| "request_build_failed")?;
+        let backend = ensure_integration_backend_with_transport_timeouts(
+            services,
+            APS_RUNNER_UPSTREAM_URL,
+            APS_INTEGRATION_ID,
+            APS_RUNNER_FIRST_BYTE_TIMEOUT,
+            APS_RUNNER_BLOCKING_READ_TIMEOUT,
+        )
+        .map_err(|_| "backend_unavailable")?;
+        let response = services
+            .http_client()
+            .send_raw_proxy_v1(
+                PlatformHttpRequest::new(outbound_request, backend),
+                RawProxyPolicyV1 {
+                    total_timeout: APS_RUNNER_TOTAL_TIMEOUT,
+                    first_byte_timeout: APS_RUNNER_FIRST_BYTE_TIMEOUT,
+                    blocking_read_timeout: APS_RUNNER_BLOCKING_READ_TIMEOUT,
+                    max_response_bytes: APS_RUNNER_MAX_RESPONSE_BYTES,
+                },
+            )
+            .await
+            .map_err(|_| "transport_failed")?;
+        Self::validate_runner_response(&response)?;
+
+        http::Response::builder()
+            .status(StatusCode::OK)
+            .header(
+                header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            )
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .header("cross-origin-resource-policy", "cross-origin")
+            .header("x-content-type-options", "nosniff")
+            .header("referrer-policy", "no-referrer")
+            .body(EdgeBody::from(response.body))
+            .map(Self::mark_exact_headers)
+            .map_err(|_| "response_build_failed")
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[async_trait(?Send)]
+impl IntegrationProxy for ApsV1Integration {
+    fn integration_name(&self) -> &'static str {
+        APS_INTEGRATION_ID
+    }
+
+    fn routes(&self) -> Vec<IntegrationEndpoint> {
+        Vec::new()
+    }
+
+    async fn handle(
+        &self,
+        _settings: &Settings,
+        services: &RuntimeServices,
+        request: http::Request<EdgeBody>,
+    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+        let path = request.uri().path();
+        if !path.starts_with("/integrations/aps/") {
+            return Self::local_status(StatusCode::NOT_FOUND, false);
+        }
+        if request.method() != Method::GET {
+            return Self::local_status(StatusCode::METHOD_NOT_ALLOWED, true);
+        }
+        if !self.enabled {
+            return Self::local_status(StatusCode::NOT_FOUND, false);
+        }
+        match path {
+            APS_RENDERER_V1_ROUTE => Self::renderer_response(),
+            APS_RUNNER_ROUTE => match Self::runner_response(services).await {
+                Ok(response) => Ok(response),
+                Err(reason) => {
+                    log::warn!("APS runner proxy failed closed: {reason}");
+                    Self::local_status(StatusCode::BAD_GATEWAY, false)
+                }
+            },
+            _ => Self::local_status(StatusCode::NOT_FOUND, false),
+        }
+    }
+}
+
 /// Register the APS static renderer endpoint when APS is enabled.
 ///
 /// # Errors
@@ -1314,9 +1729,12 @@ mod tests {
     };
     use crate::consent::ConsentContext;
     use crate::openrtb::{Eid, Uid};
-    use crate::platform::GeoInfo;
     use crate::platform::test_support::{
         StubHttpClient, build_services_with_http_client, noop_services,
+    };
+    use crate::platform::{
+        GeoInfo, ProxyHeaderEvidenceV1, ProxyResponseEvidenceV1, RawProxyPolicyV1,
+        RawProxyResponseV1,
     };
     use crate::test_support::tests::create_test_settings;
     use serde_json::json;
@@ -3060,5 +3478,467 @@ mod tests {
         assert!(APS_RENDERER_CSP.contains("default-src 'none'"));
         assert!(APS_RENDERER_CSP.contains("sandbox allow-forms"));
         assert!(!APS_RENDERER_CSP.contains("allow-same-origin"));
+    }
+
+    #[test]
+    fn coordinated_cutover_routes_are_reserved_with_exact_local_method_policy() {
+        let enabled = ApsV1Integration { enabled: true };
+        let disabled = ApsV1Integration { enabled: false };
+        let settings = create_test_settings();
+        let services = noop_services();
+
+        for path in [APS_RENDERER_V1_ROUTE, APS_RUNNER_ROUTE] {
+            let disabled_get = http::Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .body(EdgeBody::empty())
+                .expect("should build disabled APS request");
+            let response =
+                futures::executor::block_on(disabled.handle(&settings, &services, disabled_get))
+                    .expect("disabled APS family should answer locally");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+
+            for method in [
+                Method::POST,
+                Method::HEAD,
+                Method::OPTIONS,
+                Method::PUT,
+                Method::PATCH,
+                Method::DELETE,
+                Method::TRACE,
+                Method::CONNECT,
+                Method::from_bytes(b"PROPFIND").expect("PROPFIND should be a valid method"),
+            ] {
+                let request = http::Request::builder()
+                    .method(method.clone())
+                    .uri(path)
+                    .body(EdgeBody::empty())
+                    .expect("should build APS method rejection");
+                let response =
+                    futures::executor::block_on(enabled.handle(&settings, &services, request))
+                        .expect("reserved APS family should reject unsupported methods locally");
+                assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+                assert_eq!(response.headers()[header::ALLOW], "GET");
+                assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+                assert_eq!(response.headers().len(), 2, "method={method} path={path}");
+                assert!(
+                    response
+                        .into_body()
+                        .into_bytes()
+                        .unwrap_or_default()
+                        .is_empty()
+                );
+            }
+        }
+
+        for path in [
+            "/integrations/aps/renderer/v2",
+            "/integrations/aps/runner/v1.js",
+            "/integrations/aps/renderer/v1/extra",
+            "/integrations/aps/not-a-route",
+        ] {
+            let request = http::Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .body(EdgeBody::empty())
+                .expect("should build unknown APS family request");
+            let response =
+                futures::executor::block_on(enabled.handle(&settings, &services, request))
+                    .expect("unknown APS family path should answer locally");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "path={path}");
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        }
+    }
+
+    #[test]
+    fn aps_family_classifier_has_an_exact_segment_boundary() {
+        assert!(is_aps_family_path("/integrations/aps"));
+        assert!(is_aps_family_path("/integrations/aps/renderer/v1"));
+        assert!(!is_aps_family_path("/integrations/apsx"));
+        assert!(!is_aps_family_path("/integrations/ap"));
+    }
+
+    #[test]
+    fn coordinated_cutover_renderer_has_exact_immutable_embedding_policy() {
+        let integration = ApsV1Integration { enabled: true };
+        let request = http::Request::builder()
+            .method(Method::GET)
+            .uri(APS_RENDERER_V1_ROUTE)
+            .body(EdgeBody::empty())
+            .expect("should build versioned renderer request");
+        let response = futures::executor::block_on(integration.handle(
+            &create_test_settings(),
+            &noop_services(),
+            request,
+        ))
+        .expect("versioned renderer should be served");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+        assert_eq!(
+            response.headers()[header::CONTENT_SECURITY_POLICY],
+            APS_RENDERER_V1_CSP
+        );
+        assert!(!response.headers().contains_key("x-frame-options"));
+        assert!(!APS_RENDERER_V1_CSP.contains("frame-ancestors"));
+        assert_eq!(
+            APS_RENDERER_SANDBOX,
+            "allow-forms allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts allow-top-navigation-by-user-activation"
+        );
+
+        let body = futures::executor::block_on(
+            response
+                .into_body()
+                .into_bytes_bounded(APS_RUNNER_MAX_RESPONSE_BYTES),
+        )
+        .expect("renderer body should stay within the runner cap");
+        assert_eq!(body.as_ref(), APS_RENDERER_V1_DOCUMENT.as_bytes());
+        assert!(APS_RENDERER_V1_DOCUMENT.contains("/integrations/aps/runner.js"));
+        assert!(!APS_RENDERER_V1_DOCUMENT.contains("client.aps.amazon-adsystem.com"));
+    }
+
+    fn raw_runner_response(
+        body: impl Into<Vec<u8>>,
+        content_type: ProxyHeaderEvidenceV1,
+        content_encoding: ProxyHeaderEvidenceV1,
+        content_length: ProxyHeaderEvidenceV1,
+    ) -> RawProxyResponseV1 {
+        RawProxyResponseV1 {
+            evidence: ProxyResponseEvidenceV1 {
+                status: 200,
+                content_type,
+                content_encoding,
+                content_length,
+            },
+            body: body.into(),
+        }
+    }
+
+    fn request_runner(
+        stub: &Arc<StubHttpClient>,
+    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+        let services = build_services_with_http_client(
+            Arc::clone(stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let request = http::Request::builder()
+            .method(Method::GET)
+            .uri(APS_RUNNER_ROUTE)
+            .body(EdgeBody::empty())
+            .expect("should build APS runner request");
+        futures::executor::block_on(ApsV1Integration { enabled: true }.handle(
+            &create_test_settings(),
+            &services,
+            request,
+        ))
+    }
+
+    #[test]
+    fn coordinated_cutover_runner_proxies_exact_valid_identity_bytes() {
+        let body = b"window.fictionalApsRunner = true;".to_vec();
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_raw_proxy_response(raw_runner_response(
+            body.clone(),
+            ProxyHeaderEvidenceV1::one("application/javascript; charset=utf-8"),
+            ProxyHeaderEvidenceV1::absent(),
+            ProxyHeaderEvidenceV1::one(body.len().to_string()),
+        ));
+
+        let response = request_runner(&stub).expect("valid runner should be proxied");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/javascript; charset=utf-8"
+        );
+        assert_eq!(response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        assert_eq!(
+            response.headers()["cross-origin-resource-policy"],
+            "cross-origin"
+        );
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+        assert_eq!(response.headers().len(), 5);
+        let returned = futures::executor::block_on(
+            response
+                .into_body()
+                .into_bytes_bounded(APS_RUNNER_MAX_RESPONSE_BYTES),
+        )
+        .expect("valid runner body should remain bounded");
+        assert_eq!(returned.as_ref(), body.as_slice());
+
+        assert_eq!(stub.recorded_backend_names(), vec!["stub-backend"]);
+        assert_eq!(stub.recorded_request_uris(), vec![APS_RUNNER_UPSTREAM_URL]);
+        assert_eq!(stub.recorded_request_methods(), vec!["GET"]);
+        assert_eq!(
+            stub.recorded_request_headers(),
+            vec![vec![(
+                "accept-encoding".to_string(),
+                "identity".to_string()
+            )]]
+        );
+        assert_eq!(stub.recorded_request_bodies(), vec![Vec::<u8>::new()]);
+        assert_eq!(
+            stub.recorded_raw_proxy_policies(),
+            vec![RawProxyPolicyV1 {
+                total_timeout: Duration::from_millis(4_500),
+                first_byte_timeout: Duration::from_secs(4),
+                blocking_read_timeout: Duration::from_millis(250),
+                max_response_bytes: APS_RUNNER_MAX_RESPONSE_BYTES,
+            }]
+        );
+    }
+
+    #[test]
+    fn coordinated_cutover_runner_rejects_ambiguous_or_invalid_upstream_evidence() {
+        let valid_body = b"window.fictionalApsRunner = true;".to_vec();
+        let valid_length = valid_body.len().to_string();
+        let cases = [
+            (
+                "redirect",
+                RawProxyResponseV1 {
+                    evidence: ProxyResponseEvidenceV1 {
+                        status: 302,
+                        content_type: ProxyHeaderEvidenceV1::one("application/javascript"),
+                        content_encoding: ProxyHeaderEvidenceV1::absent(),
+                        content_length: ProxyHeaderEvidenceV1::one(valid_length.clone()),
+                    },
+                    body: valid_body.clone(),
+                },
+            ),
+            (
+                "missing content type",
+                raw_runner_response(
+                    valid_body.clone(),
+                    ProxyHeaderEvidenceV1::absent(),
+                    ProxyHeaderEvidenceV1::absent(),
+                    ProxyHeaderEvidenceV1::one(valid_length.clone()),
+                ),
+            ),
+            (
+                "duplicate content type",
+                raw_runner_response(
+                    valid_body.clone(),
+                    ProxyHeaderEvidenceV1::Occurrences(vec![
+                        b"application/javascript".to_vec(),
+                        b"text/javascript".to_vec(),
+                    ]),
+                    ProxyHeaderEvidenceV1::absent(),
+                    ProxyHeaderEvidenceV1::one(valid_length.clone()),
+                ),
+            ),
+            (
+                "combined content type list",
+                raw_runner_response(
+                    valid_body.clone(),
+                    ProxyHeaderEvidenceV1::Combined(
+                        b"application/javascript, text/javascript".to_vec(),
+                    ),
+                    ProxyHeaderEvidenceV1::absent(),
+                    ProxyHeaderEvidenceV1::one(valid_length.clone()),
+                ),
+            ),
+            (
+                "wrong charset",
+                raw_runner_response(
+                    valid_body.clone(),
+                    ProxyHeaderEvidenceV1::one("application/javascript; charset=iso-8859-1"),
+                    ProxyHeaderEvidenceV1::absent(),
+                    ProxyHeaderEvidenceV1::one(valid_length.clone()),
+                ),
+            ),
+            (
+                "encoded body",
+                raw_runner_response(
+                    valid_body.clone(),
+                    ProxyHeaderEvidenceV1::one("application/javascript"),
+                    ProxyHeaderEvidenceV1::one("gzip"),
+                    ProxyHeaderEvidenceV1::one(valid_length.clone()),
+                ),
+            ),
+            (
+                "unavailable encoding evidence",
+                raw_runner_response(
+                    valid_body.clone(),
+                    ProxyHeaderEvidenceV1::one("application/javascript"),
+                    ProxyHeaderEvidenceV1::Unavailable,
+                    ProxyHeaderEvidenceV1::one(valid_length.clone()),
+                ),
+            ),
+            (
+                "leading-zero length",
+                raw_runner_response(
+                    valid_body.clone(),
+                    ProxyHeaderEvidenceV1::one("application/javascript"),
+                    ProxyHeaderEvidenceV1::absent(),
+                    ProxyHeaderEvidenceV1::one(format!("0{valid_length}")),
+                ),
+            ),
+            (
+                "mismatched length",
+                raw_runner_response(
+                    valid_body.clone(),
+                    ProxyHeaderEvidenceV1::one("application/javascript"),
+                    ProxyHeaderEvidenceV1::absent(),
+                    ProxyHeaderEvidenceV1::one("1"),
+                ),
+            ),
+            (
+                "invalid utf-8",
+                raw_runner_response(
+                    vec![0xff],
+                    ProxyHeaderEvidenceV1::one("application/javascript"),
+                    ProxyHeaderEvidenceV1::absent(),
+                    ProxyHeaderEvidenceV1::one("1"),
+                ),
+            ),
+        ];
+
+        for (name, response) in cases {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_raw_proxy_response(response);
+            let response = request_runner(&stub).expect("invalid runner should fail locally");
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "case={name}");
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            assert_eq!(response.headers().len(), 1, "case={name}");
+            let body = futures::executor::block_on(
+                response
+                    .into_body()
+                    .into_bytes_bounded(APS_RUNNER_MAX_RESPONSE_BYTES),
+            )
+            .expect("local failure body should be bounded");
+            assert!(body.is_empty(), "case={name}");
+        }
+    }
+
+    #[test]
+    fn coordinated_cutover_runner_header_grammars_are_closed_and_complete() {
+        for content_type in [
+            ProxyHeaderEvidenceV1::one("application/javascript"),
+            ProxyHeaderEvidenceV1::one("text/javascript"),
+            ProxyHeaderEvidenceV1::one(" Application/JavaScript ; Charset = UTF-8 "),
+            ProxyHeaderEvidenceV1::Combined(b"text/javascript; charset=utf-8".to_vec()),
+        ] {
+            assert!(
+                ApsV1Integration::validate_runner_content_type(&content_type).is_ok(),
+                "accepted content type: {content_type:?}"
+            );
+        }
+        for content_type in [
+            ProxyHeaderEvidenceV1::Unavailable,
+            ProxyHeaderEvidenceV1::absent(),
+            ProxyHeaderEvidenceV1::one("application/ecmascript"),
+            ProxyHeaderEvidenceV1::one("application/javascript; charset=\"utf-8\""),
+            ProxyHeaderEvidenceV1::one("application/javascript; charset=utf-8; level=1"),
+            ProxyHeaderEvidenceV1::one("application/javascript; boundary=x"),
+            ProxyHeaderEvidenceV1::one("application/javascript,"),
+            ProxyHeaderEvidenceV1::one("application/javascript\u{a0}"),
+        ] {
+            assert!(
+                ApsV1Integration::validate_runner_content_type(&content_type).is_err(),
+                "rejected content type: {content_type:?}"
+            );
+        }
+
+        for encoding in [
+            ProxyHeaderEvidenceV1::absent(),
+            ProxyHeaderEvidenceV1::one("identity"),
+            ProxyHeaderEvidenceV1::Combined(b" IDENTITY\t".to_vec()),
+        ] {
+            assert!(
+                ApsV1Integration::validate_runner_content_encoding(&encoding).is_ok(),
+                "accepted encoding: {encoding:?}"
+            );
+        }
+        for encoding in [
+            ProxyHeaderEvidenceV1::Unavailable,
+            ProxyHeaderEvidenceV1::one(""),
+            ProxyHeaderEvidenceV1::one("gzip"),
+            ProxyHeaderEvidenceV1::one("identity, identity"),
+            ProxyHeaderEvidenceV1::Occurrences(vec![b"identity".to_vec(), b"identity".to_vec()]),
+        ] {
+            assert!(
+                ApsV1Integration::validate_runner_content_encoding(&encoding).is_err(),
+                "rejected encoding: {encoding:?}"
+            );
+        }
+
+        assert_eq!(
+            ApsV1Integration::validate_runner_content_length(&ProxyHeaderEvidenceV1::absent()),
+            Ok(None)
+        );
+        assert_eq!(
+            ApsV1Integration::validate_runner_content_length(&ProxyHeaderEvidenceV1::one("0")),
+            Ok(Some(0))
+        );
+        assert_eq!(
+            ApsV1Integration::validate_runner_content_length(&ProxyHeaderEvidenceV1::Combined(
+                APS_RUNNER_MAX_RESPONSE_BYTES.to_string().into_bytes()
+            )),
+            Ok(Some(APS_RUNNER_MAX_RESPONSE_BYTES))
+        );
+        for length in [
+            ProxyHeaderEvidenceV1::Unavailable,
+            ProxyHeaderEvidenceV1::one(""),
+            ProxyHeaderEvidenceV1::one("00"),
+            ProxyHeaderEvidenceV1::one("01"),
+            ProxyHeaderEvidenceV1::one("+1"),
+            ProxyHeaderEvidenceV1::one(" 1"),
+            ProxyHeaderEvidenceV1::one("1 "),
+            ProxyHeaderEvidenceV1::one("1, 1"),
+            ProxyHeaderEvidenceV1::one((APS_RUNNER_MAX_RESPONSE_BYTES + 1).to_string()),
+            ProxyHeaderEvidenceV1::Occurrences(vec![b"1".to_vec(), b"1".to_vec()]),
+        ] {
+            assert!(
+                ApsV1Integration::validate_runner_content_length(&length).is_err(),
+                "rejected length: {length:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn coordinated_cutover_runner_accepts_exact_cap_and_rejects_one_byte_over() {
+        let exact = raw_runner_response(
+            vec![b' '; APS_RUNNER_MAX_RESPONSE_BYTES],
+            ProxyHeaderEvidenceV1::one("application/javascript"),
+            ProxyHeaderEvidenceV1::absent(),
+            ProxyHeaderEvidenceV1::absent(),
+        );
+        assert!(ApsV1Integration::validate_runner_response(&exact).is_ok());
+
+        let over = raw_runner_response(
+            vec![b' '; APS_RUNNER_MAX_RESPONSE_BYTES + 1],
+            ProxyHeaderEvidenceV1::one("application/javascript"),
+            ProxyHeaderEvidenceV1::absent(),
+            ProxyHeaderEvidenceV1::absent(),
+        );
+        assert_eq!(
+            ApsV1Integration::validate_runner_response(&over),
+            Err("body_overflow")
+        );
+    }
+
+    #[test]
+    fn coordinated_cutover_runner_transport_failure_is_empty_and_non_leaking() {
+        let stub = Arc::new(StubHttpClient::new());
+        let response = request_runner(&stub).expect("transport failure should answer locally");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(response.headers().len(), 1);
+        let body = futures::executor::block_on(
+            response
+                .into_body()
+                .into_bytes_bounded(APS_RUNNER_MAX_RESPONSE_BYTES),
+        )
+        .expect("local failure body should be bounded");
+        assert!(body.is_empty());
     }
 }

@@ -4,6 +4,7 @@
 use std::io::Read as _;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use edgezero_adapter_fastly::key_value_store::FastlyKvStore;
@@ -13,13 +14,18 @@ use fastly::geo::{Geo, geo_lookup};
 use fastly::{ConfigStore, Request, SecretStore};
 
 use crate::backend::BackendConfig;
+#[cfg(feature = "aps-runner-proxy-integration-test")]
+use trusted_server_core::integrations::aps::{
+    APS_RUNNER_BLOCKING_READ_TIMEOUT, APS_RUNNER_FIRST_BYTE_TIMEOUT, APS_RUNNER_UPSTREAM_URL,
+};
 pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
     PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformImageOptimizerCrop,
     PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions, PlatformImageOptimizerParams,
     PlatformImageOptimizerRegion, PlatformKvStore, PlatformPendingRequest, PlatformResponse,
-    PlatformSecretStore, PlatformSelectResult, StoreId, StoreName,
+    PlatformSecretStore, PlatformSelectResult, ProxyHeaderEvidenceV1, ProxyResponseEvidenceV1,
+    RawProxyPolicyV1, RawProxyResponseV1, StoreId, StoreName,
 };
 
 // ---------------------------------------------------------------------------
@@ -531,6 +537,31 @@ fn apply_fastly_cache_bypass(request: &mut fastly::Request, bypass_cache: bool) 
     }
 }
 
+fn fastly_raw_header_evidence(response: &fastly::Response, name: &str) -> ProxyHeaderEvidenceV1 {
+    ProxyHeaderEvidenceV1::Occurrences(
+        response
+            .get_header_all(name)
+            .map(|value| value.as_bytes().to_vec())
+            .collect(),
+    )
+}
+
+fn canonical_fastly_declared_length(evidence: &ProxyHeaderEvidenceV1) -> Option<usize> {
+    let ProxyHeaderEvidenceV1::Occurrences(values) = evidence else {
+        return None;
+    };
+    let [value] = values.as_slice() else {
+        return None;
+    };
+    if value.is_empty()
+        || !value.iter().all(u8::is_ascii_digit)
+        || (value.len() > 1 && value[0] == b'0')
+    {
+        return None;
+    }
+    std::str::from_utf8(value).ok()?.parse().ok()
+}
+
 /// Fastly implementation of [`PlatformHttpClient`].
 ///
 /// - [`send`](PlatformHttpClient::send) converts the platform request to a
@@ -544,6 +575,67 @@ fn apply_fastly_cache_bypass(request: &mut fastly::Request, bypass_cache: bool) 
 ///   [`PlatformPendingRequest`] back to `fastly::PendingRequest` and calls
 ///   `fastly::http::request::select()`.
 pub struct FastlyPlatformHttpClient;
+
+#[cfg(feature = "aps-runner-proxy-integration-test")]
+const APS_RUNNER_PROXY_TEST_BACKEND: &str = "aps_runner_proxy_fixture";
+const RAW_PROXY_DEADLINE_SAFETY_MARGIN: Duration = Duration::from_millis(250);
+const RAW_PROXY_PENDING_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+fn raw_proxy_call_start_deadline(policy: RawProxyPolicyV1) -> Option<Duration> {
+    policy.total_timeout.checked_sub(
+        policy
+            .blocking_read_timeout
+            .checked_add(RAW_PROXY_DEADLINE_SAFETY_MARGIN)?,
+    )
+}
+
+fn raw_proxy_pending_poll_sleep(elapsed: Duration, deadline: Duration) -> Duration {
+    deadline
+        .saturating_sub(elapsed)
+        .min(RAW_PROXY_PENDING_POLL_INTERVAL)
+}
+
+#[cfg(feature = "aps-runner-proxy-integration-test")]
+fn aps_runner_proxy_test_backend(
+    policy: RawProxyPolicyV1,
+) -> Result<String, Report<PlatformError>> {
+    if policy.first_byte_timeout != APS_RUNNER_FIRST_BYTE_TIMEOUT
+        || policy.blocking_read_timeout != APS_RUNNER_BLOCKING_READ_TIMEOUT
+    {
+        return Err(Report::new(PlatformError::HttpClient)
+            .attach("APS runner raw proxy policy does not match the static fixture timeouts"));
+    }
+    let fixture = fastly::Backend::from_name(APS_RUNNER_PROXY_TEST_BACKEND)
+        .change_context(PlatformError::HttpClient)?;
+    if !fixture.exists() || fixture.is_ssl() {
+        return Err(Report::new(PlatformError::HttpClient)
+            .attach("APS runner fixture backend must exist as plain HTTP"));
+    }
+    let fixture_host = fixture.get_host();
+    let fixture_address = fixture_host.parse::<IpAddr>().map_err(|_| {
+        Report::new(PlatformError::HttpClient)
+            .attach("APS runner fixture backend host must be a literal IP address")
+    })?;
+    if !fixture_address.is_loopback() {
+        return Err(Report::new(PlatformError::HttpClient)
+            .attach("APS runner fixture backend host must be loopback"));
+    }
+    let logical_url =
+        url::Url::parse(APS_RUNNER_UPSTREAM_URL).change_context(PlatformError::HttpClient)?;
+    let logical_host = logical_url.host_str().ok_or_else(|| {
+        Report::new(PlatformError::HttpClient).attach("APS runner logical URL must contain a host")
+    })?;
+    if fixture
+        .get_host_override()
+        .as_ref()
+        .and_then(|host| host.to_str().ok())
+        != Some(logical_host)
+    {
+        return Err(Report::new(PlatformError::HttpClient)
+            .attach("APS runner fixture backend must preserve the logical host"));
+    }
+    Ok(APS_RUNNER_PROXY_TEST_BACKEND.to_string())
+}
 
 #[async_trait::async_trait(?Send)]
 impl PlatformHttpClient for FastlyPlatformHttpClient {
@@ -569,6 +661,109 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
             .send(&backend_name)
             .change_context(PlatformError::HttpClient)?;
         fastly_response_to_platform(fastly_resp, backend_name, stream_response, request_is_head)
+    }
+
+    async fn send_raw_proxy_v1(
+        &self,
+        request: PlatformHttpRequest,
+        policy: RawProxyPolicyV1,
+    ) -> Result<RawProxyResponseV1, Report<PlatformError>> {
+        if request.image_optimizer.is_some() || request.stream_response {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("unsupported option on Fastly raw proxy request"));
+        }
+
+        let started = web_time::Instant::now();
+        let call_start_deadline = raw_proxy_call_start_deadline(policy).ok_or_else(|| {
+            Report::new(PlatformError::HttpClient)
+                .attach("raw proxy timeout cannot reserve one bounded body read")
+        })?;
+        if policy.first_byte_timeout > call_start_deadline {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("raw proxy first-byte timeout exceeds reduced deadline"));
+        }
+        let backend_name = request.backend_name;
+        let mut fastly_request = edge_request_to_fastly(request.request)?;
+        #[cfg(feature = "aps-runner-proxy-integration-test")]
+        let backend_name = {
+            if fastly_request.get_url_str() == APS_RUNNER_UPSTREAM_URL {
+                fastly_request.set_header("x-ts-aps-logical-url", APS_RUNNER_UPSTREAM_URL);
+                aps_runner_proxy_test_backend(policy)?
+            } else {
+                backend_name
+            }
+        };
+        apply_fastly_cache_bypass(&mut fastly_request, request.bypass_cache);
+        let mut pending = fastly_request
+            .send_async(&backend_name)
+            .change_context(PlatformError::HttpClient)?;
+        let mut response = loop {
+            if started.elapsed() >= call_start_deadline {
+                return Err(Report::new(PlatformError::HttpClient)
+                    .attach("raw proxy reduced deadline exceeded before response headers"));
+            }
+            match pending.poll() {
+                fastly::http::request::PollResult::Pending(next) => {
+                    pending = next;
+                    let sleep =
+                        raw_proxy_pending_poll_sleep(started.elapsed(), call_start_deadline);
+                    if !sleep.is_zero() {
+                        std::thread::sleep(sleep);
+                    }
+                    if started.elapsed() >= call_start_deadline {
+                        return Err(Report::new(PlatformError::HttpClient).attach(
+                            "raw proxy reduced deadline exceeded while polling response headers",
+                        ));
+                    }
+                }
+                fastly::http::request::PollResult::Done(result) => {
+                    break result.change_context(PlatformError::HttpClient)?;
+                }
+            }
+        };
+
+        let evidence = ProxyResponseEvidenceV1 {
+            status: response.get_status().as_u16(),
+            content_type: fastly_raw_header_evidence(&response, "content-type"),
+            content_encoding: fastly_raw_header_evidence(&response, "content-encoding"),
+            content_length: fastly_raw_header_evidence(&response, "content-length"),
+        };
+        if canonical_fastly_declared_length(&evidence.content_length)
+            .is_some_and(|length| length > policy.max_response_bytes)
+        {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("raw proxy declared body exceeds configured cap"));
+        }
+
+        let mut reader = response.take_body();
+        let mut body = Vec::new();
+        let mut chunk = [0_u8; 64 * 1024];
+        loop {
+            if started.elapsed() >= call_start_deadline {
+                return Err(Report::new(PlatformError::HttpClient)
+                    .attach("raw proxy reduced deadline exceeded before blocking body read"));
+            }
+            let read = reader
+                .read(&mut chunk)
+                .change_context(PlatformError::HttpClient)?;
+            if started.elapsed() >= policy.total_timeout {
+                return Err(Report::new(PlatformError::HttpClient)
+                    .attach("raw proxy total deadline exceeded while reading body"));
+            }
+            if read == 0 {
+                break;
+            }
+            let next_len = body.len().checked_add(read).ok_or_else(|| {
+                Report::new(PlatformError::HttpClient).attach("raw proxy body length overflow")
+            })?;
+            if next_len > policy.max_response_bytes {
+                return Err(Report::new(PlatformError::HttpClient)
+                    .attach("raw proxy body exceeds configured cap"));
+            }
+            body.extend_from_slice(&chunk[..read]);
+        }
+
+        Ok(RawProxyResponseV1 { evidence, body })
     }
 
     async fn send_async(
@@ -757,6 +952,22 @@ mod tests {
             fastly_req.get_header_str(fastly::http::header::HOST),
             Some("www.example.com"),
             "should replace the URL-derived Host instead of appending a duplicate"
+        );
+    }
+
+    #[test]
+    fn raw_proxy_pending_poll_sleep_is_bounded_by_interval_and_deadline() {
+        assert_eq!(
+            raw_proxy_pending_poll_sleep(Duration::from_secs(1), Duration::from_secs(4)),
+            RAW_PROXY_PENDING_POLL_INTERVAL
+        );
+        assert_eq!(
+            raw_proxy_pending_poll_sleep(Duration::from_millis(3_998), Duration::from_secs(4),),
+            Duration::from_millis(2)
+        );
+        assert_eq!(
+            raw_proxy_pending_poll_sleep(Duration::from_secs(4), Duration::from_secs(4)),
+            Duration::ZERO
         );
     }
 

@@ -167,7 +167,23 @@ fn edgezero_main(mut req: FastlyRequest) {
             core_req.extensions_mut().insert(config_store);
             core_req.extensions_mut().insert(device_signals);
             core_req.extensions_mut().insert(client_info);
-            match futures::executor::block_on(app.router().oneshot(core_req)) {
+            #[cfg(feature = "aps-runner-proxy-integration-test")]
+            let routed = if let Some(state) = app_state
+                .as_ref()
+                .filter(|state| state.registry.has_reserved_path(core_req.uri().path()))
+            {
+                Ok(
+                    futures::executor::block_on(crate::app::dispatch_reserved_for_state(
+                        state, core_req,
+                    ))
+                    .expect("reserved path should dispatch before RouterService"),
+                )
+            } else {
+                futures::executor::block_on(app.router().oneshot(core_req))
+            };
+            #[cfg(not(feature = "aps-runner-proxy-integration-test"))]
+            let routed = futures::executor::block_on(app.router().oneshot(core_req));
+            match routed {
                 Ok(response) => response,
                 Err(error) => edge_error_response(error),
             }
@@ -186,7 +202,15 @@ fn edgezero_main(mut req: FastlyRequest) {
     let asset_cache_policy = response.extensions_mut().remove::<AssetProxyCachePolicy>();
     let request_filter_effects = response.extensions_mut().remove::<RequestFilterEffects>();
 
-    if !take_finalize_sentinel(&mut response) {
+    #[cfg(feature = "aps-runner-proxy-integration-test")]
+    let should_finalize = response
+        .extensions()
+        .get::<trusted_server_core::platform::ExactResponseHeadersV1>()
+        .is_none()
+        && !take_finalize_sentinel(&mut response);
+    #[cfg(not(feature = "aps-runner-proxy-integration-test"))]
+    let should_finalize = !take_finalize_sentinel(&mut response);
+    if should_finalize {
         if let Some(settings) = settings_snapshot.as_deref() {
             apply_entry_point_finalize_headers(settings, &mut response, client_ip);
         } else {

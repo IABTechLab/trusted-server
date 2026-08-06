@@ -159,6 +159,54 @@ jobs:
           VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/configs/viceroy.toml
           RUST_LOG: info
 
+  aps-runner-proxy:
+    name: APS runner proxy (${{ matrix.runtime }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [axum, fastly, cloudflare, spin]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up APS proxy test environment
+        id: shared-setup
+        uses: ./.github/actions/setup-integration-test-env
+        with:
+          origin-port: ${{ env.ORIGIN_PORT }}
+          install-viceroy: ${{ matrix.runtime == 'fastly' && 'true' || 'false' }}
+          build-wasm: "false"
+          build-axum: "false"
+          build-test-images: "false"
+          build-cloudflare: "false"
+
+      - name: Add Cloudflare wasm target
+        if: matrix.runtime == 'cloudflare'
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Set up Node.js for Wrangler
+        if: matrix.runtime == 'cloudflare'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.shared-setup.outputs.node-version }}
+
+      - name: Install Wrangler
+        if: matrix.runtime == 'cloudflare'
+        run: npm install -g wrangler@4.64.0
+
+      - name: Install Spin
+        if: matrix.runtime == 'spin'
+        uses: fermyon/actions/spin/setup@v1
+        with:
+          version: "4.0.2"
+
+      - name: Run actual-adapter APS runner-proxy corpus
+        run: ./scripts/integration-tests-aps-runner-proxy.sh --runtime ${{ matrix.runtime }}
+        env:
+          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
+          RUST_LOG: info
+
   browser-tests:
     name: browser integration tests
     needs: prepare-artifacts
@@ -277,3 +325,49 @@ jobs:
           path: crates/trusted-server-js/lib/test/fixtures/performance/aps-tsjs-prechange.json
           if-no-files-found: error
           retention-days: 30
+
+  browser-tests-aps-v1:
+    name: browser integration tests (APS v1 feature artifact)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up APS v1 browser test runtime
+        id: shared-setup
+        uses: ./.github/actions/setup-integration-test-env
+        with:
+          origin-port: ${{ env.ORIGIN_PORT }}
+          install-viceroy: "true"
+          build-wasm: "false"
+          build-axum: "false"
+          build-test-images: "false"
+          build-cloudflare: "false"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.shared-setup.outputs.node-version }}
+          cache: npm
+          cache-dependency-path: |
+            crates/trusted-server-integration-tests/browser/package-lock.json
+            crates/trusted-server-js/lib/package-lock.json
+
+      - name: Run focused APS v1 Chromium test with explicit feature artifact
+        env:
+          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
+          TS_BROWSER_FRAMEWORKS: nextjs
+          TS_TEST_APS_V1: "1"
+        run: >-
+          ./scripts/integration-tests-browser.sh
+          tests/shared/aps-renderer.spec.ts
+          --project=chromium
+          --grep="uses one port, reports ordered progress, and fails closed"
+
+      - name: Upload APS v1 Playwright report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report-aps-v1
+          path: crates/trusted-server-integration-tests/browser/playwright-report/
+          retention-days: 7

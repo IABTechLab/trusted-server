@@ -99,6 +99,32 @@ pub(crate) fn ensure_integration_backend_with_timeout(
         })
 }
 
+/// Registers or retrieves a platform backend with separate response-header and
+/// response-body gap timeouts.
+///
+/// # Errors
+///
+/// Returns an error when `url` cannot be parsed, is missing a host, or the
+/// backend registration fails.
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) fn ensure_integration_backend_with_transport_timeouts(
+    services: &RuntimeServices,
+    url: &str,
+    integration: &'static str,
+    first_byte_timeout: Duration,
+    between_bytes_timeout: Duration,
+) -> Result<String, Report<TrustedServerError>> {
+    let mut spec = integration_backend_spec(url, integration, true, first_byte_timeout)?;
+    spec.between_bytes_timeout = between_bytes_timeout;
+    services
+        .backend()
+        .ensure(&spec)
+        .change_context(TrustedServerError::Integration {
+            integration: integration.to_string(),
+            message: "Failed to register backend".to_string(),
+        })
+}
+
 /// Compute the deterministic platform backend name for a URL without registering it.
 ///
 /// Parses `url`, builds a [`PlatformBackendSpec`], and delegates to

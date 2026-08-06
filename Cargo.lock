@@ -5287,6 +5287,7 @@ dependencies = [
  "trusted-server-core",
  "url",
  "urlencoding",
+ "web-time",
 ]
 
 [[package]]
@@ -5415,6 +5416,7 @@ dependencies = [
  "reqwest 0.12.28",
  "scraper",
  "serde_json",
+ "tempfile",
  "testcontainers",
  "tokio",
  "toml",

@@ -531,31 +531,46 @@ Every task's regression suite therefore remains green in task order.
 **Files:**
 
 - Modify: `crates/trusted-server-core/src/integrations/aps.rs`
+- Modify: `crates/trusted-server-core/src/integrations/mod.rs`
 - Modify: `crates/trusted-server-core/src/integrations/registry.rs`
 - Modify: `crates/trusted-server-core/src/platform/http.rs`
+- Modify: `crates/trusted-server-core/src/platform/mod.rs`
 - Modify: `crates/trusted-server-core/src/platform/test_support.rs`
 - Modify: `crates/trusted-server-core/src/platform/types.rs`
 - Modify: `crates/trusted-server-adapter-fastly/src/app.rs`
+- Modify: `crates/trusted-server-adapter-fastly/src/main.rs`
+- Modify: `crates/trusted-server-adapter-fastly/src/middleware.rs`
 - Modify: `crates/trusted-server-adapter-fastly/src/platform.rs`
 - Modify: `crates/trusted-server-adapter-fastly/Cargo.toml`
 - Modify: `crates/trusted-server-adapter-axum/src/app.rs`
+- Modify: `crates/trusted-server-adapter-axum/src/main.rs`
+- Modify: `crates/trusted-server-adapter-axum/src/middleware.rs`
 - Modify: `crates/trusted-server-adapter-axum/src/platform.rs`
 - Modify: `crates/trusted-server-adapter-axum/tests/routes.rs`
 - Modify: `crates/trusted-server-adapter-cloudflare/src/app.rs`
+- Modify: `crates/trusted-server-adapter-cloudflare/src/lib.rs`
+- Modify: `crates/trusted-server-adapter-cloudflare/src/middleware.rs`
 - Modify: `crates/trusted-server-adapter-cloudflare/src/platform.rs`
 - Modify: `crates/trusted-server-adapter-cloudflare/Cargo.toml`
+- Modify: `crates/trusted-server-adapter-cloudflare/build.sh`
 - Modify: `crates/trusted-server-adapter-cloudflare/tests/routes.rs`
 - Create: `crates/trusted-server-adapter-cloudflare/wrangler.aps-runner-proxy.toml`
 - Modify: `crates/trusted-server-adapter-spin/src/app.rs`
+- Modify: `crates/trusted-server-adapter-spin/src/lib.rs`
+- Modify: `crates/trusted-server-adapter-spin/src/middleware.rs`
 - Modify: `crates/trusted-server-adapter-spin/src/platform.rs`
 - Modify: `crates/trusted-server-adapter-spin/Cargo.toml`
 - Modify: `crates/trusted-server-adapter-spin/tests/routes.rs`
 - Create: `crates/trusted-server-integration-tests/fixtures/configs/spin-aps-runner-proxy.toml`
-- Create: `crates/trusted-server-integration-tests/fixtures/configs/viceroy-aps-runner-proxy-template.toml`
+- Create: `crates/trusted-server-integration-tests/fixtures/configs/cloudflare-aps-runner-proxy-fixture.toml`
+- Create: `crates/trusted-server-integration-tests/fixtures/cloudflare/aps-runner-proxy-service.js`
 - Modify: `crates/trusted-server-integration-tests/Cargo.toml`
+- Modify: `crates/trusted-server-integration-tests/README.md`
 - Create: `crates/trusted-server-integration-tests/tests/aps_runner_proxy.rs`
 - Create: `crates/trusted-server-integration-tests/tests/common/aps_runner_upstream.rs`
 - Modify: `crates/trusted-server-integration-tests/tests/common/mod.rs`
+- Modify: `crates/trusted-server-integration-tests/tests/common/runtime.rs`
+- Modify: `crates/trusted-server-integration-tests/tests/environments/axum.rs`
 - Create: `crates/trusted-server-integration-tests/tests/environments/spin.rs`
 - Modify: `crates/trusted-server-integration-tests/tests/environments/mod.rs`
 - Modify: `crates/trusted-server-integration-tests/tests/environments/cloudflare.rs`
@@ -565,7 +580,14 @@ Every task's regression suite therefore remains green in task order.
 - Create: `crates/trusted-server-integration-tests/browser/fixtures/fictional-aps-runner.js`
 - Create: `scripts/integration-tests-aps-runner-proxy.sh`
 - Modify: `scripts/integration-tests-browser.sh`
+- Modify: `scripts/integration-tests.sh`
 - Modify: `.github/workflows/integration-tests.yml`
+- Modify: `.tool-versions`
+- Modify: `Cargo.lock`
+- Modify: `CLAUDE.md`
+- Modify: `docs/guide/error-reference.md`
+- Modify: `docs/guide/getting-started.md`
+- Modify: `docs/guide/testing.md`
 
 - [ ] **Step 1: Write failing route and exact renderer-policy tests.**
 
@@ -608,8 +630,11 @@ Every task's regression suite therefore remains green in task order.
     generation-inert late continuations; and
   - uses the common `APS_RUNNER_MAX_RESPONSE_BYTES = 8 MiB` cap.
 
-  Cloudflare must inspect the initial Workers headers before its generic adapter
-  strips encoding/length; concatenated duplicates remain visibly combined and fail.
+  Cloudflare must preserve `web_sys::Request.method()` before workers-rs conversion
+  and restore it at the reserved pre-router boundary because workers-rs maps extension
+  methods such as `PROPFIND` to `GET`. It must also inspect the initial Workers headers
+  before its generic adapter strips encoding/length; concatenated duplicates remain
+  visibly combined and fail.
   Spin must bypass `spin_sdk::http::send`, call the WASI HTTP outgoing handler with
   supported request options, and poll both response and body stream against a
   monotonic-clock total deadline. Axum and Fastly must enforce the same deadline,
@@ -635,21 +660,40 @@ Every task's regression suite therefore remains green in task order.
   carries the compile-time APS logical URL. An integration-test-only platform
   resolver maps only that exact logical origin to the loopback fixture below target
   validation and immediately above the real adapter transport. Fastly uses a
-  generated Viceroy backend, Cloudflare uses a workerd service binding in the
-  dedicated Wrangler manifest, Spin uses the dedicated Spin manifest, and Axum uses
-  its real bounded client. Production constructors expose no resolver/override, and
-  release-build absence tests fail if the integration feature, fixture address, or
-  service binding is enabled or embedded.
+  generated static Viceroy backend with exact 4,000 ms first-byte and 250 ms
+  between-bytes timeouts. That static selection is simulator-only: production keeps
+  using Fastly's dynamic backend API with the same transport policy. Cloudflare uses
+  a workerd service binding in the dedicated Wrangler manifest, Spin uses the
+  dedicated Spin manifest, and Axum uses its real bounded client. Production
+  constructors expose no resolver/override, and release-build absence tests fail if
+  the integration feature, fixture address, or service binding is enabled or
+  embedded.
 
   `scripts/integration-tests-aps-runner-proxy.sh` builds the actual Fastly
   `wasm32-wasip1`, Cloudflare `wasm32-unknown-unknown`, and Spin `wasm32-wasip1`
   artifacts with that integration-only transport seam; launches Viceroy,
   `wrangler dev`/workerd, and `spin up`; waits for readiness; runs the identical
   `aps_runner_proxy` corpus against each runtime with `--test-threads=1`; and always
-  terminates process groups. The test asserts the logical URL and Host remain the
-  fixed APS target, the fixture is loopback-only, and actual runtime header
-  normalization, cancellation/resource drop, streaming cap, and
-  dispatch-through-final-byte clock produce the expected response.
+  terminates process groups. The test asserts that the request entering each raw
+  adapter transport still carries the compile-time logical URL and authority of the
+  fixed APS target. Where the runtime supports a backend/resolver authority override,
+  the fixture also asserts the wire `Host` is the APS host. A runtime-owned transport
+  such as Spin/Wasmtime that forbids guest `Host` writes must not synthesize one: its
+  integration-only seam instead validates the exact logical APS URL immediately
+  before lowering to the private loopback URI, carries a test-only logical-target
+  attestation to the fixture, and proves that neither an inbound request nor any
+  production configuration can select the loopback target. The corpus also proves the
+  fixture is loopback-only and that actual runtime header normalization,
+  cancellation/resource drop, streaming cap, and dispatch-through-final-byte clock
+  produce the expected response.
+
+  The Fastly corpus requires Viceroy `0.19.0`. Diagnostics showed that its dynamic
+  backend path did not interrupt a mid-body stall even with the configured
+  between-bytes timeout, while a generated static backend with the exact 4,000/250 ms
+  policy did. The corpus therefore uses that feature-only static backend; production
+  continues to use Fastly's dynamic backend API and the same policy. This is a pin
+  and transport seam for the local Fastly simulator only; it is not an APS runner
+  pin, and no APS runner version, digest, or body enters the repository.
 
 - [ ] **Step 5: Implement the reserved dispatcher and live proxy response.**
 
@@ -2112,6 +2156,13 @@ Every task's regression suite therefore remains green in task order.
   - render trace and GPT diagnostics commit only after correctness transitions and
     expose their exact bounded asynchronous frozen APIs. Creative guards auto-install
     from frozen boot configuration and both-false guards have zero DOM side effects.
+
+  Before enabling the Fastly production route, run the unchanged stall/slow-drip
+  deadline cases through a non-production Fastly Compute service and a controlled
+  staging-only backend. Viceroy proves the feature artifact and static simulator
+  seam, but it does not prove Fastly's production dynamic-backend body-timeout
+  behavior. The staging smoke must retain the strict five-second downstream ceiling
+  and block cutover on any timeout or late-continuation failure.
 
   Run old-surface and new-surface fixture tests immediately before the switch, then
   require the entire suite green after it. Do not add a production selector, dual

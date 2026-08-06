@@ -7,7 +7,7 @@ containers using [Testcontainers](https://testcontainers.com/) and
 ## Prerequisites
 
 - **Docker** — running and accessible
-- **Viceroy** — Fastly local simulator (`cargo install viceroy --version 0.17.0 --locked --force`)
+- **Viceroy** — Fastly local simulator (`cargo install viceroy --version 0.19.0 --locked --force`)
 - **wasm32-wasip1 target** — `rustup target add wasm32-wasip1`
 - **Node.js** — version pinned in `.tool-versions`, for browser tests only
 

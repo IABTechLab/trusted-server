@@ -10,6 +10,8 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+#[cfg(all(feature = "aps-runner-proxy-integration-test", target_arch = "wasm32"))]
+use trusted_server_core::config_payload::settings_from_config_blob;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::sanitize_forwarded_headers;
@@ -50,8 +52,23 @@ pub struct AppState {
 ///
 /// Returns an error when settings, the auction orchestrator, or the integration
 /// registry fail to initialise.
+#[cfg(not(all(feature = "aps-runner-proxy-integration-test", target_arch = "wasm32")))]
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let settings = Settings::from_toml(include_str!("../../../trusted-server.example.toml"))?;
+    build_state_with_settings(settings)
+}
+
+#[cfg(all(feature = "aps-runner-proxy-integration-test", target_arch = "wasm32"))]
+fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    let envelope =
+        futures::executor::block_on(spin_sdk::variables::get("v_trusted_x5fserver_x5fconfig"))
+            .map_err(|error| {
+                Report::new(TrustedServerError::Configuration {
+                    message: "failed to read the Spin APS proxy test app config".to_string(),
+                })
+                .attach(error.to_string())
+            })?;
+    let settings = settings_from_config_blob(&envelope)?;
     build_state_with_settings(settings)
 }
 
@@ -65,6 +82,9 @@ fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let orchestrator = build_orchestrator(&settings)?;
+    #[cfg(feature = "aps-runner-proxy-integration-test")]
+    let registry = IntegrationRegistry::new_with_aps_v1_for_tests(&settings)?;
+    #[cfg(not(feature = "aps-runner-proxy-integration-test"))]
     let registry = IntegrationRegistry::new(&settings)?;
 
     Ok(Arc::new(AppState {
@@ -72,6 +92,52 @@ fn build_state_with_settings(
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
     }))
+}
+
+#[cfg(feature = "aps-runner-proxy-integration-test")]
+async fn dispatch_reserved_for_state(state: &Arc<AppState>, req: Request) -> Option<Response> {
+    if !state.registry.has_reserved_path(req.uri().path()) {
+        return None;
+    }
+    let ctx = RequestContext::new(req, edgezero_core::params::PathParams::default());
+    let services = build_runtime_services(&ctx);
+    Some(
+        state
+            .registry
+            .handle_reserved_proxy(&state.settings, &services, ctx.into_request())
+            .await
+            .expect("reserved path should have a coordinated-cutover handler")
+            .unwrap_or_else(|report| http_error(&report)),
+    )
+}
+
+#[cfg(feature = "aps-runner-proxy-integration-test")]
+/// Dispatch a reserved APS request using explicit settings.
+///
+/// # Errors
+///
+/// Returns an error when the feature-only application state cannot be
+/// initialized from `settings`.
+pub async fn dispatch_reserved_with_settings(
+    settings: Settings,
+    req: Request,
+) -> Result<Option<Response>, Report<TrustedServerError>> {
+    let state = build_state_with_settings(settings)?;
+    Ok(dispatch_reserved_for_state(&state, req).await)
+}
+
+#[cfg(feature = "aps-runner-proxy-integration-test")]
+/// Dispatch a reserved APS request using startup settings.
+///
+/// # Errors
+///
+/// Returns an error when startup settings or the feature-only application
+/// state cannot be initialized.
+pub async fn dispatch_reserved(
+    req: Request,
+) -> Result<Option<Response>, Report<TrustedServerError>> {
+    let state = build_state()?;
+    Ok(dispatch_reserved_for_state(&state, req).await)
 }
 
 // ---------------------------------------------------------------------------
