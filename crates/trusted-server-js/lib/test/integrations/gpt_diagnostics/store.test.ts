@@ -145,7 +145,11 @@ describe('GptDiagnosticsStore', () => {
     store.recordSlotRenderEnded(slot, { isEmpty: false });
 
     const cycle = store.snapshot().slots[0].requests[0];
-    expect(cycle).toMatchObject({ loadAtMs: 3, loadObservedBeforeRender: true, incompleteSequence: false });
+    expect(cycle).toMatchObject({
+      loadAtMs: 3,
+      loadObservedBeforeRender: true,
+      incompleteSequence: false,
+    });
     expect(cycle.durations.renderToLoadMs).toBeUndefined();
     expect(store.snapshot().callbackIssues).not.toContainEqual(
       expect.objectContaining({ kind: 'slotOnload', reason: 'invalid_event_order' })
@@ -597,7 +601,12 @@ describe('GptDiagnosticsStore', () => {
     });
     const slot = fakeSlot('intent');
 
-    store.recordTrustedServerOpportunity(slot, 'auction-slot', 'renderable_candidate', ' auction-123 ');
+    store.recordTrustedServerOpportunity(
+      slot,
+      'auction-slot',
+      'renderable_candidate',
+      ' auction-123 '
+    );
     now = 20;
     store.recordPrebidRefresh([slot]);
     now = 30;

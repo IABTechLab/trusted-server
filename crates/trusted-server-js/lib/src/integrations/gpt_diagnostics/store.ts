@@ -560,10 +560,7 @@ export class GptDiagnosticsStore {
         : {}),
       ...(trustedServerEvidence
         ? {
-            opportunityToRequestMs: validDuration(
-              trustedServerEvidence.observedAtMs,
-              timestampMs
-            ),
+            opportunityToRequestMs: validDuration(trustedServerEvidence.observedAtMs, timestampMs),
           }
         : {}),
     });
@@ -846,13 +843,17 @@ export class GptDiagnosticsStore {
     intent.sources.set(source, evidence);
     this.defer(() => {
       const currentIntent = this.pendingRequestIntents.get(slot);
-      if (currentIntent !== intent || currentIntent.sources.get(source)?.generation !== generation) return;
+      if (currentIntent !== intent || currentIntent.sources.get(source)?.generation !== generation)
+        return;
       currentIntent.sources.delete(source);
       if (currentIntent.sources.size === 0) this.pendingRequestIntents.delete(slot);
     }, REQUEST_PATH_ATTRIBUTION_WINDOW_MS);
   }
 
-  private consumeRequestIntent(slot: object, timestampMs: number): PendingRequestIntent | undefined {
+  private consumeRequestIntent(
+    slot: object,
+    timestampMs: number
+  ): PendingRequestIntent | undefined {
     const intent = this.pendingRequestIntents.get(slot);
     this.pendingRequestIntents.delete(slot);
     if (!intent) return undefined;

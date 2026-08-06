@@ -118,7 +118,10 @@ describe('GptDiagnosticsObserver', () => {
     observer.install();
     gpt.googletag.cmd[0]();
 
-    const result = Reflect.apply(gpt.pubads.refresh, receiver, [[slot], { changeCorrelator: false }]);
+    const result = Reflect.apply(gpt.pubads.refresh, receiver, [
+      [slot],
+      { changeCorrelator: false },
+    ]);
 
     expect(store.recordPublisherRefresh).toHaveBeenCalledWith([slot]);
     expect(originalRefresh).toHaveBeenCalledTimes(1);

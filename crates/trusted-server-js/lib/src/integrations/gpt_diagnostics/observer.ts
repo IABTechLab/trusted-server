@@ -244,12 +244,22 @@ export class GptDiagnosticsObserver {
       return;
     }
     const originalRefresh = pubads.refresh;
-    const observer = this;
+    const { store, window: observerWindow } = this;
     pubads.refresh = function (this: unknown, ...args: unknown[]): unknown {
       try {
-        if (observer.shouldRecordPublisherRefresh()) {
-          const slots = observer.refreshSlots(pubads, args);
-          if (slots.length > 0) observer.store.recordPublisherRefresh(slots);
+        if (
+          !(
+            observerWindow.tsjs?.adInitRefreshInProgress ||
+            observerWindow.tsjs?.prebidRefreshDispatchInProgress
+          )
+        ) {
+          const rawSlots = args.length === 0 ? pubads.getSlots?.() : args[0];
+          const slots = Array.isArray(rawSlots)
+            ? rawSlots.filter(
+                (slot): slot is GptDiagnosticsSlotLike => typeof slot === 'object' && slot !== null
+              )
+            : [];
+          if (slots.length > 0) store.recordPublisherRefresh(slots);
         }
       } catch {
         // Diagnostics must not affect the original refresh.
@@ -259,25 +269,5 @@ export class GptDiagnosticsObserver {
     (pubads as GptPubAdsService & { [REFRESH_OBSERVER_INSTALLED]?: boolean })[
       REFRESH_OBSERVER_INSTALLED
     ] = true;
-  }
-
-  private shouldRecordPublisherRefresh(): boolean {
-    try {
-      return !(
-        this.window.tsjs?.adInitRefreshInProgress ||
-        this.window.tsjs?.prebidRefreshDispatchInProgress
-      );
-    } catch {
-      return false;
-    }
-  }
-
-  private refreshSlots(pubads: GptPubAdsService, args: unknown[]): GptDiagnosticsSlotLike[] {
-    const rawSlots = args.length === 0 ? pubads.getSlots?.() : args[0];
-    return Array.isArray(rawSlots)
-      ? rawSlots.filter((slot): slot is GptDiagnosticsSlotLike =>
-          typeof slot === 'object' && slot !== null
-        )
-      : [];
   }
 }
