@@ -58,7 +58,6 @@ beforeAll(async () => {
           format: 'iife',
           dir: outputDirectory,
           entryFileNames: 'tsjs-prebid.js',
-          inlineDynamicImports: true,
           extend: false,
           name: 'tsjs_prebid',
         },

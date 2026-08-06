@@ -30,16 +30,13 @@ type RenderCreativeInlineOptions = {
 // Entry point matching Prebid's requestBids signature; uses unified /auction endpoint.
 export function requestAds(
   callbackOrOpts?: RequestAdsCallback | RequestAdsOptions,
-  maybeOpts?: RequestAdsOptions
+  _maybeOpts?: RequestAdsOptions
 ): void {
   let callback: RequestAdsCallback | undefined;
-  let opts: RequestAdsOptions | undefined;
   if (typeof callbackOrOpts === 'function') {
     callback = callbackOrOpts as RequestAdsCallback;
-    opts = maybeOpts;
   } else {
-    opts = callbackOrOpts as RequestAdsOptions | undefined;
-    callback = opts?.bidsBackHandler;
+    callback = (callbackOrOpts as RequestAdsOptions | undefined)?.bidsBackHandler;
   }
 
   log.info('requestAds: called', { hasCallback: typeof callback === 'function' });

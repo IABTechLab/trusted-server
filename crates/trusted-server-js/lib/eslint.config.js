@@ -1,8 +1,9 @@
-// ESLint v9 flat config
+// ESLint v10 flat config
 import js from '@eslint/js';
+import { createTypeScriptImportResolver } from 'eslint-import-resolver-typescript';
+import importX from 'eslint-plugin-import-x';
 import globals from 'globals';
 import tseslint from 'typescript-eslint';
-import importPlugin from 'eslint-plugin-import';
 import jsdoc from 'eslint-plugin-jsdoc';
 import unicorn from 'eslint-plugin-unicorn';
 
@@ -87,14 +88,11 @@ export default [
   {
     files: ['**/*.ts', '**/*.tsx'],
     settings: {
-      'import/resolver': {
-        typescript: {
+      'import-x/resolver-next': [
+        createTypeScriptImportResolver({
           project: './tsconfig.json',
-        },
-        node: {
-          extensions: ['.js', '.mjs', '.ts', '.tsx'],
-        },
-      },
+        }),
+      ],
     },
     languageOptions: {
       parser: tseslint.parser,
@@ -104,7 +102,7 @@ export default [
       },
     },
     plugins: {
-      import: importPlugin,
+      'import-x': importX,
       jsdoc,
       tsjs: {
         rules: {
@@ -117,7 +115,7 @@ export default [
     rules: {
       'unicorn/prevent-abbreviations': 'off',
       'unicorn/filename-case': 'off',
-      'import/order': ['error', { 'newlines-between': 'always' }],
+      'import-x/order': ['error', { 'newlines-between': 'always' }],
     },
   },
   // New architecture paths are clean by default. These exact legacy files are
@@ -138,7 +136,7 @@ export default [
     files: ['src/**/*.ts', 'src/**/*.tsx'],
     ignores: LEGACY_RESTRICTED_IMPORT_ALLOWLIST,
     rules: {
-      'import/no-restricted-paths': [
+      'import-x/no-restricted-paths': [
         'error',
         {
           basePath: import.meta.dirname,

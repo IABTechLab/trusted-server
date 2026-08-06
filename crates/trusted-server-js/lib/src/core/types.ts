@@ -442,8 +442,7 @@ export interface TsjsApi {
    * a minimal fallback for pages where the bundle fails to load.
    */
   scheduleInitialAdInit?:
-    | ((initialBids?: Record<string, AuctionBidData> | undefined) => void)
-    | undefined;
+    ((initialBids?: Record<string, AuctionBidData> | undefined) => void) | undefined;
   /** Read-only GPT lifecycle diagnostics API, present only in an activated tab. */
   gptDiagnostics?: GptDiagnosticsApi | undefined;
 }

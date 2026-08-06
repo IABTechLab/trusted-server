@@ -102,7 +102,8 @@ function validateUserIdImport(entry) {
   } catch (error) {
     throw new Error(
       `[build-prebid-external] Required Prebid user ID module "${entry.moduleName}" ` +
-        `could not be resolved from ${entry.importPath}: ${error.message}`
+        `could not be resolved from ${entry.importPath}: ${error.message}`,
+      { cause: error }
     );
   }
 }
@@ -337,7 +338,6 @@ async function buildExternalBundle(outDir, generatedModules) {
             format: 'iife',
             dir: outDir,
             entryFileNames: temporaryFile,
-            inlineDynamicImports: true,
             extend: false,
             name: 'tsjs_prebid_external',
           },
