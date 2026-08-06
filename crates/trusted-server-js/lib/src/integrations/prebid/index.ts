@@ -88,14 +88,11 @@ function getExternalBundleManifest(): ExternalPrebidBundleManifest | undefined {
  * bundle fails to load.
  */
 function hasPrebidJsApi(): boolean {
-  const prebidApi = pbjs as {
-    markWinningBidAsUsed?: unknown;
-    registerBidAdapter?: unknown;
-  };
-  return (
-    typeof prebidApi.registerBidAdapter === 'function' &&
-    typeof prebidApi.markWinningBidAsUsed === 'function'
-  );
+  return typeof (pbjs as { registerBidAdapter?: unknown }).registerBidAdapter === 'function';
+}
+
+function hasApsRendererApi(): boolean {
+  return typeof (pbjs as { markWinningBidAsUsed?: unknown }).markWinningBidAsUsed === 'function';
 }
 
 const ADAPTER_CODE = 'trustedServer';
@@ -284,11 +281,13 @@ let auctionEndpoint = '/auction';
  * Convert parsed {@link AuctionBid}s into Prebid bid response objects,
  * linking each bid back to the original BidRequest via `requestId`.
  */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function auctionBidsToPrebidBids(auctionBids: AuctionBid[], bidRequests: any[]): any[] {
+export function auctionBidsToPrebidBids(
+  auctionBids: AuctionBid[],
+  bidRequests: Array<{ adUnitCode?: string; code?: string; bidId?: string }>,
+  apsRendererSupported: boolean
+) {
   // Build a lookup from impid (adUnitCode) → original bidRequest
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const requestsByCode = new Map<string, any>();
+  const requestsByCode = new Map<string, (typeof bidRequests)[number]>();
   for (const br of bidRequests) {
     const code = br.adUnitCode ?? br.code ?? '';
     if (!requestsByCode.has(code)) {
@@ -297,6 +296,12 @@ export function auctionBidsToPrebidBids(auctionBids: AuctionBid[], bidRequests: 
   }
 
   return auctionBids.flatMap((bid) => {
+    // A renderer bid cannot be delivered safely without Prebid's public
+    // lifecycle API. Ordinary Trusted Server bids remain eligible.
+    if (bid.renderer && !apsRendererSupported) {
+      return [];
+    }
+
     // Prebid admission is the last point before the descriptor becomes a bid
     // capability. Drop malformed APS bids rather than letting them participate
     // in the auction without a render path.
@@ -1008,6 +1013,10 @@ function installApsBidResponseRegistry(): void {
     // still owns the generated ad ID and ordinary GAM targeting on this bid object.
     delete bid[APS_RENDERER_FIELD];
     if (!registered) {
+      // Prebid can admit zero-CPM bids when `allowZeroCpmBids` is enabled.
+      // Its targeting selection rejects every negative CPM, so this bid cannot
+      // displace a renderable GAM candidate after registration fails.
+      bid['cpm'] = -1;
       log.warn('[tsjs-prebid] rejected APS renderer capability that failed registration');
     }
   });
@@ -1064,7 +1073,12 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   };
 
   auctionEndpoint = merged.endpoint ?? '/auction';
-  installApsBidResponseRegistry();
+  const apsRendererSupported = hasApsRendererApi();
+  if (apsRendererSupported) {
+    installApsBidResponseRegistry();
+  } else {
+    log.warn('[tsjs-prebid] Prebid bundle lacks markWinningBidAsUsed; APS renderer bids disabled');
+  }
 
   // Register the trustedServer adapter using pbjs.registerBidAdapter(null, code, spec)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1106,7 +1120,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       log.debug('[tsjs-prebid] interpretResponse', { hasSeatbid: !!body?.seatbid });
       const auctionBids = parseAuctionResponse(body);
       const bidRequests = request?.tsjsBidRequests ?? request?.bidRequests ?? [];
-      return auctionBidsToPrebidBids(auctionBids, bidRequests);
+      return auctionBidsToPrebidBids(auctionBids, bidRequests, apsRendererSupported);
     },
   });
 

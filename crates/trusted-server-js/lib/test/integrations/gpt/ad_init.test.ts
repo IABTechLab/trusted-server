@@ -1780,7 +1780,7 @@ describe('installTsRenderBridge', () => {
     beaconSpy.mockRestore();
   });
 
-  it('serves one exact APS dynamic-renderer response without cache fetches or beacons', async () => {
+  it('serves a server APS renderer once and rejects a repeated request', async () => {
     const renderer = apsRenderer();
     (window as TestWindow).tsjs.bids.homepage_header = {
       hb_adid: renderer.bidId,
@@ -1813,9 +1813,9 @@ describe('installTsRenderBridge', () => {
     expect(stopSpy).toHaveBeenCalledTimes(2);
     expect(fetchStub).not.toHaveBeenCalled();
     expect(beaconSpy).not.toHaveBeenCalled();
-    // Server-rendered APS descriptors are reusable: GAM can issue repeated
-    // Universal Creative requests for the same winning ad ID.
-    expect(portMessages).toHaveLength(2);
+    // Server-rendered APS capabilities are one-shot per slot and ad ID. A
+    // repeated Universal Creative request is claimed but receives no payload.
+    expect(portMessages).toHaveLength(1);
     const response = JSON.parse(portMessages[0]) as Record<string, unknown>;
     expect(Object.keys(response).sort()).toEqual(
       [
@@ -2139,7 +2139,7 @@ describe('installTsRenderBridge', () => {
     expect((window as TestWindow).tsjs.apsPrebidRenderers[prebidAdId]).toBeUndefined();
   });
 
-  it('validates APS data before claiming the Prebid request', async () => {
+  it('claims a TS-owned request before rejecting invalid APS data', async () => {
     const renderer = { ...apsRenderer(), aaxResponse: 'invalid' };
     (window as TestWindow).tsjs.bids.homepage_header = {
       hb_adid: renderer.bidId,
@@ -2160,7 +2160,7 @@ describe('installTsRenderBridge', () => {
       }) as unknown as MessageEvent
     );
 
-    expect(stopSpy).not.toHaveBeenCalled();
+    expect(stopSpy).toHaveBeenCalledOnce();
     expect(portMessages).toEqual([]);
     expect(fetchStub).not.toHaveBeenCalled();
   });

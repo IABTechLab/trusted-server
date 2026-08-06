@@ -1062,16 +1062,20 @@ impl AuctionProvider for ApsAuctionProvider {
         log::info!("APS requests bids for {} impressions", openrtb.imp.len());
         log::trace!("APS request body: {openrtb:?}");
         let body = Self::serialize_openrtb_request(&openrtb)?;
+        let debug_body = self
+            .config
+            .debug
+            .then(|| String::from_utf8_lossy(&body).into_owned());
         let outbound_request = http::Request::builder()
             .method(Method::POST)
             .uri(&self.config.endpoint)
             .header(header::CONTENT_TYPE, "application/json")
-            .body(EdgeBody::from(body.clone()))
+            .body(EdgeBody::from(body))
             .change_context(TrustedServerError::Auction {
                 message: "Failed to build APS request".to_string(),
             })?;
-        let debug_request = self.config.debug.then(|| ApsDebugRequest {
-            body: String::from_utf8_lossy(&body).into_owned(),
+        let debug_request = debug_body.map(|body| ApsDebugRequest {
+            body,
             headers: Self::debug_headers(outbound_request.headers()),
         });
         let backend = ensure_integration_backend_with_timeout(
@@ -2371,6 +2375,31 @@ mod tests {
         assert_eq!(registration.integration_id, APS_INTEGRATION_ID);
         assert_eq!(registration.proxies.len(), 1);
         assert!(registration.js_disabled);
+    }
+
+    #[test]
+    fn config_without_enabled_does_not_register_provider_or_renderer() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                APS_INTEGRATION_ID,
+                &json!({"account_id": "example-account"}),
+            )
+            .expect("should insert default-disabled APS config");
+
+        assert!(
+            register(&settings)
+                .expect("should evaluate renderer registration")
+                .is_none(),
+            "omitted enabled should not register the renderer route"
+        );
+        assert!(
+            register_providers(&settings)
+                .expect("should evaluate provider registration")
+                .is_empty(),
+            "omitted enabled should not register the auction provider"
+        );
     }
 
     #[test]

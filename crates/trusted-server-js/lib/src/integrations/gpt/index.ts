@@ -10,6 +10,8 @@ import {
   APS_UNIVERSAL_CREATIVE_RENDERER,
   APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
   apsRendererUrl,
+  consumeApsPrebidRenderer,
+  getApsPrebidRenderer,
   validateApsRenderer,
 } from '../aps/render';
 
@@ -111,11 +113,17 @@ function slotIdForMessageSource(source: MessageEventSource | null): string | und
   if (!source) return undefined;
 
   const slots = window.tsjs?.adSlots ?? [];
-  return slots.find((slot) =>
-    candidateSlotRoots(slot.div_id).some((root) =>
-      Array.from(root.querySelectorAll('iframe')).some((iframe) => iframe.contentWindow === source)
-    )
-  )?.id;
+  // Prefer the most-specific configured prefix so an earlier broad prefix
+  // cannot claim an iframe owned by a later, more-specific slot.
+  return [...slots]
+    .sort((left, right) => right.div_id.length - left.div_id.length)
+    .find((slot) =>
+      candidateSlotRoots(slot.div_id).some((root) =>
+        Array.from(root.querySelectorAll('iframe')).some(
+          (iframe) => iframe.contentWindow === source
+        )
+      )
+    )?.id;
 }
 
 function messageSourceBelongsToAdUnit(
@@ -1256,6 +1264,9 @@ export function installTsRenderBridge(): void {
   // keying on it alone would let one slot block a distinct slot's render.
   const renderingKeys = new Set<string>();
   const consumedPrebidApsIds = new Map<string, { expiresAt: number }>();
+  // One consumed APS ad ID per slot is sufficient: a newer bid replaces the
+  // slot's old ad ID in `window.tsjs.bids`, so the ownership guard rejects it.
+  const consumedServerApsBySlot = new Map<string, string>();
 
   window.addEventListener('message', (e: MessageEvent) => {
     let data: Record<string, unknown>;
@@ -1339,6 +1350,30 @@ export function installTsRenderBridge(): void {
     // pulling slot B's creative and firing slot B's win/billing beacons.
     if (!matchedBid || matchedBid.hb_adid !== adId) return;
 
+    if (matchedBid.renderer !== undefined) {
+      // This slot and ad ID belong to TS, so fail closed before validating the
+      // descriptor and never let native Prebid answer a rejected or replayed request.
+      e.stopImmediatePropagation();
+      if (consumedServerApsBySlot.get(slotId) === adId) return;
+      const renderer = validateApsRenderer(matchedBid.renderer);
+      const rendererUrl = apsRendererUrl();
+      if (!renderer || !rendererUrl) return;
+      consumedServerApsBySlot.set(slotId, adId);
+      port.postMessage(
+        JSON.stringify({
+          message: 'Prebid Response',
+          adId,
+          renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
+          rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+          rendererUrl,
+          apsRenderer: renderer,
+          width: renderer.width,
+          height: renderer.height,
+        })
+      );
+      return;
+    }
+
     const attemptId = safelyRecordCreativeRequest(slotId);
 
     const slot = window.tsjs?.adSlots?.find((s) => s.id === slotId);
@@ -1355,41 +1390,6 @@ export function installTsRenderBridge(): void {
     const cachePath = isNonEmptyString(matchedBid.hb_cache_path)
       ? matchedBid.hb_cache_path
       : undefined;
-
-    if (matchedBid.renderer !== undefined) {
-      const renderer = validateApsRenderer(matchedBid.renderer);
-      const rendererUrl = apsRendererUrl();
-      if (!renderer || !rendererUrl) return;
-
-      // Ownership and the complete consumed envelope are valid before this
-      // handler claims the message or suppresses another legitimate handler.
-      e.stopImmediatePropagation();
-      const renderingKey = `${slotId}|${adId}`;
-      if (renderingKeys.has(renderingKey)) return;
-      renderingKeys.add(renderingKey);
-
-      try {
-        port.postMessage(
-          JSON.stringify({
-            message: 'Prebid Response',
-            adId,
-            renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
-            rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
-            rendererUrl,
-            apsRenderer: renderer,
-            width: renderer.width,
-            height: renderer.height,
-          })
-        );
-        safelyRecordCreativeResponse(attemptId);
-        log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' through APS renderer`);
-      } catch (err) {
-        renderingKeys.delete(renderingKey);
-        safelyRecordCreativeFailure(attemptId, 'response_post_failed');
-        log.warn('[tsjs-gpt] pbRender bridge: APS response failed', err);
-      }
-      return;
-    }
 
     if (inlineAdm) {
       e.stopImmediatePropagation();

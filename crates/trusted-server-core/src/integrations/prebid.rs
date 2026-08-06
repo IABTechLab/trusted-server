@@ -2371,6 +2371,10 @@ impl PrebidAuctionProvider {
             .get("adid")
             .and_then(|v| v.as_str())
             .map(String::from);
+        let creative_id = bid_obj
+            .get("crid")
+            .and_then(|v| v.as_str())
+            .map(String::from);
 
         let adomain = bid_obj
             .get("adomain")
@@ -2437,6 +2441,8 @@ impl PrebidAuctionProvider {
             burl,
             bid_id,
             ad_id,
+            creative_id,
+            renderer: None,
             cache_id,
             cache_host,
             cache_path,
