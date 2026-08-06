@@ -253,6 +253,12 @@ jobs:
       - name: Lint full TSJS package
         run: npm run lint
 
+      - name: Verify generated APS renderer contract
+        run: npm run check:aps-contract
+
+      - name: Run embedded APS renderer contract
+        run: node --test test/contract/aps-renderer-es5.test.mjs
+
       - name: Verify rc/july adoption manifest
         run: node --test test/contract/rc-july-adoption.test.mjs
 

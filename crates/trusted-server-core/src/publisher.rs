@@ -8363,7 +8363,7 @@ mod tests {
             MatchedSlotsContext, build_ad_slots_script, build_auction_request, build_bid_map,
             build_bids_script, html_escape_for_script,
         };
-        use crate::auction::types::{ApsRendererV1, ApsTagType, Bid, BidRenderer, MediaType};
+        use crate::auction::types::{ApsRendererV1, ApsTagType, Bid, BidRenderSourceV1, MediaType};
         use crate::consent::ConsentContext;
         use crate::creative_opportunities::{
             CreativeOpportunitiesConfig, CreativeOpportunityFormat, CreativeOpportunitySlot,
@@ -8613,7 +8613,7 @@ mod tests {
         fn bid_map_exposes_aps_renderer_and_selected_bid_id_without_debug_adm() {
             let mut bid = make_bid("atf_sidebar_ad", 1.50, "aps", "fallback-ad", "", "");
             bid.bid_id = Some("selected-bid".to_string());
-            bid.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
+            bid.renderer = Some(BidRenderSourceV1::Aps(ApsRendererV1 {
                 version: 1,
                 account_id: "example-account".to_string(),
                 bid_id: "selected-bid".to_string(),
@@ -9461,7 +9461,7 @@ mod tests {
             bid.bid_id = Some("selected-bid".to_string());
             bid.nurl = None;
             bid.burl = None;
-            bid.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
+            bid.renderer = Some(BidRenderSourceV1::Aps(ApsRendererV1 {
                 version: 1,
                 account_id: "example-account".to_string(),
                 bid_id: "selected-bid".to_string(),

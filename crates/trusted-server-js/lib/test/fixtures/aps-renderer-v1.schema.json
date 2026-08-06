@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://iabtechlab.com/trusted-server/aps-renderer-v1.schema.json",
+  "title": "Trusted Server APS renderer descriptor version 1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "type",
+    "version",
+    "accountId",
+    "bidId",
+    "tagType",
+    "creativeUrl",
+    "width",
+    "height",
+    "aaxResponse"
+  ],
+  "properties": {
+    "type": {
+      "const": "aps"
+    },
+    "version": {
+      "const": 1
+    },
+    "accountId": {
+      "type": "string",
+      "minLength": 1,
+      "x-utf8MaxBytes": 1024
+    },
+    "bidId": {
+      "type": "string",
+      "minLength": 1,
+      "x-utf8MaxBytes": 64,
+      "x-forbidNulAndAsciiControl": true
+    },
+    "creativeId": {
+      "type": "string",
+      "minLength": 1,
+      "x-utf8MaxBytes": 1024
+    },
+    "tagType": {
+      "enum": ["iframe", "script"]
+    },
+    "creativeUrl": {
+      "type": "string",
+      "format": "uri",
+      "x-utf8MaxBytes": 4096,
+      "x-requiredScheme": "https",
+      "x-forbidCredentials": true,
+      "x-forbidPublisherOrigin": true
+    },
+    "width": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4096
+    },
+    "height": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4096
+    },
+    "aaxResponse": {
+      "type": "string",
+      "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$",
+      "x-canonicalStandardBase64": true,
+      "x-decodedMaxBytes": 262144
+    }
+  },
+  "x-envelope": {
+    "rootKeys": ["seatbid"],
+    "seatCount": 1,
+    "seatKeys": ["bid"],
+    "bidCount": 1,
+    "bidKeys": ["ext", "h", "id", "price", "w"],
+    "extKeys": ["creativeurl", "tagtype"],
+    "price": {
+      "finite": true,
+      "minimum": 0
+    },
+    "duplicatedFields": {
+      "bidId": ["seatbid", 0, "bid", 0, "id"],
+      "width": ["seatbid", 0, "bid", 0, "w"],
+      "height": ["seatbid", 0, "bid", 0, "h"],
+      "creativeUrl": ["seatbid", 0, "bid", 0, "ext", "creativeurl"],
+      "tagType": ["seatbid", 0, "bid", 0, "ext", "tagtype"]
+    }
+  }
+}

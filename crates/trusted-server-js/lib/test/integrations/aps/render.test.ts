@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import corpusFixture from '../../fixtures/aps-renderer-v1-corpus.json';
 import envelope from '../../fixtures/aps-renderer-v1.json';
 import type { ApsRendererV1 } from '../../../src/core/types';
 import { log } from '../../../src/core/log';
+import { classifyApsRendererV1 } from '../../../src/integrations/aps/generated/renderer_validator_v1';
 import {
   APS_RENDERER_PATH,
   APS_RENDERER_SANDBOX,
@@ -50,7 +52,235 @@ function descriptor(overrides: Partial<ApsRendererV1> = {}): ApsRendererV1 {
   };
 }
 
+type CorpusResult =
+  | 'accepted'
+  | 'descriptor_invalid'
+  | 'invalid_dimensions'
+  | 'dimensions_out_of_range';
+
+interface CorpusVector {
+  id: string;
+  expected: CorpusResult;
+  operation: Record<string, unknown>;
+}
+
+interface RendererCorpus {
+  publisherOrigin: string;
+  baseDescriptor: Record<string, unknown>;
+  vectors: CorpusVector[];
+}
+
+interface MaterializedCorpusVector {
+  id: string;
+  expected: CorpusResult;
+  publisherOrigin: string;
+  descriptor: Record<string, unknown>;
+}
+
+const rendererCorpus = corpusFixture as unknown as RendererCorpus;
+
+function mutableRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function jsonPathParent(
+  root: unknown,
+  path: readonly (string | number)[]
+): { parent: unknown; key: string | number } {
+  if (path.length === 0) throw new Error('corpus path should not be empty');
+  let parent = root;
+  for (const segment of path.slice(0, -1)) {
+    if (typeof segment === 'number') {
+      if (!Array.isArray(parent)) throw new Error('corpus numeric path should address an array');
+      parent = parent[segment];
+    } else {
+      if (!mutableRecord(parent)) throw new Error('corpus string path should address an object');
+      parent = parent[segment];
+    }
+  }
+  const key = path[path.length - 1];
+  if (key === undefined) throw new Error('corpus path should have a final key');
+  return { parent, key };
+}
+
+function setJsonPath(root: unknown, path: readonly (string | number)[], value: unknown): void {
+  const { parent, key } = jsonPathParent(root, path);
+  if (typeof key === 'number') {
+    if (!Array.isArray(parent)) throw new Error('corpus numeric key should address an array');
+    parent[key] = value;
+    return;
+  }
+  if (!mutableRecord(parent)) throw new Error('corpus string key should address an object');
+  parent[key] = value;
+}
+
+function deleteJsonPath(root: unknown, path: readonly (string | number)[]): void {
+  const { parent, key } = jsonPathParent(root, path);
+  if (typeof key !== 'string' || !mutableRecord(parent)) {
+    throw new Error('corpus delete should address an object field');
+  }
+  delete parent[key];
+}
+
+function operationString(operation: Record<string, unknown>, field: string): string {
+  const value = operation[field];
+  if (typeof value !== 'string') throw new Error(`corpus ${field} should be a string`);
+  return value;
+}
+
+function operationNumber(operation: Record<string, unknown>, field: string): number {
+  const value = operation[field];
+  if (typeof value !== 'number') throw new Error(`corpus ${field} should be a number`);
+  return value;
+}
+
+function operationPath(operation: Record<string, unknown>): Array<string | number> {
+  const value = operation.path;
+  if (
+    !Array.isArray(value) ||
+    !value.every((segment) => typeof segment === 'string' || typeof segment === 'number')
+  ) {
+    throw new Error('corpus path should contain only string and number segments');
+  }
+  return value;
+}
+
+function materializeCorpusVector(vector: CorpusVector): MaterializedCorpusVector {
+  const descriptor = structuredClone(rendererCorpus.baseDescriptor);
+  const decodedEnvelope = structuredClone(envelope) as unknown;
+  const operation = vector.operation;
+  const kind = operationString(operation, 'kind');
+  let encodedEnvelope: string | undefined;
+
+  switch (kind) {
+    case 'none':
+      break;
+    case 'descriptor-delete':
+      delete descriptor[operationString(operation, 'field')];
+      break;
+    case 'descriptor-set':
+      descriptor[operationString(operation, 'field')] = operation.value;
+      break;
+    case 'descriptor-repeat': {
+      const repeated =
+        operationString(operation, 'unit').repeat(operationNumber(operation, 'count')) +
+        (typeof operation.suffix === 'string' ? operation.suffix : '');
+      descriptor[operationString(operation, 'field')] = repeated;
+      break;
+    }
+    case 'bid-id-repeat': {
+      const repeated =
+        operationString(operation, 'unit').repeat(operationNumber(operation, 'count')) +
+        (typeof operation.suffix === 'string' ? operation.suffix : '');
+      descriptor.bidId = repeated;
+      setJsonPath(decodedEnvelope, ['seatbid', 0, 'bid', 0, 'id'], repeated);
+      break;
+    }
+    case 'dimension': {
+      const field = operationString(operation, 'field');
+      if (field !== 'width' && field !== 'height') {
+        throw new Error('corpus dimension field should be width or height');
+      }
+      descriptor[field] = operation.value;
+      setJsonPath(
+        decodedEnvelope,
+        ['seatbid', 0, 'bid', 0, field === 'width' ? 'w' : 'h'],
+        operation.value
+      );
+      break;
+    }
+    case 'dimensions':
+      descriptor.width = operation.width;
+      descriptor.height = operation.height;
+      setJsonPath(decodedEnvelope, ['seatbid', 0, 'bid', 0, 'w'], operation.width);
+      setJsonPath(decodedEnvelope, ['seatbid', 0, 'bid', 0, 'h'], operation.height);
+      break;
+    case 'creative-url': {
+      const value = operationString(operation, 'value');
+      descriptor.creativeUrl = value;
+      setJsonPath(decodedEnvelope, ['seatbid', 0, 'bid', 0, 'ext', 'creativeurl'], value);
+      break;
+    }
+    case 'creative-url-bytes': {
+      const prefix = 'https://creative.example/';
+      const value = prefix + 'a'.repeat(operationNumber(operation, 'bytes') - prefix.length);
+      descriptor.creativeUrl = value;
+      setJsonPath(decodedEnvelope, ['seatbid', 0, 'bid', 0, 'ext', 'creativeurl'], value);
+      break;
+    }
+    case 'aax-literal':
+      encodedEnvelope = operationString(operation, 'value');
+      break;
+    case 'aax-bytes': {
+      const values = operation.values;
+      if (!Array.isArray(values) || !values.every((value) => Number.isInteger(value))) {
+        throw new Error('corpus byte vector should contain integers');
+      }
+      encodedEnvelope = encodeBytes(Uint8Array.from(values as number[]));
+      break;
+    }
+    case 'aax-raw-json':
+      encodedEnvelope = encodeBytes(new TextEncoder().encode(operationString(operation, 'value')));
+      break;
+    case 'aax-decoded-bytes': {
+      const serialized = JSON.stringify(decodedEnvelope);
+      const target = operationNumber(operation, 'bytes');
+      if (serialized.length > target) throw new Error('corpus decoded size is below fixture size');
+      encodedEnvelope = encodeBytes(
+        new TextEncoder().encode(serialized + ' '.repeat(target - serialized.length))
+      );
+      break;
+    }
+    case 'aax-raw-price': {
+      const serialized = JSON.stringify(decodedEnvelope);
+      const price = operationString(operation, 'value');
+      const raw = serialized.replace('"price":1.23', `"price":${price}`);
+      if (raw === serialized) throw new Error('corpus should replace the fixture price');
+      encodedEnvelope = encodeBytes(new TextEncoder().encode(raw));
+      break;
+    }
+    case 'envelope-set':
+      setJsonPath(decodedEnvelope, operationPath(operation), operation.value);
+      break;
+    case 'envelope-delete':
+      deleteJsonPath(decodedEnvelope, operationPath(operation));
+      break;
+    case 'duplicate-seat': {
+      if (!mutableRecord(decodedEnvelope) || !Array.isArray(decodedEnvelope.seatbid)) {
+        throw new Error('corpus fixture should contain seatbid');
+      }
+      decodedEnvelope.seatbid.push(structuredClone(decodedEnvelope.seatbid[0]));
+      break;
+    }
+    case 'duplicate-bid': {
+      const seatbid = mutableRecord(decodedEnvelope) ? decodedEnvelope.seatbid : undefined;
+      const seat = Array.isArray(seatbid) ? seatbid[0] : undefined;
+      const bids = mutableRecord(seat) ? seat.bid : undefined;
+      if (!Array.isArray(bids)) throw new Error('corpus fixture should contain a bid array');
+      bids.push(structuredClone(bids[0]));
+      break;
+    }
+    default:
+      throw new Error(`unknown APS renderer corpus operation: ${kind}`);
+  }
+
+  descriptor.aaxResponse = encodedEnvelope ?? encodeEnvelope(decodedEnvelope);
+  return {
+    id: vector.id,
+    expected: vector.expected,
+    publisherOrigin: rendererCorpus.publisherOrigin,
+    descriptor,
+  };
+}
+
 describe('APS renderer validation', () => {
+  it('matches every shared cross-language contract vector', () => {
+    for (const vector of rendererCorpus.vectors.map(materializeCorpusVector)) {
+      const actual = classifyApsRendererV1(vector.descriptor, vector.publisherOrigin);
+      expect(actual, vector.id).toBe(vector.expected);
+    }
+  });
+
   it('consumes the shared fictional golden envelope and supports an omitted creative ID', () => {
     const withCreativeId = descriptor();
     const withoutCreativeId = descriptor();

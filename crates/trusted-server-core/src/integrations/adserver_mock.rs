@@ -633,7 +633,7 @@ mod tests {
             bid_id: Some(bid_id.to_string()),
             ad_id: None,
             creative_id: Some(format!("creative-{bid_id}")),
-            renderer: Some(BidRenderer::Aps(ApsRendererV1 {
+            renderer: Some(BidRenderSourceV1::Aps(ApsRendererV1 {
                 version: 1,
                 account_id: "example-account".to_string(),
                 bid_id: bid_id.to_string(),
@@ -830,7 +830,7 @@ mod tests {
                 bid_id: Some("source-bid-id".to_string()),
                 ad_id: Some("bid-impression-id".to_string()),
                 creative_id: Some("source-creative-id".to_string()),
-                renderer: Some(BidRenderer::Aps(ApsRendererV1 {
+                renderer: Some(BidRenderSourceV1::Aps(ApsRendererV1 {
                     version: 1,
                     account_id: "example-account".to_string(),
                     bid_id: "source-bid-id".to_string(),

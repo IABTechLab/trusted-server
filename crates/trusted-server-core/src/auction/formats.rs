@@ -365,21 +365,25 @@ pub(crate) fn convert_to_openrtb_response_with_report(
         let width = to_openrtb_i32(bid.width, "width", &bid_context);
         let height = to_openrtb_i32(bid.height, "height", &bid_context);
 
-        // Ordinary markup remains on the mandatory sanitize/rewrite path. A
-        // typed renderer is serialized separately and never enters the HTML sanitizer.
-        let (adm, ext) = if let Some(raw_creative) = bid
+        let creative = bid
             .creative
             .as_deref()
-            .filter(|creative| !creative.trim().is_empty())
-        {
-            if bid.renderer.is_some() {
-                log::warn!(
-                    "Auction {}: winning bid for slot '{}' from '{}' has both creative markup and a renderer; using creative markup",
-                    auction_request.id,
-                    slot_id,
-                    bid.bidder
-                );
-            }
+            .filter(|creative| !creative.trim().is_empty());
+        if creative.is_some() && bid.renderer.is_some() {
+            log::warn!(
+                "Auction {}: skipping winning bid for slot '{}' from '{}' because it has multiple render sources",
+                auction_request.id,
+                slot_id,
+                bid.bidder
+            );
+            delivery.record_drop("multiple_render_sources");
+            continue;
+        }
+
+        // Ordinary markup remains on the mandatory sanitize/rewrite path. A
+        // typed render source is serialized separately and never enters the
+        // HTML sanitizer.
+        let (adm, ext) = if let Some(raw_creative) = creative {
             let processed = creative::process_auction_creative(settings, raw_creative);
 
             log::debug!(
@@ -519,7 +523,7 @@ pub(crate) fn convert_to_openrtb_response_with_report(
 mod tests {
     use super::*;
     use crate::auction::types::{
-        ApsRendererV1, ApsTagType, AuctionResponse, Bid, BidRenderer, BidStatus,
+        ApsRendererV1, ApsTagType, AuctionResponse, Bid, BidRenderSourceV1, BidStatus,
     };
     use crate::openrtb::{Eid, Uid};
     use crate::platform::test_support::noop_services;
@@ -1413,7 +1417,7 @@ mod tests {
         renderer.creative = Some("  ".to_string());
         renderer.bid_id = Some("upstream-renderer-bid".to_string());
         renderer.creative_id = None;
-        renderer.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
+        renderer.renderer = Some(BidRenderSourceV1::Aps(ApsRendererV1 {
             version: 1,
             account_id: "example-account".to_string(),
             bid_id: "upstream-renderer-bid".to_string(),
@@ -1483,12 +1487,12 @@ mod tests {
     }
 
     #[test]
-    fn convert_to_openrtb_response_prefers_creative_when_both_render_sources_exist() {
+    fn convert_to_openrtb_response_rejects_multiple_render_sources() {
         let mut settings = make_settings();
         settings.auction.rewrite_creatives = false;
         let auction_request = make_auction_request();
         let mut bid = make_bid("div-gpt-top", "aps", Some(2.75));
-        bid.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
+        bid.renderer = Some(BidRenderSourceV1::Aps(ApsRendererV1 {
             version: 1,
             account_id: "example-account".to_string(),
             bid_id: "fictional-bid".to_string(),
@@ -1501,15 +1505,21 @@ mod tests {
         }));
         let result = make_result(bid);
 
-        let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
-            .expect("should prefer ordinary creative markup");
-        let json = response_json(response);
-        let bid = &json["seatbid"][0]["bid"][0];
-
-        assert_eq!(bid["adm"], "<div>Ad</div>");
+        let conversion =
+            convert_to_openrtb_response_with_report(&result, &settings, &auction_request, false)
+                .expect("should reject an ambiguous render source");
+        let json = response_json(conversion.response);
         assert!(
-            bid.get("ext").is_none(),
-            "should omit renderer extension when creative markup wins precedence"
+            json["seatbid"].as_array().is_none_or(Vec::is_empty),
+            "should not serialize an ambiguous winner"
+        );
+        assert_eq!(conversion.delivery.dropped_winner_count, 1);
+        assert!(
+            conversion
+                .delivery
+                .dropped_winner_reasons
+                .contains_key("multiple_render_sources"),
+            "should report the exact ambiguous-source reason"
         );
     }
 
@@ -1522,7 +1532,7 @@ mod tests {
         bid.bid_id = Some("fictional-bid".to_string());
         bid.ad_id = Some("fictional-ad".to_string());
         bid.creative_id = Some("fictional-creative".to_string());
-        bid.renderer = Some(BidRenderer::Aps(ApsRendererV1 {
+        bid.renderer = Some(BidRenderSourceV1::Aps(ApsRendererV1 {
             version: 1,
             account_id: "example-account".to_string(),
             bid_id: "fictional-bid".to_string(),

@@ -1524,7 +1524,7 @@ mod tests {
     use crate::auction::test_support::create_test_auction_context;
     use crate::auction::types::{
         AdFormat, AdSlot, ApsRendererV1, ApsTagType, AuctionContext, AuctionRequest,
-        AuctionResponse, Bid, BidRenderer, BidStatus, MediaType, PublisherInfo, UserInfo,
+        AuctionResponse, Bid, BidRenderSourceV1, BidStatus, MediaType, PublisherInfo, UserInfo,
     };
     use crate::error::TrustedServerError;
     use crate::platform::test_support::{
@@ -1739,7 +1739,7 @@ mod tests {
 
     fn auction_bid(bidder: &str, price: f64) -> Bid {
         let renderer = (bidder == "aps").then(|| {
-            BidRenderer::Aps(ApsRendererV1 {
+            BidRenderSourceV1::Aps(ApsRendererV1 {
                 version: 1,
                 account_id: "example-account".to_string(),
                 bid_id: "aps-selected-bid".to_string(),

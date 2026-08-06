@@ -1,9 +1,11 @@
 //! Core types for auction requests and responses.
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use edgezero_core::body::Body as EdgeBody;
 use http::Request;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use url::Url;
 
 use crate::auction::context::ContextValue;
 use crate::geo::GeoInfo;
@@ -187,7 +189,7 @@ pub enum ApsTagType {
 
 /// Version 1 APS renderer descriptor shared with browser clients.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ApsRendererV1 {
     /// Renderer contract version.
     pub version: u8,
@@ -210,22 +212,306 @@ pub struct ApsRendererV1 {
     pub height: u32,
 }
 
-/// Typed browser renderer capability carried by a bid.
+/// Version 1 inline ADM render source shared with browser clients.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum BidRenderer {
-    /// APS renderer version 1.
-    Aps(ApsRendererV1),
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AdmRenderSourceV1 {
+    /// Render-source contract version.
+    pub version: u8,
+    /// Exact creative markup.
+    pub adm: String,
+    /// Creative width.
+    pub width: u32,
+    /// Creative height.
+    pub height: u32,
 }
 
-impl BidRenderer {
+/// Version 1 trusted cache render source shared with browser clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CacheRenderSourceV1 {
+    /// Render-source contract version.
+    pub version: u8,
+    /// Exact validated PBS Cache UUID.
+    pub cache_id: String,
+    /// Server-constructed trusted cache fetch URL.
+    pub fetch_url: String,
+    /// Creative width.
+    pub width: u32,
+    /// Creative height.
+    pub height: u32,
+}
+
+/// Typed browser render source carried by a bid.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum BidRenderSourceV1 {
+    /// APS renderer version 1.
+    Aps(ApsRendererV1),
+    /// Inline ADM version 1.
+    Adm(AdmRenderSourceV1),
+    /// Trusted cache fetch version 1.
+    Cache(CacheRenderSourceV1),
+}
+
+impl BidRenderSourceV1 {
     /// Return the APS renderer descriptor when this is an APS renderer.
     #[must_use]
     pub fn as_aps(&self) -> Option<&ApsRendererV1> {
         match self {
             Self::Aps(renderer) => Some(renderer),
+            Self::Adm(_) | Self::Cache(_) => None,
         }
     }
+}
+
+/// Smallest accepted renderer dimension in CSS pixels.
+pub const RENDER_DIMENSION_MIN: u64 = 1;
+/// Largest accepted renderer dimension in CSS pixels.
+pub const RENDER_DIMENSION_MAX: u64 = 4096;
+
+const MAX_APS_ACCOUNT_ID_BYTES: usize = 1024;
+const MAX_APS_BID_ID_BYTES: usize = 64;
+const MAX_APS_CREATIVE_ID_BYTES: usize = 1024;
+const MAX_APS_CREATIVE_URL_BYTES: usize = 4096;
+const MAX_APS_RENDER_ENVELOPE_BYTES: usize = 256 * 1024;
+const MAX_APS_RENDER_ENVELOPE_BASE64_BYTES: usize = 4 * MAX_APS_RENDER_ENVELOPE_BYTES.div_ceil(3);
+
+/// Cross-language APS descriptor validation result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApsRendererValidationResult {
+    /// Descriptor and decoded envelope are valid and agree.
+    Accepted,
+    /// Descriptor or decoded envelope is malformed.
+    DescriptorInvalid,
+    /// A dimension has the wrong type or is nonfinite, fractional, zero, or negative.
+    InvalidDimensions,
+    /// An otherwise integral positive dimension is outside the supported range.
+    DimensionsOutOfRange,
+}
+
+impl ApsRendererValidationResult {
+    /// Return the exact browser failure/result literal.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::DescriptorInvalid => "descriptor_invalid",
+            Self::InvalidDimensions => "invalid_dimensions",
+            Self::DimensionsOutOfRange => "dimensions_out_of_range",
+        }
+    }
+}
+
+fn has_exact_json_keys(value: &serde_json::Value, expected: &[&str]) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.len() == expected.len() && expected.iter().all(|key| object.contains_key(*key))
+    })
+}
+
+fn classify_render_dimension(value: &serde_json::Value) -> ApsRendererValidationResult {
+    let Some(number) = value.as_f64() else {
+        return ApsRendererValidationResult::InvalidDimensions;
+    };
+    if !number.is_finite() || number.fract() != 0.0 || number <= 0.0 {
+        return ApsRendererValidationResult::InvalidDimensions;
+    }
+    if number < RENDER_DIMENSION_MIN as f64 || number > RENDER_DIMENSION_MAX as f64 {
+        return ApsRendererValidationResult::DimensionsOutOfRange;
+    }
+    ApsRendererValidationResult::Accepted
+}
+
+fn valid_aps_creative_url(value: &str, publisher_origin: &str) -> bool {
+    if value.len() > MAX_APS_CREATIVE_URL_BYTES {
+        return false;
+    }
+    let Ok(url) = Url::parse(value) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.origin().ascii_serialization() != publisher_origin
+}
+
+/// Classify a raw APS renderer descriptor using the cross-language version-1 contract.
+#[must_use]
+pub fn classify_aps_renderer_v1(
+    value: &serde_json::Value,
+    publisher_origin: &str,
+) -> ApsRendererValidationResult {
+    const REQUIRED_KEYS: &[&str] = &[
+        "aaxResponse",
+        "accountId",
+        "bidId",
+        "creativeUrl",
+        "height",
+        "tagType",
+        "type",
+        "version",
+        "width",
+    ];
+    const KEYS_WITH_CREATIVE_ID: &[&str] = &[
+        "aaxResponse",
+        "accountId",
+        "bidId",
+        "creativeId",
+        "creativeUrl",
+        "height",
+        "tagType",
+        "type",
+        "version",
+        "width",
+    ];
+
+    if !has_exact_json_keys(value, REQUIRED_KEYS)
+        && !has_exact_json_keys(value, KEYS_WITH_CREATIVE_ID)
+    {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    }
+
+    let Some(descriptor) = value.as_object() else {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    };
+    if descriptor.get("type").and_then(serde_json::Value::as_str) != Some("aps")
+        || descriptor
+            .get("version")
+            .and_then(serde_json::Value::as_f64)
+            .is_none_or(|version| version != 1.0)
+    {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    }
+
+    let Some(account_id) = descriptor
+        .get("accountId")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    };
+    let Some(bid_id) = descriptor.get("bidId").and_then(serde_json::Value::as_str) else {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    };
+    if account_id.is_empty()
+        || account_id.len() > MAX_APS_ACCOUNT_ID_BYTES
+        || bid_id.is_empty()
+        || bid_id.len() > MAX_APS_BID_ID_BYTES
+        || bid_id.bytes().any(|byte| byte <= 0x1f || byte == 0x7f)
+    {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    }
+    if let Some(creative_id) = descriptor.get("creativeId") {
+        let Some(creative_id) = creative_id.as_str() else {
+            return ApsRendererValidationResult::DescriptorInvalid;
+        };
+        if creative_id.is_empty() || creative_id.len() > MAX_APS_CREATIVE_ID_BYTES {
+            return ApsRendererValidationResult::DescriptorInvalid;
+        }
+    }
+    let Some(tag_type) = descriptor
+        .get("tagType")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    };
+    if tag_type != "iframe" && tag_type != "script" {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    }
+
+    let width_result =
+        classify_render_dimension(descriptor.get("width").unwrap_or(&serde_json::Value::Null));
+    if width_result != ApsRendererValidationResult::Accepted {
+        return width_result;
+    }
+    let height_result =
+        classify_render_dimension(descriptor.get("height").unwrap_or(&serde_json::Value::Null));
+    if height_result != ApsRendererValidationResult::Accepted {
+        return height_result;
+    }
+
+    let Some(creative_url) = descriptor
+        .get("creativeUrl")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    };
+    let Some(aax_response) = descriptor
+        .get("aaxResponse")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    };
+    if !valid_aps_creative_url(creative_url, publisher_origin)
+        || aax_response.is_empty()
+        || aax_response.len() > MAX_APS_RENDER_ENVELOPE_BASE64_BYTES
+    {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    }
+    let Ok(decoded_bytes) = BASE64_STANDARD.decode(aax_response) else {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    };
+    if decoded_bytes.len() > MAX_APS_RENDER_ENVELOPE_BYTES
+        || BASE64_STANDARD.encode(&decoded_bytes) != aax_response
+    {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    }
+    let Ok(decoded_utf8) = core::str::from_utf8(&decoded_bytes) else {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    };
+    let Ok(decoded) = serde_json::from_str::<serde_json::Value>(decoded_utf8) else {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    };
+    if !has_exact_json_keys(&decoded, &["seatbid"]) {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    }
+    let Some(seats) = decoded.get("seatbid").and_then(serde_json::Value::as_array) else {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    };
+    if seats.len() != 1 || !has_exact_json_keys(&seats[0], &["bid"]) {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    }
+    let Some(bids) = seats[0].get("bid").and_then(serde_json::Value::as_array) else {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    };
+    if bids.len() != 1 || !has_exact_json_keys(&bids[0], &["ext", "h", "id", "price", "w"]) {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    }
+    let bid = &bids[0];
+    let Some(ext) = bid.get("ext") else {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    };
+    if !has_exact_json_keys(ext, &["creativeurl", "tagtype"]) {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    }
+
+    let bid_width_result =
+        classify_render_dimension(bid.get("w").unwrap_or(&serde_json::Value::Null));
+    if bid_width_result != ApsRendererValidationResult::Accepted {
+        return bid_width_result;
+    }
+    let bid_height_result =
+        classify_render_dimension(bid.get("h").unwrap_or(&serde_json::Value::Null));
+    if bid_height_result != ApsRendererValidationResult::Accepted {
+        return bid_height_result;
+    }
+    let price_is_valid = bid
+        .get("price")
+        .and_then(serde_json::Value::as_f64)
+        .is_some_and(|price| price.is_finite() && price >= 0.0);
+    if bid.get("id").and_then(serde_json::Value::as_str) != Some(bid_id)
+        || bid.get("w").and_then(serde_json::Value::as_f64)
+            != descriptor.get("width").and_then(serde_json::Value::as_f64)
+        || bid.get("h").and_then(serde_json::Value::as_f64)
+            != descriptor.get("height").and_then(serde_json::Value::as_f64)
+        || ext.get("creativeurl").and_then(serde_json::Value::as_str) != Some(creative_url)
+        || ext.get("tagtype").and_then(serde_json::Value::as_str) != Some(tag_type)
+        || !price_is_valid
+    {
+        return ApsRendererValidationResult::DescriptorInvalid;
+    }
+
+    ApsRendererValidationResult::Accepted
 }
 
 /// Individual bid from a provider.
@@ -239,7 +525,7 @@ pub struct Bid {
     pub currency: String,
     /// Creative markup (HTML/VAST).
     ///
-    /// `None` when the bid uses a typed [`BidRenderer`] instead.
+    /// `None` when the bid uses a typed [`BidRenderSourceV1`] instead.
     pub creative: Option<String>,
     /// Advertiser domain
     pub adomain: Option<Vec<String>>,
@@ -267,7 +553,7 @@ pub struct Bid {
     pub creative_id: Option<String>,
     /// Typed browser renderer capability.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub renderer: Option<BidRenderer>,
+    pub renderer: Option<BidRenderSourceV1>,
     /// Prebid Cache UUID for this bid.
     ///
     /// Populated from `ext.prebid.cache.bids.cacheId` in the PBS response.
@@ -597,7 +883,7 @@ mod tests {
 
     #[test]
     fn aps_renderer_serializes_to_versioned_camel_case_contract() {
-        let renderer = BidRenderer::Aps(ApsRendererV1 {
+        let renderer = BidRenderSourceV1::Aps(ApsRendererV1 {
             version: 1,
             account_id: "example-account-id".to_string(),
             bid_id: "fictional-bid-id".to_string(),
@@ -631,7 +917,7 @@ mod tests {
 
     #[test]
     fn aps_renderer_omits_absent_creative_id() {
-        let renderer = BidRenderer::Aps(ApsRendererV1 {
+        let renderer = BidRenderSourceV1::Aps(ApsRendererV1 {
             version: 1,
             account_id: "example-account-id".to_string(),
             bid_id: "fictional-bid-id".to_string(),
