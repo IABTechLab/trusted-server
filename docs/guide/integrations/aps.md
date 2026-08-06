@@ -6,10 +6,10 @@ Server-side bidding integration for Amazon's Transparent Ad Marketplace (TAM).
 
 The APS integration enables publishers to request bids from Amazon's demand sources server-side, providing:
 
-- **Privacy-first bidding**: No client-side ID tracking or third-party cookies required
-- **Reduced latency**: Server-side auction reduces page load impact
-- **Unified auction**: Integrates seamlessly with other bidders (Prebid, GAM)
-- **Performance**: Async bidding with configurable timeouts
+- **Server-side bidding**: bidding runs in Trusted Server (no client-side JavaScript executes for the auction)
+- **Reduced latency**: server-side auction reduces page load impact
+- **Unified auction**: integrates with other bidders (Prebid, GAM)
+- **Performance**: async bidding with configurable timeouts
 
 ## Quick Start
 
@@ -374,7 +374,7 @@ timeout_ms = 1000
 While this implementation focuses on server-side bidding, you can optionally add client-side components later:
 
 1. **ID Resolution**: Integrate third-party ID vendors client-side
-2. **Analytics**: Load `aps_csm.js` for viewability tracking
+2. **Analytics**: Load `aps_csm.js` for viewability measurement
 3. **Config Loading**: Fetch `/configs/{pub_id}` for advanced settings
 
 See the original network flow documentation for client-side patterns.

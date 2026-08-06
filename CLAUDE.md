@@ -6,8 +6,9 @@
 ## Project Overview
 
 Rust-based edge computing application targeting **Fastly Compute**. Handles
-privacy-preserving Edge Cookie (EC) ID generation, ad serving with GDPR compliance,
-real-time bidding integration, and publisher-side JavaScript injection.
+Edge Cookie (EC) ID generation, ad serving with consent signal extraction
+and enforcement, real-time bidding integration, and publisher-side
+JavaScript injection.
 
 ## Workspace Layout
 
