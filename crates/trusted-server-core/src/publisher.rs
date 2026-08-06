@@ -8088,7 +8088,7 @@ mod tests {
     mod creative_opportunities_tests {
         use super::super::{
             MatchedSlotsContext, build_ad_slots_script, build_auction_request, build_bid_map,
-            build_bid_map_with_auction_id, build_bids_script, html_escape_for_script,
+            build_bids_script, html_escape_for_script, write_bids_to_state,
         };
         use crate::auction::types::{Bid, MediaType};
         use crate::consent::ConsentContext;
@@ -8335,7 +8335,26 @@ mod tests {
         }
 
         #[test]
-        fn bid_map_includes_the_opaque_auction_id_only_for_winning_bids() {
+        fn initial_document_bids_script_includes_auction_id_only_for_winning_bids() {
+            let slot = make_slot();
+            let slots = [slot];
+            let slots_ctx = MatchedSlotsContext {
+                matched_slots: &slots,
+                request_path: "/2024/01/my-article/",
+            };
+            let request_info = RequestInfo {
+                host: "publisher.example.com".to_string(),
+                scheme: "https".to_string(),
+            };
+            let mut auction_request = build_auction_request(
+                &slots_ctx,
+                None,
+                &ConsentContext::default(),
+                &request_info,
+                "publisher.example.com",
+                Some("Mozilla/5.0"),
+            );
+            auction_request.id = "initial-auction-example-123".to_string();
             let mut winning_bids = HashMap::new();
             winning_bids.insert(
                 "atf_sidebar_ad".to_string(),
@@ -8349,30 +8368,75 @@ mod tests {
                 ),
             );
 
-            let map = build_bid_map_with_auction_id(
+            let state = std::sync::Arc::new(std::sync::Mutex::new(None));
+            write_bids_to_state(
                 &winning_bids,
                 PriceGranularity::Dense,
+                &state,
                 &test_settings(),
                 "",
                 false,
-                Some("auction-example-123"),
+                Some(&auction_request.id),
             );
+            let script = state
+                .lock()
+                .expect("should lock initial bid state")
+                .clone()
+                .expect("should generate initial-document bids script");
+            let bid_json = script
+                .strip_prefix(
+                    "<script>(function(){var t=window.tsjs=window.tsjs||{};var b=JSON.parse(\"",
+                )
+                .and_then(|script| {
+                    script.strip_suffix(
+                        "\");var s=t.scheduleInitialAdInit;if(typeof s===\"function\")s(b);else t.bids=b;})();</script>",
+                    )
+                })
+                .expect("should emit the initial-document tsjs.bids script shape");
+            let bid_json: String = serde_json::from_str(&format!("\"{bid_json}\""))
+                .expect("should decode initial-document JSON.parse input");
+            let bids: serde_json::Value = serde_json::from_str(&bid_json)
+                .expect("should serialize initial-document bids as JSON");
 
             assert_eq!(
-                map["atf_sidebar_ad"]["hb_auction_id"], "auction-example-123",
-                "should expose only the current opaque request ID"
+                bids["atf_sidebar_ad"]["hb_auction_id"], auction_request.id,
+                "initial-document bids should expose the current request ID only on the winner"
             );
-            let empty = build_bid_map_with_auction_id(
+
+            write_bids_to_state(
                 &HashMap::new(),
                 PriceGranularity::Dense,
+                &state,
                 &test_settings(),
                 "",
                 false,
-                Some("auction-example-123"),
+                Some(&auction_request.id),
             );
+            let empty_script = state
+                .lock()
+                .expect("should lock empty initial bid state")
+                .clone()
+                .expect("should generate empty initial-document bids script");
+            let empty_bid_json = empty_script
+                .strip_prefix(
+                    "<script>(function(){var t=window.tsjs=window.tsjs||{};var b=JSON.parse(\"",
+                )
+                .and_then(|script| {
+                    script.strip_suffix(
+                        "\");var s=t.scheduleInitialAdInit;if(typeof s===\"function\")s(b);else t.bids=b;})();</script>",
+                    )
+                })
+                .expect("should emit the empty initial-document tsjs.bids script shape");
+            let empty_bid_json: String = serde_json::from_str(&format!("\"{empty_bid_json}\""))
+                .expect("should decode empty initial-document JSON.parse input");
+            let empty_bids: serde_json::Value = serde_json::from_str(&empty_bid_json)
+                .expect("should serialize empty initial-document bids as JSON");
             assert!(
-                empty.is_empty(),
-                "should not create bid metadata without a winner"
+                empty_bids
+                    .as_object()
+                    .expect("initial-document bids should be an object")
+                    .is_empty(),
+                "initial-document bids should not fabricate metadata without a winner"
             );
         }
 
@@ -9338,11 +9402,104 @@ mod tests {
 
     mod page_bids_no_match_tests {
         use super::super::*;
+        use super::build_services_with_http_client;
         use crate::auction::AuctionOrchestrator;
+        use crate::auction::provider::AuctionProvider;
+        use crate::auction::types::{AuctionRequest, AuctionResponse, Bid};
         use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
-        use crate::platform::test_support::noop_services;
+        use crate::platform::test_support::{StubHttpClient, noop_services};
+        use crate::platform::{PlatformHttpRequest, PlatformPendingRequest, PlatformResponse};
         use crate::test_support::tests::crate_test_settings_str;
+        use error_stack::{Report, ResultExt};
         use http::Method;
+        use std::sync::{Arc, Mutex};
+
+        const AUCTION_ID_TEST_PROVIDER: &str = "auction_id_test_provider";
+        const AUCTION_ID_TEST_BACKEND: &str = "auction-id-test-backend";
+
+        struct AuctionIdTestProvider {
+            captured_request: Arc<Mutex<Option<AuctionRequest>>>,
+            winning_bid: bool,
+        }
+
+        #[async_trait::async_trait(?Send)]
+        impl AuctionProvider for AuctionIdTestProvider {
+            fn provider_name(&self) -> &'static str {
+                AUCTION_ID_TEST_PROVIDER
+            }
+
+            async fn request_bids(
+                &self,
+                request: &AuctionRequest,
+                context: &AuctionContext<'_>,
+            ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+                *self
+                    .captured_request
+                    .lock()
+                    .expect("should lock captured auction request") = Some(request.clone());
+                let request = PlatformHttpRequest::new(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("https://bidder.example.test/bids")
+                        .body(EdgeBody::empty())
+                        .expect("should build test bidder request"),
+                    AUCTION_ID_TEST_BACKEND,
+                );
+                context
+                    .services
+                    .http_client()
+                    .send_async(request)
+                    .await
+                    .change_context(TrustedServerError::Auction {
+                        message: "test bidder launch failed".to_string(),
+                    })
+            }
+
+            async fn parse_response(
+                &self,
+                _response: PlatformResponse,
+                response_time_ms: u64,
+            ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+                let bids = if self.winning_bid {
+                    vec![Bid {
+                        slot_id: "atf".to_string(),
+                        price: Some(1.50),
+                        currency: "USD".to_string(),
+                        creative: None,
+                        adomain: None,
+                        bidder: AUCTION_ID_TEST_PROVIDER.to_string(),
+                        width: 300,
+                        height: 250,
+                        nurl: None,
+                        burl: None,
+                        ad_id: Some("winner-123".to_string()),
+                        cache_id: None,
+                        cache_host: None,
+                        cache_path: None,
+                        metadata: Default::default(),
+                    }]
+                } else {
+                    Vec::new()
+                };
+                Ok(AuctionResponse::success(
+                    AUCTION_ID_TEST_PROVIDER,
+                    bids,
+                    response_time_ms,
+                ))
+            }
+
+            fn timeout_ms(&self) -> u32 {
+                100
+            }
+
+            fn backend_name(
+                &self,
+                _services: &RuntimeServices,
+                _timeout_ms: u32,
+            ) -> Option<String> {
+                Some(AUCTION_ID_TEST_BACKEND.to_string())
+            }
+        }
 
         fn settings_with_co() -> Settings {
             let toml = format!(
@@ -9485,6 +9642,114 @@ mod tests {
             )
             .await
             .expect("should return ok response")
+        }
+
+        fn auction_id_test_orchestrator(
+            settings: &Settings,
+            captured_request: Arc<Mutex<Option<AuctionRequest>>>,
+            winning_bid: bool,
+        ) -> AuctionOrchestrator {
+            let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            orchestrator.register_provider(Arc::new(AuctionIdTestProvider {
+                captured_request,
+                winning_bid,
+            }));
+            orchestrator
+        }
+
+        #[tokio::test]
+        async fn page_bids_response_includes_auction_id_only_for_winning_bids() {
+            let mut settings = settings_with_co();
+            settings.auction.providers = vec![AUCTION_ID_TEST_PROVIDER.to_string()];
+            let slots = article_slot();
+            let winning_stub = Arc::new(StubHttpClient::new());
+            winning_stub.push_response(200, b"winner".to_vec());
+            let winning_services = build_services_with_http_client(
+                Arc::clone(&winning_stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let winning_request = Arc::new(Mutex::new(None));
+            let winning_orchestrator =
+                auction_id_test_orchestrator(&settings, Arc::clone(&winning_request), true);
+            let ec_context = EcContext::new_for_test(
+                Some("page-auction-example-123".to_string()),
+                crate::consent::ConsentContext {
+                    jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                    ..Default::default()
+                },
+            );
+
+            let winning_response = handle_page_bids(
+                &settings,
+                &winning_services,
+                None,
+                AuctionDispatch {
+                    orchestrator: &winning_orchestrator,
+                    slots: &slots,
+                    registry: None,
+                },
+                &ec_context,
+                make_page_bids_request("/2024/01/my-article/"),
+            )
+            .await
+            .expect("should return winning page-bids response");
+            let winning_body: serde_json::Value = serde_json::from_slice(
+                &winning_response
+                    .into_body()
+                    .into_bytes()
+                    .unwrap_or_default(),
+            )
+            .expect("should serialize winning page-bids response as JSON");
+            let auction_request = winning_request
+                .lock()
+                .expect("should lock captured winning request")
+                .clone()
+                .expect("should dispatch a winning auction request");
+
+            assert_eq!(
+                auction_request.id, "ts-page-auction-example-123",
+                "test EC ID should produce a deterministic auction request ID"
+            );
+            assert_eq!(
+                winning_body["bids"]["atf"]["hb_auction_id"], auction_request.id,
+                "page-bids should expose the current request ID only on the winner"
+            );
+
+            let no_winner_stub = Arc::new(StubHttpClient::new());
+            no_winner_stub.push_response(200, b"no-bid".to_vec());
+            let no_winner_services = build_services_with_http_client(
+                Arc::clone(&no_winner_stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let no_winner_orchestrator =
+                auction_id_test_orchestrator(&settings, Arc::new(Mutex::new(None)), false);
+            let no_winner_response = handle_page_bids(
+                &settings,
+                &no_winner_services,
+                None,
+                AuctionDispatch {
+                    orchestrator: &no_winner_orchestrator,
+                    slots: &slots,
+                    registry: None,
+                },
+                &ec_context,
+                make_page_bids_request("/2024/01/my-article/"),
+            )
+            .await
+            .expect("should return no-winner page-bids response");
+            let no_winner_body: serde_json::Value = serde_json::from_slice(
+                &no_winner_response
+                    .into_body()
+                    .into_bytes()
+                    .unwrap_or_default(),
+            )
+            .expect("should serialize no-winner page-bids response as JSON");
+
+            assert!(
+                no_winner_body["bids"]
+                    .as_object()
+                    .expect("page-bids should return a bids object")
+                    .is_empty(),
+                "page-bids should not fabricate auction metadata without a winner"
+            );
         }
 
         /// The deprecated `/__ts/page-bids` alias must be handled identically to
