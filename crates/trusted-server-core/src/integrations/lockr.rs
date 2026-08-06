@@ -1,7 +1,7 @@
 //! Lockr integration for identity resolution and advertising tokens.
 //!
 //! This module provides transparent proxying for Lockr's SDK and API,
-//! enabling first-party identity resolution while maintaining privacy controls.
+//! enabling first-party identity resolution.
 //!
 //! Lockr provides a dedicated trust-server SDK (`identity-lockr-trust-server.js`)
 //! that is pre-configured to route API calls through the first-party proxy,

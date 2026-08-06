@@ -1,8 +1,8 @@
 //! Google Publisher Tags (GPT) integration for first-party ad serving.
 //!
 //! This module provides transparent proxying for Google's entire GPT script
-//! chain, enabling first-party ad tag delivery while maintaining privacy
-//! controls. GPT loads scripts in a cascade:
+//! chain, enabling first-party ad tag delivery.
+//! GPT loads scripts in a cascade:
 //!
 //! 1. `gpt.js` – the thin bootstrap loader
 //! 2. `pubads_impl.js` – the main GPT implementation (~640 KB)

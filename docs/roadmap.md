@@ -121,7 +121,7 @@ Our development is focused on three key areas:
 
 - Dedicated ID generation microservice
 - Cross-publisher ID graph support
-- Privacy-preserving ID resolution
+- ID resolution with configurable consent controls
 - API-first architecture
 
 **OpenRTB Geo Signal Enrichment**
@@ -172,7 +172,7 @@ A comprehensive creative forensics engine for ad behavior monitoring and fraud p
 
 **Business Impact:**
 
-- **Compliance Protection**: Prevent GDPR violations from third-party creatives (potential $2.3M+ fine avoidance)
+- **Compliance Support**: Detect and block creative behavior that conflicts with the publisher's consent policy (potential $2.3M+ fine risk reduction)
 - **Revenue Protection**: Detect bid manipulation and auction fraud ($400K+ annual recovery potential)
 - **User Trust**: Block malvertising before it reaches users (prevent user exodus, retain 100K+ users)
 - **Brand Safety**: Real-time creative quality assurance
@@ -217,7 +217,7 @@ A comprehensive creative forensics engine for ad behavior monitoring and fraud p
 - Deeper Didomi integration
 - OneTrust support
 - Quantcast CMP integration
-- TCF 2.2 full compliance
+- TCF v2.2 format decoding and enforcement support. TCF is one consent framework among others, including GPP and GPC
 
 ---
 
