@@ -35,6 +35,11 @@ export interface CoreActivationContext {
   readonly onDispose: (callback: DisposeCallback) => void;
 }
 
+export interface CorePreparationContext {
+  readonly signal: AbortSignal;
+  readonly onDispose: (callback: DisposeCallback) => void;
+}
+
 export interface PreparedIntegration {
   readonly activate: (context: IntegrationActivationContext) => void;
 }
@@ -53,6 +58,8 @@ export interface IntegrationRuntimeFailure {
 }
 
 export interface IntegrationInstallCallbacks {
+  /** Allocates inert composition-owned services before integration preparation. */
+  readonly prepareCore?: (context: CorePreparationContext) => void;
   /** Installs reversible core listeners before any integration module activation. */
   readonly activateCore: (context: CoreActivationContext) => void;
   /** Installs the complete API synchronously. It must not yield or invoke publisher code. */
@@ -382,6 +389,7 @@ class IntegrationRegistryOwner {
     let acceptedCallbacks: IntegrationInstallCallbacks;
     try {
       acceptedCallbacks = Object.freeze({
+        ...(callbacks.prepareCore ? { prepareCore: callbacks.prepareCore } : {}),
         activateCore: callbacks.activateCore,
         publish: callbacks.publish,
         drainPreload: callbacks.drainPreload,
@@ -569,6 +577,34 @@ class IntegrationRegistryOwner {
     }
 
     this.registryState = 'preparing';
+    if (callbacks.prepareCore) {
+      let corePreparationOpen = true;
+      const corePreparationContext: CorePreparationContext = Object.freeze({
+        signal: this.abortController.signal,
+        onDispose: (callback: DisposeCallback) => {
+          if (!corePreparationOpen && !this.coreScope.disposed) {
+            throw new Error('Core preparation disposal registration is closed');
+          }
+          this.coreScope.onDispose(callback);
+        },
+      });
+      this.enterOwnedCallback();
+      try {
+        const returned = callbacks.prepareCore(corePreparationContext);
+        if (isThenable(returned)) {
+          observeThenableRejection(returned);
+          throw new TypeError('Core preparation must be synchronous');
+        }
+      } catch {
+        this.fail('bundle_partial');
+        return this.fallbackResult();
+      } finally {
+        corePreparationOpen = false;
+        this.leaveOwnedCallback();
+      }
+
+      if (!this.canContinue('preparing')) return this.fallbackResult();
+    }
     for (const entry of this.manifestValue.integrations) {
       if (!this.canContinue('preparing')) return this.fallbackResult();
 

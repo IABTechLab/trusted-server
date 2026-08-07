@@ -7,6 +7,7 @@ import {
   createIntegrationRegistry,
   type BootFailureReason,
   type CoreActivationContext,
+  type CorePreparationContext,
   type IntegrationBindings,
   type IntegrationInstallResult,
   type IntegrationRegistry,
@@ -67,6 +68,12 @@ export interface RuntimeOwnerActivationContext extends CoreActivationContext {
   readonly generation: object;
 }
 
+/** Frozen preparation boundary for inert document-lifetime owners. */
+export interface RuntimeOwnerPreparationContext extends CorePreparationContext {
+  readonly boot: Readonly<object>;
+  readonly generation: object;
+}
+
 export interface RuntimeOptions {
   readonly target: RuntimeTarget;
   /** Server assertion only; every decision and published value is bound to the build stamp. */
@@ -76,6 +83,7 @@ export interface RuntimeOptions {
   readonly boot?: unknown;
   readonly now?: () => number;
   readonly getBindings?: (id: string) => IntegrationBindings;
+  readonly prepareOwner?: (context: RuntimeOwnerPreparationContext) => void;
   readonly activateOwner?: (context: RuntimeOwnerActivationContext) => void;
   readonly activateCore?: (context: CoreActivationContext) => void;
   readonly kernel: RuntimeKernel;
@@ -212,6 +220,21 @@ class RuntimeOwner implements Runtime {
     let published: PublishedQueue | undefined;
     this.installPromise = this.registry
       .install({
+        prepareCore: (context) => {
+          if (!this.ownsInstallingPreparation(context)) {
+            throw new Error('Runtime owner generation changed');
+          }
+          const ownerContext: RuntimeOwnerPreparationContext = Object.freeze({
+            boot: this.kernelBoot as Readonly<object>,
+            generation: this.generation,
+            onDispose: context.onDispose,
+            signal: context.signal,
+          });
+          this.invokeSynchronousActivation(this.options.prepareOwner, ownerContext);
+          if (!this.ownsInstallingPreparation(context)) {
+            throw new Error('Runtime owner generation changed');
+          }
+        },
         activateCore: (context) => {
           if (!this.ownsInstallingActivation(context)) {
             throw new Error('Runtime owner generation changed');
@@ -322,6 +345,15 @@ class RuntimeOwner implements Runtime {
       this.runtimeState === 'installing' &&
       !context.signal.aborted &&
       this.registry?.state === 'activating' &&
+      this.ownsRegistrationHandshake()
+    );
+  }
+
+  private ownsInstallingPreparation(context: CorePreparationContext): boolean {
+    return (
+      this.runtimeState === 'installing' &&
+      !context.signal.aborted &&
+      this.registry?.state === 'preparing' &&
       this.ownsRegistrationHandshake()
     );
   }

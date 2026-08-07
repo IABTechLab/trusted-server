@@ -21,6 +21,10 @@ import {
   createNoopBrowserComposition,
   createTestBrowserRuntimeComposition,
 } from '../../src/composition/browser';
+import { log as localLog } from '../../src/core/log';
+import { createGptIntegrationRegistration } from '../../src/integrations/gpt/module';
+import { isGuardInstalled, resetGuardState } from '../../src/integrations/gpt/script_guard';
+import { publicLog } from '../../src/kernel/fallback';
 import { createTestNavigationIdentityIssuer } from '../../src/kernel/identity';
 import type { RenderAttempt } from '../../src/services/render';
 
@@ -344,6 +348,71 @@ describe('browser composition', () => {
     expect(correctness).toHaveBeenCalledOnce();
     composition.runtime.dispose();
     expect(releases).toEqual(['slotRenderEnded', 'slotRequested']);
+  });
+
+  it('injects the GPT module boundary and retains only server-frozen configuration', async () => {
+    const releaseId = 'a'.repeat(64);
+    const target = {};
+    const config = Object.freeze({ scriptUrl: '/integrations/gpt/script' });
+    const providedBindings = vi.fn(() => ({
+      config,
+      interfaces: Object.freeze({ publisherControlled: Object.freeze({}) }),
+    }));
+    const startGpt = vi.fn((received: unknown) => {
+      expect(received).toBe(config);
+      expect((target as { version?: unknown }).version).toBe('1.0.0');
+    });
+    const composition = createTestBrowserRuntimeComposition(
+      {
+        target,
+        releaseId,
+        manifest: {
+          version: 1,
+          releaseId,
+          integrations: [{ id: 'gpt', required: true }],
+        },
+        knownIntegrationIds: Object.freeze(['gpt']),
+        boot: {
+          auctionProjection: {
+            version: 1,
+            auction: { version: 1, auctionId: 'initial', results: [] },
+            bids: [],
+          },
+          creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+        },
+        getBindings: providedBindings,
+        kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+      },
+      {
+        adapters: {
+          googletag: fakeGoogletagAdapter(),
+          messaging: fakeMessagingAdapter(() => vi.fn()),
+          prebid: fakePrebidAdapter(),
+        },
+        coreActivations: { correctnessGptListeners: vi.fn() },
+        gptStartupForTest: startGpt,
+      }
+    );
+
+    try {
+      expect(composition.runtime.start()).toBe(true);
+      expect(
+        composition.runtime.registerIntegration(createGptIntegrationRegistration(releaseId))
+      ).toBe(true);
+      await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+
+      expect(providedBindings).toHaveBeenCalledExactlyOnceWith('gpt');
+      expect(startGpt).toHaveBeenCalledExactlyOnceWith(config);
+      expect(isGuardInstalled()).toBe(true);
+      expect(composition.runtimeSessionForTest()?.interfaces).not.toHaveProperty(
+        'publisherControlled'
+      );
+    } finally {
+      composition.runtime.dispose();
+      resetGuardState();
+    }
+    expect(isGuardInstalled()).toBe(false);
   });
 
   it('constructs one session lazily from accepted boot and keeps it across SPA replacement', async () => {
@@ -859,6 +928,112 @@ describe('browser composition', () => {
     expect(listenerActivation).not.toHaveBeenCalled();
     expect(latePreparation).not.toHaveBeenCalled();
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('isolates and locally logs a throwing auction-context contributor', async () => {
+    const releaseId = 'a'.repeat(64);
+    const target = {};
+    const requestConfigs: unknown[] = [];
+    const auctionFetcher = vi.fn(async (_input: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as { config: unknown };
+      requestConfigs.push(body.config);
+      return {
+        ok: true,
+        json: async () => ({
+          id: 'context-auction',
+          cur: 'USD',
+          seatbid: [],
+          ext: {
+            trusted_server: {
+              slot_results: {
+                version: 1,
+                auctionId: 'context-auction',
+                results: [{ slot: 'server-slot', outcome: 'no_bid' }],
+              },
+            },
+          },
+        }),
+      };
+    });
+    const warn = vi.spyOn(localLog, 'warn').mockImplementation(() => undefined);
+    const composition = createTestBrowserRuntimeComposition(
+      {
+        target,
+        releaseId,
+        manifest: {
+          version: 1,
+          releaseId,
+          integrations: [{ id: 'context_test', required: true }],
+        },
+        knownIntegrationIds: Object.freeze(['context_test']),
+        boot: {
+          auctionProjection: {
+            version: 1,
+            auction: {
+              version: 1,
+              auctionId: 'initial',
+              results: [{ slot: 'server-slot', outcome: 'no_bid' }],
+            },
+            bids: [],
+          },
+          creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+        },
+        kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+      },
+      {
+        adapters: {
+          googletag: fakeGoogletagAdapter(),
+          messaging: fakeMessagingAdapter(),
+          prebid: fakePrebidAdapter(),
+        },
+        auctionFetcherForTest: auctionFetcher,
+        coreActivations: { correctnessGptListeners: vi.fn() },
+      }
+    );
+
+    try {
+      expect(composition.runtime.start()).toBe(true);
+      expect(
+        composition.runtime.registerIntegration({
+          id: 'context_test',
+          release: releaseId,
+          prepare: () => ({ activate: vi.fn() }),
+        })
+      ).toBe(true);
+      await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+      expect((target as { log?: unknown }).log).toBe(publicLog);
+
+      const registry = composition.auctionContextRegistryForTest();
+      const session = composition.runtimeSessionForTest();
+      expect(registry).toBeDefined();
+      expect(session).toBeDefined();
+      expect(
+        registry?.register(
+          'context_test',
+          () => {
+            throw new Error('publisher contributor');
+          },
+          session!
+        )
+      ).toBe(true);
+
+      const api = target as {
+        requestAds(options?: unknown): Promise<{ readonly slots: readonly object[] }>;
+      };
+      await expect(api.requestAds({ slots: ['server-slot'] })).resolves.toEqual({
+        slots: [{ slot: 'server-slot', path: 'primary', outcome: 'no_bid' }],
+      });
+
+      expect(requestConfigs).toEqual([{}]);
+      expect(warn).toHaveBeenCalledExactlyOnceWith('auction context: contributor failed', {
+        integrationId: 'context_test',
+        reason: 'contributor_failed',
+      });
+    } finally {
+      composition.runtime.dispose();
+      warn.mockRestore();
+    }
   });
 
   it('exercises transactional addAdUnits and invocation-time requestAds snapshots through the test kernel', async () => {
