@@ -1551,8 +1551,9 @@ describe('browser messaging adapter', () => {
     const dispose = adapter.installCaptureListener(() => {
       throw new Error('capture failed');
     });
+    expect(dispose).toBeTypeOf('function');
     expect(() => installed[0]?.({} as MessageEvent)).not.toThrow();
-    expect(() => dispose()).not.toThrow();
+    expect(() => dispose?.()).not.toThrow();
 
     const raw = createPort();
     raw.postMessage.mockImplementation(() => {
@@ -1579,7 +1580,7 @@ describe('browser messaging adapter', () => {
       },
       removeEventListener: vi.fn(),
     });
-    expect(() => throwingTarget.installCaptureListener(vi.fn())).not.toThrow();
+    expect(throwingTarget.installCaptureListener(vi.fn())).toBeUndefined();
   });
 
   it('rolls back the exact capture listener when installation throws after adding it', () => {
@@ -1604,8 +1605,7 @@ describe('browser messaging adapter', () => {
     expect(listeners.size).toBe(0);
     expect(removeEventListener).toHaveBeenCalledTimes(1);
     expect(removeEventListener).toHaveBeenCalledWith('message', installed, true);
-    expect(() => dispose()).not.toThrow();
-    expect(() => dispose()).not.toThrow();
+    expect(dispose).toBeUndefined();
     expect(removeEventListener).toHaveBeenCalledTimes(1);
   });
 });

@@ -218,7 +218,7 @@ export interface MessagingAdapter {
     targetOrigin: string,
     transferred: readonly MessagingPort[]
   ): boolean;
-  installCaptureListener(listener: CaptureMessageListener): () => void;
+  installCaptureListener(listener: CaptureMessageListener): (() => void) | undefined;
   inspectGlobalMessage(candidate: unknown):
     | Readonly<{
         message: string;
@@ -1381,16 +1381,16 @@ export function createBrowserMessagingAdapter(
   return Object.freeze({
     createChannel: () => createChannel(target),
     postWindow,
-    installCaptureListener(listener: CaptureMessageListener): () => void {
+    installCaptureListener(listener: CaptureMessageListener): (() => void) | undefined {
       let add: unknown;
       let remove: unknown;
       try {
         add = Reflect.get(target, 'addEventListener');
         remove = Reflect.get(target, 'removeEventListener');
       } catch {
-        return () => undefined;
+        return undefined;
       }
-      if (typeof add !== 'function' || typeof remove !== 'function') return () => undefined;
+      if (typeof add !== 'function' || typeof remove !== 'function') return undefined;
       const wrapped: CaptureMessageListener = (event): void => {
         try {
           listener(event);
@@ -1413,7 +1413,7 @@ export function createBrowserMessagingAdapter(
         Reflect.apply(add, target, ['message', wrapped, true]);
       } catch {
         rollback();
-        return () => undefined;
+        return undefined;
       }
       return () => {
         rollback();
@@ -1432,7 +1432,7 @@ export function createNoopMessagingAdapter(): MessagingAdapter {
   return Object.freeze({
     createChannel: () => undefined,
     postWindow: () => false,
-    installCaptureListener: () => () => undefined,
+    installCaptureListener: () => undefined,
     inspectGlobalMessage,
     parseProtocolMessage: (kind: ProtocolMessageKind, candidate: unknown) =>
       parseProtocolMessage(kind, candidate, {}),

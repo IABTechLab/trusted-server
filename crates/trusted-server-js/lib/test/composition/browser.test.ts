@@ -117,14 +117,15 @@ describe('browser composition', () => {
     const listener = vi.fn();
 
     const dispose = composition.adapters.messaging.installCaptureListener(listener);
+    expect(dispose).toBeTypeOf('function');
 
     expect(target.addEventListener).toHaveBeenCalledTimes(1);
     const installed = target.addEventListener.mock.calls[0]?.[1];
     expect(installed).toBeTypeOf('function');
     expect(target.addEventListener).toHaveBeenCalledWith('message', installed, true);
 
-    dispose();
-    dispose();
+    dispose?.();
+    dispose?.();
     expect(target.removeEventListener).toHaveBeenCalledTimes(1);
     expect(target.removeEventListener).toHaveBeenCalledWith('message', installed, true);
   });
@@ -149,7 +150,8 @@ describe('browser composition', () => {
 
     expect(composition.adapters.googletag.bindingStatus()).toBe('pending');
     expect(composition.adapters.prebid.bindingStatus()).toBe('pending');
-    expect(() => composition.adapters.messaging.installCaptureListener(listener)()).not.toThrow();
+    const disposeMessaging = composition.adapters.messaging.installCaptureListener(listener);
+    expect(disposeMessaging).toBeUndefined();
     expect(listener).not.toHaveBeenCalled();
   });
 
@@ -464,6 +466,45 @@ describe('browser composition', () => {
     expect(composition.runtimeSessionForTest()).toBeUndefined();
     expect(composition.projectionSlotsForTest()).toBeUndefined();
     expect(composition.pucBridgeForTest()).toBeUndefined();
+  });
+
+  it('falls back before publishing services when the PUC capture listener cannot install', async () => {
+    const correctnessGptListeners = vi.fn();
+    const composition = createTestBrowserRuntimeComposition(
+      {
+        target: {},
+        releaseId: 'a'.repeat(64),
+        manifest: { version: 1, releaseId: 'a'.repeat(64), integrations: [] },
+        knownIntegrationIds: Object.freeze([]),
+        boot: {
+          auctionProjection: {
+            version: 1,
+            auction: { version: 1, auctionId: 'initial', results: [] },
+            bids: [],
+          },
+          creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+        },
+        kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+      },
+      {
+        adapters: {
+          googletag: fakeGoogletagAdapter(),
+          messaging: fakeMessagingAdapter(() => undefined),
+          prebid: fakePrebidAdapter(),
+        },
+        coreActivations: { correctnessGptListeners },
+      }
+    );
+
+    expect(composition.runtime.start()).toBe(true);
+    await expect(composition.runtime.install()).resolves.toEqual({
+      state: 'fallback',
+      reason: 'bundle_partial',
+    });
+    expect(correctnessGptListeners).not.toHaveBeenCalled();
+    expect(composition.pucBridgeForTest()).toBeUndefined();
+    expect(composition.slotServiceForTest()).toBeUndefined();
   });
 
   it('releases initial programmatic slots before admitting a replacement SPA projection', async () => {
