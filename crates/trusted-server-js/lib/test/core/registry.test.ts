@@ -157,10 +157,39 @@ describe('registry', () => {
         )
       ).toHaveLength(1);
     }
+    for (const existingCount of [254, 255]) {
+      const existing = new Set(
+        Array.from({ length: existingCount }, (_, index) => `server-${index}`)
+      );
+      expect(prepareProgrammaticAdUnits(unit(`at-${existingCount + 1}`), existing)).toHaveLength(1);
+    }
     const existing = new Set(Array.from({ length: 256 }, (_, index) => `server-${index}`));
     expectRegistrationError(
       () => prepareProgrammaticAdUnits(unit('overflow'), existing),
       'registry_capacity'
+    );
+  });
+
+  it('enforces the encoded auction-unit body cap at the exact byte boundary', () => {
+    const candidate = {
+      code: 'body-boundary',
+      mediaTypes: { banner: { sizes: [[300, 250]] } },
+      bids: [{ bidder: 'fictional', params: { payload: '' } }],
+    };
+    const baseBytes = new TextEncoder().encode(
+      JSON.stringify({ adUnits: [candidate], config: {} })
+    ).byteLength;
+    const payloadAtLimit = 'x'.repeat(256 * 1024 - baseBytes);
+    candidate.bids[0]!.params.payload = payloadAtLimit;
+    expect(
+      new TextEncoder().encode(JSON.stringify({ adUnits: [candidate], config: {} }))
+    ).toHaveLength(256 * 1024);
+    expect(prepareProgrammaticAdUnits(candidate, new Set())).toHaveLength(1);
+
+    candidate.bids[0]!.params.payload += 'x';
+    expectRegistrationError(
+      () => prepareProgrammaticAdUnits(candidate, new Set()),
+      'request_body_too_large'
     );
   });
 });

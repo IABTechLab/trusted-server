@@ -211,7 +211,7 @@ function bindTrustedSlot(service: SlotService, navigation: NavigationSession, id
 describe('slot registry', () => {
   afterEach(() => vi.useRealTimers());
 
-  it('accepts exact nonempty 256-byte ids and rejects empty, 257-byte, NUL, and controls', () => {
+  it('accepts exact nonempty 256-byte ids and rejects empty, 257-byte, and ASCII controls', () => {
     const service = createSlotService({ googletag: createGptHarness().adapter });
     const navigation = createNavigation();
     const valid = `${'a'.repeat(254)}é`;
@@ -224,13 +224,17 @@ describe('slot registry', () => {
       'a'.repeat(257),
       'nul\0id',
       'line\nid',
-      `c1${String.fromCharCode(0x85)}`,
+      `del${String.fromCharCode(0x7f)}id`,
     ]) {
       expect(service.register(navigation, [serverRegistration(invalid)])).toEqual({
         ok: false,
         reason: 'invalid_slot_id',
       });
     }
+
+    expect(
+      service.register(navigation, [serverRegistration(`c1${String.fromCharCode(0x85)}id`)])
+    ).toMatchObject({ ok: true });
   });
 
   it('reserves the combined 256-record capacity atomically', () => {

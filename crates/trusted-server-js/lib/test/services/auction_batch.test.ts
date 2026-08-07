@@ -258,6 +258,35 @@ describe('auction batch service', () => {
     }
   });
 
+  it('cancels issued children without fetching for an already-aborted caller', async () => {
+    const fetcher = successfulFetcher(response([{ slot: 'slot-a', outcome: 'no_bid' }]));
+    const createAttempt = vi.fn((owner: RenderAttemptScope) => ({
+      ok: true as const,
+      value: attemptHarness(owner).attempt,
+    }));
+    const service = createService({
+      createAttempt,
+      fetcher,
+      renderWinner: () => false,
+    });
+    const caller = new AbortController();
+    caller.abort();
+
+    await expect(
+      service.create({
+        navigation: navigation(),
+        requestBody: '{}',
+        signal: caller.signal,
+        slots: Object.freeze(['slot-a']),
+        timeoutMs: 10_000,
+      }).result
+    ).resolves.toEqual({
+      slots: [{ slot: 'slot-a', path: 'primary', outcome: 'cancelled', reason: 'caller_aborted' }],
+    });
+    expect(createAttempt).toHaveBeenCalledOnce();
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it('supersedes only overlapping children and retains the old fetch until all old children settle', async () => {
     const firstFetch = abortablePendingFetcher();
     const secondFetch = successfulFetcher(response([{ slot: 'slot-a', outcome: 'no_bid' }]));
@@ -592,6 +621,39 @@ describe('auction batch service', () => {
     await expect(batch.result).resolves.toEqual({
       slots: [{ slot: 'slot-a', path: 'primary', outcome: 'cancelled', reason: 'caller_aborted' }],
     });
+    expect(pending.signals[0]?.aborted).toBe(true);
+  });
+
+  it('observes a branded caller signal without consulting shadowed instance hooks', async () => {
+    const pending = abortablePendingFetcher();
+    const service = createService({
+      createAttempt: (owner) => ({ ok: true, value: attemptHarness(owner).attempt }),
+      fetcher: pending.fetcher,
+      renderWinner: () => false,
+    });
+    const caller = new AbortController();
+    const publisherHook = vi.fn(() => {
+      throw new Error('publisher signal hook');
+    });
+    Object.defineProperties(caller.signal, {
+      aborted: { configurable: true, get: publisherHook },
+      addEventListener: { configurable: true, get: publisherHook },
+      removeEventListener: { configurable: true, get: publisherHook },
+    });
+
+    const batch = service.create({
+      navigation: navigation(),
+      requestBody: '{}',
+      signal: caller.signal,
+      slots: Object.freeze(['slot-a']),
+      timeoutMs: 10_000,
+    });
+    caller.abort();
+
+    await expect(batch.result).resolves.toEqual({
+      slots: [{ slot: 'slot-a', path: 'primary', outcome: 'cancelled', reason: 'caller_aborted' }],
+    });
+    expect(publisherHook).not.toHaveBeenCalled();
     expect(pending.signals[0]?.aborted).toBe(true);
   });
 });
