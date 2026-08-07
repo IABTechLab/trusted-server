@@ -41,6 +41,8 @@ const objectGetOwnPropertyNamesIntrinsic = Object.getOwnPropertyNames;
 const objectGetOwnPropertySymbolsIntrinsic = Object.getOwnPropertySymbols;
 const objectGetPrototypeOfIntrinsic = Object.getPrototypeOf;
 const objectIsFrozenIntrinsic = Object.isFrozen;
+const promiseThenIntrinsic = Promise.prototype.then;
+const reflectApplyIntrinsic = Reflect.apply;
 
 interface GptIntegrationRuntime {
   readonly start: (config: unknown) => void;
@@ -110,7 +112,8 @@ function currentProjectedWinner(input: GptWinnerPublicationInput): boolean {
       typeof input.artifact.dispose !== 'function' ||
       typeof input.slot !== 'object' ||
       input.slot === null ||
-      !input.navigation.isCurrent()
+      !input.navigation.isCurrent() ||
+      input.attempt.snapshot().outcome !== undefined
     ) {
       return false;
     }
@@ -200,7 +203,10 @@ function synchronousTargetingBoundary(adapter: GoogletagAdapter, slot: object): 
         completed = true;
       }
     });
-    void operation.result.catch(() => undefined);
+    void reflectApplyIntrinsic(promiseThenIntrinsic, operation.result, [
+      () => undefined,
+      () => undefined,
+    ]);
     if (!completed) {
       operation.dispose();
       throw new Error('GPT targeting operation is not synchronously available');
@@ -341,6 +347,9 @@ export async function publishGptWinner(
       if (!owner) throw new Error('targeting ownership unavailable');
       owners[owners.length] = owner;
     }
+    if (!input.navigation.isCurrent() || input.attempt.snapshot().outcome !== undefined) {
+      throw new Error('stale GPT publication');
+    }
     if (!isStillBound()) {
       disposeResources();
       return failAttempt('slot_unresolved');
@@ -378,7 +387,7 @@ export async function publishGptWinner(
       reservationId: input.bid.rendererReservationId,
       slots: {
         request: (requestInput) => {
-          const handle = input.slots.request(requestInput);
+          const handle = input.slots.request({ ...requestInput, expectedSlot: input.slot });
           requestStarted = true;
           return handle;
         },

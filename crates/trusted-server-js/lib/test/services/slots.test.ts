@@ -425,7 +425,39 @@ describe('slot registry', () => {
     expect(service.resolveRegisteredSlot('one')).toBeUndefined();
   });
 
-  it('recognizes only the exact live Trusted Server GPT binding', () => {
+  it('latches a publication request to the exact bound GPT identity', async () => {
+    const gpt = createGptHarness();
+    const service = createSlotService({ googletag: gpt.adapter });
+    const navigation = createNavigation();
+    const slot = bindTrustedSlot(service, navigation);
+    service.activate();
+
+    const stale = service.request({
+      expectedSlot: {},
+      intentId: 'stale-publication',
+      navigationGeneration: navigation.generation,
+      operation: 'display',
+      registeredSlotId: 'slot',
+      requestClass: 'primary',
+    });
+    await expect(stale.result).resolves.toEqual({ status: 'failed', reason: 'slot_unresolved' });
+    expect(gpt.display).not.toHaveBeenCalled();
+
+    const current = service.request({
+      expectedSlot: slot,
+      intentId: 'current-publication',
+      navigationGeneration: navigation.generation,
+      operation: 'display',
+      registeredSlotId: 'slot',
+      requestClass: 'primary',
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(current.status).toBe('active');
+    expect(gpt.display).toHaveBeenCalledExactlyOnceWith(slot);
+  });
+
+  it('recognizes the exact live GPT binding regardless of who defined the slot', () => {
     const service = createSlotService({ googletag: createGptHarness().adapter });
     const { navigation, runtime } = createRuntimeWithNavigation();
     const trustedSlot = bindTrustedSlot(service, navigation, 'trusted');
@@ -445,7 +477,7 @@ describe('slot registry', () => {
         slot: publisherSlot,
       })
     ).toEqual({ ok: true });
-    expect(service.isBoundGptSlot(navigation.generation, 'publisher', publisherSlot)).toBe(false);
+    expect(service.isBoundGptSlot(navigation.generation, 'publisher', publisherSlot)).toBe(true);
 
     runtime.dispose();
     expect(service.isBoundGptSlot(navigation.generation, 'trusted', trustedSlot)).toBe(false);
