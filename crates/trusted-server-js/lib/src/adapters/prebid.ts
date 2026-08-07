@@ -129,7 +129,7 @@ export interface PrebidFacade {
   registerBidAdapter(adapter: unknown, bidderCode: string, spec?: object): unknown;
   registerTrustedServerBidder(
     listener: (auction: Readonly<PrebidTrustedServerAuctionV1>) => void
-  ): unknown;
+  ): () => void;
   renderAd(targetDocument: object, adId: string): unknown;
   requestBids(options: object): unknown;
   subscribe(
@@ -957,7 +957,7 @@ export function createBrowserPrebidAdapter(
     listener: (auction: Readonly<PrebidTrustedServerAuctionV1>) => void,
     registerOperationEffect: (disposeEffect: () => void) => () => void,
     isOperationCurrent: () => boolean
-  ): unknown => {
+  ): (() => void) => {
     if (typeof listener !== 'function') {
       throw new TypeError('Trusted Server bidder listener must be a function');
     }
@@ -1043,12 +1043,13 @@ export function createBrowserPrebidAdapter(
     });
     const bidderFactory = (): Readonly<typeof bidder> => bidder;
     try {
-      return callBound(
+      callBound(
         binding,
         'registerBidAdapter',
         [bidderFactory, 'trustedServer'],
         isOperationCurrent
       );
+      return release;
     } catch (error) {
       release();
       throw error;
@@ -1076,7 +1077,7 @@ export function createBrowserPrebidAdapter(
         ),
       registerTrustedServerBidder: (
         listener: (auction: Readonly<PrebidTrustedServerAuctionV1>) => void
-      ): unknown =>
+      ): (() => void) =>
         registerTrustedServerBidder(binding, listener, registerOperationEffect, isOperationCurrent),
       renderAd: (targetDocument: object, adId: string): unknown =>
         callBound(binding, 'renderAd', [targetDocument, adId], isOperationCurrent),
