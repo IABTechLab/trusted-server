@@ -1,9 +1,21 @@
 import { DisposableStack, type DisposeCallback, type DisposalErrorHandler } from './disposable';
 import type { IdentityGenerationResult, NavigationIdentityIssuer } from './identity';
 
+const objectFreezeIntrinsic = Object.freeze;
+
+function freezeValue<Value extends object>(value: Value): Readonly<Value> {
+  return Reflect.apply(objectFreezeIntrinsic, Object, [value]) as Readonly<Value>;
+}
+
 /** Immutable price authority transferred from winner admission into one attempt. */
 export interface WinnerContext {
   readonly selectedCpm: number;
+}
+
+/** Reversible admission of one exact winner context into an attempt. */
+export interface WinnerContextAdmission {
+  readonly commit: () => boolean;
+  readonly rollback: () => boolean;
 }
 
 /** Factory that obtains one fresh eight-byte identity prefix per navigation. */
@@ -126,7 +138,7 @@ export interface RenderAttemptScope {
     callback: (...arguments_: Arguments) => unknown
   ) => (...arguments_: Arguments) => boolean;
   readonly isCurrent: () => boolean;
-  readonly adoptWinnerContext: (context: WinnerContext) => boolean;
+  readonly prepareWinnerContext: (context: WinnerContext) => WinnerContextAdmission | undefined;
   readonly onDispose: (kind: string, callback: DisposeCallback) => void;
   readonly dispose: () => void;
 }
@@ -211,6 +223,7 @@ class OwnerScope {
 class RenderAttemptOwner implements RenderAttemptScope {
   private readonly scope: OwnerScope;
   private acceptedWinnerContext: WinnerContext | undefined;
+  private pendingWinnerAdmission: object | undefined;
 
   public constructor(
     public readonly id: string,
@@ -238,9 +251,8 @@ class RenderAttemptOwner implements RenderAttemptScope {
     return this.acceptedWinnerContext;
   }
 
-  public adoptWinnerContext(context: WinnerContext): boolean {
-    if (!this.isCurrent()) return false;
-    if (this.acceptedWinnerContext !== undefined) return this.acceptedWinnerContext === context;
+  public prepareWinnerContext(context: WinnerContext): WinnerContextAdmission | undefined {
+    if (!this.isCurrent() || this.pendingWinnerAdmission !== undefined) return undefined;
     try {
       const descriptor = Object.getOwnPropertyDescriptor(context, 'selectedCpm');
       if (
@@ -255,12 +267,41 @@ class RenderAttemptOwner implements RenderAttemptScope {
         !Number.isFinite(descriptor.value) ||
         descriptor.value < 0
       ) {
-        return false;
+        return undefined;
       }
-      this.acceptedWinnerContext = context;
-      return true;
+      const previous = this.acceptedWinnerContext;
+      if (previous !== undefined && previous !== context) return undefined;
+      const token = freezeValue({});
+      this.pendingWinnerAdmission = token;
+      let committed = false;
+      return freezeValue({
+        commit: (): boolean => {
+          if (committed) return this.acceptedWinnerContext === context;
+          if (
+            this.pendingWinnerAdmission !== token ||
+            !this.isCurrent() ||
+            this.acceptedWinnerContext !== previous
+          ) {
+            return false;
+          }
+          this.acceptedWinnerContext = context;
+          this.pendingWinnerAdmission = undefined;
+          committed = true;
+          return true;
+        },
+        rollback: (): boolean => {
+          if (this.pendingWinnerAdmission === token) this.pendingWinnerAdmission = undefined;
+          if (committed && previous === undefined && this.acceptedWinnerContext === context) {
+            this.acceptedWinnerContext = undefined;
+            committed = false;
+            return true;
+          }
+          committed = false;
+          return this.acceptedWinnerContext === previous;
+        },
+      });
     } catch {
-      return false;
+      return undefined;
     }
   }
 
@@ -283,6 +324,7 @@ class RenderAttemptOwner implements RenderAttemptScope {
   }
 
   public dispose(): void {
+    this.pendingWinnerAdmission = undefined;
     this.scope.dispose();
   }
 }

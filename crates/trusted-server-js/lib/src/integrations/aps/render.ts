@@ -2,6 +2,8 @@ import { log } from '../../core/log';
 import type { ApsPrebidRendererEntry, ApsRendererV1, TsjsApi } from '../../core/types';
 import { validateApsRenderer } from '../../core/contracts/aps_renderer';
 
+const objectFreezeIntrinsic = Object.freeze;
+
 export { parseApsRendererDescriptor, validateApsRenderer } from '../../core/contracts/aps_renderer';
 
 export const APS_RENDERER_PATH = '/integrations/aps/renderer';
@@ -25,8 +27,14 @@ const MAX_PREBID_ID_BYTES = 1024;
 
 /** Validate, copy, and freeze one APS tagged render source. */
 export function prepareApsRenderSource(input: unknown): Readonly<ApsRendererV1> | undefined {
-  const renderer = validateApsRenderer(input);
-  return renderer ? Object.freeze(renderer) : undefined;
+  try {
+    const renderer = validateApsRenderer(input);
+    return renderer
+      ? (Reflect.apply(objectFreezeIntrinsic, Object, [renderer]) as Readonly<ApsRendererV1>)
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -15,6 +15,7 @@ import {
   createReservationService,
   isRendererReservationId,
   type ReservationOwner,
+  type ReservationRenderSource,
 } from '../../src/services/reservations';
 
 const CACHE_ID = '123e4567-e89b-42d3-a456-426614174000';
@@ -301,9 +302,17 @@ describe('renderer reservation identity and registration', () => {
               return adopted;
             },
             isCurrent: () => true,
-            adoptWinnerContext: (context) => {
-              adopted = context;
-              return true;
+            prepareWinnerContext: (context) => {
+              return {
+                commit: () => {
+                  adopted = context;
+                  return true;
+                },
+                rollback: () => {
+                  if (adopted === context) adopted = undefined;
+                  return true;
+                },
+              };
             },
           },
           pucSource: Object.freeze({}),
@@ -314,6 +323,220 @@ describe('renderer reservation identity and registration', () => {
       Map.prototype.set = originalSet;
       Map.prototype.delete = originalDelete;
     }
+  });
+
+  it('uses captured identity and UTF-8 validators after their prototypes are poisoned', () => {
+    const generation = Object.freeze({});
+    const renderSource = admSource() as ReservationRenderSource;
+    const service = createReservationService({
+      now: () => 0,
+      prepareRenderSource: (candidate) => (candidate === renderSource ? renderSource : undefined),
+    });
+    const owner: ReservationOwner = {
+      generation,
+      isCurrent: () => true,
+      onDispose: () => undefined,
+    };
+    const originalRegExpTest = RegExp.prototype.test;
+    const originalTextEncoderEncode = TextEncoder.prototype.encode;
+    let validIdentity: boolean | undefined;
+    let invalidIdentity: boolean | undefined;
+    let invalidSlot: ReturnType<typeof service.registerRender> | undefined;
+    let validRegistration: ReturnType<typeof service.registerRender> | undefined;
+    let thrown: unknown;
+
+    RegExp.prototype.test = function poisonedRegExpTest() {
+      throw new Error('poisoned RegExp.test');
+    };
+    TextEncoder.prototype.encode = function poisonedTextEncoderEncode() {
+      throw new Error('poisoned TextEncoder.encode');
+    };
+    try {
+      validIdentity = isRendererReservationId(reservationId());
+      invalidIdentity = isRendererReservationId('not-a-reservation');
+      invalidSlot = service.registerRender({
+        reservationId: reservationId(),
+        slot: 'x'.repeat(257),
+        navigation: owner,
+        attemptId: 'a1_0000000000000000000000',
+        renderSource,
+        winnerContext: { selectedCpm: 1 },
+      });
+      validRegistration = service.registerRender({
+        reservationId: reservationId(),
+        slot: 'fictional-slot',
+        navigation: owner,
+        attemptId: 'a1_0000000000000000000000',
+        renderSource,
+        winnerContext: { selectedCpm: 1 },
+      });
+    } catch (error) {
+      thrown = error;
+    } finally {
+      RegExp.prototype.test = originalRegExpTest;
+      TextEncoder.prototype.encode = originalTextEncoderEncode;
+    }
+
+    expect(thrown).toBeUndefined();
+    expect(validIdentity).toBe(true);
+    expect(invalidIdentity).toBe(false);
+    expect(invalidSlot).toEqual({ ok: false, reason: 'invalid_slot' });
+    expect(validRegistration).toMatchObject({ ok: true });
+  });
+
+  it('uses captured code-unit validation when String.charCodeAt returns benign data', () => {
+    const generation = Object.freeze({});
+    const renderSource = admSource() as ReservationRenderSource;
+    const service = createReservationService({
+      now: () => 0,
+      prepareRenderSource: (candidate) => (candidate === renderSource ? renderSource : undefined),
+    });
+    const originalCharCodeAt = String.prototype.charCodeAt;
+    const results: ReturnType<typeof service.registerRender>[] = [];
+    String.prototype.charCodeAt = () => 0x61;
+    try {
+      for (const [index, slot] of ['control\u0000slot', 'lone-surrogate\ud800'].entries()) {
+        results[results.length] = service.registerRender({
+          reservationId: reservationId(index),
+          slot,
+          navigation: { generation, isCurrent: () => true, onDispose: () => undefined },
+          attemptId: 'a1_0000000000000000000000',
+          renderSource,
+          winnerContext: { selectedCpm: 1 },
+        });
+      }
+    } finally {
+      String.prototype.charCodeAt = originalCharCodeAt;
+    }
+
+    expect(results).toEqual([
+      { ok: false, reason: 'invalid_slot' },
+      { ok: false, reason: 'invalid_slot' },
+    ]);
+    expect(service.snapshotInventoryForTest().size).toBe(0);
+  });
+
+  it('contains throwing String.charCodeAt poisoning without publishing', () => {
+    const generation = Object.freeze({});
+    const renderSource = admSource() as ReservationRenderSource;
+    const service = createReservationService({
+      now: () => 0,
+      prepareRenderSource: (candidate) => (candidate === renderSource ? renderSource : undefined),
+    });
+    const originalCharCodeAt = String.prototype.charCodeAt;
+    let result: ReturnType<typeof service.registerRender> | undefined;
+    let thrown: unknown;
+    String.prototype.charCodeAt = () => {
+      throw new Error('poisoned String.charCodeAt');
+    };
+    try {
+      result = service.registerRender({
+        reservationId: reservationId(),
+        slot: 'control\u0000slot',
+        navigation: { generation, isCurrent: () => true, onDispose: () => undefined },
+        attemptId: 'a1_0000000000000000000000',
+        renderSource,
+        winnerContext: { selectedCpm: 1 },
+      });
+    } catch (error) {
+      thrown = error;
+    } finally {
+      String.prototype.charCodeAt = originalCharCodeAt;
+    }
+
+    expect(thrown).toBeUndefined();
+    expect(result).toEqual({ ok: false, reason: 'invalid_slot' });
+    expect(service.snapshotInventoryForTest().size).toBe(0);
+  });
+
+  it.each([
+    ['throws before applying', false],
+    ['throws after applying', true],
+  ] as const)('contains a captured Map.set that %s', async (_name, applyFirst) => {
+    vi.resetModules();
+    const originalSet = Map.prototype.set;
+    Map.prototype.set = function poisonedReservationSet(key, value) {
+      if (typeof key !== 'string' || !key.startsWith('r1_')) {
+        return Reflect.apply(originalSet, this, [key, value]) as Map<unknown, unknown>;
+      }
+      if (applyFirst) Reflect.apply(originalSet, this, [key, value]);
+      throw new Error('captured reservation Map.set failure');
+    };
+    let isolated: typeof import('../../src/services/reservations');
+    try {
+      isolated = await import('../../src/services/reservations');
+    } finally {
+      Map.prototype.set = originalSet;
+    }
+    const generation = Object.freeze({});
+    let cleanup: (() => void) | undefined;
+    const renderSource = admSource() as ReservationRenderSource;
+    const service = isolated.createReservationService({
+      now: () => 0,
+      prepareRenderSource: (candidate) => (candidate === renderSource ? renderSource : undefined),
+    });
+    let result: ReturnType<typeof service.registerRender> | undefined;
+    let thrown: unknown;
+    try {
+      result = service.registerRender({
+        reservationId: reservationId(),
+        slot: 'fictional-slot',
+        navigation: {
+          generation,
+          isCurrent: () => true,
+          onDispose: (_kind, callback) => {
+            cleanup = callback;
+          },
+        },
+        attemptId: 'a1_0000000000000000000000',
+        renderSource,
+        winnerContext: { selectedCpm: 1 },
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeUndefined();
+    if (applyFirst) {
+      expect(result).toMatchObject({ ok: true });
+      expect(service.recognize(reservationId())).toMatchObject({ state: 'renderable' });
+      cleanup?.();
+      expect(service.recognize(reservationId())).toMatchObject({ state: 'disposed' });
+    } else {
+      expect(result).toEqual({ ok: false, reason: 'service_disposed' });
+      expect(service.recognize(reservationId())).toEqual({ recognized: false });
+      expect(cleanup).toBeUndefined();
+    }
+  });
+
+  it('checks publication identity after the final reentrant owner call', () => {
+    const service = serviceAt(() => 0);
+    const generation = Object.freeze({});
+    let cleanup: (() => void) | undefined;
+    let currentChecks = 0;
+    const owner: ReservationOwner = {
+      generation,
+      isCurrent: () => {
+        currentChecks += 1;
+        if (currentChecks === 3) cleanup?.();
+        return true;
+      },
+      onDispose: (_kind, callback) => {
+        cleanup = callback;
+      },
+    };
+
+    expect(
+      service.registerRender({
+        reservationId: reservationId(),
+        slot: 'fictional-slot',
+        navigation: owner,
+        attemptId: 'a1_0000000000000000000000',
+        renderSource: admSource(),
+        winnerContext: { selectedCpm: 1 },
+      })
+    ).toEqual({ ok: false, reason: 'stale_owner' });
+    expect(service.recognize(reservationId())).toMatchObject({ state: 'disposed' });
   });
 
   it('tombstones a registration if owner generation changes during disposal publication', () => {
@@ -396,21 +619,56 @@ describe('fixed expiry, capacity, and tombstones', () => {
     }
   });
 
-  it('never moves the monotonic clock backward', () => {
-    let now = 100;
+  it.each([
+    [
+      'throwing',
+      (): number => {
+        throw new Error('clock failed');
+      },
+    ],
+    ['nonfinite', (): number => Number.NaN],
+    ['backward', (): number => 99],
+  ] as const)('retains and suppresses every known id after a %s clock fault', (_name, fault) => {
+    let readNow = (): number => 100;
     const { navigation } = runtimeNavigation();
-    const attempt = renderAttempt(navigation);
-    const service = serviceAt(() => now);
-    expect(registerRender(service, navigation, attempt)).toEqual({
+    const liveAttempt = renderAttempt(navigation, 'live-slot');
+    const tombstonedAttempt = renderAttempt(navigation, 'tombstoned-slot');
+    const nextAttempt = renderAttempt(navigation, 'next-slot');
+    const service = serviceAt(() => readNow());
+    expect(registerRender(service, navigation, liveAttempt, reservationId())).toMatchObject({
       ok: true,
-      expiresAt: 100 + RENDER_RESERVATION_LIFETIME_MS,
     });
+    expect(registerRender(service, navigation, tombstonedAttempt, reservationId(1))).toMatchObject({
+      ok: true,
+    });
+    expect(tombstone(service, navigation, tombstonedAttempt, reservationId(1), 'disposed')).toBe(
+      true
+    );
 
-    now = 1;
-    expect(service.recognize(reservationId())).toEqual({
+    readNow = fault;
+
+    expect(service.recognize(reservationId())).toMatchObject({ state: 'renderable' });
+    expect(service.recognize(reservationId(1))).toMatchObject({ state: 'disposed' });
+    expect(claim(service, navigation, liveAttempt)).toEqual({
       recognized: true,
+      claimed: false,
       state: 'renderable',
-      expiresAt: 100 + RENDER_RESERVATION_LIFETIME_MS,
+    });
+    expect(claim(service, navigation, tombstonedAttempt, reservationId(1))).toEqual({
+      recognized: true,
+      claimed: false,
+      state: 'disposed',
+    });
+    expect(registerRender(service, navigation, nextAttempt, reservationId(2))).toEqual({
+      ok: false,
+      reason: 'service_disposed',
+    });
+    expect(service.snapshotInventoryForTest()).toMatchObject({
+      clockFaulted: true,
+      disposed: false,
+      size: 2,
+      live: 1,
+      tombstones: 1,
     });
   });
 
@@ -565,6 +823,72 @@ describe('fixed expiry, capacity, and tombstones', () => {
     expect(service.tombstone(exact, 'stale')).toBe(true);
   });
 
+  it('rejects invalid runtime tombstone states without changing live entries', () => {
+    const { navigation } = runtimeNavigation();
+    const attempt = renderAttempt(navigation);
+    const service = serviceAt(() => 0);
+    const bid = Object.freeze({ cpm: 1 });
+    registerRender(service, navigation, attempt, reservationId());
+    for (const index of [1, 2]) {
+      service.registerPrebidLease({
+        reservationId: reservationId(index),
+        slot: 'fictional-slot',
+        navigation,
+        auctionId: 'fictional-auction',
+        adUnitCode: 'fictional-slot',
+        renderSource: admSource(),
+        winnerContext: { selectedCpm: 1 },
+        prebidBid: bid,
+      });
+    }
+    const hostileState = Object.defineProperty({}, Symbol.toPrimitive, {
+      value() {
+        throw new Error('state must not be coerced');
+      },
+    });
+
+    expect(
+      service.tombstone(
+        {
+          reservationId: reservationId(),
+          slot: attempt.slot,
+          navigationGeneration: navigation.generation,
+          attemptId: attempt.id,
+        },
+        hostileState as never
+      )
+    ).toBe(false);
+    expect(
+      service.tombstonePrebidLease(
+        {
+          reservationId: reservationId(1),
+          auctionId: 'fictional-auction',
+          adUnitCode: 'fictional-slot',
+          navigationGeneration: navigation.generation,
+        },
+        'consumed' as never
+      )
+    ).toBe(false);
+    expect(
+      service.tombstonePrebidGroup(
+        {
+          auctionId: 'fictional-auction',
+          adUnitCode: 'fictional-slot',
+          navigationGeneration: navigation.generation,
+        },
+        'renderable' as never
+      )
+    ).toBe(0);
+    expect(service.recognize(reservationId())).toMatchObject({ state: 'renderable' });
+    expect(service.recognize(reservationId(1))).toMatchObject({
+      state: 'awaiting_prebid_selection',
+    });
+    expect(service.recognize(reservationId(2))).toMatchObject({
+      state: 'awaiting_prebid_selection',
+    });
+    expect(service.snapshotInventoryForTest()).toMatchObject({ live: 3, tombstones: 0 });
+  });
+
   it('shares capacity 320 across live and tombstones, never evicts, and still serves oldest', () => {
     let now = 0;
     const { navigation } = runtimeNavigation();
@@ -615,6 +939,57 @@ describe('fixed expiry, capacity, and tombstones', () => {
       entriesWithRenderSource: 0,
       entriesWithWinnerContext: 0,
     });
+  });
+
+  it('installs one owner disposer across sequential expired leases', () => {
+    let now = 0;
+    const { navigation } = runtimeNavigation();
+    const service = serviceAt(() => now);
+    const bid = Object.freeze({ cpm: 1 });
+
+    for (let index = 0; index < 1_000; index += 1) {
+      expect(
+        service.registerPrebidLease({
+          reservationId: reservationId(),
+          slot: 'fictional-slot',
+          navigation,
+          auctionId: `auction-${index}`,
+          adUnitCode: 'fictional-slot',
+          renderSource: admSource(),
+          winnerContext: { selectedCpm: 1 },
+          prebidBid: bid,
+        })
+      ).toMatchObject({ ok: true });
+      now += PREBID_ADMISSION_LEASE_MS;
+      expect(service.recognize(reservationId())).toEqual({ recognized: false });
+    }
+
+    expect(navigation.snapshotInventoryForTest().activeDisposers).toBe(1);
+    expect(service.snapshotInventoryForTest().size).toBe(0);
+  });
+
+  it('one owner callback tombstones every live state for its exact generation', () => {
+    const { navigation, runtime } = runtimeNavigation();
+    const attempt = renderAttempt(navigation);
+    const service = serviceAt(() => 0);
+    registerRender(service, navigation, attempt, reservationId());
+    service.registerPrebidLease({
+      reservationId: reservationId(1),
+      slot: 'fictional-slot',
+      navigation,
+      auctionId: 'fictional-auction',
+      adUnitCode: 'fictional-slot',
+      renderSource: admSource(),
+      winnerContext: { selectedCpm: 1 },
+      prebidBid: Object.freeze({ cpm: 1 }),
+    });
+
+    expect(navigation.snapshotInventoryForTest().activeDisposers).toBe(1);
+    runtime.replaceNavigation();
+
+    expect(service.recognize(reservationId())).toMatchObject({ state: 'disposed' });
+    expect(service.recognize(reservationId(1))).toMatchObject({ state: 'aborted' });
+    expect(service.snapshotInventoryForTest()).toMatchObject({ live: 0, tombstones: 2 });
   });
 });
 
@@ -1115,10 +1490,10 @@ describe('atomic claims and disposal', () => {
         return attempt.winnerContext;
       },
       isCurrent: () => attempt.isCurrent(),
-      adoptWinnerContext(winnerContext: WinnerContext): boolean {
+      prepareWinnerContext(winnerContext: WinnerContext) {
         const recognition = service.recognize(reservationId());
         if (recognition.recognized) observedStates.push(recognition.state);
-        return attempt.adoptWinnerContext(winnerContext);
+        return attempt.prepareWinnerContext(winnerContext);
       },
     };
 
@@ -1153,16 +1528,24 @@ describe('atomic claims and disposal', () => {
         return acceptedContext;
       },
       isCurrent: () => true,
-      adoptWinnerContext(context: WinnerContext): boolean {
-        nested = service.claim({
-          reservationId: reservationId(),
-          slot: attempt.slot,
-          navigationGeneration: navigation.generation,
-          attempt: sink,
-          pucSource: secondSource,
-        });
-        acceptedContext = context;
-        return true;
+      prepareWinnerContext(context: WinnerContext) {
+        return {
+          commit(): boolean {
+            nested = service.claim({
+              reservationId: reservationId(),
+              slot: attempt.slot,
+              navigationGeneration: navigation.generation,
+              attempt: sink,
+              pucSource: secondSource,
+            });
+            acceptedContext = context;
+            return true;
+          },
+          rollback(): boolean {
+            if (acceptedContext === context) acceptedContext = undefined;
+            return true;
+          },
+        };
       },
     };
 
@@ -1183,7 +1566,7 @@ describe('atomic claims and disposal', () => {
     });
   });
 
-  it('rolls back a throwing context transfer without retaining the attempted PUC source', () => {
+  it('terminally suppresses a throwing context preparation without retaining PUC source', () => {
     const { navigation } = runtimeNavigation();
     const attempt = renderAttempt(navigation);
     const service = serviceAt(() => 0);
@@ -1193,7 +1576,7 @@ describe('atomic claims and disposal', () => {
       slot: attempt.slot,
       winnerContext: undefined,
       isCurrent: () => true,
-      adoptWinnerContext(): boolean {
+      prepareWinnerContext() {
         throw new Error('partial transfer failed');
       },
     };
@@ -1206,9 +1589,162 @@ describe('atomic claims and disposal', () => {
         attempt: throwingSink,
         pucSource: Object.freeze({}),
       })
-    ).toEqual({ recognized: true, claimed: false, state: 'renderable' });
+    ).toEqual({ recognized: true, claimed: false, state: 'stale' });
     expect(service.snapshotInventoryForTest()).toMatchObject({
-      live: 1,
+      live: 0,
+      tombstones: 1,
+      entriesWithPucSource: 0,
+    });
+  });
+
+  it('terminally suppresses a claim when winner admission mutates, reenters, and throws', () => {
+    const { navigation } = runtimeNavigation();
+    const realAttempt = renderAttempt(navigation);
+    const service = serviceAt(() => 0);
+    registerRender(service, navigation, realAttempt);
+    const firstSource = Object.freeze({ name: 'first' });
+    const secondSource = Object.freeze({ name: 'second' });
+    let accepted: WinnerContext | undefined;
+    let nested: ReturnType<typeof service.claim> | undefined;
+    const attempt = {
+      id: realAttempt.id,
+      slot: realAttempt.slot,
+      get winnerContext(): WinnerContext | undefined {
+        return accepted;
+      },
+      isCurrent: () => true,
+      prepareWinnerContext(context: WinnerContext) {
+        return {
+          commit(): boolean {
+            accepted = context;
+            nested = service.claim({
+              reservationId: reservationId(),
+              slot: realAttempt.slot,
+              navigationGeneration: navigation.generation,
+              attempt,
+              pucSource: secondSource,
+            });
+            throw new Error('commit failed after mutation');
+          },
+          rollback(): boolean {
+            if (accepted === context) accepted = undefined;
+            return true;
+          },
+        };
+      },
+    };
+
+    expect(
+      service.claim({
+        reservationId: reservationId(),
+        slot: realAttempt.slot,
+        navigationGeneration: navigation.generation,
+        attempt,
+        pucSource: firstSource,
+      })
+    ).toEqual({ recognized: true, claimed: false, state: 'stale' });
+    expect(nested).toEqual({ recognized: true, claimed: false, state: 'renderable' });
+    expect(accepted).toBeUndefined();
+    expect(claim(service, navigation, realAttempt, reservationId(), secondSource)).toEqual({
+      recognized: true,
+      claimed: false,
+      state: 'stale',
+    });
+    expect(service.snapshotInventoryForTest()).toMatchObject({
+      live: 0,
+      tombstones: 1,
+      entriesWithPucSource: 0,
+    });
+  });
+
+  it('terminally suppresses a Prebid promotion when winner admission has unknown postcondition', () => {
+    const { navigation } = runtimeNavigation();
+    const realAttempt = renderAttempt(navigation);
+    const service = serviceAt(() => 0);
+    const bid = Object.freeze({ cpm: 1 });
+    service.registerPrebidLease({
+      reservationId: reservationId(),
+      slot: realAttempt.slot,
+      navigation,
+      auctionId: 'fictional-auction',
+      adUnitCode: realAttempt.slot,
+      renderSource: admSource(),
+      winnerContext: { selectedCpm: 1 },
+      prebidBid: bid,
+    });
+    let accepted: WinnerContext | undefined;
+    const attempt = {
+      id: realAttempt.id,
+      slot: realAttempt.slot,
+      get winnerContext(): WinnerContext | undefined {
+        throw new Error('winner context postcondition unavailable');
+      },
+      isCurrent: () => true,
+      prepareWinnerContext(context: WinnerContext) {
+        return {
+          commit(): boolean {
+            accepted = context;
+            return true;
+          },
+          rollback(): boolean {
+            if (accepted === context) accepted = undefined;
+            return true;
+          },
+        };
+      },
+    };
+
+    expect(
+      service.promotePrebidSelection({
+        reservationId: reservationId(),
+        auctionId: 'fictional-auction',
+        adUnitCode: realAttempt.slot,
+        navigationGeneration: navigation.generation,
+        attempt,
+        prebidBid: bid,
+      })
+    ).toEqual({ ok: false, reason: 'invalid_attempt' });
+    expect(accepted).toBeUndefined();
+    expect(service.recognize(reservationId())).toMatchObject({ state: 'stale' });
+    expect(
+      service.promotePrebidSelection({
+        reservationId: reservationId(),
+        auctionId: 'fictional-auction',
+        adUnitCode: realAttempt.slot,
+        navigationGeneration: navigation.generation,
+        attempt: realAttempt,
+        prebidBid: bid,
+      })
+    ).toEqual({ ok: false, reason: 'reservation_not_live' });
+  });
+
+  it('uses captured freezing during a claim without retaining busy claim state', () => {
+    const { navigation } = runtimeNavigation();
+    const attempt = renderAttempt(navigation);
+    const service = serviceAt(() => 0);
+    registerRender(service, navigation, attempt);
+    const pucSource = Object.freeze({});
+    const originalFreeze = Object.freeze;
+    let result: ReturnType<typeof service.claim> | undefined;
+    let thrown: unknown;
+
+    Object.freeze = function poisonedFreeze() {
+      throw new Error('poisoned Object.freeze');
+    };
+    try {
+      result = claim(service, navigation, attempt, reservationId(), pucSource);
+    } catch (error) {
+      thrown = error;
+    } finally {
+      Object.freeze = originalFreeze;
+    }
+
+    expect(thrown).toBeUndefined();
+    expect(result).toMatchObject({ recognized: true, claimed: true });
+    expect(service.recognize(reservationId())).toMatchObject({ state: 'consumed' });
+    expect(service.snapshotInventoryForTest()).toMatchObject({
+      live: 0,
+      tombstones: 1,
       entriesWithPucSource: 0,
     });
   });

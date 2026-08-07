@@ -1,4 +1,4 @@
-import type { WinnerContext } from '../kernel/sessions';
+import type { WinnerContext, WinnerContextAdmission } from '../kernel/sessions';
 
 export const RENDER_RESERVATION_LIFETIME_MS = 15 * 60 * 1_000;
 export const PREBID_ADMISSION_LEASE_MS = 10_000;
@@ -9,6 +9,10 @@ const AUCTION_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 const MAX_RESERVATIONS = 320;
 const textEncoder = new TextEncoder();
 
+const objectFreezeIntrinsic = Object.freeze;
+const regexpTestIntrinsic = RegExp.prototype.test;
+const stringCharCodeAtIntrinsic = String.prototype.charCodeAt;
+const textEncoderEncodeIntrinsic = TextEncoder.prototype.encode;
 const mapDeleteIntrinsic = Map.prototype.delete;
 const mapEntriesIntrinsic = Map.prototype.entries;
 const mapGetIntrinsic = Map.prototype.get;
@@ -23,6 +27,8 @@ const mapEntryIteratorNextIntrinsic = Object.getPrototypeOf(new Map().entries())
 const mapSizeGetter = Object.getOwnPropertyDescriptor(Map.prototype, 'size')?.get as (
   this: Map<unknown, unknown>
 ) => number;
+const weakMapGetIntrinsic = WeakMap.prototype.get;
+const weakMapSetIntrinsic = WeakMap.prototype.set;
 const performanceNowIntrinsic = performance.now;
 
 function mapValue<Key, Value>(map: Map<Key, Value>, key: Key): Value | undefined {
@@ -39,6 +45,21 @@ function deleteMapValue<Key, Value>(map: Map<Key, Value>, key: Key): boolean {
 
 function mapSize<Key, Value>(map: Map<Key, Value>): number {
   return Reflect.apply(mapSizeGetter, map, []) as number;
+}
+
+function weakMapValue<Key extends object, Value>(
+  map: WeakMap<Key, Value>,
+  key: Key
+): Value | undefined {
+  return Reflect.apply(weakMapGetIntrinsic, map, [key]) as Value | undefined;
+}
+
+function setWeakMapValue<Key extends object, Value>(
+  map: WeakMap<Key, Value>,
+  key: Key,
+  value: Value
+): void {
+  Reflect.apply(weakMapSetIntrinsic, map, [key, value]);
 }
 
 function mapValueSnapshot<Key, Value>(map: Map<Key, Value>): Value[] {
@@ -99,21 +120,28 @@ function ownDataRecord(
 }
 
 function frozenResult<Value extends object>(value: Value): Readonly<Value> {
-  return Object.freeze(value);
+  return Reflect.apply(objectFreezeIntrinsic, Object, [value]) as Readonly<Value>;
+}
+
+function matches(pattern: RegExp, value: string): boolean {
+  return Reflect.apply(regexpTestIntrinsic, pattern, [value]) as boolean;
 }
 
 function validBoundedString(value: unknown, maximumBytes: number): value is string {
   if (typeof value !== 'string' || value.length === 0) return false;
   for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
+    const code = Reflect.apply(stringCharCodeAtIntrinsic, value, [index]) as number;
     if (code <= 0x1f || code === 0x7f) return false;
     if (code >= 0xd800 && code <= 0xdbff) {
-      const next = value.charCodeAt(index + 1);
+      const next = Reflect.apply(stringCharCodeAtIntrinsic, value, [index + 1]) as number;
       if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
       index += 1;
     } else if (code >= 0xdc00 && code <= 0xdfff) return false;
   }
-  return textEncoder.encode(value).length <= maximumBytes;
+  return (
+    (Reflect.apply(textEncoderEncodeIntrinsic, textEncoder, [value]) as Uint8Array).length <=
+    maximumBytes
+  );
 }
 
 function copyTaggedRenderSource(value: unknown): ReservationRenderSource | undefined {
@@ -144,7 +172,7 @@ function copyTaggedRenderSource(value: unknown): ReservationRenderSource | undef
     ) {
       return undefined;
     }
-    return Object.freeze(output) as ReservationRenderSource;
+    return frozenResult(output) as ReservationRenderSource;
   } catch {
     return undefined;
   }
@@ -161,7 +189,7 @@ export interface ReservationAttempt {
   readonly slot: string;
   readonly winnerContext: WinnerContext | undefined;
   readonly isCurrent: () => boolean;
-  readonly adoptWinnerContext: (context: WinnerContext) => boolean;
+  readonly prepareWinnerContext: (context: WinnerContext) => WinnerContextAdmission | undefined;
 }
 
 export interface ReservationServiceOptions {
@@ -278,6 +306,7 @@ export type ReservationClaimResult =
     }>;
 
 export interface ReservationServiceInventory {
+  readonly clockFaulted: boolean;
   readonly disposed: boolean;
   readonly size: number;
   readonly live: number;
@@ -316,7 +345,6 @@ interface LiveReservation {
   readonly navigationGeneration: object;
   readonly renderSource: ReservationRenderSource;
   readonly winnerContext: WinnerContext;
-  readonly ownerToken: object;
   expiresAt: number;
   state: 'awaiting_prebid_selection' | 'renderable';
   attemptId: string | undefined;
@@ -334,10 +362,18 @@ interface ReservationTombstone {
 type ReservationEntry = LiveReservation | ReservationTombstone;
 
 interface OwnerSnapshot {
+  readonly identity: object;
   readonly generation: object;
   readonly isCurrent: () => boolean;
   readonly onDispose: (kind: string, callback: () => void) => void;
   readonly readGeneration: () => object | undefined;
+}
+
+interface OwnerRegistration {
+  readonly identity: object;
+  readonly token: object;
+  disposed: boolean;
+  ready: boolean;
 }
 
 function liveEntry(entry: ReservationEntry): entry is LiveReservation {
@@ -346,6 +382,22 @@ function liveEntry(entry: ReservationEntry): entry is LiveReservation {
 
 function ownerDisposalState(entry: LiveReservation): 'aborted' | 'disposed' {
   return entry.state === 'awaiting_prebid_selection' ? 'aborted' : 'disposed';
+}
+
+function validRenderTombstoneState(value: unknown): value is 'disposed' | 'stale' {
+  return value === 'disposed' || value === 'stale';
+}
+
+function validPrebidLeaseTombstoneState(
+  value: unknown
+): value is 'prebid_admission_failed' | 'prebid_contract_violation' {
+  return value === 'prebid_admission_failed' || value === 'prebid_contract_violation';
+}
+
+function validPrebidGroupTombstoneState(
+  value: unknown
+): value is 'aborted' | 'prebid_selection_timeout' {
+  return value === 'aborted' || value === 'prebid_selection_timeout';
 }
 
 function winnerContext(value: unknown): WinnerContext | undefined {
@@ -397,6 +449,7 @@ function ownerSnapshot(value: unknown): OwnerSnapshot | undefined {
       return undefined;
     }
     return {
+      identity: value as object,
       generation,
       isCurrent: () => Reflect.apply(isCurrentMethod, value, []) as boolean,
       onDispose: (kind, callback) => {
@@ -438,10 +491,53 @@ function attemptIdentity(attempt: ReservationAttempt): { id: string; slot: strin
   try {
     const id = attempt.id;
     const slot = attempt.slot;
-    if (!ATTEMPT_ID.test(id) || !validBoundedString(slot, 256)) return undefined;
+    if (!matches(ATTEMPT_ID, id) || !validBoundedString(slot, 256)) return undefined;
     return { id, slot };
   } catch {
     return undefined;
+  }
+}
+
+function prepareWinnerAdmission(
+  attempt: ReservationAttempt,
+  context: WinnerContext
+): WinnerContextAdmission | undefined {
+  try {
+    const prepare = attempt.prepareWinnerContext;
+    if (typeof prepare !== 'function') return undefined;
+    const admission = Reflect.apply(prepare, attempt, [context]) as unknown;
+    if ((typeof admission !== 'object' && typeof admission !== 'function') || admission === null) {
+      return undefined;
+    }
+    const commit = (admission as WinnerContextAdmission).commit;
+    const rollback = (admission as WinnerContextAdmission).rollback;
+    if (typeof commit !== 'function' || typeof rollback !== 'function') return undefined;
+    return frozenResult({
+      commit: (): boolean => Reflect.apply(commit, admission, []) === true,
+      rollback: (): boolean => Reflect.apply(rollback, admission, []) === true,
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+function commitWinnerAdmission(
+  attempt: ReservationAttempt,
+  admission: WinnerContextAdmission,
+  context: WinnerContext
+): boolean {
+  try {
+    return admission.commit() === true && attempt.winnerContext === context;
+  } catch {
+    return false;
+  }
+}
+
+function rollbackWinnerAdmission(admission: WinnerContextAdmission | undefined): void {
+  try {
+    admission?.rollback();
+  } catch {
+    // The reservation is terminally suppressed even when a hostile rollback fails.
   }
 }
 
@@ -450,9 +546,11 @@ function monotonicClock(source: () => number): () => number | undefined {
   return (): number | undefined => {
     try {
       const value = source();
-      if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return undefined;
-      last = Math.max(last, value);
-      return last;
+      if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value < last) {
+        return undefined;
+      }
+      last = value;
+      return value;
     } catch {
       return undefined;
     }
@@ -470,7 +568,7 @@ function defaultNow(): number {
 
 /** Whether a candidate is one exact server-minted renderer reservation id. */
 export function isRendererReservationId(value: unknown): value is string {
-  return typeof value === 'string' && RESERVATION_ID.test(value);
+  return typeof value === 'string' && matches(RESERVATION_ID, value);
 }
 
 /** Construct the runtime-owned renderer reservation service. */
@@ -478,6 +576,8 @@ export function createReservationService(options: ReservationServiceOptions): Re
   let nowSource: () => number = defaultNow;
   let prepareRenderSource: ReservationServiceOptions['prepareRenderSource'] | undefined;
   let disposed = false;
+  let clockFaulted = false;
+  let storeFaulted = false;
   try {
     if (options.now !== undefined) {
       if (typeof options.now !== 'function') disposed = true;
@@ -490,6 +590,7 @@ export function createReservationService(options: ReservationServiceOptions): Re
   }
   const readNow = monotonicClock(nowSource);
   const entries = new Map<string, ReservationEntry>();
+  const ownerRegistrations = new WeakMap<object, OwnerRegistration>();
 
   const disposeStore = (): void => {
     disposed = true;
@@ -514,14 +615,53 @@ export function createReservationService(options: ReservationServiceOptions): Re
   };
 
   const clock = (): number | undefined => {
-    if (disposed) return undefined;
+    if (disposed || clockFaulted || storeFaulted) return undefined;
     const now = readNow();
     if (now === undefined) {
-      disposeStore();
+      if (mapSize(entries) === 0) disposeStore();
+      else clockFaulted = true;
       return undefined;
     }
     prune(now);
     return now;
+  };
+
+  const refreshForLookup = (): boolean => {
+    if (disposed) return false;
+    if (clockFaulted || storeFaulted) return true;
+    const now = clock();
+    return now !== undefined || clockFaulted || storeFaulted;
+  };
+
+  const publishEntry = (
+    reservationId: string,
+    expected: ReservationEntry | undefined,
+    next: ReservationEntry
+  ): boolean => {
+    if (disposed || clockFaulted || storeFaulted) return false;
+    let before: ReservationEntry | undefined;
+    try {
+      before = mapValue(entries, reservationId);
+    } catch {
+      storeFaulted = true;
+      return false;
+    }
+    if (before !== expected) return false;
+    try {
+      setMapValue(entries, reservationId, next);
+    } catch {
+      // The captured operation may have applied the exact value before throwing.
+    }
+    let after: ReservationEntry | undefined;
+    try {
+      after = mapValue(entries, reservationId);
+    } catch {
+      storeFaulted = true;
+      return false;
+    }
+    if (after === next) return true;
+    storeFaulted = true;
+    return false;
   };
 
   const replaceWithTombstone = (
@@ -529,8 +669,68 @@ export function createReservationService(options: ReservationServiceOptions): Re
     expected: LiveReservation,
     state: ReservationTombstoneState
   ): boolean => {
-    if (mapValue(entries, reservationId) !== expected) return false;
-    setMapValue(entries, reservationId, frozenResult({ expiresAt: expected.expiresAt, state }));
+    const tombstone = frozenResult({ expiresAt: expected.expiresAt, state });
+    return publishEntry(reservationId, expected, tombstone);
+  };
+
+  const disposeOwnerEntries = (generation: object, token: object): void => {
+    const registration = weakMapValue(ownerRegistrations, generation);
+    if (!registration || registration.token !== token) return;
+    registration.disposed = true;
+    const snapshot = entrySnapshot(entries);
+    for (let index = 0; index < snapshot.length; index += 1) {
+      const pair = snapshot[index];
+      if (!pair) continue;
+      const entry = pair[1];
+      if (liveEntry(entry) && entry.navigationGeneration === generation) {
+        replaceWithTombstone(pair[0], entry, ownerDisposalState(entry));
+      }
+    }
+  };
+
+  const ensureOwnerRegistration = (owner: OwnerSnapshot): boolean => {
+    const existing = weakMapValue(ownerRegistrations, owner.generation);
+    if (existing?.identity === owner.identity) {
+      const ownerIsCurrent = currentOwner(owner);
+      const currentGeneration = owner.readGeneration();
+      return (
+        ownerIsCurrent &&
+        currentGeneration === owner.generation &&
+        weakMapValue(ownerRegistrations, owner.generation) === existing &&
+        existing.ready &&
+        !existing.disposed
+      );
+    }
+
+    const registration: OwnerRegistration = {
+      identity: owner.identity,
+      token: frozenResult({}),
+      disposed: false,
+      ready: false,
+    };
+    setWeakMapValue(ownerRegistrations, owner.generation, registration);
+    const generation = owner.generation;
+    const token = registration.token;
+    try {
+      owner.onDispose('reservation', () => disposeOwnerEntries(generation, token));
+    } catch {
+      if (weakMapValue(ownerRegistrations, generation) === registration) {
+        registration.disposed = true;
+      }
+      return false;
+    }
+    const ownerIsCurrent = currentOwner(owner);
+    const currentGeneration = owner.readGeneration();
+    if (
+      !ownerIsCurrent ||
+      currentGeneration !== generation ||
+      weakMapValue(ownerRegistrations, generation) !== registration ||
+      registration.disposed
+    ) {
+      registration.disposed = true;
+      return false;
+    }
+    registration.ready = true;
     return true;
   };
 
@@ -574,7 +774,7 @@ export function createReservationService(options: ReservationServiceOptions): Re
     if (prebid) {
       if (
         typeof input.auctionId !== 'string' ||
-        !AUCTION_ID.test(input.auctionId) ||
+        !matches(AUCTION_ID, input.auctionId) ||
         !validBoundedString(input.adUnitCode, 256) ||
         input.adUnitCode !== input.slot ||
         !prebidCpmMatches(input.prebidBid, context)
@@ -584,7 +784,7 @@ export function createReservationService(options: ReservationServiceOptions): Re
       auctionId = input.auctionId;
       adUnitCode = input.adUnitCode;
     } else {
-      if (typeof input.attemptId !== 'string' || !ATTEMPT_ID.test(input.attemptId)) {
+      if (typeof input.attemptId !== 'string' || !matches(ATTEMPT_ID, input.attemptId)) {
         return failure('invalid_attempt');
       }
       attemptId = input.attemptId;
@@ -610,7 +810,6 @@ export function createReservationService(options: ReservationServiceOptions): Re
       navigationGeneration: owner.generation,
       renderSource,
       winnerContext: context,
-      ownerToken: Object.freeze({}),
       expiresAt,
       state: prebid ? 'awaiting_prebid_selection' : 'renderable',
       attemptId,
@@ -619,33 +818,28 @@ export function createReservationService(options: ReservationServiceOptions): Re
       busy: false,
       pucSource: undefined,
     };
-    setMapValue(entries, input.reservationId, entry);
-    const publishedReservationId = input.reservationId;
-    const publishedOwnerToken = entry.ownerToken;
-    try {
-      owner.onDispose('reservation', () => {
-        const current = mapValue(entries, publishedReservationId);
-        if (current && liveEntry(current) && current.ownerToken === publishedOwnerToken) {
-          replaceWithTombstone(publishedReservationId, current, ownerDisposalState(current));
-        }
-      });
-      if (
-        mapValue(entries, input.reservationId) !== entry ||
-        !currentOwner(owner) ||
-        owner.readGeneration() !== entry.navigationGeneration
-      ) {
-        replaceWithTombstone(input.reservationId, entry, ownerDisposalState(entry));
-        return failure('stale_owner');
-      }
-    } catch {
-      replaceWithTombstone(input.reservationId, entry, ownerDisposalState(entry));
-      return failure('stale_owner');
+    const success = frozenResult({ ok: true as const, expiresAt: entry.expiresAt });
+    const staleOwner = failure('stale_owner');
+    if (!publishEntry(input.reservationId, undefined, entry)) {
+      return failure('service_disposed');
     }
-    return frozenResult({ ok: true, expiresAt: entry.expiresAt });
+    const ownerRegistered = ensureOwnerRegistration(owner);
+    const ownerIsCurrent = currentOwner(owner);
+    const currentGeneration = owner.readGeneration();
+    if (
+      !ownerRegistered ||
+      !ownerIsCurrent ||
+      currentGeneration !== entry.navigationGeneration ||
+      mapValue(entries, input.reservationId) !== entry
+    ) {
+      replaceWithTombstone(input.reservationId, entry, ownerDisposalState(entry));
+      return staleOwner;
+    }
+    return success;
   };
 
   const recognize = (reservationId: unknown): ReservationRecognition => {
-    if (clock() === undefined || typeof reservationId !== 'string') {
+    if (!refreshForLookup() || typeof reservationId !== 'string') {
       return frozenResult({ recognized: false });
     }
     const entry = mapValue(entries, reservationId);
@@ -698,40 +892,59 @@ export function createReservationService(options: ReservationServiceOptions): Re
         return failure('invalid_attempt');
       }
       entry.busy = true;
-      let adopted: boolean;
-      try {
-        adopted = attempt.adoptWinnerContext(entry.winnerContext) === true;
-      } catch {
-        adopted = false;
-      }
-      if (
-        !adopted ||
-        mapValue(entries, fields.reservationId) !== entry ||
-        !currentAttempt(attempt)
-      ) {
-        if (mapValue(entries, fields.reservationId) === entry) entry.busy = false;
+      const admission = prepareWinnerAdmission(attempt, entry.winnerContext);
+      const committed = admission
+        ? commitWinnerAdmission(attempt, admission, entry.winnerContext)
+        : false;
+      const attemptIsCurrent = currentAttempt(attempt);
+      if (!committed || !attemptIsCurrent || mapValue(entries, fields.reservationId) !== entry) {
+        rollbackWinnerAdmission(admission);
+        replaceWithTombstone(fields.reservationId, entry, 'stale');
         return failure('invalid_attempt');
       }
-      entry.attemptId = identity.id;
-      entry.state = 'renderable';
-      entry.expiresAt = promotedExpiry;
-      entry.busy = false;
+      const promoted: LiveReservation = {
+        reservationId: entry.reservationId,
+        slot: entry.slot,
+        navigationGeneration: entry.navigationGeneration,
+        renderSource: entry.renderSource,
+        winnerContext: entry.winnerContext,
+        expiresAt: promotedExpiry,
+        state: 'renderable',
+        attemptId: identity.id,
+        auctionId: entry.auctionId,
+        adUnitCode: entry.adUnitCode,
+        busy: true,
+        pucSource: undefined,
+      };
+      const success = frozenResult({ ok: true as const, expiresAt: promotedExpiry });
+      if (!publishEntry(fields.reservationId, entry, promoted)) {
+        rollbackWinnerAdmission(admission);
+        replaceWithTombstone(fields.reservationId, entry, 'stale');
+        return failure('service_disposed');
+      }
+      let losersSuppressed = true;
       const candidates = mapValueSnapshot(entries);
       for (let index = 0; index < candidates.length; index += 1) {
         const candidate = candidates[index];
         if (
           candidate &&
-          candidate !== entry &&
+          candidate !== promoted &&
           liveEntry(candidate) &&
           candidate.state === 'awaiting_prebid_selection' &&
-          candidate.auctionId === entry.auctionId &&
-          candidate.adUnitCode === entry.adUnitCode &&
-          candidate.navigationGeneration === entry.navigationGeneration
+          candidate.auctionId === promoted.auctionId &&
+          candidate.adUnitCode === promoted.adUnitCode &&
+          candidate.navigationGeneration === promoted.navigationGeneration &&
+          !replaceWithTombstone(candidate.reservationId, candidate, 'unselected')
         ) {
-          replaceWithTombstone(candidate.reservationId, candidate, 'unselected');
+          losersSuppressed = false;
         }
       }
-      return frozenResult({ ok: true, expiresAt: entry.expiresAt });
+      if (!losersSuppressed || storeFaulted) {
+        rollbackWinnerAdmission(admission);
+        return failure('service_disposed');
+      }
+      promoted.busy = false;
+      return success;
     },
     claim(input): ReservationClaimResult {
       const minimalId = (() => {
@@ -741,12 +954,15 @@ export function createReservationService(options: ReservationServiceOptions): Re
           return undefined;
         }
       })();
-      if (clock() === undefined || typeof minimalId !== 'string') {
+      if (!refreshForLookup() || typeof minimalId !== 'string') {
         return frozenResult({ recognized: false });
       }
       const entry = mapValue(entries, minimalId);
       if (!entry) return frozenResult({ recognized: false });
       if (!liveEntry(entry)) {
+        return refusedClaim(entry.state);
+      }
+      if (clockFaulted || storeFaulted) {
         return refusedClaim(entry.state);
       }
       if (entry.busy) {
@@ -780,36 +996,36 @@ export function createReservationService(options: ReservationServiceOptions): Re
       ) {
         return refusedClaim(entry.state);
       }
-      entry.busy = true;
-      entry.pucSource = fields.pucSource;
-      let adopted: boolean;
-      try {
-        adopted = attempt.adoptWinnerContext(entry.winnerContext) === true;
-      } catch {
-        adopted = false;
-      }
-      if (!adopted || mapValue(entries, minimalId) !== entry || !currentAttempt(attempt)) {
-        if (mapValue(entries, minimalId) === entry) {
-          entry.pucSource = undefined;
-          entry.busy = false;
-          return refusedClaim(entry.state);
-        }
-        const replacement = mapValue(entries, minimalId);
-        return refusedClaim(replacement?.state ?? 'stale');
-      }
       const result = frozenResult({
         recognized: true as const,
         claimed: true as const,
         renderSource: entry.renderSource,
         winnerContext: entry.winnerContext,
-        pucSource: entry.pucSource,
+        pucSource: fields.pucSource,
         expiresAt: entry.expiresAt,
       });
-      replaceWithTombstone(minimalId, entry, 'consumed');
+      entry.busy = true;
+      const admission = prepareWinnerAdmission(attempt, entry.winnerContext);
+      const committed = admission
+        ? commitWinnerAdmission(attempt, admission, entry.winnerContext)
+        : false;
+      const attemptIsCurrent = currentAttempt(attempt);
+      if (!committed || !attemptIsCurrent || mapValue(entries, minimalId) !== entry) {
+        rollbackWinnerAdmission(admission);
+        replaceWithTombstone(minimalId, entry, 'stale');
+        const replacement = mapValue(entries, minimalId);
+        return refusedClaim(replacement?.state ?? 'stale');
+      }
+      if (!replaceWithTombstone(minimalId, entry, 'consumed')) {
+        rollbackWinnerAdmission(admission);
+        const replacement = mapValue(entries, minimalId);
+        return refusedClaim(replacement?.state ?? 'stale');
+      }
       return result;
     },
     recognize,
     tombstone(input, state): boolean {
+      if (!validRenderTombstoneState(state)) return false;
       const fields = ownDataRecord(input, [
         'reservationId',
         'slot',
@@ -833,6 +1049,7 @@ export function createReservationService(options: ReservationServiceOptions): Re
       return replaceWithTombstone(fields.reservationId, entry, state);
     },
     tombstonePrebidLease(input, state): boolean {
+      if (!validPrebidLeaseTombstoneState(state)) return false;
       const fields = ownDataRecord(input, [
         'reservationId',
         'auctionId',
@@ -857,6 +1074,7 @@ export function createReservationService(options: ReservationServiceOptions): Re
       return replaceWithTombstone(fields.reservationId, entry, state);
     },
     tombstonePrebidGroup(input, state): number {
+      if (!validPrebidGroupTombstoneState(state)) return 0;
       const fields = ownDataRecord(input, ['auctionId', 'adUnitCode', 'navigationGeneration']);
       if (clock() === undefined || !fields) {
         return 0;
@@ -901,6 +1119,7 @@ export function createReservationService(options: ReservationServiceOptions): Re
         } else tombstones += 1;
       }
       return frozenResult({
+        clockFaulted,
         disposed,
         size: mapSize(entries),
         live,
