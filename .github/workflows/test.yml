@@ -247,6 +247,9 @@ jobs:
       - name: Build bundle
         run: npm run build
 
+      - name: Enforce bundle budgets
+        run: npm run check:bundle
+
       - name: Typecheck full TSJS package
         run: npm run typecheck
 

@@ -10,6 +10,7 @@
     "build:prebid-external": "node build-prebid-external.mjs",
     "generate:aps-contract": "node ../../../scripts/generate-aps-renderer-contract.mjs",
     "check:aps-contract": "node ../../../scripts/generate-aps-renderer-contract.mjs --check",
+    "check:bundle": "node scripts/check-bundle-budgets.mjs",
     "dev": "vite build --watch",
     "test": "vitest run",
     "posttest": "npm run build && npm run test:release",
