@@ -95,6 +95,8 @@ export type SlotRequestOutcome =
   | Readonly<{ status: 'cancelled'; reason: 'navigation_disposed' | 'superseded' }>;
 
 export interface SlotRequestInput {
+  /** Exact physical identity latch for a cross-service publication transaction. */
+  readonly expectedSlot?: object;
   readonly intentId: string;
   readonly navigationGeneration: object;
   readonly operation: 'display' | 'refresh';
@@ -2110,6 +2112,10 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       settle(intent, failed('slot_unresolved'));
       return handle;
     }
+    if (input.expectedSlot !== undefined && input.expectedSlot !== physical.slot) {
+      settle(intent, failed('slot_unresolved'));
+      return handle;
+    }
     if (physical.state === 'retired' || physical.quarantineReason === 'request') {
       settle(intent, failed('gpt_request_failed'));
       return handle;
@@ -2508,7 +2514,6 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
           !!physical &&
           physical.slot === slot &&
           physical.record === record &&
-          physical.ownership === 'trusted_server' &&
           physical.state === 'live'
         );
       } catch {
