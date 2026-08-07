@@ -497,6 +497,71 @@ describe('adapter-owned GPT replacement transaction', () => {
     expect(harness.destroySlots).toHaveBeenCalledTimes(2);
   });
 
+  it('normalizes a defineSlot throw after destroying the old slot', async () => {
+    const harness = createReplacementHarness();
+    const publisherFailure = new Error('publisher define failed');
+    harness.defineSlot.mockImplementation(() => {
+      throw publisherFailure;
+    });
+    const operation = harness.adapter.run((gpt) =>
+      gpt.transactionalReplace({}, definition, () => true, commitReplacement)
+    );
+
+    await expect(operation.result).rejects.toMatchObject({
+      cause: publisherFailure,
+      code: 'gpt_replacement_failed',
+      oldSlotDestroyed: true,
+      orphanedSlot: undefined,
+    });
+    expect(harness.destroySlots).toHaveBeenCalledOnce();
+  });
+
+  it('leaves the service unbound after the real adapter destroys old then defineSlot throws', async () => {
+    vi.useFakeTimers();
+    const harness = createReplacementHarness();
+    harness.defineSlot.mockImplementation(() => {
+      throw new Error('publisher define failed');
+    });
+    const service = createSlotService({ googletag: harness.adapter });
+    const navigation = createNavigation();
+    const oldSlot = { old: true };
+    expect(
+      service.register(navigation, [
+        serverRegistration('slot', {
+          adUnitCode: '/network/slot',
+          domAliases: ['slot-div'],
+        }),
+      ])
+    ).toMatchObject({ ok: true });
+    expect(
+      service.adoptGptSlot(navigation.generation, 'slot', {
+        definition,
+        ownership: 'trusted_server',
+        slot: oldSlot,
+      })
+    ).toEqual({ ok: true });
+    const request = service.request({
+      intentId: 'real-define-throw',
+      navigationGeneration: navigation.generation,
+      operation: 'refresh',
+      registeredSlotId: 'slot',
+      requestClass: 'primary',
+    });
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(3_000);
+    await expect(request.result).resolves.toMatchObject({ reason: 'gpt_request_timeout' });
+    await Promise.resolve();
+
+    expect(service.recordPublisherDestruction(oldSlot)).toBe(false);
+    expect(
+      service.adoptGptSlot(navigation.generation, 'slot', {
+        definition,
+        ownership: 'trusted_server',
+        slot: { retry: true },
+      })
+    ).toEqual({ ok: true });
+  });
+
   it('rejects a defineSlot candidate that is the retired old object', async () => {
     const harness = createReplacementHarness();
     const oldSlot = { addService: vi.fn() };
@@ -857,6 +922,96 @@ describe('physical GPT cycles', () => {
     ]);
   });
 
+  it('rejects display batches at the type and runtime boundaries before mutation', () => {
+    const harness = createGptHarness();
+    const service = createSlotService({ googletag: harness.adapter });
+    const navigation = createNavigation();
+    bindTrustedSlot(service, navigation);
+    const displayBatch = [
+      {
+        intentId: 'valid-before-display',
+        navigationGeneration: navigation.generation,
+        operation: 'refresh' as const,
+        registeredSlotId: 'slot',
+        requestClass: 'primary',
+      },
+      {
+        intentId: 'display-batch',
+        navigationGeneration: navigation.generation,
+        operation: 'display' as const,
+        registeredSlotId: 'slot',
+        requestClass: 'primary',
+      },
+    ] as const;
+    const compileOnly = (): void => {
+      // @ts-expect-error requestBatch is refresh-only; single request retains display support.
+      service.requestBatch(displayBatch);
+    };
+    expect(compileOnly).toBeTypeOf('function');
+    const inventory = service.snapshotForTest();
+    const runtimeRequestBatch = service.requestBatch as unknown as (
+      inputs: readonly object[]
+    ) => unknown;
+
+    expect(runtimeRequestBatch(displayBatch)).toEqual([]);
+    expect(service.snapshotForTest()).toEqual(inventory);
+    expect(harness.display).not.toHaveBeenCalled();
+    expect(harness.refresh).not.toHaveBeenCalled();
+  });
+
+  it.each(['unknown-slot', 'duplicate-slot', 'duplicate-intent', 'mixed-navigation'] as const)(
+    'prevalidates the entire SRA batch atomically: %s',
+    (failure) => {
+      const harness = createGptHarness();
+      const service = createSlotService({ googletag: harness.adapter });
+      const firstNavigation = createNavigation();
+      const secondNavigation = createNavigation();
+      bindTrustedSlot(service, firstNavigation, 'first');
+      bindTrustedSlot(service, firstNavigation, 'second');
+      bindTrustedSlot(service, secondNavigation, 'other-navigation');
+      const first = {
+        intentId: 'first-intent',
+        navigationGeneration: firstNavigation.generation,
+        operation: 'refresh' as const,
+        registeredSlotId: 'first',
+        requestClass: 'primary',
+      };
+      const second = {
+        intentId: failure === 'duplicate-intent' ? first.intentId : 'second-intent',
+        navigationGeneration:
+          failure === 'mixed-navigation' ? secondNavigation.generation : firstNavigation.generation,
+        operation: 'refresh' as const,
+        registeredSlotId:
+          failure === 'unknown-slot'
+            ? 'missing'
+            : failure === 'duplicate-slot'
+              ? first.registeredSlotId
+              : failure === 'mixed-navigation'
+                ? 'other-navigation'
+                : 'second',
+        requestClass: 'primary',
+      };
+      const inventory = service.snapshotForTest();
+
+      expect(service.requestBatch([first, second])).toEqual([]);
+      expect(service.snapshotForTest()).toEqual(inventory);
+      expect(harness.refresh).not.toHaveBeenCalled();
+    }
+  );
+
+  it('treats an empty SRA batch as an inert rejection', () => {
+    const harness = createGptHarness();
+    const service = createSlotService({ googletag: harness.adapter });
+    expect(service.requestBatch([])).toEqual([]);
+    expect(service.snapshotForTest()).toEqual({
+      cycles: 0,
+      intents: 0,
+      physicalSlots: 0,
+      records: 0,
+    });
+    expect(harness.refresh).not.toHaveBeenCalled();
+  });
+
   it('keeps publisher display intent publisher-owned and fails ambiguous overlap', async () => {
     const harness = createGptHarness();
     const service = createSlotService({ googletag: harness.adapter });
@@ -967,6 +1122,50 @@ describe('physical GPT cycles', () => {
       responseIdentifier: 'second-primary-response',
       status: 'empty',
     });
+  });
+
+  it('promotes a queued replacement when its active predecessor cancels before invocation', async () => {
+    const harness = createGptHarness();
+    const service = createSlotService({ googletag: harness.adapter });
+    const navigation = createNavigation();
+    const slot = bindTrustedSlot(service, navigation);
+    const first = service.request({
+      intentId: 'cancelled-before-invocation',
+      navigationGeneration: navigation.generation,
+      operation: 'refresh',
+      requestClass: 'primary',
+      registeredSlotId: 'slot',
+    });
+    const second = service.request({
+      intentId: 'promoted-after-cancellation',
+      navigationGeneration: navigation.generation,
+      operation: 'refresh',
+      requestClass: 'primary',
+      registeredSlotId: 'slot',
+    });
+    expect(second.status).toBe('queued');
+
+    first.dispose();
+    await expect(first.result).resolves.toEqual({
+      reason: 'superseded',
+      status: 'cancelled',
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(harness.refresh).toHaveBeenCalledTimes(1);
+    expect(second.status).toBe('active');
+
+    service.handleGptEvent('slotRequested', { slot });
+    service.handleGptEvent('slotRenderEnded', {
+      isEmpty: false,
+      responseIdentifier: 'promoted-response',
+      slot,
+    });
+    await expect(second.result).resolves.toEqual({
+      responseIdentifier: 'promoted-response',
+      status: 'rendered',
+    });
+    expect(service.snapshotForTest()).toMatchObject({ cycles: 0, intents: 0 });
   });
 
   it('fails active and queued TS work when publisher intent makes ownership ambiguous', async () => {
@@ -1739,6 +1938,70 @@ describe('Task 11 adversarial ownership review', () => {
     ).toEqual({ ok: false, reason: 'gpt_request_failed' });
   });
 
+  it('reads a replacement definition once and owns an immutable placement snapshot', async () => {
+    vi.useFakeTimers();
+    const harness = createGptHarness();
+    const service = createSlotService({ googletag: harness.adapter });
+    const navigation = createNavigation();
+    expect(
+      service.register(navigation, [
+        serverRegistration('slot', {
+          adUnitCode: '/network/original',
+          domAliases: ['original-div'],
+        }),
+      ])
+    ).toMatchObject({ ok: true });
+    let adUnitPath = '/network/original';
+    let elementId = 'original-div';
+    const sizes = [[300, 250]];
+    const reads = { adUnitPath: 0, elementId: 0, sizes: 0 };
+    const definition = {
+      get adUnitPath() {
+        reads.adUnitPath += 1;
+        return adUnitPath;
+      },
+      get elementId() {
+        reads.elementId += 1;
+        return elementId;
+      },
+      get sizes() {
+        reads.sizes += 1;
+        return sizes;
+      },
+    };
+    const slot = { original: true };
+    expect(
+      service.adoptGptSlot(navigation.generation, 'slot', {
+        definition,
+        ownership: 'trusted_server',
+        slot,
+      })
+    ).toEqual({ ok: true });
+    expect(reads).toEqual({ adUnitPath: 1, elementId: 1, sizes: 1 });
+
+    adUnitPath = '/network/redirected';
+    elementId = 'redirected-div';
+    sizes[0] = [999, 999];
+    const request = service.request({
+      intentId: 'immutable-definition',
+      navigationGeneration: navigation.generation,
+      operation: 'refresh',
+      registeredSlotId: 'slot',
+      requestClass: 'primary',
+    });
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(3_000);
+    await expect(request.result).resolves.toMatchObject({ reason: 'gpt_request_timeout' });
+    await Promise.resolve();
+
+    expect(reads).toEqual({ adUnitPath: 1, elementId: 1, sizes: 1 });
+    expect(harness.defineSlot).toHaveBeenCalledWith(
+      '/network/original',
+      [[300, 250]],
+      'original-div'
+    );
+  });
+
   it('counts multiple publisher intents and preserves two publisher cycles', () => {
     const service = createSlotService({ googletag: createGptHarness().adapter });
     const navigation = createNavigation();
@@ -2007,8 +2270,9 @@ describe('Task 11 adversarial ownership review', () => {
   it('enforces the completion deadline in the handler when timer delivery is blocked', async () => {
     vi.useFakeTimers();
     let current = 0;
+    const harness = createGptHarness();
     const service = createSlotService({
-      googletag: createGptHarness().adapter,
+      googletag: harness.adapter,
       now: () => current,
     });
     const navigation = createNavigation();
@@ -2027,6 +2291,20 @@ describe('Task 11 adversarial ownership review', () => {
     service.handleGptEvent('slotRenderEnded', { isEmpty: false, slot });
 
     await expect(request.result).resolves.toMatchObject({ reason: 'gpt_completion_timeout' });
+    expect(service.snapshotForTest().cycles).toBe(0);
+
+    const next = service.request({
+      intentId: 'after-late-exact-completion',
+      navigationGeneration: navigation.generation,
+      operation: 'refresh',
+      registeredSlotId: 'slot',
+      requestClass: 'primary',
+    });
+    await Promise.resolve();
+    expect(harness.refresh).toHaveBeenCalledTimes(2);
+    service.handleGptEvent('slotRequested', { slot });
+    service.handleGptEvent('slotRenderEnded', { isEmpty: false, slot });
+    await expect(next.result).resolves.toMatchObject({ status: 'rendered' });
   });
 
   it('fails active and queued work when publisher intent overlaps the opened TS cycle', async () => {
@@ -2205,6 +2483,85 @@ describe('Task 11 adversarial ownership review', () => {
     expect(service.recordPublisherDestruction(oldSlot)).toBe(true);
   });
 
+  it.each([true, false])(
+    'never cleans or republishes a replacement candidate owned by another record: cleanup=%s',
+    async (candidateCleanupWouldSucceed) => {
+      vi.useFakeTimers();
+      const harness = createReplacementHarness();
+      harness.destroySlots
+        .mockReturnValueOnce(true)
+        .mockReturnValueOnce(candidateCleanupWouldSucceed);
+      const service = createSlotService({ googletag: harness.adapter });
+      const navigation = createNavigation();
+      const firstDefinition = Object.freeze({
+        adUnitPath: '/network/first',
+        elementId: 'first-div',
+        sizes: Object.freeze([[300, 250]]),
+      });
+      const secondDefinition = Object.freeze({
+        adUnitPath: '/network/second',
+        elementId: 'second-div',
+        sizes: Object.freeze([[300, 250]]),
+      });
+      const oldSlot = { old: true };
+      expect(
+        service.register(navigation, [
+          serverRegistration('first', {
+            adUnitCode: firstDefinition.adUnitPath,
+            domAliases: [firstDefinition.elementId],
+          }),
+          serverRegistration('second', {
+            adUnitCode: secondDefinition.adUnitPath,
+            domAliases: [secondDefinition.elementId],
+          }),
+        ])
+      ).toMatchObject({ ok: true });
+      expect(
+        service.adoptGptSlot(navigation.generation, 'first', {
+          definition: firstDefinition,
+          ownership: 'trusted_server',
+          slot: oldSlot,
+        })
+      ).toEqual({ ok: true });
+      expect(
+        service.adoptGptSlot(navigation.generation, 'second', {
+          definition: secondDefinition,
+          ownership: 'trusted_server',
+          slot: harness.replacement,
+        })
+      ).toEqual({ ok: true });
+      const request = service.request({
+        intentId: `collision-${String(candidateCleanupWouldSucceed)}`,
+        navigationGeneration: navigation.generation,
+        operation: 'refresh',
+        registeredSlotId: 'first',
+        requestClass: 'primary',
+      });
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(3_000);
+      await expect(request.result).resolves.toMatchObject({ reason: 'gpt_request_timeout' });
+      await Promise.resolve();
+
+      expect(harness.destroySlots).toHaveBeenCalledOnce();
+      expect(harness.replacement.addService).not.toHaveBeenCalled();
+      expect(
+        service.adoptGptSlot(navigation.generation, 'second', {
+          definition: secondDefinition,
+          ownership: 'trusted_server',
+          slot: harness.replacement,
+        })
+      ).toEqual({ ok: true });
+      const blocked = service.request({
+        intentId: 'original-remains-quarantined',
+        navigationGeneration: navigation.generation,
+        operation: 'refresh',
+        registeredSlotId: 'first',
+        requestClass: 'primary',
+      });
+      await expect(blocked.result).resolves.toMatchObject({ reason: 'gpt_request_failed' });
+    }
+  );
+
   it('leaves a clean define failure unbound and immediately re-adoptable', async () => {
     vi.useFakeTimers();
     const harness = createGptHarness();
@@ -2346,6 +2703,58 @@ describe('Task 11 adversarial ownership review', () => {
     expect(service.register(next, [serverRegistration('unrelated')])).toEqual({
       ok: false,
       reason: 'slot_quarantined',
+    });
+  });
+
+  it('clears saturated placement quarantine only after every saturated owner releases once', () => {
+    const harness = createGptHarness();
+    harness.destroySlots.mockReturnValue(false);
+    const service = createSlotService({ googletag: harness.adapter });
+    const navigation = createNavigation();
+    const oldSlots: object[] = [];
+    for (let recordIndex = 0; recordIndex < 9; recordIndex += 1) {
+      const id = `recover-saturated-${recordIndex}`;
+      const aliases = Array.from({ length: 256 }, (_, aliasIndex) => `${id}-${aliasIndex}`);
+      const slot = { id };
+      oldSlots[oldSlots.length] = slot;
+      expect(
+        service.register(navigation, [
+          serverRegistration(id, { adUnitCode: `/network/${id}`, domAliases: aliases }),
+        ])
+      ).toMatchObject({ ok: true });
+      expect(
+        service.adoptGptSlot(navigation.generation, id, {
+          definition: {
+            adUnitPath: `/network/${id}`,
+            elementId: aliases[0] ?? `${id}-div`,
+            sizes: [[300, 250]],
+          },
+          ownership: 'trusted_server',
+          slot,
+        })
+      ).toEqual({ ok: true });
+    }
+    navigation.dispose();
+    const next = createNavigation();
+    expect(service.register(next, [serverRegistration('unrelated-after-saturation')])).toEqual({
+      ok: false,
+      reason: 'slot_quarantined',
+    });
+
+    for (let index = 0; index < oldSlots.length - 1; index += 1) {
+      expect(service.recordPublisherDestruction(oldSlots[index] as object)).toBe(true);
+    }
+    expect(service.recordPublisherDestruction(oldSlots[7] as object)).toBe(false);
+    expect(service.register(next, [serverRegistration('unrelated-after-saturation')])).toEqual({
+      ok: false,
+      reason: 'slot_quarantined',
+    });
+
+    expect(service.recordPublisherDestruction(oldSlots[8] as object)).toBe(true);
+    expect(
+      service.register(next, [serverRegistration('unrelated-after-saturation')])
+    ).toMatchObject({
+      ok: true,
     });
   });
 

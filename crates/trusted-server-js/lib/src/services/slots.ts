@@ -6,7 +6,10 @@ import type {
   GoogletagReplacementDefinition,
   GoogletagReplacementResult,
 } from '../adapters/googletag';
-import { GoogletagReplacementError } from '../adapters/googletag';
+import {
+  GoogletagReplacementCandidateCollisionError,
+  GoogletagReplacementError,
+} from '../adapters/googletag';
 import type { NavigationSession } from '../kernel/sessions';
 
 import type { PreparedProjectionSlots, ProjectionSlotRegistry } from './projections';
@@ -92,6 +95,10 @@ export interface SlotRequestInput {
   readonly requestClass: string;
 }
 
+/** Refresh-only input accepted by one shared GPT SRA operation. */
+export type SlotBatchRequestInput = Omit<SlotRequestInput, 'operation'> &
+  Readonly<{ operation: 'refresh' }>;
+
 export interface SlotRequestHandle {
   readonly status: 'active' | 'queued' | 'terminal';
   readonly result: Promise<SlotRequestOutcome>;
@@ -130,7 +137,7 @@ export interface SlotService {
     registrations: readonly SlotRegistration[]
   ) => SlotRegistrationResult;
   readonly request: (input: SlotRequestInput) => SlotRequestHandle;
-  readonly requestBatch: (inputs: readonly SlotRequestInput[]) => readonly SlotRequestHandle[];
+  readonly requestBatch: (inputs: readonly SlotBatchRequestInput[]) => readonly SlotRequestHandle[];
   readonly resolveAdUnitCode: (adUnitCode: string) => SlotRecord | undefined;
   readonly resolveDomAlias: (alias: string) => SlotRecord | undefined;
   readonly resolveRegisteredSlot: (registeredSlotId: string) => SlotRecord | undefined;
@@ -173,6 +180,7 @@ interface PhysicalSlot {
   publisherIntentCount: number;
   quarantineReason: 'completion' | 'navigation' | 'request' | undefined;
   record: InternalSlotRecord | undefined;
+  saturationOwner: boolean;
   readonly slot: object;
   state: PhysicalSlotState;
   destroyAttempted: boolean;
@@ -392,6 +400,69 @@ function ownData(event: unknown, key: PropertyKey): unknown {
   }
 }
 
+function copyReplacementSizes(sizes: unknown): unknown | undefined {
+  if (!Array.isArray(sizes)) return undefined;
+  const length = sizes.length;
+  const copyPair = (value: unknown): readonly [number, number] | undefined => {
+    if (!Array.isArray(value) || value.length !== 2) return undefined;
+    const width = value[0] as unknown;
+    const height = value[1] as unknown;
+    if (
+      typeof width !== 'number' ||
+      !Number.isInteger(width) ||
+      width < 1 ||
+      width > 4_096 ||
+      typeof height !== 'number' ||
+      !Number.isInteger(height) ||
+      height < 1 ||
+      height > 4_096
+    ) {
+      return undefined;
+    }
+    return Object.freeze([width, height]);
+  };
+  const single = copyPair(sizes);
+  if (single) return single;
+  if (length === 0 || length > MAX_ACTIVE_SLOT_RECORDS) return undefined;
+  const copied: Array<readonly [number, number]> = [];
+  for (let index = 0; index < length; index += 1) {
+    const pair = copyPair(sizes[index] as unknown);
+    if (!pair) return undefined;
+    copied[copied.length] = pair;
+  }
+  return Object.freeze(copied);
+}
+
+function snapshotReplacementDefinition(input: unknown): GoogletagReplacementDefinition | undefined {
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) return undefined;
+  let adUnitPath: unknown;
+  let elementId: unknown;
+  let sizes: unknown;
+  try {
+    const external = input as {
+      readonly adUnitPath?: unknown;
+      readonly elementId?: unknown;
+      readonly sizes?: unknown;
+    };
+    adUnitPath = external.adUnitPath;
+    elementId = external.elementId;
+    sizes = external.sizes;
+  } catch {
+    return undefined;
+  }
+  const copiedSizes = copyReplacementSizes(sizes);
+  if (
+    typeof adUnitPath !== 'string' ||
+    !validSlotIdentity(adUnitPath) ||
+    typeof elementId !== 'string' ||
+    !validSlotIdentity(elementId) ||
+    copiedSizes === undefined
+  ) {
+    return undefined;
+  }
+  return Object.freeze({ adUnitPath, elementId, sizes: copiedSizes });
+}
+
 const failed = (reason: SlotRequestFailure): SlotRequestOutcome =>
   Object.freeze({ status: 'failed' as const, reason });
 const cancelled = (reason: 'navigation_disposed' | 'superseded'): SlotRequestOutcome =>
@@ -428,6 +499,8 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
   const quarantinedKeysByPhysical = new WeakMap<object, readonly string[]>();
   const now = options.now ?? (() => performance.now());
   let placementQuarantineSaturated = false;
+  let placementQuarantinePoisoned = false;
+  let saturationOwnerCount = 0;
   let disposed = false;
   let deferInvocations = false;
   let activation: GoogletagOperation<void> | undefined;
@@ -435,12 +508,19 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
   const bindingSubscriptions = new Set<BindingSubscriptions>();
 
   const hasPlacementQuarantine = (keys: readonly string[]): boolean => {
-    if (placementQuarantineSaturated) return true;
+    if (placementQuarantineSaturated || placementQuarantinePoisoned) return true;
     for (let index = 0; index < keys.length; index += 1) {
       const key = keys[index];
       if (key !== undefined && mapValue(placementQuarantine, key) !== undefined) return true;
     }
     return false;
+  };
+
+  const markSaturationOwner = (physical: PhysicalSlot): void => {
+    if (physical.saturationOwner) return;
+    physical.saturationOwner = true;
+    saturationOwnerCount += 1;
+    placementQuarantineSaturated = true;
   };
 
   const quarantinePhysicalPlacement = (physical: PhysicalSlot): void => {
@@ -452,7 +532,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         additionalKeys += 1;
     }
     if (mapSize(placementQuarantine) + additionalKeys > MAX_PLACEMENT_QUARANTINE_KEYS) {
-      placementQuarantineSaturated = true;
+      markSaturationOwner(physical);
       return;
     }
     try {
@@ -472,11 +552,16 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         }
       }
     } catch {
-      placementQuarantineSaturated = true;
+      markSaturationOwner(physical);
     }
   };
 
   const releasePhysicalPlacement = (physical: PhysicalSlot): void => {
+    if (physical.saturationOwner) {
+      physical.saturationOwner = false;
+      saturationOwnerCount -= 1;
+      if (saturationOwnerCount === 0) placementQuarantineSaturated = false;
+    }
     const keys = weakMapValue(quarantinedKeysByPhysical, physical.slot);
     if (!keys) return;
     deleteWeakMapValue(quarantinedKeysByPhysical, physical.slot);
@@ -538,7 +623,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       throw new Error('gpt_request_failed');
     }
     const existing = weakMapValue(physicalByObject, replacement);
-    if (existing) throw new Error('gpt_request_failed');
+    if (existing) throw new GoogletagReplacementCandidateCollisionError(replacement);
     const physical: PhysicalSlot = {
       activeCycle: undefined,
       definition: oldPhysical.definition,
@@ -549,6 +634,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       publisherIntentCount: 0,
       quarantineReason: undefined,
       record,
+      saturationOwner: false,
       slot: replacement,
       state: 'live',
     };
@@ -652,7 +738,11 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         physical.state = 'quarantined';
         const replacementError = error instanceof GoogletagReplacementError ? error : undefined;
         const reusedOldIdentity = replacementError?.orphanedSlot === physical.slot;
-        if (replacementError?.oldSlotDestroyed && !reusedOldIdentity) {
+        if (
+          replacementError?.oldSlotDestroyed &&
+          !replacementError.preserveOldQuarantine &&
+          !reusedOldIdentity
+        ) {
           detachDestroyedOld();
         }
         if (replacementError?.orphanedSlot && replacementError.orphanedSlot !== physical.slot) {
@@ -666,6 +756,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
             publisherIntentCount: 0,
             quarantineReason: 'request',
             record: undefined,
+            saturationOwner: false,
             slot: replacementError.orphanedSlot,
             state: 'quarantined',
           };
@@ -676,7 +767,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
             }
             quarantinePhysicalPlacement(orphan);
           } catch {
-            placementQuarantineSaturated = true;
+            placementQuarantinePoisoned = true;
           }
         }
         failQueued(record, 'gpt_request_failed');
@@ -697,6 +788,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     }
     settle(intent, cancelled('superseded'));
     if (wasInvoked && physical) recoverRequestTimeout(intent.record, physical);
+    else advanceQueued(intent.record);
   };
 
   const onRequestTimeout = (intent: RequestIntent): void => {
@@ -970,7 +1062,6 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       now() > (intent.completionDeadlineAt ?? Number.NEGATIVE_INFINITY)
     ) {
       onCompletionTimeout(intent);
-      return;
     }
     const isEmptyValue = ownData(event, 'isEmpty');
     if (isEmptyValue !== true && isEmptyValue !== false) return;
@@ -1234,11 +1325,11 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     if (!record) return Object.freeze({ ok: false, reason: 'slot_unresolved' });
     let slot: unknown;
     let ownership: unknown;
-    let definition: GoogletagReplacementDefinition | undefined;
+    let externalDefinition: unknown;
     try {
       slot = binding.slot;
       ownership = binding.ownership;
-      definition = binding.definition;
+      externalDefinition = binding.definition;
     } catch {
       return Object.freeze({ ok: false, reason: 'gpt_request_failed' });
     }
@@ -1251,7 +1342,14 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     if (ownership !== 'publisher' && ownership !== 'trusted_server') {
       return Object.freeze({ ok: false, reason: 'gpt_request_failed' });
     }
-    if (ownership === 'trusted_server' && definition === undefined) {
+    const definition =
+      externalDefinition === undefined
+        ? undefined
+        : snapshotReplacementDefinition(externalDefinition);
+    if (
+      (externalDefinition !== undefined && definition === undefined) ||
+      (ownership === 'trusted_server' && definition === undefined)
+    ) {
       return Object.freeze({ ok: false, reason: 'gpt_request_failed' });
     }
     const slotObject = slot as object;
@@ -1321,6 +1419,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       publisherIntentCount: 0,
       quarantineReason: undefined,
       record,
+      saturationOwner: false,
       slot: slotObject,
       state: 'live',
     };
@@ -1456,17 +1555,85 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     return handle;
   };
 
-  const requestBatch = (inputs: readonly SlotRequestInput[]): readonly SlotRequestHandle[] => {
-    if (!Array.isArray(inputs)) return Object.freeze([]);
+  const requestBatch = (inputs: readonly SlotBatchRequestInput[]): readonly SlotRequestHandle[] => {
+    if (!Array.isArray(inputs) || inputs.length === 0 || inputs.length > MAX_ACTIVE_SLOT_RECORDS) {
+      return Object.freeze([]);
+    }
+    const preparedInputs: SlotBatchRequestInput[] = [];
+    const admittedIntents = new Set<string>();
+    const admittedRecords = new Set<InternalSlotRecord>();
+    const admittedPhysicalSlots = new Set<object>();
+    let batchGeneration: object | undefined;
+    try {
+      for (let index = 0; index < inputs.length; index += 1) {
+        const input = inputs[index] as unknown;
+        if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+          return Object.freeze([]);
+        }
+        const intentId = ownData(input, 'intentId');
+        const navigationGeneration = ownData(input, 'navigationGeneration');
+        const operation = ownData(input, 'operation');
+        const registeredSlotId = ownData(input, 'registeredSlotId');
+        const requestClass = ownData(input, 'requestClass');
+        if (
+          typeof intentId !== 'string' ||
+          intentId.length === 0 ||
+          typeof navigationGeneration !== 'object' ||
+          navigationGeneration === null ||
+          operation !== 'refresh' ||
+          typeof registeredSlotId !== 'string' ||
+          registeredSlotId.length === 0 ||
+          typeof requestClass !== 'string' ||
+          requestClass.length === 0 ||
+          setHasValue(admittedIntents, intentId)
+        ) {
+          return Object.freeze([]);
+        }
+        if (batchGeneration === undefined) batchGeneration = navigationGeneration;
+        else if (batchGeneration !== navigationGeneration) return Object.freeze([]);
+        const state = mapValue(navigationStates, navigationGeneration);
+        const record = state ? mapValue(state.records, registeredSlotId) : undefined;
+        const physical = record?.physical;
+        if (
+          !state ||
+          state.disposed ||
+          !state.owner.isCurrent() ||
+          !record ||
+          record.activeIntent ||
+          record.queuedIntent ||
+          !physical ||
+          physical.record !== record ||
+          physical.state !== 'live' ||
+          physical.activeCycle ||
+          physical.publisherIntentCount > 0 ||
+          setHasValue(admittedRecords, record) ||
+          setHasValue(admittedPhysicalSlots, physical.slot)
+        ) {
+          return Object.freeze([]);
+        }
+        addSetValue(admittedIntents, intentId);
+        addSetValue(admittedRecords, record);
+        addSetValue(admittedPhysicalSlots, physical.slot);
+        preparedInputs[preparedInputs.length] = Object.freeze({
+          intentId,
+          navigationGeneration,
+          operation,
+          registeredSlotId,
+          requestClass,
+        });
+      }
+    } catch {
+      return Object.freeze([]);
+    }
     deferInvocations = true;
     let handles: SlotRequestHandle[];
     try {
-      handles = inputs.map((input) => request(input));
+      handles = preparedInputs.map((input) => request(input));
     } finally {
       deferInvocations = false;
     }
     const intents: RequestIntent[] = [];
-    for (const input of inputs) {
+    for (const input of preparedInputs) {
       const state = mapValue(navigationStates, input.navigationGeneration);
       const record = state ? mapValue(state.records, input.registeredSlotId) : undefined;
       const intent = record?.activeIntent;

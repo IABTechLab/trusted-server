@@ -50,13 +50,31 @@ export class GoogletagReplacementError extends Error {
   public readonly cause: unknown;
   public readonly oldSlotDestroyed: boolean;
   public readonly orphanedSlot: object | undefined;
+  public readonly preserveOldQuarantine: boolean;
 
-  public constructor(orphanedSlot?: object, oldSlotDestroyed = false, cause?: unknown) {
+  public constructor(
+    orphanedSlot?: object,
+    oldSlotDestroyed = false,
+    cause?: unknown,
+    preserveOldQuarantine = false
+  ) {
     super('gpt_replacement_failed');
     this.name = 'GoogletagReplacementError';
     this.orphanedSlot = orphanedSlot;
     this.oldSlotDestroyed = oldSlotDestroyed;
     this.cause = cause;
+    this.preserveOldQuarantine = preserveOldQuarantine;
+  }
+}
+
+/** Internal signal that a defineSlot result is already owned by another live record. */
+export class GoogletagReplacementCandidateCollisionError extends Error {
+  public readonly candidate: object;
+
+  public constructor(candidate: object) {
+    super('gpt_replacement_candidate_collision');
+    this.name = 'GoogletagReplacementCandidateCollisionError';
+    this.candidate = candidate;
   }
 }
 
@@ -649,13 +667,6 @@ function createFacade(
           if (!destroy(stale)) throw new GoogletagReplacementError(stale, true);
           return destroyed;
         }
-        call(replacement as object, 'addService', [service()]);
-        if (!isGenerationCurrent() || !isOperationCurrent()) {
-          const stale = replacement as object;
-          replacement = undefined;
-          if (!destroy(stale)) throw new GoogletagReplacementError(stale, true);
-          return destroyed;
-        }
         admission = prepareCommit(replacement as object);
         if (
           !admission ||
@@ -663,6 +674,13 @@ function createFacade(
           typeof admission.rollback !== 'function'
         ) {
           throw new GoogletagReplacementError(undefined, true);
+        }
+        call(replacement as object, 'addService', [service()]);
+        if (!isGenerationCurrent() || !isOperationCurrent()) {
+          const stale = replacement as object;
+          replacement = undefined;
+          if (!destroy(stale)) throw new GoogletagReplacementError(stale, true);
+          return destroyed;
         }
         commitAttempted = true;
         if (!admission.commit()) throw new GoogletagReplacementError(undefined, true);
@@ -695,8 +713,12 @@ function createFacade(
             // Candidate cleanup remains mandatory even when service rollback is hostile.
           }
         }
+        if (error instanceof GoogletagReplacementCandidateCollisionError) {
+          throw new GoogletagReplacementError(undefined, true, error, true);
+        }
         if (replacement) cleanup(replacement, error);
-        throw error;
+        if (error instanceof GoogletagReplacementError) throw error;
+        throw new GoogletagReplacementError(undefined, true, error);
       }
     },
   });

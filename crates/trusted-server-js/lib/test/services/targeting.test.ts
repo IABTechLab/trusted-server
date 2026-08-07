@@ -408,6 +408,40 @@ describe('adapter-owned targeting interception', () => {
 });
 
 describe('targeting mutate-then-throw recovery', () => {
+  it('rejects a successful no-op write and removes only its failed frame', () => {
+    const service = createTargetingService();
+    const slot = {};
+    const targeting = createTargetingHarness({ key: ['publisher'] });
+    const older = service.own(slot, 'key', 'older', 'older-owner', targeting);
+    targeting.setTargeting.mockImplementationOnce(() => undefined);
+
+    expect(() => service.own(slot, 'key', 'newer', 'newer-owner', targeting)).toThrow(
+      'GPT targeting postcondition failed'
+    );
+    expect(targeting.values.get('key')).toEqual(['older']);
+    expect(service.snapshotForTest()).toEqual({ frames: 1, slots: 1 });
+    older?.release();
+    expect(targeting.values.get('key')).toEqual(['publisher']);
+    expect(service.snapshotForTest()).toEqual({ frames: 0, slots: 0 });
+  });
+
+  it('retains owner-disposable quarantine when a successful write leaves the wrong value', () => {
+    const service = createTargetingService();
+    const slot = {};
+    const targeting = createTargetingHarness({ key: ['publisher'] });
+    targeting.setTargeting.mockImplementationOnce((key) => {
+      targeting.values.set(key, Object.freeze(['wrong-value']));
+    });
+
+    expect(() => service.own(slot, 'key', 'trusted', 'owner', targeting)).toThrow(
+      'GPT targeting postcondition failed'
+    );
+    expect(service.snapshotForTest()).toEqual({ frames: 1, slots: 1 });
+    service.disposeOwner('owner');
+    expect(targeting.values.get('key')).toEqual(['wrong-value']);
+    expect(service.snapshotForTest()).toEqual({ frames: 0, slots: 0 });
+  });
+
   it('restores the publisher predecessor when installation mutates then throws', () => {
     const service = createTargetingService();
     const slot = {};

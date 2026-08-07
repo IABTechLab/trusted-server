@@ -425,6 +425,16 @@ export function createTargetingService(): TargetingService {
       rollbackFailedInstallation(frame);
       throw error;
     }
+    let installedExactly = false;
+    try {
+      installedExactly = exactInstalledValue(copyValues(targeting.getTargeting(key)), value);
+    } catch {
+      // The rollback path below retries observation and retains ownership if still unreadable.
+    }
+    if (!installedExactly) {
+      rollbackFailedInstallation(frame);
+      throw new Error('GPT targeting postcondition failed');
+    }
 
     let released = false;
     return Object.freeze({
