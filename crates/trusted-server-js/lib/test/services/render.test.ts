@@ -6,6 +6,7 @@ import type { RenderAttemptScope, WinnerContext } from '../../src/kernel/session
 import {
   createCommittedArtifactStore,
   createRenderAttempt,
+  createRendererNonceRegistry,
   createSlotOperation,
   type CommittedRenderArtifact,
   type RenderAttempt,
@@ -22,6 +23,14 @@ import {
 
 const ATTEMPT_ONE = 'a1_0000000000000000000000';
 const ATTEMPT_TWO = 'a1_0000000000000000000001';
+
+function indexedAttemptId(index: number): string {
+  return `a1_${index.toString().padStart(22, '0')}`;
+}
+
+function indexedRendererNonce(index: number): string {
+  return `n1_${index.toString().padStart(22, '0')}`;
+}
 
 const ADM_SOURCE = Object.freeze({
   type: 'adm' as const,
@@ -166,6 +175,615 @@ function attempt(
   attemptReservations.set(result.value, reservationService);
   return result.value;
 }
+
+function rendererPort() {
+  return Object.freeze({ close: vi.fn() });
+}
+
+describe('renderer nonce registry', () => {
+  it('admits exactly 256 active bindings and refuses the 257th without drawing', () => {
+    let draw = 0;
+    const mintNonce = vi.fn(() =>
+      Object.freeze({ ok: true as const, value: indexedRendererNonce(draw++) })
+    );
+    const registry = createRendererNonceRegistry({ mintNonce });
+
+    for (let index = 0; index < 257; index += 1) {
+      const render = attempt(owner(indexedAttemptId(index), `slot-${index}`));
+      const issued = registry.issue({
+        attempt: render,
+        source: Object.freeze({ index }),
+        port: rendererPort(),
+      });
+      if (index < 256) {
+        expect(issued).toEqual({ ok: true, nonce: indexedRendererNonce(index) });
+        expect(registry.snapshotForTest()).toMatchObject({
+          bindings: index + 1,
+          liveNonces: index + 1,
+        });
+      } else {
+        expect(issued).toEqual({ ok: false, reason: 'capability_registry_full' });
+      }
+    }
+    expect(mintNonce).toHaveBeenCalledTimes(256);
+  });
+
+  it('uses eight total collision draws and contains identity-source failure', () => {
+    const nonce = indexedRendererNonce(7);
+    const collisionMint = vi.fn(() => Object.freeze({ ok: true as const, value: nonce }));
+    const registry = createRendererNonceRegistry({ mintNonce: collisionMint });
+    const first = attempt(owner(indexedAttemptId(1), 'slot-1'));
+    const second = attempt(owner(indexedAttemptId(2), 'slot-2'));
+    expect(
+      registry.issue({ attempt: first, source: Object.freeze({}), port: rendererPort() })
+    ).toEqual({ ok: true, nonce });
+    expect(
+      registry.issue({ attempt: second, source: Object.freeze({}), port: rendererPort() })
+    ).toEqual({ ok: false, reason: 'identity_generation_failed' });
+    expect(collisionMint).toHaveBeenCalledTimes(9);
+
+    const failedMint = vi.fn(() =>
+      Object.freeze({ ok: false as const, reason: 'identity_generation_failed' as const })
+    );
+    const failedRegistry = createRendererNonceRegistry({ mintNonce: failedMint });
+    expect(
+      failedRegistry.issue({
+        attempt: attempt(owner(indexedAttemptId(3), 'slot-3')),
+        source: Object.freeze({}),
+        port: rendererPort(),
+      })
+    ).toEqual({ ok: false, reason: 'identity_generation_failed' });
+    expect(failedMint).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ['undefined', () => undefined],
+    ['null', () => null],
+    ['primitive', () => 1],
+    [
+      'accessor',
+      () =>
+        Object.freeze(
+          Object.defineProperties(
+            {},
+            {
+              ok: {
+                enumerable: true,
+                get: () => {
+                  throw new Error('sensitive issuer result');
+                },
+              },
+              value: { enumerable: true, value: indexedRendererNonce(1) },
+            }
+          )
+        ),
+    ],
+    [
+      'proxy',
+      () =>
+        new Proxy(Object.freeze({ ok: true, value: indexedRendererNonce(1) }), {
+          ownKeys: () => {
+            throw new Error('sensitive issuer proxy');
+          },
+        }),
+    ],
+    [
+      'malformed success',
+      () => Object.freeze({ ok: true, value: indexedRendererNonce(1), unexpected: true }),
+    ],
+    ['malformed failure', () => Object.freeze({ ok: false, reason: 'different_failure' })],
+  ])('fails closed for a hostile %s issuer result', (_label, hostileResult) => {
+    const registry = createRendererNonceRegistry({
+      mintNonce: hostileResult as never,
+    });
+    let result: unknown;
+    expect(() => {
+      result = registry.issue({
+        attempt: attempt(owner(indexedAttemptId(9), 'slot-9')),
+        source: Object.freeze({}),
+        port: rendererPort(),
+      });
+    }).not.toThrow();
+    expect(result).toEqual({ ok: false, reason: 'identity_generation_failed' });
+  });
+
+  it('consumes once only for the exact nonce, source, port, attempt, and generation', () => {
+    const nonce = indexedRendererNonce(1);
+    const registry = createRendererNonceRegistry({
+      mintNonce: () => Object.freeze({ ok: true as const, value: nonce }),
+    });
+    const render = attempt(owner(indexedAttemptId(1), 'slot-1'));
+    const other = attempt(owner(indexedAttemptId(2), 'slot-2'));
+    const source = Object.freeze({});
+    const port = rendererPort();
+    expect(registry.issue({ attempt: render, source, port })).toEqual({ ok: true, nonce });
+
+    expect(
+      registry.consume({
+        nonce: indexedRendererNonce(2),
+        attempt: render,
+        generation: render.generation,
+        source,
+        port,
+      })
+    ).toBe(false);
+    expect(
+      registry.consume({
+        nonce,
+        attempt: other,
+        generation: render.generation,
+        source,
+        port,
+      })
+    ).toBe(false);
+    expect(
+      registry.consume({
+        nonce,
+        attempt: render,
+        generation: Object.freeze({}),
+        source,
+        port,
+      })
+    ).toBe(false);
+    expect(
+      registry.consume({
+        nonce,
+        attempt: render,
+        generation: render.generation,
+        source: Object.freeze({}),
+        port,
+      })
+    ).toBe(false);
+    expect(
+      registry.consume({
+        nonce,
+        attempt: render,
+        generation: render.generation,
+        source,
+        port: rendererPort(),
+      })
+    ).toBe(false);
+    const exact = { nonce, attempt: render, generation: render.generation, source, port };
+    expect(registry.consume(exact)).toBe(true);
+    expect(registry.consume(exact)).toBe(false);
+    expect(registry.snapshotForTest()).toMatchObject({ bindings: 1, liveNonces: 0 });
+    expect(port.close).not.toHaveBeenCalled();
+  });
+
+  it('rejects cross-attempt retained-port reuse without taking failed-issue ownership', () => {
+    let draw = 0;
+    const registry = createRendererNonceRegistry({
+      mintNonce: () => Object.freeze({ ok: true as const, value: indexedRendererNonce(draw++) }),
+    });
+    const port = rendererPort();
+    const first = attempt(owner(indexedAttemptId(1), 'slot-1'));
+    const second = attempt(owner(indexedAttemptId(2), 'slot-2'));
+    expect(registry.issue({ attempt: first, source: Object.freeze({}), port })).toMatchObject({
+      ok: true,
+    });
+    expect(registry.issue({ attempt: second, source: Object.freeze({}), port })).toEqual({
+      ok: false,
+      reason: 'invalid_attempt',
+    });
+    expect(port.close).not.toHaveBeenCalled();
+    expect(second.fail('internal_error')).toBe(true);
+    expect(port.close).not.toHaveBeenCalled();
+    expect(first.fail('internal_error')).toBe(true);
+    expect(port.close).toHaveBeenCalledOnce();
+    expect(
+      registry.issue({
+        attempt: attempt(owner(indexedAttemptId(3), 'slot-3')),
+        source: Object.freeze({}),
+        port,
+      })
+    ).toEqual({ ok: false, reason: 'invalid_attempt' });
+    registry.dispose();
+    expect(port.close).toHaveBeenCalledOnce();
+  });
+
+  it('retires a transferred port before close can reenter issuance', () => {
+    let draw = 0;
+    const registry = createRendererNonceRegistry({
+      mintNonce: () => Object.freeze({ ok: true as const, value: indexedRendererNonce(draw++) }),
+    });
+    const first = attempt(owner(indexedAttemptId(1), 'slot-1'));
+    const second = attempt(owner(indexedAttemptId(2), 'slot-2'));
+    let nested: unknown;
+    const port = Object.freeze({
+      close: vi.fn(() => {
+        nested = registry.issue({ attempt: second, source: Object.freeze({}), port });
+      }),
+    });
+    expect(registry.issue({ attempt: first, source: Object.freeze({}), port })).toMatchObject({
+      ok: true,
+    });
+    expect(first.fail('internal_error')).toBe(true);
+    expect(nested).toEqual({ ok: false, reason: 'invalid_attempt' });
+    expect(port.close).toHaveBeenCalledOnce();
+  });
+
+  it('makes branded settlement registration and revalidation intrinsic under prototype mutation', () => {
+    const registry = createRendererNonceRegistry({
+      mintNonce: () => Object.freeze({ ok: true as const, value: indexedRendererNonce(1) }),
+    });
+    const render = attempt(owner(indexedAttemptId(1), 'slot-1'));
+    let closes = 0;
+    const port = Object.freeze({
+      close: () => {
+        closes += 1;
+      },
+    });
+    const nativePush = Array.prototype.push;
+    const nativeSlice = Array.prototype.slice;
+    let poisonCalls = 0;
+    const push = vi.spyOn(Array.prototype, 'push').mockImplementation(function (
+      this: unknown[],
+      ...values
+    ) {
+      poisonCalls += 1;
+      Reflect.apply(nativePush, this, values);
+      throw new Error('hostile observer registration');
+    });
+    let sliceCalls = 0;
+    const slice = vi.spyOn(Array.prototype, 'slice').mockImplementation(function (
+      this: unknown[],
+      start?: number,
+      end?: number
+    ) {
+      sliceCalls += 1;
+      const result = Reflect.apply(nativeSlice, this, [start, end]);
+      if (sliceCalls >= 4) throw new Error('hostile post-registration snapshot');
+      return result;
+    });
+    let issued: unknown;
+    try {
+      issued = registry.issue({ attempt: render, source: Object.freeze({}), port });
+    } finally {
+      slice.mockRestore();
+      push.mockRestore();
+    }
+    expect(poisonCalls).toBe(0);
+    expect(sliceCalls).toBe(0);
+    expect(issued).toEqual({ ok: true, nonce: indexedRendererNonce(1) });
+    expect(closes).toBe(0);
+    expect(render.fail('internal_error')).toBe(true);
+    expect(closes).toBe(1);
+  });
+
+  it('drains terminal observers intrinsically before prototype splice can throw', () => {
+    const registry = createRendererNonceRegistry({
+      mintNonce: () => Object.freeze({ ok: true as const, value: indexedRendererNonce(1) }),
+    });
+    const render = attempt(owner(indexedAttemptId(1), 'slot-1'));
+    let closes = 0;
+    const port = Object.freeze({
+      close: () => {
+        closes += 1;
+      },
+    });
+    expect(registry.issue({ attempt: render, source: Object.freeze({}), port })).toMatchObject({
+      ok: true,
+    });
+    const nativeSplice = Array.prototype.splice;
+    let spliceCalls = 0;
+    const splice = vi.spyOn(Array.prototype, 'splice').mockImplementation(function (
+      this: unknown[],
+      start: number,
+      deleteCount?: number
+    ) {
+      spliceCalls += 1;
+      Reflect.apply(nativeSplice, this, [start, deleteCount]);
+      throw new Error('hostile terminal observer drain');
+    });
+    let iteratorCalls = 0;
+    const iterator = Object.getOwnPropertyDescriptor(Array.prototype, Symbol.iterator);
+    Object.defineProperty(Array.prototype, Symbol.iterator, {
+      configurable: true,
+      writable: true,
+      value: () => {
+        iteratorCalls += 1;
+        throw new Error('hostile terminal observer iteration');
+      },
+    });
+    let settled: boolean | undefined;
+    let thrown: unknown;
+    try {
+      settled = render.fail('internal_error');
+    } catch (error) {
+      thrown = error;
+    } finally {
+      if (iterator) Object.defineProperty(Array.prototype, Symbol.iterator, iterator);
+      splice.mockRestore();
+    }
+    expect(thrown).toBeUndefined();
+    expect(settled).toBe(true);
+    expect(spliceCalls).toBe(0);
+    expect(iteratorCalls).toBe(0);
+    expect(closes).toBe(1);
+  });
+
+  it('binds pending and live issuance to the exact issued attempt generation', () => {
+    let draw = 0;
+    const registry = createRendererNonceRegistry({
+      mintNonce: () => Object.freeze({ ok: true as const, value: indexedRendererNonce(draw++) }),
+    });
+    const sharedOwner = owner(indexedAttemptId(1), 'slot-1');
+    const first = attempt(sharedOwner);
+    const second = attempt(sharedOwner);
+    const secondPort = rendererPort();
+    expect(
+      registry.issue({ attempt: first, source: Object.freeze({}), port: rendererPort() })
+    ).toMatchObject({ ok: true });
+    expect(
+      registry.issue({ attempt: second, source: Object.freeze({}), port: secondPort })
+    ).toEqual({ ok: false, reason: 'invalid_attempt' });
+    expect(secondPort.close).not.toHaveBeenCalled();
+
+    const nestedOwner = owner(indexedAttemptId(2), 'slot-2');
+    const outer = attempt(nestedOwner);
+    const inner = attempt(nestedOwner);
+    const innerPort = rendererPort();
+    let nested: unknown;
+    let recurse = true;
+    const reentrantRegistry = createRendererNonceRegistry({
+      mintNonce: () => {
+        if (recurse) {
+          recurse = false;
+          nested = reentrantRegistry.issue({
+            attempt: inner,
+            source: Object.freeze({}),
+            port: innerPort,
+          });
+        }
+        return Object.freeze({ ok: true as const, value: indexedRendererNonce(9) });
+      },
+    });
+    expect(
+      reentrantRegistry.issue({
+        attempt: outer,
+        source: Object.freeze({}),
+        port: rendererPort(),
+      })
+    ).toMatchObject({ ok: true });
+    expect(nested).toEqual({ ok: false, reason: 'invalid_attempt' });
+    expect(innerPort.close).not.toHaveBeenCalled();
+  });
+
+  it('cannot publish after the issuer reentrantly disposes the registry', () => {
+    const port = rendererPort();
+    const registry = createRendererNonceRegistry({
+      mintNonce: () => {
+        registry.dispose();
+        return Object.freeze({ ok: true as const, value: indexedRendererNonce(1) });
+      },
+    });
+    const issued = registry.issue({
+      attempt: attempt(owner(indexedAttemptId(1), 'slot-1')),
+      source: Object.freeze({}),
+      port,
+    });
+    expect(issued).toEqual({ ok: false, reason: 'invalid_attempt' });
+    expect(issued).not.toHaveProperty('nonce');
+    expect(port.close).not.toHaveBeenCalled();
+    expect(registry.snapshotForTest()).toEqual({
+      bindings: 0,
+      disposed: true,
+      liveNonces: 0,
+    });
+  });
+
+  it('reserves attempt and capacity before invoking a reentrant issuer', () => {
+    let draw = 0;
+    let reenter: (() => void) | undefined;
+    const registry = createRendererNonceRegistry({
+      mintNonce: () => {
+        const callback = reenter;
+        reenter = undefined;
+        callback?.();
+        return Object.freeze({ ok: true as const, value: indexedRendererNonce(draw++) });
+      },
+    });
+
+    for (let index = 0; index < 255; index += 1) {
+      expect(
+        registry.issue({
+          attempt: attempt(owner(indexedAttemptId(index), `slot-${index}`)),
+          source: Object.freeze({}),
+          port: rendererPort(),
+        })
+      ).toMatchObject({ ok: true });
+    }
+    const outerAttempt = attempt(owner(indexedAttemptId(255), 'slot-255'));
+    const innerAttempt = attempt(owner(indexedAttemptId(256), 'slot-256'));
+    let nestedCapacity: unknown;
+    reenter = () => {
+      nestedCapacity = registry.issue({
+        attempt: innerAttempt,
+        source: Object.freeze({}),
+        port: rendererPort(),
+      });
+    };
+    expect(
+      registry.issue({
+        attempt: outerAttempt,
+        source: Object.freeze({}),
+        port: rendererPort(),
+      })
+    ).toMatchObject({ ok: true });
+    expect(nestedCapacity).toEqual({ ok: false, reason: 'capability_registry_full' });
+    expect(registry.snapshotForTest()).toMatchObject({ bindings: 256, liveNonces: 256 });
+
+    const sameAttempt = attempt(owner(indexedAttemptId(999), 'slot-999'));
+    const sameInput = {
+      attempt: sameAttempt,
+      source: Object.freeze({}),
+      port: rendererPort(),
+    };
+    let nestedSameAttempt: unknown;
+    let recurse = true;
+    const sameAttemptRegistry = createRendererNonceRegistry({
+      mintNonce: () => {
+        if (recurse) {
+          recurse = false;
+          nestedSameAttempt = sameAttemptRegistry.issue(sameInput);
+        }
+        return Object.freeze({ ok: true as const, value: indexedRendererNonce(998) });
+      },
+    });
+    expect(sameAttemptRegistry.issue(sameInput)).toMatchObject({ ok: true });
+    expect(nestedSameAttempt).toEqual({ ok: false, reason: 'invalid_attempt' });
+    expect(sameAttemptRegistry.snapshotForTest()).toMatchObject({ bindings: 1, liveNonces: 1 });
+  });
+
+  it('lets exactly one nested exact consume win before a hostile outer replay', () => {
+    const nonce = indexedRendererNonce(1);
+    const registry = createRendererNonceRegistry({
+      mintNonce: () => Object.freeze({ ok: true as const, value: nonce }),
+    });
+    const render = attempt(owner(indexedAttemptId(1), 'slot-1'));
+    const source = Object.freeze({});
+    const port = rendererPort();
+    expect(registry.issue({ attempt: render, source, port })).toEqual({ ok: true, nonce });
+    const exact = Object.freeze({
+      nonce,
+      attempt: render,
+      generation: render.generation,
+      source,
+      port,
+    });
+    let nested: boolean | undefined;
+    let reentered = false;
+    const replay = new Proxy(exact, {
+      ownKeys: (target) => {
+        if (!reentered) {
+          reentered = true;
+          nested = registry.consume(exact);
+        }
+        return Reflect.ownKeys(target);
+      },
+    });
+
+    expect(registry.consume(replay)).toBe(false);
+    expect(nested).toBe(true);
+    expect(registry.consume(exact)).toBe(false);
+  });
+
+  it('closes and removes attempt-owned bindings on settlement with no nonce history', () => {
+    const nonce = indexedRendererNonce(1);
+    const registry = createRendererNonceRegistry({
+      mintNonce: () => Object.freeze({ ok: true as const, value: nonce }),
+    });
+    const first = attempt(owner(indexedAttemptId(1), 'slot-1'));
+    const firstPort = rendererPort();
+    const firstSource = Object.freeze({});
+    expect(registry.issue({ attempt: first, source: firstSource, port: firstPort })).toEqual({
+      ok: true,
+      nonce,
+    });
+    expect(
+      registry.consume({
+        nonce,
+        attempt: first,
+        generation: first.generation,
+        source: firstSource,
+        port: firstPort,
+      })
+    ).toBe(true);
+    expect(
+      registry.issue({ attempt: first, source: Object.freeze({}), port: rendererPort() })
+    ).toEqual({ ok: false, reason: 'invalid_attempt' });
+    expect(first.fail('internal_error')).toBe(true);
+    expect(first.fail('internal_error')).toBe(false);
+    expect(firstPort.close).toHaveBeenCalledOnce();
+    expect(registry.snapshotForTest()).toEqual({
+      bindings: 0,
+      disposed: false,
+      liveNonces: 0,
+    });
+
+    const second = attempt(owner(indexedAttemptId(2), 'slot-2'));
+    expect(
+      registry.issue({ attempt: second, source: Object.freeze({}), port: rendererPort() })
+    ).toEqual({ ok: true, nonce });
+    expect(
+      registry.issue({ attempt: second, source: Object.freeze({}), port: rendererPort() })
+    ).toEqual({ ok: false, reason: 'invalid_attempt' });
+  });
+
+  it('disposes live and consumed runtime bindings exactly once and remains terminal', () => {
+    let draw = 0;
+    const registry = createRendererNonceRegistry({
+      mintNonce: () => Object.freeze({ ok: true as const, value: indexedRendererNonce(draw++) }),
+    });
+    const live = attempt(owner(indexedAttemptId(1), 'slot-1'));
+    const consumed = attempt(owner(indexedAttemptId(2), 'slot-2'));
+    const liveSource = Object.freeze({ live: true });
+    const consumedSource = Object.freeze({ consumed: true });
+    let liveCloses = 0;
+    let consumedCloses = 0;
+    const livePort = Object.freeze({ close: () => (liveCloses += 1) });
+    const consumedPort = Object.freeze({ close: () => (consumedCloses += 1) });
+    const liveIssue = registry.issue({ attempt: live, source: liveSource, port: livePort });
+    const consumedIssue = registry.issue({
+      attempt: consumed,
+      source: consumedSource,
+      port: consumedPort,
+    });
+    if (!liveIssue.ok || !consumedIssue.ok) throw new Error('Expected nonce bindings');
+    const consumedExpectation = Object.freeze({
+      nonce: consumedIssue.nonce,
+      attempt: consumed,
+      generation: consumed.generation,
+      source: consumedSource,
+      port: consumedPort,
+    });
+    expect(registry.consume(consumedExpectation)).toBe(true);
+
+    const iterator = Object.getOwnPropertyDescriptor(Array.prototype, Symbol.iterator);
+    let iteratorCalls = 0;
+    Object.defineProperty(Array.prototype, Symbol.iterator, {
+      configurable: true,
+      writable: true,
+      value: () => {
+        iteratorCalls += 1;
+        throw new Error('hostile registry disposal iteration');
+      },
+    });
+    let disposeError: unknown;
+    try {
+      registry.dispose();
+    } catch (error) {
+      disposeError = error;
+    } finally {
+      if (iterator) Object.defineProperty(Array.prototype, Symbol.iterator, iterator);
+    }
+    expect(disposeError).toBeUndefined();
+    expect(iteratorCalls).toBe(0);
+    expect(liveCloses).toBe(1);
+    expect(consumedCloses).toBe(1);
+    expect(registry.snapshotForTest()).toEqual({
+      bindings: 0,
+      disposed: true,
+      liveNonces: 0,
+    });
+    registry.dispose();
+    expect(live.fail('internal_error')).toBe(true);
+    expect(consumed.fail('internal_error')).toBe(true);
+    expect(liveCloses).toBe(1);
+    expect(consumedCloses).toBe(1);
+    expect(registry.consume(consumedExpectation)).toBe(false);
+
+    const rejectedPort = rendererPort();
+    expect(
+      registry.issue({
+        attempt: attempt(owner(indexedAttemptId(3), 'slot-3')),
+        source: Object.freeze({}),
+        port: rejectedPort,
+      })
+    ).toEqual({ ok: false, reason: 'invalid_attempt' });
+    expect(rejectedPort.close).not.toHaveBeenCalled();
+  });
+});
 
 function claimed(
   render: RenderAttempt,
