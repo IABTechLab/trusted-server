@@ -513,7 +513,108 @@ export interface RequestAdsResult {
   readonly slots: readonly RequestAdsSlotResult[];
 }
 
-export interface TsjsApi {
+export type TsjsLogLevel = 'silent' | 'error' | 'warn' | 'info' | 'debug';
+
+export interface TsjsLog {
+  setLevel(level: TsjsLogLevel): void;
+  getLevel(): TsjsLogLevel;
+  error(...values: readonly unknown[]): void;
+  warn(...values: readonly unknown[]): void;
+  info(...values: readonly unknown[]): void;
+  debug(...values: readonly unknown[]): void;
+}
+
+export interface TsjsCommandQueue {
+  readonly length: 0;
+  push(callback: unknown): 0;
+}
+
+export interface CreativeBootV1 {
+  readonly version: 1;
+  readonly enabled: boolean;
+  readonly clickGuard: boolean;
+  readonly renderGuard: boolean;
+}
+
+export interface DiagnosticsBootV1 {
+  readonly version: 1;
+  readonly renderTraceOverlay: boolean;
+  readonly gpt: Readonly<{ readonly active: boolean }>;
+}
+
+export interface TsjsBootV1 {
+  readonly abi: 1;
+  readonly releaseId: string;
+  readonly manifest: Readonly<BootManifestV1>;
+  readonly auctionProjection: Readonly<BrowserAuctionProjectionV1>;
+  readonly cachePolicy?: Readonly<CacheFetchPolicyV1>;
+  readonly creative: Readonly<CreativeBootV1>;
+  readonly diagnostics: Readonly<DiagnosticsBootV1>;
+}
+
+export type RenderTracePathV1 = 'auction' | 'ssat' | 'gam-refresh';
+export type RenderTraceServedFromV1 = 'inline' | 'gam' | 'debug-adm' | 'pbs-cache' | 'prebid';
+
+export interface RenderTraceRecord {
+  readonly slotId: string;
+  readonly path: RenderTracePathV1;
+  readonly rendered: boolean;
+  readonly elementId?: string;
+  readonly auctionId?: string;
+  readonly bidder?: string;
+  readonly adId?: string;
+  readonly bidId?: string;
+  readonly creativeId?: string;
+  readonly admHash?: string;
+  readonly servedFrom?: RenderTraceServedFromV1;
+  readonly gamEmpty?: boolean;
+  readonly injected?: boolean;
+  readonly visible?: boolean;
+  readonly count: number;
+  readonly seq: number;
+  readonly at: number;
+}
+
+export interface RenderTraceDiagnostics {
+  current(): Readonly<Record<string, Readonly<RenderTraceRecord>>>;
+  history(): readonly Readonly<RenderTraceRecord>[];
+  subscribe(listener: (record: Readonly<RenderTraceRecord>) => void): () => void;
+}
+
+export interface TsjsDiagnostics {
+  readonly renderTrace: RenderTraceDiagnostics;
+  readonly gpt?: GptDiagnosticsApi;
+}
+
+export interface TsjsApiBase {
+  readonly version: '1.0.0';
+  readonly releaseId: string;
+  readonly boot: Readonly<TsjsBootV1>;
+  readonly que: TsjsCommandQueue;
+  readonly log: TsjsLog;
+  readonly _registerIntegration: (registration: unknown) => false;
+  addAdUnits(units: ProgrammaticAdUnit | readonly ProgrammaticAdUnit[]): AddAdUnitsResult;
+  requestAds(options?: RequestAdsOptions): Promise<RequestAdsResult>;
+}
+
+export interface TsjsKernelApi extends TsjsApiBase {
+  readonly diagnostics: Readonly<TsjsDiagnostics>;
+  readonly _internal: Readonly<{ state: 'kernel'; releaseId: string }>;
+}
+
+export interface TsjsFallbackApi extends TsjsApiBase {
+  readonly diagnostics?: never;
+  readonly _internal: Readonly<{
+    state: 'fallback';
+    releaseId: string;
+    reason: 'abi_mismatch' | 'bundle_partial';
+  }>;
+}
+
+export type TsjsApi = TsjsKernelApi | TsjsFallbackApi;
+
+/** Pre-cutover bundle implementation shape. Deleted with the unreachable legacy core. */
+export interface LegacyTsjsApi {
   version: string;
   que: Array<() => void>;
   addAdUnits(units: AdUnit | AdUnit[]): void;

@@ -1,4 +1,4 @@
-import type { TsjsApi } from '../../core/types';
+import type { LegacyTsjsApi } from '../../core/types';
 import { installQueue } from '../../core/queue';
 import { log } from '../../core/log';
 import { resolvePrebidWindow } from '../../shared/globals';
@@ -14,9 +14,9 @@ type TestlightWindow = PrebidWindow & {
   testlight?: TestlightGlobal;
 };
 
-function ensureTsjsApi(win: TestlightWindow): TsjsApi {
+function ensureTsjsApi(win: TestlightWindow): LegacyTsjsApi {
   if (win.tsjs) return win.tsjs;
-  const stub: TsjsApi = {
+  const stub: LegacyTsjsApi = {
     version: '0.0.0',
     que: [],
     addAdUnits: () => undefined,
@@ -27,13 +27,13 @@ function ensureTsjsApi(win: TestlightWindow): TsjsApi {
   return stub;
 }
 
-function installTestlightQueue(api: TsjsApi, win: TestlightWindow): void {
+function installTestlightQueue(api: LegacyTsjsApi, win: TestlightWindow): void {
   if (!Array.isArray(api.que)) {
     installQueue(api, win);
   }
 }
 
-function flushCallbacks(queue: TestlightCallback[], api: TsjsApi): void {
+function flushCallbacks(queue: TestlightCallback[], api: LegacyTsjsApi): void {
   while (queue.length > 0) {
     const fn = queue.shift();
     if (typeof fn !== 'function') {

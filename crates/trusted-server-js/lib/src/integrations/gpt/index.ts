@@ -14,7 +14,7 @@ import type {
   AuctionBidData,
   BrowserAuctionBidV1,
   GptSlotHandoff,
-  TsjsApi,
+  LegacyTsjsApi,
 } from '../../core/types';
 import {
   APS_UNIVERSAL_CREATIVE_RENDERER,
@@ -87,8 +87,10 @@ export function prepareTrustedServerGptTargetingV1(
   return Object.freeze(targeting);
 }
 
-function isNonEmptyString(value: unknown): value is string {
-  return typeof value === 'string' && value.length > 0;
+function bumpRenderGeneration(ts: LegacyTsjsApi): number {
+  const next = (ts.renderGeneration ?? 0) + 1;
+  ts.renderGeneration = next;
+  return next;
 }
 
 function trustedServerOpportunity(bid: AuctionBidData): GptDiagnosticsTrustedServerOpportunity {
@@ -742,7 +744,7 @@ function queueWinBillingBeacon(url: string): boolean {
  * `installTsAdInit` runs, so the detector is still queued ahead of the
  * publisher's GPT setup.
  */
-function syncInitialLoadDisabled(gpt: Partial<GoogleTag>, ts: TsjsApi): boolean {
+function syncInitialLoadDisabled(gpt: Partial<GoogleTag>, ts: LegacyTsjsApi): boolean {
   if (typeof gpt.getConfig !== 'function') return false;
 
   const config = gpt.getConfig('disableInitialLoad');
@@ -752,7 +754,7 @@ function syncInitialLoadDisabled(gpt: Partial<GoogleTag>, ts: TsjsApi): boolean 
   return true;
 }
 
-function installInitialLoadDetector(ts: TsjsApi): void {
+function installInitialLoadDetector(ts: LegacyTsjsApi): void {
   const win = window as GptWindow;
   const cmd = win.googletag?.cmd;
   if (!cmd) return;
@@ -874,7 +876,7 @@ function findGptSlotByElementId(
   return pubads.getSlots?.().find((slot) => slot.getSlotElementId() === elementId);
 }
 
-function handoffForSlot(ts: TsjsApi, slot: GoogleTagSlot): GptSlotHandoff | undefined {
+function handoffForSlot(ts: LegacyTsjsApi, slot: GoogleTagSlot): GptSlotHandoff | undefined {
   return ts.gptSlotHandoffs?.[slot.getSlotElementId()];
 }
 
@@ -897,7 +899,7 @@ function handoffFormatsMatch(handoff: GptSlotHandoff, formats: Array<number | nu
 }
 
 function matchingHandoff(
-  ts: TsjsApi,
+  ts: LegacyTsjsApi,
   pubads: GoogleTagPubAdsService,
   adUnitPath: string,
   formats: Array<number | number[]>,
@@ -919,11 +921,11 @@ function matchingHandoff(
   return matching.length === 1 ? matching[0] : undefined;
 }
 
-function registerHandoffAlias(ts: TsjsApi, elementId: string, handoff: GptSlotHandoff): void {
+function registerHandoffAlias(ts: LegacyTsjsApi, elementId: string, handoff: GptSlotHandoff): void {
   (ts.gptSlotHandoffs ??= {})[elementId] = handoff;
 }
 
-function withGptSlotHandoffInternal<T>(ts: TsjsApi, callback: () => T): T {
+function withGptSlotHandoffInternal<T>(ts: LegacyTsjsApi, callback: () => T): T {
   const wasInternal = ts.gptSlotHandoffInternal;
   ts.gptSlotHandoffInternal = true;
   try {
@@ -943,7 +945,7 @@ function withGptSlotHandoffInternal<T>(ts: TsjsApi, callback: () => T): T {
  * the original div is gone. The first duplicate publisher request is suppressed
  * because TS has already issued the initial request with TS targeting.
  */
-function installLatePublisherSlotHandoff(ts: TsjsApi): void {
+function installLatePublisherSlotHandoff(ts: LegacyTsjsApi): void {
   const win = window as GptWindow;
   const cmd = win.googletag?.cmd;
   if (!cmd) return;
@@ -1058,75 +1060,63 @@ function installLatePublisherSlotHandoff(ts: TsjsApi): void {
   });
 }
 
-function installFirstImpressionLifecycleObservers(ts: TsjsApi, g: Partial<GoogleTag>): void {
-  if (ts.firstImpressionListenersInstalled) return;
-  g.cmd?.push(() => {
-    if (ts.firstImpressionListenersInstalled) return;
-    const pubads = g.pubads?.();
-    if (!pubads?.addEventListener) return;
-
-    const observe =
-      (phase: 'requested' | 'rendered') =>
-      (event: SlotRenderEndedEvent): void => {
-        const elementId = event.slot?.getSlotElementId?.();
-        const element = elementId ? document.getElementById(elementId) : null;
-        if (element) observeFirstImpressionGptLifecycle(ts, element, phase);
-      };
-    pubads.addEventListener('slotRequested', observe('requested'));
-    pubads.addEventListener('slotRenderEnded', observe('rendered'));
-    ts.firstImpressionListenersInstalled = true;
-  });
-}
-
-function trustedServerTargeting(
-  slot: AuctionSlot,
-  bid: AuctionBidData
-): Record<string, string | string[]> {
-  const targeting: Record<string, string | string[]> = { ...(slot.targeting ?? {}) };
-  for (const key of TS_BID_TARGETING_KEYS) {
-    if (bid[key]) targeting[key] = String(bid[key]);
-  }
-  targeting[TS_INITIAL_TARGETING_KEY] = '1';
-  return targeting;
-}
-
-function applyTrustedServerTargeting(
-  ts: TsjsApi,
-  gptSlot: GoogleTagSlot,
-  slot: AuctionSlot,
-  bid: AuctionBidData,
-  elementIds: readonly string[]
-): string[] {
-  const previousKeys = ts.prevSlotTargetingKeys ?? {};
-  clearTargetingKeys(gptSlot, [
-    ...TS_BASE_TARGETING_KEYS,
-    ...elementIds.flatMap((elementId) => previousKeys[elementId] ?? []),
-  ]);
-  const targeting = trustedServerTargeting(slot, bid);
-  for (const [key, value] of Object.entries(targeting)) gptSlot.setTargeting(key, value);
-  const element = document.getElementById(elementIds[0]!);
-  const claim = element ? firstImpressionClaim(ts, element) : undefined;
-  if (claim?.owner === 'trusted_server') claim.targeting = targeting;
-  return Object.keys(slot.targeting ?? {});
-}
-
-function schedulePublisherFirstImpressionFallback(
-  ts: TsjsApi,
-  g: Partial<GoogleTag>,
-  slot: AuctionSlot,
-  bid: AuctionBidData,
-  element: HTMLElement,
-  generation: number
-): void {
-  if (!reservePublisherFirstImpressionFallback(ts, element)) return;
-
-  const retry = (): void => {
-    if (
-      (ts.navGeneration ?? 0) !== generation ||
-      !element.isConnected ||
-      document.getElementById(element.id) !== element
-    ) {
-      return;
+/**
+ * Install `window.tsjs.scheduleInitialAdInit`.
+ *
+ * The server-injected `</body>` bids script calls this to run the initial
+ * `adInit()` after React hydration instead of synchronously at body-parse
+ * time. `adInit()` defines GPT slots on the publisher's `-container`
+ * wrappers, mutating those ad-slot subtrees; on a Next.js App Router page a
+ * synchronous call lands that mutation inside React's hydration window and
+ * trips a #418 hydration mismatch. Deferral: gate on window `load` (the
+ * client bundles that hydrate the tree have executed by then), then a double
+ * `requestAnimationFrame` so the call runs after React has committed. A
+ * single deferred call — no retry timer.
+ *
+ * The SSR document is navigation generation 0 by definition, so the scheduler
+ * pins the whole initial pass to generation 0 rather than capturing whatever
+ * the counter reads when the `</body>` script runs: the SPA hook is installed
+ * by the synchronous head bundle, so a navigation can commit while the HTML
+ * is still streaming, and capturing that advanced value would adopt the stale
+ * SSR bootstrap as current. For the same reason the initial bids payload is
+ * passed in and applied here, generation-guarded — assigning it
+ * unconditionally at body end would clobber the live bids a faster SPA
+ * navigation already applied. When a navigation has committed since — or
+ * commits while the deferred callback is pending — the SSR payload is
+ * dropped and `adInit()` is not run: running anyway would re-run the newer
+ * route's live slots/bids, destroying and redefining that route's TS slots
+ * and double-refreshing it. The generation counter (not a URL comparison)
+ * keeps this guard aligned with the SPA auction hook's pathname-and-query
+ * route identity: query changes cancel the initial call because they request
+ * fresh page bids, while an `/a → /b → /a` round trip remains
+ * distinguishable even though the final URL equals the original.
+ *
+ * Hidden documents: browsers do not service `requestAnimationFrame` while a
+ * document is hidden, so a background-tab load (Cmd+click, open-in-new-tab)
+ * holds the initial `adInit()` until the tab is first viewed. This is
+ * intended, not an oversight: the initial ad request then spends its
+ * impression on a tab someone is actually looking at instead of firing —
+ * unviewable — at parse time in a tab that may never be foregrounded, and
+ * riding rAF keeps a single code path whose post-hydration-commit guarantee
+ * holds whenever the request is actually issued.
+ */
+function installScheduleInitialAdInit(ts: LegacyTsjsApi): void {
+  ts.scheduleInitialAdInit = function (initialBids?: Record<string, AuctionBidData>) {
+    if ((ts.navGeneration ?? 0) !== 0) return;
+    if (initialBids) ts.bids = initialBids;
+    const runUnlessNavigated = (): void => {
+      if ((ts.navGeneration ?? 0) !== 0) return;
+      ts.adInit?.();
+    };
+    const afterHydrationFrames = (): void => {
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(runUnlessNavigated);
+      });
+    };
+    if (document.readyState === 'complete') {
+      afterHydrationFrames();
+    } else {
+      window.addEventListener('load', afterHydrationFrames, { once: true });
     }
     const delay = publisherFirstImpressionRetryDelay(ts, element);
     if (delay === undefined) return;
@@ -1222,7 +1212,7 @@ function schedulePublisherFirstImpressionFallback(
 }
 
 export function installTsAdInit(): void {
-  const ts = (window.tsjs ??= {} as TsjsApi);
+  const ts = (window.tsjs ??= {} as LegacyTsjsApi);
   installInitialLoadDetector(ts);
   installScheduleInitialAdInit(ts);
 
@@ -1664,7 +1654,7 @@ function waitForSlotElements(slots: AuctionSlot[], signal: AbortSignal): Promise
  */
 export function installSpaAuctionHook(): void {
   if (typeof window === 'undefined') return;
-  const ts = (window.tsjs ??= {} as TsjsApi);
+  const ts = (window.tsjs ??= {} as LegacyTsjsApi);
   if (ts.spaHookInstalled) return;
   ts.spaHookInstalled = true;
   // Navigation identity for the deferred initial-adInit bootstrap (see

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { TsjsApi } from '../../../src/core/types';
+import type { LegacyTsjsApi } from '../../../src/core/types';
 import {
   installGptDiagnosticsRuntime,
   isGptDiagnosticsActive,
@@ -18,7 +18,7 @@ type DiagnosticsTestWindow = NonNullable<Parameters<typeof installGptDiagnostics
 
 const target = window as unknown as DiagnosticsTestWindow;
 
-function coreApi(): TsjsApi {
+function coreApi(): LegacyTsjsApi {
   return {
     version: 'test',
     que: [],

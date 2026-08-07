@@ -67,7 +67,7 @@ interface ApsPrebidTestEntry {
 
 interface PrebidTestWindow {
   pbjs?: unknown;
-  tsjs?: Partial<TsjsApi> | undefined;
+  tsjs?: Partial<LegacyTsjsApi> | undefined;
   googletag?: unknown;
   __tsjs_prebid?: Record<string, unknown> | undefined;
   __tsjsPrebidShimInstalled?: boolean | undefined;
@@ -218,7 +218,11 @@ import {
   prepareTrustedServerPrebidBidV1,
 } from '../../../src/integrations/prebid/index';
 import type { AuctionBid } from '../../../src/core/auction';
-import type { BidRenderSourceV1, BrowserAuctionBidV1, TsjsApi } from '../../../src/core/types';
+import type {
+  BidRenderSourceV1,
+  BrowserAuctionBidV1,
+  LegacyTsjsApi,
+} from '../../../src/core/types';
 import { log } from '../../../src/core/log';
 import type { TsjsApi } from '../../../src/core/types';
 import { GptDiagnosticsObserver } from '../../../src/integrations/gpt_diagnostics/observer';
