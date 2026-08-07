@@ -635,14 +635,17 @@ function installScheduleInitialAdInit(ts: TsjsApi): void {
     // a median 1.1s after the hydration commit and never before it, on either
     // page type. #418 stays on the deploy A/B checklist for that reason.
     let fired = false;
-    let poll: ReturnType<typeof setInterval> | undefined;
     let loadSeen = false;
     let ticksSinceLoad = 0;
+    // Held in a box rather than a bare binding: the synchronous pre-check can
+    // fire — and so try to clear the interval — before the interval has been
+    // created, which a `const` initialized at its declaration cannot express.
+    const poll: { id?: ReturnType<typeof setInterval> } = {};
 
     const fire = (): void => {
       if (fired) return;
       fired = true;
-      if (poll !== undefined) clearInterval(poll);
+      if (poll.id !== undefined) clearInterval(poll.id);
       afterHydrationFrames();
     };
     // The whole initial pass is one adInit call, so GPT issues a single batched
@@ -713,7 +716,7 @@ function installScheduleInitialAdInit(ts: TsjsApi): void {
     // before installing the interval.
     tick();
     if (fired) return;
-    poll = setInterval(tick, POLL_MS);
+    poll.id = setInterval(tick, POLL_MS);
   };
 }
 
