@@ -86,7 +86,13 @@ function createNavigationIdentityIssuer(
   }
   const prefixResult = randomBytes(8, source, observer);
   if (!prefixResult.ok) return prefixResult;
-  const prefix = prefixResult.value;
+  let prefix: Uint8Array<ArrayBuffer>;
+  try {
+    prefix = new Uint8Array(new ArrayBuffer(8));
+    prefix.set(prefixResult.value);
+  } catch {
+    return reportFailure(observer);
+  }
   let highWord = initialOrdinal[0] >>> 0;
   let lowWord = initialOrdinal[1] >>> 0;
 
@@ -95,19 +101,39 @@ function createNavigationIdentityIssuer(
       if (highWord === 0xffff_ffff && lowWord === 0xffff_ffff) {
         return reportFailure(observer);
       }
-      if (lowWord === 0xffff_ffff) {
-        highWord = (highWord + 1) >>> 0;
-        lowWord = 0;
-      } else {
-        lowWord = (lowWord + 1) >>> 0;
+      try {
+        const nextHighWord = lowWord === 0xffff_ffff ? (highWord + 1) >>> 0 : highWord;
+        const nextLowWord = lowWord === 0xffff_ffff ? 0 : (lowWord + 1) >>> 0;
+        const identity = new Uint8Array(16);
+        identity.set(prefix, 0);
+        const view = new DataView(identity.buffer);
+        view.setUint32(8, nextHighWord, false);
+        view.setUint32(12, nextLowWord, false);
+        if (identity.byteLength !== 16) return reportFailure(observer);
+        for (let index = 0; index < prefix.length; index += 1) {
+          if (identity[index] !== prefix[index]) return reportFailure(observer);
+        }
+        if (
+          identity[8] !== nextHighWord >>> 24 ||
+          identity[9] !== ((nextHighWord >>> 16) & 0xff) ||
+          identity[10] !== ((nextHighWord >>> 8) & 0xff) ||
+          identity[11] !== (nextHighWord & 0xff) ||
+          identity[12] !== nextLowWord >>> 24 ||
+          identity[13] !== ((nextLowWord >>> 16) & 0xff) ||
+          identity[14] !== ((nextLowWord >>> 8) & 0xff) ||
+          identity[15] !== (nextLowWord & 0xff)
+        ) {
+          return reportFailure(observer);
+        }
+        const encoded = encodeBase64Url(identity);
+        if (encoded.length !== 22) return reportFailure(observer);
+        const result = Object.freeze({ ok: true as const, value: `a1_${encoded}` });
+        highWord = nextHighWord;
+        lowWord = nextLowWord;
+        return result;
+      } catch {
+        return reportFailure(observer);
       }
-
-      const identity = new Uint8Array(16);
-      identity.set(prefix, 0);
-      const view = new DataView(identity.buffer);
-      view.setUint32(8, highWord, false);
-      view.setUint32(12, lowWord, false);
-      return Object.freeze({ ok: true, value: `a1_${encodeBase64Url(identity)}` });
     },
     snapshotOrdinalForTest: () => Object.freeze([highWord, lowWord] as const),
   });

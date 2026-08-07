@@ -55,6 +55,98 @@ describe('navigation identity issuer', () => {
     expect(created.value.snapshotOrdinalForTest()).toEqual([0, 2]);
   });
 
+  it('owns an immutable copy of the source-filled navigation prefix', () => {
+    let sourceBuffer: Uint8Array<ArrayBuffer> | undefined;
+    const created = createTestNavigationIdentityIssuer({
+      getRandomValues: (target) => {
+        target.set([0, 1, 2, 3, 4, 5, 6, 7]);
+        sourceBuffer = target;
+        return target;
+      },
+    });
+    expect(created).toMatchObject({ ok: true });
+    if (!created.ok) throw new Error('Expected an identity issuer');
+
+    sourceBuffer?.fill(255);
+
+    expect(created.value.mintAttemptId()).toEqual({
+      ok: true,
+      value: 'a1_AAECAwQFBgcAAAAAAAAAAQ',
+    });
+  });
+
+  it('survives detachment of the source-filled navigation prefix buffer', () => {
+    let sourceBuffer: Uint8Array<ArrayBuffer> | undefined;
+    const created = createTestNavigationIdentityIssuer({
+      getRandomValues: (target) => {
+        target.set([0, 1, 2, 3, 4, 5, 6, 7]);
+        sourceBuffer = target;
+        return target;
+      },
+    });
+    expect(created).toMatchObject({ ok: true });
+    if (!created.ok) throw new Error('Expected an identity issuer');
+    if (!sourceBuffer) throw new Error('Expected the source buffer');
+
+    structuredClone(sourceBuffer.buffer, { transfer: [sourceBuffer.buffer] });
+
+    expect(sourceBuffer.byteLength).toBe(0);
+    expect(created.value.mintAttemptId()).toEqual({
+      ok: true,
+      value: 'a1_AAECAwQFBgcAAAAAAAAAAQ',
+    });
+  });
+
+  it('contains mint buffer and view failures behind the typed identity failure', () => {
+    const failure = vi.fn();
+    const { source } = deterministicSource([0, 1, 2, 3, 4, 5, 6, 7]);
+    const created = createTestNavigationIdentityIssuer({
+      getRandomValues: source,
+      onFailure: failure,
+    });
+    expect(created).toMatchObject({ ok: true });
+    if (!created.ok) throw new Error('Expected an identity issuer');
+    vi.stubGlobal(
+      'DataView',
+      class {
+        public constructor() {
+          throw new Error('sensitive detached view failure');
+        }
+      }
+    );
+
+    expect(created.value.mintAttemptId()).toEqual({
+      ok: false,
+      reason: 'identity_generation_failed',
+    });
+    expect(failure.mock.calls).toEqual([['identity_generation_failed']]);
+    expect(created.value.snapshotOrdinalForTest()).toEqual([0, 0]);
+  });
+
+  it('fails closed when a mint view silently leaves ordinal bytes unwritten', () => {
+    const failure = vi.fn();
+    const { source } = deterministicSource([0, 1, 2, 3, 4, 5, 6, 7]);
+    const created = createTestNavigationIdentityIssuer({
+      getRandomValues: source,
+      onFailure: failure,
+    });
+    expect(created).toMatchObject({ ok: true });
+    if (!created.ok) throw new Error('Expected an identity issuer');
+    vi.stubGlobal(
+      'DataView',
+      class {
+        public setUint32(): void {}
+      }
+    );
+
+    expect(created.value.mintAttemptId()).toEqual({
+      ok: false,
+      reason: 'identity_generation_failed',
+    });
+    expect(failure.mock.calls).toEqual([['identity_generation_failed']]);
+    expect(created.value.snapshotOrdinalForTest()).toEqual([0, 0]);
+  });
+
   it('issues the final ordinal once and then fails forever without wrapping', () => {
     const { source } = deterministicSource([8, 7, 6, 5, 4, 3, 2, 1]);
     const failure = vi.fn();

@@ -126,6 +126,51 @@ describe('Runtime bootstrap owner', () => {
     ).toBe(false);
   });
 
+  it('stops activation when owner activation disposes the installing runtime', async () => {
+    const activateCore = vi.fn();
+    const activateModule = vi.fn();
+    const disposeOwner = vi.fn();
+    const target = {};
+    const runtime = createRuntime({
+      target,
+      releaseId: RELEASE,
+      manifest: manifest(['gpt']),
+      knownIntegrationIds: Object.freeze(['gpt']),
+      boot: boot(),
+      activateOwner: ({ onDispose }) => {
+        onDispose(disposeOwner);
+        runtime.dispose();
+      },
+      activateCore,
+      kernel: {
+        addAdUnits: vi.fn(),
+        diagnostics: Object.freeze({}),
+        requestAds: vi.fn(),
+      },
+    });
+
+    expect(runtime.start()).toBe(true);
+    expect(
+      runtime.registerIntegration({
+        id: 'gpt',
+        release: RELEASE,
+        prepare: () => ({ activate: activateModule }),
+      })
+    ).toBe(true);
+
+    await expect(runtime.install()).resolves.toEqual({
+      state: 'fallback',
+      reason: 'bundle_partial',
+    });
+    expect(activateCore).not.toHaveBeenCalled();
+    expect(activateModule).not.toHaveBeenCalled();
+    expect(disposeOwner).toHaveBeenCalledOnce();
+    expect(runtime.state).toBe('fallback');
+    expect(target).toMatchObject({
+      _internal: { state: 'fallback', releaseId: RELEASE, reason: 'bundle_partial' },
+    });
+  });
+
   it('runs queued work at the exact activation, commit, afterCommit, and FIFO drain boundaries', async () => {
     const order: string[] = [];
     let commitPushInstalled = false;

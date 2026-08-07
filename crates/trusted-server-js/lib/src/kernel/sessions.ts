@@ -336,17 +336,26 @@ class NavigationSessionOwner implements NavigationSession {
   private readonly batches = new Map<string, AuctionBatchOwner>();
   private readonly attempts = new Map<string, RenderAttemptOwner>();
   private readonly batchOrder: AuctionBatchOwner[] = [];
+  private issuer: NavigationIdentityIssuer | undefined;
+  private ownerIsCurrentCallback: (() => boolean) | undefined;
+  private onDisposingCallback: (() => DisposeCallback | undefined) | undefined;
+  private onDisposedCallback: (() => void) | undefined;
   private projection: Readonly<object> | undefined;
   private isDisposing = false;
 
   public constructor(
-    private readonly issuer: NavigationIdentityIssuer,
+    issuer: NavigationIdentityIssuer,
     initialProjection: Readonly<object> | undefined,
-    private readonly ownerIsCurrent: () => boolean,
-    private readonly onDisposed: () => void,
+    ownerIsCurrent: () => boolean,
+    onDisposing: () => DisposeCallback | undefined,
+    onDisposed: () => void,
     private readonly onDisposalError?: DisposalErrorHandler
   ) {
     this.scope = new OwnerScope(onDisposalError);
+    this.issuer = issuer;
+    this.ownerIsCurrentCallback = ownerIsCurrent;
+    this.onDisposingCallback = onDisposing;
+    this.onDisposedCallback = onDisposed;
     this.projection = initialProjection;
   }
 
@@ -389,10 +398,11 @@ class NavigationSessionOwner implements NavigationSession {
   }
 
   public createAuctionBatch(key: string): AuctionBatchScope | undefined {
-    if (!this.isCurrent() || this.batches.has(key)) return undefined;
+    const issuer = this.issuer;
+    if (!issuer || !this.isCurrent() || this.batches.has(key)) return undefined;
     const batchReference: { current?: AuctionBatchOwner } = {};
     const batch = new AuctionBatchOwner(
-      this.issuer,
+      issuer,
       (): boolean => this.isCurrent() && this.batches.get(key) === batchReference.current,
       (slot) => this.attempts.has(slot),
       (slot, attempt) => {
@@ -425,7 +435,7 @@ class NavigationSessionOwner implements NavigationSession {
   }
 
   public isCurrent(): boolean {
-    return !this.disposed && this.ownerIsCurrent();
+    return !this.disposed && (this.ownerIsCurrentCallback?.() ?? false);
   }
 
   public onDispose(kind: string, callback: DisposeCallback): void {
@@ -435,18 +445,31 @@ class NavigationSessionOwner implements NavigationSession {
   public dispose(): void {
     if (this.disposed) return;
     this.isDisposing = true;
-    for (let index = this.batchOrder.length - 1; index >= 0; index -= 1) {
-      this.batchOrder[index]?.dispose();
+    const releaseTransition = this.onDisposingCallback?.();
+    try {
+      for (let index = this.batchOrder.length - 1; index >= 0; index -= 1) {
+        this.batchOrder[index]?.dispose();
+      }
+      this.batchOrder.length = 0;
+      this.batches.clear();
+      this.attempts.clear();
+      this.scope.dispose();
+      this.aliases.clear();
+      this.intents.clear();
+      this.targetingOwners.clear();
+      this.projection = undefined;
+    } finally {
+      const onDisposed = this.onDisposedCallback;
+      this.issuer = undefined;
+      this.ownerIsCurrentCallback = undefined;
+      this.onDisposingCallback = undefined;
+      this.onDisposedCallback = undefined;
+      try {
+        onDisposed?.();
+      } finally {
+        releaseTransition?.();
+      }
     }
-    this.batchOrder.length = 0;
-    this.batches.clear();
-    this.attempts.clear();
-    this.scope.dispose();
-    this.aliases.clear();
-    this.intents.clear();
-    this.targetingOwners.clear();
-    this.projection = undefined;
-    this.onDisposed();
   }
 
   public snapshotInventoryForTest(): NavigationInventorySnapshot {
@@ -593,6 +616,22 @@ class RuntimeSessionOwner implements RuntimeSession {
       projection,
       () => !this.disposed && this.navigation === navigationReference.current,
       () => {
+        const disposingNavigation = navigationReference.current;
+        const ownsCurrent =
+          disposingNavigation !== undefined && this.navigation === disposingNavigation;
+        if (ownsCurrent) this.navigation = undefined;
+        if (!ownsCurrent || this.navigationTransitionInProgress || this.disposed) return undefined;
+        this.navigationTransitionInProgress = true;
+        return () => {
+          this.navigationTransitionInProgress = false;
+        };
+      },
+      () => {
+        const disposedNavigation = navigationReference.current;
+        if (disposedNavigation && this.navigation === disposedNavigation) {
+          this.navigation = undefined;
+        }
+        delete navigationReference.current;
         this.disposedNavigations += 1;
       },
       this.onDisposalError

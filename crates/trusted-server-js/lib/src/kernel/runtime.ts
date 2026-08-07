@@ -213,7 +213,7 @@ class RuntimeOwner implements Runtime {
     this.installPromise = this.registry
       .install({
         activateCore: (context) => {
-          if (!this.ownsRegistrationHandshake()) {
+          if (!this.ownsInstallingActivation(context)) {
             throw new Error('Runtime owner generation changed');
           }
           const ownerContext: RuntimeOwnerActivationContext = Object.freeze({
@@ -223,11 +223,11 @@ class RuntimeOwner implements Runtime {
             signal: context.signal,
           });
           this.invokeSynchronousActivation(this.options.activateOwner, ownerContext);
-          if (!this.ownsRegistrationHandshake()) {
+          if (!this.ownsInstallingActivation(context)) {
             throw new Error('Runtime owner generation changed');
           }
           this.invokeSynchronousActivation(this.options.activateCore, context);
-          if (!this.ownsRegistrationHandshake()) {
+          if (!this.ownsInstallingActivation(context)) {
             throw new Error('Runtime owner generation changed');
           }
         },
@@ -315,6 +315,15 @@ class RuntimeOwner implements Runtime {
     } catch {
       return false;
     }
+  }
+
+  private ownsInstallingActivation(context: CoreActivationContext): boolean {
+    return (
+      this.runtimeState === 'installing' &&
+      !context.signal.aborted &&
+      this.registry?.state === 'activating' &&
+      this.ownsRegistrationHandshake()
+    );
   }
 
   private bootCandidate(): unknown {

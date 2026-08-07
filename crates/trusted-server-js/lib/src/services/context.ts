@@ -2,6 +2,12 @@ import type { DisposeCallback } from '../kernel/disposable';
 
 const MAX_MANIFEST_INTEGRATIONS = 16;
 const INTEGRATION_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+// Context shares the existing /auction request-body ceiling. The structural
+// bound follows from the smallest repeated JSON unit (`0,`), and the key bound
+// reserves the seven bytes required by a one-property `{<key>:null}` object.
+const MAX_CONTEXT_JSON_BYTES = 256 * 1024;
+const MAX_CONTEXT_STRUCTURE_ENTRIES = Math.floor((MAX_CONTEXT_JSON_BYTES - 1) / 2);
+const MAX_CONTEXT_ENCODED_KEY_BYTES = MAX_CONTEXT_JSON_BYTES - 7;
 
 /** Owner boundary required for generation-scoped contributor registration. */
 export interface ContextContributorOwner {
@@ -50,7 +56,68 @@ interface ContributorRecord {
   readonly ownerGeneration: object;
 }
 
-const INVALID = Symbol('invalid_context_value');
+type JsonPrimitive = null | boolean | number | string;
+
+interface ContextMeasurement {
+  readonly jsonBytes: number;
+  readonly keyBytes: number;
+  readonly structureEntries: number;
+}
+
+interface PrimitiveSnapshot {
+  readonly kind: 'primitive';
+  readonly measurement: ContextMeasurement;
+  readonly value: JsonPrimitive;
+}
+
+interface ContextSnapshotEntry {
+  readonly encodedKeyBytes: number;
+  readonly key: string;
+  readonly sourceValue: unknown;
+  snapshot: ContextSnapshotNode | PrimitiveSnapshot | undefined;
+}
+
+interface ContextSnapshotNode {
+  readonly array: boolean;
+  readonly entries: readonly ContextSnapshotEntry[];
+  readonly kind: 'node';
+  readonly source: object;
+}
+
+interface ContextSnapshotGraph {
+  readonly nodes: readonly ContextSnapshotNode[];
+  readonly root: ContextSnapshotNode;
+}
+
+interface ClonedContextValue {
+  readonly measurement: ContextMeasurement;
+  readonly value: unknown;
+}
+
+interface CopiedContributionEntry extends ContextMeasurement {
+  readonly key: string;
+  readonly value: unknown;
+}
+
+interface CopiedContribution {
+  readonly entries: readonly CopiedContributionEntry[];
+}
+
+interface AcceptedContributionEntry {
+  readonly contribution: CopiedContributionEntry;
+  readonly integrationId: string;
+  readonly record: ContributorRecord;
+}
+
+interface TraversalBudget {
+  keyBytes: number;
+  structureEntries: number;
+}
+
+interface TraversalFrame {
+  readonly node: ContextSnapshotNode;
+  index: number;
+}
 
 function snapshotManifest(candidate: readonly string[]): readonly string[] {
   if (!Object.isFrozen(candidate) || candidate.length > MAX_MANIFEST_INTEGRATIONS) {
@@ -68,77 +135,225 @@ function snapshotManifest(candidate: readonly string[]): readonly string[] {
   return Object.freeze(snapshot);
 }
 
-function cloneContextValue(value: unknown, ancestors: Set<object>): unknown | typeof INVALID {
-  if (
-    value === null ||
-    typeof value === 'string' ||
-    typeof value === 'boolean' ||
-    (typeof value === 'number' && Number.isFinite(value))
-  ) {
-    return value;
+function boundedSum(left: number, right: number, maximum: number): number {
+  return left > maximum - right ? maximum + 1 : left + right;
+}
+
+function encodedJsonStringBytes(value: string, maximum: number): number {
+  let bytes = 2;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    let encodedBytes: number;
+    if (code === 0x22 || code === 0x5c) encodedBytes = 2;
+    else if (code <= 0x1f) {
+      encodedBytes =
+        code === 0x08 || code === 0x09 || code === 0x0a || code === 0x0c || code === 0x0d ? 2 : 6;
+    } else if (code <= 0x7f) encodedBytes = 1;
+    else if (code <= 0x7ff) encodedBytes = 2;
+    else if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        encodedBytes = 4;
+        index += 1;
+      } else encodedBytes = 6;
+    } else if (code >= 0xdc00 && code <= 0xdfff) encodedBytes = 6;
+    else encodedBytes = 3;
+    bytes = boundedSum(bytes, encodedBytes, maximum);
+    if (bytes > maximum) return bytes;
   }
-  if (typeof value !== 'object') return INVALID;
-  if (ancestors.has(value)) return INVALID;
+  return bytes;
+}
 
-  try {
-    const prototype = Object.getPrototypeOf(value) as unknown;
-    const array = Array.isArray(value);
-    if ((array && prototype !== Array.prototype) || (!array && prototype !== Object.prototype)) {
-      return INVALID;
+function snapshotPrimitive(value: unknown): PrimitiveSnapshot | undefined {
+  let jsonBytes: number;
+  if (value === null) jsonBytes = 4;
+  else if (typeof value === 'boolean') jsonBytes = value ? 4 : 5;
+  else if (typeof value === 'number' && Number.isFinite(value)) jsonBytes = `${value}`.length;
+  else if (typeof value === 'string') {
+    jsonBytes = encodedJsonStringBytes(value, MAX_CONTEXT_JSON_BYTES);
+    if (jsonBytes > MAX_CONTEXT_JSON_BYTES) return undefined;
+  } else return undefined;
+  return Object.freeze({
+    kind: 'primitive',
+    measurement: Object.freeze({ jsonBytes, keyBytes: 0, structureEntries: 0 }),
+    value,
+  }) as PrimitiveSnapshot;
+}
+
+function spendStructure(budget: TraversalBudget): boolean {
+  budget.structureEntries += 1;
+  return budget.structureEntries <= MAX_CONTEXT_STRUCTURE_ENTRIES;
+}
+
+function snapshotNode(source: object, budget: TraversalBudget): ContextSnapshotNode | undefined {
+  if (!spendStructure(budget)) return undefined;
+  const prototype = Object.getPrototypeOf(source) as unknown;
+  const array = Array.isArray(source);
+  if ((array && prototype !== Array.prototype) || (!array && prototype !== Object.prototype)) {
+    return undefined;
+  }
+  const entries: ContextSnapshotEntry[] = [];
+  if (array) {
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(source, 'length');
+    if (
+      !lengthDescriptor ||
+      !('value' in lengthDescriptor) ||
+      !Number.isSafeInteger(lengthDescriptor.value) ||
+      lengthDescriptor.value < 0 ||
+      lengthDescriptor.value > MAX_CONTEXT_STRUCTURE_ENTRIES
+    ) {
+      return undefined;
     }
-    if (Object.getOwnPropertySymbols(value).length > 0) return INVALID;
-    ancestors.add(value);
-    if (array) {
-      const names = Object.getOwnPropertyNames(value);
-      if (names.length !== value.length + 1 || !names.includes('length')) return INVALID;
-      const output: unknown[] = [];
-      for (let index = 0; index < value.length; index += 1) {
-        const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
-        if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) return INVALID;
-        const cloned = cloneContextValue(descriptor.value, ancestors);
-        if (cloned === INVALID) return INVALID;
-        output.push(cloned);
+    for (let index = 0; index < lengthDescriptor.value; index += 1) {
+      if (!spendStructure(budget)) return undefined;
+      const key = `${index}`;
+      const descriptor = Object.getOwnPropertyDescriptor(source, key);
+      if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) return undefined;
+      entries.push({ encodedKeyBytes: 0, key, snapshot: undefined, sourceValue: descriptor.value });
+    }
+  } else {
+    for (const key in source as Record<string, unknown>) {
+      const descriptor = Object.getOwnPropertyDescriptor(source, key);
+      if (!descriptor) continue;
+      if (!descriptor.enumerable || !('value' in descriptor) || !spendStructure(budget)) {
+        return undefined;
       }
-      return Object.freeze(output);
+      const encodedKeyBytes = encodedJsonStringBytes(key, MAX_CONTEXT_ENCODED_KEY_BYTES);
+      budget.keyBytes = boundedSum(budget.keyBytes, encodedKeyBytes, MAX_CONTEXT_ENCODED_KEY_BYTES);
+      if (budget.keyBytes > MAX_CONTEXT_ENCODED_KEY_BYTES) return undefined;
+      entries.push({ encodedKeyBytes, key, snapshot: undefined, sourceValue: descriptor.value });
     }
+  }
+  return { array, entries, kind: 'node', source };
+}
 
-    const output: Record<string, unknown> = {};
-    for (const key of Object.getOwnPropertyNames(value)) {
-      const descriptor = Object.getOwnPropertyDescriptor(value, key);
-      if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) return INVALID;
-      const cloned = cloneContextValue(descriptor.value, ancestors);
-      if (cloned === INVALID) return INVALID;
-      Object.defineProperty(output, key, {
-        configurable: true,
-        enumerable: true,
-        value: cloned,
-        writable: true,
-      });
+function snapshotContextGraph(value: unknown): ContextSnapshotGraph | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const budget: TraversalBudget = { keyBytes: 0, structureEntries: 0 };
+  try {
+    const root = snapshotNode(value, budget);
+    if (!root || root.array) return undefined;
+    const active = new Set<object>([value]);
+    const nodes: ContextSnapshotNode[] = [root];
+    const stack: TraversalFrame[] = [{ index: 0, node: root }];
+    while (stack.length > 0) {
+      const frame = stack[stack.length - 1];
+      if (!frame) return undefined;
+      if (frame.index >= frame.node.entries.length) {
+        active.delete(frame.node.source);
+        stack.pop();
+        continue;
+      }
+      const entry = frame.node.entries[frame.index];
+      frame.index += 1;
+      if (!entry) return undefined;
+      const primitive = snapshotPrimitive(entry.sourceValue);
+      if (primitive) {
+        entry.snapshot = primitive;
+        continue;
+      }
+      if (
+        typeof entry.sourceValue !== 'object' ||
+        entry.sourceValue === null ||
+        active.has(entry.sourceValue)
+      ) {
+        return undefined;
+      }
+      const child = snapshotNode(entry.sourceValue, budget);
+      if (!child) return undefined;
+      entry.snapshot = child;
+      nodes.push(child);
+      active.add(entry.sourceValue);
+      stack.push({ index: 0, node: child });
     }
-    return Object.freeze(output);
+    return Object.freeze({ nodes: Object.freeze(nodes), root });
   } catch {
-    return INVALID;
-  } finally {
-    ancestors.delete(value);
+    return undefined;
   }
 }
 
-function copyContribution(
-  value: Readonly<Record<string, unknown>>
-): Readonly<Record<string, unknown>> | undefined {
-  const cloned = cloneContextValue(value, new Set<object>());
-  return cloned === INVALID ||
-    typeof cloned !== 'object' ||
-    cloned === null ||
-    Array.isArray(cloned)
-    ? undefined
-    : (cloned as Readonly<Record<string, unknown>>);
+function cloneSnapshotGraph(graph: ContextSnapshotGraph): CopiedContribution | undefined {
+  const completed = new Map<ContextSnapshotNode, ClonedContextValue>();
+  try {
+    for (let nodeIndex = graph.nodes.length - 1; nodeIndex >= 0; nodeIndex -= 1) {
+      const node = graph.nodes[nodeIndex];
+      if (!node) return undefined;
+      const output: Record<string, unknown> | unknown[] = node.array ? [] : {};
+      let jsonBytes = 2;
+      let keyBytes = 0;
+      let structureEntries = 1;
+      for (let entryIndex = 0; entryIndex < node.entries.length; entryIndex += 1) {
+        const entry = node.entries[entryIndex];
+        if (!entry?.snapshot) return undefined;
+        const child =
+          entry.snapshot.kind === 'node' ? completed.get(entry.snapshot) : entry.snapshot;
+        if (!child) return undefined;
+        const prefixBytes =
+          (entryIndex === 0 ? 0 : 1) + (node.array ? 0 : entry.encodedKeyBytes + 1);
+        jsonBytes = boundedSum(jsonBytes, prefixBytes, MAX_CONTEXT_JSON_BYTES);
+        jsonBytes = boundedSum(jsonBytes, child.measurement.jsonBytes, MAX_CONTEXT_JSON_BYTES);
+        keyBytes = boundedSum(
+          keyBytes,
+          entry.encodedKeyBytes + child.measurement.keyBytes,
+          MAX_CONTEXT_ENCODED_KEY_BYTES
+        );
+        structureEntries = boundedSum(
+          structureEntries,
+          1 + child.measurement.structureEntries,
+          MAX_CONTEXT_STRUCTURE_ENTRIES
+        );
+        if (
+          jsonBytes > MAX_CONTEXT_JSON_BYTES ||
+          keyBytes > MAX_CONTEXT_ENCODED_KEY_BYTES ||
+          structureEntries > MAX_CONTEXT_STRUCTURE_ENTRIES
+        ) {
+          return undefined;
+        }
+        Object.defineProperty(output, entry.key, {
+          configurable: true,
+          enumerable: true,
+          value: child.value,
+          writable: true,
+        });
+      }
+      completed.set(
+        node,
+        Object.freeze({
+          measurement: Object.freeze({ jsonBytes, keyBytes, structureEntries }),
+          value: Object.freeze(output),
+        })
+      );
+    }
+
+    const entries = graph.root.entries.map((entry): CopiedContributionEntry | undefined => {
+      if (!entry.snapshot) return undefined;
+      const child = entry.snapshot.kind === 'node' ? completed.get(entry.snapshot) : entry.snapshot;
+      if (!child) return undefined;
+      return Object.freeze({
+        jsonBytes: entry.encodedKeyBytes + 1 + child.measurement.jsonBytes,
+        key: entry.key,
+        keyBytes: entry.encodedKeyBytes + child.measurement.keyBytes,
+        structureEntries: 1 + child.measurement.structureEntries,
+        value: child.value,
+      });
+    });
+    return entries.some((entry) => entry === undefined)
+      ? undefined
+      : Object.freeze({ entries: Object.freeze(entries as CopiedContributionEntry[]) });
+  } catch {
+    return undefined;
+  }
+}
+
+function copyContribution(value: unknown): CopiedContribution | undefined {
+  const graph = snapshotContextGraph(value);
+  return graph ? cloneSnapshotGraph(graph) : undefined;
 }
 
 class AuctionContextRegistryOwner implements AuctionContextRegistry {
   private readonly manifestIntegrationIds: readonly string[];
   private readonly manifestSet: ReadonlySet<string>;
-  private readonly runtimeGeneration: object;
+  private readonly runtimeGeneration: object | undefined;
   private readonly registrations = new Map<string, ContributorRecord>();
   private readonly runtimeOwner: ContextContributorOwner;
   private readonly onContributorFailure:
@@ -149,8 +364,12 @@ class AuctionContextRegistryOwner implements AuctionContextRegistry {
     this.manifestIntegrationIds = snapshotManifest(options.manifestIntegrationIds);
     this.manifestSet = new Set(this.manifestIntegrationIds);
     this.runtimeOwner = options.runtimeOwner;
-    this.runtimeGeneration = options.runtimeOwner.generation;
+    this.runtimeGeneration = this.snapshotCurrentOwnerGeneration(options.runtimeOwner);
     this.onContributorFailure = options.onContributorFailure;
+    if (this.runtimeGeneration === undefined) {
+      this.dispose();
+      return;
+    }
     try {
       options.runtimeOwner.onDispose('auction-context-registry', () => this.dispose());
     } catch {
@@ -164,33 +383,40 @@ class AuctionContextRegistryOwner implements AuctionContextRegistry {
     contributor: AuctionContextContributor,
     owner: ContextContributorOwner
   ): boolean {
+    const ownerGeneration = this.snapshotCurrentOwnerGeneration(owner);
     if (
       !this.runtimeIsCurrent() ||
       !this.manifestSet.has(integrationId) ||
       this.registrations.has(integrationId) ||
       typeof contributor !== 'function' ||
-      !this.ownerIsCurrent(owner, owner.generation)
+      ownerGeneration === undefined
     ) {
       return false;
     }
     const record: ContributorRecord = Object.freeze({
       contributor,
       owner,
-      ownerGeneration: owner.generation,
+      ownerGeneration,
     });
     this.registrations.set(integrationId, record);
     try {
       owner.onDispose('auction-context-contributor', () => {
-        if (this.registrations.get(integrationId) === record) {
-          this.registrations.delete(integrationId);
-        }
+        this.deleteRegistration(integrationId, record);
       });
     } catch {
-      this.registrations.delete(integrationId);
+      this.deleteRegistration(integrationId, record);
       return false;
     }
-    if (!this.runtimeIsCurrent() || !this.ownerIsCurrent(owner, record.ownerGeneration)) {
-      this.registrations.delete(integrationId);
+    const runtimeIsCurrent = this.runtimeIsCurrent();
+    const recordSurvivedRuntimeReflection = this.registrations.get(integrationId) === record;
+    if (!runtimeIsCurrent || !recordSurvivedRuntimeReflection) {
+      this.deleteRegistration(integrationId, record);
+      return false;
+    }
+    const ownerIsCurrent = this.ownerIsCurrent(owner, ownerGeneration);
+    const recordSurvivedOwnerReflection = this.registrations.get(integrationId) === record;
+    if (!ownerIsCurrent || !recordSurvivedOwnerReflection) {
+      this.deleteRegistration(integrationId, record);
       return false;
     }
     return true;
@@ -201,34 +427,95 @@ class AuctionContextRegistryOwner implements AuctionContextRegistry {
       this.dispose();
       return Object.freeze({});
     }
-    const output: Record<string, unknown> = {};
+    const accepted = new Map<string, AcceptedContributionEntry>();
+    let acceptedEntryBytes = 0;
+    let acceptedKeyBytes = 0;
+    let acceptedStructureEntries = 1;
     for (const integrationId of this.manifestIntegrationIds) {
       const record = this.registrations.get(integrationId);
-      if (!record || !this.ownerIsCurrent(record.owner, record.ownerGeneration)) continue;
-      let contribution: Readonly<Record<string, unknown>> | undefined;
+      if (!record) continue;
+      const ownerIsCurrentBeforeInvocation = this.ownerIsCurrent(
+        record.owner,
+        record.ownerGeneration
+      );
+      const recordSurvivedOwnerReflection = this.registrations.get(integrationId) === record;
+      if (!ownerIsCurrentBeforeInvocation || !recordSurvivedOwnerReflection) continue;
+      let contribution: CopiedContribution | undefined;
+      let contributorReturnedUndefined = false;
       try {
         const candidate = record.contributor();
-        if (candidate === undefined) continue;
-        contribution = copyContribution(candidate);
+        contributorReturnedUndefined = candidate === undefined;
+        if (!contributorReturnedUndefined) contribution = copyContribution(candidate);
       } catch {
         contribution = undefined;
       }
+      if (this.registrations.get(integrationId) !== record) continue;
+      if (contributorReturnedUndefined) continue;
       if (!contribution) {
         this.reportFailure(integrationId);
         continue;
       }
-      if (!this.runtimeIsCurrent()) return Object.freeze({});
-      if (!this.ownerIsCurrent(record.owner, record.ownerGeneration)) continue;
-      for (const [key, value] of Object.entries(contribution)) {
+      const runtimeIsCurrent = this.runtimeIsCurrent();
+      const recordSurvivedRuntimeReflection = this.registrations.get(integrationId) === record;
+      if (!runtimeIsCurrent) return Object.freeze({});
+      if (!recordSurvivedRuntimeReflection) continue;
+      const ownerIsCurrentBeforeMerge = this.ownerIsCurrent(record.owner, record.ownerGeneration);
+      const recordSurvivedOwnerReflectionBeforeMerge =
+        this.registrations.get(integrationId) === record;
+      if (!ownerIsCurrentBeforeMerge || !recordSurvivedOwnerReflectionBeforeMerge) continue;
+      let prospectiveEntryBytes = acceptedEntryBytes;
+      let prospectiveKeyBytes = acceptedKeyBytes;
+      let prospectiveStructureEntries = acceptedStructureEntries;
+      let prospectiveEntryCount = accepted.size;
+      for (const entry of contribution.entries) {
+        const predecessor = accepted.get(entry.key);
+        if (predecessor) {
+          prospectiveEntryBytes -= predecessor.contribution.jsonBytes;
+          prospectiveKeyBytes -= predecessor.contribution.keyBytes;
+          prospectiveStructureEntries -= predecessor.contribution.structureEntries;
+        } else prospectiveEntryCount += 1;
+        prospectiveEntryBytes += entry.jsonBytes;
+        prospectiveKeyBytes += entry.keyBytes;
+        prospectiveStructureEntries += entry.structureEntries;
+      }
+      const prospectiveJsonBytes =
+        2 + Math.max(0, prospectiveEntryCount - 1) + prospectiveEntryBytes;
+      if (
+        prospectiveJsonBytes > MAX_CONTEXT_JSON_BYTES ||
+        prospectiveKeyBytes > MAX_CONTEXT_ENCODED_KEY_BYTES ||
+        prospectiveStructureEntries > MAX_CONTEXT_STRUCTURE_ENTRIES
+      ) {
+        this.reportFailure(integrationId);
+        continue;
+      }
+      if (this.registrations.get(integrationId) !== record) continue;
+      for (const entry of contribution.entries) {
+        accepted.set(entry.key, Object.freeze({ contribution: entry, integrationId, record }));
+      }
+      acceptedEntryBytes = prospectiveEntryBytes;
+      acceptedKeyBytes = prospectiveKeyBytes;
+      acceptedStructureEntries = prospectiveStructureEntries;
+    }
+    try {
+      const output: Record<string, unknown> = {};
+      for (const [key, entry] of accepted) {
         Object.defineProperty(output, key, {
           configurable: true,
           enumerable: true,
-          value,
+          value: entry.contribution.value,
           writable: true,
         });
       }
+      if (!this.runtimeIsCurrent()) return Object.freeze({});
+      for (const entry of accepted.values()) {
+        if (this.registrations.get(entry.integrationId) !== entry.record) {
+          return Object.freeze({});
+        }
+      }
+      return Object.freeze(output);
+    } catch {
+      return Object.freeze({});
     }
-    return this.runtimeIsCurrent() ? Object.freeze(output) : Object.freeze({});
   }
 
   public dispose(): void {
@@ -247,11 +534,9 @@ class AuctionContextRegistryOwner implements AuctionContextRegistry {
   }
 
   private runtimeIsCurrent(): boolean {
-    return (
-      !this.isDisposed &&
-      this.runtimeOwner.generation === this.runtimeGeneration &&
-      this.ownerIsCurrent(this.runtimeOwner, this.runtimeGeneration)
-    );
+    const generation = this.runtimeGeneration;
+    if (this.isDisposed || generation === undefined) return false;
+    return this.ownerIsCurrent(this.runtimeOwner, generation) && !this.isDisposed;
   }
 
   private ownerIsCurrent(owner: ContextContributorOwner, generation: object): boolean {
@@ -259,6 +544,22 @@ class AuctionContextRegistryOwner implements AuctionContextRegistry {
       return owner.generation === generation && owner.isCurrent();
     } catch {
       return false;
+    }
+  }
+
+  private snapshotCurrentOwnerGeneration(owner: ContextContributorOwner): object | undefined {
+    try {
+      const generation = owner.generation;
+      if (typeof generation !== 'object' || generation === null) return undefined;
+      return owner.isCurrent() ? generation : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private deleteRegistration(integrationId: string, record: ContributorRecord): void {
+    if (this.registrations.get(integrationId) === record) {
+      this.registrations.delete(integrationId);
     }
   }
 
