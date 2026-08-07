@@ -196,6 +196,7 @@ describe('renderer reservation identity and registration', () => {
       const context = attempt.winnerContext;
       if (!context) throw new Error('Expected an admitted winner context');
       const admission = service.consumeClaim(result, {
+        attempt,
         attemptId: attempt.id,
         slot: attempt.slot,
         navigationGeneration: navigation.generation,
@@ -227,7 +228,29 @@ describe('renderer reservation identity and registration', () => {
     if (!context) throw new Error('Expected an admitted winner context');
 
     expect(
+      Reflect.apply(service.consumeClaim, service, [
+        result,
+        {
+          attemptId: attempt.id,
+          slot: attempt.slot,
+          navigationGeneration: navigation.generation,
+          winnerContext: context,
+        },
+      ])
+    ).toBeUndefined();
+    const replayedAttempt = Object.freeze({ ...attempt });
+    expect(
       service.consumeClaim(result, {
+        attempt: replayedAttempt,
+        attemptId: attempt.id,
+        slot: attempt.slot,
+        navigationGeneration: navigation.generation,
+        winnerContext: context,
+      })
+    ).toBeUndefined();
+    expect(
+      service.consumeClaim(result, {
+        attempt,
         attemptId: attempt.id,
         slot: attempt.slot,
         navigationGeneration: Object.freeze({}),
@@ -236,6 +259,7 @@ describe('renderer reservation identity and registration', () => {
     ).toBeUndefined();
     expect(
       service.consumeClaim(result, {
+        attempt,
         attemptId: attempt.id,
         slot: attempt.slot,
         navigationGeneration: navigation.generation,
@@ -244,6 +268,7 @@ describe('renderer reservation identity and registration', () => {
     ).toBeUndefined();
     expect(
       service.consumeClaim(Object.freeze({ ...result }), {
+        attempt,
         attemptId: attempt.id,
         slot: attempt.slot,
         navigationGeneration: navigation.generation,
@@ -252,6 +277,7 @@ describe('renderer reservation identity and registration', () => {
     ).toBeUndefined();
 
     const admission = service.consumeClaim(result, {
+      attempt,
       attemptId: attempt.id,
       slot: attempt.slot,
       navigationGeneration: navigation.generation,
@@ -265,6 +291,7 @@ describe('renderer reservation identity and registration', () => {
     expect(Object.isFrozen(admission)).toBe(true);
     expect(
       service.consumeClaim(result, {
+        attempt,
         attemptId: attempt.id,
         slot: attempt.slot,
         navigationGeneration: navigation.generation,
@@ -292,6 +319,7 @@ describe('renderer reservation identity and registration', () => {
 
       expect(
         service.consumeClaim(result, {
+          attempt,
           attemptId: attempt.id,
           slot: attempt.slot,
           navigationGeneration: navigation.generation,

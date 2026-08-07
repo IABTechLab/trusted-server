@@ -992,6 +992,7 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
       admission = Reflect.apply(consumeClaimMethod, reservations, [
         candidate,
         frozen<ReservationClaimExpectation>({
+          attempt: owner,
           attemptId: id,
           slot,
           navigationGeneration,
