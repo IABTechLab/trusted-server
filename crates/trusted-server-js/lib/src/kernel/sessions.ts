@@ -1,6 +1,11 @@
 import { DisposableStack, type DisposeCallback, type DisposalErrorHandler } from './disposable';
 import type { IdentityGenerationResult, NavigationIdentityIssuer } from './identity';
 
+/** Immutable price authority transferred from winner admission into one attempt. */
+export interface WinnerContext {
+  readonly selectedCpm: number;
+}
+
 /** Factory that obtains one fresh eight-byte identity prefix per navigation. */
 export type NavigationIdentityIssuerFactory =
   () => IdentityGenerationResult<NavigationIdentityIssuer>;
@@ -114,12 +119,14 @@ export interface RenderAttemptScope {
   readonly interfaces: RuntimeInterfaces;
   readonly id: string;
   readonly slot: string;
+  readonly winnerContext: WinnerContext | undefined;
   readonly disposed: boolean;
   readonly signal: AbortSignal;
   readonly capture: <Arguments extends readonly unknown[]>(
     callback: (...arguments_: Arguments) => unknown
   ) => (...arguments_: Arguments) => boolean;
   readonly isCurrent: () => boolean;
+  readonly adoptWinnerContext: (context: WinnerContext) => boolean;
   readonly onDispose: (kind: string, callback: DisposeCallback) => void;
   readonly dispose: () => void;
 }
@@ -203,6 +210,7 @@ class OwnerScope {
 
 class RenderAttemptOwner implements RenderAttemptScope {
   private readonly scope: OwnerScope;
+  private acceptedWinnerContext: WinnerContext | undefined;
 
   public constructor(
     public readonly id: string,
@@ -224,6 +232,36 @@ class RenderAttemptOwner implements RenderAttemptScope {
 
   public get signal(): AbortSignal {
     return this.scope.signal;
+  }
+
+  public get winnerContext(): WinnerContext | undefined {
+    return this.acceptedWinnerContext;
+  }
+
+  public adoptWinnerContext(context: WinnerContext): boolean {
+    if (!this.isCurrent()) return false;
+    if (this.acceptedWinnerContext !== undefined) return this.acceptedWinnerContext === context;
+    try {
+      const descriptor = Object.getOwnPropertyDescriptor(context, 'selectedCpm');
+      if (
+        !Object.isFrozen(context) ||
+        Object.getPrototypeOf(context) !== Object.prototype ||
+        Object.getOwnPropertyNames(context).length !== 1 ||
+        Object.getOwnPropertySymbols(context).length !== 0 ||
+        !descriptor ||
+        !descriptor.enumerable ||
+        !('value' in descriptor) ||
+        typeof descriptor.value !== 'number' ||
+        !Number.isFinite(descriptor.value) ||
+        descriptor.value < 0
+      ) {
+        return false;
+      }
+      this.acceptedWinnerContext = context;
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   public capture<Arguments extends readonly unknown[]>(

@@ -1,5 +1,5 @@
 import { log } from '../../core/log';
-import type { ApsPrebidRendererEntry, TsjsApi } from '../../core/types';
+import type { ApsPrebidRendererEntry, ApsRendererV1, TsjsApi } from '../../core/types';
 import { validateApsRenderer } from '../../core/contracts/aps_renderer';
 
 export { parseApsRendererDescriptor, validateApsRenderer } from '../../core/contracts/aps_renderer';
@@ -18,6 +18,12 @@ const MAX_PREBID_RENDERER_ENTRIES = 256;
 const DEFAULT_PREBID_RENDERER_TTL_SECONDS = 300;
 const MAX_PREBID_RENDERER_TTL_SECONDS = 3600;
 const MAX_PREBID_ID_BYTES = 1024;
+
+/** Validate, copy, and freeze one APS tagged render source. */
+export function prepareApsRenderSource(input: unknown): Readonly<ApsRendererV1> | undefined {
+  const renderer = validateApsRenderer(input);
+  return renderer ? Object.freeze(renderer) : undefined;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -70,7 +76,7 @@ export function registerApsPrebidRenderer(
   ) {
     return false;
   }
-  const renderer = validateApsRenderer(input);
+  const renderer = prepareApsRenderSource(input);
   if (!renderer) return false;
 
   const now = Date.now();
@@ -165,7 +171,7 @@ export interface RenderApsCreativeOptions {
 
 /** Render APS through the static endpoint under an outer opaque-origin sandbox. */
 export function renderApsCreative({ slotId, renderer: input }: RenderApsCreativeOptions): boolean {
-  const renderer = validateApsRenderer(input);
+  const renderer = prepareApsRenderSource(input);
   const rendererUrl = apsRendererUrl();
   const nonce = createNonce();
   if (!renderer || !rendererUrl || !nonce) {

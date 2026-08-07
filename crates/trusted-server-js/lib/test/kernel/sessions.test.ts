@@ -321,6 +321,27 @@ describe('runtime and navigation sessions', () => {
     });
   });
 
+  it('adopts one immutable winner context and rejects replacement or stale adoption', () => {
+    const runtime = createRuntimeSession({ createIdentityIssuer: identityFactory() });
+    const navigation = runtime.startInitialNavigation();
+    if (!navigation.ok) throw new Error('Expected navigation');
+    const batch = navigation.value.createAuctionBatch('winner-context');
+    if (!batch) throw new Error('Expected auction batch');
+    const attempt = batch.createRenderAttempt('fictional-slot');
+    if (!attempt.ok) throw new Error('Expected render attempt');
+    const accepted = Object.freeze({ selectedCpm: 1.25 });
+
+    expect(attempt.value.winnerContext).toBeUndefined();
+    expect(attempt.value.adoptWinnerContext(accepted)).toBe(true);
+    expect(attempt.value.winnerContext).toBe(accepted);
+    expect(attempt.value.adoptWinnerContext(accepted)).toBe(true);
+    expect(attempt.value.adoptWinnerContext(Object.freeze({ selectedCpm: 1.25 }))).toBe(false);
+
+    attempt.value.dispose();
+    expect(attempt.value.adoptWinnerContext(Object.freeze({ selectedCpm: 2 }))).toBe(false);
+    expect(attempt.value.winnerContext).toBe(accepted);
+  });
+
   it('refuses identity failure before replacing or creating route work', () => {
     const firstIssuer = identityFactory();
     const createIdentityIssuer = vi

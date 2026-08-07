@@ -361,10 +361,13 @@ describe('browser composition', () => {
     expect(composition.runtimeSessionForTest()).toBe(session);
     const slotService = composition.slotServiceForTest();
     const targetingService = composition.targetingServiceForTest();
+    const reservationService = composition.reservationServiceForTest();
     expect(slotService).toBeDefined();
     expect(targetingService).toBeDefined();
+    expect(reservationService).toBeDefined();
     expect(session?.interfaces['slots']).toBe(slotService);
     expect(session?.interfaces['targeting']).toBe(targetingService);
+    expect(session?.interfaces['reservations']).toBe(reservationService);
     expect(session?.currentNavigation?.interfaces).toBe(session?.interfaces);
     expect(session?.currentNavigation?.currentAuctionProjection).toEqual(projection);
     expect(Object.isFrozen(session?.currentNavigation?.currentAuctionProjection)).toBe(true);
@@ -382,6 +385,7 @@ describe('browser composition', () => {
     if (!replacement?.ok) throw new Error('Expected SPA navigation');
     expect(replacement.value.currentAuctionProjection).toBeUndefined();
     expect(composition.runtimeSessionForTest()).toBe(session);
+    expect(composition.reservationServiceForTest()).toBe(reservationService);
 
     const pageBids = composition.pageBidsControllerForTest();
     expect(
@@ -406,8 +410,13 @@ describe('browser composition', () => {
       records: 0,
     });
     expect(targetingService?.snapshotForTest()).toEqual({ frames: 0, slots: 0 });
+    expect(reservationService?.snapshotInventoryForTest()).toMatchObject({
+      disposed: true,
+      size: 0,
+    });
     expect(composition.slotServiceForTest()).toBeUndefined();
     expect(composition.targetingServiceForTest()).toBeUndefined();
+    expect(composition.reservationServiceForTest()).toBeUndefined();
   });
 
   it('unwinds a lazily-created session when navigation identity generation fails', async () => {

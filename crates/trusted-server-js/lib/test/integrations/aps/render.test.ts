@@ -13,6 +13,7 @@ import {
   apsRendererUrl,
   getApsPrebidRenderer,
   parseApsRendererDescriptor,
+  prepareApsRenderSource,
   registerApsPrebidRenderer,
   renderApsCreative,
   validateApsRenderer,
@@ -271,6 +272,17 @@ function materializeCorpusVector(vector: CorpusVector): MaterializedCorpusVector
 }
 
 describe('APS renderer validation', () => {
+  it('prepares a copied frozen tagged source without retaining projection input', () => {
+    const input = descriptor();
+    const prepared = prepareApsRenderSource(input);
+
+    expect(prepared).toEqual(input);
+    expect(prepared).not.toBe(input);
+    expect(Object.isFrozen(prepared)).toBe(true);
+    input.width = 1;
+    expect(prepared?.width).toBe(300);
+  });
+
   it('matches every shared cross-language contract vector', () => {
     for (const vector of rendererCorpus.vectors.map(materializeCorpusVector)) {
       const actual = classifyApsRendererV1(vector.descriptor, vector.publisherOrigin);
