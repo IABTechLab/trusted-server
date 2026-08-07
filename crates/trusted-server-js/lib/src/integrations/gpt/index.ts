@@ -77,6 +77,26 @@ function isReactHydrated(el: Element): boolean {
   );
 }
 
+// Whether this document is hydrated by React at all.
+//
+// React marks its root container and hydrates the elements beneath it, so the
+// document root reports ownership on a React page and never does on a plain
+// one. Used to keep the hydration wait from penalizing non-React publishers,
+// whose ad containers would otherwise never report hydrated.
+function documentUsesReact(): boolean {
+  // `hydrateRoot(document, …)` — what the App Router does — marks `document`
+  // itself as the root container, and that marker appears before the per-element
+  // fibers do (measured ~700ms earlier), so check it first.
+  const container = Object.getOwnPropertyNames(document).some((key) =>
+    key.startsWith('__reactContainer$')
+  );
+  return (
+    container ||
+    isReactHydrated(document.documentElement) ||
+    (document.body !== null && isReactHydrated(document.body))
+  );
+}
+
 function candidateSlotRoots(divId: string): HTMLElement[] {
   const roots: HTMLElement[] = [];
   const slotEl = findSlotElementByDivId(divId);
@@ -515,11 +535,18 @@ function installInitialLoadDetector(ts: TsjsApi): void {
  * time. `adInit()` defines GPT slots on the publisher's `-container`
  * wrappers, mutating those ad-slot subtrees; on a Next.js App Router page a
  * synchronous call lands that mutation inside React's hydration window and
- * trips a #418 hydration mismatch. Deferral: gate on the first hydration
- * signal to arrive — the Next.js App Router runtime patching `window.__next_f`
- * (~9s on heavy publishers) or window `load` (fallback, and the only signal on
- * non-Next publishers) — then a double `requestAnimationFrame` so the call runs
- * after React has committed. A single deferred call — no retry timer.
+ * trips a #418 hydration mismatch. Deferral: poll the ad-slot containers
+ * `adInit` is about to mutate until React reports them hydrated, with window
+ * `load` starting a bounded grace period rather than firing the call itself —
+ * then a double `requestAnimationFrame`. A single deferred call — no retry
+ * timer.
+ *
+ * An earlier revision gated on a page-global framework signal (the App Router
+ * patching `window.__next_f`). Controlled capture on a live App Router
+ * publisher measured that unsafe: it fires a median 16ms after React's *first*
+ * commit — sometimes before it — while hydration continues for seconds, giving
+ * 8/8 #418 with the creative destroyed on 3/6 runs. Gating on the mutation
+ * targets themselves is what replaced it.
  *
  * The SSR document is navigation generation 0 by definition, so the scheduler
  * pins the whole initial pass to generation 0 rather than capturing whatever
@@ -539,17 +566,16 @@ function installInitialLoadDetector(ts: TsjsApi): void {
  * initial call, while an `/a → /b → /a` round trip — where the URL compares
  * equal again — must.
  *
- * `window.__next_f` is a Next.js **internal**: the App Router RSC flight-data
- * global, present only on App Router pages (Next 13+) and observed on the
- * App Router publisher this gate was measured against. Pages Router
- * publishers never define it, and a future Next release that renames it would
- * stop patching the name we poll — in both cases the poll simply never fires
- * and the publisher takes the `load` path, so the failure mode is slow, not
- * broken. Worth re-checking this signal on a gated publisher's major Next
- * upgrade, since nothing else would surface the regression. The head
- * bootstrap's fallback scheduler in `gpt_bootstrap.js` deliberately stays on
- * `load` only — it exists for the bundle-failed-to-load path, where being
- * early matters less than being small.
+ * `__reactFiber$` / `__reactProps$` are React **internals**: the own-properties
+ * React DOM attaches to each host node it hydrates, with a suffix randomized
+ * per React instance. Non-React publishers never carry them, and a future
+ * React release that renames them would stop marking the nodes we poll — in
+ * both cases the containers never report hydrated and the publisher takes the
+ * `load` path, so the failure mode is slow, not broken. Worth re-checking this
+ * signal on a gated publisher's major React upgrade, since nothing else would
+ * surface the regression. The head bootstrap's fallback scheduler in
+ * `gpt_bootstrap.js` deliberately stays on `load` only — it exists for the
+ * bundle-failed-to-load path, where being early matters less than being small.
  *
  * Hidden documents: browsers do not service `requestAnimationFrame` while a
  * document is hidden, so a background-tab load (Cmd+click, open-in-new-tab)
@@ -557,10 +583,10 @@ function installInitialLoadDetector(ts: TsjsApi): void {
  * intended, not an oversight: the initial ad request then spends its
  * impression on a tab someone is actually looking at instead of firing —
  * unviewable — at parse time in a tab that may never be foregrounded, and
- * riding rAF keeps a single code path whose post-hydration-commit guarantee
- * holds whenever the request is actually issued. The `__next_f` poll fires
+ * riding rAF keeps a single code path whose post-hydration ordering holds
+ * whenever the request is actually issued. The container poll fires
  * independently of rAF, but `afterHydrationFrames` still gates the call, so
- * the hidden-tab behavior is unchanged by the runtime signal.
+ * the hidden-tab behavior is unchanged by the container signal.
  */
 function installScheduleInitialAdInit(ts: TsjsApi): void {
   ts.scheduleInitialAdInit = function (initialBids?: Record<string, AuctionBidData>) {
@@ -575,60 +601,119 @@ function installScheduleInitialAdInit(ts: TsjsApi): void {
         window.requestAnimationFrame(runUnlessNavigated);
       });
     };
-    if (document.readyState === 'complete') {
-      afterHydrationFrames();
-      return;
-    }
-    // Fire on whichever signal arrives first, exactly once:
-    //  - the slot containers adInit is about to mutate having been hydrated by
-    //    React, checked directly on those elements. This is the early signal.
-    //  - window.load: unconditional fallback, and the only signal where the
-    //    containers never report hydrated (non-React publishers, or a React
-    //    internal rename), so the failure mode stays "slow, not broken".
-    // The double requestAnimationFrame after the trigger still lands the call
-    // after React commits, and runUnlessNavigated still honors navGeneration.
+    // Fire when the ad-slot containers adInit will mutate have been hydrated by
+    // React, exactly once.
     //
+    // `window.load` deliberately does NOT trigger the call. Measured on a live
+    // App Router publisher, load lands 65ms (article page) to ~1000ms (homepage,
+    // whose header/fixed_bottom containers are client-rendered and absent from
+    // the SSR HTML) BEFORE those containers are ready. Firing there mutates a
+    // subtree React is still building, which trips #418 — and React then
+    // regenerates the subtree, destroying the creative that just rendered.
+    // Instead `load` starts a bounded grace period, so the wait still cannot
+    // hang on a page whose configured slots never appear at all.
+    const POLL_MS = 50;
+    // Bounds the post-load wait. 3s covers the observed load-to-container gap
+    // (65ms to ~1s across both page types) with margin. Counted in poll ticks so
+    // the deadline advances on the same timer the poll runs on.
+    const GRACE_TICKS = Math.ceil(3000 / POLL_MS);
     // Why the mutation targets and not a page-global signal: adInit defines GPT
     // slots on the publisher's ad-slot subtrees, so what matters is whether
     // React has hydrated *those* elements — not whether the framework runtime
-    // booted or every subresource finished. Measured on a live App Router
-    // publisher, a page-global runtime signal fires within ~30ms of React's
-    // FIRST commit while the ad containers hydrate seconds later; mutating in
-    // that window trips #418 and React then regenerates the subtree, destroying
-    // the creative that was just rendered into it.
+    // booted or every subresource finished. A page-global runtime signal fires
+    // within ~30ms of React's FIRST commit while the ad containers are ready
+    // seconds later.
+    //
+    // The double requestAnimationFrame after the trigger adds two frames on top,
+    // and runUnlessNavigated still honors navGeneration.
+    //
+    // Note what this does and does not guarantee. React attaches the fiber
+    // properties when the hydration *render* pass claims a host node; the
+    // enclosing commit lands later, and a time-sliced pass can span frames after
+    // the containers are claimed. So "after React commits" is an empirical
+    // result, not a construction — measured on the gated publisher, adInit lands
+    // a median 1.1s after the hydration commit and never before it, on either
+    // page type. #418 stays on the deploy A/B checklist for that reason.
     let fired = false;
+    let poll: ReturnType<typeof setInterval> | undefined;
+    let loadSeen = false;
+    let ticksSinceLoad = 0;
+
     const fire = (): void => {
       if (fired) return;
       fired = true;
+      if (poll !== undefined) clearInterval(poll);
       afterHydrationFrames();
     };
-    window.addEventListener('load', fire, { once: true });
     // The whole initial pass is one adInit call, so GPT issues a single batched
-    // ad request; requiring every currently-present container to be hydrated
-    // keeps that batch intact. Containers that appear later are not part of the
-    // initial pass today either.
+    // ad request; every configured slot must therefore be ready before it runs.
+    //
+    // Each slot has to *resolve to an element* as well as be hydrated. Requiring
+    // only that the containers present so far are hydrated is trivially true
+    // early on — a page whose in-content slots exist before its header slot has
+    // been rendered would satisfy it, fire while React is still building the
+    // rest, and mutate mid-render. A configured slot that never appears on this
+    // page leaves the condition false until the post-load grace period expires.
     const slotContainersHydrated = (): boolean => {
       const slots = ts.adSlots ?? [];
       if (slots.length === 0) return false;
-      const roots = slots.flatMap((slot) => candidateSlotRoots(slot.div_id));
-      if (roots.length === 0) return false;
-      return roots.every(isReactHydrated);
+      return slots.every((slot) => {
+        const roots = candidateSlotRoots(slot.div_id);
+        return roots.length > 0 && roots.every(isReactHydrated);
+      });
     };
+    const tick = (): void => {
+      if (fired) return;
+      if (slotContainersHydrated()) {
+        fire();
+        return;
+      }
+      if (!loadSeen) return;
+      // No configured slots: adInit has no subtree to mutate, so `load` behaves
+      // as it always did.
+      const slots = ts.adSlots ?? [];
+      if (slots.length === 0) {
+        fire();
+        return;
+      }
+      // Static page: every configured slot is already in the DOM and neither
+      // they nor the document are React-owned, so there is no hydration pass
+      // that could still touch them. Fire now rather than making non-React
+      // publishers sit out the grace period.
+      //
+      // Absence of React cannot be settled at `load` alone — measured on this
+      // publisher, `load` sometimes precedes React creating its root by ~700ms,
+      // so a bare "no React yet" check would misread a React page as static.
+      // Requiring every slot to be *present* is what distinguishes them: a page
+      // still waiting on React has containers that do not exist yet.
+      const everySlotResolves = slots.every((slot) => candidateSlotRoots(slot.div_id).length > 0);
+      if (everySlotResolves && !documentUsesReact()) {
+        fire();
+        return;
+      }
+      ticksSinceLoad += 1;
+      if (ticksSinceLoad >= GRACE_TICKS) fire();
+    };
+
+    if (document.readyState === 'complete') {
+      loadSeen = true;
+    } else {
+      window.addEventListener(
+        'load',
+        () => {
+          loadSeen = true;
+          tick();
+        },
+        { once: true }
+      );
+    }
+
     // This script runs at `</body>`; on a streamed App Router page React can
     // already have hydrated the containers by then, so check once synchronously
-    // before installing the interval. The `load` listener above stays
-    // registered; `once: true` plus the `fired` guard make it inert.
-    if (slotContainersHydrated()) {
-      fire();
-      return;
-    }
-    // The poll stops itself on the first tick after either signal wins, so a
-    // later hydration cannot re-run adInit (the `fired` guard also holds).
-    const poll: ReturnType<typeof setInterval> = setInterval(() => {
-      if (!fired && !slotContainersHydrated()) return;
-      clearInterval(poll);
-      fire();
-    }, 50);
+    // before installing the interval.
+    tick();
+    if (fired) return;
+    poll = setInterval(tick, POLL_MS);
   };
 }
 

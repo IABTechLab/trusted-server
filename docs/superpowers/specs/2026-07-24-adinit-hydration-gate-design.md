@@ -74,7 +74,46 @@ whose absence — Pages Router, or a future rename — degrades to the `window.l
 breaking.
 
 The sections below document the superseded chunk-await approach and why it was chosen — kept for the
-record. The **current** implementation is the `__next_f` gate.
+record.
+
+## Update 2 (controlled capture): the `__next_f` gate measured unsafe, replaced by container hydration
+
+**The `__next_f` gate above is superseded — it was measured unsafe, not merely unproven.** A
+controlled capture on a live App Router publisher (Playwright with a stubbed
+`__REACT_DEVTOOLS_GLOBAL_HOOK__`, so React's own commit timestamps are observable in a production
+build; arms differ only in what drives `adInit`, on one build and one page):
+
+| arm                                  | #418 | SSAT creative destroyed |
+| ------------------------------------ | ---- | ----------------------- |
+| Trusted Server off (publisher alone) | 0/8  | —                       |
+| TS on, `adInit` suppressed           | 0/8  | —                       |
+| TS on, `window.load` gate (#945)     | 0/6  | 0/6                     |
+| TS on, **`__next_f` gate**           | 8/8  | **3/6**                 |
+| TS on, **container-hydration gate**  | 0/8  | 0/8                     |
+
+The suppressed arm isolates `adInit` as the sole cause — the publisher contributes none, and TS's
+`<head>`/`</body>` script injection contributes none. `__next_f.push` being patched lands a median
+16ms after React's **first** commit and sometimes before it, while hydration continues for seconds
+(830–21,876 commits per run), so the double-rAF margin is ~32ms against a multi-second tail. The
+#418 is not cosmetic: React regenerates the mismatched subtree and destroys the creative that just
+rendered.
+
+**Correction to the deferral reasoning above.** The `requestIdleCallback` deferral leans on "#418 at
+2/38 (~5%) with 0/38 correlation to slot loss". That reading does not hold: it came from pages whose
+ad slots are not React-owned. On an article page whose containers are React-rendered with `useId`
+ids, the same gate reproduces #418 at **100%**, and it _does_ cost impressions. Do not reuse that
+~5% figure as a safety argument.
+
+**Current implementation:** gate on the ad-slot containers `adInit` will mutate reporting
+React-hydrated (`__reactFiber$` / `__reactProps$` own-properties), in `installScheduleInitialAdInit`
+(`crates/trusted-server-js/lib/src/integrations/gpt/index.ts`). Per-element rather than page-global,
+so there is no timing constant to invent; `window.load` starts a bounded grace period rather than
+firing the call, because `load` has no defined relationship to container creation — measured 65ms to
+~1000ms _before_ the containers were ready, and on one page React had not yet created its root when
+`load` fired.
+
+A future reader restoring the `__next_f` gate from the sections above would reproduce #418 at 100%
+on React-owned slots. Don't.
 
 ## Problem
 

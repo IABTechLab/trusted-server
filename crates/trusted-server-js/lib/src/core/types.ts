@@ -263,7 +263,8 @@ export interface TsjsApi {
    * Lives in the bundle so the lifecycle is executable under test and shares
    * [`navGeneration`] with the SPA auction hook; `gpt_bootstrap.js` installs
    * a minimal fallback for pages where the bundle fails to load (that fallback
-   * gates on `load` only — the runtime signal is a bundle-side optimization).
+   * gates on `load` only — the container-hydration signal is a bundle-side
+   * optimization).
    */
   scheduleInitialAdInit?: (initialBids?: Record<string, AuctionBidData>) => void;
   /** Read-only GPT lifecycle diagnostics API, present only in an activated tab. */

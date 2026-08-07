@@ -107,6 +107,10 @@ describe('scheduleInitialAdInit', () => {
     // Reset jsdom location back to root for the next test.
     originalReplaceState({}, '', '/');
     document.body.innerHTML = '';
+    // The React-ownership marker is an own property, so it outlives innerHTML
+    // and would make every later test look like a React document.
+    delete (document.body as unknown as Record<string, unknown>).__reactFiber$r4nd0m;
+    delete (document.documentElement as unknown as Record<string, unknown>).__reactFiber$r4nd0m;
     popstateHandlers.forEach((handler) => window.removeEventListener('popstate', handler));
     popstateHandlers = [];
     // Remove the instance properties so the prototype getters are visible again.
@@ -303,6 +307,98 @@ describe('scheduleInitialAdInit', () => {
       // The trigger fired, but the double rAF still gates the actual call.
       flushFrame();
       expect(adInit).not.toHaveBeenCalled();
+      flushFrame();
+      expect(adInit).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('waits past window load for a container React has not produced yet', async () => {
+    // The homepage case: window.load fires ~1s BEFORE React renders the header
+    // and fixed-bottom containers, which are client-only and absent from the
+    // SSR HTML. Firing on load mutates a subtree React is still building.
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      await importGptModule();
+      const ts = (window as TestWindow).tsjs!;
+      const adInit = vi.fn();
+      ts.adInit = adInit;
+      markReactHydrated(document.body);
+      ts.adSlots = [slotFor('ad-header-0')];
+
+      ts.scheduleInitialAdInit!();
+      window.dispatchEvent(new Event('load'));
+      flushFrame();
+      flushFrame();
+      expect(adInit).not.toHaveBeenCalled();
+
+      // React produces the container a second after load.
+      vi.advanceTimersByTime(1000);
+      const late = appendSlotElement('ad-header-0');
+      markReactHydrated(late);
+      vi.advanceTimersByTime(50);
+      flushFrame();
+      flushFrame();
+      expect(adInit).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('gives up waiting and fires once the post-load grace period expires', async () => {
+    // A configured slot that never appears must not hang the initial pass: the
+    // wait is bounded, and adInit still runs (degraded) rather than never.
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      await importGptModule();
+      const ts = (window as TestWindow).tsjs!;
+      const adInit = vi.fn();
+      ts.adInit = adInit;
+      markReactHydrated(document.body);
+      ts.adSlots = [slotFor('ad-never-rendered')];
+
+      ts.scheduleInitialAdInit!();
+      window.dispatchEvent(new Event('load'));
+      vi.advanceTimersByTime(2000);
+      flushFrame();
+      flushFrame();
+      expect(adInit).not.toHaveBeenCalled();
+
+      vi.advanceTimersByTime(1100);
+      flushFrame();
+      flushFrame();
+      expect(adInit).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('holds while a configured slot has no element yet, then fires when it appears hydrated', async () => {
+    // A page whose in-content slot is rendered before its header slot: the
+    // present-and-hydrated container must not be enough to fire, or adInit
+    // mutates while React is still building the rest of the tree.
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      await importGptModule();
+      const ts = (window as TestWindow).tsjs!;
+      const adInit = vi.fn();
+      ts.adInit = adInit;
+      const present = appendSlotElement('ad-in_content-0');
+      markReactHydrated(present);
+      ts.adSlots = [slotFor('ad-in_content-0'), slotFor('ad-header-0')];
+
+      ts.scheduleInitialAdInit!();
+      vi.advanceTimersByTime(500);
+      flushFrame();
+      flushFrame();
+      expect(adInit).not.toHaveBeenCalled();
+
+      // React renders and hydrates the header slot.
+      const late = appendSlotElement('ad-header-0');
+      markReactHydrated(late);
+      vi.advanceTimersByTime(50);
+      flushFrame();
       flushFrame();
       expect(adInit).toHaveBeenCalledTimes(1);
     } finally {

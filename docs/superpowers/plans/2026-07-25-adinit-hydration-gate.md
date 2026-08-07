@@ -28,6 +28,19 @@
 > covered by `crates/trusted-server-js/lib/test/integrations/gpt/schedule_initial_ad_init.test.ts`
 > (executable Vitest lifecycle assertions, not string matches on emitted Rust output). Edit the TS
 > module, not the Rust `format!`.
+>
+> **UPDATE 2 (controlled capture): the `__next_f` gate was measured unsafe and replaced.** A
+> controlled capture on a live App Router publisher — arms differing only in what drives `adInit` —
+> put the `__next_f` gate at **8/8 #418 with the creative destroyed on 3/6 runs**, against 0/8 for
+> both the publisher-alone and `adInit`-suppressed control arms. `__next_f.push` being patched fires
+> a median 16ms after React's _first_ commit (sometimes before it) while hydration runs for seconds.
+> The gate now polls the **ad-slot containers `adInit` will mutate** for React's `__reactFiber$` /
+> `__reactProps$` own-properties, with `window.load` starting a bounded grace period instead of
+> firing the call; that measured 0/8 #418 and 0/8 destroyed creatives on the same pages. The tests
+> assert container hydration rather than `__next_f`. Note also that the spec's "~5% and not
+> impression-costing" figure — used there to defer `requestIdleCallback` — does not hold: it came
+> from pages whose slots are not React-owned. See the spec's "Update 2" section. Tasks below are kept
+> for the record; restoring the `__next_f` gate would reproduce #418 at 100% on React-owned slots.
 
 ---
 

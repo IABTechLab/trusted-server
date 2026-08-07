@@ -95,8 +95,8 @@
   // spent on a viewed tab, and the post-hydration guarantee holds whenever
   // the request is actually issued.
   //
-  // This fallback stays on `load` only — it does not poll for the Next.js
-  // runtime signal the bundle scheduler uses. It exists for the
+  // This fallback stays on `load` only — it does not poll for container
+  // hydration the way the bundle scheduler does. It exists for the
   // bundle-failed-to-load path, where staying small matters more than being
   // early.
   ts.scheduleInitialAdInit = function (initialBids) {
