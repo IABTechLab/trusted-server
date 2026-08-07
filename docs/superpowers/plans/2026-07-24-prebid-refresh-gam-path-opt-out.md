@@ -136,7 +136,9 @@ npm run format
    - matching is case-sensitive literal suffix matching via `getAdUnitPath()`;
    - invalid/empty/root suffixes are rejected and a missing getter fails open;
    - use a specific terminal path rather than a size or div-ID rule;
-   - mixed global refreshes still auction normal slots.
+   - mixed global refreshes still auction normal slots;
+   - excluded slots in mixed refreshes wait for the auction or refresh watchdog before
+     GAM refresh, while an all-excluded refresh passes through immediately.
 3. Explain that the server-served shim and injected configuration deploy together
    for this option; retain the pre-split external-bundle migration caveat and the
    direct-Prebid/APS non-goals. Do not add real inventory names, production domains,
@@ -193,6 +195,7 @@ npm run format
 - An all-excluded refresh produces no `requestBids()` or targeting call.
 - A mixed refresh auctions and targets only eligible slots while refreshing every
   requested GPT slot.
-- Stale Trusted Server/Prebid targeting is cleared from every target slot, and the
-  initial-load bypass remains untouched.
+- Stale Trusted Server/Prebid targeting is cleared from every independent slot,
+  including excluded slots, while publisher delivery-slot targeting and the
+  initial-load bypass remain untouched.
 - The deployed server shim and injected configuration are version-compatible.

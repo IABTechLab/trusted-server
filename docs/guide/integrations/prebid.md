@@ -354,7 +354,9 @@ the configured suffixes with an exact, case-sensitive `endsWith()` match. A matc
 slot is omitted from the synthetic Prebid refresh ad units, but it remains in the
 original GPT refresh call. In a mixed global refresh, normal display slots still
 auction and receive refreshed Prebid targeting while excluded slots still refresh in
-GAM.
+GAM. Because the original refresh is preserved as one GPT call, an excluded slot in
+that mixed refresh waits for the auction to complete or the refresh watchdog to fire
+(up to 1.5 seconds by default); an all-excluded refresh passes through immediately.
 
 Each suffix must be a non-empty slash-prefixed path with no surrounding whitespace.
 The root suffix (`"/"`) is rejected, as are suffixes without a leading slash; exact

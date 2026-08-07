@@ -32,8 +32,9 @@ covered by deterministic tests rather than an unstable external page.
 - Keep excluded slots in the final GPT refresh list and preserve refresh options.
 - Continue refreshing and auctioning non-excluded display slots, including in mixed
   global refreshes.
-- Clear stale Trusted Server/Prebid targeting from every target slot before its GAM
-  refresh, including excluded slots.
+- Clear stale Trusted Server/Prebid targeting from every independent slot before its
+  GAM refresh, including excluded slots, while preserving targeting on publisher
+  delivery slots.
 - Preserve the existing `adInitRefreshInProgress` direct-GAM bypass exactly.
 
 ### Non-goals
@@ -58,9 +59,11 @@ covered by deterministic tests rather than an unstable external page.
    (`index.ts:726-818`). The wrapper:
    - immediately passes through `adInitRefreshInProgress` requests;
    - resolves explicit slots, or `pubads.getSlots()` for bare refreshes;
+   - partitions the resolved slots into publisher delivery slots and independent
+     slots;
    - clears `ts_initial`, `hb_pb`, `hb_bidder`, `hb_adid`, `hb_cache_host`, and
-     `hb_cache_path` from every resolved slot (`index.ts:43-50, 461-467`);
-   - creates one synthetic refresh ad unit per target slot;
+     `hb_cache_path` from every independent slot (`index.ts:43-50, 461-467`);
+   - creates one synthetic refresh ad unit per eligible independent slot;
    - calls `pbjs.requestBids()`;
    - scopes `setTargetingForGPTAsync()` to the synthetic codes; and
    - calls the original GPT refresh after bids return.
@@ -144,8 +147,8 @@ For a non-empty normalized list the server injects:
 For `[]`, omit the property with `skip_serializing_if`, matching the existing
 `clientSideBidders` convention. A browser that receives no property treats it as an
 empty list. This makes upgrade and rollback backwards compatible: old configuration
-has no behavior change; an older external bundle safely ignores the extra injected
-property; and a newer bundle with old configuration has no exclusions.
+has no behavior change; an older shim safely ignores the extra injected property;
+and a newer shim with old configuration has no exclusions.
 
 ## 5. Matching and refresh behavior
 
@@ -157,11 +160,11 @@ Extend `RefreshGptSlot` with:
 getAdUnitPath?: () => string;
 ```
 
-At each publisher refresh, derive a `Set` from
+At each publisher refresh, read the injected readonly array from
 `getInjectedConfig()?.excludedGamAdUnitPathSuffixes ?? []`. A slot is excluded only
 when all of the following hold:
 
-1. The normalized set is non-empty.
+1. The array is non-empty.
 2. `slot.getAdUnitPath` is a function.
 3. Calling it returns a string.
 4. The returned GAM path `endsWith()` at least one configured suffix, using exact,
@@ -191,8 +194,14 @@ if targetSlots is empty:
     originalRefresh(slots, options)
     return
 
-clear TS/Prebid refresh-targeting keys from every target slot
-auctionSlots = targetSlots excluding suffix-matched slots
+deliverySlots = publisher delivery slots in targetSlots
+independentSlots = targetSlots excluding deliverySlots
+if independentSlots is empty:
+    originalRefresh(slots, options)
+    return
+
+clear TS/Prebid refresh-targeting keys from every independent slot
+auctionSlots = independentSlots excluding suffix-matched slots
 
 if auctionSlots is empty:
     originalRefresh(slots, options)
@@ -212,14 +221,14 @@ slots.
 
 ### 5.3 Refresh sequences
 
-| Call and slot set                                        | Prebid behavior                                                                     | GPT behavior                                                            |
-| -------------------------------------------------------- | ----------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| `refresh([normal], options)`                             | Auction `normal`, target its synthetic code after bids return.                      | Refresh `[normal]` with the same options after the callback.            |
-| `refresh([excluded], options)`                           | Clear TS/Prebid keys; do not call `requestBids()` or `setTargetingForGPTAsync()`.   | Immediately refresh `[excluded]` with the same options.                 |
-| Bare `refresh(options)`; all slots excluded              | Resolve `pubads.getSlots()`, clear their TS/Prebid keys, then make no Prebid calls. | Immediately pass through the original bare refresh and options.         |
-| Bare `refresh(options)`; mixed normal and excluded slots | Clear every target slot; auction and target only normal slots.                      | After the callback, pass through the original bare refresh and options. |
-| Any refresh while `adInitRefreshInProgress` is true      | No cleanup, match, auction, or targeting.                                           | Directly pass through the original `slots` and options unchanged.       |
-| Missing/throwing `getAdUnitPath()`                       | Treat the slot as normal and auction it.                                            | Existing post-auction refresh behavior.                                 |
+| Call and slot set                                        | Prebid behavior                                                                   | GPT behavior                                                            |
+| -------------------------------------------------------- | --------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| `refresh([normal], options)`                             | Auction `normal`, target its synthetic code after bids return.                    | Refresh `[normal]` with the same options after the callback.            |
+| `refresh([excluded], options)`                           | Clear TS/Prebid keys; do not call `requestBids()` or `setTargetingForGPTAsync()`. | Immediately refresh `[excluded]` with the same options.                 |
+| Bare `refresh(options)`; all slots excluded              | Resolve slots; clear independent keys; skip Prebid.                               | Immediately pass through the original bare refresh and options.         |
+| Bare `refresh(options)`; mixed normal and excluded slots | Clear independent slots; auction eligible slots.                                  | After the callback, pass through the original bare refresh and options. |
+| Any refresh while `adInitRefreshInProgress` is true      | No cleanup, match, auction, or targeting.                                         | Directly pass through the original `slots` and options unchanged.       |
+| Missing/throwing `getAdUnitPath()`                       | Treat the slot as normal and auction it.                                          | Existing post-auction refresh behavior.                                 |
 
 The resolved list is used only for cleanup and synthetic-auction selection. The
 wrapper preserves the publisher's original refresh form, so GPT itself resolves the
@@ -273,11 +282,12 @@ source-of-truth edit target.
 - Explicit matching slot clears each existing TS/Prebid key, does not call
   `requestBids()` or `setTargetingForGPTAsync()`, and immediately calls original
   GPT refresh with the exact slot array and options.
-- Global all-excluded slots resolve through `getSlots()`, clear every target, make
-  no Prebid calls, and pass the original bare refresh and options to GPT.
-- Global mixed slots clear both categories, auction only eligible slots, scope
-  targeting to eligible synthetic codes, and pass the original bare refresh and
-  options to GPT after bids return.
+- Global all-excluded slots resolve through `getSlots()`, clear independent-slot
+  targeting, make no Prebid calls, and pass the original bare refresh and options to
+  GPT.
+- Global mixed slots preserve publisher delivery-slot targeting, clear independent
+  slots, auction only eligible slots, scope targeting to eligible synthetic codes,
+  and pass the original bare refresh and options to GPT after bids return.
 - Missing `getAdUnitPath`, non-string path, and a throwing getter each fail open to
   the normal auction path without throwing from the wrapper.
 - Case mismatch and a trailing-slash mismatch do not exclude, proving literal
