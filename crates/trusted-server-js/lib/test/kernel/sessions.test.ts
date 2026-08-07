@@ -209,6 +209,63 @@ describe('runtime and navigation sessions', () => {
     });
   });
 
+  it('clears an exactly current navigation after direct child disposal', () => {
+    const runtime = createRuntimeSession({ createIdentityIssuer: identityFactory() });
+    const initial = runtime.startInitialNavigation(frozenProjection('initial'));
+    if (!initial.ok) throw new Error('Expected initial navigation');
+
+    initial.value.dispose();
+
+    expect(runtime.currentNavigation).toBeUndefined();
+    expect(runtime.snapshotInventoryForTest()).toMatchObject({
+      currentNavigationGeneration: undefined,
+      disposedNavigations: 1,
+      navigationCount: 0,
+    });
+    const replacement = runtime.replaceNavigation();
+    expect(replacement).toMatchObject({ ok: true });
+    if (!replacement.ok) throw new Error('Expected replacement navigation');
+    expect(runtime.currentNavigation).toBe(replacement.value);
+    expect(replacement.value.disposed).toBe(false);
+  });
+
+  it('blocks replacement before remaining direct-disposal callbacks can mutate a new route', () => {
+    const runtime = createRuntimeSession({ createIdentityIssuer: identityFactory() });
+    const initial = runtime.startInitialNavigation(frozenProjection('initial'));
+    if (!initial.ok) throw new Error('Expected initial navigation');
+    let replacement: ReturnType<typeof runtime.replaceNavigation> | undefined;
+    let disposerSawCurrent = true;
+    let aliasMutation: boolean | undefined;
+    initial.value.onDispose('old-mutator', () => {
+      disposerSawCurrent = runtime.currentNavigation !== undefined;
+      aliasMutation = runtime.currentNavigation?.claimAlias('must-not-cross-generation');
+    });
+    initial.value.onDispose('replacement', () => {
+      replacement = runtime.replaceNavigation();
+    });
+
+    initial.value.dispose();
+
+    expect(replacement).toEqual({
+      ok: false,
+      reason: 'navigation_transition_in_progress',
+    });
+    expect(disposerSawCurrent).toBe(false);
+    expect(aliasMutation).toBeUndefined();
+    expect(runtime.currentNavigation).toBeUndefined();
+    expect(runtime.snapshotInventoryForTest()).toMatchObject({
+      currentNavigationGeneration: undefined,
+      disposedNavigations: 1,
+      navigationCount: 0,
+    });
+
+    const successive = runtime.replaceNavigation();
+    expect(successive).toMatchObject({ ok: true });
+    if (!successive.ok) throw new Error('Expected successive navigation');
+    expect(runtime.currentNavigation).toBe(successive.value);
+    expect(successive.value.snapshotInventoryForTest().aliases).toBe(0);
+  });
+
   it('owns auction batches and render attempts in nested child scopes', () => {
     const order: string[] = [];
     const staleMutation = vi.fn();
