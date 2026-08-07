@@ -17,7 +17,11 @@ import {
   type PrebidAdapter,
   type PrebidGlobalTarget,
 } from '../adapters/prebid';
-import { parseBrowserAuctionProjectionV1 } from '../core/contracts/auction_projection';
+import { parseCacheFetchPolicyV1 } from '../core/config';
+import {
+  parseBidRenderSourceV1,
+  parseBrowserAuctionProjectionV1,
+} from '../core/contracts/auction_projection';
 import { validateApsRenderer } from '../core/contracts/aps_renderer';
 import { createBrowserNavigationIdentityIssuer } from '../kernel/identity';
 import type { NavigationIdentityIssuerFactory, RuntimeSession } from '../kernel/sessions';
@@ -30,6 +34,7 @@ import {
   type PageBidsController,
   prepareInitialAuctionProjection,
 } from '../services/projections';
+import { createReservationService, type ReservationService } from '../services/reservations';
 import { createSlotService, type SlotService } from '../services/slots';
 import { createTargetingService, type TargetingService } from '../services/targeting';
 
@@ -44,6 +49,7 @@ export interface BrowserComposition {
 }
 
 export interface BrowserServices {
+  readonly reservations: ReservationService;
   readonly slots: SlotService;
   readonly targeting: TargetingService;
 }
@@ -70,6 +76,8 @@ export interface BrowserRuntimeComposition extends BrowserComposition {
   readonly slotServiceForTest: () => SlotService | undefined;
   /** Return runtime-owned targeting operations only in coordinated-cutover tests. */
   readonly targetingServiceForTest: () => TargetingService | undefined;
+  /** Return runtime-owned reservation operations only in coordinated-cutover tests. */
+  readonly reservationServiceForTest: () => ReservationService | undefined;
 }
 
 export interface BrowserCoreActivations {
@@ -181,6 +189,8 @@ export function createTestBrowserRuntimeComposition(
     ...runtimeOptions,
     activateOwner: (context) => {
       const boot = context.boot as unknown as AcceptedBrowserBoot;
+      const cachePolicy =
+        boot.cachePolicy === undefined ? undefined : parseCacheFetchPolicyV1(boot.cachePolicy);
       const parseProjection = (candidate: unknown): object | undefined =>
         parseBrowserAuctionProjectionV1(candidate, boot.cachePolicy);
       const initialProjection = prepareInitialAuctionProjection(
@@ -190,7 +200,14 @@ export function createTestBrowserRuntimeComposition(
       if (!initialProjection) throw new Error('Accepted boot projection is unavailable');
       const slotService = createSlotService({ googletag: composition.adapters.googletag });
       const targetingService = createTargetingService();
-      const services = Object.freeze({ slots: slotService, targeting: targetingService });
+      const reservationService = createReservationService({
+        prepareRenderSource: (candidate) => parseBidRenderSourceV1(candidate, cachePolicy),
+      });
+      const services = Object.freeze({
+        reservations: reservationService,
+        slots: slotService,
+        targeting: targetingService,
+      });
       const session = createRuntimeSession({
         createIdentityIssuer:
           compositionOptions.createIdentityIssuerForTest ?? createBrowserNavigationIdentityIssuer,
@@ -198,6 +215,7 @@ export function createTestBrowserRuntimeComposition(
       });
       context.onDispose(() => {
         session.dispose();
+        reservationService.dispose();
         slotService.dispose();
         targetingService.dispose();
         composition.adapters.googletag.dispose();
@@ -264,5 +282,6 @@ export function createTestBrowserRuntimeComposition(
     auctionContextRegistryForTest: () => auctionContextRegistry,
     slotServiceForTest: () => browserServices?.slots,
     targetingServiceForTest: () => browserServices?.targeting,
+    reservationServiceForTest: () => browserServices?.reservations,
   });
 }
