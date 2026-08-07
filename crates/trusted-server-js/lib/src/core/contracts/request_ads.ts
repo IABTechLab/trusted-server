@@ -1,6 +1,8 @@
 const REQUEST_ADS_DEFAULT_TIMEOUT_MS = 10_000;
 const REQUEST_ADS_MAX_SLOTS = 256;
 const reflectApplyIntrinsic = Reflect.apply;
+const objectGetOwnPropertyNamesIntrinsic = Object.getOwnPropertyNames;
+const objectKeysIntrinsic = Object.keys;
 const textEncoder = new TextEncoder();
 const textEncoderEncodeIntrinsic = TextEncoder.prototype.encode;
 const regExpTestIntrinsic = RegExp.prototype.test;
@@ -42,7 +44,9 @@ function ownDataOptions(value: unknown): Record<string, unknown> | undefined {
     if (prototype !== Object.prototype && prototype !== null) return undefined;
     if (Object.getOwnPropertySymbols(value).length !== 0) return undefined;
     const output: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
-    const names = Object.getOwnPropertyNames(value);
+    const names = reflectApplyIntrinsic(objectGetOwnPropertyNamesIntrinsic, Object, [
+      value,
+    ]) as string[];
     for (let index = 0; index < names.length; index += 1) {
       const key = names[index];
       if (key === undefined) return undefined;
@@ -72,7 +76,9 @@ function ownDataSlots(value: unknown): readonly unknown[] | undefined {
       !Number.isSafeInteger(length.value) ||
       length.value < 0 ||
       length.value > REQUEST_ADS_MAX_SLOTS ||
-      Object.getOwnPropertyNames(value).length !== length.value + 1
+      (reflectApplyIntrinsic(objectGetOwnPropertyNamesIntrinsic, Object, [value]) as string[])
+        .length !==
+        length.value + 1
     ) {
       return undefined;
     }
@@ -117,10 +123,11 @@ export function validateRequestAdsOptions(value: unknown): ValidatedRequestAdsOp
     });
   }
   const options = ownDataOptions(value);
-  if (
-    !options ||
-    !Object.keys(options).every((key) => key === 'slots' || key === 'timeoutMs' || key === 'signal')
-  ) {
+  if (!options) throw new RequestAdsInputError('invalid_options');
+  const optionKeys = reflectApplyIntrinsic(objectKeysIntrinsic, Object, [options]) as string[];
+  for (let index = 0; index < optionKeys.length; index += 1) {
+    const key = optionKeys[index];
+    if (key === 'slots' || key === 'timeoutMs' || key === 'signal') continue;
     throw new RequestAdsInputError('invalid_options');
   }
 

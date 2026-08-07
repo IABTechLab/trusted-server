@@ -253,11 +253,13 @@ describe('registry', () => {
 
   it('uses captured validation intrinsics after platform prototypes are poisoned', () => {
     const validCandidate = unit('poison-safe');
-    const invalidCandidate = { ...unit('invalid-bidder'), bids: [{ bidder: '' }] };
+    const invalidCandidate = { ...unit('unknown-key'), unknown: true };
     const iteratorDescriptor = Object.getOwnPropertyDescriptor(Array.prototype, Symbol.iterator);
+    const everyDescriptor = Object.getOwnPropertyDescriptor(Array.prototype, 'every');
+    const includesDescriptor = Object.getOwnPropertyDescriptor(Array.prototype, 'includes');
     const encodeDescriptor = Object.getOwnPropertyDescriptor(TextEncoder.prototype, 'encode');
     const testDescriptor = Object.getOwnPropertyDescriptor(RegExp.prototype, 'test');
-    const calls = { encode: 0, iterator: 0, test: 0 };
+    const calls = { encode: 0, every: 0, includes: 0, iterator: 0, test: 0 };
     let prepared: ReturnType<typeof prepareProgrammaticAdUnits> | undefined;
     let invalidError: unknown;
     Object.defineProperty(Array.prototype, Symbol.iterator, {
@@ -281,6 +283,20 @@ describe('registry', () => {
         throw new Error('poisoned regular expression');
       },
     });
+    Object.defineProperty(Array.prototype, 'every', {
+      configurable: true,
+      value: () => {
+        calls.every += 1;
+        throw new Error('poisoned array every');
+      },
+    });
+    Object.defineProperty(Array.prototype, 'includes', {
+      configurable: true,
+      value: () => {
+        calls.includes += 1;
+        throw new Error('poisoned array includes');
+      },
+    });
     try {
       prepared = prepareProgrammaticAdUnits(validCandidate, new Set());
       try {
@@ -295,12 +311,15 @@ describe('registry', () => {
       if (encodeDescriptor)
         Object.defineProperty(TextEncoder.prototype, 'encode', encodeDescriptor);
       if (testDescriptor) Object.defineProperty(RegExp.prototype, 'test', testDescriptor);
+      if (everyDescriptor) Object.defineProperty(Array.prototype, 'every', everyDescriptor);
+      if (includesDescriptor)
+        Object.defineProperty(Array.prototype, 'includes', includesDescriptor);
     }
 
     expect(prepared?.[0]?.code).toBe('poison-safe');
     expect(invalidError).toBeInstanceOf(AdUnitRegistrationError);
-    expect(invalidError).toMatchObject({ code: 'invalid_bidder', unitIndex: 0 });
-    expect(calls).toEqual({ encode: 0, iterator: 0, test: 0 });
+    expect(invalidError).toMatchObject({ code: 'invalid_unit', unitIndex: 0 });
+    expect(calls).toEqual({ encode: 0, every: 0, includes: 0, iterator: 0, test: 0 });
   });
 
   it('serializes detached auction data without invoking inherited toJSON hooks', () => {

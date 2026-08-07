@@ -20,6 +20,8 @@ const MAX_TARGETING_ENTRIES = 32;
 const MAX_ADM_BYTES = 512 * 1024;
 const MAX_URL_BYTES = 4096;
 const reflectApplyIntrinsic = Reflect.apply;
+const objectGetOwnPropertyNamesIntrinsic = Object.getOwnPropertyNames;
+const objectKeysIntrinsic = Object.keys;
 const textEncoder = new TextEncoder();
 const textEncoderEncodeIntrinsic = TextEncoder.prototype.encode;
 const regExpTestIntrinsic = RegExp.prototype.test;
@@ -42,6 +44,13 @@ const auctionFailureReasons = new Set<AuctionSlotFailureReason>([
   'internal_error',
 ]);
 
+function hasString(values: readonly string[], expected: string): boolean {
+  for (let index = 0; index < values.length; index += 1) {
+    if (values[index] === expected) return true;
+  }
+  return false;
+}
+
 export function ownDataObject(
   value: unknown,
   expectedKeys?: readonly string[]
@@ -50,12 +59,15 @@ export function ownDataObject(
     if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
     if (Object.getPrototypeOf(value) !== Object.prototype) return undefined;
     if (Object.getOwnPropertySymbols(value).length !== 0) return undefined;
-    const names = Object.getOwnPropertyNames(value);
-    if (
-      expectedKeys &&
-      (names.length !== expectedKeys.length || expectedKeys.some((key) => !names.includes(key)))
-    ) {
-      return undefined;
+    const names = reflectApplyIntrinsic(objectGetOwnPropertyNamesIntrinsic, Object, [
+      value,
+    ]) as string[];
+    if (expectedKeys) {
+      if (names.length !== expectedKeys.length) return undefined;
+      for (let index = 0; index < expectedKeys.length; index += 1) {
+        const expected = expectedKeys[index];
+        if (expected === undefined || !hasString(names, expected)) return undefined;
+      }
     }
     const snapshot: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
     for (let index = 0; index < names.length; index += 1) {
@@ -76,8 +88,10 @@ export function ownDataArray(value: unknown, maximum: number): unknown[] | undef
     if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) return undefined;
     if (value.length > maximum || Object.getOwnPropertySymbols(value).length !== 0)
       return undefined;
-    const names = Object.getOwnPropertyNames(value);
-    if (names.length !== value.length + 1 || !names.includes('length')) return undefined;
+    const names = reflectApplyIntrinsic(objectGetOwnPropertyNamesIntrinsic, Object, [
+      value,
+    ]) as string[];
+    if (names.length !== value.length + 1 || !hasString(names, 'length')) return undefined;
     const snapshot: unknown[] = [];
     for (let index = 0; index < value.length; index += 1) {
       const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
@@ -211,7 +225,10 @@ function snapshotJsonForMeasurement(value: object): JsonMeasureSnapshot | undefi
     array,
     entries: array
       ? values!.map((entry, index) => ({ key: String(index), value: entry }))
-      : Object.keys(record!).map((key) => ({ key, value: record![key] })),
+      : (reflectApplyIntrinsic(objectKeysIntrinsic, Object, [record]) as string[]).map((key) => ({
+          key,
+          value: record![key],
+        })),
   };
 }
 

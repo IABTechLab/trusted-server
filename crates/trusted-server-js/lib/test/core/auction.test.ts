@@ -659,12 +659,13 @@ describe('auction/parseBrowserAuctionProjectionV1', () => {
 
   it('uses captured validation intrinsics after platform prototypes are poisoned', () => {
     const valid = largeAdmProjection([16]);
-    const invalid = largeAdmProjection([16]);
-    invalid.bids[0]!.provider = '-invalid';
+    const invalid = { ...largeAdmProjection([16]), unknown: true };
     const iteratorDescriptor = Object.getOwnPropertyDescriptor(Array.prototype, Symbol.iterator);
+    const everyDescriptor = Object.getOwnPropertyDescriptor(Array.prototype, 'every');
+    const includesDescriptor = Object.getOwnPropertyDescriptor(Array.prototype, 'includes');
     const encodeDescriptor = Object.getOwnPropertyDescriptor(TextEncoder.prototype, 'encode');
     const testDescriptor = Object.getOwnPropertyDescriptor(RegExp.prototype, 'test');
-    const calls = { encode: 0, iterator: 0, test: 0 };
+    const calls = { encode: 0, every: 0, includes: 0, iterator: 0, test: 0 };
     let parsed: BrowserAuctionProjectionV1 | undefined;
     let rejected: BrowserAuctionProjectionV1 | undefined;
     Object.defineProperty(Array.prototype, Symbol.iterator, {
@@ -688,6 +689,20 @@ describe('auction/parseBrowserAuctionProjectionV1', () => {
         throw new Error('poisoned regular expression');
       },
     });
+    Object.defineProperty(Array.prototype, 'every', {
+      configurable: true,
+      value: () => {
+        calls.every += 1;
+        throw new Error('poisoned array every');
+      },
+    });
+    Object.defineProperty(Array.prototype, 'includes', {
+      configurable: true,
+      value: () => {
+        calls.includes += 1;
+        throw new Error('poisoned array includes');
+      },
+    });
     try {
       parsed = parseBrowserAuctionProjectionV1(valid);
       rejected = parseBrowserAuctionProjectionV1(invalid);
@@ -698,11 +713,14 @@ describe('auction/parseBrowserAuctionProjectionV1', () => {
       if (encodeDescriptor)
         Object.defineProperty(TextEncoder.prototype, 'encode', encodeDescriptor);
       if (testDescriptor) Object.defineProperty(RegExp.prototype, 'test', testDescriptor);
+      if (everyDescriptor) Object.defineProperty(Array.prototype, 'every', everyDescriptor);
+      if (includesDescriptor)
+        Object.defineProperty(Array.prototype, 'includes', includesDescriptor);
     }
 
     expect(parsed).toBeDefined();
     expect(rejected).toBeUndefined();
-    expect(calls).toEqual({ encode: 0, iterator: 0, test: 0 });
+    expect(calls).toEqual({ encode: 0, every: 0, includes: 0, iterator: 0, test: 0 });
   });
 
   it('requires cache sources to match one frozen cache policy exactly', () => {
