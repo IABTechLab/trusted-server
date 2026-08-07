@@ -603,19 +603,15 @@ export function parseBrowserAuctionProjectionV1(
       bids.push(bid);
     }
 
-    const winners = auction.results.filter(
-      (result): result is Extract<SlotAuctionDecisionV1, { outcome: 'winner' }> =>
-        result.outcome === 'winner'
-    );
-    if (
-      winners.length !== bids.length ||
-      winners.some(
-        (winner, index) =>
-          bids[index]?.candidateId !== winner.candidateId || bids[index]?.slot !== winner.slot
-      )
-    ) {
-      return undefined;
+    let winnerIndex = 0;
+    for (let index = 0; index < auction.results.length; index += 1) {
+      const result = auction.results[index];
+      if (!result || result.outcome !== 'winner') continue;
+      const bid = bids[winnerIndex];
+      if (bid?.candidateId !== result.candidateId || bid.slot !== result.slot) return undefined;
+      winnerIndex += 1;
     }
+    if (winnerIndex !== bids.length) return undefined;
 
     const projection: BrowserAuctionProjectionV1 = { version: 1, auction, bids };
     if (jsonUtf8ByteLength(projection) > MAX_BROWSER_AUCTION_PROJECTION_BYTES) {

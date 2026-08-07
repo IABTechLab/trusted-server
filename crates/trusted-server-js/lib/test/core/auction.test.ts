@@ -660,14 +660,18 @@ describe('auction/parseBrowserAuctionProjectionV1', () => {
   it('uses captured validation intrinsics after platform prototypes are poisoned', () => {
     const valid = largeAdmProjection([16]);
     const invalid = { ...largeAdmProjection([16]), unknown: true };
+    const mismatchedWinner = largeAdmProjection([16]);
+    mismatchedWinner.auction.results[0]!.slot = 'mismatched-slot';
     const iteratorDescriptor = Object.getOwnPropertyDescriptor(Array.prototype, Symbol.iterator);
     const everyDescriptor = Object.getOwnPropertyDescriptor(Array.prototype, 'every');
     const includesDescriptor = Object.getOwnPropertyDescriptor(Array.prototype, 'includes');
+    const someDescriptor = Object.getOwnPropertyDescriptor(Array.prototype, 'some');
     const encodeDescriptor = Object.getOwnPropertyDescriptor(TextEncoder.prototype, 'encode');
     const testDescriptor = Object.getOwnPropertyDescriptor(RegExp.prototype, 'test');
-    const calls = { encode: 0, every: 0, includes: 0, iterator: 0, test: 0 };
+    const calls = { encode: 0, every: 0, includes: 0, iterator: 0, some: 0, test: 0 };
     let parsed: BrowserAuctionProjectionV1 | undefined;
     let rejected: BrowserAuctionProjectionV1 | undefined;
+    let rejectedMismatch: BrowserAuctionProjectionV1 | undefined;
     Object.defineProperty(Array.prototype, Symbol.iterator, {
       configurable: true,
       value: () => {
@@ -703,9 +707,17 @@ describe('auction/parseBrowserAuctionProjectionV1', () => {
         throw new Error('poisoned array includes');
       },
     });
+    Object.defineProperty(Array.prototype, 'some', {
+      configurable: true,
+      value: () => {
+        calls.some += 1;
+        throw new Error('poisoned array some');
+      },
+    });
     try {
       parsed = parseBrowserAuctionProjectionV1(valid);
       rejected = parseBrowserAuctionProjectionV1(invalid);
+      rejectedMismatch = parseBrowserAuctionProjectionV1(mismatchedWinner);
     } finally {
       if (iteratorDescriptor) {
         Object.defineProperty(Array.prototype, Symbol.iterator, iteratorDescriptor);
@@ -716,11 +728,13 @@ describe('auction/parseBrowserAuctionProjectionV1', () => {
       if (everyDescriptor) Object.defineProperty(Array.prototype, 'every', everyDescriptor);
       if (includesDescriptor)
         Object.defineProperty(Array.prototype, 'includes', includesDescriptor);
+      if (someDescriptor) Object.defineProperty(Array.prototype, 'some', someDescriptor);
     }
 
     expect(parsed).toBeDefined();
     expect(rejected).toBeUndefined();
-    expect(calls).toEqual({ encode: 0, every: 0, includes: 0, iterator: 0, test: 0 });
+    expect(rejectedMismatch).toBeUndefined();
+    expect(calls).toEqual({ encode: 0, every: 0, includes: 0, iterator: 0, some: 0, test: 0 });
   });
 
   it('requires cache sources to match one frozen cache policy exactly', () => {

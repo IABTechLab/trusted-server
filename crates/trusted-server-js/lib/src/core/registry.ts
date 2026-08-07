@@ -166,6 +166,12 @@ function jsonPrimitive(value: unknown): null | boolean | number | string | undef
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
+function validPositiveInteger(value: unknown): value is number {
+  return (
+    typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value) && value > 0
+  );
+}
+
 function snapshotJsonContainer(value: object): JsonContainerSnapshot | undefined {
   const array = Array.isArray(value);
   const values = array ? ownDataArray(value, MAX_JSON_STRUCTURE_ENTRIES) : undefined;
@@ -520,23 +526,20 @@ export function prepareProgrammaticAdUnits(
     for (let sizeIndex = 0; sizeIndex < rawSizes.length; sizeIndex += 1) {
       const rawSize = rawSizes[sizeIndex];
       const dimensions = ownDataArray(rawSize, 2);
+      const width = dimensions?.[0];
+      const height = dimensions?.[1];
       if (
         !dimensions ||
         dimensions.length !== 2 ||
-        dimensions.some(
-          (dimension) =>
-            typeof dimension !== 'number' ||
-            !Number.isFinite(dimension) ||
-            !Number.isInteger(dimension) ||
-            dimension <= 0
-        )
+        !validPositiveInteger(width) ||
+        !validPositiveInteger(height)
       ) {
         throw new AdUnitRegistrationError('invalid_dimensions', index);
       }
-      if (dimensions.some((dimension) => (dimension as number) > 4_096)) {
+      if (width > 4_096 || height > 4_096) {
         throw new AdUnitRegistrationError('dimensions_out_of_range', index);
       }
-      sizes.push(Object.freeze([dimensions[0] as number, dimensions[1] as number]));
+      sizes.push(Object.freeze([width, height]));
     }
 
     let bids: readonly PendingProgrammaticBid[] | undefined;
