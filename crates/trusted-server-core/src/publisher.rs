@@ -3329,13 +3329,15 @@ pub(crate) fn build_bid_map(
                 // The Prebid Universal Creative constructs:
                 //   https://<hb_cache_host><hb_cache_path>?uuid=<hb_adid>
                 //
-                // Gated on `cache_id`: PBS reports the cache `url` and `cacheId`
-                // independently, and hb_adid falls back to a non-cache identifier
-                // (`adid`, then the bid id). Emitting the coordinates without a
-                // cache UUID would point the Universal Creative at
-                // `?uuid=<non-cache-id>` — a guaranteed cache miss — instead of
-                // letting it fall through to the inline `adm`.
-                if bid.cache_id.is_some() {
+                // Gated on a non-blank `cache_id`: PBS reports the cache `url`
+                // and `cacheId` independently, and hb_adid falls back to a
+                // non-cache identifier (`adid`, then the bid id). Emitting the
+                // coordinates without a cache UUID would point the Universal
+                // Creative at `?uuid=<non-cache-id>` — a guaranteed cache miss —
+                // instead of letting it fall through to the inline `adm`. The
+                // gate matches the `non_empty` chain above so a blank `cacheId`
+                // cannot pass here while losing the hb_adid precedence.
+                if non_empty(bid.cache_id.as_deref()).is_some() {
                     if let Some(ref host) = bid.cache_host {
                         obj.insert(
                             "hb_cache_host".to_string(),
@@ -9143,6 +9145,62 @@ mod tests {
             assert!(
                 obj.get("hb_cache_path").is_none(),
                 "should omit hb_cache_path when there is no cache UUID to look up"
+            );
+        }
+
+        #[test]
+        fn bid_map_omits_cache_coordinates_for_a_blank_cache_id() {
+            // A blank `cacheId` loses the hb_adid precedence to `adid`/the bid
+            // id, so the cache gate must treat it as absent too. Otherwise the
+            // coordinates ship alongside a non-cache hb_adid and the Universal
+            // Creative fetches `?uuid=<adid>` — a guaranteed miss — rather than
+            // falling through to the inline adm.
+            let mut winning_bids = HashMap::new();
+            winning_bids.insert(
+                "atf_sidebar_ad".to_string(),
+                Bid {
+                    slot_id: "atf_sidebar_ad".to_string(),
+                    price: Some(1.00),
+                    currency: "USD".to_string(),
+                    creative: None,
+                    adomain: None,
+                    bidder: "example-bidder".to_string(),
+                    width: 300,
+                    height: 250,
+                    nurl: None,
+                    burl: None,
+                    bid_id: Some("019f7e2a-b45b-70b0-a2d1-b651c430700b".to_string()),
+                    ad_id: Some("creative-123".to_string()),
+                    cache_id: Some(String::new()),
+                    cache_host: Some("cache.example.com".to_string()),
+                    cache_path: Some("/cache".to_string()),
+                    metadata: Default::default(),
+                },
+            );
+            let map = build_bid_map(
+                &winning_bids,
+                PriceGranularity::Dense,
+                &test_settings(),
+                "",
+                false,
+            );
+            let obj = map
+                .get("atf_sidebar_ad")
+                .expect("should have bid entry")
+                .as_object()
+                .expect("should be object");
+            assert_eq!(
+                obj.get("hb_adid").and_then(|v| v.as_str()),
+                Some("creative-123"),
+                "should fall back to ad_id when cache_id is blank"
+            );
+            assert!(
+                obj.get("hb_cache_host").is_none(),
+                "should omit hb_cache_host when the cache UUID is blank"
+            );
+            assert!(
+                obj.get("hb_cache_path").is_none(),
+                "should omit hb_cache_path when the cache UUID is blank"
             );
         }
 
