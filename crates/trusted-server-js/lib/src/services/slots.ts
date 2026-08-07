@@ -910,6 +910,37 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     });
   };
 
+  const quarantineReplacementOrphan = (
+    source: PhysicalSlot,
+    orphanedSlot: object | undefined
+  ): void => {
+    if (!orphanedSlot || orphanedSlot === source.slot) return;
+    const orphan: PhysicalSlot = {
+      activeCycle: undefined,
+      definition: source.definition,
+      domElement: undefined,
+      destroyAttempted: true,
+      lastResponseIdentifier: undefined,
+      ownership: 'trusted_server',
+      placementKeys: source.placementKeys,
+      publisherIntentCount: 0,
+      quarantineReason: 'request',
+      record: undefined,
+      saturationOwner: false,
+      slot: orphanedSlot,
+      state: 'quarantined',
+    };
+    try {
+      setWeakMapValue(physicalByObject, orphan.slot, orphan);
+      if (weakMapValue(physicalByObject, orphan.slot) !== orphan) {
+        throw new Error('orphan publication failed');
+      }
+      quarantinePhysicalPlacement(orphan);
+    } catch {
+      placementQuarantinePoisoned = true;
+    }
+  };
+
   const recoverRequestTimeout = (record: InternalSlotRecord, physical: PhysicalSlot): void => {
     if (physical.destroyAttempted) {
       physical.state = 'quarantined';
@@ -979,32 +1010,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         ) {
           detachDestroyedOld();
         }
-        if (replacementError?.orphanedSlot && replacementError.orphanedSlot !== physical.slot) {
-          const orphan: PhysicalSlot = {
-            activeCycle: undefined,
-            definition: physical.definition,
-            domElement: undefined,
-            destroyAttempted: true,
-            lastResponseIdentifier: undefined,
-            ownership: 'trusted_server',
-            placementKeys: physical.placementKeys,
-            publisherIntentCount: 0,
-            quarantineReason: 'request',
-            record: undefined,
-            saturationOwner: false,
-            slot: replacementError.orphanedSlot,
-            state: 'quarantined',
-          };
-          try {
-            setWeakMapValue(physicalByObject, orphan.slot, orphan);
-            if (weakMapValue(physicalByObject, orphan.slot) !== orphan) {
-              throw new Error('orphan publication failed');
-            }
-            quarantinePhysicalPlacement(orphan);
-          } catch {
-            placementQuarantinePoisoned = true;
-          }
-        }
+        quarantineReplacementOrphan(physical, replacementError?.orphanedSlot);
         failQueued(record, 'gpt_request_failed');
       }
     );
@@ -1551,6 +1557,10 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       return;
     }
     if (finalPass && !transactionStarted) {
+      void operation.result.then(
+        () => undefined,
+        () => undefined
+      );
       retireFailedReconciliation(record, window, 'slot_unresolved', transactionStarted, false);
       return;
     }
@@ -1562,12 +1572,18 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       },
       (error: unknown) => {
         const replacementError = error instanceof GoogletagReplacementError ? error : undefined;
+        const reusedOldIdentity = replacementError?.orphanedSlot === orphan.slot;
+        const oldSlotDestroyed =
+          replacementError?.oldSlotDestroyed === true &&
+          replacementError.preserveOldQuarantine !== true &&
+          !reusedOldIdentity;
+        quarantineReplacementOrphan(orphan, replacementError?.orphanedSlot);
         retireFailedReconciliation(
           record,
           window,
           'gpt_request_failed',
           transactionStarted,
-          replacementError?.oldSlotDestroyed === true
+          oldSlotDestroyed
         );
       }
     );
