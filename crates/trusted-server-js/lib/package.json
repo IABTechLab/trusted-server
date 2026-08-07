@@ -6,18 +6,21 @@
   "description": "Trusted Server tsjs TypeScript library with queue and simple banner rendering.",
   "scripts": {
     "build": "node build-all.mjs",
+    "print:release-id": "node scripts/print-release-id.mjs",
     "build:prebid-external": "node build-prebid-external.mjs",
     "generate:aps-contract": "node ../../../scripts/generate-aps-renderer-contract.mjs",
     "check:aps-contract": "node ../../../scripts/generate-aps-renderer-contract.mjs --check",
     "dev": "vite build --watch",
     "test": "vitest run",
+    "posttest": "npm run build && npm run test:release",
     "test:watch": "vitest",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test:architecture": "node --test test/eslint/no-adtech-globals.test.mjs",
+    "test:release": "node --test test/build/release-v1.test.mjs test/build/generated-fallback.test.mjs",
     "lint": "npm run test:architecture && eslint . --max-warnings=0",
     "lint:fix": "eslint --fix . --max-warnings=0",
-    "format": "prettier --check \"**/*.{ts,tsx,js,json,css,md}\"",
-    "format:write": "prettier --write \"**/*.{ts,tsx,js,json,css,md}\""
+    "format": "prettier --check \"**/*.{ts,tsx,js,json,css,md}\" \"build-all.mjs\" \"scripts/**/*.mjs\" \"test/build/**/*.mjs\"",
+    "format:write": "prettier --write \"**/*.{ts,tsx,js,json,css,md}\" \"build-all.mjs\" \"scripts/**/*.mjs\" \"test/build/**/*.mjs\""
   },
   "dependencies": {
     "prebid.js": "10.26.0"

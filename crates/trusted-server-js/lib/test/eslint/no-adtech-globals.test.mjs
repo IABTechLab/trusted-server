@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
-import { readdir } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 
 import { ESLint, Linter } from 'eslint';
+import ts from 'typescript';
 
 import noAdtechGlobals, {
   LEGACY_ADTECH_GLOBAL_ALLOWLIST,
@@ -60,6 +61,47 @@ function assertRejected(source, filename) {
   assert.ok(messages.length > 0, `expected an ad-tech-global error for: ${source}`);
   assert.ok(messages.every((message) => message.ruleId === ruleId));
   assert.ok(messages.every((message) => message.messageId === 'externalGlobalOwnedByAdapter'));
+}
+
+async function collectRelativeModuleGraph(entry) {
+  const pending = [path.resolve(packageRoot, entry)];
+  const visited = new Set();
+  while (pending.length > 0) {
+    const filename = pending.pop();
+    if (!filename || visited.has(filename)) continue;
+    visited.add(filename);
+    const source = await readFile(filename, 'utf8');
+    const sourceFile = ts.createSourceFile(filename, source, ts.ScriptTarget.Latest, false);
+    for (const statement of sourceFile.statements) {
+      const moduleSpecifier =
+        (ts.isImportDeclaration(statement) || ts.isExportDeclaration(statement)) &&
+        statement.moduleSpecifier &&
+        ts.isStringLiteral(statement.moduleSpecifier)
+          ? statement.moduleSpecifier.text
+          : undefined;
+      if (!moduleSpecifier?.startsWith('.')) continue;
+      const unresolved = path.resolve(path.dirname(filename), moduleSpecifier);
+      const candidates = [
+        unresolved,
+        `${unresolved}.ts`,
+        `${unresolved}.tsx`,
+        path.join(unresolved, 'index.ts'),
+      ];
+      let resolved;
+      for (const candidate of candidates) {
+        try {
+          await readFile(candidate, 'utf8');
+          resolved = candidate;
+          break;
+        } catch {
+          // Try the next TypeScript module resolution candidate.
+        }
+      }
+      assert.ok(resolved, `could not resolve ${moduleSpecifier} from ${filename}`);
+      pending.push(resolved);
+    }
+  }
+  return [...visited].map((filename) => path.relative(packageRoot, filename).replaceAll('\\', '/'));
 }
 
 test('rejects direct GPT and Prebid access through every browser global root', () => {
@@ -184,7 +226,6 @@ test('temporary allowlists are exact, narrow, and inventoried for Task 22 remova
     'src/integrations/prebid/index.ts',
   ]);
   assert.deepEqual(LEGACY_RESTRICTED_IMPORT_ALLOWLIST, [
-    'src/core/auction.ts',
     'src/core/request.ts',
     'src/integrations/gpt/index.ts',
     'src/integrations/prebid/index.ts',
@@ -322,6 +363,16 @@ test('restricted paths enforce dependency direction and exact target-file exempt
   );
   assert.deepEqual(
     await restrictedMessages("import './script_guard';", 'src/integrations/gpt/new-module.ts'),
+    []
+  );
+});
+
+test('generated fallback source graph excludes APS integration implementation', async () => {
+  const graph = await collectRelativeModuleGraph('src/integrations/gpt/bootstrap_fallback.ts');
+
+  assert.ok(graph.includes('src/kernel/fallback.ts'));
+  assert.deepEqual(
+    graph.filter((filename) => filename.startsWith('src/integrations/aps/')),
     []
   );
 });

@@ -520,6 +520,11 @@ impl IntegrationHeadInjector for GptIntegration {
 /// publisher's own init code also calls `googletag.enableServices()`.
 const GPT_BOOTSTRAP_JS: &str = include_str!("gpt_bootstrap.js");
 
+#[cfg(test)]
+fn proposed_gpt_bootstrap_fallback_js() -> &'static str {
+    trusted_server_js::gpt_bootstrap_fallback_bundle()
+}
+
 // Default value functions
 
 fn default_enabled() -> bool {
@@ -1451,6 +1456,26 @@ mod tests {
                 .iter()
                 .all(|s| !s.contains("__tsjs_slim_prebid_url")),
             "should not emit slim-Prebid URL tag when not configured"
+        );
+    }
+
+    #[test]
+    fn proposed_generated_fallback_is_stamped_but_not_the_production_bootstrap() {
+        let release = trusted_server_js::release_id();
+        let proposed = proposed_gpt_bootstrap_fallback_js();
+
+        assert_eq!(
+            proposed.matches(release).count(),
+            1,
+            "generated proposal should carry the exact release once"
+        );
+        assert!(
+            proposed.contains("runtime_unavailable"),
+            "generated proposal should contain the terminal fallback shell"
+        );
+        assert!(
+            !GPT_BOOTSTRAP_JS.contains(release),
+            "Task 8 must not replace the production GPT bootstrap before Task 19"
         );
     }
 }

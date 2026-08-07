@@ -160,7 +160,7 @@ export default [
   // so CommonJS-only names (__dirname, require, module) still fail no-undef
   // in these ES modules
   {
-    files: ['*.mjs', 'test/**/*.mjs'],
+    files: ['*.mjs', 'scripts/**/*.mjs', 'test/**/*.mjs'],
     languageOptions: {
       globals: globals.nodeBuiltin,
     },

@@ -6,6 +6,8 @@ export type {
   GptDiagnosticsRequestCycle,
   TsjsApi,
 } from './types';
+// Erased coordinated-cutover types only. Production ownership remains below until Task 19.
+export type { Runtime, RuntimeOptions, RuntimeState } from '../kernel/runtime';
 import type { TsjsApi } from './types';
 import { addAdUnits } from './registry';
 import { renderAdUnit, renderAllAdUnits } from './render';

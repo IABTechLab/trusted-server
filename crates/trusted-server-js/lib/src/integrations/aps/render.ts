@@ -1,10 +1,8 @@
 import { log } from '../../core/log';
-import type { ApsPrebidRendererEntry, ApsRendererV1, TsjsApi } from '../../core/types';
+import type { ApsPrebidRendererEntry, TsjsApi } from '../../core/types';
+import { validateApsRenderer } from '../../core/contracts/aps_renderer';
 
-import {
-  classifyApsRendererDescriptorV1,
-  classifyApsRendererV1,
-} from './generated/renderer_validator_v1';
+export { parseApsRendererDescriptor, validateApsRenderer } from '../../core/contracts/aps_renderer';
 
 export const APS_RENDERER_PATH = '/integrations/aps/renderer';
 export const APS_RENDERER_SANDBOX =
@@ -21,12 +19,6 @@ const DEFAULT_PREBID_RENDERER_TTL_SECONDS = 300;
 const MAX_PREBID_RENDERER_TTL_SECONDS = 3600;
 const MAX_PREBID_ID_BYTES = 1024;
 
-type ValidatedRendererCacheEntry = {
-  publisherOrigin: string;
-  renderer: ApsRendererV1;
-};
-const validatedRendererCache = new WeakMap<object, ValidatedRendererCacheEntry>();
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -35,34 +27,6 @@ function isExactRendererResult(value: unknown): value is Record<string, unknown>
   if (!isRecord(value)) return false;
   const actual = Object.keys(value).sort();
   return actual.length === 2 && actual[0] === 'message' && actual[1] === 'nonce';
-}
-
-/** Parse only the versioned descriptor shape; decoded-envelope trust checks happen separately. */
-export function parseApsRendererDescriptor(value: unknown): ApsRendererV1 | undefined {
-  if (classifyApsRendererDescriptorV1(value) !== 'accepted') {
-    return undefined;
-  }
-
-  return value as unknown as ApsRendererV1;
-}
-
-/** Fully validate the exact APS envelope and cross-check every duplicated descriptor field. */
-export function validateApsRenderer(
-  value: unknown,
-  publisherOrigin = window.location.origin
-): ApsRendererV1 | undefined {
-  if (isRecord(value)) {
-    const cached = validatedRendererCache.get(value);
-    if (cached?.publisherOrigin === publisherOrigin) return cached.renderer;
-  }
-
-  if (classifyApsRendererV1(value, publisherOrigin) !== 'accepted') return undefined;
-  const renderer = value as ApsRendererV1;
-
-  const validated = Object.freeze({ ...renderer }) as ApsRendererV1;
-  validatedRendererCache.set(value as object, { publisherOrigin, renderer: validated });
-  validatedRendererCache.set(validated, { publisherOrigin, renderer: validated });
-  return validated;
 }
 
 function validPrebidIdentity(value: unknown): value is string {

@@ -19,6 +19,7 @@ test = false
 
 [build-dependencies]
 build-print = { workspace = true }
+sha2 = { workspace = true }
 which = { workspace = true }
 
 [dependencies]

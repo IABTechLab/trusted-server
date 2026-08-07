@@ -10,6 +10,9 @@
 //! streaming processor treats unknown encodings as identity, so publisher code
 //! must gate them out before the body enters the rewrite pipeline.
 //!
+//! `BootManifestV1` serialization remains a pure helper in Task 8. This
+//! production pipeline does not emit it until the coordinated Task 19 switch.
+//!
 //! **Note on platform coupling:** The handler boundaries use portable HTTP
 //! types: [`handle_publisher_request`] and [`stream_publisher_body`] take and
 //! return `http::Request`/`http::Response` over `EdgeBody`, and platform I/O is

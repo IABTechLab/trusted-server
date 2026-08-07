@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { GoogletagAdapter } from '../../src/adapters/googletag';
 import type { CaptureMessageListener, MessagingAdapter } from '../../src/adapters/messaging';
@@ -6,6 +6,7 @@ import type { PrebidAdapter } from '../../src/adapters/prebid';
 import {
   createBrowserComposition,
   createNoopBrowserComposition,
+  createTestBrowserRuntimeComposition,
 } from '../../src/composition/browser';
 
 function createTarget() {
@@ -20,6 +21,8 @@ function createTarget() {
 }
 
 describe('browser composition', () => {
+  afterEach(() => vi.useRealTimers());
+
   it('constructs live adapters without changing production globals', () => {
     const target = createTarget();
     const composition = createBrowserComposition({ target });
@@ -83,5 +86,156 @@ describe('browser composition', () => {
     expect(composition.adapters.prebid.bindingStatus()).toBe('pending');
     expect(() => composition.adapters.messaging.installCaptureListener(listener)()).not.toThrow();
     expect(listener).not.toHaveBeenCalled();
+  });
+
+  it('activates reversible core effects in exact order and disposes them in reverse', async () => {
+    const target = {};
+    const order: string[] = [];
+    const composition = createTestBrowserRuntimeComposition(
+      {
+        target,
+        releaseId: 'a'.repeat(64),
+        manifest: {
+          version: 1,
+          releaseId: 'a'.repeat(64),
+          integrations: [{ id: 'test', required: true }],
+        },
+        knownIntegrationIds: Object.freeze(['test']),
+        boot: {
+          auctionProjection: {
+            version: 1,
+            auction: { version: 1, auctionId: 'boot', results: [] },
+            bids: [],
+          },
+          creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+        },
+        kernel: {
+          addAdUnits: vi.fn(),
+          diagnostics: Object.freeze({}),
+          requestAds: vi.fn(),
+        },
+      },
+      {
+        adapters: {
+          googletag: { bindingStatus: () => 'pending' },
+          prebid: { bindingStatus: () => 'pending' },
+          messaging: { installCaptureListener: () => vi.fn() },
+        },
+        coreActivations: {
+          bridgeRecognizer: ({ onDispose }, adapters) => {
+            expect(Object.isFrozen(adapters)).toBe(true);
+            onDispose(() => order.push('dispose-bridge'));
+            order.push('bridge');
+          },
+          correctnessGptListeners: ({ onDispose }, adapters) => {
+            expect(Object.isFrozen(adapters)).toBe(true);
+            onDispose(() => order.push('dispose-gpt'));
+            order.push('gpt');
+          },
+        },
+      }
+    );
+
+    expect(composition.runtime.state).toBe('unclaimed');
+    expect(composition.runtime.start()).toBe(true);
+    expect(
+      composition.runtime.registerIntegration({
+        id: 'test',
+        release: 'a'.repeat(64),
+        prepare: ({ onDispose }: { onDispose(callback: () => void): void }) => {
+          onDispose(() => order.push('dispose-module'));
+          return { activate: () => order.push('module') };
+        },
+      })
+    ).toBe(true);
+    await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+    expect(order).toEqual(['bridge', 'gpt', 'module']);
+
+    composition.runtime.dispose();
+    expect(order).toEqual([
+      'bridge',
+      'gpt',
+      'module',
+      'dispose-module',
+      'dispose-gpt',
+      'dispose-bridge',
+    ]);
+    expect(Object.isFrozen(composition)).toBe(true);
+    expect(Object.isFrozen(composition.runtime)).toBe(true);
+  });
+
+  it('constructs or activates nothing after a terminal fallback', async () => {
+    vi.useFakeTimers();
+    const serviceConstruction = vi.fn(() => ({
+      config: Object.freeze({}),
+      interfaces: Object.freeze({}),
+    }));
+    const adapterActivation = vi.fn(() => 'pending' as const);
+    const listenerActivation = vi.fn(() => vi.fn());
+    const timerActivation = vi.fn(() => setTimeout(vi.fn(), 1));
+    const latePreparation = vi.fn();
+    const target = {};
+    const composition = createTestBrowserRuntimeComposition(
+      {
+        target,
+        releaseId: 'a'.repeat(64),
+        manifest: {
+          version: 1,
+          releaseId: 'a'.repeat(64),
+          integrations: [{ id: 'missing', required: true }],
+        },
+        knownIntegrationIds: Object.freeze(['missing']),
+        boot: {
+          auctionProjection: {
+            version: 1,
+            auction: { version: 1, auctionId: 'boot', results: [] },
+            bids: [],
+          },
+          creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+        },
+        getBindings: serviceConstruction,
+        kernel: {
+          addAdUnits: vi.fn(),
+          diagnostics: Object.freeze({}),
+          requestAds: vi.fn(),
+        },
+      },
+      {
+        adapters: {
+          googletag: { bindingStatus: adapterActivation },
+          prebid: { bindingStatus: adapterActivation },
+          messaging: { installCaptureListener: listenerActivation },
+        },
+        coreActivations: {
+          bridgeRecognizer: timerActivation,
+          correctnessGptListeners: adapterActivation,
+        },
+      }
+    );
+
+    expect(composition.runtime.start()).toBe(true);
+    await expect(composition.runtime.install()).resolves.toEqual({
+      state: 'fallback',
+      reason: 'bundle_partial',
+    });
+    expect(vi.getTimerCount()).toBe(0);
+
+    expect(
+      (target as { _registerIntegration(value: unknown): boolean })._registerIntegration({
+        id: 'missing',
+        release: 'a'.repeat(64),
+        prepare: latePreparation,
+      })
+    ).toBe(false);
+    await vi.runAllTimersAsync();
+
+    expect(serviceConstruction).not.toHaveBeenCalled();
+    expect(adapterActivation).not.toHaveBeenCalled();
+    expect(listenerActivation).not.toHaveBeenCalled();
+    expect(timerActivation).not.toHaveBeenCalled();
+    expect(latePreparation).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

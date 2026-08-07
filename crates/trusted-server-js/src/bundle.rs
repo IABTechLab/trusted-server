@@ -6,6 +6,20 @@ use sha2::{Digest as _, Sha256};
 
 include!(concat!(env!("OUT_DIR"), "/tsjs_modules.rs"));
 
+/// Return the sentinel-normalized release identifier shared by every bundle.
+#[must_use]
+#[inline]
+pub const fn release_id() -> &'static str {
+    TSJS_RELEASE_ID
+}
+
+/// Return the generated, executable GPT bootstrap fallback proposal.
+#[must_use]
+#[inline]
+pub const fn gpt_bootstrap_fallback_bundle() -> &'static str {
+    GPT_BOOTSTRAP_FALLBACK
+}
+
 /// Return the JS bundle content for a given module ID (e.g., "core", "prebid").
 #[must_use]
 #[inline]
