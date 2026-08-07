@@ -330,6 +330,90 @@ export interface BootManifestV1 {
   readonly integrations: readonly BootManifestIntegrationV1[];
 }
 
+/** One direct-auction ad unit admitted into the current navigation. */
+export interface ProgrammaticAdUnit {
+  readonly code: string;
+  readonly mediaTypes: Readonly<{
+    banner: Readonly<{ sizes: readonly (readonly [number, number])[] }>;
+  }>;
+  readonly bids?: readonly Readonly<{
+    bidder: string;
+    params?: Readonly<Record<string, unknown>>;
+  }>[];
+}
+
+export interface AddAdUnitsResult {
+  readonly registered: readonly string[];
+}
+
+export interface RequestAdsOptions {
+  readonly slots?: readonly string[];
+  readonly timeoutMs?: number;
+  readonly signal?: AbortSignal;
+}
+
+export type RenderFailureReason =
+  | 'auction_timeout'
+  | AuctionSlotFailureReason
+  | 'network_error'
+  | 'http_error'
+  | 'invalid_response'
+  | 'slot_unresolved'
+  | 'descriptor_invalid'
+  | 'invalid_dimensions'
+  | 'dimensions_out_of_range'
+  | 'no_render_source'
+  | 'registry_full'
+  | 'capability_registry_full'
+  | 'external_queue_full'
+  | 'external_ready_timeout'
+  | 'external_artifact_incompatible'
+  | 'prebid_admission_failed'
+  | 'prebid_contract_violation'
+  | 'prebid_selection_timeout'
+  | 'reservation_collision'
+  | 'identity_generation_failed'
+  | 'cycle_unattributable'
+  | 'slot_quarantined'
+  | 'gpt_request_failed'
+  | 'gpt_request_timeout'
+  | 'gpt_completion_timeout'
+  | 'reconciliation_capacity'
+  | 'gam_empty'
+  | 'bridge_claim_timeout'
+  | 'bridge_id_mismatch'
+  | 'owner_registration_timeout'
+  | 'owner_insertion_timeout'
+  | 'renderer_document_no_load'
+  | 'runner_no_load'
+  | 'runner_failed'
+  | 'cache_network_error'
+  | 'cache_http_error'
+  | 'cache_invalid_response'
+  | 'adm_document_no_load'
+  | 'abi_mismatch'
+  | 'bundle_partial';
+
+export type RequestAdsSlotResult =
+  | Readonly<{ slot: string; path: 'primary' | 'fallback'; outcome: 'accepted' }>
+  | Readonly<{ slot: string; path: 'primary' | 'fallback'; outcome: 'no_bid' }>
+  | Readonly<{
+      slot: string;
+      path: 'primary' | 'fallback';
+      outcome: 'failed';
+      reason: RenderFailureReason;
+    }>
+  | Readonly<{
+      slot: string;
+      path: 'primary' | 'fallback';
+      outcome: 'cancelled';
+      reason: 'caller_aborted' | 'superseded' | 'navigation_disposed';
+    }>;
+
+export interface RequestAdsResult {
+  readonly slots: readonly RequestAdsSlotResult[];
+}
+
 export interface TsjsApi {
   version: string;
   que: Array<() => void>;
