@@ -42,6 +42,7 @@ const objectGetPrototypeOfIntrinsic = Object.getPrototypeOf;
 const objectIsFrozenIntrinsic = Object.isFrozen;
 
 interface PrebidIntegrationRuntime {
+  readonly activate: () => () => void;
   readonly start: (config: unknown) => void;
 }
 
@@ -110,12 +111,22 @@ function readPrebidRuntime(
       candidate === null ||
       arrayIsArrayIntrinsic(candidate) ||
       !objectIsFrozenIntrinsic(candidate) ||
-      Reflect.ownKeys(candidate).length !== 1
+      Reflect.ownKeys(candidate).length !== 2
     ) {
       return undefined;
     }
+    const activate = objectGetOwnPropertyDescriptorIntrinsic(candidate, 'activate');
     const start = objectGetOwnPropertyDescriptorIntrinsic(candidate, 'start');
-    if (!start || !('value' in start) || typeof start.value !== 'function') return undefined;
+    if (
+      !activate ||
+      !('value' in activate) ||
+      typeof activate.value !== 'function' ||
+      !start ||
+      !('value' in start) ||
+      typeof start.value !== 'function'
+    ) {
+      return undefined;
+    }
     return candidate as PrebidIntegrationRuntime;
   } catch {
     return undefined;
@@ -133,7 +144,14 @@ export function createPrebidIntegrationRegistration(release: string): Integratio
       if (!runtime) throw new TypeError('Prebid integration runtime is unavailable');
 
       return Object.freeze({
-        activate: ({ afterCommit }: IntegrationActivationContext) => {
+        activate: ({ afterCommit, onDispose }: IntegrationActivationContext) => {
+          const runtimeRelease: { value?: () => void } = {};
+          onDispose(() => runtimeRelease.value?.());
+          const release = runtime.activate();
+          if (typeof release !== 'function') {
+            throw new TypeError('Prebid integration activation disposer is unavailable');
+          }
+          runtimeRelease.value = release;
           afterCommit(() => runtime.start(config));
         },
       });

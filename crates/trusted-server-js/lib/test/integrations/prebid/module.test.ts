@@ -48,12 +48,17 @@ function callbacks(order: string[]): IntegrationInstallCallbacks {
 }
 
 describe('transactional Prebid integration module', () => {
-  it('prepares inertly and starts the external boundary only after commit', async () => {
+  it('prepares inertly, activates reversible listeners, and starts only after commit', async () => {
     const config = Object.freeze({ clientSideBidders: Object.freeze(['rubicon']) });
     const order: string[] = [];
     const start = vi.fn((received: unknown) => {
       order.push('start');
       expect(received).toBe(config);
+    });
+    const release = vi.fn(() => order.push('release'));
+    const activate = vi.fn(() => {
+      order.push('prebid:activate');
+      return release;
     });
     let finishPreparation: (() => void) | undefined;
     const preparationGate = new Promise<void>((resolve) => {
@@ -67,7 +72,7 @@ describe('transactional Prebid integration module', () => {
       now: () => 0,
       getBindings: () => ({
         config,
-        interfaces: Object.freeze({ prebid: Object.freeze({ start }) }),
+        interfaces: Object.freeze({ prebid: Object.freeze({ activate, start }) }),
       }),
     });
     registry.register(createPrebidIntegrationRegistration(RELEASE_ID));
@@ -87,9 +92,84 @@ describe('transactional Prebid integration module', () => {
     const result = await installing;
 
     expect(result).toMatchObject({ state: 'kernel' });
-    expect(order).toEqual(['gate:prepare', 'core', 'gate:activate', 'publish', 'start', 'drain']);
+    expect(order).toEqual([
+      'gate:prepare',
+      'core',
+      'prebid:activate',
+      'gate:activate',
+      'publish',
+      'start',
+      'drain',
+    ]);
+    expect(activate).toHaveBeenCalledTimes(1);
     expect(start).toHaveBeenCalledExactlyOnceWith(config);
-    if (result.state === 'kernel') result.dispose();
+    if (result.state === 'kernel') {
+      result.dispose();
+      result.dispose();
+    }
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it('unwinds Prebid activation before fallback when a later module fails', async () => {
+    const release = vi.fn();
+    const start = vi.fn();
+    const registry = createIntegrationRegistry({
+      manifest: manifest(['prebid', 'broken']),
+      releaseId: RELEASE_ID,
+      knownIntegrationIds: Object.freeze(['prebid', 'broken']),
+      startedAtMs: 0,
+      now: () => 0,
+      getBindings: () => ({
+        config: Object.freeze({}),
+        interfaces: Object.freeze({
+          prebid: Object.freeze({ activate: () => release, start }),
+        }),
+      }),
+    });
+    registry.register(createPrebidIntegrationRegistration(RELEASE_ID));
+    registry.register(
+      registration('broken', () => ({
+        activate: () => {
+          throw new Error('fictional activation failure');
+        },
+      }))
+    );
+
+    await expect(registry.install(callbacks([]))).resolves.toMatchObject({
+      state: 'fallback',
+      reason: 'bundle_partial',
+    });
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it('does not start when reversible Prebid activation fails', async () => {
+    const start = vi.fn();
+    const registry = createIntegrationRegistry({
+      manifest: manifest(['prebid']),
+      releaseId: RELEASE_ID,
+      knownIntegrationIds: Object.freeze(['prebid']),
+      startedAtMs: 0,
+      now: () => 0,
+      getBindings: () => ({
+        config: Object.freeze({}),
+        interfaces: Object.freeze({
+          prebid: Object.freeze({
+            activate: () => {
+              throw new Error('fictional listener activation failure');
+            },
+            start,
+          }),
+        }),
+      }),
+    });
+    registry.register(createPrebidIntegrationRegistration(RELEASE_ID));
+
+    await expect(registry.install(callbacks([]))).resolves.toMatchObject({
+      state: 'fallback',
+      reason: 'bundle_partial',
+    });
+    expect(start).not.toHaveBeenCalled();
   });
 
   it('fails preparation without effects when the composition omits the Prebid boundary', async () => {
@@ -131,7 +211,9 @@ describe('transactional Prebid integration module', () => {
       now: () => 0,
       getBindings: () => ({
         config,
-        interfaces: Object.freeze({ prebid: Object.freeze({ start }) }),
+        interfaces: Object.freeze({
+          prebid: Object.freeze({ activate: () => vi.fn(), start }),
+        }),
       }),
     });
     registry.register(createPrebidIntegrationRegistration(RELEASE_ID));
@@ -157,7 +239,9 @@ describe('transactional Prebid integration module', () => {
       onRuntimeFailure: (failure) => runtimeFailures.push(failure),
       getBindings: () => ({
         config: Object.freeze({}),
-        interfaces: Object.freeze({ prebid: Object.freeze({ start }) }),
+        interfaces: Object.freeze({
+          prebid: Object.freeze({ activate: () => vi.fn(), start }),
+        }),
       }),
     });
     registry.register(createPrebidIntegrationRegistration(RELEASE_ID));
