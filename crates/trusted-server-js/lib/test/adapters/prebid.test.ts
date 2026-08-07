@@ -41,7 +41,6 @@ function createReadyPrebid(
   const listeners = new Map<string, Set<(event: unknown) => void>>();
   const pbjs = {
     addAdUnits: vi.fn(),
-    addBidResponse: vi.fn(),
     getHighestCpmBids: vi.fn<() => object[]>(() => []),
     offEvent: vi.fn((type: string, listener: (event: unknown) => void) => {
       listeners.get(type)?.delete(listener);
@@ -52,6 +51,7 @@ function createReadyPrebid(
       listeners.set(type, registered);
     }),
     processQueue: vi.fn(),
+    registerBidAdapter: vi.fn(),
     que: {
       push: vi.fn((command: Command): number => {
         if (options.deferCommands) commands.push(command);
@@ -83,7 +83,7 @@ describe('browser Prebid adapter readiness', () => {
       expect('que' in prebid).toBe(false);
       expect('__trustedServerArtifactV1' in prebid).toBe(false);
       prebid.addAdUnits([{ code: 'slot-a' }]);
-      prebid.addBidResponse('slot-a', { adId: 'bid-a' });
+      prebid.registerBidAdapter(undefined, 'trustedServer', { code: 'trustedServer' });
       prebid.requestBids({ adUnitCodes: ['slot-a'] });
       prebid.renderAd({}, 'bid-a');
       return prebid.highestBids('slot-a');
@@ -92,7 +92,9 @@ describe('browser Prebid adapter readiness', () => {
     expect(operation.status).toBe('present');
     await expect(operation.result).resolves.toEqual([]);
     expect(ready.pbjs.addAdUnits).toHaveBeenCalledTimes(1);
-    expect(ready.pbjs.addBidResponse).toHaveBeenCalledWith('slot-a', { adId: 'bid-a' });
+    expect(ready.pbjs.registerBidAdapter).toHaveBeenCalledWith(undefined, 'trustedServer', {
+      code: 'trustedServer',
+    });
     expect(ready.pbjs.requestBids).toHaveBeenCalledTimes(1);
     expect(ready.pbjs.renderAd).toHaveBeenCalledWith({}, 'bid-a');
   });
@@ -601,11 +603,11 @@ describe('browser Prebid adapter readiness', () => {
   it('requires every real API method and contains hostile target and member getters', async () => {
     for (const method of [
       'addAdUnits',
-      'addBidResponse',
       'getHighestCpmBids',
       'offEvent',
       'onEvent',
       'processQueue',
+      'registerBidAdapter',
       'renderAd',
       'requestBids',
     ] as const) {

@@ -67,9 +67,9 @@ export interface PrebidArtifactRequirements {
 /** The small Prebid surface exposed to an accepted operation. */
 export interface PrebidFacade {
   addAdUnits(adUnits: readonly unknown[]): unknown;
-  addBidResponse(adUnitCode: string, bid: object): unknown;
   highestBids(adUnitCode?: string): readonly object[];
   processQueue(): unknown;
+  registerBidAdapter(adapter: unknown, bidderCode: string, spec?: object): unknown;
   renderAd(targetDocument: object, adId: string): unknown;
   requestBids(options: object): unknown;
   subscribe(eventType: string, listener: (event: unknown) => void): () => void;
@@ -176,13 +176,11 @@ function frozenRecordValues(
   value: unknown,
   keys: readonly string[]
 ): Readonly<Record<string, unknown>> | undefined {
-  if (
-    typeof value !== 'object' ||
-    value === null ||
-    Object.getPrototypeOf(value) !== Object.prototype
-  ) {
+  if (typeof value !== 'object' || value === null) {
     return undefined;
   }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== null && Object.getPrototypeOf(prototype) !== null) return undefined;
   if (!Object.isFrozen(value)) return undefined;
   let ownKeys: PropertyKey[];
   let descriptors: Record<PropertyKey, PropertyDescriptor>;
@@ -224,7 +222,7 @@ function validString(value: unknown, maximumBytes: number, lowercase = false): v
 }
 
 function frozenArrayValues(value: unknown, maximumLength: number): readonly unknown[] | undefined {
-  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) return undefined;
+  if (!Array.isArray(value)) return undefined;
   if (!Object.isFrozen(value)) return undefined;
   const descriptors = Object.getOwnPropertyDescriptors(value);
   const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
@@ -380,11 +378,11 @@ function validateStamp(
 
 const REQUIRED_API_METHODS = [
   'addAdUnits',
-  'addBidResponse',
   'getHighestCpmBids',
   'offEvent',
   'onEvent',
   'processQueue',
+  'registerBidAdapter',
   'renderAd',
   'requestBids',
 ] as const;
@@ -559,8 +557,6 @@ export function createBrowserPrebidAdapter(
     Object.freeze({
       addAdUnits: (adUnits: readonly unknown[]): unknown =>
         callBound(binding, 'addAdUnits', [[...adUnits]], isOperationCurrent),
-      addBidResponse: (adUnitCode: string, bid: object): unknown =>
-        callBound(binding, 'addBidResponse', [adUnitCode, bid], isOperationCurrent),
       highestBids: (adUnitCode?: string): readonly object[] => {
         const value = callBound(
           binding,
@@ -575,6 +571,13 @@ export function createBrowserPrebidAdapter(
         return Object.freeze([...value]);
       },
       processQueue: (): unknown => callBound(binding, 'processQueue', [], isOperationCurrent),
+      registerBidAdapter: (adapter: unknown, bidderCode: string, spec?: object): unknown =>
+        callBound(
+          binding,
+          'registerBidAdapter',
+          spec === undefined ? [adapter, bidderCode] : [adapter, bidderCode, spec],
+          isOperationCurrent
+        ),
       renderAd: (targetDocument: object, adId: string): unknown =>
         callBound(binding, 'renderAd', [targetDocument, adId], isOperationCurrent),
       requestBids: (options: object): unknown =>

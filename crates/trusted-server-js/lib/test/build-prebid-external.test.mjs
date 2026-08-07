@@ -13,6 +13,7 @@ import {
   main,
   parseArgs,
   readAdapterBidderCodes,
+  readAdapterMetadata,
   renderIncludedUserIdModulesExport,
 } from '../build-prebid-external.mjs';
 
@@ -38,6 +39,10 @@ describe('build-prebid-external metadata', () => {
   it('derives registered bidder codes including aliases from prebid metadata', () => {
     // adfBidAdapter.js registers adf plus the adform/adformOpenRTB aliases.
     expect(readAdapterBidderCodes(['adf'])).toEqual(['adf', 'adform', 'adformOpenRTB']);
+    expect(readAdapterMetadata(['adf']).bidderAliases).toEqual([
+      { code: 'adform', moduleStem: 'adf' },
+      { code: 'adformOpenRTB', moduleStem: 'adf' },
+    ]);
   });
 
   it('maps a module file stem to its registered bidder code', () => {
@@ -115,5 +120,10 @@ describe('build-prebid-external metadata', () => {
     const parsed = parseArgs(['--adapters', 'rubicon', '--out', 'dist/prebid']);
 
     expect(parsed.outDir).toBe(path.resolve(process.cwd(), 'dist/prebid'));
+  });
+
+  it('canonicalizes module order and rejects duplicate module names', () => {
+    expect(parseArgs(['--adapters', 'rubicon,adf']).adapters).toEqual(['adf', 'rubicon']);
+    expect(() => parseArgs(['--adapters', 'rubicon,rubicon'])).toThrow(/duplicates/);
   });
 });
