@@ -285,7 +285,10 @@ describe('browser composition', () => {
       {
         adapters: {
           googletag,
-          messaging: fakeMessagingAdapter(),
+          messaging: fakeMessagingAdapter(() => {
+            expect(subscriptions).toEqual([]);
+            return vi.fn();
+          }),
           prebid: fakePrebidAdapter(),
         },
         coreActivations: {

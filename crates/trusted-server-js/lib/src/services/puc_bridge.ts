@@ -117,12 +117,24 @@ function installPucDynamicOwner(): void {
     'bundle_partial',
   ]);
   const cancellationReasons = new Set(['caller_aborted', 'superseded', 'navigation_disposed']);
+  const messageEventDataGetter = Object.getOwnPropertyDescriptor(MessageEvent.prototype, 'data')
+    ?.get as ((this: MessageEvent) => unknown) | undefined;
 
   const ownDataValue = (candidate: unknown, name: string): unknown => {
     try {
       if (typeof candidate !== 'object' || candidate === null) return undefined;
       const descriptor = Object.getOwnPropertyDescriptor(candidate, name);
       return descriptor && 'value' in descriptor ? descriptor.value : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const eventDataValue = (event: unknown): unknown => {
+    try {
+      if (typeof event !== 'object' || event === null) return undefined;
+      const descriptor = Object.getOwnPropertyDescriptor(event, 'data');
+      if (descriptor) return 'value' in descriptor ? descriptor.value : undefined;
+      return messageEventDataGetter ? Reflect.apply(messageEventDataGetter, event, []) : undefined;
     } catch {
       return undefined;
     }
@@ -151,37 +163,147 @@ function installPucDynamicOwner(): void {
     }
     return candidate as Record<string, unknown>;
   };
-  const eventPorts = (event: unknown, count: number): MessagePort[] | undefined => {
+  const snapshotEventPorts = (event: unknown): MessagePort[] | undefined => {
     try {
       if (typeof event !== 'object' || event === null) return undefined;
       const ports = Reflect.get(event, 'ports') as unknown;
-      if (!Array.isArray(ports) || ports.length !== count) return undefined;
-      for (let index = 0; index < ports.length; index += 1) {
-        const port = ports[index] as Partial<MessagePort> | undefined;
-        if (!port || typeof port.postMessage !== 'function' || typeof port.close !== 'function') {
+      if (
+        !Array.isArray(ports) ||
+        Object.getPrototypeOf(ports) !== Array.prototype ||
+        Object.getOwnPropertySymbols(ports).length !== 0
+      ) {
+        return undefined;
+      }
+      const length = Object.getOwnPropertyDescriptor(ports, 'length');
+      if (
+        !length ||
+        !('value' in length) ||
+        !Number.isSafeInteger(length.value) ||
+        length.value < 0 ||
+        Object.getOwnPropertyNames(ports).length !== length.value + 1
+      ) {
+        return undefined;
+      }
+      const snapshot: MessagePort[] = [];
+      for (let index = 0; index < length.value; index += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(ports, String(index));
+        if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) return undefined;
+        const port = descriptor.value as Partial<MessagePort> | undefined;
+        if (
+          !port ||
+          typeof Reflect.get(port, 'postMessage') !== 'function' ||
+          typeof Reflect.get(port, 'close') !== 'function'
+        ) {
           return undefined;
         }
+        snapshot[index] = port as MessagePort;
       }
-      return ports as MessagePort[];
+      return snapshot;
     } catch {
       return undefined;
     }
   };
+  const eventPorts = (event: unknown, count: number): MessagePort[] | undefined => {
+    const ports = snapshotEventPorts(event);
+    return ports?.length === count ? ports : undefined;
+  };
   const closeEventPorts = (event: unknown): void => {
-    try {
-      if (typeof event !== 'object' || event === null) return;
-      const ports = Reflect.get(event, 'ports') as unknown;
-      if (!Array.isArray(ports)) return;
-      for (let index = 0; index < ports.length; index += 1) {
-        try {
-          const port = ports[index] as Partial<MessagePort> | undefined;
-          if (typeof port?.close === 'function') port.close();
-        } catch {
-          // Late or malformed endpoints are still contained independently.
-        }
+    const ports = snapshotEventPorts(event);
+    if (!ports) return;
+    for (let index = 0; index < ports.length; index += 1) {
+      try {
+        ports[index]?.close();
+      } catch {
+        // Late or malformed endpoints are still contained independently.
       }
+    }
+  };
+  const skipJsonWhitespace = (source: string, start: number): number => {
+    let index = start;
+    while (
+      source[index] === ' ' ||
+      source[index] === '\t' ||
+      source[index] === '\n' ||
+      source[index] === '\r'
+    ) {
+      index += 1;
+    }
+    return index;
+  };
+  const scanJsonString = (source: string, start: number): number | undefined => {
+    if (source[start] !== '"') return undefined;
+    let index = start + 1;
+    while (index < source.length) {
+      const character = source[index];
+      if (character === '"') return index + 1;
+      if (character === '\\') {
+        index += 1;
+        if (index >= source.length) return undefined;
+        if (source[index] === 'u') {
+          if (!/^[0-9a-fA-F]{4}$/.test(source.slice(index + 1, index + 5))) return undefined;
+          index += 4;
+        }
+      } else if (character !== undefined && character.charCodeAt(0) < 0x20) {
+        return undefined;
+      }
+      index += 1;
+    }
+    return undefined;
+  };
+  const scanJsonValue = (source: string, start: number): number | undefined => {
+    let index = skipJsonWhitespace(source, start);
+    if (source[index] === '"') return scanJsonString(source, index);
+    if (source[index] === '[') {
+      index = skipJsonWhitespace(source, index + 1);
+      if (source[index] === ']') return index + 1;
+      while (index < source.length) {
+        const end = scanJsonValue(source, index);
+        if (end === undefined) return undefined;
+        index = skipJsonWhitespace(source, end);
+        if (source[index] === ']') return index + 1;
+        if (source[index] !== ',') return undefined;
+        index = skipJsonWhitespace(source, index + 1);
+      }
+      return undefined;
+    }
+    if (source[index] === '{') {
+      const keys = new Set<string>();
+      index = skipJsonWhitespace(source, index + 1);
+      if (source[index] === '}') return index + 1;
+      while (index < source.length) {
+        const keyEnd = scanJsonString(source, index);
+        if (keyEnd === undefined) return undefined;
+        let key: unknown;
+        try {
+          key = JSON.parse(source.slice(index, keyEnd)) as unknown;
+        } catch {
+          return undefined;
+        }
+        if (typeof key !== 'string' || keys.has(key)) return undefined;
+        keys.add(key);
+        index = skipJsonWhitespace(source, keyEnd);
+        if (source[index] !== ':') return undefined;
+        const valueEnd = scanJsonValue(source, index + 1);
+        if (valueEnd === undefined) return undefined;
+        index = skipJsonWhitespace(source, valueEnd);
+        if (source[index] === '}') return index + 1;
+        if (source[index] !== ',') return undefined;
+        index = skipJsonWhitespace(source, index + 1);
+      }
+      return undefined;
+    }
+    const match = /^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)/.exec(
+      source.slice(index)
+    );
+    return match ? index + match[0].length : undefined;
+  };
+  const parseJsonWithoutDuplicateKeys = (source: string): unknown => {
+    const end = scanJsonValue(source, 0);
+    if (end === undefined || skipJsonWhitespace(source, end) !== source.length) return undefined;
+    try {
+      return JSON.parse(source) as unknown;
     } catch {
-      // A hostile event cannot interrupt terminal cleanup.
+      return undefined;
     }
   };
   const parseRegistration = (value: unknown): Record<string, unknown> | undefined => {
@@ -189,7 +311,7 @@ function installPucDynamicOwner(): void {
       if (typeof value !== 'string' || new TextEncoder().encode(value).byteLength > 4096) {
         return undefined;
       }
-      return exactRecord(JSON.parse(value) as unknown, [
+      return exactRecord(parseJsonWithoutDuplicateKeys(value), [
         'message',
         'adId',
         'version',
@@ -218,10 +340,12 @@ function installPucDynamicOwner(): void {
     return true;
   };
   const utf8Length = (value: string): number => new TextEncoder().encode(value).byteLength;
-  const validApsRenderer = (
-    renderer: Record<string, unknown>,
-    publisherOrigin: URL
-  ): boolean => {
+  const containsAsciiControl = (value: string): boolean =>
+    Array.from(value).some((character) => {
+      const codePoint = character.codePointAt(0);
+      return codePoint !== undefined && (codePoint <= 0x1f || codePoint === 0x7f);
+    });
+  const validApsRenderer = (renderer: Record<string, unknown>, publisherOrigin: URL): boolean => {
     const accountId = renderer['accountId'];
     const bidId = renderer['bidId'];
     const creativeId = renderer['creativeId'];
@@ -236,7 +360,7 @@ function installPucDynamicOwner(): void {
       typeof bidId !== 'string' ||
       bidId.length === 0 ||
       utf8Length(bidId) > 64 ||
-      /[\x00-\x1f\x7f]/.test(bidId) ||
+      containsAsciiControl(bidId) ||
       (renderer['tagType'] !== 'iframe' && renderer['tagType'] !== 'script') ||
       !validDimension(renderer['width']) ||
       !validDimension(renderer['height']) ||
@@ -284,6 +408,7 @@ function installPucDynamicOwner(): void {
       }
       const adId = outer?.['adId'];
       const lifecycleTicket = owner?.['lifecycleTicket'];
+      const ownerKind = owner?.['kind'];
       if (
         !outer ||
         !owner ||
@@ -311,6 +436,7 @@ function installPucDynamicOwner(): void {
       let controlPort: MessagePort | undefined;
       let documentPort: MessagePort | undefined;
       let frame: HTMLIFrameElement | undefined;
+      let ownerFrameCurrent: (() => boolean) | undefined;
       let frameCommitted = false;
       let localApsFailure = false;
       let started = false;
@@ -406,8 +532,14 @@ function installPucDynamicOwner(): void {
         }
         prepareDocument();
         const next = configureFrame(source, admSandbox);
+        const intendedSource = `<!doctype html><html><head><meta charset="utf-8"><meta name="referrer" content="no-referrer"><style>html,body{border:0;margin:0;padding:0;overflow:hidden}</style></head><body>${source['adm'] as string}</body></html>`;
+        ownerFrameCurrent = () =>
+          frame === next &&
+          next.parentNode === creativeWindow.document.body &&
+          next.srcdoc === intendedSource &&
+          next.getAttribute('src') === null;
         next.onload = () => {
-          if (!settled && frame === next && next.isConnected) {
+          if (!settled && ownerFrameCurrent?.() === true) {
             postControl({
               message: 'TS ADM Loaded',
               version: 1,
@@ -424,7 +556,7 @@ function installPucDynamicOwner(): void {
             });
           }
         };
-        next.srcdoc = `<!doctype html><html><head><meta charset="utf-8"><meta name="referrer" content="no-referrer"><style>html,body{border:0;margin:0;padding:0;overflow:hidden}</style></head><body>${source['adm'] as string}</body></html>`;
+        next.srcdoc = intendedSource;
         frame = next;
         creativeWindow.document.body.appendChild(next);
         postControl({
@@ -511,6 +643,13 @@ function installPucDynamicOwner(): void {
         prepareDocument();
         documentPort = ports[0];
         const next = configureFrame(renderer, apsSandbox);
+        const intendedSource = `${parsedUrl.href}#tsaps=${envelope['nonce'] as string}`;
+        let intendedWindow: Window | null = null;
+        ownerFrameCurrent = () =>
+          frame === next &&
+          next.parentNode === creativeWindow.document.body &&
+          next.getAttribute('src') === intendedSource &&
+          next.contentWindow === intendedWindow;
         const containLocalFailure = (transferred?: MessagePort): void => {
           localApsFailure = true;
           next.onload = null;
@@ -523,7 +662,7 @@ function installPucDynamicOwner(): void {
           next.remove();
         };
         next.onload = () => {
-          if (settled || frame !== next || !next.isConnected || !documentPort) return;
+          if (settled || ownerFrameCurrent?.() !== true || !documentPort) return;
           const transferred = documentPort;
           documentPort = undefined;
           try {
@@ -535,9 +674,10 @@ function installPucDynamicOwner(): void {
           }
         };
         next.onerror = () => containLocalFailure();
-        next.src = `${parsedUrl.href}#tsaps=${envelope['nonce'] as string}`;
+        next.src = intendedSource;
         frame = next;
         creativeWindow.document.body.appendChild(next);
+        intendedWindow = next.contentWindow;
         postControl({
           message: 'TS Owner Inserted',
           version: 1,
@@ -550,7 +690,7 @@ function installPucDynamicOwner(): void {
           return;
         }
         const ports = eventPorts(event, 0) ?? eventPorts(event, 1);
-        const dataValue = ownDataValue(event, 'data');
+        const dataValue = eventDataValue(event);
         const routedMessage = ownDataValue(dataValue, 'message');
         const routedOutcome = ownDataValue(dataValue, 'outcome');
         const message = exactRecord(dataValue, [
@@ -577,18 +717,32 @@ function installPucDynamicOwner(): void {
           finish(false, 'TS render owner control refused');
           return;
         }
-        if (message['message'] === 'TS ADM Start' && ports.length === 0 && !started) {
+        if (
+          message['message'] === 'TS ADM Start' &&
+          ownerKind === 'adm' &&
+          ports.length === 0 &&
+          !started
+        ) {
           started = true;
           insertAdm(message['source'] as Record<string, unknown>);
           return;
         }
-        if (message['message'] === 'TS APS Start' && ports.length === 1 && !started) {
+        if (
+          message['message'] === 'TS APS Start' &&
+          ownerKind === 'aps' &&
+          ports.length === 1 &&
+          !started
+        ) {
           started = true;
           insertAps(message, ports);
           return;
         }
         if (message['message'] === 'TS Owner Settled' && ports.length === 0) {
-          if (message['outcome'] === 'accepted' && !localApsFailure && frame && frame.isConnected) {
+          if (
+            message['outcome'] === 'accepted' &&
+            !localApsFailure &&
+            ownerFrameCurrent?.() === true
+          ) {
             frameCommitted = true;
             finish(true, '');
             return;
@@ -622,13 +776,7 @@ function installPucDynamicOwner(): void {
         stopHelper();
         if (registrationTimer !== undefined) creativeWindow.clearTimeout(registrationTimer);
         const ports = eventPorts(event, 1);
-        let dataValue: unknown;
-        try {
-          dataValue =
-            typeof event === 'object' && event !== null ? Reflect.get(event, 'data') : undefined;
-        } catch {
-          dataValue = undefined;
-        }
+        const dataValue = eventDataValue(event);
         const response = parseRegistration(dataValue);
         if (
           !ports ||
@@ -2083,12 +2231,14 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
   ): void => {
     const ticket = routing.lifecycleTicket;
     if (!ticket) return;
-    const now = readNow();
-    if (now === undefined) return;
-    pruneExpiredTickets(now);
     const entry = mapValue(tickets, ticket);
     if (!entry) return;
     if (!suppress(event)) return;
+    const now = readNow();
+    if (now !== undefined) {
+      pruneExpiredTickets(now);
+      if (mapValue(tickets, ticket) !== entry) return;
+    }
 
     const exact = messaging.parseProtocolMessage('ownerRegister', data);
     const inspection = messaging.inspectTransferredPorts(event);
@@ -2103,6 +2253,15 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
         if (port) closePort(port);
       }
     };
+    if (now === undefined) {
+      if (responsePort) refuseOwner(responsePort, routing.adId ?? '');
+      closeAdditionalPorts();
+      if (entry.state !== 'tombstone') {
+        retireTicket(entry.binding);
+        failBinding(entry.binding, 'internal_error', false);
+      }
+      return;
+    }
     if (entry.state === 'tombstone') {
       if (responsePort) refuseOwner(responsePort, routing.adId ?? '');
       closeAdditionalPorts();
