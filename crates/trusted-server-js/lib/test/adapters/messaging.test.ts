@@ -46,6 +46,636 @@ function createApsRenderer() {
 }
 
 describe('browser messaging adapter', () => {
+  it('creates one owned channel and transfers only its exact wrapped endpoint', () => {
+    const retainedRaw = createPort();
+    const transferredRaw = createPort();
+    const adapter = createBrowserMessagingAdapter({
+      ...createTarget(),
+      MessageChannel: class {
+        readonly port1 = retainedRaw;
+        readonly port2 = transferredRaw;
+      },
+    });
+    const channel = adapter.createChannel();
+    if (!channel) throw new Error('Expected one channel');
+    expect(Object.isFrozen(channel)).toBe(true);
+    expect(Object.isFrozen(channel.retained)).toBe(true);
+    expect(Object.isFrozen(channel.transferred)).toBe(true);
+
+    const receiver = { postMessage: vi.fn() };
+    const envelope = Object.freeze({ version: 1, nonce: 'n1_abcdefghijklmnopqrstuv' });
+    expect(adapter.postWindow(receiver, envelope, '*', [channel.transferred])).toBe(true);
+    expect(receiver.postMessage).toHaveBeenCalledWith(envelope, '*', [transferredRaw]);
+    channel.transferred.close();
+    expect(transferredRaw.close).not.toHaveBeenCalled();
+    expect(adapter.postWindow(receiver, envelope, '*', [channel.transferred])).toBe(false);
+    channel.retained.close();
+    expect(retainedRaw.close).toHaveBeenCalledOnce();
+  });
+
+  it('leaves an untransferred endpoint locally closeable when exact window posting fails', () => {
+    const retainedRaw = createPort();
+    const transferredRaw = createPort();
+    const adapter = createBrowserMessagingAdapter({
+      ...createTarget(),
+      MessageChannel: class {
+        readonly port1 = retainedRaw;
+        readonly port2 = transferredRaw;
+      },
+    });
+    const channel = adapter.createChannel();
+    if (!channel) throw new Error('Expected one channel');
+    const receiver = {
+      postMessage: vi.fn(() => {
+        throw new Error('window post failed');
+      }),
+    };
+    expect(adapter.postWindow(receiver, Object.freeze({}), '*', [channel.transferred])).toBe(false);
+    channel.transferred.close();
+    expect(transferredRaw.close).toHaveBeenCalledOnce();
+    channel.retained.close();
+  });
+
+  it('reserves a transferred endpoint before a reentrant window post', () => {
+    const retainedRaw = createPort();
+    const transferredRaw = createPort();
+    const adapter = createBrowserMessagingAdapter({
+      ...createTarget(),
+      MessageChannel: class {
+        readonly port1 = retainedRaw;
+        readonly port2 = transferredRaw;
+      },
+    });
+    const channel = adapter.createChannel();
+    if (!channel) throw new Error('Expected one channel');
+    let nested: boolean | undefined;
+    const receiver = {
+      postMessage: vi.fn(() => {
+        nested = adapter.postWindow(receiver, Object.freeze({ nested: true }), '*', [
+          channel.transferred,
+        ]);
+      }),
+    };
+    expect(
+      adapter.postWindow(receiver, Object.freeze({ outer: true }), '*', [channel.transferred])
+    ).toBe(true);
+    expect(nested).toBe(false);
+    expect(receiver.postMessage).toHaveBeenCalledOnce();
+    channel.transferred.close();
+    expect(transferredRaw.close).not.toHaveBeenCalled();
+  });
+
+  it('closes invalid channel endpoints without returning a partial facade', () => {
+    const duplicate = createPort();
+    const adapter = createBrowserMessagingAdapter({
+      ...createTarget(),
+      MessageChannel: class {
+        readonly port1 = duplicate;
+        readonly port2 = duplicate;
+      },
+    });
+    expect(adapter.createChannel()).toBeUndefined();
+    expect(duplicate.close).toHaveBeenCalledOnce();
+    expect(createBrowserMessagingAdapter(createTarget()).createChannel()).toBeUndefined();
+  });
+
+  it('transfers through descriptor snapshots when Array prototype operations are poisoned', () => {
+    const retainedRaw = createPort();
+    const transferredRaw = createPort();
+    const adapter = createBrowserMessagingAdapter({
+      ...createTarget(),
+      MessageChannel: class {
+        readonly port1 = retainedRaw;
+        readonly port2 = transferredRaw;
+      },
+    });
+    const channel = adapter.createChannel();
+    if (!channel) throw new Error('Expected one channel');
+    let posts = 0;
+    let receivedTransfer: unknown;
+    const receiver = {
+      postMessage(...parameters: unknown[]): void {
+        posts += 1;
+        receivedTransfer = parameters[2];
+      },
+    };
+    const originalFilter = Object.getOwnPropertyDescriptor(Array.prototype, 'filter');
+    const originalSort = Object.getOwnPropertyDescriptor(Array.prototype, 'sort');
+    const originalPush = Object.getOwnPropertyDescriptor(Array.prototype, 'push');
+    const originalIterator = Object.getOwnPropertyDescriptor(Array.prototype, Symbol.iterator);
+    const poisoned = (): never => {
+      throw new Error('poisoned Array prototype operation');
+    };
+    let result: boolean | undefined;
+    let thrown: unknown;
+    try {
+      Object.defineProperty(Array.prototype, 'filter', { value: poisoned, configurable: true });
+      Object.defineProperty(Array.prototype, 'sort', { value: poisoned, configurable: true });
+      Object.defineProperty(Array.prototype, 'push', { value: poisoned, configurable: true });
+      Object.defineProperty(Array.prototype, Symbol.iterator, {
+        value: poisoned,
+        configurable: true,
+      });
+      result = adapter.postWindow(receiver, Object.freeze({}), '*', [channel.transferred]);
+    } catch (error) {
+      thrown = error;
+    } finally {
+      if (originalFilter) Object.defineProperty(Array.prototype, 'filter', originalFilter);
+      if (originalSort) Object.defineProperty(Array.prototype, 'sort', originalSort);
+      if (originalPush) Object.defineProperty(Array.prototype, 'push', originalPush);
+      if (originalIterator) {
+        Object.defineProperty(Array.prototype, Symbol.iterator, originalIterator);
+      }
+    }
+
+    expect(thrown).toBeUndefined();
+    expect(result).toBe(true);
+    expect(posts).toBe(1);
+    expect(receivedTransfer).toEqual([transferredRaw]);
+    channel.retained.close();
+  });
+
+  it('drains listeners and closes the raw port when collection iterators are poisoned', () => {
+    let messageListener: unknown;
+    let messageErrorListener: unknown;
+    let removals = 0;
+    let closes = 0;
+    const raw = {
+      addEventListener(type: string, listener: unknown): void {
+        if (type === 'message') messageListener = listener;
+        else messageErrorListener = listener;
+      },
+      close(): void {
+        closes += 1;
+      },
+      postMessage(): void {},
+      removeEventListener(type: string, listener: unknown): void {
+        if (type === 'message' && listener === messageListener) removals += 1;
+        if (type === 'messageerror' && listener === messageErrorListener) removals += 1;
+      },
+      start(): void {},
+    };
+    const adapter = createBrowserMessagingAdapter(createTarget());
+    const [port] = adapter.extractTransferredPorts({ ports: [raw] }, 1) ?? [];
+    if (!port) throw new Error('Expected one port');
+    port.listen(
+      () => undefined,
+      () => undefined
+    );
+
+    const originalSetIterator = Object.getOwnPropertyDescriptor(Set.prototype, Symbol.iterator);
+    const originalSetValues = Object.getOwnPropertyDescriptor(Set.prototype, 'values');
+    const originalArrayIterator = Object.getOwnPropertyDescriptor(Array.prototype, Symbol.iterator);
+    const iteratorPrototype = Object.getPrototypeOf(new Set().values()) as object;
+    const originalNext = Object.getOwnPropertyDescriptor(iteratorPrototype, 'next');
+    const poisoned = (): never => {
+      throw new Error('poisoned collection iterator');
+    };
+    let thrown: unknown;
+    try {
+      Object.defineProperty(Set.prototype, Symbol.iterator, {
+        value: poisoned,
+        configurable: true,
+      });
+      Object.defineProperty(Set.prototype, 'values', { value: poisoned, configurable: true });
+      Object.defineProperty(Array.prototype, Symbol.iterator, {
+        value: poisoned,
+        configurable: true,
+      });
+      Object.defineProperty(iteratorPrototype, 'next', { value: poisoned, configurable: true });
+      port.close();
+    } catch (error) {
+      thrown = error;
+    } finally {
+      if (originalSetIterator) {
+        Object.defineProperty(Set.prototype, Symbol.iterator, originalSetIterator);
+      }
+      if (originalSetValues) Object.defineProperty(Set.prototype, 'values', originalSetValues);
+      if (originalArrayIterator) {
+        Object.defineProperty(Array.prototype, Symbol.iterator, originalArrayIterator);
+      }
+      if (originalNext) Object.defineProperty(iteratorPrototype, 'next', originalNext);
+    }
+
+    expect(thrown).toBeUndefined();
+    expect(removals).toBe(2);
+    expect(closes).toBe(1);
+    port.close();
+    expect(closes).toBe(1);
+  });
+
+  it('posts through a wrapped port without dynamic transfer-array iteration', () => {
+    const raw = createPort();
+    const adapter = createBrowserMessagingAdapter(createTarget());
+    const [port] = adapter.extractTransferredPorts({ ports: [raw] }, 1) ?? [];
+    if (!port) throw new Error('Expected one port');
+    const transferred: unknown[] = [];
+    const originalIterator = Object.getOwnPropertyDescriptor(Array.prototype, Symbol.iterator);
+    const poisoned = (): never => {
+      throw new Error('poisoned Array iterator');
+    };
+    try {
+      Object.defineProperty(Array.prototype, Symbol.iterator, {
+        value: poisoned,
+        configurable: true,
+      });
+      port.post(Object.freeze({ message: true }), transferred);
+    } finally {
+      if (originalIterator) {
+        Object.defineProperty(Array.prototype, Symbol.iterator, originalIterator);
+      }
+    }
+
+    expect(raw.postMessage).toHaveBeenCalledWith({ message: true }, []);
+    port.close();
+  });
+
+  it('unwraps and commits exact channel endpoints transferred through a retained port', () => {
+    const retainedRaw = createPort();
+    const transferredRaw = createPort();
+    const controlRaw = createPort();
+    const adapter = createBrowserMessagingAdapter({
+      ...createTarget(),
+      MessageChannel: class {
+        readonly port1 = retainedRaw;
+        readonly port2 = transferredRaw;
+      },
+    });
+    const channel = adapter.createChannel();
+    const [control] = adapter.extractTransferredPorts({ ports: [controlRaw] }, 1) ?? [];
+    if (!channel || !control) throw new Error('Expected channel and control port');
+    const message = Object.freeze({ message: 'transfer' });
+
+    expect(control.post(message, [channel.transferred])).toBe(true);
+    expect(controlRaw.postMessage).toHaveBeenCalledWith(message, [transferredRaw]);
+    expect(control.post(message, [channel.transferred])).toBe(false);
+    channel.transferred.close();
+    expect(transferredRaw.close).not.toHaveBeenCalled();
+    channel.retained.close();
+    control.close();
+  });
+
+  it('rolls back exact channel transfer ownership when retained-port posting throws', () => {
+    const retainedRaw = createPort();
+    const transferredRaw = createPort();
+    const controlRaw = createPort();
+    controlRaw.postMessage.mockImplementation(() => {
+      throw new Error('port post failed');
+    });
+    const adapter = createBrowserMessagingAdapter({
+      ...createTarget(),
+      MessageChannel: class {
+        readonly port1 = retainedRaw;
+        readonly port2 = transferredRaw;
+      },
+    });
+    const channel = adapter.createChannel();
+    const [control] = adapter.extractTransferredPorts({ ports: [controlRaw] }, 1) ?? [];
+    if (!channel || !control) throw new Error('Expected channel and control port');
+
+    expect(control.post(Object.freeze({}), [channel.transferred])).toBe(false);
+    channel.transferred.close();
+    expect(transferredRaw.close).toHaveBeenCalledOnce();
+    channel.retained.close();
+    control.close();
+  });
+
+  it('uses captured close authority when later channel validation fails', () => {
+    let closeReads = 0;
+    let closes = 0;
+    const first = {
+      addEventListener(): void {},
+      get close(): () => void {
+        closeReads += 1;
+        if (closeReads > 1) throw new Error('close authority re-read');
+        return () => {
+          closes += 1;
+        };
+      },
+      postMessage(): void {},
+      removeEventListener(): void {},
+      start(): void {},
+    };
+    const adapter = createBrowserMessagingAdapter({
+      ...createTarget(),
+      MessageChannel: class {
+        readonly port1 = first;
+        readonly port2 = Object.freeze({ invalid: true });
+      },
+    });
+
+    expect(adapter.createChannel()).toBeUndefined();
+    expect(closeReads).toBe(1);
+    expect(closes).toBe(1);
+  });
+
+  it('preserves captured close authority when later raw-port method inspection throws', () => {
+    const first = createPort();
+    let closeReads = 0;
+    let closes = 0;
+    const partial = {
+      addEventListener(): void {},
+      get close(): () => void {
+        closeReads += 1;
+        if (closeReads > 1) throw new Error('close authority re-read');
+        return () => {
+          closes += 1;
+        };
+      },
+      get postMessage(): never {
+        throw new Error('later port inspection failed');
+      },
+      removeEventListener(): void {},
+      start(): void {},
+    };
+    const adapter = createBrowserMessagingAdapter({
+      ...createTarget(),
+      MessageChannel: class {
+        readonly port1 = first;
+        readonly port2 = partial;
+      },
+    });
+
+    expect(adapter.createChannel()).toBeUndefined();
+    expect(closeReads).toBe(1);
+    expect(closes).toBe(1);
+    expect(first.close).toHaveBeenCalledOnce();
+  });
+
+  it('captures the first endpoint close before a hostile second-endpoint getter runs', () => {
+    let closeReads = 0;
+    let poisonedCloseReads = 0;
+    let closes = 0;
+    const first = {
+      addEventListener(): void {},
+      get close(): () => void {
+        closeReads += 1;
+        if (closeReads > 1) throw new Error('first close authority re-read');
+        return () => {
+          closes += 1;
+        };
+      },
+      postMessage(): void {},
+      removeEventListener(): void {},
+      start(): void {},
+    };
+    const adapter = createBrowserMessagingAdapter({
+      ...createTarget(),
+      MessageChannel: class {
+        readonly port1 = first;
+
+        get port2(): never {
+          Object.defineProperty(first, 'close', {
+            configurable: true,
+            get: () => {
+              poisonedCloseReads += 1;
+              throw new Error('first close authority poisoned');
+            },
+          });
+          throw new Error('second endpoint unavailable');
+        }
+      },
+    });
+
+    expect(adapter.createChannel()).toBeUndefined();
+    expect(closeReads).toBe(1);
+    expect(poisonedCloseReads).toBe(0);
+    expect(closes).toBe(1);
+  });
+
+  it('uses captured WeakMap authority for channel registration and facade lookup', () => {
+    const retainedRaw = createPort();
+    const transferredRaw = createPort();
+    const adapter = createBrowserMessagingAdapter({
+      ...createTarget(),
+      MessageChannel: class {
+        readonly port1 = retainedRaw;
+        readonly port2 = transferredRaw;
+      },
+    });
+    const originalGet = WeakMap.prototype.get;
+    const originalSet = WeakMap.prototype.set;
+    let dynamicGets = 0;
+    let dynamicSets = 0;
+    WeakMap.prototype.set = function <K extends WeakKey, V>(
+      this: WeakMap<K, V>,
+      key: K,
+      value: V
+    ): WeakMap<K, V> {
+      dynamicSets += 1;
+      Reflect.apply(originalSet, this, [key, value]);
+      throw new Error('registration intercepted');
+    };
+    WeakMap.prototype.get = function <K extends WeakKey, V>(this: WeakMap<K, V>, _key: K): V {
+      dynamicGets += 1;
+      return {
+        raw: { binding: transferredRaw },
+        transferable: true,
+        closed: false,
+        transferred: false,
+        transferring: false,
+      } as V;
+    };
+
+    let channel: ReturnType<typeof adapter.createChannel>;
+    let forgedResult: boolean | undefined;
+    let thrown: unknown;
+    let posts = 0;
+    try {
+      channel = adapter.createChannel();
+      forgedResult = adapter.postWindow(
+        { postMessage: () => (posts += 1) },
+        Object.freeze({}),
+        '*',
+        [Object.freeze({}) as never]
+      );
+    } catch (error) {
+      thrown = error;
+    } finally {
+      WeakMap.prototype.get = originalGet;
+      WeakMap.prototype.set = originalSet;
+    }
+
+    expect(thrown).toBeUndefined();
+    expect(channel).toBeDefined();
+    expect(forgedResult).toBe(false);
+    expect(posts).toBe(0);
+    expect(dynamicGets).toBe(0);
+    expect(dynamicSets).toBe(0);
+    channel?.retained.close();
+    channel?.transferred.close();
+  });
+
+  it('rejects MessageChannel constructors that reuse an already-owned raw endpoint', () => {
+    const retainedRaw = createPort();
+    const transferredRaw = createPort();
+    const adapter = createBrowserMessagingAdapter({
+      ...createTarget(),
+      MessageChannel: class {
+        readonly port1 = retainedRaw;
+        readonly port2 = transferredRaw;
+      },
+    });
+    const first = adapter.createChannel();
+    if (!first) throw new Error('Expected one channel');
+
+    expect(adapter.createChannel()).toBeUndefined();
+    expect(retainedRaw.close).not.toHaveBeenCalled();
+    expect(transferredRaw.close).not.toHaveBeenCalled();
+    first.retained.close();
+    first.transferred.close();
+    expect(retainedRaw.close).toHaveBeenCalledOnce();
+    expect(transferredRaw.close).toHaveBeenCalledOnce();
+  });
+
+  it('does not close a live owned endpoint when a later constructor returns it twice', () => {
+    const retainedRaw = createPort();
+    const transferredRaw = createPort();
+    let constructions = 0;
+    const adapter = createBrowserMessagingAdapter({
+      ...createTarget(),
+      MessageChannel: class {
+        readonly port1: unknown;
+        readonly port2: unknown;
+
+        constructor() {
+          constructions += 1;
+          this.port1 = retainedRaw;
+          this.port2 = constructions === 1 ? transferredRaw : retainedRaw;
+        }
+      },
+    });
+    const first = adapter.createChannel();
+    if (!first) throw new Error('Expected one channel');
+
+    expect(adapter.createChannel()).toBeUndefined();
+    expect(retainedRaw.close).not.toHaveBeenCalled();
+    expect(transferredRaw.close).not.toHaveBeenCalled();
+    first.retained.close();
+    first.transferred.close();
+    expect(retainedRaw.close).toHaveBeenCalledOnce();
+    expect(transferredRaw.close).toHaveBeenCalledOnce();
+  });
+
+  it('keeps failed channel bindings retired throughout reentrant close cleanup', () => {
+    let constructions = 0;
+    let closes = 0;
+    let nestedCloses = 0;
+    let nestedResult: ReturnType<ReturnType<typeof createBrowserMessagingAdapter>['createChannel']>;
+    const retainedRaw = {
+      addEventListener(): void {},
+      close(): void {
+        closes += 1;
+        nestedResult = adapter.createChannel();
+      },
+      postMessage(): void {},
+      removeEventListener(): void {},
+      start(): void {},
+    };
+    const nestedRaw = {
+      addEventListener(): void {},
+      close(): void {
+        nestedCloses += 1;
+      },
+      postMessage(): void {},
+      removeEventListener(): void {},
+      start(): void {},
+    };
+    const adapter = createBrowserMessagingAdapter({
+      ...createTarget(),
+      MessageChannel: class {
+        readonly port1: unknown;
+        readonly port2: unknown;
+
+        constructor() {
+          constructions += 1;
+          this.port1 = retainedRaw;
+          this.port2 = constructions === 1 ? Object.freeze({ invalid: true }) : nestedRaw;
+        }
+      },
+    });
+
+    expect(adapter.createChannel()).toBeUndefined();
+    expect(nestedResult).toBeUndefined();
+    expect(closes).toBe(1);
+    expect(nestedCloses).toBe(1);
+  });
+
+  it('rejects channel-owned raw endpoints at transferred-port extraction without closing them', () => {
+    const retainedRaw = createPort();
+    const transferredRaw = createPort();
+    const adapter = createBrowserMessagingAdapter({
+      ...createTarget(),
+      MessageChannel: class {
+        readonly port1 = retainedRaw;
+        readonly port2 = transferredRaw;
+      },
+    });
+    const channel = adapter.createChannel();
+    if (!channel) throw new Error('Expected one channel');
+
+    expect(adapter.extractTransferredPorts({ ports: [retainedRaw] }, 1)).toBeUndefined();
+    expect(adapter.extractTransferredPorts({ ports: [retainedRaw] }, 0)).toBeUndefined();
+    expect(retainedRaw.close).not.toHaveBeenCalled();
+    channel.retained.close();
+    channel.transferred.close();
+    expect(retainedRaw.close).toHaveBeenCalledOnce();
+    expect(transferredRaw.close).toHaveBeenCalledOnce();
+  });
+
+  it('rejects MessageChannel endpoints already owned by transferred-port extraction', () => {
+    const extractedRaw = createPort();
+    const newRaw = createPort();
+    const adapter = createBrowserMessagingAdapter({
+      ...createTarget(),
+      MessageChannel: class {
+        readonly port1 = extractedRaw;
+        readonly port2 = newRaw;
+      },
+    });
+    const [extracted] = adapter.extractTransferredPorts({ ports: [extractedRaw] }, 1) ?? [];
+    if (!extracted) throw new Error('Expected one extracted port');
+
+    expect(adapter.createChannel()).toBeUndefined();
+    expect(extractedRaw.close).not.toHaveBeenCalled();
+    expect(newRaw.close).toHaveBeenCalledOnce();
+    extracted.close();
+    expect(extractedRaw.close).toHaveBeenCalledOnce();
+  });
+
+  it('extracts and wraps transferred ports without dynamic Array operations or iteration', () => {
+    const adapter = createBrowserMessagingAdapter(createTarget());
+    const raw = createPort();
+    const originalPush = Object.getOwnPropertyDescriptor(Array.prototype, 'push');
+    const originalIterator = Object.getOwnPropertyDescriptor(Array.prototype, Symbol.iterator);
+    const poisoned = (): never => {
+      throw new Error('poisoned Array operation');
+    };
+    let extracted: readonly unknown[] | undefined;
+    let thrown: unknown;
+    try {
+      Object.defineProperty(Array.prototype, 'push', { value: poisoned, configurable: true });
+      Object.defineProperty(Array.prototype, Symbol.iterator, {
+        value: poisoned,
+        configurable: true,
+      });
+      extracted = adapter.extractTransferredPorts({ ports: [raw] }, 1);
+    } catch (error) {
+      thrown = error;
+    } finally {
+      if (originalPush) Object.defineProperty(Array.prototype, 'push', originalPush);
+      if (originalIterator) {
+        Object.defineProperty(Array.prototype, Symbol.iterator, originalIterator);
+      }
+    }
+
+    expect(thrown).toBeUndefined();
+    expect(extracted).toHaveLength(1);
+    const port = extracted?.[0] as { close?: () => void } | undefined;
+    port?.close?.();
+    expect(raw.close).toHaveBeenCalledOnce();
+  });
+
   it('centralizes every protocol literal and exact message shape as frozen data', () => {
     expect(TSJS_MESSAGE_PROTOCOL_V1).toEqual({
       version: 1,
@@ -495,12 +1125,13 @@ describe('browser messaging adapter', () => {
 
   it('extracts exactly zero, one, or two transferred ports into frozen narrow facades', () => {
     const adapter = createBrowserMessagingAdapter(createTarget());
-    const first = createPort();
-    const second = createPort();
+    const single = createPort();
+    const pairFirst = createPort();
+    const pairSecond = createPort();
 
     const zero = adapter.extractTransferredPorts({ ports: [] }, 0);
-    const one = adapter.extractTransferredPorts({ ports: [first] }, 1);
-    const two = adapter.extractTransferredPorts({ ports: [first, second] }, 2);
+    const one = adapter.extractTransferredPorts({ ports: [single] }, 1);
+    const two = adapter.extractTransferredPorts({ ports: [pairFirst, pairSecond] }, 2);
 
     expect(zero).toEqual([]);
     expect(one).toHaveLength(1);
@@ -570,6 +1201,25 @@ describe('browser messaging adapter', () => {
     ).toBeUndefined();
     expect(mismatchFirst.close).toHaveBeenCalledTimes(1);
     expect(mismatchSecond.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('bounds sparse hostile array inspection by present own keys rather than declared length', () => {
+    const adapter = createBrowserMessagingAdapter(createTarget());
+    const raw = createPort();
+    const sparse = [raw];
+    sparse.length = 0xffff_ffff;
+    let descriptorReads = 0;
+    const hostile = new Proxy(sparse, {
+      getOwnPropertyDescriptor(target, key) {
+        descriptorReads += 1;
+        if (descriptorReads > 8) throw new Error('unbounded descriptor scan');
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+
+    expect(adapter.extractTransferredPorts({ ports: hostile }, 1)).toBeUndefined();
+    expect(descriptorReads).toBeLessThanOrEqual(3);
+    expect(raw.close).toHaveBeenCalledOnce();
   });
 
   it('contains port listener throws and disposes listeners and ports exactly once', () => {
