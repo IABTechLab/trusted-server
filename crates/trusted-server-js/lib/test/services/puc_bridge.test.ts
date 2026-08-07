@@ -2899,6 +2899,100 @@ describe('Universal Creative bridge dispatcher', () => {
     expect(gam.artifact.dispose).not.toHaveBeenCalled();
   });
 
+  it('keeps the first buffered APS failure when a later completion arrives', () => {
+    const gam = createGamAttempt('aps', 1_016);
+    const pucSource = Object.freeze({ frame: 'authoritative' });
+    const controlRetained = createPort();
+    const controlTransferred = createPort();
+    const documentRetained = createPort();
+    const documentTransferred = createPort();
+    const channels = [
+      { port1: controlRetained, port2: controlTransferred },
+      { port1: documentRetained, port2: documentTransferred },
+    ];
+    let channelIndex = 0;
+    const issue = vi.fn(
+      (input: {
+        readonly attempt: PucRenderAttempt;
+        readonly port: { readonly close: () => void };
+      }) => {
+        expect(input.attempt.onSettled(() => input.port.close())).toBe(true);
+        return Object.freeze({ ok: true as const, nonce: 'n1_abcdefghijklmnopqrstuv' });
+      }
+    );
+    const consume = vi.fn(() => true);
+    const harness = createHarness(
+      () => ({ recognized: true, state: 'renderable', expiresAt: 10_000 }),
+      {
+        claim: ({ pucSource: claimedSource }) => ({
+          recognized: true,
+          claimed: true,
+          pucSource: claimedSource as object,
+          expiresAt: 10_000,
+        }),
+        messageChannel: class {
+          readonly port1: unknown;
+          readonly port2: unknown;
+
+          constructor() {
+            const channel = channels[channelIndex];
+            channelIndex += 1;
+            if (!channel) throw new Error('Unexpected extra MessageChannel');
+            this.port1 = channel.port1;
+            this.port2 = channel.port2;
+          }
+        },
+        mintLifecycleTicket: () => Object.freeze({ ok: true, value: LIFECYCLE_TICKET }),
+        publisherOrigin: 'https://publisher.example',
+        rendererNonces: Object.freeze({ issue, consume }),
+        rendererUrl: 'https://publisher.example/integrations/aps/renderer/v1',
+      }
+    );
+    issueReadyTicket(harness, gam, pucSource);
+    harness.dispatch({
+      data: exactOwnerRegistration(gam.reservationId),
+      ports: [createPort()],
+      source: pucSource,
+      stopImmediatePropagation: vi.fn(),
+    });
+
+    dispatchPortMessage(documentRetained, {
+      message: 'TS APS Document Accepted',
+      version: 1,
+      nonce: 'n1_abcdefghijklmnopqrstuv',
+    });
+    dispatchPortMessage(documentRetained, {
+      message: 'TS APS Render Failed',
+      version: 1,
+      nonce: 'n1_abcdefghijklmnopqrstuv',
+      reason: 'runner_failed',
+    });
+    dispatchPortMessage(documentRetained, {
+      message: 'TS APS Render Completed',
+      version: 1,
+      nonce: 'n1_abcdefghijklmnopqrstuv',
+    });
+    dispatchPortMessage(controlRetained, {
+      message: 'TS Owner Inserted',
+      version: 1,
+      lifecycleTicket: LIFECYCLE_TICKET,
+    });
+
+    expect(consume).toHaveBeenCalledOnce();
+    expect(gam.attempt.accept).not.toHaveBeenCalled();
+    expect(gam.attempt.fail).toHaveBeenCalledWith('runner_failed');
+    expect(controlRetained.postMessage.mock.calls[1]).toEqual([
+      {
+        message: 'TS Owner Settled',
+        version: 1,
+        lifecycleTicket: LIFECYCLE_TICKET,
+        outcome: 'failed',
+        reason: 'runner_failed',
+      },
+      [],
+    ]);
+  });
+
   it('closes a reentrant APS document channel before issuing nonce authority', () => {
     const gam = createGamAttempt('aps', 1_015);
     const pucSource = Object.freeze({ frame: 'authoritative' });
