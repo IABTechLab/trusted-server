@@ -220,6 +220,12 @@ Every task's regression suite therefore remains green in task order.
       `aps-tsjs-prechange.json`; later tasks may compare against it but must not
       regenerate it from the completed implementation.
 
+  Define the sets exactly as minimal `[core]`, reference
+  `[core, creative, gpt, prebid, datadome]`, and maximal core plus every built
+  integration. Expose the comparator as `npm run check:bundle` and run it in the
+  TypeScript CI job immediately after `npm run build`; a generated metrics file that
+  is not consumed by CI is not a gate.
+
   Extend `scripts/integration-tests-browser.sh` with
   `TS_BROWSER_FRAMEWORKS=nextjs` and use `npm --prefix ... exec -- playwright` for
   argument-safe invocation. The script remains the clean-checkout fixture builder:
@@ -622,8 +628,8 @@ collapse those checkpoints or carry unverified behavior between them.
 
 - [ ] **Step A3: Define the bounded raw-proxy platform contract.**
 
-  Add a dedicated request/response policy in `platform/http.rs` and adapter
-  implementations that:
+  Add a dedicated request/response policy in `platform/http.rs` and core test-support
+  contract that requires adapter implementations to:
   - sends only credential-free `GET` to the compile-time fixed URL
     `https://client.aps.amazon-adsystem.com/prebid-creative.js` with
     `Accept-Encoding: identity`, no forwarded browser/publisher headers, no referrer,
@@ -638,7 +644,7 @@ collapse those checkpoints or carry unverified behavior between them.
     generation-inert late continuations; and
   - uses the common `APS_RUNNER_MAX_RESPONSE_BYTES = 8 MiB` cap.
 
-  Cloudflare must preserve `web_sys::Request.method()` before workers-rs conversion
+  Task 5B's Cloudflare implementation must preserve `web_sys::Request.method()` before workers-rs conversion
   and restore it at the reserved pre-router boundary because workers-rs maps extension
   methods such as `PROPFIND` to `GET`. It must also inspect the initial Workers headers
   before its generic adapter strips encoding/length; concatenated duplicates remain
@@ -717,7 +723,8 @@ collapse those checkpoints or carry unverified behavior between them.
   and transport seam for the local Fastly simulator only; it is not an APS runner
   pin, and no APS runner version, digest, or body enters the repository.
 
-- [ ] **Step B2: Implement the reserved dispatcher and live proxy response.**
+- [ ] **Step B2: Implement each actual adapter transport, the reserved dispatcher, and the live**
+      **proxy response.**
 
   Register the family ahead of auth/EC/fallback through one explicit test-only
   registry constructor used by unit tests and the dedicated integration artifacts.
@@ -2336,6 +2343,11 @@ implementation change.
     runner-proxy corpora; and
   - old-surface rejection plus new-surface fixture tests, proving the cutover commit
     contains no new behavior implementation or test repair.
+
+  Keep the ±5% bundle-size gate wired and visible. Intermediate old-plus-new bundle
+  growth may remain recorded as a failing pre-switch check, but it must never be
+  rebased into the immutable pre-change artifact; the gate must be green after the
+  atomic switch and Task 22 legacy deletion, before release readiness.
 
   Install the real performance marks before this checklist closes. Execute
   `performance.mark('tsjs:bids-script')` in the actual server-emitted bids/projection

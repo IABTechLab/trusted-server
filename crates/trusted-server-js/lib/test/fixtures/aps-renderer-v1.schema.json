@@ -1,6 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://iabtechlab.com/trusted-server/aps-renderer-v1.schema.json",
+  "$comment": "The x-* semantic markers are documentation only; scripts/generate-aps-renderer-contract.mjs hard-codes these checks and does not read marker values, so editing a marker does not change enforcement.",
   "title": "Trusted Server APS renderer descriptor version 1",
   "type": "object",
   "additionalProperties": false,
