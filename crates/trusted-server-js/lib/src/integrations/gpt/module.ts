@@ -91,10 +91,10 @@ function currentProjectedWinner(input: GptWinnerPublicationInput): boolean {
     const bid = input.bid;
     if (
       !projection ||
-      !Object.isFrozen(projection) ||
-      !Object.isFrozen(bid) ||
-      !Object.isFrozen(bid.renderSource) ||
-      !Object.isFrozen(bid.targeting) ||
+      !objectIsFrozenIntrinsic(projection) ||
+      !objectIsFrozenIntrinsic(bid) ||
+      !objectIsFrozenIntrinsic(bid.renderSource) ||
+      !objectIsFrozenIntrinsic(bid.targeting) ||
       !isAuctionCandidateIdV1(bid.candidateId) ||
       !isRendererReservationIdV1(bid.rendererReservationId) ||
       bid.slot !== input.attempt.slot ||
@@ -144,8 +144,19 @@ function targetingEntries(
   bid: BrowserAuctionBidV1
 ): readonly (readonly [string, string])[] | undefined {
   try {
-    const names = Object.getOwnPropertyNames(bid.targeting).sort();
-    if (names.length > 32 || Object.getOwnPropertySymbols(bid.targeting).length !== 0) {
+    const unsortedNames = objectGetOwnPropertyNamesIntrinsic(bid.targeting);
+    const names: string[] = [];
+    for (let index = 0; index < unsortedNames.length; index += 1) {
+      const name = unsortedNames[index];
+      if (name === undefined) return undefined;
+      let insertion = names.length;
+      while (insertion > 0 && (names[insertion - 1] as string) > name) insertion -= 1;
+      for (let move = names.length; move > insertion; move -= 1) {
+        names[move] = names[move - 1] as string;
+      }
+      names[insertion] = name;
+    }
+    if (names.length > 32 || objectGetOwnPropertySymbolsIntrinsic(bid.targeting).length !== 0) {
       return undefined;
     }
     const entries: Array<readonly [string, string]> = [
@@ -154,7 +165,7 @@ function targetingEntries(
     for (let index = 0; index < names.length; index += 1) {
       const key = names[index];
       if (!key || key === 'hb_adid') return undefined;
-      const descriptor = Object.getOwnPropertyDescriptor(bid.targeting, key);
+      const descriptor = objectGetOwnPropertyDescriptorIntrinsic(bid.targeting, key);
       if (
         !descriptor ||
         !descriptor.enumerable ||
@@ -174,6 +185,7 @@ function targetingEntries(
 function synchronousTargetingBoundary(adapter: GoogletagAdapter, slot: object): TargetingBoundary {
   const invoke = <Value>(command: (gpt: Readonly<GoogletagFacade>) => Value): Value => {
     let completed = false;
+    let failed = false;
     let value: Value | undefined;
     let failure: unknown;
     const operation = adapter.run((gpt) => {
@@ -181,6 +193,7 @@ function synchronousTargetingBoundary(adapter: GoogletagAdapter, slot: object): 
         value = command(gpt);
         return value;
       } catch (error) {
+        failed = true;
         failure = error;
         throw error;
       } finally {
@@ -192,7 +205,7 @@ function synchronousTargetingBoundary(adapter: GoogletagAdapter, slot: object): 
       operation.dispose();
       throw new Error('GPT targeting operation is not synchronously available');
     }
-    if (failure !== undefined) throw failure;
+    if (failed) throw failure;
     return value as Value;
   };
   return Object.freeze({
@@ -235,14 +248,14 @@ export async function publishGptWinner(
     disposeArtifact();
     return failAttempt('winner_not_renderable');
   }
-  const bound = (() => {
+  const isStillBound = (): boolean => {
     try {
       return input.slots.isBoundGptSlot(input.navigation.generation, input.bid.slot, input.slot);
     } catch {
       return false;
     }
-  })();
-  if (!bound) {
+  };
+  if (!isStillBound()) {
     disposeArtifact();
     return failAttempt('slot_unresolved');
   }
@@ -273,10 +286,29 @@ export async function publishGptWinner(
 
   const owners: TargetingOwnership[] = [];
   let observation: ReturnType<TargetingService['observePublisherMutations']> | undefined;
+  let retirementAttempted = false;
   let resourcesDisposed = false;
+  const tombstone = (): void => {
+    if (retirementAttempted) return;
+    retirementAttempted = true;
+    try {
+      input.reservations.tombstone(
+        {
+          reservationId: input.bid.rendererReservationId,
+          slot: input.bid.slot,
+          navigationGeneration: input.navigation.generation,
+          attemptId: input.attempt.id,
+        },
+        'disposed'
+      );
+    } catch {
+      // Runtime disposal retains the last-resort retirement boundary.
+    }
+  };
   const disposeResources = (): void => {
     if (resourcesDisposed) return;
     resourcesDisposed = true;
+    tombstone();
     for (let index = owners.length - 1; index >= 0; index -= 1) {
       try {
         owners[index]?.release();
@@ -291,26 +323,15 @@ export async function publishGptWinner(
     }
     disposeArtifact();
   };
-  const tombstone = (): void => {
-    try {
-      input.reservations.tombstone(
-        {
-          reservationId: input.bid.rendererReservationId,
-          slot: input.bid.slot,
-          navigationGeneration: input.navigation.generation,
-          attemptId: input.attempt.id,
-        },
-        'disposed'
-      );
-    } catch {
-      // The failed publication is already terminal and cannot expose the id again.
-    }
-  };
   try {
     observation = input.targeting.observePublisherMutations(input.slot, input.googletag);
     await observation.result;
     if (!input.navigation.isCurrent() || input.attempt.snapshot().outcome !== undefined) {
       throw new Error('stale GPT publication');
+    }
+    if (!isStillBound()) {
+      disposeResources();
+      return failAttempt('slot_unresolved');
     }
     const boundary = synchronousTargetingBoundary(input.googletag, input.slot);
     for (let index = 0; index < entries.length; index += 1) {
@@ -320,8 +341,11 @@ export async function publishGptWinner(
       if (!owner) throw new Error('targeting ownership unavailable');
       owners[owners.length] = owner;
     }
+    if (!isStillBound()) {
+      disposeResources();
+      return failAttempt('slot_unresolved');
+    }
   } catch {
-    tombstone();
     disposeResources();
     return failAttempt('gpt_request_failed');
   }
@@ -361,12 +385,10 @@ export async function publishGptWinner(
       },
     });
   } catch {
-    tombstone();
     disposeResources();
     return failAttempt('gpt_request_failed');
   }
   if (!operation.ok || !bridgeRegistered || !requestStarted) {
-    tombstone();
     disposeResources();
     return failAttempt('gpt_request_failed');
   }

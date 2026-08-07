@@ -614,8 +614,10 @@ describe('ordered GPT winner publication', () => {
       'slot:validate',
       'reservation',
       'observe',
+      'slot:validate',
       'target:hb_adid',
       'target:hb_bidder',
+      'slot:validate',
       'bridge',
       'request',
     ]);
@@ -627,7 +629,76 @@ describe('ordered GPT winner publication', () => {
     );
     publication.bridgeArtifact()?.dispose();
     expect(publication.values.size).toBe(0);
+    expect(publication.harness.reservations.recognize(RESERVATION_ID)).toMatchObject({
+      recognized: true,
+      state: 'disposed',
+    });
     expect(publication.harness.artifact.dispose).toHaveBeenCalledTimes(1);
+    publication.harness.runtime.dispose();
+  });
+
+  it('fails before targeting when exact slot ownership is lost across observation', async () => {
+    const publication = preparePublication();
+    publication.slots.isBoundGptSlot
+      .mockImplementationOnce(() => {
+        publication.order.push('slot:validate');
+        return true;
+      })
+      .mockImplementation(() => {
+        publication.order.push('slot:validate');
+        return false;
+      });
+
+    await expect(publishGptWinner(publication.input)).resolves.toEqual({
+      ok: false,
+      reason: 'slot_unresolved',
+    });
+    expect(publication.order).toEqual(['slot:validate', 'reservation', 'observe', 'slot:validate']);
+    expect(publication.values.size).toBe(0);
+    expect(publication.slots.request).not.toHaveBeenCalled();
+    expect(publication.harness.reservations.recognize(RESERVATION_ID)).toMatchObject({
+      recognized: true,
+      state: 'disposed',
+    });
+    expect(publication.harness.artifact.dispose).toHaveBeenCalledTimes(1);
+    publication.harness.runtime.dispose();
+  });
+
+  it('compare-restores targeting when exact slot ownership is lost during writes', async () => {
+    const publication = preparePublication();
+    publication.slots.isBoundGptSlot
+      .mockImplementationOnce(() => {
+        publication.order.push('slot:validate');
+        return true;
+      })
+      .mockImplementationOnce(() => {
+        publication.order.push('slot:validate');
+        return true;
+      })
+      .mockImplementation(() => {
+        publication.order.push('slot:validate');
+        return false;
+      });
+
+    await expect(publishGptWinner(publication.input)).resolves.toEqual({
+      ok: false,
+      reason: 'slot_unresolved',
+    });
+    expect(publication.order).toEqual([
+      'slot:validate',
+      'reservation',
+      'observe',
+      'slot:validate',
+      'target:hb_adid',
+      'target:hb_bidder',
+      'slot:validate',
+    ]);
+    expect(publication.values.size).toBe(0);
+    expect(publication.slots.request).not.toHaveBeenCalled();
+    expect(publication.harness.reservations.recognize(RESERVATION_ID)).toMatchObject({
+      recognized: true,
+      state: 'disposed',
+    });
     publication.harness.runtime.dispose();
   });
 
@@ -667,8 +738,10 @@ describe('ordered GPT winner publication', () => {
       'slot:validate',
       'reservation',
       'observe',
+      'slot:validate',
       'target:hb_adid',
       'target:hb_bidder',
+      'slot:validate',
       'bridge',
       'request',
     ]);
