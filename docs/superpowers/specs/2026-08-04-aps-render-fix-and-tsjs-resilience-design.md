@@ -650,9 +650,13 @@ finite and nonnegative. Prebid admission verifies that the frozen bid's `cpm` is
 exactly this stored value, and selection promotion preserves the same context
 rather than reconstructing it from Prebid. A successful PUC claim transfers the
 context into the `RenderAttempt` before replacing the live entry with a tombstone.
+The exact frozen successful claim result is also a one-shot internal capability:
+`RenderAttempt` consumes that object to receive its already-bound render source and
+winner context. Callers cannot pass, reconstruct, or swap either field separately.
 The tombstone discards the render source and winner context and retains only the id,
 original expiry, terminal state, and minimum suppression metadata. Neither the
-descriptor nor any capability contains CPM.
+renderer descriptor nor any capability crossing a browser-context boundary contains
+CPM; the one-shot claim object remains internal to the same runtime.
 
 Ids are unique across all live/tombstoned entries, so lookup identifies one entry
 and then requires its exact active slot, cycle, and generation. The first compatible
@@ -1389,6 +1393,9 @@ render path begins.
 Transitions are methods on `RenderAttempt`, not ad-hoc flag mutation. Each method
 checks the expected state and terminal latch. Timers are created at the transition
 whose deadline they enforce and are cleared by the transition that settles them.
+`waiting_for_document` accepts only an APS source; `waiting_for_adm` accepts only an
+ADM or cache source. A direct path stages only a `direct_iframe` artifact, while an
+owner-controlled PUC path stages only a `puc` artifact.
 
 An accepted transition first atomically promotes durable DOM/targeting ownership
 from the attempt into one `CommittedRenderArtifact` owned by the exact slot and
@@ -1403,6 +1410,10 @@ slot publishes another accepted artifact it disposes the prior artifact. Navigat
 disposes artifacts according to those same ownership/quarantine rules. Claim,
 registration, owner-control, and renderer-document ports/listeners that are no
 longer needed close after terminal settlement and are never promoted.
+Artifact disposal is synchronous and exact-once. A disposer that throws, returns a
+Promise/thenable, or otherwise violates the synchronous contract fails closed and
+cannot authorize publication of a replacement or later republication of the disposed
+artifact object.
 
 ### 4.2 Universal Creative claim
 
@@ -2462,7 +2473,11 @@ subscription methods. The final schema is:
 ```ts
 type RenderTracePathV1 = 'auction' | 'ssat' | 'gam-refresh'
 type RenderTraceServedFromV1 =
-  'inline' | 'gam' | 'debug-adm' | 'pbs-cache' | 'prebid'
+  | 'inline'
+  | 'gam'
+  | 'debug-adm'
+  | 'pbs-cache'
+  | 'prebid'
 
 interface RenderTraceRecord {
   readonly slotId: string

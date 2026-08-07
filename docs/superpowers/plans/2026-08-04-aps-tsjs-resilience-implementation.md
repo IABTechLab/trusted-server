@@ -1382,7 +1382,8 @@ Every task's regression suite therefore remains green in task order.
       immutable `WinnerContext{selectedCpm}`, timers, ports, iframe, terminal result,
       and disposer. Direct winner admission constructs the context from the exact
       validated joined server winner; a PUC claim receives the same context from the
-      consumed reservation.
+      consumed reservation by presenting the exact one-shot frozen claim result;
+      source and context are never accepted as independently swappable values.
       Obtain the id only from the NavigationSession issuer before registering work; an
       issuance failure settles `identity_generation_failed` without DOM/global
       mutation. Add `SlotOperation` above attempts so a primary and optional fallback
@@ -1396,6 +1397,9 @@ Every task's regression suite therefore remains green in task order.
       without clearing the newer generation. Direct
       iframe artifacts remove their DOM; PUC artifacts defer DOM ownership to GPT and
       follow TS-owned destroy/redefine versus publisher-owned metadata-only rules.
+      Require synchronous exact-once artifact disposal, reject Promise/thenable
+      disposers, reject republication once disposal starts, and require private
+      provenance for artifact stores, attempts, and fallback children.
 
 - [ ] **Step 3: Implement direct APS:**
   - validate descriptor before DOM mutation;
