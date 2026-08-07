@@ -37,6 +37,41 @@ describe('config', () => {
     expect(Object.isFrozen(policy)).toBe(true);
   });
 
+  it('accepts an exact 4,096-byte cache base URL and rejects the next byte', async () => {
+    const { parseCacheFetchPolicyV1 } = await import('../../src/core/config');
+    const prefix = 'https://cache.example/';
+    const exactBaseUrl = `${prefix}${'x'.repeat(4_096 - prefix.length)}`;
+    expect(new TextEncoder().encode(exactBaseUrl)).toHaveLength(4_096);
+
+    expect(parseCacheFetchPolicyV1({ version: 1, baseUrl: exactBaseUrl })).toEqual({
+      version: 1,
+      baseUrl: exactBaseUrl,
+    });
+    expect(parseCacheFetchPolicyV1({ version: 1, baseUrl: `${exactBaseUrl}x` })).toBeUndefined();
+  });
+
+  it.each([4_095, 4_096, 4_097])(
+    'enforces the cache base URL byte boundary for multibyte UTF-8 at %s bytes',
+    async (targetBytes) => {
+      const { parseCacheFetchPolicyV1 } = await import('../../src/core/config');
+      const prefix = 'https://cache.example/';
+      const remainingBytes = targetBytes - new TextEncoder().encode(prefix).byteLength;
+      const baseUrl = `${prefix}${'é'.repeat(Math.floor(remainingBytes / 2))}${
+        remainingBytes % 2 === 0 ? '' : 'x'
+      }`;
+      expect(new TextEncoder().encode(baseUrl)).toHaveLength(targetBytes);
+
+      if (targetBytes <= 4_096) {
+        expect(parseCacheFetchPolicyV1({ version: 1, baseUrl })).toEqual({
+          version: 1,
+          baseUrl,
+        });
+      } else {
+        expect(parseCacheFetchPolicyV1({ version: 1, baseUrl })).toBeUndefined();
+      }
+    }
+  );
+
   it('rejects malformed cache policies before integration preparation', async () => {
     const { parseCacheFetchPolicyV1 } = await import('../../src/core/config');
     const accessor = { version: 1 } as { version: number; baseUrl?: string };

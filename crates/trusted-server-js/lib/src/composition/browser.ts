@@ -234,7 +234,22 @@ export function createTestBrowserRuntimeComposition(
         }
       };
       const renderDirectCache = (attempt: RenderAttempt, container: HTMLElement): boolean => {
-        if (!cachePolicy || typeof fetchCache !== 'function') return false;
+        if (!cachePolicy) {
+          try {
+            attempt.fail('descriptor_invalid');
+          } catch {
+            // The admitted attempt remains the only terminal authority.
+          }
+          return false;
+        }
+        if (typeof fetchCache !== 'function') {
+          try {
+            attempt.fail('cache_network_error');
+          } catch {
+            // The admitted attempt remains the only terminal authority.
+          }
+          return false;
+        }
         try {
           return renderDirectCacheAttempt({
             attempt,

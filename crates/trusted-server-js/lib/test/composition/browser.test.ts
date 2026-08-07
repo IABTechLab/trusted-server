@@ -22,6 +22,7 @@ import {
   createTestBrowserRuntimeComposition,
 } from '../../src/composition/browser';
 import { createTestNavigationIdentityIssuer } from '../../src/kernel/identity';
+import type { RenderAttempt } from '../../src/services/render';
 
 function createTarget() {
   return {
@@ -652,6 +653,66 @@ describe('browser composition', () => {
 
     expect(composition.runtimeSessionForTest()?.replaceNavigation()).toMatchObject({ ok: true });
     expect(composition.projectionSlotsForTest()).toEqual([]);
+  });
+
+  it('fails an admitted cache attempt when owner activation captured no fetch authority', async () => {
+    const fetchDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
+    Object.defineProperty(globalThis, 'fetch', {
+      configurable: true,
+      value: undefined,
+      writable: true,
+    });
+    const composition = createTestBrowserRuntimeComposition(
+      {
+        target: {},
+        releaseId: 'a'.repeat(64),
+        manifest: { version: 1, releaseId: 'a'.repeat(64), integrations: [] },
+        knownIntegrationIds: Object.freeze([]),
+        boot: {
+          auctionProjection: {
+            version: 1,
+            auction: { version: 1, auctionId: 'initial', results: [] },
+            bids: [],
+          },
+          cachePolicy: {
+            version: 1,
+            baseUrl: 'https://cache.example/pbc/v1/cache',
+          },
+          creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+        },
+        kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+      },
+      {
+        adapters: {
+          googletag: fakeGoogletagAdapter(),
+          messaging: fakeMessagingAdapter(),
+          prebid: fakePrebidAdapter(),
+        },
+        coreActivations: {
+          bridgeRecognizer: vi.fn(),
+          correctnessGptListeners: vi.fn(),
+        },
+      }
+    );
+
+    try {
+      expect(composition.runtime.start()).toBe(true);
+      await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+      const renderCache = composition.runtimeSessionForTest()?.interfaces['renderDirectCache'] as
+        ((attempt: RenderAttempt, container: HTMLElement) => boolean) | undefined;
+      const fail = vi.fn(() => true);
+      expect(renderCache).toBeTypeOf('function');
+      expect(
+        renderCache?.(Object.freeze({ fail }) as unknown as RenderAttempt, document.body)
+      ).toBe(false);
+      expect(fail).toHaveBeenCalledOnce();
+      expect(fail).toHaveBeenCalledWith('cache_network_error');
+    } finally {
+      composition.runtime.dispose();
+      if (fetchDescriptor) Object.defineProperty(globalThis, 'fetch', fetchDescriptor);
+      else Reflect.deleteProperty(globalThis, 'fetch');
+    }
   });
 
   it('constructs or activates nothing after a terminal fallback', async () => {

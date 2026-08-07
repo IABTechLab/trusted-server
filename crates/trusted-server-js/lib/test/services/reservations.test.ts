@@ -1908,7 +1908,7 @@ describe('atomic claims and disposal', () => {
     expect(attempt.winnerContext).toBeUndefined();
     expect(service.snapshotInventoryForTest().entriesWithPucSource).toBe(0);
   });
-  it('preserves one cache source and immutable context after projection replacement', () => {
+  it('preserves one cache source and immutable context after registration input mutation', () => {
     const { navigation } = runtimeNavigation();
     const attempt = renderAttempt(navigation);
     const service = serviceAt(() => 0);
