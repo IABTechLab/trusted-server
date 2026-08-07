@@ -65,7 +65,7 @@ function browserProjection() {
   };
 }
 
-function largeAdmProjection(admLengths: number[]) {
+function largeAdmProjection(admLengths: number[]): BrowserAuctionProjectionV1 {
   return {
     version: 1,
     auction: {
@@ -752,6 +752,49 @@ describe('auction/parseTrustedServerAuctionResponseV1', () => {
     };
   }
 
+  function admResponse(admLengths: number[]) {
+    const projected = largeAdmProjection(admLengths);
+    const canonical: BrowserAuctionProjectionV1 = {
+      version: 1,
+      auction: projected.auction,
+      bids: projected.bids.map((bid) => ({
+        ...bid,
+        upstreamBidId: bid.rendererReservationId,
+      })),
+    };
+    return {
+      canonical,
+      wire: {
+        id: canonical.auction.auctionId,
+        cur: 'USD',
+        seatbid: [
+          {
+            seat: 'prebid',
+            bid: canonical.bids.map((bid) => {
+              if (bid.renderSource.type !== 'adm') throw new Error('expected ADM source');
+              return {
+                id: bid.rendererReservationId,
+                impid: bid.slot,
+                price: bid.cpm,
+                adm: bid.renderSource.adm,
+                w: bid.renderSource.width,
+                h: bid.renderSource.height,
+                ext: {
+                  trusted_server: {
+                    candidate_id: bid.candidateId,
+                    slot_id: bid.slot,
+                    render_source: bid.renderSource,
+                  },
+                },
+              };
+            }),
+          },
+        ],
+        ext: { trusted_server: { slot_results: canonical.auction } },
+      },
+    };
+  }
+
   it('accepts the exact four-way decision/candidate/impid/slot join', () => {
     const parsed = parseTrustedServerAuctionResponseV1(response());
 
@@ -764,6 +807,31 @@ describe('auction/parseTrustedServerAuctionResponseV1', () => {
         renderSource: apsRenderer('fictional-creative-id'),
       })
     );
+  });
+
+  it('caps the deduplicated canonical projection instead of duplicated ADM wire bytes', () => {
+    const lengths = Array.from({ length: 16 }, () => 512 * 1024);
+    lengths[15] = 1;
+    const baseline = admResponse(lengths).canonical;
+    const baselineBytes = new TextEncoder().encode(JSON.stringify(baseline)).byteLength;
+    const exactTail = 1 + MAX_BROWSER_AUCTION_PROJECTION_BYTES - baselineBytes;
+    expect(exactTail).toBeLessThanOrEqual(512 * 1024);
+
+    for (const [delta, accepted] of [
+      [0, true],
+      [1, false],
+    ] as const) {
+      lengths[15] = exactTail + delta;
+      const { canonical, wire } = admResponse(lengths);
+      expect(new TextEncoder().encode(JSON.stringify(canonical)).byteLength).toBe(
+        MAX_BROWSER_AUCTION_PROJECTION_BYTES + delta
+      );
+      expect(new TextEncoder().encode(JSON.stringify(wire)).byteLength).toBeGreaterThan(
+        MAX_BROWSER_AUCTION_PROJECTION_BYTES
+      );
+      expect(parseBrowserAuctionProjectionV1(canonical) !== undefined).toBe(accepted);
+      expect(parseTrustedServerAuctionResponseV1(wire) !== undefined).toBe(accepted);
+    }
   });
 
   it.each([

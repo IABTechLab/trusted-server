@@ -23,6 +23,7 @@ import type {
   ApsRendererV1,
   AuctionDecisionSetV1,
   BidRenderSourceV1,
+  BrowserAuctionProjectionV1,
   SlotAuctionDecisionV1,
 } from './types';
 
@@ -210,8 +211,7 @@ export function parseTrustedServerAuctionResponseV1(
       const winner = winners.find((entry) => entry.candidateId === bid.candidateId);
       return !winner || winner.slot !== bid.impid;
     }) ||
-    winners.some((winner) => !bids.some((bid) => bid.candidateId === winner.candidateId)) ||
-    jsonUtf8ByteLength(value) > MAX_BROWSER_AUCTION_PROJECTION_BYTES
+    winners.some((winner) => !bids.some((bid) => bid.candidateId === winner.candidateId))
   ) {
     return undefined;
   }
@@ -222,6 +222,32 @@ export function parseTrustedServerAuctionResponseV1(
     const bid = bidsByCandidate.get(winner.candidateId);
     if (!bid) return undefined;
     orderedBids.push(bid);
+  }
+
+  const canonicalBids: BrowserAuctionProjectionV1['bids'] = [];
+  for (let index = 0; index < orderedBids.length; index += 1) {
+    const bid = orderedBids[index];
+    if (!bid) return undefined;
+    canonicalBids.push({
+      candidateId: bid.candidateId,
+      slot: bid.impid,
+      provider: bid.provider,
+      upstreamBidId:
+        bid.renderSource.type === 'aps' ? bid.renderSource.bidId : bid.rendererReservationId,
+      cpm: bid.price,
+      currency: 'USD',
+      targeting: {},
+      rendererReservationId: bid.rendererReservationId,
+      renderSource: bid.renderSource,
+    });
+  }
+  const canonicalProjection: BrowserAuctionProjectionV1 = {
+    version: 1,
+    auction,
+    bids: canonicalBids,
+  };
+  if (jsonUtf8ByteLength(canonicalProjection) > MAX_BROWSER_AUCTION_PROJECTION_BYTES) {
+    return undefined;
   }
 
   return { auction, bids: orderedBids };

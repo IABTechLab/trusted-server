@@ -19,6 +19,9 @@ export const MAX_ACTIVE_SLOT_RECORDS = 256;
 
 const GPT_REQUEST_START_TIMEOUT_MS = 3_000;
 const GPT_COMPLETION_TIMEOUT_MS = 10_000;
+const GPT_RECONCILIATION_DEBOUNCE_MS = 250;
+const GPT_RECONCILIATION_WINDOW_MS = 5_000;
+const MAX_SUCCESSFUL_RECONCILIATIONS = 2;
 const MAX_PENDING_PUBLISHER_INTENTS = 64;
 const MAX_SLOT_ALIASES = 256;
 const MAX_PLACEMENT_QUARANTINE_KEYS = 2_048;
@@ -79,6 +82,7 @@ export type SlotRequestFailure =
   | 'gpt_completion_timeout'
   | 'gpt_request_failed'
   | 'gpt_request_timeout'
+  | 'reconciliation_capacity'
   | 'slot_quarantined'
   | 'slot_unresolved';
 
@@ -151,11 +155,24 @@ export interface SlotService {
 export interface SlotServiceOptions {
   readonly googletag: GoogletagAdapter;
   readonly now?: () => number;
+  readonly reconciliation?: SlotReconciliationBoundary;
+}
+
+export type SlotReconciliationResolution =
+  | Readonly<{ status: 'ambiguous' | 'unresolved' }>
+  | Readonly<{ status: 'unique'; element: object; elementId: string }>;
+
+/** Narrow DOM ownership boundary used by navigation-scoped slot reconciliation. */
+export interface SlotReconciliationBoundary {
+  readonly isConnected: (element: object) => boolean;
+  readonly observe: (callback: () => void) => () => void;
+  readonly resolve: (elementIds: readonly string[]) => SlotReconciliationResolution;
 }
 
 interface NavigationState {
   disposed: boolean;
   nextOrdinal: number;
+  observerRelease: (() => void) | undefined;
   readonly owner: NavigationSession;
   readonly records: Map<string, InternalSlotRecord>;
 }
@@ -164,6 +181,8 @@ interface InternalSlotRecord {
   activeIntent: RequestIntent | undefined;
   physical: PhysicalSlot | undefined;
   queuedIntent: RequestIntent | undefined;
+  reconciliation: ReconciliationWindow | undefined;
+  reconciliationSuccesses: number;
   readonly state: NavigationState;
   readonly view: SlotRecord;
 }
@@ -178,6 +197,7 @@ interface PhysicalCycle {
 interface PhysicalSlot {
   activeCycle: PhysicalCycle | undefined;
   definition: GoogletagReplacementDefinition | undefined;
+  domElement: object | undefined;
   lastResponseIdentifier: string | undefined;
   ownership: GptSlotOwnership;
   placementKeys: readonly string[];
@@ -188,6 +208,16 @@ interface PhysicalSlot {
   readonly slot: object;
   state: PhysicalSlotState;
   destroyAttempted: boolean;
+}
+
+interface ReconciliationWindow {
+  debounceTimer: ReturnType<typeof setTimeout> | undefined;
+  deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  readonly deadlineAt: number;
+  firstPassFinished: boolean;
+  operation: GoogletagOperation<GoogletagReplacementResult> | undefined;
+  readonly orphan: PhysicalSlot;
+  terminal: boolean;
 }
 
 interface RequestIntent {
@@ -501,6 +531,80 @@ function placementKeysFor(
   return Object.freeze(keys);
 }
 
+/** Capture a browser DOM boundary without installing an observer until service activation. */
+export function createBrowserSlotReconciliationBoundary(
+  documentTarget: Document,
+  Observer: typeof MutationObserver
+): SlotReconciliationBoundary | undefined {
+  try {
+    const root = documentTarget.documentElement;
+    const windowTarget = documentTarget.defaultView;
+    if (!root || !windowTarget || typeof Observer !== 'function') return undefined;
+    const querySelectorAll = windowTarget.Document.prototype.querySelectorAll;
+    const contains = windowTarget.Node.prototype.contains;
+    const elementId = Object.getOwnPropertyDescriptor(windowTarget.Element.prototype, 'id')?.get;
+    if (
+      typeof querySelectorAll !== 'function' ||
+      typeof contains !== 'function' ||
+      typeof elementId !== 'function'
+    ) {
+      return undefined;
+    }
+    const isConnected = (element: object): boolean => {
+      try {
+        return Reflect.apply(contains, root, [element]) === true;
+      } catch {
+        return false;
+      }
+    };
+    return Object.freeze({
+      isConnected,
+      observe: (callback: () => void): (() => void) => {
+        if (typeof callback !== 'function') throw new TypeError('reconciliation callback required');
+        const observer = new Observer(() => callback());
+        observer.observe(root, { childList: true, subtree: true });
+        let active = true;
+        return (): void => {
+          if (!active) return;
+          active = false;
+          observer.disconnect();
+        };
+      },
+      resolve: (elementIds: readonly string[]): SlotReconciliationResolution => {
+        if (!Array.isArray(elementIds) || elementIds.length === 0) {
+          return Object.freeze({ status: 'unresolved' });
+        }
+        const elements = Reflect.apply(querySelectorAll, documentTarget, [
+          '[id]',
+        ]) as NodeListOf<Element>;
+        let match: object | undefined;
+        let matchId: string | undefined;
+        for (let elementIndex = 0; elementIndex < elements.length; elementIndex += 1) {
+          const element = elements.item(elementIndex);
+          if (!element || !isConnected(element)) continue;
+          const id = Reflect.apply(elementId, element, []) as string;
+          let accepted = false;
+          for (let idIndex = 0; idIndex < elementIds.length; idIndex += 1) {
+            if (elementIds[idIndex] === id) {
+              accepted = true;
+              break;
+            }
+          }
+          if (!accepted) continue;
+          if (match && match !== element) return Object.freeze({ status: 'ambiguous' });
+          match = element;
+          matchId = id;
+        }
+        return match && matchId !== undefined
+          ? Object.freeze({ status: 'unique', element: match, elementId: matchId })
+          : Object.freeze({ status: 'unresolved' });
+      },
+    });
+  } catch {
+    return undefined;
+  }
+}
+
 /** Construct the document-lifetime slot registry and physical GPT cycle service. */
 export function createSlotService(options: SlotServiceOptions): SlotService {
   const navigationStates = new Map<object, NavigationState>();
@@ -512,14 +616,97 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
   const placementQuarantine = new Map<string, number>();
   const quarantinedKeysByPhysical = new WeakMap<object, readonly string[]>();
   const now = options.now ?? (() => performance.now());
+  let reconciliationBoundary: SlotReconciliationBoundary | undefined;
+  let reconciliationObserve: SlotReconciliationBoundary['observe'] | undefined;
+  let reconciliationIsConnected: SlotReconciliationBoundary['isConnected'] | undefined;
+  let reconciliationResolve: SlotReconciliationBoundary['resolve'] | undefined;
+  try {
+    const candidate = options.reconciliation;
+    if (
+      candidate &&
+      typeof candidate.observe === 'function' &&
+      typeof candidate.isConnected === 'function' &&
+      typeof candidate.resolve === 'function'
+    ) {
+      reconciliationBoundary = candidate;
+      reconciliationObserve = candidate.observe;
+      reconciliationIsConnected = candidate.isConnected;
+      reconciliationResolve = candidate.resolve;
+    }
+  } catch {
+    reconciliationBoundary = undefined;
+  }
   let placementQuarantineSaturated = false;
   let placementQuarantinePoisoned = false;
   let saturationOwnerCount = 0;
   let disposed = false;
   let deferInvocations = false;
   let activation: GoogletagOperation<void> | undefined;
+  let reconciliationActive = false;
   const subscriptionsByBinding = new WeakMap<object, BindingSubscriptions>();
   const bindingSubscriptions = new Set<BindingSubscriptions>();
+
+  const reconciliationElementIds = (
+    record: InternalSlotRecord,
+    definition: GoogletagReplacementDefinition
+  ): readonly string[] => {
+    const values: string[] = [definition.elementId];
+    for (let aliasIndex = 0; aliasIndex < record.view.domAliases.length; aliasIndex += 1) {
+      const alias = record.view.domAliases[aliasIndex];
+      if (alias === undefined) continue;
+      let duplicate = false;
+      for (let valueIndex = 0; valueIndex < values.length; valueIndex += 1) {
+        if (values[valueIndex] === alias) {
+          duplicate = true;
+          break;
+        }
+      }
+      if (!duplicate) values[values.length] = alias;
+    }
+    return Object.freeze(values);
+  };
+
+  const resolveReconciliationElement = (
+    record: InternalSlotRecord,
+    definition: GoogletagReplacementDefinition
+  ): SlotReconciliationResolution | undefined => {
+    if (!reconciliationBoundary || !reconciliationResolve) return undefined;
+    try {
+      const resolution = Reflect.apply(reconciliationResolve, reconciliationBoundary, [
+        reconciliationElementIds(record, definition),
+      ]) as SlotReconciliationResolution;
+      if (
+        !resolution ||
+        (resolution.status !== 'unique' &&
+          resolution.status !== 'unresolved' &&
+          resolution.status !== 'ambiguous')
+      ) {
+        return undefined;
+      }
+      if (
+        resolution.status === 'unique' &&
+        (((typeof resolution.element !== 'object' || resolution.element === null) &&
+          typeof resolution.element !== 'function') ||
+          typeof resolution.elementId !== 'string' ||
+          resolution.elementId.length === 0)
+      ) {
+        return undefined;
+      }
+      return resolution;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const reconciliationElementConnected = (element: object | undefined): boolean => {
+    if (!reconciliationBoundary || !reconciliationIsConnected) return true;
+    if (!element) return false;
+    try {
+      return Reflect.apply(reconciliationIsConnected, reconciliationBoundary, [element]) === true;
+    } catch {
+      return true;
+    }
+  };
 
   const hasPlacementQuarantine = (keys: readonly string[]): boolean => {
     if (placementQuarantineSaturated || placementQuarantinePoisoned) return true;
@@ -650,7 +837,9 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
   const prepareReplacementCommit = (
     record: InternalSlotRecord,
     oldPhysical: PhysicalSlot,
-    replacement: object
+    replacement: object,
+    definition = oldPhysical.definition,
+    domElement = oldPhysical.domElement
   ): GoogletagReplacementCommitAdmission => {
     if (
       replacement === oldPhysical.slot ||
@@ -664,7 +853,8 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     if (existing) throw new GoogletagReplacementCandidateCollisionError(replacement);
     const physical: PhysicalSlot = {
       activeCycle: undefined,
-      definition: oldPhysical.definition,
+      definition,
+      domElement,
       destroyAttempted: false,
       lastResponseIdentifier: undefined,
       ownership: 'trusted_server',
@@ -787,6 +977,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
           const orphan: PhysicalSlot = {
             activeCycle: undefined,
             definition: physical.definition,
+            domElement: undefined,
             destroyAttempted: true,
             lastResponseIdentifier: undefined,
             ownership: 'trusted_server',
@@ -1176,11 +1367,338 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     }
   };
 
+  const clearReconciliationTimers = (window: ReconciliationWindow): void => {
+    if (window.debounceTimer !== undefined) clearTimeout(window.debounceTimer);
+    if (window.deadlineTimer !== undefined) clearTimeout(window.deadlineTimer);
+    window.debounceTimer = undefined;
+    window.deadlineTimer = undefined;
+  };
+
+  const cancelReconciliation = (record: InternalSlotRecord): void => {
+    const window = record.reconciliation;
+    if (!window || window.terminal) return;
+    window.terminal = true;
+    clearReconciliationTimers(window);
+    window.operation?.dispose();
+    window.operation = undefined;
+    if (record.reconciliation === window) record.reconciliation = undefined;
+  };
+
+  const detachDestroyedReconciliationPhysical = (physical: PhysicalSlot): void => {
+    releasePhysicalPlacement(physical);
+    deleteSetValue(physicalSlots, physical);
+    if (weakMapValue(physicalByObject, physical.slot) === physical) {
+      deleteWeakMapValue(physicalByObject, physical.slot);
+    }
+  };
+
+  const settleReconciliationWork = (
+    record: InternalSlotRecord,
+    physical: PhysicalSlot,
+    reason: SlotRequestFailure
+  ): void => {
+    const cycleIntent = physical.activeCycle?.intent;
+    if (cycleIntent && !cycleIntent.terminal) settle(cycleIntent, failed(reason));
+    if (record.activeIntent) settle(record.activeIntent, failed(reason));
+    if (record.queuedIntent) settle(record.queuedIntent, failed(reason));
+    physical.activeCycle = undefined;
+  };
+
+  const retireFailedReconciliation = (
+    record: InternalSlotRecord,
+    window: ReconciliationWindow,
+    reason: SlotRequestFailure,
+    transactionStarted: boolean,
+    oldSlotDestroyed: boolean
+  ): void => {
+    if (window.terminal) return;
+    window.terminal = true;
+    clearReconciliationTimers(window);
+    window.operation?.dispose();
+    window.operation = undefined;
+    if (record.reconciliation === window) record.reconciliation = undefined;
+    const physical = window.orphan;
+    if (record.physical !== physical || physical.ownership !== 'trusted_server') return;
+
+    settleReconciliationWork(record, physical, reason);
+    record.physical = undefined;
+    physical.record = undefined;
+    physical.state = 'retired';
+    physical.quarantineReason = 'request';
+    physical.destroyAttempted = true;
+    deleteSetValue(physicalSlots, physical);
+    if (oldSlotDestroyed) {
+      detachDestroyedReconciliationPhysical(physical);
+      return;
+    }
+    quarantinePhysicalPlacement(physical);
+    if (transactionStarted) return;
+
+    let destroyOperation: GoogletagOperation<unknown> | undefined;
+    try {
+      destroyOperation = options.googletag.run((gpt) =>
+        gpt.transactionalReplace(
+          physical.slot,
+          undefined,
+          () => false,
+          () => {
+            throw new Error('destroy-only reconciliation cannot commit');
+          }
+        )
+      );
+      void destroyOperation.result.then(
+        () => detachDestroyedReconciliationPhysical(physical),
+        () => undefined
+      );
+    } catch {
+      destroyOperation?.dispose();
+    }
+  };
+
+  const completeReconciliation = (
+    record: InternalSlotRecord,
+    window: ReconciliationWindow
+  ): boolean => {
+    if (window.terminal || record.reconciliation !== window) return false;
+    const physical = record.physical;
+    if (
+      !physical ||
+      physical === window.orphan ||
+      physical.ownership !== 'trusted_server' ||
+      physical.record !== record ||
+      record.state.disposed ||
+      !record.state.owner.isCurrent()
+    ) {
+      return false;
+    }
+    window.terminal = true;
+    clearReconciliationTimers(window);
+    window.operation?.dispose();
+    window.operation = undefined;
+    record.reconciliation = undefined;
+    record.reconciliationSuccesses += 1;
+    detachDestroyedReconciliationPhysical(window.orphan);
+    return true;
+  };
+
+  const startReconciliationReplacement = (
+    record: InternalSlotRecord,
+    window: ReconciliationWindow,
+    resolution: Extract<SlotReconciliationResolution, { status: 'unique' }>,
+    finalPass: boolean
+  ): void => {
+    const orphan = window.orphan;
+    const existingDefinition = orphan.definition;
+    if (!existingDefinition) {
+      retireFailedReconciliation(record, window, 'slot_unresolved', false, false);
+      return;
+    }
+    const definition = Object.freeze({
+      adUnitPath: existingDefinition.adUnitPath,
+      elementId: resolution.elementId,
+      sizes: existingDefinition.sizes,
+    });
+    let transactionStarted = false;
+    let operation: GoogletagOperation<GoogletagReplacementResult> | undefined;
+    try {
+      operation = options.googletag.run((gpt) => {
+        transactionStarted = true;
+        orphan.state = 'retired';
+        orphan.quarantineReason = 'request';
+        orphan.destroyAttempted = true;
+        quarantinePhysicalPlacement(orphan);
+        return gpt.transactionalReplace(
+          orphan.slot,
+          definition,
+          () =>
+            !window.terminal &&
+            record.reconciliation === window &&
+            !record.state.disposed &&
+            record.state.owner.isCurrent() &&
+            ((record.physical === orphan && orphan.ownership === 'trusted_server') ||
+              (record.physical !== undefined &&
+                record.physical !== orphan &&
+                record.physical.record === record &&
+                record.physical.ownership === 'trusted_server')),
+          (replacement) =>
+            prepareReplacementCommit(record, orphan, replacement, definition, resolution.element)
+        );
+      });
+      window.operation = operation;
+    } catch {
+      retireFailedReconciliation(record, window, 'gpt_request_failed', transactionStarted, false);
+      return;
+    }
+
+    if (record.physical !== orphan) {
+      completeReconciliation(record, window);
+      return;
+    }
+    if (finalPass && !transactionStarted) {
+      retireFailedReconciliation(record, window, 'slot_unresolved', transactionStarted, false);
+      return;
+    }
+    void operation.result.then(
+      (result) => {
+        if (window.terminal) return;
+        if (result.status === 'replaced' && completeReconciliation(record, window)) return;
+        retireFailedReconciliation(record, window, 'gpt_request_failed', true, true);
+      },
+      (error: unknown) => {
+        const replacementError = error instanceof GoogletagReplacementError ? error : undefined;
+        retireFailedReconciliation(
+          record,
+          window,
+          'gpt_request_failed',
+          transactionStarted,
+          replacementError?.oldSlotDestroyed === true
+        );
+      }
+    );
+  };
+
+  const runReconciliationPass = (
+    record: InternalSlotRecord,
+    window: ReconciliationWindow,
+    finalPass: boolean
+  ): void => {
+    if (
+      window.terminal ||
+      record.reconciliation !== window ||
+      record.physical !== window.orphan ||
+      window.orphan.ownership !== 'trusted_server' ||
+      record.state.disposed ||
+      !record.state.owner.isCurrent()
+    ) {
+      cancelReconciliation(record);
+      return;
+    }
+    if (reconciliationElementConnected(window.orphan.domElement)) {
+      cancelReconciliation(record);
+      return;
+    }
+    if (window.operation) {
+      if (record.physical !== window.orphan) completeReconciliation(record, window);
+      else if (finalPass) {
+        retireFailedReconciliation(record, window, 'slot_unresolved', false, false);
+      }
+      return;
+    }
+    const definition = window.orphan.definition;
+    const resolution = definition && resolveReconciliationElement(record, definition);
+    if (resolution?.status === 'unique') {
+      startReconciliationReplacement(record, window, resolution, finalPass);
+      return;
+    }
+    if (finalPass) {
+      retireFailedReconciliation(record, window, 'slot_unresolved', false, false);
+    } else {
+      window.firstPassFinished = true;
+    }
+  };
+
+  const scheduleReconciliationDebounce = (
+    record: InternalSlotRecord,
+    window: ReconciliationWindow
+  ): void => {
+    if (window.firstPassFinished || window.operation || window.terminal) return;
+    if (window.debounceTimer !== undefined) clearTimeout(window.debounceTimer);
+    window.debounceTimer = setTimeout(() => {
+      window.debounceTimer = undefined;
+      runReconciliationPass(record, window, false);
+    }, GPT_RECONCILIATION_DEBOUNCE_MS);
+  };
+
+  const openReconciliation = (record: InternalSlotRecord, physical: PhysicalSlot): void => {
+    if (record.reconciliationSuccesses >= MAX_SUCCESSFUL_RECONCILIATIONS) {
+      const instant: ReconciliationWindow = {
+        debounceTimer: undefined,
+        deadlineTimer: undefined,
+        deadlineAt: Number.NEGATIVE_INFINITY,
+        firstPassFinished: true,
+        operation: undefined,
+        orphan: physical,
+        terminal: false,
+      };
+      record.reconciliation = instant;
+      retireFailedReconciliation(record, instant, 'reconciliation_capacity', false, false);
+      return;
+    }
+    const openedAt = now();
+    if (!Number.isFinite(openedAt) || openedAt < 0) return;
+    const window: ReconciliationWindow = {
+      debounceTimer: undefined,
+      deadlineTimer: undefined,
+      deadlineAt: openedAt + GPT_RECONCILIATION_WINDOW_MS,
+      firstPassFinished: false,
+      operation: undefined,
+      orphan: physical,
+      terminal: false,
+    };
+    record.reconciliation = window;
+    scheduleReconciliationDebounce(record, window);
+    window.deadlineTimer = setTimeout(() => {
+      window.deadlineTimer = undefined;
+      if (window.terminal) return;
+      const current = now();
+      if (Number.isFinite(current) && current < window.deadlineAt) {
+        window.deadlineTimer = setTimeout(
+          () => runReconciliationPass(record, window, true),
+          Math.max(1, window.deadlineAt - current)
+        );
+        return;
+      }
+      runReconciliationPass(record, window, true);
+    }, GPT_RECONCILIATION_WINDOW_MS);
+  };
+
+  const inspectNavigationDom = (state: NavigationState): void => {
+    if (state.disposed || !state.owner.isCurrent()) return;
+    const records = mapValueSnapshot(state.records);
+    for (let index = 0; index < records.length; index += 1) {
+      const record = records[index];
+      const physical = record?.physical;
+      if (!record || !physical) continue;
+      if (physical.ownership !== 'trusted_server' || !physical.definition) {
+        cancelReconciliation(record);
+        continue;
+      }
+      if (reconciliationElementConnected(physical.domElement)) continue;
+      const existing = record.reconciliation;
+      if (!existing) openReconciliation(record, physical);
+      else if (existing.orphan === physical) scheduleReconciliationDebounce(record, existing);
+      else cancelReconciliation(record);
+    }
+  };
+
+  const installNavigationObserver = (state: NavigationState): boolean => {
+    if (!reconciliationBoundary || !reconciliationObserve) return true;
+    if (state.observerRelease) return true;
+    try {
+      const release = Reflect.apply(reconciliationObserve, reconciliationBoundary, [
+        () => inspectNavigationDom(state),
+      ]) as () => void;
+      if (typeof release !== 'function') return false;
+      state.observerRelease = release;
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
   const disposeNavigationState = (state: NavigationState): void => {
     if (state.disposed) return;
     state.disposed = true;
+    const observerRelease = state.observerRelease;
+    state.observerRelease = undefined;
+    try {
+      observerRelease?.();
+    } catch {
+      // Logical observer ownership is already released.
+    }
     const records = mapValueSnapshot(state.records);
     for (const record of records) {
+      cancelReconciliation(record);
       const active = record.activeIntent;
       const queued = record.queuedIntent;
       if (active) settle(active, cancelled('navigation_disposed'));
@@ -1205,6 +1723,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     const state: NavigationState = {
       disposed: false,
       nextOrdinal: 0,
+      observerRelease: undefined,
       owner,
       records: new Map(),
     };
@@ -1212,6 +1731,9 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     try {
       owner.onDispose('slot-records', () => disposeNavigationState(state));
       disposerInstalled = true;
+      if (reconciliationActive && !installNavigationObserver(state)) {
+        throw new Error('reconciliation observer failed');
+      }
       if (!owner.isCurrent() || state.disposed) return undefined;
       setMapValue(navigationStates, owner.generation, state);
       if (!owner.isCurrent() || state.disposed) {
@@ -1316,6 +1838,8 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
           activeIntent: undefined,
           physical: undefined,
           queuedIntent: undefined,
+          reconciliation: undefined,
+          reconciliationSuccesses: 0,
           state,
           view,
         };
@@ -1401,6 +1925,12 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     ) {
       return Object.freeze({ ok: false, reason: 'gpt_request_failed' });
     }
+    const initialResolution =
+      ownership === 'trusted_server' && definition
+        ? resolveReconciliationElement(record, definition)
+        : undefined;
+    const domElement =
+      initialResolution?.status === 'unique' ? initialResolution.element : undefined;
     const slotObject = slot as object;
     let bindingPlacementKeys: readonly string[];
     try {
@@ -1434,6 +1964,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       const previousRecord = existing.record;
       const previousOwnership = existing.ownership;
       const previousDefinition = existing.definition;
+      const previousDomElement = existing.domElement;
       const previousPlacementKeys = existing.placementKeys;
       try {
         if (!wasStrong) addSetValue(physicalSlots, existing);
@@ -1442,14 +1973,17 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         existing.record = record;
         existing.ownership = ownership;
         existing.definition = definition;
+        existing.domElement = domElement;
         existing.placementKeys = bindingPlacementKeys;
         record.physical = existing;
+        if (ownership === 'publisher') cancelReconciliation(record);
         return Object.freeze({ ok: true });
       } catch {
         if (record.physical === existing) record.physical = undefined;
         existing.record = previousRecord;
         existing.ownership = previousOwnership;
         existing.definition = previousDefinition;
+        existing.domElement = previousDomElement;
         existing.placementKeys = previousPlacementKeys;
         if (!wasStrong) deleteSetValue(physicalSlots, existing);
         return Object.freeze({ ok: false, reason: 'stale_owner' });
@@ -1461,6 +1995,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     const physical: PhysicalSlot = {
       activeCycle: undefined,
       definition,
+      domElement,
       destroyAttempted: false,
       lastResponseIdentifier: undefined,
       ownership,
@@ -1495,7 +2030,13 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       resolve = resolveResult;
     });
     const placeholderRecord =
-      record ?? ({ activeIntent: undefined, queuedIntent: undefined } as InternalSlotRecord);
+      record ??
+      ({
+        activeIntent: undefined,
+        queuedIntent: undefined,
+        reconciliation: undefined,
+        reconciliationSuccesses: 0,
+      } as InternalSlotRecord);
     const intent: RequestIntent = {
       completionTimer: undefined,
       completionDeadlineAt: undefined,
@@ -1849,6 +2390,28 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
   const service: SlotService = Object.freeze({
     activate: (): GoogletagOperation<void> => {
       if (activation) return activation;
+      if (!reconciliationActive) {
+        const states = mapValueSnapshot(navigationStates);
+        const installed: NavigationState[] = [];
+        for (let index = 0; index < states.length; index += 1) {
+          const state = states[index];
+          if (!state || !installNavigationObserver(state)) {
+            for (let releaseIndex = installed.length - 1; releaseIndex >= 0; releaseIndex -= 1) {
+              const installedState = installed[releaseIndex];
+              const release = installedState?.observerRelease;
+              if (installedState) installedState.observerRelease = undefined;
+              try {
+                release?.();
+              } catch {
+                // Failed activation retains no observer ownership.
+              }
+            }
+            throw new Error('reconciliation observer failed');
+          }
+          if (state.observerRelease) installed[installed.length] = state;
+        }
+        reconciliationActive = true;
+      }
       let subscriptions: BindingSubscriptionAdmission | undefined;
       const operation = options.googletag.run<void>((gpt) => {
         if (disposed) return;
