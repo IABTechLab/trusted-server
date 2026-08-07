@@ -1,14 +1,106 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { createGptIntegrationRegistration } from '../../../src/integrations/gpt/module';
+import {
+  createGptIntegrationRegistration,
+  startGptSlotOperation,
+  type GptSlotOperationInput,
+} from '../../../src/integrations/gpt/module';
 import { isGuardInstalled, resetGuardState } from '../../../src/integrations/gpt/script_guard';
+import { createTestNavigationIdentityIssuer } from '../../../src/kernel/identity';
 import {
   createIntegrationRegistry,
   type IntegrationInstallCallbacks,
   type IntegrationRegistration,
 } from '../../../src/kernel/integration_registry';
+import { createRuntimeSession } from '../../../src/kernel/sessions';
+import {
+  createCommittedArtifactStore,
+  createRenderAttempt,
+  type CommittedRenderArtifact,
+  type RenderAttempt,
+} from '../../../src/services/render';
+import { createReservationService } from '../../../src/services/reservations';
+import type { SlotRequestOutcome } from '../../../src/services/slots';
 
 const RELEASE_ID = 'a'.repeat(64);
+const RESERVATION_ID = `r1_${'a'.repeat(22)}`;
+
+function createAttemptHarness() {
+  const runtime = createRuntimeSession({
+    createIdentityIssuer: () =>
+      createTestNavigationIdentityIssuer({
+        getRandomValues: (target) => {
+          target.fill(1);
+          return target;
+        },
+      }),
+  });
+  const navigationResult = runtime.startInitialNavigation();
+  if (!navigationResult.ok) throw new Error('Expected navigation creation');
+  const batch = navigationResult.value.createAuctionBatch('gpt-cycle');
+  if (!batch) throw new Error('Expected batch creation');
+  const artifacts = createCommittedArtifactStore();
+  const reservations = createReservationService({
+    prepareRenderSource: (candidate) =>
+      typeof candidate === 'object' &&
+      candidate !== null &&
+      Object.isFrozen(candidate) &&
+      'type' in candidate &&
+      'version' in candidate
+        ? (candidate as Readonly<{ type: 'aps' | 'adm' | 'cache'; version: 1 }>)
+        : undefined,
+  });
+  const createAttemptWithOwner = (parentAttemptId?: string) => {
+    const owner = batch.createRenderAttempt('slot-one');
+    if (!owner.ok) throw new Error(`Expected attempt owner: ${owner.reason}`);
+    const created = createRenderAttempt({
+      artifacts,
+      owner: owner.value,
+      prepareRenderSource: (candidate) =>
+        typeof candidate === 'object' &&
+        candidate !== null &&
+        Object.isFrozen(candidate) &&
+        'type' in candidate &&
+        'version' in candidate
+          ? (candidate as Readonly<{ type: 'aps' | 'adm' | 'cache'; version: 1 }>)
+          : undefined,
+      reservations,
+      ...(parentAttemptId === undefined ? {} : { parentAttemptId }),
+    });
+    if (!created.ok) throw new Error(`Expected render attempt: ${created.reason}`);
+    return { attempt: created.value, owner: owner.value };
+  };
+  const primaryCreated = createAttemptWithOwner();
+  const primary = primaryCreated.attempt;
+  const artifact = Object.freeze({
+    kind: 'puc' as const,
+    attemptId: primary.id,
+    slot: primary.slot,
+    navigationGeneration: primary.navigationGeneration,
+    dispose: vi.fn(),
+  }) satisfies CommittedRenderArtifact;
+  return {
+    artifact,
+    createAttempt: (parentAttemptId: string): RenderAttempt =>
+      createAttemptWithOwner(parentAttemptId).attempt,
+    primary,
+    primaryOwner: primaryCreated.owner,
+    runtime,
+  };
+}
+
+function deferredSlotOutcome() {
+  let resolve!: (outcome: SlotRequestOutcome) => void;
+  const result = new Promise<SlotRequestOutcome>((resolveResult) => {
+    resolve = resolveResult;
+  });
+  const dispose = vi.fn();
+  return {
+    dispose,
+    request: vi.fn(() => Object.freeze({ status: 'active' as const, result, dispose })),
+    resolve,
+  };
+}
 
 function manifest(ids: readonly string[]) {
   return {
@@ -206,4 +298,157 @@ describe('transactional GPT integration module', () => {
     expect(runtimeFailures).toEqual([{ id: 'gpt', phase: 'after_commit' }]);
     expect(isGuardInstalled()).toBe(false);
   });
+
+  it('starts fallback only after an attributable TS-owned empty cycle settles the primary', async () => {
+    const harness = createAttemptHarness();
+    const slot = deferredSlotOutcome();
+    const order: string[] = [];
+    let fallback: RenderAttempt | undefined;
+    const bridgeInput: unknown[] = [];
+    const bridge = {
+      registerGamAttempt: vi.fn((input: GptSlotOperationInput) => {
+        bridgeInput.push(input);
+        return input.attempt.beginGamClaim();
+      }),
+      recordNonemptyGam: vi.fn(() => true),
+    };
+    const started = startGptSlotOperation({
+      artifact: harness.artifact,
+      attempt: harness.primary,
+      createFallback: (parentAttemptId) => {
+        expect(harness.primary.snapshot().outcome).toEqual({
+          outcome: 'failed',
+          reason: 'gam_empty',
+        });
+        order.push('fallback:create');
+        fallback = harness.createAttempt(parentAttemptId);
+        return Object.freeze({ ok: true as const, value: fallback });
+      },
+      operation: 'refresh',
+      owner: harness.primaryOwner,
+      pucBridge: bridge,
+      requestClass: 'primary',
+      reservationId: RESERVATION_ID,
+      slots: { request: slot.request },
+    });
+
+    expect(started.ok).toBe(true);
+    expect(bridge.registerGamAttempt).toHaveBeenCalledTimes(1);
+    expect(slot.request).toHaveBeenCalledWith({
+      intentId: harness.primary.id,
+      navigationGeneration: harness.primary.navigationGeneration,
+      operation: 'refresh',
+      registeredSlotId: harness.primary.slot,
+      requestClass: 'primary',
+    });
+
+    slot.resolve(Object.freeze({ status: 'empty', responseIdentifier: 'response-one' }));
+    await Promise.resolve();
+
+    expect(order).toEqual(['fallback:create']);
+    expect(harness.primary.snapshot()).toMatchObject({
+      state: 'failed',
+      outcome: { outcome: 'failed', reason: 'gam_empty' },
+    });
+    expect(started.ok && started.value.snapshot()).toEqual({ settled: false });
+    expect(slot.dispose).toHaveBeenCalledTimes(1);
+    expect(bridge.recordNonemptyGam).not.toHaveBeenCalled();
+
+    expect(fallback?.fail('gpt_request_failed')).toBe(true);
+    expect(started.ok && started.value.snapshot()).toMatchObject({
+      settled: true,
+      result: {
+        path: 'fallback',
+        primaryAttemptId: harness.primary.id,
+        primary: { outcome: 'failed', reason: 'gam_empty' },
+        fallbackAttemptId: fallback?.id,
+        fallback: { outcome: 'failed', reason: 'gpt_request_failed' },
+      },
+    });
+    expect(harness.primary.snapshot().outcome).toEqual({
+      outcome: 'failed',
+      reason: 'gam_empty',
+    });
+    harness.runtime.dispose();
+  });
+
+  it('joins an attributable nonempty cycle to the PUC bridge without settling the operation', async () => {
+    const harness = createAttemptHarness();
+    const slot = deferredSlotOutcome();
+    const registered: unknown[] = [];
+    const nonempty: unknown[] = [];
+    const bridge = {
+      registerGamAttempt: vi.fn((input: GptSlotOperationInput) => {
+        registered.push(input);
+        return input.attempt.beginGamClaim();
+      }),
+      recordNonemptyGam: vi.fn((input: unknown) => {
+        nonempty.push(input);
+        return true;
+      }),
+    };
+    const input = {
+      artifact: harness.artifact,
+      attempt: harness.primary,
+      operation: 'display' as const,
+      owner: harness.primaryOwner,
+      pucBridge: bridge,
+      requestClass: 'primary',
+      reservationId: RESERVATION_ID,
+      slots: { request: slot.request },
+    };
+    const started = startGptSlotOperation(input);
+    slot.resolve(Object.freeze({ status: 'rendered', responseIdentifier: 'response-one' }));
+    await Promise.resolve();
+
+    expect(nonempty).toEqual(registered);
+    expect(started.ok && started.value.snapshot()).toEqual({ settled: false });
+    expect(harness.primary.snapshot().state).toBe('waiting_for_gam_and_claim');
+    expect(slot.dispose).not.toHaveBeenCalled();
+
+    harness.primary.cancel('superseded');
+    expect(slot.dispose).toHaveBeenCalledTimes(1);
+    harness.runtime.dispose();
+  });
+
+  it.each([
+    [{ status: 'failed', reason: 'cycle_unattributable' }, 'cycle_unattributable'],
+    [{ status: 'failed', reason: 'slot_quarantined' }, 'slot_quarantined'],
+    [{ status: 'failed', reason: 'gpt_request_timeout' }, 'gpt_request_timeout'],
+    [{ status: 'failed', reason: 'gpt_completion_timeout' }, 'gpt_completion_timeout'],
+    [{ status: 'cancelled', reason: 'navigation_disposed' }, 'navigation_disposed'],
+  ] as const)(
+    'does not start fallback for non-empty terminal cycle outcome %s',
+    async (slotOutcome, reason) => {
+      const harness = createAttemptHarness();
+      const slot = deferredSlotOutcome();
+      const createFallback = vi.fn();
+      const started = startGptSlotOperation({
+        artifact: harness.artifact,
+        attempt: harness.primary,
+        createFallback,
+        operation: 'refresh',
+        owner: harness.primaryOwner,
+        pucBridge: {
+          registerGamAttempt: (input) => input.attempt.beginGamClaim(),
+          recordNonemptyGam: () => true,
+        },
+        requestClass: 'primary',
+        reservationId: RESERVATION_ID,
+        slots: { request: slot.request },
+      });
+      slot.resolve(Object.freeze(slotOutcome) as SlotRequestOutcome);
+      await Promise.resolve();
+
+      expect(createFallback).not.toHaveBeenCalled();
+      expect(started.ok && started.value.snapshot()).toMatchObject({
+        settled: true,
+        result: {
+          path: 'primary',
+          outcome: { reason },
+        },
+      });
+      harness.runtime.dispose();
+    }
+  );
 });

@@ -3,6 +3,14 @@ import type {
   IntegrationPrepareContext,
   IntegrationRegistration,
 } from '../../kernel/integration_registry';
+import {
+  createSlotOperation,
+  type RenderAttempt,
+  type SlotOperationCreationResult,
+  type SlotOperationOptions,
+} from '../../services/render';
+import type { PucBridge, PucGamAttemptInput } from '../../services/puc_bridge';
+import type { SlotRequestOutcome, SlotService } from '../../services/slots';
 
 import { installGptGuard, resetGuardState } from './script_guard';
 
@@ -21,6 +29,134 @@ const objectIsFrozenIntrinsic = Object.isFrozen;
 
 interface GptIntegrationRuntime {
   readonly start: (config: unknown) => void;
+}
+
+export interface GptSlotOperationInput extends Omit<PucGamAttemptInput, 'attempt'> {
+  readonly attempt: RenderAttempt;
+  readonly createFallback?: SlotOperationOptions['createFallback'];
+  readonly operation: 'display' | 'refresh';
+  readonly pucBridge: Pick<PucBridge, 'recordNonemptyGam' | 'registerGamAttempt'>;
+  readonly requestClass: string;
+  readonly slots: Pick<SlotService, 'request'>;
+}
+
+function settleFromSlotOutcome(
+  attempt: RenderAttempt,
+  bridge: GptSlotOperationInput['pucBridge'],
+  bridgeInput: PucGamAttemptInput,
+  outcome: SlotRequestOutcome
+): void {
+  try {
+    if (outcome.status === 'empty') {
+      attempt.fail('gam_empty');
+      return;
+    }
+    if (outcome.status === 'rendered') {
+      if (!bridge.recordNonemptyGam(bridgeInput)) attempt.fail('cycle_unattributable');
+      return;
+    }
+    if (outcome.status === 'failed') {
+      attempt.fail(outcome.reason);
+      return;
+    }
+    if (outcome.status === 'cancelled') attempt.cancel(outcome.reason);
+  } catch {
+    try {
+      attempt.fail('internal_error');
+    } catch {
+      // The attempt latch remains the terminal authority.
+    }
+  }
+}
+
+/**
+ * Join one TS-owned physical GPT cycle to its primary render attempt.
+ *
+ * Only the slot service may identify an attributable empty cycle. The resulting
+ * `gam_empty` transition is therefore the sole path that can activate the
+ * optional `SlotOperation` fallback child.
+ */
+export function startGptSlotOperation(input: GptSlotOperationInput): SlotOperationCreationResult {
+  const operation = createSlotOperation({
+    primary: input.attempt,
+    ...(input.createFallback === undefined ? {} : { createFallback: input.createFallback }),
+  });
+  if (!operation.ok) return operation;
+
+  const bridgeInput = Object.freeze({
+    artifact: input.artifact,
+    attempt: input.attempt,
+    owner: input.owner,
+    reservationId: input.reservationId,
+  });
+  const registered = (() => {
+    try {
+      return input.pucBridge.registerGamAttempt(bridgeInput);
+    } catch {
+      return false;
+    }
+  })();
+  if (!registered) {
+    try {
+      input.attempt.fail('gpt_request_failed');
+    } catch {
+      // The operation still observes any terminal result already committed by the bridge.
+    }
+    return operation;
+  }
+
+  let handle: ReturnType<SlotService['request']>;
+  try {
+    handle = input.slots.request({
+      intentId: input.attempt.id,
+      navigationGeneration: input.attempt.navigationGeneration,
+      operation: input.operation,
+      registeredSlotId: input.attempt.slot,
+      requestClass: input.requestClass,
+    });
+  } catch {
+    input.attempt.fail('gpt_request_failed');
+    return operation;
+  }
+
+  let handleDisposed = false;
+  const disposeHandle = (): void => {
+    if (handleDisposed) return;
+    handleDisposed = true;
+    try {
+      handle.dispose();
+    } catch {
+      // Attempt settlement remains authoritative when request cleanup throws.
+    }
+  };
+  const observing = (() => {
+    try {
+      return input.attempt.onSettled(disposeHandle);
+    } catch {
+      return false;
+    }
+  })();
+  if (!observing) {
+    disposeHandle();
+    try {
+      input.attempt.fail('internal_error');
+    } catch {
+      // A concurrently terminal attempt cannot be overwritten.
+    }
+    return operation;
+  }
+
+  void handle.result.then(
+    (outcome) => settleFromSlotOutcome(input.attempt, input.pucBridge, bridgeInput, outcome),
+    () => {
+      try {
+        input.attempt.fail('gpt_request_failed');
+      } catch {
+        // A late rejected request cannot overwrite an existing terminal outcome.
+      }
+    }
+  );
+  return operation;
 }
 
 function validFrozenConfig(candidate: unknown): boolean {

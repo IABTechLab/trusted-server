@@ -34,6 +34,7 @@ import {
 } from '../core/registry';
 import { prepareAdmIframe } from '../core/render';
 import { APS_RENDERER_V1_PATH, renderDirectApsAttempt } from '../integrations/aps/render';
+import { startGptSlotOperation, type GptSlotOperationInput } from '../integrations/gpt/module';
 import { createBrowserNavigationIdentityIssuer } from '../kernel/identity';
 import type { NavigationIdentityIssuerFactory, RuntimeSession } from '../kernel/sessions';
 import { createRuntimeSession } from '../kernel/sessions';
@@ -62,9 +63,11 @@ import {
   type RenderAttempt,
   type CommittedArtifactStore,
   type RendererNonceRegistry,
+  type SlotOperationCreationResult,
 } from '../services/render';
 import { createPucBridge, type PucBridge, type PucBridgeOptions } from '../services/puc_bridge';
 import {
+  createBrowserSlotReconciliationBoundary,
   createSlotService,
   type SlotRecord,
   type SlotRegistrationFailure,
@@ -123,6 +126,10 @@ export interface BrowserRuntimeComposition extends BrowserComposition {
   readonly rendererNonceRegistryForTest: () => RendererNonceRegistry | undefined;
   /** Return the single runtime-owned PUC bridge only in coordinated-cutover tests. */
   readonly pucBridgeForTest: () => PucBridge | undefined;
+  /** Join one prospective GPT attempt through the runtime-owned services in tests. */
+  readonly startGptSlotOperationForTest: (
+    input: Omit<GptSlotOperationInput, 'pucBridge' | 'slots'>
+  ) => SlotOperationCreationResult;
 }
 
 export interface BrowserCoreActivations {
@@ -450,7 +457,14 @@ export function createTestBrowserRuntimeComposition(
         parseProjection
       );
       if (!initialProjection) throw new Error('Accepted boot projection is unavailable');
-      const slotService = createSlotService({ googletag: composition.adapters.googletag });
+      const reconciliation =
+        typeof document === 'undefined' || typeof MutationObserver === 'undefined'
+          ? undefined
+          : createBrowserSlotReconciliationBoundary(document, MutationObserver);
+      const slotService = createSlotService({
+        googletag: composition.adapters.googletag,
+        ...(reconciliation ? { reconciliation } : {}),
+      });
       const targetingService = createTargetingService();
       const reservationService = createReservationService({
         prepareRenderSource: (candidate) => parseBidRenderSourceV1(candidate, cachePolicy),
@@ -717,5 +731,16 @@ export function createTestBrowserRuntimeComposition(
     reservationServiceForTest: () => browserServices?.reservations,
     rendererNonceRegistryForTest: () => browserServices?.rendererNonces,
     pucBridgeForTest: () => browserServices?.pucBridge,
+    startGptSlotOperationForTest: (
+      input: Omit<GptSlotOperationInput, 'pucBridge' | 'slots'>
+    ): SlotOperationCreationResult => {
+      const services = browserServices;
+      if (!services) return Object.freeze({ ok: false, reason: 'invalid_attempt' });
+      return startGptSlotOperation({
+        ...input,
+        pucBridge: services.pucBridge,
+        slots: services.slots,
+      });
+    },
   });
 }
