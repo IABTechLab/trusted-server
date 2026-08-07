@@ -685,7 +685,61 @@ describe('renderer reservation identity and registration', () => {
     });
   });
 
-  it('makes a late expired owner callback token-safe after the same id is reused', () => {
+  it('preserves the established callback when another identity reuses its live generation', () => {
+    const service = serviceAt(() => 0);
+    const generation = Object.freeze({});
+    let establishedCleanup: (() => void) | undefined;
+    const firstOwner: ReservationOwner = {
+      generation,
+      isCurrent: () => true,
+      onDispose: (_kind, callback) => {
+        establishedCleanup = callback;
+      },
+    };
+    expect(
+      service.registerRender({
+        reservationId: reservationId(),
+        slot: 'first-slot',
+        navigation: firstOwner,
+        attemptId: 'a1_0000000000000000000000',
+        renderSource: admSource(),
+        winnerContext: { selectedCpm: 1 },
+      })
+    ).toMatchObject({ ok: true });
+    const replacementOnDispose = vi.fn(() => {
+      throw new Error('replacement callback publication failed');
+    });
+
+    expect(
+      service.registerRender({
+        reservationId: reservationId(1),
+        slot: 'second-slot',
+        navigation: {
+          generation,
+          isCurrent: () => true,
+          onDispose: replacementOnDispose,
+        },
+        attemptId: 'a1_0000000000000000000001',
+        renderSource: admSource(),
+        winnerContext: { selectedCpm: 2 },
+      })
+    ).toEqual({ ok: false, reason: 'stale_owner' });
+    expect(replacementOnDispose).not.toHaveBeenCalled();
+    expect(service.recognize(reservationId())).toMatchObject({ state: 'renderable' });
+    expect(service.recognize(reservationId(1))).toMatchObject({ state: 'disposed' });
+
+    establishedCleanup?.();
+
+    expect(service.recognize(reservationId())).toMatchObject({ state: 'disposed' });
+    expect(service.snapshotInventoryForTest()).toMatchObject({
+      live: 0,
+      tombstones: 2,
+      entriesWithRenderSource: 0,
+      entriesWithWinnerContext: 0,
+    });
+  });
+
+  it('requires a fresh generation when a different owner identity arrives after expiry', () => {
     let now = 0;
     const service = serviceAt(() => now);
     const generation = Object.freeze({});
@@ -713,10 +767,20 @@ describe('renderer reservation identity and registration', () => {
       isCurrent: () => true,
       onDispose: vi.fn(),
     };
-    expect(service.registerRender({ ...input, navigation: newOwner })).toMatchObject({ ok: true });
+    expect(service.registerRender({ ...input, navigation: newOwner })).toEqual({
+      ok: false,
+      reason: 'stale_owner',
+    });
+    expect(newOwner.onDispose).not.toHaveBeenCalled();
     oldCleanup?.();
 
-    expect(service.recognize(reservationId())).toMatchObject({ state: 'renderable' });
+    expect(service.recognize(reservationId())).toMatchObject({ state: 'disposed' });
+    expect(service.snapshotInventoryForTest()).toMatchObject({
+      live: 0,
+      tombstones: 1,
+      entriesWithRenderSource: 0,
+      entriesWithWinnerContext: 0,
+    });
   });
 });
 

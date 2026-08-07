@@ -697,7 +697,6 @@ export function createReservationService(options: ReservationServiceOptions): Re
 
   const publishOwnerRegistration = (
     generation: object,
-    existing: OwnerRegistration | undefined,
     registration: OwnerRegistration
   ): boolean => {
     try {
@@ -710,7 +709,6 @@ export function createReservationService(options: ReservationServiceOptions): Re
       registration.callbackState.active = false;
       return false;
     }
-    if (existing) existing.callbackState.active = false;
     return true;
   };
 
@@ -732,7 +730,8 @@ export function createReservationService(options: ReservationServiceOptions): Re
     const initial = readOwnerRegistration(owner.generation);
     if (!initial.ok) return undefined;
     const existing = initial.value;
-    if (existing?.identity === owner.identity) {
+    if (existing) {
+      if (existing.identity !== owner.identity) return undefined;
       const ownerIsCurrent = currentOwner(owner);
       const currentGeneration = owner.readGeneration();
       const current = readOwnerRegistration(owner.generation);
@@ -757,7 +756,7 @@ export function createReservationService(options: ReservationServiceOptions): Re
       ready: false,
     };
     const generation = owner.generation;
-    if (!publishOwnerRegistration(generation, existing, registration)) return undefined;
+    if (!publishOwnerRegistration(generation, registration)) return undefined;
     try {
       owner.onDispose('reservation', () => disposeOwnerEntries(generation, callbackState));
     } catch {
