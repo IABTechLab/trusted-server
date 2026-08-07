@@ -920,6 +920,55 @@ describe('physical GPT cycles', () => {
     });
   });
 
+  it('queues one same-class replacement behind an open trusted-server cycle', async () => {
+    const harness = createGptHarness();
+    const service = createSlotService({ googletag: harness.adapter });
+    const navigation = createNavigation();
+    const slot = bindTrustedSlot(service, navigation);
+    const first = service.request({
+      intentId: 'first-primary',
+      navigationGeneration: navigation.generation,
+      operation: 'refresh',
+      requestClass: 'primary',
+      registeredSlotId: 'slot',
+    });
+    await Promise.resolve();
+    service.handleGptEvent('slotRequested', { slot });
+
+    const second = service.request({
+      intentId: 'second-primary',
+      navigationGeneration: navigation.generation,
+      operation: 'refresh',
+      requestClass: 'primary',
+      registeredSlotId: 'slot',
+    });
+    expect(second.status).toBe('queued');
+    expect(harness.refresh).toHaveBeenCalledTimes(1);
+
+    service.handleGptEvent('slotRenderEnded', {
+      isEmpty: false,
+      responseIdentifier: 'first-primary-response',
+      slot,
+    });
+    await expect(first.result).resolves.toEqual({
+      responseIdentifier: 'first-primary-response',
+      status: 'rendered',
+    });
+    await Promise.resolve();
+    expect(harness.refresh).toHaveBeenCalledTimes(2);
+
+    service.handleGptEvent('slotRequested', { slot });
+    service.handleGptEvent('slotRenderEnded', {
+      isEmpty: true,
+      responseIdentifier: 'second-primary-response',
+      slot,
+    });
+    await expect(second.result).resolves.toEqual({
+      responseIdentifier: 'second-primary-response',
+      status: 'empty',
+    });
+  });
+
   it('fails active and queued TS work when publisher intent makes ownership ambiguous', async () => {
     const harness = createGptHarness();
     const service = createSlotService({ googletag: harness.adapter });
@@ -1843,8 +1892,8 @@ describe('Task 11 adversarial ownership review', () => {
     await expect(requests[1]?.result).resolves.toMatchObject({ status: 'empty' });
   });
 
-  it('does not invoke a deferred SRA batch after its navigation is disposed', async () => {
-    const harness = createGptHarness({ synchronousRun: false });
+  it('does not invoke an SRA batch after its subscription continuation is disposed', async () => {
+    const harness = createGptHarness();
     const service = createSlotService({ googletag: harness.adapter });
     const navigation = createNavigation();
     bindTrustedSlot(service, navigation, 'deferred-first');

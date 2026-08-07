@@ -1383,22 +1383,37 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       settle(intent, failed('gpt_request_failed'));
       return handle;
     }
-    if (physical.publisherIntentCount > 0 || physical.activeCycle) {
+    if (physical.publisherIntentCount > 0) {
+      settle(intent, failed('cycle_unattributable'));
+      return handle;
+    }
+    if (physical.state === 'quarantined') {
       settle(
         intent,
         failed(
           physical.activeCycle?.kind === 'trusted_server' && physical.state === 'quarantined'
             ? 'slot_quarantined'
-            : 'cycle_unattributable'
+            : physical.activeCycle
+              ? 'cycle_unattributable'
+              : 'slot_quarantined'
         )
       );
       return handle;
     }
-    if (physical.state === 'quarantined') {
-      settle(intent, failed('slot_quarantined'));
-      return handle;
-    }
     if (record.activeIntent) {
+      if (
+        physical.activeCycle &&
+        (physical.activeCycle.kind !== 'trusted_server' ||
+          physical.activeCycle.intent !== record.activeIntent)
+      ) {
+        const active = record.activeIntent;
+        settle(active, failed('cycle_unattributable'));
+        if (record.queuedIntent) {
+          settle(record.queuedIntent, failed('cycle_unattributable'));
+        }
+        settle(intent, failed('cycle_unattributable'));
+        return handle;
+      }
       if (record.activeIntent.input.requestClass !== input.requestClass) {
         const active = record.activeIntent;
         const activePhysical = record.physical;
@@ -1429,6 +1444,10 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         settle(queued, cancelled('superseded'));
       }
       record.queuedIntent = intent;
+      return handle;
+    }
+    if (physical.activeCycle) {
+      settle(intent, failed('cycle_unattributable'));
       return handle;
     }
     record.activeIntent = intent;
@@ -1465,6 +1484,38 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         slots[slots.length] = physical.slot;
       }
       if (slots.length === intents.length) {
+        const allIntentsAdmitted = (): boolean => {
+          for (let index = 0; index < intents.length; index += 1) {
+            const intent = intents[index];
+            const expectedSlot = slots[index];
+            if (!intent || intent.terminal || intent.record.activeIntent !== intent) return false;
+            const state = intent.record.state;
+            if (state.disposed || !state.owner.isCurrent()) return false;
+            const physical = intent.record.physical;
+            if (
+              !physical ||
+              physical.state !== 'live' ||
+              physical.activeCycle ||
+              physical.slot !== expectedSlot
+            ) {
+              return false;
+            }
+          }
+          return true;
+        };
+        const failInvalidAdmission = (): void => {
+          for (let index = 0; index < intents.length; index += 1) {
+            const intent = intents[index];
+            if (!intent || intent.terminal) continue;
+            const state = intent.record.state;
+            settle(
+              intent,
+              state.disposed || !state.owner.isCurrent()
+                ? cancelled('navigation_disposed')
+                : failed('gpt_request_failed')
+            );
+          }
+        };
         let subscriptionOperation: GoogletagOperation<BindingSubscriptionAdmission>;
         let provisionalSubscriptions: BindingSubscriptionAdmission | undefined;
         try {
@@ -1475,11 +1526,18 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
           void subscriptionOperation.result.then(
             (subscriptions) => {
               retireHistoricalSubscriptions(subscriptions.ownership);
+              if (!allIntentsAdmitted()) {
+                failInvalidAdmission();
+                return;
+              }
               let operation: GoogletagOperation<unknown>;
               try {
                 operation = options.googletag.run((gpt) => {
                   if (gpt.bindingToken() !== subscriptions.ownership.token) {
                     throw new Error('GPT binding changed before SRA invocation');
+                  }
+                  if (!allIntentsAdmitted()) {
+                    throw new Error('SRA admission changed before invocation');
                   }
                   for (const intent of intents) {
                     if (!intent.terminal) armRequestDeadline(intent);
