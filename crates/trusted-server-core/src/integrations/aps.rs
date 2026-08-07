@@ -78,9 +78,8 @@ const MAX_LANGUAGE_BYTES: usize = 8;
 const MAX_PAGE_URL_BYTES: usize = 8192;
 const MAX_RENDER_ENVELOPE_BYTES: usize = 256 * 1024;
 #[cfg(any(test, feature = "test-utils"))]
-// Reserve downstream response/finalization overhead inside the externally
-// observed five-second dispatch-to-final-byte ceiling.
-const APS_RUNNER_TOTAL_TIMEOUT: Duration = Duration::from_millis(4_500);
+// Exact transport window from dispatch through the final upstream byte.
+const APS_RUNNER_TOTAL_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(any(test, feature = "test-utils"))]
 /// Maximum wait for the APS runner response headers.
 pub const APS_RUNNER_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(4);
@@ -4484,10 +4483,11 @@ mod tests {
             )]]
         );
         assert_eq!(stub.recorded_request_bodies(), vec![Vec::<u8>::new()]);
+        assert_eq!(APS_RUNNER_TOTAL_TIMEOUT, Duration::from_secs(5));
         assert_eq!(
             stub.recorded_raw_proxy_policies(),
             vec![RawProxyPolicyV1 {
-                total_timeout: Duration::from_millis(4_500),
+                total_timeout: APS_RUNNER_TOTAL_TIMEOUT,
                 first_byte_timeout: Duration::from_secs(4),
                 blocking_read_timeout: Duration::from_millis(250),
                 max_response_bytes: APS_RUNNER_MAX_RESPONSE_BYTES,
