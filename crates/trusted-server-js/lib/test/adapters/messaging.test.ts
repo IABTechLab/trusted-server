@@ -764,6 +764,79 @@ describe('browser messaging adapter', () => {
     }
   });
 
+  it('inspects only own routing data before exact global-message parsing', () => {
+    const adapter = createBrowserMessagingAdapter(createTarget());
+    const json = JSON.stringify({
+      message: 'Prebid Request',
+      adId: 'r1_abcdefghijklmnopqrstuv',
+      adServerDomain: 'ads.example.com',
+      ignored: { renderer: '<script>not routing data</script>' },
+    });
+    const object = Object.assign(Object.create(null), {
+      message: 'TS Render Owner Register',
+      adId: 'r1_abcdefghijklmnopqrstuv',
+      lifecycleTicket: 't1_abcdefghijklmnopqrstuv',
+      ignored: true,
+    });
+
+    const inspectedJson = adapter.inspectGlobalMessage(json);
+    const inspectedObject = adapter.inspectGlobalMessage(object);
+
+    expect(inspectedJson).toEqual({
+      message: 'Prebid Request',
+      adId: 'r1_abcdefghijklmnopqrstuv',
+    });
+    expect(inspectedObject).toEqual({
+      message: 'TS Render Owner Register',
+      adId: 'r1_abcdefghijklmnopqrstuv',
+      lifecycleTicket: 't1_abcdefghijklmnopqrstuv',
+    });
+    expect(Object.isFrozen(inspectedJson)).toBe(true);
+    expect(Object.isFrozen(inspectedObject)).toBe(true);
+  });
+
+  it('inspects global routing data without invoking accessors or inherited properties', () => {
+    const adapter = createBrowserMessagingAdapter(createTarget());
+    const getter = vi.fn(() => 'Prebid Request');
+    const accessor = Object.create(null) as Record<string, unknown>;
+    Object.defineProperty(accessor, 'message', { get: getter, enumerable: true });
+    Object.defineProperty(accessor, 'adId', {
+      value: 'r1_abcdefghijklmnopqrstuv',
+      enumerable: true,
+    });
+    const inherited = Object.assign(Object.create({ message: 'Prebid Request' }), {
+      adId: 'r1_abcdefghijklmnopqrstuv',
+    });
+    const throwingProxy = new Proxy(
+      {},
+      {
+        getPrototypeOf: () => {
+          throw new Error('prototype trap');
+        },
+      }
+    );
+
+    expect(adapter.inspectGlobalMessage(accessor)).toBeUndefined();
+    expect(adapter.inspectGlobalMessage(inherited)).toBeUndefined();
+    expect(adapter.inspectGlobalMessage(throwingProxy)).toBeUndefined();
+    expect(getter).not.toHaveBeenCalled();
+  });
+
+  it('rejects malformed, duplicate-key, and oversized routing JSON during inspection', () => {
+    const adapter = createBrowserMessagingAdapter(createTarget());
+    const duplicate = '{"message":"Prebid Request","adId":"first","adId":"second","ignored":true}';
+    const oversized = JSON.stringify({
+      message: 'Prebid Request',
+      adId: 'r1_abcdefghijklmnopqrstuv',
+      ignored: 'é'.repeat(2_100),
+    });
+
+    expect(adapter.inspectGlobalMessage('{')).toBeUndefined();
+    expect(adapter.inspectGlobalMessage(duplicate)).toBeUndefined();
+    expect(adapter.inspectGlobalMessage(oversized)).toBeUndefined();
+    expect(adapter.inspectGlobalMessage({ adId: 'r1_abcdefghijklmnopqrstuv' })).toBeUndefined();
+  });
+
   it('does not invoke accessors while rejecting an exact-shape candidate', () => {
     const adapter = createBrowserMessagingAdapter(createTarget());
     const getter = vi.fn(() => 'TS Owner Inserted');
