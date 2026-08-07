@@ -83,6 +83,48 @@ export interface GoogletagTargetingObserver {
   readonly beforePublisherMutation: (slot: object, key?: string) => void;
 }
 
+/** One publisher-originated GPT call observed outside Trusted Server operations. */
+export interface GoogletagPublisherCallObserver {
+  readonly defineSlot?: (
+    call: Readonly<GoogletagPublisherDefineSlotCall>
+  ) => Readonly<{ action: 'forward' }> | Readonly<{ action: 'handoff'; slot: object }>;
+  readonly destroySlots?: (call: Readonly<GoogletagPublisherDestroySlotsCall>) => void;
+  readonly display?: (
+    call: Readonly<GoogletagPublisherDisplayCall>
+  ) => Readonly<{ action: 'forward' }> | Readonly<{ action: 'suppress' }>;
+  readonly refresh?: (
+    call: Readonly<GoogletagPublisherRefreshCall>
+  ) =>
+    | Readonly<{ action: 'forward' }>
+    | Readonly<{ action: 'replace'; slots: readonly object[] }>
+    | Readonly<{ action: 'suppress' }>;
+}
+
+/** Narrow data supplied before one publisher `defineSlot` call. */
+export interface GoogletagPublisherDefineSlotCall {
+  readonly adUnitPath: unknown;
+  readonly elementId: unknown;
+  readonly initialLoadDisabled: boolean;
+  readonly sizes: unknown;
+}
+
+/** Narrow data supplied after one successful publisher `destroySlots` call. */
+export interface GoogletagPublisherDestroySlotsCall {
+  readonly slots: readonly object[];
+}
+
+/** Narrow data supplied before one publisher `display` call. */
+export interface GoogletagPublisherDisplayCall {
+  readonly initialLoadDisabled: boolean;
+  readonly target: unknown;
+}
+
+/** Narrow data supplied before one publisher `refresh` call. */
+export interface GoogletagPublisherRefreshCall {
+  readonly requestedSlots: readonly object[] | undefined;
+  readonly slots: readonly object[];
+}
+
 /** The small GPT surface exposed to an accepted operation. */
 export interface GoogletagFacade {
   bindingToken(): object;
@@ -122,6 +164,7 @@ export interface GoogletagOperation<T> {
 /** Narrow GPT boundary consumed by kernel sessions and services. */
 export interface GoogletagAdapter {
   bindingStatus(): GoogletagBindingStatus;
+  observePublisherCalls(observer: GoogletagPublisherCallObserver): () => void;
   run<T>(
     command: (googletag: Readonly<GoogletagFacade>) => T,
     options?: GoogletagOperationOptions
@@ -750,6 +793,7 @@ export function createBrowserGoogletagAdapter(
   let pendingReservations = 0;
   let disposed = false;
   let firstDisplayObserved = false;
+  let trustedCallDepth = 0;
 
   const markFirstDisplay = (): void => {
     if (firstDisplayObserved) return;
@@ -1481,7 +1525,13 @@ export function createBrowserGoogletagAdapter(
             return;
           }
           try {
-            const value = operation.command(facade);
+            trustedCallDepth += 1;
+            let value: unknown;
+            try {
+              value = operation.command(facade);
+            } finally {
+              trustedCallDepth -= 1;
+            }
             if (operation.settled) return;
             if (disposed) {
               fail(operation, 'operation_disposed');
@@ -1744,8 +1794,190 @@ export function createBrowserGoogletagAdapter(
     return handle;
   };
 
+  const observePublisherCalls = (observer: GoogletagPublisherCallObserver): (() => void) => {
+    if (disposed) throw new GoogletagAdapterError('operation_disposed');
+    if (typeof observer !== 'object' || observer === null) {
+      throw new TypeError('GPT publisher observer must be an object');
+    }
+    const current = currentBinding();
+    if (current.status !== 'present') {
+      return (): void => undefined;
+    }
+    const service = Reflect.apply(current.value.pubads, current.value.binding, []);
+    if ((typeof service !== 'object' || service === null) && typeof service !== 'function') {
+      throw new GoogletagAdapterError('external_artifact_incompatible');
+    }
+    const serviceObject = service as object;
+    const currentBindingObject = current.value.binding;
+    const observerMethod = <Key extends keyof GoogletagPublisherCallObserver>(
+      key: Key
+    ): GoogletagPublisherCallObserver[Key] | undefined => {
+      const descriptor = Object.getOwnPropertyDescriptor(observer, key);
+      if (!descriptor) return undefined;
+      if (!Object.prototype.hasOwnProperty.call(descriptor, 'value')) {
+        throw new TypeError('GPT publisher observer methods must be own data properties');
+      }
+      if (descriptor.value !== undefined && typeof descriptor.value !== 'function') {
+        throw new TypeError('GPT publisher observer methods must be functions');
+      }
+      return descriptor.value as GoogletagPublisherCallObserver[Key] | undefined;
+    };
+    const defineObserver = observerMethod('defineSlot');
+    const destroyObserver = observerMethod('destroySlots');
+    const displayObserver = observerMethod('display');
+    const refreshObserver = observerMethod('refresh');
+    const tracker = ensureInitialLoadTracking(current.value, serviceObject);
+    const stillCurrent = (): boolean =>
+      !disposed &&
+      readTarget(target) === currentBindingObject &&
+      Reflect.apply(current.value.pubads, currentBindingObject, []) === serviceObject;
+    const objectSlots = (candidate: unknown): readonly object[] | undefined => {
+      if (
+        !Array.isArray(candidate) ||
+        candidate.some(
+          (slot) => (typeof slot !== 'object' || slot === null) && typeof slot !== 'function'
+        )
+      ) {
+        return undefined;
+      }
+      return Object.freeze([...candidate]) as readonly object[];
+    };
+    const allSlots = (): readonly object[] | undefined => {
+      const getSlots = safeMember(serviceObject, 'getSlots');
+      if (typeof getSlots !== 'function') return undefined;
+      try {
+        return objectSlots(Reflect.apply(getSlots, serviceObject, []));
+      } catch {
+        return undefined;
+      }
+    };
+    const restorers: Array<() => void> = [];
+    const install = (
+      external: object,
+      key: PropertyKey,
+      mediate: (
+        original: (...arguments_: unknown[]) => unknown,
+        receiver: unknown,
+        arguments_: readonly unknown[]
+      ) => unknown
+    ): void => {
+      const original = safeMember(external, key);
+      if (typeof original !== 'function') return;
+      const callable = original as (...arguments_: unknown[]) => unknown;
+      const wrapper = function (this: unknown, ...arguments_: unknown[]): unknown {
+        if (trustedCallDepth > 0 || !stillCurrent()) {
+          return Reflect.apply(callable, this, arguments_);
+        }
+        return mediate(callable, this, arguments_);
+      };
+      const restore = replaceMethod(external, key, wrapper, stillCurrent);
+      if (!restore) throw new GoogletagAdapterError('external_artifact_incompatible');
+      restorers[restorers.length] = restore;
+    };
+    try {
+      install(currentBindingObject, 'defineSlot', (original, receiver, arguments_) => {
+        if (!defineObserver || arguments_.length !== 3) {
+          return Reflect.apply(original, receiver, arguments_);
+        }
+        try {
+          const decision = defineObserver(
+            Object.freeze({
+              adUnitPath: arguments_[0],
+              sizes: arguments_[1],
+              elementId: arguments_[2],
+              initialLoadDisabled: tracker?.disabled === true,
+            })
+          );
+          if (
+            decision?.action === 'handoff' &&
+            ((typeof decision.slot === 'object' && decision.slot !== null) ||
+              typeof decision.slot === 'function')
+          ) {
+            return decision.slot;
+          }
+        } catch {
+          // Observer failure must leave the publisher call native.
+        }
+        return Reflect.apply(original, receiver, arguments_);
+      });
+      install(currentBindingObject, 'display', (original, receiver, arguments_) => {
+        if (displayObserver && arguments_.length === 1) {
+          try {
+            const decision = displayObserver(
+              Object.freeze({
+                target: arguments_[0],
+                initialLoadDisabled: tracker?.disabled === true,
+              })
+            );
+            if (decision?.action === 'suppress') return undefined;
+          } catch {
+            // Observer failure must leave the publisher call native.
+          }
+        }
+        return Reflect.apply(original, receiver, arguments_);
+      });
+      install(serviceObject, 'refresh', (original, receiver, arguments_) => {
+        if (refreshObserver && arguments_.length <= 2) {
+          const requested = arguments_[0] === undefined ? undefined : objectSlots(arguments_[0]);
+          const effective = requested ?? (arguments_[0] === undefined ? allSlots() : undefined);
+          if (effective) {
+            try {
+              const decision = refreshObserver(
+                Object.freeze({ requestedSlots: requested, slots: effective })
+              );
+              if (decision?.action === 'suppress') return undefined;
+              if (decision?.action === 'replace') {
+                const replacement = objectSlots(decision.slots);
+                if (replacement) {
+                  return Reflect.apply(original, receiver, [replacement, ...arguments_.slice(1)]);
+                }
+              }
+            } catch {
+              // Observer failure must leave the publisher call native.
+            }
+          }
+        }
+        return Reflect.apply(original, receiver, arguments_);
+      });
+      install(currentBindingObject, 'destroySlots', (original, receiver, arguments_) => {
+        let destroyedSlots: readonly object[] | undefined;
+        if (arguments_.length === 0 || (arguments_.length === 1 && arguments_[0] === undefined)) {
+          destroyedSlots = allSlots();
+        } else if (arguments_.length === 1) {
+          destroyedSlots = objectSlots(arguments_[0]);
+        }
+        const result = Reflect.apply(original, receiver, arguments_);
+        if (result === true && destroyedSlots && destroyObserver) {
+          try {
+            destroyObserver(Object.freeze({ slots: destroyedSlots }));
+          } catch {
+            // Post-call bookkeeping cannot alter the publisher return value.
+          }
+        }
+        return result;
+      });
+    } catch (error) {
+      for (let index = restorers.length - 1; index >= 0; index -= 1) restorers[index]?.();
+      throw error;
+    }
+    let released = false;
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      try {
+        deleteSetValue(effects, release);
+      } catch {
+        // Exact wrapper restoration still runs when bookkeeping is hostile.
+      }
+      for (let index = restorers.length - 1; index >= 0; index -= 1) restorers[index]?.();
+    };
+    registerAdapterEffect(release);
+    return release;
+  };
+
   return Object.freeze({
     bindingStatus: (): GoogletagBindingStatus => currentBinding().status,
+    observePublisherCalls,
     run,
     notifyReady,
     dispose: (): void => {

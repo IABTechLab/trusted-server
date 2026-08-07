@@ -89,6 +89,7 @@ function synchronousGptAdapter() {
     bindingStatus: () => 'present',
     dispose: vi.fn(),
     notifyReady: vi.fn(),
+    observePublisherCalls: () => vi.fn(),
     run: <Value>(command: (gpt: Readonly<GoogletagFacade>) => Value) => {
       let result: Promise<Value>;
       try {
@@ -537,6 +538,7 @@ describe('browser composition', () => {
       bindingStatus: () => 'present',
       dispose: vi.fn(),
       notifyReady: vi.fn(),
+      observePublisherCalls: () => vi.fn(),
       run: <T>(command: (gpt: Readonly<GoogletagFacade>) => T) => {
         const result = Promise.resolve(command(facade));
         return Object.freeze({ status: 'present' as const, result, dispose: vi.fn() });

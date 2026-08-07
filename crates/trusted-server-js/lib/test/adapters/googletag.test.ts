@@ -37,6 +37,8 @@ function createReadyGoogletag(
         return commands.length;
       }),
     },
+    defineSlot: vi.fn(),
+    destroySlots: vi.fn(),
     display,
     getConfig: vi.fn((key: string) =>
       key === 'disableInitialLoad' ? { disableInitialLoad: initialLoad.disabled } : {}
@@ -1917,6 +1919,141 @@ describe('browser googletag adapter readiness', () => {
     expect(ready.pubads.refresh).toHaveBeenCalledWith([slot], { changeCorrelator: false });
     expect(ready.pubads.removeEventListener).toHaveBeenCalledTimes(1);
     expect(targeting.has('hb_adid')).toBe(false);
+  });
+
+  it('exposes one reversible publisher-call observer without changing ordinary calls', () => {
+    const ready = createReadyGoogletag();
+    const nativeDisplay = ready.googletag.display;
+    const nativeRefresh = ready.pubads.refresh;
+    const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+    const boundary = adapter as unknown as {
+      observePublisherCalls?: (observer: object) => () => void;
+    };
+
+    expect(boundary.observePublisherCalls).toBeTypeOf('function');
+    if (!boundary.observePublisherCalls) return;
+
+    const release = boundary.observePublisherCalls(Object.freeze({}));
+    expect(ready.googletag.display).not.toBe(nativeDisplay);
+    expect(ready.pubads.refresh).not.toBe(nativeRefresh);
+
+    release();
+    expect(ready.googletag.display).toBe(nativeDisplay);
+    expect(ready.pubads.refresh).toBe(nativeRefresh);
+  });
+
+  it('mediates only explicit publisher decisions and preserves receiver, arguments, return, throw, and order', () => {
+    const ready = createReadyGoogletag({ initialLoadDisabled: true });
+    const handoffSlot = Object.freeze({ id: 'handoff' });
+    const ordinarySlot = Object.freeze({ id: 'ordinary' });
+    const refreshOptions = Object.freeze({ changeCorrelator: true, publisher: 'kept' });
+    const defineReceiver = Object.freeze({ receiver: 'define' });
+    const refreshReceiver = Object.freeze({ receiver: 'refresh' });
+    const order: string[] = [];
+    const nativeDefineSlot = vi.fn(function (this: unknown, ...arguments_: unknown[]) {
+      order.push('native:define');
+      return Object.freeze({ arguments_, receiver: this });
+    });
+    const nativeDisplay = vi.fn(function (this: unknown, ...arguments_: unknown[]) {
+      order.push('native:display');
+      return Object.freeze({ arguments_, receiver: this });
+    });
+    const nativeRefresh = vi.fn(function (this: unknown, ...arguments_: unknown[]) {
+      order.push('native:refresh');
+      return Object.freeze({ arguments_, receiver: this });
+    });
+    const nativeDestroy = vi.fn(function (this: unknown, ...arguments_: unknown[]) {
+      order.push('native:destroy');
+      return arguments_[0] === 'throw'
+        ? (() => {
+            throw new Error('publisher destroy failed');
+          })()
+        : true;
+    });
+    Object.assign(ready.googletag, {
+      defineSlot: nativeDefineSlot,
+      destroySlots: nativeDestroy,
+      display: nativeDisplay,
+    });
+    ready.pubads.refresh = nativeRefresh;
+    ready.pubads.getSlots.mockReturnValue([handoffSlot, ordinarySlot]);
+    const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+    let suppressDisplay = true;
+    const destroyed: Array<readonly object[]> = [];
+    const release = adapter.observePublisherCalls({
+      defineSlot: (call) => {
+        order.push('observer:define');
+        expect(call.initialLoadDisabled).toBe(true);
+        return call.elementId === 'handoff-id'
+          ? Object.freeze({ action: 'handoff' as const, slot: handoffSlot })
+          : Object.freeze({ action: 'forward' as const });
+      },
+      destroySlots: (call) => {
+        order.push('observer:destroy');
+        destroyed.push(call.slots);
+      },
+      display: () => {
+        order.push('observer:display');
+        if (!suppressDisplay) return Object.freeze({ action: 'forward' as const });
+        suppressDisplay = false;
+        return Object.freeze({ action: 'suppress' as const });
+      },
+      refresh: (call) => {
+        order.push('observer:refresh');
+        expect(call.requestedSlots).toBeUndefined();
+        expect(call.slots).toEqual([handoffSlot, ordinarySlot]);
+        return Object.freeze({ action: 'replace' as const, slots: Object.freeze([ordinarySlot]) });
+      },
+    });
+
+    const defineSlot = ready.googletag.defineSlot as unknown as (
+      ...arguments_: unknown[]
+    ) => unknown;
+    expect(
+      Reflect.apply(defineSlot, defineReceiver, ['/publisher', [300, 250], 'handoff-id'])
+    ).toBe(handoffSlot);
+    expect(nativeDefineSlot).not.toHaveBeenCalled();
+    const forwarded = Reflect.apply(defineSlot, defineReceiver, [
+      '/publisher',
+      [728, 90],
+      'ordinary-id',
+      'publisher-extra',
+    ]);
+    expect(forwarded).toEqual({
+      arguments_: ['/publisher', [728, 90], 'ordinary-id', 'publisher-extra'],
+      receiver: defineReceiver,
+    });
+
+    const display = ready.googletag.display as (...arguments_: unknown[]) => unknown;
+    expect(Reflect.apply(display, defineReceiver, ['handoff-id'])).toBeUndefined();
+    expect(Reflect.apply(display, defineReceiver, ['handoff-id', 'publisher-extra'])).toEqual({
+      arguments_: ['handoff-id', 'publisher-extra'],
+      receiver: defineReceiver,
+    });
+
+    const refresh = ready.pubads.refresh as (...arguments_: unknown[]) => unknown;
+    expect(Reflect.apply(refresh, refreshReceiver, [undefined, refreshOptions])).toEqual({
+      arguments_: [[ordinarySlot], refreshOptions],
+      receiver: refreshReceiver,
+    });
+
+    const destroySlots = ready.googletag.destroySlots as unknown as (
+      slots?: readonly object[]
+    ) => unknown;
+    expect(destroySlots([handoffSlot])).toBe(true);
+    expect(destroyed).toEqual([[handoffSlot]]);
+    expect(order).toEqual([
+      'observer:define',
+      'native:define',
+      'observer:display',
+      'native:display',
+      'observer:refresh',
+      'native:refresh',
+      'native:destroy',
+      'observer:destroy',
+    ]);
+
+    release();
   });
 
   it('tracks native GPT initial-load configuration without duplicate wrappers', async () => {
