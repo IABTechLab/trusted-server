@@ -484,6 +484,136 @@ describe('slot registry', () => {
     expect(service.isBoundGptSlot(navigation.generation, 'trusted', trustedSlot)).toBe(false);
   });
 
+  it('hands an exact late publisher definition the TS slot and consumes only duplicate requests', async () => {
+    const gpt = createGptHarness({ initialLoadDisabled: true });
+    const service = createSlotService({ googletag: gpt.adapter });
+    const { navigation, runtime } = createRuntimeWithNavigation();
+    const slot = bindTrustedSlot(service, navigation);
+
+    expect(
+      service.claimPublisherGptSlot({
+        adUnitPath: '/publisher/mismatch',
+        elementId: 'slot-div',
+        initialLoadDisabled: true,
+        sizes: Object.freeze([[728, 90]]),
+      })
+    ).toEqual({ action: 'handoff', slot });
+    expect(
+      service.preparePublisherDisplay({ initialLoadDisabled: true, target: 'slot-div' })
+    ).toEqual({ action: 'suppress' });
+    expect(
+      service.preparePublisherDisplay({ initialLoadDisabled: true, target: 'slot-div' })
+    ).toEqual({ action: 'forward' });
+
+    const unrelated = {};
+    expect(
+      service.preparePublisherRefresh({
+        requestedSlots: undefined,
+        slots: Object.freeze([slot, unrelated]),
+      })
+    ).toEqual({ action: 'replace', slots: [unrelated] });
+    expect(
+      service.preparePublisherRefresh({
+        requestedSlots: Object.freeze([slot]),
+        slots: Object.freeze([slot]),
+      })
+    ).toEqual({ action: 'forward' });
+
+    const request = service.request({
+      intentId: 'after-publisher-refresh',
+      navigationGeneration: navigation.generation,
+      operation: 'refresh',
+      registeredSlotId: 'slot',
+      requestClass: 'primary',
+    });
+    await expect(request.result).resolves.toEqual({
+      status: 'failed',
+      reason: 'cycle_unattributable',
+    });
+
+    runtime.dispose();
+    expect(gpt.destroySlots).not.toHaveBeenCalled();
+  });
+
+  it('hydrates only one disconnected TS fallback with the configured prefix, path, and sizes', () => {
+    const dom = createReconciliationBoundary();
+    const firstElement = {};
+    const secondElement = {};
+    dom.put('slot-first', firstElement);
+    dom.put('slot-second', secondElement);
+    const service = createSlotService({
+      googletag: createGptHarness().adapter,
+      reconciliation: dom.boundary,
+    });
+    const navigation = createNavigation();
+    expect(
+      service.register(navigation, [serverRegistration('first'), serverRegistration('second')])
+    ).toMatchObject({ ok: true });
+    const first = {};
+    const second = {};
+    for (const [id, slot] of [
+      ['first', first],
+      ['second', second],
+    ] as const) {
+      expect(
+        service.adoptGptSlot(navigation.generation, id, {
+          definition: {
+            adUnitPath: '/network/hydrated',
+            elementId: `slot-${id}`,
+            sizes: Object.freeze([[300, 250]]),
+          },
+          elementIdPrefix: 'slot-',
+          ownership: 'trusted_server',
+          slot,
+        })
+      ).toEqual({ ok: true });
+      dom.disconnect(`slot-${id}`);
+    }
+
+    const hydration = Object.freeze({
+      adUnitPath: '/network/hydrated',
+      elementId: 'slot-hydrated',
+      initialLoadDisabled: false,
+      sizes: Object.freeze([300, 250]),
+    });
+    expect(service.claimPublisherGptSlot(hydration)).toEqual({ action: 'forward' });
+    expect(service.recordPublisherDestruction(second)).toBe(true);
+    expect(
+      service.claimPublisherGptSlot({ ...hydration, adUnitPath: '/network/mismatch' })
+    ).toEqual({ action: 'forward' });
+    expect(service.claimPublisherGptSlot({ ...hydration, sizes: [728, 90] })).toEqual({
+      action: 'forward',
+    });
+    expect(service.claimPublisherGptSlot(hydration)).toEqual({ action: 'handoff', slot: first });
+  });
+
+  it('suppresses the exact first explicit refresh after a disabled-load handoff', () => {
+    const service = createSlotService({ googletag: createGptHarness().adapter });
+    const navigation = createNavigation();
+    const slot = bindTrustedSlot(service, navigation);
+    expect(
+      service.claimPublisherGptSlot({
+        adUnitPath: '/network/slot',
+        elementId: 'slot-div',
+        initialLoadDisabled: true,
+        sizes: [300, 250],
+      })
+    ).toEqual({ action: 'handoff', slot });
+
+    expect(
+      service.preparePublisherRefresh({
+        requestedSlots: Object.freeze([slot]),
+        slots: Object.freeze([slot]),
+      })
+    ).toEqual({ action: 'suppress' });
+    expect(
+      service.preparePublisherRefresh({
+        requestedSlots: Object.freeze([slot]),
+        slots: Object.freeze([slot]),
+      })
+    ).toEqual({ action: 'forward' });
+  });
+
   it('uses captured Set validation intrinsics on a hostile page', () => {
     const service = createSlotService({ googletag: createGptHarness().adapter });
     const navigation = createNavigation();

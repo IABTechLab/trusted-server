@@ -1942,11 +1942,80 @@ describe('browser googletag adapter readiness', () => {
     expect(ready.pubads.refresh).toBe(nativeRefresh);
   });
 
+  it('installs the publisher observer when an accepted command-queue stub becomes ready', () => {
+    const commands: Array<() => void> = [];
+    const pending = {
+      cmd: {
+        push: vi.fn((callback: () => void) => {
+          commands.push(callback);
+          return commands.length;
+        }),
+      },
+    };
+    const target = { googletag: pending as object };
+    const adapter = createBrowserGoogletagAdapter(target);
+    const handoff = {};
+    const release = adapter.observePublisherCalls({
+      defineSlot: () => Object.freeze({ action: 'handoff', slot: handoff }),
+    });
+    const ready = createReadyGoogletag();
+    const nativeDefineSlot = vi.fn((_path: string, _sizes: unknown, _elementId: string) => ({}));
+    Object.assign(pending, {
+      apiReady: true,
+      defineSlot: nativeDefineSlot,
+      destroySlots: ready.googletag.destroySlots,
+      display: ready.googletag.display,
+      getConfig: ready.googletag.getConfig,
+      pubads: ready.googletag.pubads,
+      pubadsReady: true,
+      setConfig: ready.googletag.setConfig,
+    });
+
+    expect(commands).toHaveLength(1);
+    commands[0]?.();
+    const defineSlot = (pending as typeof pending & { defineSlot: typeof nativeDefineSlot })
+      .defineSlot;
+    expect(defineSlot).not.toBe(nativeDefineSlot);
+    expect(defineSlot('/publisher', [300, 250], 'slot')).toBe(handoff);
+    expect(nativeDefineSlot).not.toHaveBeenCalled();
+
+    release();
+    expect((pending as typeof pending & { defineSlot: typeof nativeDefineSlot }).defineSlot).toBe(
+      nativeDefineSlot
+    );
+  });
+
+  it('does not classify facade-driven GPT calls as publisher calls', async () => {
+    const ready = createReadyGoogletag();
+    const nativeRefresh = ready.pubads.refresh;
+    const observer = {
+      display: vi.fn(() => Object.freeze({ action: 'suppress' as const })),
+      refresh: vi.fn(() => Object.freeze({ action: 'suppress' as const })),
+    };
+    const adapter = createBrowserGoogletagAdapter({ googletag: ready.googletag });
+    adapter.observePublisherCalls(observer);
+
+    await expect(
+      adapter.run((gpt) => {
+        gpt.display('trusted-slot');
+        gpt.refresh([], { changeCorrelator: false });
+      }).result
+    ).resolves.toBeUndefined();
+
+    expect(observer.display).not.toHaveBeenCalled();
+    expect(observer.refresh).not.toHaveBeenCalled();
+    expect(ready.display).toHaveBeenCalledExactlyOnceWith('trusted-slot');
+    expect(nativeRefresh).toHaveBeenCalledExactlyOnceWith([], {
+      changeCorrelator: false,
+    });
+  });
+
   it('mediates only explicit publisher decisions and preserves receiver, arguments, return, throw, and order', () => {
     const ready = createReadyGoogletag({ initialLoadDisabled: true });
     const handoffSlot = Object.freeze({ id: 'handoff' });
     const ordinarySlot = Object.freeze({ id: 'ordinary' });
     const refreshOptions = Object.freeze({ changeCorrelator: true, publisher: 'kept' });
+    const publisherError = new Error('publisher display failed');
     const defineReceiver = Object.freeze({ receiver: 'define' });
     const refreshReceiver = Object.freeze({ receiver: 'refresh' });
     const order: string[] = [];
@@ -1956,6 +2025,7 @@ describe('browser googletag adapter readiness', () => {
     });
     const nativeDisplay = vi.fn(function (this: unknown, ...arguments_: unknown[]) {
       order.push('native:display');
+      if (arguments_[0] === 'throw') throw publisherError;
       return Object.freeze({ arguments_, receiver: this });
     });
     const nativeRefresh = vi.fn(function (this: unknown, ...arguments_: unknown[]) {
@@ -2030,6 +2100,9 @@ describe('browser googletag adapter readiness', () => {
       arguments_: ['handoff-id', 'publisher-extra'],
       receiver: defineReceiver,
     });
+    expect(() => Reflect.apply(display, defineReceiver, ['throw', 'publisher-extra'])).toThrow(
+      publisherError
+    );
 
     const refresh = ready.pubads.refresh as (...arguments_: unknown[]) => unknown;
     expect(Reflect.apply(refresh, refreshReceiver, [undefined, refreshOptions])).toEqual({
@@ -2046,6 +2119,7 @@ describe('browser googletag adapter readiness', () => {
       'observer:define',
       'native:define',
       'observer:display',
+      'native:display',
       'native:display',
       'observer:refresh',
       'native:refresh',

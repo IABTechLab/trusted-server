@@ -1799,16 +1799,6 @@ export function createBrowserGoogletagAdapter(
     if (typeof observer !== 'object' || observer === null) {
       throw new TypeError('GPT publisher observer must be an object');
     }
-    const current = currentBinding();
-    if (current.status !== 'present') {
-      return (): void => undefined;
-    }
-    const service = Reflect.apply(current.value.pubads, current.value.binding, []);
-    if ((typeof service !== 'object' || service === null) && typeof service !== 'function') {
-      throw new GoogletagAdapterError('external_artifact_incompatible');
-    }
-    const serviceObject = service as object;
-    const currentBindingObject = current.value.binding;
     const observerMethod = <Key extends keyof GoogletagPublisherCallObserver>(
       key: Key
     ): GoogletagPublisherCallObserver[Key] | undefined => {
@@ -1826,6 +1816,56 @@ export function createBrowserGoogletagAdapter(
     const destroyObserver = observerMethod('destroySlots');
     const displayObserver = observerMethod('display');
     const refreshObserver = observerMethod('refresh');
+    const current = currentBinding();
+    if (current.status === 'pending' && current.commandQueue) {
+      const normalizedObserver: GoogletagPublisherCallObserver = Object.freeze({
+        ...(defineObserver ? { defineSlot: defineObserver } : {}),
+        ...(destroyObserver ? { destroySlots: destroyObserver } : {}),
+        ...(displayObserver ? { display: displayObserver } : {}),
+        ...(refreshObserver ? { refresh: refreshObserver } : {}),
+      });
+      let released = false;
+      let notificationActive = true;
+      let installedRelease: (() => void) | undefined;
+      const release = (): void => {
+        if (released) return;
+        released = true;
+        notificationActive = false;
+        try {
+          deleteSetValue(effects, release);
+        } catch {
+          // Exact deferred restoration still runs when bookkeeping is hostile.
+        }
+        installedRelease?.();
+      };
+      try {
+        queueCommand(current.commandQueue, () => {
+          if (!notificationActive || released || disposed) return;
+          notificationActive = false;
+          const ready = currentBinding();
+          if (ready.status !== 'present') return;
+          try {
+            installedRelease = observePublisherCalls(normalizedObserver);
+            if (released) installedRelease();
+          } catch {
+            // Readiness mediation cannot escape the publisher-owned command queue.
+          }
+        });
+      } catch (error) {
+        notificationActive = false;
+        released = true;
+        throw error;
+      }
+      registerAdapterEffect(release);
+      return release;
+    }
+    if (current.status !== 'present') return (): void => undefined;
+    const service = Reflect.apply(current.value.pubads, current.value.binding, []);
+    if ((typeof service !== 'object' || service === null) && typeof service !== 'function') {
+      throw new GoogletagAdapterError('external_artifact_incompatible');
+    }
+    const serviceObject = service as object;
+    const currentBindingObject = current.value.binding;
     const tracker = ensureInitialLoadTracking(current.value, serviceObject);
     const stillCurrent = (): boolean =>
       !disposed &&

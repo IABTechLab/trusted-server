@@ -45,6 +45,7 @@ const promiseThenIntrinsic = Promise.prototype.then;
 const reflectApplyIntrinsic = Reflect.apply;
 
 interface GptIntegrationRuntime {
+  readonly activate: () => () => void;
   readonly start: (config: unknown) => void;
 }
 
@@ -585,12 +586,22 @@ function readGptRuntime(
     candidate === null ||
     Array.isArray(candidate) ||
     !Object.isFrozen(candidate) ||
-    Reflect.ownKeys(candidate).length !== 1
+    Reflect.ownKeys(candidate).length !== 2
   ) {
     return undefined;
   }
+  const activate = Object.getOwnPropertyDescriptor(candidate, 'activate');
   const start = Object.getOwnPropertyDescriptor(candidate, 'start');
-  if (!start || !('value' in start) || typeof start.value !== 'function') return undefined;
+  if (
+    !activate ||
+    !('value' in activate) ||
+    typeof activate.value !== 'function' ||
+    !start ||
+    !('value' in start) ||
+    typeof start.value !== 'function'
+  ) {
+    return undefined;
+  }
   return candidate as GptIntegrationRuntime;
 }
 
@@ -608,6 +619,13 @@ export function createGptIntegrationRegistration(release: string): IntegrationRe
         activate: ({ afterCommit, onDispose }: IntegrationActivationContext) => {
           // Register restoration before the first live browser mutation.
           onDispose(resetGuardState);
+          const runtimeRelease: { value?: () => void } = {};
+          onDispose(() => runtimeRelease.value?.());
+          const release = runtime.activate();
+          if (typeof release !== 'function') {
+            throw new TypeError('GPT integration activation disposer is unavailable');
+          }
+          runtimeRelease.value = release;
           installGptGuard();
           afterCommit(() => runtime.start(config));
         },

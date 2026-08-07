@@ -141,6 +141,11 @@ describe('transactional GPT integration module', () => {
       order.push('start');
       expect(received).toBe(config);
     });
+    const release = vi.fn(() => order.push('release'));
+    const activate = vi.fn(() => {
+      order.push('gpt:activate');
+      return release;
+    });
     let finishPreparation: (() => void) | undefined;
     const preparationGate = new Promise<void>((resolve) => {
       finishPreparation = resolve;
@@ -153,7 +158,7 @@ describe('transactional GPT integration module', () => {
       now: () => 0,
       getBindings: () => ({
         config,
-        interfaces: Object.freeze({ gpt: Object.freeze({ start }) }),
+        interfaces: Object.freeze({ gpt: Object.freeze({ activate, start }) }),
       }),
     });
     registry.register(createGptIntegrationRegistration(RELEASE_ID));
@@ -179,7 +184,16 @@ describe('transactional GPT integration module', () => {
     expect(result).toMatchObject({ state: 'kernel' });
     expect(isGuardInstalled()).toBe(true);
     expect(document.write).not.toBe(originalDocumentWrite);
-    expect(order).toEqual(['gate:prepare', 'core', 'gate:activate', 'publish', 'start', 'drain']);
+    expect(order).toEqual([
+      'gate:prepare',
+      'core',
+      'gpt:activate',
+      'gate:activate',
+      'publish',
+      'start',
+      'drain',
+    ]);
+    expect(activate).toHaveBeenCalledTimes(1);
     expect(start).toHaveBeenCalledExactlyOnceWith(config);
 
     if (result.state === 'kernel') {
@@ -188,6 +202,7 @@ describe('transactional GPT integration module', () => {
     }
     expect(isGuardInstalled()).toBe(false);
     expect(document.write).toBe(originalDocumentWrite);
+    expect(release).toHaveBeenCalledTimes(1);
   });
 
   it('unwinds the GPT guard before fallback when a later activation fails', async () => {
@@ -200,7 +215,9 @@ describe('transactional GPT integration module', () => {
       now: () => 0,
       getBindings: () => ({
         config: Object.freeze({}),
-        interfaces: Object.freeze({ gpt: Object.freeze({ start }) }),
+        interfaces: Object.freeze({
+          gpt: Object.freeze({ activate: () => vi.fn(), start }),
+        }),
       }),
     });
     registry.register(createGptIntegrationRegistration(RELEASE_ID));
@@ -218,6 +235,37 @@ describe('transactional GPT integration module', () => {
       reason: 'bundle_partial',
     });
 
+    expect(isGuardInstalled()).toBe(false);
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it('never installs the guard or starts when reversible GPT activation fails', async () => {
+    const start = vi.fn();
+    const registry = createIntegrationRegistry({
+      manifest: manifest(['gpt']),
+      releaseId: RELEASE_ID,
+      knownIntegrationIds: Object.freeze(['gpt']),
+      startedAtMs: 0,
+      now: () => 0,
+      getBindings: () => ({
+        config: Object.freeze({}),
+        interfaces: Object.freeze({
+          gpt: Object.freeze({
+            activate: () => {
+              expect(isGuardInstalled()).toBe(false);
+              throw new Error('fictional observer activation failure');
+            },
+            start,
+          }),
+        }),
+      }),
+    });
+    registry.register(createGptIntegrationRegistration(RELEASE_ID));
+
+    await expect(registry.install(callbacks([]))).resolves.toMatchObject({
+      state: 'fallback',
+      reason: 'bundle_partial',
+    });
     expect(isGuardInstalled()).toBe(false);
     expect(start).not.toHaveBeenCalled();
   });
@@ -263,7 +311,9 @@ describe('transactional GPT integration module', () => {
       now: () => 0,
       getBindings: () => ({
         config,
-        interfaces: Object.freeze({ gpt: Object.freeze({ start }) }),
+        interfaces: Object.freeze({
+          gpt: Object.freeze({ activate: () => vi.fn(), start }),
+        }),
       }),
     });
     registry.register(createGptIntegrationRegistration(RELEASE_ID));
@@ -290,7 +340,9 @@ describe('transactional GPT integration module', () => {
       onRuntimeFailure: (failure) => runtimeFailures.push(failure),
       getBindings: () => ({
         config: Object.freeze({}),
-        interfaces: Object.freeze({ gpt: Object.freeze({ start }) }),
+        interfaces: Object.freeze({
+          gpt: Object.freeze({ activate: () => vi.fn(), start }),
+        }),
       }),
     });
     registry.register(createGptIntegrationRegistration(RELEASE_ID));
