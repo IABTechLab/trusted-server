@@ -702,9 +702,9 @@ deadline measured from enqueue and fails `external_ready_timeout`; public
 `requestAds.timeoutMs` never shortens or extends it. After a request-capable
 `display()` or `refresh()` is
 invoked, `slotRequested` must arrive within three seconds or the attempt fails
-`gpt_request_timeout`. Once `slotRequested` arrives, its matching
-`slotRenderEnded` must arrive within ten seconds or the attempt fails
-`gpt_completion_timeout`. A timeout tombstones the reservation, closes owned ports,
+`gpt_request_timeout`. Its matching `slotRenderEnded` must arrive within ten seconds
+of that same request invocation or the attempt fails `gpt_completion_timeout`.
+A timeout tombstones the reservation, closes owned ports,
 and settles the attempt, but does not pretend the physical GPT cycle completed.
 
 At `gpt_request_timeout`, no attributable physical cycle exists. The adapter

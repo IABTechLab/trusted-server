@@ -33,6 +33,33 @@ export interface GoogletagReplacementDefinition {
   readonly sizes: unknown;
 }
 
+/** Reversible synchronous admission for one newly defined GPT identity. */
+export interface GoogletagReplacementCommitAdmission {
+  commit(): boolean;
+  rollback(): void;
+}
+
+/** Successful outcome of one GPT destroy/redefine transaction. */
+export type GoogletagReplacementResult = Readonly<
+  { status: 'destroyed' } | { status: 'replaced'; slot: object }
+>;
+
+/** Failure from a replacement transaction, including any candidate GPT could not destroy. */
+export class GoogletagReplacementError extends Error {
+  public readonly code = 'gpt_replacement_failed';
+  public readonly cause: unknown;
+  public readonly oldSlotDestroyed: boolean;
+  public readonly orphanedSlot: object | undefined;
+
+  public constructor(orphanedSlot?: object, oldSlotDestroyed = false, cause?: unknown) {
+    super('gpt_replacement_failed');
+    this.name = 'GoogletagReplacementError';
+    this.orphanedSlot = orphanedSlot;
+    this.oldSlotDestroyed = oldSlotDestroyed;
+    this.cause = cause;
+  }
+}
+
 /** Observer called before a publisher-originated targeting mutation is forwarded. */
 export interface GoogletagTargetingObserver {
   readonly beforePublisherMutation: (slot: object, key?: string) => void;
@@ -57,8 +84,9 @@ export interface GoogletagFacade {
   transactionalReplace(
     oldSlot: object,
     definition: GoogletagReplacementDefinition | undefined,
-    isGenerationCurrent: () => boolean
-  ): object | undefined;
+    isGenerationCurrent: () => boolean,
+    prepareCommit: (replacement: object) => GoogletagReplacementCommitAdmission
+  ): GoogletagReplacementResult;
 }
 
 /** Options owned by one GPT operation. */
@@ -151,6 +179,9 @@ const setSizeGetter = Object.getOwnPropertyDescriptor(Set.prototype, 'size')?.ge
   this: Set<unknown>
 ) => number;
 const setValuesIntrinsic = Set.prototype.values;
+const setIteratorNextIntrinsic = Object.getPrototypeOf(new Set().values()).next as (
+  this: IterableIterator<unknown>
+) => IteratorResult<unknown>;
 const weakMapDeleteIntrinsic = WeakMap.prototype.delete;
 const weakMapGetIntrinsic = WeakMap.prototype.get;
 const weakMapSetIntrinsic = WeakMap.prototype.set;
@@ -178,6 +209,16 @@ function addSetValue<T>(set: Set<T>, value: T): void {
 
 function setValues<T>(set: Set<T>): IterableIterator<T> {
   return Reflect.apply(setValuesIntrinsic, set, []) as IterableIterator<T>;
+}
+
+function setValueSnapshot<T>(set: Set<T>): T[] {
+  const iterator = setValues(set);
+  const values: T[] = [];
+  while (true) {
+    const step = Reflect.apply(setIteratorNextIntrinsic, iterator, []) as IteratorResult<T>;
+    if (step.done) return values;
+    values[values.length] = step.value;
+  }
 }
 
 function setSize(set: Set<unknown>): number {
@@ -327,7 +368,7 @@ function createFacade(
     if (!isOperationCurrent()) return undefined;
     const original = member(slot, key);
     let descriptor: PropertyDescriptor | undefined;
-    let installed = false;
+    let defineAttempted = false;
     const wrapper = function (this: unknown, ...arguments_: unknown[]): unknown {
       if ((weakMapValue(targetingWrites, slot) ?? 0) === 0) {
         try {
@@ -340,8 +381,8 @@ function createFacade(
       return Reflect.apply(original, this, arguments_);
     };
     const restore = (): void => {
-      if (!installed) return;
-      installed = false;
+      if (!defineAttempted) return;
+      defineAttempted = false;
       try {
         const current = Object.getOwnPropertyDescriptor(slot, key);
         if (!current || current.value !== wrapper) return;
@@ -363,10 +404,14 @@ function createFacade(
       const replacement = descriptor
         ? { ...descriptor, value: wrapper }
         : { configurable: true, enumerable: true, value: wrapper, writable: true };
-      if (!isOperationCurrent() || !Reflect.defineProperty(slot, key, replacement)) {
+      if (!isOperationCurrent()) {
         return undefined;
       }
-      installed = true;
+      defineAttempted = true;
+      if (!Reflect.defineProperty(slot, key, replacement)) {
+        restore();
+        return undefined;
+      }
       if (!isOperationCurrent() || safeMember(slot, key) !== wrapper) {
         restore();
         return undefined;
@@ -403,7 +448,10 @@ function createFacade(
         const observers = new Set<GoogletagTargetingObserver>();
         const dispatcher: GoogletagTargetingObserver = Object.freeze({
           beforePublisherMutation: (mutatedSlot: object, key?: string): void => {
-            for (const current of setValues(observers)) {
+            const currentObservers = setValueSnapshot(observers);
+            for (let index = 0; index < currentObservers.length; index += 1) {
+              const current = currentObservers[index];
+              if (!current) continue;
               try {
                 current.beforePublisherMutation(mutatedSlot, key);
               } catch {
@@ -546,9 +594,14 @@ function createFacade(
     transactionalReplace: (
       oldSlot: object,
       definition: GoogletagReplacementDefinition | undefined,
-      isGenerationCurrent: () => boolean
-    ): object | undefined => {
-      if (typeof isGenerationCurrent !== 'function' || !isOperationCurrent()) {
+      isGenerationCurrent: () => boolean,
+      prepareCommit: (replacement: object) => GoogletagReplacementCommitAdmission
+    ): GoogletagReplacementResult => {
+      if (
+        typeof isGenerationCurrent !== 'function' ||
+        typeof prepareCommit !== 'function' ||
+        !isOperationCurrent()
+      ) {
         throw new GoogletagAdapterError('external_artifact_incompatible');
       }
       const destroy = (slot: object): boolean => {
@@ -558,11 +611,20 @@ function createFacade(
           return false;
         }
       };
-      if (!destroy(oldSlot)) throw new Error('gpt_request_failed');
+      const destroyed = Object.freeze({ status: 'destroyed' as const });
+      const cleanup = (candidate: object, cause?: unknown): never => {
+        if (!destroy(candidate)) {
+          throw new GoogletagReplacementError(candidate, true, cause);
+        }
+        throw new GoogletagReplacementError(undefined, true, cause);
+      };
+      if (!destroy(oldSlot)) throw new GoogletagReplacementError(oldSlot);
       if (definition === undefined || !isGenerationCurrent() || !isOperationCurrent()) {
-        return undefined;
+        return destroyed;
       }
       let replacement: object | undefined;
+      let admission: GoogletagReplacementCommitAdmission | undefined;
+      let commitAttempted = false;
       try {
         const candidate = call(binding.binding, 'defineSlot', [
           definition.adUnitPath,
@@ -573,25 +635,67 @@ function createFacade(
           (typeof candidate !== 'object' || candidate === null) &&
           typeof candidate !== 'function'
         ) {
-          throw new Error('gpt_request_failed');
+          throw new GoogletagReplacementError(undefined, true);
         }
         replacement = candidate as object;
-        if (!isGenerationCurrent() || !isOperationCurrent()) {
-          const stale = replacement;
+        if (replacement === oldSlot) {
+          const invalid = replacement;
           replacement = undefined;
-          if (!destroy(stale)) throw new Error('gpt_request_failed');
-          return undefined;
+          cleanup(invalid);
         }
-        call(replacement, 'addService', [service()]);
         if (!isGenerationCurrent() || !isOperationCurrent()) {
-          const stale = replacement;
+          const stale = replacement as object;
           replacement = undefined;
-          if (!destroy(stale)) throw new Error('gpt_request_failed');
-          return undefined;
+          if (!destroy(stale)) throw new GoogletagReplacementError(stale, true);
+          return destroyed;
         }
-        return replacement;
+        call(replacement as object, 'addService', [service()]);
+        if (!isGenerationCurrent() || !isOperationCurrent()) {
+          const stale = replacement as object;
+          replacement = undefined;
+          if (!destroy(stale)) throw new GoogletagReplacementError(stale, true);
+          return destroyed;
+        }
+        admission = prepareCommit(replacement as object);
+        if (
+          !admission ||
+          typeof admission.commit !== 'function' ||
+          typeof admission.rollback !== 'function'
+        ) {
+          throw new GoogletagReplacementError(undefined, true);
+        }
+        commitAttempted = true;
+        if (!admission.commit()) throw new GoogletagReplacementError(undefined, true);
+        if (!isGenerationCurrent() || !isOperationCurrent()) {
+          let rollbackFailed = false;
+          let rollbackFailure: unknown;
+          try {
+            admission.rollback();
+          } catch (error) {
+            rollbackFailed = true;
+            rollbackFailure = error;
+          }
+          commitAttempted = false;
+          const stale = replacement as object;
+          replacement = undefined;
+          if (!destroy(stale)) {
+            throw new GoogletagReplacementError(stale, true, rollbackFailure);
+          }
+          if (rollbackFailed) {
+            throw new GoogletagReplacementError(undefined, true, rollbackFailure);
+          }
+          return destroyed;
+        }
+        return Object.freeze({ status: 'replaced' as const, slot: replacement as object });
       } catch (error) {
-        if (replacement) destroy(replacement);
+        if (commitAttempted) {
+          try {
+            admission?.rollback();
+          } catch {
+            // Candidate cleanup remains mandatory even when service rollback is hostile.
+          }
+        }
+        if (replacement) cleanup(replacement, error);
         throw error;
       }
     },

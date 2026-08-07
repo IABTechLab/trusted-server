@@ -2,8 +2,11 @@ import type {
   GoogletagAdapter,
   GoogletagFacade,
   GoogletagOperation,
+  GoogletagReplacementCommitAdmission,
   GoogletagReplacementDefinition,
+  GoogletagReplacementResult,
 } from '../adapters/googletag';
+import { GoogletagReplacementError } from '../adapters/googletag';
 import type { NavigationSession } from '../kernel/sessions';
 
 import type { PreparedProjectionSlots, ProjectionSlotRegistry } from './projections';
@@ -13,6 +16,9 @@ export const MAX_ACTIVE_SLOT_RECORDS = 256;
 
 const GPT_REQUEST_START_TIMEOUT_MS = 3_000;
 const GPT_COMPLETION_TIMEOUT_MS = 10_000;
+const MAX_PENDING_PUBLISHER_INTENTS = 64;
+const MAX_SLOT_ALIASES = 256;
+const MAX_PLACEMENT_QUARANTINE_KEYS = 2_048;
 
 export type SlotSource = 'programmatic' | 'server';
 export type GptSlotOwnership = 'publisher' | 'trusted_server';
@@ -36,7 +42,7 @@ export interface SlotRecord {
 }
 
 export type SlotRegistrationFailure =
-  'duplicate_slot' | 'invalid_slot_id' | 'registry_capacity' | 'stale_owner';
+  'duplicate_slot' | 'invalid_slot_id' | 'registry_capacity' | 'slot_quarantined' | 'stale_owner';
 
 export type SlotRegistrationResult =
   | Readonly<{ ok: true; records: readonly SlotRecord[] }>
@@ -116,6 +122,7 @@ export interface SlotService {
     slots: readonly string[]
   ) => PreparedProjectionSlots | undefined;
   readonly projectionRegistry: (owner: NavigationSession) => ProjectionSlotRegistry;
+  readonly recordPublisherDestruction: (slot: object) => boolean;
   readonly recordPublisherIntent: (slot: object) => boolean;
   readonly registeredSlotIdsForTest: () => readonly string[];
   readonly register: (
@@ -162,18 +169,22 @@ interface PhysicalSlot {
   definition: GoogletagReplacementDefinition | undefined;
   lastResponseIdentifier: string | undefined;
   ownership: GptSlotOwnership;
-  publisherIntent: boolean;
+  placementKeys: readonly string[];
+  publisherIntentCount: number;
   quarantineReason: 'completion' | 'navigation' | 'request' | undefined;
   record: InternalSlotRecord | undefined;
   readonly slot: object;
   state: PhysicalSlotState;
+  destroyAttempted: boolean;
 }
 
 interface RequestIntent {
   completionTimer: ReturnType<typeof setTimeout> | undefined;
   readonly input: SlotRequestInput;
-  invocation: GoogletagOperation<unknown> | undefined;
+  invocation: { dispose(): void } | undefined;
   requestStartedAt: number | undefined;
+  requestDeadlineAt: number | undefined;
+  completionDeadlineAt: number | undefined;
   requestTimer: ReturnType<typeof setTimeout> | undefined;
   readonly resolve: (outcome: SlotRequestOutcome) => void;
   readonly result: Promise<SlotRequestOutcome>;
@@ -196,6 +207,9 @@ const mapDeleteIntrinsic = Map.prototype.delete;
 const mapGetIntrinsic = Map.prototype.get;
 const mapSetIntrinsic = Map.prototype.set;
 const mapValuesIntrinsic = Map.prototype.values;
+const mapIteratorNextIntrinsic = Object.getPrototypeOf(new Map().values()).next as (
+  this: IterableIterator<unknown>
+) => IteratorResult<unknown>;
 const mapSizeGetter = Object.getOwnPropertyDescriptor(Map.prototype, 'size')?.get as (
   this: Map<unknown, unknown>
 ) => number;
@@ -203,6 +217,9 @@ const setAddIntrinsic = Set.prototype.add;
 const setDeleteIntrinsic = Set.prototype.delete;
 const setHasIntrinsic = Set.prototype.has;
 const setValuesIntrinsic = Set.prototype.values;
+const setIteratorNextIntrinsic = Object.getPrototypeOf(new Set().values()).next as (
+  this: IterableIterator<unknown>
+) => IteratorResult<unknown>;
 const setSizeGetter = Object.getOwnPropertyDescriptor(Set.prototype, 'size')?.get as (
   this: Set<unknown>
 ) => number;
@@ -226,6 +243,16 @@ function mapValues<Key, Value>(map: Map<Key, Value>): IterableIterator<Value> {
   return Reflect.apply(mapValuesIntrinsic, map, []) as IterableIterator<Value>;
 }
 
+function mapValueSnapshot<Key, Value>(map: Map<Key, Value>): Value[] {
+  const iterator = mapValues(map);
+  const values: Value[] = [];
+  while (true) {
+    const step = Reflect.apply(mapIteratorNextIntrinsic, iterator, []) as IteratorResult<Value>;
+    if (step.done) return values;
+    values[values.length] = step.value;
+  }
+}
+
 function mapSize(map: Map<unknown, unknown>): number {
   return Reflect.apply(mapSizeGetter, map, []) as number;
 }
@@ -244,6 +271,16 @@ function setHasValue<Value>(set: Set<Value>, value: Value): boolean {
 
 function setValues<Value>(set: Set<Value>): IterableIterator<Value> {
   return Reflect.apply(setValuesIntrinsic, set, []) as IterableIterator<Value>;
+}
+
+function setValueSnapshot<Value>(set: Set<Value>): Value[] {
+  const iterator = setValues(set);
+  const values: Value[] = [];
+  while (true) {
+    const step = Reflect.apply(setIteratorNextIntrinsic, iterator, []) as IteratorResult<Value>;
+    if (step.done) return values;
+    values[values.length] = step.value;
+  }
 }
 
 function setSize(set: Set<unknown>): number {
@@ -280,7 +317,12 @@ function setIndexValue(
   let records = mapValue(index, key);
   if (!records) {
     records = new Set<InternalSlotRecord>();
-    setMapValue(index, key, records);
+    try {
+      setMapValue(index, key, records);
+    } catch (error) {
+      if (mapValue(index, key) === records) deleteMapValue(index, key);
+      throw error;
+    }
   }
   try {
     addSetValue(records, record);
@@ -308,19 +350,26 @@ function resolveUnique(
   const records = mapValue(index, key);
   if (!records || setSize(records) !== 1) return undefined;
   const iterator = setValues(records);
-  const first = iterator.next();
+  const first = Reflect.apply(
+    setIteratorNextIntrinsic,
+    iterator,
+    []
+  ) as IteratorResult<InternalSlotRecord>;
   return first.done ? undefined : first.value.view;
 }
 
 function validSlotIdentity(value: string): boolean {
   return (
-    value.length > 0 && new TextEncoder().encode(value).length <= 256 && !/[\p{Cc}]/u.test(value)
+    value.length > 0 &&
+    new TextEncoder().encode(value).length <= 256 &&
+    !/[\p{Cc}]/u.test(value) &&
+    !/[\uD800-\uDFFF]/u.test(value)
   );
 }
 
 function frozenAliases(aliases: readonly string[] | undefined): readonly string[] | undefined {
   if (aliases === undefined) return Object.freeze([]);
-  if (!Array.isArray(aliases)) return undefined;
+  if (!Array.isArray(aliases) || aliases.length > MAX_SLOT_ALIASES) return undefined;
   const output: string[] = [];
   const seen = new Set<string>();
   for (const alias of aliases) {
@@ -348,6 +397,25 @@ const failed = (reason: SlotRequestFailure): SlotRequestOutcome =>
 const cancelled = (reason: 'navigation_disposed' | 'superseded'): SlotRequestOutcome =>
   Object.freeze({ status: 'cancelled' as const, reason });
 
+function placementKeysFor(
+  registeredSlotId: string,
+  adUnitCode: string | undefined,
+  aliases: readonly string[],
+  definition?: GoogletagReplacementDefinition
+): readonly string[] {
+  const keys: string[] = [`registered:${registeredSlotId}`];
+  if (adUnitCode !== undefined) keys[keys.length] = `ad-unit:${adUnitCode}`;
+  for (let index = 0; index < aliases.length; index += 1) {
+    const alias = aliases[index];
+    if (alias !== undefined) keys[keys.length] = `dom:${alias}`;
+  }
+  if (definition) {
+    keys[keys.length] = `path:${definition.adUnitPath}`;
+    keys[keys.length] = `dom:${definition.elementId}`;
+  }
+  return Object.freeze(keys);
+}
+
 /** Construct the document-lifetime slot registry and physical GPT cycle service. */
 export function createSlotService(options: SlotServiceOptions): SlotService {
   const navigationStates = new Map<object, NavigationState>();
@@ -356,12 +424,71 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
   const domAliases = new Map<string, Set<InternalSlotRecord>>();
   const physicalByObject = new WeakMap<object, PhysicalSlot>();
   const physicalSlots = new Set<PhysicalSlot>();
-  const now = options.now ?? (() => Date.now());
+  const placementQuarantine = new Map<string, number>();
+  const quarantinedKeysByPhysical = new WeakMap<object, readonly string[]>();
+  const now = options.now ?? (() => performance.now());
+  let placementQuarantineSaturated = false;
   let disposed = false;
   let deferInvocations = false;
   let activation: GoogletagOperation<void> | undefined;
   const subscriptionsByBinding = new WeakMap<object, BindingSubscriptions>();
   const bindingSubscriptions = new Set<BindingSubscriptions>();
+
+  const hasPlacementQuarantine = (keys: readonly string[]): boolean => {
+    if (placementQuarantineSaturated) return true;
+    for (let index = 0; index < keys.length; index += 1) {
+      const key = keys[index];
+      if (key !== undefined && mapValue(placementQuarantine, key) !== undefined) return true;
+    }
+    return false;
+  };
+
+  const quarantinePhysicalPlacement = (physical: PhysicalSlot): void => {
+    if (weakMapValue(quarantinedKeysByPhysical, physical.slot)) return;
+    let additionalKeys = 0;
+    for (let index = 0; index < physical.placementKeys.length; index += 1) {
+      const key = physical.placementKeys[index];
+      if (key !== undefined && mapValue(placementQuarantine, key) === undefined)
+        additionalKeys += 1;
+    }
+    if (mapSize(placementQuarantine) + additionalKeys > MAX_PLACEMENT_QUARANTINE_KEYS) {
+      placementQuarantineSaturated = true;
+      return;
+    }
+    try {
+      setWeakMapValue(quarantinedKeysByPhysical, physical.slot, physical.placementKeys);
+      if (weakMapValue(quarantinedKeysByPhysical, physical.slot) !== physical.placementKeys) {
+        throw new Error('quarantine publication failed');
+      }
+      for (let index = 0; index < physical.placementKeys.length; index += 1) {
+        const key = physical.placementKeys[index];
+        if (key === undefined) continue;
+        const previous = mapValue(placementQuarantine, key) ?? 0;
+        try {
+          setMapValue(placementQuarantine, key, previous + 1);
+        } catch (error) {
+          if (mapValue(placementQuarantine, key) !== previous + 1) throw error;
+          throw error;
+        }
+      }
+    } catch {
+      placementQuarantineSaturated = true;
+    }
+  };
+
+  const releasePhysicalPlacement = (physical: PhysicalSlot): void => {
+    const keys = weakMapValue(quarantinedKeysByPhysical, physical.slot);
+    if (!keys) return;
+    deleteWeakMapValue(quarantinedKeysByPhysical, physical.slot);
+    for (let index = 0; index < keys.length; index += 1) {
+      const key = keys[index];
+      if (key === undefined) continue;
+      const count = mapValue(placementQuarantine, key);
+      if (count === undefined) continue;
+      if (count <= 1) deleteMapValue(placementQuarantine, key);
+      else setMapValue(placementQuarantine, key, count - 1);
+    }
+  };
 
   const settle = (intent: RequestIntent, outcome: SlotRequestOutcome): void => {
     if (intent.terminal) return;
@@ -371,6 +498,8 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     if (intent.completionTimer !== undefined) clearTimeout(intent.completionTimer);
     intent.requestTimer = undefined;
     intent.completionTimer = undefined;
+    intent.requestDeadlineAt = undefined;
+    intent.completionDeadlineAt = undefined;
     intent.invocation?.dispose();
     intent.invocation = undefined;
     if (intent.record.activeIntent === intent) intent.record.activeIntent = undefined;
@@ -395,51 +524,82 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     invokeIntent(record, queued);
   };
 
-  const bindReplacement = (
+  const prepareReplacementCommit = (
     record: InternalSlotRecord,
     oldPhysical: PhysicalSlot,
     replacement: object
-  ): boolean => {
+  ): GoogletagReplacementCommitAdmission => {
     if (
+      replacement === oldPhysical.slot ||
       record.physical !== oldPhysical ||
       record.state.disposed ||
       !record.state.owner.isCurrent()
     ) {
-      return false;
+      throw new Error('gpt_request_failed');
     }
     const existing = weakMapValue(physicalByObject, replacement);
-    if (existing && existing !== oldPhysical) return false;
+    if (existing) throw new Error('gpt_request_failed');
     const physical: PhysicalSlot = {
       activeCycle: undefined,
       definition: oldPhysical.definition,
+      destroyAttempted: false,
       lastResponseIdentifier: undefined,
       ownership: 'trusted_server',
-      publisherIntent: false,
+      placementKeys: oldPhysical.placementKeys,
+      publisherIntentCount: 0,
       quarantineReason: undefined,
       record,
       slot: replacement,
       state: 'live',
     };
-    try {
-      setWeakMapValue(physicalByObject, replacement, physical);
-      addSetValue(physicalSlots, physical);
-      if (record.state.disposed || !record.state.owner.isCurrent()) throw new Error('stale owner');
-      oldPhysical.record = undefined;
-      record.physical = physical;
-      deleteSetValue(physicalSlots, oldPhysical);
-      return true;
-    } catch {
+    let committed = false;
+    const rollback = (): void => {
+      if (record.physical === physical) record.physical = oldPhysical;
+      if (oldPhysical.record === undefined && record.physical === oldPhysical) {
+        oldPhysical.record = record;
+      }
       deleteSetValue(physicalSlots, physical);
       if (weakMapValue(physicalByObject, replacement) === physical) {
         deleteWeakMapValue(physicalByObject, replacement);
       }
-      return false;
-    }
+      if (committed) addSetValue(physicalSlots, oldPhysical);
+      committed = false;
+    };
+    return Object.freeze({
+      commit: (): boolean => {
+        if (
+          committed ||
+          record.physical !== oldPhysical ||
+          record.state.disposed ||
+          !record.state.owner.isCurrent()
+        ) {
+          return false;
+        }
+        setWeakMapValue(physicalByObject, replacement, physical);
+        if (weakMapValue(physicalByObject, replacement) !== physical) return false;
+        addSetValue(physicalSlots, physical);
+        if (!setHasValue(physicalSlots, physical)) return false;
+        if (record.state.disposed || !record.state.owner.isCurrent()) return false;
+        record.physical = physical;
+        oldPhysical.record = undefined;
+        deleteSetValue(physicalSlots, oldPhysical);
+        committed = true;
+        return true;
+      },
+      rollback,
+    });
   };
 
   const recoverRequestTimeout = (record: InternalSlotRecord, physical: PhysicalSlot): void => {
+    if (physical.destroyAttempted) {
+      physical.state = 'quarantined';
+      failQueued(record, 'gpt_request_failed');
+      return;
+    }
     physical.state = 'retired';
     physical.quarantineReason = 'request';
+    physical.destroyAttempted = true;
+    quarantinePhysicalPlacement(physical);
     if (
       physical.ownership !== 'trusted_server' ||
       !physical.definition ||
@@ -450,13 +610,14 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       failQueued(record, 'gpt_request_failed');
       return;
     }
-    let operation: GoogletagOperation<object | undefined>;
+    let operation: GoogletagOperation<GoogletagReplacementResult>;
     try {
       operation = options.googletag.run((gpt) =>
         gpt.transactionalReplace(
           physical.slot,
           physical.definition,
-          () => !record.state.disposed && record.state.owner.isCurrent()
+          () => !record.state.disposed && record.state.owner.isCurrent(),
+          (replacement) => prepareReplacementCommit(record, physical, replacement)
         )
       );
     } catch {
@@ -464,17 +625,60 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       failQueued(record, 'gpt_request_failed');
       return;
     }
+    const detachDestroyedOld = (): void => {
+      if (record.physical === physical) record.physical = undefined;
+      physical.record = undefined;
+      releasePhysicalPlacement(physical);
+      deleteSetValue(physicalSlots, physical);
+      if (weakMapValue(physicalByObject, physical.slot) === physical) {
+        deleteWeakMapValue(physicalByObject, physical.slot);
+      }
+    };
     void operation.result.then(
-      (replacement) => {
-        if (!replacement || !bindReplacement(record, physical, replacement)) {
-          physical.state = 'quarantined';
+      (result) => {
+        if (result.status !== 'replaced') {
+          detachDestroyedOld();
           failQueued(record, 'gpt_request_failed');
           return;
         }
+        releasePhysicalPlacement(physical);
+        if (weakMapValue(physicalByObject, physical.slot) === physical) {
+          deleteWeakMapValue(physicalByObject, physical.slot);
+        }
+        deleteSetValue(physicalSlots, physical);
         advanceQueued(record);
       },
-      () => {
+      (error: unknown) => {
         physical.state = 'quarantined';
+        const replacementError = error instanceof GoogletagReplacementError ? error : undefined;
+        const reusedOldIdentity = replacementError?.orphanedSlot === physical.slot;
+        if (replacementError?.oldSlotDestroyed && !reusedOldIdentity) {
+          detachDestroyedOld();
+        }
+        if (replacementError?.orphanedSlot && replacementError.orphanedSlot !== physical.slot) {
+          const orphan: PhysicalSlot = {
+            activeCycle: undefined,
+            definition: physical.definition,
+            destroyAttempted: true,
+            lastResponseIdentifier: undefined,
+            ownership: 'trusted_server',
+            placementKeys: physical.placementKeys,
+            publisherIntentCount: 0,
+            quarantineReason: 'request',
+            record: undefined,
+            slot: replacementError.orphanedSlot,
+            state: 'quarantined',
+          };
+          try {
+            setWeakMapValue(physicalByObject, orphan.slot, orphan);
+            if (weakMapValue(physicalByObject, orphan.slot) !== orphan) {
+              throw new Error('orphan publication failed');
+            }
+            quarantinePhysicalPlacement(orphan);
+          } catch {
+            placementQuarantineSaturated = true;
+          }
+        }
         failQueued(record, 'gpt_request_failed');
       }
     );
@@ -497,6 +701,14 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
 
   const onRequestTimeout = (intent: RequestIntent): void => {
     if (intent.terminal || intent.state !== 'active') return;
+    const deadline = intent.requestDeadlineAt;
+    if (deadline !== undefined && now() < deadline) {
+      intent.requestTimer = setTimeout(
+        () => onRequestTimeout(intent),
+        Math.max(1, deadline - now())
+      );
+      return;
+    }
     const physical = intent.record.physical;
     settle(intent, failed('gpt_request_timeout'));
     if (!physical) {
@@ -508,6 +720,14 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
 
   const onCompletionTimeout = (intent: RequestIntent): void => {
     if (intent.terminal || intent.state !== 'cycle') return;
+    const deadline = intent.completionDeadlineAt;
+    if (deadline !== undefined && now() < deadline) {
+      intent.completionTimer = setTimeout(
+        () => onCompletionTimeout(intent),
+        Math.max(1, deadline - now())
+      );
+      return;
+    }
     const physical = intent.record.physical;
     if (physical?.activeCycle?.intent === intent) {
       physical.activeCycle.intent = undefined;
@@ -519,7 +739,25 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
 
   const armRequestDeadline = (intent: RequestIntent): void => {
     intent.requestStartedAt = now();
+    intent.requestDeadlineAt = intent.requestStartedAt + GPT_REQUEST_START_TIMEOUT_MS;
+    intent.completionDeadlineAt = intent.requestStartedAt + GPT_COMPLETION_TIMEOUT_MS;
     intent.requestTimer = setTimeout(() => onRequestTimeout(intent), GPT_REQUEST_START_TIMEOUT_MS);
+  };
+
+  const failExternalInvocation = (record: InternalSlotRecord, intent: RequestIntent): void => {
+    if (intent.terminal) return;
+    const physical = record.physical;
+    if (physical?.activeCycle?.intent === intent) {
+      physical.activeCycle.intent = undefined;
+      physical.state = 'quarantined';
+      physical.quarantineReason = 'completion';
+      settle(intent, failed('gpt_request_failed'));
+      return;
+    }
+    const wasInvoked = intent.requestStartedAt !== undefined;
+    settle(intent, failed('gpt_request_failed'));
+    if (wasInvoked && physical) recoverRequestTimeout(record, physical);
+    else advanceQueued(record);
   };
 
   const ensureBindingSubscriptions = (
@@ -568,7 +806,19 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     return { installed: true, ownership };
   };
 
-  function invokeIntent(record: InternalSlotRecord, intent: RequestIntent): void {
+  const retireHistoricalSubscriptions = (current: BindingSubscriptions): void => {
+    const historical = setValueSnapshot(bindingSubscriptions);
+    for (let index = 0; index < historical.length; index += 1) {
+      const subscription = historical[index];
+      if (subscription && subscription !== current) subscription.release();
+    }
+  };
+
+  function invokeExternalIntent(
+    record: InternalSlotRecord,
+    intent: RequestIntent,
+    expectedBindingToken: object
+  ): void {
     if (
       intent.terminal ||
       record.activeIntent !== intent ||
@@ -582,14 +832,21 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     if (!physical || physical.state !== 'live' || physical.activeCycle) {
       settle(
         intent,
-        failed(physical?.state === 'quarantined' ? 'slot_quarantined' : 'slot_unresolved')
+        failed(
+          physical?.state === 'quarantined'
+            ? 'slot_quarantined'
+            : physical?.activeCycle
+              ? 'cycle_unattributable'
+              : 'slot_unresolved'
+        )
       );
       return;
     }
-    let subscriptions: BindingSubscriptionAdmission | undefined;
     try {
       const operation = options.googletag.run((gpt) => {
-        subscriptions = ensureBindingSubscriptions(gpt);
+        if (gpt.bindingToken() !== expectedBindingToken) {
+          throw new Error('GPT binding changed before invocation');
+        }
         if (
           intent.terminal ||
           record.activeIntent !== intent ||
@@ -616,17 +873,42 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       void operation.result.then(
         () => undefined,
         () => {
-          if (subscriptions?.installed) subscriptions.ownership.release();
-          if (intent.terminal) return;
-          settle(intent, failed('gpt_request_failed'));
-          advanceQueued(record);
+          failExternalInvocation(record, intent);
         }
       );
     } catch {
-      if (subscriptions?.installed) subscriptions.ownership.release();
-      settle(intent, failed('gpt_request_failed'));
-      advanceQueued(record);
+      failExternalInvocation(record, intent);
     }
+  }
+
+  function invokeIntent(record: InternalSlotRecord, intent: RequestIntent): void {
+    if (intent.terminal) return;
+    let operation: GoogletagOperation<BindingSubscriptionAdmission>;
+    let provisionalSubscriptions: BindingSubscriptionAdmission | undefined;
+    try {
+      operation = options.googletag.run((gpt) => {
+        provisionalSubscriptions = ensureBindingSubscriptions(gpt);
+        return provisionalSubscriptions;
+      });
+    } catch {
+      if (provisionalSubscriptions?.installed) provisionalSubscriptions.ownership.release();
+      failExternalInvocation(record, intent);
+      return;
+    }
+    intent.invocation = operation;
+    void operation.result.then(
+      (subscriptions) => {
+        if (intent.invocation === operation) intent.invocation = undefined;
+        retireHistoricalSubscriptions(subscriptions.ownership);
+        if (intent.terminal) return;
+        invokeExternalIntent(record, intent, subscriptions.ownership.token);
+      },
+      () => {
+        if (intent.invocation === operation) intent.invocation = undefined;
+        if (provisionalSubscriptions?.installed) provisionalSubscriptions.ownership.release();
+        failExternalInvocation(record, intent);
+      }
+    );
   }
 
   const handleGptEvent = (type: GptEventType, event: unknown): void => {
@@ -639,8 +921,8 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       if (physical.state !== 'live' || physical.activeCycle) return;
       const record = physical.record;
       const intent = record?.activeIntent;
-      if (physical.publisherIntent) {
-        physical.publisherIntent = false;
+      if (physical.publisherIntentCount > 0) {
+        physical.publisherIntentCount -= 1;
         if (intent && !intent.terminal) settle(intent, failed('cycle_unattributable'));
         physical.activeCycle = { intent: undefined, kind: 'publisher' };
         return;
@@ -651,14 +933,17 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         intent.state === 'active' &&
         intent.requestStartedAt !== undefined
       ) {
+        if (now() > (intent.requestDeadlineAt ?? Number.NEGATIVE_INFINITY)) {
+          onRequestTimeout(intent);
+          return;
+        }
         if (intent.requestTimer !== undefined) clearTimeout(intent.requestTimer);
         intent.requestTimer = undefined;
         intent.state = 'cycle';
         physical.activeCycle = { intent, kind: 'trusted_server' };
-        const elapsed = Math.max(0, now() - intent.requestStartedAt);
         intent.completionTimer = setTimeout(
           () => onCompletionTimeout(intent),
-          Math.max(0, GPT_COMPLETION_TIMEOUT_MS - elapsed)
+          Math.max(0, (intent.completionDeadlineAt ?? now()) - now())
         );
         return;
       }
@@ -678,16 +963,25 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     }
     const cycle = physical.activeCycle;
     if (!cycle) return;
+    const intent = cycle.intent;
+    if (
+      intent &&
+      !intent.terminal &&
+      now() > (intent.completionDeadlineAt ?? Number.NEGATIVE_INFINITY)
+    ) {
+      onCompletionTimeout(intent);
+      return;
+    }
+    const isEmptyValue = ownData(event, 'isEmpty');
+    if (isEmptyValue !== true && isEmptyValue !== false) return;
     if (responseIdentifier !== undefined) physical.lastResponseIdentifier = responseIdentifier;
     physical.activeCycle = undefined;
-    const intent = cycle.intent;
     if (intent && !intent.terminal) {
-      const isEmpty = ownData(event, 'isEmpty') === true;
       settle(
         intent,
         Object.freeze({
           ...(responseIdentifier === undefined ? {} : { responseIdentifier }),
-          status: isEmpty ? ('empty' as const) : ('rendered' as const),
+          status: isEmptyValue ? ('empty' as const) : ('rendered' as const),
         })
       );
       advanceQueued(intent.record);
@@ -696,6 +990,9 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     if (physical.quarantineReason === 'completion' || physical.quarantineReason === 'navigation') {
       const quarantineReason = physical.quarantineReason;
       physical.quarantineReason = undefined;
+      if (quarantineReason === 'navigation' && physical.ownership === 'publisher') {
+        releasePhysicalPlacement(physical);
+      }
       if (quarantineReason === 'completion' || physical.ownership === 'publisher') {
         physical.state = 'live';
       }
@@ -710,35 +1007,50 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       if (physical.activeCycle) {
         physical.state = 'quarantined';
         physical.quarantineReason = 'navigation';
+        quarantinePhysicalPlacement(physical);
       }
+      deleteSetValue(physicalSlots, physical);
       return;
     }
-    if (physical.state === 'retired') return;
+    if (physical.destroyAttempted) {
+      deleteSetValue(physicalSlots, physical);
+      return;
+    }
     physical.state = 'retired';
     physical.quarantineReason = 'navigation';
+    physical.destroyAttempted = true;
+    quarantinePhysicalPlacement(physical);
+    deleteSetValue(physicalSlots, physical);
     let operation: GoogletagOperation<unknown> | undefined;
     try {
       operation = options.googletag.run((gpt) =>
-        gpt.transactionalReplace(physical.slot, undefined, () => false)
+        gpt.transactionalReplace(
+          physical.slot,
+          undefined,
+          () => false,
+          () => {
+            throw new Error('destroy-only replacement cannot commit');
+          }
+        )
       );
       void operation.result.then(
         () => {
-          if (!physical.activeCycle && !physical.record) deleteSetValue(physicalSlots, physical);
+          releasePhysicalPlacement(physical);
+          if (weakMapValue(physicalByObject, physical.slot) === physical) {
+            deleteWeakMapValue(physicalByObject, physical.slot);
+          }
         },
-        () => {
-          if (!physical.activeCycle && !physical.record) deleteSetValue(physicalSlots, physical);
-        }
+        () => undefined
       );
     } catch {
       operation?.dispose();
-      if (!physical.activeCycle && !physical.record) deleteSetValue(physicalSlots, physical);
     }
   };
 
   const disposeNavigationState = (state: NavigationState): void => {
     if (state.disposed) return;
     state.disposed = true;
-    const records = [...mapValues(state.records)];
+    const records = mapValueSnapshot(state.records);
     for (const record of records) {
       const active = record.activeIntent;
       const queued = record.queuedIntent;
@@ -796,6 +1108,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       readonly adUnitCode: string | undefined;
       readonly aliases: readonly string[];
       readonly id: string;
+      readonly placementKeys: readonly string[];
       readonly source: SlotSource;
     }> = [];
     const ids = new Set<string>();
@@ -820,8 +1133,18 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       if (setHasValue(ids, id) || mapValue(registeredSlots, id)) {
         return Object.freeze({ ok: false, reason: 'duplicate_slot' });
       }
+      const registrationPlacementKeys = placementKeysFor(id, adUnitCode, aliases);
+      if (hasPlacementQuarantine(registrationPlacementKeys)) {
+        return Object.freeze({ ok: false, reason: 'slot_quarantined' });
+      }
       addSetValue(ids, id);
-      prepared[prepared.length] = { adUnitCode, aliases, id, source };
+      prepared[prepared.length] = {
+        adUnitCode,
+        aliases,
+        id,
+        placementKeys: registrationPlacementKeys,
+        source,
+      };
     }
 
     let state: NavigationState | undefined;
@@ -856,9 +1179,16 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
           state,
           view,
         };
-        setMapValue(registeredSlots, registration.id, record);
+        inserted[inserted.length] = record;
         try {
+          setMapValue(registeredSlots, registration.id, record);
+          if (mapValue(registeredSlots, registration.id) !== record) {
+            throw new Error('slot publication failed');
+          }
           setMapValue(state.records, registration.id, record);
+          if (mapValue(state.records, registration.id) !== record) {
+            throw new Error('slot publication failed');
+          }
           if (registration.adUnitCode !== undefined) {
             setIndexValue(adUnitCodes, registration.adUnitCode, record);
           }
@@ -872,7 +1202,6 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
           for (const alias of registration.aliases) deleteIndexValue(domAliases, alias, record);
           throw error;
         }
-        inserted[inserted.length] = record;
       }
       if (!owner.isCurrent() || state.disposed) throw new Error('stale owner');
       state.nextOrdinal += prepared.length;
@@ -922,7 +1251,24 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     if (ownership !== 'publisher' && ownership !== 'trusted_server') {
       return Object.freeze({ ok: false, reason: 'gpt_request_failed' });
     }
+    if (ownership === 'trusted_server' && definition === undefined) {
+      return Object.freeze({ ok: false, reason: 'gpt_request_failed' });
+    }
     const slotObject = slot as object;
+    let bindingPlacementKeys: readonly string[];
+    try {
+      bindingPlacementKeys = placementKeysFor(
+        record.view.registeredSlotId,
+        record.view.adUnitCode,
+        record.view.domAliases,
+        definition
+      );
+    } catch {
+      return Object.freeze({ ok: false, reason: 'gpt_request_failed' });
+    }
+    if (hasPlacementQuarantine(bindingPlacementKeys)) {
+      return Object.freeze({ ok: false, reason: 'slot_quarantined' });
+    }
     const existing = weakMapValue(physicalByObject, slotObject);
     if (existing) {
       if (existing.state === 'quarantined') {
@@ -934,11 +1280,33 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       if (existing.record && existing.record !== record) {
         return Object.freeze({ ok: false, reason: 'gpt_object_collision' });
       }
-      existing.record = record;
-      existing.ownership = ownership;
-      existing.definition = definition;
-      record.physical = existing;
-      return Object.freeze({ ok: true });
+      if (record.physical && record.physical !== existing) {
+        return Object.freeze({ ok: false, reason: 'gpt_object_collision' });
+      }
+      const wasStrong = setHasValue(physicalSlots, existing);
+      const previousRecord = existing.record;
+      const previousOwnership = existing.ownership;
+      const previousDefinition = existing.definition;
+      const previousPlacementKeys = existing.placementKeys;
+      try {
+        if (!wasStrong) addSetValue(physicalSlots, existing);
+        if (!setHasValue(physicalSlots, existing)) throw new Error('physical publication failed');
+        if (!state.owner.isCurrent() || state.disposed) throw new Error('stale owner');
+        existing.record = record;
+        existing.ownership = ownership;
+        existing.definition = definition;
+        existing.placementKeys = bindingPlacementKeys;
+        record.physical = existing;
+        return Object.freeze({ ok: true });
+      } catch {
+        if (record.physical === existing) record.physical = undefined;
+        existing.record = previousRecord;
+        existing.ownership = previousOwnership;
+        existing.definition = previousDefinition;
+        existing.placementKeys = previousPlacementKeys;
+        if (!wasStrong) deleteSetValue(physicalSlots, existing);
+        return Object.freeze({ ok: false, reason: 'stale_owner' });
+      }
     }
     if (record.physical && record.physical.slot !== slotObject) {
       return Object.freeze({ ok: false, reason: 'gpt_object_collision' });
@@ -946,9 +1314,11 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     const physical: PhysicalSlot = {
       activeCycle: undefined,
       definition,
+      destroyAttempted: false,
       lastResponseIdentifier: undefined,
       ownership,
-      publisherIntent: false,
+      placementKeys: bindingPlacementKeys,
+      publisherIntentCount: 0,
       quarantineReason: undefined,
       record,
       slot: slotObject,
@@ -980,8 +1350,10 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       record ?? ({ activeIntent: undefined, queuedIntent: undefined } as InternalSlotRecord);
     const intent: RequestIntent = {
       completionTimer: undefined,
+      completionDeadlineAt: undefined,
       input,
       invocation: undefined,
+      requestDeadlineAt: undefined,
       requestStartedAt: undefined,
       requestTimer: undefined,
       resolve,
@@ -1011,15 +1383,41 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       settle(intent, failed('gpt_request_failed'));
       return handle;
     }
+    if (physical.publisherIntentCount > 0 || physical.activeCycle) {
+      settle(
+        intent,
+        failed(
+          physical.activeCycle?.kind === 'trusted_server' && physical.state === 'quarantined'
+            ? 'slot_quarantined'
+            : 'cycle_unattributable'
+        )
+      );
+      return handle;
+    }
     if (physical.state === 'quarantined') {
       settle(intent, failed('slot_quarantined'));
       return handle;
     }
-    if (physical.publisherIntent) {
-      settle(intent, failed('cycle_unattributable'));
-      return handle;
-    }
     if (record.activeIntent) {
+      if (record.activeIntent.input.requestClass !== input.requestClass) {
+        const active = record.activeIntent;
+        const activePhysical = record.physical;
+        const hadStarted = active.requestStartedAt !== undefined;
+        if (activePhysical?.activeCycle?.intent === active) {
+          activePhysical.activeCycle.intent = undefined;
+          activePhysical.state = 'quarantined';
+          activePhysical.quarantineReason = 'completion';
+        }
+        settle(active, failed('cycle_unattributable'));
+        if (record.queuedIntent) {
+          settle(record.queuedIntent, failed('cycle_unattributable'));
+        }
+        settle(intent, failed('cycle_unattributable'));
+        if (hadStarted && activePhysical && !activePhysical.activeCycle) {
+          recoverRequestTimeout(record, activePhysical);
+        }
+        return handle;
+      }
       intent.state = 'queued';
       const queued = record.queuedIntent;
       if (queued) {
@@ -1067,32 +1465,64 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         slots[slots.length] = physical.slot;
       }
       if (slots.length === intents.length) {
-        let subscriptions: BindingSubscriptionAdmission | undefined;
+        let subscriptionOperation: GoogletagOperation<BindingSubscriptionAdmission>;
+        let provisionalSubscriptions: BindingSubscriptionAdmission | undefined;
         try {
-          const operation = options.googletag.run((gpt) => {
-            subscriptions = ensureBindingSubscriptions(gpt);
-            for (const intent of intents) {
-              if (!intent.terminal) armRequestDeadline(intent);
-            }
-            gpt.refresh(slots, Object.freeze({ changeCorrelator: false }));
+          subscriptionOperation = options.googletag.run((gpt) => {
+            provisionalSubscriptions = ensureBindingSubscriptions(gpt);
+            return provisionalSubscriptions;
           });
-          for (const intent of intents) {
-            intent.invocation = operation;
-            if (intent.terminal) operation.dispose();
-          }
-          void operation.result.then(
-            () => undefined,
-            () => {
-              if (subscriptions?.installed) subscriptions.ownership.release();
-              for (const intent of intents) {
-                if (!intent.terminal) settle(intent, failed('gpt_request_failed'));
+          void subscriptionOperation.result.then(
+            (subscriptions) => {
+              retireHistoricalSubscriptions(subscriptions.ownership);
+              let operation: GoogletagOperation<unknown>;
+              try {
+                operation = options.googletag.run((gpt) => {
+                  if (gpt.bindingToken() !== subscriptions.ownership.token) {
+                    throw new Error('GPT binding changed before SRA invocation');
+                  }
+                  for (const intent of intents) {
+                    if (!intent.terminal) armRequestDeadline(intent);
+                  }
+                  gpt.refresh(slots, Object.freeze({ changeCorrelator: false }));
+                });
+              } catch {
+                for (const intent of intents) failExternalInvocation(intent.record, intent);
+                return;
               }
+              const liveIntents: RequestIntent[] = [];
+              for (const intent of intents) {
+                if (!intent.terminal) liveIntents[liveIntents.length] = intent;
+              }
+              let remaining = liveIntents.length;
+              for (const intent of liveIntents) {
+                let released = false;
+                intent.invocation = {
+                  dispose: (): void => {
+                    if (released) return;
+                    released = true;
+                    remaining -= 1;
+                    if (remaining === 0) operation.dispose();
+                  },
+                };
+              }
+              if (remaining === 0) operation.dispose();
+              void operation.result.then(
+                () => undefined,
+                () => {
+                  for (const intent of intents) failExternalInvocation(intent.record, intent);
+                }
+              );
+            },
+            () => {
+              if (provisionalSubscriptions?.installed) provisionalSubscriptions.ownership.release();
+              for (const intent of intents) failExternalInvocation(intent.record, intent);
             }
           );
         } catch {
-          if (subscriptions?.installed) subscriptions.ownership.release();
+          if (provisionalSubscriptions?.installed) provisionalSubscriptions.ownership.release();
           for (const intent of intents) {
-            if (!intent.terminal) settle(intent, failed('gpt_request_failed'));
+            failExternalInvocation(intent.record, intent);
           }
         }
       }
@@ -1111,6 +1541,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       activation = operation;
       void operation.result.then(
         () => {
+          if (subscriptions) retireHistoricalSubscriptions(subscriptions.ownership);
           if (activation === operation) activation = undefined;
         },
         () => {
@@ -1124,8 +1555,12 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     dispose: (): void => {
       if (disposed) return;
       disposed = true;
-      for (const state of [...mapValues(navigationStates)]) disposeNavigationState(state);
-      const subscriptions = [...setValues(bindingSubscriptions)];
+      const states = mapValueSnapshot(navigationStates);
+      for (let index = 0; index < states.length; index += 1) {
+        const state = states[index];
+        if (state) disposeNavigationState(state);
+      }
+      const subscriptions = setValueSnapshot(bindingSubscriptions);
       for (let index = subscriptions.length - 1; index >= 0; index -= 1) {
         try {
           subscriptions[index]?.release();
@@ -1185,20 +1620,57 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
           return service.prepareProjectionSlots(owner, slots);
         },
       }),
+    recordPublisherDestruction: (slot: object): boolean => {
+      const physical = weakMapValue(physicalByObject, slot);
+      if (!physical) return false;
+      const record = physical.record;
+      const cycleIntent = physical.activeCycle?.intent;
+      if (cycleIntent && !cycleIntent.terminal) settle(cycleIntent, failed('gpt_request_failed'));
+      if (record?.activeIntent) settle(record.activeIntent, failed('gpt_request_failed'));
+      if (record?.queuedIntent) settle(record.queuedIntent, failed('gpt_request_failed'));
+      if (record?.physical === physical) record.physical = undefined;
+      physical.record = undefined;
+      physical.activeCycle = undefined;
+      physical.publisherIntentCount = 0;
+      physical.state = 'retired';
+      releasePhysicalPlacement(physical);
+      deleteSetValue(physicalSlots, physical);
+      if (weakMapValue(physicalByObject, slot) === physical) {
+        deleteWeakMapValue(physicalByObject, slot);
+      }
+      return true;
+    },
     recordPublisherIntent: (slot: object): boolean => {
       const physical = weakMapValue(physicalByObject, slot);
-      if (!physical || physical.state !== 'live' || physical.activeCycle) return false;
+      if (!physical || (physical.state !== 'live' && !physical.activeCycle)) return false;
+      if (physical.publisherIntentCount >= MAX_PENDING_PUBLISHER_INTENTS) {
+        physical.state = 'quarantined';
+        physical.quarantineReason = 'request';
+        quarantinePhysicalPlacement(physical);
+        if (physical.record?.activeIntent) {
+          settle(physical.record.activeIntent, failed('cycle_unattributable'));
+        }
+        if (physical.record?.queuedIntent) {
+          settle(physical.record.queuedIntent, failed('cycle_unattributable'));
+        }
+        return false;
+      }
       if (physical.record?.activeIntent) {
         settle(physical.record.activeIntent, failed('cycle_unattributable'));
       }
       if (physical.record?.queuedIntent) {
         settle(physical.record.queuedIntent, failed('cycle_unattributable'));
       }
-      physical.publisherIntent = true;
+      physical.publisherIntentCount += 1;
+      if (physical.activeCycle?.kind === 'trusted_server') {
+        physical.activeCycle = { intent: undefined, kind: 'publisher' };
+        physical.state = 'quarantined';
+        physical.quarantineReason = 'completion';
+      }
       return true;
     },
     registeredSlotIdsForTest: (): readonly string[] => {
-      const records = [...mapValues(registeredSlots)];
+      const records = mapValueSnapshot(registeredSlots);
       records.sort((left, right) => left.view.ordinal - right.view.ordinal);
       return Object.freeze(records.map(({ view }) => view.registeredSlotId));
     },
@@ -1212,13 +1684,19 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     snapshotForTest: () => {
       let cycles = 0;
       let intents = 0;
-      for (const physical of setValues(physicalSlots)) {
-        if (physical.activeCycle) cycles += 1;
+      const physicalSnapshot = setValueSnapshot(physicalSlots);
+      for (let index = 0; index < physicalSnapshot.length; index += 1) {
+        if (physicalSnapshot[index]?.activeCycle) cycles += 1;
       }
-      for (const state of mapValues(navigationStates)) {
-        for (const record of mapValues(state.records)) {
-          if (record.activeIntent) intents += 1;
-          if (record.queuedIntent) intents += 1;
+      const stateSnapshot = mapValueSnapshot(navigationStates);
+      for (let stateIndex = 0; stateIndex < stateSnapshot.length; stateIndex += 1) {
+        const state = stateSnapshot[stateIndex];
+        if (!state) continue;
+        const recordSnapshot = mapValueSnapshot(state.records);
+        for (let recordIndex = 0; recordIndex < recordSnapshot.length; recordIndex += 1) {
+          const record = recordSnapshot[recordIndex];
+          if (record?.activeIntent) intents += 1;
+          if (record?.queuedIntent) intents += 1;
         }
       }
       return Object.freeze({
