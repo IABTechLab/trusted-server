@@ -3792,6 +3792,18 @@ else t.bids=b;\
     )
 }
 
+/// Prospective hard-cutover mark emitted at the bids/projection boundary.
+///
+/// Task 19 inserts this already-tested fragment into the production boot path in
+/// the same atomic switch that installs the matching first-display mark.
+#[allow(
+    dead_code,
+    reason = "Task 16 prepares this fragment for the atomic Task 19 production switch"
+)]
+pub(crate) fn build_bids_script_performance_mark() -> &'static str {
+    "(function(){try{window.performance.mark(\"tsjs:bids-script\");}catch(_){}})();"
+}
+
 /// Build the empty-bids `<script>` tag used when no bids were returned.
 ///
 /// Shares the same shape as [`build_bids_script`] so any change to the script
@@ -9000,7 +9012,7 @@ mod tests {
     mod creative_opportunities_tests {
         use super::super::{
             MatchedSlotsContext, build_ad_slots_script, build_auction_request, build_bid_map,
-            build_bids_script, html_escape_for_script,
+            build_bids_script, build_bids_script_performance_mark, html_escape_for_script,
         };
         use crate::auction::types::{ApsRendererV1, ApsTagType, Bid, BidRenderSourceV1, MediaType};
         use crate::consent::ConsentContext;
@@ -10299,6 +10311,20 @@ mod tests {
                 .trim_end_matches("</script>");
             assert!(!inner.contains('<'), "no unescaped < in bids script");
             assert!(!inner.contains('>'), "no unescaped > in bids script");
+        }
+
+        #[test]
+        fn bids_script_performance_mark_is_exact_and_not_yet_wired() {
+            let fragment = build_bids_script_performance_mark();
+            assert_eq!(
+                fragment,
+                "(function(){try{window.performance.mark(\"tsjs:bids-script\");}catch(_){}})();"
+            );
+            assert!(!fragment.contains("__tsjsPerf"));
+            assert!(
+                !build_bids_script(&serde_json::Map::new()).contains("tsjs:bids-script"),
+                "Task 19 owns the coordinated production insertion"
+            );
         }
 
         #[test]
