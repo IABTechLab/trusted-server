@@ -401,36 +401,40 @@ function ownData(event: unknown, key: PropertyKey): unknown {
 }
 
 function copyReplacementSizes(sizes: unknown): unknown | undefined {
-  if (!Array.isArray(sizes)) return undefined;
-  const length = sizes.length;
-  const copyPair = (value: unknown): readonly [number, number] | undefined => {
-    if (!Array.isArray(value) || value.length !== 2) return undefined;
-    const width = value[0] as unknown;
-    const height = value[1] as unknown;
-    if (
-      typeof width !== 'number' ||
-      !Number.isInteger(width) ||
-      width < 1 ||
-      width > 4_096 ||
-      typeof height !== 'number' ||
-      !Number.isInteger(height) ||
-      height < 1 ||
-      height > 4_096
-    ) {
-      return undefined;
+  try {
+    if (!Array.isArray(sizes)) return undefined;
+    const length = sizes.length;
+    const copyPair = (value: unknown): readonly [number, number] | undefined => {
+      if (!Array.isArray(value) || value.length !== 2) return undefined;
+      const width = value[0] as unknown;
+      const height = value[1] as unknown;
+      if (
+        typeof width !== 'number' ||
+        !Number.isInteger(width) ||
+        width < 1 ||
+        width > 4_096 ||
+        typeof height !== 'number' ||
+        !Number.isInteger(height) ||
+        height < 1 ||
+        height > 4_096
+      ) {
+        return undefined;
+      }
+      return Object.freeze([width, height]);
+    };
+    const single = copyPair(sizes);
+    if (single) return single;
+    if (length === 0 || length > MAX_ACTIVE_SLOT_RECORDS) return undefined;
+    const copied: Array<readonly [number, number]> = [];
+    for (let index = 0; index < length; index += 1) {
+      const pair = copyPair(sizes[index] as unknown);
+      if (!pair) return undefined;
+      copied[copied.length] = pair;
     }
-    return Object.freeze([width, height]);
-  };
-  const single = copyPair(sizes);
-  if (single) return single;
-  if (length === 0 || length > MAX_ACTIVE_SLOT_RECORDS) return undefined;
-  const copied: Array<readonly [number, number]> = [];
-  for (let index = 0; index < length; index += 1) {
-    const pair = copyPair(sizes[index] as unknown);
-    if (!pair) return undefined;
-    copied[copied.length] = pair;
+    return Object.freeze(copied);
+  } catch {
+    return undefined;
   }
-  return Object.freeze(copied);
 }
 
 function snapshotReplacementDefinition(input: unknown): GoogletagReplacementDefinition | undefined {
@@ -535,23 +539,47 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       markSaturationOwner(physical);
       return;
     }
+    const confirmedKeys: string[] = [];
     try {
-      setWeakMapValue(quarantinedKeysByPhysical, physical.slot, physical.placementKeys);
-      if (weakMapValue(quarantinedKeysByPhysical, physical.slot) !== physical.placementKeys) {
-        throw new Error('quarantine publication failed');
-      }
-      for (let index = 0; index < physical.placementKeys.length; index += 1) {
-        const key = physical.placementKeys[index];
-        if (key === undefined) continue;
-        const previous = mapValue(placementQuarantine, key) ?? 0;
-        try {
-          setMapValue(placementQuarantine, key, previous + 1);
-        } catch (error) {
-          if (mapValue(placementQuarantine, key) !== previous + 1) throw error;
-          throw error;
-        }
-      }
+      setWeakMapValue(quarantinedKeysByPhysical, physical.slot, confirmedKeys);
     } catch {
+      if (weakMapValue(quarantinedKeysByPhysical, physical.slot) !== confirmedKeys) {
+        placementQuarantinePoisoned = true;
+        return;
+      }
+    }
+    if (weakMapValue(quarantinedKeysByPhysical, physical.slot) !== confirmedKeys) {
+      placementQuarantinePoisoned = true;
+      return;
+    }
+    for (let index = 0; index < physical.placementKeys.length; index += 1) {
+      const key = physical.placementKeys[index];
+      if (key === undefined) continue;
+      const previous = mapValue(placementQuarantine, key) ?? 0;
+      let publicationThrew = false;
+      try {
+        setMapValue(placementQuarantine, key, previous + 1);
+      } catch {
+        publicationThrew = true;
+      }
+      const actual = mapValue(placementQuarantine, key) ?? 0;
+      if (actual === previous + 1) {
+        confirmedKeys[confirmedKeys.length] = key;
+        if (!publicationThrew) continue;
+      } else if (actual !== previous) {
+        placementQuarantinePoisoned = true;
+        return;
+      }
+      if (publicationThrew || actual === previous) {
+        // A hostile Map implementation either rejected this increment or threw
+        // after applying it. Retain only the increments whose ownership can be
+        // proven and fail closed until this physical slot is released.
+        markSaturationOwner(physical);
+        return;
+      }
+    }
+    if (weakMapValue(quarantinedKeysByPhysical, physical.slot) !== confirmedKeys) {
+      placementQuarantinePoisoned = true;
       markSaturationOwner(physical);
     }
   };
@@ -1556,7 +1584,14 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
   };
 
   const requestBatch = (inputs: readonly SlotBatchRequestInput[]): readonly SlotRequestHandle[] => {
-    if (!Array.isArray(inputs) || inputs.length === 0 || inputs.length > MAX_ACTIVE_SLOT_RECORDS) {
+    let inputCount: number;
+    try {
+      if (!Array.isArray(inputs)) return Object.freeze([]);
+      inputCount = inputs.length;
+    } catch {
+      return Object.freeze([]);
+    }
+    if (inputCount === 0 || inputCount > MAX_ACTIVE_SLOT_RECORDS) {
       return Object.freeze([]);
     }
     const preparedInputs: SlotBatchRequestInput[] = [];
@@ -1565,7 +1600,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     const admittedPhysicalSlots = new Set<object>();
     let batchGeneration: object | undefined;
     try {
-      for (let index = 0; index < inputs.length; index += 1) {
+      for (let index = 0; index < inputCount; index += 1) {
         const input = inputs[index] as unknown;
         if (typeof input !== 'object' || input === null || Array.isArray(input)) {
           return Object.freeze([]);
@@ -1626,12 +1661,27 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       return Object.freeze([]);
     }
     deferInvocations = true;
-    let handles: SlotRequestHandle[];
+    const handles: SlotRequestHandle[] = [];
+    let admissionFailed = false;
     try {
-      handles = preparedInputs.map((input) => request(input));
+      for (let index = 0; index < preparedInputs.length; index += 1) {
+        const input = preparedInputs[index];
+        if (!input) throw new Error('missing prepared SRA input');
+        handles[handles.length] = request(input);
+      }
+    } catch {
+      admissionFailed = true;
+      for (let index = handles.length - 1; index >= 0; index -= 1) {
+        try {
+          handles[index]?.dispose();
+        } catch {
+          // Continue rolling back later admissions after one hostile owner callback.
+        }
+      }
     } finally {
       deferInvocations = false;
     }
+    if (admissionFailed) return Object.freeze([]);
     const intents: RequestIntent[] = [];
     for (const input of preparedInputs) {
       const state = mapValue(navigationStates, input.navigationGeneration);
