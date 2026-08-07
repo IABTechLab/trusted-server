@@ -766,6 +766,44 @@ describe('auction/parseTrustedServerAuctionResponseV1', () => {
     );
   });
 
+  it.each([
+    ['Object', Object.prototype],
+    ['Array', Array.prototype],
+  ] as const)(
+    'measures projection and response own data without inherited %s.prototype.toJSON',
+    (_name, prototype) => {
+      const lengths = Array.from({ length: 16 }, () => 512 * 1024);
+      lengths[15] = 1;
+      const baselineBytes = new TextEncoder().encode(
+        JSON.stringify(largeAdmProjection(lengths))
+      ).length;
+      lengths[15] = 2 + MAX_BROWSER_AUCTION_PROJECTION_BYTES - baselineBytes;
+      const oversizedProjection = largeAdmProjection(lengths);
+      expect(new TextEncoder().encode(JSON.stringify(oversizedProjection)).length).toBe(
+        MAX_BROWSER_AUCTION_PROJECTION_BYTES + 1
+      );
+      const acceptedResponse = response();
+
+      const descriptor = Object.getOwnPropertyDescriptor(prototype, 'toJSON');
+      const inheritedToJson = vi.fn(() => ({}));
+      try {
+        Object.defineProperty(prototype, 'toJSON', {
+          configurable: true,
+          value: inheritedToJson,
+          writable: true,
+        });
+
+        expect(parseBrowserAuctionProjectionV1(oversizedProjection)).toBeUndefined();
+        expect(inheritedToJson).not.toHaveBeenCalled();
+        expect(parseTrustedServerAuctionResponseV1(acceptedResponse)).toBeDefined();
+        expect(inheritedToJson).not.toHaveBeenCalled();
+      } finally {
+        if (descriptor) Object.defineProperty(prototype, 'toJSON', descriptor);
+        else Reflect.deleteProperty(prototype, 'toJSON');
+      }
+    }
+  );
+
   it('returns direct winners in decision order regardless of response order', () => {
     const value = response();
     const first = value.seatbid[0]!.bid[0]!;
