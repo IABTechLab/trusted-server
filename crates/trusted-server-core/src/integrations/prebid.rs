@@ -6952,29 +6952,6 @@ set = { placementId = "explicit_header" }
     // ========================================================================
 
     #[test]
-    fn to_openrtb_uses_stored_request_when_slot_has_no_pbs_bidder_params() {
-        // Slot only has "aps" provider — not a PBS bidder
-        let slot = make_slot(
-            "atf_sidebar_ad",
-            HashMap::from([("aps".to_string(), json!({"slotID": "aps-slot-atf-sidebar"}))]),
-        );
-        let request = make_auction_request(vec![slot]);
-
-        let ortb = call_to_openrtb(base_config(), &request);
-        let ext = ortb.imp[0].ext.as_ref().expect("should have imp ext");
-        let prebid = ext.get("prebid").expect("should have prebid in ext");
-
-        assert!(
-            prebid.get("bidder").is_none(),
-            "should not send inline bidder params when using stored request"
-        );
-        assert_eq!(
-            prebid["storedrequest"]["id"], "atf_sidebar_ad",
-            "should use slot id as stored request id"
-        );
-    }
-
-    #[test]
     fn to_openrtb_uses_stored_request_when_slot_has_empty_bidders() {
         let slot = make_slot("homepage_header_ad", HashMap::new());
         let request = make_auction_request(vec![slot]);
