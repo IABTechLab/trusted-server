@@ -252,19 +252,43 @@ export function createAuctionBatchService(
       finishIfComplete();
     };
 
+    const containCancellation = (child: BatchChild, reason: RenderCancellationReason): void => {
+      try {
+        child.attempt.cancel(reason);
+      } catch {
+        // Synthetic public settlement below contains a broken attempt implementation.
+      }
+      if (!child.terminal) settleIndex(child.index, cancelledResult(child.slot, reason));
+    };
+
+    const containFailure = (child: BatchChild, reason: RenderFailureReason): void => {
+      try {
+        child.attempt.fail(reason);
+      } catch {
+        // Synthetic public settlement below contains a broken attempt implementation.
+      }
+      if (!child.terminal) settleIndex(child.index, failedResult(child.slot, reason));
+    };
+
+    const containNoBid = (child: BatchChild): void => {
+      try {
+        child.attempt.noBid();
+      } catch {
+        // Synthetic public settlement below contains a broken attempt implementation.
+      }
+      if (!child.terminal) {
+        settleIndex(
+          child.index,
+          terminalResult(child.slot, frozen({ outcome: 'no_bid' as const }))
+        );
+      }
+    };
+
     const cancelLive = (reason: RenderCancellationReason): void => {
       for (let index = 0; index < children.length; index += 1) {
         const child = children[index];
         if (!child || child.terminal) continue;
-        let cancelled: boolean;
-        try {
-          cancelled = child.attempt.cancel(reason) === true;
-        } catch {
-          cancelled = false;
-        }
-        if (!cancelled && !child.terminal) {
-          settleIndex(index, cancelledResult(child.slot, reason));
-        }
+        containCancellation(child, reason);
       }
       finishIfComplete();
     };
@@ -344,11 +368,7 @@ export function createAuctionBatchService(
         observing = false;
       }
       if (!observing && !child.terminal) {
-        try {
-          created.value.fail('internal_error');
-        } catch {
-          settleIndex(index, failedResult(slot, 'internal_error'));
-        }
+        containFailure(child, 'internal_error');
       }
     }
     building = false;
@@ -384,13 +404,7 @@ export function createAuctionBatchService(
       for (let index = 0; index < children.length; index += 1) {
         const child = children[index];
         if (!child || child.terminal) continue;
-        try {
-          if (child.attempt.fail(reason) !== true && !child.terminal) {
-            settleIndex(index, failedResult(child.slot, reason));
-          }
-        } catch {
-          settleIndex(index, failedResult(child.slot, reason));
-        }
+        containFailure(child, reason);
       }
       finishIfComplete();
     };
@@ -410,15 +424,15 @@ export function createAuctionBatchService(
         if (!child || child.terminal) continue;
         const decision = decisions.get(child.slot);
         if (!decision) {
-          child.attempt.fail('invalid_response');
+          containFailure(child, 'invalid_response');
           continue;
         }
         if (decision.outcome === 'no_bid') {
-          child.attempt.noBid();
+          containNoBid(child);
           continue;
         }
         if (decision.outcome === 'failed') {
-          child.attempt.fail(decision.reason);
+          containFailure(child, decision.reason);
           continue;
         }
         const bid = bids.get(decision.candidateId);
@@ -435,7 +449,7 @@ export function createAuctionBatchService(
           admitted = false;
         }
         if (!admitted || !bid) {
-          if (!child.terminal) child.attempt.fail('winner_not_renderable');
+          if (!child.terminal) containFailure(child, 'winner_not_renderable');
           continue;
         }
         let rendering: boolean;
@@ -444,7 +458,7 @@ export function createAuctionBatchService(
         } catch {
           rendering = false;
         }
-        if (!rendering && !child.terminal) child.attempt.fail('winner_not_renderable');
+        if (!rendering && !child.terminal) containFailure(child, 'winner_not_renderable');
       }
     };
 

@@ -32,11 +32,14 @@ export interface SlotRegistration {
   readonly source: SlotSource;
   readonly adUnitCode?: string;
   readonly domAliases?: readonly string[];
+  /** Detached programmatic `/auction` unit; absent for server projection slots. */
+  readonly directAuctionUnit?: Readonly<object>;
 }
 
 /** Public immutable view of a registered slot. */
 export interface SlotRecord {
   readonly adUnitCode: string | undefined;
+  readonly directAuctionUnit?: Readonly<object>;
   readonly domAliases: readonly string[];
   readonly navigationGeneration: object;
   readonly ordinal: number;
@@ -138,6 +141,7 @@ export interface SlotService {
   ) => SlotRegistrationResult;
   readonly request: (input: SlotRequestInput) => SlotRequestHandle;
   readonly requestBatch: (inputs: readonly SlotBatchRequestInput[]) => readonly SlotRequestHandle[];
+  readonly snapshotRegisteredSlots: (owner: NavigationSession) => readonly SlotRecord[] | undefined;
   readonly resolveAdUnitCode: (adUnitCode: string) => SlotRecord | undefined;
   readonly resolveDomAlias: (alias: string) => SlotRecord | undefined;
   readonly resolveRegisteredSlot: (registeredSlotId: string) => SlotRecord | undefined;
@@ -1226,6 +1230,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     const prepared: Array<{
       readonly adUnitCode: string | undefined;
       readonly aliases: readonly string[];
+      readonly directAuctionUnit: Readonly<object> | undefined;
       readonly id: string;
       readonly placementKeys: readonly string[];
       readonly source: SlotSource;
@@ -1238,6 +1243,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       const id = registration.registeredSlotId;
       const source = registration.source;
       const adUnitCode = registration.adUnitCode;
+      const directAuctionUnit = registration.directAuctionUnit;
       const aliases = frozenAliases(registration.domAliases);
       if (
         typeof id !== 'string' ||
@@ -1245,6 +1251,11 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         (source !== 'server' && source !== 'programmatic') ||
         (adUnitCode !== undefined &&
           (typeof adUnitCode !== 'string' || !validSlotIdentity(adUnitCode))) ||
+        (directAuctionUnit !== undefined &&
+          (source !== 'programmatic' ||
+            typeof directAuctionUnit !== 'object' ||
+            directAuctionUnit === null ||
+            !Object.isFrozen(directAuctionUnit))) ||
         aliases === undefined
       ) {
         return Object.freeze({ ok: false, reason: 'invalid_slot_id' });
@@ -1260,6 +1271,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       prepared[prepared.length] = {
         adUnitCode,
         aliases,
+        directAuctionUnit,
         id,
         placementKeys: registrationPlacementKeys,
         source,
@@ -1285,6 +1297,9 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         const ordinal = state.nextOrdinal + index;
         const view: SlotRecord = Object.freeze({
           adUnitCode: registration.adUnitCode,
+          ...(registration.directAuctionUnit === undefined
+            ? {}
+            : { directAuctionUnit: registration.directAuctionUnit }),
           domAliases: registration.aliases,
           navigationGeneration: owner.generation,
           ordinal,
@@ -1972,6 +1987,14 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     register,
     request,
     requestBatch,
+    snapshotRegisteredSlots: (owner: NavigationSession): readonly SlotRecord[] | undefined => {
+      if (!owner.isCurrent()) return undefined;
+      const state = mapValue(navigationStates, owner.generation);
+      if (!state || state.disposed || state.owner !== owner) return undefined;
+      const records = mapValueSnapshot(state.records);
+      records.sort((left, right) => left.view.ordinal - right.view.ordinal);
+      return Object.freeze(records.map(({ view }) => view));
+    },
     resolveAdUnitCode: (adUnitCode: string) => resolveUnique(adUnitCodes, adUnitCode),
     resolveDomAlias: (alias: string) => resolveUnique(domAliases, alias),
     resolveRegisteredSlot: (registeredSlotId: string) =>
