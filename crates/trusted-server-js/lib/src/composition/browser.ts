@@ -24,12 +24,12 @@ import {
   parseBrowserAuctionProjectionV1,
 } from '../core/contracts/auction_projection';
 import { validateApsRenderer } from '../core/contracts/aps_renderer';
+import { validateRequestAdsOptions } from '../core/contracts/request_ads';
 import {
   AdUnitRegistrationError,
   addAdUnitsResult,
   prepareProgrammaticAdUnits,
 } from '../core/registry';
-import { validateRequestAdsOptions } from '../core/request';
 import { prepareAdmIframe } from '../core/render';
 import { APS_RENDERER_V1_PATH, renderDirectApsAttempt } from '../integrations/aps/render';
 import { createBrowserNavigationIdentityIssuer } from '../kernel/identity';
@@ -61,7 +61,12 @@ import {
   type RendererNonceRegistry,
 } from '../services/render';
 import { createPucBridge, type PucBridge, type PucBridgeOptions } from '../services/puc_bridge';
-import { createSlotService, type SlotRecord, type SlotService } from '../services/slots';
+import {
+  createSlotService,
+  type SlotRecord,
+  type SlotRegistrationFailure,
+  type SlotService,
+} from '../services/slots';
 import { createTargetingService, type TargetingService } from '../services/targeting';
 
 export interface BrowserAdapters {
@@ -262,30 +267,45 @@ export function createTestBrowserRuntimeComposition(
       ),
     });
   };
+  const registrationError = (reason: SlotRegistrationFailure): AdUnitRegistrationError => {
+    switch (reason) {
+      case 'invalid_slot_id':
+        return new AdUnitRegistrationError('invalid_code');
+      case 'registry_capacity':
+        return new AdUnitRegistrationError('registry_capacity');
+      case 'duplicate_slot':
+      case 'slot_quarantined':
+      case 'stale_owner':
+        return new AdUnitRegistrationError('slot_collision');
+    }
+  };
   const addProgrammaticAdUnits = (candidate: unknown): unknown => {
     const navigation = runtimeSession?.currentNavigation;
     const slots = browserServices?.slots;
-    const snapshot = navigation && slots?.snapshotRegisteredSlots(navigation);
-    if (!navigation || !slots || !snapshot) throw new Error('TSJS navigation is unavailable');
+    if (!navigation || !slots) throw new AdUnitRegistrationError('slot_collision');
+    let snapshot: readonly SlotRecord[] | undefined;
+    try {
+      snapshot = slots.snapshotRegisteredSlots(navigation);
+    } catch {
+      throw new AdUnitRegistrationError('slot_collision');
+    }
+    if (!snapshot) throw new AdUnitRegistrationError('slot_collision');
     const knownSlots = new Set(snapshot.map(({ registeredSlotId }) => registeredSlotId));
     const prepared = prepareProgrammaticAdUnits(candidate, knownSlots);
-    const registered = slots.register(
-      navigation,
-      prepared.map((unit) => ({
-        directAuctionUnit: unit,
-        registeredSlotId: unit.code,
-        source: 'programmatic' as const,
-      }))
-    );
-    if (!registered.ok) {
-      if (registered.reason === 'registry_capacity') {
-        throw new AdUnitRegistrationError('registry_capacity');
-      }
-      if (registered.reason === 'duplicate_slot') {
-        throw new AdUnitRegistrationError('slot_collision');
-      }
-      throw new Error('TSJS navigation changed during registration');
+    let registered: ReturnType<SlotService['register']>;
+    try {
+      registered = slots.register(
+        navigation,
+        prepared.map((unit) => ({
+          directAuctionUnit: unit,
+          registeredSlotId: unit.code,
+          source: 'programmatic' as const,
+        }))
+      );
+    } catch {
+      throw new AdUnitRegistrationError('slot_collision');
     }
+    if (!registered.ok) throw registrationError(registered.reason);
     return addAdUnitsResult(prepared);
   };
   const requestDirectAds = (candidate?: unknown): Promise<unknown> => {
@@ -507,13 +527,19 @@ export function createTestBrowserRuntimeComposition(
       };
       const resolveDirectContainer = (record: SlotRecord): HTMLElement | undefined => {
         try {
-          if (typeof document === 'undefined' || record.domAliases.length === 0) return undefined;
-          const aliases = new Set(record.domAliases);
+          if (typeof document === 'undefined') return undefined;
+          const identifiers =
+            record.source === 'programmatic'
+              ? new Set([record.registeredSlotId])
+              : new Set(record.domAliases);
+          if (identifiers.size === 0) return undefined;
           const matches = new Set<HTMLElement>();
           const elements = document.querySelectorAll('[id]');
           for (let index = 0; index < elements.length; index += 1) {
             const element = elements.item(index);
-            if (element instanceof HTMLElement && aliases.has(element.id)) matches.add(element);
+            if (element instanceof HTMLElement && identifiers.has(element.id)) {
+              matches.add(element);
+            }
           }
           return matches.size === 1 ? Array.from(matches)[0] : undefined;
         } catch {
@@ -527,7 +553,10 @@ export function createTestBrowserRuntimeComposition(
           createRenderAttempt({
             artifacts,
             owner,
-            prepareRenderSource: (candidate) => parseBidRenderSourceV1(candidate, cachePolicy),
+            prepareRenderSource: (candidate) => {
+              const source = parseBidRenderSourceV1(candidate, cachePolicy);
+              return source ? Object.freeze(source) : undefined;
+            },
             reservations: reservationService,
           }),
         fetcher: (input, init) => {

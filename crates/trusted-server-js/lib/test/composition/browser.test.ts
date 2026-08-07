@@ -834,18 +834,57 @@ describe('browser composition', () => {
       };
       requestBodies.push(body);
       const slots = body.adUnits.map(({ code }) => code);
+      const winnerSlot =
+        requestBodies.length === 1 || (slots.length === 1 && slots[0] === 'ambiguous-slot')
+          ? slots[0]
+          : undefined;
+      const candidateId = 'AAAAAAAAAAAA';
+      const renderSource = {
+        type: 'adm',
+        version: 1,
+        adm: '<div>programmatic winner</div>',
+        width: 300,
+        height: 250,
+      } as const;
       return {
         ok: true,
         json: async () => ({
           id: `auction-${requestBodies.length}`,
           cur: 'USD',
-          seatbid: [],
+          seatbid: winnerSlot
+            ? [
+                {
+                  seat: 'fictional',
+                  bid: [
+                    {
+                      id: 'r1_AAAAAAAAAAAAAAAAAAAAAA',
+                      impid: winnerSlot,
+                      price: 1,
+                      adm: renderSource.adm,
+                      w: renderSource.width,
+                      h: renderSource.height,
+                      ext: {
+                        trusted_server: {
+                          candidate_id: candidateId,
+                          slot_id: winnerSlot,
+                          render_source: renderSource,
+                        },
+                      },
+                    },
+                  ],
+                },
+              ]
+            : [],
           ext: {
             trusted_server: {
               slot_results: {
                 version: 1,
                 auctionId: `auction-${requestBodies.length}`,
-                results: slots.map((slot) => ({ slot, outcome: 'no_bid' })),
+                results: slots.map((slot) =>
+                  slot === winnerSlot
+                    ? { slot, outcome: 'winner', candidateId }
+                    : { slot, outcome: 'no_bid' }
+                ),
               },
             },
           },
@@ -917,6 +956,13 @@ describe('browser composition', () => {
 
     expect(api.addAdUnits(programmatic)).toEqual({ registered: ['programmatic-slot'] });
     expect(composition.projectionSlotsForTest()).toEqual(['server-slot', 'programmatic-slot']);
+    const slotService = composition.slotServiceForTest();
+    expect(slotService?.resolveRegisteredSlot('programmatic-slot')).toMatchObject({
+      domAliases: [],
+      registeredSlotId: 'programmatic-slot',
+      source: 'programmatic',
+    });
+    expect(slotService?.resolveDomAlias('programmatic-slot')).toBeUndefined();
     expect(() =>
       api.addAdUnits([
         {
@@ -930,10 +976,18 @@ describe('browser composition', () => {
       ])
     ).toThrowError(expect.objectContaining({ code: 'slot_collision', unitIndex: 1 }));
     expect(composition.projectionSlotsForTest()).toEqual(['server-slot', 'programmatic-slot']);
-    await expect(api.requestAds({ slots: ['unknown', 'programmatic-slot'] })).resolves.toEqual({
+    document.body.innerHTML = '<div id="programmatic-slot"><span>placeholder</span></div>';
+    const explicit = api.requestAds({ slots: ['unknown', 'programmatic-slot'] });
+    await vi.waitFor(() =>
+      expect(document.querySelector('#programmatic-slot iframe')).not.toBeNull()
+    );
+    const frame = document.querySelector<HTMLIFrameElement>('#programmatic-slot iframe');
+    expect(frame?.srcdoc).toContain('programmatic winner');
+    frame?.dispatchEvent(new Event('load'));
+    await expect(explicit).resolves.toEqual({
       slots: [
         { slot: 'unknown', path: 'primary', outcome: 'failed', reason: 'slot_unresolved' },
-        { slot: 'programmatic-slot', path: 'primary', outcome: 'no_bid' },
+        { slot: 'programmatic-slot', path: 'primary', outcome: 'accepted' },
       ],
     });
     expect(requestBodies[0]).toEqual({
@@ -966,6 +1020,55 @@ describe('browser composition', () => {
     expect(contextContributor).toHaveBeenCalledTimes(2);
     expect(auctionFetcher).toHaveBeenCalledTimes(2);
 
+    expect(
+      slotService?.register(session!.currentNavigation!, [
+        {
+          adUnitCode: '/network/path',
+          domAliases: ['publisher-alias'],
+          registeredSlotId: 'alias-owner',
+          source: 'server',
+        },
+      ])
+    ).toMatchObject({ ok: true });
+    await expect(
+      api.requestAds({ slots: ['publisher-alias', '/network/path', 'alias-owner'] })
+    ).resolves.toEqual({
+      slots: [
+        { slot: 'publisher-alias', path: 'primary', outcome: 'failed', reason: 'slot_unresolved' },
+        { slot: '/network/path', path: 'primary', outcome: 'failed', reason: 'slot_unresolved' },
+        { slot: 'alias-owner', path: 'primary', outcome: 'no_bid' },
+      ],
+    });
+    expect(requestBodies[2]?.adUnits.map(({ code }) => code)).toEqual(['alias-owner']);
+
+    expect(
+      api.addAdUnits({
+        code: 'ambiguous-slot',
+        mediaTypes: { banner: { sizes: [[300, 250]] } },
+      })
+    ).toEqual({ registered: ['ambiguous-slot'] });
+    document.body.insertAdjacentHTML(
+      'beforeend',
+      '<div id="ambiguous-slot"></div><div id="ambiguous-slot"></div>'
+    );
+    await expect(api.requestAds({ slots: ['ambiguous-slot'] })).resolves.toEqual({
+      slots: [
+        {
+          slot: 'ambiguous-slot',
+          path: 'primary',
+          outcome: 'failed',
+          reason: 'slot_unresolved',
+        },
+      ],
+    });
+    expect(document.querySelectorAll('[id="ambiguous-slot"] iframe')).toHaveLength(0);
+    expect(contextContributor).toHaveBeenCalledTimes(4);
+    expect(auctionFetcher).toHaveBeenCalledTimes(4);
+
     composition.runtime.dispose();
+    expect(() => api.addAdUnits(programmatic)).toThrowError(
+      expect.objectContaining({ name: 'AdUnitRegistrationError', code: 'slot_collision' })
+    );
+    document.body.innerHTML = '';
   });
 });

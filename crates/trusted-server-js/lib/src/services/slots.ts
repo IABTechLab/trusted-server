@@ -371,12 +371,18 @@ function resolveUnique(
 }
 
 function validSlotIdentity(value: string): boolean {
-  return (
-    value.length > 0 &&
-    new TextEncoder().encode(value).length <= 256 &&
-    !/[\p{Cc}]/u.test(value) &&
-    !/[\uD800-\uDFFF]/u.test(value)
-  );
+  if (
+    value.length === 0 ||
+    new TextEncoder().encode(value).length > 256 ||
+    /[\uD800-\uDFFF]/u.test(value)
+  ) {
+    return false;
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x1f || code === 0x7f) return false;
+  }
+  return true;
 }
 
 function frozenAliases(aliases: readonly string[] | undefined): readonly string[] | undefined {

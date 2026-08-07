@@ -9,6 +9,23 @@ import type {
 } from './render';
 
 const DEFAULT_AUCTION_ENDPOINT = '/auction';
+const reflectApplyIntrinsic = Reflect.apply;
+function captureAbortSignalMethod(name: 'addEventListener' | 'removeEventListener'): unknown {
+  if (typeof AbortSignal === 'undefined') return undefined;
+  let prototype: object | null = AbortSignal.prototype;
+  while (prototype) {
+    const descriptor = Object.getOwnPropertyDescriptor(prototype, name);
+    if (descriptor && 'value' in descriptor) return descriptor.value;
+    prototype = Object.getPrototypeOf(prototype) as object | null;
+  }
+  return undefined;
+}
+const abortSignalAbortedGetter =
+  typeof AbortSignal === 'undefined'
+    ? undefined
+    : Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted')?.get;
+const abortSignalAddEventListener = captureAbortSignalMethod('addEventListener');
+const abortSignalRemoveEventListener = captureAbortSignalMethod('removeEventListener');
 
 export type AuctionBatchFetcher = (input: string, init: RequestInit) => Promise<unknown>;
 
@@ -114,6 +131,34 @@ function cancelledResult(slot: string, reason: RenderCancellationReason): Auctio
   return terminalResult(slot, frozen({ outcome: 'cancelled' as const, reason }));
 }
 
+function signalAborted(signal: AbortSignal): boolean | undefined {
+  if (typeof abortSignalAbortedGetter !== 'function') return undefined;
+  try {
+    return reflectApplyIntrinsic(abortSignalAbortedGetter, signal, []) as boolean;
+  } catch {
+    return undefined;
+  }
+}
+
+function addAbortListener(signal: AbortSignal, listener: () => void): boolean {
+  if (typeof abortSignalAddEventListener !== 'function') return false;
+  try {
+    reflectApplyIntrinsic(abortSignalAddEventListener, signal, ['abort', listener, { once: true }]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function removeAbortListener(signal: AbortSignal, listener: () => void): void {
+  if (typeof abortSignalRemoveEventListener !== 'function') return;
+  try {
+    reflectApplyIntrinsic(abortSignalRemoveEventListener, signal, ['abort', listener]);
+  } catch {
+    // Logical cancellation authority is already detached.
+  }
+}
+
 function responseMembershipIsExact(
   parsed: ParsedAuctionBatchResponse,
   slots: readonly string[]
@@ -207,11 +252,7 @@ export function createAuctionBatchService(
 
     const cleanupSignal = (): void => {
       if (!callerListener || !input.signal) return;
-      try {
-        input.signal.removeEventListener('abort', callerListener);
-      } catch {
-        // A hostile signal cannot retain batch authority.
-      }
+      removeAbortListener(input.signal, callerListener);
       callerListener = undefined;
     };
 
@@ -382,19 +423,17 @@ export function createAuctionBatchService(
       finishIfComplete();
       return publicBatch;
     }
-    if (input.signal?.aborted === true) {
-      cancelLive('caller_aborted');
-      return publicBatch;
-    }
     if (input.signal) {
-      callerListener = (): void => cancelLive('caller_aborted');
-      try {
-        input.signal.addEventListener('abort', callerListener, { once: true });
-      } catch {
+      if (signalAborted(input.signal) !== false) {
         cancelLive('caller_aborted');
         return publicBatch;
       }
-      if (Reflect.get(input.signal, 'aborted') === true) {
+      callerListener = (): void => cancelLive('caller_aborted');
+      if (!addAbortListener(input.signal, callerListener)) {
+        cancelLive('caller_aborted');
+        return publicBatch;
+      }
+      if (signalAborted(input.signal) !== false) {
         cancelLive('caller_aborted');
         return publicBatch;
       }
