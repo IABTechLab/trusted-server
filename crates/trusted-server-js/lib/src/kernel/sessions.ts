@@ -128,6 +128,7 @@ export interface AuctionBatchScope {
 /** Attempt-owned scope for timers, listeners, ports, and one terminal lifecycle. */
 export interface RenderAttemptScope {
   readonly generation: object;
+  readonly navigationGeneration: object;
   readonly interfaces: RuntimeInterfaces;
   readonly id: string;
   readonly slot: string;
@@ -228,6 +229,7 @@ class RenderAttemptOwner implements RenderAttemptScope {
   public constructor(
     public readonly id: string,
     public readonly slot: string,
+    public readonly navigationGeneration: object,
     public readonly interfaces: RuntimeInterfaces,
     private readonly ownerIsCurrent: () => boolean,
     onDisposalError?: DisposalErrorHandler
@@ -337,6 +339,7 @@ class AuctionBatchOwner implements AuctionBatchScope {
 
   public constructor(
     private readonly issuer: NavigationIdentityIssuer,
+    private readonly navigationGeneration: object,
     public readonly interfaces: RuntimeInterfaces,
     private readonly ownerIsCurrent: () => boolean,
     private readonly attemptExists: (slot: string) => boolean,
@@ -370,6 +373,7 @@ class AuctionBatchOwner implements AuctionBatchScope {
     const attempt = new RenderAttemptOwner(
       identity.value,
       slot,
+      this.navigationGeneration,
       this.interfaces,
       (): boolean => this.isCurrent() && this.attempts.get(slot) === attemptReference.current,
       this.onDisposalError
@@ -490,6 +494,7 @@ class NavigationSessionOwner implements NavigationSession {
     const batchReference: { current?: AuctionBatchOwner } = {};
     const batch = new AuctionBatchOwner(
       issuer,
+      this.generation,
       this.interfaces,
       (): boolean => this.isCurrent() && this.batches.get(key) === batchReference.current,
       (slot) => this.attempts.has(slot),

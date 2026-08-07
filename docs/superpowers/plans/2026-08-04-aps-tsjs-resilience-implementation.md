@@ -1369,6 +1369,8 @@ Every task's regression suite therefore remains green in task order.
       construction assert one exact navigation-unique `a1_` attempt id; fallback child
       ids are distinct and bind their exact parent id. Test navigation-prefix failure,
       ordinal exhaustion, disposal, and that neither ids nor issuer bytes reach logs.
+      Treat `created -> no_bid` as the sole `no_bid` transition for an exact parsed
+      server no-winner decision; every later no-bid transition is invalid.
 
   Add renderer-nonce live-registry tests at 255/256/257 entries, eight collision
   draws, crypto failure, exact source/port/attempt/generation binding, disposal reuse,
