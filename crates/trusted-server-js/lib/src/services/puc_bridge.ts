@@ -119,6 +119,8 @@ function installPucDynamicOwner(): void {
   const cancellationReasons = new Set(['caller_aborted', 'superseded', 'navigation_disposed']);
   const messageEventDataGetter = Object.getOwnPropertyDescriptor(MessageEvent.prototype, 'data')
     ?.get as ((this: MessageEvent) => unknown) | undefined;
+  const messageEventPortsGetter = Object.getOwnPropertyDescriptor(MessageEvent.prototype, 'ports')
+    ?.get as ((this: MessageEvent) => readonly MessagePort[]) | undefined;
 
   const ownDataValue = (candidate: unknown, name: string): unknown => {
     try {
@@ -163,56 +165,88 @@ function installPucDynamicOwner(): void {
     }
     return candidate as Record<string, unknown>;
   };
-  const snapshotEventPorts = (event: unknown): MessagePort[] | undefined => {
+  const inspectEventPorts = (
+    event: unknown
+  ):
+    | Readonly<{
+        exactShape: boolean;
+        originalCount: number;
+        ports: readonly MessagePort[];
+      }>
+    | undefined => {
     try {
       if (typeof event !== 'object' || event === null) return undefined;
-      const ports = Reflect.get(event, 'ports') as unknown;
-      if (
-        !Array.isArray(ports) ||
-        Object.getPrototypeOf(ports) !== Array.prototype ||
-        Object.getOwnPropertySymbols(ports).length !== 0
-      ) {
-        return undefined;
-      }
+      const descriptor = Object.getOwnPropertyDescriptor(event, 'ports');
+      const ports = descriptor
+        ? 'value' in descriptor
+          ? descriptor.value
+          : undefined
+        : messageEventPortsGetter
+          ? Reflect.apply(messageEventPortsGetter, event, [])
+          : undefined;
+      if (!Array.isArray(ports)) return undefined;
       const length = Object.getOwnPropertyDescriptor(ports, 'length');
       if (
         !length ||
         !('value' in length) ||
         !Number.isSafeInteger(length.value) ||
-        length.value < 0 ||
-        Object.getOwnPropertyNames(ports).length !== length.value + 1
+        length.value < 0
       ) {
         return undefined;
       }
+      let exactShape =
+        Object.getPrototypeOf(ports) === Array.prototype &&
+        Object.getOwnPropertySymbols(ports).length === 0 &&
+        Object.getOwnPropertyNames(ports).length === length.value + 1;
       const snapshot: MessagePort[] = [];
+      const seen = new Set<MessagePort>();
       for (let index = 0; index < length.value; index += 1) {
         const descriptor = Object.getOwnPropertyDescriptor(ports, String(index));
-        if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) return undefined;
-        const port = descriptor.value as Partial<MessagePort> | undefined;
-        if (
-          !port ||
-          typeof Reflect.get(port, 'postMessage') !== 'function' ||
-          typeof Reflect.get(port, 'close') !== 'function'
-        ) {
-          return undefined;
+        if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) {
+          exactShape = false;
+          continue;
         }
-        snapshot[index] = port as MessagePort;
+        const port = descriptor.value as Partial<MessagePort> | undefined;
+        let validPort = false;
+        try {
+          validPort =
+            !!port &&
+            typeof Reflect.get(port, 'postMessage') === 'function' &&
+            typeof Reflect.get(port, 'close') === 'function';
+        } catch {
+          validPort = false;
+        }
+        if (!port || !validPort) {
+          exactShape = false;
+          continue;
+        }
+        const accepted = port as MessagePort;
+        if (seen.has(accepted)) {
+          exactShape = false;
+          continue;
+        }
+        seen.add(accepted);
+        snapshot[snapshot.length] = accepted;
       }
-      return snapshot;
+      return { exactShape, originalCount: length.value, ports: snapshot };
     } catch {
       return undefined;
     }
   };
   const eventPorts = (event: unknown, count: number): MessagePort[] | undefined => {
-    const ports = snapshotEventPorts(event);
-    return ports?.length === count ? ports : undefined;
+    const inspection = inspectEventPorts(event);
+    return inspection?.exactShape === true &&
+      inspection.originalCount === count &&
+      inspection.ports.length === count
+      ? [...inspection.ports]
+      : undefined;
   };
   const closeEventPorts = (event: unknown): void => {
-    const ports = snapshotEventPorts(event);
-    if (!ports) return;
-    for (let index = 0; index < ports.length; index += 1) {
+    const inspection = inspectEventPorts(event);
+    if (!inspection) return;
+    for (let index = 0; index < inspection.ports.length; index += 1) {
       try {
-        ports[index]?.close();
+        inspection.ports[index]?.close();
       } catch {
         // Late or malformed endpoints are still contained independently.
       }
@@ -443,8 +477,31 @@ function installPucDynamicOwner(): void {
 
       const removeFrameHandlers = (): void => {
         if (!frame) return;
-        frame.onload = null;
-        frame.onerror = null;
+        try {
+          frame.onload = null;
+        } catch {
+          // One hostile DOM setter cannot skip the remaining terminal cleanup.
+        }
+        try {
+          frame.onerror = null;
+        } catch {
+          // One hostile DOM setter cannot skip the remaining terminal cleanup.
+        }
+      };
+      const clearTimer = (handle: number | undefined): void => {
+        if (handle === undefined) return;
+        try {
+          creativeWindow.clearTimeout(handle);
+        } catch {
+          // Timer cleanup cannot prevent channel cleanup or Promise settlement.
+        }
+      };
+      const removeFrame = (candidate: HTMLIFrameElement | undefined): void => {
+        try {
+          candidate?.remove();
+        } catch {
+          // DOM cleanup is best-effort after authority is already terminal.
+        }
       };
       const closePort = (port: MessagePort | undefined): void => {
         try {
@@ -465,21 +522,33 @@ function installPucDynamicOwner(): void {
       const finish = (accepted: boolean, reason: string): void => {
         if (settled) return;
         settled = true;
-        if (registrationTimer !== undefined) creativeWindow.clearTimeout(registrationTimer);
-        if (ownerTimer !== undefined) creativeWindow.clearTimeout(ownerTimer);
-        stopHelper();
-        removeFrameHandlers();
-        if (!accepted && frame && !frameCommitted) frame.remove();
-        if (controlPort) {
-          controlPort.onmessage = null;
-          controlPort.onmessageerror = null;
+        try {
+          clearTimer(registrationTimer);
+          clearTimer(ownerTimer);
+          stopHelper();
+          removeFrameHandlers();
+          if (!accepted && frame && !frameCommitted) removeFrame(frame);
+          if (controlPort) {
+            try {
+              controlPort.onmessage = null;
+            } catch {
+              // One hostile handler setter cannot retain the remaining authority.
+            }
+            try {
+              controlPort.onmessageerror = null;
+            } catch {
+              // One hostile handler setter cannot retain the remaining authority.
+            }
+          }
+          closePort(documentPort);
+          closePort(controlPort);
+          documentPort = undefined;
+          controlPort = undefined;
+          ownerFrameCurrent = undefined;
+        } finally {
+          if (accepted) resolve();
+          else reject(new Error(reason));
         }
-        closePort(documentPort);
-        closePort(controlPort);
-        documentPort = undefined;
-        controlPort = undefined;
-        if (accepted) resolve();
-        else reject(new Error(reason));
       };
       const postControl = (message: Record<string, unknown>): boolean => {
         try {
@@ -652,14 +721,22 @@ function installPucDynamicOwner(): void {
           next.contentWindow === intendedWindow;
         const containLocalFailure = (transferred?: MessagePort): void => {
           localApsFailure = true;
-          next.onload = null;
-          next.onerror = null;
+          try {
+            next.onload = null;
+          } catch {
+            // Local containment continues through hostile DOM setters.
+          }
+          try {
+            next.onerror = null;
+          } catch {
+            // Local containment continues through hostile DOM setters.
+          }
           closePort(transferred);
           if (documentPort) {
             closePort(documentPort);
             documentPort = undefined;
           }
-          next.remove();
+          removeFrame(next);
         };
         next.onload = () => {
           if (settled || ownerFrameCurrent?.() !== true || !documentPort) return;
@@ -774,7 +851,7 @@ function installPucDynamicOwner(): void {
         }
         registrationFinished = true;
         stopHelper();
-        if (registrationTimer !== undefined) creativeWindow.clearTimeout(registrationTimer);
+        clearTimer(registrationTimer);
         const ports = eventPorts(event, 1);
         const dataValue = eventDataValue(event);
         const response = parseRegistration(dataValue);
@@ -918,6 +995,7 @@ interface GamAttemptBinding {
   active: boolean;
   claim: PendingClaim | undefined;
   claimDeadlineHandle: unknown;
+  claimDeadlineToken: object | undefined;
   controlListenerDispose: (() => void) | undefined;
   controlPort: MessagingPort | undefined;
   controlStarted: boolean;
@@ -1490,6 +1568,7 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
   const clearClaimDeadline = (binding: GamAttemptBinding): void => {
     const handle = binding.claimDeadlineHandle;
     binding.claimDeadlineHandle = undefined;
+    binding.claimDeadlineToken = undefined;
     clearScheduled(handle);
   };
 
@@ -1814,18 +1893,22 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
   };
 
   const armClaimDeadline = (binding: GamAttemptBinding): boolean => {
-    if (!binding.active || binding.claimDeadlineHandle !== undefined) return false;
+    if (!binding.active || binding.claimDeadlineToken !== undefined) return false;
+    const token = frozen({});
+    binding.claimDeadlineToken = token;
     let handle: unknown;
     try {
       handle = Reflect.apply(schedulerSet, scheduler, [
         () => {
+          if (binding.claimDeadlineToken !== token) return;
+          binding.claimDeadlineToken = undefined;
+          binding.claimDeadlineHandle = undefined;
           if (
             binding.active &&
             binding.gamReady &&
             !binding.claim &&
-            mapValue(attempts, binding.reservationId) === binding
+            currentBindingState(binding, 'waiting_for_gam_and_claim')
           ) {
-            binding.claimDeadlineHandle = undefined;
             failBinding(binding, 'bridge_claim_timeout', false);
           }
         },
@@ -1834,9 +1917,12 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
     } catch {
       handle = undefined;
     }
-    if (handle === undefined || !binding.active) {
+    if (handle === undefined || !binding.active || binding.claimDeadlineToken !== token) {
       clearScheduled(handle);
-      if (binding.active) failBinding(binding, 'internal_error', false);
+      if (binding.active && binding.claimDeadlineToken === token) {
+        binding.claimDeadlineToken = undefined;
+        failBinding(binding, 'internal_error', false);
+      }
       return false;
     }
     binding.claimDeadlineHandle = handle;
@@ -2112,7 +2198,9 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
       if (completed?.['nonce'] === nonce) {
         if (!binding.documentAccepted) {
           if (binding.documentAcceptancePending) {
-            binding.documentTerminalPending = 'completed';
+            if (binding.documentTerminalPending === undefined) {
+              binding.documentTerminalPending = 'completed';
+            }
             return;
           }
           failBinding(binding, 'renderer_document_no_load', false);
@@ -2138,7 +2226,9 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
             ? reason
             : 'winner_not_renderable';
         if (!binding.documentAccepted && binding.documentAcceptancePending) {
-          binding.documentTerminalPending = mapped;
+          if (binding.documentTerminalPending === undefined) {
+            binding.documentTerminalPending = mapped;
+          }
           return;
         }
         failBinding(binding, mapped, false);
@@ -2235,9 +2325,10 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
     if (!entry) return;
     if (!suppress(event)) return;
     const now = readNow();
+    let entryStillCurrent = true;
     if (now !== undefined) {
       pruneExpiredTickets(now);
-      if (mapValue(tickets, ticket) !== entry) return;
+      entryStillCurrent = mapValue(tickets, ticket) === entry;
     }
 
     const exact = messaging.parseProtocolMessage('ownerRegister', data);
@@ -2253,6 +2344,11 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
         if (port) closePort(port);
       }
     };
+    if (!entryStillCurrent) {
+      if (responsePort) refuseOwner(responsePort, routing.adId ?? '');
+      closeAdditionalPorts();
+      return;
+    }
     if (now === undefined) {
       if (responsePort) refuseOwner(responsePort, routing.adId ?? '');
       closeAdditionalPorts();
@@ -2421,6 +2517,9 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
   };
 
   const uninstall = messaging.installCaptureListener(dispatch);
+  if (typeof uninstall !== 'function') {
+    throw new Error('Universal Creative capture listener installation failed');
+  }
 
   const bridge: PucBridge = {
     registerGamAttempt(input): boolean {
@@ -2473,6 +2572,7 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
         active: true,
         claim: undefined,
         claimDeadlineHandle: undefined,
+        claimDeadlineToken: undefined,
         controlListenerDispose: undefined,
         controlPort: undefined,
         controlStarted: false,
