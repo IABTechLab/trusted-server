@@ -26,7 +26,11 @@ import { createGptIntegrationRegistration } from '../../src/integrations/gpt/mod
 import { isGuardInstalled, resetGuardState } from '../../src/integrations/gpt/script_guard';
 import { publicLog } from '../../src/kernel/fallback';
 import { createTestNavigationIdentityIssuer } from '../../src/kernel/identity';
-import type { RenderAttempt } from '../../src/services/render';
+import {
+  createRenderAttempt,
+  type CommittedRenderArtifact,
+  type RenderAttempt,
+} from '../../src/services/render';
 
 function createTarget() {
   return {
@@ -43,6 +47,52 @@ function fakeGoogletagAdapter(
   bindingStatus: () => GoogletagBindingStatus = () => 'pending'
 ): GoogletagAdapter {
   return Object.freeze({ ...createNoopGoogletagAdapter(), bindingStatus });
+}
+
+function synchronousGptAdapter() {
+  const listeners = new Map<string, Set<(event: unknown) => void>>();
+  const bindingToken = Object.freeze({});
+  const refresh = vi.fn();
+  const facade: GoogletagFacade = Object.freeze({
+    bindingToken: () => bindingToken,
+    clearTargeting: vi.fn(),
+    display: vi.fn(),
+    getTargeting: vi.fn(() => []),
+    observeTargeting: () => vi.fn(),
+    refresh,
+    serviceState: () =>
+      Object.freeze({ apiReady: true, initialLoadDisabled: false, pubadsReady: true }),
+    setTargeting: vi.fn(),
+    slots: () => Object.freeze([]),
+    subscribe: (eventType: string, listener: (event: unknown) => void) => {
+      const registered = listeners.get(eventType) ?? new Set();
+      registered.add(listener);
+      listeners.set(eventType, registered);
+      return () => registered.delete(listener);
+    },
+    transactionalReplace: () => Object.freeze({ status: 'destroyed' as const }),
+  });
+  const adapter: GoogletagAdapter = Object.freeze({
+    bindingStatus: () => 'present',
+    dispose: vi.fn(),
+    notifyReady: vi.fn(),
+    run: <Value>(command: (gpt: Readonly<GoogletagFacade>) => Value) => {
+      let result: Promise<Value>;
+      try {
+        result = Promise.resolve(command(facade));
+      } catch (error) {
+        result = Promise.reject(error);
+      }
+      return Object.freeze({ status: 'present' as const, result, dispose: vi.fn() });
+    },
+  });
+  return {
+    adapter,
+    emit: (eventType: string, event: unknown): void => {
+      for (const listener of listeners.get(eventType) ?? []) listener(event);
+    },
+    refresh,
+  };
 }
 
 function fakePrebidAdapter(
@@ -117,6 +167,173 @@ describe('browser composition', () => {
       'tsjs:first-display'
     );
     expect(display).toHaveBeenCalledTimes(3);
+  });
+
+  it('routes an attributable empty GPT cycle through the owned slot and PUC services', async () => {
+    const gpt = synchronousGptAdapter();
+    let prefix = 0;
+    const projection = Object.freeze({
+      version: 1,
+      auction: Object.freeze({
+        version: 1,
+        auctionId: 'initial',
+        results: Object.freeze([Object.freeze({ slot: 'slot-one', outcome: 'no_bid' as const })]),
+      }),
+      bids: Object.freeze([]),
+    });
+    const composition = createTestBrowserRuntimeComposition(
+      {
+        target: {},
+        releaseId: 'a'.repeat(64),
+        manifest: { version: 1, releaseId: 'a'.repeat(64), integrations: [] },
+        knownIntegrationIds: Object.freeze([]),
+        boot: {
+          auctionProjection: projection,
+          creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+        },
+        kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+      },
+      {
+        adapters: {
+          googletag: gpt.adapter,
+          messaging: fakeMessagingAdapter(),
+          prebid: fakePrebidAdapter(),
+        },
+        coreActivations: { correctnessGptListeners: vi.fn() },
+        createIdentityIssuerForTest: () => {
+          prefix += 1;
+          return createTestNavigationIdentityIssuer({
+            getRandomValues: (target) => {
+              target.fill(prefix);
+              return target;
+            },
+          });
+        },
+      }
+    );
+    expect(composition.runtime.start()).toBe(true);
+    await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+
+    const session = composition.runtimeSessionForTest();
+    const navigation = session?.currentNavigation;
+    const batch = navigation?.createAuctionBatch('gpt-primary');
+    const services = session?.interfaces;
+    const artifacts = services?.['artifacts'];
+    const reservations = composition.reservationServiceForTest();
+    const slots = composition.slotServiceForTest();
+    if (!navigation || !batch || !artifacts || !reservations || !slots) {
+      throw new Error('Expected runtime-owned GPT dependencies');
+    }
+    const createAttempt = (parentAttemptId?: string): RenderAttempt => {
+      const owner = batch.createRenderAttempt('slot-one');
+      if (!owner.ok) throw new Error(owner.reason);
+      const attempt = createRenderAttempt({
+        artifacts: artifacts as Parameters<typeof createRenderAttempt>[0]['artifacts'],
+        owner: owner.value,
+        prepareRenderSource: (candidate) =>
+          typeof candidate === 'object' && candidate !== null && Object.isFrozen(candidate)
+            ? (candidate as Readonly<{ type: 'aps' | 'adm' | 'cache'; version: 1 }>)
+            : undefined,
+        reservations,
+        ...(parentAttemptId === undefined ? {} : { parentAttemptId }),
+      });
+      if (!attempt.ok) throw new Error(attempt.reason);
+      return attempt.value;
+    };
+    const ownerResult = batch.createRenderAttempt('slot-one');
+    if (!ownerResult.ok) throw new Error(ownerResult.reason);
+    const source = Object.freeze({
+      type: 'adm' as const,
+      version: 1 as const,
+      adm: '<main>fictional fallback</main>',
+      width: 300,
+      height: 250,
+    });
+    const primaryResult = createRenderAttempt({
+      artifacts: artifacts as Parameters<typeof createRenderAttempt>[0]['artifacts'],
+      owner: ownerResult.value,
+      prepareRenderSource: () => source,
+      reservations,
+    });
+    if (!primaryResult.ok) throw new Error(primaryResult.reason);
+    const primary = primaryResult.value;
+    const reservationId = `r1_${'a'.repeat(22)}`;
+    const winnerContext = Object.freeze({ selectedCpm: 1 });
+    expect(
+      reservations.registerRender({
+        reservationId,
+        slot: primary.slot,
+        navigation,
+        attemptId: primary.id,
+        renderSource: source,
+        winnerContext,
+      })
+    ).toMatchObject({ ok: true });
+    const physicalSlot = Object.freeze({});
+    const slotElement = document.createElement('div');
+    slotElement.id = 'slot-one';
+    document.body.append(slotElement);
+    expect(
+      slots.adoptGptSlot(navigation.generation, 'slot-one', {
+        definition: {
+          adUnitPath: '/123/slot-one',
+          elementId: 'slot-one',
+          sizes: Object.freeze([[300, 250]]),
+        },
+        ownership: 'trusted_server',
+        slot: physicalSlot,
+      })
+    ).toEqual({ ok: true });
+    const artifact = Object.freeze({
+      kind: 'puc' as const,
+      attemptId: primary.id,
+      slot: primary.slot,
+      navigationGeneration: primary.navigationGeneration,
+      dispose: vi.fn(),
+    }) satisfies CommittedRenderArtifact;
+    let fallback: RenderAttempt | undefined;
+    const operation = composition.startGptSlotOperationForTest({
+      artifact,
+      attempt: primary,
+      createFallback: (parentAttemptId) => {
+        fallback = createAttempt(parentAttemptId);
+        return Object.freeze({ ok: true as const, value: fallback });
+      },
+      operation: 'refresh',
+      owner: ownerResult.value,
+      requestClass: 'primary',
+      reservationId,
+    });
+    expect(operation.ok).toBe(true);
+
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(gpt.refresh).toHaveBeenCalledExactlyOnceWith(
+      [physicalSlot],
+      Object.freeze({ changeCorrelator: false })
+    );
+    gpt.emit('slotRequested', { slot: physicalSlot });
+    gpt.emit('slotRenderEnded', {
+      isEmpty: true,
+      responseIdentifier: 'response-one',
+      slot: physicalSlot,
+    });
+    await Promise.resolve();
+
+    expect(primary.snapshot().outcome).toEqual({ outcome: 'failed', reason: 'gam_empty' });
+    expect(fallback).toBeDefined();
+    fallback?.fail('winner_not_renderable');
+    expect(operation.ok && operation.value.snapshot()).toMatchObject({
+      settled: true,
+      result: {
+        path: 'fallback',
+        primary: { outcome: 'failed', reason: 'gam_empty' },
+        fallback: { outcome: 'failed', reason: 'winner_not_renderable' },
+      },
+    });
+    composition.runtime.dispose();
+    slotElement.remove();
   });
 
   it('derives exact APS validation coordinates only for the real browser target', () => {
