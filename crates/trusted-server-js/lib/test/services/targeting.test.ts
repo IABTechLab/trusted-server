@@ -134,6 +134,8 @@ describe('owner-aware targeting journal', () => {
       throw new Error('restore failed');
     });
     expect(() => frame?.release()).not.toThrow();
+    expect(service.snapshotForTest()).toEqual({ frames: 1, slots: 1 });
+    service.disposeOwner('owner');
     expect(service.snapshotForTest()).toEqual({ frames: 0, slots: 0 });
   });
 
@@ -312,5 +314,252 @@ describe('adapter-owned targeting interception', () => {
     });
     expect(slot.setTargeting).toBe(originalSet);
     expect(slot.clearTargeting).toBe(originalClear);
+  });
+
+  it.each(['false', 'throw'] as const)(
+    'compare-restores setTargeting when a Proxy define trap mutates then returns %s',
+    async (failure) => {
+      const originalSet = vi.fn();
+      const originalClear = vi.fn();
+      const target = {
+        clearTargeting: originalClear,
+        getTargeting: () => [],
+        setTargeting: originalSet,
+      };
+      let attempted = false;
+      const slot = new Proxy(target, {
+        defineProperty: (current, key, descriptor) => {
+          const result = Reflect.defineProperty(current, key, descriptor);
+          if (key === 'setTargeting' && !attempted) {
+            attempted = true;
+            if (failure === 'throw') throw new Error('mutated then threw');
+            return false;
+          }
+          return result;
+        },
+      });
+      const adapter = adapterForTargetingSlot(slot);
+      const operation = adapter.run((gpt) =>
+        gpt.observeTargeting(slot, { beforePublisherMutation: vi.fn() })
+      );
+
+      await expect(operation.result).rejects.toMatchObject({
+        code: 'external_artifact_incompatible',
+      });
+      expect(target.setTargeting).toBe(originalSet);
+      expect(target.clearTargeting).toBe(originalClear);
+    }
+  );
+
+  it.each(['false', 'throw'] as const)(
+    'restores both wrappers when the clearTargeting Proxy define trap mutates then returns %s',
+    async (failure) => {
+      const originalSet = vi.fn();
+      const originalClear = vi.fn();
+      const target = {
+        clearTargeting: originalClear,
+        getTargeting: () => [],
+        setTargeting: originalSet,
+      };
+      let attempted = false;
+      const slot = new Proxy(target, {
+        defineProperty: (current, key, descriptor) => {
+          const result = Reflect.defineProperty(current, key, descriptor);
+          if (key === 'clearTargeting' && !attempted) {
+            attempted = true;
+            if (failure === 'throw') throw new Error('mutated then threw');
+            return false;
+          }
+          return result;
+        },
+      });
+      const adapter = adapterForTargetingSlot(slot);
+      const operation = adapter.run((gpt) =>
+        gpt.observeTargeting(slot, { beforePublisherMutation: vi.fn() })
+      );
+
+      await expect(operation.result).rejects.toMatchObject({
+        code: 'external_artifact_incompatible',
+      });
+      expect(target.setTargeting).toBe(originalSet);
+      expect(target.clearTargeting).toBe(originalClear);
+    }
+  );
+
+  it('lets one observation dispose its wrappers after its adapter operation settled', async () => {
+    const originalSet = vi.fn();
+    const originalClear = vi.fn();
+    const slot = {
+      clearTargeting: originalClear,
+      getTargeting: () => [],
+      setTargeting: originalSet,
+    };
+    const adapter = adapterForTargetingSlot(slot);
+    const service = createTargetingService();
+    const observation = service.observePublisherMutations(slot, adapter);
+    await expect(observation.result).resolves.toBeUndefined();
+    expect(slot.setTargeting).not.toBe(originalSet);
+
+    observation.dispose();
+
+    expect(slot.setTargeting).toBe(originalSet);
+    expect(slot.clearTargeting).toBe(originalClear);
+  });
+});
+
+describe('targeting mutate-then-throw recovery', () => {
+  it('restores the publisher predecessor when installation mutates then throws', () => {
+    const service = createTargetingService();
+    const slot = {};
+    const targeting = createTargetingHarness({ key: ['publisher'] });
+    targeting.setTargeting.mockImplementationOnce((key, value) => {
+      targeting.values.set(key, Object.freeze(typeof value === 'string' ? [value] : [...value]));
+      throw new Error('mutated then threw');
+    });
+
+    expect(() => service.own(slot, 'key', 'trusted', 'owner', targeting)).toThrow(
+      'mutated then threw'
+    );
+    expect(targeting.values.get('key')).toEqual(['publisher']);
+    expect(service.snapshotForTest()).toEqual({ frames: 0, slots: 0 });
+  });
+
+  it('retains owner-disposable quarantine when failed restoration did not mutate', () => {
+    const service = createTargetingService();
+    const slot = {};
+    const targeting = createTargetingHarness({ key: ['publisher'] });
+    const frame = service.own(slot, 'key', 'trusted', 'owner', targeting);
+    targeting.setTargeting.mockImplementationOnce(() => {
+      throw new Error('failed before mutation');
+    });
+
+    frame?.release();
+
+    expect(targeting.values.get('key')).toEqual(['trusted']);
+    expect(service.snapshotForTest()).toEqual({ frames: 1, slots: 1 });
+    service.disposeOwner('owner');
+    expect(targeting.values.get('key')).toEqual(['publisher']);
+    expect(service.snapshotForTest()).toEqual({ frames: 0, slots: 0 });
+  });
+
+  it('removes ownership when restoration mutates to the predecessor and then throws', () => {
+    const service = createTargetingService();
+    const slot = {};
+    const targeting = createTargetingHarness({ key: ['publisher'] });
+    const frame = service.own(slot, 'key', 'trusted', 'owner', targeting);
+    targeting.setTargeting.mockImplementationOnce((key, value) => {
+      targeting.values.set(key, Object.freeze(typeof value === 'string' ? [value] : [...value]));
+      throw new Error('mutated then threw');
+    });
+
+    frame?.release();
+
+    expect(targeting.values.get('key')).toEqual(['publisher']);
+    expect(service.snapshotForTest()).toEqual({ frames: 0, slots: 0 });
+  });
+
+  it('retains an owner-disposable frame when post-failure state cannot be read', () => {
+    const service = createTargetingService();
+    const slot = {};
+    const targeting = createTargetingHarness({ key: ['publisher'] });
+    targeting.setTargeting.mockImplementationOnce((key, value) => {
+      targeting.values.set(key, Object.freeze(typeof value === 'string' ? [value] : [...value]));
+      throw new Error('mutated then threw');
+    });
+    targeting.getTargeting
+      .mockImplementationOnce(() => ['publisher'])
+      .mockImplementationOnce(() => {
+        throw new Error('unreadable after failure');
+      });
+
+    expect(() => service.own(slot, 'key', 'trusted', 'owner', targeting)).toThrow(
+      'mutated then threw'
+    );
+    expect(service.snapshotForTest()).toEqual({ frames: 1, slots: 1 });
+    targeting.getTargeting.mockImplementation((key: string) =>
+      Object.freeze([...(targeting.values.get(key) ?? [])])
+    );
+    service.disposeOwner('owner');
+    expect(service.snapshotForTest()).toEqual({ frames: 0, slots: 0 });
+  });
+
+  it('retains owner-disposable quarantine when failed installation leaves unknown state', () => {
+    const service = createTargetingService();
+    const slot = {};
+    const targeting = createTargetingHarness({ key: ['publisher'] });
+    targeting.setTargeting.mockImplementationOnce((key) => {
+      targeting.values.set(key, Object.freeze(['publisher-interference']));
+      throw new Error('mutated unpredictably then threw');
+    });
+
+    expect(() => service.own(slot, 'key', 'trusted', 'owner', targeting)).toThrow(
+      'mutated unpredictably then threw'
+    );
+    expect(service.snapshotForTest()).toEqual({ frames: 1, slots: 1 });
+    service.disposeOwner('owner');
+    expect(targeting.values.get('key')).toEqual(['publisher-interference']);
+    expect(service.snapshotForTest()).toEqual({ frames: 0, slots: 0 });
+  });
+
+  it('rolls back only a newer failed publication when the older TS value never changed', () => {
+    const service = createTargetingService();
+    const slot = {};
+    const targeting = createTargetingHarness({ key: ['publisher'] });
+    const older = service.own(slot, 'key', 'older', 'older-owner', targeting);
+    targeting.setTargeting.mockImplementationOnce(() => {
+      throw new Error('newer failed before mutation');
+    });
+
+    expect(() => service.own(slot, 'key', 'newer', 'newer-owner', targeting)).toThrow(
+      'newer failed before mutation'
+    );
+    expect(targeting.values.get('key')).toEqual(['older']);
+    expect(service.snapshotForTest()).toEqual({ frames: 1, slots: 1 });
+    older?.release();
+    expect(targeting.values.get('key')).toEqual(['publisher']);
+    expect(service.snapshotForTest()).toEqual({ frames: 0, slots: 0 });
+  });
+
+  it('releases service observation ownership when adapter promotion rejects', async () => {
+    const externalRelease = vi.fn();
+    const facade = {
+      observeTargeting: () => externalRelease,
+    } as never;
+    const adapter = {
+      run: (command: (gpt: never) => void) => {
+        command(facade);
+        return Object.freeze({
+          status: 'incompatible' as const,
+          result: Promise.reject(new Error('promotion rejected')),
+          dispose: vi.fn(),
+        });
+      },
+    } as never;
+    const service = createTargetingService();
+    const observation = service.observePublisherMutations({}, adapter);
+
+    await expect(observation.result).rejects.toThrow('promotion rejected');
+    expect(externalRelease).toHaveBeenCalledOnce();
+    service.dispose();
+    expect(externalRelease).toHaveBeenCalledOnce();
+  });
+
+  it('disposes frames through captured Set iterator next after prototype poisoning', () => {
+    const service = createTargetingService();
+    const targeting = createTargetingHarness({ key: ['publisher'] });
+    service.own({}, 'key', 'trusted', 'owner', targeting);
+    const iteratorPrototype = Object.getPrototypeOf(new Set().values()) as {
+      next: () => IteratorResult<unknown>;
+    };
+    const originalNext = iteratorPrototype.next;
+    iteratorPrototype.next = () => {
+      throw new Error('poisoned iterator');
+    };
+    try {
+      expect(() => service.disposeOwner('owner')).not.toThrow();
+    } finally {
+      iteratorPrototype.next = originalNext;
+    }
+    expect(service.snapshotForTest()).toEqual({ frames: 0, slots: 0 });
   });
 });

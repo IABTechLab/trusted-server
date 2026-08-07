@@ -62,6 +62,9 @@ const mapSetIntrinsic = Map.prototype.set;
 const mapSizeGetter = Object.getOwnPropertyDescriptor(Map.prototype, 'size')?.get as (
   this: Map<unknown, unknown>
 ) => number;
+const mapIteratorNextIntrinsic = Object.getPrototypeOf(new Map().entries()).next as (
+  this: IterableIterator<unknown>
+) => IteratorResult<unknown>;
 const weakMapDeleteIntrinsic = WeakMap.prototype.delete;
 const weakMapGetIntrinsic = WeakMap.prototype.get;
 const weakMapSetIntrinsic = WeakMap.prototype.set;
@@ -108,6 +111,14 @@ function exactInstalledValue(values: readonly string[], installed: string): bool
   return values.length === 1 && values[0] === installed;
 }
 
+function exactValues(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+}
+
 function copyValues(values: readonly string[]): readonly string[] {
   if (!Array.isArray(values)) {
     throw new TypeError('GPT targeting values must be strings');
@@ -131,6 +142,9 @@ export function createTargetingService(): TargetingService {
   const setAddIntrinsic = Set.prototype.add;
   const setDeleteIntrinsic = Set.prototype.delete;
   const setValuesIntrinsic = Set.prototype.values;
+  const setIteratorNextIntrinsic = Object.getPrototypeOf(new Set().values()).next as (
+    this: IterableIterator<unknown>
+  ) => IteratorResult<unknown>;
   let disposed = false;
   let frameCount = 0;
   let slotCount = 0;
@@ -149,6 +163,14 @@ export function createTargetingService(): TargetingService {
     Reflect.apply(setDeleteIntrinsic, observationReleases, [release]) as boolean;
   const observationValues = (): IterableIterator<() => void> =>
     Reflect.apply(setValuesIntrinsic, observationReleases, []) as IterableIterator<() => void>;
+  const setSnapshot = <Value>(iterator: IterableIterator<Value>): Value[] => {
+    const values: Value[] = [];
+    while (true) {
+      const step = Reflect.apply(setIteratorNextIntrinsic, iterator, []) as IteratorResult<Value>;
+      if (step.done) return values;
+      values[values.length] = step.value;
+    }
+  };
 
   const removeEmptySlot = (slot: object, slotChains: Map<string, TargetingChain>): void => {
     if (mapSize(slotChains) !== 0) return;
@@ -175,15 +197,51 @@ export function createTargetingService(): TargetingService {
     removeEmptySlot(slot, slotChains);
   };
 
-  const release = (frame: TargetingFrame): void => {
-    if (!frame.alive) return;
+  const removeFrame = (
+    frame: TargetingFrame,
+    slotChains: Map<string, TargetingChain>,
+    chain: TargetingChain,
+    frameIndex: number
+  ): void => {
+    const successor = chain.frames[frameIndex + 1];
+    if (successor) successor.predecessor = frame.predecessor;
+    for (let index = frameIndex; index < chain.frames.length - 1; index += 1) {
+      const next = chain.frames[index + 1];
+      if (next) chain.frames[index] = next;
+    }
+    chain.frames.length -= 1;
+    frame.alive = false;
+    frameCount -= 1;
+    deleteLiveFrame(frame);
+    if (chain.frames.length === 0) deleteMapValue(slotChains, frame.key);
+    removeEmptySlot(frame.slot, slotChains);
+  };
+
+  const expectedPredecessor = (frame: TargetingFrame): readonly string[] | undefined => {
+    const predecessor = frame.predecessor;
+    if (predecessor.kind === 'publisher') return predecessor.values;
+    return predecessor.alive ? Object.freeze([predecessor.installed]) : undefined;
+  };
+
+  const restorePredecessor = (frame: TargetingFrame): void => {
+    const predecessor = frame.predecessor;
+    if (predecessor.kind === 'publisher') {
+      if (predecessor.values.length === 0) frame.boundary.clearTargeting(frame.key);
+      else frame.boundary.setTargeting(frame.key, predecessor.values);
+    } else if (predecessor.alive) {
+      frame.boundary.setTargeting(frame.key, predecessor.installed);
+    }
+  };
+
+  const release = (frame: TargetingFrame): boolean => {
+    if (!frame.alive) return true;
     const slotChains = weakMapValue(chainsBySlot, frame.slot);
     const chain = slotChains ? mapValue(slotChains, frame.key) : undefined;
     if (!slotChains || !chain) {
       frame.alive = false;
       frameCount -= 1;
       deleteLiveFrame(frame);
-      return;
+      return true;
     }
     let frameIndex = -1;
     for (let index = 0; index < chain.frames.length; index += 1) {
@@ -196,47 +254,69 @@ export function createTargetingService(): TargetingService {
       frame.alive = false;
       frameCount -= 1;
       deleteLiveFrame(frame);
-      return;
+      return true;
     }
 
     const wasTop = frameIndex === chain.frames.length - 1;
-    const successor = chain.frames[frameIndex + 1];
-    if (successor) successor.predecessor = frame.predecessor;
-    for (let index = frameIndex; index < chain.frames.length - 1; index += 1) {
-      const next = chain.frames[index + 1];
-      if (next) chain.frames[index] = next;
+    if (!wasTop) {
+      removeFrame(frame, slotChains, chain, frameIndex);
+      return true;
     }
-    chain.frames.length -= 1;
-    frame.alive = false;
-    frameCount -= 1;
-    deleteLiveFrame(frame);
-
-    if (!wasTop) return;
-    if (chain.frames.length === 0) deleteMapValue(slotChains, frame.key);
-    removeEmptySlot(frame.slot, slotChains);
 
     let actual: readonly string[];
     try {
       actual = copyValues(frame.boundary.getTargeting(frame.key));
     } catch {
-      return;
+      return false;
     }
     if (!exactInstalledValue(actual, frame.installed)) {
-      if (chain.frames.length > 0) invalidateChain(frame.slot, slotChains, frame.key, chain);
-      return;
+      invalidateChain(frame.slot, slotChains, frame.key, chain);
+      return true;
     }
 
-    const predecessor = frame.predecessor;
+    const expected = expectedPredecessor(frame);
+    if (!expected) return false;
     try {
-      if (predecessor.kind === 'publisher') {
-        if (predecessor.values.length === 0) frame.boundary.clearTargeting(frame.key);
-        else frame.boundary.setTargeting(frame.key, predecessor.values);
-      } else if (predecessor.alive) {
-        frame.boundary.setTargeting(frame.key, predecessor.installed);
-      }
+      restorePredecessor(frame);
     } catch {
-      // Restoration is compare-checked and best-effort; ownership is still released exactly once.
+      // The post-failure read below distinguishes mutate-then-throw from no mutation.
     }
+    let restored: readonly string[];
+    try {
+      restored = copyValues(frame.boundary.getTargeting(frame.key));
+    } catch {
+      return false;
+    }
+    let exact = restored.length === expected.length;
+    for (let index = 0; exact && index < restored.length; index += 1) {
+      exact = restored[index] === expected[index];
+    }
+    if (!exact) {
+      return false;
+    }
+    removeFrame(frame, slotChains, chain, frameIndex);
+    return true;
+  };
+
+  const rollbackFailedInstallation = (frame: TargetingFrame): boolean => {
+    const slotChains = weakMapValue(chainsBySlot, frame.slot);
+    const chain = slotChains ? mapValue(slotChains, frame.key) : undefined;
+    if (!slotChains || !chain) return true;
+    const frameIndex = chain.frames.length - 1;
+    if (chain.frames[frameIndex] !== frame) return false;
+    let actual: readonly string[];
+    try {
+      actual = copyValues(frame.boundary.getTargeting(frame.key));
+    } catch {
+      return false;
+    }
+    const predecessor = expectedPredecessor(frame);
+    if (predecessor && exactValues(actual, predecessor)) {
+      removeFrame(frame, slotChains, chain, frameIndex);
+      return true;
+    }
+    if (exactInstalledValue(actual, frame.installed)) return release(frame);
+    return false;
   };
 
   const invalidatePublisherMutation = (slot: object, key?: string): void => {
@@ -252,7 +332,13 @@ export function createTargetingService(): TargetingService {
     const iterator = Reflect.apply(mapEntriesIntrinsic, slotChains, []) as IterableIterator<
       [string, TargetingChain]
     >;
-    for (const entry of iterator) entries[entries.length] = entry;
+    while (true) {
+      const step = Reflect.apply(mapIteratorNextIntrinsic, iterator, []) as IteratorResult<
+        [string, TargetingChain]
+      >;
+      if (step.done) break;
+      entries[entries.length] = step.value;
+    }
     for (const [entryKey, chain] of entries) invalidateChain(slot, slotChains, entryKey, chain);
   };
 
@@ -306,27 +392,37 @@ export function createTargetingService(): TargetingService {
     try {
       if (wasNewSlot) {
         setWeakMapValue(chainsBySlot, slot, slotChains);
+        if (weakMapValue(chainsBySlot, slot) !== slotChains) throw new Error('journal publication');
         publishedWeakMap = true;
         slotCount += 1;
       }
       if (wasNewChain) {
         setMapValue(slotChains, key, chain);
+        if (mapValue(slotChains, key) !== chain) throw new Error('journal publication');
         publishedChain = true;
       }
       chain.frames[chain.frames.length] = frame;
       publishedFrame = true;
       addLiveFrame(frame);
       frameCount += 1;
-      targeting.setTargeting(key, value);
     } catch (error) {
       if (publishedFrame) chain.frames.length -= 1;
       frame.alive = false;
       if (deleteLiveFrame(frame) && frameCount > 0) frameCount -= 1;
-      if (publishedChain && chain.frames.length === 0) deleteMapValue(slotChains, key);
-      if (publishedWeakMap && mapSize(slotChains) === 0) {
-        deleteWeakMapValue(chainsBySlot, slot);
-        if (slotCount > 0) slotCount -= 1;
+      if ((publishedChain || mapValue(slotChains, key) === chain) && chain.frames.length === 0) {
+        deleteMapValue(slotChains, key);
       }
+      if (weakMapValue(chainsBySlot, slot) === slotChains && mapSize(slotChains) === 0) {
+        deleteWeakMapValue(chainsBySlot, slot);
+        if (publishedWeakMap && slotCount > 0) slotCount -= 1;
+      }
+      throw error;
+    }
+
+    try {
+      targeting.setTargeting(key, value);
+    } catch (error) {
+      rollbackFailedInstallation(frame);
       throw error;
     }
 
@@ -335,8 +431,7 @@ export function createTargetingService(): TargetingService {
       ownerId,
       release: (): void => {
         if (released) return;
-        released = true;
-        release(frame);
+        released = release(frame);
       },
     });
   };
@@ -345,12 +440,12 @@ export function createTargetingService(): TargetingService {
     dispose: (): void => {
       if (disposed) return;
       disposed = true;
-      const frames = [...liveFrameValues()];
+      const frames = setSnapshot(liveFrameValues());
       for (let index = frames.length - 1; index >= 0; index -= 1) {
         const frame = frames[index];
         if (frame) release(frame);
       }
-      const observations = [...observationValues()];
+      const observations = setSnapshot(observationValues());
       for (let index = observations.length - 1; index >= 0; index -= 1) {
         try {
           observations[index]?.();
@@ -360,7 +455,7 @@ export function createTargetingService(): TargetingService {
       }
     },
     disposeOwner: (ownerId: string): void => {
-      const frames = [...liveFrameValues()];
+      const frames = setSnapshot(liveFrameValues());
       for (let index = frames.length - 1; index >= 0; index -= 1) {
         const frame = frames[index];
         if (frame?.ownerId === ownerId) release(frame);
@@ -368,6 +463,7 @@ export function createTargetingService(): TargetingService {
     },
     invalidatePublisherMutation,
     observePublisherMutations: (slot: object, adapter: GoogletagAdapter) => {
+      let ownedRelease = (): void => undefined;
       const operation = adapter.run<void>((gpt) => {
         if (disposed) return;
         let release = gpt.observeTargeting(
@@ -379,7 +475,7 @@ export function createTargetingService(): TargetingService {
           })
         );
         let active = true;
-        const ownedRelease = (): void => {
+        ownedRelease = (): void => {
           if (!active) return;
           active = false;
           deleteObservationRelease(ownedRelease);
@@ -395,8 +491,19 @@ export function createTargetingService(): TargetingService {
         }
         if (disposed) ownedRelease();
       });
-      void operation.result.catch(() => undefined);
-      return operation;
+      void operation.result.catch(() => {
+        ownedRelease();
+      });
+      return Object.freeze({
+        get status() {
+          return operation.status;
+        },
+        result: operation.result,
+        dispose: (): void => {
+          ownedRelease();
+          operation.dispose();
+        },
+      });
     },
     own,
     snapshotForTest: () => Object.freeze({ frames: frameCount, slots: slotCount }),
