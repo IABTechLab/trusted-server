@@ -12,6 +12,8 @@ const textEncoder = new TextEncoder();
 const reflectApplyIntrinsic = Reflect.apply;
 const jsonStringifyIntrinsic = JSON.stringify;
 const objectCreateIntrinsic = Object.create;
+const objectGetOwnPropertyNamesIntrinsic = Object.getOwnPropertyNames;
+const objectKeysIntrinsic = Object.keys;
 const objectSetPrototypeOfIntrinsic = Object.setPrototypeOf;
 const textEncoderEncodeIntrinsic = TextEncoder.prototype.encode;
 
@@ -87,7 +89,9 @@ function ownDataRecord(value: unknown): Record<string, unknown> | undefined {
     if (prototype !== Object.prototype && prototype !== null) return undefined;
     if (Object.getOwnPropertySymbols(value).length !== 0) return undefined;
     const output: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
-    const names = Object.getOwnPropertyNames(value);
+    const names = reflectApplyIntrinsic(objectGetOwnPropertyNamesIntrinsic, Object, [
+      value,
+    ]) as string[];
     for (let index = 0; index < names.length; index += 1) {
       const key = names[index];
       if (key === undefined) return undefined;
@@ -122,7 +126,9 @@ function ownDataArray(value: unknown, maximum: number): readonly unknown[] | und
       !Number.isSafeInteger(length.value) ||
       length.value < 0 ||
       length.value > maximum ||
-      Object.getOwnPropertyNames(value).length !== length.value + 1
+      (reflectApplyIntrinsic(objectGetOwnPropertyNamesIntrinsic, Object, [value]) as string[])
+        .length !==
+        length.value + 1
     ) {
       return undefined;
     }
@@ -139,8 +145,20 @@ function ownDataArray(value: unknown, maximum: number): readonly unknown[] | und
 }
 
 function exactKeys(record: Record<string, unknown>, keys: readonly string[]): boolean {
-  const actual = Object.keys(record);
-  return actual.length === keys.length && actual.every((key) => keys.includes(key));
+  const actual = reflectApplyIntrinsic(objectKeysIntrinsic, Object, [record]) as string[];
+  if (actual.length !== keys.length) return false;
+  for (let actualIndex = 0; actualIndex < actual.length; actualIndex += 1) {
+    const actualKey = actual[actualIndex];
+    let found = false;
+    for (let expectedIndex = 0; expectedIndex < keys.length; expectedIndex += 1) {
+      if (keys[expectedIndex] === actualKey) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) return false;
+  }
+  return true;
 }
 
 function jsonPrimitive(value: unknown): null | boolean | number | string | undefined {
@@ -156,7 +174,9 @@ function snapshotJsonContainer(value: object): JsonContainerSnapshot | undefined
   if (!array && !record) return undefined;
   const entries = array
     ? values!.map((entry, index) => Object.freeze({ key: String(index), value: entry }))
-    : Object.keys(record!).map((key) => Object.freeze({ key, value: record![key] }));
+    : (reflectApplyIntrinsic(objectKeysIntrinsic, Object, [record]) as string[]).map((key) =>
+        Object.freeze({ key, value: record![key] })
+      );
   return Object.freeze({ array, entries: Object.freeze(entries) });
 }
 

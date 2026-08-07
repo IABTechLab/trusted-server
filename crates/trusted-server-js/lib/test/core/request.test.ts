@@ -96,11 +96,13 @@ describe('requestAds input contract', () => {
 
   it('uses captured validation intrinsics after platform prototypes are poisoned', () => {
     const iteratorDescriptor = Object.getOwnPropertyDescriptor(Array.prototype, Symbol.iterator);
+    const everyDescriptor = Object.getOwnPropertyDescriptor(Array.prototype, 'every');
+    const includesDescriptor = Object.getOwnPropertyDescriptor(Array.prototype, 'includes');
     const encodeDescriptor = Object.getOwnPropertyDescriptor(TextEncoder.prototype, 'encode');
     const testDescriptor = Object.getOwnPropertyDescriptor(RegExp.prototype, 'test');
-    const calls = { encode: 0, iterator: 0, test: 0 };
+    const calls = { encode: 0, every: 0, includes: 0, iterator: 0, test: 0 };
     let validated: ReturnType<typeof validateRequestAdsOptions> | undefined;
-    let duplicateError: unknown;
+    let unknownKeyError: unknown;
     Object.defineProperty(Array.prototype, Symbol.iterator, {
       configurable: true,
       value: () => {
@@ -122,12 +124,26 @@ describe('requestAds input contract', () => {
         throw new Error('poisoned regular expression');
       },
     });
+    Object.defineProperty(Array.prototype, 'every', {
+      configurable: true,
+      value: () => {
+        calls.every += 1;
+        throw new Error('poisoned array every');
+      },
+    });
+    Object.defineProperty(Array.prototype, 'includes', {
+      configurable: true,
+      value: () => {
+        calls.includes += 1;
+        throw new Error('poisoned array includes');
+      },
+    });
     try {
       validated = validateRequestAdsOptions({ slots: ['slot-one'], timeoutMs: 100 });
       try {
-        validateRequestAdsOptions({ slots: ['slot-one', 'slot-one'] });
+        validateRequestAdsOptions({ unknown: true });
       } catch (error) {
-        duplicateError = error;
+        unknownKeyError = error;
       }
     } finally {
       if (iteratorDescriptor) {
@@ -136,12 +152,15 @@ describe('requestAds input contract', () => {
       if (encodeDescriptor)
         Object.defineProperty(TextEncoder.prototype, 'encode', encodeDescriptor);
       if (testDescriptor) Object.defineProperty(RegExp.prototype, 'test', testDescriptor);
+      if (everyDescriptor) Object.defineProperty(Array.prototype, 'every', everyDescriptor);
+      if (includesDescriptor)
+        Object.defineProperty(Array.prototype, 'includes', includesDescriptor);
     }
 
     expect(validated).toMatchObject({ slots: ['slot-one'], timeoutMs: 100 });
-    expect(duplicateError).toBeInstanceOf(RequestAdsInputError);
-    expect(duplicateError).toMatchObject({ code: 'duplicate_slot' });
-    expect(calls).toEqual({ encode: 0, iterator: 0, test: 0 });
+    expect(unknownKeyError).toBeInstanceOf(RequestAdsInputError);
+    expect(unknownKeyError).toMatchObject({ code: 'invalid_options' });
+    expect(calls).toEqual({ encode: 0, every: 0, includes: 0, iterator: 0, test: 0 });
   });
 });
 
