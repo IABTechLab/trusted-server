@@ -637,13 +637,13 @@ function createFacade(
         throw new GoogletagReplacementError(undefined, true, cause);
       };
       if (!destroy(oldSlot)) throw new GoogletagReplacementError(oldSlot);
-      if (definition === undefined || !isGenerationCurrent() || !isOperationCurrent()) {
-        return destroyed;
-      }
       let replacement: object | undefined;
       let admission: GoogletagReplacementCommitAdmission | undefined;
       let commitAttempted = false;
       try {
+        if (definition === undefined || !isGenerationCurrent() || !isOperationCurrent()) {
+          return destroyed;
+        }
         const candidate = call(binding.binding, 'defineSlot', [
           definition.adUnitPath,
           definition.sizes,
