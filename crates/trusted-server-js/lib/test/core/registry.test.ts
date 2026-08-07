@@ -222,6 +222,35 @@ describe('registry', () => {
     expect(ownKeysCalls).toBeLessThanOrEqual(4);
   });
 
+  it('charges acyclic shared-DAG multiplicity to the aggregate body budget', () => {
+    const descriptorReads: number[] = [];
+    let shared: object = { value: 'leaf' };
+    for (let depth = 0; depth < 24; depth += 1) {
+      const node = { left: shared, right: shared };
+      const nodeIndex = descriptorReads.length;
+      descriptorReads.push(0);
+      shared = new Proxy(node, {
+        getOwnPropertyDescriptor: (target, key) => {
+          descriptorReads[nodeIndex] = (descriptorReads[nodeIndex] ?? 0) + 1;
+          return Reflect.getOwnPropertyDescriptor(target, key);
+        },
+      });
+    }
+
+    expectRegistrationError(
+      () =>
+        prepareProgrammaticAdUnits(
+          {
+            ...unit('shared-dag'),
+            bids: [{ bidder: 'fictional', params: shared }],
+          },
+          new Set()
+        ),
+      'request_body_too_large'
+    );
+    expect(descriptorReads.every((reads) => reads <= 2)).toBe(true);
+  });
+
   it('uses captured validation intrinsics after platform prototypes are poisoned', () => {
     const validCandidate = unit('poison-safe');
     const invalidCandidate = { ...unit('invalid-bidder'), bids: [{ bidder: '' }] };
