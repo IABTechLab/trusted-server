@@ -100,6 +100,7 @@ describe('build-prebid-external metadata', () => {
       expect(manifest.sha256).toMatch(/^[0-9a-f]{64}$/);
       expect(manifest.sri).toMatch(/^sha384-/);
       expect(bundle).toContain('__trustedServerArtifactV1');
+      expect(bundle).toContain('getBidResponsesForAdUnitCode');
       expect(bundle).toContain(manifest.artifactReleaseId);
       expect(bundle).not.toContain(ARTIFACT_RELEASE_SENTINEL);
       expect(bundle).not.toContain('__tsjs_prebid_bundle');
