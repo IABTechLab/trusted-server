@@ -29,6 +29,7 @@ export type RuntimeInterfaces = Readonly<Record<string, unknown>>;
 export interface RuntimeSessionOptions {
   readonly createIdentityIssuer: NavigationIdentityIssuerFactory;
   readonly interfaces?: RuntimeInterfaces;
+  readonly onNavigationDispose?: (navigationGeneration: object) => void;
   readonly onDisposalError?: DisposalErrorHandler;
 }
 
@@ -597,6 +598,7 @@ class RuntimeSessionOwner implements RuntimeSession {
   public readonly interfaces: RuntimeInterfaces;
   private readonly scope: OwnerScope;
   private readonly createIdentityIssuer: NavigationIdentityIssuerFactory;
+  private readonly onNavigationDispose: ((navigationGeneration: object) => void) | undefined;
   private readonly onDisposalError: DisposalErrorHandler | undefined;
   private navigation: NavigationSessionOwner | undefined;
   private started = false;
@@ -606,6 +608,8 @@ class RuntimeSessionOwner implements RuntimeSession {
 
   public constructor(options: RuntimeSessionOptions) {
     this.createIdentityIssuer = options.createIdentityIssuer;
+    this.onNavigationDispose =
+      typeof options.onNavigationDispose === 'function' ? options.onNavigationDispose : undefined;
     this.onDisposalError = options.onDisposalError;
     this.scope = new OwnerScope(options.onDisposalError);
     this.interfaces = options.interfaces ?? EMPTY_INTERFACES;
@@ -730,6 +734,11 @@ class RuntimeSessionOwner implements RuntimeSession {
       },
       this.onDisposalError
     );
+    const onNavigationDispose = this.onNavigationDispose;
+    if (onNavigationDispose) {
+      const navigationGeneration = navigation.generation;
+      navigation.onDispose('navigation-lifecycle', () => onNavigationDispose(navigationGeneration));
+    }
     navigationReference.current = navigation;
     return navigation;
   }

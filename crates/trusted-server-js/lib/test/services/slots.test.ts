@@ -627,8 +627,12 @@ describe('navigation-owned DOM reconciliation', () => {
     vi.setSystemTime(0);
     const gpt = createGptHarness();
     const dom = createReconciliationBoundary();
+    const disposeCommittedArtifact = vi.fn(() => {
+      throw new Error('fictional artifact cleanup failure');
+    });
     dom.put('slot-div', {});
     const service = createSlotService({
+      disposeCommittedArtifact,
       googletag: gpt.adapter,
       now: () => Date.now(),
       reconciliation: dom.boundary,
@@ -650,6 +654,7 @@ describe('navigation-owned DOM reconciliation', () => {
       [[300, 250]],
       'slot-div'
     );
+    expect(disposeCommittedArtifact).toHaveBeenCalledExactlyOnceWith(navigation.generation, 'slot');
 
     const request = service.request({
       intentId: 'after-rebind',
@@ -741,6 +746,33 @@ describe('navigation-owned DOM reconciliation', () => {
       expect.objectContaining({ id: 'slot' }),
     ]);
     expect(gpt.defineSlot).not.toHaveBeenCalled();
+  });
+
+  it('releases the exact committed artifact before retiring a failed reconciliation', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const gpt = createGptHarness();
+    const dom = createReconciliationBoundary();
+    const disposeCommittedArtifact = vi.fn();
+    dom.put('slot-div', {});
+    const service = createSlotService({
+      disposeCommittedArtifact,
+      googletag: gpt.adapter,
+      now: () => Date.now(),
+      reconciliation: dom.boundary,
+    });
+    const navigation = createNavigation();
+    bindTrustedSlot(service, navigation);
+    service.activate();
+
+    dom.disconnect('slot-div');
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(disposeCommittedArtifact).toHaveBeenCalledExactlyOnceWith(navigation.generation, 'slot');
+    expect(disposeCommittedArtifact.mock.invocationCallOrder[0]).toBeLessThan(
+      gpt.destroySlots.mock.invocationCallOrder[0] as number
+    );
+    expect(gpt.destroySlots).toHaveBeenCalledOnce();
   });
 
   it('commits a unique replacement found only by the final 5,000 ms pass', async () => {
@@ -2421,12 +2453,16 @@ describe('physical GPT cycles', () => {
     });
   });
 
-  it('keeps a completion-timeout cycle quarantined until its exact late completion drains', async () => {
+  it('recovers a completion timeout through the exact destroy/redefine transaction', async () => {
     vi.useFakeTimers();
     const harness = createGptHarness();
-    const service = createSlotService({ googletag: harness.adapter });
+    const disposeCommittedArtifact = vi.fn();
+    const service = createSlotService({
+      disposeCommittedArtifact,
+      googletag: harness.adapter,
+    });
     const navigation = createNavigation();
-    const slot = bindTrustedSlot(service, navigation);
+    const oldSlot = bindTrustedSlot(service, navigation);
     const first = service.request({
       intentId: 'completion-timeout',
       navigationGeneration: navigation.generation,
@@ -2435,24 +2471,21 @@ describe('physical GPT cycles', () => {
       registeredSlotId: 'slot',
     });
     await Promise.resolve();
-    service.handleGptEvent('slotRequested', { slot });
+    service.handleGptEvent('slotRequested', { slot: oldSlot });
     await vi.advanceTimersByTimeAsync(10_000);
     await expect(first.result).resolves.toMatchObject({ reason: 'gpt_completion_timeout' });
-    const blocked = service.request({
-      intentId: 'blocked',
-      navigationGeneration: navigation.generation,
-      operation: 'refresh',
-      requestClass: 'primary',
-      registeredSlotId: 'slot',
-    });
-    await expect(blocked.result).resolves.toMatchObject({ reason: 'slot_quarantined' });
+    await Promise.resolve();
+    const replacement = harness.defineSlot.mock.results[0]?.value;
+    if (typeof replacement !== 'object' || replacement === null) {
+      throw new Error('Expected completion-timeout replacement');
+    }
+    expect(harness.destroySlots).toHaveBeenCalledExactlyOnceWith([oldSlot]);
+    expect(disposeCommittedArtifact).toHaveBeenCalledExactlyOnceWith(navigation.generation, 'slot');
 
-    service.handleGptEvent('slotRequested', { slot });
-    expect(service.snapshotForTest().cycles).toBe(1);
     service.handleGptEvent('slotRenderEnded', {
       isEmpty: false,
       responseIdentifier: 'late-completion',
-      slot,
+      slot: oldSlot,
     });
     const recovered = service.request({
       intentId: 'recovered',
@@ -2463,7 +2496,20 @@ describe('physical GPT cycles', () => {
     });
     await Promise.resolve();
     expect(recovered.status).toBe('active');
-    recovered.dispose();
+    expect(harness.refresh).toHaveBeenLastCalledWith(
+      [replacement],
+      Object.freeze({ changeCorrelator: false })
+    );
+    service.handleGptEvent('slotRequested', { slot: replacement });
+    service.handleGptEvent('slotRenderEnded', {
+      isEmpty: false,
+      responseIdentifier: 'replacement-completion',
+      slot: replacement,
+    });
+    await expect(recovered.result).resolves.toEqual({
+      responseIdentifier: 'replacement-completion',
+      status: 'rendered',
+    });
   });
 
   it('never releases publisher request-timeout quarantine from later GPT events', async () => {
@@ -3294,6 +3340,10 @@ describe('Task 11 adversarial ownership review', () => {
 
     await expect(request.result).resolves.toMatchObject({ reason: 'gpt_completion_timeout' });
     expect(service.snapshotForTest().cycles).toBe(0);
+    const replacement = harness.defineSlot.mock.results[0]?.value;
+    if (typeof replacement !== 'object' || replacement === null) {
+      throw new Error('Expected handler-enforced timeout replacement');
+    }
 
     const next = service.request({
       intentId: 'after-late-exact-completion',
@@ -3304,8 +3354,8 @@ describe('Task 11 adversarial ownership review', () => {
     });
     await Promise.resolve();
     expect(harness.refresh).toHaveBeenCalledTimes(2);
-    service.handleGptEvent('slotRequested', { slot });
-    service.handleGptEvent('slotRenderEnded', { isEmpty: false, slot });
+    service.handleGptEvent('slotRequested', { slot: replacement });
+    service.handleGptEvent('slotRenderEnded', { isEmpty: false, slot: replacement });
     await expect(next.result).resolves.toMatchObject({ status: 'rendered' });
   });
 
