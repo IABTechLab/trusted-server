@@ -605,6 +605,10 @@ export function createPrebidSelectionCoordinator(
         } catch {
           continue;
         }
+        if (highest.length !== 1) {
+          finishGroup(group, 'unselected');
+          continue;
+        }
         const selected: Readonly<PreparedTrustedBidV1>[] = [];
         for (let bidIndex = 0; bidIndex < highest.length; bidIndex += 1) {
           const match = exactSelectedBid(highest[bidIndex], group);
@@ -624,20 +628,34 @@ export function createPrebidSelectionCoordinator(
           finishGroup(group, 'unselected');
           continue;
         }
-        const created = options.createAttempt(owner.value);
+        let created: RenderAttemptCreationResult;
+        try {
+          created = options.createAttempt(owner.value);
+        } catch {
+          owner.value.dispose();
+          finishGroup(group, 'unselected');
+          continue;
+        }
         if (!created.ok) {
           owner.value.dispose();
           finishGroup(group, 'unselected');
           continue;
         }
-        const promotion = options.reservations.promotePrebidSelection({
-          reservationId: prepared.bid.adId,
-          auctionId: prepared.auctionId,
-          adUnitCode: prepared.adUnitCode,
-          navigationGeneration: auction.navigation.generation,
-          attempt: owner.value,
-          prebidBid: prepared.bid,
-        });
+        let promotion: ReturnType<ReservationService['promotePrebidSelection']>;
+        try {
+          promotion = options.reservations.promotePrebidSelection({
+            reservationId: prepared.bid.adId,
+            auctionId: prepared.auctionId,
+            adUnitCode: prepared.adUnitCode,
+            navigationGeneration: auction.navigation.generation,
+            attempt: owner.value,
+            prebidBid: prepared.bid,
+          });
+        } catch {
+          created.value.fail('prebid_contract_violation');
+          finishGroup(group, 'unselected');
+          continue;
+        }
         if (!promotion.ok) {
           created.value.fail('prebid_contract_violation');
           finishGroup(group, 'unselected');

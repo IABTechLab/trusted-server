@@ -410,7 +410,14 @@ describe('ordered Prebid bid publication', () => {
 });
 
 describe('Prebid selection coordination', () => {
-  function prepareSelection(activateResult = true, synchronousTimer = false) {
+  function prepareSelection(
+    options: Readonly<{
+      activateResult?: boolean;
+      synchronousTimer?: boolean;
+      throwCreateAttempt?: boolean;
+      throwPromotion?: boolean;
+    }> = {}
+  ) {
     let now = 0;
     const runtime = createRuntimeSession({
       createIdentityIssuer: () =>
@@ -437,10 +444,11 @@ describe('Prebid selection coordination', () => {
     const attemptOwners: RenderAttemptScope[] = [];
     const timers = new Map<object, () => void>();
     const cleared: object[] = [];
-    const activateAttempt = vi.fn(() => activateResult);
+    const activateAttempt = vi.fn(() => options.activateResult ?? true);
     const coordinator = createPrebidSelectionCoordinator({
       activateAttempt,
       createAttempt: (owner) => {
+        if (options.throwCreateAttempt) throw new Error('attempt factory failed');
         attemptOwners.push(owner);
         const result = createRenderAttempt({
           artifacts,
@@ -456,6 +464,7 @@ describe('Prebid selection coordination', () => {
       },
       reservations: {
         promotePrebidSelection: (input) => {
+          if (options.throwPromotion) throw new Error('promotion failed');
           const result = reservations.promotePrebidSelection(input);
           promotions.push(result);
           return result;
@@ -472,7 +481,7 @@ describe('Prebid selection coordination', () => {
           expect(milliseconds).toBe(10_000);
           const handle = Object.freeze({});
           timers.set(handle, callback);
-          if (synchronousTimer) callback();
+          if (options.synchronousTimer) callback();
           return handle;
         },
       },
@@ -517,7 +526,7 @@ describe('Prebid selection coordination', () => {
           prebidBid: bid,
         })
       ).toMatchObject({ ok: true });
-      expect(coordinator.track(prepared, navigation)).toBe(!synchronousTimer);
+      expect(coordinator.track(prepared, navigation)).toBe(!options.synchronousTimer);
       return prepared;
     };
     return {
@@ -573,7 +582,7 @@ describe('Prebid selection coordination', () => {
   });
 
   it('tombstones a selected reservation when its PUC attempt cannot activate', () => {
-    const harness = prepareSelection(false);
+    const harness = prepareSelection({ activateResult: false });
     const selected = harness.admitted('f');
 
     harness.coordinator.auctionEnded(
@@ -625,6 +634,38 @@ describe('Prebid selection coordination', () => {
     harness.runtime.dispose();
   });
 
+  it('fails closed when the pinned single-unit winner query is ambiguous', () => {
+    const harness = prepareSelection();
+    const selected = harness.admitted('i');
+
+    harness.coordinator.auctionEnded(
+      Object.freeze({ auctionId: 'auction-one' }),
+      Object.freeze({
+        highestBids: () =>
+          Object.freeze([
+            Object.freeze({
+              ...selected.bid,
+              adUnitCode: selected.adUnitCode,
+              auctionId: selected.auctionId,
+            }),
+            Object.freeze({
+              adId: 'native-prebid-id',
+              adUnitCode: selected.adUnitCode,
+              auctionId: selected.auctionId,
+              cpm: selected.bid.cpm,
+            }),
+          ]),
+      })
+    );
+
+    expect(harness.reservations.recognize(selected.bid.adId)).toMatchObject({
+      state: 'unselected',
+    });
+    expect(harness.attempts).toEqual([]);
+    expect(harness.timers).toHaveLength(0);
+    harness.runtime.dispose();
+  });
+
   it('times out a missing auctionEnd and cancels the watchdog on navigation disposal', () => {
     const timedOut = prepareSelection();
     const bid = timedOut.admitted('d');
@@ -646,12 +687,48 @@ describe('Prebid selection coordination', () => {
   });
 
   it('rolls back a scheduler that invokes the deadline before timer publication returns', () => {
-    const harness = prepareSelection(true, true);
+    const harness = prepareSelection({ synchronousTimer: true });
     const bid = harness.admitted('g');
 
     expect(harness.reservations.recognize(bid.bid.adId)).toMatchObject({
       state: 'prebid_selection_timeout',
     });
+    expect(harness.timers).toHaveLength(0);
+    expect(harness.navigation.snapshotInventoryForTest().batches).toBe(0);
+    harness.runtime.dispose();
+  });
+
+  it.each([
+    { failure: 'attempt creation', options: { throwCreateAttempt: true } },
+    { failure: 'reservation promotion', options: { throwPromotion: true } },
+  ])('fails closed when $failure throws during selection', ({ options }) => {
+    const harness = prepareSelection(options);
+    const selected = harness.admitted('h');
+
+    expect(() =>
+      harness.coordinator.auctionEnded(
+        Object.freeze({ auctionId: 'auction-one' }),
+        Object.freeze({
+          highestBids: () =>
+            Object.freeze([
+              Object.freeze({
+                ...selected.bid,
+                adUnitCode: selected.adUnitCode,
+                auctionId: selected.auctionId,
+              }),
+            ]),
+        })
+      )
+    ).not.toThrow();
+
+    expect(harness.reservations.recognize(selected.bid.adId)).toMatchObject({
+      state: 'unselected',
+    });
+    expect(harness.attempts[0]?.snapshot().outcome).toEqual(
+      options.throwPromotion
+        ? { outcome: 'failed', reason: 'prebid_contract_violation' }
+        : undefined
+    );
     expect(harness.timers).toHaveLength(0);
     expect(harness.navigation.snapshotInventoryForTest().batches).toBe(0);
     harness.runtime.dispose();
