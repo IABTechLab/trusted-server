@@ -3,7 +3,8 @@
 **Status:** Draft
 **Author:** Engineering
 **Issue references:** #782
-**Related specs:** `2026-07-30-pluggable-providers-design.md`
+**Related specs:** `2026-07-30-pluggable-providers-design.md`; baseline
+DataDome design `2026-06-11-datadome-server-side-protection-design.md`
 **Last updated:** 2026-07-31
 
 > **Context.** Issue #782 already specifies this feature well; its done-when
@@ -17,6 +18,14 @@
 ---
 
 ## 1. Overview
+
+The pre-existing DataDome design remains unchanged. For implementations
+governed by this spec, §4a is the normative PR-specific delta and supersedes
+that baseline wherever its generic request/effect API, header ordering,
+session-by-header behavior, endpoint/request surface, cookie lifecycle,
+challenge transport, or response-pointer behavior conflicts. The baseline
+continues to provide historical context; it is not a second normative source
+for those surfaces.
 
 Integrations can today rewrite request-path behavior (proxies, attribute
 rewriters, head injectors) but cannot mutate **response** headers. The hook
@@ -587,7 +596,7 @@ referrers are never in the security view. Every degree of freedom is closed:
   and `X-DD-B`, and the higher-priority header session would never see
   a cookie update; the older DataDome spec's "always send
   X-DataDome-X-Set-Cookie when the header ID is used" is superseded for
-  v1 by its banner). Supporting header mode later means the full vendor
+  v1 by this section). Supporting header mode later means the full vendor
   protocol — typed owner-scoped `X-Set-Cookie`/`X-DD-B` forwarding,
   CORS exposure, and a JavaScript/local-storage identifier observer —
   as an explicit opt-in under **sign-off 23**. Every `ts-*`
@@ -680,7 +689,7 @@ referrers are never in the security view. Every degree of freedom is closed:
   operator explicitly sets
   `[integrations.datadome] expose_client_id_to_origin = true` (default
   `false`); every other `X-DataDome-*`
-  field is rejected until a reviewed commit adds it to that file
+  field is rejected until a reviewed commit adds it to §4a.2
   ("documented enrichment set, listed one by one" without an actual list
   was a wildcard whose contents could change outside the spec) —
   resolving what was a contradiction. When the opt-in is false, the
@@ -712,7 +721,7 @@ referrers are never in the security view. Every degree of freedom is closed:
   allowlist does not admit those fields, and ambiguity here decides
   whether a challenge enforces or silently fails open (batch rejection →
   Continue). If the vendor ever requires more, it arrives as a reviewed
-  allowlist-file addition. A _Continue_ decision may not touch
+  §4a.2 field-contract addition. A _Continue_ decision may not touch
   representation metadata of publisher bytes.
 - **Respond transport is bounded, with exact measurement points.** The
   challenge body has a maximum size (64 KiB) and a **complete-response
@@ -765,9 +774,10 @@ referrers are never in the security view. Every degree of freedom is closed:
   mutations comes from its position, not a "wins" rule; nothing outranks
   the invariant pass, or a challenge could combine `Set-Cookie` with
   public caching. The older DataDome spec's "applies last, after
-  finalization" wording is **superseded by this order** — updating that
-  document is a done-when item, since as written it would place DataDome
-  after the invariant pass and reopen the public-cache-plus-cookie bug.
+  finalization" wording is **superseded by this order**. That baseline remains
+  unchanged; this PR-specific section prevents an implementation from placing
+  DataDome after the invariant pass and reopening the
+  public-cache-plus-cookie bug.
 - The channel adopts the shared layers: structured attributed batches
   (§3, atomic per batch — a 302 must never lose `Location` to a budget
   while keeping its cookie), reserved header names, budgets, and the
@@ -1063,13 +1073,62 @@ merely inside the vendor batch.
 (`Set-Cookie X-DD-B`) asserts Continue proceeds with the cookie applied
 and `X-DD-B` forwarded exactly once — neither fixture may fail open.
 
+### 4a.3 DataDome configuration delta (normative)
+
+The canonical v1 effective configuration is the pre-existing DataDome schema
+plus this exact PR-specific delta. The configuration parser rejects unknown
+security/session fields rather than ignoring them as compatibility toggles,
+and the materialized values below participate in permission §5.5's complete
+effective-config digest.
+
+```toml
+[integrations.datadome]
+
+# Existing timeout_ms remains the 1500 ms first-byte bound.
+complete_response_timeout_ms = 3000
+challenge_body_max_bytes = 65536
+
+# Required when enable_protection = true; there is no silent lifetime default.
+security_cookie_max_age = 2592000 # example; allowed 604800..=31536000
+security_cookie_domain = "host-only" # or one exact normalized ASCII domain
+security_cookie_same_site = "Lax" # Lax | Strict | None
+
+expose_client_id_to_origin = false
+expose_host_fingerprints_to_vendor = false
+```
+
+The Protection API authority is not configurable: it is the core-owned
+`https://api-fastly.datadome.co/validate-request` endpoint defined in §4a.2.1,
+with redirects disabled. The baseline `protection_api_origin` field is a
+startup error under this delta, as are `sessionByHeader`, `session_by_header`,
+any equivalent session-mode spelling, and every other unknown
+security/session field. Supporting another region or a publisher proxy is a
+reviewed endpoint-registry and product/security decision, never a free-form
+URL setting.
+
+`complete_response_timeout_ms` defaults to and may not exceed 3000;
+`challenge_body_max_bytes` defaults to and may not exceed 65,536.
+`security_cookie_max_age` is mandatory when protection is enabled and must be
+in `604800..=31536000` seconds. `security_cookie_domain` defaults to
+`host-only`; an explicit value must pass §4a's exact-domain, domain-match, PSL,
+and active-scope-change rules. `security_cookie_same_site` accepts exactly
+`Lax`, `Strict`, or `None`; `None` is valid only with the unconditionally
+emitted `Secure` attribute, and the cookie never carries `HttpOnly`.
+
+Both exposure booleans default to `false`. ClientID-to-origin additionally
+requires the owner-scoped overlay capability. Host fingerprints additionally
+require qualified JA4 availability and sign-offs 23/28. A selected adapter
+that cannot preserve admitted request-header field-line order or enforce the
+request/body limits fails startup for protection rather than synthesizing
+different evidence.
+
 ## 4. Done-when (from #782, sharpened)
 
 1. Trait + builder + registry application, each public item documented.
 2. **The old generic `RequestFilterEffects.response_headers` channel is
    removed.** DataDome uses the separate sealed, core-registered
    `DataDomeSecurityRequestFilter` and typed `DataDomeSecurityEffects` defined
-   by its design; §4a defines that closed boundary. Generic request filters
+   by §4a's PR-specific delta. Generic request filters
    receive only `RedactedRequestView` and ordinary attributed effects and
    cannot express the security view, owner overlay, cookie operation, or
    reserved security header. The dedicated channel is necessary because
@@ -1109,13 +1168,13 @@ and `X-DD-B` forwarded exactly once — neither fixture may fail open.
 
 ## 5. Size and sequencing
 
-This is a modest feature plus tests with zero coupling to the provider
-architecture or, in its v1 headers-only form (§3), to the permission
-model. It lands whenever its first real consumer is identified (§4, item 3);
-cookie operations arrive only with their own follow-up spec (§3) and its
-permission-model coupling. If no consumer
-materializes, it does not land; being unblocked is not a reason to ship
-scaffolding.
+The ordinary mutator API in §§2–3 is a modest headers-only feature with no
+provider or permission-model coupling. It lands only with the real consumer
+required by §4 item 3; without one, scaffolding does not ship. The separately
+typed security channel in §4a is already that consumer's PR-specific contract:
+it owns DataDome cookie operations and intentionally couples configuration
+activation to permission §5.5. Those capabilities never become part of the
+ordinary mutator API.
 
 ## 6. Divergences from issue #782
 

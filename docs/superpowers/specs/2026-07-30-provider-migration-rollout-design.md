@@ -579,6 +579,86 @@ global honoring of opt-out signals is unconditional.
    reader after a provider switch (providers spec §6.1), which is the
    deliberate end of the identities only that reader can resolve.
 
+### 6.1 Operator CLI delta for this epic
+
+The pre-existing CLI design remains unchanged. For implementations governed by
+this spec, this subsection is the normative delta to its `ts config push`
+contract; where the baseline describes a direct mutable blob-store write, this
+subsection and permission §5.5 supersede that behavior. The delta does not
+authorize a generic raw metadata command or a model-transition command.
+
+`ts config push` keeps the baseline arguments and validation behavior, then:
+
+1. Obtains the next never-reused `push_sequence` from the selected adapter's
+   qualified linearizable deployment-metadata allocator. Concurrent losers
+   retry with a new value; gaps are allowed and reuse or overflow is forbidden.
+2. Builds the envelope with both the canonical data hash and the permission
+   §5.5.2 sequence-binding hash, writes it under the immutable
+   `(logical_root, push_sequence)` identity, reads it back, and verifies both
+   hashes. Writing the mutable logical root does not stage or activate it. If
+   an adapter must split an envelope for platform limits, its pointer/manifest
+   belongs to that immutable identity and names immutable chunks; the adapter
+   reconstructs and verifies the complete envelope before readiness or
+   settings exposure. The manifest and chunks are one blob for reachability
+   and lifecycle protection.
+3. CAS-installs the exact object and complete content-binding tuple as the sole
+   settings candidate, with a never-reused candidate incarnation and unchanged
+   active model fields. A competing candidate fails; config push cannot create
+   or promote a model candidate and no force option bypasses that boundary.
+4. Uses permission §5.5's authoritative membership, readiness, bounded
+   admission-lease drain, quiescence, journal, and promotion protocol. Only the
+   final register CAS activates settings. A config-only push retains the policy
+   ordinal but still follows the complete protocol and scheduled unavailable
+   interval.
+
+`--dry-run` performs validation and reports the provisional immutable identity
+and candidate tuple using the allocator's observed next value, but does not
+reserve a sequence, write an object, or mutate the activation register. The
+reported value is advisory because another publisher can win.
+
+The baseline reserved-future-key description is also superseded narrowly:
+`ts-config-signature`, if implemented later, is a signature or DSSE envelope
+over `sequence_binding_hash`, not merely the data/blob hash. Signing remains
+out of scope for this epic.
+
+This epic also adds the following operator command as a delta owned here, not
+as a modification to the baseline CLI design:
+
+```bash
+ts config gc \
+  --adapter <adapter> \
+  [--manifest <path>] \
+  [--store <logical-config-store-id>] \
+  [--key <config-entry-key>] \
+  [--dry-run] \
+  [--yes] \
+  [--runtime-config <path>]
+```
+
+The command uses only permission §5.5.3's qualified immutable-object listing,
+lifecycle, reachability, and object-ID-CAS deletion protocol. `--store` selects
+the same logical config store for both roots; `--key` selects the app-config
+root and defaults to `app_config`, while `ts_activation_journal` is fixed and
+cannot be overridden. EdgeZero's selected adapter supplies snapshot listing,
+object/lifecycle metadata, and object-ID-CAS deletion. Trusted Server owns
+journal/hash validation and reachability decisions and never constructs a
+platform-specific physical key. The command completes one snapshot-consistent
+paginated inventory before deleting, verifies all hashes and journal links,
+and protects every active, candidate, operational-history, retained-journal,
+referenced-manifest/chunk, and referenced-blob object. Any incomplete listing,
+expired pagination token, broken hash/link, cycle, unknown schema, uncertain
+store clock, or missing lifecycle value aborts before the first deletion.
+
+`--dry-run` prints only roots, object IDs, reasons, and lifecycle timestamps.
+Without it, deletion requires `--yes` or interactive confirmation. A partial
+platform deletion error stops the run and reports exact completed IDs; retry is
+safe because reachability and object-ID CAS are re-evaluated. The command never
+publishes a checkpoint, changes the journal head, alters active/model state, or
+guesses physical keys. Conformance tests cover dry-run non-mutation, complete
+pagination, every reachability root, lifecycle boundaries, malformed graphs,
+CAS conflicts, partial-error retry, confirmation, and reproduction of the
+activation-journal vector in permission §5.5.3.1.
+
 ## 7. Documentation deliverables
 
 - Migration guide page (§5), linked from `CHANGELOG.md` and the release
@@ -625,7 +705,7 @@ implemented.
 | 16  | Persist use-opt-out suppression until ordered explicit authorization for that use or identity deletion. TCF `LastUpdated` or an authenticated monotonic authorization revision proves order; bare timestamp-less GPP/USP does not. A currently presented identical timestamp-less opt-out starts a new restrictive episode after a clear without refreshing its original age. TTL and saturation never shorten it. This rejects the prior TTL-sticky alternative under which suppression became inert at consent-TTL expiry, as well as administrative clear without newer authorization and saturation-based shortening.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | permission §4.3                             | —               | open   |
 | 17  | N/A, absent, reserved, unknown, and unsupported values never grant processing.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | permission §4.5                             | —               | open   |
 | 18  | A selected geo provider's lookup failure uses the compiled-in protective profile; `default_country` is only for acknowledged static-jurisdiction mode.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | permission §5.2                             | —               | open   |
-| 19  | Use immutable version-addressed whole-config publication plus prepare/commit activation of the complete blob/data/config/policy tuple with authenticated authoritative fleet membership/readiness, a deployment-qualified bounded admission lease, a shared authenticated register/journal time domain, store-enforced promotion-not-before, an all-request quiescence barrier, and a time-retained immutable activation journal. Use a second unanimous, lease-drained and quiescent model transition on the same register to advance model epoch, minimum binary generation, and row schema floor atomically. Every ordinary settings promotion intentionally causes a scheduled fleet-wide deployment-unavailable interval; this is not a zero-downtime protocol, and controller failure may extend the outage until authenticated cancellation or promotion. A mutable “latest” blob never activates settings or the writer; membership changes restage the candidate; no request admitted under a displaced logical `activation_generation` remains able to produce effects after either promotion. The activation fence is universal, including stateless-identity and identity-free traffic; an adapter that cannot qualify it cannot serve under this spec. The lease amortizes only whole-settings admission: positive authority, revocation, outbox, `w`, and breaker decisions retain fresh strong reads. | permission §5.5; CLI §5                     | —               | open   |
+| 19  | Use immutable version-addressed whole-config publication plus prepare/commit activation of the complete blob/data/config/policy tuple with authenticated authoritative fleet membership/readiness, a deployment-qualified bounded admission lease, a shared authenticated register/journal time domain, store-enforced promotion-not-before, an all-request quiescence barrier, and a time-retained immutable activation journal. Use a second unanimous, lease-drained and quiescent model transition on the same register to advance model epoch, minimum binary generation, and row schema floor atomically. Every ordinary settings promotion intentionally causes a scheduled fleet-wide deployment-unavailable interval; this is not a zero-downtime protocol, and controller failure may extend the outage until authenticated cancellation or promotion. A mutable “latest” blob never activates settings or the writer; membership changes restage the candidate; no request admitted under a displaced logical `activation_generation` remains able to produce effects after either promotion. The activation fence is universal, including stateless-identity and identity-free traffic; an adapter that cannot qualify it cannot serve under this spec. The lease amortizes only whole-settings admission: positive authority, revocation, outbox, `w`, and breaker decisions retain fresh strong reads. | permission §5.5; rollout §6.1               | —               | open   |
 | 20  | N+1 keeps v1 minting and pre-epic live gating. It reads/enforces N+2 negative state for rollback safety and can persist an explicit pre-epic withdrawal/deletion, but it does not originate durable P4 use suppression. New-shape settings alone do not activate the new writer/model: N+2 emulates N+1 until the fleet-wide `permissions_v2` model CAS, after which the register's minimum binary generation bars N+1 from serving. The N+1 batch boundary already fails closed as soon as new-shape settings are active.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | migration §4.4                              | —               | open   |
 | 21  | Expire and re-mint rowless legacy cookies without continuity; a prefix match cannot authenticate the cookie suffix. Non-destructive signals are request-local and create no negative record for the old rowless identity; if ordinary P1-gated re-mint succeeds, the new row-backed family commits the current suppression before use.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | providers §5                                | —               | open   |
 | 22  | Defer host JA4/H2 fingerprint processing to a separate approved design; reject `[device] provider = "fastly"` at startup and do not persist fingerprint-derived classifications.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | providers §5                                | —               | open   |

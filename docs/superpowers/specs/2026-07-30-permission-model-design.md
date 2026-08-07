@@ -1184,7 +1184,7 @@ the admission-lease bound and promotion-not-before time, retention horizon,
 and controller identity. The journal object's qualified immutable-store
 metadata supplies store-issued `created_at`; its canonical schema, object ID,
 known-answer vector, lifecycle, listing, genesis, and pruning rules are
-normative in CLI §5.1. The controller writes and read-verifies that object
+normative in §5.5.3. The controller writes and read-verifies that object
 before promotion; the one register CAS both promotes the candidate and changes
 `activation_journal_head` to its object ID. A losing CAS leaves an unreferenced
 journal object, never an active tuple without a journal entry. Journal records
@@ -1600,6 +1600,223 @@ revision fixture.
 ```
 
 <!-- END NORMATIVE JSON: revision-canonicalization-v1 -->
+
+#### 5.5.3 Activation journal object and GC protocol
+
+The journal uses the same qualified immutable config-object service under the
+reserved logical root `ts_activation_journal`, never the mutable app-config
+root or the identity graph. Its logical object ID is lowercase
+`SHA-256("tsactj1|" || RFC8785-JCS-UTF8(journal))`; adapters map
+`("ts_activation_journal", object_id)` to a write-once physical object. The
+object materializes exactly these fields and rejects unknown/missing fields:
+
+Every JSON number in the journal, including every number nested in an active
+tuple, is an integer in `0..=9,007,199,254,740,991` (2^53 − 1). Booleans,
+floats, negative values, and larger otherwise-valid `u64` values are rejected
+before JCS; implementations may use wider internal integers but cannot emit
+them here. Store-supplied lifecycle timestamps use the same portable range,
+and addition that would exceed it fails closed. This profile makes the JCS
+object ID identical in JavaScript, Rust, and every adapter rather than relying
+on a language's larger integer type.
+
+- `schema_version = 1`; `attempt_id` as 32 lowercase hex characters from 16
+  CSPRNG bytes, allowing a timed-out attempt to publish a new object;
+- `candidate_incarnation` as the exact candidate's never-reused 32 lowercase
+  hex CSPRNG identity for `config`/`model`, or null for `checkpoint`;
+- `previous_journal_id` and `pruned_through_journal_id`, each 64 lowercase hex
+  or null under the link/pruning rules below;
+- `expected_activation_generation: u64` and `transition_kind` exactly
+  `config`, `model`, or `checkpoint`;
+- `drain_attempt: u64`, which is the exact nonzero candidate drain attempt for
+  `config`/`model` and zero for `checkpoint`;
+- `serve_admission_lease_bound_ms: u64`, the exact positive
+  deployment-qualified bound snapshotted by the candidate, and
+  `promotion_not_before_unix_ms: u64`, the exact store-clock gate written by
+  that drain attempt; both are zero only for a `checkpoint`;
+- complete `displaced_active` and `activated_active` tuples from §5.5,
+  including settings bindings, policy identity, model epoch, minimum
+  binary generation, row schema floor, and logical activation generation;
+- `membership_epoch: u64`, sorted unique `ready_members` and
+  `quiesced_members` using the stable member grammar, authenticated
+  `controller_id`, and `retain_for_ms: u64` constrained
+  to at least 2,592,000,000 and the longest applicable artifact, cookie-scope,
+  rollback, and audit horizon.
+
+The cross-language known-answer and rejection vectors are inline in §5.5.3.1;
+every controller, runtime verifier, and GC must reproduce both JCS bytes and
+object ID and reject every numeric boundary vector. For the first promotion,
+`previous_journal_id` is null only when the register head is
+null and expected generation is zero. Every later config/model promotion must
+name the exact current head and has null `pruned_through_journal_id`; the active
+register CAS rejects any link/generation mismatch. For config/model entries,
+`expected_activation_generation` must equal current active's logical
+activation generation, and activated active must set it to that value + 1;
+both member lists must equal the candidate snapshot's complete sorted member
+list, `membership_epoch` must equal that snapshot's epoch, `drain_attempt` must
+equal the candidate's current attempt and every quiescence acknowledgment, and
+`candidate_incarnation` must equal every readiness/quiescence binding,
+`serve_admission_lease_bound_ms` and `promotion_not_before_unix_ms` must equal
+the candidate's exact drain fields, the admission-lease bound must be positive,
+the immutable-store `created_at` for the journal must be at or after the
+promotion-not-before time and no more than 60 seconds before the promotion CAS,
+and the promotion CAS must independently enforce that its register store clock
+has reached that time. These comparisons are defined only because the
+activation register and immutable object service expose the same qualified,
+authenticated Unix-millisecond time domain; adapters with incomparable clocks
+fail activation qualification rather than comparing local timestamps.
+Independently, `displaced_active` must equal current active and
+`activated_active` must equal the candidate's computed post-CAS tuple. Overflow
+is a hard error. A checkpoint
+uses the current membership epoch, empty `ready_members` and
+`quiesced_members` lists, and identical displaced and activated tuples
+(including unchanged activation generation), with null
+`candidate_incarnation`, `drain_attempt = 0`,
+`serve_admission_lease_bound_ms = 0`, and
+`promotion_not_before_unix_ms = 0`; it cannot stand in for fleet readiness or
+quiescence.
+
+The immutable store returns authenticated `created_at_unix_ms` object metadata
+from the shared qualified activation time domain and maintains a separate,
+extend-only `delete_not_before_unix_ms` lifecycle value. On every config or journal object
+write, the adapter atomically initializes deletion protection to at least store
+creation time + 30 days. For a promotion journal it extends protection for the
+journal and both named blobs to at least `created_at + 60 seconds +
+retain_for_ms` before the active CAS may bind the journal. These lifecycle
+values can only increase. Therefore failed publication, aborted candidates,
+losing journal attempts, and other unreferenced objects still have a store-clock
+not-before value even though no successful promotion names them.
+
+The object service's qualification supplies snapshot-consistent complete
+listing for both logical roots: a listing returns one snapshot generation and
+opaque pagination token; every page is from that generation, and mutation or
+expiry of the token forces GC to restart without deleting. GC first completes
+the listing, traverses and verifies the journal from the active head, and builds
+the active/candidate/history/journal reachable set. Missing objects, broken
+hashes/links, unknown schema, cycles, incomplete pages, or uncertain lifecycle
+metadata abort the run. Deletion then uses object-ID CAS and is allowed only
+when the object is unreachable and its store-enforced not-before has passed.
+
+Journal pruning is an authenticated controller operation, never implicit GC.
+Only when every record reachable from the current head is older than its full
+retention horizon may the controller publish a `checkpoint` whose displaced
+and activated tuples both equal current active, whose previous ID is null, and
+whose `pruned_through_journal_id` is the old head. One register CAS verifies the
+unchanged active tuple/generation and replaces only the journal head. The
+checkpoint names and protects the current active blob; old journal objects
+remain until their individual not-before values pass. Frequent activation can
+therefore retain a longer chain but can never cut a still-required segment.
+
+##### 5.5.3.1 Activation-journal vectors
+
+The JSON object between the stable markers is the sole normative
+machine-readable activation-journal fixture. Extractors exclude the markers
+and code fences, parse the enclosed UTF-8 JSON, and must reject duplicate
+object keys.
+
+<!-- BEGIN NORMATIVE JSON: activation-journal-v1 -->
+
+```json
+{
+  "schema_version": 1,
+  "canonicalization": "RFC 8785 (JCS)",
+  "digest": "SHA-256",
+  "domain_prefix_utf8": "tsactj1|",
+  "numeric_profile": {
+    "type": "integer",
+    "minimum": 0,
+    "maximum": 9007199254740991
+  },
+  "vectors": [
+    {
+      "name": "genesis-config-promotion",
+      "journal": {
+        "schema_version": 1,
+        "attempt_id": "00000000000000000000000000000000",
+        "candidate_incarnation": "11111111111111111111111111111111",
+        "previous_journal_id": null,
+        "pruned_through_journal_id": null,
+        "expected_activation_generation": 0,
+        "drain_attempt": 1,
+        "serve_admission_lease_bound_ms": 1000,
+        "promotion_not_before_unix_ms": 1700000001000,
+        "transition_kind": "config",
+        "displaced_active": {
+          "logical_root": "builtin",
+          "immutable_blob_id": "builtin",
+          "source_version": 0,
+          "data_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+          "config_revision": "0000000000000000000000000000000000000000000000000000000000000000",
+          "policy_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+          "ordinal": 0,
+          "model_epoch": "pre_epic_v1",
+          "minimum_binary_generation": 1,
+          "row_schema_floor": 1,
+          "activation_generation": 0
+        },
+        "activated_active": {
+          "logical_root": "app_config",
+          "immutable_blob_id": "app_config/1",
+          "source_version": 1,
+          "data_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+          "config_revision": "2222222222222222222222222222222222222222222222222222222222222222",
+          "policy_digest": "3333333333333333333333333333333333333333333333333333333333333333",
+          "ordinal": 1,
+          "model_epoch": "pre_epic_v1",
+          "minimum_binary_generation": 1,
+          "row_schema_floor": 1,
+          "activation_generation": 1
+        },
+        "membership_epoch": 7,
+        "ready_members": ["edge-a", "edge-b"],
+        "quiesced_members": ["edge-a", "edge-b"],
+        "controller_id": "deploy-controller",
+        "retain_for_ms": 2592000000
+      },
+      "canonical_json_utf8": "{\"activated_active\":{\"activation_generation\":1,\"config_revision\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"data_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"immutable_blob_id\":\"app_config/1\",\"logical_root\":\"app_config\",\"minimum_binary_generation\":1,\"model_epoch\":\"pre_epic_v1\",\"ordinal\":1,\"policy_digest\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"row_schema_floor\":1,\"source_version\":1},\"attempt_id\":\"00000000000000000000000000000000\",\"candidate_incarnation\":\"11111111111111111111111111111111\",\"controller_id\":\"deploy-controller\",\"displaced_active\":{\"activation_generation\":0,\"config_revision\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"data_hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"immutable_blob_id\":\"builtin\",\"logical_root\":\"builtin\",\"minimum_binary_generation\":1,\"model_epoch\":\"pre_epic_v1\",\"ordinal\":0,\"policy_digest\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"row_schema_floor\":1,\"source_version\":0},\"drain_attempt\":1,\"expected_activation_generation\":0,\"membership_epoch\":7,\"previous_journal_id\":null,\"promotion_not_before_unix_ms\":1700000001000,\"pruned_through_journal_id\":null,\"quiesced_members\":[\"edge-a\",\"edge-b\"],\"ready_members\":[\"edge-a\",\"edge-b\"],\"retain_for_ms\":2592000000,\"schema_version\":1,\"serve_admission_lease_bound_ms\":1000,\"transition_kind\":\"config\"}",
+      "sha256_hex": "7af3934b4e5500903ef77ad8a1367db83b03fc62a0bb83bd0849289c685d2e88"
+    }
+  ],
+  "rejection_vectors": [
+    {
+      "name": "unsafe-top-level-u64",
+      "base_vector": "genesis-config-promotion",
+      "replace_json_pointer": "/expected_activation_generation",
+      "raw_json_number": "9007199254740992",
+      "error": "integer exceeds portable JCS profile"
+    },
+    {
+      "name": "unsafe-embedded-active-u64",
+      "base_vector": "genesis-config-promotion",
+      "replace_json_pointer": "/activated_active/source_version",
+      "raw_json_number": "9007199254740992",
+      "error": "integer exceeds portable JCS profile"
+    },
+    {
+      "name": "fractional-journal-number",
+      "base_vector": "genesis-config-promotion",
+      "replace_json_pointer": "/retain_for_ms",
+      "raw_json_number": "2592000000.5",
+      "error": "journal number is not an integer"
+    },
+    {
+      "name": "unsafe-admission-lease-bound",
+      "base_vector": "genesis-config-promotion",
+      "replace_json_pointer": "/serve_admission_lease_bound_ms",
+      "raw_json_number": "9007199254740992",
+      "error": "integer exceeds portable JCS profile"
+    },
+    {
+      "name": "zero-promotion-admission-lease-bound",
+      "base_vector": "genesis-config-promotion",
+      "replace_json_pointer": "/serve_admission_lease_bound_ms",
+      "raw_json_number": "0",
+      "error": "config/model admission lease bound is not positive"
+    }
+  ]
+}
+```
+
+<!-- END NORMATIVE JSON: activation-journal-v1 -->
 
 ## 6. Failure-mode matrix — normative
 

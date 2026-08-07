@@ -883,3 +883,29 @@ The independent internal recomputation produced
 This verifies the current KAT inside the review process but is not relabeled as
 the fresh external recomputation requested in pass 5. Decision rows and release
 gates remain unchanged.
+
+## Post-decision pass 7 (baseline-spec scope correction, 2026-08-07)
+
+The product owner set a repository-scope boundary: specifications that predate
+this PR are references, not modification targets. The final PR therefore keeps
+both pre-existing June designs byte-identical to `origin/main`:
+
+- `2026-06-11-datadome-server-side-protection-design.md`; and
+- `2026-06-16-edgezero-based-ts-cli-design.md`.
+
+The PR-specific contracts formerly written into those baselines now live only
+in new PR-owned specifications. Hook §1 declares §4a the normative DataDome
+delta and sole authority where the unchanged baseline conflicts. Permission
+§5.5.3 owns the activation-journal schema, lifecycle, listing/pruning protocol,
+and its byte-identical known-answer/rejection fixture; rollout §6.1 owns the
+`ts config push` activation delta, immutable chunk-manifest mapping, future
+signature binding, and `ts config gc` command/ownership contract. Hook §4a.3
+owns the canonical DataDome configuration delta and startup rejection rules.
+Sign-off 19 cites those PR-owned sections rather than the baseline CLI spec.
+
+Earlier ledger entries describing banners or inline edits to the old DataDome
+document record intermediate revisions and are superseded by this scope
+correction; they are not descriptions of the final tree. The activation object
+ID remains
+`7af3934b4e5500903ef77ad8a1367db83b03fc62a0bb83bd0849289c685d2e88`.
+Decision rows and release gates remain unchanged.
