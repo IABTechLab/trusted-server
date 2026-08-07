@@ -83,6 +83,8 @@ export interface IntegrationRegistryOptions {
   readonly now?: () => number;
   readonly signal?: AbortSignal;
   readonly getBindings?: (id: string) => IntegrationBindings;
+  /** Monotonic bootstrap-generation guard supplied by the composition owner. */
+  readonly isCurrentOwner?: () => boolean;
   readonly onDisposalError?: (error: unknown) => void;
   readonly onRuntimeFailure?: (failure: IntegrationRuntimeFailure) => void;
 }
@@ -255,6 +257,7 @@ class IntegrationRegistryOwner {
   private readonly coreScope: DisposableStack;
   private readonly now: () => number;
   private readonly getBindings: (id: string) => IntegrationBindings;
+  private readonly isCurrentOwner: () => boolean;
   private readonly startedAtMs: number;
   private readonly releaseId: string;
   private readonly ownerSignal: AbortSignal | undefined;
@@ -277,6 +280,7 @@ class IntegrationRegistryOwner {
         config: EMPTY_BINDING,
         interfaces: EMPTY_BINDING,
       }));
+    this.isCurrentOwner = options.isCurrentOwner ?? (() => true);
     this.ownerSignal = options.signal;
     this.onDisposalError = options.onDisposalError ?? (() => undefined);
     this.onRuntimeFailure = options.onRuntimeFailure ?? (() => undefined);
@@ -313,6 +317,10 @@ class IntegrationRegistryOwner {
   }
 
   public register(candidate: unknown): boolean {
+    if (!this.ownerIsCurrent()) {
+      this.fail('bundle_partial');
+      return false;
+    }
     if (this.registryState === 'preparing' || this.registryState === 'activating') {
       this.fail('abi_mismatch');
       return false;
@@ -342,6 +350,10 @@ class IntegrationRegistryOwner {
         return false;
       }
 
+      if (!this.ownerIsCurrent()) {
+        this.fail('bundle_partial');
+        return false;
+      }
       if (this.registryState !== 'collecting') return false;
 
       this.registrations.set(
@@ -405,6 +417,23 @@ class IntegrationRegistryOwner {
   private deadlineExpired(): boolean {
     const elapsed = this.now() - this.startedAtMs;
     return !Number.isFinite(elapsed) || elapsed >= BOOT_DEADLINE_MS;
+  }
+
+  private ownerIsCurrent(): boolean {
+    try {
+      return this.isCurrentOwner();
+    } catch {
+      return false;
+    }
+  }
+
+  private canContinue(phase: 'preparing' | 'activating'): boolean {
+    if (this.registryState !== phase) return false;
+    if (!this.ownerIsCurrent() || this.deadlineExpired()) {
+      this.fail('bundle_partial');
+      return false;
+    }
+    return true;
   }
 
   private fail(reason: BootFailureReason): void {
@@ -531,6 +560,7 @@ class IntegrationRegistryOwner {
     }
     if (
       !this.manifestValue ||
+      !this.ownerIsCurrent() ||
       this.deadlineExpired() ||
       this.manifestValue.integrations.some((entry) => !this.registrations.has(entry.id))
     ) {
@@ -540,10 +570,7 @@ class IntegrationRegistryOwner {
 
     this.registryState = 'preparing';
     for (const entry of this.manifestValue.integrations) {
-      if (this.registryState !== 'preparing' || this.deadlineExpired()) {
-        this.fail('bundle_partial');
-        return this.fallbackResult();
-      }
+      if (!this.canContinue('preparing')) return this.fallbackResult();
 
       const scope = new DisposableStack(this.onDisposalError);
       const registration = this.registrations.get(entry.id);
@@ -562,7 +589,7 @@ class IntegrationRegistryOwner {
 
       try {
         const { context, close } = this.createPreparationContext(entry.id, scope);
-        if (this.registryState !== 'preparing') {
+        if (!this.canContinue('preparing')) {
           close();
           return this.fallbackResult();
         }
@@ -581,7 +608,7 @@ class IntegrationRegistryOwner {
           close();
           prepared = pending;
         }
-        if (prepared === ABORTED || this.registryState !== 'preparing') {
+        if (prepared === ABORTED || !this.canContinue('preparing')) {
           this.fail('bundle_partial');
           return this.fallbackResult();
         }
@@ -589,7 +616,7 @@ class IntegrationRegistryOwner {
         if (!preparedFields || typeof preparedFields.activate !== 'function') {
           throw new TypeError('prepare must return one exact activation module');
         }
-        if (this.registryState !== 'preparing') return this.fallbackResult();
+        if (!this.canContinue('preparing')) return this.fallbackResult();
         this.prepared[recordIndex] = {
           id: entry.id,
           scope,
@@ -603,18 +630,12 @@ class IntegrationRegistryOwner {
         return this.fallbackResult();
       }
 
-      if (this.registryState !== 'preparing' || this.deadlineExpired()) {
-        this.fail('bundle_partial');
-        return this.fallbackResult();
-      }
+      if (!this.canContinue('preparing')) return this.fallbackResult();
     }
 
-    if (this.registryState !== 'preparing') return this.fallbackResult();
+    if (!this.canContinue('preparing')) return this.fallbackResult();
     this.registryState = 'activating';
-    if (this.deadlineExpired()) {
-      this.fail('bundle_partial');
-      return this.fallbackResult();
-    }
+    if (!this.canContinue('activating')) return this.fallbackResult();
 
     let coreActivationOpen = true;
     const coreContext: CoreActivationContext = Object.freeze({
@@ -641,16 +662,10 @@ class IntegrationRegistryOwner {
       this.leaveOwnedCallback();
     }
 
-    if (this.registryState !== 'activating' || this.deadlineExpired()) {
-      this.fail('bundle_partial');
-      return this.fallbackResult();
-    }
+    if (!this.canContinue('activating')) return this.fallbackResult();
 
     for (const record of this.prepared) {
-      if (this.registryState !== 'activating' || this.deadlineExpired()) {
-        this.fail('bundle_partial');
-        return this.fallbackResult();
-      }
+      if (!this.canContinue('activating')) return this.fallbackResult();
 
       let activationOpen = true;
       let afterCommitRegistered = false;
@@ -693,18 +708,12 @@ class IntegrationRegistryOwner {
         this.leaveOwnedCallback();
       }
 
-      if (this.registryState !== 'activating' || this.deadlineExpired()) {
-        this.fail('bundle_partial');
-        return this.fallbackResult();
-      }
+      if (!this.canContinue('activating')) return this.fallbackResult();
     }
 
     // This final monotonic check closes the timer-task delay gap. A same-thread
     // activation that never returns cannot be preempted by JavaScript.
-    if (this.registryState !== 'activating' || this.deadlineExpired()) {
-      this.fail('bundle_partial');
-      return this.fallbackResult();
-    }
+    if (!this.canContinue('activating')) return this.fallbackResult();
 
     this.registryState = 'publishing';
     this.enterOwnedCallback();

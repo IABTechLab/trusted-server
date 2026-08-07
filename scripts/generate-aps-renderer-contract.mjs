@@ -16,7 +16,7 @@ const es5Path = path.join(
 );
 const typescriptPath = path.join(
   repositoryRoot,
-  'crates/trusted-server-js/lib/src/integrations/aps/generated/renderer_validator_v1.ts'
+  'crates/trusted-server-js/lib/src/core/contracts/generated/renderer_validator_v1.ts'
 );
 
 const [schemaText, corpusText] = await Promise.all([

@@ -21,6 +21,17 @@ const BOOTSTRAP_SOURCE = readFileSync(
   path.resolve(process.cwd(), '../../trusted-server-core/src/integrations/gpt_bootstrap.js'),
   'utf8'
 );
+const FALLBACK_ENTRY_SOURCE = readFileSync(
+  path.resolve(process.cwd(), 'src/integrations/gpt/bootstrap_fallback.ts'),
+  'utf8'
+);
+const RELEASE_SENTINEL = '__TSJS_RELEASE_ID_SENTINEL_V1__';
+const TEST_RELEASE_ID = 'a'.repeat(64);
+
+async function runProposedFallback(): Promise<void> {
+  vi.resetModules();
+  await import('../../../src/integrations/gpt/bootstrap_fallback');
+}
 
 // The command queue the bootstrap pushes into: a real array once GPT has
 // loaded, or the bare `push`-only stub GPT installs before then.
@@ -531,5 +542,98 @@ describe('gpt_bootstrap.js fallback', () => {
     expect(defineSlot).not.toHaveBeenCalled();
     expect(nativeRefresh).not.toHaveBeenCalled();
     expect(mockPubads.enableSingleRequest).not.toHaveBeenCalled();
+  });
+});
+
+describe('generated terminal bootstrap fallback proposal', () => {
+  afterEach(() => {
+    delete (window as TestWindow).tsjs;
+    delete (window as unknown as Record<string, unknown>).tsjs_gpt_bootstrap_fallback;
+  });
+
+  it('uses the build-stamped release contract and remains dormant until Task 19', () => {
+    expect(FALLBACK_ENTRY_SOURCE).toContain('EMBEDDED_RELEASE_ID');
+    expect(FALLBACK_ENTRY_SOURCE).not.toContain(RELEASE_SENTINEL);
+    expect(BOOTSTRAP_SOURCE).toContain('ts.adInit');
+    expect(BOOTSTRAP_SOURCE).not.toContain(RELEASE_SENTINEL);
+  });
+
+  it('executes the complete terminal shell, drains once, and creates no callable global', async () => {
+    const calls: string[] = [];
+    const target = {
+      que: [
+        function (this: unknown) {
+          expect(this).toBe(target);
+          calls.push('queued');
+        },
+      ],
+      boot: {
+        failureReason: 'abi_mismatch',
+        auctionProjection: {
+          version: 1,
+          auction: {
+            version: 1,
+            auctionId: 'boot',
+            results: [{ slot: 'known', outcome: 'no_bid' }],
+          },
+          bids: [],
+        },
+      },
+    };
+    (window as unknown as { tsjs: unknown }).tsjs = target;
+
+    await runProposedFallback();
+    const api = window.tsjs as unknown as {
+      version: string;
+      releaseId: string;
+      que: unknown[];
+      requestAds(options?: unknown): Promise<unknown>;
+      _internal: unknown;
+      _registerIntegration(value: unknown): boolean;
+      adInit?: unknown;
+    };
+
+    expect(calls).toEqual(['queued']);
+    expect(api.version).toBe('1.0.0');
+    expect(api.releaseId).toBe(TEST_RELEASE_ID);
+    expect(api._internal).toEqual({
+      state: 'fallback',
+      releaseId: TEST_RELEASE_ID,
+      reason: 'bundle_partial',
+    });
+    expect(Object.isFrozen(api.que)).toBe(true);
+    expect(api._registerIntegration({ prepare: vi.fn() })).toBe(false);
+    expect(api.adInit).toBeUndefined();
+    expect(
+      (window as unknown as Record<string, unknown>).tsjs_gpt_bootstrap_fallback
+    ).toBeUndefined();
+    await expect(api.requestAds({ slots: ['known'] })).resolves.toEqual({
+      slots: [
+        {
+          slot: 'known',
+          path: 'primary',
+          outcome: 'failed',
+          reason: 'bundle_partial',
+        },
+      ],
+    });
+  });
+
+  it('does not execute hostile boot accessors before substituting safe boot', async () => {
+    const getter = vi.fn();
+    const target = { que: [] as unknown[] };
+    Object.defineProperty(target, 'boot', { configurable: true, enumerable: true, get: getter });
+    (window as unknown as { tsjs: unknown }).tsjs = target;
+
+    await expect(runProposedFallback()).resolves.toBeUndefined();
+
+    expect(getter).not.toHaveBeenCalled();
+    expect((window.tsjs as unknown as { boot: unknown } | undefined)?.boot).toMatchObject({
+      auctionProjection: {
+        version: 1,
+        auction: { version: 1, auctionId: 'fallback', results: [] },
+        bids: [],
+      },
+    });
   });
 });

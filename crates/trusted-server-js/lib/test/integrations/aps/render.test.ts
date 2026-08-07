@@ -4,7 +4,7 @@ import corpusFixture from '../../fixtures/aps-renderer-v1-corpus.json';
 import envelope from '../../fixtures/aps-renderer-v1.json';
 import type { ApsRendererV1 } from '../../../src/core/types';
 import { log } from '../../../src/core/log';
-import { classifyApsRendererV1 } from '../../../src/integrations/aps/generated/renderer_validator_v1';
+import { classifyApsRendererV1 } from '../../../src/core/contracts/generated/renderer_validator_v1';
 import {
   APS_NATIVE_RENDERER_TIMEOUT_MS,
   APS_PREBID_CREATIVE_RUNNER_URL,

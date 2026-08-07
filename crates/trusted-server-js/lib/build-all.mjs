@@ -21,11 +21,15 @@ import { brotliCompressSync, constants as zlibConstants, gzipSync } from 'node:z
 import { fileURLToPath } from 'node:url';
 import { build } from 'vite';
 
+import { computeReleaseId, RELEASE_SENTINEL, stampRelease } from './scripts/release-v1.mjs';
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const srcDir = path.resolve(__dirname, 'src');
 const distDir = path.resolve(__dirname, '..', 'dist');
 const integrationsDir = path.join(srcDir, 'integrations');
 const metricsFile = 'tsjs-build-metrics-v1.json';
+const releaseFile = 'tsjs-release-v1.json';
+const fallbackFile = 'gpt-bootstrap-fallback.js';
 
 const REFERENCE_INTEGRATIONS = ['creative', 'gpt', 'prebid'];
 
@@ -77,13 +81,15 @@ const integrationModules = fs.existsSync(integrationsDir)
 console.log('[build-all] Discovered integrations:', integrationModules);
 
 /** Build a single module as a self-contained IIFE. */
-async function buildModule(name, entryPath) {
-  const outFile = `tsjs-${name}.js`;
+async function buildModule(name, entryPath, outFile = `tsjs-${name}.js`) {
   console.log(`[build-all] Building ${outFile} from ${path.relative(__dirname, entryPath)}`);
 
   await build({
     configFile: false,
     root: __dirname,
+    define: {
+      __TSJS_EMBEDDED_RELEASE_ID_V1__: JSON.stringify(RELEASE_SENTINEL),
+    },
     build: {
       emptyOutDir: false,
       outDir: distDir,
@@ -114,12 +120,58 @@ await buildModule('core', path.join(srcDir, 'core', 'index.ts'));
 await Promise.all(
   integrationModules.map((name) => buildModule(name, path.join(integrationsDir, name, 'index.ts')))
 );
+await buildModule(
+  'gpt_bootstrap_fallback',
+  path.join(integrationsDir, 'gpt', 'bootstrap_fallback.ts'),
+  fallbackFile
+);
 
 // List all built files
 const builtFiles = fs
   .readdirSync(distDir)
   .filter((f) => f.startsWith('tsjs-') && f.endsWith('.js'))
-  .sort();
+  .sort((left, right) => {
+    if (left === 'tsjs-core.js') return -1;
+    if (right === 'tsjs-core.js') return 1;
+    return left < right ? -1 : left > right ? 1 : 0;
+  });
+
+for (const file of builtFiles) {
+  const filePath = path.join(distDir, file);
+  const source = fs.readFileSync(filePath, 'utf8');
+  const sentinelCount = source.split(RELEASE_SENTINEL).length - 1;
+  if (sentinelCount > 1) {
+    throw new Error(`[build-all] Multiple release sentinels before stamping: ${file}`);
+  }
+  if (sentinelCount === 0) {
+    fs.writeFileSync(filePath, `${source}\n;void"${RELEASE_SENTINEL}";\n`);
+  }
+}
+
+const releaseId = computeReleaseId(
+  builtFiles.map((file) => ({
+    id: file.slice('tsjs-'.length, -'.js'.length),
+    bytes: fs.readFileSync(path.join(distDir, file)),
+  }))
+);
+for (const file of builtFiles) {
+  const filePath = path.join(distDir, file);
+  const source = fs.readFileSync(filePath, 'utf8');
+  fs.writeFileSync(filePath, stampRelease(source, releaseId));
+}
+const fallbackPath = path.join(distDir, fallbackFile);
+const fallbackSource = fs.readFileSync(fallbackPath, 'utf8');
+fs.writeFileSync(fallbackPath, stampRelease(fallbackSource, releaseId));
+
+const releaseManifest = {
+  version: 1,
+  releaseId,
+  bundles: builtFiles.map((file) => ({
+    id: file.slice('tsjs-'.length, -'.js'.length),
+    file,
+  })),
+};
+fs.writeFileSync(path.join(distDir, releaseFile), `${JSON.stringify(releaseManifest)}\n`);
 
 const referenceFiles = ['tsjs-core.js', ...REFERENCE_INTEGRATIONS.map((name) => `tsjs-${name}.js`)];
 for (const file of referenceFiles) {
@@ -157,3 +209,5 @@ fs.writeFileSync(path.join(distDir, metricsFile), `${JSON.stringify(metrics, nul
 console.log('[build-all] Built files:', builtFiles);
 console.log(`[build-all] Total: ${builtFiles.length} modules`);
 console.log(`[build-all] Wrote deterministic metrics: ${metricsFile}`);
+console.log(`[build-all] Wrote release manifest: ${releaseFile}`);
+console.log(`[build-all] Wrote proposed fallback artifact: ${fallbackFile}`);

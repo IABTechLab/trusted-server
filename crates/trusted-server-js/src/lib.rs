@@ -6,5 +6,6 @@
 pub mod bundle;
 
 pub use bundle::{
-    all_module_ids, concatenate_modules, concatenated_hash, module_bundle, single_module_hash,
+    all_module_ids, concatenate_modules, concatenated_hash, gpt_bootstrap_fallback_bundle,
+    module_bundle, release_id, single_module_hash,
 };

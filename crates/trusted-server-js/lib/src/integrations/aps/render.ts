@@ -1,11 +1,8 @@
 import { log } from '../../core/log';
-import { findSlot } from '../../core/render';
-import type { ApsPrebidRendererEntry, ApsRendererV1, TsjsApi } from '../../core/types';
+import type { ApsPrebidRendererEntry, TsjsApi } from '../../core/types';
+import { validateApsRenderer } from '../../core/contracts/aps_renderer';
 
-import {
-  classifyApsRendererDescriptorV1,
-  classifyApsRendererV1,
-} from './generated/renderer_validator_v1';
+export { parseApsRendererDescriptor, validateApsRenderer } from '../../core/contracts/aps_renderer';
 
 export const APS_RENDERER_PATH = '/integrations/aps/renderer';
 export const APS_RENDERING_MODE_ATTRIBUTE_NAME = 'data-ts-aps-rendering-mode';
@@ -26,98 +23,6 @@ const DEFAULT_PREBID_RENDERER_TTL_SECONDS = 300;
 const MAX_PREBID_RENDERER_TTL_SECONDS = 3600;
 const MAX_PREBID_ID_BYTES = 1024;
 
-type ValidatedRendererCacheEntry = {
-  publisherOrigin: string;
-  renderer: ApsRendererV1;
-};
-const validatedRendererCache = new WeakMap<object, ValidatedRendererCacheEntry>();
-const nativeDispatches = new Map<string, symbol>();
-const publisherNativeRendering =
-  typeof document !== 'undefined' &&
-  document.currentScript?.getAttribute(APS_RENDERING_MODE_ATTRIBUTE_NAME) === 'publisher_native';
-
-function releaseNativeDispatch(slotId: string, dispatch: symbol): boolean {
-  if (nativeDispatches.get(slotId) !== dispatch) return false;
-  nativeDispatches.delete(slotId);
-  return true;
-}
-
-function sourceBelongsToElement(
-  source: MessageEventSource | null | undefined,
-  element: HTMLElement
-): boolean {
-  return source
-    ? Array.from(element.querySelectorAll('iframe')).some(
-        (iframe) => iframe.contentWindow === source
-      )
-    : false;
-}
-
-function sourceMatchedCandidates(
-  candidates: HTMLElement[],
-  source?: MessageEventSource | null
-): HTMLElement[] {
-  if (!source) return candidates;
-  const sourceMatches = candidates.filter((element) => sourceBelongsToElement(source, element));
-  return sourceMatches.length > 0 ? sourceMatches : candidates;
-}
-
-function dynamicSlotCandidates(
-  divIdPrefix: string,
-  source?: MessageEventSource | null
-): HTMLElement[] {
-  const candidates = Array.from(document.querySelectorAll<HTMLElement>('[id]')).filter(
-    (element) => element.id.startsWith(divIdPrefix) && !element.id.endsWith('-container')
-  );
-  return sourceMatchedCandidates(candidates, source);
-}
-
-function uniqueSlotCandidate(candidates: HTMLElement[]): HTMLElement | null {
-  return candidates.length === 1 ? candidates[0]! : null;
-}
-
-function findApsContainer(slotId: string, source?: MessageEventSource | null): HTMLElement | null {
-  try {
-    const mapping = window.tsjs?.divToSlotId ?? {};
-    const mappedCandidates = sourceMatchedCandidates(
-      Object.entries(mapping)
-        .filter(([, mappedSlotId]) => mappedSlotId === slotId)
-        .map(([divId]) => findSlot(divId))
-        .filter((element): element is HTMLElement => element !== null),
-      source
-    );
-    const mapped = uniqueSlotCandidate(mappedCandidates);
-    if (mapped) return mapped;
-
-    if (slotId.endsWith('-container')) {
-      const inner = findSlot(slotId.slice(0, -'-container'.length));
-      if (inner) return inner;
-    }
-
-    const direct = findSlot(slotId);
-    if (direct && !direct.id.endsWith('-container')) return direct;
-
-    const configuredDivId = window.tsjs?.adSlots?.find((slot) => slot.id === slotId)?.div_id;
-    if (configuredDivId) {
-      const configured = findSlot(configuredDivId);
-      if (configured) return configured;
-
-      const dynamic = uniqueSlotCandidate(dynamicSlotCandidates(configuredDivId, source));
-      if (dynamic) return dynamic;
-    }
-
-    const dynamic = uniqueSlotCandidate(dynamicSlotCandidates(slotId, source));
-    return dynamic ?? direct;
-  } catch {
-    return null;
-  }
-}
-
-function cancelPendingApsRendering(slotId: string, source?: MessageEventSource | null): void {
-  const container = findApsContainer(slotId, source);
-  if (container) pendingFrameCancels.get(container)?.();
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -126,34 +31,6 @@ function isExactRendererResult(value: unknown): value is Record<string, unknown>
   if (!isRecord(value)) return false;
   const actual = Object.keys(value).sort();
   return actual.length === 2 && actual[0] === 'message' && actual[1] === 'nonce';
-}
-
-/** Parse only the versioned descriptor shape; decoded-envelope trust checks happen separately. */
-export function parseApsRendererDescriptor(value: unknown): ApsRendererV1 | undefined {
-  if (classifyApsRendererDescriptorV1(value) !== 'accepted') {
-    return undefined;
-  }
-
-  return value as unknown as ApsRendererV1;
-}
-
-/** Fully validate the exact APS envelope and cross-check every duplicated descriptor field. */
-export function validateApsRenderer(
-  value: unknown,
-  publisherOrigin = window.location.origin
-): ApsRendererV1 | undefined {
-  if (isRecord(value)) {
-    const cached = validatedRendererCache.get(value);
-    if (cached?.publisherOrigin === publisherOrigin) return cached.renderer;
-  }
-
-  if (classifyApsRendererV1(value, publisherOrigin) !== 'accepted') return undefined;
-  const renderer = value as ApsRendererV1;
-
-  const validated = Object.freeze({ ...renderer }) as ApsRendererV1;
-  validatedRendererCache.set(value as object, { publisherOrigin, renderer: validated });
-  validatedRendererCache.set(validated, { publisherOrigin, renderer: validated });
-  return validated;
 }
 
 function validPrebidIdentity(value: unknown): value is string {

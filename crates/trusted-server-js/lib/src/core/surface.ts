@@ -1,0 +1,30 @@
+/** Explicit hard-cutover inventory removed before either terminal API is exposed. */
+export const LEGACY_TSJS_FIELDS = Object.freeze([
+  'adSlots',
+  'bids',
+  'apsPrebidRenderers',
+  'adInit',
+  'renderAdUnit',
+  'renderAllAdUnits',
+  'setConfig',
+  'getConfig',
+  'renders',
+  'renderLog',
+  'renderGeneration',
+  'renderSeq',
+  'prevGptSlots',
+  'servicesEnabled',
+  'divToSlotId',
+  'firedBeacons',
+  'prevSlotTargetingKeys',
+  'adInitRefreshInProgress',
+  'gptInitialLoadDisabled',
+  'gptSlotHandoffs',
+  'gptSlotHandoffInternal',
+  'spaHookInstalled',
+  'navGeneration',
+  'scheduleInitialAdInit',
+  'gptDiagnostics',
+]);
+
+export const FALLBACK_REMOVED_FIELDS = Object.freeze([...LEGACY_TSJS_FIELDS, 'diagnostics']);

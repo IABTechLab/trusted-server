@@ -1,4 +1,52 @@
-use trusted_server_js::{concatenated_hash, single_module_hash};
+use std::collections::HashSet;
+
+use error_stack::Report;
+use trusted_server_js::{all_module_ids, concatenated_hash, release_id, single_module_hash};
+
+use crate::error::TrustedServerError;
+
+/// Serialize one exact `BootManifestV1` without publishing it into HTML.
+///
+/// `module_ids` contains enabled integration bundles in actual injection order;
+/// core is implicit and therefore rejected here. Unknown, duplicate, malformed,
+/// or over-capacity inventories fail closed.
+pub fn tsjs_boot_manifest_v1(module_ids: &[&str]) -> Result<String, Report<TrustedServerError>> {
+    if module_ids.len() > 16 {
+        return Err(boot_manifest_error("more than 16 integration modules"));
+    }
+    let known = all_module_ids().into_iter().collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    let mut integrations = Vec::with_capacity(module_ids.len());
+    for id in module_ids {
+        if *id == "core" || !valid_integration_id(id) || !known.contains(id) || !seen.insert(*id) {
+            return Err(boot_manifest_error("invalid integration inventory"));
+        }
+        let encoded = serde_json::to_string(id)
+            .map_err(|_| boot_manifest_error("integration id serialization failed"))?;
+        integrations.push(format!(r#"{{"id":{encoded},"required":true}}"#));
+    }
+    Ok(format!(
+        r#"{{"version":1,"releaseId":"{}","integrations":[{}]}}"#,
+        release_id(),
+        integrations.join(",")
+    ))
+}
+
+fn valid_integration_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 64
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_' || *byte == b'-'
+        })
+}
+
+fn boot_manifest_error(message: &str) -> Report<TrustedServerError> {
+    Report::new(TrustedServerError::Configuration {
+        message: format!("TSJS boot manifest: {message}"),
+    })
+}
 
 /// `/static` URL for the tsjs bundle with cache-busting hash based on
 /// the concatenated content of the given module set.
@@ -119,6 +167,53 @@ mod tests {
             value.chars().all(|ch| ch.is_ascii_hexdigit()),
             "should contain only ASCII hex digits"
         );
+    }
+
+    #[test]
+    fn release_id_is_shared_by_generated_metadata_and_every_bundle() {
+        let release = release_id();
+
+        assert_eq!(release.len(), 64, "should be one SHA-256 release id");
+        assert!(
+            release
+                .chars()
+                .all(|character| character.is_ascii_digit() || ('a'..='f').contains(&character)),
+            "should use lowercase hexadecimal"
+        );
+        for id in all_module_ids() {
+            let bundle = trusted_server_js::module_bundle(id).expect("should include known module");
+            assert_eq!(
+                bundle.matches(release).count(),
+                1,
+                "module {id} should carry the shared release id exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn boot_manifest_serializer_preserves_enabled_injection_order() {
+        let value = tsjs_boot_manifest_v1(&["prebid", "creative"])
+            .expect("should serialize known unique integrations");
+
+        assert_eq!(
+            value,
+            format!(
+                "{{\"version\":1,\"releaseId\":\"{}\",\"integrations\":[{{\"id\":\"prebid\",\"required\":true}},{{\"id\":\"creative\",\"required\":true}}]}}",
+                release_id()
+            ),
+            "should emit the exact BootManifestV1 field and integration order"
+        );
+    }
+
+    #[test]
+    fn boot_manifest_serializer_rejects_duplicate_unknown_and_core_ids() {
+        for ids in [
+            &["creative", "creative"][..],
+            &["unknown"] as &[&str],
+            &["core"] as &[&str],
+        ] {
+            assert!(tsjs_boot_manifest_v1(ids).is_err(), "should reject {ids:?}");
+        }
     }
 
     #[test]

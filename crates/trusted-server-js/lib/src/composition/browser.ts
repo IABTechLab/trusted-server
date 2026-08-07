@@ -16,6 +16,8 @@ import {
   type PrebidAdapter,
   type PrebidGlobalTarget,
 } from '../adapters/prebid';
+import type { CoreActivationContext } from '../kernel/integration_registry';
+import { createRuntime, type Runtime, type RuntimeOptions } from '../kernel/runtime';
 
 export interface BrowserAdapters {
   readonly googletag: GoogletagAdapter;
@@ -32,6 +34,25 @@ export type BrowserAdapterTarget = GoogletagGlobalTarget & PrebidGlobalTarget & 
 export interface BrowserCompositionOptions {
   readonly adapters?: Partial<BrowserAdapters>;
   readonly target?: BrowserAdapterTarget;
+}
+
+export interface BrowserRuntimeComposition extends BrowserComposition {
+  readonly runtime: Runtime;
+}
+
+export interface BrowserCoreActivations {
+  readonly bridgeRecognizer: (
+    context: CoreActivationContext,
+    adapters: Readonly<BrowserAdapters>
+  ) => void;
+  readonly correctnessGptListeners: (
+    context: CoreActivationContext,
+    adapters: Readonly<BrowserAdapters>
+  ) => void;
+}
+
+export interface TestBrowserRuntimeCompositionOptions extends BrowserCompositionOptions {
+  readonly coreActivations: BrowserCoreActivations;
 }
 
 /**
@@ -71,4 +92,26 @@ export function createNoopBrowserComposition(): BrowserComposition {
       prebid: createNoopPrebidAdapter(),
     }),
   });
+}
+
+/**
+ * Construct the single runtime only for coordinated-cutover tests.
+ *
+ * The shipped core remains on its existing bootstrap until Task 19; keeping this
+ * explicit prevents an import of the composition module from claiming globals.
+ */
+export function createTestBrowserRuntimeComposition(
+  runtimeOptions: RuntimeOptions,
+  compositionOptions: TestBrowserRuntimeCompositionOptions
+): BrowserRuntimeComposition {
+  const composition = createBrowserComposition(compositionOptions);
+  const runtime = createRuntime({
+    ...runtimeOptions,
+    activateCore: (context) => {
+      compositionOptions.coreActivations.bridgeRecognizer(context, composition.adapters);
+      compositionOptions.coreActivations.correctnessGptListeners(context, composition.adapters);
+      runtimeOptions.activateCore?.(context);
+    },
+  });
+  return Object.freeze({ adapters: composition.adapters, runtime });
 }

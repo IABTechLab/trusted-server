@@ -3,6 +3,9 @@ import path from 'node:path';
 import { configDefaults, defineConfig } from 'vitest/config';
 
 export default defineConfig({
+  define: {
+    __TSJS_EMBEDDED_RELEASE_ID_V1__: JSON.stringify('a'.repeat(64)),
+  },
   resolve: {
     alias: {
       // prebid.js doesn't expose src/adapterManager.js via its package
@@ -28,6 +31,7 @@ export default defineConfig({
       ...configDefaults.exclude,
       'test/contract/aps-renderer-es5.test.mjs',
       'test/eslint/no-adtech-globals.test.mjs',
+      'test/build/*.test.mjs',
     ],
     // Run tests in the main thread to avoid spawning
     // child processes/workers, which are blocked in this sandbox.

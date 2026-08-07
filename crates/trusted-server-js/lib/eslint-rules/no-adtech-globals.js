@@ -8,7 +8,6 @@ export const LEGACY_ADTECH_GLOBAL_ALLOWLIST = Object.freeze([
 ]);
 
 export const LEGACY_RESTRICTED_IMPORT_ALLOWLIST = Object.freeze([
-  'src/core/auction.ts',
   'src/core/request.ts',
   'src/integrations/gpt/index.ts',
   'src/integrations/prebid/index.ts',
