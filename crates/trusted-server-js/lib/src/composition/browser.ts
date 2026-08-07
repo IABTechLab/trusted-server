@@ -34,7 +34,13 @@ import {
 } from '../core/registry';
 import { prepareAdmIframe } from '../core/render';
 import { APS_RENDERER_V1_PATH, renderDirectApsAttempt } from '../integrations/aps/render';
-import { startGptSlotOperation, type GptSlotOperationInput } from '../integrations/gpt/module';
+import {
+  publishGptWinner,
+  startGptSlotOperation,
+  type GptSlotOperationInput,
+  type GptWinnerPublicationInput,
+  type GptWinnerPublicationResult,
+} from '../integrations/gpt/module';
 import { createBrowserNavigationIdentityIssuer } from '../kernel/identity';
 import type { NavigationIdentityIssuerFactory, RuntimeSession } from '../kernel/sessions';
 import { createRuntimeSession } from '../kernel/sessions';
@@ -130,6 +136,13 @@ export interface BrowserRuntimeComposition extends BrowserComposition {
   readonly startGptSlotOperationForTest: (
     input: Omit<GptSlotOperationInput, 'pucBridge' | 'slots'>
   ) => SlotOperationCreationResult;
+  /** Publish one prospective server winner through the ordered GPT transaction in tests. */
+  readonly publishGptWinnerForTest: (
+    input: Omit<
+      GptWinnerPublicationInput,
+      'googletag' | 'navigation' | 'pucBridge' | 'reservations' | 'slots' | 'targeting'
+    >
+  ) => Promise<GptWinnerPublicationResult>;
 }
 
 export interface BrowserCoreActivations {
@@ -731,6 +744,27 @@ export function createTestBrowserRuntimeComposition(
     reservationServiceForTest: () => browserServices?.reservations,
     rendererNonceRegistryForTest: () => browserServices?.rendererNonces,
     pucBridgeForTest: () => browserServices?.pucBridge,
+    publishGptWinnerForTest: (
+      input: Omit<
+        GptWinnerPublicationInput,
+        'googletag' | 'navigation' | 'pucBridge' | 'reservations' | 'slots' | 'targeting'
+      >
+    ): Promise<GptWinnerPublicationResult> => {
+      const services = browserServices;
+      const navigation = runtimeSession?.currentNavigation;
+      if (!services || !navigation) {
+        return Promise.resolve(Object.freeze({ ok: false, reason: 'gpt_request_failed' }));
+      }
+      return publishGptWinner({
+        ...input,
+        googletag: composition.adapters.googletag,
+        navigation,
+        pucBridge: services.pucBridge,
+        reservations: services.reservations,
+        slots: services.slots,
+        targeting: services.targeting,
+      });
+    },
     startGptSlotOperationForTest: (
       input: Omit<GptSlotOperationInput, 'pucBridge' | 'slots'>
     ): SlotOperationCreationResult => {

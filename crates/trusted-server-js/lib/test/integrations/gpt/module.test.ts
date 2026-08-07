@@ -2,9 +2,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   createGptIntegrationRegistration,
+  publishGptWinner,
   startGptSlotOperation,
+  type GptWinnerPublicationInput,
   type GptSlotOperationInput,
 } from '../../../src/integrations/gpt/module';
+import { createNoopGoogletagAdapter, type GoogletagFacade } from '../../../src/adapters/googletag';
 import { isGuardInstalled, resetGuardState } from '../../../src/integrations/gpt/script_guard';
 import { createTestNavigationIdentityIssuer } from '../../../src/kernel/identity';
 import {
@@ -21,6 +24,7 @@ import {
 } from '../../../src/services/render';
 import { createReservationService } from '../../../src/services/reservations';
 import type { SlotRequestOutcome } from '../../../src/services/slots';
+import { createTargetingService } from '../../../src/services/targeting';
 
 const RELEASE_ID = 'a'.repeat(64);
 const RESERVATION_ID = `r1_${'a'.repeat(22)}`;
@@ -83,8 +87,10 @@ function createAttemptHarness() {
     artifact,
     createAttempt: (parentAttemptId: string): RenderAttempt =>
       createAttemptWithOwner(parentAttemptId).attempt,
+    navigation: navigationResult.value,
     primary,
     primaryOwner: primaryCreated.owner,
+    reservations,
     runtime,
   };
 }
@@ -451,4 +457,272 @@ describe('transactional GPT integration module', () => {
       harness.runtime.dispose();
     }
   );
+});
+
+describe('ordered GPT winner publication', () => {
+  function preparePublication() {
+    const harness = createAttemptHarness();
+    const source = Object.freeze({
+      type: 'adm' as const,
+      version: 1 as const,
+      adm: '<main>trusted</main>',
+      width: 300,
+      height: 250,
+    });
+    const bid = Object.freeze({
+      candidateId: 'AAAAAAAAAAAA',
+      slot: harness.primary.slot,
+      provider: 'trusted',
+      upstreamBidId: 'upstream-one',
+      cpm: 1.25,
+      currency: 'USD' as const,
+      targeting: Object.freeze({ hb_bidder: 'trusted' }),
+      rendererReservationId: RESERVATION_ID,
+      renderSource: source,
+    });
+    const projection = Object.freeze({
+      version: 1,
+      auction: Object.freeze({
+        version: 1,
+        auctionId: 'gpt-publication',
+        results: Object.freeze([
+          Object.freeze({
+            slot: bid.slot,
+            outcome: 'winner' as const,
+            candidateId: bid.candidateId,
+          }),
+        ]),
+      }),
+      bids: Object.freeze([bid]),
+    });
+    expect(harness.navigation.installAuctionProjection(projection)).toBe(true);
+
+    const order: string[] = [];
+    const values = new Map<string, readonly string[]>();
+    const slot = Object.freeze({
+      clearTargeting: vi.fn((key?: string) => {
+        if (key === undefined) values.clear();
+        else values.delete(key);
+      }),
+      getTargeting: vi.fn((key: string) => Object.freeze([...(values.get(key) ?? [])])),
+      setTargeting: vi.fn((key: string, value: string | readonly string[]) => {
+        order.push(`target:${key}`);
+        values.set(key, Object.freeze(typeof value === 'string' ? [value] : [...value]));
+      }),
+    });
+    const facade: GoogletagFacade = Object.freeze({
+      bindingToken: () => Object.freeze({}),
+      clearTargeting: (target: object, key?: string) => (target as typeof slot).clearTargeting(key),
+      display: vi.fn(),
+      getTargeting: (target: object, key: string) => (target as typeof slot).getTargeting(key),
+      observeTargeting: () => {
+        order.push('observe');
+        return vi.fn();
+      },
+      refresh: vi.fn(),
+      serviceState: () =>
+        Object.freeze({ apiReady: true, initialLoadDisabled: false, pubadsReady: true }),
+      setTargeting: (target: object, key: string, value: string | readonly string[]) =>
+        (target as typeof slot).setTargeting(key, value),
+      slots: () => Object.freeze([slot]),
+      subscribe: () => vi.fn(),
+      transactionalReplace: () => Object.freeze({ status: 'destroyed' as const }),
+    });
+    const googletag = Object.freeze({
+      ...createNoopGoogletagAdapter(),
+      bindingStatus: () => 'present' as const,
+      run: <Value>(command: (gpt: Readonly<GoogletagFacade>) => Value) => {
+        let result: Promise<Value>;
+        try {
+          result = Promise.resolve(command(facade));
+        } catch (error) {
+          result = Promise.reject(error);
+        }
+        return Object.freeze({ status: 'present' as const, result, dispose: vi.fn() });
+      },
+    });
+    const targeting = createTargetingService();
+    const slotOutcome = deferredSlotOutcome();
+    const slots = {
+      isBoundGptSlot: vi.fn(() => {
+        order.push('slot:validate');
+        return true;
+      }),
+      request: vi.fn((input: unknown) => {
+        order.push('request');
+        expect(input).toMatchObject({ registeredSlotId: bid.slot });
+        expect(harness.reservations.recognize(RESERVATION_ID)).toMatchObject({
+          recognized: true,
+          state: 'renderable',
+        });
+        return slotOutcome.request();
+      }),
+    };
+    let bridgeArtifact: CommittedRenderArtifact | undefined;
+    const pucBridge = {
+      registerGamAttempt: vi.fn((input: GptSlotOperationInput) => {
+        order.push('bridge');
+        bridgeArtifact = input.artifact;
+        return input.attempt.beginGamClaim();
+      }),
+      recordNonemptyGam: vi.fn(() => true),
+    };
+    const reservations = {
+      registerRender: vi.fn((input: Parameters<typeof harness.reservations.registerRender>[0]) => {
+        order.push('reservation');
+        return harness.reservations.registerRender(input);
+      }),
+      tombstone: harness.reservations.tombstone,
+    };
+    const input: GptWinnerPublicationInput = {
+      artifact: harness.artifact,
+      attempt: harness.primary,
+      bid,
+      googletag,
+      navigation: harness.navigation,
+      operation: 'refresh',
+      owner: harness.primaryOwner,
+      pucBridge,
+      requestClass: 'primary',
+      reservations,
+      slot,
+      slots,
+      targeting,
+    };
+    return {
+      bid,
+      bridgeArtifact: () => bridgeArtifact,
+      harness,
+      input,
+      order,
+      pucBridge,
+      reservations,
+      slot,
+      slots,
+      targeting,
+      values,
+    };
+  }
+
+  it('publishes reservation, targeting, intent, and request in that exact order', async () => {
+    const publication = preparePublication();
+
+    const result = await publishGptWinner(publication.input);
+
+    expect(result.ok).toBe(true);
+    expect(publication.order).toEqual([
+      'slot:validate',
+      'reservation',
+      'observe',
+      'target:hb_adid',
+      'target:hb_bidder',
+      'bridge',
+      'request',
+    ]);
+    expect(publication.values).toEqual(
+      new Map([
+        ['hb_adid', [RESERVATION_ID]],
+        ['hb_bidder', ['trusted']],
+      ])
+    );
+    publication.bridgeArtifact()?.dispose();
+    expect(publication.values.size).toBe(0);
+    expect(publication.harness.artifact.dispose).toHaveBeenCalledTimes(1);
+    publication.harness.runtime.dispose();
+  });
+
+  it('rolls back targeting and tombstones when the bridge refuses before request', async () => {
+    const publication = preparePublication();
+    publication.pucBridge.registerGamAttempt.mockImplementation(() => {
+      publication.order.push('bridge');
+      return false;
+    });
+
+    await expect(publishGptWinner(publication.input)).resolves.toEqual({
+      ok: false,
+      reason: 'gpt_request_failed',
+    });
+    expect(publication.slots.request).not.toHaveBeenCalled();
+    expect(publication.values.size).toBe(0);
+    expect(publication.harness.reservations.recognize(RESERVATION_ID)).toMatchObject({
+      recognized: true,
+      state: 'disposed',
+    });
+    expect(publication.harness.artifact.dispose).toHaveBeenCalledTimes(1);
+    publication.harness.runtime.dispose();
+  });
+
+  it('rolls back targeting and tombstones when the slot request throws', async () => {
+    const publication = preparePublication();
+    publication.slots.request.mockImplementation(() => {
+      publication.order.push('request');
+      throw new Error('fictional request failure');
+    });
+
+    await expect(publishGptWinner(publication.input)).resolves.toEqual({
+      ok: false,
+      reason: 'gpt_request_failed',
+    });
+    expect(publication.order).toEqual([
+      'slot:validate',
+      'reservation',
+      'observe',
+      'target:hb_adid',
+      'target:hb_bidder',
+      'bridge',
+      'request',
+    ]);
+    expect(publication.values.size).toBe(0);
+    expect(publication.harness.reservations.recognize(RESERVATION_ID)).toMatchObject({
+      recognized: true,
+      state: 'disposed',
+    });
+    expect(publication.harness.artifact.dispose).toHaveBeenCalledTimes(1);
+    publication.harness.runtime.dispose();
+  });
+
+  it('fails before exposure when reservation insertion collides', async () => {
+    const publication = preparePublication();
+    expect(
+      publication.harness.reservations.registerRender({
+        reservationId: RESERVATION_ID,
+        slot: publication.bid.slot,
+        navigation: publication.harness.navigation,
+        attemptId: publication.harness.primary.id,
+        renderSource: publication.bid.renderSource,
+        winnerContext: Object.freeze({ selectedCpm: publication.bid.cpm }),
+      })
+    ).toMatchObject({ ok: true });
+
+    await expect(publishGptWinner(publication.input)).resolves.toEqual({
+      ok: false,
+      reason: 'reservation_collision',
+    });
+    expect(publication.order).toEqual(['slot:validate', 'reservation']);
+    expect(publication.values.size).toBe(0);
+    expect(publication.pucBridge.registerGamAttempt).not.toHaveBeenCalled();
+    expect(publication.harness.artifact.dispose).toHaveBeenCalledTimes(1);
+    publication.harness.runtime.dispose();
+  });
+
+  it('compare-restores earlier targeting when a later targeting write throws', async () => {
+    const publication = preparePublication();
+    publication.slot.setTargeting.mockImplementation((key, value) => {
+      publication.order.push(`target:${key}`);
+      if (key === 'hb_bidder') throw new Error('fictional targeting failure');
+      publication.values.set(key, Object.freeze(typeof value === 'string' ? [value] : [...value]));
+    });
+
+    await expect(publishGptWinner(publication.input)).resolves.toEqual({
+      ok: false,
+      reason: 'gpt_request_failed',
+    });
+    expect(publication.values.size).toBe(0);
+    expect(publication.slots.request).not.toHaveBeenCalled();
+    expect(publication.harness.reservations.recognize(RESERVATION_ID)).toMatchObject({
+      recognized: true,
+      state: 'disposed',
+    });
+    publication.harness.runtime.dispose();
+  });
 });

@@ -3,14 +3,29 @@ import type {
   IntegrationPrepareContext,
   IntegrationRegistration,
 } from '../../kernel/integration_registry';
+import type { GoogletagAdapter, GoogletagFacade } from '../../adapters/googletag';
+import {
+  isAuctionCandidateIdV1,
+  isRendererReservationIdV1,
+} from '../../core/contracts/auction_projection';
+import type { BrowserAuctionBidV1, BrowserAuctionProjectionV1 } from '../../core/types';
+import type { NavigationSession } from '../../kernel/sessions';
 import {
   createSlotOperation,
+  type CommittedRenderArtifact,
   type RenderAttempt,
+  type RenderFailureReason,
   type SlotOperationCreationResult,
   type SlotOperationOptions,
 } from '../../services/render';
 import type { PucBridge, PucGamAttemptInput } from '../../services/puc_bridge';
+import type { ReservationService } from '../../services/reservations';
 import type { SlotRequestOutcome, SlotService } from '../../services/slots';
+import type {
+  TargetingBoundary,
+  TargetingOwnership,
+  TargetingService,
+} from '../../services/targeting';
 
 import { installGptGuard, resetGuardState } from './script_guard';
 
@@ -38,6 +53,324 @@ export interface GptSlotOperationInput extends Omit<PucGamAttemptInput, 'attempt
   readonly pucBridge: Pick<PucBridge, 'recordNonemptyGam' | 'registerGamAttempt'>;
   readonly requestClass: string;
   readonly slots: Pick<SlotService, 'request'>;
+}
+
+export type GptWinnerPublicationFailureReason = Extract<
+  RenderFailureReason,
+  | 'descriptor_invalid'
+  | 'gpt_request_failed'
+  | 'registry_full'
+  | 'reservation_collision'
+  | 'slot_unresolved'
+  | 'winner_not_renderable'
+>;
+
+export type GptWinnerPublicationResult =
+  | Extract<SlotOperationCreationResult, { ok: true }>
+  | Readonly<{ ok: false; reason: GptWinnerPublicationFailureReason }>;
+
+export interface GptWinnerPublicationInput extends Omit<
+  GptSlotOperationInput,
+  'artifact' | 'pucBridge' | 'reservationId' | 'slots'
+> {
+  readonly artifact: CommittedRenderArtifact;
+  readonly bid: BrowserAuctionBidV1;
+  readonly googletag: GoogletagAdapter;
+  readonly navigation: NavigationSession;
+  readonly pucBridge: Pick<PucBridge, 'recordNonemptyGam' | 'registerGamAttempt'>;
+  readonly reservations: Pick<ReservationService, 'registerRender' | 'tombstone'>;
+  readonly slot: object;
+  readonly slots: Pick<SlotService, 'isBoundGptSlot' | 'request'>;
+  readonly targeting: Pick<TargetingService, 'observePublisherMutations' | 'own'>;
+}
+
+function currentProjectedWinner(input: GptWinnerPublicationInput): boolean {
+  try {
+    const projection = input.navigation.currentAuctionProjection as
+      BrowserAuctionProjectionV1 | undefined;
+    const bid = input.bid;
+    if (
+      !projection ||
+      !Object.isFrozen(projection) ||
+      !Object.isFrozen(bid) ||
+      !Object.isFrozen(bid.renderSource) ||
+      !Object.isFrozen(bid.targeting) ||
+      !isAuctionCandidateIdV1(bid.candidateId) ||
+      !isRendererReservationIdV1(bid.rendererReservationId) ||
+      bid.slot !== input.attempt.slot ||
+      input.attempt.navigationGeneration !== input.navigation.generation ||
+      input.owner.id !== input.attempt.id ||
+      input.owner.slot !== input.attempt.slot ||
+      input.owner.generation !== input.attempt.generation ||
+      input.owner.navigationGeneration !== input.navigation.generation ||
+      input.artifact.kind !== 'puc' ||
+      input.artifact.attemptId !== input.attempt.id ||
+      input.artifact.slot !== input.attempt.slot ||
+      input.artifact.navigationGeneration !== input.navigation.generation ||
+      typeof input.artifact.dispose !== 'function' ||
+      typeof input.slot !== 'object' ||
+      input.slot === null ||
+      !input.navigation.isCurrent()
+    ) {
+      return false;
+    }
+    let exactBid = false;
+    for (let index = 0; index < projection.bids.length; index += 1) {
+      if (projection.bids[index] === bid) {
+        if (exactBid) return false;
+        exactBid = true;
+      }
+    }
+    if (!exactBid) return false;
+    let exactWinner = false;
+    for (let index = 0; index < projection.auction.results.length; index += 1) {
+      const result = projection.auction.results[index];
+      if (
+        result?.outcome === 'winner' &&
+        result.slot === bid.slot &&
+        result.candidateId === bid.candidateId
+      ) {
+        if (exactWinner) return false;
+        exactWinner = true;
+      }
+    }
+    return exactWinner;
+  } catch {
+    return false;
+  }
+}
+
+function targetingEntries(
+  bid: BrowserAuctionBidV1
+): readonly (readonly [string, string])[] | undefined {
+  try {
+    const names = Object.getOwnPropertyNames(bid.targeting).sort();
+    if (names.length > 32 || Object.getOwnPropertySymbols(bid.targeting).length !== 0) {
+      return undefined;
+    }
+    const entries: Array<readonly [string, string]> = [
+      Object.freeze(['hb_adid', bid.rendererReservationId]),
+    ];
+    for (let index = 0; index < names.length; index += 1) {
+      const key = names[index];
+      if (!key || key === 'hb_adid') return undefined;
+      const descriptor = Object.getOwnPropertyDescriptor(bid.targeting, key);
+      if (
+        !descriptor ||
+        !descriptor.enumerable ||
+        !('value' in descriptor) ||
+        typeof descriptor.value !== 'string'
+      ) {
+        return undefined;
+      }
+      entries[entries.length] = Object.freeze([key, descriptor.value]);
+    }
+    return Object.freeze(entries);
+  } catch {
+    return undefined;
+  }
+}
+
+function synchronousTargetingBoundary(adapter: GoogletagAdapter, slot: object): TargetingBoundary {
+  const invoke = <Value>(command: (gpt: Readonly<GoogletagFacade>) => Value): Value => {
+    let completed = false;
+    let value: Value | undefined;
+    let failure: unknown;
+    const operation = adapter.run((gpt) => {
+      try {
+        value = command(gpt);
+        return value;
+      } catch (error) {
+        failure = error;
+        throw error;
+      } finally {
+        completed = true;
+      }
+    });
+    void operation.result.catch(() => undefined);
+    if (!completed) {
+      operation.dispose();
+      throw new Error('GPT targeting operation is not synchronously available');
+    }
+    if (failure !== undefined) throw failure;
+    return value as Value;
+  };
+  return Object.freeze({
+    clearTargeting: (key?: string) => invoke((gpt) => gpt.clearTargeting(slot, key)),
+    getTargeting: (key: string) => invoke((gpt) => gpt.getTargeting(slot, key)),
+    setTargeting: (key: string, value: string | readonly string[]) =>
+      invoke((gpt) => gpt.setTargeting(slot, key, value)),
+  });
+}
+
+function reservationFailure(reason: string): GptWinnerPublicationFailureReason {
+  if (reason === 'reservation_collision') return 'reservation_collision';
+  if (reason === 'registry_full') return 'registry_full';
+  if (reason === 'invalid_render_source' || reason === 'invalid_reservation_id') {
+    return 'descriptor_invalid';
+  }
+  return 'gpt_request_failed';
+}
+
+/** Publish one server-projected PUC winner without exposing capability state out of order. */
+export async function publishGptWinner(
+  input: GptWinnerPublicationInput
+): Promise<GptWinnerPublicationResult> {
+  const failAttempt = (reason: GptWinnerPublicationFailureReason): GptWinnerPublicationResult => {
+    try {
+      input.attempt.fail(reason);
+    } catch {
+      // The attempt latch remains authoritative.
+    }
+    return Object.freeze({ ok: false, reason });
+  };
+  const disposeArtifact = (): void => {
+    try {
+      input.artifact.dispose();
+    } catch {
+      // Rejected publication retains no artifact authority.
+    }
+  };
+  if (!currentProjectedWinner(input)) {
+    disposeArtifact();
+    return failAttempt('winner_not_renderable');
+  }
+  const bound = (() => {
+    try {
+      return input.slots.isBoundGptSlot(input.navigation.generation, input.bid.slot, input.slot);
+    } catch {
+      return false;
+    }
+  })();
+  if (!bound) {
+    disposeArtifact();
+    return failAttempt('slot_unresolved');
+  }
+  const entries = targetingEntries(input.bid);
+  if (!entries) {
+    disposeArtifact();
+    return failAttempt('descriptor_invalid');
+  }
+  const winnerContext = Object.freeze({ selectedCpm: input.bid.cpm });
+  const registration = (() => {
+    try {
+      return input.reservations.registerRender({
+        reservationId: input.bid.rendererReservationId,
+        slot: input.bid.slot,
+        navigation: input.navigation,
+        attemptId: input.attempt.id,
+        renderSource: input.bid.renderSource,
+        winnerContext,
+      });
+    } catch {
+      return Object.freeze({ ok: false as const, reason: 'service_disposed' as const });
+    }
+  })();
+  if (!registration.ok) {
+    disposeArtifact();
+    return failAttempt(reservationFailure(registration.reason));
+  }
+
+  const owners: TargetingOwnership[] = [];
+  let observation: ReturnType<TargetingService['observePublisherMutations']> | undefined;
+  let resourcesDisposed = false;
+  const disposeResources = (): void => {
+    if (resourcesDisposed) return;
+    resourcesDisposed = true;
+    for (let index = owners.length - 1; index >= 0; index -= 1) {
+      try {
+        owners[index]?.release();
+      } catch {
+        // One targeting cleanup cannot suppress the remaining rollback.
+      }
+    }
+    try {
+      observation?.dispose();
+    } catch {
+      // The adapter owns final wrapper restoration.
+    }
+    disposeArtifact();
+  };
+  const tombstone = (): void => {
+    try {
+      input.reservations.tombstone(
+        {
+          reservationId: input.bid.rendererReservationId,
+          slot: input.bid.slot,
+          navigationGeneration: input.navigation.generation,
+          attemptId: input.attempt.id,
+        },
+        'disposed'
+      );
+    } catch {
+      // The failed publication is already terminal and cannot expose the id again.
+    }
+  };
+  try {
+    observation = input.targeting.observePublisherMutations(input.slot, input.googletag);
+    await observation.result;
+    if (!input.navigation.isCurrent() || input.attempt.snapshot().outcome !== undefined) {
+      throw new Error('stale GPT publication');
+    }
+    const boundary = synchronousTargetingBoundary(input.googletag, input.slot);
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry = entries[index];
+      if (!entry) throw new Error('targeting entry unavailable');
+      const owner = input.targeting.own(input.slot, entry[0], entry[1], input.attempt.id, boundary);
+      if (!owner) throw new Error('targeting ownership unavailable');
+      owners[owners.length] = owner;
+    }
+  } catch {
+    tombstone();
+    disposeResources();
+    return failAttempt('gpt_request_failed');
+  }
+
+  const publishedArtifact = Object.freeze({
+    kind: 'puc' as const,
+    attemptId: input.artifact.attemptId,
+    slot: input.artifact.slot,
+    navigationGeneration: input.artifact.navigationGeneration,
+    dispose: disposeResources,
+  });
+  let bridgeRegistered = false;
+  let requestStarted = false;
+  let operation: SlotOperationCreationResult;
+  try {
+    operation = startGptSlotOperation({
+      artifact: publishedArtifact,
+      attempt: input.attempt,
+      ...(input.createFallback === undefined ? {} : { createFallback: input.createFallback }),
+      operation: input.operation,
+      owner: input.owner,
+      pucBridge: {
+        registerGamAttempt: (bridgeInput) => {
+          bridgeRegistered = input.pucBridge.registerGamAttempt(bridgeInput) === true;
+          return bridgeRegistered;
+        },
+        recordNonemptyGam: (bridgeInput) => input.pucBridge.recordNonemptyGam(bridgeInput),
+      },
+      requestClass: input.requestClass,
+      reservationId: input.bid.rendererReservationId,
+      slots: {
+        request: (requestInput) => {
+          const handle = input.slots.request(requestInput);
+          requestStarted = true;
+          return handle;
+        },
+      },
+    });
+  } catch {
+    tombstone();
+    disposeResources();
+    return failAttempt('gpt_request_failed');
+  }
+  if (!operation.ok || !bridgeRegistered || !requestStarted) {
+    tombstone();
+    disposeResources();
+    return failAttempt('gpt_request_failed');
+  }
+  return operation;
 }
 
 function settleFromSlotOutcome(
