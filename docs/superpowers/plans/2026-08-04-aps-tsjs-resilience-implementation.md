@@ -74,6 +74,7 @@ crates/trusted-server-js/lib/src/
     identity.ts         navigation-prefix + u64 attempts; 128-bit CSPRNG tickets/nonces
     disposable.ts       owned disposer stack and terminal latch primitives
     integration_registry.ts  release-matched prepare/activate transaction
+    diagnostics.ts      bounded failure-isolated internal diagnostics bus
     runtime.ts          bootstrap ownership and shared Runtime object
     sessions.ts         RuntimeSession and NavigationSession
   adapters/
@@ -793,6 +794,7 @@ collapse those checkpoints or carry unverified behavior between them.
   cargo test-axum --test routes
   cargo test-cloudflare --test routes
   cargo test-spin --test routes
+  cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity
   ./scripts/integration-tests-aps-runner-proxy.sh --runtime axum
   ./scripts/integration-tests-aps-runner-proxy.sh --runtime fastly
   ./scripts/integration-tests-aps-runner-proxy.sh --runtime cloudflare
@@ -870,6 +872,10 @@ collapse those checkpoints or carry unverified behavior between them.
 
   ```bash
   cargo test-fastly integrations::aps
+  cargo test-axum --test routes
+  cargo test-cloudflare --test routes
+  cargo test-spin --test routes
+  cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity
   npm --prefix crates/trusted-server-js/lib run check:aps-contract
   node --test crates/trusted-server-js/lib/test/contract/aps-renderer-es5.test.mjs
   TS_TEST_APS_V1=1 TS_BROWSER_FRAMEWORKS=nextjs TS_BROWSER_PROJECTS=chromium \
@@ -2502,6 +2508,7 @@ implementation change.
   ```bash
   npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/datadome test/integrations/didomi test/integrations/google_tag_manager test/integrations/lockr test/integrations/osano test/integrations/permutive test/integrations/sourcepoint test/integrations/testlight
   npm --prefix crates/trusted-server-js/lib test -- --run test/services/context.test.ts test/shared/beacon_guard.test.ts test/composition/browser.test.ts
+  npm --prefix crates/trusted-server-js/lib run build
   npm --prefix crates/trusted-server-js/lib run test:release
   cargo test-fastly publisher
   ```
@@ -2613,6 +2620,7 @@ implementation change.
 
   ```bash
   git diff --cached --quiet
+  npm --prefix crates/trusted-server-js/lib run build
   npm --prefix crates/trusted-server-js/lib run test:release
   npm --prefix crates/trusted-server-js/lib run test:architecture
   npm --prefix crates/trusted-server-js/lib test -- --run test/core/index.test.ts test/kernel/runtime.test.ts test/composition/browser.test.ts
