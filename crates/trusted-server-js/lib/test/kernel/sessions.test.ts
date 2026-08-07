@@ -289,6 +289,8 @@ describe('runtime and navigation sessions', () => {
       reason: 'attempt_exists',
     });
     expect(attempt.value.id).toMatch(/^a1_[A-Za-z0-9_-]{22}$/);
+    expect(attempt.value.navigationGeneration).toBe(navigation.value.generation);
+    expect(attempt.value.navigationGeneration).not.toBe(attempt.value.generation);
     batch.onDispose('batch', () => order.push('batch'));
     batch.onDispose('late-callback', navigation.value.capture(staleMutation));
     attempt.value.onDispose('attempt-first', () => order.push('attempt-first'));

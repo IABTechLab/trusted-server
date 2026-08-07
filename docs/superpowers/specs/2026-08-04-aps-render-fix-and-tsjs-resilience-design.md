@@ -1361,7 +1361,7 @@ global `postMessage` acknowledgement.
 
 ```text
 created
-  -> waiting_for_gam_and_claim | rendering_direct
+  -> no_bid | waiting_for_gam_and_claim | rendering_direct | failed | cancelled
 waiting_for_gam_and_claim
   -> waiting_for_owner | failed | cancelled
 waiting_for_owner
@@ -1377,6 +1377,14 @@ waiting_for_aps_completion
 waiting_for_adm
   -> accepted | failed | cancelled
 ```
+
+`no_bid` is terminal and is valid only as `created -> no_bid`: it records the exact,
+successfully parsed server decision that the slot has no winner before any render path
+starts. It is invalid from every later state; GAM empty, transport, timeout, parse,
+descriptor, and renderer failures retain their explicit failure outcome.
+`failed` and `cancelled` remain valid from `created` so an auction child can settle
+when its exact server decision fails or its caller/batch/navigation cancels before a
+render path begins.
 
 Transitions are methods on `RenderAttempt`, not ad-hoc flag mutation. Each method
 checks the expected state and terminal latch. Timers are created at the transition
@@ -2454,11 +2462,7 @@ subscription methods. The final schema is:
 ```ts
 type RenderTracePathV1 = 'auction' | 'ssat' | 'gam-refresh'
 type RenderTraceServedFromV1 =
-  | 'inline'
-  | 'gam'
-  | 'debug-adm'
-  | 'pbs-cache'
-  | 'prebid'
+  'inline' | 'gam' | 'debug-adm' | 'pbs-cache' | 'prebid'
 
 interface RenderTraceRecord {
   readonly slotId: string
