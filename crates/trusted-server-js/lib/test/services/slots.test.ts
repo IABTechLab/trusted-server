@@ -1201,6 +1201,62 @@ describe('physical GPT cycles', () => {
     expect(service.snapshotForTest().intents).toBe(0);
   });
 
+  it('does not leak post-admission intents through a poisoned Array iterator', async () => {
+    const harness = createGptHarness();
+    const service = createSlotService({ googletag: harness.adapter });
+    const navigation = createNavigation();
+    bindTrustedSlot(service, navigation, 'iterator-first');
+    bindTrustedSlot(service, navigation, 'iterator-second');
+    const inputs = [
+      {
+        intentId: 'poison-iterator-first',
+        navigationGeneration: navigation.generation,
+        operation: 'refresh' as const,
+        registeredSlotId: 'iterator-first',
+        requestClass: 'primary',
+      },
+      {
+        intentId: 'poison-iterator-second',
+        navigationGeneration: navigation.generation,
+        operation: 'refresh' as const,
+        registeredSlotId: 'iterator-second',
+        requestClass: 'primary',
+      },
+    ];
+    const originalIterator = Array.prototype[Symbol.iterator];
+    Array.prototype[Symbol.iterator] = function (): ArrayIterator<unknown> {
+      for (let index = 0; index < this.length; index += 1) {
+        const value = this[index] as { intentId?: unknown } | undefined;
+        if (value?.intentId === 'poison-iterator-first') {
+          throw new Error('poisoned iterator after admission');
+        }
+      }
+      return Reflect.apply(originalIterator, this, []) as ArrayIterator<unknown>;
+    };
+    let handles: readonly ReturnType<SlotService['request']>[] | undefined;
+    let escaped: unknown;
+    try {
+      handles = service.requestBatch(inputs);
+    } catch (error) {
+      escaped = error;
+    } finally {
+      Array.prototype[Symbol.iterator] = originalIterator;
+    }
+
+    expect(escaped).toBeUndefined();
+    expect(handles).toHaveLength(2);
+    for (let index = 0; index < (handles?.length ?? 0); index += 1) {
+      handles?.[index]?.dispose();
+    }
+    await expect(Promise.all((handles ?? []).map(({ result }) => result))).resolves.toEqual([
+      { reason: 'superseded', status: 'cancelled' },
+      { reason: 'superseded', status: 'cancelled' },
+    ]);
+    await Promise.resolve();
+    expect(harness.refresh).not.toHaveBeenCalled();
+    expect(service.snapshotForTest().intents).toBe(0);
+  });
+
   it('rolls back every admitted batch handle when a later request unexpectedly throws', () => {
     const service = createSlotService({ googletag: createGptHarness().adapter });
     let poison = false;
