@@ -75,6 +75,46 @@ describe('browser composition', () => {
     expect(composition.adapters.prebid.bindingStatus()).toBe('incompatible');
   });
 
+  it('routes the prospective first-display measure through the concrete test composition', async () => {
+    const display = vi.fn();
+    const pubadsService = {};
+    const performance = { mark: vi.fn(), measure: vi.fn() };
+    const target = {
+      ...createTarget(),
+      googletag: {
+        apiReady: true,
+        cmd: {
+          push: (command: () => void): number => {
+            command();
+            return 1;
+          },
+        },
+        display,
+        pubads: vi.fn(() => pubadsService),
+      },
+      performance,
+    };
+    const composition = createBrowserComposition({ target });
+
+    target.googletag.display('publisher-slot');
+    expect(performance.mark).not.toHaveBeenCalled();
+
+    await expect(
+      composition.adapters.googletag.run((gpt) => {
+        gpt.display('authoritative-slot');
+        gpt.display('replay-slot');
+      }).result
+    ).resolves.toBeUndefined();
+
+    expect(performance.mark).toHaveBeenCalledExactlyOnceWith('tsjs:first-display');
+    expect(performance.measure).toHaveBeenCalledExactlyOnceWith(
+      'tsjs:boot-to-first-display',
+      'tsjs:bids-script',
+      'tsjs:first-display'
+    );
+    expect(display).toHaveBeenCalledTimes(3);
+  });
+
   it('derives exact APS validation coordinates only for the real browser target', () => {
     const renderer = {
       type: 'aps',
