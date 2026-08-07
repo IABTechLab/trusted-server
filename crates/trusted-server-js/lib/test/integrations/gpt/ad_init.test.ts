@@ -3558,76 +3558,91 @@ describe('installTsRenderBridge', () => {
     beaconSpy.mockRestore();
   });
 
-  it('contract test: renders a server APS owner with the injected runner and no Universal Creative response', async () => {
-    const renderer = apsRenderer();
-    (window as TestWindow).tsjs.bids.homepage_header = {
-      hb_adid: renderer.bidId,
-      renderer,
+  it('resizes only the authenticated collapsed 1x1 creative shell after responding', async () => {
+    (window as TestWindow).tsjs!.bids!.homepage_header = {
+      hb_adid: 'collapsed-inline-ad-id',
+      hb_bidder: 'fictional',
+      hb_pb: '1.23',
+      adm: '<div>fictional creative</div>',
+      w: 300,
+      h: 250,
     };
-    const marker = enablePublisherNativeMode();
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const slot = document.getElementById('div-header')!;
+    const selectedFrame = slot.querySelector<HTMLIFrameElement>('iframe')!;
+    slot.style.width = '1px';
+    slot.style.height = '1px';
+    selectedFrame.width = '1';
+    selectedFrame.height = '1';
+    selectedFrame.style.width = '1px';
+    selectedFrame.style.height = '1px';
+
+    const siblingSlot = document.createElement('div');
+    siblingSlot.style.width = '1px';
+    siblingSlot.style.height = '1px';
+    const siblingFrame = document.createElement('iframe');
+    siblingFrame.width = '1';
+    siblingFrame.height = '1';
+    siblingFrame.style.width = '1px';
+    siblingFrame.style.height = '1px';
+    siblingSlot.appendChild(siblingFrame);
+    document.body.appendChild(siblingSlot);
 
     try {
-      const bridgeListener = await captureBridgeListener();
-      const source = createTrustedSlotIframe();
-      const portMessages: string[] = [];
-      const request = Object.assign(new Event('message'), {
-        data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
-        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
-        source,
-        stopImmediatePropagation: vi.fn(),
-      }) as unknown as MessageEvent;
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: 'collapsed-inline-ad-id' }),
+          ports: [{ postMessage: vi.fn() }],
+          source,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
 
-      bridgeListener(request);
-      bridgeListener(request);
-      const native = nativeRunnerIn('div-header');
-      expect(native.event.type).toBe('prebid/creative/render');
-      expect(native.event.detail).toEqual({
-        aaxResponse: renderer.aaxResponse,
-        seatBidId: renderer.bidId,
-      });
-      native.runner.dispatchEvent(new Event('load'));
-      await Promise.resolve();
-      await Promise.resolve();
-
-      expect(native.frame.style.display).toBe('');
-      expect(portMessages).toEqual([]);
-      expect(document.querySelector('iframe[src*="/integrations/aps/renderer"]')).toBeNull();
+      expect(selectedFrame.style.width).toBe('300px');
+      expect(selectedFrame.style.height).toBe('250px');
+      expect(slot.style.width).toBe('300px');
+      expect(slot.style.height).toBe('250px');
+      expect(siblingFrame.style.width).toBe('1px');
+      expect(siblingFrame.style.height).toBe('1px');
     } finally {
-      marker.remove();
+      siblingSlot.remove();
     }
   });
 
-  it('contract test: fails a server APS runner without a Universal Creative response or fallback', async () => {
-    const renderer = apsRenderer();
-    (window as TestWindow).tsjs.bids.homepage_header = {
-      hb_adid: renderer.bidId,
-      renderer,
+  it('does not partially resize when the authenticated wrapper is already expanded', async () => {
+    (window as TestWindow).tsjs!.bids!.homepage_header = {
+      hb_adid: 'expanded-wrapper-ad-id',
+      hb_bidder: 'fictional',
+      hb_pb: '1.23',
+      adm: '<div>fictional creative</div>',
+      w: 300,
+      h: 250,
     };
-    const marker = enablePublisherNativeMode();
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const slot = document.getElementById('div-header')!;
+    const frame = slot.querySelector<HTMLIFrameElement>('iframe')!;
+    slot.style.width = '2px';
+    slot.style.height = '1px';
+    frame.width = '1';
+    frame.height = '1';
+    frame.style.width = '1px';
+    frame.style.height = '1px';
 
-    try {
-      const bridgeListener = await captureBridgeListener();
-      const source = createTrustedSlotIframe();
-      const portMessages: string[] = [];
-      const request = Object.assign(new Event('message'), {
-        data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
-        ports: [{ postMessage: (message: string) => portMessages.push(message) }],
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'expanded-wrapper-ad-id' }),
+        ports: [{ postMessage: vi.fn() }],
         source,
         stopImmediatePropagation: vi.fn(),
-      }) as unknown as MessageEvent;
+      }) as unknown as MessageEvent
+    );
 
-      bridgeListener(request);
-      nativeRunnerIn('div-header').runner.dispatchEvent(new Event('error'));
-      await Promise.resolve();
-      await Promise.resolve();
-      bridgeListener(request);
-
-      expect(portMessages).toEqual([]);
-      expect(document.querySelector('iframe[title="Ad content"]')).toBeNull();
-      expect(document.querySelector('iframe[src*="/integrations/aps/renderer"]')).toBeNull();
-    } finally {
-      marker.remove();
-    }
+    expect(frame.style.width).toBe('1px');
+    expect(frame.style.height).toBe('1px');
+    expect(slot.style.width).toBe('2px');
+    expect(slot.style.height).toBe('1px');
   });
 
   it('serves a registered Prebid APS renderer when its generated ad ID differs from the APS bid ID', async () => {

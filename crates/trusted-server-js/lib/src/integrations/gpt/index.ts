@@ -16,6 +16,7 @@ import type {
   GptSlotHandoff,
   LegacyTsjsApi,
 } from '../../core/types';
+import { resizeCollapsedPucShell } from '../../services/render';
 import {
   APS_UNIVERSAL_CREATIVE_RENDERER,
   APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
@@ -364,6 +365,15 @@ function resizeCollapsedCreativeFrame(
     wrapper.style.width = `${width}px`;
     wrapper.style.height = `${height}px`;
   }
+}
+
+function resizeAuthenticatedBridgeShell(
+  source: MessageEventSource | null,
+  width: number,
+  height: number
+): void {
+  if ((typeof source !== 'object' && typeof source !== 'function') || source === null) return;
+  resizeCollapsedPucShell({ source, width, height });
 }
 
 function clearTargetingKeys(slot: GoogleTagSlot, keys: Iterable<string>): void {
@@ -2012,56 +2022,30 @@ export function installTsRenderBridge(): void {
       if (!consumeApsPrebidRenderer(adId, prebidRendererEntry)) return;
       recordConsumedPrebidApsId(consumedPrebidApsIds, adId, prebidRendererEntry.expiresAt);
 
-      const markUsed = (): void => {
-        try {
-          prebidRendererEntry.markUsed();
-        } catch (err) {
-          log.warn(`[tsjs-gpt] APS Prebid markUsed callback threw for '${adId}'`, err);
-        }
-      };
-      const dispatched = dispatchApsRendering({
-        slotId: prebidRendererEntry.adUnitCode,
-        renderer,
-        source: e.source,
-        trustedServer: (validatedRenderer) => {
-          const rendererUrl = apsRendererUrl();
-          if (!rendererUrl) return false;
-          try {
-            port.postMessage(
-              JSON.stringify({
-                message: 'Prebid Response',
-                adId,
-                renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
-                rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
-                rendererUrl,
-                apsRenderer: validatedRenderer,
-                width: validatedRenderer.width,
-                height: validatedRenderer.height,
-              })
-            );
-            resizeCollapsedCreativeFrame(
-              e.source,
-              sourceFrame,
-              validatedRenderer.width,
-              validatedRenderer.height,
-              generation,
-              () =>
-                sourceFrameForAdUnit(e.source, prebidRendererEntry.adUnitCode)?.iframe ===
-                sourceFrame.iframe
-            );
-            return true;
-          } catch (err) {
-            log.warn(`[tsjs-gpt] APS Prebid response post failed for '${adId}'`, err);
-            return false;
-          }
-        },
-      });
-      if (typeof dispatched === 'boolean') {
-        if (dispatched) markUsed();
-      } else {
-        void dispatched.then((accepted) => {
-          if (accepted) markUsed();
-        });
+      try {
+        prebidRendererEntry.markWinner();
+      } catch (err) {
+        log.warn(`[tsjs-gpt] APS Prebid markWinner callback threw for '${adId}'`, err);
+      }
+
+      port.postMessage(
+        JSON.stringify({
+          message: 'Prebid Response',
+          adId,
+          renderer: APS_UNIVERSAL_CREATIVE_RENDERER,
+          rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+          rendererUrl,
+          apsRenderer: renderer,
+          width: renderer.width,
+          height: renderer.height,
+        })
+      );
+      resizeAuthenticatedBridgeShell(e.source, renderer.width, renderer.height);
+
+      try {
+        prebidRendererEntry.markRendered();
+      } catch (err) {
+        log.warn(`[tsjs-gpt] APS Prebid markRendered callback threw for '${adId}'`, err);
       }
       return;
     }
@@ -2132,6 +2116,7 @@ export function installTsRenderBridge(): void {
           },
         })
       );
+      resizeAuthenticatedBridgeShell(e.source, renderer.width, renderer.height);
       return;
     }
 
@@ -2165,6 +2150,8 @@ export function installTsRenderBridge(): void {
             height,
           })
         );
+        resizeAuthenticatedBridgeShell(e.source, renderer.width, renderer.height);
+        log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' through APS renderer`);
       } catch (err) {
         safelyRecordCreativeFailure(attemptId, 'response_post_failed');
         log.warn(`[tsjs-gpt] pbRender bridge: response post failed for '${slotId}'`, err);
@@ -2177,7 +2164,7 @@ export function installTsRenderBridge(): void {
           sourceFrameForSlotId(e.source, slotId)?.iframe === sourceSlotFrame.iframe
         )
       );
-      safelyRecordCreativeResponse(attemptId);
+      resizeAuthenticatedBridgeShell(e.source, width, height);
       fireWinBillingBeacons(slotId, matchedBid);
       log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from inline adm`);
       return;
@@ -2267,7 +2254,34 @@ export function installTsRenderBridge(): void {
           safelyRecordCreativeFailure(attemptId, 'cache_fetch_failed');
           log.warn(`[tsjs-gpt] pbRender bridge: PBS Cache fetch failed for '${slotId}'`, err);
         }
-      )
+        // Resolve the auction-price macro from the cached clearing price, and
+        // size from the cached bid's own dimensions, falling back to the slot
+        // format only when the cache omits them.
+        const ad =
+          cached.price !== undefined
+            ? expandAuctionPriceMacro(cached.adm, cached.price)
+            : cached.adm;
+        const cachedWidth = cached.width ?? width;
+        const cachedHeight = cached.height ?? height;
+        port.postMessage(
+          JSON.stringify({
+            message: 'Prebid Response',
+            adId,
+            ad,
+            renderer: TS_DISPLAY_RENDERER,
+            width: cachedWidth,
+            height: cachedHeight,
+          })
+        );
+        resizeAuthenticatedBridgeShell(e.source, cachedWidth, cachedHeight);
+        // Beacons carry the server-expanded ${AUCTION_PRICE} from the auction's
+        // clearing price, not `cached.price` — the auction result is the
+        // authoritative clearing price, and the cached copy is only the render
+        // source. Do not re-expand them here.
+        fireWinBillingBeacons(slotId, matchedBid);
+        recordGptBridgeRender(slotId, matchedBid, 'pbs-cache', findSlotElementByDivId(slotId));
+        log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from PBS Cache`);
+      })
       .catch((err) => {
         // Errors reaching this stage were thrown after the cache body promise
         // settled, so parsing, posting follow-up work, beacons, success logging,

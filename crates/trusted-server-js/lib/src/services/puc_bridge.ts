@@ -8,6 +8,7 @@ import type { IdentityGenerationResult } from '../kernel/identity';
 
 import type {
   CacheAdmSource,
+  CollapsedPucShellResizeInput,
   CommittedRenderArtifact,
   RenderAttempt,
   RenderFailureReason,
@@ -959,6 +960,7 @@ export interface PucBridgeOptions {
   readonly mintLifecycleTicket?: () => IdentityGenerationResult<string>;
   readonly now?: () => number;
   readonly publisherOrigin?: string;
+  readonly resizeCollapsedShell?: (input: CollapsedPucShellResizeInput) => boolean;
   readonly rendererNonces?: Pick<RendererNonceRegistry, 'consume' | 'issue'>;
   readonly rendererUrl?: string;
   readonly resolveCacheAdm?: (
@@ -1358,6 +1360,7 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
   let rendererNonces: PucBridgeOptions['rendererNonces'];
   let rendererUrl: string | undefined;
   let resolveCacheAdm: PucBridgeOptions['resolveCacheAdm'];
+  let resizeCollapsedShell: PucBridgeOptions['resizeCollapsedShell'];
   let scheduler: PucBridgeScheduler;
   try {
     messaging = options.messaging;
@@ -1368,6 +1371,7 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
     rendererNonces = options.rendererNonces;
     rendererUrl = options.rendererUrl;
     resolveCacheAdm = options.resolveCacheAdm;
+    resizeCollapsedShell = options.resizeCollapsedShell;
     scheduler = options.scheduler ?? defaultScheduler();
   } catch {
     messaging = options.messaging;
@@ -1378,6 +1382,7 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
     rendererNonces = undefined;
     rendererUrl = undefined;
     resolveCacheAdm = undefined;
+    resizeCollapsedShell = undefined;
     scheduler = defaultScheduler();
   }
   let schedulerSet: PucBridgeScheduler['set'];
@@ -1885,6 +1890,31 @@ export function createPucBridge(options: PucBridgeOptions): PucBridge {
       if (!posted || !binding.active || !activateTicket(binding, issued.ticket)) {
         if (binding.active) failBinding(binding, 'internal_error', false);
         return false;
+      }
+      if (resizeCollapsedShell && currentBindingState(binding, 'waiting_for_owner')) {
+        try {
+          const renderSource = binding.attempt.renderSource;
+          const width = renderSource && Reflect.get(renderSource, 'width');
+          const height = renderSource && Reflect.get(renderSource, 'height');
+          if (
+            typeof width === 'number' &&
+            typeof height === 'number' &&
+            Number.isFinite(width) &&
+            Number.isFinite(height) &&
+            width > 0 &&
+            height > 0
+          ) {
+            Reflect.apply(resizeCollapsedShell, undefined, [
+              frozen({
+                source: pending.source,
+                width,
+                height,
+              }),
+            ]);
+          }
+        } catch {
+          // Shell correction is best-effort and cannot affect render authority.
+        }
       }
       return true;
     } finally {
