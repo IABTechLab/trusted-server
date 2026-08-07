@@ -5,15 +5,30 @@ import {
   validDimension,
 } from '../../core/contracts/auction_projection';
 import type { BrowserAuctionBidV1, BrowserAuctionProjectionV1 } from '../../core/types';
+import {
+  PrebidAdmissionContractError,
+  type PrebidEventFacade,
+  type PreparedTrustedBidV1,
+} from '../../adapters/prebid';
 import type {
   IntegrationActivationContext,
   IntegrationPrepareContext,
   IntegrationRegistration,
 } from '../../kernel/integration_registry';
-import type { NavigationSession } from '../../kernel/sessions';
+import type {
+  AuctionBatchScope,
+  NavigationSession,
+  RenderAttemptScope,
+} from '../../kernel/sessions';
+import type {
+  RenderAttempt,
+  RenderAttemptCreationResult,
+  RenderScheduler,
+} from '../../services/render';
 import type { ReservationService } from '../../services/reservations';
 
 export const PREBID_INTEGRATION_ID = 'prebid' as const;
+export type { PreparedTrustedBidV1 } from '../../adapters/prebid';
 
 const MAX_CONFIG_DEPTH = 16;
 const MAX_CONFIG_NODES = 512;
@@ -126,31 +141,6 @@ export function createPrebidIntegrationRegistration(release: string): Integratio
   });
 }
 
-/** Exact TS-owned bid passed to the version-pinned Prebid admission boundary. */
-export interface PreparedTrustedBidV1 {
-  readonly auctionId: string;
-  readonly adUnitCode: string;
-  readonly bid: Readonly<{
-    readonly requestId: string;
-    readonly adId: string;
-    readonly cpm: number;
-    readonly width: number;
-    readonly height: number;
-    readonly ad: '';
-    readonly ttl: 300;
-    readonly creativeId: string;
-    readonly netRevenue: true;
-    readonly currency: 'USD';
-    readonly bidderCode: 'trustedServer';
-    readonly meta: Readonly<{
-      readonly advertiserDomains: readonly string[];
-      readonly tsAuctionId: string;
-      readonly tsBidId: string;
-      readonly tsAdmHash?: string;
-    }>;
-  }>;
-}
-
 export type PrebidBidPublicationFailureReason =
   | 'descriptor_invalid'
   | 'prebid_admission_failed'
@@ -163,10 +153,7 @@ export type PrebidBidPublicationResult =
   | Readonly<{ ok: true; bid: Readonly<PreparedTrustedBidV1> }>
   | Readonly<{ ok: false; reason: PrebidBidPublicationFailureReason }>;
 
-type PrebidPublicationNavigation = Pick<
-  NavigationSession,
-  'currentAuctionProjection' | 'generation' | 'isCurrent' | 'onDispose'
->;
+type PrebidPublicationNavigation = NavigationSession;
 
 export interface PrebidBidPublicationInput {
   readonly admitTrustedBid: (preparedBid: Readonly<PreparedTrustedBidV1>) => unknown;
@@ -176,6 +163,10 @@ export interface PrebidBidPublicationInput {
   readonly generatedBid: unknown;
   readonly navigation: PrebidPublicationNavigation;
   readonly reservations: Pick<ReservationService, 'registerPrebidLease' | 'tombstonePrebidLease'>;
+  readonly trackAdmittedBid: (
+    preparedBid: Readonly<PreparedTrustedBidV1>,
+    navigation: PrebidPublicationNavigation
+  ) => boolean;
 }
 
 function isCurrentProjectedWinner(input: PrebidBidPublicationInput): boolean {
@@ -323,10 +314,22 @@ export function publishPrebidBid(input: PrebidBidPublicationInput): PrebidBidPub
     const admission = input.admitTrustedBid(preparedBid);
     if (admission === 'not_admitted') failure = 'prebid_admission_failed';
     else if (admission !== 'admitted') failure = 'prebid_contract_violation';
-  } catch {
-    failure = 'prebid_admission_failed';
+  } catch (error) {
+    failure =
+      error instanceof PrebidAdmissionContractError
+        ? 'prebid_contract_violation'
+        : 'prebid_admission_failed';
   }
-  if (!failure) return Object.freeze({ ok: true, bid: preparedBid });
+  if (!failure) {
+    try {
+      if (input.trackAdmittedBid(preparedBid, input.navigation)) {
+        return Object.freeze({ ok: true, bid: preparedBid });
+      }
+    } catch {
+      // A published bid without selection ownership must stay suppress-only.
+    }
+    failure = 'prebid_contract_violation';
+  }
 
   const tombstoned = (() => {
     try {
@@ -346,5 +349,366 @@ export function publishPrebidBid(input: PrebidBidPublicationInput): PrebidBidPub
   return Object.freeze({
     ok: false,
     reason: tombstoned ? failure : 'prebid_contract_violation',
+  });
+}
+
+export interface PrebidSelectionCoordinatorOptions {
+  readonly activateAttempt: (
+    input: Readonly<{
+      attempt: RenderAttempt;
+      owner: RenderAttemptScope;
+      preparedBid: Readonly<PreparedTrustedBidV1>;
+    }>
+  ) => boolean;
+  readonly createAttempt: (owner: RenderAttemptScope) => RenderAttemptCreationResult;
+  readonly reservations: Pick<
+    ReservationService,
+    'promotePrebidSelection' | 'tombstone' | 'tombstonePrebidGroup'
+  >;
+  readonly scheduler?: RenderScheduler;
+}
+
+export interface PrebidSelectionCoordinator {
+  readonly track: (
+    preparedBid: Readonly<PreparedTrustedBidV1>,
+    navigation: NavigationSession
+  ) => boolean;
+  readonly auctionEnded: (event: unknown, prebid: Readonly<PrebidEventFacade>) => void;
+  readonly abort: (navigation: NavigationSession, auctionId: string) => void;
+  readonly dispose: () => void;
+}
+
+interface TrackedPrebidGroup {
+  readonly adUnitCode: string;
+  readonly auction: TrackedPrebidAuction;
+  readonly bids: Map<string, Readonly<PreparedTrustedBidV1>>;
+  active: boolean;
+  timer: unknown;
+}
+
+interface TrackedPrebidAuction {
+  readonly auctionId: string;
+  readonly batch: AuctionBatchScope;
+  readonly groups: Map<string, TrackedPrebidGroup>;
+  readonly navigation: NavigationSession;
+  active: boolean;
+  promotedAttempts: number;
+}
+
+const PREBID_SELECTION_TIMEOUT_MS = 10_000;
+
+function defaultSelectionScheduler(): RenderScheduler {
+  return Object.freeze({
+    clear: (handle: unknown): void => {
+      globalThis.clearTimeout(handle as ReturnType<typeof globalThis.setTimeout>);
+    },
+    set: (callback: () => void, milliseconds: number): unknown =>
+      globalThis.setTimeout(callback, milliseconds),
+  });
+}
+
+function exactSelectedBid(
+  candidate: unknown,
+  group: TrackedPrebidGroup
+): Readonly<PreparedTrustedBidV1> | undefined {
+  const record = ownDataObject(candidate);
+  if (
+    !record ||
+    record.auctionId !== group.auction.auctionId ||
+    record.adUnitCode !== group.adUnitCode ||
+    typeof record.adId !== 'string'
+  ) {
+    return undefined;
+  }
+  const prepared = group.bids.get(record.adId);
+  if (!prepared) return undefined;
+  const meta = ownDataObject(record.meta);
+  return record.requestId === prepared.bid.requestId &&
+    Object.is(record.cpm, prepared.bid.cpm) &&
+    record.bidderCode === prepared.bid.bidderCode &&
+    meta?.tsAuctionId === prepared.auctionId &&
+    meta.tsBidId === prepared.bid.meta.tsBidId
+    ? prepared
+    : undefined;
+}
+
+/** Own short Prebid-selection leases without exposing reservation state to the artifact. */
+export function createPrebidSelectionCoordinator(
+  options: PrebidSelectionCoordinatorOptions
+): PrebidSelectionCoordinator {
+  const scheduler = options.scheduler ?? defaultSelectionScheduler();
+  const auctions: TrackedPrebidAuction[] = [];
+  let disposed = false;
+
+  const removeAuction = (auction: TrackedPrebidAuction): void => {
+    const index = auctions.indexOf(auction);
+    if (index >= 0) auctions.splice(index, 1);
+    auction.active = false;
+  };
+
+  const clearGroupTimer = (group: TrackedPrebidGroup): void => {
+    if (group.timer === undefined) return;
+    const timer = group.timer;
+    group.timer = undefined;
+    try {
+      scheduler.clear(timer);
+    } catch {
+      // Timer cleanup cannot weaken reservation suppression.
+    }
+  };
+
+  const finishGroup = (
+    group: TrackedPrebidGroup,
+    state?: 'aborted' | 'prebid_selection_timeout' | 'unselected'
+  ): void => {
+    if (!group.active) return;
+    group.active = false;
+    clearGroupTimer(group);
+    if (state) {
+      try {
+        options.reservations.tombstonePrebidGroup(
+          {
+            auctionId: group.auction.auctionId,
+            adUnitCode: group.adUnitCode,
+            navigationGeneration: group.auction.navigation.generation,
+          },
+          state
+        );
+      } catch {
+        // The bounded reservation service remains the suppression authority.
+      }
+    }
+    group.auction.groups.delete(group.adUnitCode);
+    if (group.auction.groups.size !== 0) return;
+    if (group.auction.promotedAttempts === 0) {
+      try {
+        group.auction.batch.dispose();
+      } catch {
+        // Navigation disposal remains the final owner of a hostile batch.
+      }
+    }
+    removeAuction(group.auction);
+  };
+
+  const findAuction = (
+    navigation: NavigationSession,
+    auctionId: string
+  ): TrackedPrebidAuction | undefined => {
+    for (let index = 0; index < auctions.length; index += 1) {
+      const auction = auctions[index];
+      if (auction?.active && auction.navigation === navigation && auction.auctionId === auctionId) {
+        return auction;
+      }
+    }
+    return undefined;
+  };
+
+  const track = (
+    preparedBid: Readonly<PreparedTrustedBidV1>,
+    navigation: NavigationSession
+  ): boolean => {
+    try {
+      if (
+        disposed ||
+        !navigation.isCurrent() ||
+        !Object.isFrozen(preparedBid) ||
+        !Object.isFrozen(preparedBid.bid) ||
+        !isRendererReservationIdV1(preparedBid.bid.adId)
+      ) {
+        return false;
+      }
+      let auction = findAuction(navigation, preparedBid.auctionId);
+      let createdAuction = false;
+      if (!auction) {
+        const batch = navigation.createAuctionBatch(`prebid:${preparedBid.auctionId}`);
+        if (!batch) return false;
+        auction = {
+          auctionId: preparedBid.auctionId,
+          batch,
+          groups: new Map(),
+          navigation,
+          active: true,
+          promotedAttempts: 0,
+        };
+        createdAuction = true;
+      }
+      let group = auction.groups.get(preparedBid.adUnitCode);
+      if (group?.bids.has(preparedBid.bid.adId)) return false;
+      if (!group) {
+        group = {
+          adUnitCode: preparedBid.adUnitCode,
+          auction,
+          bids: new Map(),
+          active: true,
+          timer: undefined,
+        };
+        group.bids.set(preparedBid.bid.adId, preparedBid);
+        auction.groups.set(preparedBid.adUnitCode, group);
+        if (createdAuction) auctions.push(auction);
+        let timer: unknown;
+        try {
+          timer = scheduler.set(
+            () => finishGroup(group as TrackedPrebidGroup, 'prebid_selection_timeout'),
+            PREBID_SELECTION_TIMEOUT_MS
+          );
+          if (!group.active) {
+            try {
+              scheduler.clear(timer);
+            } catch {
+              // The synchronously-fired logical deadline remains terminal.
+            }
+            return false;
+          }
+          group.timer = timer;
+          navigation.onDispose('prebid-selection', () =>
+            finishGroup(group as TrackedPrebidGroup, 'aborted')
+          );
+          if (!group.active || !navigation.isCurrent()) {
+            finishGroup(group, 'aborted');
+            return false;
+          }
+        } catch {
+          if (timer !== undefined && group.timer === undefined) {
+            try {
+              scheduler.clear(timer);
+            } catch {
+              // Failed publication retains no live logical deadline.
+            }
+          }
+          finishGroup(group);
+          return false;
+        }
+        return true;
+      }
+      group.bids.set(preparedBid.bid.adId, preparedBid);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const auctionEnded = (event: unknown, prebid: Readonly<PrebidEventFacade>): void => {
+    if (disposed) return;
+    const record = ownDataObject(event);
+    if (!record || !validBoundedString(record.auctionId, 128)) return;
+    const snapshot = auctions.slice();
+    for (let auctionIndex = 0; auctionIndex < snapshot.length; auctionIndex += 1) {
+      const auction = snapshot[auctionIndex];
+      if (!auction?.active || auction.auctionId !== record.auctionId) continue;
+      const groups = [...auction.groups.values()];
+      for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
+        const group = groups[groupIndex];
+        if (!group?.active) continue;
+        let highest: readonly object[];
+        try {
+          highest = prebid.highestBids(group.adUnitCode);
+        } catch {
+          continue;
+        }
+        const selected: Readonly<PreparedTrustedBidV1>[] = [];
+        for (let bidIndex = 0; bidIndex < highest.length; bidIndex += 1) {
+          const match = exactSelectedBid(highest[bidIndex], group);
+          if (match) selected.push(match);
+        }
+        if (selected.length !== 1) {
+          finishGroup(group, 'unselected');
+          continue;
+        }
+        const prepared = selected[0];
+        if (!prepared) {
+          finishGroup(group, 'unselected');
+          continue;
+        }
+        const owner = auction.batch.createRenderAttempt(group.adUnitCode);
+        if (!owner.ok) {
+          finishGroup(group, 'unselected');
+          continue;
+        }
+        const created = options.createAttempt(owner.value);
+        if (!created.ok) {
+          owner.value.dispose();
+          finishGroup(group, 'unselected');
+          continue;
+        }
+        const promotion = options.reservations.promotePrebidSelection({
+          reservationId: prepared.bid.adId,
+          auctionId: prepared.auctionId,
+          adUnitCode: prepared.adUnitCode,
+          navigationGeneration: auction.navigation.generation,
+          attempt: owner.value,
+          prebidBid: prepared.bid,
+        });
+        if (!promotion.ok) {
+          created.value.fail('prebid_contract_violation');
+          finishGroup(group, 'unselected');
+          continue;
+        }
+        let activated: boolean;
+        try {
+          activated =
+            options.activateAttempt(
+              Object.freeze({ attempt: created.value, owner: owner.value, preparedBid: prepared })
+            ) === true;
+        } catch {
+          activated = false;
+        }
+        if (!activated) {
+          try {
+            options.reservations.tombstone(
+              {
+                reservationId: prepared.bid.adId,
+                slot: prepared.adUnitCode,
+                navigationGeneration: auction.navigation.generation,
+                attemptId: owner.value.id,
+              },
+              'stale'
+            );
+          } catch {
+            // A failed PUC activation remains terminal at the attempt boundary.
+          }
+          created.value.fail('prebid_contract_violation');
+          finishGroup(group);
+          continue;
+        }
+        auction.promotedAttempts += 1;
+        finishGroup(group);
+      }
+    }
+  };
+
+  const abort = (navigation: NavigationSession, auctionId: string): void => {
+    const auction = findAuction(navigation, auctionId);
+    if (!auction) return;
+    const groups = [...auction.groups.values()];
+    for (let index = 0; index < groups.length; index += 1) {
+      const group = groups[index];
+      if (group) finishGroup(group, 'aborted');
+    }
+  };
+
+  return Object.freeze({
+    track,
+    auctionEnded,
+    abort,
+    dispose: (): void => {
+      if (disposed) return;
+      disposed = true;
+      const snapshot = auctions.slice();
+      for (let index = 0; index < snapshot.length; index += 1) {
+        const auction = snapshot[index];
+        if (!auction) continue;
+        const groups = [...auction.groups.values()];
+        for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
+          const group = groups[groupIndex];
+          if (group) finishGroup(group, 'aborted');
+        }
+        try {
+          auction.batch.dispose();
+        } catch {
+          // Runtime disposal remains terminal under hostile callbacks.
+        }
+      }
+      auctions.length = 0;
+    },
   });
 }
