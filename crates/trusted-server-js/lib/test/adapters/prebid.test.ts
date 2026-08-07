@@ -41,6 +41,7 @@ function createReadyPrebid(
   const listeners = new Map<string, Set<(event: unknown) => void>>();
   const pbjs = {
     addAdUnits: vi.fn(),
+    getBidResponsesForAdUnitCode: vi.fn<() => { bids: object[] }>(() => ({ bids: [] })),
     getHighestCpmBids: vi.fn<() => object[]>(() => []),
     offEvent: vi.fn((type: string, listener: (event: unknown) => void) => {
       listeners.get(type)?.delete(listener);
@@ -77,7 +78,8 @@ describe('browser Prebid adapter readiness', () => {
 
   it('binds an exact valid artifact and exposes a frozen narrow facade', async () => {
     const ready = createReadyPrebid();
-    const adapter = createBrowserPrebidAdapter({ pbjs: ready.pbjs });
+    const target: { pbjs: unknown } = { pbjs: ready.pbjs };
+    const adapter = createBrowserPrebidAdapter(target);
     const operation = adapter.run((prebid) => {
       expect(Object.isFrozen(prebid)).toBe(true);
       expect('que' in prebid).toBe(false);
@@ -1519,5 +1521,232 @@ describe('browser Prebid adapter readiness', () => {
       pushOperation = pushAdapter.run(() => undefined);
     }).not.toThrow();
     await expect(pushOperation?.result).rejects.toBe(pushError);
+  });
+});
+
+describe('version-pinned Trusted Server bid admission', () => {
+  const preparedBid = () =>
+    recursivelyFreeze({
+      auctionId: 'auction-one',
+      adUnitCode: 'slot-one',
+      bid: {
+        requestId: 'request-one',
+        adId: 'r1_BwcHBwcHBwcHBwcHBwcHBw',
+        cpm: 1.25,
+        width: 300,
+        height: 250,
+        ad: '' as const,
+        ttl: 300 as const,
+        creativeId: 'creative-one',
+        netRevenue: true as const,
+        currency: 'USD' as const,
+        bidderCode: 'trustedServer',
+        meta: {
+          advertiserDomains: [] as string[],
+          tsAuctionId: 'auction-one',
+          tsBidId: 'bid-one',
+        },
+      },
+    });
+
+  function admissionFixture() {
+    const ready = createReadyPrebid();
+    const stored: object[] = [];
+    ready.pbjs.getBidResponsesForAdUnitCode.mockImplementation((adUnitCode?: string) => ({
+      bids: stored.filter((bid) => (bid as { adUnitCode?: unknown }).adUnitCode === adUnitCode),
+    }));
+    const target: { pbjs: unknown } = { pbjs: ready.pbjs };
+    const adapter = createBrowserPrebidAdapter(target);
+    const auctions: unknown[] = [];
+    const operation = adapter.run((facade) => {
+      const boundary = facade as unknown as {
+        registerTrustedServerBidder(listener: (auction: unknown) => void): unknown;
+      };
+      return boundary.registerTrustedServerBidder((auction) => auctions.push(auction));
+    });
+    const bidderFactory = ready.pbjs.registerBidAdapter.mock.calls[0]?.[0] as
+      | (() => {
+          callBids(
+            request: unknown,
+            admit: (adUnitCode: string, bid: Record<string, unknown>) => void,
+            done: () => void
+          ): void;
+        })
+      | undefined;
+    const bidder = bidderFactory?.();
+    expect(ready.pbjs.registerBidAdapter).toHaveBeenCalledWith(bidderFactory, 'trustedServer');
+    const done = vi.fn();
+    const emitBidResponse = (bid: object): void => {
+      for (const listener of ready.listeners.get('bidResponse') ?? []) listener(bid);
+    };
+    const admit = vi.fn((adUnitCode: string, bid: Record<string, unknown>) => {
+      const published = { ...bid, adUnitCode };
+      stored.push(published);
+      emitBidResponse(published);
+    });
+    bidder?.callBids(
+      {
+        auctionId: 'auction-one',
+        bids: [{ adUnitCode: 'slot-one', bidId: 'request-one' }],
+      },
+      admit,
+      done
+    );
+    const boundary = adapter as unknown as {
+      admitTrustedBid(prepared: ReturnType<typeof preparedBid>): 'admitted' | 'not_admitted';
+    };
+    return {
+      adapter,
+      admit,
+      auctions,
+      boundary,
+      done,
+      emitBidResponse,
+      operation,
+      ready,
+      stored,
+      target,
+    };
+  }
+
+  it('captures one exact auction callback and admits a mutable copy atomically', async () => {
+    const fixture = admissionFixture();
+    await expect(fixture.operation.result).resolves.toBeUndefined();
+
+    expect(fixture.auctions).toHaveLength(1);
+    const auction = fixture.auctions[0] as {
+      auctionId: string;
+      bids: readonly { adUnitCode: string; requestId: string }[];
+      complete(): void;
+    };
+    expect(Object.isFrozen(auction)).toBe(true);
+    expect(Object.isFrozen(auction.bids)).toBe(true);
+    expect(auction).toMatchObject({
+      auctionId: 'auction-one',
+      bids: [{ adUnitCode: 'slot-one', requestId: 'request-one' }],
+    });
+
+    const prepared = preparedBid();
+    expect(fixture.boundary.admitTrustedBid(prepared)).toBe('admitted');
+    expect(fixture.admit).toHaveBeenCalledTimes(1);
+    const admitted = fixture.admit.mock.calls[0]?.[1];
+    expect(admitted).toEqual(prepared.bid);
+    expect(admitted).not.toBe(prepared.bid);
+    expect(admitted?.['meta']).not.toBe(prepared.bid.meta);
+    expect((admitted?.['meta'] as { advertiserDomains?: unknown })?.advertiserDomains).not.toBe(
+      prepared.bid.meta.advertiserDomains
+    );
+    expect(Object.isFrozen(prepared.bid)).toBe(true);
+
+    auction.complete();
+    auction.complete();
+    expect(fixture.done).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns not_admitted only when neither state nor an event was published', async () => {
+    const fixture = admissionFixture();
+    await fixture.operation.result;
+    fixture.admit.mockImplementation(() => undefined);
+
+    expect(fixture.boundary.admitTrustedBid(preparedBid())).toBe('not_admitted');
+    expect(fixture.stored).toEqual([]);
+  });
+
+  it('makes a request terminal after not_admitted instead of retrying publication', async () => {
+    const fixture = admissionFixture();
+    await fixture.operation.result;
+    fixture.admit.mockImplementation(() => undefined);
+
+    expect(fixture.boundary.admitTrustedBid(preparedBid())).toBe('not_admitted');
+    fixture.admit.mockImplementation((adUnitCode, bid) => {
+      const published = { ...bid, adUnitCode };
+      fixture.stored.push(published);
+      fixture.emitBidResponse(published);
+    });
+    expect(fixture.boundary.admitTrustedBid(preparedBid())).toBe('not_admitted');
+    expect(fixture.admit).toHaveBeenCalledTimes(1);
+    expect(fixture.stored).toEqual([]);
+  });
+
+  it('matches response state and events by exact request and ad-unit identity', async () => {
+    const fixture = admissionFixture();
+    await fixture.operation.result;
+    const prepared = preparedBid();
+    fixture.stored.push({
+      ...prepared.bid,
+      requestId: 'other-request',
+      adUnitCode: prepared.adUnitCode,
+    });
+    fixture.admit.mockImplementation((adUnitCode, bid) => {
+      fixture.emitBidResponse({
+        ...bid,
+        requestId: 'other-request',
+        adUnitCode,
+      });
+      const published = { ...bid, adUnitCode };
+      fixture.stored.push(published);
+      fixture.emitBidResponse(published);
+    });
+
+    expect(fixture.boundary.admitTrustedBid(prepared)).toBe('admitted');
+  });
+
+  it('refuses a second live Trusted Server bidder registration on the same binding', async () => {
+    const fixture = admissionFixture();
+    await fixture.operation.result;
+
+    const duplicate = fixture.adapter.run((prebid) => prebid.registerTrustedServerBidder(vi.fn()));
+
+    await expect(duplicate.result).rejects.toMatchObject({
+      code: 'external_artifact_incompatible',
+    });
+    expect(fixture.ready.pbjs.registerBidAdapter).toHaveBeenCalledTimes(1);
+    fixture.adapter.dispose();
+  });
+
+  it('throws a contract violation for partial publication and an ordinary callback throw otherwise', async () => {
+    const partial = admissionFixture();
+    await partial.operation.result;
+    partial.admit.mockImplementation((adUnitCode, bid) =>
+      partial.emitBidResponse({ ...bid, adUnitCode })
+    );
+
+    expect(() => partial.boundary.admitTrustedBid(preparedBid())).toThrowError(
+      expect.objectContaining({ code: 'prebid_partial_publication' })
+    );
+
+    const failed = admissionFixture();
+    await failed.operation.result;
+    const callbackFailure = new Error('fictional response callback failure');
+    failed.admit.mockImplementation(() => {
+      throw callbackFailure;
+    });
+    expect(() => failed.boundary.admitTrustedBid(preparedBid())).toThrow(callbackFailure);
+  });
+
+  it('rejects detached requests, duplicate admission, binding replacement, and late use', async () => {
+    const fixture = admissionFixture();
+    await fixture.operation.result;
+
+    expect(
+      fixture.boundary.admitTrustedBid(
+        recursivelyFreeze({ ...preparedBid(), adUnitCode: 'other-slot' })
+      )
+    ).toBe('not_admitted');
+    expect(fixture.boundary.admitTrustedBid(preparedBid())).toBe('admitted');
+    expect(() => fixture.boundary.admitTrustedBid(preparedBid())).toThrowError(
+      expect.objectContaining({ code: 'prebid_partial_publication' })
+    );
+
+    const auction = fixture.auctions[0] as { complete(): void };
+    auction.complete();
+    expect(fixture.boundary.admitTrustedBid(preparedBid())).toBe('not_admitted');
+
+    const replaced = admissionFixture();
+    await replaced.operation.result;
+    replaced.target.pbjs = createReadyPrebid().pbjs;
+    expect(() => replaced.boundary.admitTrustedBid(preparedBid())).toThrowError(
+      expect.objectContaining({ code: 'external_artifact_incompatible' })
+    );
   });
 });

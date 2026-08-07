@@ -39,6 +39,58 @@ export class PrebidAdapterError extends Error {
   }
 }
 
+/** A version-pinned response callback exposed some, but not all, bid state. */
+export class PrebidAdmissionContractError extends Error {
+  public readonly code = 'prebid_partial_publication';
+  public readonly cause: unknown;
+
+  public constructor(cause?: unknown) {
+    super('prebid_partial_publication');
+    this.name = 'PrebidAdmissionContractError';
+    this.cause = cause;
+  }
+}
+
+/** Exact capability-free TS bid accepted by the version-pinned adapter boundary. */
+export interface PreparedTrustedBidV1 {
+  readonly auctionId: string;
+  readonly adUnitCode: string;
+  readonly bid: Readonly<{
+    readonly requestId: string;
+    readonly adId: string;
+    readonly cpm: number;
+    readonly width: number;
+    readonly height: number;
+    readonly ad: '';
+    readonly ttl: 300;
+    readonly creativeId: string;
+    readonly netRevenue: true;
+    readonly currency: 'USD';
+    readonly bidderCode: string;
+    readonly meta: Readonly<{
+      readonly advertiserDomains: readonly string[];
+      readonly tsAuctionId: string;
+      readonly tsBidId: string;
+      readonly tsAdmHash?: string;
+    }>;
+  }>;
+}
+
+export type PrebidTrustedBidAdmissionResult = 'admitted' | 'not_admitted';
+
+/** One exact bidder request owned by a captured Prebid auction callback. */
+export interface PrebidTrustedServerBidRequestV1 {
+  readonly adUnitCode: string;
+  readonly requestId: string;
+}
+
+/** Private request delivered by the custom TS bidder adapter. */
+export interface PrebidTrustedServerAuctionV1 {
+  readonly auctionId: string;
+  readonly bids: readonly PrebidTrustedServerBidRequestV1[];
+  complete(): void;
+}
+
 /** The exact recursively frozen external Prebid artifact stamp. */
 export interface ExternalPrebidArtifactV1 {
   readonly abi: 1;
@@ -75,6 +127,9 @@ export interface PrebidFacade {
   highestBids(adUnitCode?: string): readonly object[];
   processQueue(): unknown;
   registerBidAdapter(adapter: unknown, bidderCode: string, spec?: object): unknown;
+  registerTrustedServerBidder(
+    listener: (auction: Readonly<PrebidTrustedServerAuctionV1>) => void
+  ): unknown;
   renderAd(targetDocument: object, adId: string): unknown;
   requestBids(options: object): unknown;
   subscribe(
@@ -98,6 +153,7 @@ export interface PrebidOperation<T> {
 /** Narrow Prebid boundary consumed by kernel sessions and services. */
 export interface PrebidAdapter {
   bindingStatus(): PrebidBindingStatus;
+  admitTrustedBid(preparedBid: Readonly<PreparedTrustedBidV1>): PrebidTrustedBidAdmissionResult;
   run<T>(
     command: (prebid: Readonly<PrebidFacade>) => T,
     options?: PrebidOperationOptions
@@ -146,6 +202,18 @@ interface PendingOperation<T> {
   abortRegistration: AbortRegistration | undefined;
   readinessBinding: object | undefined;
   readonly provisionalEffects: ProvisionalEffect[];
+}
+
+interface ActiveTrustedServerAdmission {
+  readonly addBidResponse: (...arguments_: unknown[]) => unknown;
+  readonly binding: PresentPrebid;
+  readonly requests: readonly PrebidTrustedServerBidRequestV1[];
+  readonly admittedIds: Set<string>;
+  readonly admittedRequests: Set<string>;
+  readonly attemptedRequests: Set<string>;
+  readonly registration: object;
+  readonly violatedRequests: Set<string>;
+  complete(): void;
 }
 
 const encoder = new TextEncoder();
@@ -384,8 +452,79 @@ function validateStamp(
   }
 }
 
+function validatePreparedBid(candidate: unknown): Readonly<PreparedTrustedBidV1> | undefined {
+  try {
+    const prepared = frozenRecordValues(candidate, ['auctionId', 'adUnitCode', 'bid']);
+    if (
+      !prepared ||
+      !validString(prepared.auctionId, 128) ||
+      !validString(prepared.adUnitCode, 256)
+    ) {
+      return undefined;
+    }
+    const bid = frozenRecordValues(prepared.bid, [
+      'requestId',
+      'adId',
+      'cpm',
+      'width',
+      'height',
+      'ad',
+      'ttl',
+      'creativeId',
+      'netRevenue',
+      'currency',
+      'bidderCode',
+      'meta',
+    ]);
+    if (
+      !bid ||
+      !validString(bid.requestId, 128) ||
+      typeof bid.adId !== 'string' ||
+      !/^r1_[A-Za-z0-9_-]{22}$/u.test(bid.adId) ||
+      typeof bid.cpm !== 'number' ||
+      !Number.isFinite(bid.cpm) ||
+      bid.cpm < 0 ||
+      typeof bid.width !== 'number' ||
+      !Number.isInteger(bid.width) ||
+      bid.width < 1 ||
+      bid.width > 4096 ||
+      typeof bid.height !== 'number' ||
+      !Number.isInteger(bid.height) ||
+      bid.height < 1 ||
+      bid.height > 4096 ||
+      bid.ad !== '' ||
+      bid.ttl !== 300 ||
+      !validString(bid.creativeId, 256) ||
+      bid.netRevenue !== true ||
+      bid.currency !== 'USD' ||
+      !validString(bid.bidderCode, MAX_NAME_BYTES)
+    ) {
+      return undefined;
+    }
+    const metaKeys = Object.prototype.hasOwnProperty.call(bid.meta, 'tsAdmHash')
+      ? ['advertiserDomains', 'tsAuctionId', 'tsBidId', 'tsAdmHash']
+      : ['advertiserDomains', 'tsAuctionId', 'tsBidId'];
+    const meta = frozenRecordValues(bid.meta, metaKeys);
+    const advertiserDomains = meta && frozenArrayValues(meta.advertiserDomains, 16);
+    if (
+      !meta ||
+      !advertiserDomains ||
+      advertiserDomains.some((domain) => !validString(domain, 256)) ||
+      meta.tsAuctionId !== prepared.auctionId ||
+      !validString(meta.tsBidId, 256) ||
+      (meta.tsAdmHash !== undefined && !validString(meta.tsAdmHash, 128))
+    ) {
+      return undefined;
+    }
+    return candidate as Readonly<PreparedTrustedBidV1>;
+  } catch {
+    return undefined;
+  }
+}
+
 const REQUIRED_API_METHODS = [
   'addAdUnits',
+  'getBidResponsesForAdUnitCode',
   'getHighestCpmBids',
   'offEvent',
   'onEvent',
@@ -469,6 +608,8 @@ export function createBrowserPrebidAdapter(
   const pending: PendingOperation<unknown>[] = [];
   const live = new Set<PendingOperation<unknown>>();
   const effects = new Set<() => void>();
+  const activeAdmissions = new Map<string, ActiveTrustedServerAdmission>();
+  const trustedBidderRegistrations = new Map<object, object>();
   let armedBindings = new WeakSet<object>();
   let diagnosedBindings = new WeakSet<object>();
   let diagnosedUnbound = false;
@@ -556,6 +697,197 @@ export function createBrowserPrebidAdapter(
     return result;
   };
 
+  const bidderRequestSnapshot = (
+    candidate: unknown
+  ):
+    | Readonly<{
+        auctionId: string;
+        bids: readonly PrebidTrustedServerBidRequestV1[];
+      }>
+    | undefined => {
+    try {
+      if (typeof candidate !== 'object' || candidate === null || Array.isArray(candidate)) {
+        return undefined;
+      }
+      const auctionId = safeOwnDescriptor(candidate, 'auctionId');
+      const bidsDescriptor = safeOwnDescriptor(candidate, 'bids');
+      if (
+        !auctionId ||
+        !Object.prototype.hasOwnProperty.call(auctionId, 'value') ||
+        !validString(auctionId.value, 128) ||
+        !bidsDescriptor ||
+        !Object.prototype.hasOwnProperty.call(bidsDescriptor, 'value') ||
+        !Array.isArray(bidsDescriptor.value) ||
+        bidsDescriptor.value.length === 0 ||
+        bidsDescriptor.value.length > 256
+      ) {
+        return undefined;
+      }
+      const requests: PrebidTrustedServerBidRequestV1[] = [];
+      const identities = new Set<string>();
+      for (const rawBid of bidsDescriptor.value as unknown[]) {
+        if (typeof rawBid !== 'object' || rawBid === null || Array.isArray(rawBid))
+          return undefined;
+        const adUnitCode = safeOwnDescriptor(rawBid, 'adUnitCode');
+        const requestId = safeOwnDescriptor(rawBid, 'bidId');
+        if (
+          !adUnitCode ||
+          !Object.prototype.hasOwnProperty.call(adUnitCode, 'value') ||
+          !validString(adUnitCode.value, 256) ||
+          !requestId ||
+          !Object.prototype.hasOwnProperty.call(requestId, 'value') ||
+          !validString(requestId.value, 128)
+        ) {
+          return undefined;
+        }
+        const identity = `${adUnitCode.value}\u0000${requestId.value}`;
+        if (identities.has(identity)) return undefined;
+        identities.add(identity);
+        requests.push(Object.freeze({ adUnitCode: adUnitCode.value, requestId: requestId.value }));
+      }
+      return Object.freeze({ auctionId: auctionId.value, bids: Object.freeze(requests) });
+    } catch {
+      return undefined;
+    }
+  };
+
+  const responseCount = (
+    binding: PresentPrebid,
+    adUnitCode: string,
+    adId: string,
+    requestId: string,
+    isCurrent: () => boolean
+  ): number => {
+    const response = callBound(binding, 'getBidResponsesForAdUnitCode', [adUnitCode], isCurrent);
+    if (typeof response !== 'object' || response === null || Array.isArray(response)) {
+      throw new PrebidAdapterError('external_artifact_incompatible');
+    }
+    const bids = safeMember(response, 'bids');
+    if (!Array.isArray(bids)) throw new PrebidAdapterError('external_artifact_incompatible');
+    let matches = 0;
+    for (const bid of bids) {
+      if (typeof bid !== 'object' || bid === null) {
+        throw new PrebidAdapterError('external_artifact_incompatible');
+      }
+      if (
+        safeMember(bid, 'adId') === adId &&
+        safeMember(bid, 'requestId') === requestId &&
+        safeMember(bid, 'adUnitCode') === adUnitCode
+      ) {
+        matches += 1;
+      }
+    }
+    return matches;
+  };
+
+  const admitTrustedBid = (
+    candidate: Readonly<PreparedTrustedBidV1>
+  ): PrebidTrustedBidAdmissionResult => {
+    if (disposed) throw new PrebidAdapterError('operation_disposed');
+    const prepared = validatePreparedBid(candidate);
+    if (!prepared) return 'not_admitted';
+    const context = activeAdmissions.get(prepared.auctionId);
+    if (!context) return 'not_admitted';
+    if (!sameBinding(context.binding)) {
+      throw new PrebidAdapterError('external_artifact_incompatible');
+    }
+    const requestIdentity = `${prepared.adUnitCode}\u0000${prepared.bid.requestId}`;
+    if (
+      !context.requests.some(
+        (request) =>
+          request.adUnitCode === prepared.adUnitCode && request.requestId === prepared.bid.requestId
+      )
+    ) {
+      return 'not_admitted';
+    }
+    if (
+      context.admittedIds.has(prepared.bid.adId) ||
+      context.admittedRequests.has(requestIdentity) ||
+      context.violatedRequests.has(requestIdentity)
+    ) {
+      throw new PrebidAdmissionContractError();
+    }
+    if (context.attemptedRequests.has(requestIdentity)) return 'not_admitted';
+    const isCurrent = (): boolean => !disposed && sameBinding(context.binding);
+    const before = responseCount(
+      context.binding,
+      prepared.adUnitCode,
+      prepared.bid.adId,
+      prepared.bid.requestId,
+      isCurrent
+    );
+    if (before !== 0) {
+      context.violatedRequests.add(requestIdentity);
+      throw new PrebidAdmissionContractError();
+    }
+    context.attemptedRequests.add(requestIdentity);
+
+    let responseEvents = 0;
+    const responseListener = (event: unknown): void => {
+      if (
+        typeof event === 'object' &&
+        event !== null &&
+        safeMember(event, 'adId') === prepared.bid.adId &&
+        safeMember(event, 'requestId') === prepared.bid.requestId &&
+        safeMember(event, 'adUnitCode') === prepared.adUnitCode
+      ) {
+        responseEvents += 1;
+      }
+    };
+    callBound(context.binding, 'onEvent', ['bidResponse', responseListener], isCurrent);
+    let callbackFailure: unknown;
+    try {
+      const mutableBid = {
+        ...prepared.bid,
+        meta: {
+          ...prepared.bid.meta,
+          advertiserDomains: [...prepared.bid.meta.advertiserDomains],
+        },
+      };
+      Reflect.apply(context.addBidResponse, undefined, [prepared.adUnitCode, mutableBid]);
+    } catch (error) {
+      callbackFailure = error;
+    }
+    let cleanupFailure: unknown;
+    try {
+      callBound(context.binding, 'offEvent', ['bidResponse', responseListener], isCurrent);
+    } catch (error) {
+      cleanupFailure = error;
+    }
+    let after: number;
+    try {
+      after = responseCount(
+        context.binding,
+        prepared.adUnitCode,
+        prepared.bid.adId,
+        prepared.bid.requestId,
+        isCurrent
+      );
+    } catch (error) {
+      context.violatedRequests.add(requestIdentity);
+      throw new PrebidAdmissionContractError(error);
+    }
+    if (cleanupFailure !== undefined) {
+      context.violatedRequests.add(requestIdentity);
+      throw new PrebidAdmissionContractError(cleanupFailure);
+    }
+    if (callbackFailure !== undefined) {
+      if (responseEvents !== 0 || after !== 0) {
+        context.violatedRequests.add(requestIdentity);
+        throw new PrebidAdmissionContractError(callbackFailure);
+      }
+      throw callbackFailure;
+    }
+    if (responseEvents === 0 && after === 0) return 'not_admitted';
+    if (responseEvents !== 1 || after !== 1) {
+      context.violatedRequests.add(requestIdentity);
+      throw new PrebidAdmissionContractError();
+    }
+    context.admittedIds.add(prepared.bid.adId);
+    context.admittedRequests.add(requestIdentity);
+    return 'admitted';
+  };
+
   const highestBids = (
     binding: PresentPrebid,
     adUnitCode: string | undefined,
@@ -572,6 +904,109 @@ export function createBrowserPrebidAdapter(
     }
     if (!isCurrent()) throw new PrebidAdapterError('external_artifact_incompatible');
     return Object.freeze([...value]);
+  };
+
+  const registerTrustedServerBidder = (
+    binding: PresentPrebid,
+    listener: (auction: Readonly<PrebidTrustedServerAuctionV1>) => void,
+    registerOperationEffect: (disposeEffect: () => void) => () => void,
+    isOperationCurrent: () => boolean
+  ): unknown => {
+    if (typeof listener !== 'function') {
+      throw new TypeError('Trusted Server bidder listener must be a function');
+    }
+    if (trustedBidderRegistrations.has(binding.binding)) {
+      throw new PrebidAdapterError('external_artifact_incompatible');
+    }
+    const registration = Object.freeze({});
+    trustedBidderRegistrations.set(binding.binding, registration);
+    let active = true;
+    const completeRegistrationAuctions = (): void => {
+      for (const context of [...activeAdmissions.values()]) {
+        if (context.registration !== registration) continue;
+        context.complete();
+      }
+    };
+    let release: () => void;
+    try {
+      release = registerOperationEffect(() => {
+        active = false;
+        if (trustedBidderRegistrations.get(binding.binding) === registration) {
+          trustedBidderRegistrations.delete(binding.binding);
+        }
+        completeRegistrationAuctions();
+      });
+    } catch (error) {
+      if (trustedBidderRegistrations.get(binding.binding) === registration) {
+        trustedBidderRegistrations.delete(binding.binding);
+      }
+      throw error;
+    }
+    const bidder = Object.freeze({
+      callBids: (rawRequest: unknown, rawAddBidResponse: unknown, rawDone: unknown): void => {
+        const done = typeof rawDone === 'function' ? rawDone : undefined;
+        let completed = false;
+        const finish = (): void => {
+          if (completed) return;
+          completed = true;
+          try {
+            Reflect.apply(done ?? (() => undefined), undefined, []);
+          } catch {
+            // Prebid completion cannot escape the registered adapter boundary.
+          }
+        };
+        const request = bidderRequestSnapshot(rawRequest);
+        if (
+          !active ||
+          !sameBinding(binding) ||
+          !request ||
+          typeof rawAddBidResponse !== 'function' ||
+          !done ||
+          activeAdmissions.has(request.auctionId)
+        ) {
+          finish();
+          return;
+        }
+        const context: ActiveTrustedServerAdmission = {
+          addBidResponse: rawAddBidResponse as (...arguments_: unknown[]) => unknown,
+          binding,
+          requests: request.bids,
+          admittedIds: new Set<string>(),
+          admittedRequests: new Set<string>(),
+          attemptedRequests: new Set<string>(),
+          registration,
+          violatedRequests: new Set<string>(),
+          complete: (): void => {
+            if (activeAdmissions.get(request.auctionId) !== context) return;
+            activeAdmissions.delete(request.auctionId);
+            finish();
+          },
+        };
+        activeAdmissions.set(request.auctionId, context);
+        const auction = Object.freeze({
+          auctionId: request.auctionId,
+          bids: request.bids,
+          complete: context.complete,
+        });
+        try {
+          listener(auction);
+        } catch {
+          context.complete();
+        }
+      },
+    });
+    const bidderFactory = (): Readonly<typeof bidder> => bidder;
+    try {
+      return callBound(
+        binding,
+        'registerBidAdapter',
+        [bidderFactory, 'trustedServer'],
+        isOperationCurrent
+      );
+    } catch (error) {
+      release();
+      throw error;
+    }
   };
 
   const createFacade = (
@@ -593,6 +1028,10 @@ export function createBrowserPrebidAdapter(
           spec === undefined ? [adapter, bidderCode] : [adapter, bidderCode, spec],
           isOperationCurrent
         ),
+      registerTrustedServerBidder: (
+        listener: (auction: Readonly<PrebidTrustedServerAuctionV1>) => void
+      ): unknown =>
+        registerTrustedServerBidder(binding, listener, registerOperationEffect, isOperationCurrent),
       renderAd: (targetDocument: object, adId: string): unknown =>
         callBound(binding, 'renderAd', [targetDocument, adId], isOperationCurrent),
       requestBids: (options: object): unknown =>
@@ -1150,6 +1589,7 @@ export function createBrowserPrebidAdapter(
   };
 
   return Object.freeze({
+    admitTrustedBid,
     bindingStatus: (): PrebidBindingStatus => currentBinding().status,
     run,
     notifyReady,
