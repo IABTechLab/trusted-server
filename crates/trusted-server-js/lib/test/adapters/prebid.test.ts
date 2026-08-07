@@ -611,6 +611,7 @@ describe('browser Prebid adapter readiness', () => {
   it('requires every real API method and contains hostile target and member getters', async () => {
     for (const method of [
       'addAdUnits',
+      'getBidResponsesForAdUnitCode',
       'getHighestCpmBids',
       'offEvent',
       'onEvent',
