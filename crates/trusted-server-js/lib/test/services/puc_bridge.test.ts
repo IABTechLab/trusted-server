@@ -384,21 +384,23 @@ describe('Universal Creative bridge dispatcher', () => {
       expect(stopListening).toHaveBeenCalledOnce();
       expect(controlPort.start).toHaveBeenCalledOnce();
 
-      controlListener?.({
-        data: {
-          message: 'TS ADM Start',
-          version: 1,
-          lifecycleTicket: LIFECYCLE_TICKET,
-          source: {
-            type: 'adm',
+      controlListener?.(
+        new MessageEvent('message', {
+          data: {
+            message: 'TS ADM Start',
             version: 1,
-            adm: '<main>remote creative</main>',
-            width: 300,
-            height: 250,
+            lifecycleTicket: LIFECYCLE_TICKET,
+            source: {
+              type: 'adm',
+              version: 1,
+              adm: '<main>remote creative</main>',
+              width: 300,
+              height: 250,
+            },
           },
-        },
-        ports: [],
-      });
+          ports: [],
+        })
+      );
       const frame = document.body.querySelector<HTMLIFrameElement>('iframe');
       expect(frame).not.toBeNull();
       expect(frame?.srcdoc).toContain('<main>remote creative</main>');
@@ -417,15 +419,17 @@ describe('Universal Creative bridge dispatcher', () => {
         version: 1,
         lifecycleTicket: LIFECYCLE_TICKET,
       });
-      controlListener?.({
-        data: {
-          message: 'TS Owner Settled',
-          version: 1,
-          lifecycleTicket: LIFECYCLE_TICKET,
-          outcome: 'accepted',
-        },
-        ports: [],
-      });
+      controlListener?.(
+        new MessageEvent('message', {
+          data: {
+            message: 'TS Owner Settled',
+            version: 1,
+            lifecycleTicket: LIFECYCLE_TICKET,
+            outcome: 'accepted',
+          },
+          ports: [],
+        })
+      );
 
       await expect(rendered).resolves.toBeUndefined();
       expect(frame?.isConnected).toBe(true);
@@ -889,7 +893,18 @@ describe('Universal Creative bridge dispatcher', () => {
     }
   });
 
-  it('refuses an APS owner start whose renderer URL is outside the publisher origin', async () => {
+  it.each([
+    {
+      caseName: 'cross-origin renderer route',
+      rendererOverrides: {},
+      rendererUrl: 'https://attacker.example/integrations/aps/renderer/v1',
+    },
+    {
+      caseName: 'semantically invalid renderer descriptor',
+      rendererOverrides: { tagType: 'native' },
+      rendererUrl: 'https://publisher.example/integrations/aps/renderer/v1',
+    },
+  ])('refuses an APS owner start with a $caseName', async ({ rendererOverrides, rendererUrl }) => {
     vi.useFakeTimers();
     const dynamicWindow = window as unknown as {
       render?: (
@@ -956,7 +971,7 @@ describe('Universal Creative bridge dispatcher', () => {
           message: 'TS APS Start',
           version: 1,
           lifecycleTicket: LIFECYCLE_TICKET,
-          rendererUrl: 'https://attacker.example/integrations/aps/renderer/v1',
+          rendererUrl,
           envelope: {
             version: 1,
             nonce: 'n1_abcdefghijklmnopqrstuv',
@@ -971,6 +986,7 @@ describe('Universal Creative bridge dispatcher', () => {
               width: 300,
               height: 250,
               aaxResponse: 'renderer-envelope',
+              ...rendererOverrides,
             },
           },
         },
@@ -1866,7 +1882,8 @@ describe('Universal Creative bridge dispatcher', () => {
       version: 1,
       lifecycleTicket: LIFECYCLE_TICKET,
     });
-    expect(gam.attempt.beginAdm).toHaveBeenCalledOnce();
+    expect(gam.attempt.beginAdm).toHaveBeenCalledWith(gam.artifact);
+    expect(gam.artifact.dispose).not.toHaveBeenCalled();
     expect(gam.attempt.accept).not.toHaveBeenCalled();
 
     dispatchPortMessage(controlRetained, {
@@ -1875,6 +1892,7 @@ describe('Universal Creative bridge dispatcher', () => {
       lifecycleTicket: LIFECYCLE_TICKET,
     });
     expect(gam.attempt.accept).toHaveBeenCalledOnce();
+    expect(gam.artifact.dispose).not.toHaveBeenCalled();
     expect(controlRetained.postMessage).toHaveBeenCalledTimes(2);
     expect(controlRetained.postMessage.mock.calls[1]).toEqual([
       {
@@ -2084,7 +2102,8 @@ describe('Universal Creative bridge dispatcher', () => {
       version: 1,
       lifecycleTicket: LIFECYCLE_TICKET,
     });
-    expect(gam.attempt.beginApsDocument).toHaveBeenCalledOnce();
+    expect(gam.attempt.beginApsDocument).toHaveBeenCalledWith(gam.artifact);
+    expect(gam.artifact.dispose).not.toHaveBeenCalled();
     expect(consume).toHaveBeenCalledOnce();
     expect(gam.attempt.apsDocumentAccepted).toHaveBeenCalledOnce();
     expect(gam.attempt.accept).toHaveBeenCalledOnce();
@@ -2101,6 +2120,7 @@ describe('Universal Creative bridge dispatcher', () => {
     expect(documentRetained.close).toHaveBeenCalledOnce();
     expect(controlTransferred.close).not.toHaveBeenCalled();
     expect(documentTransferred.close).not.toHaveBeenCalled();
+    expect(gam.artifact.dispose).not.toHaveBeenCalled();
   });
 
   it('suppresses, refuses, and invalidates a live ticket used from the wrong source', () => {
