@@ -1214,6 +1214,32 @@ describe('browser messaging adapter', () => {
     expect(one?.[0]).not.toHaveProperty('postMessage');
   });
 
+  it('inspects every available refusal port without treating malformed counts as exact', () => {
+    const adapter = createBrowserMessagingAdapter(createTarget());
+    const first = createPort();
+    const second = createPort();
+    const third = createPort();
+    const malformed = { close: vi.fn() };
+    const laterUsable = createPort();
+
+    const overflow = adapter.inspectTransferredPorts({ ports: [first, second, third] });
+    expect(overflow).toMatchObject({ exactShape: true, originalCount: 3 });
+    expect(overflow?.ports).toHaveLength(3);
+    expect(Object.isFrozen(overflow)).toBe(true);
+    expect(Object.isFrozen(overflow?.ports)).toBe(true);
+    overflow?.ports.forEach((port) => port.close());
+    expect(first.close).toHaveBeenCalledOnce();
+    expect(second.close).toHaveBeenCalledOnce();
+    expect(third.close).toHaveBeenCalledOnce();
+
+    const mixed = adapter.inspectTransferredPorts({ ports: [malformed, laterUsable] });
+    expect(mixed).toMatchObject({ exactShape: true, originalCount: 2 });
+    expect(mixed?.ports).toHaveLength(1);
+    expect(malformed.close).toHaveBeenCalledOnce();
+    mixed?.ports[0]?.close();
+    expect(laterUsable.close).toHaveBeenCalledOnce();
+  });
+
   it('closes every transferred port on count mismatch and contains hostile closure', () => {
     const adapter = createBrowserMessagingAdapter(createTarget());
     const first = createPort();

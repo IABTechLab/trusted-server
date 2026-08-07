@@ -24,7 +24,7 @@ import {
 } from '../core/contracts/auction_projection';
 import { validateApsRenderer } from '../core/contracts/aps_renderer';
 import { prepareAdmIframe } from '../core/render';
-import { renderDirectApsAttempt } from '../integrations/aps/render';
+import { APS_RENDERER_V1_PATH, renderDirectApsAttempt } from '../integrations/aps/render';
 import { createBrowserNavigationIdentityIssuer } from '../kernel/identity';
 import type { NavigationIdentityIssuerFactory, RuntimeSession } from '../kernel/sessions';
 import { createRuntimeSession } from '../kernel/sessions';
@@ -39,11 +39,13 @@ import {
 import { createReservationService, type ReservationService } from '../services/reservations';
 import {
   createRendererNonceRegistry,
+  resolveCacheAdmAttempt,
   renderDirectCacheAttempt,
   renderDirectAdmAttempt,
   type RenderAttempt,
   type RendererNonceRegistry,
 } from '../services/render';
+import { createPucBridge, type PucBridge, type PucBridgeOptions } from '../services/puc_bridge';
 import { createSlotService, type SlotService } from '../services/slots';
 import { createTargetingService, type TargetingService } from '../services/targeting';
 
@@ -58,6 +60,7 @@ export interface BrowserComposition {
 }
 
 export interface BrowserServices {
+  readonly pucBridge: PucBridge;
   readonly reservations: ReservationService;
   readonly rendererNonces: RendererNonceRegistry;
   readonly renderDirectAdm: (attempt: RenderAttempt, container: HTMLElement) => boolean;
@@ -93,13 +96,11 @@ export interface BrowserRuntimeComposition extends BrowserComposition {
   readonly reservationServiceForTest: () => ReservationService | undefined;
   /** Return runtime-owned renderer nonces only in coordinated-cutover tests. */
   readonly rendererNonceRegistryForTest: () => RendererNonceRegistry | undefined;
+  /** Return the single runtime-owned PUC bridge only in coordinated-cutover tests. */
+  readonly pucBridgeForTest: () => PucBridge | undefined;
 }
 
 export interface BrowserCoreActivations {
-  readonly bridgeRecognizer: (
-    context: CoreActivationContext,
-    adapters: Readonly<BrowserAdapters>
-  ) => void;
   readonly correctnessGptListeners: (
     context: CoreActivationContext,
     adapters: Readonly<BrowserAdapters>,
@@ -119,6 +120,13 @@ interface AcceptedBrowserBoot {
   readonly manifest: {
     readonly integrations: readonly { readonly id: string }[];
   };
+}
+
+interface PreparedBrowserServices {
+  readonly publisherOrigin: string;
+  readonly rendererUrl: string;
+  readonly resolveCacheAdm: NonNullable<PucBridgeOptions['resolveCacheAdm']>;
+  readonly services: Readonly<Omit<BrowserServices, 'pucBridge'>>;
 }
 
 function projectionSlots(projection: object): readonly string[] {
@@ -197,6 +205,7 @@ export function createTestBrowserRuntimeComposition(
 ): BrowserRuntimeComposition {
   const composition = createBrowserComposition(compositionOptions);
   let runtimeSession: RuntimeSession | undefined;
+  let preparedBrowserServices: PreparedBrowserServices | undefined;
   let browserServices: Readonly<BrowserServices> | undefined;
   let auctionContextRegistry: AuctionContextRegistry | undefined;
   let projectionParser: ((candidate: unknown) => object | undefined) | undefined;
@@ -221,6 +230,7 @@ export function createTestBrowserRuntimeComposition(
       const rendererNonces = createRendererNonceRegistry();
       const publisherOrigin = window.location.origin;
       const fetchCache = globalThis.fetch;
+      const rendererUrl = new URL(APS_RENDERER_V1_PATH, publisherOrigin).href;
       const renderDirectAdm = (attempt: RenderAttempt, container: HTMLElement): boolean => {
         try {
           return renderDirectAdmAttempt({
@@ -276,6 +286,38 @@ export function createTestBrowserRuntimeComposition(
           return false;
         }
       };
+      const resolveCacheAdm: NonNullable<PucBridgeOptions['resolveCacheAdm']> = (
+        attempt,
+        onResolved
+      ): boolean => {
+        if (!cachePolicy) {
+          try {
+            attempt.fail('descriptor_invalid');
+          } catch {
+            // The admitted attempt remains the only terminal authority.
+          }
+          return false;
+        }
+        if (typeof fetchCache !== 'function') {
+          try {
+            attempt.fail('cache_network_error');
+          } catch {
+            // The admitted attempt remains the only terminal authority.
+          }
+          return false;
+        }
+        try {
+          return resolveCacheAdmAttempt({
+            attempt: attempt as RenderAttempt,
+            cachePolicy,
+            fetcher: (input, init) => fetchCache(input, init),
+            onResolved,
+            publisherOrigin,
+          });
+        } catch {
+          return false;
+        }
+      };
       const services = Object.freeze({
         reservations: reservationService,
         rendererNonces,
@@ -284,6 +326,12 @@ export function createTestBrowserRuntimeComposition(
         renderDirectCache,
         slots: slotService,
         targeting: targetingService,
+      });
+      preparedBrowserServices = Object.freeze({
+        publisherOrigin,
+        rendererUrl,
+        resolveCacheAdm,
+        services,
       });
       const session = createRuntimeSession({
         createIdentityIssuer:
@@ -300,6 +348,7 @@ export function createTestBrowserRuntimeComposition(
         composition.adapters.prebid.dispose();
         if (runtimeSession === session) {
           runtimeSession = undefined;
+          preparedBrowserServices = undefined;
           browserServices = undefined;
           auctionContextRegistry = undefined;
           projectionParser = undefined;
@@ -326,14 +375,23 @@ export function createTestBrowserRuntimeComposition(
         runtimeOwner: session,
       });
       runtimeSession = session;
-      browserServices = services;
       auctionContextRegistry = contextRegistry;
       projectionParser = parseProjection;
       return runtimeOptions.activateOwner?.(context);
     },
     activateCore: (context) => {
-      if (!browserServices) throw new Error('Browser services are unavailable');
-      compositionOptions.coreActivations.bridgeRecognizer(context, composition.adapters);
+      const prepared = preparedBrowserServices;
+      if (!prepared) throw new Error('Browser services are unavailable');
+      const pucBridge = createPucBridge({
+        messaging: composition.adapters.messaging,
+        publisherOrigin: prepared.publisherOrigin,
+        rendererNonces: prepared.services.rendererNonces,
+        rendererUrl: prepared.rendererUrl,
+        reservations: prepared.services.reservations,
+        resolveCacheAdm: prepared.resolveCacheAdm,
+      });
+      context.onDispose(() => pucBridge.dispose());
+      browserServices = Object.freeze({ ...prepared.services, pucBridge });
       browserServices.slots.activate();
       compositionOptions.coreActivations.correctnessGptListeners(
         context,
@@ -362,5 +420,6 @@ export function createTestBrowserRuntimeComposition(
     targetingServiceForTest: () => browserServices?.targeting,
     reservationServiceForTest: () => browserServices?.reservations,
     rendererNonceRegistryForTest: () => browserServices?.rendererNonces,
+    pucBridgeForTest: () => browserServices?.pucBridge,
   });
 }
