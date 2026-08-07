@@ -261,6 +261,8 @@ impl AdServerMockProvider {
     /// fields back, so they are restored from the index using
     /// `(seat, impid, bidder)` where bidder is recovered from the echoed `crid`
     /// field (`"{bidder}-creative"` format set during request construction).
+    /// `bid_id` is the exception: the mediation response carries its own
+    /// `OpenRTB` bid `id`, which is preferred over the original SSP bid's.
     fn parse_mediation_response(
         &self,
         json: &Json,
@@ -318,6 +320,17 @@ impl AdServerMockProvider {
                     }),
                     nurl: original.and_then(|b| b.nurl.clone()),
                     burl: original.and_then(|b| b.burl.clone()),
+                    // The mediation response is itself `OpenRTB`, so the mediated
+                    // bid's own `id` is this bid's identifier. Fall back to the
+                    // original SSP bid's id when the mediator omits one. Without
+                    // either, a mediated bid whose only `hb_adid` source is the bid
+                    // id would lose it and never render — including APS bids, which
+                    // carry no `ad_id` or `cache_id` for the restore to recover.
+                    bid_id: bid["id"]
+                        .as_str()
+                        .filter(|id| !id.is_empty())
+                        .map(String::from)
+                        .or_else(|| original.and_then(|b| b.bid_id.clone())),
                     ad_id: original.and_then(|b| b.ad_id.clone()),
                     cache_id: original.and_then(|b| b.cache_id.clone()),
                     cache_host: original.and_then(|b| b.cache_host.clone()),
@@ -642,6 +655,7 @@ mod tests {
                     adomain: Some(vec!["amazon.com".to_string()]),
                     nurl: None,
                     burl: None,
+                    bid_id: None,
                     ad_id: None,
                     cache_id: None,
                     cache_host: None,
@@ -665,6 +679,7 @@ mod tests {
                     adomain: None,
                     nurl: Some("https://ssp.example/win?id=mock-bid-001".to_string()),
                     burl: Some("https://ssp.example/bill?id=mock-bid-001".to_string()),
+                    bid_id: None,
                     ad_id: Some("mock-bid-001".to_string()),
                     cache_id: None,
                     cache_host: None,
@@ -784,6 +799,7 @@ mod tests {
                 height: 90,
                 nurl: Some("https://ssp.example/win".to_string()),
                 burl: Some("https://ssp.example/bill".to_string()),
+                bid_id: None,
                 ad_id: Some("bid-impression-id".to_string()),
                 cache_id: Some("cache-uuid".to_string()),
                 cache_host: Some("cache.example".to_string()),
@@ -831,6 +847,73 @@ mod tests {
             bid.cache_path.as_deref(),
             Some("/cache"),
             "should restore PBS cache path"
+        );
+        assert_eq!(
+            bid.bid_id.as_deref(),
+            Some("mediated-bid-001"),
+            "should carry the mediated OpenRTB bid id so hb_adid always has a source"
+        );
+    }
+
+    #[test]
+    fn parse_mediation_response_falls_back_to_original_bid_id() {
+        // A mediator that omits the per-bid `id` must not strand a pass-through
+        // bid whose only hb_adid source is its OpenRTB bid id.
+        let provider = AdServerMockProvider::new(AdServerMockConfig::default());
+        let mediation_response = json!({
+            "id": "test-auction-123",
+            "seatbid": [
+                {
+                    "seat": "prebid",
+                    "bid": [
+                        {
+                            "impid": "header-banner",
+                            "price": 0.20,
+                            "adm": "<div>Mediated Ad</div>",
+                            "w": 728,
+                            "h": 90,
+                            "crid": "example-bidder-creative",
+                        }
+                    ]
+                }
+            ],
+            "cur": "USD"
+        });
+        let mut bid_index = BidIndex::new();
+        bid_index.insert(
+            (
+                "prebid".to_string(),
+                "header-banner".to_string(),
+                "example-bidder".to_string(),
+            ),
+            Bid {
+                slot_id: "header-banner".to_string(),
+                price: Some(0.20),
+                currency: "USD".to_string(),
+                creative: Some("<div>Original Ad</div>".to_string()),
+                adomain: None,
+                bidder: "example-bidder".to_string(),
+                width: 728,
+                height: 90,
+                nurl: None,
+                burl: None,
+                bid_id: Some("019f7e2a-b45b-70b0-a2d1-b651c430700b".to_string()),
+                ad_id: None,
+                cache_id: None,
+                cache_host: None,
+                cache_path: None,
+                metadata: HashMap::new(),
+            },
+        );
+
+        let auction_response =
+            provider.parse_mediation_response(&mediation_response, 42, &bid_index);
+
+        let bid = &auction_response.bids[0];
+        assert_eq!(
+            bid.bid_id.as_deref(),
+            Some("019f7e2a-b45b-70b0-a2d1-b651c430700b"),
+            "should restore the original SSP bid id when the mediator omits one"
         );
     }
 
@@ -903,6 +986,7 @@ mod tests {
                 adomain: Some(vec!["amazon.com".to_string()]),
                 nurl: None,
                 burl: None,
+                bid_id: None,
                 ad_id: None,
                 cache_id: None,
                 cache_host: None,

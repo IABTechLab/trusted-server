@@ -7,7 +7,7 @@ import NORMALIZE_CSS from './styles/normalize.css?inline';
 import IFRAME_TEMPLATE from './templates/iframe.html?raw';
 
 // Sandbox permissions granted to creative iframes.
-// Ad creatives routinely contain scripts for tracking, click handling, and
+// Ad creatives routinely contain scripts for impression reporting, click handling, and
 // viewability measurement, so allow-scripts and allow-same-origin are required
 // for creatives to render correctly. Server-side sanitization is the primary
 // defense against malicious markup; the sandbox provides defense-in-depth.

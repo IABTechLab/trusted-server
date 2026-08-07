@@ -260,6 +260,13 @@ pub struct PrebidIntegrationConfig {
     /// manages both lists explicitly.
     #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
     pub client_side_bidders: Vec<String>,
+    /// GAM ad-unit-path suffixes excluded from Trusted Server refresh auctions.
+    ///
+    /// Matching is exact and case-sensitive. Excluded slots still refresh through
+    /// GAM, but are not included in synthetic Prebid refresh ad units.
+    #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
+    #[validate(custom(function = "validate_excluded_gam_ad_unit_path_suffixes"))]
+    pub excluded_gam_ad_unit_path_suffixes: Vec<String>,
     /// Compatibility sugar for per-bidder, per-zone param overrides.
     ///
     /// This preserves the natural `bidder -> zone -> params` config shape for
@@ -338,6 +345,70 @@ impl IntegrationConfig for PrebidIntegrationConfig {
     }
 }
 
+fn excluded_gam_ad_unit_path_suffix_validation_error(message: &'static str) -> ValidationError {
+    let mut error = ValidationError::new("invalid_gam_ad_unit_path_suffix");
+    error.message = Some(message.into());
+    error
+}
+
+fn validate_excluded_gam_ad_unit_path_suffix(value: &str) -> Result<(), ValidationError> {
+    if value.trim() != value {
+        return Err(excluded_gam_ad_unit_path_suffix_validation_error(
+            "excluded_gam_ad_unit_path_suffixes entries must not have surrounding whitespace",
+        ));
+    }
+
+    if value.is_empty() {
+        return Err(excluded_gam_ad_unit_path_suffix_validation_error(
+            "excluded_gam_ad_unit_path_suffixes entries must not be empty",
+        ));
+    }
+
+    if !value.starts_with('/') {
+        return Err(excluded_gam_ad_unit_path_suffix_validation_error(
+            "excluded_gam_ad_unit_path_suffixes entries must start with '/'",
+        ));
+    }
+
+    if value == "/" {
+        return Err(excluded_gam_ad_unit_path_suffix_validation_error(
+            "excluded_gam_ad_unit_path_suffixes entries must identify a non-root path suffix",
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_excluded_gam_ad_unit_path_suffixes(values: &[String]) -> Result<(), ValidationError> {
+    for value in values {
+        validate_excluded_gam_ad_unit_path_suffix(value)?;
+    }
+
+    Ok(())
+}
+
+fn canonicalize_excluded_gam_ad_unit_path_suffixes(config: &mut PrebidIntegrationConfig) {
+    let mut canonical = Vec::with_capacity(config.excluded_gam_ad_unit_path_suffixes.len());
+    for suffix in std::mem::take(&mut config.excluded_gam_ad_unit_path_suffixes) {
+        if !canonical.contains(&suffix) {
+            canonical.push(suffix);
+        }
+    }
+    config.excluded_gam_ad_unit_path_suffixes = canonical;
+}
+
+fn load_config(
+    settings: &Settings,
+) -> Result<Option<PrebidIntegrationConfig>, Report<TrustedServerError>> {
+    let Some(mut config) =
+        settings.integration_config::<PrebidIntegrationConfig>(PREBID_INTEGRATION_ID)?
+    else {
+        return Ok(None);
+    };
+    canonicalize_excluded_gam_ad_unit_path_suffixes(&mut config);
+    Ok(Some(config))
+}
+
 /// Validate enabled Prebid config using the same startup-only checks as runtime registration.
 ///
 /// # Errors
@@ -347,9 +418,7 @@ impl IntegrationConfig for PrebidIntegrationConfig {
 pub fn validate_config_for_startup(
     settings: &Settings,
 ) -> Result<Option<PrebidIntegrationConfig>, Report<TrustedServerError>> {
-    let Some(config) =
-        settings.integration_config::<PrebidIntegrationConfig>(PREBID_INTEGRATION_ID)?
-    else {
+    let Some(config) = load_config(settings)? else {
         return Ok(None);
     };
     BidParamOverrideEngine::try_from_config(&config)?;
@@ -869,9 +938,7 @@ fn escape_html_attr(value: &str) -> String {
 fn build(
     settings: &Settings,
 ) -> Result<Option<Arc<PrebidIntegration>>, Report<TrustedServerError>> {
-    let Some(config) =
-        settings.integration_config::<PrebidIntegrationConfig>(PREBID_INTEGRATION_ID)?
-    else {
+    let Some(config) = load_config(settings)? else {
         return Ok(None);
     };
 
@@ -1003,6 +1070,8 @@ impl IntegrationHeadInjector for PrebidIntegration {
             bidders: &'a [String],
             #[serde(skip_serializing_if = "<[String]>::is_empty")]
             client_side_bidders: &'a [String],
+            #[serde(skip_serializing_if = "<[String]>::is_empty")]
+            excluded_gam_ad_unit_path_suffixes: &'a [String],
         }
 
         let payload = InjectedPrebidClientConfig {
@@ -1011,6 +1080,7 @@ impl IntegrationHeadInjector for PrebidIntegration {
             debug: self.config.debug,
             bidders: &self.config.bidders,
             client_side_bidders: &self.config.client_side_bidders,
+            excluded_gam_ad_unit_path_suffixes: &self.config.excluded_gam_ad_unit_path_suffixes,
         };
 
         // Escape `</` to prevent breaking out of the script tag.
@@ -2223,6 +2293,14 @@ impl PrebidAuctionProvider {
         // not an ad ID, so it is not used as a fallback: surfacing it as `ad_id`
         // (which is exposed raw in the debug bid) would mislead any consumer that
         // treats `ad_id` as a creative identifier. Absent `adid`, `ad_id` is None.
+        // The bid ID is carried separately in `bid_id` instead. An empty `id` is
+        // treated as absent — a blank hb_adid is falsey on the page, so it would
+        // be no better than omitting the key.
+        let bid_id = bid_obj
+            .get("id")
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty())
+            .map(String::from);
         let ad_id = bid_obj
             .get("adid")
             .and_then(|v| v.as_str())
@@ -2291,6 +2369,7 @@ impl PrebidAuctionProvider {
             height,
             nurl,
             burl,
+            bid_id,
             ad_id,
             cache_id,
             cache_host,
@@ -2574,6 +2653,7 @@ mod tests {
             external_bundle_sha256: None,
             external_bundle_sri: None,
             client_side_bidders: Vec::new(),
+            excluded_gam_ad_unit_path_suffixes: Vec::new(),
             bid_param_zone_overrides: HashMap::default(),
             bid_param_overrides: HashMap::default(),
             bid_param_override_rules: Vec::new(),
@@ -2882,6 +2962,96 @@ passphrase = "test-secret-key-32-bytes-minimum"
 
     fn json_object(value: Json) -> serde_json::Map<String, Json> {
         serde_json::from_value(value).expect("should build JSON object")
+    }
+
+    #[test]
+    fn excluded_gam_ad_unit_path_suffixes_default_to_empty() {
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+server_url = "https://prebid.example/openrtb2/auction"
+"#,
+        );
+
+        assert!(
+            config.excluded_gam_ad_unit_path_suffixes.is_empty(),
+            "should default to no refresh-auction exclusions"
+        );
+    }
+
+    #[test]
+    fn startup_validation_and_runtime_build_canonicalize_excluded_gam_ad_unit_path_suffixes() {
+        let mut settings = make_settings();
+        settings
+            .integrations
+            .insert_config(
+                PREBID_INTEGRATION_ID,
+                &json!({
+                    "enabled": true,
+                    "server_url": "https://prebid.example/openrtb2/auction",
+                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
+                    "excluded_gam_ad_unit_path_suffixes": [
+                        "/trackingonly",
+                        "/measurement-only",
+                        "/trackingonly"
+                    ]
+                }),
+            )
+            .expect("should replace Prebid test configuration");
+
+        let config = validate_config_for_startup(&settings)
+            .expect("should validate Prebid configuration")
+            .expect("should return enabled Prebid configuration");
+
+        assert_eq!(
+            config.excluded_gam_ad_unit_path_suffixes,
+            ["/trackingonly", "/measurement-only"],
+            "should retain only the first declaration of each suffix"
+        );
+
+        let integration = build(&settings)
+            .expect("should build Prebid integration")
+            .expect("should return enabled Prebid integration");
+        let document_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "pub.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &document_state,
+        };
+        let inserts = integration.head_inserts(&ctx);
+
+        assert!(
+            inserts[0].contains(
+                r#""excludedGamAdUnitPathSuffixes":["/trackingonly","/measurement-only"]"#
+            ),
+            "should inject the canonical suffix list: {}",
+            inserts[0]
+        );
+    }
+
+    #[test]
+    fn excluded_gam_ad_unit_path_suffixes_reject_invalid_values() {
+        for (suffix, expected_message) in [
+            ("", "must not be empty"),
+            (" /trackingonly", "must not have surrounding whitespace"),
+            ("trackingonly", "must start with '/'"),
+            ("/", "must identify a non-root path suffix"),
+        ] {
+            let error = parse_prebid_toml_result(&format!(
+                r#"
+[integrations.prebid]
+server_url = "https://prebid.example/openrtb2/auction"
+excluded_gam_ad_unit_path_suffixes = ["{suffix}"]
+"#
+            ))
+            .expect_err("should reject an invalid refresh-auction exclusion suffix");
+
+            assert!(
+                error.to_string().contains(expected_message),
+                "should report why suffix {suffix:?} is invalid: {error}"
+            );
+        }
     }
 
     #[test]
@@ -3749,6 +3919,36 @@ external_bundle_sri = "sha384-AAAA"
         assert!(
             script.contains(r#""bidders":["exampleBidder"]"#),
             "should include bidders array: {}",
+            script
+        );
+        assert!(
+            !script.contains("excludedGamAdUnitPathSuffixes"),
+            "should omit empty refresh-auction exclusions: {}",
+            script
+        );
+    }
+
+    #[test]
+    fn head_injector_includes_excluded_gam_ad_unit_path_suffixes() {
+        let mut config = base_config();
+        config.excluded_gam_ad_unit_path_suffixes =
+            vec!["/trackingonly".to_string(), "/measurement-only".to_string()];
+        let integration = PrebidIntegration::new(config);
+        let document_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "pub.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &document_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+        let script = &inserts[0];
+        assert!(
+            script.contains(
+                r#""excludedGamAdUnitPathSuffixes":["/trackingonly","/measurement-only"]"#
+            ),
+            "should inject refresh-auction exclusion suffixes: {}",
             script
         );
     }
@@ -7306,6 +7506,60 @@ set = { networkId = 42 }
             bid.cache_id.as_deref(),
             Some("cache-uuid-xyz"),
             "should extract cache UUID separately"
+        );
+        assert_eq!(
+            bid.bid_id.as_deref(),
+            Some("bid-impression-id"),
+            "should keep the OpenRTB bid id separate from ad_id"
+        );
+    }
+
+    #[test]
+    fn parse_bid_keeps_bid_id_when_adid_and_cache_are_absent() {
+        // The shape that leaves hb_adid with no other source: `id` is mandatory
+        // per OpenRTB, `adid` is optional and omitted by some bidders, and no
+        // Prebid Cache entry exists because the creative ships inline.
+        let bid_json = serde_json::json!({
+            "id": "019f7e2a-b45b-70b0-a2d1-b651c430700b",
+            "impid": "atf_sidebar_ad",
+            "price": 1.0,
+            "w": 300,
+            "h": 250,
+        });
+        let provider = PrebidAuctionProvider::new(base_config());
+        let bid = provider
+            .parse_bid(&bid_json, "example-bidder")
+            .expect("should parse bid");
+        assert_eq!(
+            bid.bid_id.as_deref(),
+            Some("019f7e2a-b45b-70b0-a2d1-b651c430700b"),
+            "should populate bid_id from the OpenRTB bid id"
+        );
+        assert!(bid.ad_id.is_none(), "should not synthesize ad_id from id");
+        assert!(
+            bid.cache_id.is_none(),
+            "should not synthesize cache_id from id"
+        );
+    }
+
+    #[test]
+    fn parse_bid_treats_blank_bid_id_as_absent() {
+        // A blank hb_adid is falsey on the page, so carrying an empty `id`
+        // forward would be no better than omitting the field.
+        let bid_json = serde_json::json!({
+            "id": "",
+            "impid": "atf_sidebar_ad",
+            "price": 1.0,
+            "w": 300,
+            "h": 250,
+        });
+        let provider = PrebidAuctionProvider::new(base_config());
+        let bid = provider
+            .parse_bid(&bid_json, "example-bidder")
+            .expect("should parse bid");
+        assert!(
+            bid.bid_id.is_none(),
+            "should treat an empty OpenRTB bid id as absent"
         );
     }
 

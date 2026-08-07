@@ -45,6 +45,9 @@ timeout_ms = 1000
 bidders = []
 debug = false
 client_side_bidders = []
+# Keep selected GAM inventory out of Trusted Server's Prebid refresh auctions.
+# Matching slots still refresh through GAM.
+# excluded_gam_ad_unit_path_suffixes = ["/trackingonly"]
 # Runtime bundle metadata. Set these after running `ts prebid bundle` and uploading the bundle.
 # external_bundle_url = "https://assets.example.com/prebid/trusted-prebid-<sha256>.js"
 # external_bundle_sha256 = "<manifest sha256>"

@@ -129,6 +129,8 @@ interface InjectedPrebidConfig {
   bidders?: string[];
   /** Bidders that run client-side via native Prebid.js adapters. */
   clientSideBidders?: string[];
+  /** GAM ad-unit-path suffixes excluded from refresh auctions. */
+  excludedGamAdUnitPathSuffixes?: string[];
 }
 
 interface PrebidUserIdDiagnostics {
@@ -364,6 +366,7 @@ type PrebidUserIdEid = {
 
 type RefreshGptSlot = {
   getSlotElementId?: () => string;
+  getAdUnitPath?: () => string;
   getTargeting?: (key: string) => string[];
   clearTargeting?: (key?: string) => RefreshGptSlot;
   getSizes?: () => unknown[];
@@ -733,6 +736,33 @@ function serverSideBidderParamsForRefresh(
 function publisherZoneForRefresh(candidateCodes: Array<string | undefined>): string | undefined {
   const match = findRefreshAdUnit(candidateCodes);
   return match ? match.mediaTypes?.banner?.name : findRefreshSnapshot(candidateCodes)?.zone;
+}
+
+function isUsableRefreshAuctionExclusionSuffix(suffix: unknown): suffix is string {
+  return typeof suffix === 'string' && suffix.startsWith('/') && suffix.length > 1;
+}
+
+function refreshAuctionExclusionSuffixes(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter(isUsableRefreshAuctionExclusionSuffix) : [];
+}
+
+function isExcludedFromRefreshAuction(
+  slot: RefreshGptSlot,
+  excludedGamAdUnitPathSuffixes: readonly string[]
+): boolean {
+  if (excludedGamAdUnitPathSuffixes.length === 0) return false;
+
+  try {
+    const adUnitPath = slot.getAdUnitPath?.();
+    return (
+      typeof adUnitPath === 'string' &&
+      excludedGamAdUnitPathSuffixes.some((suffix) => adUnitPath.endsWith(suffix))
+    );
+  } catch {
+    // GPT path metadata is optional for this optimization. If it is unavailable,
+    // preserve normal refresh-auction behavior rather than suppressing demand.
+    return false;
+  }
 }
 
 function clearRefreshTargeting(slot: RefreshGptSlot): void {
@@ -1275,9 +1305,21 @@ export function installRefreshHandler(timeoutMs = 1500): void {
         return dispatchPrebidRefresh(originalRefresh, slots, opts);
       }
 
+      // Clear stale Trusted Server/Prebid targeting from independent slots before
+      // filtering so excluded slots still receive a clean GAM refresh.
       independentSlots.forEach(clearRefreshTargeting);
 
-      const adUnits = independentSlots.map((slot) => {
+      const excludedGamAdUnitPathSuffixes = refreshAuctionExclusionSuffixes(
+        getInjectedConfig()?.excludedGamAdUnitPathSuffixes
+      );
+      const auctionSlots = independentSlots.filter(
+        (slot) => !isExcludedFromRefreshAuction(slot, excludedGamAdUnitPathSuffixes)
+      );
+      if (!auctionSlots.length) {
+        return originalRefresh(slots, opts);
+      }
+
+      const adUnits = auctionSlots.map((slot) => {
         const injectedSlot = findInjectedSlotForRefresh(slot);
         const code = refreshSlotElementId(slot) ?? 'refresh-slot';
         // A TS-owned slot may be defined on `${div_id}-container`, so the GPT
@@ -1338,6 +1380,10 @@ export function installRefreshHandler(timeoutMs = 1500): void {
           }
         }
         recordPrebidRefreshForDiagnostics(targetSlots);
+        // Preserve the publisher's original refresh form. In particular, a bare
+        // GPT refresh remains bare so GPT resolves its registered slot set when
+        // the auction completes; the dispatch wrapper only scopes the shared
+        // diagnostics context around the delegated call.
         dispatchPrebidRefresh(originalRefresh, slots, opts);
       }
 
