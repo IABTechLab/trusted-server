@@ -512,6 +512,33 @@ describe('slot registry', () => {
 describe('navigation-owned DOM reconciliation', () => {
   afterEach(() => vi.useRealTimers());
 
+  it('preserves the physical slot when DOM connectivity cannot be established', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const gpt = createGptHarness();
+    const dom = createReconciliationBoundary();
+    dom.put('slot-div', {});
+    const service = createSlotService({
+      googletag: gpt.adapter,
+      now: () => Date.now(),
+      reconciliation: Object.freeze({
+        ...dom.boundary,
+        isConnected: () => {
+          throw new Error('fictional DOM connectivity failure');
+        },
+      }),
+    });
+    const navigation = createNavigation();
+    bindTrustedSlot(service, navigation);
+    service.activate();
+
+    dom.trigger();
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(gpt.destroySlots).not.toHaveBeenCalled();
+    expect(gpt.defineSlot).not.toHaveBeenCalled();
+  });
+
   it('reconciles a TS slot whose original DOM element was already absent at adoption', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
@@ -719,14 +746,18 @@ describe('navigation-owned DOM reconciliation', () => {
     expect(gpt.destroySlots).toHaveBeenCalledTimes(1);
   });
 
-  it.each(['destroy', 'define'] as const)(
+  it.each(['destroy_false', 'destroy_throw', 'define'] as const)(
     'settles %s transaction failure as gpt_request_failed without a second physical slot',
     async (failure) => {
       vi.useFakeTimers();
       vi.setSystemTime(0);
       const gpt = createGptHarness();
-      if (failure === 'destroy') gpt.destroySlots.mockReturnValue(false);
-      else gpt.defineSlot.mockReturnValueOnce(undefined);
+      if (failure === 'destroy_false') gpt.destroySlots.mockReturnValue(false);
+      else if (failure === 'destroy_throw') {
+        gpt.destroySlots.mockImplementation(() => {
+          throw new Error('fictional destroy failure');
+        });
+      } else gpt.defineSlot.mockReturnValueOnce(undefined);
       const dom = createReconciliationBoundary();
       dom.put('slot-div', {});
       const service = createSlotService({
@@ -757,6 +788,126 @@ describe('navigation-owned DOM reconciliation', () => {
       expect(service.snapshotForTest().physicalSlots).toBe(0);
     }
   );
+
+  it('quarantines an exact replacement candidate the adapter could not destroy', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const orphan = Object.freeze({ orphan: true });
+    const gpt = createGptHarness({ orphanOnReplace: orphan });
+    const dom = createReconciliationBoundary();
+    dom.put('slot-div', {});
+    const service = createSlotService({
+      googletag: gpt.adapter,
+      now: () => Date.now(),
+      reconciliation: dom.boundary,
+    });
+    const navigation = createNavigation();
+    bindTrustedSlot(service, navigation);
+    service.activate();
+    const request = service.request({
+      intentId: 'orphaned-replacement',
+      navigationGeneration: navigation.generation,
+      operation: 'display',
+      registeredSlotId: 'slot',
+      requestClass: 'primary',
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    dom.replace('slot-div', {});
+    await vi.advanceTimersByTimeAsync(250);
+    await expect(request.result).resolves.toEqual({
+      status: 'failed',
+      reason: 'gpt_request_failed',
+    });
+    const replacementBinding = {
+      definition: {
+        adUnitPath: '/network/slot',
+        elementId: 'slot-div',
+        sizes: Object.freeze([[300, 250]]),
+      },
+      ownership: 'trusted_server' as const,
+      slot: Object.freeze({ replacementAfterOrphan: true }),
+    };
+    expect(service.adoptGptSlot(navigation.generation, 'slot', replacementBinding)).toEqual({
+      ok: false,
+      reason: 'slot_quarantined',
+    });
+
+    expect(service.recordPublisherDestruction(orphan)).toBe(true);
+    expect(service.adoptGptSlot(navigation.generation, 'slot', replacementBinding)).toEqual({
+      ok: true,
+    });
+  });
+
+  it('lets expiry beat a final-pass replacement that cannot commit synchronously', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const gpt = createGptHarness({ synchronousRun: false });
+    const dom = createReconciliationBoundary();
+    dom.put('slot-div', {});
+    const service = createSlotService({
+      googletag: gpt.adapter,
+      now: () => Date.now(),
+      reconciliation: dom.boundary,
+    });
+    const navigation = createNavigation();
+    bindTrustedSlot(service, navigation);
+    service.activate();
+    await Promise.resolve();
+
+    dom.disconnect('slot-div');
+    await vi.advanceTimersByTimeAsync(250);
+    await vi.advanceTimersByTimeAsync(4_749);
+    dom.put('slot-div', {});
+    const request = service.request({
+      intentId: 'expiry-wins',
+      navigationGeneration: navigation.generation,
+      operation: 'display',
+      registeredSlotId: 'slot',
+      requestClass: 'primary',
+    });
+
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(request.result).resolves.toEqual({
+      status: 'failed',
+      reason: 'slot_unresolved',
+    });
+    expect(gpt.defineSlot).not.toHaveBeenCalled();
+    expect(gpt.destroySlots).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('lets publisher ownership transfer cancel a queued reconciliation transaction', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const gpt = createGptHarness({ synchronousRun: false });
+    const dom = createReconciliationBoundary();
+    dom.put('slot-div', {});
+    const service = createSlotService({
+      googletag: gpt.adapter,
+      now: () => Date.now(),
+      reconciliation: dom.boundary,
+    });
+    const navigation = createNavigation();
+    const slot = bindTrustedSlot(service, navigation);
+    service.activate();
+    await Promise.resolve();
+
+    dom.replace('slot-div', {});
+    vi.advanceTimersByTime(250);
+    expect(
+      service.adoptGptSlot(navigation.generation, 'slot', {
+        ownership: 'publisher',
+        slot,
+      })
+    ).toEqual({ ok: true });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(gpt.defineSlot).not.toHaveBeenCalled();
+    expect(gpt.destroySlots).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
 
   it('allows two successful rebinds and fails a third disconnect immediately', async () => {
     vi.useFakeTimers();
