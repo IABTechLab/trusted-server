@@ -422,8 +422,8 @@ export function prepareProgrammaticAdUnits(
 
   const unitsBytes = measureJsonBytes(prepared);
   if (unitsBytes === undefined) throw new AdUnitRegistrationError('invalid_params');
-  // `{"adUnits":` + encoded array + `}`.
-  if (boundedBytes(12, unitsBytes) > MAX_AUCTION_BODY_BYTES) {
+  // `{"adUnits":` + encoded array + `,"config":{}}`.
+  if (boundedBytes(24, unitsBytes) > MAX_AUCTION_BODY_BYTES) {
     throw new AdUnitRegistrationError('request_body_too_large');
   }
   if (occupied.size + prepared.length > MAX_ACTIVE_SLOT_RECORDS) {
