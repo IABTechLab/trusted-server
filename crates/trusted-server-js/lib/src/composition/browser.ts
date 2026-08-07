@@ -29,6 +29,7 @@ import {
   AdUnitRegistrationError,
   addAdUnitsResult,
   prepareProgrammaticAdUnits,
+  serializeAuctionRequestBody,
 } from '../core/registry';
 import { prepareAdmIframe } from '../core/render';
 import { APS_RENDERER_V1_PATH, renderDirectApsAttempt } from '../integrations/aps/render';
@@ -362,10 +363,9 @@ export function createTestBrowserRuntimeComposition(
     );
     let requestBody: string;
     try {
-      requestBody = JSON.stringify({ adUnits, config: context });
-      if (new TextEncoder().encode(requestBody).byteLength > 256 * 1024) {
-        throw new Error('auction request body exceeds limit');
-      }
+      const serialized = serializeAuctionRequestBody(adUnits, context);
+      if (!serialized) throw new Error('auction request body exceeds limit');
+      requestBody = serialized;
     } catch {
       return Promise.resolve(
         combineRequestResults(
