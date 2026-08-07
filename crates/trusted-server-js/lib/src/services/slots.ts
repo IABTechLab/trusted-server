@@ -1683,7 +1683,9 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     }
     if (admissionFailed) return Object.freeze([]);
     const intents: RequestIntent[] = [];
-    for (const input of preparedInputs) {
+    for (let index = 0; index < preparedInputs.length; index += 1) {
+      const input = preparedInputs[index];
+      if (!input) continue;
       const state = mapValue(navigationStates, input.navigationGeneration);
       const record = state ? mapValue(state.records, input.registeredSlotId) : undefined;
       const intent = record?.activeIntent;
@@ -1692,7 +1694,9 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     }
     if (intents.length > 0) {
       const slots: object[] = [];
-      for (const intent of intents) {
+      for (let index = 0; index < intents.length; index += 1) {
+        const intent = intents[index];
+        if (!intent) continue;
         const physical = intent.record.physical;
         if (!physical || physical.state !== 'live' || physical.activeCycle) {
           settle(intent, failed('slot_unresolved'));
@@ -1756,21 +1760,30 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
                   if (!allIntentsAdmitted()) {
                     throw new Error('SRA admission changed before invocation');
                   }
-                  for (const intent of intents) {
+                  for (let index = 0; index < intents.length; index += 1) {
+                    const intent = intents[index];
+                    if (!intent) continue;
                     if (!intent.terminal) armRequestDeadline(intent);
                   }
                   gpt.refresh(slots, Object.freeze({ changeCorrelator: false }));
                 });
               } catch {
-                for (const intent of intents) failExternalInvocation(intent.record, intent);
+                for (let index = 0; index < intents.length; index += 1) {
+                  const intent = intents[index];
+                  if (intent) failExternalInvocation(intent.record, intent);
+                }
                 return;
               }
               const liveIntents: RequestIntent[] = [];
-              for (const intent of intents) {
+              for (let index = 0; index < intents.length; index += 1) {
+                const intent = intents[index];
+                if (!intent) continue;
                 if (!intent.terminal) liveIntents[liveIntents.length] = intent;
               }
               let remaining = liveIntents.length;
-              for (const intent of liveIntents) {
+              for (let index = 0; index < liveIntents.length; index += 1) {
+                const intent = liveIntents[index];
+                if (!intent) continue;
                 let released = false;
                 intent.invocation = {
                   dispose: (): void => {
@@ -1785,19 +1798,26 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
               void operation.result.then(
                 () => undefined,
                 () => {
-                  for (const intent of intents) failExternalInvocation(intent.record, intent);
+                  for (let index = 0; index < intents.length; index += 1) {
+                    const intent = intents[index];
+                    if (intent) failExternalInvocation(intent.record, intent);
+                  }
                 }
               );
             },
             () => {
               if (provisionalSubscriptions?.installed) provisionalSubscriptions.ownership.release();
-              for (const intent of intents) failExternalInvocation(intent.record, intent);
+              for (let index = 0; index < intents.length; index += 1) {
+                const intent = intents[index];
+                if (intent) failExternalInvocation(intent.record, intent);
+              }
             }
           );
         } catch {
           if (provisionalSubscriptions?.installed) provisionalSubscriptions.ownership.release();
-          for (const intent of intents) {
-            failExternalInvocation(intent.record, intent);
+          for (let index = 0; index < intents.length; index += 1) {
+            const intent = intents[index];
+            if (intent) failExternalInvocation(intent.record, intent);
           }
         }
       }
