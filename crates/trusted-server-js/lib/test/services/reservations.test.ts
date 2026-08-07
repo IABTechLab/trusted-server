@@ -505,8 +505,124 @@ describe('renderer reservation identity and registration', () => {
     } else {
       expect(result).toEqual({ ok: false, reason: 'service_disposed' });
       expect(service.recognize(reservationId())).toEqual({ recognized: false });
-      expect(cleanup).toBeUndefined();
+      expect(cleanup).toBeTypeOf('function');
+      expect(() => cleanup?.()).not.toThrow();
     }
+  });
+
+  it.each([
+    ['throws before applying', false],
+    ['throws after applying', true],
+  ] as const)('contains a captured WeakMap.set that %s', async (_name, applyFirst) => {
+    vi.resetModules();
+    const originalSet = WeakMap.prototype.set;
+    WeakMap.prototype.set = function poisonedOwnerSet(key, value) {
+      const record = value as Record<string, unknown> | undefined;
+      if (!record || !('identity' in record) || !('ready' in record)) {
+        return Reflect.apply(originalSet, this, [key, value]) as WeakMap<object, unknown>;
+      }
+      if (applyFirst) Reflect.apply(originalSet, this, [key, value]);
+      throw new Error('captured owner WeakMap.set failure');
+    };
+    let isolated: typeof import('../../src/services/reservations');
+    try {
+      isolated = await import('../../src/services/reservations');
+    } finally {
+      WeakMap.prototype.set = originalSet;
+    }
+    const generation = Object.freeze({});
+    let cleanup: (() => void) | undefined;
+    const renderSource = admSource() as ReservationRenderSource;
+    const service = isolated.createReservationService({
+      now: () => 0,
+      prepareRenderSource: (candidate) => (candidate === renderSource ? renderSource : undefined),
+    });
+    let result: ReturnType<typeof service.registerRender> | undefined;
+    let thrown: unknown;
+    try {
+      result = service.registerRender({
+        reservationId: reservationId(),
+        slot: 'fictional-slot',
+        navigation: {
+          generation,
+          isCurrent: () => true,
+          onDispose: (_kind, callback) => {
+            cleanup = callback;
+          },
+        },
+        attemptId: 'a1_0000000000000000000000',
+        renderSource,
+        winnerContext: { selectedCpm: 1 },
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeUndefined();
+    if (applyFirst) {
+      expect(result).toMatchObject({ ok: true });
+      expect(service.recognize(reservationId())).toMatchObject({ state: 'renderable' });
+      cleanup?.();
+      expect(service.recognize(reservationId())).toMatchObject({ state: 'disposed' });
+    } else {
+      expect(result).toEqual({ ok: false, reason: 'stale_owner' });
+      expect(cleanup).toBeUndefined();
+      expect(service.recognize(reservationId())).toMatchObject({ state: 'disposed' });
+    }
+    expect(service.snapshotInventoryForTest()).toMatchObject({
+      live: 0,
+      tombstones: 1,
+      entriesWithRenderSource: 0,
+      entriesWithWinnerContext: 0,
+    });
+  });
+
+  it('contains a captured WeakMap.get failure in a navigation callback', async () => {
+    vi.resetModules();
+    const originalGet = WeakMap.prototype.get;
+    let poisoned = false;
+    WeakMap.prototype.get = function poisonedOwnerGet(key) {
+      if (poisoned) throw new Error('captured owner WeakMap.get failure');
+      return Reflect.apply(originalGet, this, [key]) as unknown;
+    };
+    let isolated: typeof import('../../src/services/reservations');
+    try {
+      isolated = await import('../../src/services/reservations');
+    } finally {
+      WeakMap.prototype.get = originalGet;
+    }
+    const generation = Object.freeze({});
+    let cleanup: (() => void) | undefined;
+    const renderSource = admSource() as ReservationRenderSource;
+    const service = isolated.createReservationService({
+      now: () => 0,
+      prepareRenderSource: (candidate) => (candidate === renderSource ? renderSource : undefined),
+    });
+    expect(
+      service.registerRender({
+        reservationId: reservationId(),
+        slot: 'fictional-slot',
+        navigation: {
+          generation,
+          isCurrent: () => true,
+          onDispose: (_kind, callback) => {
+            cleanup = callback;
+          },
+        },
+        attemptId: 'a1_0000000000000000000000',
+        renderSource,
+        winnerContext: { selectedCpm: 1 },
+      })
+    ).toMatchObject({ ok: true });
+    poisoned = true;
+
+    expect(() => cleanup?.()).not.toThrow();
+    expect(service.recognize(reservationId())).toMatchObject({ state: 'disposed' });
+    expect(service.snapshotInventoryForTest()).toMatchObject({
+      live: 0,
+      entriesWithRenderSource: 0,
+      entriesWithWinnerContext: 0,
+    });
   });
 
   it('checks publication identity after the final reentrant owner call', () => {
@@ -669,6 +785,124 @@ describe('fixed expiry, capacity, and tombstones', () => {
       size: 2,
       live: 1,
       tombstones: 1,
+    });
+  });
+
+  it('releases live render and lease payloads when navigation disposes after a clock fault', () => {
+    let now = 100;
+    const { navigation, runtime } = runtimeNavigation();
+    const attempt = renderAttempt(navigation);
+    const service = serviceAt(() => now);
+    expect(registerRender(service, navigation, attempt, reservationId())).toEqual({
+      ok: true,
+      expiresAt: 100 + RENDER_RESERVATION_LIFETIME_MS,
+    });
+    expect(
+      service.registerPrebidLease({
+        reservationId: reservationId(1),
+        slot: 'fictional-slot',
+        navigation,
+        auctionId: 'fictional-auction',
+        adUnitCode: 'fictional-slot',
+        renderSource: admSource(),
+        winnerContext: { selectedCpm: 1 },
+        prebidBid: Object.freeze({ cpm: 1 }),
+      })
+    ).toEqual({ ok: true, expiresAt: 100 + PREBID_ADMISSION_LEASE_MS });
+    now = Number.NaN;
+    expect(service.recognize(reservationId())).toMatchObject({ state: 'renderable' });
+
+    runtime.replaceNavigation();
+
+    expect(service.recognize(reservationId())).toEqual({
+      recognized: true,
+      state: 'disposed',
+      expiresAt: 100 + RENDER_RESERVATION_LIFETIME_MS,
+    });
+    expect(service.recognize(reservationId(1))).toEqual({
+      recognized: true,
+      state: 'aborted',
+      expiresAt: 100 + PREBID_ADMISSION_LEASE_MS,
+    });
+    expect(service.snapshotInventoryForTest()).toMatchObject({
+      clockFaulted: true,
+      live: 0,
+      tombstones: 2,
+      entriesWithRenderSource: 0,
+      entriesWithWinnerContext: 0,
+      entriesWithPucSource: 0,
+    });
+  });
+
+  it('allows exact explicit terminal tombstones after a clock fault', () => {
+    let now = 100;
+    const { navigation } = runtimeNavigation();
+    const attempt = renderAttempt(navigation);
+    const service = serviceAt(() => now);
+    registerRender(service, navigation, attempt, reservationId());
+    const bid = Object.freeze({ cpm: 1 });
+    const registerLease = (id: string, auctionId: string) =>
+      service.registerPrebidLease({
+        reservationId: id,
+        slot: 'fictional-slot',
+        navigation,
+        auctionId,
+        adUnitCode: 'fictional-slot',
+        renderSource: admSource(),
+        winnerContext: { selectedCpm: 1 },
+        prebidBid: bid,
+      });
+    registerLease(reservationId(1), 'single-auction');
+    registerLease(reservationId(2), 'group-auction');
+    registerLease(reservationId(3), 'group-auction');
+    now = Number.NaN;
+    expect(service.recognize(reservationId())).toMatchObject({ state: 'renderable' });
+
+    expect(tombstone(service, navigation, attempt, reservationId(), 'stale')).toBe(true);
+    expect(
+      service.tombstonePrebidLease(
+        {
+          reservationId: reservationId(1),
+          auctionId: 'single-auction',
+          adUnitCode: 'fictional-slot',
+          navigationGeneration: navigation.generation,
+        },
+        'prebid_admission_failed'
+      )
+    ).toBe(true);
+    expect(
+      service.tombstonePrebidGroup(
+        {
+          auctionId: 'group-auction',
+          adUnitCode: 'fictional-slot',
+          navigationGeneration: navigation.generation,
+        },
+        'prebid_selection_timeout'
+      )
+    ).toBe(2);
+
+    expect(service.recognize(reservationId())).toEqual({
+      recognized: true,
+      state: 'stale',
+      expiresAt: 100 + RENDER_RESERVATION_LIFETIME_MS,
+    });
+    for (const [index, state] of [
+      [1, 'prebid_admission_failed'],
+      [2, 'prebid_selection_timeout'],
+      [3, 'prebid_selection_timeout'],
+    ] as const) {
+      expect(service.recognize(reservationId(index))).toEqual({
+        recognized: true,
+        state,
+        expiresAt: 100 + PREBID_ADMISSION_LEASE_MS,
+      });
+    }
+    expect(service.snapshotInventoryForTest()).toMatchObject({
+      live: 0,
+      tombstones: 4,
+      entriesWithRenderSource: 0,
+      entriesWithWinnerContext: 0,
+      entriesWithPucSource: 0,
     });
   });
 

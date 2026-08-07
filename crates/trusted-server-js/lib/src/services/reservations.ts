@@ -370,10 +370,14 @@ interface OwnerSnapshot {
 }
 
 interface OwnerRegistration {
+  readonly callbackState: OwnerCallbackState;
   readonly identity: object;
-  readonly token: object;
-  disposed: boolean;
   ready: boolean;
+}
+
+interface OwnerCallbackState {
+  active: boolean;
+  disposed: boolean;
 }
 
 function liveEntry(entry: ReservationEntry): entry is LiveReservation {
@@ -633,12 +637,20 @@ export function createReservationService(options: ReservationServiceOptions): Re
     return now !== undefined || clockFaulted || storeFaulted;
   };
 
+  const refreshForTerminalMutation = (): boolean => {
+    if (disposed || storeFaulted) return false;
+    if (clockFaulted) return true;
+    const now = clock();
+    return now !== undefined || clockFaulted;
+  };
+
   const publishEntry = (
     reservationId: string,
     expected: ReservationEntry | undefined,
-    next: ReservationEntry
+    next: ReservationEntry,
+    allowClockFault = false
   ): boolean => {
-    if (disposed || clockFaulted || storeFaulted) return false;
+    if (disposed || storeFaulted || (clockFaulted && !allowClockFault)) return false;
     let before: ReservationEntry | undefined;
     try {
       before = mapValue(entries, reservationId);
@@ -670,13 +682,41 @@ export function createReservationService(options: ReservationServiceOptions): Re
     state: ReservationTombstoneState
   ): boolean => {
     const tombstone = frozenResult({ expiresAt: expected.expiresAt, state });
-    return publishEntry(reservationId, expected, tombstone);
+    return publishEntry(reservationId, expected, tombstone, true);
   };
 
-  const disposeOwnerEntries = (generation: object, token: object): void => {
-    const registration = weakMapValue(ownerRegistrations, generation);
-    if (!registration || registration.token !== token) return;
-    registration.disposed = true;
+  const readOwnerRegistration = (
+    generation: object
+  ): Readonly<{ ok: true; value: OwnerRegistration | undefined }> | Readonly<{ ok: false }> => {
+    try {
+      return { ok: true, value: weakMapValue(ownerRegistrations, generation) };
+    } catch {
+      return { ok: false };
+    }
+  };
+
+  const publishOwnerRegistration = (
+    generation: object,
+    existing: OwnerRegistration | undefined,
+    registration: OwnerRegistration
+  ): boolean => {
+    try {
+      setWeakMapValue(ownerRegistrations, generation, registration);
+    } catch {
+      // The captured operation may have applied the exact registration before throwing.
+    }
+    const current = readOwnerRegistration(generation);
+    if (!current.ok || current.value !== registration) {
+      registration.callbackState.active = false;
+      return false;
+    }
+    if (existing) existing.callbackState.active = false;
+    return true;
+  };
+
+  const disposeOwnerEntries = (generation: object, state: OwnerCallbackState): void => {
+    if (!state.active || state.disposed) return;
+    state.disposed = true;
     const snapshot = entrySnapshot(entries);
     for (let index = 0; index < snapshot.length; index += 1) {
       const pair = snapshot[index];
@@ -688,50 +728,69 @@ export function createReservationService(options: ReservationServiceOptions): Re
     }
   };
 
-  const ensureOwnerRegistration = (owner: OwnerSnapshot): boolean => {
-    const existing = weakMapValue(ownerRegistrations, owner.generation);
+  const ensureOwnerRegistration = (owner: OwnerSnapshot): OwnerRegistration | undefined => {
+    const initial = readOwnerRegistration(owner.generation);
+    if (!initial.ok) return undefined;
+    const existing = initial.value;
     if (existing?.identity === owner.identity) {
       const ownerIsCurrent = currentOwner(owner);
       const currentGeneration = owner.readGeneration();
-      return (
-        ownerIsCurrent &&
+      const current = readOwnerRegistration(owner.generation);
+      return ownerIsCurrent &&
         currentGeneration === owner.generation &&
-        weakMapValue(ownerRegistrations, owner.generation) === existing &&
+        current.ok &&
+        current.value === existing &&
         existing.ready &&
-        !existing.disposed
-      );
+        existing.callbackState.active &&
+        !existing.callbackState.disposed
+        ? existing
+        : undefined;
     }
 
-    const registration: OwnerRegistration = {
-      identity: owner.identity,
-      token: frozenResult({}),
+    const callbackState: OwnerCallbackState = {
+      active: true,
       disposed: false,
+    };
+    const registration: OwnerRegistration = {
+      callbackState,
+      identity: owner.identity,
       ready: false,
     };
-    setWeakMapValue(ownerRegistrations, owner.generation, registration);
     const generation = owner.generation;
-    const token = registration.token;
+    if (!publishOwnerRegistration(generation, existing, registration)) return undefined;
     try {
-      owner.onDispose('reservation', () => disposeOwnerEntries(generation, token));
+      owner.onDispose('reservation', () => disposeOwnerEntries(generation, callbackState));
     } catch {
-      if (weakMapValue(ownerRegistrations, generation) === registration) {
-        registration.disposed = true;
-      }
-      return false;
+      callbackState.disposed = true;
+      return undefined;
     }
     const ownerIsCurrent = currentOwner(owner);
     const currentGeneration = owner.readGeneration();
+    const current = readOwnerRegistration(generation);
     if (
       !ownerIsCurrent ||
       currentGeneration !== generation ||
-      weakMapValue(ownerRegistrations, generation) !== registration ||
-      registration.disposed
+      !current.ok ||
+      current.value !== registration ||
+      !callbackState.active ||
+      callbackState.disposed
     ) {
-      registration.disposed = true;
-      return false;
+      callbackState.disposed = true;
+      return undefined;
     }
     registration.ready = true;
-    return true;
+    return registration;
+  };
+
+  const currentOwnerRegistration = (owner: OwnerSnapshot, expected: OwnerRegistration): boolean => {
+    const current = readOwnerRegistration(owner.generation);
+    return (
+      current.ok &&
+      current.value === expected &&
+      expected.ready &&
+      expected.callbackState.active &&
+      !expected.callbackState.disposed
+    );
   };
 
   const failure = (
@@ -820,17 +879,28 @@ export function createReservationService(options: ReservationServiceOptions): Re
     };
     const success = frozenResult({ ok: true as const, expiresAt: entry.expiresAt });
     const staleOwner = failure('stale_owner');
+    const ownerRegistration = ensureOwnerRegistration(owner);
+    if (!ownerRegistration) {
+      const rejected = frozenResult({
+        expiresAt: entry.expiresAt,
+        state: ownerDisposalState(entry),
+      });
+      return publishEntry(input.reservationId, undefined, rejected)
+        ? staleOwner
+        : failure('service_disposed');
+    }
     if (!publishEntry(input.reservationId, undefined, entry)) {
       return failure('service_disposed');
     }
-    const ownerRegistered = ensureOwnerRegistration(owner);
     const ownerIsCurrent = currentOwner(owner);
     const currentGeneration = owner.readGeneration();
+    const ownerRegistrationIsCurrent = currentOwnerRegistration(owner, ownerRegistration);
+    const entryIsCurrent = mapValue(entries, input.reservationId) === entry;
     if (
-      !ownerRegistered ||
       !ownerIsCurrent ||
       currentGeneration !== entry.navigationGeneration ||
-      mapValue(entries, input.reservationId) !== entry
+      !ownerRegistrationIsCurrent ||
+      !entryIsCurrent
     ) {
       replaceWithTombstone(input.reservationId, entry, ownerDisposalState(entry));
       return staleOwner;
@@ -1032,7 +1102,7 @@ export function createReservationService(options: ReservationServiceOptions): Re
         'navigationGeneration',
         'attemptId',
       ]);
-      if (clock() === undefined || !fields || typeof fields.reservationId !== 'string') {
+      if (!refreshForTerminalMutation() || !fields || typeof fields.reservationId !== 'string') {
         return false;
       }
       const entry = mapValue(entries, fields.reservationId);
@@ -1056,7 +1126,7 @@ export function createReservationService(options: ReservationServiceOptions): Re
         'adUnitCode',
         'navigationGeneration',
       ]);
-      if (clock() === undefined || !fields || typeof fields.reservationId !== 'string') {
+      if (!refreshForTerminalMutation() || !fields || typeof fields.reservationId !== 'string') {
         return false;
       }
       const entry = mapValue(entries, fields.reservationId);
@@ -1076,7 +1146,7 @@ export function createReservationService(options: ReservationServiceOptions): Re
     tombstonePrebidGroup(input, state): number {
       if (!validPrebidGroupTombstoneState(state)) return 0;
       const fields = ownDataRecord(input, ['auctionId', 'adUnitCode', 'navigationGeneration']);
-      if (clock() === undefined || !fields) {
+      if (!refreshForTerminalMutation() || !fields) {
         return 0;
       }
       let count = 0;
