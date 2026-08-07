@@ -6,7 +6,7 @@
 
 ## Overview
 
-The Google Tag Manager (GTM) integration enables Trusted Server to act as a first-party proxy for GTM scripts and analytics beacons. This improves performance, tracking accuracy, and privacy control by serving these assets from your own domain.
+The Google Tag Manager (GTM) integration enables Trusted Server to act as a first-party proxy for GTM scripts and analytics beacons. This improves performance and measurement accuracy by serving these assets from your own domain, and limits the client data forwarded to Google.
 
 ## What is the Tag Gateway?
 
@@ -17,17 +17,17 @@ The Tag Gateway intercepts requests for GTM scripts (`gtm.js`) and Google Analyt
 - **Bypass Ad Blockers**: Serving scripts from a first-party domain can prevent them from being blocked by some ad blockers and privacy extensions.
 - **Extended Cookie Life**: First-party cookies set by these scripts are more durable in environments like Safari (ITP).
 - **Performance**: Utilize edge caching for scripts.
-- **Privacy Enhancement**: Does not forward client IP to Google (Google sees edge server IP, not user IP).
+- **IP Address Handling**: Does not forward client IP to Google (Google sees edge server IP, not user IP).
 
-**Privacy vs. Analytics Tradeoff**:
+**IP Forwarding vs. Analytics Tradeoff**:
 
 Client IP addresses are intentionally **not forwarded** to Google Analytics. This means:
 
-- ✅ **Privacy**: User IP addresses remain private and are not sent to Google
+- ✅ **IP withheld**: User IP addresses are not sent to Google
 - ⚠️ **Analytics**: Geographic targeting and user location data will be based on the edge server's IP, not the actual user's location
 - ⚠️ **Accuracy**: Analytics reports may show less accurate geographic distribution
 
-This is a deliberate privacy-first design choice. If your use case requires accurate geographic data, you may need to consider alternative approaches.
+This is a deliberate design choice to limit data forwarded to Google. If your use case requires accurate geographic data, you may need to consider alternative approaches.
 
 ## Configuration
 
@@ -100,7 +100,7 @@ Analytics data (events, pageviews) normally sent to `google-analytics.com/collec
 
 `https://your-server.com/integrations/google_tag_manager/collect`
 
-Trusted Server acts as a privacy-enhancing gateway. Client IP addresses are not forwarded to Google — Google sees only the edge server IP, not the actual user IP.
+Trusted Server acts as the forwarding gateway. Client IP addresses are not forwarded to Google. Google sees only the edge server IP, not the actual user IP.
 
 ## Core Endpoints
 
@@ -150,7 +150,7 @@ POST /integrations/google_tag_manager/g/collect?v=2&...
 
 - Proxies to `https://www.google-analytics.com/g/collect`
 - Forwarding: User-Agent, Referer, Payload
-- Privacy: Does NOT forward client IP (Google sees Trusted Server IP)
+- IP forwarding: Does NOT forward client IP (Google sees Trusted Server IP)
 
 **POST Request Handling**:
 
