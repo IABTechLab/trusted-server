@@ -644,7 +644,10 @@ impl AuctionOrchestrator {
         }
 
         if pending_requests.is_empty() {
-            if immediate_response_count > 0 || !responses.is_empty() {
+            // An immediate response (for example, an APS-only Prebid no-bid) is
+            // a completed provider outcome. Launch failures alone remain a
+            // terminal auction error rather than being converted to a 200 no-bid.
+            if immediate_response_count > 0 {
                 return Ok(responses);
             }
             return Err(Report::new(TrustedServerError::Auction {
@@ -2502,7 +2505,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_launch_failures_remain_attributable_when_no_requests_launch() {
+    fn provider_launch_failures_error_when_no_requests_launch() {
         futures::executor::block_on(async {
             let config = AuctionConfig {
                 enabled: true,
@@ -2522,17 +2525,16 @@ mod tests {
                 .expect("should build request");
             let context = create_test_auction_context(&settings, &req, 2000);
 
-            let result = orchestrator
+            let error = orchestrator
                 .run_auction(&request, &context)
                 .await
-                .expect("should preserve attributable launch failures");
+                .expect_err("should fail when every provider launch fails");
 
-            assert_eq!(result.provider_responses.len(), 1);
-            assert_eq!(result.provider_responses[0].provider, "launch-failing");
-            assert_eq!(result.provider_responses[0].status, BidStatus::Error);
-            assert_eq!(
-                result.provider_responses[0].metadata["error_type"],
-                serde_json::json!("launch_failed")
+            assert!(
+                error
+                    .to_string()
+                    .contains("All 1 configured provider(s) skipped or failed to launch"),
+                "should explain that no configured provider request launched"
             );
         });
     }

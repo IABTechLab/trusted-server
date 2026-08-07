@@ -2921,12 +2921,15 @@ mod tests {
             services: &services,
         };
 
-        let pending =
+        let outcome =
             futures::executor::block_on(provider.request_bids(&auction_request, &context))
                 .expect("should start request");
+        let ProviderRequestOutcome::Pending { request, .. } = outcome else {
+            panic!("should return a pending Prebid request");
+        };
 
         assert!(
-            pending.backend_name().is_some(),
+            request.backend_name().is_some(),
             "should preserve backend correlation"
         );
         assert_eq!(
