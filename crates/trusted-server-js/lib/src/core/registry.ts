@@ -59,7 +59,25 @@ interface JsonMeasureFrame {
   readonly entries: readonly Readonly<{ key: string; value: unknown }>[];
   readonly source: object;
   bytes: number;
+  structureEntries: number;
   index: number;
+}
+
+interface JsonMeasurement {
+  readonly bytes: number;
+  readonly snapshot?: JsonContainerSnapshot;
+  readonly structureEntries: number;
+}
+
+interface PendingProgrammaticBid {
+  readonly bidder: string;
+  readonly params?: object;
+}
+
+interface PendingProgrammaticAdUnit {
+  readonly code: string;
+  readonly mediaTypes: ProgrammaticAdUnit['mediaTypes'];
+  readonly bids?: readonly PendingProgrammaticBid[];
 }
 
 function ownDataRecord(value: unknown): Record<string, unknown> | undefined {
@@ -140,13 +158,20 @@ function snapshotJsonContainer(value: object): JsonContainerSnapshot | undefined
 }
 
 /** Copy JSON data without invoking accessors or retaining publisher-owned objects. */
-function copyJsonRecord(value: unknown): Readonly<Record<string, unknown>> | undefined {
+function copyJsonRecord(
+  value: unknown,
+  completed = new WeakMap<object, Record<string, unknown> | unknown[]>(),
+  measurements?: WeakMap<object, JsonMeasurement>
+): Readonly<Record<string, unknown>> | undefined {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
-  const rootSnapshot = snapshotJsonContainer(value);
+  const completedRoot = completed.get(value);
+  if (completedRoot) {
+    return Array.isArray(completedRoot) ? undefined : completedRoot;
+  }
+  const rootSnapshot = measurements?.get(value)?.snapshot ?? snapshotJsonContainer(value);
   if (!rootSnapshot || rootSnapshot.array) return undefined;
   const root: Record<string, unknown> = {};
   const active = new Set<object>([value]);
-  const completed = new WeakMap<object, Record<string, unknown> | unknown[]>();
   const stack: JsonCloneFrame[] = [
     { index: 0, output: root, snapshot: rootSnapshot, source: value },
   ];
@@ -188,7 +213,8 @@ function copyJsonRecord(value: unknown): Readonly<Record<string, unknown>> | und
         });
         continue;
       }
-      const childSnapshot = snapshotJsonContainer(entry.value);
+      const childSnapshot =
+        measurements?.get(entry.value)?.snapshot ?? snapshotJsonContainer(entry.value);
       if (!childSnapshot) return undefined;
       const child: Record<string, unknown> | unknown[] = childSnapshot.array ? [] : {};
       Object.defineProperty(frame.output, entry.key, {
@@ -315,29 +341,52 @@ function boundedBytes(left: number, right: number): number {
   return left > MAX_AUCTION_BODY_BYTES - right ? MAX_AUCTION_BODY_BYTES + 1 : left + right;
 }
 
+function boundedStructureEntries(left: number, right: number): number {
+  return left > MAX_JSON_STRUCTURE_ENTRIES - right ? MAX_JSON_STRUCTURE_ENTRIES + 1 : left + right;
+}
+
 /** Exact JSON byte measurement that never consults `toJSON` or publisher prototypes. */
-function measureJsonBytes(value: unknown): number | undefined {
+function measureJson(
+  value: unknown,
+  memo = new WeakMap<object, JsonMeasurement>()
+): JsonMeasurement | undefined {
   const primitive = primitiveJsonBytes(value);
-  if (primitive !== undefined) return primitive;
+  if (primitive !== undefined) return Object.freeze({ bytes: primitive, structureEntries: 0 });
   if (typeof value !== 'object' || value === null) return undefined;
+  const completedRoot = memo.get(value);
+  if (completedRoot) return completedRoot;
   const root = snapshotJsonContainer(value);
   if (!root) return undefined;
-  const memo = new WeakMap<object, number>();
   const active = new Set<object>([value]);
   const stack: JsonMeasureFrame[] = [
-    { array: root.array, bytes: 2, entries: root.entries, index: 0, source: value },
+    {
+      array: root.array,
+      bytes: 2,
+      entries: root.entries,
+      index: 0,
+      source: value,
+      structureEntries: 1,
+    },
   ];
   while (stack.length > 0) {
     const frame = stack[stack.length - 1];
     if (!frame) return undefined;
     if (frame.index >= frame.entries.length) {
-      memo.set(frame.source, frame.bytes);
+      const measurement = Object.freeze({
+        bytes: frame.bytes,
+        snapshot: Object.freeze({ array: frame.array, entries: frame.entries }),
+        structureEntries: frame.structureEntries,
+      });
+      memo.set(frame.source, measurement);
       active.delete(frame.source);
       stack.pop();
       const parent = stack[stack.length - 1];
-      if (!parent) return frame.bytes;
-      parent.bytes = boundedBytes(parent.bytes, frame.bytes);
-      if (parent.bytes > MAX_AUCTION_BODY_BYTES) return parent.bytes;
+      if (!parent) return measurement;
+      parent.bytes = boundedBytes(parent.bytes, measurement.bytes);
+      parent.structureEntries = boundedStructureEntries(
+        parent.structureEntries,
+        measurement.structureEntries - 1
+      );
       continue;
     }
     const entry = frame.entries[frame.index];
@@ -347,11 +396,10 @@ function measureJsonBytes(value: unknown): number | undefined {
     const prefix =
       (entryIndex === 0 ? 0 : 1) + (frame.array ? 0 : encodedJsonStringBytes(entry.key) + 1);
     frame.bytes = boundedBytes(frame.bytes, prefix);
-    if (frame.bytes > MAX_AUCTION_BODY_BYTES) return frame.bytes;
+    frame.structureEntries = boundedStructureEntries(frame.structureEntries, 1);
     const childPrimitive = primitiveJsonBytes(entry.value);
     if (childPrimitive !== undefined) {
       frame.bytes = boundedBytes(frame.bytes, childPrimitive);
-      if (frame.bytes > MAX_AUCTION_BODY_BYTES) return frame.bytes;
       continue;
     }
     if (typeof entry.value !== 'object' || entry.value === null || active.has(entry.value)) {
@@ -359,8 +407,11 @@ function measureJsonBytes(value: unknown): number | undefined {
     }
     const completed = memo.get(entry.value);
     if (completed !== undefined) {
-      frame.bytes = boundedBytes(frame.bytes, completed);
-      if (frame.bytes > MAX_AUCTION_BODY_BYTES) return frame.bytes;
+      frame.bytes = boundedBytes(frame.bytes, completed.bytes);
+      frame.structureEntries = boundedStructureEntries(
+        frame.structureEntries,
+        completed.structureEntries - 1
+      );
       continue;
     }
     const child = snapshotJsonContainer(entry.value);
@@ -372,6 +423,7 @@ function measureJsonBytes(value: unknown): number | undefined {
       entries: child.entries,
       index: 0,
       source: entry.value,
+      structureEntries: 1,
     });
   }
   return undefined;
@@ -407,7 +459,8 @@ export function prepareProgrammaticAdUnits(
 
   const occupied = snapshotKnownSlots(knownSlots);
   const seen = new Set<string>();
-  const prepared: ProgrammaticAdUnit[] = [];
+  const pending: PendingProgrammaticAdUnit[] = [];
+  const measurementMemo = new WeakMap<object, JsonMeasurement>();
   for (let index = 0; index < units.length; index += 1) {
     const unit = ownDataRecord(units[index]);
     if (
@@ -459,11 +512,11 @@ export function prepareProgrammaticAdUnits(
       sizes.push(Object.freeze([dimensions[0] as number, dimensions[1] as number]));
     }
 
-    let bids: ProgrammaticAdUnit['bids'];
+    let bids: readonly PendingProgrammaticBid[] | undefined;
     if (unit.bids !== undefined) {
       const rawBids = ownDataArray(unit.bids, MAX_JSON_STRUCTURE_ENTRIES);
       if (!rawBids) throw new AdUnitRegistrationError('invalid_bids', index);
-      const copiedBids: Array<NonNullable<ProgrammaticAdUnit['bids']>[number]> = [];
+      const pendingBids: PendingProgrammaticBid[] = [];
       for (const rawBid of rawBids) {
         const bid = ownDataRecord(rawBid);
         if (!bid || (!exactKeys(bid, ['bidder']) && !exactKeys(bid, ['bidder', 'params']))) {
@@ -476,19 +529,25 @@ export function prepareProgrammaticAdUnits(
         ) {
           throw new AdUnitRegistrationError('invalid_bidder', index);
         }
-        let params: Readonly<Record<string, unknown>> | undefined;
+        let params: object | undefined;
         if (bid.params !== undefined) {
-          params = copyJsonRecord(bid.params);
-          if (!params) throw new AdUnitRegistrationError('invalid_params', index);
+          if (typeof bid.params !== 'object' || bid.params === null || Array.isArray(bid.params)) {
+            throw new AdUnitRegistrationError('invalid_params', index);
+          }
+          const measurement = measureJson(bid.params, measurementMemo);
+          if (!measurement || measurement.structureEntries > MAX_JSON_STRUCTURE_ENTRIES) {
+            throw new AdUnitRegistrationError('invalid_params', index);
+          }
+          params = bid.params;
         }
-        copiedBids.push(
+        pendingBids.push(
           Object.freeze({ bidder: bid.bidder, ...(params === undefined ? {} : { params }) })
         );
       }
-      bids = Object.freeze(copiedBids);
+      bids = Object.freeze(pendingBids);
     }
 
-    prepared.push(
+    pending.push(
       Object.freeze({
         code: unit.code,
         mediaTypes: Object.freeze({
@@ -499,16 +558,58 @@ export function prepareProgrammaticAdUnits(
     );
   }
 
-  const unitsBytes = measureJsonBytes(prepared);
-  if (unitsBytes === undefined) throw new AdUnitRegistrationError('invalid_params');
-  // `{"adUnits":` + encoded array + `,"config":{}}`.
-  if (boundedBytes(24, unitsBytes) > MAX_AUCTION_BODY_BYTES) {
+  const bodyMeasurement = measureJson({ adUnits: pending, config: {} }, measurementMemo);
+  if (!bodyMeasurement) throw new AdUnitRegistrationError('invalid_params');
+  if (
+    bodyMeasurement.bytes > MAX_AUCTION_BODY_BYTES ||
+    bodyMeasurement.structureEntries > MAX_JSON_STRUCTURE_ENTRIES
+  ) {
     throw new AdUnitRegistrationError('request_body_too_large');
   }
-  if (occupied.size + prepared.length > MAX_ACTIVE_SLOT_RECORDS) {
+  if (occupied.size + pending.length > MAX_ACTIVE_SLOT_RECORDS) {
     throw new AdUnitRegistrationError('registry_capacity');
   }
-  return Object.freeze(prepared);
+
+  const completedCopies = new WeakMap<object, Record<string, unknown> | unknown[]>();
+  const prepared: ProgrammaticAdUnit[] = [];
+  for (let index = 0; index < pending.length; index += 1) {
+    const unit = pending[index];
+    if (!unit) throw new AdUnitRegistrationError('invalid_unit', index);
+    let bids: ProgrammaticAdUnit['bids'];
+    if (unit.bids !== undefined) {
+      const copiedBids: Array<NonNullable<ProgrammaticAdUnit['bids']>[number]> = [];
+      for (let bidIndex = 0; bidIndex < unit.bids.length; bidIndex += 1) {
+        const bid = unit.bids[bidIndex];
+        if (!bid) throw new AdUnitRegistrationError('invalid_bids', index);
+        let params: Readonly<Record<string, unknown>> | undefined;
+        if (bid.params !== undefined) {
+          params = copyJsonRecord(bid.params, completedCopies, measurementMemo);
+          if (!params) throw new AdUnitRegistrationError('invalid_params', index);
+        }
+        copiedBids.push(
+          Object.freeze({ bidder: bid.bidder, ...(params === undefined ? {} : { params }) })
+        );
+      }
+      bids = Object.freeze(copiedBids);
+    }
+    prepared.push(
+      Object.freeze({
+        code: unit.code,
+        mediaTypes: unit.mediaTypes,
+        ...(bids === undefined ? {} : { bids }),
+      })
+    );
+  }
+  const frozenPrepared = Object.freeze(prepared);
+  const finalMeasurement = measureJson({ adUnits: frozenPrepared, config: {} });
+  if (!finalMeasurement) throw new AdUnitRegistrationError('invalid_params');
+  if (
+    finalMeasurement.bytes > MAX_AUCTION_BODY_BYTES ||
+    finalMeasurement.structureEntries > MAX_JSON_STRUCTURE_ENTRIES
+  ) {
+    throw new AdUnitRegistrationError('request_body_too_large');
+  }
+  return frozenPrepared;
 }
 
 export function addAdUnitsResult(units: readonly ProgrammaticAdUnit[]): AddAdUnitsResult {

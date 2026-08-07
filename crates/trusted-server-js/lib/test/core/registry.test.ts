@@ -197,6 +197,31 @@ describe('registry', () => {
     );
   });
 
+  it('bounds validation work before rejecting repeated shared params by aggregate body size', () => {
+    let ownKeysCalls = 0;
+    const sharedParams = new Proxy(
+      Object.fromEntries(
+        Array.from({ length: 16_384 }, (_, index) => [`p${index.toString(36)}`, 'x'])
+      ),
+      {
+        ownKeys: (target) => {
+          ownKeysCalls += 1;
+          return Reflect.ownKeys(target);
+        },
+      }
+    );
+    const candidates = Array.from({ length: 32 }, (_, index) => ({
+      ...unit(`shared-${index}`),
+      bids: [{ bidder: 'fictional', params: sharedParams }],
+    }));
+
+    expectRegistrationError(
+      () => prepareProgrammaticAdUnits(candidates, new Set()),
+      'request_body_too_large'
+    );
+    expect(ownKeysCalls).toBeLessThanOrEqual(4);
+  });
+
   it('serializes detached auction data without invoking inherited toJSON hooks', () => {
     const prepared = prepareProgrammaticAdUnits(unit(), new Set());
     const context = Object.freeze({ segments: Object.freeze(['one']) });
