@@ -17,6 +17,7 @@ import {
   createRenderAttempt,
   createRendererNonceRegistry,
   createSlotOperation,
+  renderDirectCacheAttempt,
   renderDirectAdmAttempt,
   type CommittedRenderArtifact,
   type DirectAdmIframeConstructor,
@@ -79,9 +80,23 @@ const DIRECT_APS_SOURCE = Object.freeze({
 });
 
 const WINNER_CONTEXT = Object.freeze({ selectedCpm: 1 });
+const CACHE_ID = 'f47447a0-b759-4f2f-9887-af458b79b570';
+const CACHE_POLICY = Object.freeze({
+  version: 1 as const,
+  baseUrl: 'https://cache.example:8443/pbc/v1/cache',
+});
+const CACHE_SOURCE = Object.freeze({
+  type: 'cache' as const,
+  version: 1 as const,
+  cacheId: CACHE_ID,
+  fetchUrl: `${CACHE_POLICY.baseUrl}?uuid=${CACHE_ID}`,
+  width: 300,
+  height: 250,
+});
 
 function prepareRenderSource(candidate: unknown) {
   if (candidate === ADM_SOURCE) return ADM_SOURCE;
+  if (candidate === CACHE_SOURCE) return CACHE_SOURCE;
   if (candidate === APS_SOURCE) return APS_SOURCE;
   if (candidate === DIRECT_APS_SOURCE) return DIRECT_APS_SOURCE;
   return undefined;
@@ -1911,6 +1926,580 @@ function claimed(
   if (!result.recognized || !result.claimed) throw new Error('should claim a reservation');
   return result;
 }
+
+function corsResponse(body: BodyInit, status = 200): Response {
+  const response = new Response(body, { status });
+  Object.defineProperty(response, 'type', { configurable: true, value: 'cors' });
+  return response;
+}
+
+function cacheResponse(body: Uint8Array) {
+  let delivered = false;
+  const cancel = vi.fn(async () => undefined);
+  return {
+    cancel,
+    response: Object.freeze({
+      body: Object.freeze({
+        getReader: () =>
+          Object.freeze({
+            cancel,
+            read: async () => {
+              if (delivered) return { done: true as const, value: undefined };
+              delivered = true;
+              return { done: false as const, value: body };
+            },
+            releaseLock: vi.fn(),
+          }),
+      }),
+      ok: true,
+      type: 'cors' as const,
+    }) as unknown as Response,
+  };
+}
+
+async function insertedCacheFrame(
+  container: HTMLElement,
+  render?: RenderAttempt
+): Promise<HTMLIFrameElement> {
+  await vi.waitFor(() =>
+    expect({
+      frame: container.querySelector('iframe'),
+      snapshot: render?.snapshot(),
+    }).toMatchObject({
+      frame: expect.any(HTMLIFrameElement),
+    })
+  );
+  const frame = container.querySelector('iframe');
+  if (!frame) throw new Error('should insert a cache ADM iframe');
+  return frame;
+}
+
+describe('direct cache attempt rendering', () => {
+  it('uses the exact bounded CORS request and renders validated OpenRTB ADM through the shared constructor', async () => {
+    document.body.innerHTML = '<div id="fictional-slot"></div>';
+    const context = Object.freeze({ selectedCpm: 1.25 });
+    const render = attempt();
+    expect(render.admitDirectWinner(CACHE_SOURCE, context)).toBe(true);
+    const container = document.getElementById('fictional-slot')!;
+    const fetchCache = vi.fn(async () =>
+      corsResponse(
+        JSON.stringify({
+          adm: '<div data-price="${AUCTION_PRICE}" data-b64="${AUCTION_PRICE:B64}">cached</div>',
+          w: 300,
+          h: 250,
+          price: 999,
+          id: 'fictional-openrtb-bid',
+          ext: { ignored: true },
+        })
+      )
+    );
+
+    expect(
+      renderDirectCacheAttempt({
+        attempt: render,
+        cachePolicy: CACHE_POLICY,
+        container,
+        fetcher: fetchCache,
+        prepareIframe: prepareAdmIframe,
+        publisherOrigin: window.location.origin,
+      })
+    ).toBe(true);
+    expect(render.snapshot()).toMatchObject({ outcome: undefined, state: 'rendering_direct' });
+    const frame = await insertedCacheFrame(container, render);
+
+    expect(fetchCache).toHaveBeenCalledWith(CACHE_SOURCE.fetchUrl, {
+      credentials: 'omit',
+      method: 'GET',
+      mode: 'cors',
+      redirect: 'error',
+      referrer: '',
+      referrerPolicy: 'no-referrer',
+      signal: expect.any(AbortSignal),
+    });
+    expect(frame.srcdoc).toContain('data-price="1.25"');
+    expect(frame.srcdoc).toContain('${AUCTION_PRICE:B64}');
+    expect(frame.srcdoc).not.toContain('999');
+    frame.dispatchEvent(new Event('load'));
+    expect(render.snapshot().outcome).toEqual({ outcome: 'accepted' });
+    document.body.innerHTML = '';
+  });
+
+  it('accepts a same-origin basic response because request mode enforces CORS', async () => {
+    document.body.innerHTML = '<div id="fictional-slot"></div>';
+    const render = attempt();
+    expect(render.admitDirectWinner(CACHE_SOURCE, WINNER_CONTEXT)).toBe(true);
+    const container = document.getElementById('fictional-slot')!;
+
+    const basicResponse = new Response(JSON.stringify({ adm: '<div>cached</div>' }));
+    Object.defineProperty(basicResponse, 'type', { configurable: true, value: 'basic' });
+    expect(
+      renderDirectCacheAttempt({
+        attempt: render,
+        cachePolicy: CACHE_POLICY,
+        container,
+        fetcher: async () => basicResponse,
+        prepareIframe: prepareAdmIframe,
+        publisherOrigin: window.location.origin,
+      })
+    ).toBe(true);
+
+    const frame = await insertedCacheFrame(container, render);
+    frame.dispatchEvent(new Event('load'));
+    expect(render.snapshot().outcome).toEqual({ outcome: 'accepted' });
+    document.body.innerHTML = '';
+  });
+
+  it('clears the fetch deadline at the final byte before preparing the ADM frame', async () => {
+    document.body.innerHTML = '<div id="fictional-slot"></div>';
+    const clear = vi.fn();
+    const render = attempt(owner(), {
+      scheduler: Object.freeze({
+        clear,
+        set: vi.fn(() => Object.freeze({})),
+      }),
+    });
+    expect(render.admitDirectWinner(CACHE_SOURCE, WINNER_CONTEXT)).toBe(true);
+    const container = document.getElementById('fictional-slot')!;
+    const prepareIframe: DirectAdmIframeConstructor = (options) => {
+      expect(clear).toHaveBeenCalledTimes(1);
+      return prepareAdmIframe(options);
+    };
+
+    expect(
+      renderDirectCacheAttempt({
+        attempt: render,
+        cachePolicy: CACHE_POLICY,
+        container,
+        fetcher: async () => corsResponse(JSON.stringify({ adm: '<div>cached</div>' })),
+        prepareIframe,
+        publisherOrigin: window.location.origin,
+      })
+    ).toBe(true);
+
+    const frame = await insertedCacheFrame(container, render);
+    frame.dispatchEvent(new Event('load'));
+    expect(render.snapshot().outcome).toEqual({ outcome: 'accepted' });
+    document.body.innerHTML = '';
+  });
+
+  it('keeps the admitted direct-cache winner context across delayed fetch and later winner changes', async () => {
+    document.body.innerHTML = '<div id="fictional-slot"></div>';
+    const render = attempt();
+    expect(render.admitDirectWinner(CACHE_SOURCE, Object.freeze({ selectedCpm: 2.5 }))).toBe(true);
+    const container = document.getElementById('fictional-slot')!;
+    let resolveFetch: ((response: Response) => void) | undefined;
+    const fetchCache = vi.fn(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveFetch = resolve;
+        })
+    );
+
+    expect(
+      renderDirectCacheAttempt({
+        attempt: render,
+        cachePolicy: CACHE_POLICY,
+        container,
+        fetcher: fetchCache,
+        prepareIframe: prepareAdmIframe,
+        publisherOrigin: window.location.origin,
+      })
+    ).toBe(true);
+    const later = attempt(owner(ATTEMPT_TWO, 'later-slot'));
+    expect(later.admitDirectWinner(CACHE_SOURCE, Object.freeze({ selectedCpm: 8.75 }))).toBe(true);
+    resolveFetch?.(
+      corsResponse(JSON.stringify({ adm: '<div>${AUCTION_PRICE}</div>', price: 1000 }))
+    );
+    const frame = await insertedCacheFrame(container);
+
+    expect(frame.srcdoc).toContain('<div>2.5</div>');
+    expect(frame.srcdoc).not.toContain('8.75');
+    expect(frame.srcdoc).not.toContain('1000');
+    frame.dispatchEvent(new Event('load'));
+    expect(render.snapshot().outcome).toEqual({ outcome: 'accepted' });
+    document.body.innerHTML = '';
+  });
+
+  it('does not let the generic direct transition bypass the cache-specific deadline', () => {
+    const render = attempt();
+    expect(render.admitDirectWinner(CACHE_SOURCE, WINNER_CONTEXT)).toBe(true);
+
+    expect(render.beginDirect()).toBe(false);
+    expect(render.snapshot()).toMatchObject({ outcome: undefined, state: 'created' });
+    expect(render.cancel('caller_aborted')).toBe(true);
+  });
+
+  it.each([
+    [
+      'network rejection',
+      () => Promise.reject(new TypeError('fictional CORS failure')),
+      'cache_network_error',
+    ],
+    ['HTTP status', () => Promise.resolve(corsResponse('{}', 503)), 'cache_http_error'],
+  ] as const)('maps %s to the exact typed cache failure', async (_case, fetchResult, reason) => {
+    document.body.innerHTML = '<div id="fictional-slot"></div>';
+    const render = attempt();
+    expect(render.admitDirectWinner(CACHE_SOURCE, WINNER_CONTEXT)).toBe(true);
+
+    expect(
+      renderDirectCacheAttempt({
+        attempt: render,
+        cachePolicy: CACHE_POLICY,
+        container: document.getElementById('fictional-slot')!,
+        fetcher: vi.fn(fetchResult),
+        prepareIframe: prepareAdmIframe,
+        publisherOrigin: window.location.origin,
+      })
+    ).toBe(true);
+    await vi.waitFor(() =>
+      expect(render.snapshot().outcome).toEqual({ outcome: 'failed', reason })
+    );
+    expect(render.snapshot().outcome?.outcome).not.toBe('no_bid');
+    document.body.innerHTML = '';
+  });
+
+  it.each([
+    ['opaque response', Object.freeze({ body: null, ok: true, type: 'opaque' })],
+    [
+      'throwing type accessor',
+      Object.defineProperties(Object.create(null), {
+        body: { enumerable: true, value: null },
+        ok: { enumerable: true, value: true },
+        type: {
+          enumerable: true,
+          get: () => {
+            throw new Error('hostile response type');
+          },
+        },
+      }),
+    ],
+    [
+      'rejecting body reader',
+      Object.freeze({
+        body: Object.freeze({
+          getReader: () =>
+            Object.freeze({
+              cancel: vi.fn(),
+              read: async () => {
+                throw new Error('fictional stream failure');
+              },
+              releaseLock: vi.fn(),
+            }),
+        }),
+        ok: true,
+        type: 'cors',
+      }),
+    ],
+  ] as const)('contains a %s as cache_network_error', async (_case, response) => {
+    document.body.innerHTML = '<div id="fictional-slot"></div>';
+    const render = attempt();
+    expect(render.admitDirectWinner(CACHE_SOURCE, WINNER_CONTEXT)).toBe(true);
+
+    expect(
+      renderDirectCacheAttempt({
+        attempt: render,
+        cachePolicy: CACHE_POLICY,
+        container: document.getElementById('fictional-slot')!,
+        fetcher: async () => response,
+        prepareIframe: prepareAdmIframe,
+        publisherOrigin: window.location.origin,
+      })
+    ).toBe(true);
+    await vi.waitFor(() =>
+      expect(render.snapshot().outcome).toEqual({
+        outcome: 'failed',
+        reason: 'cache_network_error',
+      })
+    );
+    expect(document.querySelector('iframe')).toBeNull();
+    document.body.innerHTML = '';
+  });
+
+  it('renders a delayed owner-controlled cache claim as one PUC artifact', async () => {
+    document.body.innerHTML = '<div id="fictional-slot"><span>placeholder</span></div>';
+    const scope = owner();
+    const artifacts = createCommittedArtifactStore();
+    const render = attempt(scope, { artifacts });
+    expect(render.beginGamClaim()).toBe(true);
+    expect(render.admitClaimedWinner(claimed(render, scope, CACHE_SOURCE))).toBe(true);
+    expect(render.ownerClaimed()).toBe(true);
+    expect(render.ownerRegistered()).toBe(true);
+    let resolveFetch: ((response: Response) => void) | undefined;
+    const fetchCache = vi.fn(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveFetch = resolve;
+        })
+    );
+    const container = document.getElementById('fictional-slot')!;
+
+    expect(
+      renderDirectCacheAttempt({
+        attempt: render,
+        cachePolicy: CACHE_POLICY,
+        container,
+        fetcher: fetchCache,
+        prepareIframe: prepareAdmIframe,
+        publisherOrigin: window.location.origin,
+      })
+    ).toBe(true);
+    expect(render.snapshot()).toMatchObject({
+      outcome: undefined,
+      state: 'waiting_for_insertion',
+    });
+    expect(fetchCache).toHaveBeenCalledOnce();
+    expect(resolveFetch).toBeTypeOf('function');
+    resolveFetch?.(
+      corsResponse(JSON.stringify({ adm: '<div>${AUCTION_PRICE}</div>', price: 9000 }))
+    );
+    const frame = await insertedCacheFrame(container, render);
+    expect(frame.srcdoc).toContain('<div>1</div>');
+    expect(frame.srcdoc).not.toContain('9000');
+
+    if (render.snapshot().outcome === undefined) frame.dispatchEvent(new Event('load'));
+    expect(render.snapshot().outcome).toEqual({ outcome: 'accepted' });
+    expect(artifacts.current('fictional-slot')).toMatchObject({
+      attemptId: render.id,
+      kind: 'puc',
+    });
+    expect(container.querySelector('span')).toBeNull();
+    artifacts.dispose();
+    document.body.innerHTML = '';
+  });
+
+  it.each([
+    ['raw markup', '<div>raw</div>'],
+    ['array', JSON.stringify([{ adm: '<div>wrapped</div>' }])],
+    ['primitive', JSON.stringify('creative')],
+    ['wrapper', JSON.stringify({ bid: { adm: '<div>wrapped</div>' } })],
+    ['empty adm', JSON.stringify({ adm: '' })],
+    ['width alias', JSON.stringify({ adm: '<div>alias</div>', width: 300, height: 250 })],
+    ['unpaired w', JSON.stringify({ adm: '<div>unpaired</div>', w: 300 })],
+    ['fractional dimensions', JSON.stringify({ adm: '<div>fractional</div>', w: 300.5, h: 250 })],
+    ['out-of-range dimensions', JSON.stringify({ adm: '<div>large</div>', w: 4097, h: 250 })],
+    ['mismatched dimensions', JSON.stringify({ adm: '<div>wrong</div>', w: 728, h: 90 })],
+    ['negative price', JSON.stringify({ adm: '<div>price</div>', price: -1 })],
+  ] as const)('rejects a cache %s response shape', async (_case, body) => {
+    document.body.innerHTML = '<div id="fictional-slot"></div>';
+    const render = attempt();
+    expect(render.admitDirectWinner(CACHE_SOURCE, WINNER_CONTEXT)).toBe(true);
+
+    expect(
+      renderDirectCacheAttempt({
+        attempt: render,
+        cachePolicy: CACHE_POLICY,
+        container: document.getElementById('fictional-slot')!,
+        fetcher: vi.fn(async () => corsResponse(body)),
+        prepareIframe: prepareAdmIframe,
+        publisherOrigin: window.location.origin,
+      })
+    ).toBe(true);
+    await vi.waitFor(() =>
+      expect(render.snapshot().outcome).toEqual({
+        outcome: 'failed',
+        reason: 'cache_invalid_response',
+      })
+    );
+    expect(document.querySelector('iframe')).toBeNull();
+    document.body.innerHTML = '';
+  });
+
+  it('enforces the 512 KiB streamed-body limit before JSON parsing', async () => {
+    document.body.innerHTML = '<div id="fictional-slot"></div>';
+    const render = attempt();
+    expect(render.admitDirectWinner(CACHE_SOURCE, WINNER_CONTEXT)).toBe(true);
+    const oversized = new Uint8Array(512 * 1024 + 1);
+    oversized.fill(0x20);
+
+    expect(
+      renderDirectCacheAttempt({
+        attempt: render,
+        cachePolicy: CACHE_POLICY,
+        container: document.getElementById('fictional-slot')!,
+        fetcher: vi.fn(async () => corsResponse(oversized)),
+        prepareIframe: prepareAdmIframe,
+        publisherOrigin: window.location.origin,
+      })
+    ).toBe(true);
+    await vi.waitFor(() =>
+      expect(render.snapshot().outcome).toEqual({
+        outcome: 'failed',
+        reason: 'cache_invalid_response',
+      })
+    );
+    document.body.innerHTML = '';
+  });
+
+  it('cancels an oversized streamed body before publishing a failure', async () => {
+    document.body.innerHTML = '<div id="fictional-slot"></div>';
+    const render = attempt();
+    expect(render.admitDirectWinner(CACHE_SOURCE, WINNER_CONTEXT)).toBe(true);
+    const oversized = cacheResponse(new Uint8Array(512 * 1024 + 1));
+
+    expect(
+      renderDirectCacheAttempt({
+        attempt: render,
+        cachePolicy: CACHE_POLICY,
+        container: document.getElementById('fictional-slot')!,
+        fetcher: async () => oversized.response,
+        prepareIframe: prepareAdmIframe,
+        publisherOrigin: window.location.origin,
+      })
+    ).toBe(true);
+    await vi.waitFor(() =>
+      expect(render.snapshot().outcome).toEqual({
+        outcome: 'failed',
+        reason: 'cache_invalid_response',
+      })
+    );
+
+    expect(oversized.cancel).toHaveBeenCalledOnce();
+    expect(document.querySelector('iframe')).toBeNull();
+    document.body.innerHTML = '';
+  });
+
+  it('requires one frozen exact policy and canonical bounded cache source before fetching', () => {
+    const cases = [
+      {
+        policy: { ...CACHE_POLICY },
+        source: CACHE_SOURCE,
+      },
+      {
+        policy: CACHE_POLICY,
+        source: Object.freeze({
+          ...CACHE_SOURCE,
+          fetchUrl: `${CACHE_SOURCE.fetchUrl}&uuid=${CACHE_ID}`,
+        }),
+      },
+      {
+        policy: CACHE_POLICY,
+        source: Object.freeze({
+          ...CACHE_SOURCE,
+          fetchUrl: `https://other.example/cache?uuid=${CACHE_ID}`,
+        }),
+      },
+      {
+        policy: CACHE_POLICY,
+        source: Object.freeze({
+          ...CACHE_SOURCE,
+          fetchUrl: `https://cache.example:8443/${'x'.repeat(4096)}?uuid=${CACHE_ID}`,
+        }),
+      },
+      {
+        policy: CACHE_POLICY,
+        source: Object.freeze({
+          ...CACHE_SOURCE,
+          fetchUrl: `${CACHE_SOURCE.fetchUrl}\n`,
+        }),
+      },
+    ];
+
+    for (let index = 0; index < cases.length; index += 1) {
+      document.body.innerHTML = `<div id="fictional-slot-${index}"></div>`;
+      const candidate = cases[index]!;
+      const render = attempt(owner(indexedAttemptId(index), `fictional-slot-${index}`), {
+        prepareRenderSource: (value) => (value === candidate.source ? candidate.source : undefined),
+      });
+      expect(render.admitDirectWinner(candidate.source, WINNER_CONTEXT)).toBe(true);
+      const fetchCache = vi.fn();
+
+      expect(
+        renderDirectCacheAttempt({
+          attempt: render,
+          cachePolicy: candidate.policy,
+          container: document.getElementById(`fictional-slot-${index}`)!,
+          fetcher: fetchCache,
+          prepareIframe: prepareAdmIframe,
+          publisherOrigin: window.location.origin,
+        })
+      ).toBe(false);
+      expect(fetchCache).not.toHaveBeenCalled();
+      expect(render.snapshot().outcome).toEqual({
+        outcome: 'failed',
+        reason: 'descriptor_invalid',
+      });
+    }
+    document.body.innerHTML = '';
+  });
+
+  it('aborts the cache request after five seconds and makes late work inert', async () => {
+    vi.useFakeTimers();
+    document.body.innerHTML = '<div id="fictional-slot"></div>';
+    const render = attempt();
+    expect(render.admitDirectWinner(CACHE_SOURCE, WINNER_CONTEXT)).toBe(true);
+    let signal: AbortSignal | undefined;
+    let resolveFetch: ((response: Response) => void) | undefined;
+    const fetchCache = vi.fn((_input: string, init: RequestInit) => {
+      signal = init.signal as AbortSignal;
+      return new Promise<Response>((resolve) => {
+        resolveFetch = resolve;
+      });
+    });
+
+    try {
+      expect(
+        renderDirectCacheAttempt({
+          attempt: render,
+          cachePolicy: CACHE_POLICY,
+          container: document.getElementById('fictional-slot')!,
+          fetcher: fetchCache,
+          prepareIframe: prepareAdmIframe,
+          publisherOrigin: window.location.origin,
+        })
+      ).toBe(true);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(signal?.aborted).toBe(true);
+      expect(render.snapshot().outcome).toEqual({
+        outcome: 'failed',
+        reason: 'cache_network_error',
+      });
+
+      resolveFetch?.(corsResponse(JSON.stringify({ adm: '<div>late</div>' })));
+      await vi.runAllTimersAsync();
+      expect(document.querySelector('iframe')).toBeNull();
+      expect(render.snapshot().outcome).toEqual({
+        outcome: 'failed',
+        reason: 'cache_network_error',
+      });
+    } finally {
+      vi.useRealTimers();
+      document.body.innerHTML = '';
+    }
+  });
+
+  it('aborts on caller cancellation and ignores a late cache response', async () => {
+    document.body.innerHTML = '<div id="fictional-slot"></div>';
+    const render = attempt();
+    expect(render.admitDirectWinner(CACHE_SOURCE, WINNER_CONTEXT)).toBe(true);
+    let signal: AbortSignal | undefined;
+    let resolveFetch: ((response: Response) => void) | undefined;
+    const fetchCache = vi.fn((_input: string, init: RequestInit) => {
+      signal = init.signal as AbortSignal;
+      return new Promise<Response>((resolve) => {
+        resolveFetch = resolve;
+      });
+    });
+
+    expect(
+      renderDirectCacheAttempt({
+        attempt: render,
+        cachePolicy: CACHE_POLICY,
+        container: document.getElementById('fictional-slot')!,
+        fetcher: fetchCache,
+        prepareIframe: prepareAdmIframe,
+        publisherOrigin: window.location.origin,
+      })
+    ).toBe(true);
+    expect(render.cancel('caller_aborted')).toBe(true);
+    expect(signal?.aborted).toBe(true);
+    resolveFetch?.(corsResponse(JSON.stringify({ adm: '<div>late</div>' })));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(document.querySelector('iframe')).toBeNull();
+    expect(render.snapshot().outcome).toEqual({ outcome: 'cancelled', reason: 'caller_aborted' });
+    document.body.innerHTML = '';
+  });
+});
 
 function slotOperation(options: SlotOperationOptions): SlotOperation {
   const result = createSlotOperation(options);
