@@ -8,6 +8,7 @@ import type {
   GptSlotHandoff,
   LegacyTsjsApi,
 } from '../../core/types';
+import { resizeCollapsedPucShell } from '../../services/render';
 import {
   APS_UNIVERSAL_CREATIVE_RENDERER,
   APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
@@ -215,6 +216,15 @@ function messageSourceBelongsToAdUnit(
   return candidateSlotRoots(adUnitCode).some((root) =>
     Array.from(root.querySelectorAll('iframe')).some((iframe) => iframe.contentWindow === source)
   );
+}
+
+function resizeAuthenticatedBridgeShell(
+  source: MessageEventSource | null,
+  width: number,
+  height: number
+): void {
+  if ((typeof source !== 'object' && typeof source !== 'function') || source === null) return;
+  resizeCollapsedPucShell({ source, width, height });
 }
 
 function clearTargetingKeys(slot: GoogleTagSlot, keys: Iterable<string>): void {
@@ -1624,6 +1634,7 @@ export function installTsRenderBridge(): void {
           height: renderer.height,
         })
       );
+      resizeAuthenticatedBridgeShell(e.source, renderer.width, renderer.height);
 
       try {
         prebidRendererEntry.markRendered();
@@ -1666,6 +1677,7 @@ export function installTsRenderBridge(): void {
           height: renderer.height,
         })
       );
+      resizeAuthenticatedBridgeShell(e.source, renderer.width, renderer.height);
       return;
     }
 
@@ -1702,6 +1714,7 @@ export function installTsRenderBridge(): void {
             height: renderer.height,
           })
         );
+        resizeAuthenticatedBridgeShell(e.source, renderer.width, renderer.height);
         log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' through APS renderer`);
       } catch (err) {
         renderingKeys.delete(rendererKey);
@@ -1722,6 +1735,7 @@ export function installTsRenderBridge(): void {
           height,
         })
       );
+      resizeAuthenticatedBridgeShell(e.source, width, height);
       fireWinBillingBeacons(slotId, matchedBid);
       recordGptBridgeRender(slotId, matchedBid, 'inline', findSlotElementByDivId(slotId));
       log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from inline adm`);
@@ -1763,16 +1777,19 @@ export function installTsRenderBridge(): void {
           cached.price !== undefined
             ? expandAuctionPriceMacro(cached.adm, cached.price)
             : cached.adm;
+        const cachedWidth = cached.width ?? width;
+        const cachedHeight = cached.height ?? height;
         port.postMessage(
           JSON.stringify({
             message: 'Prebid Response',
             adId,
             ad,
             renderer: TS_DISPLAY_RENDERER,
-            width: cached.width ?? width,
-            height: cached.height ?? height,
+            width: cachedWidth,
+            height: cachedHeight,
           })
         );
+        resizeAuthenticatedBridgeShell(e.source, cachedWidth, cachedHeight);
         // Beacons carry the server-expanded ${AUCTION_PRICE} from the auction's
         // clearing price, not `cached.price` — the auction result is the
         // authoritative clearing price, and the cached copy is only the render

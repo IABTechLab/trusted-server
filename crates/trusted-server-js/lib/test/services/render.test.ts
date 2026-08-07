@@ -20,6 +20,7 @@ import {
   renderDirectCacheAttempt,
   renderDirectAdmAttempt,
   resolveCacheAdmAttempt,
+  resizeCollapsedPucShell,
   type CacheAdmSource,
   type CommittedRenderArtifact,
   type DirectAdmIframeConstructor,
@@ -94,6 +95,105 @@ const CACHE_SOURCE = Object.freeze({
   fetchUrl: `${CACHE_POLICY.baseUrl}?uuid=${CACHE_ID}`,
   width: 300,
   height: 250,
+});
+
+describe('collapsed PUC shell resize', () => {
+  function collapsedShell(): {
+    readonly frame: HTMLIFrameElement;
+    readonly wrapper: HTMLDivElement;
+  } {
+    const wrapper = document.createElement('div');
+    const frame = document.createElement('iframe');
+    wrapper.style.width = '1px';
+    wrapper.style.height = '1px';
+    frame.setAttribute('width', '1');
+    frame.setAttribute('height', '1');
+    frame.style.width = '1px';
+    frame.style.height = '1px';
+    wrapper.appendChild(frame);
+    document.body.appendChild(wrapper);
+    return { frame, wrapper };
+  }
+
+  it('resizes only the exact connected source iframe and its collapsed immediate wrapper once', () => {
+    const selected = collapsedShell();
+    const sibling = collapsedShell();
+
+    try {
+      expect(
+        resizeCollapsedPucShell({
+          source: selected.frame.contentWindow!,
+          width: 300,
+          height: 250,
+        })
+      ).toBe(true);
+      expect(selected.frame.style.width).toBe('300px');
+      expect(selected.frame.style.height).toBe('250px');
+      expect(selected.wrapper.style.width).toBe('300px');
+      expect(selected.wrapper.style.height).toBe('250px');
+      expect(sibling.frame.style.width).toBe('1px');
+      expect(sibling.wrapper.style.width).toBe('1px');
+
+      expect(
+        resizeCollapsedPucShell({
+          source: selected.frame.contentWindow!,
+          width: 300,
+          height: 250,
+        })
+      ).toBe(false);
+    } finally {
+      selected.wrapper.remove();
+      sibling.wrapper.remove();
+    }
+  });
+
+  it('rejects invalid dimensions and non-ordinary, expanded, detached, or replaced shells atomically', () => {
+    const cases: Array<(shell: ReturnType<typeof collapsedShell>) => void> = [
+      ({ wrapper }) => {
+        wrapper.style.width = '2px';
+      },
+      ({ frame }) => {
+        frame.style.position = 'fixed';
+      },
+      ({ wrapper }) => {
+        wrapper.style.position = 'sticky';
+      },
+      ({ wrapper }) => {
+        wrapper.setAttribute('data-anchor-status', 'displayed');
+      },
+      ({ frame }) => {
+        frame.remove();
+      },
+    ];
+
+    for (const mutate of cases) {
+      const shell = collapsedShell();
+      const source = shell.frame.contentWindow!;
+      mutate(shell);
+      try {
+        expect(resizeCollapsedPucShell({ source, width: 300, height: 250 })).toBe(false);
+        expect(shell.wrapper.style.height).toBe('1px');
+        expect(shell.frame.style.height).toBe('1px');
+      } finally {
+        shell.wrapper.remove();
+      }
+    }
+
+    const invalid = collapsedShell();
+    try {
+      expect(
+        resizeCollapsedPucShell({
+          source: invalid.frame.contentWindow!,
+          width: Number.NaN,
+          height: 250,
+        })
+      ).toBe(false);
+      expect(invalid.frame.style.width).toBe('1px');
+      expect(invalid.wrapper.style.width).toBe('1px');
+    } finally {
+      invalid.wrapper.remove();
+    }
+  });
 });
 
 function prepareRenderSource(candidate: unknown) {

@@ -50,6 +50,7 @@ interface HarnessOptions {
   readonly mintLifecycleTicket?: PucBridgeOptions['mintLifecycleTicket'];
   readonly now?: PucBridgeOptions['now'];
   readonly publisherOrigin?: string;
+  readonly resizeCollapsedShell?: PucBridgeOptions['resizeCollapsedShell'];
   readonly rendererNonces?: PucBridgeOptions['rendererNonces'];
   readonly rendererUrl?: string;
   readonly resolveCacheAdm?: PucBridgeOptions['resolveCacheAdm'];
@@ -83,6 +84,7 @@ function createHarness(
     ...(options.mintLifecycleTicket ? { mintLifecycleTicket: options.mintLifecycleTicket } : {}),
     ...(options.now ? { now: options.now } : {}),
     ...(options.publisherOrigin ? { publisherOrigin: options.publisherOrigin } : {}),
+    ...(options.resizeCollapsedShell ? { resizeCollapsedShell: options.resizeCollapsedShell } : {}),
     ...(options.rendererNonces ? { rendererNonces: options.rendererNonces } : {}),
     ...(options.rendererUrl ? { rendererUrl: options.rendererUrl } : {}),
     ...(options.resolveCacheAdm ? { resolveCacheAdm: options.resolveCacheAdm } : {}),
@@ -1936,6 +1938,106 @@ describe('Universal Creative bridge dispatcher', () => {
       pendingClaims: 0,
       ticketTombstones: 1,
     });
+  });
+
+  it('requests one guarded shell resize only after the current ready response posts', () => {
+    const gam = createGamAttempt('aps', 81);
+    const source = Object.freeze({ frame: 'authoritative' });
+    const resizeCollapsedShell = vi.fn(() => true);
+    const harness = createHarness(
+      () => ({ recognized: true, state: 'renderable', expiresAt: 10_000 }),
+      {
+        claim: ({ pucSource }) => ({
+          recognized: true,
+          claimed: true,
+          pucSource: pucSource as object,
+          expiresAt: 10_000,
+        }),
+        mintLifecycleTicket: () => Object.freeze({ ok: true, value: LIFECYCLE_TICKET }),
+        resizeCollapsedShell,
+      }
+    );
+    const port = createPort();
+    expect(
+      harness.bridge.registerGamAttempt({
+        artifact: gam.artifact,
+        attempt: gam.attempt,
+        owner: gam.owner,
+        reservationId: gam.reservationId,
+      })
+    ).toBe(true);
+    harness.dispatch({
+      data: exactRequest(gam.reservationId),
+      ports: [port],
+      source,
+      stopImmediatePropagation: vi.fn(),
+    });
+    expect(
+      harness.bridge.recordNonemptyGam({
+        artifact: gam.artifact,
+        attempt: gam.attempt,
+        owner: gam.owner,
+        reservationId: gam.reservationId,
+      })
+    ).toBe(true);
+
+    expect(resizeCollapsedShell).toHaveBeenCalledExactlyOnceWith({
+      source,
+      width: 300,
+      height: 250,
+    });
+    expect(port.postMessage.mock.invocationCallOrder[0]).toBeLessThan(
+      resizeCollapsedShell.mock.invocationCallOrder[0]!
+    );
+  });
+
+  it('does not resize after a failed post or a navigation cancellation during the post', () => {
+    const resizeCollapsedShell = vi.fn(() => true);
+    for (const cancelDuringPost of [false, true]) {
+      const gam = createGamAttempt('adm', cancelDuringPost ? 83 : 82);
+      const harness = createHarness(
+        () => ({ recognized: true, state: 'renderable', expiresAt: 10_000 }),
+        {
+          claim: ({ pucSource }) => ({
+            recognized: true,
+            claimed: true,
+            pucSource: pucSource as object,
+            expiresAt: 10_000,
+          }),
+          mintLifecycleTicket: () => Object.freeze({ ok: true, value: LIFECYCLE_TICKET }),
+          resizeCollapsedShell,
+        }
+      );
+      const port = createPort();
+      port.postMessage.mockImplementation(() => {
+        if (cancelDuringPost) gam.attempt.cancel('navigation_disposed');
+        else throw new Error('post failed');
+      });
+      expect(
+        harness.bridge.registerGamAttempt({
+          artifact: gam.artifact,
+          attempt: gam.attempt,
+          owner: gam.owner,
+          reservationId: gam.reservationId,
+        })
+      ).toBe(true);
+      harness.dispatch({
+        data: exactRequest(gam.reservationId),
+        ports: [port],
+        source: Object.freeze({ frame: cancelDuringPost ? 'cancelled' : 'failed' }),
+        stopImmediatePropagation: vi.fn(),
+      });
+      expect(
+        harness.bridge.recordNonemptyGam({
+          artifact: gam.artifact,
+          attempt: gam.attempt,
+          owner: gam.owner,
+          reservationId: gam.reservationId,
+        })
+      ).toBe(true);
+    }
+
+    expect(resizeCollapsedShell).not.toHaveBeenCalled();
   });
 
   it('starts the exact three-second claim deadline only after nonempty GAM', () => {

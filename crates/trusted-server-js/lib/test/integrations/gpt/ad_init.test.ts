@@ -2648,6 +2648,93 @@ describe('installTsRenderBridge', () => {
     beaconSpy.mockRestore();
   });
 
+  it('resizes only the authenticated collapsed 1x1 creative shell after responding', async () => {
+    (window as TestWindow).tsjs!.bids!.homepage_header = {
+      hb_adid: 'collapsed-inline-ad-id',
+      hb_bidder: 'fictional',
+      hb_pb: '1.23',
+      adm: '<div>fictional creative</div>',
+      w: 300,
+      h: 250,
+    };
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const slot = document.getElementById('div-header')!;
+    const selectedFrame = slot.querySelector<HTMLIFrameElement>('iframe')!;
+    slot.style.width = '1px';
+    slot.style.height = '1px';
+    selectedFrame.width = '1';
+    selectedFrame.height = '1';
+    selectedFrame.style.width = '1px';
+    selectedFrame.style.height = '1px';
+
+    const siblingSlot = document.createElement('div');
+    siblingSlot.style.width = '1px';
+    siblingSlot.style.height = '1px';
+    const siblingFrame = document.createElement('iframe');
+    siblingFrame.width = '1';
+    siblingFrame.height = '1';
+    siblingFrame.style.width = '1px';
+    siblingFrame.style.height = '1px';
+    siblingSlot.appendChild(siblingFrame);
+    document.body.appendChild(siblingSlot);
+
+    try {
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: 'collapsed-inline-ad-id' }),
+          ports: [{ postMessage: vi.fn() }],
+          source,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+
+      expect(selectedFrame.style.width).toBe('300px');
+      expect(selectedFrame.style.height).toBe('250px');
+      expect(slot.style.width).toBe('300px');
+      expect(slot.style.height).toBe('250px');
+      expect(siblingFrame.style.width).toBe('1px');
+      expect(siblingFrame.style.height).toBe('1px');
+    } finally {
+      siblingSlot.remove();
+    }
+  });
+
+  it('does not partially resize when the authenticated wrapper is already expanded', async () => {
+    (window as TestWindow).tsjs!.bids!.homepage_header = {
+      hb_adid: 'expanded-wrapper-ad-id',
+      hb_bidder: 'fictional',
+      hb_pb: '1.23',
+      adm: '<div>fictional creative</div>',
+      w: 300,
+      h: 250,
+    };
+    const bridgeListener = await captureBridgeListener();
+    const source = createTrustedSlotIframe();
+    const slot = document.getElementById('div-header')!;
+    const frame = slot.querySelector<HTMLIFrameElement>('iframe')!;
+    slot.style.width = '2px';
+    slot.style.height = '1px';
+    frame.width = '1';
+    frame.height = '1';
+    frame.style.width = '1px';
+    frame.style.height = '1px';
+
+    bridgeListener(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'expanded-wrapper-ad-id' }),
+        ports: [{ postMessage: vi.fn() }],
+        source,
+        stopImmediatePropagation: vi.fn(),
+      }) as unknown as MessageEvent
+    );
+
+    expect(frame.style.width).toBe('1px');
+    expect(frame.style.height).toBe('1px');
+    expect(slot.style.width).toBe('2px');
+    expect(slot.style.height).toBe('1px');
+  });
+
   it('serves a registered Prebid APS renderer when its generated ad ID differs from the APS bid ID', async () => {
     const renderer = apsRenderer();
     const prebidAdId = 'prebid-generated-ad-id';
