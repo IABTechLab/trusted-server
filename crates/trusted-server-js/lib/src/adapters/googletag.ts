@@ -26,11 +26,25 @@ export class GoogletagAdapterError extends Error {
   }
 }
 
+/** Immutable GPT definition used by the adapter-owned replacement transaction. */
+export interface GoogletagReplacementDefinition {
+  readonly adUnitPath: string;
+  readonly elementId: string;
+  readonly sizes: unknown;
+}
+
+/** Observer called before a publisher-originated targeting mutation is forwarded. */
+export interface GoogletagTargetingObserver {
+  readonly beforePublisherMutation: (slot: object, key?: string) => void;
+}
+
 /** The small GPT surface exposed to an accepted operation. */
 export interface GoogletagFacade {
+  bindingToken(): object;
   clearTargeting(slot: object, key?: string): unknown;
   display(slot: string | object): unknown;
   getTargeting(slot: object, key: string): readonly string[];
+  observeTargeting(slot: object, observer: GoogletagTargetingObserver): () => void;
   refresh(slots?: readonly object[], options?: Readonly<{ changeCorrelator: boolean }>): unknown;
   serviceState(): Readonly<{
     apiReady: boolean;
@@ -40,6 +54,11 @@ export interface GoogletagFacade {
   setTargeting(slot: object, key: string, value: string | readonly string[]): unknown;
   slots(): readonly object[];
   subscribe(eventType: string, listener: (event: unknown) => void): () => void;
+  transactionalReplace(
+    oldSlot: object,
+    definition: GoogletagReplacementDefinition | undefined,
+    isGenerationCurrent: () => boolean
+  ): object | undefined;
 }
 
 /** Options owned by one GPT operation. */
@@ -117,13 +136,24 @@ interface SharedInitialLoadTracker {
   readonly services: WeakMap<object, () => void>;
 }
 
+interface TargetingObservation {
+  readonly observers: Set<GoogletagTargetingObserver>;
+  readonly restore: () => void;
+}
+
 const sharedInitialLoadTrackers = new WeakMap<object, SharedInitialLoadTracker>();
 const mapDeleteIntrinsic = Map.prototype.delete;
 const mapGetIntrinsic = Map.prototype.get;
 const mapKeysIntrinsic = Map.prototype.keys;
 const setDeleteIntrinsic = Set.prototype.delete;
+const setAddIntrinsic = Set.prototype.add;
+const setSizeGetter = Object.getOwnPropertyDescriptor(Set.prototype, 'size')?.get as (
+  this: Set<unknown>
+) => number;
+const setValuesIntrinsic = Set.prototype.values;
 const weakMapDeleteIntrinsic = WeakMap.prototype.delete;
 const weakMapGetIntrinsic = WeakMap.prototype.get;
+const weakMapSetIntrinsic = WeakMap.prototype.set;
 const weakSetDeleteIntrinsic = WeakSet.prototype.delete;
 
 function mapValue<K, V>(map: Map<K, V>, key: K): V | undefined {
@@ -142,8 +172,24 @@ function deleteSetValue<T>(set: Set<T>, value: T): boolean {
   return Reflect.apply(setDeleteIntrinsic, set, [value]) as boolean;
 }
 
+function addSetValue<T>(set: Set<T>, value: T): void {
+  Reflect.apply(setAddIntrinsic, set, [value]);
+}
+
+function setValues<T>(set: Set<T>): IterableIterator<T> {
+  return Reflect.apply(setValuesIntrinsic, set, []) as IterableIterator<T>;
+}
+
+function setSize(set: Set<unknown>): number {
+  return Reflect.apply(setSizeGetter, set, []) as number;
+}
+
 function weakMapValue<K extends object, V>(map: WeakMap<K, V>, key: K): V | undefined {
   return Reflect.apply(weakMapGetIntrinsic, map, [key]) as V | undefined;
+}
+
+function setWeakMapValue<K extends object, V>(map: WeakMap<K, V>, key: K, value: V): void {
+  Reflect.apply(weakMapSetIntrinsic, map, [key, value]);
 }
 
 function deleteWeakMapValue<K extends object, V>(map: WeakMap<K, V>, key: K): boolean {
@@ -234,7 +280,10 @@ function createFacade(
   registerEffect: (dispose: () => void) => () => void,
   isOperationCurrent: () => boolean,
   isBindingCurrent: () => boolean,
-  initialLoadDisabled: (service: object) => boolean
+  initialLoadDisabled: (service: object) => boolean,
+  targetingWrites: WeakMap<object, number>,
+  targetingObservations: WeakMap<object, TargetingObservation>,
+  bindingToken: object
 ): Readonly<GoogletagFacade> {
   const member = (external: object, key: PropertyKey): ((...args: unknown[]) => unknown) => {
     if (!isOperationCurrent()) throw new GoogletagAdapterError('external_artifact_incompatible');
@@ -260,9 +309,78 @@ function createFacade(
     return result;
   };
   const service = (): object => asObject(call(binding.binding, 'pubads', []));
+  const withTargetingWrite = (slot: object, callback: () => unknown): unknown => {
+    const depth = weakMapValue(targetingWrites, slot) ?? 0;
+    setWeakMapValue(targetingWrites, slot, depth + 1);
+    try {
+      return callback();
+    } finally {
+      if (depth === 0) deleteWeakMapValue(targetingWrites, slot);
+      else setWeakMapValue(targetingWrites, slot, depth);
+    }
+  };
+  const replaceObservedMethod = (
+    slot: object,
+    key: 'clearTargeting' | 'setTargeting',
+    observer: GoogletagTargetingObserver
+  ): (() => void) | undefined => {
+    if (!isOperationCurrent()) return undefined;
+    const original = member(slot, key);
+    let descriptor: PropertyDescriptor | undefined;
+    let installed = false;
+    const wrapper = function (this: unknown, ...arguments_: unknown[]): unknown {
+      if ((weakMapValue(targetingWrites, slot) ?? 0) === 0) {
+        try {
+          const mutationKey = typeof arguments_[0] === 'string' ? arguments_[0] : undefined;
+          observer.beforePublisherMutation(slot, mutationKey);
+        } catch {
+          // Bookkeeping must not change publisher call arguments, order, return, or throw.
+        }
+      }
+      return Reflect.apply(original, this, arguments_);
+    };
+    const restore = (): void => {
+      if (!installed) return;
+      installed = false;
+      try {
+        const current = Object.getOwnPropertyDescriptor(slot, key);
+        if (!current || current.value !== wrapper) return;
+        if (descriptor) Reflect.defineProperty(slot, key, descriptor);
+        else Reflect.deleteProperty(slot, key);
+      } catch {
+        // Publisher replacement wins once the installed method no longer matches.
+      }
+    };
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(slot, key);
+      if (
+        descriptor &&
+        (!Object.prototype.hasOwnProperty.call(descriptor, 'value') ||
+          (descriptor.configurable !== true && descriptor.writable !== true))
+      ) {
+        return undefined;
+      }
+      const replacement = descriptor
+        ? { ...descriptor, value: wrapper }
+        : { configurable: true, enumerable: true, value: wrapper, writable: true };
+      if (!isOperationCurrent() || !Reflect.defineProperty(slot, key, replacement)) {
+        return undefined;
+      }
+      installed = true;
+      if (!isOperationCurrent() || safeMember(slot, key) !== wrapper) {
+        restore();
+        return undefined;
+      }
+      return restore;
+    } catch {
+      restore();
+      return undefined;
+    }
+  };
   return Object.freeze({
+    bindingToken: (): object => bindingToken,
     clearTargeting: (slot: object, key?: string): unknown =>
-      call(slot, 'clearTargeting', key === undefined ? [] : [key]),
+      withTargetingWrite(slot, () => call(slot, 'clearTargeting', key === undefined ? [] : [key])),
     display: (slot: string | object): unknown => call(binding.binding, 'display', [slot]),
     getTargeting: (slot: object, key: string): readonly string[] => {
       const targeting = call(slot, 'getTargeting', [key]);
@@ -271,6 +389,79 @@ function createFacade(
       }
       if (!isOperationCurrent()) throw new GoogletagAdapterError('external_artifact_incompatible');
       return Object.freeze([...targeting]);
+    },
+    observeTargeting: (slot: object, observer: GoogletagTargetingObserver): (() => void) => {
+      if (
+        typeof observer !== 'object' ||
+        observer === null ||
+        typeof observer.beforePublisherMutation !== 'function'
+      ) {
+        throw new GoogletagAdapterError('external_artifact_incompatible');
+      }
+      let observation = weakMapValue(targetingObservations, slot);
+      if (!observation) {
+        const observers = new Set<GoogletagTargetingObserver>();
+        const dispatcher: GoogletagTargetingObserver = Object.freeze({
+          beforePublisherMutation: (mutatedSlot: object, key?: string): void => {
+            for (const current of setValues(observers)) {
+              try {
+                current.beforePublisherMutation(mutatedSlot, key);
+              } catch {
+                // One observer cannot prevent another or alter the publisher mutation.
+              }
+            }
+          },
+        });
+        const restoreSet = replaceObservedMethod(slot, 'setTargeting', dispatcher);
+        if (!restoreSet) throw new GoogletagAdapterError('external_artifact_incompatible');
+        const restoreClear = replaceObservedMethod(slot, 'clearTargeting', dispatcher);
+        if (!restoreClear) {
+          restoreSet();
+          throw new GoogletagAdapterError('external_artifact_incompatible');
+        }
+        let restored = false;
+        observation = {
+          observers,
+          restore: (): void => {
+            if (restored) return;
+            restored = true;
+            try {
+              restoreClear();
+            } finally {
+              restoreSet();
+            }
+          },
+        };
+        try {
+          setWeakMapValue(targetingObservations, slot, observation);
+        } catch (error) {
+          observation.restore();
+          throw error;
+        }
+      }
+      try {
+        addSetValue(observation.observers, observer);
+      } catch (error) {
+        if (setSize(observation.observers) === 0) {
+          if (weakMapValue(targetingObservations, slot) === observation) {
+            deleteWeakMapValue(targetingObservations, slot);
+          }
+          observation.restore();
+        }
+        throw error;
+      }
+      let active = true;
+      return registerEffect(() => {
+        if (!active) return;
+        active = false;
+        deleteSetValue(observation!.observers, observer);
+        if (setSize(observation!.observers) === 0) {
+          if (weakMapValue(targetingObservations, slot) === observation) {
+            deleteWeakMapValue(targetingObservations, slot);
+          }
+          observation!.restore();
+        }
+      });
     },
     refresh: (
       slots?: readonly object[],
@@ -298,7 +489,9 @@ function createFacade(
       });
     },
     setTargeting: (slot: object, key: string, value: string | readonly string[]): unknown =>
-      call(slot, 'setTargeting', [key, Array.isArray(value) ? [...value] : value]),
+      withTargetingWrite(slot, () =>
+        call(slot, 'setTargeting', [key, Array.isArray(value) ? [...value] : value])
+      ),
     slots: (): readonly object[] => {
       const currentSlots = call(service(), 'getSlots', []);
       if (
@@ -350,6 +543,58 @@ function createFacade(
         rollback();
       });
     },
+    transactionalReplace: (
+      oldSlot: object,
+      definition: GoogletagReplacementDefinition | undefined,
+      isGenerationCurrent: () => boolean
+    ): object | undefined => {
+      if (typeof isGenerationCurrent !== 'function' || !isOperationCurrent()) {
+        throw new GoogletagAdapterError('external_artifact_incompatible');
+      }
+      const destroy = (slot: object): boolean => {
+        try {
+          return call(binding.binding, 'destroySlots', [[slot]]) === true;
+        } catch {
+          return false;
+        }
+      };
+      if (!destroy(oldSlot)) throw new Error('gpt_request_failed');
+      if (definition === undefined || !isGenerationCurrent() || !isOperationCurrent()) {
+        return undefined;
+      }
+      let replacement: object | undefined;
+      try {
+        const candidate = call(binding.binding, 'defineSlot', [
+          definition.adUnitPath,
+          definition.sizes,
+          definition.elementId,
+        ]);
+        if (
+          (typeof candidate !== 'object' || candidate === null) &&
+          typeof candidate !== 'function'
+        ) {
+          throw new Error('gpt_request_failed');
+        }
+        replacement = candidate as object;
+        if (!isGenerationCurrent() || !isOperationCurrent()) {
+          const stale = replacement;
+          replacement = undefined;
+          if (!destroy(stale)) throw new Error('gpt_request_failed');
+          return undefined;
+        }
+        call(replacement, 'addService', [service()]);
+        if (!isGenerationCurrent() || !isOperationCurrent()) {
+          const stale = replacement;
+          replacement = undefined;
+          if (!destroy(stale)) throw new Error('gpt_request_failed');
+          return undefined;
+        }
+        return replacement;
+      } catch (error) {
+        if (replacement) destroy(replacement);
+        throw error;
+      }
+    },
   });
 }
 
@@ -361,6 +606,9 @@ export function createBrowserGoogletagAdapter(
   const live = new Set<PendingOperation<unknown>>();
   const effects = new Set<() => void>();
   let armedBindings = new WeakSet<object>();
+  const targetingWrites = new WeakMap<object, number>();
+  const targetingObservations = new WeakMap<object, TargetingObservation>();
+  const bindingTokens = new WeakMap<object, object>();
   const initialLoadReleases = new Map<object, () => void>();
   const initialLoadOwner = Object.freeze({});
   let pendingReservations = 0;
@@ -1013,6 +1261,11 @@ export function createBrowserGoogletagAdapter(
         (error: unknown) => rejectOperation(operation, error)
       );
     };
+    let bindingToken = weakMapValue(bindingTokens, binding.binding);
+    if (!bindingToken) {
+      bindingToken = Object.freeze({});
+      setWeakMapValue(bindingTokens, binding.binding, bindingToken);
+    }
     const facade = createFacade(
       binding,
       registerOperationEffect,
@@ -1021,7 +1274,10 @@ export function createBrowserGoogletagAdapter(
       (service) => {
         const tracker = ensureInitialLoadTracking(binding, service);
         return tracker?.disabled === true;
-      }
+      },
+      targetingWrites,
+      targetingObservations,
+      bindingToken
     );
     try {
       if (disposed) {

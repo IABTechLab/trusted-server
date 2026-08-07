@@ -4,6 +4,7 @@ import {
   createNoopGoogletagAdapter,
   type GoogletagAdapter,
   type GoogletagBindingStatus,
+  type GoogletagFacade,
 } from '../../src/adapters/googletag';
 import {
   createNoopMessagingAdapter,
@@ -234,6 +235,74 @@ describe('browser composition', () => {
     expect(Object.isFrozen(composition.runtime)).toBe(true);
   });
 
+  it('subscribes the injected slot service before correctness activation and disposes both listeners', async () => {
+    const subscriptions: string[] = [];
+    const releases: string[] = [];
+    const facade = {
+      bindingToken: () => Object.freeze({}),
+      subscribe: (eventType: string) => {
+        subscriptions.push(eventType);
+        return () => releases.push(eventType);
+      },
+    } as unknown as GoogletagFacade;
+    const googletag: GoogletagAdapter = Object.freeze({
+      bindingStatus: () => 'present',
+      dispose: vi.fn(),
+      notifyReady: vi.fn(),
+      run: <T>(command: (gpt: Readonly<GoogletagFacade>) => T) => {
+        const result = Promise.resolve(command(facade));
+        return Object.freeze({ status: 'present' as const, result, dispose: vi.fn() });
+      },
+    });
+    const correctness = vi.fn(
+      (
+        _context: unknown,
+        _adapters: unknown,
+        services: { readonly slots: { readonly snapshotForTest: () => { records: number } } }
+      ) => {
+        expect(subscriptions).toEqual(['slotRequested', 'slotRenderEnded']);
+        expect(services.slots.snapshotForTest().records).toBe(0);
+      }
+    );
+    const composition = createTestBrowserRuntimeComposition(
+      {
+        target: {},
+        releaseId: 'a'.repeat(64),
+        manifest: { version: 1, releaseId: 'a'.repeat(64), integrations: [] },
+        knownIntegrationIds: Object.freeze([]),
+        boot: {
+          auctionProjection: {
+            version: 1,
+            auction: { version: 1, auctionId: 'initial', results: [] },
+            bids: [],
+          },
+          creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+        },
+        kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+      },
+      {
+        adapters: {
+          googletag,
+          messaging: fakeMessagingAdapter(),
+          prebid: fakePrebidAdapter(),
+        },
+        coreActivations: {
+          bridgeRecognizer: vi.fn(() => {
+            expect(subscriptions).toEqual([]);
+          }),
+          correctnessGptListeners: correctness,
+        },
+      }
+    );
+
+    expect(composition.runtime.start()).toBe(true);
+    await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+    expect(correctness).toHaveBeenCalledOnce();
+    composition.runtime.dispose();
+    expect(releases).toEqual(['slotRenderEnded', 'slotRequested']);
+  });
+
   it('constructs one session lazily from accepted boot and keeps it across SPA replacement', async () => {
     const projection = {
       version: 1,
@@ -290,6 +359,13 @@ describe('browser composition', () => {
     const session = composition.runtimeSessionForTest();
     expect(session).toBeDefined();
     expect(composition.runtimeSessionForTest()).toBe(session);
+    const slotService = composition.slotServiceForTest();
+    const targetingService = composition.targetingServiceForTest();
+    expect(slotService).toBeDefined();
+    expect(targetingService).toBeDefined();
+    expect(session?.interfaces['slots']).toBe(slotService);
+    expect(session?.interfaces['targeting']).toBe(targetingService);
+    expect(session?.currentNavigation?.interfaces).toBe(session?.interfaces);
     expect(session?.currentNavigation?.currentAuctionProjection).toEqual(projection);
     expect(Object.isFrozen(session?.currentNavigation?.currentAuctionProjection)).toBe(true);
 
@@ -323,6 +399,15 @@ describe('browser composition', () => {
 
     composition.runtime.dispose();
     expect(session?.disposed).toBe(true);
+    expect(slotService?.snapshotForTest()).toEqual({
+      cycles: 0,
+      intents: 0,
+      physicalSlots: 0,
+      records: 0,
+    });
+    expect(targetingService?.snapshotForTest()).toEqual({ frames: 0, slots: 0 });
+    expect(composition.slotServiceForTest()).toBeUndefined();
+    expect(composition.targetingServiceForTest()).toBeUndefined();
   });
 
   it('unwinds a lazily-created session when navigation identity generation fails', async () => {
@@ -462,6 +547,58 @@ describe('browser composition', () => {
     expect(composition.runtimeSessionForTest()).toBeUndefined();
     expect(composition.projectionSlotsForTest()).toBeUndefined();
   });
+
+  it.each([
+    [2, 255],
+    [1, 256],
+  ] as const)(
+    'rejects one atomic initial registration of %i server plus %i programmatic records',
+    async (serverCount, programmaticCount) => {
+      const composition = createTestBrowserRuntimeComposition(
+        {
+          target: {},
+          releaseId: 'a'.repeat(64),
+          manifest: { version: 1, releaseId: 'a'.repeat(64), integrations: [] },
+          knownIntegrationIds: Object.freeze([]),
+          boot: {
+            auctionProjection: {
+              version: 1,
+              auction: {
+                version: 1,
+                auctionId: 'initial',
+                results: Array.from({ length: serverCount }, (_, index) => ({
+                  outcome: 'no_bid' as const,
+                  slot: `server-${index}`,
+                })),
+              },
+              bids: [],
+            },
+            creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+            diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+          },
+          kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+        },
+        {
+          admittedProgrammaticSlotsForTest: Object.freeze(
+            Array.from({ length: programmaticCount }, (_, index) => `programmatic-${index}`)
+          ),
+          coreActivations: {
+            bridgeRecognizer: vi.fn(),
+            correctnessGptListeners: vi.fn(),
+          },
+        }
+      );
+
+      expect(composition.runtime.start()).toBe(true);
+      await expect(composition.runtime.install()).resolves.toEqual({
+        state: 'fallback',
+        reason: 'bundle_partial',
+      });
+      expect(composition.runtimeSessionForTest()).toBeUndefined();
+      expect(composition.slotServiceForTest()).toBeUndefined();
+      expect(composition.projectionSlotsForTest()).toBeUndefined();
+    }
+  );
 
   it('owns an immutable copy of admitted programmatic slot input for navigation cleanup', async () => {
     const programmaticSlots = ['programmatic-one', 'programmatic-two'];

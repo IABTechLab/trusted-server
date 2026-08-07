@@ -78,6 +78,7 @@ export interface RuntimeSession {
 /** One route-local owner for aliases, intent, targeting, batches, attempts, and projection. */
 export interface NavigationSession {
   readonly generation: object;
+  readonly interfaces: RuntimeInterfaces;
   readonly disposed: boolean;
   readonly currentAuctionProjection: Readonly<object> | undefined;
   readonly signal: AbortSignal;
@@ -98,6 +99,7 @@ export interface NavigationSession {
 /** Navigation-owned scope for one shared auction request and its child attempts. */
 export interface AuctionBatchScope {
   readonly generation: object;
+  readonly interfaces: RuntimeInterfaces;
   readonly disposed: boolean;
   readonly signal: AbortSignal;
   readonly createRenderAttempt: (slot: string) => RenderAttemptResult;
@@ -109,6 +111,7 @@ export interface AuctionBatchScope {
 /** Attempt-owned scope for timers, listeners, ports, and one terminal lifecycle. */
 export interface RenderAttemptScope {
   readonly generation: object;
+  readonly interfaces: RuntimeInterfaces;
   readonly id: string;
   readonly slot: string;
   readonly disposed: boolean;
@@ -204,6 +207,7 @@ class RenderAttemptOwner implements RenderAttemptScope {
   public constructor(
     public readonly id: string,
     public readonly slot: string,
+    public readonly interfaces: RuntimeInterfaces,
     private readonly ownerIsCurrent: () => boolean,
     onDisposalError?: DisposalErrorHandler
   ) {
@@ -253,6 +257,7 @@ class AuctionBatchOwner implements AuctionBatchScope {
 
   public constructor(
     private readonly issuer: NavigationIdentityIssuer,
+    public readonly interfaces: RuntimeInterfaces,
     private readonly ownerIsCurrent: () => boolean,
     private readonly attemptExists: (slot: string) => boolean,
     private readonly registerAttempt: (slot: string, attempt: RenderAttemptOwner) => boolean,
@@ -285,6 +290,7 @@ class AuctionBatchOwner implements AuctionBatchScope {
     const attempt = new RenderAttemptOwner(
       identity.value,
       slot,
+      this.interfaces,
       (): boolean => this.isCurrent() && this.attempts.get(slot) === attemptReference.current,
       this.onDisposalError
     );
@@ -346,6 +352,7 @@ class NavigationSessionOwner implements NavigationSession {
   public constructor(
     issuer: NavigationIdentityIssuer,
     initialProjection: Readonly<object> | undefined,
+    public readonly interfaces: RuntimeInterfaces,
     ownerIsCurrent: () => boolean,
     onDisposing: () => DisposeCallback | undefined,
     onDisposed: () => void,
@@ -403,6 +410,7 @@ class NavigationSessionOwner implements NavigationSession {
     const batchReference: { current?: AuctionBatchOwner } = {};
     const batch = new AuctionBatchOwner(
       issuer,
+      this.interfaces,
       (): boolean => this.isCurrent() && this.batches.get(key) === batchReference.current,
       (slot) => this.attempts.has(slot),
       (slot, attempt) => {
@@ -614,6 +622,7 @@ class RuntimeSessionOwner implements RuntimeSession {
     const navigation = new NavigationSessionOwner(
       identityIssuer,
       projection,
+      this.interfaces,
       () => !this.disposed && this.navigation === navigationReference.current,
       () => {
         const disposingNavigation = navigationReference.current;
