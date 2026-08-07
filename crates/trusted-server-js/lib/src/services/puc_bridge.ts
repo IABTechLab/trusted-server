@@ -217,6 +217,53 @@ function installPucDynamicOwner(): void {
     }
     return true;
   };
+  const utf8Length = (value: string): number => new TextEncoder().encode(value).byteLength;
+  const validApsRenderer = (
+    renderer: Record<string, unknown>,
+    publisherOrigin: URL
+  ): boolean => {
+    const accountId = renderer['accountId'];
+    const bidId = renderer['bidId'];
+    const creativeId = renderer['creativeId'];
+    const creativeUrl = renderer['creativeUrl'];
+    const aaxResponse = renderer['aaxResponse'];
+    if (
+      renderer['type'] !== 'aps' ||
+      renderer['version'] !== 1 ||
+      typeof accountId !== 'string' ||
+      accountId.length === 0 ||
+      utf8Length(accountId) > 1024 ||
+      typeof bidId !== 'string' ||
+      bidId.length === 0 ||
+      utf8Length(bidId) > 64 ||
+      /[\x00-\x1f\x7f]/.test(bidId) ||
+      (renderer['tagType'] !== 'iframe' && renderer['tagType'] !== 'script') ||
+      !validDimension(renderer['width']) ||
+      !validDimension(renderer['height']) ||
+      typeof creativeUrl !== 'string' ||
+      utf8Length(creativeUrl) > 4096 ||
+      typeof aaxResponse !== 'string' ||
+      aaxResponse.length > 349_528 ||
+      (Object.prototype.hasOwnProperty.call(renderer, 'creativeId') &&
+        (typeof creativeId !== 'string' ||
+          creativeId.length === 0 ||
+          utf8Length(creativeId) > 1024))
+    ) {
+      return false;
+    }
+    try {
+      const parsedCreativeUrl = new URL(creativeUrl);
+      return (
+        parsedCreativeUrl.protocol === 'https:' &&
+        parsedCreativeUrl.hostname !== '' &&
+        parsedCreativeUrl.username === '' &&
+        parsedCreativeUrl.password === '' &&
+        parsedCreativeUrl.origin !== publisherOrigin.origin
+      );
+    } catch {
+      return false;
+    }
+  };
 
   ownerWindow.render = (data, helper, creativeWindow) =>
     new Promise<void>((resolve, reject) => {
@@ -433,12 +480,9 @@ function installPucDynamicOwner(): void {
           !/^n1_[A-Za-z0-9_-]{22}$/.test(envelope['nonce']) ||
           typeof envelope['publisherOrigin'] !== 'string' ||
           new TextEncoder().encode(envelope['publisherOrigin']).byteLength > 2048 ||
-          renderer['type'] !== 'aps' ||
-          renderer['version'] !== 1 ||
-          !validDimension(renderer['width']) ||
-          !validDimension(renderer['height']) ||
           !parsedUrl ||
           !parsedPublisherOrigin ||
+          !validApsRenderer(renderer, parsedPublisherOrigin) ||
           new TextEncoder().encode(String(rendererUrl)).byteLength > 2048 ||
           (parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'http:') ||
           parsedUrl.hostname === '' ||
