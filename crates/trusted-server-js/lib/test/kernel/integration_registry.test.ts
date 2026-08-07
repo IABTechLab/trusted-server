@@ -325,6 +325,73 @@ describe('integration manifest and registration admission', () => {
 });
 
 describe('integration preparation and activation transaction', () => {
+  it('prepares core-owned bindings before module preparation and activates afterward', async () => {
+    const order: string[] = [];
+    const registry = createIntegrationRegistry({
+      manifest: manifest(['gpt']),
+      releaseId: RELEASE_ID,
+      startedAtMs: 0,
+      now: () => 0,
+      getBindings: () => {
+        order.push('bindings');
+        return { config: Object.freeze({}), interfaces: Object.freeze({}) };
+      },
+    });
+    registry.register(
+      registration('gpt', {
+        prepare: () => {
+          order.push('module:prepare');
+          return { activate: () => order.push('module:activate') };
+        },
+      })
+    );
+
+    const result = await registry.install({
+      prepareCore: () => order.push('core:prepare'),
+      activateCore: () => order.push('core:activate'),
+      publish: () => order.push('publish'),
+      drainPreload: () => order.push('drain'),
+    });
+
+    expect(result).toMatchObject({ state: 'kernel' });
+    expect(order).toEqual([
+      'core:prepare',
+      'bindings',
+      'module:prepare',
+      'core:activate',
+      'module:activate',
+      'publish',
+      'drain',
+    ]);
+  });
+
+  it('unwinds core-prepared resources when later module preparation fails', async () => {
+    const release = vi.fn();
+    const registry = createIntegrationRegistry({
+      manifest: manifest(['gpt']),
+      releaseId: RELEASE_ID,
+      startedAtMs: 0,
+      now: () => 0,
+    });
+    registry.register(
+      registration('gpt', {
+        prepare: () => {
+          throw new Error('fictional preparation failure');
+        },
+      })
+    );
+
+    const result = await registry.install({
+      prepareCore: ({ onDispose }) => onDispose(release),
+      activateCore: vi.fn(),
+      publish: vi.fn(),
+      drainPreload: vi.fn(),
+    });
+
+    expect(result).toMatchObject({ state: 'fallback', reason: 'bundle_partial' });
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
   it('collects without execution, prepares sequentially, and commits in exact order', async () => {
     const order: string[] = [];
     const contexts: IntegrationPrepareContext[] = [];

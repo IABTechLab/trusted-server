@@ -126,6 +126,70 @@ describe('Runtime bootstrap owner', () => {
     ).toBe(false);
   });
 
+  it('prepares inert owner interfaces before module preparation and activates afterward', async () => {
+    const order: string[] = [];
+    let prepared = false;
+    const runtime = createRuntime({
+      target: { que: [() => order.push('drain')] },
+      releaseId: RELEASE,
+      manifest: manifest(['gpt']),
+      knownIntegrationIds: Object.freeze(['gpt']),
+      boot: boot(),
+      prepareOwner: ({ boot: acceptedBoot, onDispose }) => {
+        expect(Object.isFrozen(acceptedBoot)).toBe(true);
+        prepared = true;
+        order.push('owner:prepare');
+        onDispose(() => order.push('owner:dispose'));
+      },
+      getBindings: () => {
+        expect(prepared).toBe(true);
+        order.push('bindings');
+        return { config: Object.freeze({}), interfaces: Object.freeze({}) };
+      },
+      activateOwner: () => order.push('owner:activate'),
+      activateCore: () => order.push('core:activate'),
+      kernel: {
+        addAdUnits: vi.fn(),
+        diagnostics: Object.freeze({}),
+        requestAds: vi.fn(),
+      },
+    });
+
+    expect(runtime.start()).toBe(true);
+    expect(
+      runtime.registerIntegration({
+        id: 'gpt',
+        release: RELEASE,
+        prepare: ({ onDispose }: { onDispose(callback: () => void): void }) => {
+          order.push('module:prepare');
+          onDispose(() => order.push('module:dispose'));
+          return {
+            activate: ({ afterCommit }: { afterCommit(callback: () => void): void }) => {
+              order.push('module:activate');
+              afterCommit(() => order.push('after-commit'));
+            },
+          };
+        },
+      })
+    ).toBe(true);
+
+    const result = await runtime.install();
+    expect(result).toMatchObject({ state: 'kernel' });
+    expect(order).toEqual([
+      'owner:prepare',
+      'bindings',
+      'module:prepare',
+      'owner:activate',
+      'core:activate',
+      'module:activate',
+      'after-commit',
+      'drain',
+    ]);
+
+    if (result.state === 'kernel') result.dispose();
+    expect(order.slice(-2)).toEqual(['module:dispose', 'owner:dispose']);
+  });
+
   it('stops activation when owner activation disposes the installing runtime', async () => {
     const activateCore = vi.fn();
     const activateModule = vi.fn();

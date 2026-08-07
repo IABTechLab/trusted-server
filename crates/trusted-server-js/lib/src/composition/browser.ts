@@ -25,6 +25,7 @@ import {
 } from '../core/contracts/auction_projection';
 import { validateApsRenderer } from '../core/contracts/aps_renderer';
 import { validateRequestAdsOptions } from '../core/contracts/request_ads';
+import { log } from '../core/log';
 import {
   AdUnitRegistrationError,
   addAdUnitsResult,
@@ -56,6 +57,7 @@ import {
   createRendererNonceRegistry,
   resolveCacheAdmAttempt,
   renderDirectCacheAttempt,
+  resizeCollapsedPucShell,
   renderDirectAdmAttempt,
   type RenderAttempt,
   type CommittedArtifactStore,
@@ -136,6 +138,7 @@ export interface TestBrowserRuntimeCompositionOptions extends BrowserComposition
   readonly coreActivations: BrowserCoreActivations;
   readonly createIdentityIssuerForTest?: NavigationIdentityIssuerFactory;
   readonly admittedProgrammaticSlotsForTest?: readonly string[];
+  readonly gptStartupForTest?: (config: unknown) => void;
 }
 
 interface AcceptedBrowserBoot {
@@ -228,7 +231,25 @@ export function createTestBrowserRuntimeComposition(
   compositionOptions: TestBrowserRuntimeCompositionOptions
 ): BrowserRuntimeComposition {
   const composition = createBrowserComposition(compositionOptions);
+  const providedBindings = runtimeOptions.getBindings;
+  const startGpt = compositionOptions.gptStartupForTest ?? (() => undefined);
+  const gptRuntime = Object.freeze({ start: startGpt });
   let runtimeSession: RuntimeSession | undefined;
+  const getBindings: NonNullable<RuntimeOptions['getBindings']> = (id) => {
+    const provided = providedBindings?.(id);
+    let config: unknown;
+    if (provided !== undefined) {
+      const descriptor = Object.getOwnPropertyDescriptor(provided, 'config');
+      if (!descriptor || !('value' in descriptor)) return provided;
+      config = descriptor.value;
+    }
+    const interfaces = runtimeSession?.interfaces;
+    if (!interfaces) throw new Error(`Integration interfaces are unavailable for ${id}`);
+    return Object.freeze({
+      config,
+      interfaces,
+    });
+  };
   let preparedBrowserServices: PreparedBrowserServices | undefined;
   let browserServices: Readonly<BrowserServices> | undefined;
   let auctionContextRegistry: AuctionContextRegistry | undefined;
@@ -412,12 +433,13 @@ export function createTestBrowserRuntimeComposition(
   };
   const runtime = createRuntime({
     ...runtimeOptions,
+    getBindings,
     kernel: {
       addAdUnits: addProgrammaticAdUnits,
       diagnostics: runtimeOptions.kernel.diagnostics,
       requestAds: requestDirectAds,
     },
-    activateOwner: (context) => {
+    prepareOwner: (context) => {
       const boot = context.boot as unknown as AcceptedBrowserBoot;
       const cachePolicy =
         boot.cachePolicy === undefined ? undefined : parseCacheFetchPolicyV1(boot.cachePolicy);
@@ -438,61 +460,67 @@ export function createTestBrowserRuntimeComposition(
       const publisherOrigin = window.location.origin;
       const fetchCache = globalThis.fetch;
       const rendererUrl = new URL(APS_RENDERER_V1_PATH, publisherOrigin).href;
-      const renderDirectAdm = (attempt: RenderAttempt, container: HTMLElement): boolean => {
-        try {
-          return renderDirectAdmAttempt({
-            attempt,
-            container,
-            prepareIframe: prepareAdmIframe,
-            publisherOrigin,
-          });
-        } catch {
-          return false;
-        }
-      };
-      const renderDirectCache = (attempt: RenderAttempt, container: HTMLElement): boolean => {
-        if (!cachePolicy) {
+      const renderDirectAdm = Object.freeze(
+        (attempt: RenderAttempt, container: HTMLElement): boolean => {
           try {
-            attempt.fail('descriptor_invalid');
+            return renderDirectAdmAttempt({
+              attempt,
+              container,
+              prepareIframe: prepareAdmIframe,
+              publisherOrigin,
+            });
           } catch {
-            // The admitted attempt remains the only terminal authority.
+            return false;
           }
-          return false;
         }
-        if (typeof fetchCache !== 'function') {
+      );
+      const renderDirectCache = Object.freeze(
+        (attempt: RenderAttempt, container: HTMLElement): boolean => {
+          if (!cachePolicy) {
+            try {
+              attempt.fail('descriptor_invalid');
+            } catch {
+              // The admitted attempt remains the only terminal authority.
+            }
+            return false;
+          }
+          if (typeof fetchCache !== 'function') {
+            try {
+              attempt.fail('cache_network_error');
+            } catch {
+              // The admitted attempt remains the only terminal authority.
+            }
+            return false;
+          }
           try {
-            attempt.fail('cache_network_error');
+            return renderDirectCacheAttempt({
+              attempt,
+              cachePolicy,
+              container,
+              fetcher: (input, init) => fetchCache(input, init),
+              prepareIframe: prepareAdmIframe,
+              publisherOrigin,
+            });
           } catch {
-            // The admitted attempt remains the only terminal authority.
+            return false;
           }
-          return false;
         }
-        try {
-          return renderDirectCacheAttempt({
-            attempt,
-            cachePolicy,
-            container,
-            fetcher: (input, init) => fetchCache(input, init),
-            prepareIframe: prepareAdmIframe,
-            publisherOrigin,
-          });
-        } catch {
-          return false;
+      );
+      const renderDirectAps = Object.freeze(
+        (attempt: RenderAttempt, container: HTMLElement): boolean => {
+          try {
+            return renderDirectApsAttempt({
+              attempt,
+              container,
+              messaging: composition.adapters.messaging,
+              nonces: rendererNonces,
+              publisherOrigin,
+            });
+          } catch {
+            return false;
+          }
         }
-      };
-      const renderDirectAps = (attempt: RenderAttempt, container: HTMLElement): boolean => {
-        try {
-          return renderDirectApsAttempt({
-            attempt,
-            container,
-            messaging: composition.adapters.messaging,
-            nonces: rendererNonces,
-            publisherOrigin,
-          });
-        } catch {
-          return false;
-        }
-      };
+      );
       const resolveCacheAdm: NonNullable<PucBridgeOptions['resolveCacheAdm']> = (
         attempt,
         onResolved
@@ -598,7 +626,7 @@ export function createTestBrowserRuntimeComposition(
       const session = createRuntimeSession({
         createIdentityIssuer:
           compositionOptions.createIdentityIssuerForTest ?? createBrowserNavigationIdentityIssuer,
-        interfaces: Object.freeze({ adapters: composition.adapters, ...services }),
+        interfaces: Object.freeze({ adapters: composition.adapters, gpt: gptRuntime, ...services }),
       });
       context.onDispose(() => {
         batchCoordinator.dispose();
@@ -637,13 +665,14 @@ export function createTestBrowserRuntimeComposition(
       }
       const contextRegistry = createAuctionContextRegistry({
         manifestIntegrationIds: Object.freeze(boot.manifest.integrations.map(({ id }) => id)),
+        onContributorFailure: (failure) => log.warn('auction context: contributor failed', failure),
         runtimeOwner: session,
       });
       runtimeSession = session;
       auctionBatchService = batchCoordinator;
       auctionContextRegistry = contextRegistry;
       projectionParser = parseProjection;
-      return runtimeOptions.activateOwner?.(context);
+      return runtimeOptions.prepareOwner?.(context);
     },
     activateCore: (context) => {
       const prepared = preparedBrowserServices;
@@ -654,6 +683,7 @@ export function createTestBrowserRuntimeComposition(
         rendererNonces: prepared.services.rendererNonces,
         rendererUrl: prepared.rendererUrl,
         reservations: prepared.services.reservations,
+        resizeCollapsedShell: resizeCollapsedPucShell,
         resolveCacheAdm: prepared.resolveCacheAdm,
       });
       context.onDispose(() => pucBridge.dispose());
