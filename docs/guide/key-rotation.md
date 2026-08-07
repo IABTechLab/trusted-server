@@ -687,4 +687,4 @@ Restrict rotation endpoints:
 - Learn about [Request Signing](/guide/request-signing) for using keys
 - Review [Configuration](/guide/configuration) for additional store setup
 - Set up [Testing](/guide/testing) for rotation procedures
-- Read about [GDPR Compliance](/guide/gdpr-compliance) for privacy considerations
+- Read about [GDPR Compliance](/guide/gdpr-compliance) for consent signal handling
