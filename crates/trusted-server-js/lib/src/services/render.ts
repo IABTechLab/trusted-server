@@ -14,6 +14,9 @@ const ATTEMPT_ID = /^a1_[A-Za-z0-9_-]{22}$/;
 const RENDERER_NONCE = /^n1_[A-Za-z0-9_-]{22}$/;
 const MAX_RENDERER_NONCES = 256;
 const MAX_RENDERER_NONCE_DRAWS = 8;
+const MAX_CACHE_BODY_BYTES = 512 * 1024;
+const MAX_CACHE_URL_BYTES = 4096;
+const CACHE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const reflectApplyIntrinsic = Reflect.apply;
 const directAdmDocument = typeof document === 'undefined' ? undefined : document;
 const directAdmOwnerDocumentGetter =
@@ -21,6 +24,7 @@ const directAdmOwnerDocumentGetter =
     ? undefined
     : Object.getOwnPropertyDescriptor(Node.prototype, 'ownerDocument')?.get;
 const objectFreezeIntrinsic = Object.freeze;
+const objectToStringIntrinsic = Object.prototype.toString;
 const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayPushIntrinsic = Array.prototype.push;
 const arraySliceIntrinsic = Array.prototype.slice;
@@ -59,6 +63,10 @@ const weakSetAddIntrinsic = WeakSet.prototype.add;
 const weakSetHasIntrinsic = WeakSet.prototype.has;
 const weakSetDeleteIntrinsic = WeakSet.prototype.delete;
 const promiseThenIntrinsic = Promise.prototype.then;
+const stringIndexOfIntrinsic = String.prototype.indexOf;
+const stringSliceIntrinsic = String.prototype.slice;
+const stringIntrinsic = String;
+const jsonParseIntrinsic = JSON.parse;
 const artifactDisposals = new WeakMap<object, boolean>();
 const committedArtifactStores = new WeakSet<object>();
 const renderAttempts = new WeakSet<object>();
@@ -70,6 +78,14 @@ function frozen<const Value extends object>(value: Value): Readonly<Value> {
 
 function arrayPush<Value>(array: Value[], value: Value): number {
   return Reflect.apply(arrayPushIntrinsic, array, [value]) as number;
+}
+
+function isUint8Array(value: unknown): value is Uint8Array {
+  return (
+    (typeof value === 'object' || typeof value === 'function') &&
+    value !== null &&
+    reflectApplyIntrinsic(objectToStringIntrinsic, value, []) === '[object Uint8Array]'
+  );
 }
 
 function arraySlice<Value>(array: Value[]): Value[] {
@@ -321,6 +337,11 @@ export const RENDER_STATE_DEADLINES: Readonly<
   waiting_for_adm: frozen({ milliseconds: 5_000, reason: 'adm_document_no_load' }),
 });
 
+const CACHE_FETCH_DEADLINE = frozen({
+  milliseconds: 5_000,
+  reason: 'cache_network_error' as const,
+});
+
 export interface RenderAttemptOptions {
   readonly owner: RenderAttemptScope;
   readonly artifacts: CommittedArtifactStore;
@@ -356,6 +377,8 @@ export interface RenderAttempt {
   readonly beginGamClaim: () => boolean;
   readonly ownerClaimed: () => boolean;
   readonly ownerRegistered: () => boolean;
+  readonly beginCacheFetch: () => boolean;
+  readonly cacheFetchCompleted: () => boolean;
   readonly beginDirect: () => boolean;
   readonly beginApsDocument: (artifact: CommittedRenderArtifact) => boolean;
   readonly beginAdm: (artifact: CommittedRenderArtifact) => boolean;
@@ -373,6 +396,23 @@ export interface DirectAdmAttemptOptions {
   readonly container: HTMLElement;
   readonly prepareIframe: DirectAdmIframeConstructor;
   readonly publisherOrigin: string;
+}
+
+interface CacheFetchReader {
+  readonly cancel?: () => Promise<unknown> | unknown;
+  readonly read: () => Promise<Readonly<{ done: boolean; value: Uint8Array | undefined }>>;
+  readonly releaseLock?: () => void;
+}
+
+interface CacheFetchResponse {
+  readonly body: Readonly<{ getReader: () => CacheFetchReader }> | null;
+  readonly ok: boolean;
+  readonly type?: Response['type'];
+}
+
+export interface DirectCacheAttemptOptions extends DirectAdmAttemptOptions {
+  readonly cachePolicy: Readonly<{ version: 1; baseUrl: string }>;
+  readonly fetcher: (input: string, init: RequestInit) => Promise<unknown>;
 }
 
 export interface DirectAdmIframeHandle {
@@ -957,6 +997,7 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
   let pendingArtifact: CommittedRenderArtifact | undefined;
   let admittedRenderSource: ReservationRenderSource | undefined;
   let admittedWinnerContext: WinnerContext | undefined;
+  let cacheFetchStarted = false;
   let deadlineHandle: unknown;
   let deadlineState: RenderAttemptActiveState | undefined;
   let settlingInternally = false;
@@ -1198,8 +1239,11 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
       ? settle(frozen({ outcome: 'failed', reason }), true)
       : false;
 
-  const armDeadline = (entered: RenderAttemptActiveState): void => {
-    const deadline = RENDER_STATE_DEADLINES[entered];
+  const armDeadline = (
+    entered: RenderAttemptActiveState,
+    explicitDeadline?: RenderDeadline
+  ): void => {
+    const deadline = explicitDeadline ?? RENDER_STATE_DEADLINES[entered];
     if (!deadline) return;
     deadlineState = entered;
     try {
@@ -1229,7 +1273,8 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
 
   const enter = (
     allowed: readonly RenderAttemptActiveState[],
-    next: RenderAttemptActiveState
+    next: RenderAttemptActiveState,
+    explicitDeadline?: RenderDeadline
   ): boolean => {
     if (outcome !== undefined || !ownerIsCurrent() || !allowed.includes(state as never)) {
       return false;
@@ -1237,7 +1282,7 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
     state = next;
     arrayPush(history, next);
     clearDeadline();
-    if (outcome === undefined) armDeadline(next);
+    if (outcome === undefined) armDeadline(next, explicitDeadline);
     return true;
   };
 
@@ -1269,6 +1314,29 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
     return false;
   };
 
+  const beginCacheFetch = (): boolean => {
+    if (
+      cacheFetchStarted ||
+      outcome !== undefined ||
+      admittedRenderSource?.type !== 'cache' ||
+      admittedWinnerContext === undefined ||
+      !ownerIsCurrent()
+    ) {
+      return false;
+    }
+    if (state === 'created') {
+      cacheFetchStarted = true;
+      return enter(['created'], 'rendering_direct', CACHE_FETCH_DEADLINE);
+    }
+    if (state !== 'waiting_for_insertion') return false;
+    cacheFetchStarted = true;
+    clearDeadline();
+    if (outcome === undefined && state === 'waiting_for_insertion') {
+      armDeadline('waiting_for_insertion', CACHE_FETCH_DEADLINE);
+    }
+    return outcome === undefined && state === 'waiting_for_insertion';
+  };
+
   const lifecycle: RenderAttempt = {
     id,
     slot,
@@ -1292,8 +1360,24 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
         ? enter(['waiting_for_gam_and_claim'], 'waiting_for_owner')
         : false,
     ownerRegistered: () => enter(['waiting_for_owner'], 'waiting_for_insertion'),
+    beginCacheFetch,
+    cacheFetchCompleted: () => {
+      if (
+        admittedRenderSource?.type !== 'cache' ||
+        !admittedWinnerContext ||
+        outcome !== undefined ||
+        (state !== 'rendering_direct' && state !== 'waiting_for_insertion') ||
+        deadlineState !== state ||
+        !ownerIsCurrent()
+      ) {
+        return false;
+      }
+      clearDeadline();
+      return true;
+    },
     beginDirect: () =>
-      admittedRenderSource && admittedWinnerContext
+      (admittedRenderSource?.type === 'aps' || admittedRenderSource?.type === 'adm') &&
+      admittedWinnerContext
         ? enter(['created'], 'rendering_direct')
         : false,
     beginApsDocument: (artifact) =>
@@ -1435,6 +1519,337 @@ type DirectAdmSource = Readonly<{
   width: number;
 }>;
 
+type DirectCacheSource = Readonly<{
+  cacheId: string;
+  fetchUrl: string;
+  height: number;
+  type: 'cache';
+  version: 1;
+  width: number;
+}>;
+
+type CacheBodyResult =
+  | Readonly<{ ok: true; text: string }>
+  | Readonly<{ ok: false; reason: 'cache_network_error' | 'cache_invalid_response' }>;
+
+function exactFrozenDataRecord(
+  value: unknown,
+  expectedNames: readonly string[]
+): Record<string, unknown> | undefined {
+  try {
+    if (
+      typeof value !== 'object' ||
+      value === null ||
+      !Object.isFrozen(value) ||
+      Object.getPrototypeOf(value) !== Object.prototype ||
+      Object.getOwnPropertySymbols(value).length !== 0
+    ) {
+      return undefined;
+    }
+    const names = Object.getOwnPropertyNames(value).sort();
+    if (names.length !== expectedNames.length) return undefined;
+    const fields = Object.create(null) as Record<string, unknown>;
+    for (let index = 0; index < expectedNames.length; index += 1) {
+      const name = expectedNames[index];
+      if (!name || names[index] !== name) return undefined;
+      const descriptor = Object.getOwnPropertyDescriptor(value, name);
+      if (
+        !descriptor ||
+        !('value' in descriptor) ||
+        descriptor.enumerable !== true ||
+        descriptor.configurable !== false ||
+        descriptor.writable !== false
+      ) {
+        return undefined;
+      }
+      fields[name] = descriptor.value;
+    }
+    return fields;
+  } catch {
+    return undefined;
+  }
+}
+
+function readCachePolicyBase(value: unknown): URL | undefined {
+  try {
+    const fields = exactFrozenDataRecord(value, ['baseUrl', 'version']);
+    const baseUrl = fields?.['baseUrl'];
+    if (
+      !fields ||
+      fields['version'] !== 1 ||
+      typeof baseUrl !== 'string' ||
+      baseUrl.length === 0 ||
+      new TextEncoder().encode(baseUrl).byteLength > MAX_CACHE_URL_BYTES
+    ) {
+      return undefined;
+    }
+    for (let index = 0; index < baseUrl.length; index += 1) {
+      const code = baseUrl.charCodeAt(index);
+      if (code <= 0x1f || code === 0x7f) return undefined;
+      if (code >= 0xd800 && code <= 0xdbff) {
+        const next = baseUrl.charCodeAt(index + 1);
+        if (next < 0xdc00 || next > 0xdfff) return undefined;
+        index += 1;
+      } else if (code >= 0xdc00 && code <= 0xdfff) {
+        return undefined;
+      }
+    }
+    const base = new URL(baseUrl);
+    if (
+      base.protocol !== 'https:' ||
+      base.hostname === '' ||
+      base.username !== '' ||
+      base.password !== '' ||
+      base.search !== '' ||
+      base.hash !== '' ||
+      base.pathname === '/'
+    ) {
+      return undefined;
+    }
+    return base;
+  } catch {
+    return undefined;
+  }
+}
+
+function readDirectCacheSource(
+  value: unknown,
+  cachePolicy: unknown
+): DirectCacheSource | undefined {
+  try {
+    const base = readCachePolicyBase(cachePolicy);
+    if (!base) return undefined;
+    const fields = exactFrozenDataRecord(value, [
+      'cacheId',
+      'fetchUrl',
+      'height',
+      'type',
+      'version',
+      'width',
+    ]);
+    if (
+      !fields ||
+      fields['type'] !== 'cache' ||
+      fields['version'] !== 1 ||
+      typeof fields['cacheId'] !== 'string' ||
+      !CACHE_ID.test(fields['cacheId']) ||
+      typeof fields['fetchUrl'] !== 'string' ||
+      fields['fetchUrl'].length === 0 ||
+      new TextEncoder().encode(fields['fetchUrl']).byteLength > MAX_CACHE_URL_BYTES ||
+      typeof fields['width'] !== 'number' ||
+      !Number.isInteger(fields['width']) ||
+      fields['width'] < 1 ||
+      fields['width'] > 4096 ||
+      typeof fields['height'] !== 'number' ||
+      !Number.isInteger(fields['height']) ||
+      fields['height'] < 1 ||
+      fields['height'] > 4096
+    ) {
+      return undefined;
+    }
+    const sourceFetchUrl = fields['fetchUrl'] as string;
+    for (let index = 0; index < sourceFetchUrl.length; index += 1) {
+      const code = sourceFetchUrl.charCodeAt(index);
+      if (code <= 0x1f || code === 0x7f) return undefined;
+      if (code >= 0xd800 && code <= 0xdbff) {
+        const next = sourceFetchUrl.charCodeAt(index + 1);
+        if (next < 0xdc00 || next > 0xdfff) return undefined;
+        index += 1;
+      } else if (code >= 0xdc00 && code <= 0xdfff) {
+        return undefined;
+      }
+    }
+    const fetchUrl = new URL(sourceFetchUrl);
+    const expected = new URL(base.href);
+    expected.search = `?uuid=${encodeURIComponent(fields['cacheId'])}`;
+    if (
+      fetchUrl.protocol !== 'https:' ||
+      fetchUrl.username !== '' ||
+      fetchUrl.password !== '' ||
+      fetchUrl.hash !== '' ||
+      fetchUrl.origin !== base.origin ||
+      fetchUrl.port !== base.port ||
+      fetchUrl.pathname !== base.pathname ||
+      [...fetchUrl.searchParams.keys()].length !== 1 ||
+      fetchUrl.searchParams.get('uuid') !== fields['cacheId'] ||
+      fetchUrl.search !== `?uuid=${encodeURIComponent(fields['cacheId'])}` ||
+      fetchUrl.href !== fields['fetchUrl'] ||
+      fetchUrl.href !== expected.href
+    ) {
+      return undefined;
+    }
+    return value as DirectCacheSource;
+  } catch {
+    return undefined;
+  }
+}
+
+function readSelectedCpm(value: unknown): number | undefined {
+  const fields = exactFrozenDataRecord(value, ['selectedCpm']);
+  const selectedCpm = fields?.['selectedCpm'];
+  return typeof selectedCpm === 'number' && Number.isFinite(selectedCpm) && selectedCpm >= 0
+    ? selectedCpm
+    : undefined;
+}
+
+function expandAuctionPrice(adm: string, selectedCpm: number): string {
+  const token = '${AUCTION_PRICE}';
+  const replacement = stringIntrinsic(selectedCpm);
+  let cursor = 0;
+  let output = '';
+  while (true) {
+    const next = reflectApplyIntrinsic(stringIndexOfIntrinsic, adm, [token, cursor]) as number;
+    if (next < 0) {
+      return output + (reflectApplyIntrinsic(stringSliceIntrinsic, adm, [cursor]) as string);
+    }
+    output +=
+      (reflectApplyIntrinsic(stringSliceIntrinsic, adm, [cursor, next]) as string) + replacement;
+    cursor = next + token.length;
+  }
+}
+
+function parseCacheAdm(
+  text: string,
+  source: DirectCacheSource,
+  selectedCpm: number
+): DirectAdmSource | undefined {
+  try {
+    const value = reflectApplyIntrinsic(jsonParseIntrinsic, JSON, [text]) as unknown;
+    if (
+      typeof value !== 'object' ||
+      value === null ||
+      Array.isArray(value) ||
+      Object.getPrototypeOf(value) !== Object.prototype ||
+      Object.getOwnPropertySymbols(value).length !== 0
+    ) {
+      return undefined;
+    }
+    const record = value as Record<string, unknown>;
+    const names = Object.getOwnPropertyNames(record);
+    for (let index = 0; index < names.length; index += 1) {
+      const name = names[index];
+      if (!name) return undefined;
+      const descriptor = Object.getOwnPropertyDescriptor(record, name);
+      if (!descriptor || !('value' in descriptor) || descriptor.enumerable !== true) {
+        return undefined;
+      }
+    }
+    const hasOwn = (name: string): boolean => Object.prototype.hasOwnProperty.call(record, name);
+    if (hasOwn('width') || hasOwn('height')) return undefined;
+    const admDescriptor = Object.getOwnPropertyDescriptor(record, 'adm');
+    if (
+      !admDescriptor ||
+      !('value' in admDescriptor) ||
+      typeof admDescriptor.value !== 'string' ||
+      admDescriptor.value.trim().length === 0 ||
+      new TextEncoder().encode(admDescriptor.value).byteLength > MAX_CACHE_BODY_BYTES
+    ) {
+      return undefined;
+    }
+    const hasWidth = hasOwn('w');
+    const hasHeight = hasOwn('h');
+    if (hasWidth !== hasHeight) return undefined;
+    if (
+      hasWidth &&
+      (typeof record['w'] !== 'number' ||
+        !Number.isInteger(record['w']) ||
+        record['w'] < 1 ||
+        record['w'] > 4096 ||
+        record['w'] !== source.width ||
+        typeof record['h'] !== 'number' ||
+        !Number.isInteger(record['h']) ||
+        record['h'] < 1 ||
+        record['h'] > 4096 ||
+        record['h'] !== source.height)
+    ) {
+      return undefined;
+    }
+    if (
+      hasOwn('price') &&
+      (typeof record['price'] !== 'number' ||
+        !Number.isFinite(record['price']) ||
+        record['price'] < 0)
+    ) {
+      return undefined;
+    }
+    const adm = expandAuctionPrice(admDescriptor.value, selectedCpm);
+    if (new TextEncoder().encode(adm).byteLength > MAX_CACHE_BODY_BYTES) return undefined;
+    return frozen({
+      adm,
+      height: source.height,
+      type: 'adm',
+      version: 1,
+      width: source.width,
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+async function readCacheBody(response: CacheFetchResponse): Promise<CacheBodyResult> {
+  let reader: CacheFetchReader | undefined;
+  let cancel: CacheFetchReader['cancel'];
+  let releaseLock: (() => void) | undefined;
+  try {
+    if (
+      response.type === 'error' ||
+      response.type === 'opaque' ||
+      response.type === 'opaqueredirect'
+    ) {
+      return frozen({ ok: false, reason: 'cache_network_error' });
+    }
+    if (!response.ok) return frozen({ ok: false, reason: 'cache_invalid_response' });
+    if (!response.body) return frozen({ ok: true, text: '' });
+    reader = response.body.getReader();
+    cancel = reader.cancel;
+    releaseLock = reader.releaseLock;
+    if (typeof reader.read !== 'function' || typeof cancel !== 'function') {
+      return frozen({ ok: false, reason: 'cache_network_error' });
+    }
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    while (true) {
+      const step = await reader.read();
+      if (step.done) break;
+      if (!isUint8Array(step.value)) {
+        return frozen({ ok: false, reason: 'cache_network_error' });
+      }
+      total += step.value.byteLength;
+      if (total > MAX_CACHE_BODY_BYTES) {
+        try {
+          await cancel.call(reader);
+        } catch {
+          // The byte limit is authoritative even if stream cancellation is hostile.
+        }
+        return frozen({ ok: false, reason: 'cache_invalid_response' });
+      }
+      arrayPush(chunks, step.value);
+    }
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (let index = 0; index < chunks.length; index += 1) {
+      const chunk = chunks[index];
+      if (!chunk) return frozen({ ok: false, reason: 'cache_network_error' });
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return frozen({
+      ok: true,
+      text: new TextDecoder('utf-8', { fatal: true }).decode(bytes),
+    });
+  } catch {
+    return frozen({ ok: false, reason: 'cache_network_error' });
+  } finally {
+    if (reader && typeof releaseLock === 'function') {
+      try {
+        releaseLock.call(reader);
+      } catch {
+        // The bounded result remains authoritative if stream lock release is hostile.
+      }
+    }
+  }
+}
+
 function readDirectAdmSource(value: unknown): DirectAdmSource | undefined {
   try {
     if (
@@ -1489,8 +1904,10 @@ function readDirectAdmSource(value: unknown): DirectAdmSource | undefined {
   }
 }
 
-/** Drive one admitted direct ADM attempt through the shared iframe constructor. */
-export function renderDirectAdmAttempt(options: DirectAdmAttemptOptions): boolean {
+function renderAdmAttempt(
+  options: DirectAdmAttemptOptions,
+  admittedCacheAdm?: DirectAdmSource
+): boolean {
   let attempt: RenderAttempt;
   let container: HTMLElement;
   let prepareIframe: DirectAdmIframeConstructor;
@@ -1520,12 +1937,22 @@ export function renderDirectAdmAttempt(options: DirectAdmAttemptOptions): boolea
     return false;
   }
 
-  const source = readDirectAdmSource(attempt.renderSource);
+  const source = admittedCacheAdm ?? readDirectAdmSource(attempt.renderSource);
   if (!source) {
     attempt.fail('winner_not_renderable');
     return false;
   }
-  if (!attempt.beginDirect()) return false;
+  if (admittedCacheAdm === undefined && !attempt.beginDirect()) return false;
+  let artifactKind: CommittedRenderArtifact['kind'];
+  try {
+    const pathState = attempt.snapshot().state;
+    if (pathState === 'waiting_for_insertion') artifactKind = 'puc';
+    else if (pathState === 'rendering_direct') artifactKind = 'direct_iframe';
+    else return false;
+  } catch {
+    attempt.fail('internal_error');
+    return false;
+  }
 
   let activeHandle: DirectAdmIframeHandle | undefined;
   let activateHandleMethod: DirectAdmIframeHandle['activate'] | undefined;
@@ -1618,7 +2045,7 @@ export function renderDirectAdmAttempt(options: DirectAdmAttemptOptions): boolea
   }
 
   const artifact = frozen<CommittedRenderArtifact>({
-    kind: 'direct_iframe',
+    kind: artifactKind,
     attemptId: attempt.id,
     slot: attempt.slot,
     navigationGeneration: attempt.navigationGeneration,
@@ -1658,6 +2085,198 @@ export function renderDirectAdmAttempt(options: DirectAdmAttemptOptions): boolea
     return fail('internal_error');
   }
   return state === 'waiting_for_adm' || state === 'accepted';
+}
+
+/** Drive one admitted direct ADM attempt through the shared iframe constructor. */
+export function renderDirectAdmAttempt(options: DirectAdmAttemptOptions): boolean {
+  return renderAdmAttempt(options);
+}
+
+/** Fetch one admitted cache source, then enter the exact shared direct-ADM lifecycle. */
+export function renderDirectCacheAttempt(options: DirectCacheAttemptOptions): boolean {
+  let attempt: RenderAttempt;
+  let cachePolicy: DirectCacheAttemptOptions['cachePolicy'];
+  let container: HTMLElement;
+  let fetchCache: DirectCacheAttemptOptions['fetcher'];
+  let prepareIframe: DirectAdmIframeConstructor;
+  let publisherOrigin: string;
+  try {
+    attempt = options.attempt;
+    cachePolicy = options.cachePolicy;
+    container = options.container;
+    fetchCache = options.fetcher;
+    prepareIframe = options.prepareIframe;
+    publisherOrigin = options.publisherOrigin;
+  } catch {
+    return false;
+  }
+  if (
+    !weakSetHas(renderAttempts, attempt) ||
+    typeof fetchCache !== 'function' ||
+    typeof prepareIframe !== 'function'
+  ) {
+    return false;
+  }
+
+  let exactDocumentOrigin: boolean;
+  try {
+    exactDocumentOrigin =
+      !!directAdmDocument &&
+      typeof directAdmOwnerDocumentGetter === 'function' &&
+      reflectApplyIntrinsic(directAdmOwnerDocumentGetter, container, []) === directAdmDocument &&
+      directAdmDocument.defaultView?.location.origin === publisherOrigin;
+  } catch {
+    exactDocumentOrigin = false;
+  }
+  if (!exactDocumentOrigin) {
+    attempt.fail('winner_not_renderable');
+    return false;
+  }
+
+  const source = readDirectCacheSource(attempt.renderSource, cachePolicy);
+  const winnerContext = attempt.winnerContext;
+  const selectedCpm = readSelectedCpm(winnerContext);
+  if (!source || selectedCpm === undefined) {
+    attempt.fail('descriptor_invalid');
+    return false;
+  }
+  if (!attempt.beginCacheFetch()) return false;
+
+  let controller: AbortController;
+  try {
+    controller = new AbortController();
+  } catch {
+    attempt.fail('cache_network_error');
+    return false;
+  }
+
+  let pending = true;
+  const abortFetch = (): void => {
+    if (controller.signal.aborted) return;
+    try {
+      controller.abort();
+    } catch {
+      // Abort is best-effort after the attempt has already settled.
+    }
+  };
+  const failCache = (reason: RenderFailureReason): void => {
+    if (!pending) return;
+    pending = false;
+    abortFetch();
+    try {
+      attempt.fail(reason);
+    } catch {
+      // A hostile attempt boundary cannot replay the already-closed cache phase.
+    }
+  };
+  if (
+    !attempt.onSettled(() => {
+      pending = false;
+      abortFetch();
+    })
+  ) {
+    failCache('cache_network_error');
+    return false;
+  }
+  if (!pending) return false;
+
+  let responsePromise: Promise<unknown>;
+  try {
+    responsePromise = reflectApplyIntrinsic(fetchCache, undefined, [
+      source.fetchUrl,
+      {
+        credentials: 'omit',
+        method: 'GET',
+        mode: 'cors',
+        redirect: 'error',
+        referrer: '',
+        referrerPolicy: 'no-referrer',
+        signal: controller.signal,
+      } satisfies RequestInit,
+    ]) as Promise<unknown>;
+  } catch {
+    failCache('cache_network_error');
+    return false;
+  }
+
+  const complete = async (): Promise<void> => {
+    let fetched: unknown;
+    try {
+      fetched = await responsePromise;
+    } catch {
+      failCache('cache_network_error');
+      return;
+    }
+    if (!pending) return;
+    let response: CacheFetchResponse;
+    let responseOk: boolean;
+    let responseType: Response['type'] | undefined;
+    try {
+      if ((typeof fetched !== 'object' && typeof fetched !== 'function') || fetched === null) {
+        throw new TypeError('invalid cache response');
+      }
+      response = fetched as CacheFetchResponse;
+      responseOk = response.ok;
+      responseType = response.type;
+      if (typeof responseOk !== 'boolean') throw new TypeError('invalid cache status');
+    } catch {
+      failCache('cache_network_error');
+      return;
+    }
+    if (
+      responseType === 'error' ||
+      responseType === 'opaque' ||
+      responseType === 'opaqueredirect'
+    ) {
+      failCache('cache_network_error');
+      return;
+    }
+    if (!responseOk) {
+      failCache('cache_http_error');
+      return;
+    }
+    const body = await readCacheBody(response);
+    if (!pending) return;
+    if (!body.ok) {
+      failCache(body.reason);
+      return;
+    }
+    if (!attempt.cacheFetchCompleted()) {
+      failCache('cache_network_error');
+      return;
+    }
+    const admSource = parseCacheAdm(body.text, source, selectedCpm);
+    if (!admSource) {
+      failCache('cache_invalid_response');
+      return;
+    }
+    if (attempt.renderSource !== source || attempt.winnerContext !== winnerContext) {
+      failCache('cache_invalid_response');
+      return;
+    }
+    pending = false;
+    try {
+      if (
+        !renderAdmAttempt({ attempt, container, prepareIframe, publisherOrigin }, admSource) &&
+        attempt.snapshot().outcome === undefined
+      ) {
+        attempt.fail('internal_error');
+      }
+    } catch {
+      attempt.fail('internal_error');
+    }
+  };
+  const completion = complete();
+  try {
+    reflectApplyIntrinsic(promiseThenIntrinsic, completion, [
+      ignoreAsyncDisposal,
+      ignoreAsyncDisposal,
+    ]);
+  } catch {
+    failCache('cache_network_error');
+    return false;
+  }
+  return true;
 }
 
 interface RendererNonceBinding {

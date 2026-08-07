@@ -39,6 +39,7 @@ import {
 import { createReservationService, type ReservationService } from '../services/reservations';
 import {
   createRendererNonceRegistry,
+  renderDirectCacheAttempt,
   renderDirectAdmAttempt,
   type RenderAttempt,
   type RendererNonceRegistry,
@@ -61,6 +62,7 @@ export interface BrowserServices {
   readonly rendererNonces: RendererNonceRegistry;
   readonly renderDirectAdm: (attempt: RenderAttempt, container: HTMLElement) => boolean;
   readonly renderDirectAps: (attempt: RenderAttempt, container: HTMLElement) => boolean;
+  readonly renderDirectCache: (attempt: RenderAttempt, container: HTMLElement) => boolean;
   readonly slots: SlotService;
   readonly targeting: TargetingService;
 }
@@ -218,11 +220,27 @@ export function createTestBrowserRuntimeComposition(
       });
       const rendererNonces = createRendererNonceRegistry();
       const publisherOrigin = window.location.origin;
+      const fetchCache = globalThis.fetch;
       const renderDirectAdm = (attempt: RenderAttempt, container: HTMLElement): boolean => {
         try {
           return renderDirectAdmAttempt({
             attempt,
             container,
+            prepareIframe: prepareAdmIframe,
+            publisherOrigin,
+          });
+        } catch {
+          return false;
+        }
+      };
+      const renderDirectCache = (attempt: RenderAttempt, container: HTMLElement): boolean => {
+        if (!cachePolicy || typeof fetchCache !== 'function') return false;
+        try {
+          return renderDirectCacheAttempt({
+            attempt,
+            cachePolicy,
+            container,
+            fetcher: (input, init) => fetchCache(input, init),
             prepareIframe: prepareAdmIframe,
             publisherOrigin,
           });
@@ -248,6 +266,7 @@ export function createTestBrowserRuntimeComposition(
         rendererNonces,
         renderDirectAdm,
         renderDirectAps,
+        renderDirectCache,
         slots: slotService,
         targeting: targetingService,
       });
