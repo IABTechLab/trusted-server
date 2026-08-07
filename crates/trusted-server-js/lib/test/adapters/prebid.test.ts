@@ -1567,7 +1567,7 @@ describe('version-pinned Trusted Server bid admission', () => {
     const auctions: unknown[] = [];
     const operation = adapter.run((facade) => {
       const boundary = facade as unknown as {
-        registerTrustedServerBidder(listener: (auction: unknown) => void): unknown;
+        registerTrustedServerBidder(listener: (auction: unknown) => void): () => void;
       };
       return boundary.registerTrustedServerBidder((auction) => auctions.push(auction));
     });
@@ -1627,7 +1627,7 @@ describe('version-pinned Trusted Server bid admission', () => {
 
   it('captures one exact auction callback and admits a mutable copy atomically', async () => {
     const fixture = admissionFixture();
-    await expect(fixture.operation.result).resolves.toBeUndefined();
+    await expect(fixture.operation.result).resolves.toBeTypeOf('function');
 
     expect(fixture.auctions).toHaveLength(1);
     const auction = fixture.auctions[0] as {
@@ -1739,6 +1739,23 @@ describe('version-pinned Trusted Server bid admission', () => {
     });
     expect(fixture.ready.pbjs.registerBidAdapter).toHaveBeenCalledTimes(1);
     fixture.adapter.dispose();
+  });
+
+  it('releases the private bidder registration and permits exact replacement', async () => {
+    const fixture = admissionFixture();
+    const release = await fixture.operation.result;
+
+    expect(release).toBeTypeOf('function');
+    Reflect.apply(release, undefined, []);
+    expect(fixture.done).toHaveBeenCalledTimes(1);
+
+    const replacement = fixture.adapter.run((prebid) =>
+      prebid.registerTrustedServerBidder(vi.fn())
+    );
+    const releaseReplacement = await replacement.result;
+    expect(releaseReplacement).toBeTypeOf('function');
+    expect(fixture.ready.pbjs.registerBidAdapter).toHaveBeenCalledTimes(2);
+    Reflect.apply(releaseReplacement, undefined, []);
   });
 
   it('throws a contract violation for partial publication and an ordinary callback throw otherwise', async () => {
