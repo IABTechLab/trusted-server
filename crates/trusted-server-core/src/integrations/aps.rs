@@ -73,7 +73,7 @@ function validRenderer(renderer){
  if(typeof renderer.aaxResponse!=='string'||!renderer.aaxResponse||renderer.aaxResponse.length>349528)return false;
  try{
   var url=new URL(renderer.creativeUrl);
-  if(url.protocol!=='https:'||url.username||url.password||url.origin===location.origin)return false;
+  if(url.protocol!=='https:'||url.username||url.password)return false;
   var binary=atob(renderer.aaxResponse);
   if(binary.length>262144||btoa(binary)!==renderer.aaxResponse)return false;
   var bytes=Uint8Array.from(binary,function(character){return character.charCodeAt(0);});
