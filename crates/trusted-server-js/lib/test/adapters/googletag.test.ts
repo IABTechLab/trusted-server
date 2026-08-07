@@ -71,6 +71,100 @@ describe('browser googletag adapter readiness', () => {
     expect(ready.display).toHaveBeenCalledWith('slot-a');
   });
 
+  it('marks and measures only the first TS-authoritative display', async () => {
+    const ready = createReadyGoogletag();
+    const performance = {
+      mark: vi.fn(),
+      measure: vi.fn(),
+    };
+    const target = { googletag: ready.googletag, performance };
+    const adapter = createBrowserGoogletagAdapter(target);
+
+    ready.googletag.display('publisher-slot');
+    expect(performance.mark).not.toHaveBeenCalled();
+
+    const first = adapter.run((gpt) => {
+      gpt.display('trusted-slot-one');
+      gpt.display('trusted-slot-two');
+    });
+    await expect(first.result).resolves.toBeUndefined();
+    const replay = adapter.run((gpt) => gpt.display('trusted-slot-three'));
+    await expect(replay.result).resolves.toBeUndefined();
+
+    expect(performance.mark).toHaveBeenCalledExactlyOnceWith('tsjs:first-display');
+    expect(performance.measure).toHaveBeenCalledExactlyOnceWith(
+      'tsjs:boot-to-first-display',
+      'tsjs:bids-script',
+      'tsjs:first-display'
+    );
+    expect(performance.mark.mock.invocationCallOrder[0]).toBeLessThan(
+      ready.display.mock.invocationCallOrder[1]!
+    );
+  });
+
+  it('contains missing and throwing Performance APIs at the first display boundary', async () => {
+    const missing = createReadyGoogletag();
+    const missingAdapter = createBrowserGoogletagAdapter({ googletag: missing.googletag });
+    await expect(missingAdapter.run((gpt) => gpt.display('slot-missing')).result).resolves.toBe(
+      undefined
+    );
+    expect(missing.display).toHaveBeenCalledExactlyOnceWith('slot-missing');
+
+    const throwing = createReadyGoogletag();
+    const mark = vi.fn(() => {
+      throw new Error('performance unavailable');
+    });
+    const measure = vi.fn();
+    const target = { googletag: throwing.googletag, performance: { mark, measure } };
+    const throwingAdapter = createBrowserGoogletagAdapter(target);
+    await expect(
+      throwingAdapter.run((gpt) => {
+        gpt.display('slot-throwing');
+        gpt.display('slot-replay');
+      }).result
+    ).resolves.toBeUndefined();
+
+    expect(mark).toHaveBeenCalledExactlyOnceWith('tsjs:first-display');
+    expect(measure).not.toHaveBeenCalled();
+    expect(throwing.display).toHaveBeenCalledTimes(2);
+
+    const markOnly = createReadyGoogletag();
+    const markWithoutMeasure = vi.fn();
+    const markOnlyAdapter = createBrowserGoogletagAdapter({
+      googletag: markOnly.googletag,
+      performance: { mark: markWithoutMeasure },
+    });
+    await expect(markOnlyAdapter.run((gpt) => gpt.display('slot-mark-only')).result).resolves.toBe(
+      undefined
+    );
+    expect(markWithoutMeasure).toHaveBeenCalledExactlyOnceWith('tsjs:first-display');
+    expect(markOnly.display).toHaveBeenCalledExactlyOnceWith('slot-mark-only');
+  });
+
+  it('does not mark a display rejected from a stale GPT generation', async () => {
+    const first = createReadyGoogletag();
+    const replacement = createReadyGoogletag();
+    const performance = { mark: vi.fn(), measure: vi.fn() };
+    const target = { googletag: first.googletag, performance };
+    const adapter = createBrowserGoogletagAdapter(target);
+    const operation = adapter.run((gpt) => {
+      target.googletag = replacement.googletag;
+      gpt.display('stale-slot');
+    });
+
+    await expect(operation.result).rejects.toMatchObject({
+      code: 'external_artifact_incompatible',
+    });
+    expect(performance.mark).not.toHaveBeenCalled();
+    expect(performance.measure).not.toHaveBeenCalled();
+    expect(first.display).not.toHaveBeenCalled();
+    expect(replacement.display).not.toHaveBeenCalled();
+
+    await expect(adapter.run((gpt) => gpt.display('current-slot')).result).resolves.toBeUndefined();
+    expect(performance.mark).toHaveBeenCalledExactlyOnceWith('tsjs:first-display');
+    expect(replacement.display).toHaveBeenCalledExactlyOnceWith('current-slot');
+  });
+
   it('reports pending and drains live operations FIFO through a real GPT command notification', async () => {
     const readinessCommands: Command[] = [];
     const target: { googletag?: unknown } = {

@@ -5630,73 +5630,16 @@ else t.bids=b;\
     )
 }
 
-/// Build the `</body>` seam script for a shared-template mode.
+/// Prospective hard-cutover mark emitted at the bids/projection boundary.
 ///
-/// Carries **both** request-scoped pieces: the slot definitions and the bids. Under a
-/// shared mode the head seam emits no `tsjs.adSlots`, because slot *presence* is
-/// request-gated and baking it into a template shared between readers would decide for
-/// all of them. Sending only bids — which is what this did — left `tsjs.adSlots` at its
-/// `[]` default, so `adInit` defined no slots and the page rendered correctly with **no
-/// TS ads at all**. A review caught it; nothing here or in the harness would have.
-///
-/// Both are handed to the **scheduler**, not assigned here. `scheduleInitialAdInit`
-/// drops the whole payload once a SPA navigation has committed, and slots assigned on
-/// the line before the call would already have overwritten that navigation's slots by
-/// the time the guard ran — the guard covered the bids and `adInit`, and the assignment
-/// it was there to protect happened in front of it. The `else` arm keeps the direct
-/// assignment for the one case with no scheduler to race against: the GPT integration
-/// active without its head bootstrap, which is not an expected deployment.
-///
-/// Slots are applied before bids inside the scheduler, because the scheduler may fire
-/// `adInit` and `adInit` reads `ts.adSlots`.
-pub(crate) fn build_seam_script(
-    slots_json: &str,
-    bid_map: &serde_json::Map<String, serde_json::Value>,
-) -> String {
-    // The local test script probes the minified `var a=JSON.parse`,
-    // `var b=JSON.parse`, and `s(b,a)` literals below. Update the harness with any
-    // semantically equivalent rewrite so its black-box checks keep matching output.
-    let bids = serde_json::to_string(bid_map)
-        .expect("serde_json::to_string of Map<String,Value> should be infallible");
-    format!(
-        "<script>(function(){{\
-var t=window.tsjs=window.tsjs||{{}};\
-var a=JSON.parse(\"{}\");\
-var b=JSON.parse(\"{}\");\
-var s=t.scheduleInitialAdInit;\
-if(typeof s===\"function\")s(b,a);\
-else{{t.adSlots=a;t.bids=b;}}\
-}})();</script>",
-        html_escape_for_script(slots_json),
-        html_escape_for_script(&bids)
-    )
-}
-
-/// The slot definitions a shared-mode seam must carry, as JSON.
-///
-/// Mirrors [`template_ad_slots_script`]'s gating: same `should_run_ad_stack` condition,
-/// same slot set. The difference is only *where* it is delivered — the seam, per
-/// request, rather than the head, into a shared template.
-pub(crate) fn seam_ad_slots_json(
-    mode: AssemblyMode,
-    should_run_ad_stack: bool,
-    settings: &Settings,
-    matched_slots: &[crate::creative_opportunities::CreativeOpportunitySlot],
-    request_path: &str,
-) -> Option<String> {
-    if matches!(mode, AssemblyMode::Inline) || !should_run_ad_stack {
-        return None;
-    }
-    let co_config = settings.creative_opportunities.as_ref()?;
-    let section = co_config.section_for_path(request_path);
-    let slots: Vec<serde_json::Value> = matched_slots
-        .iter()
-        .filter_map(|slot| build_slot_json(slot, co_config, &section))
-        .collect();
-    Some(
-        serde_json::to_string(&slots)
-            .expect("serde_json::to_string of Vec<Value> should be infallible"),
-    )
+/// Task 19 inserts this already-tested fragment into the production boot path in
+/// the same atomic switch that installs the matching first-display mark.
+#[allow(
+    dead_code,
+    reason = "Task 16 prepares this fragment for the atomic Task 19 production switch"
+)]
+pub(crate) fn build_bids_script_performance_mark() -> &'static str {
+    "(function(){try{window.performance.mark(\"tsjs:bids-script\");}catch(_){}})();"
 }
 
 /// Build the empty-bids `<script>` tag used when no bids were returned.
@@ -18352,9 +18295,8 @@ mod tests {
     #[cfg(test)]
     mod creative_opportunities_tests {
         use super::super::{
-            AdBidsState, MatchedSlotsContext, build_ad_slots_script, build_auction_request,
-            build_bid_map, build_bids_script, diagnostics_auction_id, html_escape_for_script,
-            write_bids_to_state,
+            MatchedSlotsContext, build_ad_slots_script, build_auction_request, build_bid_map,
+            build_bids_script, build_bids_script_performance_mark, html_escape_for_script,
         };
         use crate::auction::types::{ApsRendererV1, ApsTagType, Bid, BidRenderSourceV1, MediaType};
         use crate::consent::ConsentContext;
@@ -19739,6 +19681,20 @@ mod tests {
                 .trim_end_matches("</script>");
             assert!(!inner.contains('<'), "no unescaped < in bids script");
             assert!(!inner.contains('>'), "no unescaped > in bids script");
+        }
+
+        #[test]
+        fn bids_script_performance_mark_is_exact_and_not_yet_wired() {
+            let fragment = build_bids_script_performance_mark();
+            assert_eq!(
+                fragment,
+                "(function(){try{window.performance.mark(\"tsjs:bids-script\");}catch(_){}})();"
+            );
+            assert!(!fragment.contains("__tsjsPerf"));
+            assert!(
+                !build_bids_script(&serde_json::Map::new()).contains("tsjs:bids-script"),
+                "Task 19 owns the coordinated production insertion"
+            );
         }
 
         #[test]

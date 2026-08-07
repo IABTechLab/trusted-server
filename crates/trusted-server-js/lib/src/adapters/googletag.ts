@@ -133,6 +133,7 @@ export interface GoogletagAdapter {
 /** Browser surface owned by the concrete GPT adapter. */
 export interface GoogletagGlobalTarget {
   googletag?: unknown;
+  performance?: unknown;
 }
 
 interface CommandQueue {
@@ -342,7 +343,8 @@ function createFacade(
   initialLoadDisabled: (service: object) => boolean,
   targetingWrites: WeakMap<object, number>,
   targetingObservations: WeakMap<object, TargetingObservation>,
-  bindingToken: object
+  bindingToken: object,
+  markFirstDisplay: () => void
 ): Readonly<GoogletagFacade> {
   const member = (external: object, key: PropertyKey): ((...args: unknown[]) => unknown) => {
     if (!isOperationCurrent()) throw new GoogletagAdapterError('external_artifact_incompatible');
@@ -444,7 +446,15 @@ function createFacade(
     bindingToken: (): object => bindingToken,
     clearTargeting: (slot: object, key?: string): unknown =>
       withTargetingWrite(slot, () => call(slot, 'clearTargeting', key === undefined ? [] : [key])),
-    display: (slot: string | object): unknown => call(binding.binding, 'display', [slot]),
+    display: (slot: string | object): unknown => {
+      const display = member(binding.binding, 'display');
+      if (!isOperationCurrent()) throw new GoogletagAdapterError('external_artifact_incompatible');
+      markFirstDisplay();
+      if (!isOperationCurrent()) throw new GoogletagAdapterError('external_artifact_incompatible');
+      const result = Reflect.apply(display, binding.binding, [slot]);
+      if (!isOperationCurrent()) throw new GoogletagAdapterError('external_artifact_incompatible');
+      return result;
+    },
     getTargeting: (slot: object, key: string): readonly string[] => {
       const targeting = call(slot, 'getTargeting', [key]);
       if (!Array.isArray(targeting) || targeting.some((entry) => typeof entry !== 'string')) {
@@ -739,6 +749,33 @@ export function createBrowserGoogletagAdapter(
   const initialLoadOwner = Object.freeze({});
   let pendingReservations = 0;
   let disposed = false;
+  let firstDisplayObserved = false;
+
+  const markFirstDisplay = (): void => {
+    if (firstDisplayObserved) return;
+    firstDisplayObserved = true;
+    try {
+      const performance = safeMember(target, 'performance');
+      if (
+        (typeof performance !== 'object' || performance === null) &&
+        typeof performance !== 'function'
+      ) {
+        return;
+      }
+      const mark = safeMember(performance as object, 'mark');
+      if (typeof mark !== 'function') return;
+      Reflect.apply(mark, performance, ['tsjs:first-display']);
+      const measure = safeMember(performance as object, 'measure');
+      if (typeof measure !== 'function') return;
+      Reflect.apply(measure, performance, [
+        'tsjs:boot-to-first-display',
+        'tsjs:bids-script',
+        'tsjs:first-display',
+      ]);
+    } catch {
+      // Performance instrumentation cannot change GPT display behavior.
+    }
+  };
 
   const registerAdapterEffect = (disposeEffect: () => void): void => {
     const rollback = (): void => {
@@ -1403,7 +1440,8 @@ export function createBrowserGoogletagAdapter(
       },
       targetingWrites,
       targetingObservations,
-      bindingToken
+      bindingToken,
+      markFirstDisplay
     );
     try {
       if (disposed) {
