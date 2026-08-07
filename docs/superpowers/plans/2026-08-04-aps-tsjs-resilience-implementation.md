@@ -2088,7 +2088,7 @@ collapse those checkpoints or carry unverified behavior between them.
     test/adapters/googletag.test.ts \
     test/integrations/gpt/ad_init.test.ts
   npm --prefix crates/trusted-server-js/lib run build:prebid-external
-  node --test \
+  npm --prefix crates/trusted-server-js/lib test -- --run \
     crates/trusted-server-js/lib/test/build-prebid-external.test.mjs \
     crates/trusted-server-js/lib/test/prebid-artifact-integration.test.mjs
   ```
