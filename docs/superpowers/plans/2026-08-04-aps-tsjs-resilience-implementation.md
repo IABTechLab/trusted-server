@@ -528,7 +528,13 @@ Every task's regression suite therefore remains green in task order.
   npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/gpt/ad_init.test.ts test/integrations/prebid/index.test.ts
   ```
 
-### Task 5: Serve the static renderer and live APS runner proxy with adapter parity
+### Task 5: Serve the static renderer and live APS runner proxy in three green checkpoints
+
+Task 5 is an umbrella only. Execute and review three independent red-to-green
+commits: 5A defines the common reserved-family and raw-proxy contract, 5B implements
+and attests the four adapter transports, and 5C implements the static renderer plus
+its fictional browser fixture. The combined inventory below is not authorization to
+collapse those checkpoints or carry unverified behavior between them.
 
 **Files:**
 
@@ -591,18 +597,19 @@ Every task's regression suite therefore remains green in task order.
 - Modify: `docs/guide/getting-started.md`
 - Modify: `docs/guide/testing.md`
 
-- [ ] **Step 1: Write failing route and exact renderer-policy tests.**
+#### Task 5A: Define and test the common reserved-route and raw-proxy contract
 
-  Cover enabled `GET /integrations/aps/renderer/v1` and
-  `GET /integrations/aps/runner.js`; APS-disabled local `404 no-store`; local
-  negative `404 no-store` for `/integrations/aps/runner/v1.js`, unknown renderer
-  versions, and malformed family paths; `405` plus `Allow: GET`; and proof that no
-  reserved path reaches publisher auth, EC, or fallback. Assert renderer body bytes,
-  the exact ordered sandbox tokens, the exact CSP from spec §3.6, exact content type,
-  immutable cache policy, `nosniff`, and referrer policy. Assert the deliberate
-  absence of `X-Frame-Options` and CSP `frame-ancestors`.
+- [ ] **Step A1: Write failing reserved-family and raw-proxy contract tests.**
 
-- [ ] **Step 2: Run the new focused tests and prove they fail.**
+  Cover enabled `GET /integrations/aps/runner.js`; APS-disabled local
+  `404 no-store`; negative `/integrations/aps/runner/v1.js` and malformed family
+  paths; `405` plus `Allow: GET`; and proof that no reserved path reaches publisher
+  auth, EC, or fallback. At the common platform boundary, assert exact upstream
+  target/request evidence, the five-second dispatch-through-final-byte deadline,
+  cancellation, body cap, closed response grammar, and replacement headers. Static
+  renderer bytes and policy remain Task 5C.
+
+- [ ] **Step A2: Run the new focused tests and prove they fail.**
 
   ```bash
   cargo test-fastly integrations::aps
@@ -611,10 +618,9 @@ Every task's regression suite therefore remains green in task order.
   cargo test-spin --test routes
   ```
 
-  Expected: the live runner route/raw proxy policy and exact renderer headers are not
-  yet implemented on every adapter.
+  Expected: the live runner route and raw-proxy policy are not implemented.
 
-- [ ] **Step 3: Define the bounded raw-proxy platform contract.**
+- [ ] **Step A3: Define the bounded raw-proxy platform contract.**
 
   Add a dedicated request/response policy in `platform/http.rs` and adapter
   implementations that:
@@ -644,7 +650,21 @@ Every task's regression suite therefore remains green in task order.
   defaults. If a runtime cannot supply the required evidence or cancellation
   behavior, APS cannot be enabled there and the release is blocked.
 
-- [ ] **Step 4: Write and pass the complete actual-adapter proxy corpus.**
+- [ ] **Step A4: Make the common contract and core fakes green, then commit before adapter**
+      transport work. This checkpoint contains only reserved-family dispatch,
+      request/response evidence types, bounded policy, core validation, and test
+      support; it does not claim actual-runtime parity or renderer behavior.
+
+  ```bash
+  cargo test --package trusted-server-core --target aarch64-apple-darwin integrations::aps
+  cargo fmt --all -- --check
+  git add crates/trusted-server-core/src/integrations/aps.rs crates/trusted-server-core/src/integrations/mod.rs crates/trusted-server-core/src/integrations/registry.rs crates/trusted-server-core/src/platform
+  git commit -m "Define the bounded APS runner proxy contract"
+  ```
+
+#### Task 5B: Implement and attest all four actual adapter transports
+
+- [ ] **Step B1: Write and pass the complete actual-adapter proxy corpus.**
 
   Drive each real transport boundary—including Cloudflare and Spin wasm and full
   Fastly routes—against a controlled fictional upstream. Cover status other than
@@ -697,7 +717,7 @@ Every task's regression suite therefore remains green in task order.
   and transport seam for the local Fastly simulator only; it is not an APS runner
   pin, and no APS runner version, digest, or body enters the repository.
 
-- [ ] **Step 5: Implement the reserved dispatcher and live proxy response.**
+- [ ] **Step B2: Implement the reserved dispatcher and live proxy response.**
 
   Register the family ahead of auth/EC/fallback through one explicit test-only
   registry constructor used by unit tests and the dedicated integration artifacts.
@@ -712,7 +732,33 @@ Every task's regression suite therefore remains green in task order.
   no-referrer policy. Every upstream or validation failure returns a local empty
   `502 no-store`, with no vendor body or descriptor/capability data in logs.
 
-- [ ] **Step 6: Implement and test the static renderer contract.**
+- [ ] **Step B3: Run and commit adapter transport parity before adding the static renderer.**
+
+  ```bash
+  cargo test-fastly
+  cargo test-axum
+  cargo test-cloudflare
+  cargo test-spin
+  cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity
+  ./scripts/integration-tests-aps-runner-proxy.sh --runtime axum
+  ./scripts/integration-tests-aps-runner-proxy.sh --runtime fastly
+  ./scripts/integration-tests-aps-runner-proxy.sh --runtime cloudflare
+  ./scripts/integration-tests-aps-runner-proxy.sh --runtime spin
+  git add crates/trusted-server-adapter-fastly crates/trusted-server-adapter-axum crates/trusted-server-adapter-cloudflare crates/trusted-server-adapter-spin crates/trusted-server-integration-tests scripts/integration-tests-aps-runner-proxy.sh scripts/integration-tests.sh .github/workflows/integration-tests.yml
+  git commit -m "Implement APS runner proxy parity"
+  ```
+
+#### Task 5C: Implement the static renderer and fictional browser fixture
+
+- [ ] **Step C1: Write failing static-renderer route and policy tests.** Cover
+      `/integrations/aps/renderer/v1`, disabled and unknown-version local
+      `404 no-store`, malformed family paths, `405` plus `Allow: GET`, and proof the
+      route cannot reach publisher auth, EC, or fallback. Assert exact body bytes,
+      ordered sandbox tokens, CSP, content type, immutable cache policy, `nosniff`,
+      referrer policy, and deliberate absence of `X-Frame-Options` and CSP
+      `frame-ancestors`.
+
+- [ ] **Step C2: Implement and test the static renderer contract.**
 
   The renderer validates/clears the fragment nonce, accepts one exact source-bound
   parent port, validates the descriptor and kernel-captured publisher origin, and
@@ -726,7 +772,7 @@ Every task's regression suite therefore remains green in task order.
   from document acceptance. Mutable APS callback correctness is an accepted external
   trust dependency, not a fact TS can derive from script load or body inspection.
 
-- [ ] **Step 7: Add the hermetic fictional runner fixture.**
+- [ ] **Step C3: Add the hermetic fictional runner fixture.**
 
   Author a minimal local fixture that implements only the documented event and
   queue/resolve/reject behavior. Assert it is neither a copy, transformation, nor
@@ -734,7 +780,7 @@ Every task's regression suite therefore remains green in task order.
   callback-silence, nested-iframe, and duplicate-callback tests. The fixture is not
   served as a production fallback and cannot be included in release bundles.
 
-- [ ] **Step 8: Run the full route, transport, parity, and browser checks.**
+- [ ] **Step C4: Run the full route, transport, parity, and browser checks.**
 
   ```bash
   cargo test-fastly
@@ -751,47 +797,12 @@ Every task's regression suite therefore remains green in task order.
       tests/shared/aps-renderer.spec.ts --project=chromium
   ```
 
-- [ ] **Step 9: Commit the transport and renderer slice.**
+- [ ] **Step C5: Commit only the static renderer and fictional browser fixture after C1-C4**
+      are green. Adapter transport files must already be clean from Task 5B.
 
   ```bash
-  git add \
-    crates/trusted-server-core/src/integrations/aps.rs \
-    crates/trusted-server-core/src/integrations/registry.rs \
-    crates/trusted-server-core/src/platform/http.rs \
-    crates/trusted-server-core/src/platform/test_support.rs \
-    crates/trusted-server-core/src/platform/types.rs \
-    crates/trusted-server-adapter-fastly/src/app.rs \
-    crates/trusted-server-adapter-fastly/src/platform.rs \
-    crates/trusted-server-adapter-fastly/Cargo.toml \
-    crates/trusted-server-adapter-axum/src/app.rs \
-    crates/trusted-server-adapter-axum/src/platform.rs \
-    crates/trusted-server-adapter-axum/tests/routes.rs \
-    crates/trusted-server-adapter-cloudflare/src/app.rs \
-    crates/trusted-server-adapter-cloudflare/src/platform.rs \
-    crates/trusted-server-adapter-cloudflare/Cargo.toml \
-    crates/trusted-server-adapter-cloudflare/tests/routes.rs \
-    crates/trusted-server-adapter-cloudflare/wrangler.aps-runner-proxy.toml \
-    crates/trusted-server-adapter-spin/src/app.rs \
-    crates/trusted-server-adapter-spin/src/platform.rs \
-    crates/trusted-server-adapter-spin/Cargo.toml \
-    crates/trusted-server-adapter-spin/tests/routes.rs \
-    crates/trusted-server-integration-tests/Cargo.toml \
-    crates/trusted-server-integration-tests/fixtures/configs/spin-aps-runner-proxy.toml \
-    crates/trusted-server-integration-tests/fixtures/configs/viceroy-aps-runner-proxy-template.toml \
-    crates/trusted-server-integration-tests/tests/aps_runner_proxy.rs \
-    crates/trusted-server-integration-tests/tests/common/aps_runner_upstream.rs \
-    crates/trusted-server-integration-tests/tests/common/mod.rs \
-    crates/trusted-server-integration-tests/tests/environments/spin.rs \
-    crates/trusted-server-integration-tests/tests/environments/mod.rs \
-    crates/trusted-server-integration-tests/tests/environments/cloudflare.rs \
-    crates/trusted-server-integration-tests/tests/environments/fastly.rs \
-    crates/trusted-server-integration-tests/tests/parity.rs \
-    crates/trusted-server-integration-tests/browser/tests/shared/aps-renderer.spec.ts \
-    crates/trusted-server-integration-tests/browser/fixtures/fictional-aps-runner.js \
-    scripts/integration-tests-aps-runner-proxy.sh \
-    scripts/integration-tests-browser.sh \
-    .github/workflows/integration-tests.yml
-  git commit -m "feat(aps): proxy the live creative runner safely"
+  git add crates/trusted-server-core/src/integrations/aps.rs crates/trusted-server-integration-tests/browser/tests/shared/aps-renderer.spec.ts crates/trusted-server-integration-tests/browser/fixtures/fictional-aps-runner.js scripts/integration-tests-browser.sh docs/guide/error-reference.md docs/guide/getting-started.md docs/guide/testing.md
+  git commit -m "Implement the static APS renderer"
   ```
 
 ### Phase 1 exit
@@ -1767,7 +1778,16 @@ Every task's regression suite therefore remains green in task order.
 - [ ] **Step 3: Route APS and ADM winners to `RenderAttempt`/PUC bridge. Remove duplicate renderer**
       branches, slot expandos, local consumed-id maps, and independent refresh wrappers.
 
-- [ ] **Step 4: Implement the owner-and-value targeting journal in `services/targeting.ts`.**
+- [ ] **Step 4: Rebuild and unit-test the RCJ-GPT-04 collapsed-shell resize in the attempt-owned**
+      PUC success path. Resize only after the authenticated current attempt posts its
+      response, and only when the exact connected source iframe and its immediate
+      ordinary wrapper both remain collapsed to at most 1x1. Require finite positive
+      winning dimensions; reject anchors, unrelated frames, detached/replaced frames,
+      expanded dimensions, and fixed/sticky shells. Assert one guarded resize of only
+      those two nodes, plus inert replay, stale-attempt, navigation, and failure paths
+      in `test/integrations/gpt/ad_init.test.ts` and `test/services/render.test.ts`.
+
+- [ ] **Step 5: Implement the owner-and-value targeting journal in `services/targeting.ts`.**
       Keep one closure-private stack per physical GPT slot/key. Each TS write pushes a
       distinct frame containing its owner id, exact installed string, and predecessor
       value/owner—even when the string is unchanged. The GPT adapter observes the live
@@ -1794,14 +1814,14 @@ Every task's regression suite therefore remains green in task order.
   reservation, compare-restores targeting, and settles. Prove a fast creative
   request always finds the store entry.
 
-- [ ] **Step 5: Fold integration-specific script-guard mechanics onto the shared factory while**
+- [ ] **Step 6: Fold integration-specific script-guard mechanics onto the shared factory while**
       keeping GPT configuration in its integration. Implement one runtime-owned
       `MutationObserver` per `NavigationSession`, 250 ms debounce, 5,000 ms monotonic
       window, one final boundary pass, the two-success cap, exact physical-object
       quarantine, and complete timer/candidate/reference disposal. Successful handoff
       cancels reconciliation and transfers cleanup ownership synchronously.
 
-- [ ] **Step 6: Run the entire GPT suite, not only new files:**
+- [ ] **Step 7: Run the entire GPT suite, not only new files:**
 
   ```bash
   npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/gpt
@@ -1881,7 +1901,33 @@ Every task's regression suite therefore remains green in task order.
   `prebid_selection_timeout`; navigation/auction abort clears the admitted set. No
   losing bid remains live for 15 minutes.
 
-- [ ] **Step 5: Make the external artifact independently correct and pure.** Build exactly
+- [ ] **Step 5: Rebuild and unit-test RCJ-PREBID-04 through one Prebid refresh policy over the**
+      GPT adapter. Literal, case-sensitive configured GAM-path suffixes remove only
+      eligible matches from the synthetic Prebid auction; missing, non-string, or
+      throwing `getAdUnitPath()` fails open. Clear stale TS/Prebid targeting from every
+      target, while the full original slot list and exact options continue to GPT.
+      Cover global, explicit, mixed, all-excluded, no-exclusion, and fail-open cases in
+      `test/integrations/prebid/index.test.ts`, `test/adapters/googletag.test.ts`, and
+      `test/integrations/gpt/ad_init.test.ts` before rebuilding the external artifact.
+
+  Treat RCJ-PREBID-04 as its own named red-to-green checkpoint. Run the three focused
+  unit files before implementation and require the new cases to fail for refresh-list
+  or stale-targeting behavior; rerun them after implementation, rebuild the external
+  Prebid artifact, and rerun its purity/integration contract so the rebuild cannot
+  silently reintroduce refresh behavior:
+
+  ```bash
+  npm --prefix crates/trusted-server-js/lib test -- --run \
+    test/integrations/prebid/index.test.ts \
+    test/adapters/googletag.test.ts \
+    test/integrations/gpt/ad_init.test.ts
+  npm --prefix crates/trusted-server-js/lib run build:prebid-external
+  node --test \
+    crates/trusted-server-js/lib/test/build-prebid-external.test.mjs \
+    crates/trusted-server-js/lib/test/prebid-artifact-integration.test.mjs
+  ```
+
+- [ ] **Step 6: Make the external artifact independently correct and pure.** Build exactly
       lockfile-resolved Prebid.js 10.26.0 with no TS auction, admission, render,
       targeting, or refresh behavior. The first wrapper statement arms an independent
       5,000 ms queue-drain watchdog before stamp inspection or module factories. It
@@ -1905,7 +1951,7 @@ Every task's regression suite therefore remains green in task order.
   the exact `pbjs` plus stamp identities, cover late valid replacement, and prove the
   external artifact contains no TS behavior or `window.__tsjs_*` handshake.
 
-- [ ] **Step 6: Run:**
+- [ ] **Step 7: Run:**
 
   ```bash
   npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/prebid test/integrations/aps
@@ -1914,6 +1960,11 @@ Every task's regression suite therefore remains green in task order.
   ```
 
 ### Task 18: Prepare creative, diagnostics, and remaining integration modules
+
+Task 18 is an umbrella only. Execute the detailed 18A creative, 18B diagnostics, and
+18C remaining-integration sections below as three independently reviewed
+red-to-green commits. The shared inventory is not authorization to stage them as one
+implementation change.
 
 **Files:**
 
@@ -2001,25 +2052,22 @@ Every task's regression suite therefore remains green in task order.
 - Modify: `crates/trusted-server-js/lib/src/composition/browser.ts`
 - Modify: `crates/trusted-server-js/lib/test/composition/browser.test.ts`
 
-- [ ] **Step 1: Add a maximal-bundle failing smoke test that loads core followed by every**
-      server-declared integration in manifest order and asserts one runtime, no unknown
-      integration id, no duplicate activation, exact reverse-order disposal, and no
-      leaked timer/listener/wrapper/observer after disposal. Run every module alone
-      and in the maximal manifest with missing globals, readiness/timeouts, malformed
-      config/consent/storage, matcher false positives, callback throws, startup
-      failure, and cross-integration isolation.
+#### Task 18A: Rebuild creative as one independently green integration module
 
-- [ ] **Step 2: Convert every remaining capability into a thin integration module.** Each
+- [ ] **Step A1: Add the failing creative-only composition and lifecycle corpus.** Cover
+      boot validation, guard enablement combinations, automatic scans, wrapper and
+      observer ownership, hostile callbacks, startup rollback, disposal, and every
+      existing click/image/iframe/proxy-sign behavior. Run creative alone and inside
+      a manifest composition without modifying any other integration.
+
+- [ ] **Step A2: Convert only creative into a thin integration module.** Its
       `_registerIntegration({id,release,prepare})` call is pure registration;
-      `prepare(ctx)` is inert and Promise-returning; the returned `activate(ctx)` is
-      synchronous, registers a disposer before each reversible mutation, and uses at
-      most one staged `afterCommit` callback for irreversible work. Exercise all
-      modules through the same manifest-ordered test composition. Preserve existing
-      feature behavior and integration-owned matchers/configuration; shared helpers
-      must not broaden matching, reorder startup, stack interception, or retain work
-      after disposal. Do not change shipped entry-point side effects until Task 19.
+      `prepare(ctx)` is inert and Promise-returning; `activate(ctx)` is synchronous,
+      pre-registers disposal before every reversible mutation, and contributes at
+      most one `afterCommit` callback. Keep shipped entry-point side effects unchanged
+      until Task 19.
 
-- [ ] **Step 3: Rebuild creative startup around the exact frozen `CreativeBootV1`.** Validate
+- [ ] **Step A3: Rebuild creative startup around the exact frozen `CreativeBootV1`.** Validate
       the complete plain-object shape, defaults, disabled/manifest mismatch, unknown
       keys, accessors, prototypes, and literals before preparation. Activation installs
       the click guard when `clickGuard` is true and dynamic image/iframe guards when
@@ -2037,7 +2085,19 @@ Every task's regression suite therefore remains green in task order.
   rejection of credentials, malformed values, and non-network schemes. Delete the
   mutable/install creative globals only in Task 22.
 
-- [ ] **Step 4: Move render tracing to the kernel diagnostics bus and exact public surface.**
+- [ ] **Step A4: Run and commit the creative slice before diagnostics or other modules.**
+
+  ```bash
+  npm --prefix crates/trusted-server-js/lib test -- --run test/integrations/creative test/composition/browser.test.ts
+  npm --prefix crates/trusted-server-js/lib run lint
+  npm --prefix crates/trusted-server-js/lib run typecheck
+  git add crates/trusted-server-js/lib/src/integrations/creative crates/trusted-server-js/lib/test/integrations/creative crates/trusted-server-js/lib/src/composition/browser.ts crates/trusted-server-js/lib/test/composition/browser.test.ts
+  git commit -m "Prepare the creative integration module"
+  ```
+
+#### Task 18B: Rebuild diagnostics transport, producers, and consumers
+
+- [ ] **Step B1: Move render tracing to the kernel diagnostics bus and exact public surface.**
       `tsjs.diagnostics.renderTrace` exposes only frozen `current()`, `history()`, and
       `subscribe()`. Keep current state keyed by exact slot and capped by the 256-slot
       navigation registry; prune on disposal. Keep document-runtime history at 200,
@@ -2053,7 +2113,7 @@ Every task's regression suite therefore remains green in task order.
   registration-during-dispatch, callback throw isolation, and 199/200/201 overflow.
   Emit no `CustomEvent`, mutable trace global, or compatibility alias.
 
-- [ ] **Step 5: Preserve GPT diagnostics through the adapter event stream.** Validate exact
+- [ ] **Step B2: Preserve GPT diagnostics through the adapter event stream.** Validate exact
       `DiagnosticsBootV1` plus manifest activation before any listener/buffer exists.
       When active, core owns the six documented GPT observations before TS requests,
       buffers 512 raw facts until module activation, then replays and releases the
@@ -2071,7 +2131,40 @@ Every task's regression suite therefore remains green in task order.
   storage, upload, old flag, runtime expando, or `tsjs.gptDiagnostics` alias remains
   after Task 22.
 
-- [ ] **Step 6: Preserve each remaining `rc/july` integration corpus exactly.** Cover DataDome
+- [ ] **Step B3: Rebuild and unit-test the server-owned `ts_console` browser-session mechanics.**
+      On eligible GET document navigations, accept exactly one case-sensitive
+      `ts_console=1|true` enable directive or `0|false` disable directive;
+      duplicate, conflicting, empty, or unknown values fail closed for that response.
+      Strip every reserved pair before publisher/origin/cookie/auction handling,
+      preserve all unrelated path/query/fragment data, and set or clear only the
+      host-only `Secure`, `HttpOnly`, `SameSite=Lax` session cookie. Assert same-origin
+      tab/session behavior, disabled-by-default behavior, and that frozen
+      `DiagnosticsBootV1.gpt.active` is the only browser-visible activation result.
+
+- [ ] **Step B4: Wire every diagnostics producer explicitly after its correctness commit.**
+      `RenderAttempt` publishes immutable render observations only after terminal or
+      accepted-artifact state commits; the sole GPT adapter publishes its six raw
+      facts only after adapter bookkeeping commits. Both use the kernel-owned bus,
+      never call public subscribers inline, and cannot delay, reject, retry, or mutate
+      rendering/GPT behavior. Test inactive zero-effects, producer throw isolation,
+      event ordering, enrichment replacement, buffer release, navigation disposal,
+      and absence of `CustomEvent`, mutable globals, or a second GPT listener set.
+
+- [ ] **Step B5: Run and commit diagnostics transport, producer, and consumer wiring as one**
+      independently green slice.
+
+  ```bash
+  cargo test --package trusted-server-core --target aarch64-apple-darwin trace_cookie
+  npm --prefix crates/trusted-server-js/lib test -- --run test/core/trace.test.ts test/services/render.test.ts test/adapters/googletag.test.ts test/integrations/gpt_diagnostics
+  npm --prefix crates/trusted-server-js/lib run lint
+  npm --prefix crates/trusted-server-js/lib run typecheck
+  git add crates/trusted-server-core/src/trace_cookie.rs crates/trusted-server-core/src/integrations/gpt_diagnostics.rs crates/trusted-server-js/lib/src/core/trace.ts crates/trusted-server-js/lib/src/services crates/trusted-server-js/lib/src/adapters/googletag.ts crates/trusted-server-js/lib/src/integrations/gpt_diagnostics crates/trusted-server-js/lib/test/core/trace.test.ts crates/trusted-server-js/lib/test/services/render.test.ts crates/trusted-server-js/lib/test/adapters/googletag.test.ts crates/trusted-server-js/lib/test/integrations/gpt_diagnostics
+  git commit -m "Rebuild bounded runtime diagnostics"
+  ```
+
+#### Task 18C: Migrate the remaining integrations and maximal manifest
+
+- [ ] **Step C1: Preserve each remaining `rc/july` integration corpus exactly.** Cover DataDome
       script/preload path rewriting; Didomi absolute SDK path without config clobber;
       GTM script/preload and GA beacon/fetch rewriting; Lockr bounded readiness and API
       host; Osano USP/GPP/TCF marker ownership and lifecycle; Permutive bounded
@@ -2084,14 +2177,29 @@ Every task's regression suite therefore remains green in task order.
       provider survives failed activation or module/runtime disposal, and SPA
       navigation does not register a duplicate.
 
-- [ ] **Step 7: Generate and test the prospective manifest member list/order from the exact**
+- [ ] **Step C2: Convert only the remaining integrations into thin modules.** Each
+      `_registerIntegration({id,release,prepare})` call is pure registration;
+      `prepare(ctx)` is inert and Promise-returning; `activate(ctx)` is synchronous,
+      pre-registers disposal before reversible mutation, and contributes at most one
+      `afterCommit`. Shared helpers must preserve each integration's exact matcher,
+      startup order, failure isolation, and disposal semantics.
+
+- [ ] **Step C3: Add the maximal-bundle failing smoke test.** Load core followed by every
+      server-declared integration in manifest order and assert one runtime, no unknown
+      id, no duplicate activation, exact reverse-order disposal, and no leaked timer,
+      listener, wrapper, observer, context provider, or queued continuation. Run each
+      module alone and in the maximal manifest with missing globals, timeout, malformed
+      config/consent/storage, matcher false positives, callback throws, startup
+      failure, and cross-integration isolation.
+
+- [ ] **Step C4: Generate and test the prospective manifest member list/order from the exact**
       enabled bundle list. Embed the same release id in core and every integration
       IIFE. Add failures for integration before core, unknown/missing/duplicate member,
       malformed/unsorted/oversized manifest, wrong release, preparation or activation
       failure, duplicate `afterCommit`, and the 16-member/10-second transaction limits.
       Production manifest emission starts only in Task 19.
 
-- [ ] **Step 8: Run:**
+- [ ] **Step C5: Run the complete remaining-integration and maximal-manifest gate:**
 
   ```bash
   npm --prefix crates/trusted-server-js/lib test
@@ -2099,6 +2207,16 @@ Every task's regression suite therefore remains green in task order.
   npm --prefix crates/trusted-server-js/lib run lint
   npm --prefix crates/trusted-server-js/lib run typecheck
   cargo test-fastly publisher
+  ```
+
+- [ ] **Step C6: Commit the remaining integrations only after C1-C5 are green.** Stage the
+      remaining integration directories, their shared helpers/tests, composition,
+      build manifest, and exact Rust config emitters; do not fold creative or
+      diagnostics changes from Tasks 18A/18B into this commit.
+
+  ```bash
+  git add crates/trusted-server-js/lib/src/integrations crates/trusted-server-js/lib/test/integrations crates/trusted-server-js/lib/src/shared crates/trusted-server-js/lib/test/shared crates/trusted-server-js/lib/src/composition/browser.ts crates/trusted-server-js/lib/test/composition/browser.test.ts crates/trusted-server-js/lib/build-all.mjs crates/trusted-server-core/src/integrations
+  git commit -m "Prepare the remaining integration modules"
   ```
 
 ### Task 19: Complete lifecycle behavior and perform the coordinated production switch
@@ -2203,7 +2321,47 @@ Every task's regression suite therefore remains green in task order.
 - [ ] **Step 4: Test already-loaded-page limits honestly: configuration changes reach a page only**
       through an existing response path; do not add polling, push, or event ingestion.
 
-- [ ] **Step 5: Atomically activate the new production surface in one task and one commit:**
+- [ ] **Step 5: Complete the pre-switch checklist with no production-wiring changes staged.**
+      The atomic switch is allowed to flip wiring only after every behavior suite
+      below is already green against the test-only composition and prospective
+      routes/artifacts:
+  - render attempt, direct APS, direct ADM, bounded cache, PUC claim/channel, artifact
+    store, reservations, slots, targeting, projections, auction batching, context,
+    navigation sessions, runtime transaction, queue handoff, and integration registry;
+  - GPT including RCJ-GPT-04, Prebid including RCJ-PREBID-04 and the rebuilt pure
+    10.26.0 artifact, APS, creative, render trace, GPT diagnostics/`ts_console`, and
+    every remaining integration alone and in the maximal manifest;
+  - generated release/fallback/absence contracts, architecture/lint/typecheck, all
+    Rust projection/config/route tests, adapter parity, and the four actual-adapter
+    runner-proxy corpora; and
+  - old-surface rejection plus new-surface fixture tests, proving the cutover commit
+    contains no new behavior implementation or test repair.
+
+  Install the real performance marks before this checklist closes. Execute
+  `performance.mark('tsjs:bids-script')` in the actual server-emitted bids/projection
+  boot script, and execute `performance.mark('tsjs:first-display')` exactly once at
+  the first authoritative GPT display call in the real adapter path. The browser
+  performance fixture must measure those marks with
+  `performance.measure('tsjs:boot-to-first-display', 'tsjs:bids-script', 'tsjs:first-display')`;
+  `window.__tsjsPerf` remains baseline-capture scaffolding and cannot satisfy the
+  post-switch gate.
+
+  ```bash
+  npm --prefix crates/trusted-server-js/lib test -- --run \
+    test/services test/kernel test/adapters test/core
+  npm --prefix crates/trusted-server-js/lib test -- --run \
+    test/integrations test/composition test/build
+  npm --prefix crates/trusted-server-js/lib run build
+  npm --prefix crates/trusted-server-js/lib run lint
+  npm --prefix crates/trusted-server-js/lib run typecheck
+  cargo test-fastly
+  cargo test-axum
+  cargo test-cloudflare
+  cargo test-spin
+  cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity
+  ```
+
+- [ ] **Step 6: Atomically activate the new production surface in one task and one commit:**
   - `/auction` emits/parses only the exact decision-set/tagged-source wire, and
     initial HTML/page-bids emit only `tsjs.boot.auctionProjection`;
   - the immutable initial projection seeds the first `NavigationSession`; every SPA
@@ -2260,7 +2418,11 @@ Every task's regression suite therefore remains green in task order.
     services; and
   - render trace and GPT diagnostics commit only after correctness transitions and
     expose their exact bounded asynchronous frozen APIs. Creative guards auto-install
-    from frozen boot configuration and both-false guards have zero DOM side effects.
+    from frozen boot configuration and both-false guards have zero DOM side effects;
+    and
+  - the real boot/render path records the named `tsjs:bids-script` and
+    `tsjs:first-display` performance marks at their authoritative transitions; the
+    temporary `__tsjsPerf` baseline shim is not carried into the switched runtime.
 
   Before enabling the Fastly production route, run the unchanged stall/slow-drip
   deadline cases through a non-production Fastly Compute service and a controlled
@@ -2274,7 +2436,7 @@ Every task's regression suite therefore remains green in task order.
   manifest, or shape autodetection. The temporarily unused server routes and old
   declarations are deleted in Task 22 before release.
 
-- [ ] **Step 6: Run:**
+- [ ] **Step 7: Run:**
 
   ```bash
   npm --prefix crates/trusted-server-js/lib test -- --run test/services test/core test/integrations/gpt
@@ -2354,8 +2516,13 @@ Every task's regression suite therefore remains green in task order.
     9,999/10,000/10,001 ms boundaries, duplicate `afterCommit`, 15/16 member capacity,
     late continuation after fallback, publisher work during startup, exact same-task
     rollback, full/fallback `TsjsApi` own surfaces, malformed boot, actual-Array queue
-    swap/retained references/native mutators/nested pushes/callback throws, and missing
-    main bundle after server projection;
+    swap/retained references/native mutators/nested pushes/callback throws, and
+    missing main bundle after server projection. For every fallback commit,
+    instrument the real browser surfaces and assert that no second runtime,
+    GPT/Prebid/message listener, `MessagePort`, interval/timeout, request, script,
+    wrapper, observer, guard, or iframe survives; dispatch late messages, timer
+    boundaries, and bundles afterward and prove none can revive rendering or allocate
+    replacement state;
   - navigation/projection/API: immutable initial boot versus SPA-owned replacement,
     stale/duplicate/malformed page-bids, exact grammar/count/UTF-8 and 8 MiB all-winner
     reduction, 255/256/257 combined server/programmatic slots, transactional
@@ -2604,7 +2771,11 @@ Every task's regression suite therefore remains green in task order.
 
 - [ ] **Step 2: On the pinned Chromium/CI-machine/fixture, measure boot-to-first-display p90 after**
       five warmups and 50 samples and require ≤1.10× the Task 0 baseline. Do not rerun
-      selectively to turn a failed sample into a pass.
+      selectively to turn a failed sample into a pass. The post-switch sample reads
+      the real `tsjs:bids-script` and `tsjs:first-display` performance marks and the
+      `tsjs:boot-to-first-display` measure installed in Task 19; fail if any sample
+      falls back to the pre-change `window.__tsjsPerf` placeholder or lacks either
+      mark.
 
 - [ ] **Step 3: Through Chromium CDP, collect garbage then record retained heap after boot, first**
       render, refresh, and SPA navigation; gate each checkpoint at ≤1.10×. Firefox and
