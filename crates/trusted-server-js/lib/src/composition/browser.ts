@@ -474,7 +474,14 @@ export function createTestBrowserRuntimeComposition(
         typeof document === 'undefined' || typeof MutationObserver === 'undefined'
           ? undefined
           : createBrowserSlotReconciliationBoundary(document, MutationObserver);
+      const artifacts = createCommittedArtifactStore();
       const slotService = createSlotService({
+        disposeCommittedArtifact: (navigationGeneration, registeredSlotId) => {
+          const artifact = artifacts.current(registeredSlotId);
+          if (artifact?.navigationGeneration === navigationGeneration) {
+            artifacts.release(artifact);
+          }
+        },
         googletag: composition.adapters.googletag,
         ...(reconciliation ? { reconciliation } : {}),
       });
@@ -482,7 +489,6 @@ export function createTestBrowserRuntimeComposition(
       const reservationService = createReservationService({
         prepareRenderSource: (candidate) => parseBidRenderSourceV1(candidate, cachePolicy),
       });
-      const artifacts = createCommittedArtifactStore();
       const rendererNonces = createRendererNonceRegistry();
       const publisherOrigin = window.location.origin;
       const fetchCache = globalThis.fetch;
@@ -654,6 +660,8 @@ export function createTestBrowserRuntimeComposition(
         createIdentityIssuer:
           compositionOptions.createIdentityIssuerForTest ?? createBrowserNavigationIdentityIssuer,
         interfaces: Object.freeze({ adapters: composition.adapters, gpt: gptRuntime, ...services }),
+        onNavigationDispose: (navigationGeneration) =>
+          artifacts.disposeNavigation(navigationGeneration),
       });
       context.onDispose(() => {
         batchCoordinator.dispose();

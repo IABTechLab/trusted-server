@@ -160,6 +160,10 @@ export interface SlotService {
 }
 
 export interface SlotServiceOptions {
+  readonly disposeCommittedArtifact?: (
+    navigationGeneration: object,
+    registeredSlotId: string
+  ) => void;
   readonly googletag: GoogletagAdapter;
   readonly now?: () => number;
   readonly reconciliation?: SlotReconciliationBoundary;
@@ -203,6 +207,7 @@ interface PhysicalCycle {
 
 interface PhysicalSlot {
   activeCycle: PhysicalCycle | undefined;
+  artifactRetirementAttempted: boolean;
   definition: GoogletagReplacementDefinition | undefined;
   domElement: object | undefined;
   lastResponseIdentifier: string | undefined;
@@ -629,6 +634,10 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
   const placementQuarantine = new Map<string, number>();
   const quarantinedKeysByPhysical = new WeakMap<object, readonly string[]>();
   const now = options.now ?? (() => performance.now());
+  const disposeCommittedArtifact =
+    typeof options.disposeCommittedArtifact === 'function'
+      ? options.disposeCommittedArtifact
+      : undefined;
   let reconciliationBoundary: SlotReconciliationBoundary | undefined;
   let reconciliationObserve: SlotReconciliationBoundary['observe'] | undefined;
   let reconciliationIsConnected: SlotReconciliationBoundary['isConnected'] | undefined;
@@ -847,6 +856,16 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     invokeIntent(record, queued);
   };
 
+  const retireCommittedArtifact = (record: InternalSlotRecord, physical: PhysicalSlot): void => {
+    if (physical.artifactRetirementAttempted) return;
+    physical.artifactRetirementAttempted = true;
+    try {
+      disposeCommittedArtifact?.(record.state.owner.generation, record.view.registeredSlotId);
+    } catch {
+      // Physical retirement remains authoritative when artifact cleanup throws.
+    }
+  };
+
   const prepareReplacementCommit = (
     record: InternalSlotRecord,
     oldPhysical: PhysicalSlot,
@@ -866,6 +885,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     if (existing) throw new GoogletagReplacementCandidateCollisionError(replacement);
     const physical: PhysicalSlot = {
       activeCycle: undefined,
+      artifactRetirementAttempted: false,
       definition,
       domElement,
       destroyAttempted: false,
@@ -907,6 +927,8 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         addSetValue(physicalSlots, physical);
         if (!setHasValue(physicalSlots, physical)) return false;
         if (record.state.disposed || !record.state.owner.isCurrent()) return false;
+        retireCommittedArtifact(record, oldPhysical);
+        if (record.state.disposed || !record.state.owner.isCurrent()) return false;
         record.physical = physical;
         oldPhysical.record = undefined;
         deleteSetValue(physicalSlots, oldPhysical);
@@ -924,6 +946,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     if (!orphanedSlot || orphanedSlot === source.slot) return;
     const orphan: PhysicalSlot = {
       activeCycle: undefined,
+      artifactRetirementAttempted: true,
       definition: source.definition,
       domElement: undefined,
       destroyAttempted: true,
@@ -979,6 +1002,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         )
       );
     } catch {
+      retireCommittedArtifact(record, physical);
       physical.state = 'quarantined';
       failQueued(record, 'gpt_request_failed');
       return;
@@ -994,6 +1018,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     };
     void operation.result.then(
       (result) => {
+        retireCommittedArtifact(record, physical);
         if (result.status !== 'replaced') {
           detachDestroyedOld();
           failQueued(record, 'gpt_request_failed');
@@ -1007,6 +1032,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
         advanceQueued(record);
       },
       (error: unknown) => {
+        retireCommittedArtifact(record, physical);
         physical.state = 'quarantined';
         const replacementError = error instanceof GoogletagReplacementError ? error : undefined;
         const reusedOldIdentity = replacementError?.orphanedSlot === physical.slot;
@@ -1069,12 +1095,17 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       return;
     }
     const physical = intent.record.physical;
-    if (physical?.activeCycle?.intent === intent) {
-      physical.activeCycle.intent = undefined;
+    const physicalCycle = physical?.activeCycle;
+    const ownsPhysicalCycle = physicalCycle?.intent === intent;
+    if (ownsPhysicalCycle && physical && physicalCycle) {
+      physicalCycle.intent = undefined;
       physical.state = 'quarantined';
       physical.quarantineReason = 'completion';
     }
     settle(intent, failed('gpt_completion_timeout'));
+    if (ownsPhysicalCycle && physical?.ownership === 'trusted_server') {
+      recoverRequestTimeout(intent.record, physical);
+    }
   };
 
   const armRequestDeadline = (intent: RequestIntent): void => {
@@ -1341,6 +1372,8 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
   };
 
   const retirePhysicalForNavigation = (physical: PhysicalSlot): void => {
+    const record = physical.record;
+    if (record) retireCommittedArtifact(record, physical);
     physical.record = undefined;
     if (physical.ownership === 'publisher') {
       if (physical.activeCycle) {
@@ -1440,6 +1473,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     if (record.physical !== physical || physical.ownership !== 'trusted_server') return;
 
     settleReconciliationWork(record, physical, reason);
+    retireCommittedArtifact(record, physical);
     record.physical = undefined;
     physical.record = undefined;
     physical.state = 'retired';
@@ -1490,6 +1524,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     ) {
       return false;
     }
+    retireCommittedArtifact(record, window.orphan);
     window.terminal = true;
     clearReconciliationTimers(window);
     window.operation?.dispose();
@@ -2038,6 +2073,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
     }
     const physical: PhysicalSlot = {
       activeCycle: undefined,
+      artifactRetirementAttempted: false,
       definition,
       domElement,
       destroyAttempted: false,
@@ -2578,6 +2614,7 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       if (cycleIntent && !cycleIntent.terminal) settle(cycleIntent, failed('gpt_request_failed'));
       if (record?.activeIntent) settle(record.activeIntent, failed('gpt_request_failed'));
       if (record?.queuedIntent) settle(record.queuedIntent, failed('gpt_request_failed'));
+      if (record) retireCommittedArtifact(record, physical);
       if (record?.physical === physical) record.physical = undefined;
       physical.record = undefined;
       physical.activeCycle = undefined;

@@ -729,6 +729,44 @@ describe('browser composition', () => {
     expect(session?.currentNavigation?.currentAuctionProjection).toEqual(projection);
     expect(Object.isFrozen(session?.currentNavigation?.currentAuctionProjection)).toBe(true);
 
+    const initialNavigation = session?.currentNavigation;
+    const artifactBatch = initialNavigation?.createAuctionBatch('accepted-artifact');
+    const artifactOwner = artifactBatch?.createRenderAttempt('accepted-artifact-slot');
+    const artifactStore = session?.interfaces['artifacts'] as
+      Parameters<typeof createRenderAttempt>[0]['artifacts'] | undefined;
+    if (!artifactOwner?.ok || !artifactStore || !reservationService) {
+      throw new Error('Expected accepted-artifact dependencies');
+    }
+    const acceptedSource = Object.freeze({
+      type: 'adm' as const,
+      version: 1 as const,
+      adm: '<main>accepted</main>',
+      width: 300,
+      height: 250,
+    });
+    const acceptedAttempt = createRenderAttempt({
+      artifacts: artifactStore,
+      owner: artifactOwner.value,
+      prepareRenderSource: () => acceptedSource,
+      reservations: reservationService,
+    });
+    if (!acceptedAttempt.ok) throw new Error(acceptedAttempt.reason);
+    const disposeAcceptedArtifact = vi.fn();
+    const acceptedArtifact = Object.freeze({
+      kind: 'direct_iframe' as const,
+      attemptId: acceptedAttempt.value.id,
+      slot: acceptedAttempt.value.slot,
+      navigationGeneration: acceptedAttempt.value.navigationGeneration,
+      dispose: disposeAcceptedArtifact,
+    });
+    expect(
+      acceptedAttempt.value.admitDirectWinner(acceptedSource, Object.freeze({ selectedCpm: 1 }))
+    ).toBe(true);
+    expect(acceptedAttempt.value.beginDirect()).toBe(true);
+    expect(acceptedAttempt.value.beginAdm(acceptedArtifact)).toBe(true);
+    expect(acceptedAttempt.value.accept()).toBe(true);
+    expect(artifactStore.current('accepted-artifact-slot')).toBe(acceptedArtifact);
+
     projection.auction.auctionId = 'publisher-mutated';
     expect(
       (
@@ -740,6 +778,8 @@ describe('browser composition', () => {
     const replacement = session?.replaceNavigation();
     expect(replacement).toMatchObject({ ok: true });
     if (!replacement?.ok) throw new Error('Expected SPA navigation');
+    expect(disposeAcceptedArtifact).toHaveBeenCalledOnce();
+    expect(artifactStore.current('accepted-artifact-slot')).toBeUndefined();
     expect(replacement.value.currentAuctionProjection).toBeUndefined();
     expect(composition.runtimeSessionForTest()).toBe(session);
     expect(composition.reservationServiceForTest()).toBe(reservationService);

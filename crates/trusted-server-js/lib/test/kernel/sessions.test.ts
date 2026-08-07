@@ -29,6 +29,25 @@ function frozenProjection(id: string): Readonly<object> {
 }
 
 describe('runtime and navigation sessions', () => {
+  it('reports every navigation generation exactly once at its disposal boundary', () => {
+    const onNavigationDispose = vi.fn();
+    const runtime = createRuntimeSession({
+      createIdentityIssuer: identityFactory(),
+      onNavigationDispose,
+    });
+    const initial = runtime.startInitialNavigation(frozenProjection('initial'));
+    if (!initial.ok) throw new Error('Expected initial navigation');
+
+    const replacement = runtime.replaceNavigation();
+    if (!replacement.ok) throw new Error('Expected replacement navigation');
+    expect(onNavigationDispose).toHaveBeenCalledExactlyOnceWith(initial.value.generation);
+
+    runtime.dispose();
+    runtime.dispose();
+    expect(onNavigationDispose).toHaveBeenCalledTimes(2);
+    expect(onNavigationDispose).toHaveBeenLastCalledWith(replacement.value.generation);
+  });
+
   it('owns one current navigation and replaces it atomically before reverse disposal', () => {
     const order: string[] = [];
     const runtime = createRuntimeSession({ createIdentityIssuer: identityFactory() });
