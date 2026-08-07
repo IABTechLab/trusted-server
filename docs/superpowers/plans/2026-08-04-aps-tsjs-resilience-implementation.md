@@ -1383,7 +1383,10 @@ Every task's regression suite therefore remains green in task order.
       and disposer. Direct winner admission constructs the context from the exact
       validated joined server winner; a PUC claim receives the same context from the
       consumed reservation by presenting the exact one-shot frozen claim result;
-      source and context are never accepted as independently swappable values.
+      the result exposes neither source nor context, and those values are never
+      accepted as independently swappable inputs. Accept that claim only through the
+      branded reservation service while the service,
+      original attempt/navigation, and fixed reservation expiry remain live.
       Obtain the id only from the NavigationSession issuer before registering work; an
       issuance failure settles `identity_generation_failed` without DOM/global
       mutation. Add `SlotOperation` above attempts so a primary and optional fallback
@@ -1400,6 +1403,9 @@ Every task's regression suite therefore remains green in task order.
       Require synchronous exact-once artifact disposal, reject Promise/thenable
       disposers, reject republication once disposal starts, and require private
       provenance for artifact stores, attempts, and fallback children.
+      On every post-issuance construction rejection, best-effort dispose the exact
+      captured attempt scope and prove the session permits an immediate same-slot
+      retry.
 
 - [ ] **Step 3: Implement direct APS:**
   - validate descriptor before DOM mutation;

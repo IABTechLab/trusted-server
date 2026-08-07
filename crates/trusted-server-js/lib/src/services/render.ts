@@ -1,9 +1,11 @@
 import type { RenderAttemptScope, WinnerContext } from '../kernel/sessions';
 
+import { isReservationService } from './reservations';
 import type {
   ReservationClaimAdmission,
   ReservationClaimExpectation,
   ReservationRenderSource,
+  ReservationService,
 } from './reservations';
 
 const ATTEMPT_ID = /^a1_[A-Za-z0-9_-]{22}$/;
@@ -38,6 +40,7 @@ const promiseThenIntrinsic = Promise.prototype.then;
 const artifactDisposals = new WeakMap<object, boolean>();
 const committedArtifactStores = new WeakSet<object>();
 const renderAttempts = new WeakSet<object>();
+const ignoreAsyncDisposal = (): void => undefined;
 
 function frozen<const Value extends object>(value: Value): Readonly<Value> {
   return Reflect.apply(objectFreezeIntrinsic, Object, [value]) as Readonly<Value>;
@@ -272,10 +275,7 @@ export interface RenderAttemptOptions {
   readonly owner: RenderAttemptScope;
   readonly artifacts: CommittedArtifactStore;
   readonly prepareRenderSource: (candidate: unknown) => ReservationRenderSource | undefined;
-  readonly consumeClaimedWinner: (
-    claim: unknown,
-    expectation: ReservationClaimExpectation
-  ) => ReservationClaimAdmission | undefined;
+  readonly reservations: ReservationService;
   readonly parentAttemptId?: string;
   readonly scheduler?: RenderScheduler;
 }
@@ -337,6 +337,7 @@ export interface SlotOperation {
   readonly onSettled: (callback: (result: SlotOperationResult) => void) => boolean;
 }
 
+/** Result of provenance-checking a primary attempt before operation subscription. */
 export type SlotOperationCreationResult =
   Readonly<{ ok: true; value: SlotOperation }> | Readonly<{ ok: false; reason: 'invalid_attempt' }>;
 
@@ -460,7 +461,7 @@ function disposeArtifact(artifact: CommittedRenderArtifact | undefined): boolean
     const result = Reflect.apply(artifact.dispose, artifact, []) as unknown;
     if ((typeof result === 'object' || typeof result === 'function') && result !== null) {
       try {
-        Reflect.apply(promiseThenIntrinsic, result, [undefined, () => undefined]);
+        Reflect.apply(promiseThenIntrinsic, result, [ignoreAsyncDisposal, ignoreAsyncDisposal]);
         return false;
       } catch {
         // Non-Promise thenables are contained through their own `then` method below.
@@ -473,7 +474,7 @@ function disposeArtifact(artifact: CommittedRenderArtifact | undefined): boolean
       }
       if (typeof thenMethod === 'function') {
         try {
-          Reflect.apply(thenMethod, result, [undefined, () => undefined]);
+          Reflect.apply(thenMethod, result, [ignoreAsyncDisposal, ignoreAsyncDisposal]);
         } catch {
           // A hostile thenable is still an unsupported asynchronous disposer.
         }
@@ -696,6 +697,8 @@ function terminalState(outcome: RenderOutcome): RenderAttemptState {
 /** Construct one path-independent attempt lifecycle around an issued owner scope. */
 export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemptCreationResult {
   let owner: RenderAttemptScope;
+  let ownerForCleanup: unknown;
+  let ownerDisposeForCleanup: unknown;
   let artifacts: CommittedArtifactStore;
   let id: string;
   let slot: string;
@@ -703,7 +706,8 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
   let navigationGeneration: object;
   let parentAttemptId: string | undefined;
   let prepareRenderSource: (candidate: unknown) => ReservationRenderSource | undefined;
-  let consumeClaimedWinner: RenderAttemptOptions['consumeClaimedWinner'];
+  let reservations: ReservationService;
+  let consumeClaimMethod: ReservationService['consumeClaim'];
   let ownerIsCurrentMethod: RenderAttemptScope['isCurrent'];
   let ownerDisposeMethod: RenderAttemptScope['dispose'];
   let ownerOnDisposeMethod: RenderAttemptScope['onDispose'];
@@ -711,11 +715,30 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
   let promoteArtifactMethod: CommittedArtifactStore['promote'];
   let currentArtifactMethod: CommittedArtifactStore['current'];
   let releaseArtifactMethod: CommittedArtifactStore['release'];
+  const rejectConstruction = (
+    reason: 'invalid_attempt' | 'stale_owner'
+  ): RenderAttemptCreationResult => {
+    try {
+      if (
+        ((typeof ownerForCleanup === 'object' && ownerForCleanup !== null) ||
+          typeof ownerForCleanup === 'function') &&
+        typeof ownerDisposeForCleanup === 'function'
+      ) {
+        Reflect.apply(ownerDisposeForCleanup, ownerForCleanup, []);
+      }
+    } catch {
+      // Rejection remains authoritative even when issued-owner cleanup throws.
+    }
+    return frozen({ ok: false, reason });
+  };
   try {
     owner = options.owner;
+    ownerForCleanup = owner;
+    ownerDisposeForCleanup = owner.dispose;
+    ownerDisposeMethod = ownerDisposeForCleanup as RenderAttemptScope['dispose'];
     artifacts = options.artifacts;
     if (!weakSetHas(committedArtifactStores, artifacts)) {
-      return frozen({ ok: false, reason: 'invalid_attempt' });
+      return rejectConstruction('invalid_attempt');
     }
     id = owner.id;
     slot = owner.slot;
@@ -723,9 +746,12 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
     navigationGeneration = owner.navigationGeneration;
     parentAttemptId = options.parentAttemptId;
     prepareRenderSource = options.prepareRenderSource;
-    consumeClaimedWinner = options.consumeClaimedWinner;
+    reservations = options.reservations;
+    if (!isReservationService(reservations)) {
+      return rejectConstruction('invalid_attempt');
+    }
+    consumeClaimMethod = reservations.consumeClaim;
     ownerIsCurrentMethod = owner.isCurrent;
-    ownerDisposeMethod = owner.dispose;
     ownerOnDisposeMethod = owner.onDispose;
     ownerPrepareWinnerMethod = owner.prepareWinnerContext;
     promoteArtifactMethod = artifacts.promote;
@@ -748,14 +774,14 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
       typeof ownerOnDisposeMethod !== 'function' ||
       typeof ownerPrepareWinnerMethod !== 'function' ||
       typeof prepareRenderSource !== 'function' ||
-      typeof consumeClaimedWinner !== 'function' ||
+      typeof consumeClaimMethod !== 'function' ||
       (parentAttemptId !== undefined &&
         (!validAttemptId(parentAttemptId) || parentAttemptId === id))
     ) {
-      return frozen({ ok: false, reason: 'invalid_attempt' });
+      return rejectConstruction('invalid_attempt');
     }
   } catch {
-    return frozen({ ok: false, reason: 'invalid_attempt' });
+    return rejectConstruction('invalid_attempt');
   }
   const ownerIsCurrent = (): boolean => {
     try {
@@ -777,19 +803,20 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
       return false;
     }
   };
-  if (!ownerIsCurrent()) return frozen({ ok: false, reason: 'stale_owner' });
+  if (!ownerIsCurrent()) return rejectConstruction('stale_owner');
 
-  const scheduler = options.scheduler ?? defaultScheduler();
+  let scheduler: RenderScheduler;
   let schedulerSetMethod: RenderScheduler['set'];
   let schedulerClearMethod: RenderScheduler['clear'];
   try {
+    scheduler = options.scheduler ?? defaultScheduler();
     schedulerSetMethod = scheduler.set;
     schedulerClearMethod = scheduler.clear;
     if (typeof schedulerSetMethod !== 'function' || typeof schedulerClearMethod !== 'function') {
-      return frozen({ ok: false, reason: 'invalid_attempt' });
+      return rejectConstruction('invalid_attempt');
     }
   } catch {
-    return frozen({ ok: false, reason: 'invalid_attempt' });
+    return rejectConstruction('invalid_attempt');
   }
   const history: RenderAttemptState[] = ['created'];
   const observers: Array<(outcome: RenderOutcome) => void> = [];
@@ -962,15 +989,15 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
     if (!validWinnerContext(context)) return false;
     let admission: ReservationClaimAdmission | undefined;
     try {
-      admission = consumeClaimedWinner(
+      admission = Reflect.apply(consumeClaimMethod, reservations, [
         candidate,
-        frozen({
+        frozen<ReservationClaimExpectation>({
           attemptId: id,
           slot,
           navigationGeneration,
           winnerContext: context,
-        })
-      );
+        }),
+      ]) as ReservationClaimAdmission | undefined;
     } catch {
       return false;
     }
