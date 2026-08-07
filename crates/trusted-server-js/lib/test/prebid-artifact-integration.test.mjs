@@ -26,6 +26,7 @@ let outputDirectory;
 let bundleCode;
 let shimCode;
 let prebidVersion;
+let artifactManifest;
 
 beforeAll(async () => {
   outputDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'trusted-server-prebid-artifacts-'));
@@ -38,9 +39,11 @@ beforeAll(async () => {
     '--out',
     outputDirectory,
   ]);
-  const manifest = JSON.parse(fs.readFileSync(path.join(outputDirectory, 'manifest.json'), 'utf8'));
-  bundleCode = fs.readFileSync(path.join(outputDirectory, manifest.filename), 'utf8');
-  prebidVersion = manifest.prebidVersion;
+  artifactManifest = JSON.parse(
+    fs.readFileSync(path.join(outputDirectory, 'manifest.json'), 'utf8')
+  );
+  bundleCode = fs.readFileSync(path.join(outputDirectory, artifactManifest.filename), 'utf8');
+  prebidVersion = artifactManifest.prebidVersion;
 
   const { build } = await import('vite');
   await build({
@@ -91,6 +94,117 @@ describe('tsjs-prebid shim artifact', () => {
 });
 
 describe('external bundle + served shim evaluated together', () => {
+  it('reuses an exact artifact without replaying factories and keeps one watchdog per wrapper', () => {
+    const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', {
+      url: 'https://pub.example.com/article',
+      runScripts: 'outside-only',
+    });
+    const pageWindow = dom.window;
+    const watchdogs = [];
+    const originalSetTimeout = pageWindow.setTimeout.bind(pageWindow);
+    pageWindow.setTimeout = (callback, delay, ...arguments_) => {
+      if (delay === 5_000 && String(callback).includes('__tsWatchdogFired')) {
+        watchdogs.push(callback);
+        return 1;
+      }
+      return originalSetTimeout(callback, delay, ...arguments_);
+    };
+    pageWindow.fetch = vi.fn(async () => new Response('{}'));
+    pageWindow.Request = Request;
+    pageWindow.Headers = Headers;
+    pageWindow.Response = Response;
+    pageWindow.AbortController = AbortController;
+    if (!('isSecureContext' in pageWindow)) pageWindow.isSecureContext = true;
+    pageWindow.eval('window.pbjs = { que: [], cmd: [] };');
+
+    pageWindow.eval(bundleCode);
+    const firstBinding = pageWindow.pbjs;
+    const firstRequestBids = firstBinding.requestBids;
+    const firstStamp = firstBinding.__trustedServerArtifactV1;
+    pageWindow.eval(bundleCode);
+
+    expect(pageWindow.pbjs).toBe(firstBinding);
+    expect(pageWindow.pbjs.requestBids).toBe(firstRequestBids);
+    expect(pageWindow.pbjs.__trustedServerArtifactV1).toBe(firstStamp);
+    expect(watchdogs).toHaveLength(2);
+
+    const processQueue = vi.fn(firstBinding.processQueue.bind(firstBinding));
+    firstBinding.processQueue = processQueue;
+    for (const watchdog of watchdogs) {
+      watchdog();
+      watchdog();
+    }
+    expect(processQueue).toHaveBeenCalledTimes(2);
+    dom.window.close();
+  });
+
+  it('refuses a different valid artifact without disturbing the working binding', () => {
+    const dom = new JSDOM('<!doctype html><html></html>', {
+      url: 'https://pub.example.com/article',
+      runScripts: 'outside-only',
+    });
+    const pageWindow = dom.window;
+    const conflictingStamp = {
+      abi: artifactManifest.abi,
+      artifactReleaseId: 'f'.repeat(64),
+      prebidVersion: artifactManifest.prebidVersion,
+      moduleStems: artifactManifest.moduleStems,
+      bidderCodes: artifactManifest.bidderCodes,
+      bidderAliases: artifactManifest.bidderAliases,
+      userIdModules: artifactManifest.userIdModules,
+    };
+    pageWindow.eval('window.pbjs = { que: [], cmd: [] };');
+    pageWindow.eval(
+      `window.__conflictingStamp=(function freeze(value){if(value&&typeof value==='object'){Object.getOwnPropertyNames(value).forEach(function(key){freeze(value[key]);});Object.freeze(value);}return value;})(${JSON.stringify(conflictingStamp)});`
+    );
+    pageWindow.Object.defineProperty(pageWindow.pbjs, '__trustedServerArtifactV1', {
+      value: pageWindow.__conflictingStamp,
+      enumerable: false,
+      writable: false,
+      configurable: false,
+    });
+    const binding = pageWindow.pbjs;
+    const warn = vi.fn();
+    pageWindow.console.warn = warn;
+
+    expect(() => pageWindow.eval(bundleCode)).not.toThrow();
+    expect(pageWindow.pbjs).toBe(binding);
+    expect(pageWindow.pbjs.requestBids).toBeUndefined();
+    expect(pageWindow.pbjs.__trustedServerArtifactV1).toBe(pageWindow.__conflictingStamp);
+    expect(warn).toHaveBeenCalledTimes(1);
+    dom.window.close();
+  });
+
+  it('keeps publisher Prebid usable when a hostile stamp cannot be replaced', () => {
+    const dom = new JSDOM('<!doctype html><html></html>', {
+      url: 'https://pub.example.com/article',
+      runScripts: 'outside-only',
+    });
+    const pageWindow = dom.window;
+    pageWindow.fetch = vi.fn(async () => new Response('{}'));
+    pageWindow.Request = Request;
+    pageWindow.Headers = Headers;
+    pageWindow.Response = Response;
+    pageWindow.AbortController = AbortController;
+    if (!('isSecureContext' in pageWindow)) pageWindow.isSecureContext = true;
+    pageWindow.eval('window.pbjs = { que: [], cmd: [] };');
+    const hostileStamp = Object.freeze({ abi: 99 });
+    pageWindow.Object.defineProperty(pageWindow.pbjs, '__trustedServerArtifactV1', {
+      value: hostileStamp,
+      enumerable: true,
+      writable: false,
+      configurable: false,
+    });
+    const warn = vi.fn();
+    pageWindow.console.warn = warn;
+
+    expect(() => pageWindow.eval(bundleCode)).not.toThrow();
+    expect(typeof pageWindow.pbjs.requestBids).toBe('function');
+    expect(pageWindow.pbjs.__trustedServerArtifactV1).toBe(hostileStamp);
+    expect(warn).toHaveBeenCalledTimes(1);
+    dom.window.close();
+  });
+
   it('populates the public API, installs the shim exactly once, and routes an /auction request', async () => {
     const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', {
       url: 'https://pub.example.com/article',
@@ -140,13 +254,45 @@ describe('external bundle + served shim evaluated together', () => {
 
     expect(typeof pageWindow.pbjs.requestBids).toBe('function');
     expect(typeof pageWindow.pbjs.registerBidAdapter).toBe('function');
-    expect(pageWindow.__tsjs_prebid_bundle.adapters).toEqual(['adf']);
-    expect([...pageWindow.__tsjs_prebid_bundle.bidderCodes]).toEqual([
-      'adf',
-      'adform',
-      'adformOpenRTB',
+    expect(pageWindow.__tsjs_prebid_bundle).toBeUndefined();
+    expect(pageWindow.__tsjsPrebidShimInstalled).toBeUndefined();
+    const artifactDescriptor = Object.getOwnPropertyDescriptor(
+      pageWindow.pbjs,
+      '__trustedServerArtifactV1'
+    );
+    expect(artifactDescriptor).toMatchObject({
+      enumerable: false,
+      writable: false,
+      configurable: false,
+    });
+    expect(artifactDescriptor.value).toEqual(
+      expect.objectContaining({
+        abi: 1,
+        artifactReleaseId: artifactManifest.artifactReleaseId,
+        prebidVersion: '10.26.0',
+      })
+    );
+    expect([...artifactDescriptor.value.bidderCodes]).toEqual(['adf', 'adform', 'adformOpenRTB']);
+    expect([...artifactDescriptor.value.bidderAliases]).toEqual([
+      { code: 'adform', moduleStem: 'adf' },
+      { code: 'adformOpenRTB', moduleStem: 'adf' },
     ]);
-    expect([...pageWindow.__tsjs_prebid_bundle.userIdModules]).toEqual(['sharedIdSystem']);
+    expect([...artifactDescriptor.value.userIdModules]).toEqual([
+      {
+        moduleName: 'sharedIdSystem',
+        configNames: ['pubCommonId', 'sharedId'],
+        eidSources: ['pubcid.org'],
+      },
+    ]);
+    expect(Object.isFrozen(artifactDescriptor.value)).toBe(true);
+    expect(Object.isFrozen(artifactDescriptor.value.moduleStems)).toBe(true);
+    expect(Object.isFrozen(artifactDescriptor.value.bidderCodes)).toBe(true);
+    expect(Object.isFrozen(artifactDescriptor.value.bidderAliases)).toBe(true);
+    expect(Object.isFrozen(artifactDescriptor.value.bidderAliases[0])).toBe(true);
+    expect(Object.isFrozen(artifactDescriptor.value.userIdModules)).toBe(true);
+    expect(Object.isFrozen(artifactDescriptor.value.userIdModules[0])).toBe(true);
+    expect(Object.isFrozen(artifactDescriptor.value.userIdModules[0].configNames)).toBe(true);
+    expect(Object.isFrozen(artifactDescriptor.value.userIdModules[0].eidSources)).toBe(true);
 
     // Count trustedServer registrations across repeated shim evaluations.
     const originalRegisterBidAdapter = pageWindow.pbjs.registerBidAdapter.bind(pageWindow.pbjs);
