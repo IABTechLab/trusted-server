@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import { createTestNavigationIdentityIssuer } from '../../src/kernel/identity';
+import { createRuntimeSession } from '../../src/kernel/sessions';
 import type { RenderAttemptScope, WinnerContext } from '../../src/kernel/sessions';
 import {
   createCommittedArtifactStore,
@@ -7,11 +9,16 @@ import {
   createSlotOperation,
   type CommittedRenderArtifact,
   type RenderAttempt,
-  type RenderAttemptOptions,
   type RenderAttemptState,
   type SlotOperation,
   type SlotOperationOptions,
 } from '../../src/services/render';
+import {
+  createReservationService,
+  type ReservationClaimResult,
+  type ReservationRenderSource,
+  type ReservationService,
+} from '../../src/services/reservations';
 
 const ATTEMPT_ONE = 'a1_0000000000000000000000';
 const ATTEMPT_TWO = 'a1_0000000000000000000001';
@@ -44,22 +51,13 @@ function prepareRenderSource(candidate: unknown) {
   return undefined;
 }
 
-const claimedSources = new WeakMap<object, typeof ADM_SOURCE | typeof APS_SOURCE>();
+const RESERVATION_ID = 'r1_0000000000000000000000';
+const attemptReservations = new WeakMap<RenderAttempt, ReservationService>();
+const matrixClaims = new WeakMap<RenderAttempt, object>();
 
-function claimed(source: typeof ADM_SOURCE | typeof APS_SOURCE): object {
-  const claim = Object.freeze({});
-  claimedSources.set(claim, source);
-  return claim;
+function reservations(): ReservationService {
+  return createReservationService({ now: () => 0, prepareRenderSource });
 }
-
-const consumeClaimedWinner: RenderAttemptOptions['consumeClaimedWinner'] = (claim, expectation) => {
-  if ((typeof claim !== 'object' && typeof claim !== 'function') || claim === null) {
-    return undefined;
-  }
-  const source = claimedSources.get(claim);
-  if (!source || !claimedSources.delete(claim)) return undefined;
-  return Object.freeze({ renderSource: source, winnerContext: expectation.winnerContext });
-};
 
 type TestOwner = RenderAttemptScope & {
   admitClaimedContext(context: WinnerContext): void;
@@ -154,17 +152,50 @@ function attempt(
   scope = owner(),
   options: Partial<Parameters<typeof createRenderAttempt>[0]> = {}
 ): RenderAttempt {
+  const reservationService = options.reservations ?? reservations();
   const result = createRenderAttempt({
     artifacts: options.artifacts ?? createCommittedArtifactStore(),
-    consumeClaimedWinner: options.consumeClaimedWinner ?? consumeClaimedWinner,
     owner: scope,
     prepareRenderSource: options.prepareRenderSource ?? prepareRenderSource,
+    reservations: reservationService,
     ...(options.parentAttemptId === undefined ? {} : { parentAttemptId: options.parentAttemptId }),
     ...(options.scheduler === undefined ? {} : { scheduler: options.scheduler }),
   });
   expect(result).toMatchObject({ ok: true });
   if (!result.ok) throw new Error('should create an attempt');
+  attemptReservations.set(result.value, reservationService);
   return result.value;
+}
+
+function claimed(
+  render: RenderAttempt,
+  scope: TestOwner,
+  source: ReservationRenderSource
+): Extract<ReservationClaimResult, { claimed: true }> {
+  const service = attemptReservations.get(render);
+  if (!service) throw new Error('should own a reservation service');
+  const registered = service.registerRender({
+    reservationId: RESERVATION_ID,
+    slot: scope.slot,
+    navigation: {
+      generation: scope.navigationGeneration,
+      isCurrent: scope.isCurrent,
+      onDispose: scope.onDispose,
+    },
+    attemptId: scope.id,
+    renderSource: source,
+    winnerContext: WINNER_CONTEXT,
+  });
+  if (!registered.ok) throw new Error('should register a render reservation');
+  const result = service.claim({
+    reservationId: RESERVATION_ID,
+    slot: scope.slot,
+    navigationGeneration: scope.navigationGeneration,
+    attempt: scope,
+    pucSource: Object.freeze({}),
+  });
+  if (!result.recognized || !result.claimed) throw new Error('should claim a reservation');
+  return result;
 }
 
 function slotOperation(options: SlotOperationOptions): SlotOperation {
@@ -183,8 +214,7 @@ describe('RenderAttempt state machine', () => {
 
     expect(render.beginGamClaim()).toBe(true);
     expect(render.beginDirect()).toBe(false);
-    scope.admitClaimedContext(WINNER_CONTEXT);
-    expect(render.admitClaimedWinner(claimed(APS_SOURCE))).toBe(true);
+    expect(render.admitClaimedWinner(claimed(render, scope, APS_SOURCE))).toBe(true);
     expect(render.ownerClaimed()).toBe(true);
     expect(render.ownerRegistered()).toBe(true);
     expect(render.beginApsDocument(candidate)).toBe(true);
@@ -226,8 +256,7 @@ describe('RenderAttempt state machine', () => {
     const pucArtifact = artifact(pucOwner, 'puc');
     const puc = attempt(pucOwner);
     expect(puc.beginGamClaim()).toBe(true);
-    pucOwner.admitClaimedContext(WINNER_CONTEXT);
-    expect(puc.admitClaimedWinner(claimed(ADM_SOURCE))).toBe(true);
+    expect(puc.admitClaimedWinner(claimed(puc, pucOwner, ADM_SOURCE))).toBe(true);
     expect(puc.ownerClaimed()).toBe(true);
     expect(puc.ownerRegistered()).toBe(true);
     expect(puc.beginAdm(pucArtifact)).toBe(true);
@@ -262,8 +291,7 @@ describe('RenderAttempt state machine', () => {
     const pucApsOwner = owner('a1_0000000000000000000002');
     const pucAps = attempt(pucApsOwner);
     expect(pucAps.beginGamClaim()).toBe(true);
-    pucApsOwner.admitClaimedContext(WINNER_CONTEXT);
-    expect(pucAps.admitClaimedWinner(claimed(APS_SOURCE))).toBe(true);
+    expect(pucAps.admitClaimedWinner(claimed(pucAps, pucApsOwner, APS_SOURCE))).toBe(true);
     expect(pucAps.ownerClaimed()).toBe(true);
     expect(pucAps.ownerRegistered()).toBe(true);
     expect(pucAps.beginAdm(artifact(pucApsOwner, 'puc'))).toBe(false);
@@ -275,27 +303,23 @@ describe('RenderAttempt state machine', () => {
     const scope = owner();
     const render = attempt(scope);
     expect(render.beginGamClaim()).toBe(true);
-    scope.admitClaimedContext(WINNER_CONTEXT);
-    const exactClaim = claimed(APS_SOURCE);
-    expect(render.admitClaimedWinner(Object.freeze({}))).toBe(false);
-    expect(render.admitClaimedWinner(exactClaim)).toBe(true);
-    expect(render.renderSource).toBe(APS_SOURCE);
-    expect(render.winnerContext).toBe(WINNER_CONTEXT);
-    expect(render.admitClaimedWinner(exactClaim)).toBe(false);
+    const exactClaim = claimed(render, scope, APS_SOURCE);
+    const exactContext = scope.winnerContext;
+    if (!exactContext) throw new Error('should admit the exact reservation context');
 
     const mismatchedOwner = owner(ATTEMPT_TWO);
-    const mismatched = attempt(mismatchedOwner, {
-      consumeClaimedWinner: (_claim, expectation) =>
-        Object.freeze({
-          renderSource: ADM_SOURCE,
-          winnerContext: Object.freeze({ selectedCpm: expectation.winnerContext.selectedCpm }),
-        }),
-    });
+    const mismatched = attempt(mismatchedOwner);
     expect(mismatched.beginGamClaim()).toBe(true);
-    mismatchedOwner.admitClaimedContext(WINNER_CONTEXT);
-    expect(mismatched.admitClaimedWinner(Object.freeze({}))).toBe(false);
+    mismatchedOwner.admitClaimedContext(exactContext);
+    expect(mismatched.admitClaimedWinner(exactClaim)).toBe(false);
     expect(mismatched.renderSource).toBeUndefined();
     mismatched.cancel('caller_aborted');
+
+    expect(render.admitClaimedWinner(Object.freeze({}))).toBe(false);
+    expect(render.admitClaimedWinner(exactClaim)).toBe(true);
+    expect(render.renderSource).toEqual(APS_SOURCE);
+    expect(render.winnerContext).toBe(exactContext);
+    expect(render.admitClaimedWinner(exactClaim)).toBe(false);
   });
 
   it('enforces every valid, invalid, and replay transition in the state table', () => {
@@ -375,8 +399,7 @@ describe('RenderAttempt state machine', () => {
       const render = attempt(scope);
       const claim = (source: typeof APS_SOURCE | typeof ADM_SOURCE): void => {
         render.beginGamClaim();
-        scope.admitClaimedContext(WINNER_CONTEXT);
-        render.admitClaimedWinner(claimed(source));
+        render.admitClaimedWinner(claimed(render, scope, source));
       };
       switch (name) {
         case 'created':
@@ -386,7 +409,7 @@ describe('RenderAttempt state machine', () => {
           break;
         case 'waiting_for_gam_and_claim':
           render.beginGamClaim();
-          scope.admitClaimedContext(WINNER_CONTEXT);
+          matrixClaims.set(render, claimed(render, scope, APS_SOURCE));
           break;
         case 'waiting_for_gam_and_claim_admitted':
           claim(APS_SOURCE);
@@ -454,7 +477,7 @@ describe('RenderAttempt state machine', () => {
         case 'admit_direct':
           return render.admitDirectWinner(ADM_SOURCE, WINNER_CONTEXT);
         case 'admit_claimed':
-          return render.admitClaimedWinner(claimed(APS_SOURCE));
+          return render.admitClaimedWinner(matrixClaims.get(render) ?? Object.freeze({}));
         case 'begin_gam_claim':
           return render.beginGamClaim();
         case 'owner_claimed':
@@ -570,8 +593,7 @@ describe('RenderAttempt state machine', () => {
       const registrationOwner = owner();
       const registration = attempt(registrationOwner);
       registration.beginGamClaim();
-      registrationOwner.admitClaimedContext(WINNER_CONTEXT);
-      registration.admitClaimedWinner(claimed(APS_SOURCE));
+      registration.admitClaimedWinner(claimed(registration, registrationOwner, APS_SOURCE));
       registration.ownerClaimed();
       vi.advanceTimersByTime(2_999);
       expect(registration.snapshot().state).toBe('waiting_for_owner');
@@ -584,8 +606,7 @@ describe('RenderAttempt state machine', () => {
       const insertionOwner = owner(ATTEMPT_TWO);
       const insertion = attempt(insertionOwner);
       insertion.beginGamClaim();
-      insertionOwner.admitClaimedContext(WINNER_CONTEXT);
-      insertion.admitClaimedWinner(claimed(APS_SOURCE));
+      insertion.admitClaimedWinner(claimed(insertion, insertionOwner, APS_SOURCE));
       insertion.ownerClaimed();
       insertion.ownerRegistered();
       vi.advanceTimersByTime(1_000);
@@ -708,7 +729,7 @@ describe('RenderAttempt state machine', () => {
       createRenderAttempt({
         owner: malformed,
         artifacts: createCommittedArtifactStore(),
-        consumeClaimedWinner,
+        reservations: reservations(),
         prepareRenderSource,
       })
     ).toEqual({ ok: false, reason: 'invalid_attempt' });
@@ -719,7 +740,7 @@ describe('RenderAttempt state machine', () => {
       createRenderAttempt({
         owner: stale,
         artifacts: createCommittedArtifactStore(),
-        consumeClaimedWinner,
+        reservations: reservations(),
         prepareRenderSource,
       })
     ).toEqual({ ok: false, reason: 'stale_owner' });
@@ -746,12 +767,79 @@ describe('RenderAttempt state machine', () => {
         createRenderAttempt({
           owner: scope,
           artifacts: createCommittedArtifactStore(),
-          consumeClaimedWinner,
+          reservations: reservations(),
           prepareRenderSource,
         })
       ).toEqual({ ok: false, reason: 'stale_owner' });
       expect(dispose, mode).toHaveBeenCalledOnce();
     }
+  });
+
+  it('releases real session indexes after every post-issuance construction rejection', () => {
+    let issuedByte = 0;
+    const runtime = createRuntimeSession({
+      createIdentityIssuer: () =>
+        createTestNavigationIdentityIssuer({
+          getRandomValues: (target) => {
+            target.fill(issuedByte);
+            issuedByte += 1;
+            return target;
+          },
+        }),
+    });
+    const navigation = runtime.startInitialNavigation();
+    if (!navigation.ok) throw new Error('should start a navigation');
+    const batch = navigation.value.createAuctionBatch('batch-render-construction');
+    if (!batch) throw new Error('should create an auction batch');
+    const slot = 'fictional-slot';
+
+    const unbrandedOwner = batch.createRenderAttempt(slot);
+    if (!unbrandedOwner.ok) throw new Error('should issue the first owner');
+    expect(
+      createRenderAttempt({
+        owner: unbrandedOwner.value,
+        artifacts: { ...createCommittedArtifactStore() },
+        reservations: reservations(),
+        prepareRenderSource,
+      })
+    ).toEqual({ ok: false, reason: 'invalid_attempt' });
+
+    const invalidSchedulerOwner = batch.createRenderAttempt(slot);
+    expect(invalidSchedulerOwner).toMatchObject({ ok: true });
+    if (!invalidSchedulerOwner.ok) throw new Error('should retry after provenance rejection');
+    expect(
+      createRenderAttempt({
+        owner: invalidSchedulerOwner.value,
+        artifacts: createCommittedArtifactStore(),
+        reservations: reservations(),
+        prepareRenderSource,
+        scheduler: { set: undefined as never, clear: () => undefined },
+      })
+    ).toEqual({ ok: false, reason: 'invalid_attempt' });
+
+    const unbrandedReservationsOwner = batch.createRenderAttempt(slot);
+    expect(unbrandedReservationsOwner).toMatchObject({ ok: true });
+    if (!unbrandedReservationsOwner.ok) {
+      throw new Error('should retry after scheduler rejection');
+    }
+    expect(
+      createRenderAttempt({
+        owner: unbrandedReservationsOwner.value,
+        artifacts: createCommittedArtifactStore(),
+        prepareRenderSource,
+        reservations: {
+          ...reservations(),
+          consumeClaim: () =>
+            Object.freeze({
+              renderSource: ADM_SOURCE,
+              winnerContext: WINNER_CONTEXT,
+            }),
+        },
+      })
+    ).toEqual({ ok: false, reason: 'invalid_attempt' });
+
+    expect(batch.createRenderAttempt(slot)).toMatchObject({ ok: true });
+    runtime.dispose();
   });
 
   it('runtime-rejects invalid terminal reasons instead of publishing malformed outcomes', () => {
@@ -942,6 +1030,40 @@ describe('committed artifact ownership', () => {
     expect(store.current('fictional-slot')).toBe(first);
   });
 
+  it.each(['fulfilled_promise', 'fulfilling_thenable'] as const)(
+    'contains an asynchronous %s disposer without publishing a replacement',
+    async (mode) => {
+      const store = createCommittedArtifactStore();
+      const generation = Object.freeze({});
+      const firstOwner = owner(ATTEMPT_ONE, 'fictional-slot', generation);
+      const replacementOwner = owner(ATTEMPT_TWO, 'fictional-slot', generation);
+      const dispose = vi.fn(() =>
+        mode === 'fulfilled_promise'
+          ? Promise.resolve()
+          : {
+              then: (fulfilled: () => void) => {
+                queueMicrotask(() => fulfilled());
+              },
+            }
+      );
+      const first = Object.freeze({
+        kind: 'direct_iframe' as const,
+        attemptId: firstOwner.id,
+        slot: firstOwner.slot,
+        navigationGeneration: generation,
+        dispose,
+      });
+      expect(store.promote(first)).toBe(true);
+
+      expect(store.promote(artifact(replacementOwner))).toBe(false);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(dispose).toHaveBeenCalledOnce();
+      expect(store.current('fictional-slot')).toBe(first);
+    }
+  );
+
   it('never republishes an artifact after its disposal has started', () => {
     const store = createCommittedArtifactStore();
     const candidate = artifact(owner());
@@ -1091,7 +1213,7 @@ describe('SlotOperation result isolation', () => {
         const result = createRenderAttempt({
           owner: childOwner,
           artifacts: createCommittedArtifactStore(),
-          consumeClaimedWinner,
+          reservations: reservations(),
           prepareRenderSource,
           parentAttemptId,
         });
@@ -1164,7 +1286,7 @@ describe('SlotOperation result isolation', () => {
         const result = createRenderAttempt({
           owner: owner(ATTEMPT_TWO),
           artifacts: createCommittedArtifactStore(),
-          consumeClaimedWinner,
+          reservations: reservations(),
           prepareRenderSource,
           parentAttemptId,
         });

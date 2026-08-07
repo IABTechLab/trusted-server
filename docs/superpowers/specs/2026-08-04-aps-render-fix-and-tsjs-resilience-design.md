@@ -652,7 +652,12 @@ rather than reconstructing it from Prebid. A successful PUC claim transfers the
 context into the `RenderAttempt` before replacing the live entry with a tombstone.
 The exact frozen successful claim result is also a one-shot internal capability:
 `RenderAttempt` consumes that object to receive its already-bound render source and
-winner context. Callers cannot pass, reconstruct, or swap either field separately.
+winner context from the service's bounded internal record. The claim object exposes
+neither field, so callers cannot pass, reconstruct, or swap them separately.
+Consumption additionally requires the branded reservation service, its live runtime,
+the original current attempt and navigation generation, and a time strictly before
+the reservation's fixed expiry. Disposal, expiry, or loss of exact attempt authority
+invalidates the claim capability.
 The tombstone discards the render source and winner context and retains only the id,
 original expiry, terminal state, and minimum suppression metadata. Neither the
 renderer descriptor nor any capability crossing a browser-context boundary contains
@@ -1396,6 +1401,9 @@ whose deadline they enforce and are cleared by the transition that settles them.
 `waiting_for_document` accepts only an APS source; `waiting_for_adm` accepts only an
 ADM or cache source. A direct path stages only a `direct_iframe` artifact, while an
 owner-controlled PUC path stages only a `puc` artifact.
+Construction owns an already-issued attempt scope: every rejection after scope
+issuance best-effort disposes that exact scope so session indexes cannot retain a
+failed construction or block a same-slot retry.
 
 An accepted transition first atomically promotes durable DOM/targeting ownership
 from the attempt into one `CommittedRenderArtifact` owned by the exact slot and

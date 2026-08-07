@@ -193,10 +193,18 @@ describe('renderer reservation identity and registration', () => {
       const result = claim(service, navigation, attempt, reservationId(index));
       expect(result).toMatchObject({ recognized: true, claimed: true });
       if (!result.recognized || !result.claimed) throw new Error('Expected a claim');
-      expect(result.renderSource).toEqual(source);
-      expect(result.renderSource).not.toBe(mutable);
-      expect(Object.isFrozen(result.renderSource)).toBe(true);
-      expect(Object.isFrozen(result.winnerContext)).toBe(true);
+      const context = attempt.winnerContext;
+      if (!context) throw new Error('Expected an admitted winner context');
+      const admission = service.consumeClaim(result, {
+        attemptId: attempt.id,
+        slot: attempt.slot,
+        navigationGeneration: navigation.generation,
+        winnerContext: context,
+      });
+      expect(admission?.renderSource).toEqual(source);
+      expect(admission?.renderSource).not.toBe(mutable);
+      expect(Object.isFrozen(admission?.renderSource)).toBe(true);
+      expect(Object.isFrozen(admission?.winnerContext)).toBe(true);
     }
   });
 
@@ -207,6 +215,14 @@ describe('renderer reservation identity and registration', () => {
     expect(registerRender(service, navigation, attempt)).toMatchObject({ ok: true });
     const result = claim(service, navigation, attempt);
     if (!result.recognized || !result.claimed) throw new Error('Expected a claim');
+    expect(Object.getOwnPropertyNames(result).sort()).toEqual([
+      'claimed',
+      'expiresAt',
+      'pucSource',
+      'recognized',
+    ]);
+    expect(result).not.toHaveProperty('renderSource');
+    expect(result).not.toHaveProperty('winnerContext');
     const context = attempt.winnerContext;
     if (!context) throw new Error('Expected an admitted winner context');
 
@@ -242,10 +258,9 @@ describe('renderer reservation identity and registration', () => {
       winnerContext: context,
     });
     expect(admission).toEqual({
-      renderSource: result.renderSource,
+      renderSource: admSource(),
       winnerContext: context,
     });
-    expect(admission?.renderSource).toBe(result.renderSource);
     expect(admission?.winnerContext).toBe(context);
     expect(Object.isFrozen(admission)).toBe(true);
     expect(
@@ -257,6 +272,34 @@ describe('renderer reservation identity and registration', () => {
       })
     ).toBeUndefined();
   });
+
+  it.each(['navigation_disposed', 'service_disposed', 'expired'] as const)(
+    'invalidates a consumed claim when its authority is %s',
+    (mode) => {
+      let now = 5;
+      const { navigation } = runtimeNavigation();
+      const service = serviceAt(() => now);
+      const attempt = renderAttempt(navigation);
+      expect(registerRender(service, navigation, attempt)).toMatchObject({ ok: true });
+      const result = claim(service, navigation, attempt);
+      if (!result.recognized || !result.claimed) throw new Error('Expected a claim');
+      const context = attempt.winnerContext;
+      if (!context) throw new Error('Expected an admitted winner context');
+
+      if (mode === 'navigation_disposed') navigation.dispose();
+      else if (mode === 'service_disposed') service.dispose();
+      else now = result.expiresAt;
+
+      expect(
+        service.consumeClaim(result, {
+          attemptId: attempt.id,
+          slot: attempt.slot,
+          navigationGeneration: navigation.generation,
+          winnerContext: context,
+        })
+      ).toBeUndefined();
+    }
+  );
 
   it('rejects duplicate identity against live and tombstoned entries without overwriting either', () => {
     const { navigation } = runtimeNavigation();

@@ -29,8 +29,10 @@ const mapSizeGetter = Object.getOwnPropertyDescriptor(Map.prototype, 'size')?.ge
 ) => number;
 const weakMapGetIntrinsic = WeakMap.prototype.get;
 const weakMapSetIntrinsic = WeakMap.prototype.set;
-const weakMapDeleteIntrinsic = WeakMap.prototype.delete;
+const weakSetAddIntrinsic = WeakSet.prototype.add;
+const weakSetHasIntrinsic = WeakSet.prototype.has;
 const performanceNowIntrinsic = performance.now;
+const reservationServices = new WeakSet<object>();
 
 function mapValue<Key, Value>(map: Map<Key, Value>, key: Key): Value | undefined {
   return Reflect.apply(mapGetIntrinsic, map, [key]) as Value | undefined;
@@ -63,11 +65,12 @@ function setWeakMapValue<Key extends object, Value>(
   Reflect.apply(weakMapSetIntrinsic, map, [key, value]);
 }
 
-function deleteWeakMapValue<Key extends object, Value>(
-  map: WeakMap<Key, Value>,
-  key: Key
-): boolean {
-  return Reflect.apply(weakMapDeleteIntrinsic, map, [key]) as boolean;
+function addWeakSetValue<Value extends object>(set: WeakSet<Value>, value: Value): void {
+  Reflect.apply(weakSetAddIntrinsic, set, [value]);
+}
+
+function hasWeakSetValue<Value extends object>(set: WeakSet<Value>, value: Value): boolean {
+  return Reflect.apply(weakSetHasIntrinsic, set, [value]) as boolean;
 }
 
 function mapValueSnapshot<Key, Value>(map: Map<Key, Value>): Value[] {
@@ -307,12 +310,11 @@ export type ReservationClaimResult =
   | Readonly<{
       recognized: true;
       claimed: true;
-      renderSource: ReservationRenderSource;
-      winnerContext: WinnerContext;
       pucSource: object;
       expiresAt: number;
     }>;
 
+/** Exact lifecycle authority required to consume one successful claim object. */
 export interface ReservationClaimExpectation {
   readonly attemptId: string;
   readonly slot: string;
@@ -320,6 +322,7 @@ export interface ReservationClaimExpectation {
   readonly winnerContext: WinnerContext;
 }
 
+/** Source and winner context atomically recovered from one valid claim object. */
 export interface ReservationClaimAdmission {
   readonly renderSource: ReservationRenderSource;
   readonly winnerContext: WinnerContext;
@@ -384,11 +387,14 @@ interface ReservationTombstone {
 }
 
 interface ClaimedAdmission {
+  readonly attempt: ReservationAttempt;
   readonly attemptId: string;
+  readonly expiresAt: number;
   readonly slot: string;
   readonly navigationGeneration: object;
-  readonly renderSource: ReservationRenderSource;
-  readonly winnerContext: WinnerContext;
+  active: boolean;
+  renderSource: ReservationRenderSource | undefined;
+  winnerContext: WinnerContext | undefined;
 }
 
 type ReservationEntry = LiveReservation | ReservationTombstone;
@@ -607,6 +613,18 @@ export function isRendererReservationId(value: unknown): value is string {
   return typeof value === 'string' && matches(RESERVATION_ID, value);
 }
 
+/** Whether a candidate is an exact service instance created by this module. */
+export function isReservationService(value: unknown): value is ReservationService {
+  try {
+    return (
+      ((typeof value === 'object' && value !== null) || typeof value === 'function') &&
+      hasWeakSetValue(reservationServices, value)
+    );
+  } catch {
+    return false;
+  }
+}
+
 /** Construct the runtime-owned renderer reservation service. */
 export function createReservationService(options: ReservationServiceOptions): ReservationService {
   let nowSource: () => number = defaultNow;
@@ -627,10 +645,26 @@ export function createReservationService(options: ReservationServiceOptions): Re
   const readNow = monotonicClock(nowSource);
   const entries = new Map<string, ReservationEntry>();
   const ownerRegistrations = new WeakMap<object, OwnerRegistration>();
-  const claimAdmissions = new WeakMap<object, ClaimedAdmission>();
+  const claimAdmissions = new Map<object, ClaimedAdmission>();
+
+  const invalidateClaimAdmission = (claim: object, admission: ClaimedAdmission): void => {
+    if (mapValue(claimAdmissions, claim) === admission) deleteMapValue(claimAdmissions, claim);
+    admission.active = false;
+    admission.renderSource = undefined;
+    admission.winnerContext = undefined;
+  };
+
+  const invalidateClaimAdmissions = (predicate: (admission: ClaimedAdmission) => boolean): void => {
+    const snapshot = entrySnapshot(claimAdmissions);
+    for (let index = 0; index < snapshot.length; index += 1) {
+      const pair = snapshot[index];
+      if (pair && predicate(pair[1])) invalidateClaimAdmission(pair[0], pair[1]);
+    }
+  };
 
   const disposeStore = (): void => {
     disposed = true;
+    invalidateClaimAdmissions(() => true);
     const snapshot = entrySnapshot(entries);
     for (let index = 0; index < snapshot.length; index += 1) {
       const pair = snapshot[index];
@@ -639,6 +673,7 @@ export function createReservationService(options: ReservationServiceOptions): Re
   };
 
   const prune = (now: number): void => {
+    invalidateClaimAdmissions((admission) => admission.expiresAt <= now);
     const snapshot = entrySnapshot(entries);
     for (let index = 0; index < snapshot.length; index += 1) {
       const pair = snapshot[index];
@@ -748,6 +783,7 @@ export function createReservationService(options: ReservationServiceOptions): Re
   const disposeOwnerEntries = (generation: object, state: OwnerCallbackState): void => {
     if (!state.active || state.disposed) return;
     state.disposed = true;
+    invalidateClaimAdmissions((admission) => admission.navigationGeneration === generation);
     const snapshot = entrySnapshot(entries);
     for (let index = 0; index < snapshot.length; index += 1) {
       const pair = snapshot[index];
@@ -1101,8 +1137,6 @@ export function createReservationService(options: ReservationServiceOptions): Re
       const result = frozenResult({
         recognized: true as const,
         claimed: true as const,
-        renderSource: entry.renderSource,
-        winnerContext: entry.winnerContext,
         pucSource: fields.pucSource,
         expiresAt: entry.expiresAt,
       });
@@ -1124,13 +1158,20 @@ export function createReservationService(options: ReservationServiceOptions): Re
         return refusedClaim(replacement?.state ?? 'stale');
       }
       try {
-        setWeakMapValue(claimAdmissions, result, {
+        const claimedAdmission: ClaimedAdmission = {
+          attempt,
           attemptId: identity.id,
+          expiresAt: entry.expiresAt,
           slot: identity.slot,
           navigationGeneration: entry.navigationGeneration,
+          active: true,
           renderSource: entry.renderSource,
           winnerContext: entry.winnerContext,
-        });
+        };
+        setMapValue(claimAdmissions, result, claimedAdmission);
+        if (mapValue(claimAdmissions, result) !== claimedAdmission) {
+          throw new Error('claim admission publication failed');
+        }
       } catch {
         storeFaulted = true;
         rollbackWinnerAdmission(admission);
@@ -1148,7 +1189,31 @@ export function createReservationService(options: ReservationServiceOptions): Re
       if (!fields || (typeof claim !== 'object' && typeof claim !== 'function') || claim === null) {
         return undefined;
       }
-      const admission = weakMapValue(claimAdmissions, claim);
+      const admission = mapValue(claimAdmissions, claim);
+      const now = clock();
+      const currentIdentity = admission ? attemptIdentity(admission.attempt) : undefined;
+      let currentContext: WinnerContext | undefined;
+      try {
+        currentContext = admission?.attempt.winnerContext;
+      } catch {
+        currentContext = undefined;
+      }
+      if (
+        admission &&
+        (!admission.active ||
+          !admission.renderSource ||
+          !admission.winnerContext ||
+          now === undefined ||
+          now >= admission.expiresAt ||
+          !currentAttempt(admission.attempt) ||
+          !currentIdentity ||
+          currentIdentity.id !== admission.attemptId ||
+          currentIdentity.slot !== admission.slot ||
+          currentContext !== admission.winnerContext)
+      ) {
+        invalidateClaimAdmission(claim, admission);
+        return undefined;
+      }
       if (
         !admission ||
         fields.attemptId !== admission.attemptId ||
@@ -1158,11 +1223,12 @@ export function createReservationService(options: ReservationServiceOptions): Re
       ) {
         return undefined;
       }
-      if (!deleteWeakMapValue(claimAdmissions, claim)) return undefined;
-      return frozenResult({
-        renderSource: admission.renderSource,
-        winnerContext: admission.winnerContext,
-      });
+      const renderSource = admission.renderSource;
+      const winnerContext = admission.winnerContext;
+      invalidateClaimAdmission(claim, admission);
+      return renderSource && winnerContext
+        ? frozenResult({ renderSource, winnerContext })
+        : undefined;
     },
     recognize,
     tombstone(input, state): boolean {
@@ -1271,5 +1337,6 @@ export function createReservationService(options: ReservationServiceOptions): Re
       });
     },
   };
+  addWeakSetValue(reservationServices, service);
   return frozenResult(service);
 }
