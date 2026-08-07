@@ -219,6 +219,13 @@ export interface MessagingAdapter {
     transferred: readonly MessagingPort[]
   ): boolean;
   installCaptureListener(listener: CaptureMessageListener): () => void;
+  inspectGlobalMessage(candidate: unknown):
+    | Readonly<{
+        message: string;
+        adId?: string;
+        lifecycleTicket?: string;
+      }>
+    | undefined;
   parseProtocolMessage(
     kind: ProtocolMessageKind,
     candidate: unknown
@@ -486,6 +493,36 @@ function parseGlobalJson(candidate: unknown): unknown {
   if (end === undefined || skipWhitespace(candidate, end) !== candidate.length) return undefined;
   try {
     return JSON.parse(candidate);
+  } catch {
+    return undefined;
+  }
+}
+
+function inspectGlobalMessage(
+  candidate: unknown
+): Readonly<{ message: string; adId?: string; lifecycleTicket?: string }> | undefined {
+  try {
+    const decoded = typeof candidate === 'string' ? parseGlobalJson(candidate) : candidate;
+    if (typeof decoded !== 'object' || decoded === null) return undefined;
+    const prototype = Object.getPrototypeOf(decoded);
+    if (prototype !== Object.prototype && prototype !== null) return undefined;
+    const descriptors = Object.getOwnPropertyDescriptors(decoded);
+    const message = descriptors['message'];
+    if (!message || !Object.prototype.hasOwnProperty.call(message, 'value')) return undefined;
+    if (typeof message.value !== 'string') return undefined;
+    const adId = descriptors['adId'];
+    const lifecycleTicket = descriptors['lifecycleTicket'];
+    if (adId && !Object.prototype.hasOwnProperty.call(adId, 'value')) return undefined;
+    if (lifecycleTicket && !Object.prototype.hasOwnProperty.call(lifecycleTicket, 'value')) {
+      return undefined;
+    }
+    return Object.freeze({
+      message: message.value,
+      ...(adId && typeof adId.value === 'string' ? { adId: adId.value } : {}),
+      ...(lifecycleTicket && typeof lifecycleTicket.value === 'string'
+        ? { lifecycleTicket: lifecycleTicket.value }
+        : {}),
+    });
   } catch {
     return undefined;
   }
@@ -1307,6 +1344,7 @@ export function createBrowserMessagingAdapter(
         rollback();
       };
     },
+    inspectGlobalMessage,
     parseProtocolMessage: (kind: ProtocolMessageKind, candidate: unknown) =>
       parseProtocolMessage(kind, candidate, validation),
     extractTransferredPorts,
@@ -1319,6 +1357,7 @@ export function createNoopMessagingAdapter(): MessagingAdapter {
     createChannel: () => undefined,
     postWindow: () => false,
     installCaptureListener: () => () => undefined,
+    inspectGlobalMessage,
     parseProtocolMessage: (kind: ProtocolMessageKind, candidate: unknown) =>
       parseProtocolMessage(kind, candidate, {}),
     extractTransferredPorts,
