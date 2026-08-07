@@ -1,5 +1,5 @@
 import { log } from '../../core/log';
-import type { ApsPrebidRendererEntry, ApsRendererV1, TsjsApi } from '../../core/types';
+import type { ApsPrebidRendererEntry, ApsRendererV1, LegacyTsjsApi } from '../../core/types';
 import { validateApsRenderer } from '../../core/contracts/aps_renderer';
 import type { MessagingAdapter, MessagingChannel } from '../../adapters/messaging';
 import type {
@@ -164,7 +164,7 @@ export function registerApsPrebidRenderer(
     typeof ttlSeconds === 'number' && Number.isFinite(ttlSeconds) && ttlSeconds > 0
       ? Math.min(ttlSeconds, MAX_PREBID_RENDERER_TTL_SECONDS)
       : DEFAULT_PREBID_RENDERER_TTL_SECONDS;
-  const tsjs = (window.tsjs ??= {} as TsjsApi);
+  const tsjs = (window.tsjs ??= {} as LegacyTsjsApi);
   const registry = (tsjs.apsPrebidRenderers ??= Object.create(null) as Record<
     string,
     ApsPrebidRendererEntry

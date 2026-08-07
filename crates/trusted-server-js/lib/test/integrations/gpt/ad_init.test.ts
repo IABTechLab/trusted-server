@@ -8,7 +8,7 @@ import type {
   BidRenderSourceV1,
   BrowserAuctionBidV1,
   GptSlotHandoff,
-  TsjsApi,
+  LegacyTsjsApi,
 } from '../../../src/core/types';
 
 function apsRenderer() {
@@ -143,11 +143,11 @@ interface PrebidResponseMessage {
   height?: number;
 }
 
-// `tsjs` is declared globally as the full `TsjsApi` (core/types.ts). Omitting
+// `tsjs` is declared globally as the full legacy API (core/types.ts). Omitting
 // it from `Window` before re-adding it as a `Partial` avoids the intersection
-// that would force every fixture below to satisfy the whole `TsjsApi` shape.
+// that would force every fixture below to satisfy the whole legacy API shape.
 type TestGptSlotHandoff = Omit<GptSlotHandoff, 'formats'> & { formats: number[][] };
-type TestTsjsApi = Omit<Partial<TsjsApi>, 'gptSlotHandoffs'> & {
+type TestTsjsApi = Omit<Partial<LegacyTsjsApi>, 'gptSlotHandoffs'> & {
   gptSlotHandoffs?: Record<string, TestGptSlotHandoff> | undefined;
 };
 type TestWindow = Omit<Window, 'tsjs'> & {

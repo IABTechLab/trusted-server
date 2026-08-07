@@ -6,7 +6,7 @@ import type {
   AuctionBidData,
   BrowserAuctionBidV1,
   GptSlotHandoff,
-  TsjsApi,
+  LegacyTsjsApi,
 } from '../../core/types';
 import {
   APS_UNIVERSAL_CREATIVE_RENDERER,
@@ -78,7 +78,7 @@ export function prepareTrustedServerGptTargetingV1(
   return Object.freeze(targeting);
 }
 
-function bumpRenderGeneration(ts: TsjsApi): number {
+function bumpRenderGeneration(ts: LegacyTsjsApi): number {
   const next = (ts.renderGeneration ?? 0) + 1;
   ts.renderGeneration = next;
   return next;
@@ -572,7 +572,7 @@ function queueWinBillingBeacon(url: string): boolean {
  * `installTsAdInit` runs, so the detector is still queued ahead of the
  * publisher's GPT setup.
  */
-function syncInitialLoadDisabled(gpt: Partial<GoogleTag>, ts: TsjsApi): boolean {
+function syncInitialLoadDisabled(gpt: Partial<GoogleTag>, ts: LegacyTsjsApi): boolean {
   if (typeof gpt.getConfig !== 'function') return false;
 
   const config = gpt.getConfig('disableInitialLoad');
@@ -582,7 +582,7 @@ function syncInitialLoadDisabled(gpt: Partial<GoogleTag>, ts: TsjsApi): boolean 
   return true;
 }
 
-function installInitialLoadDetector(ts: TsjsApi): void {
+function installInitialLoadDetector(ts: LegacyTsjsApi): void {
   const win = window as GptWindow;
   const cmd = win.googletag?.cmd;
   if (!cmd) return;
@@ -635,7 +635,7 @@ function findGptSlotByElementId(
   return pubads.getSlots?.().find((slot) => slot.getSlotElementId() === elementId);
 }
 
-function handoffForSlot(ts: TsjsApi, slot: GoogleTagSlot): GptSlotHandoff | undefined {
+function handoffForSlot(ts: LegacyTsjsApi, slot: GoogleTagSlot): GptSlotHandoff | undefined {
   return ts.gptSlotHandoffs?.[slot.getSlotElementId()];
 }
 
@@ -658,7 +658,7 @@ function handoffFormatsMatch(handoff: GptSlotHandoff, formats: Array<number | nu
 }
 
 function matchingHandoff(
-  ts: TsjsApi,
+  ts: LegacyTsjsApi,
   pubads: GoogleTagPubAdsService,
   adUnitPath: string,
   formats: Array<number | number[]>,
@@ -680,11 +680,11 @@ function matchingHandoff(
   return matching.length === 1 ? matching[0] : undefined;
 }
 
-function registerHandoffAlias(ts: TsjsApi, elementId: string, handoff: GptSlotHandoff): void {
+function registerHandoffAlias(ts: LegacyTsjsApi, elementId: string, handoff: GptSlotHandoff): void {
   (ts.gptSlotHandoffs ??= {})[elementId] = handoff;
 }
 
-function withGptSlotHandoffInternal<T>(ts: TsjsApi, callback: () => T): T {
+function withGptSlotHandoffInternal<T>(ts: LegacyTsjsApi, callback: () => T): T {
   const wasInternal = ts.gptSlotHandoffInternal;
   ts.gptSlotHandoffInternal = true;
   try {
@@ -704,7 +704,7 @@ function withGptSlotHandoffInternal<T>(ts: TsjsApi, callback: () => T): T {
  * the original div is gone. The first duplicate publisher request is suppressed
  * because TS has already issued the initial request with TS targeting.
  */
-function installLatePublisherSlotHandoff(ts: TsjsApi): void {
+function installLatePublisherSlotHandoff(ts: LegacyTsjsApi): void {
   const win = window as GptWindow;
   const cmd = win.googletag?.cmd;
   if (!cmd) return;
@@ -859,7 +859,7 @@ function installLatePublisherSlotHandoff(ts: TsjsApi): void {
  * riding rAF keeps a single code path whose post-hydration-commit guarantee
  * holds whenever the request is actually issued.
  */
-function installScheduleInitialAdInit(ts: TsjsApi): void {
+function installScheduleInitialAdInit(ts: LegacyTsjsApi): void {
   ts.scheduleInitialAdInit = function (initialBids?: Record<string, AuctionBidData>) {
     if ((ts.navGeneration ?? 0) !== 0) return;
     if (initialBids) ts.bids = initialBids;
@@ -881,7 +881,7 @@ function installScheduleInitialAdInit(ts: TsjsApi): void {
 }
 
 export function installTsAdInit(): void {
-  const ts = (window.tsjs ??= {} as TsjsApi);
+  const ts = (window.tsjs ??= {} as LegacyTsjsApi);
   installInitialLoadDetector(ts);
   installScheduleInitialAdInit(ts);
   installLatePublisherSlotHandoff(ts);
@@ -1289,7 +1289,7 @@ function waitForSlotElements(slots: AuctionSlot[], signal: AbortSignal): Promise
  */
 export function installSpaAuctionHook(): void {
   if (typeof window === 'undefined') return;
-  const ts = (window.tsjs ??= {} as TsjsApi);
+  const ts = (window.tsjs ??= {} as LegacyTsjsApi);
   if (ts.spaHookInstalled) return;
   ts.spaHookInstalled = true;
   // Navigation identity for the deferred initial-adInit bootstrap (see

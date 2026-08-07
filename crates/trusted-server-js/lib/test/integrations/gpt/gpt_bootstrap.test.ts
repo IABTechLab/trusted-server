@@ -3,7 +3,7 @@ import path from 'node:path';
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-import type { TsjsApi } from '../../../src/core/types';
+import type { LegacyTsjsApi } from '../../../src/core/types';
 
 /**
  * Executable coverage for the edge-injected `gpt_bootstrap.js` — the
@@ -46,11 +46,11 @@ interface MockGoogleTag {
   display: (divId: string) => void;
 }
 
-// `tsjs` is declared globally as the full `TsjsApi`; `Omit` drops it from
+// `tsjs` is declared globally as the full legacy API; `Omit` drops it from
 // `Window` so the fixtures below only have to satisfy the fields they set.
 type TestWindow = Omit<Window, 'tsjs'> & {
   googletag?: MockGoogleTag;
-  tsjs?: Partial<TsjsApi>;
+  tsjs?: Partial<LegacyTsjsApi>;
 };
 
 function runBootstrap(): void {

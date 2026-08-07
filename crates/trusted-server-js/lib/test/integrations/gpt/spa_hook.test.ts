@@ -1,10 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-import type { TsjsApi } from '../../../src/core/types';
+import type { LegacyTsjsApi } from '../../../src/core/types';
 
 type TestWindow = Window & {
   googletag?: unknown;
-  tsjs?: TsjsApi;
+  tsjs?: LegacyTsjsApi;
 };
 
 const originalPushState = history.pushState.bind(history);

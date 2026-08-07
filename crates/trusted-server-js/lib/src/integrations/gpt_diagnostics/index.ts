@@ -1,5 +1,5 @@
 import { log } from '../../core/log';
-import type { GptDiagnosticsApi, TsjsApi } from '../../core/types';
+import type { GptDiagnosticsApi, LegacyTsjsApi } from '../../core/types';
 
 import { GptDiagnosticsApiController } from './api';
 import { GptDiagnosticsBadgeManager } from './badges';
@@ -19,7 +19,7 @@ type GptDiagnosticsWindow = Window &
   GptObserverWindow & {
     __tsjs_gpt_diagnostics_active?: boolean;
     __tsjs_gpt_diagnostics_runtime?: GptDiagnosticsRuntime;
-    tsjs?: TsjsApi;
+    tsjs?: LegacyTsjsApi;
   };
 
 /** Whether the early bootstrap activated diagnostics for this document. */

@@ -8,7 +8,7 @@
 // that creatives came through Trusted Server — on both the SSAT/GAM and
 // /auction render paths.
 import { log } from './log';
-import type { RenderRecord, TsjsApi } from './types';
+import type { LegacyTsjsApi, RenderRecord } from './types';
 
 /** CustomEvent fired on window after each render-trace record is written. */
 export const RENDER_EVENT_NAME = 'tsjs:adRendered';
@@ -48,7 +48,7 @@ let fallbackRenderSeq = 0;
  */
 function nextRenderSeq(): number {
   try {
-    const ts = (window.tsjs ??= {} as TsjsApi);
+    const ts = (window.tsjs ??= {} as LegacyTsjsApi);
     const next = Math.max(ts.renderSeq ?? 0, fallbackRenderSeq) + 1;
     ts.renderSeq = next;
     fallbackRenderSeq = next;
@@ -445,7 +445,7 @@ export function renderTracePanel(): void {
 export function recordRender(record: Omit<RenderRecord, 'count' | 'at' | 'seq'>): RenderRecord {
   const full: RenderRecord = { ...record, count: 1, seq: nextRenderSeq(), at: Date.now() };
   try {
-    const ts = (window.tsjs ??= {} as TsjsApi);
+    const ts = (window.tsjs ??= {} as LegacyTsjsApi);
     const renders = (ts.renders ??= {});
     const prev = renders[record.slotId];
     if (prev) full.count = prev.count + 1;

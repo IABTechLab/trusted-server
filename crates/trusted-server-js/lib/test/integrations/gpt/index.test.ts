@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 
-import type { TsjsApi } from '../../../src/core/types';
+import type { LegacyTsjsApi } from '../../../src/core/types';
 
 // We import installGptShim dynamically so each test can control whether the
 // GPT enable flag is present before module evaluation.
@@ -244,10 +244,10 @@ describe('GPT – installTsAdInit', () => {
     enableServices: Mock;
   }
 
-  // `tsjs` is declared globally as the full `TsjsApi`; `Omit` drops it from
+  // `tsjs` is declared globally as the full legacy API; `Omit` drops it from
   // `Window` so the fixture below only has to satisfy the fields it sets.
   type AdInitWindow = Omit<Window, 'tsjs'> & {
-    tsjs?: Partial<TsjsApi>;
+    tsjs?: Partial<LegacyTsjsApi>;
     googletag?: MockGoogleTag;
   };
 

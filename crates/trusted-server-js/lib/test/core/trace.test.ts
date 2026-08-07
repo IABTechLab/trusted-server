@@ -12,7 +12,7 @@ import {
   TRACE_PANEL_ID,
   TRACE_BADGE_CLASS,
 } from '../../src/core/trace';
-import type { RenderRecord, TsjsApi } from '../../src/core/types';
+import type { LegacyTsjsApi, RenderRecord } from '../../src/core/types';
 
 function clearTraceCookie(): void {
   document.cookie = 'ts-trace=; Max-Age=0; Path=/';
@@ -24,7 +24,7 @@ function removePanel(): void {
 
 describe('trace/recordRender', () => {
   beforeEach(() => {
-    delete (window as { tsjs?: TsjsApi }).tsjs;
+    delete (window as { tsjs?: LegacyTsjsApi }).tsjs;
     clearTraceCookie();
     removePanel();
   });
@@ -215,7 +215,7 @@ describe('trace/floating panel', () => {
   };
 
   beforeEach(() => {
-    delete (window as { tsjs?: TsjsApi }).tsjs;
+    delete (window as { tsjs?: LegacyTsjsApi }).tsjs;
     clearTraceCookie();
     removePanel();
   });
@@ -377,10 +377,10 @@ describe('trace/floating panel', () => {
     document.cookie = 'ts-trace=1; Path=/';
     const oldRecord = { ...record, auctionId: 'auction-old', count: 1, seq: 7, at: 1 };
     const liveRecord = { ...record, auctionId: 'auction-live', count: 2, seq: 7, at: 2 };
-    (window as { tsjs?: TsjsApi }).tsjs = {
+    (window as { tsjs?: LegacyTsjsApi }).tsjs = {
       renders: { 'slot-1': liveRecord },
       renderLog: [oldRecord, liveRecord],
-    } as unknown as TsjsApi;
+    } as unknown as LegacyTsjsApi;
 
     renderTracePanel();
 
@@ -403,9 +403,9 @@ describe('trace/floating panel', () => {
   });
 
   it('renderTracePanel is a no-op while disarmed even if renders exist', () => {
-    (window as { tsjs?: TsjsApi }).tsjs = {
+    (window as { tsjs?: LegacyTsjsApi }).tsjs = {
       renders: { 'slot-1': { ...record, count: 1, seq: 1, at: 1 } },
-    } as unknown as TsjsApi;
+    } as unknown as LegacyTsjsApi;
     renderTracePanel();
     expect(document.getElementById(TRACE_PANEL_ID)).toBeNull();
   });
@@ -429,7 +429,7 @@ describe('trace/floating panel', () => {
 
 describe('trace/confirmation badge', () => {
   beforeEach(() => {
-    delete (window as { tsjs?: TsjsApi }).tsjs;
+    delete (window as { tsjs?: LegacyTsjsApi }).tsjs;
     clearTraceCookie();
     document.body.innerHTML = '';
   });

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
-import type { AuctionBidData, AuctionSlot, TsjsApi } from '../../src/core/types';
+import type { AuctionBidData, AuctionSlot, LegacyTsjsApi } from '../../src/core/types';
 
 const ORIGINAL_FETCH = global.fetch;
 
@@ -17,7 +17,7 @@ describe('core/index', () => {
 
   it('initializes tsjs API with expected surface', async () => {
     await import('../../src/core/index');
-    const api = window.tsjs as TsjsApi;
+    const api = window.tsjs as LegacyTsjsApi;
     expect(api).toBeDefined();
     expect(typeof api.version).toBe('string');
     expect(Array.isArray(api.que)).toBe(true);
@@ -31,7 +31,7 @@ describe('core/index', () => {
 
   it('defaults adSlots and bids so gated-off pages never see undefined', async () => {
     await import('../../src/core/index');
-    const api = window.tsjs as TsjsApi;
+    const api = window.tsjs as LegacyTsjsApi;
     expect(api.adSlots).toEqual([]);
     expect(api.bids).toEqual({});
   });
@@ -40,7 +40,7 @@ describe('core/index', () => {
     window.tsjs = {
       adSlots: [{ id: 'pre-injected' } as AuctionSlot],
       bids: { 'pre-injected': { hb_pb: '1.00' } } as Record<string, AuctionBidData>,
-    } as TsjsApi;
+    } as LegacyTsjsApi;
 
     await import('../../src/core/index');
 
@@ -49,10 +49,10 @@ describe('core/index', () => {
   });
 
   it('flushes queued callbacks that existed before initialization', async () => {
-    const callback = vi.fn(function (this: TsjsApi) {
+    const callback = vi.fn(function (this: LegacyTsjsApi) {
       expect(this).toBe(window.tsjs);
     });
-    window.tsjs = { que: [callback] as Array<() => void> } as TsjsApi;
+    window.tsjs = { que: [callback] as Array<() => void> } as LegacyTsjsApi;
 
     await import('../../src/core/index');
 
@@ -61,7 +61,7 @@ describe('core/index', () => {
 
   it('installs queue that executes callbacks immediately with api context', async () => {
     await import('../../src/core/index');
-    const api = window.tsjs as TsjsApi;
+    const api = window.tsjs as LegacyTsjsApi;
     const fn = vi.fn();
 
     api.que.push(fn);
@@ -72,7 +72,7 @@ describe('core/index', () => {
 
   it('renders registered ad units using core rendering helpers', async () => {
     await import('../../src/core/index');
-    const api = window.tsjs as TsjsApi;
+    const api = window.tsjs as LegacyTsjsApi;
 
     api.addAdUnits([
       { code: 'slot-1', mediaTypes: { banner: { sizes: [[300, 250]] } } },
@@ -88,7 +88,7 @@ describe('core/index', () => {
   it('exposes requestAds from the core request module', async () => {
     const { requestAds } = await import('../../src/core/request');
     await import('../../src/core/index');
-    const api = window.tsjs as TsjsApi;
+    const api = window.tsjs as LegacyTsjsApi;
 
     expect(api.requestAds).toBe(requestAds);
   });

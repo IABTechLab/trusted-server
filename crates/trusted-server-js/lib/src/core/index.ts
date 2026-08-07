@@ -4,11 +4,11 @@ export type {
   GptDiagnosticsApi,
   GptDiagnosticsExportV1,
   GptDiagnosticsRequestCycle,
-  TsjsApi,
+  LegacyTsjsApi,
 } from './types';
 // Erased coordinated-cutover types only. Production ownership remains below until Task 19.
 export type { Runtime, RuntimeOptions, RuntimeState } from '../kernel/runtime';
-import type { TsjsApi } from './types';
+import type { LegacyTsjsApi } from './types';
 import { addAdUnits } from './registry';
 import { renderAdUnit, renderAllAdUnits } from './render';
 import { log } from './log';
@@ -18,16 +18,16 @@ import { installQueue } from './queue';
 
 const VERSION = '0.1.0';
 
-const w: Window & { tsjs?: TsjsApi } =
+const w: Window & { tsjs?: LegacyTsjsApi } =
   ((globalThis as unknown as { window?: Window }).window as Window & {
-    tsjs?: TsjsApi;
-  }) || ({} as Window & { tsjs?: TsjsApi });
+    tsjs?: LegacyTsjsApi;
+  }) || ({} as Window & { tsjs?: LegacyTsjsApi });
 
 // Collect existing tsjs queued fns before we overwrite
 const pending: Array<() => void> = Array.isArray(w.tsjs?.que) ? [...w.tsjs.que] : [];
 
 // Create API and attach methods
-const api: TsjsApi = (w.tsjs ??= {} as TsjsApi);
+const api: LegacyTsjsApi = (w.tsjs ??= {} as LegacyTsjsApi);
 api.version = VERSION;
 api.addAdUnits = addAdUnits;
 api.renderAdUnit = renderAdUnit;
