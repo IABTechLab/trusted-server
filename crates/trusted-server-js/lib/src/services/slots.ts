@@ -131,6 +131,11 @@ export interface SlotService {
   ) => GptSlotAdoptionResult;
   readonly dispose: () => void;
   readonly handleGptEvent: (type: GptEventType, event: unknown) => void;
+  readonly isBoundGptSlot: (
+    navigationGeneration: object,
+    registeredSlotId: string,
+    slot: object
+  ) => boolean;
   readonly prepareProjectionSlots: (
     owner: NavigationSession,
     slots: readonly string[]
@@ -2487,6 +2492,29 @@ export function createSlotService(options: SlotServiceOptions): SlotService {
       activation?.dispose();
     },
     handleGptEvent,
+    isBoundGptSlot: (
+      navigationGeneration: object,
+      registeredSlotId: string,
+      slot: object
+    ): boolean => {
+      try {
+        const state = mapValue(navigationStates, navigationGeneration);
+        const record = state ? mapValue(state.records, registeredSlotId) : undefined;
+        const physical = record?.physical;
+        return (
+          !!state &&
+          !state.disposed &&
+          state.owner.isCurrent() &&
+          !!physical &&
+          physical.slot === slot &&
+          physical.record === record &&
+          physical.ownership === 'trusted_server' &&
+          physical.state === 'live'
+        );
+      } catch {
+        return false;
+      }
+    },
     prepareProjectionSlots: (
       owner: NavigationSession,
       slots: readonly string[]

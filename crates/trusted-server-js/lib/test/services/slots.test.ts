@@ -425,6 +425,32 @@ describe('slot registry', () => {
     expect(service.resolveRegisteredSlot('one')).toBeUndefined();
   });
 
+  it('recognizes only the exact live Trusted Server GPT binding', () => {
+    const service = createSlotService({ googletag: createGptHarness().adapter });
+    const { navigation, runtime } = createRuntimeWithNavigation();
+    const trustedSlot = bindTrustedSlot(service, navigation, 'trusted');
+
+    expect(service.isBoundGptSlot(navigation.generation, 'trusted', trustedSlot)).toBe(true);
+    expect(service.isBoundGptSlot(navigation.generation, 'other', trustedSlot)).toBe(false);
+    expect(service.isBoundGptSlot({}, 'trusted', trustedSlot)).toBe(false);
+    expect(service.isBoundGptSlot(navigation.generation, 'trusted', {})).toBe(false);
+
+    const publisherSlot = {};
+    expect(service.register(navigation, [serverRegistration('publisher')])).toMatchObject({
+      ok: true,
+    });
+    expect(
+      service.adoptGptSlot(navigation.generation, 'publisher', {
+        ownership: 'publisher',
+        slot: publisherSlot,
+      })
+    ).toEqual({ ok: true });
+    expect(service.isBoundGptSlot(navigation.generation, 'publisher', publisherSlot)).toBe(false);
+
+    runtime.dispose();
+    expect(service.isBoundGptSlot(navigation.generation, 'trusted', trustedSlot)).toBe(false);
+  });
+
   it('uses captured Set validation intrinsics on a hostile page', () => {
     const service = createSlotService({ googletag: createGptHarness().adapter });
     const navigation = createNavigation();

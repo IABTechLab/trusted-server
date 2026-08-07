@@ -22,6 +22,7 @@ import {
   createTestBrowserRuntimeComposition,
 } from '../../src/composition/browser';
 import { log as localLog } from '../../src/core/log';
+import type { BrowserAuctionBidV1 } from '../../src/core/types';
 import { createGptIntegrationRegistration } from '../../src/integrations/gpt/module';
 import { isGuardInstalled, resetGuardState } from '../../src/integrations/gpt/script_guard';
 import { publicLog } from '../../src/kernel/fallback';
@@ -51,18 +52,29 @@ function fakeGoogletagAdapter(
 
 function synchronousGptAdapter() {
   const listeners = new Map<string, Set<(event: unknown) => void>>();
+  const targeting = new WeakMap<object, Map<string, readonly string[]>>();
   const bindingToken = Object.freeze({});
   const refresh = vi.fn();
   const facade: GoogletagFacade = Object.freeze({
     bindingToken: () => bindingToken,
-    clearTargeting: vi.fn(),
+    clearTargeting: vi.fn((slot: object, key?: string) => {
+      const values = targeting.get(slot);
+      if (key === undefined) values?.clear();
+      else values?.delete(key);
+    }),
     display: vi.fn(),
-    getTargeting: vi.fn(() => []),
+    getTargeting: vi.fn((slot: object, key: string) =>
+      Object.freeze([...(targeting.get(slot)?.get(key) ?? [])])
+    ),
     observeTargeting: () => vi.fn(),
     refresh,
     serviceState: () =>
       Object.freeze({ apiReady: true, initialLoadDisabled: false, pubadsReady: true }),
-    setTargeting: vi.fn(),
+    setTargeting: vi.fn((slot: object, key: string, value: string | readonly string[]) => {
+      const values = targeting.get(slot) ?? new Map<string, readonly string[]>();
+      targeting.set(slot, values);
+      values.set(key, Object.freeze(typeof value === 'string' ? [value] : [...value]));
+    }),
     slots: () => Object.freeze([]),
     subscribe: (eventType: string, listener: (event: unknown) => void) => {
       const registered = listeners.get(eventType) ?? new Set();
@@ -172,14 +184,39 @@ describe('browser composition', () => {
   it('routes an attributable empty GPT cycle through the owned slot and PUC services', async () => {
     const gpt = synchronousGptAdapter();
     let prefix = 0;
+    const reservationId = `r1_${'a'.repeat(22)}`;
+    const source = Object.freeze({
+      type: 'adm' as const,
+      version: 1 as const,
+      adm: '<main>fictional fallback</main>',
+      width: 300,
+      height: 250,
+    });
+    const bid = Object.freeze({
+      candidateId: 'AAAAAAAAAAAA',
+      slot: 'slot-one',
+      provider: 'trusted',
+      upstreamBidId: 'upstream-one',
+      cpm: 1,
+      currency: 'USD' as const,
+      targeting: Object.freeze({ hb_bidder: 'trusted' }),
+      rendererReservationId: reservationId,
+      renderSource: source,
+    });
     const projection = Object.freeze({
       version: 1,
       auction: Object.freeze({
         version: 1,
         auctionId: 'initial',
-        results: Object.freeze([Object.freeze({ slot: 'slot-one', outcome: 'no_bid' as const })]),
+        results: Object.freeze([
+          Object.freeze({
+            slot: 'slot-one',
+            outcome: 'winner' as const,
+            candidateId: bid.candidateId,
+          }),
+        ]),
       }),
-      bids: Object.freeze([]),
+      bids: Object.freeze([bid]),
     });
     const composition = createTestBrowserRuntimeComposition(
       {
@@ -243,13 +280,6 @@ describe('browser composition', () => {
     };
     const ownerResult = batch.createRenderAttempt('slot-one');
     if (!ownerResult.ok) throw new Error(ownerResult.reason);
-    const source = Object.freeze({
-      type: 'adm' as const,
-      version: 1 as const,
-      adm: '<main>fictional fallback</main>',
-      width: 300,
-      height: 250,
-    });
     const primaryResult = createRenderAttempt({
       artifacts: artifacts as Parameters<typeof createRenderAttempt>[0]['artifacts'],
       owner: ownerResult.value,
@@ -258,18 +288,6 @@ describe('browser composition', () => {
     });
     if (!primaryResult.ok) throw new Error(primaryResult.reason);
     const primary = primaryResult.value;
-    const reservationId = `r1_${'a'.repeat(22)}`;
-    const winnerContext = Object.freeze({ selectedCpm: 1 });
-    expect(
-      reservations.registerRender({
-        reservationId,
-        slot: primary.slot,
-        navigation,
-        attemptId: primary.id,
-        renderSource: source,
-        winnerContext,
-      })
-    ).toMatchObject({ ok: true });
     const physicalSlot = Object.freeze({});
     const slotElement = document.createElement('div');
     slotElement.id = 'slot-one';
@@ -292,10 +310,15 @@ describe('browser composition', () => {
       navigationGeneration: primary.navigationGeneration,
       dispose: vi.fn(),
     }) satisfies CommittedRenderArtifact;
+    const projectedBid = (
+      navigation.currentAuctionProjection as Readonly<{ bids: readonly BrowserAuctionBidV1[] }>
+    ).bids[0];
+    if (!projectedBid) throw new Error('Expected the parsed projected winner');
     let fallback: RenderAttempt | undefined;
-    const operation = composition.startGptSlotOperationForTest({
+    const operation = await composition.publishGptWinnerForTest({
       artifact,
       attempt: primary,
+      bid: projectedBid,
       createFallback: (parentAttemptId) => {
         fallback = createAttempt(parentAttemptId);
         return Object.freeze({ ok: true as const, value: fallback });
@@ -303,7 +326,7 @@ describe('browser composition', () => {
       operation: 'refresh',
       owner: ownerResult.value,
       requestClass: 'primary',
-      reservationId,
+      slot: physicalSlot,
     });
     expect(operation.ok).toBe(true);
 
