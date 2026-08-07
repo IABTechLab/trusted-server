@@ -1,4 +1,6 @@
 import type { RenderAttemptScope, WinnerContext } from '../kernel/sessions';
+import { mintBrowserRendererNonce } from '../kernel/identity';
+import type { IdentityGenerationResult } from '../kernel/identity';
 
 import { isReservationService } from './reservations';
 import type {
@@ -9,14 +11,23 @@ import type {
 } from './reservations';
 
 const ATTEMPT_ID = /^a1_[A-Za-z0-9_-]{22}$/;
+const RENDERER_NONCE = /^n1_[A-Za-z0-9_-]{22}$/;
+const MAX_RENDERER_NONCES = 256;
+const MAX_RENDERER_NONCE_DRAWS = 8;
 const objectFreezeIntrinsic = Object.freeze;
 const arrayIncludesIntrinsic = Array.prototype.includes;
+const arrayPushIntrinsic = Array.prototype.push;
+const arraySliceIntrinsic = Array.prototype.slice;
+const arraySpliceIntrinsic = Array.prototype.splice;
 const mapGetIntrinsic = Map.prototype.get;
 const mapSetIntrinsic = Map.prototype.set;
 const mapDeleteIntrinsic = Map.prototype.delete;
 const mapClearIntrinsic = Map.prototype.clear;
 const mapEntriesIntrinsic = Map.prototype.entries;
 const mapValuesIntrinsic = Map.prototype.values;
+const mapSizeGetter = Object.getOwnPropertyDescriptor(Map.prototype, 'size')?.get as (
+  this: Map<unknown, unknown>
+) => number;
 const mapEntryIteratorNextIntrinsic = Object.getPrototypeOf(new Map().entries()).next as (
   this: IterableIterator<unknown>
 ) => IteratorResult<unknown>;
@@ -28,14 +39,19 @@ const setHasIntrinsic = Set.prototype.has;
 const setDeleteIntrinsic = Set.prototype.delete;
 const setClearIntrinsic = Set.prototype.clear;
 const setValuesIntrinsic = Set.prototype.values;
+const setSizeGetter = Object.getOwnPropertyDescriptor(Set.prototype, 'size')?.get as (
+  this: Set<unknown>
+) => number;
 const setValueIteratorNextIntrinsic = Object.getPrototypeOf(new Set().values()).next as (
   this: IterableIterator<unknown>
 ) => IteratorResult<unknown>;
 const weakMapGetIntrinsic = WeakMap.prototype.get;
 const weakMapSetIntrinsic = WeakMap.prototype.set;
+const weakMapDeleteIntrinsic = WeakMap.prototype.delete;
 const weakMapHasIntrinsic = WeakMap.prototype.has;
 const weakSetAddIntrinsic = WeakSet.prototype.add;
 const weakSetHasIntrinsic = WeakSet.prototype.has;
+const weakSetDeleteIntrinsic = WeakSet.prototype.delete;
 const promiseThenIntrinsic = Promise.prototype.then;
 const artifactDisposals = new WeakMap<object, boolean>();
 const committedArtifactStores = new WeakSet<object>();
@@ -44,6 +60,18 @@ const ignoreAsyncDisposal = (): void => undefined;
 
 function frozen<const Value extends object>(value: Value): Readonly<Value> {
   return Reflect.apply(objectFreezeIntrinsic, Object, [value]) as Readonly<Value>;
+}
+
+function arrayPush<Value>(array: Value[], value: Value): number {
+  return Reflect.apply(arrayPushIntrinsic, array, [value]) as number;
+}
+
+function arraySlice<Value>(array: Value[]): Value[] {
+  return Reflect.apply(arraySliceIntrinsic, array, [0]) as Value[];
+}
+
+function arraySpliceAll<Value>(array: Value[]): Value[] {
+  return Reflect.apply(arraySpliceIntrinsic, array, [0, array.length]) as Value[];
 }
 
 function mapGet<Key, Value>(map: Map<Key, Value>, key: Key): Value | undefined {
@@ -60,6 +88,10 @@ function mapDelete<Key, Value>(map: Map<Key, Value>, key: Key): boolean {
 
 function mapClear<Key, Value>(map: Map<Key, Value>): void {
   Reflect.apply(mapClearIntrinsic, map, []);
+}
+
+function mapSize<Key, Value>(map: Map<Key, Value>): number {
+  return Reflect.apply(mapSizeGetter, map, []) as number;
 }
 
 function mapEntrySnapshot<Key, Value>(map: Map<Key, Value>): Array<[Key, Value]> {
@@ -104,6 +136,10 @@ function setClear<Value>(set: Set<Value>): void {
   Reflect.apply(setClearIntrinsic, set, []);
 }
 
+function setSize<Value>(set: Set<Value>): number {
+  return Reflect.apply(setSizeGetter, set, []) as number;
+}
+
 function setValueSnapshot<Value>(set: Set<Value>): Value[] {
   const iterator = Reflect.apply(setValuesIntrinsic, set, []) as IterableIterator<Value>;
   const output: Value[] = [];
@@ -133,6 +169,10 @@ function weakMapSet<Key extends object, Value>(
   Reflect.apply(weakMapSetIntrinsic, map, [key, value]);
 }
 
+function weakMapDelete<Key extends object, Value>(map: WeakMap<Key, Value>, key: Key): boolean {
+  return Reflect.apply(weakMapDeleteIntrinsic, map, [key]) as boolean;
+}
+
 function weakMapHas<Key extends object, Value>(map: WeakMap<Key, Value>, key: Key): boolean {
   return Reflect.apply(weakMapHasIntrinsic, map, [key]) as boolean;
 }
@@ -143,6 +183,10 @@ function weakSetAdd<Value extends object>(set: WeakSet<Value>, value: Value): vo
 
 function weakSetHas<Value extends object>(set: WeakSet<Value>, value: Value): boolean {
   return Reflect.apply(weakSetHasIntrinsic, set, [value]) as boolean;
+}
+
+function weakSetDelete<Value extends object>(set: WeakSet<Value>, value: Value): boolean {
+  return Reflect.apply(weakSetDeleteIntrinsic, set, [value]) as boolean;
 }
 
 export const RENDER_FAILURE_REASONS = frozen([
@@ -318,6 +362,47 @@ export interface RenderAttempt {
   readonly snapshot: () => RenderAttemptSnapshot;
 }
 
+/** Retained endpoint whose lifetime is owned by one renderer nonce binding. */
+export interface RendererNoncePort {
+  readonly close: () => void;
+}
+
+export interface RendererNonceIssueInput {
+  readonly attempt: RenderAttempt;
+  readonly source: object;
+  readonly port: RendererNoncePort;
+}
+
+export interface RendererNonceExpectation extends RendererNonceIssueInput {
+  readonly nonce: string;
+  readonly generation: object;
+}
+
+export type RendererNonceIssueResult =
+  | Readonly<{ ok: true; nonce: string }>
+  | Readonly<{
+      ok: false;
+      reason: 'capability_registry_full' | 'identity_generation_failed' | 'invalid_attempt';
+    }>;
+
+export interface RendererNonceRegistrySnapshot {
+  readonly bindings: number;
+  readonly disposed: boolean;
+  readonly liveNonces: number;
+}
+
+export interface RendererNonceRegistry {
+  /** On failure the caller retains port ownership; success transfers it to this registry. */
+  readonly issue: (input: RendererNonceIssueInput) => RendererNonceIssueResult;
+  readonly consume: (expectation: RendererNonceExpectation) => boolean;
+  readonly dispose: () => void;
+  readonly snapshotForTest: () => RendererNonceRegistrySnapshot;
+}
+
+export interface RendererNonceRegistryOptions {
+  readonly mintNonce?: () => IdentityGenerationResult<string>;
+}
+
 export interface SlotOperationResult {
   readonly path: 'primary' | 'fallback';
   readonly outcome: RenderOutcome;
@@ -423,7 +508,9 @@ function validArtifact(
     ) {
       return false;
     }
-    for (const name of names) {
+    for (let index = 0; index < names.length; index += 1) {
+      const name = names[index];
+      if (!name) return false;
       const descriptor = Object.getOwnPropertyDescriptor(value, name);
       if (!descriptor || !('value' in descriptor) || !descriptor.enumerable) return false;
     }
@@ -508,7 +595,11 @@ export function createCommittedArtifactStore(): CommittedArtifactStore {
 
   const disposeGeneration = (navigationGeneration: object): void => {
     const snapshot = mapEntrySnapshot(entries);
-    for (const [slot, artifact] of snapshot) {
+    for (let index = 0; index < snapshot.length; index += 1) {
+      const entry = snapshot[index];
+      if (!entry) continue;
+      const slot = entry[0];
+      const artifact = entry[1];
       if (
         artifact.navigationGeneration === navigationGeneration &&
         mapGet(entries, slot) === artifact
@@ -527,7 +618,9 @@ export function createCommittedArtifactStore(): CommittedArtifactStore {
       mapClear(entries);
       disposed = true;
       setClear(pendingNavigationDisposals);
-      for (const artifact of snapshot) disposeArtifact(artifact);
+      for (let index = 0; index < snapshot.length; index += 1) {
+        disposeArtifact(snapshot[index]);
+      }
       return;
     }
     const generations = setValueSnapshot(pendingNavigationDisposals);
@@ -535,7 +628,10 @@ export function createCommittedArtifactStore(): CommittedArtifactStore {
     if (generations.length === 0) return;
     mutating = true;
     try {
-      for (const generation of generations) disposeGeneration(generation);
+      for (let index = 0; index < generations.length; index += 1) {
+        const generation = generations[index];
+        if (generation) disposeGeneration(generation);
+      }
     } finally {
       mutating = false;
       if (disposeRequested || setValueSnapshot(pendingNavigationDisposals).length > 0) {
@@ -662,7 +758,9 @@ export function createCommittedArtifactStore(): CommittedArtifactStore {
         disposeRequested = false;
         disposed = true;
         setClear(pendingNavigationDisposals);
-        for (const artifact of snapshot) disposeArtifact(artifact);
+        for (let index = 0; index < snapshot.length; index += 1) {
+          disposeArtifact(snapshot[index]);
+        }
       } catch {
         disposeRequested = false;
         disposed = true;
@@ -1022,8 +1120,10 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
   };
 
   const notify = (terminal: RenderOutcome): void => {
-    const snapshot = observers.splice(0, observers.length);
-    for (const observer of snapshot) {
+    const snapshot = arraySpliceAll(observers);
+    for (let index = 0; index < snapshot.length; index += 1) {
+      const observer = snapshot[index];
+      if (!observer) continue;
       try {
         observer(terminal);
       } catch {
@@ -1036,7 +1136,7 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
     if (outcome !== undefined) return false;
     outcome = terminal;
     state = terminalState(terminal);
-    history.push(state);
+    arrayPush(history, state);
     clearDeadline();
     admittedRenderSource = undefined;
     admittedWinnerContext = undefined;
@@ -1101,7 +1201,7 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
       return false;
     }
     state = next;
-    history.push(next);
+    arrayPush(history, next);
     clearDeadline();
     if (outcome === undefined) armDeadline(next);
     return true;
@@ -1252,12 +1352,12 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
         }
         return true;
       }
-      observers.push(callback);
+      arrayPush(observers, callback);
       return true;
     },
     snapshot: () =>
       frozen({
-        history: frozen(history.slice()),
+        history: frozen(arraySlice(history)),
         outcome,
         state,
       }),
@@ -1291,6 +1391,365 @@ export function createRenderAttempt(options: RenderAttemptOptions): RenderAttemp
   }
   weakSetAdd(renderAttempts, lifecycle);
   return frozen({ ok: true, value: frozen(lifecycle) });
+}
+
+interface RendererNonceBinding {
+  readonly nonce: string;
+  readonly attempt: RenderAttempt;
+  readonly attemptId: string;
+  readonly generation: object;
+  readonly source: object;
+  readonly port: RendererNoncePort;
+  readonly closeMethod: RendererNoncePort['close'];
+  consumed: boolean;
+  closed: boolean;
+}
+
+function validRendererNonce(value: unknown): value is string {
+  return typeof value === 'string' && RENDERER_NONCE.test(value);
+}
+
+function readMintedRendererNonce(value: unknown): string | undefined {
+  try {
+    if (typeof value !== 'object' || value === null || !Object.isFrozen(value)) return undefined;
+    if (Object.getPrototypeOf(value) !== Object.prototype) return undefined;
+    if (Object.getOwnPropertySymbols(value).length !== 0) return undefined;
+    const names = Object.getOwnPropertyNames(value).sort();
+    const ok = Object.getOwnPropertyDescriptor(value, 'ok');
+    if (!ok || !ok.enumerable || !('value' in ok)) return undefined;
+    if (ok.value === true) {
+      if (names.length !== 2 || names[0] !== 'ok' || names[1] !== 'value') return undefined;
+      const nonce = Object.getOwnPropertyDescriptor(value, 'value');
+      return nonce && nonce.enumerable && 'value' in nonce && validRendererNonce(nonce.value)
+        ? nonce.value
+        : undefined;
+    }
+    if (ok.value === false && names.length === 2 && names[0] === 'ok' && names[1] === 'reason') {
+      const reason = Object.getOwnPropertyDescriptor(value, 'reason');
+      if (
+        reason &&
+        reason.enumerable &&
+        'value' in reason &&
+        reason.value === 'identity_generation_failed'
+      ) {
+        return undefined;
+      }
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function readRendererNonceExpectation(value: unknown): RendererNonceExpectation | undefined {
+  try {
+    if (
+      typeof value !== 'object' ||
+      value === null ||
+      Object.getPrototypeOf(value) !== Object.prototype
+    ) {
+      return undefined;
+    }
+    if (Object.getOwnPropertySymbols(value).length !== 0) return undefined;
+    const names = Object.getOwnPropertyNames(value).sort();
+    const expected = ['attempt', 'generation', 'nonce', 'port', 'source'];
+    if (names.length !== expected.length) return undefined;
+    const fields: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+    for (let index = 0; index < expected.length; index += 1) {
+      const name = expected[index];
+      if (!name || names[index] !== name) return undefined;
+      const descriptor = Object.getOwnPropertyDescriptor(value, name);
+      if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) return undefined;
+      fields[name] = descriptor.value;
+    }
+    return fields as unknown as RendererNonceExpectation;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Own the bounded, one-use capabilities for APS renderer-document acceptance. */
+export function createRendererNonceRegistry(
+  options: RendererNonceRegistryOptions = {}
+): RendererNonceRegistry {
+  const liveByNonce = new Map<string, RendererNonceBinding>();
+  const bindingByAttempt = new WeakMap<RenderAttempt, RendererNonceBinding>();
+  const bindingByGeneration = new WeakMap<object, RendererNonceBinding>();
+  const bindingByPort = new WeakMap<RendererNoncePort, RendererNonceBinding>();
+  const bindings = new Set<RendererNonceBinding>();
+  const pendingNonces = new Set<string>();
+  const pendingAttempts = new WeakSet<RenderAttempt>();
+  const pendingGenerations = new WeakSet<object>();
+  const pendingPorts = new WeakSet<RendererNoncePort>();
+  const retiredPorts = new WeakSet<RendererNoncePort>();
+  let pendingCount = 0;
+  let disposed = false;
+  let mintNonce: () => IdentityGenerationResult<string>;
+  try {
+    mintNonce = options.mintNonce ?? mintBrowserRendererNonce;
+  } catch {
+    mintNonce = () => frozen({ ok: false, reason: 'identity_generation_failed' });
+  }
+
+  const closeBinding = (binding: RendererNonceBinding): void => {
+    if (binding.closed) return;
+    binding.closed = true;
+    binding.consumed = true;
+    if (mapGet(liveByNonce, binding.nonce) === binding) {
+      mapDelete(liveByNonce, binding.nonce);
+    }
+    if (weakMapGet(bindingByAttempt, binding.attempt) === binding) {
+      weakMapDelete(bindingByAttempt, binding.attempt);
+    }
+    if (weakMapGet(bindingByGeneration, binding.generation) === binding) {
+      weakMapDelete(bindingByGeneration, binding.generation);
+    }
+    weakSetAdd(retiredPorts, binding.port);
+    if (weakMapGet(bindingByPort, binding.port) === binding) {
+      weakMapDelete(bindingByPort, binding.port);
+    }
+    setDelete(bindings, binding);
+    try {
+      Reflect.apply(binding.closeMethod, binding.port, []);
+    } catch {
+      // Closing a retained browser port is best-effort and exact-once.
+    }
+  };
+
+  const rollbackProvisionalBinding = (binding: RendererNonceBinding): void => {
+    binding.closed = true;
+    binding.consumed = true;
+    if (mapGet(liveByNonce, binding.nonce) === binding) {
+      mapDelete(liveByNonce, binding.nonce);
+    }
+    if (weakMapGet(bindingByAttempt, binding.attempt) === binding) {
+      weakMapDelete(bindingByAttempt, binding.attempt);
+    }
+    if (weakMapGet(bindingByGeneration, binding.generation) === binding) {
+      weakMapDelete(bindingByGeneration, binding.generation);
+    }
+    if (weakMapGet(bindingByPort, binding.port) === binding) {
+      weakMapDelete(bindingByPort, binding.port);
+    }
+    setDelete(bindings, binding);
+  };
+
+  const invalidIssue = (
+    reason: Exclude<RendererNonceIssueResult, { ok: true }>['reason']
+  ): RendererNonceIssueResult => frozen({ ok: false, reason });
+
+  const registry: RendererNonceRegistry = {
+    issue(input): RendererNonceIssueResult {
+      let attempt: RenderAttempt;
+      let source: object;
+      let port: RendererNoncePort;
+      let closeMethod: RendererNoncePort['close'];
+      let attemptId: string;
+      let generation: object;
+      let onSettledMethod: RenderAttempt['onSettled'];
+      let snapshotMethod: RenderAttempt['snapshot'];
+      try {
+        attempt = input.attempt;
+        source = input.source;
+        port = input.port;
+        closeMethod = port.close;
+        attemptId = attempt.id;
+        generation = attempt.generation;
+        onSettledMethod = attempt.onSettled;
+        snapshotMethod = attempt.snapshot;
+        if (
+          disposed ||
+          !weakSetHas(renderAttempts, attempt) ||
+          (typeof source !== 'object' && typeof source !== 'function') ||
+          source === null ||
+          (typeof port !== 'object' && typeof port !== 'function') ||
+          port === null ||
+          typeof closeMethod !== 'function' ||
+          !validAttemptId(attemptId) ||
+          (typeof generation !== 'object' && typeof generation !== 'function') ||
+          generation === null ||
+          typeof onSettledMethod !== 'function' ||
+          typeof snapshotMethod !== 'function' ||
+          Reflect.apply(snapshotMethod, attempt, []).outcome !== undefined ||
+          weakMapHas(bindingByAttempt, attempt) ||
+          weakSetHas(pendingAttempts, attempt) ||
+          weakMapHas(bindingByGeneration, generation) ||
+          weakSetHas(pendingGenerations, generation) ||
+          weakMapHas(bindingByPort, port) ||
+          weakSetHas(pendingPorts, port) ||
+          weakSetHas(retiredPorts, port)
+        ) {
+          return invalidIssue('invalid_attempt');
+        }
+      } catch {
+        return invalidIssue('invalid_attempt');
+      }
+      if (setSize(bindings) + pendingCount >= MAX_RENDERER_NONCES) {
+        return invalidIssue('capability_registry_full');
+      }
+      try {
+        weakSetAdd(pendingAttempts, attempt);
+        weakSetAdd(pendingGenerations, generation);
+        weakSetAdd(pendingPorts, port);
+        pendingCount += 1;
+      } catch {
+        weakSetDelete(pendingAttempts, attempt);
+        weakSetDelete(pendingGenerations, generation);
+        weakSetDelete(pendingPorts, port);
+        return invalidIssue('invalid_attempt');
+      }
+
+      const attemptStillIssuable = (): boolean => {
+        try {
+          return (
+            !disposed &&
+            !weakMapHas(bindingByAttempt, attempt) &&
+            !weakMapHas(bindingByGeneration, generation) &&
+            !weakMapHas(bindingByPort, port) &&
+            !weakSetHas(retiredPorts, port) &&
+            attempt.id === attemptId &&
+            attempt.generation === generation &&
+            Reflect.apply(snapshotMethod, attempt, []).outcome === undefined
+          );
+        } catch {
+          return false;
+        }
+      };
+
+      let nonce: string | undefined;
+      try {
+        for (let draw = 0; draw < MAX_RENDERER_NONCE_DRAWS; draw += 1) {
+          let minted: unknown;
+          try {
+            minted = Reflect.apply(mintNonce, undefined, []);
+          } catch {
+            return invalidIssue('identity_generation_failed');
+          }
+          const candidate = readMintedRendererNonce(minted);
+          if (!attemptStillIssuable()) return invalidIssue('invalid_attempt');
+          if (setSize(bindings) + pendingCount > MAX_RENDERER_NONCES) {
+            return invalidIssue('capability_registry_full');
+          }
+          if (!candidate) return invalidIssue('identity_generation_failed');
+          if (!mapGet(liveByNonce, candidate) && !setHas(pendingNonces, candidate)) {
+            nonce = candidate;
+            setAdd(pendingNonces, candidate);
+            break;
+          }
+        }
+        if (!nonce) return invalidIssue('identity_generation_failed');
+        if (!attemptStillIssuable()) return invalidIssue('invalid_attempt');
+
+        const binding: RendererNonceBinding = {
+          nonce,
+          attempt,
+          attemptId,
+          generation,
+          source,
+          port,
+          closeMethod,
+          consumed: false,
+          closed: false,
+        };
+        let committed = false;
+        try {
+          const registered = Reflect.apply(onSettledMethod, attempt, [
+            () => {
+              if (committed) closeBinding(binding);
+            },
+          ]);
+          if (
+            registered !== true ||
+            !attemptStillIssuable() ||
+            setSize(bindings) + pendingCount > MAX_RENDERER_NONCES ||
+            mapGet(liveByNonce, nonce) !== undefined ||
+            !setHas(pendingNonces, nonce)
+          ) {
+            return invalidIssue('invalid_attempt');
+          }
+          mapSet(liveByNonce, nonce, binding);
+          weakMapSet(bindingByAttempt, attempt, binding);
+          weakMapSet(bindingByGeneration, generation, binding);
+          weakMapSet(bindingByPort, port, binding);
+          setAdd(bindings, binding);
+          if (
+            mapGet(liveByNonce, nonce) !== binding ||
+            weakMapGet(bindingByAttempt, attempt) !== binding ||
+            weakMapGet(bindingByGeneration, generation) !== binding ||
+            weakMapGet(bindingByPort, port) !== binding ||
+            !setHas(bindings, binding)
+          ) {
+            rollbackProvisionalBinding(binding);
+            return invalidIssue('invalid_attempt');
+          }
+          committed = true;
+        } catch {
+          rollbackProvisionalBinding(binding);
+          return invalidIssue('invalid_attempt');
+        }
+        return frozen({ ok: true, nonce });
+      } finally {
+        if (nonce) setDelete(pendingNonces, nonce);
+        weakSetDelete(pendingAttempts, attempt);
+        weakSetDelete(pendingGenerations, generation);
+        weakSetDelete(pendingPorts, port);
+        pendingCount -= 1;
+      }
+    },
+    consume(expectation): boolean {
+      try {
+        const fields = readRendererNonceExpectation(expectation);
+        if (disposed || !fields || !validRendererNonce(fields.nonce)) return false;
+        const binding = mapGet(liveByNonce, fields.nonce);
+        if (
+          !binding ||
+          binding.closed ||
+          binding.consumed ||
+          !setHas(bindings, binding) ||
+          fields.attempt !== binding.attempt ||
+          fields.generation !== binding.generation ||
+          fields.source !== binding.source ||
+          fields.port !== binding.port ||
+          weakMapGet(bindingByPort, binding.port) !== binding ||
+          binding.attempt.id !== binding.attemptId ||
+          binding.attempt.generation !== binding.generation ||
+          Reflect.apply(binding.attempt.snapshot, binding.attempt, []).outcome !== undefined
+        ) {
+          return false;
+        }
+        if (
+          disposed ||
+          binding.closed ||
+          binding.consumed ||
+          mapGet(liveByNonce, binding.nonce) !== binding ||
+          !mapDelete(liveByNonce, binding.nonce)
+        ) {
+          return false;
+        }
+        binding.consumed = true;
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    dispose(): void {
+      if (disposed) return;
+      disposed = true;
+      const snapshot = setValueSnapshot(bindings);
+      mapClear(liveByNonce);
+      for (let index = 0; index < snapshot.length; index += 1) {
+        const binding = snapshot[index];
+        if (binding) closeBinding(binding);
+      }
+    },
+    snapshotForTest: () =>
+      frozen({
+        bindings: setSize(bindings),
+        disposed,
+        liveNonces: mapSize(liveByNonce),
+      }),
+  };
+  return frozen(registry);
 }
 
 /** Own one public per-slot result without overwriting either child attempt result. */
@@ -1333,8 +1792,10 @@ export function createSlotOperation(options: SlotOperationOptions): SlotOperatio
   const settle = (terminal: SlotOperationResult): boolean => {
     if (result) return false;
     result = frozen(terminal);
-    const snapshot = observers.splice(0, observers.length);
-    for (const observer of snapshot) {
+    const snapshot = arraySpliceAll(observers);
+    for (let index = 0; index < snapshot.length; index += 1) {
+      const observer = snapshot[index];
+      if (!observer) continue;
       try {
         observer(result);
       } catch {
@@ -1559,7 +2020,7 @@ export function createSlotOperation(options: SlotOperationOptions): SlotOperatio
           // Observation cannot change the public result.
         }
       } else {
-        observers.push(callback);
+        arrayPush(observers, callback);
       }
       return true;
     },
