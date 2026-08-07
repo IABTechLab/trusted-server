@@ -362,12 +362,16 @@ describe('browser composition', () => {
     const slotService = composition.slotServiceForTest();
     const targetingService = composition.targetingServiceForTest();
     const reservationService = composition.reservationServiceForTest();
+    const rendererNonces = composition.rendererNonceRegistryForTest();
     expect(slotService).toBeDefined();
     expect(targetingService).toBeDefined();
     expect(reservationService).toBeDefined();
+    expect(rendererNonces).toBeDefined();
     expect(session?.interfaces['slots']).toBe(slotService);
     expect(session?.interfaces['targeting']).toBe(targetingService);
     expect(session?.interfaces['reservations']).toBe(reservationService);
+    expect(session?.interfaces['rendererNonces']).toBe(rendererNonces);
+    expect(session?.interfaces['renderDirectAps']).toBeTypeOf('function');
     expect(session?.currentNavigation?.interfaces).toBe(session?.interfaces);
     expect(session?.currentNavigation?.currentAuctionProjection).toEqual(projection);
     expect(Object.isFrozen(session?.currentNavigation?.currentAuctionProjection)).toBe(true);
@@ -414,9 +418,11 @@ describe('browser composition', () => {
       disposed: true,
       size: 0,
     });
+    expect(rendererNonces?.snapshotForTest()).toMatchObject({ disposed: true });
     expect(composition.slotServiceForTest()).toBeUndefined();
     expect(composition.targetingServiceForTest()).toBeUndefined();
     expect(composition.reservationServiceForTest()).toBeUndefined();
+    expect(composition.rendererNonceRegistryForTest()).toBeUndefined();
   });
 
   it('unwinds a lazily-created session when navigation identity generation fails', async () => {

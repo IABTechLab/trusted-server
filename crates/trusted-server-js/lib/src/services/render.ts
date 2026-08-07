@@ -369,13 +369,14 @@ export interface RendererNoncePort {
 
 export interface RendererNonceIssueInput {
   readonly attempt: RenderAttempt;
-  readonly source: object;
+  readonly source?: object;
   readonly port: RendererNoncePort;
 }
 
 export interface RendererNonceExpectation extends RendererNonceIssueInput {
   readonly nonce: string;
   readonly generation: object;
+  readonly source: object;
 }
 
 export type RendererNonceIssueResult =
@@ -394,6 +395,8 @@ export interface RendererNonceRegistrySnapshot {
 export interface RendererNonceRegistry {
   /** On failure the caller retains port ownership; success transfers it to this registry. */
   readonly issue: (input: RendererNonceIssueInput) => RendererNonceIssueResult;
+  /** Bind a pre-insertion nonce exactly once to the inserted renderer's WindowProxy. */
+  readonly bindSource: (expectation: RendererNonceExpectation) => boolean;
   readonly consume: (expectation: RendererNonceExpectation) => boolean;
   readonly dispose: () => void;
   readonly snapshotForTest: () => RendererNonceRegistrySnapshot;
@@ -1398,7 +1401,7 @@ interface RendererNonceBinding {
   readonly attempt: RenderAttempt;
   readonly attemptId: string;
   readonly generation: object;
-  readonly source: object;
+  source: object | undefined;
   readonly port: RendererNoncePort;
   readonly closeMethod: RendererNoncePort['close'];
   consumed: boolean;
@@ -1541,7 +1544,7 @@ export function createRendererNonceRegistry(
   const registry: RendererNonceRegistry = {
     issue(input): RendererNonceIssueResult {
       let attempt: RenderAttempt;
-      let source: object;
+      let source: object | undefined;
       let port: RendererNoncePort;
       let closeMethod: RendererNoncePort['close'];
       let attemptId: string;
@@ -1560,8 +1563,8 @@ export function createRendererNonceRegistry(
         if (
           disposed ||
           !weakSetHas(renderAttempts, attempt) ||
-          (typeof source !== 'object' && typeof source !== 'function') ||
-          source === null ||
+          (source !== undefined &&
+            ((typeof source !== 'object' && typeof source !== 'function') || source === null)) ||
           (typeof port !== 'object' && typeof port !== 'function') ||
           port === null ||
           typeof closeMethod !== 'function' ||
@@ -1696,6 +1699,42 @@ export function createRendererNonceRegistry(
         pendingCount -= 1;
       }
     },
+    bindSource(expectation): boolean {
+      try {
+        const fields = readRendererNonceExpectation(expectation);
+        if (
+          disposed ||
+          !fields ||
+          !validRendererNonce(fields.nonce) ||
+          (typeof fields.source !== 'object' && typeof fields.source !== 'function') ||
+          fields.source === null
+        ) {
+          return false;
+        }
+        const binding = mapGet(liveByNonce, fields.nonce);
+        if (
+          !binding ||
+          binding.closed ||
+          binding.consumed ||
+          binding.source !== undefined ||
+          !setHas(bindings, binding) ||
+          fields.attempt !== binding.attempt ||
+          fields.generation !== binding.generation ||
+          fields.port !== binding.port ||
+          weakMapGet(bindingByPort, binding.port) !== binding ||
+          binding.attempt.id !== binding.attemptId ||
+          binding.attempt.generation !== binding.generation ||
+          Reflect.apply(binding.attempt.snapshot, binding.attempt, []).outcome !== undefined ||
+          mapGet(liveByNonce, binding.nonce) !== binding
+        ) {
+          return false;
+        }
+        binding.source = fields.source;
+        return true;
+      } catch {
+        return false;
+      }
+    },
     consume(expectation): boolean {
       try {
         const fields = readRendererNonceExpectation(expectation);
@@ -1705,6 +1744,7 @@ export function createRendererNonceRegistry(
           !binding ||
           binding.closed ||
           binding.consumed ||
+          binding.source === undefined ||
           !setHas(bindings, binding) ||
           fields.attempt !== binding.attempt ||
           fields.generation !== binding.generation ||
