@@ -820,4 +820,152 @@ describe('browser composition', () => {
     expect(latePreparation).not.toHaveBeenCalled();
     expect(vi.getTimerCount()).toBe(0);
   });
+
+  it('exercises transactional addAdUnits and invocation-time requestAds snapshots through the test kernel', async () => {
+    const target = {};
+    const requestBodies: Array<{
+      adUnits: Array<{ code: string }>;
+      config: Readonly<Record<string, unknown>>;
+    }> = [];
+    const auctionFetcher = vi.fn(async (_input: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as {
+        adUnits: Array<{ code: string }>;
+        config: Readonly<Record<string, unknown>>;
+      };
+      requestBodies.push(body);
+      const slots = body.adUnits.map(({ code }) => code);
+      return {
+        ok: true,
+        json: async () => ({
+          id: `auction-${requestBodies.length}`,
+          cur: 'USD',
+          seatbid: [],
+          ext: {
+            trusted_server: {
+              slot_results: {
+                version: 1,
+                auctionId: `auction-${requestBodies.length}`,
+                results: slots.map((slot) => ({ slot, outcome: 'no_bid' })),
+              },
+            },
+          },
+        }),
+      };
+    });
+    const composition = createTestBrowserRuntimeComposition(
+      {
+        target,
+        releaseId: 'a'.repeat(64),
+        manifest: {
+          version: 1,
+          releaseId: 'a'.repeat(64),
+          integrations: [{ id: 'context_test', required: true }],
+        },
+        knownIntegrationIds: Object.freeze(['context_test']),
+        boot: {
+          auctionProjection: {
+            version: 1,
+            auction: {
+              version: 1,
+              auctionId: 'initial',
+              results: [{ slot: 'server-slot', outcome: 'no_bid' }],
+            },
+            bids: [],
+          },
+          creative: { version: 1, enabled: false, clickGuard: false, renderGuard: false },
+          diagnostics: { version: 1, renderTraceOverlay: false, gpt: { active: false } },
+        },
+        kernel: { addAdUnits: vi.fn(), diagnostics: Object.freeze({}), requestAds: vi.fn() },
+      },
+      {
+        adapters: {
+          googletag: fakeGoogletagAdapter(),
+          messaging: fakeMessagingAdapter(),
+          prebid: fakePrebidAdapter(),
+        },
+        auctionFetcherForTest: auctionFetcher,
+        coreActivations: { correctnessGptListeners: vi.fn() },
+      }
+    );
+
+    expect(composition.runtime.start()).toBe(true);
+    expect(
+      composition.runtime.registerIntegration({
+        id: 'context_test',
+        release: 'a'.repeat(64),
+        prepare: () => ({ activate: vi.fn() }),
+      })
+    ).toBe(true);
+    await expect(composition.runtime.install()).resolves.toMatchObject({ state: 'kernel' });
+    const contextContributor = vi.fn(() => ({ page: 'context' }));
+    const session = composition.runtimeSessionForTest();
+    expect(session).toBeDefined();
+    expect(
+      composition
+        .auctionContextRegistryForTest()
+        ?.register('context_test', contextContributor, session!)
+    ).toBe(true);
+    const api = target as {
+      addAdUnits(value: unknown): { readonly registered: readonly string[] };
+      requestAds(options?: unknown): Promise<{ readonly slots: readonly object[] }>;
+    };
+    const programmatic = {
+      code: 'programmatic-slot',
+      mediaTypes: { banner: { sizes: [[300, 250]] } },
+      bids: [{ bidder: 'fictional', params: { placement: 7 } }],
+    };
+
+    expect(api.addAdUnits(programmatic)).toEqual({ registered: ['programmatic-slot'] });
+    expect(composition.projectionSlotsForTest()).toEqual(['server-slot', 'programmatic-slot']);
+    expect(() =>
+      api.addAdUnits([
+        {
+          code: 'must-roll-back',
+          mediaTypes: { banner: { sizes: [[1, 1]] } },
+        },
+        {
+          code: 'server-slot',
+          mediaTypes: { banner: { sizes: [[1, 1]] } },
+        },
+      ])
+    ).toThrowError(expect.objectContaining({ code: 'slot_collision', unitIndex: 1 }));
+    expect(composition.projectionSlotsForTest()).toEqual(['server-slot', 'programmatic-slot']);
+    await expect(api.requestAds({ slots: ['unknown', 'programmatic-slot'] })).resolves.toEqual({
+      slots: [
+        { slot: 'unknown', path: 'primary', outcome: 'failed', reason: 'slot_unresolved' },
+        { slot: 'programmatic-slot', path: 'primary', outcome: 'no_bid' },
+      ],
+    });
+    expect(requestBodies[0]).toEqual({
+      adUnits: [programmatic],
+      config: { page: 'context' },
+    });
+    expect(contextContributor).toHaveBeenCalledOnce();
+
+    const omitted = api.requestAds();
+    expect(
+      api.addAdUnits({
+        code: 'later-slot',
+        mediaTypes: { banner: { sizes: [[728, 90]] } },
+      })
+    ).toEqual({ registered: ['later-slot'] });
+    await expect(omitted).resolves.toEqual({
+      slots: [
+        { slot: 'server-slot', path: 'primary', outcome: 'no_bid' },
+        { slot: 'programmatic-slot', path: 'primary', outcome: 'no_bid' },
+      ],
+    });
+    expect(requestBodies[1]?.adUnits.map(({ code }) => code)).toEqual([
+      'server-slot',
+      'programmatic-slot',
+    ]);
+    expect(requestBodies[1]?.adUnits).not.toContainEqual(
+      expect.objectContaining({ code: 'later-slot' })
+    );
+    expect(requestBodies[1]?.config).toEqual({ page: 'context' });
+    expect(contextContributor).toHaveBeenCalledTimes(2);
+    expect(auctionFetcher).toHaveBeenCalledTimes(2);
+
+    composition.runtime.dispose();
+  });
 });

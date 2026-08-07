@@ -86,6 +86,13 @@ describe('requestAds input contract', () => {
       timeoutMs: 100,
     });
   });
+
+  it('uses the registered-slot ASCII-control grammar instead of rejecting other Unicode controls', () => {
+    expect(validateRequestAdsOptions({ slots: ['slot\u0085id'] })).toMatchObject({
+      slots: ['slot\u0085id'],
+    });
+    expectInputError(() => validateRequestAdsOptions({ slots: ['slot\u007fid'] }), 'invalid_slots');
+  });
 });
 
 describe('request.requestAds', () => {
