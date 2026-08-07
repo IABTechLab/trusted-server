@@ -316,6 +316,7 @@ export type ReservationClaimResult =
 
 /** Exact lifecycle authority required to consume one successful claim object. */
 export interface ReservationClaimExpectation {
+  readonly attempt: ReservationAttempt;
   readonly attemptId: string;
   readonly slot: string;
   readonly navigationGeneration: object;
@@ -1181,6 +1182,7 @@ export function createReservationService(options: ReservationServiceOptions): Re
     },
     consumeClaim(claim, expectation): ReservationClaimAdmission | undefined {
       const fields = ownDataRecord(expectation, [
+        'attempt',
         'attemptId',
         'slot',
         'navigationGeneration',
@@ -1216,6 +1218,7 @@ export function createReservationService(options: ReservationServiceOptions): Re
       }
       if (
         !admission ||
+        fields.attempt !== admission.attempt ||
         fields.attemptId !== admission.attemptId ||
         fields.slot !== admission.slot ||
         fields.navigationGeneration !== admission.navigationGeneration ||
