@@ -1,8 +1,16 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import apsEnvelope from '../fixtures/aps-renderer-v1.json';
+import { createBrowserMessagingAdapter, type MessagingAdapter } from '../../src/adapters/messaging';
 import { createTestNavigationIdentityIssuer } from '../../src/kernel/identity';
 import { createRuntimeSession } from '../../src/kernel/sessions';
 import type { RenderAttemptScope, WinnerContext } from '../../src/kernel/sessions';
+import {
+  APS_RENDERER_SANDBOX,
+  APS_RENDERER_V1_PATH,
+  renderDirectApsAttempt,
+  resolveApsRendererV1Url,
+} from '../../src/integrations/aps/render';
 import {
   createCommittedArtifactStore,
   createRenderAttempt,
@@ -52,11 +60,26 @@ const APS_SOURCE = Object.freeze({
   aaxResponse: 'e30=',
 });
 
+const DIRECT_APS_BID = apsEnvelope.seatbid[0]!.bid[0]!;
+const DIRECT_APS_SOURCE = Object.freeze({
+  type: 'aps' as const,
+  version: 1 as const,
+  accountId: 'fictional-account',
+  bidId: DIRECT_APS_BID.id,
+  creativeId: 'fictional-creative',
+  tagType: DIRECT_APS_BID.ext.tagtype as 'iframe',
+  creativeUrl: DIRECT_APS_BID.ext.creativeurl,
+  width: DIRECT_APS_BID.w,
+  height: DIRECT_APS_BID.h,
+  aaxResponse: btoa(JSON.stringify(apsEnvelope)),
+});
+
 const WINNER_CONTEXT = Object.freeze({ selectedCpm: 1 });
 
 function prepareRenderSource(candidate: unknown) {
   if (candidate === ADM_SOURCE) return ADM_SOURCE;
   if (candidate === APS_SOURCE) return APS_SOURCE;
+  if (candidate === DIRECT_APS_SOURCE) return DIRECT_APS_SOURCE;
   return undefined;
 }
 
@@ -178,6 +201,28 @@ function attempt(
 
 function rendererPort() {
   return Object.freeze({ close: vi.fn() });
+}
+
+function browserMessagePort() {
+  const listeners = new Set<(event: unknown) => void>();
+  const messageErrorListeners = new Set<(event: unknown) => void>();
+  return {
+    addEventListener: vi.fn((type: string, listener: (event: unknown) => void) => {
+      (type === 'messageerror' ? messageErrorListeners : listeners).add(listener);
+    }),
+    close: vi.fn(),
+    emit(data: unknown): void {
+      for (const listener of listeners) listener({ data });
+    },
+    emitError(): void {
+      for (const listener of messageErrorListeners) listener({});
+    },
+    postMessage: vi.fn(),
+    removeEventListener: vi.fn((type: string, listener: (event: unknown) => void) => {
+      (type === 'messageerror' ? messageErrorListeners : listeners).delete(listener);
+    }),
+    start: vi.fn(),
+  };
 }
 
 describe('renderer nonce registry', () => {
@@ -348,6 +393,124 @@ describe('renderer nonce registry', () => {
     expect(registry.consume(exact)).toBe(false);
     expect(registry.snapshotForTest()).toMatchObject({ bindings: 1, liveNonces: 0 });
     expect(port.close).not.toHaveBeenCalled();
+  });
+
+  it('issues before insertion and binds exactly one later renderer source before consumption', () => {
+    const nonce = indexedRendererNonce(1);
+    const registry = createRendererNonceRegistry({
+      mintNonce: () => Object.freeze({ ok: true as const, value: nonce }),
+    });
+    const render = attempt(owner(indexedAttemptId(1), 'slot-1'));
+    const other = attempt(owner(indexedAttemptId(2), 'slot-2'));
+    const port = rendererPort();
+    const source = Object.freeze({ window: true });
+    const wrongSource = Object.freeze({ window: false });
+    expect(registry.issue({ attempt: render, port })).toEqual({ ok: true, nonce });
+    const exact = Object.freeze({
+      nonce,
+      attempt: render,
+      generation: render.generation,
+      source,
+      port,
+    });
+
+    expect(registry.consume(exact)).toBe(false);
+    expect(registry.bindSource(Object.freeze({ ...exact, nonce: indexedRendererNonce(2) }))).toBe(
+      false
+    );
+    expect(registry.bindSource(Object.freeze({ ...exact, attempt: other }))).toBe(false);
+    expect(registry.bindSource(Object.freeze({ ...exact, generation: Object.freeze({}) }))).toBe(
+      false
+    );
+    expect(registry.bindSource(Object.freeze({ ...exact, source: wrongSource }))).toBe(true);
+    expect(registry.bindSource(exact)).toBe(false);
+    expect(registry.consume(exact)).toBe(false);
+    expect(registry.consume(Object.freeze({ ...exact, source: wrongSource }))).toBe(true);
+    expect(registry.consume(Object.freeze({ ...exact, source: wrongSource }))).toBe(false);
+  });
+
+  it('cannot bind a deferred renderer source after attempt or registry disposal', () => {
+    let draw = 0;
+    const registry = createRendererNonceRegistry({
+      mintNonce: () => Object.freeze({ ok: true as const, value: indexedRendererNonce(draw++) }),
+    });
+    const settled = attempt(owner(indexedAttemptId(1), 'slot-1'));
+    const settledPort = rendererPort();
+    const settledIssue = registry.issue({ attempt: settled, port: settledPort });
+    if (!settledIssue.ok) throw new Error('Expected deferred binding');
+    expect(settled.fail('internal_error')).toBe(true);
+    expect(
+      registry.bindSource(
+        Object.freeze({
+          nonce: settledIssue.nonce,
+          attempt: settled,
+          generation: settled.generation,
+          source: Object.freeze({}),
+          port: settledPort,
+        })
+      )
+    ).toBe(false);
+    expect(settledPort.close).toHaveBeenCalledOnce();
+
+    const disposed = attempt(owner(indexedAttemptId(2), 'slot-2'));
+    const disposedPort = rendererPort();
+    const disposedIssue = registry.issue({ attempt: disposed, port: disposedPort });
+    if (!disposedIssue.ok) throw new Error('Expected deferred binding');
+    registry.dispose();
+    expect(
+      registry.bindSource(
+        Object.freeze({
+          nonce: disposedIssue.nonce,
+          attempt: disposed,
+          generation: disposed.generation,
+          source: Object.freeze({}),
+          port: disposedPort,
+        })
+      )
+    ).toBe(false);
+    expect(disposedPort.close).toHaveBeenCalledOnce();
+  });
+
+  it('lets exactly one nested deferred source bind win before a hostile outer replay', () => {
+    const nonce = indexedRendererNonce(1);
+    const registry = createRendererNonceRegistry({
+      mintNonce: () => Object.freeze({ ok: true as const, value: nonce }),
+    });
+    const render = attempt();
+    const port = rendererPort();
+    const nestedSource = Object.freeze({ nested: true });
+    const outerSource = Object.freeze({ outer: true });
+    expect(registry.issue({ attempt: render, port })).toEqual({ ok: true, nonce });
+    const nestedExpectation = Object.freeze({
+      nonce,
+      attempt: render,
+      generation: render.generation,
+      source: nestedSource,
+      port,
+    });
+    const outerExpectation = Object.freeze({
+      nonce,
+      attempt: render,
+      generation: render.generation,
+      source: outerSource,
+      port,
+    });
+    let nested: boolean | undefined;
+    let reentered = false;
+    const replay = new Proxy(outerExpectation, {
+      ownKeys: (target) => {
+        if (!reentered) {
+          reentered = true;
+          nested = registry.bindSource(nestedExpectation);
+        }
+        return Reflect.ownKeys(target);
+      },
+    });
+
+    expect(registry.bindSource(replay)).toBe(false);
+    expect(nested).toBe(true);
+    expect(registry.consume(outerExpectation)).toBe(false);
+    expect(registry.consume(nestedExpectation)).toBe(true);
   });
 
   it('rejects cross-attempt retained-port reuse without taking failed-issue ownership', () => {
@@ -782,6 +945,935 @@ describe('renderer nonce registry', () => {
       })
     ).toEqual({ ok: false, reason: 'invalid_attempt' });
     expect(rejectedPort.close).not.toHaveBeenCalled();
+  });
+});
+
+describe('direct APS attempt rendering', () => {
+  it('accepts no document-port traffic before the native load handoff', () => {
+    vi.useFakeTimers();
+    document.body.innerHTML = '<div id="fictional-slot"></div>';
+    const render = attempt();
+    expect(render.admitDirectWinner(DIRECT_APS_SOURCE, WINNER_CONTEXT)).toBe(true);
+    const retainedRaw = browserMessagePort();
+    const transferredRaw = browserMessagePort();
+    const nonce = indexedRendererNonce(1);
+    const messaging = createBrowserMessagingAdapter({
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      MessageChannel: class {
+        readonly port1 = retainedRaw;
+        readonly port2 = transferredRaw;
+      },
+    });
+    const nonces = createRendererNonceRegistry({
+      mintNonce: () => Object.freeze({ ok: true as const, value: nonce }),
+    });
+
+    try {
+      expect(
+        renderDirectApsAttempt({
+          attempt: render,
+          container: document.getElementById('fictional-slot')!,
+          messaging,
+          nonces,
+          publisherOrigin: window.location.origin,
+        })
+      ).toBe(true);
+      expect(transferredRaw.postMessage).not.toHaveBeenCalled();
+      retainedRaw.emit({ message: 'TS APS Document Accepted', version: 1, nonce });
+      retainedRaw.emit({ message: 'TS APS Render Completed', version: 1, nonce });
+      expect(render.snapshot()).toMatchObject({
+        outcome: undefined,
+        state: 'waiting_for_document',
+      });
+
+      const frame = document.querySelector<HTMLIFrameElement>('#fictional-slot iframe')!;
+      frame.dispatchEvent(new Event('load'));
+      retainedRaw.emit({ message: 'TS APS Document Accepted', version: 1, nonce });
+      retainedRaw.emit({ message: 'TS APS Render Completed', version: 1, nonce });
+      expect(render.snapshot().outcome).toEqual({ outcome: 'accepted' });
+    } finally {
+      nonces.dispose();
+      document.body.innerHTML = '';
+      vi.useRealTimers();
+    }
+  });
+
+  it('uses captured native creation instead of a connected iframe returned by a hostile factory', () => {
+    document.body.innerHTML =
+      '<div id="publisher-owned"><iframe title="publisher frame"></iframe></div><div id="fictional-slot"></div>';
+    const publisherContainer = document.getElementById('publisher-owned')!;
+    const publisherFrame = publisherContainer.querySelector('iframe')!;
+    const render = attempt();
+    expect(render.admitDirectWinner(DIRECT_APS_SOURCE, WINNER_CONTEXT)).toBe(true);
+    const createElement = vi
+      .spyOn(document, 'createElement')
+      .mockReturnValueOnce(publisherFrame as HTMLIFrameElement);
+    const retainedRaw = browserMessagePort();
+    const transferredRaw = browserMessagePort();
+    const messaging = createBrowserMessagingAdapter({
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      MessageChannel: class {
+        readonly port1 = retainedRaw;
+        readonly port2 = transferredRaw;
+      },
+    });
+    const nonces = createRendererNonceRegistry();
+
+    try {
+      expect(
+        renderDirectApsAttempt({
+          attempt: render,
+          container: document.getElementById('fictional-slot')!,
+          messaging,
+          nonces,
+          publisherOrigin: window.location.origin,
+        })
+      ).toBe(true);
+      expect(createElement).not.toHaveBeenCalled();
+      expect(publisherFrame.parentNode).toBe(publisherContainer);
+      expect(publisherFrame.title).toBe('publisher frame');
+      expect(document.querySelector('#fictional-slot iframe')).not.toBe(publisherFrame);
+      expect(render.cancel('caller_aborted')).toBe(true);
+      expect(publisherFrame.parentNode).toBe(publisherContainer);
+    } finally {
+      createElement.mockRestore();
+      nonces.dispose();
+      document.body.innerHTML = '';
+    }
+  });
+
+  it('ignores a detached poisoned iframe and keeps native source/removal authority', () => {
+    document.body.innerHTML =
+      '<div id="unrelated-publisher-dom"></div><div id="fictional-slot"></div>';
+    const unrelated = document.getElementById('unrelated-publisher-dom')!;
+    const poisoned = document.createElement('iframe');
+    poisoned.title = 'publisher detached frame';
+    const forgedSource = Object.freeze({ postMessage: vi.fn() });
+    Object.defineProperty(poisoned, 'contentWindow', {
+      configurable: true,
+      get: () => forgedSource,
+    });
+    Object.defineProperty(poisoned, 'src', {
+      configurable: true,
+      get: () => 'https://publisher.example/lie',
+      set: vi.fn(),
+    });
+    poisoned.getAttribute = vi.fn(() => 'https://publisher.example/lie');
+    poisoned.addEventListener = vi.fn(() => {
+      throw new Error('publisher listener');
+    });
+    poisoned.remove = vi.fn(() => unrelated.remove());
+    const createElement = vi.spyOn(document, 'createElement').mockReturnValueOnce(poisoned);
+    const render = attempt();
+    expect(render.admitDirectWinner(DIRECT_APS_SOURCE, WINNER_CONTEXT)).toBe(true);
+    const retainedRaw = browserMessagePort();
+    const transferredRaw = browserMessagePort();
+    const messaging = createBrowserMessagingAdapter({
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      MessageChannel: class {
+        readonly port1 = retainedRaw;
+        readonly port2 = transferredRaw;
+      },
+    });
+    const nonces = createRendererNonceRegistry({
+      mintNonce: () => Object.freeze({ ok: true as const, value: indexedRendererNonce(1) }),
+    });
+
+    try {
+      expect(
+        renderDirectApsAttempt({
+          attempt: render,
+          container: document.getElementById('fictional-slot')!,
+          messaging,
+          nonces,
+          publisherOrigin: window.location.origin,
+        })
+      ).toBe(true);
+      expect(createElement).not.toHaveBeenCalled();
+      expect(poisoned.parentNode).toBeNull();
+      expect(poisoned.title).toBe('publisher detached frame');
+      const exactFrame = document.querySelector<HTMLIFrameElement>('#fictional-slot iframe')!;
+      const exactSource = exactFrame.contentWindow!;
+      const exactPost = vi.spyOn(exactSource, 'postMessage');
+      exactFrame.dispatchEvent(new Event('load'));
+      expect(exactPost).toHaveBeenCalledOnce();
+      expect(forgedSource.postMessage).not.toHaveBeenCalled();
+      expect(poisoned.remove).not.toHaveBeenCalled();
+      expect(unrelated.isConnected).toBe(true);
+      expect(render.cancel('caller_aborted')).toBe(true);
+      expect(unrelated.isConnected).toBe(true);
+    } finally {
+      createElement.mockRestore();
+      nonces.dispose();
+      document.body.innerHTML = '';
+    }
+  });
+
+  it('disposes detached setup resources when listener installation throws before staging', () => {
+    document.body.innerHTML = '<div id="fictional-slot"></div>';
+    const render = attempt();
+    expect(render.admitDirectWinner(DIRECT_APS_SOURCE, WINNER_CONTEXT)).toBe(true);
+    const retained = Object.freeze({
+      close: vi.fn(),
+      listen: vi.fn(() => {
+        throw new Error('hostile retained listener');
+      }),
+      post: vi.fn(),
+    });
+    const transferred = Object.freeze({
+      close: vi.fn(),
+      listen: vi.fn(),
+      post: vi.fn(),
+    });
+    const messaging = Object.freeze({
+      createChannel: () => Object.freeze({ retained, transferred }),
+      postWindow: vi.fn(),
+      installCaptureListener: vi.fn(),
+      parseProtocolMessage: vi.fn(),
+      extractTransferredPorts: vi.fn(),
+    }) as unknown as MessagingAdapter;
+    const nonces = createRendererNonceRegistry({
+      mintNonce: () => Object.freeze({ ok: true as const, value: indexedRendererNonce(1) }),
+    });
+
+    expect(
+      renderDirectApsAttempt({
+        attempt: render,
+        container: document.getElementById('fictional-slot')!,
+        messaging,
+        nonces,
+        publisherOrigin: window.location.origin,
+      })
+    ).toBe(false);
+    expect(render.snapshot().outcome).toEqual({
+      outcome: 'failed',
+      reason: 'renderer_document_no_load',
+    });
+    expect(retained.close).toHaveBeenCalledOnce();
+    expect(transferred.close).toHaveBeenCalledOnce();
+    expect(document.querySelector('iframe')).toBeNull();
+    nonces.dispose();
+    document.body.innerHTML = '';
+  });
+
+  it('does not insert after a pre-append cancellation returns through setup', () => {
+    document.body.innerHTML = '<div id="fictional-slot"></div>';
+    const container = document.getElementById('fictional-slot')!;
+    const render = attempt();
+    expect(render.admitDirectWinner(DIRECT_APS_SOURCE, WINNER_CONTEXT)).toBe(true);
+    const retained = Object.freeze({
+      close: vi.fn(),
+      listen: vi.fn(() => {
+        render.cancel('caller_aborted');
+        return () => undefined;
+      }),
+      post: vi.fn(),
+    });
+    const transferred = Object.freeze({
+      close: vi.fn(),
+      listen: vi.fn(),
+      post: vi.fn(),
+    });
+    const messaging = Object.freeze({
+      createChannel: () => Object.freeze({ retained, transferred }),
+      postWindow: vi.fn(),
+      installCaptureListener: vi.fn(),
+      parseProtocolMessage: vi.fn(),
+      extractTransferredPorts: vi.fn(),
+    }) as unknown as MessagingAdapter;
+    const nonces = createRendererNonceRegistry({
+      mintNonce: () => Object.freeze({ ok: true as const, value: indexedRendererNonce(1) }),
+    });
+    const observer = new MutationObserver(() => undefined);
+    observer.observe(container, { childList: true });
+
+    expect(
+      renderDirectApsAttempt({
+        attempt: render,
+        container,
+        messaging,
+        nonces,
+        publisherOrigin: window.location.origin,
+      })
+    ).toBe(false);
+    expect(render.snapshot().outcome).toEqual({
+      outcome: 'cancelled',
+      reason: 'caller_aborted',
+    });
+    expect(observer.takeRecords()).toHaveLength(0);
+    expect(container.children).toHaveLength(0);
+    expect(retained.close).toHaveBeenCalledOnce();
+    expect(transferred.close).toHaveBeenCalledOnce();
+    observer.disconnect();
+    nonces.dispose();
+    document.body.innerHTML = '';
+  });
+
+  it('binds the inserted renderer window and accepts only exact document-port completion', () => {
+    vi.useFakeTimers();
+    document.body.innerHTML = '<div id="fictional-slot"><span>placeholder</span></div>';
+    const artifacts = createCommittedArtifactStore();
+    const render = attempt(owner(), { artifacts });
+    expect(render.admitDirectWinner(DIRECT_APS_SOURCE, WINNER_CONTEXT)).toBe(true);
+    const retainedRaw = browserMessagePort();
+    const transferredRaw = browserMessagePort();
+    const messaging = createBrowserMessagingAdapter({
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      MessageChannel: class {
+        readonly port1 = retainedRaw;
+        readonly port2 = transferredRaw;
+      },
+    });
+    const nonce = indexedRendererNonce(1);
+    const nonces = createRendererNonceRegistry({
+      mintNonce: () => Object.freeze({ ok: true as const, value: nonce }),
+    });
+    const container = document.getElementById('fictional-slot')!;
+
+    try {
+      expect(
+        renderDirectApsAttempt({
+          attempt: render,
+          container,
+          messaging,
+          nonces,
+          publisherOrigin: window.location.origin,
+        })
+      ).toBe(true);
+      const iframe = container.querySelector('iframe');
+      expect(iframe).not.toBeNull();
+      expect(iframe?.src).toBe(
+        `${new URL(APS_RENDERER_V1_PATH, window.location.origin).href}#tsaps=${nonce}`
+      );
+      expect(iframe?.getAttribute('sandbox')).toBe(APS_RENDERER_SANDBOX);
+      expect(iframe?.width).toBe(String(DIRECT_APS_SOURCE.width));
+      expect(iframe?.height).toBe(String(DIRECT_APS_SOURCE.height));
+      expect(iframe?.style.width).toBe(`${DIRECT_APS_SOURCE.width}px`);
+      expect(iframe?.style.height).toBe(`${DIRECT_APS_SOURCE.height}px`);
+      expect(render.snapshot().state).toBe('waiting_for_document');
+
+      const target = iframe?.contentWindow;
+      if (!iframe || !target) throw new Error('Expected renderer window');
+      const postMessage = vi.spyOn(target, 'postMessage');
+      iframe.dispatchEvent(new Event('load'));
+      expect(postMessage).toHaveBeenCalledWith(
+        {
+          version: 1,
+          nonce,
+          publisherOrigin: window.location.origin,
+          renderer: DIRECT_APS_SOURCE,
+        },
+        '*',
+        [transferredRaw]
+      );
+
+      retainedRaw.emit({
+        message: 'TS APS Document Accepted',
+        version: 1,
+        nonce: indexedRendererNonce(2),
+      });
+      expect(render.snapshot().state).toBe('waiting_for_document');
+      retainedRaw.emit({ message: 'TS APS Document Accepted', version: 1, nonce });
+      expect(render.snapshot().state).toBe('waiting_for_aps_completion');
+      retainedRaw.emit({ message: 'TS APS Runner Loaded', version: 1, nonce });
+      expect(render.snapshot().outcome).toBeUndefined();
+      expect(container.querySelector('span')).not.toBeNull();
+      retainedRaw.emit({ message: 'TS APS Render Completed', version: 1, nonce });
+      expect(render.snapshot().outcome).toEqual({ outcome: 'accepted' });
+      expect(container.querySelector('span')).toBeNull();
+      retainedRaw.emit({
+        message: 'TS APS Render Failed',
+        version: 1,
+        nonce,
+        reason: 'runner_failed',
+      });
+      expect(render.snapshot().outcome).toEqual({ outcome: 'accepted' });
+      expect(iframe.isConnected).toBe(true);
+      expect(retainedRaw.close).toHaveBeenCalledOnce();
+      expect(transferredRaw.close).not.toHaveBeenCalled();
+    } finally {
+      artifacts.dispose();
+      nonces.dispose();
+      document.body.innerHTML = '';
+      vi.useRealTimers();
+    }
+  });
+
+  it('maps document and APS completion deadlines through the attempt-owned timers', () => {
+    vi.useFakeTimers();
+    document.body.innerHTML = '<div id="document-slot"></div><div id="runner-slot"></div>';
+    const makeRender = (id: string, slot: string) => {
+      const render = attempt(owner(id, slot));
+      expect(render.admitDirectWinner(DIRECT_APS_SOURCE, WINNER_CONTEXT)).toBe(true);
+      const retainedRaw = browserMessagePort();
+      const transferredRaw = browserMessagePort();
+      const messaging = createBrowserMessagingAdapter({
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        MessageChannel: class {
+          readonly port1 = retainedRaw;
+          readonly port2 = transferredRaw;
+        },
+      });
+      return { messaging, render, retainedRaw };
+    };
+    const first = makeRender(indexedAttemptId(1), 'document-slot');
+    const second = makeRender(indexedAttemptId(2), 'runner-slot');
+    let draw = 1;
+    const nonces = createRendererNonceRegistry({
+      mintNonce: () => Object.freeze({ ok: true as const, value: indexedRendererNonce(draw++) }),
+    });
+
+    try {
+      expect(
+        renderDirectApsAttempt({
+          attempt: first.render,
+          container: document.getElementById('document-slot')!,
+          messaging: first.messaging,
+          nonces,
+          publisherOrigin: window.location.origin,
+        })
+      ).toBe(true);
+      vi.advanceTimersByTime(3_000);
+      expect(first.render.snapshot().outcome).toEqual({
+        outcome: 'failed',
+        reason: 'renderer_document_no_load',
+      });
+      expect(document.querySelector('#document-slot iframe')).toBeNull();
+
+      expect(
+        renderDirectApsAttempt({
+          attempt: second.render,
+          container: document.getElementById('runner-slot')!,
+          messaging: second.messaging,
+          nonces,
+          publisherOrigin: window.location.origin,
+        })
+      ).toBe(true);
+      const runnerFrame = document.querySelector<HTMLIFrameElement>('#runner-slot iframe')!;
+      runnerFrame.dispatchEvent(new Event('load'));
+      second.retainedRaw.emit({
+        message: 'TS APS Document Accepted',
+        version: 1,
+        nonce: indexedRendererNonce(2),
+      });
+      second.retainedRaw.emit({
+        message: 'TS APS Runner Loaded',
+        version: 1,
+        nonce: indexedRendererNonce(2),
+      });
+      vi.advanceTimersByTime(10_000);
+      expect(second.render.snapshot().outcome).toEqual({
+        outcome: 'failed',
+        reason: 'runner_failed',
+      });
+      expect(runnerFrame.isConnected).toBe(false);
+    } finally {
+      nonces.dispose();
+      document.body.innerHTML = '';
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    ['descriptor_invalid', 'winner_not_renderable'],
+    ['runner_no_load', 'runner_no_load'],
+    ['runner_failed', 'runner_failed'],
+  ] as const)('maps static renderer %s to %s', (rendererReason, attemptReason) => {
+    vi.useFakeTimers();
+    document.body.innerHTML = '<div id="fictional-slot"></div>';
+    const render = attempt();
+    expect(render.admitDirectWinner(DIRECT_APS_SOURCE, WINNER_CONTEXT)).toBe(true);
+    const retainedRaw = browserMessagePort();
+    const transferredRaw = browserMessagePort();
+    const messaging = createBrowserMessagingAdapter({
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      MessageChannel: class {
+        readonly port1 = retainedRaw;
+        readonly port2 = transferredRaw;
+      },
+    });
+    const nonce = indexedRendererNonce(1);
+    const nonces = createRendererNonceRegistry({
+      mintNonce: () => Object.freeze({ ok: true as const, value: nonce }),
+    });
+
+    try {
+      expect(
+        renderDirectApsAttempt({
+          attempt: render,
+          container: document.getElementById('fictional-slot')!,
+          messaging,
+          nonces,
+          publisherOrigin: window.location.origin,
+        })
+      ).toBe(true);
+      document.querySelector<HTMLIFrameElement>('iframe')?.dispatchEvent(new Event('load'));
+      retainedRaw.emit({ message: 'TS APS Document Accepted', version: 1, nonce });
+      retainedRaw.emit({
+        message: 'TS APS Render Failed',
+        version: 1,
+        nonce,
+        reason: rendererReason,
+      });
+      expect(render.snapshot().outcome).toEqual({ outcome: 'failed', reason: attemptReason });
+      expect(document.querySelector('iframe')).toBeNull();
+      expect(retainedRaw.close).toHaveBeenCalledOnce();
+    } finally {
+      nonces.dispose();
+      document.body.innerHTML = '';
+      vi.useRealTimers();
+    }
+  });
+
+  it('removes and retires the pending frame and channel when caller cancellation wins', () => {
+    vi.useFakeTimers();
+    document.body.innerHTML = '<div id="fictional-slot"></div>';
+    const render = attempt();
+    expect(render.admitDirectWinner(DIRECT_APS_SOURCE, WINNER_CONTEXT)).toBe(true);
+    const retainedRaw = browserMessagePort();
+    const transferredRaw = browserMessagePort();
+    const messaging = createBrowserMessagingAdapter({
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      MessageChannel: class {
+        readonly port1 = retainedRaw;
+        readonly port2 = transferredRaw;
+      },
+    });
+    const nonce = indexedRendererNonce(1);
+    const nonces = createRendererNonceRegistry({
+      mintNonce: () => Object.freeze({ ok: true as const, value: nonce }),
+    });
+    try {
+      expect(
+        renderDirectApsAttempt({
+          attempt: render,
+          container: document.getElementById('fictional-slot')!,
+          messaging,
+          nonces,
+          publisherOrigin: window.location.origin,
+        })
+      ).toBe(true);
+      const frame = document.querySelector<HTMLIFrameElement>('iframe')!;
+      expect(render.cancel('caller_aborted')).toBe(true);
+      expect(frame.isConnected).toBe(false);
+      expect(retainedRaw.close).toHaveBeenCalledOnce();
+      expect(transferredRaw.close).toHaveBeenCalledOnce();
+      frame.dispatchEvent(new Event('load'));
+      retainedRaw.emit({ message: 'TS APS Document Accepted', version: 1, nonce });
+      retainedRaw.emit({ message: 'TS APS Render Completed', version: 1, nonce });
+      expect(render.snapshot().outcome).toEqual({
+        outcome: 'cancelled',
+        reason: 'caller_aborted',
+      });
+    } finally {
+      nonces.dispose();
+      document.body.innerHTML = '';
+      vi.useRealTimers();
+    }
+  });
+
+  it('cannot accept a renderer frame removed before its load handoff', () => {
+    vi.useFakeTimers();
+    document.body.innerHTML = '<div id="fictional-slot"></div>';
+    const render = attempt();
+    expect(render.admitDirectWinner(DIRECT_APS_SOURCE, WINNER_CONTEXT)).toBe(true);
+    const retainedRaw = browserMessagePort();
+    const transferredRaw = browserMessagePort();
+    const messaging = createBrowserMessagingAdapter({
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      MessageChannel: class {
+        readonly port1 = retainedRaw;
+        readonly port2 = transferredRaw;
+      },
+    });
+    const nonce = indexedRendererNonce(1);
+    const nonces = createRendererNonceRegistry({
+      mintNonce: () => Object.freeze({ ok: true as const, value: nonce }),
+    });
+    try {
+      expect(
+        renderDirectApsAttempt({
+          attempt: render,
+          container: document.getElementById('fictional-slot')!,
+          messaging,
+          nonces,
+          publisherOrigin: window.location.origin,
+        })
+      ).toBe(true);
+      const frame = document.querySelector<HTMLIFrameElement>('iframe')!;
+      frame.remove();
+      frame.dispatchEvent(new Event('load'));
+      expect(render.snapshot().outcome).toEqual({
+        outcome: 'failed',
+        reason: 'renderer_document_no_load',
+      });
+      retainedRaw.emit({ message: 'TS APS Document Accepted', version: 1, nonce });
+      retainedRaw.emit({ message: 'TS APS Render Completed', version: 1, nonce });
+      expect(render.snapshot().outcome).toEqual({
+        outcome: 'failed',
+        reason: 'renderer_document_no_load',
+      });
+      expect(transferredRaw.close).toHaveBeenCalledOnce();
+    } finally {
+      nonces.dispose();
+      document.body.innerHTML = '';
+      vi.useRealTimers();
+    }
+  });
+
+  it('cannot accept a renderer whose container ancestor is removed before handoff', () => {
+    vi.useFakeTimers();
+    document.body.innerHTML =
+      '<section id="publisher-region"><div id="fictional-slot"></div></section>';
+    const render = attempt();
+    expect(render.admitDirectWinner(DIRECT_APS_SOURCE, WINNER_CONTEXT)).toBe(true);
+    const retainedRaw = browserMessagePort();
+    const transferredRaw = browserMessagePort();
+    const messaging = createBrowserMessagingAdapter({
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      MessageChannel: class {
+        readonly port1 = retainedRaw;
+        readonly port2 = transferredRaw;
+      },
+    });
+    const nonce = indexedRendererNonce(1);
+    const nonces = createRendererNonceRegistry({
+      mintNonce: () => Object.freeze({ ok: true as const, value: nonce }),
+    });
+    const container = document.getElementById('fictional-slot')!;
+
+    try {
+      expect(
+        renderDirectApsAttempt({
+          attempt: render,
+          container,
+          messaging,
+          nonces,
+          publisherOrigin: window.location.origin,
+        })
+      ).toBe(true);
+      const frame = container.querySelector('iframe')!;
+      const target = frame.contentWindow!;
+      const postMessage = vi.spyOn(target, 'postMessage');
+      document.getElementById('publisher-region')!.remove();
+      expect(frame.parentNode).toBe(container);
+      expect(frame.isConnected).toBe(false);
+      frame.dispatchEvent(new Event('load'));
+      expect(postMessage).not.toHaveBeenCalled();
+      expect(render.snapshot().outcome).toEqual({
+        outcome: 'failed',
+        reason: 'renderer_document_no_load',
+      });
+      retainedRaw.emit({ message: 'TS APS Document Accepted', version: 1, nonce });
+      retainedRaw.emit({ message: 'TS APS Render Completed', version: 1, nonce });
+      expect(render.snapshot().outcome).toEqual({
+        outcome: 'failed',
+        reason: 'renderer_document_no_load',
+      });
+    } finally {
+      nonces.dispose();
+      document.body.innerHTML = '';
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects a same-node src navigation before handoff', () => {
+    vi.useFakeTimers();
+    document.body.innerHTML = '<div id="navigation-slot"></div>';
+    const nonces = createRendererNonceRegistry({
+      mintNonce: () => Object.freeze({ ok: true as const, value: indexedRendererNonce(1) }),
+    });
+
+    const navigationRender = attempt(owner(indexedAttemptId(1), 'navigation-slot'));
+    expect(navigationRender.admitDirectWinner(DIRECT_APS_SOURCE, WINNER_CONTEXT)).toBe(true);
+    const navigationRetained = browserMessagePort();
+    const navigationTransferred = browserMessagePort();
+    const navigationMessaging = createBrowserMessagingAdapter({
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      MessageChannel: class {
+        readonly port1 = navigationRetained;
+        readonly port2 = navigationTransferred;
+      },
+    });
+
+    try {
+      expect(
+        renderDirectApsAttempt({
+          attempt: navigationRender,
+          container: document.getElementById('navigation-slot')!,
+          messaging: navigationMessaging,
+          nonces,
+          publisherOrigin: window.location.origin,
+        })
+      ).toBe(true);
+      const navigationFrame = document.querySelector<HTMLIFrameElement>('#navigation-slot iframe')!;
+      const originalSource = navigationFrame.contentWindow!;
+      const postMessage = vi.spyOn(originalSource, 'postMessage');
+      navigationFrame.src = 'https://attacker.example/replacement';
+      navigationFrame.dispatchEvent(new Event('load'));
+      expect(postMessage).not.toHaveBeenCalled();
+      expect(navigationRender.snapshot().outcome).toEqual({
+        outcome: 'failed',
+        reason: 'renderer_document_no_load',
+      });
+    } finally {
+      nonces.dispose();
+      document.body.innerHTML = '';
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not remove DOM installed reentrantly by accepted-settlement observers', () => {
+    vi.useFakeTimers();
+    document.body.innerHTML = '<div id="fictional-slot"><span>placeholder</span></div>';
+    const render = attempt();
+    expect(render.admitDirectWinner(DIRECT_APS_SOURCE, WINNER_CONTEXT)).toBe(true);
+    const retainedRaw = browserMessagePort();
+    const transferredRaw = browserMessagePort();
+    const messaging = createBrowserMessagingAdapter({
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      MessageChannel: class {
+        readonly port1 = retainedRaw;
+        readonly port2 = transferredRaw;
+      },
+    });
+    const nonce = indexedRendererNonce(1);
+    const nonces = createRendererNonceRegistry({
+      mintNonce: () => Object.freeze({ ok: true as const, value: nonce }),
+    });
+    const container = document.getElementById('fictional-slot')!;
+    expect(
+      render.onSettled((outcome) => {
+        if (outcome.outcome !== 'accepted') return;
+        const successor = document.createElement('div');
+        successor.id = 'reentrant-successor';
+        container.appendChild(successor);
+      })
+    ).toBe(true);
+
+    try {
+      expect(
+        renderDirectApsAttempt({
+          attempt: render,
+          container,
+          messaging,
+          nonces,
+          publisherOrigin: window.location.origin,
+        })
+      ).toBe(true);
+      container.querySelector('iframe')?.dispatchEvent(new Event('load'));
+      retainedRaw.emit({ message: 'TS APS Document Accepted', version: 1, nonce });
+      const duringRenderSuccessor = document.createElement('div');
+      duringRenderSuccessor.id = 'during-render-successor';
+      container.appendChild(duringRenderSuccessor);
+      retainedRaw.emit({ message: 'TS APS Render Completed', version: 1, nonce });
+      expect(render.snapshot().outcome).toEqual({ outcome: 'accepted' });
+      expect(container.querySelector('span')).toBeNull();
+      expect(container.querySelector('#during-render-successor')).not.toBeNull();
+      expect(container.querySelector('#reentrant-successor')).not.toBeNull();
+    } finally {
+      nonces.dispose();
+      document.body.innerHTML = '';
+      vi.useRealTimers();
+    }
+  });
+
+  it('anchors a synchronous document deadline after insertion and removes the exact frame', () => {
+    document.body.innerHTML = '<div id="fictional-slot"></div>';
+    const render = attempt(owner(), {
+      scheduler: Object.freeze({
+        clear: vi.fn(),
+        set: (callback: () => void) => {
+          callback();
+          return Object.freeze({});
+        },
+      }),
+    });
+    expect(render.admitDirectWinner(DIRECT_APS_SOURCE, WINNER_CONTEXT)).toBe(true);
+    const retainedRaw = browserMessagePort();
+    const transferredRaw = browserMessagePort();
+    const messaging = createBrowserMessagingAdapter({
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      MessageChannel: class {
+        readonly port1 = retainedRaw;
+        readonly port2 = transferredRaw;
+      },
+    });
+    const nonces = createRendererNonceRegistry({
+      mintNonce: () => Object.freeze({ ok: true as const, value: indexedRendererNonce(1) }),
+    });
+    const container = document.getElementById('fictional-slot')!;
+    const observer = new MutationObserver(() => undefined);
+    observer.observe(container, { childList: true });
+
+    expect(
+      renderDirectApsAttempt({
+        attempt: render,
+        container,
+        messaging,
+        nonces,
+        publisherOrigin: window.location.origin,
+      })
+    ).toBe(false);
+    expect(render.snapshot().outcome).toEqual({
+      outcome: 'failed',
+      reason: 'renderer_document_no_load',
+    });
+    const mutations = observer.takeRecords();
+    expect(mutations.some((mutation) => mutation.addedNodes.length === 1)).toBe(true);
+    expect(mutations.some((mutation) => mutation.removedNodes.length === 1)).toBe(true);
+    observer.disconnect();
+    expect(container.querySelector('iframe')).toBeNull();
+    expect(retainedRaw.close).toHaveBeenCalledOnce();
+    expect(transferredRaw.close).toHaveBeenCalledOnce();
+    nonces.dispose();
+    document.body.innerHTML = '';
+  });
+
+  it('contains a hostile nonce-issuer result and closes both unowned channel endpoints', () => {
+    document.body.innerHTML = '<div id="fictional-slot"></div>';
+    const render = attempt();
+    expect(render.admitDirectWinner(DIRECT_APS_SOURCE, WINNER_CONTEXT)).toBe(true);
+    const retainedRaw = browserMessagePort();
+    const transferredRaw = browserMessagePort();
+    const messaging = createBrowserMessagingAdapter({
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      MessageChannel: class {
+        readonly port1 = retainedRaw;
+        readonly port2 = transferredRaw;
+      },
+    });
+    const realNonces = createRendererNonceRegistry();
+    const nonces = Object.freeze({
+      ...realNonces,
+      issue: () =>
+        Object.freeze(
+          Object.defineProperty({}, 'ok', {
+            enumerable: true,
+            get: () => {
+              throw new Error('hostile nonce result');
+            },
+          })
+        ),
+    }) as unknown as typeof realNonces;
+    let result: boolean | undefined;
+    let thrown: unknown;
+    try {
+      result = renderDirectApsAttempt({
+        attempt: render,
+        container: document.getElementById('fictional-slot')!,
+        messaging,
+        nonces,
+        publisherOrigin: window.location.origin,
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeUndefined();
+    expect(result).toBe(false);
+    expect(render.snapshot().outcome).toEqual({
+      outcome: 'failed',
+      reason: 'identity_generation_failed',
+    });
+    expect(retainedRaw.close).toHaveBeenCalledOnce();
+    expect(transferredRaw.close).toHaveBeenCalledOnce();
+    expect(document.querySelector('iframe')).toBeNull();
+    realNonces.dispose();
+    document.body.innerHTML = '';
+  });
+
+  it('rejects an invalid APS descriptor before creating a channel or mutating the DOM', () => {
+    document.body.innerHTML = '<div id="fictional-slot"></div>';
+    const render = attempt();
+    expect(render.admitDirectWinner(APS_SOURCE, WINNER_CONTEXT)).toBe(true);
+    const channelConstructor = vi.fn();
+    const messaging = createBrowserMessagingAdapter({
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      MessageChannel: channelConstructor as never,
+    });
+    const nonces = createRendererNonceRegistry();
+    const container = document.getElementById('fictional-slot')!;
+
+    expect(
+      renderDirectApsAttempt({
+        attempt: render,
+        container,
+        messaging,
+        nonces,
+        publisherOrigin: window.location.origin,
+      })
+    ).toBe(false);
+    expect(channelConstructor).not.toHaveBeenCalled();
+    expect(container.children).toHaveLength(0);
+    expect(render.snapshot().outcome).toEqual({
+      outcome: 'failed',
+      reason: 'winner_not_renderable',
+    });
+    nonces.dispose();
+    document.body.innerHTML = '';
+  });
+
+  it('rejects a publisher origin that is not the exact container document origin', () => {
+    document.body.innerHTML = '<div id="fictional-slot"></div>';
+    const render = attempt();
+    expect(render.admitDirectWinner(DIRECT_APS_SOURCE, WINNER_CONTEXT)).toBe(true);
+    const channelConstructor = vi.fn();
+    const messaging = createBrowserMessagingAdapter({
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      MessageChannel: channelConstructor as never,
+    });
+    const nonces = createRendererNonceRegistry();
+    const container = document.getElementById('fictional-slot')!;
+
+    expect(
+      renderDirectApsAttempt({
+        attempt: render,
+        container,
+        messaging,
+        nonces,
+        publisherOrigin: 'https://foreign-publisher.example',
+      })
+    ).toBe(false);
+    expect(channelConstructor).not.toHaveBeenCalled();
+    expect(container.children).toHaveLength(0);
+    expect(render.snapshot().outcome).toEqual({
+      outcome: 'failed',
+      reason: 'winner_not_renderable',
+    });
+    nonces.dispose();
+    document.body.innerHTML = '';
+  });
+
+  it('allows HTTPS and loopback HTTP renderer origins but rejects production HTTP', () => {
+    expect(resolveApsRendererV1Url('https://publisher.example')).toBe(
+      'https://publisher.example/integrations/aps/renderer/v1'
+    );
+    expect(resolveApsRendererV1Url('http://localhost:8080')).toBe(
+      'http://localhost:8080/integrations/aps/renderer/v1'
+    );
+    expect(resolveApsRendererV1Url('http://127.0.0.1:8080')).toBe(
+      'http://127.0.0.1:8080/integrations/aps/renderer/v1'
+    );
+    expect(resolveApsRendererV1Url('http://[::1]:8080')).toBe(
+      'http://[::1]:8080/integrations/aps/renderer/v1'
+    );
+    expect(resolveApsRendererV1Url('http://publisher.example')).toBeUndefined();
   });
 });
 

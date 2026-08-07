@@ -1414,7 +1414,15 @@ Every task's regression suite therefore remains green in task order.
     generation, renderer `contentWindow`, and retained port;
   - put the nonce in the fragment and transfer an envelope containing the
     kernel-captured publisher origin;
-  - bind to the exact iframe `contentWindow` and transferred port;
+  - use captured native document, tree, event, attribute, source, and removal
+    authorities to create one fresh iframe in the exact publisher document; never
+    accept a publisher-supplied connected or detached frame, forged `contentWindow`,
+    lying `src`, or hostile cleanup method;
+  - bind to the exact iframe browsing-context `contentWindow` and transferred port,
+    fail detectable node removal/replacement or `src` mutation, and preserve the
+    explicit §4.4 ancestor-navigation trust boundary: an opaque active `Document`
+    cannot be attested after undetectable `contentWindow.location` navigation, so no
+    test or release evidence may claim otherwise;
   - atomically consume the nonce on the first valid document acceptance and
     invalidate it on failure, supersession, navigation, or disposal; duplicate,
     wrong-source, stale, or late use is inert and nonce values are never logged;

@@ -23,6 +23,7 @@ import {
   parseBrowserAuctionProjectionV1,
 } from '../core/contracts/auction_projection';
 import { validateApsRenderer } from '../core/contracts/aps_renderer';
+import { renderDirectApsAttempt } from '../integrations/aps/render';
 import { createBrowserNavigationIdentityIssuer } from '../kernel/identity';
 import type { NavigationIdentityIssuerFactory, RuntimeSession } from '../kernel/sessions';
 import { createRuntimeSession } from '../kernel/sessions';
@@ -35,6 +36,11 @@ import {
   prepareInitialAuctionProjection,
 } from '../services/projections';
 import { createReservationService, type ReservationService } from '../services/reservations';
+import {
+  createRendererNonceRegistry,
+  type RenderAttempt,
+  type RendererNonceRegistry,
+} from '../services/render';
 import { createSlotService, type SlotService } from '../services/slots';
 import { createTargetingService, type TargetingService } from '../services/targeting';
 
@@ -50,6 +56,8 @@ export interface BrowserComposition {
 
 export interface BrowserServices {
   readonly reservations: ReservationService;
+  readonly rendererNonces: RendererNonceRegistry;
+  readonly renderDirectAps: (attempt: RenderAttempt, container: HTMLElement) => boolean;
   readonly slots: SlotService;
   readonly targeting: TargetingService;
 }
@@ -78,6 +86,8 @@ export interface BrowserRuntimeComposition extends BrowserComposition {
   readonly targetingServiceForTest: () => TargetingService | undefined;
   /** Return runtime-owned reservation operations only in coordinated-cutover tests. */
   readonly reservationServiceForTest: () => ReservationService | undefined;
+  /** Return runtime-owned renderer nonces only in coordinated-cutover tests. */
+  readonly rendererNonceRegistryForTest: () => RendererNonceRegistry | undefined;
 }
 
 export interface BrowserCoreActivations {
@@ -203,8 +213,25 @@ export function createTestBrowserRuntimeComposition(
       const reservationService = createReservationService({
         prepareRenderSource: (candidate) => parseBidRenderSourceV1(candidate, cachePolicy),
       });
+      const rendererNonces = createRendererNonceRegistry();
+      const publisherOrigin = window.location.origin;
+      const renderDirectAps = (attempt: RenderAttempt, container: HTMLElement): boolean => {
+        try {
+          return renderDirectApsAttempt({
+            attempt,
+            container,
+            messaging: composition.adapters.messaging,
+            nonces: rendererNonces,
+            publisherOrigin,
+          });
+        } catch {
+          return false;
+        }
+      };
       const services = Object.freeze({
         reservations: reservationService,
+        rendererNonces,
+        renderDirectAps,
         slots: slotService,
         targeting: targetingService,
       });
@@ -216,6 +243,7 @@ export function createTestBrowserRuntimeComposition(
       context.onDispose(() => {
         session.dispose();
         reservationService.dispose();
+        rendererNonces.dispose();
         slotService.dispose();
         targetingService.dispose();
         composition.adapters.googletag.dispose();
@@ -283,5 +311,6 @@ export function createTestBrowserRuntimeComposition(
     slotServiceForTest: () => browserServices?.slots,
     targetingServiceForTest: () => browserServices?.targeting,
     reservationServiceForTest: () => browserServices?.reservations,
+    rendererNonceRegistryForTest: () => browserServices?.rendererNonces,
   });
 }

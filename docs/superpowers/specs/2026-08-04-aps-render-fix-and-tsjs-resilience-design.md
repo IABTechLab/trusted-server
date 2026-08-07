@@ -1578,6 +1578,28 @@ on iframe load transfers the envelope and document port once to that exact
 `contentWindow`. Direct APS uses the same document channel and envelope but has no
 PUC owner-control channel. The nonce is 128-bit CSPRNG, attempt-bound, and one-use.
 
+The enforceable direct-path binding is to one TS-created native iframe element, its
+unchanged `src` attribute, its browsing-context `WindowProxy`, and the one-use port;
+it is not browser attestation of the active opaque `Document`. Code executing in an
+embedding ancestor realm with DOM/navigation authority is trusted for this one
+navigation-integrity property. Such code can assign
+`iframe.contentWindow.location` without changing the iframe `src`, while the same
+`WindowProxy` survives and the opaque active document's URL and origin remain
+unreadable to the kernel. If it does so before handoff, that replacement document
+can receive the descriptor, nonce, and port and can forge the page-local document
+and completion messages. Native element creation plus exact parent/source/`src`
+checks still reject publisher-supplied frames, node replacement, removal, detectable
+`src` mutation, unrelated contexts, and stale ports; they make no claim about the
+undetectable ancestor-navigation case. APS has no synthetic notification or other
+trusted remote side effect derived from page-local completion.
+
+Removing that trust boundary requires a separately operated renderer origin, adding
+`allow-same-origin` only for that cross-origin document, and using exact
+`targetOrigin`/`event.origin` checks. Adding `allow-same-origin` to the current
+publisher-origin renderer would defeat containment when combined with scripts, so
+that is not an acceptable implementation of this design and a dedicated-origin
+variant requires a separate architecture decision.
+
 The static document sends only these exact document-port messages:
 
 - `{message:"TS APS Document Accepted",version:1,nonce}` after nonce and descriptor
@@ -2481,11 +2503,7 @@ subscription methods. The final schema is:
 ```ts
 type RenderTracePathV1 = 'auction' | 'ssat' | 'gam-refresh'
 type RenderTraceServedFromV1 =
-  | 'inline'
-  | 'gam'
-  | 'debug-adm'
-  | 'pbs-cache'
-  | 'prebid'
+  'inline' | 'gam' | 'debug-adm' | 'pbs-cache' | 'prebid'
 
 interface RenderTraceRecord {
   readonly slotId: string
@@ -2772,8 +2790,10 @@ waived by a performance pass.
 ## 6. Security and privacy
 
 1. Renderer iframes omit `allow-same-origin`; cross-origin target `"*"` is permitted
-   only when transferring a one-use port to an exact, already-checked
-   `contentWindow`.
+   only when transferring a one-use port to the exact native iframe's already-checked
+   browsing-context `WindowProxy`. As §4.4 states, this binds the context, not an
+   opaque active `Document`; embedding-ancestor code with navigation authority is
+   trusted for that navigation-integrity property.
 2. The initial global PUC request contains the opaque renderer reservation
    capability but no descriptor, ADM, lifecycle ticket, or nonce, and it establishes
    no success. The first compatible claim acquires the PUC source; render authority
