@@ -547,9 +547,7 @@ export function prepareProgrammaticAdUnits(
             throw new AdUnitRegistrationError('invalid_params', index);
           }
           const measurement = measureJson(bid.params, measurementMemo);
-          if (!measurement || measurement.structureEntries > MAX_JSON_STRUCTURE_ENTRIES) {
-            throw new AdUnitRegistrationError('invalid_params', index);
-          }
+          if (!measurement) throw new AdUnitRegistrationError('invalid_params', index);
           params = bid.params;
         }
         pendingBids.push(
