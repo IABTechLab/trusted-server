@@ -121,7 +121,7 @@ Run your Next.js application behind Trusted Server for:
 
 - First-party asset loading
 - EC ID injection
-- Privacy-compliant tracking
+- Data collection subject to consent signals
 - Ad serving integration
 
 ### Static Site with Dynamic Ads
